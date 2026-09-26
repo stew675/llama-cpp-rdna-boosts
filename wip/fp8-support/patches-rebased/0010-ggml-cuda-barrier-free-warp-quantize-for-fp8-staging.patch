@@ -1,0 +1,1105 @@
+From ce3c39c7c6af8361a2e10560898390631e9392d3 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 18:18:57 -0500
+Subject: [PATCH 10/13] ggml-cuda : barrier-free warp quantize for fp8 staging,
+ pp512 6630 -> 6818
+
+The old quantize_fp8 was latency/barrier-bound (1 float per thread, 2
+syncthreads per CTA): ~256 GB/s of the ~3 TB/s DRAM budget. The new
+quantize_fp8_warp<4> is one warp per (token, 128-col block) with a pure
+warp-butterfly amax reduce (no smem, no barriers) and 4 k-blocks per warp
+for load ILP; the fp8 encode uses the gfx12 v_cvt_pk_fp8_f32, verified
+bit-exact vs the software encoder for all finite inputs. Staging output is
+bit-exact, so the wmma/gemv/scalar consumers are untouched.
+
+Quantize on pp512 grids 25.4 -> 12.6 us/launch (-50%), pp512 6630 ->
+6818-6841 (+3%), tg64 unchanged, PPL 6.2677 exact, 47/47 GDN tests.
+
+The originally-planned fusion (quantize in the wmma staging) was measured
+and abandoned: it wins only on small under-occupied shapes and loses on the
+big GEMMs that dominate pp512 (net wash). The warp rewrite gets the same
+win with zero risk to the GEMM path.
+
+Assisted-by: Claude Sonnet
+---
+ LEVERS.md                  | 399 ++++++++++++++++++++++++++++++
+ PERF_HANDOVER.md           | 492 +++++++++++++++++++++++++++++++------
+ ggml/src/ggml-cuda/fp8.cu  |  12 +-
+ ggml/src/ggml-cuda/fp8.cuh |  61 +++++
+ 4 files changed, 883 insertions(+), 81 deletions(-)
+ create mode 100644 LEVERS.md
+
+diff --git a/LEVERS.md b/LEVERS.md
+new file mode 100644
+index 000000000..92be8ecc6
+--- /dev/null
++++ b/LEVERS.md
+@@ -0,0 +1,399 @@
++# LEVERS.md - remaining performance work, ranked, for the next session
++
++**Purpose**: self-contained list of the remaining performance levers for the
++fp8 GDN model on this box, with the current state, the approach, the expected
++win, and the validation steps for each. Step through in order; stop when the
++gain no longer justifies the risk. Everything here was measured on 2026-08-06
++after the chunked GDN correctness fix (ef41a940a) and phase B rewrite
++(56e7cb0c9). Read `PERF_HANDOVER.md` for history and `HANDOVER.md` for the
++project as a whole.
++
++Box: 1x AMD Radeon AI PRO R9700 (gfx1201, 64 CUs, 2 SIMDs/CU, wave32,
++64 KB LDS/CU, 8 MB L2), 2350 MHz. Model: `/llm/models/Qwen3.5/4B/StewFP8/
++stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
++
++---
++
++## 0. Current state (verified 2026-08-06 evening, after the L5 concat-fusion session)
++
++| metric | value | notes |
++|---|---|---|
++| pp512 (chunked) | 6818-6841 (was 6538-6554) | quantize_fp8_warp rewrite (+~4%) |
++| tg64 | 89.2-89.6 | decode untouched, sequential GDN |
++| PPL | 6.2677 | matches baseline exactly; generation matches |
++| backend tests | 47/47 GATED_DELTA_NET pass | + 83/83 SSM_CONV (incl. new 2-src cases) |
++| wmma kernel | ~186-188 us/launch avg | unchanged |
++| GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
++| concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
++| quantize_fp8 per pp512 | ~2.5 ms (was ~5.1) | warp rewrite: 12.6 us/launch (was 25.4) on pp512 grids |
++
++NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
++pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
+++/-3%) over llama-bench for judging a change; the GDN delta of this session
++(~-2.4 ms/pp512) should be ~+2% on pp512 but is hard to pin in bench.
++
++Bench geometry (IMPORTANT, do not rediscover): `llama-bench -p 512` runs the
++512-token prompt as ONE batch (n_seqs=1, n_chunks=8) and llama-bench performs
++a warmup pass first. The kernel trace therefore shows 2x the per-pp512
++launch counts (24 layers x 2) and 2x the per-pp512 kernel times. Per-pp512
++numbers in this file are the trace numbers divided by 2 unless stated.
++
++Profile command: `rocprofv3 -r -d /tmp/rocp_x -f csv -- llama-bench -m <model>
++-p 512 -n 8 -r 1 -dev ROCm0`, then parse `soar/*kernel_trace.csv`
++(Duration = End_Timestamp - Start_Timestamp; Grid_Size_X = work-items,
++divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
++
++## 1. Where pp512 time goes (per-pp512, warmup removed, after the L5 concat fusion)
++
++| kernel | ms/pp512 | share | note |
++|---|---|---|---|
++| mul_mat_fp8_wmma | ~38 | ~50% | prefill GEMMs, ~77 TFLOP/s |
++| gdn_chunk_prepare + state | ~10.9 | ~14% | A ~4.9 + B ~5.9 |
++| quantize_fp8 | ~2.5 | ~3% | warp rewrite (was ~6.3); f32->fp8 staging |
++| Cijk (CK BF16 GEMM) | ~5.3 | ~7% | delta-net in/out projections |
++| ssm_conv_long_token_2src | ~0.6 | ~1% | fused conv (was concat 4.7 + conv 0.8) |
++| flash_attn_tile | ~3.0 | ~4% | 8 attention layers |
++| silu | ~2.9 | ~4% | |
++| rms_norm (both sizes) | ~4.4 | ~6% | |
++| k_bin_bcast / cpy / get_rows / l2_norm / rope / ssm_conv | ~3.3 | ~4% | small |
++| (decode kernels: gemv, sequential GDN, etc.) | - | - | not part of pp512 |
++
++pp512 wall = 512 / ~6550 = ~78 ms (noisy). The shares above sum to ~90% of that.
++
++The GDN share is now split nearly evenly: phase A (gdn_chunk_prepare, ~4.9
++ms/pp512, 23 syncs, 1 CTA/CU at 58 KB LDS) and phase B (gdn_chunk_state,
++~5.9 ms/pp512, 2 CTAs/CU, 1 wave). Both are ~40-65% load-stall-bound with a
++substantial FP32-FMA floor (measured by stage-elimination stubs: phase A v+q
++loads ~118 us, gram ~34 us, closure ~32 us; phase B kd/q loads ~112 us,
++ac+k loads ~62 us, FMA/sync floor ~206 us).
++
++## 2. Ranked levers
++
++### L1. mul_mat_fp8_wmma - measured 2026-08-06 evening, mostly spent; revisit only with a new idea
++
++- Kernel: mul_mat_fp8_wmma, ~40.6 ms/pp512 (~48%), ~77 TFLOP/s effective (92-98 on the big shapes in a hot-loop rig).
++- The 2-CTA/CU premise is DONE (single-buffered 26.4 KB, register-staged). The
++  residual gap to the aiter triton kernel (121-137 TFLOP/s at the SAME 2
++  CTAs/CU) was investigated with a standalone rig (/tmp/bench_wmma.cu, hot
++  loop, min of 3) + stage-elimination stubs:
++  * fragment LDS chain: ~4 us/launch of the gate GEMM (250 us) - nearly free,
++    the 2addr loads + 2-CTA occupancy hide it.
++  * scale pass (16 wd + 2 ad LDS + 32 FMA per warp per k-block, serialized
++    between the wmma chain and the barrier): ~33 us (13%). Restructuring the
++    per-row scales into a contiguous smem array (2 float4 broadcast loads
++    instead of 16 scattered reads) did NOT recover it - the cost is the 32
++    FMAs + the serial position, not the LDS. The FMA count is irreducible
++    (32 acc elements/thread/k-block) and the wd (weight block scale) varies
++    per k-block, so the multiply cannot be deferred to the epilogue.
++  * staging loads + barriers + wmma issue: the ~85% floor. The 4-B weight
++    staging loads coalesce fine; a 2-k-block staging lookahead (double-buffered
++    registers, +26 VGPR) REGRESSED ~4% (scheduling).
++  * L2: ~280 MB/launch of weight+activation traffic (8x weight re-reads) is
++    NOT the limiter (measured 1.1-1.6 TB/s of a 3 TB/s budget).
++- aiter's kpack=2 does not port cleanly: it needs the wmma operand smem layout
++  rearranged (the 16-k fragment is split across lane halves, so a single wider
++  LDS load cannot cover 2 k-steps without a swizzled store side) and the
++  triton num_stages=2 doubles the smem (48 KB = 1 CTA/CU, the measured 58
++  TFLOP/s config).
++- COMPILER MISCOMPILE (new, do not retry): a 2-k-step fragment lookahead with
++  a rotate (named fp8x8_t variables, a0_1/a0_2 rotation) MISCOMPILES under the
++  single-buffer loop - LLVM folds the rotation copies, reusing the step-0
++  operand registers for step 1 (SASS shows 8 v_wmma with identical operands;
++  PPL 183142). This is the same class as the burst-array bug in section 4.
++  The 1-k-step lookahead (a0_n) is the deepest pipeline that compiles right.
++- Expected: nothing cheap left. The aiter numbers came from triton codegen we
++  cannot reproduce by hand on this compiler. L1 is spent unless a new
++  structural idea appears (e.g. a swizzled kpacked smem layout for A).
++- Measurement rig: /tmp/bench_wmma.cu (kernel-only hot loop) + /tmp/check_wmma.cu
++  (CPU-reference correctness). CHECK LESSON: random fp8 payload bytes contain
++  NaN encodings (0x7F/0xFF) that make fabs(ref-out) NaN on EVERY element -
++  the check false-passes (maxerr stays 0, bad stays 0). The check must use
++  realistically-quantized data (host-side fp8 encoder); with proper data the
++  miscompiled kernel scores maxerr 34 / 7991-of-8192 wrong.
++- Depends on: nothing. Independent of L2.
++
++### L2. wmma weight repack at load time - DONE 2026-08-06 evening, +1.6-1.8% pp512
++
++- DONE (commits below): weights are repacked once per tensor on first wmma use into a
++  cached layout (fp8 bytes contiguous [m_pad][k] 16-B aligned + scales [m_pad][n_col_blocks]
++  f32), so the wmma kernel stages 16-B uint4 loads instead of 4-B misaligned ones. The
++  GEMV and scalar paths keep reading the original block layout (decode untouched).
++- Measured (rig, gate shape 9216x512x2560): staging-stub delta 260.5 -> 175 us (the
++  weight-side staging loads were ~85 us = 33% of the kernel, far above the old ~15%
++  estimate at 55 TFLOP/s); repacked kernel 260.5 -> ~228 us = 93 -> 106 TFLOP/s (+14%).
++- In-tree: wmma ~204 -> ~186 us/launch average (-9%). The repack itself is one-time per
++  tensor (p50 71 us, max 1.09 ms for output.weight at 389 MB; ~13 ms total for the ~200
++  tensors, only on the first graph build - CUDA-graph replays reuse the cache, verified
++  stable at ~201 entries over a 2200-call PPL run).
++- Net: pp512 6220 -> 6319-6334 (+1.6-1.8%), tg64 unchanged. PPL 6.2677 exact; generation
++  matches; 47/47 GDN tests.
++- Files: fp8.cuh (fp8_repack_weights kernel + wmma staging addressing), fp8.cu (lazy
++  per-context cache keyed on src0->data, built in ggml_cuda_fp8_repack), common.cuh
++  (fp8_repack_buf in ggml_backend_cuda_context).
++- Validation: /tmp/check_repack_kernel.cu (isolated repack kernel check, all model
++  shapes incl. m=70000), /tmp/check_repack.cu (bit-exact kernel-vs-kernel).
++- Remaining: L2 as designed is spent. The kpacked smem layout for A (the other L2
++  benefit) is still blocked by the aiter layout problem (see L1).
++
++### L3. gdn_chunk_prepare (phase A) - main items DONE 2026-08-06, remaining: 2 CTAs/CU
++
++- Kernel: gdn_chunk_prepare, ~4.9 ms/pp512, ~205-210 us/launch, grid 256 CTAs
++  (32 heads x 8 chunks), 256 threads, 58 KB LDS (1 CTA/CU), 128 VGPR, no
++  spills. 23 dynamic syncs (was ~165).
++- DONE (commits a921f8fb0): closure rewritten to an exact 4x4-blocked forward
++  substitution (16 syncs vs 146; D(i,i) via warp-shuffle row substitution, the
++  off-diagonal blocks in 15 row passes reading A from a preserved packed smem
++  copy s_A); decay cumsum to a 2-sync warp-shuffle scan; k rows prefetched
++  into registers during the scan; the k_cumsum v and attn_causal q reads
++  vectorized to float4 (512 scalar global loads per thread -> 128 float4,
++  with an alignment fallback). Net 276.5 -> ~205-210 us/launch (-24%).
++- Remaining (measured by stage-elimination, all +/-3%):
++  * global loads (v+q) ~118 us of the original 293 - vectorized already, the
++    residual is the L2 latency exposure with 8 warps.
++  * gram ~34 us (1024 smem loads + 2048 FMAs/thread; symmetric-tile or
++    vectorization ideas are load-imbalance or padding-bound, see section 4).
++  * closure ~32 us (16 barriers; the pass work is inherently imbalanced -
++    pass i has i blocks; barrier count is at the floor for 4x4 granularity).
++  * 2 CTAs/CU still needs the smem under 32 KB: s_k [64][129] alone is 33 KB,
++    so it requires fp16 s_k (precision risk on the closure, which is
++    sensitivity-prone - see GDN_DEBUG_HANDOVER.md) or a chunk split. Do NOT
++    attempt casually.
++- Validation: 47/47 tests, PPL 6.2677, generation parity. Numpy check of the
++  4x4 closure math: /tmp/validate_closure_4x4.py (exact to 1e-15).
++
++### L4. gdn_chunk_state (phase B): chunk-loop latency (partial, delta loads done)
++
++- Kernel: gdn_chunk_state, ~5.9 ms/pp512, ~246 us/launch, 1 wave, 2 CTAs/CU,
++  VGPR 160, no spills.
++- DONE (commit c8757d649): the step-3 delta reads vectorized (64 scalar loads
++  per thread per chunk -> 16 float4, clamped k-row index keeps the padded
++  rows in-bounds and contributing zero). 268.8 -> ~246 us/launch (-8.5%).
++- Remaining (measured by stage-elimination): kd/q loads ~112 us/launch and
++  ac+k loads ~62 us of the 269; the FMA/sync/expf floor is ~206 us. The
++  kernel is ~65% load-stall-bound, but the loads are warp-broadcast and the
++  chunk loop is serially dependent on S, so a register pipeline is not
++  possible: a 2-stage kd/q pipeline hit 256 VGPR + spills (495 us), and
++  #pragma unroll on the r-loop regressed (349 us). 16 warps/CU already.
++  Realistic remaining ideas: none cheap - revisit only with a fresh profile.
++- Validation: same as L3.
++
++### L5. concat_non_cont: delta-net ssm conv plumbing - DONE 2026-08-06 evening, pp512 +4%
++
++- DONE (commits below): the ssm_conv input assembly is fused into the conv.
++  New op form `ggml_ssm_conv_2src(ctx, conv_states, qkv, c)` (same GGML_OP_SSM_CONV
++  code, optional src[2] = conv states) reads the two contiguous pieces directly:
++  conv_states (position-major) + qkv_mixed (channel-fastest, UNTRANSPOSED) with a
++  position-major smem tile. The old transpose+concat+conv_input buffer is gone.
++  Measured: concat_non_cont 0 launches (was 24, 4.7 ms/pp512); the fused long-token
++  kernel is ~0.6 ms/pp512 (24 launches). pp512 6303 -> 6538-6554 (+4%), tg64
++  unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN + 83/83 SSM_CONV
++  (incl. 24 new test_ssm_conv_2src cases: d_conv 3/4/9 x d_inner 1024/1536/2048 x
++  n_t 1/32/64).
++- Graph: build_conv_state returns the fused conv output; the state-save view is
++  now the transpose of a qkv-tail view (the cache stores [position][channel] with
++  the position dim fastest, and the save cpy scatters by the src flat index). The
++  concat is only built when a state window overlaps the conv_states piece
++  (n_t < d_conv-1, or rollback slots with small batches) - decode keeps it, at
++  trivial cost. The conv is expanded before the state-save cpy to keep the
++  read-before-write ordering on conv_states_all.
++- Files: ggml.c/h (ggml_ssm_conv_2src), ssm-conv.cu (fused short + long kernels,
++  dispatch branch on src[2]), ggml-cpu/ops.cpp (2-src reference), ggml-cuda.cu
++  (supports_op uses ne[0] for the 2-src form), delta-net-base.cpp + models.h
++  (build_conv_state), qwen35/moe/3next.cpp (call sites), test-backend-ops.cpp
++  (test_ssm_conv_2src).
++- Pitfalls recorded in section 4: the qkv layout is channel-fastest (c*4 + t*nb1),
++  so a fixed channel's token window is NOT contiguous - the smem tile must be
++  staged coalesced along channels. ggml_view_3d's dim0 stride is ALWAYS the
++  element size (nb reset in ggml_new_tensor_impl) - a strided-token view is
++  impossible; use transpose-of-view instead. The cpy_scalar flat-index mapping
++  follows the SRC ne00, and the state cache layout is position-fastest (row
++  p + c*(d_conv-1)), which the reshape_3d read side matches.
++
++### L6. quantize_fp8 - DONE 2026-08-06 night via a warp rewrite (not the fusion)
++
++- Kernel: quantize_fp8 was ~5.1 ms/pp512 (25.4 us/launch on pp512 grids) for the
++  f32->fp8 activation staging. It was NOT bandwidth-bound: ~6.5 MB/launch in
++  25 us is ~256 GB/s, i.e. latency/barrier-bound (1 float per thread + 2
++  __syncthreads per 128-thread CTA).
++- DONE (commits below): quantize_fp8_warp<4> - one warp per (token, 128-col
++  block), each lane covers 4 consecutive values (float4), the amax reduce is a
++  pure warp butterfly (no smem, no barriers), and the fp8 encode uses the gfx12
++  hardware v_cvt_pk_fp8_f32 (RNE) which was verified BIT-EXACT vs the software
++  encoder fp8_e4m3_from_f32 on 406K finite inputs (every boundary, tie,
++  subnormal, saturation case; only NaN/Inf differ, which activations never
++  are). 4 k-blocks per warp (KBW) overlap the DRAM latency of the independent
++  loads; KBW=4 measured better than 1/2/8.
++- Measured (rig, min of 3, per-launch): quantize 25.4 -> 12.6 us on pp512
++  grids (-50%). pp512 6630 -> 6818-6841 (+2.9-3.2%). tg64 unchanged. PPL
++  6.2677 exact; generation matches; 47/47 GDN tests. The staging is bit-exact
++  vs the old kernel (rig check bad=0 on all model shapes), so the wmma/gemv/
++  scalar consumers are untouched.
++- Dispatch: RDNA4 + n > GGML_FP8_GEMV_MAX_N + 16-B-aligned src1 -> warp
++  kernel; else the old quantize_fp8. The decode grids (n <= 16) REGRESSED with
++  the warp kernel (1.31 -> 2.04 us/launch: its grid is ceil(k/128/32) x n, too
++  few CTAs for tiny n) - keep the old kernel there.
++- THE FUSION (the original L6 approach - read f32 in the wmma kernel and
++  quantize in-kernel) was built and measured: mul_mat_fp8_wmma_fused loses on
++  the big GEMMs that dominate pp512 (+9.8% on the gate shape 9216x512x2560,
++  +5.5% on 8192x512x2560) and wins only on the small under-occupied ones
++  (-23% on 4096x512x2560). Net per pp512 ~ +0.2 ms (a wash). The in-kernel
++  quantize (~42 us/launch added at saturation) costs more than the standalone
++  kernel it replaces (25 us) because it competes with the wmma/scale-pass
++  pipes and the f32 staging is 4x the bytes. Do NOT retry the fusion; the warp
++  rewrite gets the same win with zero risk to the GEMM path.
++- Files: fp8.cuh (quantize_fp8_warp template), fp8.cu (dispatch).
++- Validation: /tmp/bench_fused.cu + /tmp/bench_pairs.cu (rigs), /tmp/fp8_cvt_test.cu
++  (hw-vs-sw encoder bit-exactness).
++- Depends on: nothing.
++
++### L7. Cijk BF16 GEMMs (delta-net in/out projections, 5.3 ms/pp512)
++
++- The qwen35 delta-net projections are BF16 in the GGUF and run on rocBLAS/
++  CK. Moving them to fp8 (they are linear projections like the rest) would
++  put them on the wmma path; the L1/L2 gains then apply. The conversion
++  script (convert_hf_to_gguf.py) already has the fp8 machinery.
++- Expected: cuts ~5.3 ms by the wmma-vs-CK ratio; medium effort (conversion +
++  PPL re-gate).
++- Depends on: decision to quantize more tensors (PPL risk; the handover's L5
++  lists the quantizable set: norms, conv1d, in_proj_a/b, A_log).
++
++### L8. Small kernels (silu 2.9, rms_norm 4.4, k_bin_bcast 1.9) - skip
++
++- Not worth the risk/effort individually. Revisit only if everything else is
++  done and a specific one shows up hot in a fresh profile.
++
++## 3. Session protocol (commands)
++
++```bash
++# build (after any kernel change)
++cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-perplexity test-backend-ops
++
++# bench (pp512 + tg64, 5 reps)
++/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm0
++
++# correctness gate (always)
++/tmp/llama-hip-full/bin/test-backend-ops test -b ROCm0 -o GATED_DELTA_NET   # 47/47
++/tmp/llama-hip-full/bin/llama-perplexity -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf \
++    -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # 6.24
++
++# generation parity (PPL is not enough for fp8 changes)
++/tmp/llama-hip-full/bin/llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -c 512 -n 24 \
++    -dev ROCm0 -p "The capital of France is" --single-turn --no-conversation   # needs both flags in this fork
++
++# profile
++rocprofv3 -r -d /tmp/rocp_x -f csv -- /tmp/llama-hip-full/bin/llama-bench \
++    -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm0
++# parse soar/*kernel_trace.csv; REMEMBER the warmup doubles every kernel count/time
++
++# sequential-vs-chunked A/B
++GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
++```
++
++## 4. Pitfalls and failed experiments (do not rediscover)
++
++- Kernel traces include llama-bench's warmup pass: counts and times are 2x
++  the per-pp512 values. Divide by 2 for per-pp512 numbers.
++- GDN phase B register-tiled 16x16 grid (4x2 tiles/thread) with smem-staged
++  kd/q/ac/k blocks: 192 VGPRs + spills (764-1028 B scratch; ISA showed 274
++  scratch instructions vs 308 FMAs) -> 675 us/launch. The tile layout spreads
++  the V dimension across threads, amplifying shared-input L2 reads 16x and
++  blowing the register budget. Thread-per-column (32 cols per warp) is the
++  right layout for these 64x128x32 matmuls: every kd/q/k/ac load becomes a
++  warp broadcast and live registers stay ~40. Do not go back to register
++  tiling here without a concrete reason.
++- `__launch_bounds__(256, 2)` forcing 128 VGPRs on a 192-VGPR kernel made it
++  worse (more spills). Fix spills by restructuring, not by capping.
++- GGML_HIP_GRAPHS=0 is a CMAKE option, not a runtime env var. The runtime
++  disable is GGML_CUDA_DISABLE_GRAPHS=1. CUDA graphs are NOT the cause of
++  any correctness issue.
++- cudaMemcpy/cudaStreamSynchronize inside the launch during graph capture is
++  illegal/unreliable. If re-adding the GDN_DUMP debug, all copies must be
++  stream-ordered (cudaMemcpyAsync on the compute stream) with one sync after
++  the phase B launch.
++- wmma experiments that failed: 16 warps/CTA with 2x1 tiles (fragment reuse
++  1.5 LDS/wmma, 4936 t/s), double-buffered smem 61 KB (1 CTA/CU, 5110 t/s),
++  burst fragment arrays (LLVM miscompile). GROUP_SIZE_M=8 was noise.
++- LLVM wmma fragment-pipeline miscompiles (do NOT retry either shape): (1) the
++  burst array fp8x8_t fa[4][4] (16/32 v_wmma get v[0:1] operands); (2) a
++  2-k-step lookahead with a named-variable rotate (a0_1/a0_2) - the allocator
++  folds the rotation copies and step 1 reuses step 0's operand registers
++  (verified in SASS; PPL 183142; the check catches it ONLY with
++  realistically-quantized data, see below). The 1-k-step lookahead (a0_n)
++  compiles correctly. Rule: never let a fragment value be rotated/reused
++  across k-steps via register copies in the single-buffer loop.
++- fp8 correctness checks false-pass with random payload bytes: the fp8 byte
++  space contains NaN encodings (0x7F/0xFF) and random f32 scales are mostly
++  NaN/inf, so fabs(ref - out) is NaN on every element, maxerr/bad stay 0.
++  Any fp8 kernel check must feed realistically-quantized values (host-side
++  encoder, sane scales). /tmp/check_wmma.cu has the working template.
++- The chunked GDN closure bug history is in GDN_DEBUG_HANDOVER.md; the
++  current closure (4x4-blocked forward substitution, 2026-08-06) is verified
++  exact (numpy diff ~1e-15, /tmp/validate_closure_4x4.py). Do NOT simplify
++  it back to I+A+A^2+A^3, and do NOT truncate the 4x4 diag power series.
++- Phase B kd/q register pipeline (2026-08-06): a 2-stage software pipeline
++  (alternating float4 register buffers for kd/q, #pragma unroll 2) hit 256
++  VGPRs + 268 B scratch -> 495 us/launch (was 269). The alternating-buffer
++  arrays force too many live registers; the thread-per-column layout that
++  made phase B fast keeps live registers ~40 and has no room for staging.
++- Phase B #pragma unroll on the step-1 r-loop (2026-08-06): 349 us/launch
++  (was 269) - the compiler's default scheduling is better; do not force.
++- Phase A syncs were NOT the main cost: cutting ~165 -> 23 dynamic barriers
++  (closure rewrite + scan) moved phase A only 293 -> 276 us. The real costs
++  were the 512 scalar global loads/thread (v in k_cumsum, q in attn_causal)
++  - vectorizing those to float4 was the big win (276 -> 210 us).
++- qkv_mixed is channel-fastest: qkv[c][t] at c*4 + t*nb1, so a fixed channel's
++  token window is strided by d_inner*4. Any kernel reading the qkv window (the
++  fused ssm_conv) must stage coalesced along CHANNELS (position-major smem
++  tile, smem[p*128 + c]); staging along tokens (channel-major tile) reads
++  garbage and faults.
++- ggml_view_3d's dim0 stride is ALWAYS the element size: ggml_new_tensor_impl
++  resets nb (nb[0] = type_size, nb[1] = nb[0]*ne[0], nb[2] = nb[1]*ne[1]), and
++  view_3d only overrides nb[1]/nb[2]. A token-strided window over a
++  channel-fastest tensor CANNOT be expressed as a view; use transpose-of-view
++  (ggml_view_tensor copies the parent nb, so transpose of a view keeps the
++  correct strides). The first state-view attempt read a silent (p+c) channel
++  mix (PPL 6.42, decode GPU fault) - caught only by the full PPL gate.
++- The conv-state cache is position-fastest: row index p + c*(d_conv-1). The
++  state-save cpy_scalar scatters by the src flat index (ne00 = n_state), and
++  the next batch's build_rs (get_rows + reshape_3d) reads the same layout -
++  the old concat-based save and the new qkv-tail transpose view are bit-exact
++  (/tmp/dbg_state2.cpp: old-vs-new maxerr=0).
++- Graph write-before-read hazard: a state-save cpy whose source has no data
++  dependency on the state buffer (e.g. a qkv view) can run before the op that
++  reads the state. The old concat-based save was implicitly ordered by the
++  concat's dependency on conv_states. Fix: expand the reading op (the fused
++  conv) before the cpy - the graph executes nodes in insertion order. Expanding
++  it AFTER the cpy (even in the same function) does not reorder.
++- The old quantize_fp8 was NOT bandwidth-bound: ~6.5 MB/launch in 25 us is
++  ~256 GB/s (latency/barrier-bound, 1 float/thread + 2 barriers per CTA). The
++  warp rewrite (quantize_fp8_warp<4>) gets ~256 GB/s -> ~500+ GB/s on pp512
++  grids. Its grid is ceil(k/128/32) x n - on tiny decode grids (n <= 16) that
++  is too few CTAs: 1.31 -> 2.04 us/launch REGRESSION. The launcher must keep
++  the old kernel for n <= GGML_FP8_GEMV_MAX_N.
++- quantize_fp8_warp uses the gfx12 v_cvt_pk_fp8_f32 (RDNA4-only builtin) and
++  must be #if-guarded like the wmma kernels; the launcher falls back to the
++  portable quantize_fp8 on other archs and when src1 is not 16-B aligned.
++- The hardware fp8 encode (v_cvt_pk_fp8_f32 + fmed3f clamp, HIP's OCP E4M3
++  recipe) is bit-exact vs the software encoder for all FINITE inputs; only
++  NaN/Inf inputs differ (hw returns +/-448, sw returns the NaN encoding).
++  Verified on 406K values incl. every rounding boundary/tie/subnormal/
++  saturation case (/tmp/fp8_cvt_test.cu). The packed result puts fp8(a) in
++  byte 0, fp8(b) in byte 1, and the idst operand is preserved in the other
++  word - chaining idst across the two op_sel words packs 4 fp8 per register
++  with no shifts/or.
++- The fused-quantize-in-wmma experiment (mul_mat_fp8_wmma_fused, reads f32 in
++  the staging): at saturation it adds ~42 us/launch to the gate GEMM (more
++  than the 25 us standalone quantize it replaces) - the in-kernel quantize
++  competes with the wmma/scale-pass pipes and the f32 staging is 4x the bytes.
++  Wins only on small under-occupied shapes. Do not retry.
++
++## 5. Suggested order for the next session
++
++1. Re-bench to confirm the working tree matches section 0 (expect ~6818-6841 pp512
++   after the L6 quantize rewrite; the box is noisy - prefer rocprof kernel times for A/B).
++2. L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512) is the next live lever: move the
++   delta-net in/out projections to fp8 so they run on the wmma path. Medium effort
++   (conversion + PPL re-gate); the quantizable set is norms, conv1d, in_proj_a/b, A_log.
++3. L1 (mul_mat_fp8_wmma) and L3/L4 (GDN phase A/B) are spent; L5 (conv fusion) and
++   L6 (quantize rewrite) are done. L8 (small kernels) - skip unless a specific one
++   shows up hot in a fresh profile.
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 8d3272d1e..6b5444339 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -1,10 +1,16 @@
+-# PERF HANDOVER — FP8 prefill: state, levers, and next-session tracking
++# PERF HANDOVER - FP8 prefill: state, history, and operational reference
+ 
+-**Purpose**: single document for the next session's performance work. Everything
+-here was measured on this box (3x R9700 gfx1201, 1x used, -dev ROCm0) with the
+-fp8 GGUFs in `/llm/models/Qwen3.5/4B/StewFP8/` (Qwen3.5-4B StewFP8). Updated
+-2026-08-05 evening after the decode session (see section 10): generation now
+-matches Q8_0; prefill is the remaining gap.
++**Purpose**: the operational reference for performance work on this box: what
++was done, why, and the standing rules (kernel facts, failed experiments,
++tooling, git state, session logs). The FORWARD plan - ranked levers, expected
++wins, validation steps, and the suggested order - lives in `LEVERS.md`;
++PERF_HANDOVER.md intentionally does not duplicate it. Start a session with
++`LEVERS.md`, come here for history and specifics.
++
++Everything was measured on this box (1x R9700 gfx1201, 64 CUs, -dev ROCm0)
++with the fp8 GGUFs in `/llm/models/Qwen3.5/4B/StewFP8/` (Qwen3.5-4B StewFP8).
++Updated 2026-08-06 after the GDN correctness fix + phase B rewrite: the
++chunked GDN is now faster than sequential and pp512 is at 6068.
+ 
+ Read `HANDOVER.md` for the project as a whole and `AITER_FINDINGS.md` for the
+ aiter inspection details. This file tracks ONLY the performance picture.
+@@ -19,89 +25,73 @@ aiter inspection details. This file tracks ONLY the performance picture.
+ | fp8 baseline (821d423ac) | 4930 | 71.0 | -20% | -22% |
+ | fp8 + aiter GEMM port (26b7be281) | 5546-5596 | 71.4 | -5.6% | -21% |
+ | fp8 now (decode session, commit below) | **5914** | **89.1** | **-4.3%** | **-2.0%** |
++| fp8 now (chunked GDN, 2026-08-06) | **6068-6072** | **89.8-90.0** | **-1.7%** | **-1.2%** |
++| fp8 now (phase A+B session, 2026-08-06) | **~6100-6200** (noisy box) | **89.8-90.1** | ~-1% | ~-1% |
++| fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
++| fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
++| fp8 now (L6 quantize rewrite, 2026-08-06) | **6818-6841** | **89.2-89.6** | ~+7% | ~-1% |
+ | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
+ | target generation (+10%) | - | ~100 | - | +10% |
+ 
+ pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
+ 
++Current authoritative numbers (2026-08-06 night, chunked GDN default, L6
++session): see LEVERS.md section 0. The box became noisy late on 2026-08-06
++(pp512 +/-60-170, occasionally much worse): trust rocprof kernel times
++(deterministic +/-3%) for A/B. GDN per pp512: phase A ~4.9 ms + phase B
++~5.9 ms (was 7.1 + 6.4). quantize_fp8 per pp512: ~2.5 ms (was ~5.1).
++
+ PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
+ /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
+ pre-change fp8 output on the same prompt/seed.
+ 
+-## 2. Where pp512 time goes (rocprofv3 kernel trace, decode session, fp8-ow GGUF)
++## 2. Where pp512 time goes (historical, decode session; current: LEVERS.md section 1)
+ 
+ | kernel | share of pp512 | note |
+ |---|---|---|
+ | mul_mat_fp8_wmma | ~48% | ~77 TFLOP/s (aiter port) |
+-| gated_delta_net_cuda | ~17% | linear-attention core, sequential per-token loop |
++| gated_delta_net_cuda | ~17% | sequential per-token loop; now replaced by the chunked path |
+ | Cijk (rocBLAS/CK BF16 GEMM) | ~6% | the delta-net in/out projections (BF16 in the GGUF) |
+ | quantize_fp8 | ~6% | activation staging pass |
+-| concat_non_cont | ~5% | delta-net plumbing (48 launches) |
++| concat_non_cont | ~5% | delta-net plumbing |
+ | flash_attn_tile | ~4% | 8 attention layers |
+ | silu / norms / conv / copy | ~9% | ssm_conv_long_token_f32 ~1% |
+ 
++The per-kernel shares are still representative; the current measured breakdown
++(per-pp512, warmup removed) is in LEVERS.md section 1.
++
+ Decode (tg64) breakdown, per ~11.1 ms step: mul_mat_fp8_gemv 8.95 ms (79%, 226
+ GEMMs incl. lm_head at ~496 GB/s), quantize_fp8 0.32 ms, gated_delta_net 0.41
+ ms, BF16 mmv 0.15 ms, norms/ops ~1.3 ms.
+ 
+-## 3. Ranked levers for the next session
+-
+-### L1. gated_delta_net_cuda (linear attention) — HIGH value, MEDIUM effort
+-- 17% of pp512. aiter has a gfx1201 port:
+-  `/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu` (explicit
+-  `__gfx1201__` support) + `op_tests/test_gated_delta_rule.py`.
+-- Our kernel is `gated_delta_net_cuda<128,false,false>` in ggml-cuda (runs the
+-  24 linear-attention layers' SSM). If 2-3x faster: pp512 +8-11% -> ~6000-6200.
+-- It is a port (different data flow than llama.cpp's), not a swap. Verify the
+-  gfx1201 path is used (there is a CK fallback; check dispatch) and that the
+-  f32 intermediate precision matches our current kernel (PPL check).
+-- This alone + the current GEMM gets close to Q8_0; combined with L2 it is the
+-  most credible route to +50%.
+-
+-### L2. GEMM: weight-layout repack at load time — MEDIUM-HIGH value, MEDIUM effort
+-- The `block_f8_e4m3` rows are 132 B (f32 d + 128 fp8), so staging loads are
+-  4-B only (misaligned for 16-B). The wmma kernel spends ~30% of its time
+-  staging (weights 16 KB + activations 8 KB per k-block per CTA).
+-- Repack weights once at model load into a wmma-friendly layout: fp8 bytes
+-  contiguous `[m][k]` (16-B aligned rows), scales as a separate `[m/128][k/128]`
+-  f32 array. Then the kernel stages sA with 16-B vector loads.
+-- The repack must happen for BOTH the safetensors loader and the GGUF path, or
+-  in a shared in-memory step after load (best: do it in the backend when the
+-  tensor is first used, or in `ggml_cuda_mul_mat_fp8` into a cached buffer).
+-  Changes the kernel's Abase addressing only.
+-- Expected: +10-20% on the wmma kernel if staging bandwidth/latency is the
+-  limiter (it was ~23% at 55 TFLOP/s; at 77 the share may differ — re-profile
+-  first with the staging-loop removed to confirm it is still worth it).
+-
+-### L3. GEMM: 3 CTAs/CU via 64x64 tiles — UNKNOWN, low confidence
+-- gfx1201: 196,608 regs/mp -> 3 CTAs of 256 threads fit by registers; LDS
+-  allows 3 x 17.7 KB = 53 KB. 24 warps/CU (vs 16 now).
+-- BUT 64x64 with 8 warps forces 2 accs/warp (2x1 or 1x2 tiles); the 16-warp
+-  experiment with 2-acc warps regressed badly (fragment-reuse loss). Try
+-  64x64 with 8 warps as 4m x 2n (warp 16x32 = 1x2 tiles, 2 accs) only if L2
+-  (repack) is done and the fragment-reuse cost is re-measured.
+-- Alternative: CTA 128x64 but 12-16 warps with 2x2 tiles... does not tile.
+-
+-### L4. Fuse activation quantization into the GEMM — SMALL
+-- quantize_fp8 is only ~1.2% of pp512, but the staging round-trip also costs
+-  ~300 MB DRAM traffic per pp512 (~1.1 ms). Fusing reads f32 activations
+-  (4x the bytes) into the kernel — net win small; only do this after L1/L2.
+-
+-### L5. Non-fp8 tensors -> Q8_0 in the GGUF — SMALL-MEDIUM, decoder-focused
+-- Only helps decode (memory-bound) and slightly reduces prefill staging.
+-- **token_embd constraint is now VOID**: the decode session added
+-  `--fp8-output-weight` (an fp8 output.weight copy of token_embd, token_embd
+-  stays BF16 for the input lookup) so lm_head runs on the fast fp8 GEMV. Do NOT
+-  quantize token_embd itself to fp8 without adding a get_rows fp8 kernel
+-  (getrows.cu has no F8_E4M3 case; CPU has no fp8 kernels either).
+-- The quantizable set is norms, conv1d, in_proj_a/b, A_log (small) -> gen maybe
+-  +5%, prefill ~0.
++## 3. Ranked levers - SEE LEVERS.md
++
++The ranked levers, expected wins, and validation steps moved to `LEVERS.md`
++(updated 2026-08-06 after the GDN work). Summary of what changed there vs the
++old L1-L5 below:
++- the delta-net port from aiter (old L1) is dead: aiter's chunk kernel does
++  not run on gfx1201 (see section 11), and the chunked GDN now beats the
++  sequential kernel anyway (section 12).
++- the GDN levers are now internal: phase A (gdn_chunk_prepare) and phase B
++  (gdn_chunk_state), both documented in LEVERS.md (L3/L4).
++- the GEMM levers (occupancy via 24 KB smem tiles, weight repack) survive as
++  LEVERS.md L1/L2 (both spent); the quantize lever is L6 (DONE - the fusion
++  approach in the original L6 was measured and abandoned in favor of a warp
++  rewrite, see section 17).
++- the non-fp8-tensor quantization lever (old L5) is folded into LEVERS.md L7
++  (Cijk BF16 projections); the quantizable-set note below is still valid.
++
++Old L5 note that still matters: **do NOT quantize token_embd to fp8** without
++adding a get_rows fp8 kernel (getrows.cu has no F8_E4M3 case; CPU has no fp8
++kernels either). lm_head already runs fp8 via the `--fp8-output-weight` copy
++(token_embd stays BF16 for the input lookup). The quantizable set is norms,
++conv1d, in_proj_a/b, A_log (small).
+ 
+ ## 4. Kernel facts (established this session, do not rediscover)
+ 
+ - **Occupancy is the dominant GEMM lever on gfx1201**: 8 warps/CU = 58 TFLOP/s,
+   16 warps/CU = 77 TFLOP/s. The aiter triton kernel's 121 TFLOP/s comes from
+-  its 24 KB smem tile running 2 CTAs/CU (16 warps) — NOT from its 2-stage
++  its 24 KB smem tile running 2 CTAs/CU (16 warps) - NOT from its 2-stage
+   pipeline. Double-buffered 128x64 (61 KB LDS) = 1 CTA/CU = the old 55-58.
+ - Raw wmma 16x16x16 fp8 ceiling: ~165 TFLOP/s (conservative microbench; codegen
+   dependent up to ~430). Current kernel = 47% of the conservative ceiling.
+@@ -122,26 +112,32 @@ ms, BF16 mmv 0.15 ms, norms/ops ~1.3 ms.
+ | Double-buffered smem (61 KB) | 1 CTA/CU -> 5110 t/s |
+ | (earlier session) 8-warp 64x128 CTA, register prefetch, aligned-A split, MT=4 | all < baseline; see HANDOVER.md section 8 |
+ 
++The GDN phase B failed designs (2026-08-06) are in section 12. The
++consolidated do-not-rediscover list (both GEMM and GDN) is LEVERS.md section 4.
++
+ ## 6. Repro / tooling
+ 
+-```bash
+-# build + bench (after any kernel change)
+-cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-cli
+-/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm0
++The full session protocol (build + bench + correctness gates + profile) is in
++LEVERS.md section 3. Below: the fp8-specific extras that LEVERS.md does not
++repeat.
+ 
++```bash
+ # Q8_0 reference on the same box/day
+ /tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf -p 512 -n 64 -r 5 -dev ROCm0
+ 
+-# correctness after kernel changes (fast gate)
++# GEMM correctness (fast gate)
+ /tmp/llama-hip-full/bin/test-backend-ops test -b ROCm0 -o MUL_MAT   # 1186 pass (no F8 cases! it only covers other types)
++# note: test-backend-ops has NO F8_E4M3 mul_mat cases (CPU backend can't do fp8) - generation diff is the gate
++
++# generation parity (fp8 changes)
+ /tmp/llama-hip-full/bin/llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -f /tmp/prompt_pp.txt -n 24 --single-turn -s 42
+ # expected: prompt echo + "[Start thinking] Thinking Process: 1. Analyze the Request:..." (matches bf16 ref)
+-# note: test-backend-ops has NO F8_E4M3 mul_mat cases (CPU backend can't do fp8) - generation diff is the gate
+ 
+ # profile (decode-heavy runs crash rocprofv3 at teardown; the trace is still written)
+ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm0
+ # per-kernel CSV in /tmp/rocp/soar/*kernel_trace.csv (Grid_Size_X = work-items = grid*256; VGPR/LDS columns)
+ # decode-only view: filter kernels after the last mul_mat_fp8_wmma start
++# REMEMBER: llama-bench's warmup pass doubles every kernel count/time - divide by 2 for per-pp512
+ ```
+ 
+ ## 7. PPL / parity (do not skip after any kernel or loader change)
+@@ -152,22 +148,21 @@ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/
+ 
+ ## 8. Git state
+ 
+-- This session (decode): ggml/src/ggml-cuda/fp8.cu + fp8.cuh (gemv rewrite +
+-  memset skip), convert_hf_to_gguf.py + conversion/base.py (--fp8-output-weight),
+-  docs (PERF_HANDOVER.md, vllm-vs-llamacpp-performance.md) committed as one unit.
+ - Branch `cllm`, origin git@github.com:stew675/llama.cpp.git.
+ - Commit style: concise subject, `Assisted-by:` line, no Co-authored-by.
++- Recent commits (2026-08-06):
++  - 56e7cb0c9 gated_delta_net : rewrite chunked phase B, 33.8ms -> 12.8ms
++  - ef41a940a gated_delta_net : fix chunked phase A closure, enable by default
++- Earlier (decode session, 2026-08-05): fp8.cu + fp8.cuh (gemv rewrite + memset
++  skip), convert_hf_to_gguf.py + conversion/base.py (--fp8-output-weight),
++  docs (PERF_HANDOVER.md, vllm-vs-llamacpp-performance.md).
++- Phase A/B session (2026-08-06): a921f8fb0 (phase A rewrite, 293 -> 210 us),
++  c8757d649 (phase B delta loads, 269 -> 246 us). See section 13.
+ 
+-## 9. Next-session suggested order
++## 9. Next-session suggested order - SEE LEVERS.md
+ 
+-1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5914).
+-2. L1 (delta-net): port aiter's chunked gated-delta-rule kernel
+-   (`/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu`, gfx1201
+-   path) into ggml-cuda; verify the gfx1201 dispatch fires; f32 intermediate
+-   precision parity (PPL check); bench pp512.
+-3. L2 (weight repack): re-profile the staging share first; implement the
+-   in-memory repack; vectorize sA staging; PPL + bench.
+-4. Re-evaluate the +50% target with both in; then decide if L3/L4/L5 are worth it.
++The suggested order, and the current state to confirm first, moved to
++LEVERS.md section 5 (re-bench ~6818-6841 -> L7 -> re-evaluate).
+ 
+ ## 10. Decode session log (2026-08-05 evening)
+ 
+@@ -195,3 +190,340 @@ New GGUF: /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf (5.36 GiB, 442
+ Left on the table (decode): gemv 496 -> ~520 GB/s (vectorized x loads, 8-block
+ ILP), fuse quantize_fp8 into the gemv (226 launches/step), delta-net 0.41
+ ms/step. Roughly +4% if all taken.
++
++## 11. Delta-net chunked session log (2026-08-05 night)
++
++STATUS 2026-08-06: superseded - the chunked path is now default-on, correct
++(closure fix, ef41a940a) and faster than sequential (phase B rewrite,
++56e7cb0c9). See section 12 and LEVERS.md. The log below is historical.
++
++Goal: speed up gated_delta_net_cuda (17% of pp512) by replacing the sequential
++per-token loop with a chunked formulation.
++
++KEY FINDING: aiter's chunk_gated_delta_rule_fwd_h.cu does NOT run on gfx1201 -
++op_tests/test_gated_delta_rule.py skips it on gfx12
++("kernel does not support gfx12!"). The handover's "aiter has a gfx1201 port"
++premise was wrong. The __gfx1201__ guard there is only for a buffer-resource
++constant. So no port; we implemented our own chunked kernel.
++
++Status: CORRECT but SLOWER. ggml-cuda/gated_delta_net.cu has gdn_chunk_prepare
++(phase A: per head x seq x chunk of 64 - decay cumsum, closure (I-A)^-1 via
++forward substitution, k_cumsum = attn @ (beta v), k_cumdecay = attn @ (beta k P),
++attn_causal = L .* (q^T k)) and gdn_chunk_state (phase B: per head x seq x
++V-slice of 8 - v_new = k_cumsum - k_cumdecay @ S, o = P .* (q @ S) + attn_causal
++@ v_new, S = P_last S + (k .* delta) @ v_new). Opt-in via GGML_CUDA_GDN_CHUNKED=1;
++off by default because pp512 = 4200 vs 5925 sequential.
++
++Math: validated in python (/tmp/validate_chunked.py) against the op recurrence
++(aiter's chunk_gated_delta_rule_ref structure, decay kept inside via
++L[i][j] = exp(decay_i - decay_j)). All 45 GATED_DELTA_NET backend-ops tests pass
++on BOTH paths (add 4 S_v=128 prefill cases to the eval set). PPL 6.30 vs 6.26
++baseline; generation matches.
++
++Bugs found and fixed (do not rediscover):
++- P = exp(cumsum(gate)) underflows to 0 for strong decay (cumsum < -88) ->
++  P_i/P_j = 0/0 = NaN. Keep the cumsum and always take exp(diff).
++- Phase-A scratch was indexed per chunk only, not per (head, seq): heads raced
++  on the same scratch (outputs looked like adjacent heads' data).
++- The decay_scratch store used tid = 0..127 over a 64-float per-head region:
++  threads 64-127 wrote garbage into the next head's region (nondeterministic
++  per-head corruption; single-head tests passed, multi-head flaky).
++- cudaStreamSynchronize / cudaEventCreate between the two kernels is ILLEGAL
++  during CUDA graph capture ("operation not permitted when stream is
++  capturing"). The kernels are on the same stream; no sync needed.
++
++Why it is slow: ~2x the FLOPs of the sequential kernel (closure + materialized
++k_cumsum/k_cumdecay/attn_causal) with untiled matmuls reading global memory and
++126 barriers in the closure. Next session: tile the matmuls with smem staging
++(phase A smem budget: s_attn 16.6 KB + s_k 32 KB fits one CTA/CU), reduce the
++closure barrier count, then re-enable by default.
++
++## 12. Delta-net chunked: correctness fixed + phase B rewrite (2026-08-06)
++
++The chunked GDN is now BOTH correct and faster than the sequential kernel.
++Committed ef41a940a fixed the phase A closure (block forward substitution,
++see GDN_DEBUG_HANDOVER.md). This session rewrote phase B.
++
++Phase B before: gdn_chunk_state, 128 threads, V-slices of 8 (16 slices),
++scalar serial reductions, stride-8KB global k loads in the S update.
++33.82 ms per pp512 bench (48 launches x 704us, grid 32x16=512 CTAs).
++
++Phase B now: 256 threads, V-slices of 32 (4 slices), one state column per
++thread (32 cols per warp -> kd/q/k/ac loads are warp broadcasts, no L2
++amplification), 8 token rows per thread (steps 1/2) or 16 state rows
++(step 3). s_S (16 KB) + s_vnew (8 KB) smem -> 2 CTAs/CU, 1 wave (grid 128).
++6.4 ms per pp512 (24 launches x 267us; the trace shows 48 x 267us = 12.8 ms
++because llama-bench runs a warmup pass). VGPR 160, scratch 0, LDS 24.6 KB.
++
++Scoreboard (pp512, stewfp8-ow, -p 512 -n 64 -r 5):
++- chunked before this session: 5436 (broken-ish phase B)
++- chunked now:               6068-6072  (sequential was 5878)
++- tg64 unchanged:            89.8
++PPL 6.2426 (sequential 6.2572), 47/47 GATED_DELTA_NET tests.
++
++Failed experiments this session (do not retry without a reason; consolidated
++with the GEMM list in LEVERS.md section 4):
++- 16x16 thread grid with 4x2 register tiles + smem-staged kd/q/ac/k blocks:
++  192 VGPRs + 764-1028 B scratch spills -> 274 scratch instructions vs 308
++  FMAs in the ISA; 675-704us/launch. The register-tiled layout spreads the
++  V dimension across threads, which both amplifies shared-input L2 reads 16x
++  and blows the register budget.
++- 16x16 grid, no staging (direct L2 float4): 591-644us/launch (L2-bound).
++- __launch_bounds__(256,2) forcing 128 VGPRs: worse (more spills, 644us).
++Lesson: for this kernel shape (64x128x32 matmuls, S resident), thread-per-
++column with 32 cols/warp is the right layout - it makes every shared-input
++load a warp broadcast and keeps live registers near 40.
++
++Remaining GDN perf: the forward plan is LEVERS.md (L3 = phase A, L4 = phase B).
++Summary: phase A (gdn_chunk_prepare) is now the bigger kernel (~7.1 ms/pp512,
++~8x its FMA floor, ~154 dynamic closure barriers, 1 CTA/CU); phase B is ~10x
++its FMA floor (chunk-loop latency).
++
++## 13. Delta-net phase A rewrite + phase B delta loads (2026-08-06, session)
++
++Goal: L3 (phase A closure barriers) per LEVERS.md, then re-evaluate. Result:
++phase A 293 -> ~205-210 us/launch (-24%), phase B 268.8 -> ~246 us/launch
++(-8.5%). GDN per pp512 13.5 -> ~10.9 ms. Commits a921f8fb0 + c8757d649.
++
++Phase A (gdn_chunk_prepare) changes, all validated 47/47 + PPL + generation:
++1. closure: the 16x16-block forward substitution (146 syncs) replaced by an
++   exact 4x4-blocked substitution over the whole 64x64 (16 syncs). The 4x4
++   diagonal blocks have nilpotency index 4, so D(i,i) = I + Aii + Aii^2 +
++   Aii^3 (computed in registers via a warp-shuffle row substitution, 1 sync);
++   the off-diagonal blocks D(i,j) = D(i,i) @ (A(i,j) D(j,j) + sum_{j<k<i}
++   A(i,k) D(k,j)) follow in 15 row passes. The row passes read A(i,k) from a
++   preserved packed strictly-lower smem copy s_A (8 KB; the in-place D writes
++   would clobber A otherwise - the row-pass ordering trick does NOT work
++   because blocks of the same row run concurrently in different warps). Numpy
++   check /tmp/validate_closure_4x4.py: exact to 1e-15 in both random and
++   model-like strong-decay regimes. The first implementation had a bug
++   (s_A[e - j] instead of s_A[e], NaN) - the packed index IS e.
++2. decay cumsum: Hillis-Steele (13 syncs) -> warp-shuffle scan (2 syncs);
++   the chunk's k rows are prefetched into registers during the scan (overlaps
++   the L2 latency of the staging loads, LEVERS.md approach b).
++3. k_cumsum/k_cumdecay and attn_causal: v[j][v0..v0+7] and the q rows were
++   512 scalar global loads per thread; now float4 (2 per v row / 4-wide d
++   unroll for q) with a runtime alignment fallback ((stride & 3) == 0 &&
++   pointer 16-B aligned). This was the REAL win - the sync reduction alone
++   (165 -> 23 barriers) moved phase A only 293 -> 276 us.
++
++Phase A stage breakdown (stage-elimination stubs, +/-3%): v loads ~81 us,
++q loads ~37 us, gram ~34 us, closure ~32 us of the original 293.
++
++Phase B (gdn_chunk_state): step-3 delta reads vectorized (64 scalar loads per
++thread per chunk -> 16 float4 with a clamped k-row index so padded rows stay
++in-bounds and contribute zero - a plain guard branch nullified the win).
++Stage-elimination: kd/q loads ~112 us, ac+k loads ~62 us, FMA/sync/expf floor
++~206 us of 269. The kernel is ~65% load-stall-bound but warp-broadcast loads
+++ the serial S dependency kill the obvious fixes: a 2-stage kd/q register
++pipeline hit 256 VGPR + spills (495 us), #pragma unroll on the r-loop
++regressed (349 us). No cheap remaining lever; revisit with a fresh profile.
++
++Also learned: the box got noisy late 2026-08-06 (pp512 +/-60-170, one run
+++/-1000). rocprof kernel times are the reliable A/B signal. fp8 gemv traffic
++in the trace stays at ~40 us avg regardless (not affected by these changes).
++
++## 14. wmma GEMM investigation (2026-08-06 evening) - L1 measured as spent
++
++Goal: LEVERS.md L1 (mul_mat_fp8_wmma 2 CTAs/CU, the last big pp512 lever).
++Outcome: the lever's premise was already satisfied (2 CTAs/CU since 823f70a3);
++the residual gap to the aiter triton kernel (121-137 vs our 92-98 TFLOP/s at
++the same occupancy) was investigated and measured as NOT reachable by the
++obvious ports. No perf change committed - the tree is unchanged.
++
++Method: standalone rig /tmp/bench_wmma.cu (kernel-only hot loop on the exact
++model shapes, min of 3, +/-1%) + /tmp/check_wmma.cu (CPU-reference
++correctness). Stage-elimination stubs on the gate GEMM (9216x512x2560, 250 us):
++
++| stub | gate us | TFLOP/s | meaning |
++|---|---|---|---|
++| none (baseline) | 262.6 | 92.0 | |
++| fragment LDS removed | ~258 | ~94 | fragment chain nearly free (~4 us) |
++| scale pass removed | 216.8 | 111.5 | scale pass ~33 us (13%) |
++| strided scale staging removed | 250.7 | 96.4 | rD/sS loads free (L1 handles) |
++| scale pass, sA_d restructure | 245.8* | 98.3 | float4 wd loads: no real gain |
++
++* = with the (later reverted) fragment pipeline; the sA_d-only restructure
++measured 261.6 - neutral.
++
++Findings:
++1. The scale pass (~13%) is FMA/serialization-bound, not LDS-bound: moving the
++   per-row scales to a contiguous smem array (18 -> 6 LDS per warp per
++   k-block) did not help. The 32 FMAs/thread/k-block are irreducible and the
++   per-k-block weight scale cannot be deferred to the epilogue (it varies per
++   k-block).
++2. The staging/barrier/wmma floor is ~85%. A 2-k-block staging lookahead
++   (double-buffered registers) regressed ~4% (scheduling). The 4-B weight
++   staging loads coalesce fine; L2 traffic (~280 MB/launch) is not the
++   limiter (1.1-1.6 TB/s used of ~3).
++3. aiter's kpack=2 does not port: the 16-k wmma fragment is split across lane
++   halves, so no single wider LDS load covers 2 k-steps without a swizzled
++   smem store side; triton's num_stages=2 doubles smem (48 KB = 1 CTA/CU =
++   the measured 58 TFLOP/s config).
++
++NEW COMPILER MISCOMPILE (do not retry): a 2-k-step fragment lookahead with a
++named-variable rotation (a0_1/a0_2) miscompiles under the single-buffer loop -
++LLVM folds the rotation copies and step 1 reuses step 0's operand registers
++(verified in SASS: 8 v_wmma with identical v[30:31]/v[26:27]/v[34:35]/v[38:39]
++operands; PPL 183142). The 1-k-step lookahead (a0_n) compiles correctly. Same
++class as the burst-array bug; rule: no register rotation of fragments across
++k-steps in the single-buffer loop.
++
++CHECK LESSON (important for the project): the pre-existing assumption that
++"standalone fp8 correctness passes" was FALSE for random data - random fp8
++payload bytes contain NaN encodings (0x7F/0xFF) and random f32 scales are
++mostly NaN/inf, so fabs(ref-out) is NaN everywhere and maxerr/bad stay 0.
++A false pass nearly shipped a miscompiled kernel. /tmp/check_wmma.cu now uses
++realistically-quantized data (host fp8 encoder, sane scales) and correctly
++flags the miscompile (maxerr 34, 7991/8192 bad). Any future fp8 kernel change
++must run this check (or the PPL gate) with proper data.
++
++Conclusion for LEVERS.md: L1 is spent unless a new structural idea appears
++(e.g. a swizzled kpacked smem layout for A, which the L2 repack would enable).
++The remaining GEMM lever with real headroom is L2 (weight repack at load
++time): 16-B staging loads + it unblocks the kpacked layout.
++
++## 15. L2 wmma weight repack (2026-08-06 evening, session)
++
++Goal: LEVERS.md L2 (wmma weight repack at load time). Result: wmma kernel
++~204 -> ~186 us/launch average (-9%), pp512 6220 -> 6319-6334 (+1.6-1.8%),
++tg64 unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN tests.
++Commits: (see git log).
++
++## 16. L5: ssm conv concat fusion (2026-08-06 evening, session)
++
++Goal: LEVERS.md L5 (concat_non_cont, 4.7 ms/pp512 - the delta-net conv input
++assembly). Result: concat eliminated, pp512 6303 -> 6538-6554 (+4%), tg64
++unchanged, PPL 6.2677 exact, 47/47 GDN + 83/83 SSM_CONV.
++
++Design: new op form ggml_ssm_conv_2src(ctx, conv_states, qkv, c) - the same
++GGML_OP_SSM_CONV op code with optional src[2] = conv states (nullptr keeps the
++old single-input behavior for mamba/kimi/etc.). The fused CUDA kernels
++(ssm_conv_2src_f32 for n_t <= 32, ssm_conv_long_token_2src_f32 for n_t > 32)
++read conv_states (position-major) and qkv_mixed (channel-fastest, untransposed)
++in their natural layouts into a position-major smem tile, coalesced along
++channels. The model graph (build_conv_state in delta-net-base.cpp) drops the
++transpose + concat + conv_input buffer; the state-save view is now the
++transpose of a qkv-tail view, and the concat is only built when a state window
++overlaps the conv_states piece (n_t < d_conv-1 or rollback slots with small
++batches) - decode keeps it at trivial cost.
++
++Bugs found and fixed (do not rediscover, consolidated in LEVERS.md section 4):
++1. The qkv layout is channel-fastest: qkv[c][t] at c*4 + t*nb1. A fixed
++   channel's token window is strided by d_inner*4, so staging must be coalesced
++   along CHANNELS (position-major tile, smem[p*128 + c]); the first version
++   staged along tokens (channel-major tile) and read garbage (GPU faults in
++   test-backend-ops, caught by the new test_ssm_conv_2src cases).
++2. ggml_view_3d CANNOT express a strided dim0: ggml_new_tensor_impl resets nb
++   (nb[0] = element size, nb[1] = nb[0]*ne[0], ...), so a view's dim0 stride is
++   always 4 B for f32. A "token-major window over qkv" view is impossible; the
++   state save must use transpose-of-view (tail = view_3d(qkv, channels, n_state,
++   seqs, token_stride, seq_stride, offset); T = transpose(tail)), which keeps
++   the parent nb via ggml_view_tensor. The first attempt (view_3d over a
++   transposed qkv) silently read qkv[c'][509] with a (p+c) channel mix -> PPL
++   6.42, exactly reproducible, and decode crashed with a GPU fault.
++3. The state cache layout is position-fastest: row index p + c*(d_conv-1)
++   (the save cpy_scalar scatters by the src flat index with ne00 = n_state, and
++   the next batch's reshape_3d read matches). The qkv-tail transpose view
++   reproduces the old concat-based save bit-exactly (standalone check
++   /tmp/dbg_state2.cpp: old-vs-new state save maxerr=0).
++4. Graph write-before-read hazard: the old state-save cpy depended on the concat
++   (which depends on conv_states), so it ran after the conv read the state; the
++   fused conv + qkv-view cpy have no dependency, so the cpy can overwrite
++   conv_states_all before the conv reads it. Fix: expand the fused conv before
++   the state-save cpy in build_conv_state (graph executes nodes in insertion
++   order). A naive "expand conv at the end" fix did NOT reorder (the cpy was
++   already inserted).
++
++Method notes: the CPU reference (ggml_compute_forward_ssm_conv_f32) needed the
++same channel-fastest fix (q[i1 + t*stride_q], not q[i1*stride_q + t]) plus the
++ir0 channel offset on q/cs in the multi-thread row partition (the first version
++read channel 0's data for every thread - caught by gpu-vs-cpu comparison in
++/tmp/dbg_2src2.cpp). test-backend-ops compares against the CPU backend with
++use_ref=true, which only disables fusion (the compute is still ops.cpp).
++
++The remaining concat-ish plumbing: none. ssm_conv 0.6 ms/pp512 (24 launches).
++Next lever per LEVERS.md: L6 (quantize_fp8 fusion).
++
++Goal: LEVERS.md L2 (wmma weight repack at load time). Result: wmma kernel
++~204 -> ~186 us/launch average (-9%), pp512 6220 -> 6319-6334 (+1.6-1.8%),
++tg64 unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN tests.
++Commits: (see git log).
++
++Method:
++1. Re-measured the staging share at the current 93 TFLOP/s with the rig
++   (/tmp/stub_rig/fp8.cuh: replaced the rA/rD weight-side staging loads with
++   constants, kept the smem stores/barriers/wmma chain): 260.5 -> 175 us, so
++   the weight staging loads were ~85 us = 33% of the kernel - far above the
++   old ~15% estimate from the 55 TFLOP/s era. L2 premise confirmed.
++2. Simulated the repacked layout in a rig (/tmp/bench_repack.cu + the shared
++   /tmp/repack_kernel.cuh): contiguous fp8 [m_pad][k] rows + separate scales
++   [m_pad][n_col_blocks], uint4 staging loads, no bounds predicates (padded
++   rows pre-zeroed). 260.5 -> ~228 us on the gate shape = 93 -> 106 TFLOP/s
++   (+14%). Bit-exact vs the block-layout kernel (0 diffs of 4.7M outputs,
++   /tmp/check_repack.cu).
++3. Implemented in-tree: fp8_repack_weights kernel (one warp per row, k-block;
++   grid.y chunks rows, loop r += gridDim.y) + lazy per-context cache in
++   ggml_cuda_fp8_repack (keyed on src0->data, shape-checked; allocated via
++   cudaMalloc - safe because the first call always happens during the
++   direct-execution warmup before CUDA-graph capture). The GEMV and scalar
++   paths keep reading the original block layout (decode untouched).
++
++BUG FOUND (do not rediscover): the repack kernel looped `r < gridDim.y`
++instead of `r < m`. For m > 65535 (output.weight, vocab 152064) grid.y is
++clamped to 65535, so rows beyond 65535 were never repacked -> garbage logits
++-> PPL 9.56 (was 6.24). The bit-exact kernel-vs-kernel rig did NOT catch it
++(its repacked buffer was host-built); the isolated repack-kernel check
++(/tmp/check_repack_kernel.cu, compares device repack vs host repack on the
++real model shapes incl. m=70000) caught it. Rule: any device-side repack/
++transform kernel needs its own isolated content check, including the m >
++grid-y-limit case.
++
++Also learned: the fp8 weight tensors get fresh data pointers (and fresh names)
++on every graph build in this codebase, but CUDA-graph replay means the lazy
++pointer-keyed cache is populated once during the first direct execution and
++reused afterwards - verified stable at ~201 entries over a 2200-call PPL run
++(no unbounded growth, no per-chunk repack cost). The one-time repack cost is
++~13 ms total (~200 tensors, p50 71 us, max 1.09 ms for output.weight).
++
++## 17. L6: quantize_fp8 warp rewrite (2026-08-06 night, session)
++
++Goal: LEVERS.md L6 (quantize_fp8, 5.1 ms/pp512). The L6 plan was to fuse the
++quantization into the wmma kernel's staging; the session found the fusion is a
++wash and the real win is a barrier-free warp rewrite of the quantize kernel.
++Result: quantize 25.4 -> 12.6 us/launch on pp512 grids (-50%), pp512 6630 ->
++6818-6841 (+2.9-3.2%), tg64 unchanged, PPL 6.2677 exact, generation matches,
++47/47 GDN. Commits: (see git log).
++
++Why the old kernel was slow: it moves ~6.5 MB/launch in 25 us (~256 GB/s),
++far below the DRAM budget - it is latency/barrier-bound (1 float per thread,
++2 __syncthreads per 128-thread CTA, block reduce via smem).
++
++New kernel quantize_fp8_warp<4> (fp8.cuh): one warp per (token, 128-col
++block); each lane covers 4 consecutive values (float4); the amax reduce is a
++pure warp butterfly (5 shfl, no smem, no barriers); the fp8 encode uses the
++gfx12 hardware v_cvt_pk_fp8_f32 (RNE). Bit-exactness of the hardware encode
++vs the software encoder was verified on 406K finite values covering every
++rounding boundary, tie, subnormal and saturation case (/tmp/fp8_cvt_test.cu):
++only NaN/Inf inputs differ (never present in activations). 4 k-blocks per
++warp overlap the DRAM latency of the independent loads (KBW=1/2/4/8 measured;
++4 best). The staging output is bit-exact vs quantize_fp8 (rig check bad=0 on
++all model shapes), so the wmma/gemv/scalar consumers are untouched.
++
++Dispatch (fp8.cu): RDNA4 + n > GGML_FP8_GEMV_MAX_N + 16-B-aligned src1 -> warp
++kernel; else the old quantize_fp8. The warp kernel's grid (ceil(k/128/32) x n)
++is too small for the decode grids (n <= 16): it REGRESSED decode quantize 1.31
++-> 2.04 us/launch, so the old kernel stays there (decode untouched).
++
++The fusion experiment (mul_mat_fp8_wmma_fused, reads f32 in the wmma staging,
++computes scales in-kernel via an aligned-8-lane butterfly): measured on the
++real shape mix - it WINS on small shapes (m=1024: -51%, m=4096: -16%) but
++LOSES on the big GEMMs that dominate pp512 (m=9216: +10%, m=8192: +5.5%);
++net ~ +0.2 ms/pp512 (a wash). The in-kernel quantize adds ~42 us/launch at
++saturation - more than the 25 us standalone kernel it replaces - because it
++competes with the wmma/scale-pass pipes and the f32 staging is 4x the bytes.
++The warp rewrite gets the same win with zero risk to the GEMM path. Do not
++retry the fusion. (The fused kernel was removed from the tree; the rigs
++/tmp/bench_fused.cu and /tmp/bench_pairs.cu keep the A/B.)
++
++Next lever per LEVERS.md: L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512).
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index 7ee4fa3c3..c3c5ef047 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -107,7 +107,17 @@ void ggml_cuda_mul_mat_fp8(
+         const float * src1_b = src1_d + ib * k * n;
+         float       * dst_b  = dst_d  + ib * m * n;
+ 
+-        {
++        // barrier-free warp quantize on RDNA4 when the f32 source is 16-B aligned
++        // (bit-exact vs quantize_fp8; the hardware fp8 encode is verified exact for
++        // all finite inputs); fall back to the block-reduce kernel otherwise. The
++        // warp kernel needs n large enough to fill its grid - on the tiny decode
++        // grids (n <= GGML_FP8_GEMV_MAX_N) the old kernel wins.
++        if (GGML_CUDA_CC_IS_RDNA4(cc) && n > GGML_FP8_GEMV_MAX_N && ((uintptr_t) src1_b & 15) == 0) {
++            const dim3 num_blocks((n_col_blocks + GGML_FP8_NTHREADS / 32 * GGML_FP8_QUANT_KBW - 1) / (GGML_FP8_NTHREADS / 32 * GGML_FP8_QUANT_KBW), n, 1);
++            const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
++            quantize_fp8_warp<GGML_FP8_QUANT_KBW><<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
++            CUDA_CHECK(cudaGetLastError());
++        } else {
+             const dim3 num_blocks(n_col_blocks, n, 1);
+             const dim3 block_size(GGML_FP8_QUANT_NTHREADS, 1, 1);
+             quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+index 6cd8790c2..ca47c02eb 100644
+--- a/ggml/src/ggml-cuda/fp8.cuh
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -145,6 +145,67 @@ __global__ void quantize_fp8(
+     y_q[(int64_t) token * k + col0 + tid] = fp8_e4m3_from_f32(v * red[1]);
+ }
+ 
++// Barrier-free rewrite of quantize_fp8: one warp per (token, 128-col block), each
++// lane covers 4 consecutive values (float4). The amax reduce is a pure warp
++// butterfly (no smem, no __syncthreads), so the kernel is a simple streaming
++// pass that runs at near-DRAM bandwidth instead of being latency-bound on the
++// old 1-value-per-thread + 2-barrier structure. Outputs are bit-exact vs
++// quantize_fp8 (same max-abs, same scale/inv expressions, hardware fp8 encode
++// verified bit-exact vs the software encoder for all finite inputs). KBW = k-
++// blocks per warp: the loads are independent, so KBW>1 overlaps the DRAM
++// latency of the f32 reads. RDNA4-only (hardware fp8 encode); the launcher
++// falls back to quantize_fp8 elsewhere.
++#define GGML_FP8_QUANT_KBW 4 // k-blocks per warp (the host grid math must match)
++template<int KBW>
++__global__ void quantize_fp8_warp(
++        const float * __restrict__ x, uint8_t * __restrict__ y_q, float * __restrict__ y_s,
++        const int64_t k, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int token = blockIdx.y;
++    constexpr int NWARPS = GGML_FP8_NTHREADS / 32;
++    const int cb0 = (blockIdx.x * NWARPS + warp) * KBW; // first k-block of this warp
++
++    float4 f[KBW];
++    float m[KBW];
++    bool valid[KBW];
++#pragma unroll
++    for (int j = 0; j < KBW; ++j) {
++        valid[j] = cb0 + j < n_col_blocks;
++        const float * xb = x + (int64_t) token * k + (int64_t) (cb0 + j) * GGML_FP8_TILE_K + lane * 4;
++        if (valid[j]) {
++            f[j] = *(const float4 *) xb;
++            m[j] = fmaxf(fmaxf(fabsf(f[j].x), fabsf(f[j].y)), fmaxf(fabsf(f[j].z), fabsf(f[j].w)));
++        } else {
++            f[j] = make_float4(0.f, 0.f, 0.f, 0.f);
++            m[j] = 0.f;
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < KBW; ++j) {
++        float mm = m[j];
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) {
++            mm = fmaxf(mm, __shfl_xor_sync(0xffffffff, mm, o, 32));
++        }
++        const float scale = mm / 448.0f;
++        const float inv = mm != 0.0f ? 448.0f / mm : 0.0f;
++        if (lane == 0 && valid[j]) {
++            y_s[(int64_t) token * n_col_blocks + cb0 + j] = scale;
++        }
++        unsigned int r0 = __builtin_amdgcn_cvt_pk_fp8_f32(f[j].x * inv, f[j].y * inv, 0, false);
++        r0 = __builtin_amdgcn_cvt_pk_fp8_f32(f[j].z * inv, f[j].w * inv, r0, true);
++        if (valid[j]) {
++            *(unsigned int *) (y_q + (int64_t) token * k + (int64_t) (cb0 + j) * GGML_FP8_TILE_K + lane * 4) = r0;
++        }
++    }
++#else
++    (void) x; (void) y_q; (void) y_s;
++    (void) k; (void) n; (void) n_col_blocks; (void) n_pad;
++#endif
++}
++
+ // ---- weight repack: block_f8_e4m3 [m][n_col_blocks] -> fp8 [m_pad][k] + scales [m_pad][n_col_blocks] ----
+ // The block rows are 132 B (f32 scale + 128 fp8), so the wmma staging loads are 4-B only
+ // (misaligned for 16-B). The repack makes the fp8 bytes 16-B aligned per row and separates
+-- 
+2.55.0
+

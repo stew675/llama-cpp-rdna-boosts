@@ -1,0 +1,136 @@
+From bc01a921ec4871ba424a75db042222402470cbc4 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 22:45:59 -0500
+Subject: [PATCH 13/13] convert : fp8 output.weight for untied lm_head + fix
+ qwen35 tensor split
+
+--fp8-output-weight assumed tied embeddings (synthesized a copy of
+token_embd); untied models (e.g. Qwen3.6-27B) crashed with a duplicated
+output.weight. Untied models now quantize lm_head.weight itself; the tied
+path is byte-identical. Also fixes the tensor-split split-state handler
+for the fused ssm_conv_2src op (qkv split on axis 0, weight/states on
+axis 1) which broke -sm tensor for the whole qwen35 arch, including the
+served Q8_K_XL model. 27B fp8 -ow: PPL 4.644 vs 4.603 BF16, pp512 1292
+vs 857 on 2x R9700.
+
+Assisted-by: DeepSeek-V4
+---
+ PERF_HANDOVER.md               | 31 +++++++++++++++++++++++++++++++
+ conversion/base.py             | 28 ++++++++++++++++++----------
+ ggml/src/ggml-backend-meta.cpp |  8 ++++++++
+ 3 files changed, 57 insertions(+), 10 deletions(-)
+
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 2704d00b6..e92f96517 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -639,3 +639,34 @@ Next lever per LEVERS.md: none live - L1 (wmma), L3/L4 (GDN) and L7 (in-proj
+ fp8) are spent; L8 (small kernels) skip. Remaining structural ideas: L1's
+ kpacked smem layout for A, and the decode-side fused quantize-in-gemv
+ (~+4% tg64 per section 10).
++
++## 20. 27B fp8 -ow conversion + tensor-split fixes (2026-08-06, session)
++
++Converted /llm/models/Qwen3.6/27B/FP8/ (Qwen3.5 arch, 64 layers, 27.3B params)
++to the fp8 -ow GGUF: /llm/models/Qwen3.6/27B/FP8/Qwen3.6-27B-StewFP8-ow.gguf
++(29.5 GB). PPL 4.6439 vs 4.6030 (BF16 gguf) = +0.9%, in the expected fp8 band.
++Bench on 2 GPUs (-dev ROCm0,ROCm2 -sm tensor): pp512 1292, tg16 29.5, vs the
++Q8_K_XL's 857/25.1 - the fp8 prefill win (~1.5x) holds at 27B scale.
++
++Two code fixes were required:
++1. --fp8-output-weight assumed tied embeddings (synthesized a copy of
++   token_embd). The 27B is untied (tie_word_embeddings=false, real
++   lm_head.weight) -> the flag crashed with "Duplicated tensor name
++   output.weight". Fixed: untied models now quantize lm_head.weight itself
++   (and pop it from the dequant path); the tied path is byte-identical
++   (verified against stewfp8-ow-2copy.gguf).
++2. Tensor split (-sm tensor) was broken for the whole qwen35 arch in this
++   build: ggml-backend-meta.cpp handle_ssm_conv required src0/src1 on the SAME
++   split axis, but the fused 2-src conv (L5 ssm_conv_2src) has qkv split on
++   axis 0 and the conv weight/states on axis 1 (same channel partition).
++   The assert also hit the Q8_K_XL model. Fixed: the handler now accepts the
++   channel-split-everywhere case and returns src0's state. The Q8_K_XL (33 GB)
++   now benches on 2 GPUs too, and the 27B fp8 runs with the fused GDN enabled.
++   NOTE: llama-bench uses "-dev A/B" (slash), llama-perplexity/llama-cli use
++   "-dev A,B" (comma) - the two tools disagree on the separator.
++
++Also noted: the 27B fp8 (27.5 GiB weights + ~27 GiB fp8_repack cache) does NOT
++fit one 32 GB R9700 (OOM in ggml_cuda_mul_mat_fp8 at the first repack), and
++partial offload (ngl<all) is impossible for fp8 (CPU has no fp8 mul_mat, so
++CPU-buffer fp8 weights crash GPU kernels - the L9 lesson). Two GPUs with
++tensor split is the only viable config on this box.
+diff --git a/conversion/base.py b/conversion/base.py
+index 413d1745b..8fc6b24f9 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -880,20 +880,25 @@ class ModelBase:
+         self.model_tensors.pop(embed_name, None)
+ 
+     def _generate_fp8_output_weight(self):
+-        """Quantize token_embd into an fp8 output.weight (lm_head) copy, keeping
+-        token_embd BF16 for the input embedding lookup. Same 128x128-block
+-        convention as the model: d = BF16(amax/448), q = fp8(w / (amax/448))."""
++        """Store an fp8 output.weight (lm_head) so the head runs on the FP8 path.
++        Tied models: fp8 copy of the BF16 token_embd (token_embd stays for the
++        input lookup). Untied models: quantize the model's own lm_head.weight in
++        place. Same 128x128-block convention as the model: d = BF16(amax/448),
++        q = fp8(w / (amax/448))."""
+         if any("output.weight" in ts for ts in self.gguf_writer.tensors):
+-            return  # model already has its own output weight
++            return  # model already has an FP8 output weight
+ 
+-        embed_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
+-        if embed_name is None:
++        head_name = next((n for n in self.model_tensors if n.endswith("lm_head.weight")), None)
++        if head_name is None:
++            # tied embeddings: synthesize a copy from the embedding, keep it BF16 for the lookup
++            head_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
++        if head_name is None:
+             return
+-        w = LazyTorchTensor.to_eager(self.model_tensors[embed_name]())
++        w = LazyTorchTensor.to_eager(self.model_tensors[head_name]())
+         if w.dtype == torch.float8_e4m3fn:
+-            return  # token_embd already fp8, lm_head already on the fp8 path
++            return  # already fp8, head already on the fp8 path
+ 
+-        if w.dim() != 2 or w.shape[1] % 128 != 0:
++        if w.dim() != 2 or w.shape[1] % 128 != 0 or w.shape[0] % 128 != 0:
+             return
+ 
+         M, N = w.shape  # [n_vocab, n_embd]
+@@ -909,9 +914,12 @@ class ModelBase:
+         blocks = np.empty((M, nb, 132), dtype=np.uint8)
+         blocks[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(M, nb, 4)
+         blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
+-        logger.info("Stored FP8 output.weight copy of token_embd (lm_head on the FP8 path)")
++        logger.info("Stored FP8 output.weight (lm_head on the FP8 path)")
+         self.gguf_writer.add_tensor("output.weight", blocks.reshape(M, nb * 132),
+                                     raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
++        if head_name.endswith("lm_head.weight"):
++            # do not write the BF16 lm_head again through the dequant path
++            self.model_tensors.pop(head_name, None)
+ 
+     @staticmethod
+     def repack_mxfp4_blocks(packed: Tensor, scale: Tensor) -> np.ndarray:
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index bc1402abc..8462909a6 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -820,6 +820,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     };
+ 
+     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        // fused 2-src form (ssm_conv_2src): qkv [channels, tokens] split on axis 0,
++        // conv weight [d_conv, channels] and states [n_state, channels] split on
++        // axis 1 - all along the same channel partition, so the output follows src0
++        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
++                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
++                (tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1)) {
++            return src_ss[0];
++        }
+         if (src_ss[0].axis == src_ss[1].axis) {
+             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+-- 
+2.55.0
+

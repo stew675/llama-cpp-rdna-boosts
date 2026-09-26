@@ -1,0 +1,787 @@
+From cdb3b48b82d110ac7ef985004b23ff6197b677d2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 22:19:08 -0500
+Subject: [PATCH 08/13] fp8 : close the decode gap to Q8_0 (tg64 72 -> 89)
+
+- mul_mat_fp8_gemv: defer the warp reduce to the end (fold per-block
+  scales into the lane partial), 4 k-blocks per iteration for load ILP;
+  bandwidth 445 -> 496 GB/s
+- skip the n_pad zero-fill for the GEMV path (n <= 16): the padded
+  tokens are never read, removes 450 cudaMemset launches per decode step
+- convert: --fp8-output-weight writes an fp8 output.weight copy of
+  token_embd (128x128 blocks, d = BF16(amax/448)) so lm_head runs on the
+  fp8 GEMV; token_embd stays BF16 for the input embedding lookup
+
+Measured (same box/day): tg64 72.03 -> 89.13 (Q8_0: 90.92), pp512
+unchanged ~5914. Generation matches; PPL 6.2572 vs 6.2508 (no-ow) and
+6.2464 (Q8_0), all within error bars.
+
+Assisted-by: Claude Sonnet
+---
+ PERF_HANDOVER.md                | 113 +++++++---
+ conversion/base.py              |  40 +++-
+ convert_hf_to_gguf.py           |   6 +
+ ggml/src/ggml-cuda/fp8.cu       |   4 +-
+ ggml/src/ggml-cuda/fp8.cuh      |  54 ++++-
+ vllm-vs-llamacpp-performance.md | 389 ++++++++++++++++++++++++++++++++
+ 6 files changed, 556 insertions(+), 50 deletions(-)
+ create mode 100644 vllm-vs-llamacpp-performance.md
+
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 5023f20c3..8d3272d1e 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -2,8 +2,9 @@
+ 
+ **Purpose**: single document for the next session's performance work. Everything
+ here was measured on this box (3x R9700 gfx1201, 1x used, -dev ROCm0) with the
+-fp8 GGUF `/tmp/stewfp8-preserved.gguf` (Qwen3.5-4B StewFP8). Updated end of
+-session 2026-08-06 after the aiter GEMM port (commit pending, see section 8).
++fp8 GGUFs in `/llm/models/Qwen3.5/4B/StewFP8/` (Qwen3.5-4B StewFP8). Updated
++2026-08-05 evening after the decode session (see section 10): generation now
++matches Q8_0; prefill is the remaining gap.
+ 
+ Read `HANDOVER.md` for the project as a whole and `AITER_FINDINGS.md` for the
+ aiter inspection details. This file tracks ONLY the performance picture.
+@@ -12,30 +13,36 @@ aiter inspection details. This file tracks ONLY the performance picture.
+ 
+ ## 1. Scoreboard (measured, all pp512 unless noted)
+ 
+-| config | pp512 t/s | vs Q8_0 | vs fp8 baseline |
+-|---|---|---|---|
+-| Q8_0 GGUF (target base) | 5847 | - | - |
+-| fp8 baseline (821d423ac) | 4929.8 | -16% | - |
+-| fp8 now (aiter port, this session) | **5546-5596** | **-5.6%** | **+12.5-13.5%** |
+-| tg64 (fp8, unchanged) | 71.0-71.4 | -21% | 0 |
+-| target prefill (+50% over Q8_0) | 8770 | +50% | +78% |
+-| target generation (+10%) | ~98.5 | +10% | +39% |
++| config | pp512 t/s | tg64 t/s | vs Q8_0 pp | vs Q8_0 tg |
++|---|---|---|---|---|
++| Q8_0 GGUF (target base) | 6177 | 90.9 | - | - |
++| fp8 baseline (821d423ac) | 4930 | 71.0 | -20% | -22% |
++| fp8 + aiter GEMM port (26b7be281) | 5546-5596 | 71.4 | -5.6% | -21% |
++| fp8 now (decode session, commit below) | **5914** | **89.1** | **-4.3%** | **-2.0%** |
++| target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
++| target generation (+10%) | - | ~100 | - | +10% |
+ 
+ pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
+ 
+-PPL 8.7152 (fp8) vs 8.6024 (bf16), 8.6126 (Q8_0) — unchanged by this port.
+-All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
++PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
++/tmp/corpus_pride.txt corpus (all within error bars); generation matches the
++pre-change fp8 output on the same prompt/seed.
+ 
+-## 2. Where pp512 time goes (rocprofv3 kernel trace, per ~1.8 bench runs)
++## 2. Where pp512 time goes (rocprofv3 kernel trace, decode session, fp8-ow GGUF)
+ 
+ | kernel | share of pp512 | note |
+ |---|---|---|
+-| mul_mat_fp8_wmma | ~50% | now ~77 TFLOP/s (was 55) |
+-| gated_delta_net_cuda | ~17% | linear-attention core, custom kernel |
+-| mul_mat_vec_f (bf16) | ~12.5% | incl. fused output_norm+lm_head (2.05 ms, m=248320) |
+-| flash_attn_tile | ~3.5% | |
+-| quantize_fp8 | ~1.2% | activation staging pass |
+-| norms/silu/rope/concat/copy | ~5% | |
++| mul_mat_fp8_wmma | ~48% | ~77 TFLOP/s (aiter port) |
++| gated_delta_net_cuda | ~17% | linear-attention core, sequential per-token loop |
++| Cijk (rocBLAS/CK BF16 GEMM) | ~6% | the delta-net in/out projections (BF16 in the GGUF) |
++| quantize_fp8 | ~6% | activation staging pass |
++| concat_non_cont | ~5% | delta-net plumbing (48 launches) |
++| flash_attn_tile | ~4% | 8 attention layers |
++| silu / norms / conv / copy | ~9% | ssm_conv_long_token_f32 ~1% |
++
++Decode (tg64) breakdown, per ~11.1 ms step: mul_mat_fp8_gemv 8.95 ms (79%, 226
++GEMMs incl. lm_head at ~496 GB/s), quantize_fp8 0.32 ms, gated_delta_net 0.41
++ms, BF16 mmv 0.15 ms, norms/ops ~1.3 ms.
+ 
+ ## 3. Ranked levers for the next session
+ 
+@@ -82,10 +89,13 @@ All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
+ 
+ ### L5. Non-fp8 tensors -> Q8_0 in the GGUF — SMALL-MEDIUM, decoder-focused
+ - Only helps decode (memory-bound) and slightly reduces prefill staging.
+-- **token_embd.weight must STAY BF16**: it is type 30 (BF16) in the GGUF today
+-  and lm_head runs the fused BF16 mmv at 2.05 ms/launch; as fp8 it would be
+-  ~5.4 ms (slower). The quantizable set is norms, conv1d, in_proj_a/b, A_log
+-  (small) -> gen maybe +5%, prefill ~0.
++- **token_embd constraint is now VOID**: the decode session added
++  `--fp8-output-weight` (an fp8 output.weight copy of token_embd, token_embd
++  stays BF16 for the input lookup) so lm_head runs on the fast fp8 GEMV. Do NOT
++  quantize token_embd itself to fp8 without adding a get_rows fp8 kernel
++  (getrows.cu has no F8_E4M3 case; CPU has no fp8 kernels either).
++- The quantizable set is norms, conv1d, in_proj_a/b, A_log (small) -> gen maybe
++  +5%, prefill ~0.
+ 
+ ## 4. Kernel facts (established this session, do not rediscover)
+ 
+@@ -117,40 +127,71 @@ All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
+ ```bash
+ # build + bench (after any kernel change)
+ cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-cli
+-/tmp/llama-hip-full/bin/llama-bench -m /tmp/stewfp8-preserved.gguf -p 512 -n 64 -r 3 -dev ROCm0
++/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm0
++
++# Q8_0 reference on the same box/day
++/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf -p 512 -n 64 -r 5 -dev ROCm0
+ 
+ # correctness after kernel changes (fast gate)
+ /tmp/llama-hip-full/bin/test-backend-ops test -b ROCm0 -o MUL_MAT   # 1186 pass (no F8 cases! it only covers other types)
+-/tmp/llama-hip-full/bin/llama-cli -m /tmp/stewfp8-preserved.gguf -f /tmp/prompt_pp.txt -n 24 --single-turn -s 42
++/tmp/llama-hip-full/bin/llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -f /tmp/prompt_pp.txt -n 24 --single-turn -s 42
+ # expected: prompt echo + "[Start thinking] Thinking Process: 1. Analyze the Request:..." (matches bf16 ref)
+ # note: test-backend-ops has NO F8_E4M3 mul_mat cases (CPU backend can't do fp8) - generation diff is the gate
+ 
+-# profile
+-rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /tmp/stewfp8-preserved.gguf -p 512 -n 8 -r 1 -dev ROCm0
++# profile (decode-heavy runs crash rocprofv3 at teardown; the trace is still written)
++rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm0
+ # per-kernel CSV in /tmp/rocp/soar/*kernel_trace.csv (Grid_Size_X = work-items = grid*256; VGPR/LDS columns)
+-
+-# aiter reference numbers (M=512 gate/up etc. at 89-137 TFLOP/s)
+-PYTHONPATH=/home/stew675/aiter /tmp/aiter-venv/bin/python /tmp/bench_aiter_stable.py
++# decode-only view: filter kernels after the last mul_mat_fp8_wmma start
+ ```
+ 
+ ## 7. PPL / parity (do not skip after any kernel or loader change)
+ 
+ ```bash
+-/tmp/llama-hip-full/bin/llama-perplexity -m /tmp/stewfp8-preserved.gguf -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # ~8.715
++/tmp/llama-hip-full/bin/llama-perplexity -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # ~6.26 on this corpus
+ ```
+ 
+ ## 8. Git state
+ 
+-- Kernel changes (ggml/src/ggml-cuda/fp8.cuh + fp8.cu) + docs (AITER_FINDINGS.md,
+-  HANDOVER.md, PERF_HANDOVER.md) are being committed as one unit this session.
++- This session (decode): ggml/src/ggml-cuda/fp8.cu + fp8.cuh (gemv rewrite +
++  memset skip), convert_hf_to_gguf.py + conversion/base.py (--fp8-output-weight),
++  docs (PERF_HANDOVER.md, vllm-vs-llamacpp-performance.md) committed as one unit.
+ - Branch `cllm`, origin git@github.com:stew675/llama.cpp.git.
+ - Commit style: concise subject, `Assisted-by:` line, no Co-authored-by.
+ 
+ ## 9. Next-session suggested order
+ 
+-1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5550).
+-2. L1 (delta-net): profile `gated_delta_net_cuda` per-layer; check aiter's
+-   gfx1201 dispatch actually fires; port or optimize ours; PPL + bench.
++1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5914).
++2. L1 (delta-net): port aiter's chunked gated-delta-rule kernel
++   (`/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu`, gfx1201
++   path) into ggml-cuda; verify the gfx1201 dispatch fires; f32 intermediate
++   precision parity (PPL check); bench pp512.
+ 3. L2 (weight repack): re-profile the staging share first; implement the
+    in-memory repack; vectorize sA staging; PPL + bench.
+ 4. Re-evaluate the +50% target with both in; then decide if L3/L4/L5 are worth it.
++
++## 10. Decode session log (2026-08-05 evening)
++
++Goal: close the fp8 generation gap to Q8_0 (tg64 was 71.0-71.4 vs Q8_0 ~90).
++Result: tg64 72.0 -> 89.1 (98% of Q8_0's 90.9), pp512 unchanged ~5914.
++
++Three changes, all gated by generation-parity + PPL:
++
++1. fp8.cu: skip the n_pad zero-fill (cudaMemset x2 per GEMM, 450/step) when
++   n <= GGML_FP8_GEMV_MAX_N; the GEMV path never reads the padded tokens.
++   Removed ~0.5 ms/step.
++2. fp8.cuh: rewrote mul_mat_fp8_gemv - fold the per-block scales into the lane
++   partial (one deferred warp-reduce instead of 160 shuffles/row), 4 k-blocks
++   per iteration for load ILP. Bandwidth 445 -> 496 GB/s (mmvf reference: 520).
++3. convert_hf_to_gguf.py + conversion/base.py: --fp8-output-weight writes an
++   fp8 output.weight copy of token_embd (same 128x128 convention as the model:
++   d = BF16(amax/448), q = fp8(w/(amax/448))). lm_head moves from the fused
++   BF16 mmv (2.44 ms/step) to the fp8 GEMV (~1.4 ms/step); token_embd stays
++   BF16 for get_rows. +0.66 GiB storage, +0.63 B params.
++
++New GGUF: /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf (5.36 GiB, 442
++  tensors: token_embd BF16 + output.weight F8_E4M3). Regenerate with:
++  python3 convert_hf_to_gguf.py /llm/models/Qwen3.5/4B/StewFP8 --outtype fp8_e4m3 --fp8-output-weight --outfile ...
++
++Left on the table (decode): gemv 496 -> ~520 GB/s (vectorized x loads, 8-block
++ILP), fuse quantize_fp8 into the gemv (226 launches/step), delta-net 0.41
++ms/step. Roughly +4% if all taken.
+diff --git a/conversion/base.py b/conversion/base.py
+index 40a0a7322..e32f12c44 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -131,7 +131,8 @@ class ModelBase:
+                  target_model_dir: Path | None = None,
+                  fuse_gate_up_exps: bool = False,
+                  fp8_as_q8: bool = False,
+-                 fuse_qkv: bool = False):
++                 fuse_qkv: bool = False,
++                 fp8_output_weight: bool = False):
+         if type(self) is ModelBase or \
+                 type(self) is TextModel or \
+                 type(self) is MmprojModel:
+@@ -172,6 +173,7 @@ class ModelBase:
+         self._is_mxfp4 = False
+         self._fp8_as_q8 = fp8_as_q8
+         self._fp8_dequantized: set[str] = set()
++        self._fp8_output_weight = fp8_output_weight
+ 
+         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
+         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
+@@ -833,6 +835,40 @@ class ModelBase:
+             logger.warning(
+                 "--outtype fp8_e4m3: no FP8 weights found, the file will contain no F8_E4M3 tensors")
+ 
++    def _generate_fp8_output_weight(self):
++        """Quantize token_embd into an fp8 output.weight (lm_head) copy, keeping
++        token_embd BF16 for the input embedding lookup. Same 128x128-block
++        convention as the model: d = BF16(amax/448), q = fp8(w / (amax/448))."""
++        if any("output.weight" in ts for ts in self.gguf_writer.tensors):
++            return  # model already has its own output weight
++
++        embed_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
++        if embed_name is None:
++            return
++        w = LazyTorchTensor.to_eager(self.model_tensors[embed_name]())
++        if w.dtype == torch.float8_e4m3fn:
++            return  # token_embd already fp8, lm_head already on the fp8 path
++
++        if w.dim() != 2 or w.shape[1] % 128 != 0:
++            return
++
++        M, N = w.shape  # [n_vocab, n_embd]
++        mb, nb = M // 128, N // 128
++        wf = w.float().view(mb, 128, nb, 128)
++        amax = wf.abs().amax(dim=(1, 3))          # [mb, nb]
++        s_f32 = amax / 448.0
++        s_bf16 = s_f32.to(torch.bfloat16)         # stored scale (BF16-rounded)
++        q = (wf / s_f32.view(mb, 1, nb, 1)).view(M, N).to(torch.float8_e4m3fn)
++
++        d = s_bf16.float().numpy().astype(np.float32)
++        q_bytes = q.view(torch.uint8).numpy()
++        blocks = np.empty((M, nb, 132), dtype=np.uint8)
++        blocks[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(M, nb, 4)
++        blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
++        logger.info("Stored FP8 output.weight copy of token_embd (lm_head on the FP8 path)")
++        self.gguf_writer.add_tensor("output.weight", blocks.reshape(M, nb * 132),
++                                    raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
++
+     @staticmethod
+     def repack_mxfp4_blocks(packed: Tensor, scale: Tensor) -> np.ndarray:
+         """
+@@ -1079,6 +1115,8 @@ class ModelBase:
+         # from model_tensors, leaving only non-FP8 for dequant.
+         if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
+             self._generate_fp8_tensors()
++            if self._fp8_output_weight:
++                self._generate_fp8_output_weight()
+ 
+         if self._is_nvfp4:
+             if nvfp4_compressed_tensors:
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 936804d52..ba7c16b40 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -156,6 +156,11 @@ def parse_args() -> argparse.Namespace:
+         "--fp8-as-q8", action="store_true",
+         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
+     )
++    parser.add_argument(
++        "--fp8-output-weight", action="store_true",
++        help="Also store an FP8 output.weight copy of token_embd so lm_head runs on the FP8 path "
++             "(keeps token_embd BF16 for the input embedding lookup).",
++    )
+ 
+     parser.add_argument(
+         "--fuse-qkv", action="store_true",
+@@ -296,6 +301,7 @@ def main() -> None:
+                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
+                                      fp8_as_q8=args.fp8_as_q8,
+                                      fuse_qkv=args.fuse_qkv,
++                                     fp8_output_weight=args.fp8_output_weight,
+                                      )
+ 
+         if args.vocab_only:
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index b471e63cc..70bf861b2 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -42,7 +42,9 @@ void ggml_cuda_mul_mat_fp8(
+     float   * src1_s_d = src1_s.get();
+     GGML_ASSERT(src1_q_d != nullptr);
+     GGML_ASSERT(src1_s_d != nullptr);
+-    if (n_pad > n) {
++    // only the wmma path reads the padded token region (its CTA spans
++    // GGML_FP8_CTA_N tokens); the GEMV path reads tokens 0..n-1 only
++    if (n_pad > n && n > GGML_FP8_GEMV_MAX_N) {
+         CUDA_CHECK(cudaMemsetAsync(src1_q_d + k * n, 0, k * (n_pad - n), stream));
+         CUDA_CHECK(cudaMemsetAsync(src1_s_d + n * n_col_blocks, 0, (n_pad - n) * n_col_blocks * sizeof(float), stream));
+     }
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+index e94abdf62..045625981 100644
+--- a/ggml/src/ggml-cuda/fp8.cuh
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -397,6 +397,11 @@ __global__ void mul_mat_fp8_wmma(
+ // generation. One warp per output row; the 32 lanes read the 128 fp8 bytes of a
+ // weight block coalesced (4 bytes each) and dot4 them with the shared activation
+ // block. This avoids the wmma tile waste (16-token tiles) at batch 1.
++//
++// The per-block scale (wblk->d, activation ad) is folded into the lane partial
++// so the dot can accumulate across all k-blocks and reduce once at the end (the
++// old per-block shuffle reduce cost 5 shfl x n_col_blocks per row). 4 k-blocks
++// are processed per iteration to keep 8 loads in flight and hide latency.
+ __global__ void mul_mat_fp8_gemv(
+         const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
+         const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
+@@ -413,22 +418,47 @@ __global__ void mul_mat_fp8_gemv(
+ 
+     float acc = 0.0f;
+     const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
++    const char * row = src0 + mi * row_stride;
+     const uint8_t * x = src1_q + ni * k;
++    const float * xs = src1_s + ni * n_col_blocks;
++
++    int64_t cb = 0;
++    for (; cb + 4 <= n_col_blocks; cb += 4) {
++        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (row + cb * (int64_t) sizeof(block_f8_e4m3));
++        const uint32_t w0 = *(const uint32_t *) (wblk[0].qs + lane * 4);
++        const uint32_t w1 = *(const uint32_t *) (wblk[1].qs + lane * 4);
++        const uint32_t w2 = *(const uint32_t *) (wblk[2].qs + lane * 4);
++        const uint32_t w3 = *(const uint32_t *) (wblk[3].qs + lane * 4);
++        const uint8_t * xb = x + cb * GGML_FP8_TILE_K + lane * 4;
++        const uint32_t x0 = *(const uint32_t *) (xb);
++        const uint32_t x1 = *(const uint32_t *) (xb + GGML_FP8_TILE_K);
++        const uint32_t x2 = *(const uint32_t *) (xb + 2 * GGML_FP8_TILE_K);
++        const uint32_t x3 = *(const uint32_t *) (xb + 3 * GGML_FP8_TILE_K);
++        const float d0 = wblk[0].d, d1 = wblk[1].d, d2 = wblk[2].d, d3 = wblk[3].d;
++        const float a0 = xs[cb], a1 = xs[cb + 1], a2 = xs[cb + 2], a3 = xs[cb + 3];
++
++        const float dot0 = __builtin_amdgcn_dot4_f32_fp8_fp8(w0, x0, 0.0f);
++        const float dot1 = __builtin_amdgcn_dot4_f32_fp8_fp8(w1, x1, 0.0f);
++        const float dot2 = __builtin_amdgcn_dot4_f32_fp8_fp8(w2, x2, 0.0f);
++        const float dot3 = __builtin_amdgcn_dot4_f32_fp8_fp8(w3, x3, 0.0f);
++        acc += d0 * a0 * dot0 + d1 * a1 * dot1 + d2 * a2 * dot2 + d3 * a3 * dot3;
++    }
++    for (; cb < n_col_blocks; ++cb) {
++        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (row + cb * (int64_t) sizeof(block_f8_e4m3));
++        const uint32_t w = *(const uint32_t *) (wblk->qs + lane * 4);
++        const uint32_t xq = *(const uint32_t *) (x + cb * GGML_FP8_TILE_K + lane * 4);
++        const float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w, xq, 0.0f);
++        acc += wblk->d * xs[cb] * dot;
++    }
+ 
+-    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
+-        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + mi * row_stride + cb * sizeof(block_f8_e4m3));
+-        const uint32_t w4 = *reinterpret_cast<const uint32_t *>(wblk->qs + lane * 4);
+-        const uint32_t x4 = *reinterpret_cast<const uint32_t *>(x + cb * GGML_FP8_TILE_K + lane * 4);
+-
+-        float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w4, x4, 0.0f);
++    // single reduce at the end, not one per k-block
+ #pragma unroll
+-        for (int o = 16; o > 0; o >>= 1) {
+-            dot += __shfl_xor_sync(0xffffffff, dot, o, 32);
+-        }
+-        acc += wblk->d * src1_s[ni * n_col_blocks + cb] * dot;
++    for (int o = 16; o > 0; o >>= 1) {
++        acc += __shfl_xor_sync(0xffffffff, acc, o, 32);
++    }
++    if (lane == 0) {
++        dst[ni * m + mi] = acc;
+     }
+-
+-    dst[ni * m + mi] = acc;
+ #else
+     (void) src0; (void) src1_q; (void) src1_s; (void) dst;
+     (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
+diff --git a/vllm-vs-llamacpp-performance.md b/vllm-vs-llamacpp-performance.md
+new file mode 100644
+index 000000000..ca4ed307c
+--- /dev/null
++++ b/vllm-vs-llamacpp-performance.md
+@@ -0,0 +1,389 @@
++---------
++
++# VLLM PERFORMANCE
++
++---------
++
++## TP = 1
++
++### Depth = 0
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B
++llama-benchy (0.4.0)
++Date: 2026-08-05 17:42:41
++Benchmarking model: Qwen3.5-4B-StewFP8 at http://localhost:8000/v1
++Concurrency levels: [1]
++Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
++Loading text from cache: /home/stew675/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt
++Total tokens available in text corpus: 144480
++Warming up...
++Warmup (User only) complete. Delta: 9 tokens (Server: 30, Local: 21)
++Warmup (System+Probe) complete. Delta: 14 tokens (Server: 36, Local context: 21, Probe: 1)
++
++Running coherence test...
++Coherence test PASSED.
++Measuring latency using mode: api...
++Average latency (api): 0.65 ms
++Running test: pp=512, tg=128, depth=0, concurrency=1
++  Warmup (batch size 1)...
++  Run 1/3 (batch size 1)...
++  Run 2/3 (batch size 1)...
++  Run 3/3 (batch size 1)...
++Printing results in MD format:
++
++
++| model              |   test |               t/s |     peak t/s |    ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|-------:|------------------:|-------------:|-------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 |  pp512 | 10455.82 ± 695.62 |              | 49.89 ± 3.17 |   49.24 ± 3.17 |    49.89 ± 3.17 |
++| Qwen3.5-4B-StewFP8 |  tg128 |      84.50 ± 0.05 | 85.00 ± 0.00 |              |                |                 |
++
++llama-benchy (0.4.0)
++date: 2026-08-05 17:42:41 | latency mode: api
++
++
++### Depth = 1024
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 1024
++
++| model              |          test |              t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|-----------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d1024 | 10814.42 ± 28.13 |              | 142.69 ± 0.37 |  142.13 ± 0.37 |   142.69 ± 0.37 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d1024 |     83.96 ± 0.04 | 84.67 ± 0.47 |               |                |                 |
++
++
++### Depth = 2048
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 2048
++
++| model              |          test |              t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|-----------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d2048 | 10125.20 ± 63.83 |              | 253.48 ± 1.63 |  252.91 ± 1.63 |   253.48 ± 1.63 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d2048 |     83.34 ± 0.09 | 84.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 4096
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 4096
++
++| model              |          test |            t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|---------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d4096 | 9469.09 ± 6.48 |              | 487.45 ± 0.28 |  486.78 ± 0.28 |   487.45 ± 0.28 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d4096 |   82.50 ± 0.04 | 83.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 8192
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 8192
++
++| model              |          test |             t/s |     peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|----------------:|-------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d8192 | 7907.61 ± 16.91 |              | 1101.30 ± 2.41 | 1100.80 ± 2.41 |  1101.30 ± 2.41 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d8192 |    81.00 ± 0.12 | 81.67 ± 0.47 |                |                |                 |
++
++
++### Depth = 16384
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 16384
++
++| model              |           test |             t/s |     peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|---------------:|----------------:|-------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d16384 | 6076.53 ± 27.63 |              | 2781.20 ± 12.69 | 2780.70 ± 12.69 | 2781.87 ± 12.74 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d16384 |    78.47 ± 0.06 | 79.00 ± 0.00 |                 |                 |                 |
++
++
++### Depth = 32768
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 32768
++
++| model              |           test |            t/s |     peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|---------------:|---------------:|-------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d32768 | 4075.66 ± 4.00 |              | 8166.39 ± 8.02 | 8165.80 ± 8.02 |  8167.58 ± 8.08 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d32768 |   73.81 ± 0.02 | 75.00 ± 0.00 |                |                |                 |
++
++
++### Depth = 65536
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 65536
++
++| model              |           test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:-------------------|---------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d65536 | 2442.39 ± 1.10 |              | 27043.68 ± 12.03 | 27043.07 ± 12.03 | 27045.75 ± 12.02 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d65536 |   65.28 ± 0.03 | 67.00 ± 0.00 |                  |                  |                  |
++
++
++### Depth = 131072
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 131072
++
++| model              |            test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:-------------------|----------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d131072 | 1342.70 ± 0.41 |              | 98000.64 ± 29.61 | 98000.14 ± 29.61 | 98004.80 ± 29.67 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d131072 |   53.59 ± 0.03 | 55.00 ± 0.00 |                  |                  |                  |
++
++---------
++
++## TP = 2
++
++### Depth = 0
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B
++
++| model              |   test |              t/s |      peak t/s |    ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|-------:|-----------------:|--------------:|-------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 |  pp512 | 10767.49 ± 50.15 |               | 48.27 ± 0.22 |   47.64 ± 0.22 |    48.27 ± 0.22 |
++| Qwen3.5-4B-StewFP8 |  tg128 |    121.93 ± 0.27 | 122.67 ± 0.47 |              |                |                 |
++
++
++### Depth = 1024
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 1024
++
++| model              |          test |              t/s |      peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|-----------------:|--------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d1024 | 12419.85 ± 52.65 |               | 124.39 ± 0.52 |  123.76 ± 0.52 |   124.39 ± 0.52 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d1024 |    121.30 ± 0.27 | 121.67 ± 0.47 |               |                |                 |
++
++
++### Depth = 2048
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 2048
++
++| model              |          test |              t/s |      peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|-----------------:|--------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d2048 | 12278.10 ± 41.04 |               | 209.04 ± 0.73 |  208.56 ± 0.73 |   209.04 ± 0.73 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d2048 |    120.70 ± 0.34 | 121.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 4096
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 4096
++
++| model              |          test |             t/s |      peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|----------------:|--------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d4096 | 12129.61 ± 4.83 |               | 380.55 ± 0.15 |  379.98 ± 0.15 |   380.55 ± 0.15 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d4096 |   119.09 ± 0.22 | 119.67 ± 0.47 |               |                |                 |
++
++
++### Depth = 8192
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 8192
++
++| model              |          test |              t/s |      peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|--------------:|-----------------:|--------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d8192 | 10841.85 ± 45.86 |               | 803.51 ± 3.43 |  802.89 ± 3.43 |   803.51 ± 3.43 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d8192 |    116.68 ± 0.10 | 117.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 16384
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 16384
++
++| model              |           test |             t/s |      peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|---------------:|----------------:|--------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d16384 | 9006.46 ± 55.46 |               | 1876.76 ± 11.67 | 1876.17 ± 11.67 | 1877.44 ± 11.66 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d16384 |   113.27 ± 0.14 | 114.00 ± 0.00 |                 |                 |                 |
++
++
++### Depth = 32768
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 32768
++
++| model              |           test |             t/s |      peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:-------------------|---------------:|----------------:|--------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d32768 | 6549.91 ± 10.07 |               | 5081.68 ± 7.82 | 5081.05 ± 7.82 |  5082.88 ± 7.82 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d32768 |   107.22 ± 0.03 | 108.00 ± 0.00 |                |                |                 |
++
++
++### Depth = 65536
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 65536
++
++| model              |           test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:-------------------|---------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d65536 | 4246.70 ± 4.63 |              | 15553.64 ± 17.04 | 15552.95 ± 17.04 | 15555.90 ± 17.07 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d65536 |   95.69 ± 0.08 | 97.00 ± 0.00 |                  |                  |                  |
++
++
++### Depth = 131072
++
++stew675@soar:~/cllm$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-StewFP8 --tokenizer Qwen/Qwen3.5-4B --depth 131072
++
++| model              |            test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:-------------------|----------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-StewFP8 | pp512 @ d131072 | 2457.63 ± 2.21 |              | 53541.81 ± 48.50 | 53541.39 ± 48.50 | 53545.91 ± 48.59 |
++| Qwen3.5-4B-StewFP8 | tg128 @ d131072 |   79.54 ± 0.06 | 82.00 ± 0.00 |                  |                  |                  |
++
++
++---------
++
++# LLAMA.CPP PERFORMANCE
++
++---------
++
++## TP=1
++
++### Depth = 0
++
++stew675@soar:~/llama.rocm$ uvx llama-benchy --base-url http://localhost:8080/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B
++
++| model           |   test |             t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|-------:|----------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 |  pp512 | 3629.13 ± 21.49 |              | 141.83 ± 0.74 |  141.45 ± 0.74 |   141.83 ± 0.74 |
++| Qwen3.5-4B-Q8_0 |  tg128 |    89.23 ± 0.06 | 90.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 1024
++
++stew675@soar:~/llama.rocm$ uvx llama-benchy --base-url http://localhost:8080/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B --depth 1024
++
++| model           |          test |             t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|----------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d1024 | 4228.15 ± 16.76 |              | 364.05 ± 1.41 |  363.60 ± 1.41 |   364.05 ± 1.41 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d1024 |    88.52 ± 0.05 | 89.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 2048
++
++| model           |          test |            t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|---------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d2048 | 4602.07 ± 4.28 |              | 556.90 ± 0.52 |  556.49 ± 0.52 |   556.90 ± 0.52 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d2048 |   88.09 ± 0.05 | 89.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 4096
++
++| model           |          test |            t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|---------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d4096 | 4693.56 ± 9.45 |              | 982.42 ± 1.98 |  981.99 ± 1.98 |   982.42 ± 1.98 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d4096 |   86.97 ± 0.03 | 87.33 ± 0.47 |               |                |                 |
++
++
++### Depth = 8192
++
++| model           |          test |            t/s |     peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|---------------:|-------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d8192 | 4473.35 ± 8.55 |              | 1946.40 ± 3.72 | 1946.05 ± 3.72 |  1946.40 ± 3.72 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d8192 |   85.50 ± 0.03 | 86.00 ± 0.00 |                |                |                 |
++
++
++### Depth = 16384
++
++| model           |           test |             t/s |     peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|---------------:|----------------:|-------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d16384 | 3782.38 ± 27.73 |              | 4467.92 ± 32.66 | 4467.44 ± 32.66 | 4467.92 ± 32.66 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d16384 |    82.27 ± 0.04 | 83.00 ± 0.00 |                 |                 |                 |
++
++
++### Depth = 32768
++
++| model           |           test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:----------------|---------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d32768 | 2812.12 ± 3.56 |              | 11835.26 ± 15.15 | 11834.87 ± 15.15 | 11835.26 ± 15.15 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d32768 |   76.68 ± 0.03 | 77.00 ± 0.00 |                  |                  |                  |
++
++
++### Depth = 65536
++
++| model           |           test |            t/s |     peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|---------------:|---------------:|-------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d65536 | 1879.03 ± 0.42 |              | 35151.25 ± 7.70 | 35150.83 ± 7.70 | 35151.25 ± 7.70 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d65536 |   67.83 ± 0.02 | 68.00 ± 0.00 |                 |                 |                 |
++
++
++
++### Depth = 131072
++
++
++| model           |            test |            t/s |     peak t/s |         ttfr (ms) |      est_ppt (ms) |     e2e_ttft (ms) |
++|:----------------|----------------:|---------------:|-------------:|------------------:|------------------:|------------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d131072 | 1131.71 ± 0.20 |              | 116270.87 ± 20.89 | 116270.48 ± 20.89 | 116270.87 ± 20.89 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d131072 |   54.97 ± 0.00 | 55.00 ± 0.00 |                   |                   |                   |
++
++
++---------
++
++## TP=2
++
++---------
++
++### Depth = 0
++
++$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B
++
++| model           |   test |            t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|-------:|---------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 |  pp512 | 2930.88 ± 5.25 |              | 175.39 ± 0.31 |  175.03 ± 0.31 |   175.39 ± 0.31 |
++| Qwen3.5-4B-Q8_0 |  tg128 |   95.67 ± 0.21 | 96.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 1024
++
++$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B --depth 1024
++
++| model           |          test |            t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|---------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d1024 | 3701.95 ± 8.14 |              | 415.32 ± 0.96 |  414.92 ± 0.96 |   415.32 ± 0.96 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d1024 |   94.59 ± 0.53 | 95.00 ± 0.82 |               |                |                 |
++
++
++### Depth = 2048
++
++| model           |          test |             t/s |     peak t/s |     ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|----------------:|-------------:|--------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d2048 | 4464.75 ± 24.72 |              | 573.94 ± 3.23 |  573.55 ± 3.23 |   573.94 ± 3.23 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d2048 |    94.41 ± 0.07 | 95.00 ± 0.00 |               |                |                 |
++
++
++### Depth = 4096
++
++| model           |          test |              t/s |     peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|-----------------:|-------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d4096 | 4928.24 ± 185.01 |              | 936.89 ± 36.12 | 936.58 ± 36.12 |  936.89 ± 36.12 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d4096 |     92.95 ± 0.05 | 93.33 ± 0.47 |                |                |                 |
++
++
++### Depth = 8192
++
++| model           |          test |            t/s |     peak t/s |      ttfr (ms) |   est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|--------------:|---------------:|-------------:|---------------:|---------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d8192 | 5268.36 ± 9.07 |              | 1652.86 ± 2.73 | 1652.51 ± 2.73 |  1652.86 ± 2.73 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d8192 |   92.13 ± 0.04 | 93.00 ± 0.00 |                |                |                 |
++
++
++### Depth = 16384
++
++| model           |           test |             t/s |     peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|---------------:|----------------:|-------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d16384 | 4898.61 ± 30.01 |              | 3449.81 ± 21.13 | 3449.41 ± 21.13 | 3449.81 ± 21.13 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d16384 |    89.89 ± 0.17 | 90.33 ± 0.47 |                 |                 |                 |
++
++
++### Depth = 32768
++
++$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B --depth 32768
++
++| model           |           test |             t/s |     peak t/s |       ttfr (ms) |    est_ppt (ms) |   e2e_ttft (ms) |
++|:----------------|---------------:|----------------:|-------------:|----------------:|----------------:|----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d32768 | 4124.81 ± 13.38 |              | 8068.81 ± 26.29 | 8068.50 ± 26.29 | 8068.81 ± 26.29 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d32768 |    86.50 ± 0.02 | 87.00 ± 0.00 |                 |                 |                 |
++
++
++### Depth = 65536
++
++| model           |           test |             t/s |     peak t/s |         ttfr (ms) |      est_ppt (ms) |     e2e_ttft (ms) |
++|:----------------|---------------:|----------------:|-------------:|------------------:|------------------:|------------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d65536 | 2948.08 ± 13.34 |              | 22404.67 ± 101.39 | 22404.29 ± 101.39 | 22404.67 ± 101.39 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d65536 |    80.16 ± 0.70 | 80.67 ± 0.47 |                   |                   |                   |
++
++
++### Depth = 131072
++
++$ uvx llama-benchy --base-url http://localhost:8000/v1 --tg 128 --pp 512 --model Qwen3.5-4B-Q8_0 --tokenizer Qwen/Qwen3.5-4B --depth 131072
++
++| model           |            test |            t/s |     peak t/s |        ttfr (ms) |     est_ppt (ms) |    e2e_ttft (ms) |
++|:----------------|----------------:|---------------:|-------------:|-----------------:|-----------------:|-----------------:|
++| Qwen3.5-4B-Q8_0 | pp512 @ d131072 | 1886.13 ± 1.33 |              | 69765.18 ± 48.95 | 69764.81 ± 48.95 | 69765.18 ± 48.95 |
++| Qwen3.5-4B-Q8_0 | tg128 @ d131072 |   70.73 ± 0.02 | 71.00 ± 0.00 |                  |                  |                  |
++
++
++---------
+-- 
+2.55.0
+

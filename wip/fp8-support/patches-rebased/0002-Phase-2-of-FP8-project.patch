@@ -1,0 +1,615 @@
+From 16895a18c3d4658c65beb11acc0dad6b4aa1996e Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 05:19:47 -0500
+Subject: [PATCH 02/13] Phase 2 of FP8 project
+
+---
+ ggml/src/ggml-cuda/fp8.cu       |  71 +++++++++
+ ggml/src/ggml-cuda/fp8.cuh      | 245 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  15 ++
+ ggml/src/ggml-quants.c          | 129 +++++++++++++++++
+ ggml/src/ggml-quants.h          |   4 +
+ ggml/src/ggml.c                 |   3 +-
+ implementation-plan.md          |  20 +--
+ 7 files changed, 471 insertions(+), 16 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/fp8.cu
+ create mode 100644 ggml/src/ggml-cuda/fp8.cuh
+
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+new file mode 100644
+index 000000000..71e831d8e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -0,0 +1,71 @@
++// FP8 E4M3 mul_mat host launcher (native FP8 hardware only).
++
++#include "common.cuh"
++#include "fp8.cuh"
++
++#include <cstdint>
++
++// Pre-quantize F32 activations to fp8 staging, then run the native FP8 mul_mat
++// kernel. Mirrors the quantize_mmq_q8_1_cuda + mul_mat_q flow.
++void ggml_cuda_mul_mat_fp8(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0->type == GGML_TYPE_F8_E4M3);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src1));
++
++    GGML_TENSOR_BINARY_OP_LOCALS;
++
++    GGML_ASSERT(ne00 % GGML_FP8_TILE_K == 0);
++    GGML_ASSERT(ne02 == 1 && ne12 == 1 && ne03 == 1 && ne13 == 1); // non-batched for now
++
++    const int64_t k = ne00;
++    const int64_t m = ne01;
++    const int64_t n = ne1;
++
++    cudaStream_t stream = ctx.stream();
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++
++    const char  * src0_d = (const char  *) src0->data;
++    const float * src1_d = (const float *) src1->data;
++    float       * dst_d  = (float       *)  dst->data;
++
++    const int64_t n_col_blocks = k / GGML_FP8_TILE_K;
++
++    // token padding: the wmma tiles span 16 tokens; out-of-range reads must be zeros
++    const int64_t n_pad = (n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N) * (GGML_FP8_NWARPS * GGML_FP8_TILE_N);
++
++    ggml_cuda_pool_alloc<uint8_t> src1_q(ctx.pool(), k * n_pad);
++    ggml_cuda_pool_alloc<float>   src1_s(ctx.pool(), n_pad * n_col_blocks);
++    uint8_t * src1_q_d = src1_q.get();
++    float   * src1_s_d = src1_s.get();
++    GGML_ASSERT(src1_q_d != nullptr);
++    GGML_ASSERT(src1_s_d != nullptr);
++    if (n_pad > n) {
++        CUDA_CHECK(cudaMemsetAsync(src1_q_d + k * n, 0, k * (n_pad - n), stream));
++        CUDA_CHECK(cudaMemsetAsync(src1_s_d + n * n_col_blocks, 0, (n_pad - n) * n_col_blocks * sizeof(float), stream));
++    }
++
++    {
++        const dim3 num_blocks(n_col_blocks, n, 1);
++        const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
++        quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_d, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        const dim3 block_dims(GGML_FP8_NTHREADS, 1, 1);
++        const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
++        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++        ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        return;
++    }
++#endif
++
++    // Scalar fallback (CUDA sm_89+)
++    const dim3 block_dims(32, 8, 1);
++    const dim3 grid_dims((n + 31) / 32, (m + 7) / 8, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++    ggml_cuda_kernel_launch(mul_mat_fp8_scalar, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++}
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+new file mode 100644
+index 000000000..b4b210759
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -0,0 +1,245 @@
++// FP8 E4M3 mul_mat kernels. Native FP8 hardware only (RDNA4 WMMA or CUDA sm_89+).
++//
++// Weight layout is the self-contained block_f8_e4m3: [f32 scale][128 fp8].
++// Activations are pre-quantized by quantize_fp8 into a transposed staging layout
++// ([k][n] fp8, k-major/token-minor, plus per-token-block scales), so the hot
++// mul_mat kernel reads contiguous fp8 fragments and never re-quantizes.
++// Mirrors the quantize_mmq_q8_1_cuda + mul_mat_q pattern in this codebase.
++
++#pragma once
++
++#include "common.cuh"
++
++#include <cstdint>
++
++#define GGML_FP8_TILE_M 16
++#define GGML_FP8_TILE_N 16
++#define GGML_FP8_TILE_K 128
++#define GGML_FP8_NWARPS 4
++#define GGML_FP8_NTHREADS (32 * GGML_FP8_NWARPS) // 128
++
++// fp8 e4m3fn (OCP) decode: value = (-1)^s * 2^(e-7) * (1.m), max 448, NaN = 0x7F/0xFF
++__device__ __forceinline__ float fp8_e4m3_to_f32(uint8_t x) {
++    const uint32_t sign = ((uint32_t)(x & 0x80)) << 24;
++    const uint32_t exp  = (x >> 3) & 0x0F;
++    const uint32_t man  = x & 0x07;
++
++    uint32_t bits;
++    if (exp == 0) {
++        // subnormal or zero: value = man * 2^-9
++        if (man == 0) {
++            bits = sign;
++        } else {
++            const uint32_t k = man >= 4 ? 2 : man >= 2 ? 1 : 0;
++            bits = sign | ((k + 118) << 23) | ((man - (1u << k)) << (23 - k));
++        }
++    } else if (exp == 15 && man == 7) {
++        bits = 0x7FC00000u; // NaN
++    } else {
++        bits = sign | ((exp + 120) << 23) | (man << 20);
++    }
++
++    return __uint_as_float(bits);
++}
++
++// fp8 e4m3fn encode, round-to-nearest-even, saturating to +/-448
++__device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
++    const uint32_t bits = __float_as_uint(x);
++    const uint32_t sign = (bits >> 31) & 1;
++    const uint32_t exp  = (bits >> 23) & 0xFF;
++    const uint32_t man  = bits & 0x7FFFFF;
++
++    if (exp == 0xFF) {
++        return sign ? 0xFF : 0x7F; // NaN/inf input
++    }
++    if (exp == 0) {
++        return sign ? 0x80 : 0x00; // f32 subnormal is far below fp8 min
++    }
++
++    int E = (int) exp - 120;
++    if (E >= 15) {
++        return sign ? 0xFE : 0x7E; // saturate to 448
++    }
++    if (E <= 0) {
++        // subnormal range: M = rne(value * 512), 0..7, 8 carries to E=1
++        const int shift = 141 - (int) exp;
++        uint32_t M = 0;
++        if (shift < 31) {
++            const uint64_t val = (1ull << 23) | man;
++            M = (uint32_t)(val >> shift);
++            const uint64_t frac = val & ((1ull << shift) - 1);
++            const uint64_t half = 1ull << (shift - 1);
++            if (frac > half || (frac == half && (M & 1))) {
++                M++;
++            }
++        }
++        if (M >= 8) {
++            return (uint8_t)((sign << 7) | 0x08); // smallest normal (E=1, M=0)
++        }
++        return (uint8_t)((sign << 7) | M);
++    }
++
++    // normal: E in 1..14, round mantissa to 3 bits (RNE)
++    uint32_t man_3 = man >> 20;
++    const uint32_t frac = man & 0xFFFFF;
++    if (frac > 0x80000 || (frac == 0x80000 && (man_3 & 1))) {
++        man_3++;
++    }
++    if (man_3 == 8) {
++        man_3 = 0;
++        E++;
++    }
++    if (E == 15 && man_3 == 7) {
++        man_3 = 6; // 480 would overflow -> clamp to 448
++    }
++    if (E >= 15) {
++        return sign ? 0xFE : 0x7E; // saturate to 448
++    }
++    return (uint8_t)((sign << 7) | (E << 3) | man_3);
++}
++
++// ---- activation quantization: F32 [k, n] -> fp8 staging [n][k] + scales [n][k/128] ----
++// one CTA of 128 threads per (token, 128-col block); block reduce for amax
++// staging is token-major/k-minor so the wmma B fragment (8 k-values of one token)
++// is one contiguous 8-byte load per lane
++__global__ void quantize_fp8(
++        const float * __restrict__ x, uint8_t * __restrict__ y_q, float * __restrict__ y_s,
++        const int64_t k, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
++    __shared__ float red[4];
++
++    const int col0 = blockIdx.x * GGML_FP8_TILE_K;
++    const int token = blockIdx.y;
++    const int tid = threadIdx.x;
++
++    const float v = x[(int64_t) token * k + col0 + tid];
++
++    // block reduce: max abs over the 128 values
++    float m = fabsf(v);
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o, 32));
++    }
++    if (tid % 32 == 0) {
++        red[tid / 32] = m;
++    }
++    __syncthreads();
++    if (tid == 0) {
++        float amax = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            amax = fmaxf(amax, red[i]);
++        }
++        red[0] = amax / 448.0f; // scale
++        red[1] = amax != 0.0f ? 448.0f / amax : 0.0f; // inverse
++    }
++    __syncthreads();
++
++    y_s[(int64_t) token * n_col_blocks + blockIdx.x] = red[0];
++    // staging: [n][k], token-major/k-minor
++    y_q[(int64_t) token * k + col0 + tid] = fp8_e4m3_from_f32(v * red[1]);
++}
++
++// C fragment layout (wmma f32 16x16x16 fp8, wave32, empirically verified on gfx1201):
++//   lane l: token column l%16, rows (l/16)*8 + slot
++//   A fragment: lane l byte e = A[l%16][(l/16)*8+e]
++//   B fragment: lane l byte e = B[(l/16)*8+e][l%16]
++__device__ __forceinline__ int fp8_wmma_row(int l, int s) {
++    return (l / 16) * 8 + s;
++}
++__device__ __forceinline__ int fp8_wmma_col(int l, int s) {
++    return l % 16;
++}
++
++// Weights: block_f8_e4m3 rows [m][k/128]. Activations: fp8 staging [n][k] + scales [n][k/128].
++// Wave32 wmma fragments (gfx12 fp8, verified on gfx1201):
++//   A: lane l byte e = A[l%16][(l/16)*8+e]  -> weight row (m0 + l%16), 8 contiguous qs bytes
++//   B: lane l byte e = B[(l/16)*8+e][l%16]  -> staging[(n0 + l%16)][...], 8 contiguous bytes
++//   C: slot s = C[(l/16)*8+s][l%16]
++// 4 warps per CTA, each on a different 16-token column tile.
++// Grid: (ceil(n/64), ceil(m/16))
++__launch_bounds__(GGML_FP8_NTHREADS, 1)
++__global__ void mul_mat_fp8_wmma(
++        const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
++        const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++    using fp8x8_t   = __attribute__((ext_vector_type(2))) int;
++    using floatx8_t = __attribute__((ext_vector_type(8))) float;
++
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++
++    const int m0 = blockIdx.y * GGML_FP8_TILE_M;
++    const int n0 = blockIdx.x * (GGML_FP8_NWARPS * GGML_FP8_TILE_N) + warp * GGML_FP8_TILE_N;
++
++    const int row_lane = lane % 16; // token column of this lane within the warp tile
++    const int k_half   = (lane / 16) * 8; // k offset of this lane's half of the 16-k step
++
++    const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
++
++    // weight tile is in-bounds for the whole warp (m is a multiple of 16 in practice);
++    // guard anyway: OOB rows read zero and are never stored
++    const bool row_valid = m0 + GGML_FP8_TILE_M <= m;
++
++    floatx8_t acc = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
++
++    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
++        // accumulate the 8 wmma k-steps of this 128-col block unscaled
++        floatx8_t acc_cb = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
++#pragma unroll
++        for (int kk = 0; kk < GGML_FP8_TILE_K / 16; ++kk) {
++            const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + ((int64_t) (m0 + row_lane)) * row_stride + cb * sizeof(block_f8_e4m3));
++            const fp8x8_t a_frag = row_valid ? *reinterpret_cast<const fp8x8_t *>(wblk->qs + kk * 16 + k_half) : fp8x8_t{0, 0};
++            const fp8x8_t b_frag = *reinterpret_cast<const fp8x8_t *>(src1_q + ((int64_t) (n0 + row_lane)) * k + cb * GGML_FP8_TILE_K + kk * 16 + k_half);
++            acc_cb = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_frag, b_frag, acc_cb);
++        }
++
++        // apply the per-128x128 weight scale and per-128-block activation scale
++#pragma unroll
++        for (int s = 0; s < 8; ++s) {
++            const int r = fp8_wmma_row(lane, s);
++            const int c = fp8_wmma_col(lane, s);
++            const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + ((int64_t) (m0 + r)) * row_stride + cb * sizeof(block_f8_e4m3));
++            const float wd = row_valid ? wblk->d : 0.0f;
++            const float ad = src1_s[(int64_t) (n0 + c) * n_col_blocks + cb];
++            acc[s] += wd * ad * acc_cb[s];
++        }
++    }
++
++#pragma unroll
++    for (int s = 0; s < 8; ++s) {
++        const int r = fp8_wmma_row(lane, s);
++        const int c = fp8_wmma_col(lane, s);
++        if (m0 + r < m && n0 + c < n) {
++            dst[(int64_t) (n0 + c) * m + m0 + r] = acc[s];
++        }
++    }
++#else
++    // unreachable: the host pass only generates the launch stub
++    (void) src0; (void) src1_q; (void) src1_s; (void) dst;
++    (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
++#endif
++}
++
++// Scalar fallback (CUDA, and any device without the RDNA4 WMMA path).
++// One thread per output element, consumes the pre-quantized staging.
++__global__ void mul_mat_fp8_scalar(
++        const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
++        const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
++    const int64_t mi = blockIdx.y * blockDim.y + threadIdx.y;
++    const int64_t ni = blockIdx.x * blockDim.x + threadIdx.x;
++    if (mi >= m || ni >= n) {
++        return;
++    }
++
++    float acc = 0.0f;
++    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
++        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + (mi * n_col_blocks + cb) * sizeof(block_f8_e4m3));
++        const float ad = src1_s[ni * n_col_blocks + cb];
++        float dot = 0.0f;
++        for (int c = 0; c < GGML_FP8_TILE_K; ++c) {
++            dot += fp8_e4m3_to_f32(wblk->qs[c]) * fp8_e4m3_to_f32(src1_q[ni * k + cb * GGML_FP8_TILE_K + c]);
++        }
++        acc += wblk->d * ad * dot;
++    }
++    dst[ni * m + mi] = acc;
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d90c1a841..cc0c6ddf3 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -41,6 +41,8 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
++
++void ggml_cuda_mul_mat_fp8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst); // fp8.cu
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/norm-gated.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -2365,6 +2367,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (src0->type == GGML_TYPE_F8_E4M3) {
++        ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst);
++        return;
++    }
+     bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
+     // RDNA4/RDNA3_5: a dense weight whose output-row count is not a multiple of 128 takes MMQ's slow
+     // non-128-row "fallback" config (~3x per launch versus the ksplit MMVQ kernel at these small
+@@ -7751,6 +7757,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
+                         return true;
++                    case GGML_TYPE_F8_E4M3:
++                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, non-batched
++                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1 || b->ne[2]*b->ne[3] != 1) {
++                            return false;
++                        }
++                        {
++                            const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
++                            return GGML_CUDA_CC_IS_RDNA4(cc) || (!GGML_CUDA_CC_IS_AMD(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE);
++                        }
+                     default:
+                         return false;
+                 }
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 550e5b416..b9c825f08 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -298,6 +298,119 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
+     }
+ }
+ 
++// fp8 e4m3fn (OCP): 1 sign, 4 exp (bias 7), 3 mantissa, max finite 448.0
++// NaN is 0x7F/0xFF; subnormals encode man * 2^-9
++static inline float fp8_e4m3_to_f32(uint8_t x) {
++    const uint32_t sign = ((uint32_t)(x & 0x80)) << 24;
++    const uint32_t exp  = (x >> 3) & 0x0F;
++    const uint32_t man  = x & 0x07;
++
++    uint32_t bits;
++    if (exp == 0) {
++        // subnormal or zero: value = man * 2^-9
++        if (man == 0) {
++            bits = sign;
++        } else {
++            const uint32_t k = man >= 4 ? 2 : man >= 2 ? 1 : 0;
++            bits = sign | ((k + 118) << 23) | ((man - (1 << k)) << (23 - k));
++        }
++    } else if (exp == 15 && man == 7) {
++        bits = 0x7FC00000u; // NaN
++    } else {
++        bits = sign | ((exp + 120) << 23) | (man << 20);
++    }
++
++    float f;
++    memcpy(&f, &bits, sizeof(f));
++    return f;
++}
++
++// f32 -> fp8 e4m3fn, round-to-nearest-even, saturating to +/-448
++static inline uint8_t fp8_e4m3_from_f32(float x) {
++    uint32_t bits;
++    memcpy(&bits, &x, sizeof(bits));
++    const uint32_t sign = (bits >> 31) & 1;
++    const uint32_t exp  = (bits >> 23) & 0xFF;
++    const uint32_t man  = bits & 0x7FFFFF;
++
++    if (exp == 0xFF) {
++        return sign ? 0xFF : 0x7F; // NaN/inf input
++    }
++    if (exp == 0) {
++        return sign ? 0x80 : 0x00; // f32 subnormal is far below fp8 min
++    }
++
++    int E = (int) exp - 120;
++    if (E >= 15) {
++        return sign ? 0xFE : 0x7E; // saturate to 448
++    }
++    if (E <= 0) {
++        // subnormal range: M = rne(value * 512), 0..7, 8 carries to E=1
++        const int shift = 141 - (int) exp;
++        uint32_t M = 0;
++        if (shift < 31) {
++            const uint64_t val = (1ull << 23) | man;
++            M = (uint32_t)(val >> shift);
++            const uint64_t frac = val & ((1ull << shift) - 1);
++            const uint64_t half = 1ull << (shift - 1);
++            if (frac > half || (frac == half && (M & 1))) {
++                M++;
++            }
++        }
++        if (M >= 8) {
++            return (uint8_t)((sign << 7) | 0x08); // smallest normal (E=1, M=0)
++        }
++        return (uint8_t)((sign << 7) | M);
++    }
++
++    // normal: E in 1..14, round mantissa to 3 bits (RNE)
++    uint32_t man_3 = man >> 20;
++    const uint32_t frac = man & 0xFFFFF;
++    if (frac > 0x80000 || (frac == 0x80000 && (man_3 & 1))) {
++        man_3++;
++    }
++    if (man_3 == 8) {
++        man_3 = 0;
++        E++;
++    }
++    if (E == 15 && man_3 == 7) {
++        man_3 = 6; // 480 would overflow -> clamp to 448
++    }
++    if (E >= 15) {
++        return sign ? 0xFE : 0x7E; // saturate to 448
++    }
++    return (uint8_t)((sign << 7) | (E << 3) | man_3);
++}
++
++void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, block_f8_e4m3 * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_F8_E4M3 == 0);
++    const int nb = k / QK_F8_E4M3;
++
++    for (int i = 0; i < nb; i++) {
++        float amax = 0.0f; // absolute max
++
++        for (int j = 0; j < QK_F8_E4M3; j++) {
++            amax = MAX(amax, fabsf(x[i*QK_F8_E4M3 + j]));
++        }
++
++        // block max maps to 448 (max finite e4m3)
++        const float d = amax / 448.0f;
++        const float id = d ? 1.0f/d : 0.0f;
++
++        y[i].d = d;
++
++        for (int j = 0; j < QK_F8_E4M3; ++j) {
++            y[i].qs[j] = fp8_e4m3_from_f32(x[i*QK_F8_E4M3 + j]*id);
++        }
++    }
++}
++
++size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
++    GGML_UNUSED(quant_weights);
++    quantize_row_f8_e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
++    return nrow * ggml_row_size(GGML_TYPE_F8_E4M3, n_per_row);
++}
++
+ // reference implementation for deterministic creation of model files
+ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k) {
+     assert(QK8_1 == 32);
+@@ -566,6 +679,22 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
+     }
+ }
+ 
++void dequantize_row_f8_e4m3(const block_f8_e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    static const int qk = QK_F8_E4M3;
++
++    assert(k % qk == 0);
++
++    const int nb = k / qk;
++
++    for (int i = 0; i < nb; i++) {
++        const float d = x[i].d;
++
++        for (int j = 0; j < qk; ++j) {
++            y[i*qk + j] = fp8_e4m3_to_f32(x[i].qs[j])*d;
++        }
++    }
++}
++
+ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+     static const int qk = QK_MXFP4;
+ 
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 75188f1af..709df4c76 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -21,6 +21,7 @@ GGML_API void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 *
+ GGML_API void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k);
++GGML_API void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, block_f8_e4m3 * GGML_RESTRICT y, int64_t k);
+ GGML_API void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k);
+ 
+ GGML_API void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k);
+@@ -50,6 +51,7 @@ GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GG
+ GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void dequantize_row_f8_e4m3(const block_f8_e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ 
+ GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+@@ -102,6 +104,8 @@ GGML_API size_t quantize_q5_0(const float * GGML_RESTRICT src, void * GGML_RESTR
+ GGML_API size_t quantize_q5_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ 
++GGML_API size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
++
+ GGML_API size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7e61a4f3e..d5bc932be 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -8591,14 +8591,13 @@ size_t ggml_quantize_chunk(
+                 ggml_fp32_to_bf16_row_ref(src + start, (ggml_bf16_t *)dst + start, n);
+                 result = n * elemsize;
+             } break;
++        case GGML_TYPE_F8_E4M3: result = quantize_f8_e4m3 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_F32:
+             {
+                 size_t elemsize = sizeof(float);
+                 result = n * elemsize;
+                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
+             } break;
+-        case GGML_TYPE_F8_E4M3:
+-            GGML_ABORT("f8_e4m3 quantization is not implemented (requires native FP8 hardware)");
+         default:
+             assert(false);
+     }
+diff --git a/implementation-plan.md b/implementation-plan.md
+index d248f4995..55c0d2277 100644
+--- a/implementation-plan.md
++++ b/implementation-plan.md
+@@ -261,20 +261,12 @@ Spike result (already done, verified by compiling a test kernel):
+   wave32 on gfx12, same as the existing f16 `w32_gfx12` path).
+ 
+ Tasks:
+-- [ ] fp8 tile-load + mmq-style mul_mat kernel: load fp8 tile (128-col blocks), apply
+-      the f32 block scale to the accumulator, BF16/F16 activation side. Start with a
+-      straightforward "fp8 load -> f32, FMA" kernel for correctness.
+-- [ ] WMMA path (`mma.cuh`, gfx12 section): `v_wmma_f32_16x16x16_fp8_fp8` using the
+-      confirmed builtin and fragment layout above.
+-- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8`.
+-- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90
+-      behind `#if !defined(__HIPCC__)` (compile-verified only).
+-- [ ] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat; any
+-      host-side data repack needed by the kernels is pure byte rearrangement (allowed),
+-      or a GPU fp8-convert kernel.
+-- [ ] `tests/test-backend-ops.cpp` mul_mat + quantize on the 3 GPUs; confirm CPU
+-      fallback never triggers for fp8 tensors (M1 rejection is effective).
+-- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB).
++- [x] fp8 tile-load + mmq-style mul_mat kernel (WMMA path): `v_wmma_f32_16x16x16_fp8_fp8` with the verified gfx12 fragment layout. **Fragment layout (empirically verified on gfx1201 + TileLang/CK docs): A lane l byte e = A[l%16][(l//16)*8+e]; B lane l byte e = B[(l//16)*8+e][l%16]; C slot s = C[(l//16)*8+s][l%16].** Staging is [n][k] (token-major, k-minor) so B fragments are contiguous 8-byte loads. Correctness: standalone test + 12-config stress suite PASS (max rel err <= 3.4e-3).
++- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8` (not yet implemented; WMMA is the primary path).
++- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
++- [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
++- [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
++- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB). Blocked on M3 (loader) or a synthetic benchmark.
+ 
+ ### M3. Direct safetensors loader (text model) + hardware gate
+ - [ ] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +
+-- 
+2.55.0
+

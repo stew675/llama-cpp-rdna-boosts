@@ -24,19 +24,25 @@ untouched and re-base into a new tree.
 - [ ] **gate 1: fp8 pp512 ≥ 7184** (the L7/L9 figure) and clearly ahead of the Q8_0 control
 - [ ] read `reference/LEVERS.md` §0 for the exact per-pp512 kernel-time breakdown to compare against
 
-## Phase 2 — Re-base onto the current base  **(gate 2)**
+## Phase 2 — Re-base onto the current base  **(gate 2)**  ✅ DONE (2026-09-26)
 
-Apply the 23-commit series **curated**, not blindly.  `git am` will conflict because the GDN / ssm-conv
-work largely **already landed** as delivery block 02 and the current `mmul`/`mmq`/FA code moved on.
+See `REBASE-2026-09-26.md`.  Result: branch `fp8-rebase` in `~/llama-fp8`, **13 commits** on
+`527d39401` (r9), **37 files +5374/-12**, builds clean on gfx1201, FP8 fully RDNA4-gated.
 
-- [ ] create a fresh clone/worktree of the fork at the current base (`84e76d8a2` + the delivery
-      patches, i.e. the `a3dc4bbb…` tree)
-- [ ] `git am wip/fp8-support/patches/*.patch`, resolving each conflict; **drop** commits whose
-      content is already in the delivery (expected: `0009`-`0014`, the chunked-GDN series)
-- [ ] expected conflict files: `ggml/src/ggml-cuda/gated_delta_net.cu`, `ssm-conv.cu`, `ggml-cuda.cu`,
-      `ggml/src/ggml-quants.c`, `ggml/src/ggml-cpu/ops.cpp`, `convert_hf_to_gguf.py`/`conversion/*`
-- [ ] build clean; delivery gates green (`test-backend-ops`, same-seed greedy text for the int8 models)
-- [ ] **gate 2: fp8 4B pp512 still ≥ 7184** on the re-based tree (the MMB/GEMM work must not regress it)
+- [x] worktree at r9 (`~/llama-fp8`), `git am -3` the series, resolve conflicts
+- [x] **dropped 10 superseded commits**: the 5 chunked-GDN commits + `fuse ssm conv input concat`
+      (the delivery's block-02 ships a newer, different GDN; dropping them leaves
+      `gated_delta_net.cu` / `ssm-conv.cu` / `delta-net-base.cpp` **identical to r9**) and the cllm
+      perf-doc commits
+- [x] conflicts resolved in `ggml-cuda.cu`, `src/CMakeLists.txt`, `llama-model-loader.cpp`,
+      `common.cuh`, `conversion/*`, `convert_hf_to_gguf.py`
+- [x] **builds clean** (`llama-cli`, `llama-bench`, `test-backend-ops`, gfx1201)
+- [ ] **gate 2: fp8 4B pp512 still ≥ 7184** on the re-based tree — *the reproducibility gate, still to
+      run (needs a free GPU)*
+- [x] audit RDNA4 gating: the constraint holds (compile-time `RDNA4` + runtime `CC_IS_RDNA4`, scalar
+      fallback otherwise).  Open policy for promotion: reject/dequantize fp8 on non-RDNA4 rather than
+      silently scalar.
+- [x] note: **no CPU oracle** for fp8 `MUL_MAT` — correctness is model-level (PPL/generation)
 
 ## Phase 3 — The 27B: convert, measure  **(gate 3 — the number the maintainer wants)**
 

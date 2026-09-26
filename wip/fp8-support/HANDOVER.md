@@ -7,8 +7,11 @@ Read order: this file → `README.md` → `MEASUREMENTS.md` → `PLAN.md` → `R
 
 ## State at handover (2026-09-26)
 
-* **Prepared, not started.**  The full 23-commit FP8 series is vendored in `patches/`, the net diff in
-  `cllm-fp8-full.diff`, and the branch's campaign docs in `reference/`.
+* **Re-based and building.**  The cllm FP8 work now sits on the current `rdna-boosts` (r9) as **13
+  commits** — branch `fp8-rebase` in the `~/llama-fp8` worktree, tip `bc01a921e`, tree `f1e49b6f8`,
+  37 files +5374/-12 — exported to `patches-rebased/`.  Builds clean on gfx1201.  The 10 superseded
+  cllm commits (chunked GDN + ssm-conv + perf docs) were dropped; see `REBASE-2026-09-26.md`.
+  The original 23-commit series is kept in `patches/` for provenance.
 * The FP8 port is the maintainer's own work on the `cllm` branch of the `stew675/llama.cpp` fork,
   last touched **2026-08-06**.  It works and it wins (+13-17 % prefill over Q8_0 on a 4B / gfx1201)
   — but it sits on a **2026-08-05 master**, ~7 weeks behind the current delivery base.
@@ -28,11 +31,13 @@ gfx1201 fp8 GEMM tuning** (121-137 vs 77-98 TFLOP/s) to close the rest.
 
 ## Next actions (in order)
 
-1. **Phase 1:** build `~/cllm`, reproduce the 4B `stewfp8-ow.gguf` pp512 ≥ 7184 t/s on a free GPU.
-2. **Phase 2:** re-base the 23-commit series onto the current base, dropping the chunked-GDN commits
-   that already landed as block 02; gate on the 4B number holding.
-3. **Phase 3:** convert the 27B FP8 checkpoint and measure pp8192 vs Q8_0 (1371 t/s) — the real test.
-4. **Phase 4:** port AITER's gfx1201 configs into `mul_mat_fp8_wmma`.
+1. **Phase 1 (reproducibility gate):** on a free GPU, `llama-bench` the re-based tree on
+   `stewfp8-ow.gguf` and confirm pp512 ≥ 7184 t/s (Q8_0 control on the same box).
+2. **Phase 3 (the real test):** convert `/llm/models/Qwen3.8/27B/FP8/` → `F8_E4M3` GGUF with the
+   **re-based** converter and measure pp8192 vs the int8 baselines
+   (`../prefill-gap-attribution/MEASUREMENTS.md`: Q8_0 1371 / Q6_K 975 / Q4_K_XL 1254 t/s).
+3. **Phase 4:** port AITER's gfx1201 fp8 GEMM configs into `mul_mat_fp8_wmma`.
+4. Settle the non-RDNA4 policy (reject vs dequantize) before any promotion.
 
 ## Traps
 

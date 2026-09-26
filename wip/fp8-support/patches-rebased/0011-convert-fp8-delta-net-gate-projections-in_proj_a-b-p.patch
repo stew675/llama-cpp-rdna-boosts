@@ -1,0 +1,360 @@
+From c4f0cd3c130c72f64836241a3324a45633487154 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 18:57:53 -0500
+Subject: [PATCH 11/13] convert : fp8 delta-net gate projections (in_proj_a/b),
+ pp512 6818 -> 7260
+
+The two remaining BF16 GEMM weights in the delta-net path (in_proj_a/b,
+[32, 2560]) are now F8_E4M3 via --fp8-delta-net-in-proj, so the 48 Cijk
+launches per pp512 (~5.37 ms at ~112 us each) run on the fp8 wmma path
+(~35 us each). pp512 +5-6%, tg64 -1% (decode alpha/beta now quantize+gemv),
+PPL 6.2528 vs 6.2677 (within noise), generation matches.
+
+Assisted-by: Claude
+---
+ LEVERS.md             | 81 +++++++++++++++++++++++++++----------------
+ PERF_HANDOVER.md      | 69 +++++++++++++++++++++++++++++++-----
+ conversion/base.py    |  4 ++-
+ conversion/qwen.py    | 57 ++++++++++++++++++++++++++++++
+ convert_hf_to_gguf.py |  6 ++++
+ 5 files changed, 179 insertions(+), 38 deletions(-)
+
+diff --git a/LEVERS.md b/LEVERS.md
+index 92be8ecc6..7543445f2 100644
+--- a/LEVERS.md
++++ b/LEVERS.md
+@@ -14,16 +14,17 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
+ 
+ ---
+ 
+-## 0. Current state (verified 2026-08-06 evening, after the L5 concat-fusion session)
++## 0. Current state (verified 2026-08-06, after the L7 in-proj fp8 session)
+ 
+ | metric | value | notes |
+ |---|---|---|
+-| pp512 (chunked) | 6818-6841 (was 6538-6554) | quantize_fp8_warp rewrite (+~4%) |
+-| tg64 | 89.2-89.6 | decode untouched, sequential GDN |
+-| PPL | 6.2677 | matches baseline exactly; generation matches |
+-| backend tests | 47/47 GATED_DELTA_NET pass | + 83/83 SSM_CONV (incl. new 2-src cases) |
+-| wmma kernel | ~186-188 us/launch avg | unchanged |
++| pp512 (chunked) | 7184-7260 (was 6818-6841) | L7: in_proj_a/b to fp8 (+5-6%) |
++| tg64 | 88.3-88.5 (was 89.2-89.6) | -1%: alpha/beta decode now quantize+gemv instead of bf16 mmvf |
++| PPL | 6.2528 (was 6.2677) | within noise; generation matches |
++| backend tests | GDN + SSM_CONV all pass | unchanged |
++| wmma kernel | ~159 us/launch avg (was ~186-188) | 48 small alpha/beta launches (8 CTAs, ~24 us) drag the avg down |
+ | GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
++| Cijk (CK BF16 GEMM) | GONE (0 launches) | in_proj_a/b now on the fp8 wmma path |
+ | concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
+ | quantize_fp8 per pp512 | ~2.5 ms (was ~5.1) | warp rewrite: 12.6 us/launch (was 25.4) on pp512 grids |
+ 
+@@ -43,14 +44,13 @@ Profile command: `rocprofv3 -r -d /tmp/rocp_x -f csv -- llama-bench -m <model>
+ (Duration = End_Timestamp - Start_Timestamp; Grid_Size_X = work-items,
+ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
+ 
+-## 1. Where pp512 time goes (per-pp512, warmup removed, after the L5 concat fusion)
++## 1. Where pp512 time goes (per-pp512, warmup removed, after the L7 in-proj fp8)
+ 
+ | kernel | ms/pp512 | share | note |
+ |---|---|---|---|
+-| mul_mat_fp8_wmma | ~38 | ~50% | prefill GEMMs, ~77 TFLOP/s |
++| mul_mat_fp8_wmma | ~39.4 | ~50% | prefill GEMMs (incl. the 48 alpha/beta in-proj GEMMs, ~1.9 ms) |
+ | gdn_chunk_prepare + state | ~10.9 | ~14% | A ~4.9 + B ~5.9 |
+-| quantize_fp8 | ~2.5 | ~3% | warp rewrite (was ~6.3); f32->fp8 staging |
+-| Cijk (CK BF16 GEMM) | ~5.3 | ~7% | delta-net in/out projections |
++| quantize_fp8 | ~2.8 | ~4% | warp rewrite (was ~6.3); f32->fp8 staging |
+ | ssm_conv_long_token_2src | ~0.6 | ~1% | fused conv (was concat 4.7 + conv 0.8) |
+ | flash_attn_tile | ~3.0 | ~4% | 8 attention layers |
+ | silu | ~2.9 | ~4% | |
+@@ -58,7 +58,13 @@ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
+ | k_bin_bcast / cpy / get_rows / l2_norm / rope / ssm_conv | ~3.3 | ~4% | small |
+ | (decode kernels: gemv, sequential GDN, etc.) | - | - | not part of pp512 |
+ 
+-pp512 wall = 512 / ~6550 = ~78 ms (noisy). The shares above sum to ~90% of that.
++pp512 wall = 512 / ~7260 = ~70.5 ms (noisy). The shares above sum to ~90% of that.
++
++The Cijk (CK BF16 GEMM) row is GONE: the delta-net in/out projections
++(in_proj_a/b = ssm_alpha/ssm_beta, 48 launches/pp512 at ~112 us each = 5.37 ms)
++are now F8_E4M3 in the GGUF and run on the wmma path (~24 us wmma + ~11 us
++quantize per launch = ~1.7 ms/pp512). The remaining in_proj cost is split
++across the wmma (~1.9 ms) and quantize (~0.3 ms) rows above.
+ 
+ The GDN share is now split nearly evenly: phase A (gdn_chunk_prepare, ~4.9
+ ms/pp512, 23 syncs, 1 CTA/CU at 58 KB LDS) and phase B (gdn_chunk_state,
+@@ -246,16 +252,32 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
+   (hw-vs-sw encoder bit-exactness).
+ - Depends on: nothing.
+ 
+-### L7. Cijk BF16 GEMMs (delta-net in/out projections, 5.3 ms/pp512)
+-
+-- The qwen35 delta-net projections are BF16 in the GGUF and run on rocBLAS/
+-  CK. Moving them to fp8 (they are linear projections like the rest) would
+-  put them on the wmma path; the L1/L2 gains then apply. The conversion
+-  script (convert_hf_to_gguf.py) already has the fp8 machinery.
+-- Expected: cuts ~5.3 ms by the wmma-vs-CK ratio; medium effort (conversion +
+-  PPL re-gate).
+-- Depends on: decision to quantize more tensors (PPL risk; the handover's L5
+-  lists the quantizable set: norms, conv1d, in_proj_a/b, A_log).
++### L7. Cijk BF16 GEMMs (delta-net in/out projections) - DONE 2026-08-06, pp512 +5-6%
++
++- DONE (commits below): in_proj_a/b (ssm_alpha/ssm_beta, [32, 2560] BF16 in the
++  GGUF) are now F8_E4M3, so the 48 Cijk launches/pp512 (~5.37 ms at ~112 us
++  each for a 32x512x2560 GEMM) run on the fp8 path instead: ~24 us wmma
++  (8 CTAs, m_pad 128) + ~11 us quantize per launch = ~1.7 ms/pp512. pp512
++  6818-6841 -> 7184-7260 (+5-6%). tg64 89.2-89.6 -> 88.3-88.5 (-1%: the
++  alpha/beta decode GEMMs move from the bf16 mmvf path to quantize_fp8 +
++  mul_mat_fp8_gemv). PPL 6.2528 (was 6.2677, within noise); generation
++  matches; GDN + SSM_CONV backend tests pass.
++- Conversion: new flag `--fp8-delta-net-in-proj` in convert_hf_to_gguf.py,
++  wired through conversion/base.py; the packing lives in
++  `_LinearAttentionVReorderBase._generate_fp8_in_proj` (conversion/qwen.py):
++  same V-head reorder as modify_tensors (head_dim=1), then the standard
++  block_f8_e4m3 pack (d = BF16(amax/448) per 128-col block, q = fp8(w/d)).
++  The 32 gate rows share ONE 128-row scale block (ceil(32/128) = 1), same
++  as the model's own scale convention. The fp8 quantization error is the
++  same regime as the model's own fp8 tensors (mean rel ~2.25% vs 2.256% in
++  the conversion summary).
++- The rest of the old "quantizable set" (norms, conv1d, A_log) are NOT GEMMs
++  (elementwise/conv ops, F32, no kernel change would apply) - nothing left
++  there. The only other BF16 tensors are token_embd (get_rows, keep BF16)
++  and eh_proj (not in the 4B main path).
++- Recovery lever for the tg64 cost: fuse the quantize into the decode gemv
++  (already listed in PERF_HANDOVER section 10 as a decode item; would also
++  recover the other 226 decode quantize launches).
+ 
+ ### L8. Small kernels (silu 2.9, rms_norm 4.4, k_bin_bcast 1.9) - skip
+ 
+@@ -389,11 +411,12 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
+ 
+ ## 5. Suggested order for the next session
+ 
+-1. Re-bench to confirm the working tree matches section 0 (expect ~6818-6841 pp512
+-   after the L6 quantize rewrite; the box is noisy - prefer rocprof kernel times for A/B).
+-2. L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512) is the next live lever: move the
+-   delta-net in/out projections to fp8 so they run on the wmma path. Medium effort
+-   (conversion + PPL re-gate); the quantizable set is norms, conv1d, in_proj_a/b, A_log.
+-3. L1 (mul_mat_fp8_wmma) and L3/L4 (GDN phase A/B) are spent; L5 (conv fusion) and
+-   L6 (quantize rewrite) are done. L8 (small kernels) - skip unless a specific one
+-   shows up hot in a fresh profile.
++1. Re-bench to confirm the working tree matches section 0 (expect ~7184-7260 pp512
++   after the L7 in-proj fp8 conversion; the box is noisy - prefer rocprof kernel times for A/B).
++2. L1 (mul_mat_fp8_wmma), L3/L4 (GDN phase A/B) and L7 (in-proj fp8) are spent;
++   L5 (conv fusion), L6 (quantize rewrite) and L7 are done. L8 (small kernels) - skip
++   unless a specific one shows up hot in a fresh profile.
++3. If pp512 headroom is needed again, the remaining structural ideas are L1's kpacked
++   smem layout for A (blocked on the aiter layout problem) and the decode-side fused
++   quantize-in-gemv (recovers the L7 tg64 cost plus the other 226 decode quantize
++   launches, ~+4% tg64 per the decode session notes).
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 6b5444339..54a7e82eb 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -30,18 +30,20 @@ aiter inspection details. This file tracks ONLY the performance picture.
+ | fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
+ | fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
+ | fp8 now (L6 quantize rewrite, 2026-08-06) | **6818-6841** | **89.2-89.6** | ~+7% | ~-1% |
++| fp8 now (L7 in-proj fp8, 2026-08-06) | **7184-7260** | **88.3-88.5** | ~+13% | ~-1.5% |
+ | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
+ | target generation (+10%) | - | ~100 | - | +10% |
+ 
+ pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
+ 
+-Current authoritative numbers (2026-08-06 night, chunked GDN default, L6
+-session): see LEVERS.md section 0. The box became noisy late on 2026-08-06
+-(pp512 +/-60-170, occasionally much worse): trust rocprof kernel times
+-(deterministic +/-3%) for A/B. GDN per pp512: phase A ~4.9 ms + phase B
+-~5.9 ms (was 7.1 + 6.4). quantize_fp8 per pp512: ~2.5 ms (was ~5.1).
++Current authoritative numbers (2026-08-06, chunked GDN default, L7 session):
++see LEVERS.md section 0. The box is noisy (pp512 +/-60-170, occasionally much
++worse): trust rocprof kernel times (deterministic +/-3%) for A/B. GDN per
++pp512: phase A ~4.9 ms + phase B ~5.9 ms. quantize_fp8 per pp512: ~2.5 ms.
++The canonical GGUF is now the L7 build (in_proj_a/b F8_E4M3); the pre-change
++file is stewfp8-ow-bf16gate.gguf in the same directory.
+ 
+-PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
++PPL 6.2528 (L7) vs 6.2677 (L6) vs 6.2464 (Q8_0) on the small
+ /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
+ pre-change fp8 output on the same prompt/seed.
+ 
+@@ -84,8 +86,9 @@ old L1-L5 below:
+ Old L5 note that still matters: **do NOT quantize token_embd to fp8** without
+ adding a get_rows fp8 kernel (getrows.cu has no F8_E4M3 case; CPU has no fp8
+ kernels either). lm_head already runs fp8 via the `--fp8-output-weight` copy
+-(token_embd stays BF16 for the input lookup). The quantizable set is norms,
+-conv1d, in_proj_a/b, A_log (small).
++(token_embd stays BF16 for the input lookup). The old quantizable set (norms,
++conv1d, in_proj_a/b, A_log) is closed: in_proj_a/b are now F8_E4M3 (L7);
++norms/conv1d/A_log are not GEMMs (no fp8 kernel would apply).
+ 
+ ## 4. Kernel facts (established this session, do not rediscover)
+ 
+@@ -527,3 +530,53 @@ retry the fusion. (The fused kernel was removed from the tree; the rigs
+ /tmp/bench_fused.cu and /tmp/bench_pairs.cu keep the A/B.)
+ 
+ Next lever per LEVERS.md: L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512).
++
++## 18. L7: delta-net in/out projections to fp8 (2026-08-06, session)
++
++Goal: LEVERS.md L7 (the Cijk BF16 GEMMs, 5.3 ms/pp512). Result: the two
++remaining BF16 GEMM weights in the delta-net path (in_proj_a/b =
++ssm_alpha/ssm_beta, [32, 2560] each) are now F8_E4M3 in the GGUF, so the 48
++Cijk launches/pp512 run on the fp8 path instead. pp512 6818-6841 ->
++7184-7260 (+5-6%), tg64 89.2-89.6 -> 88.3-88.5 (-1%), PPL 6.2528 (was
++6.2677, within noise), generation matches, GDN + SSM_CONV backend tests
++pass. Commit: (see git log).
++
++Why the Cijk kernels were 5.37 ms/pp512: 48 launches (24 layers x alpha +
++beta) of a 32x512x2560 BF16 GEMM at ~112 us each - a thin m=32 shape that
++CK handles terribly (latency/grid bound, ~0.75 TFLOP/s effective). The fp8
++path per launch is ~11 us quantize_fp8_warp + ~24 us wmma (8 CTAs, m_pad
++128 so 4x the useful FLOPs on the row side) = ~35 us, ~3.2x faster. The
++alpha/beta GEMMs read the SAME cur activation, so each is quantized
++separately (2x the quantize work on that tensor).
++
++Conversion: new `--fp8-delta-net-in-proj` flag (convert_hf_to_gguf.py),
++wired via conversion/base.py; packing in
++`_LinearAttentionVReorderBase._generate_fp8_in_proj` (conversion/qwen.py).
++The BF16 weight is V-head-reordered exactly as modify_tensors does
++(head_dim=1), then packed block_f8_e4m3: d = BF16(amax/448) per 128-col
++block, q = fp8(w/d). The 32 gate rows share ONE 128-row scale block
++(ceil(32/128) = 1) - same as the model's own scale convention, and the
++measured quantization error is the same regime as the model's fp8 tensors
++(mean rel ~2.25% vs 2.256% in the conversion summary). Regenerate the
++canonical GGUF with the same invocation plus the new flag; the pre-change
++file is kept as stewfp8-ow-bf16gate.gguf.
++
++tg64 cost (-1%) and its recovery: in decode (n <= 16) the alpha/beta GEMMs
++moved from the bf16 mmvf path to quantize_fp8 (old kernel, ~1.28 us) +
++mul_mat_fp8_gemv, adding ~48-54 quantize launches per decode step (~60-70
++us/step, ~0.5-0.6% of the 11.1 ms step; the rest of the -1% is the extra
++launch/scheduling overhead). The recovery lever is the fused
++quantize-in-gemv already listed in section 10 as a decode item ("fuse
++quantize_fp8 into the gemv, 226 launches/step") - it would recover this
++plus the other 226 decode quantize launches (~+4% tg64 per that note). Not
++done here: decode is not the L7 target and the fused gemv is a separate
++kernel project.
++
++Also closed out: the rest of the old quantizable set (norms, conv1d, A_log)
++are not GEMMs - no fp8 kernel change applies. token_embd stays BF16 (get_rows
++has no fp8 kernel); eh_proj is not in the 4B main path. The only fp8-path
++quirks for the new tensors: m=32 < GGML_FP8_CTA_M (128), so the wmma kernel
++runs with m_pad 128 and its existing mi >= m bounds check handles the
++padding; the fp8_repack_weights launcher handles m < 65535 with grid.y = m
++(no row loop needed); the block_f8_e4m3 scale grid is [1, 20] (one row
++block), which np.repeat(d, 128, axis=0)[:M] replicates per row correctly.
+diff --git a/conversion/base.py b/conversion/base.py
+index e32f12c44..6983f04d5 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -132,7 +132,8 @@ class ModelBase:
+                  fuse_gate_up_exps: bool = False,
+                  fp8_as_q8: bool = False,
+                  fuse_qkv: bool = False,
+-                 fp8_output_weight: bool = False):
++                 fp8_output_weight: bool = False,
++                 fp8_delta_net_in_proj: bool = False):
+         if type(self) is ModelBase or \
+                 type(self) is TextModel or \
+                 type(self) is MmprojModel:
+@@ -174,6 +175,7 @@ class ModelBase:
+         self._fp8_as_q8 = fp8_as_q8
+         self._fp8_dequantized: set[str] = set()
+         self._fp8_output_weight = fp8_output_weight
++        self._fp8_delta_net_in_proj = fp8_delta_net_in_proj
+ 
+         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
+         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index 6d24d4758..7e5d5efeb 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -625,6 +625,63 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
+ 
+         return weight, scale
+ 
++    def _generate_fp8_tensors(self):
++        super()._generate_fp8_tensors()
++        if self._fp8_delta_net_in_proj:
++            self._generate_fp8_in_proj()
++
++    def _generate_fp8_in_proj(self):
++        """Quantize the delta-net gate projections (in_proj_a/in_proj_b) to
++        block_f8_e4m3 so they run on the native FP8 GEMM path instead of the
++        BF16 CK/rocBLAS path. Same 128-col-block scale convention as the rest
++        of the FP8 tensors (scale grid [ceil(out/128), ceil(in/128)])."""
++        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
++        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
++        num_v_per_k = num_v_heads // num_k_heads if num_k_heads else 0
++
++        consumed: list[str] = []
++        for name in list(self.model_tensors.keys()):
++            if not name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
++                continue
++            w = LazyTorchTensor.to_eager(self.model_tensors[name]())
++            if w.dtype == torch.float8_e4m3fn or w.dim() != 2:
++                continue
++
++            M, N = w.shape
++            if N % 128 != 0:
++                logger.warning("%s: FP8 column count %d is not a multiple of 128, skipping", name, N)
++                continue
++            if M > 128:
++                # the gate rows share one 128-row block; > 128 rows would need multi-block packing
++                logger.warning("%s: %d rows do not fit one FP8 row block, skipping", name, M)
++                continue
++
++            if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads:
++                # same V-head reorder as modify_tensors (head_dim=1 for the gate rows)
++                w = self._reorder_v_heads(w, 0, num_k_heads, num_v_per_k, 1)
++
++            nb = N // 128
++            wf = w.float().view(1, M, nb, 128)
++            amax = wf.abs().amax(dim=(1, 3))          # [1, nb] - all gate rows share the one row block
++            s_f32 = amax / 448.0
++            s_bf16 = s_f32.to(torch.bfloat16)         # stored scale (BF16-rounded)
++            q = (wf / s_f32.view(1, 1, nb, 1)).view(M, N).to(torch.float8_e4m3fn)
++
++            d = s_bf16.float().numpy().astype(np.float32)      # [1, nb]
++            q_bytes = q.view(torch.uint8).numpy()              # [M, N]
++            blocks = np.empty((M, nb, 132), dtype=np.uint8)
++            blocks[:, :, 0:4] = np.repeat(d, 128, axis=0)[:M].view(np.uint8).reshape(M, nb, 4)
++            blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
++
++            new_name = self.map_tensor_name(name)
++            logger.info(f"Repacked {new_name} with quantization F8_E4M3")
++            self.gguf_writer.add_tensor(new_name, blocks.reshape(M, nb * 132),
++                                        raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
++            consumed.append(name)
++
++        for name in consumed:
++            self.model_tensors.pop(name, None)
++
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index ba7c16b40..8f74cd28c 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -161,6 +161,11 @@ def parse_args() -> argparse.Namespace:
+         help="Also store an FP8 output.weight copy of token_embd so lm_head runs on the FP8 path "
+              "(keeps token_embd BF16 for the input embedding lookup).",
+     )
++    parser.add_argument(
++        "--fp8-delta-net-in-proj", action="store_true",
++        help="Also quantize the delta-net gate projections (in_proj_a/in_proj_b) to FP8 so they "
++             "run on the native FP8 GEMM path instead of the BF16 CK/rocBLAS path.",
++    )
+ 
+     parser.add_argument(
+         "--fuse-qkv", action="store_true",
+@@ -302,6 +307,7 @@ def main() -> None:
+                                      fp8_as_q8=args.fp8_as_q8,
+                                      fuse_qkv=args.fuse_qkv,
+                                      fp8_output_weight=args.fp8_output_weight,
++                                     fp8_delta_net_in_proj=args.fp8_delta_net_in_proj,
+                                      )
+ 
+         if args.vocab_only:
+-- 
+2.55.0
+

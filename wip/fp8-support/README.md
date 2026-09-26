@@ -1,8 +1,12 @@
 # wip/fp8-support — native FP8 E4M3 for llama.cpp (RDNA4)
 
-**Status: PREPARED, not started (2026-09-26).**  Branch `wip/fp8-support`.  **NOT delivery work** —
-nothing here is in `patches/`, `apply-all.sh` ignores `wip/`, and the fork stays scratch until the
-promotion path is followed.  This tree is the ready-to-start handoff for reviving the FP8 port.
+**Status: RE-BASED and BUILDING (2026-09-26).**  Branch `wip/fp8-support`.  The cllm FP8 work now sits
+on the current `rdna-boosts` (r9) tree as **13 commits** (`patches-rebased/`, branch `fp8-rebase` in
+`~/llama-fp8`), builds clean on gfx1201, and is fully **RDNA4-gated**.  **PLAN.md Phase 2 is done** —
+see `REBASE-2026-09-26.md`.  Next: reproduce the 4B number, then convert+measure the **27B**.
+
+**NOT delivery work** — nothing here is in `patches/`, `apply-all.sh` ignores `wip/`, and the fork
+stays scratch until the promotion path is followed.
 
 **Sibling:** `../prefill-gap-attribution/` established *why* this is the lever — single-request
 prefill is **70-81 % `mul_mat_q`**, so the vLLM gap is a GEMM problem.  This campaign is the GEMM
@@ -25,7 +29,9 @@ answer: **native FP8 E4M3 + the delivery's MMB/GEMM work + AITER's gfx1201 fp8 t
 
 | path | what |
 |---|---|
-| `patches/` | the **23-commit series** (`git format-patch 6ea215d17..cllm`) — the cleanest re-base unit; `git am`-able |
+| `patches/` | the **original 23-commit series** (`git format-patch 6ea215d17..cllm`) — provenance |
+| `patches-rebased/` | the **re-based 13-commit series** onto r9 — the Phase-2 deliverable |
+| `REBASE-2026-09-26.md` | the rebase record: dropped commits, conflicts, RDNA4 gating, no-CPU-oracle |
 | `cllm-fp8-full.diff` | the **net diff** (`6ea215d17..cllm`, 7605 lines / 412 KB) for a squash or overview |
 | `reference/` | raw copies of the branch's campaign docs (LEVERS, PERF_HANDOVER, AITER_FINDINGS, HANDOVER, implementation-plan, handoff, GDN_DEBUG_HANDOVER, vllm-vs-llamacpp-performance) |
 | `MEASUREMENTS.md` | the frozen FP8-vs-Q8_0 scoreboard + AITER reference |
