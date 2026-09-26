@@ -1,5 +1,57 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-26 (r9) — block-15 amendment: restore the typed non-swizzled K/V store in the MMA FA loader (issue #47)
+
+**Issue.**  [stew675/llama-cpp-rdna-boosts#47](https://github.com/stew675/llama-cpp-rdna-boosts/issues/47)
+(reporter @briansp2020, gfx1201 / ROCm 10.0): prefill on the `84e76d8a2` base is 2-6 % slower than
+`v16-ebbb18522-r11`, traced to the upstream FA smem-swizzle refactor `1884824fd` (PR #28536).  That
+commit collapsed `swz_K`/`swz_V` into one `swz` and replaced the generic K/V loader's guarded store
+
+```c
+if constexpr (swz) { *(char *)… } else { tile_KV + i*stride_tile + k*4; }
+```
+
+with an unconditional byte-pointer form `ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(…), src)`.
+On every AMD target `swz` is **false** (swizzling is `turing_mma_available()`-gated), so the layout is
+unchanged — but the `char *` arithmetic drops the `half2` alignment and HIP then splits the 16-byte
+shared-memory store (the reporter's ISA guess; the address is identical either way).  The delivery's two
+block-15 native loaders (V4/V5) had kept the `if constexpr (swz) … else typed` guard through the
+re-base; only the upstream generic loader lost it.
+
+**Fix.**  One block-15 hunk in `ggml/src/ggml-cuda/fattn-mma-f16.cuh`
+`flash_attn_ext_f16_load_tile()`'s non-`cp_async` arm: restore the typed store under `if constexpr (!swz)`
+(the address is `tile_KV + i*stride_tile + k*h2_per_chunk`, bit-identical to the byte form).  Only
+`patches/0015-…` changed.  All four `swizzle_bytes` sites were re-audited: sites 473/553 (native
+loaders) were already guarded, site 641 is the `cp_async_cg_16` arm — unreachable on AMD
+(`cp_async_available()` is NVIDIA Ampere+) and a shared-space `unsigned int` dst, so no typed form
+applies — and site 687 is the one fixed here.  Every other `(char *)` store in `ggml-cuda` is VRAM or a
+composite global offset; the `mma.cuh` `swizzle()` helpers return `const T *` and the `load_ldmatrix`
+family already branches to the typed path for `!swz`.
+
+**Canonical chain.**  `beta-integration` block-15 amended in `~/llama-integration`; regenerated
+patches (only `0015` differs) and `release.json`.  New tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`,
+tree `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`, release `v16-84e76d8a2-r9`.
+`scripts/validate-set.sh` green (checksums, strict 16/16 `git am`, applied tree == `a3dc4bbb…`).
+
+**Performance (gfx1201, ROCm 7.14.1, one R9700, pre-fix vs post-fix same tree).**
+- `test-backend-ops perf -o FLASH_ATTN_EXT`, `hsk=256` f16: `nr23=[4,1]` kv 4096 nb 4096
+  10780 -> 10046 us (**+6.8 %**); `nr23=[8,1]` kv 4096 nb 4096 21046 -> 20269 (**+3.7 %**);
+  `nr23=[4,1]` kv 16384 nb 256 2687 -> 2504 (**+6.8 %**); kv 16384/65536 within 1.8-2.4 %.
+- 4B Q8_0, `llama-bench` pp20480 `-ub 2048` 7045 -> 7204 t/s (**+2.3 %**); pp512/2048/8192 within
+  0.4-0.8 % (shorter prefills hide the store cost), tg128 flat (95.34 -> 95.47).
+- **Reporter's exact model**, `Qwen3.8-27B-UD-Q4_K_XL` (gqa 6, head 256), 1 GPU: f16 KV
+  pp4096 @ d16000 1094.9 -> 1109.4 t/s (**+1.3 %**); q8_0 KV pp4096 @ d40000 872.6 -> 911.3 t/s
+  (**+4.4 %**) — the reporter measured 885.5 -> 922.0 (+4.1 %) on the same shape.
+
+**Purity (the change is a store-address form, so this is the no-regression gate).**
+- `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0` **6340/6340**.
+- `test-logits-width-probe` 4B, W=1..8, `RS=from_w` f16 + q8_0: `width_purity=PASS` (worst maxdiff 0)
+  and **every W/row hash identical pre- vs post-fix** (`W=1` f16 `0c5a92a62393f2a1`, q8_0
+  `fcc6041324f63857`).
+- Text gate (`prompts/code-python.txt`, seed 42, temp 0, `-n 64`) on the reporter's 27B: plain /
+  `draft-mtp` n3 / n7 x f16 / q8_0 all **`818 chars sha=336bb8dcfbf3`**, identical pre- vs post-fix;
+  4B plain `753 chars sha=c125609eb012` identical (the 4B carries no MTP head).
+
 ## 2026-09-25 (r8) — the folded `mmb`/QSA campaign is promoted to `main`
 
 **Promotion.**  `beta-integration` was merged into `main` (merge commit) and cut as release

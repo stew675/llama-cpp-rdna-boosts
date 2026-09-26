@@ -43,7 +43,8 @@ block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the
 GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16 band coverage
 (issue #45 follow-up), `r6` the block-15 bf16 native default flip, `r7` the block-14 Meta-tensor-split
 scheduler race fix, `r8` the **`beta/mmb-general` fold into the 16 blocks** (the campaign is now
-part of the delivery, no separate beta apply step), and each later release on the
+part of the delivery, no separate beta apply step), `r9` the block-15 typed non-swizzled K/V store
+fix for the MMA FA prefill loader (issue #47), and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -227,13 +228,14 @@ any more**:
 * **block 15** absorbs `qsa3`, the fused indexer top-k + prefill score fusions, HC16, `hc_gate_mix`,
   sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults, and the meta/CPU backend fixes.
 
-Applying the 16 patches to `84e76d8a2` therefore reproduces the **full campaign tree
-`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** in one pass:
+Applying the 16 patches to `84e76d8a2` therefore reproduces the **full campaign tree** (r8's
+`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`, plus r9's issue-#47 MMA-FA typed-store fix -> current
+`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`) in one pass:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2
-bash <path-to-this-repo>/scripts/apply-all.sh .   # 16/16 strict, tree 24bb0f5acb…
+bash <path-to-this-repo>/scripts/apply-all.sh .   # 16/16 strict, tree a3dc4bbb…
 ```
 
 The per-patch fold mapping and validation record are in
@@ -383,9 +385,16 @@ for per-block verification and `BASELINE.md` for provenance.
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain on **`main`**: tip
-  **`f373450de489dd0fafba5bd285e71844109cd0ec`**, net tree
-  **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (the folded campaign); release
-  **`v16-84e76d8a2-r8`**.
+  **`b48fb3f686fe2681f55aa406a8ed52313ad80875`**, net tree
+  **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`**  (r8 campaign tree + the issue-#47 store fix); release
+  **`v16-84e76d8a2-r9`**.
+- **The MMA FA prefill K/V store is typed again on the non-swizzled (AMD) path** (block 15, r9,
+  2026-09-26, issue #47): upstream `1884824fd`'s swizzle refactor left the generic loader storing
+  through `(char *) tile_KV + swizzle_bytes<…>`, which is address-identical but drops the `half2`
+  alignment, so HIP split the 16-byte shared store.  Restoring the typed store under `if constexpr
+  (!swz)` recovers +2-7 % on `hsk=256` prefill shapes and **+4.4 %** on the reporter's 27B
+  UD-Q4_K_XL q8_0 pp4096 @ d40000 (872.6 -> 911.3 t/s; reporter 885.5 -> 922.0 = +4.1 %), decode flat,
+  output byte-identical.  See `patches/README.md` (2026-09-26 block-15 r9) and `WORKLOG.md`.
 - **The `mmb`/QSA/indexer campaign is folded into the delivery** (2026-09-25, release `r8`):
   the former 28-patch opt-in `beta/mmb-general/` set is now part of the 16 block patches — the
   `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning and the

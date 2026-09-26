@@ -14,7 +14,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release on `main` (2026-09-25) — `v16-84e76d8a2-r8`:** the
+**Current release on `main` (2026-09-26) — `v16-84e76d8a2-r9`:** a **block-15** amendment (issue
+#47).  Upstream `1884824fd`'s FA smem-swizzle refactor left the generic MMA K/V loader storing
+through a byte pointer (`(char *) tile_KV + swizzle_bytes<swz, half2>(…)`); on AMD `swz` is false, so
+the address is unchanged but the `char *` loses the `half2` alignment and HIP splits the 16-byte
+shared store.  The typed store is restored under `if constexpr (!swz)` (the two block-15 native
+loaders already kept that guard).  Canonical tip
+`b48fb3f686fe2681f55aa406a8ed52313ad80875`, tree `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` (r8's
+campaign tree plus the fix; only `patches/0015` differs).  Strict `git am` 16/16,
+`scripts/validate-set.sh` PASS, `FLASH_ATTN_EXT` 6340/6340, width probe + text gate byte-identical;
+reporter's 27B UD-Q4_K_XL q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s (+4.4 %), `hsk=256` prefill shapes
++2-7 %.  Full record: `WORKLOG.md` (2026-09-26 r9) and `patches/README.md` (2026-09-26 block-15 r9).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r8`:** the
 28-patch `beta/mmb-general` campaign is **folded into the 16 blocks**, so applying the 16 patches
 alone to `84e76d8a2` reproduces the full campaign tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).

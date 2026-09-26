@@ -14,10 +14,12 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`):** the fork point is unchanged at
-> **`84e76d8a2`**, but the 16 patches now absorb the 28 `beta/mmb-general` patches, so the applied
-> tree is the campaign tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip
-> `f373450de…`, release `v16-84e76d8a2-r8`).  See `wip/beta-integration/integration.md`.
+> **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`; current `v16-84e76d8a2-r9`, 2026-09-26):**
+> the fork point is unchanged at **`84e76d8a2`**, but the 16 patches now absorb the 28
+> `beta/mmb-general` patches, so the applied tree is r8's campaign tree
+> **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** plus r9's issue-#47 typed-store fix ->
+> **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`** (canonical tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`,
+> release `v16-84e76d8a2-r9`).  See `wip/beta-integration/integration.md` and `WORKLOG.md` (2026-09-26 r9).
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
 > the fork point of release **`v16-84e76d8a2-r7`** (canonical tip

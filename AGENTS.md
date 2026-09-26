@@ -5,7 +5,9 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`, promoted from `beta-integration`): the
 > 28 `beta/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
-> reproduce the full campaign tree `24bb0f5acb…`; `beta/mmb-general/` is retained only as the
+> reproduce the full campaign tree `24bb0f5acb…`; **`v16-84e76d8a2-r9` (2026-09-26) then amends
+> block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`.**
+> `beta/mmb-general/` is retained only as the
 > historical verification record and the `apply-beta.sh` helper has been removed.  The working
 > plan, per-patch mapping and validation record are in `wip/beta-integration/integration.md`.
 
@@ -15,8 +17,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r6`, canonical tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree
-`504894e61e17c6616b54871abee9fb23beda38bd` — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r9`, canonical tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
+`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` (r6's `504894e6…` + the r9 issue-#47 typed-store fix) — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
@@ -283,9 +285,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
-chain for the current base `84e76d8a2` is a rebuild of the delivery set
-(tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`, net tree
-  `504894e61e17c6616b54871abee9fb23beda38bd` = r6, the 2026-09-25 block-15 bf16 native default flip,
+chain for the current base `84e76d8a2` is the folded-campaign rebuild of the delivery set
+(tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
+  `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` = r9, the 2026-09-26 block-15 issue-#47 typed-store fix,
+  on top of r8, the 2026-09-25 `beta/mmb-general` fold into the 16 blocks (tip `f373450de…`, tree
+  `24bb0f5acb…`) and r7's block-14 Meta-tensor-split scheduler race fix (tip `596a22db…`, tree
+  `7726e514…`),
+on top of r6, the 2026-09-25 block-15 bf16 native default flip,
 on top of r5's f16/bf16 coverage of the
 RDNA4 GQA-6 decode/verify FA band (issue #45 follow-up), on top of r4's 2026-09-25 block-15 RDNA4
 GQA-6 decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
@@ -882,7 +888,8 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
 - **The campaign is folded into the delivery (`main`, release `v16-84e76d8a2-r8`, 2026-09-25).**  The
   `mmb`/`qsa3`/indexer campaign (formerly `beta/mmb-general/`, 28 patches) was folded into the 16
   delivery blocks: apply `patches/*` alone to `84e76d8a2` and you get the campaign tree
-  `24bb0f5acb…` (release `v16-84e76d8a2-r8`, canonical tip `f373450de…`).
+  `24bb0f5acb…` (release `v16-84e76d8a2-r8`, canonical tip `f373450de…`).  **r9 (2026-09-26) then
+  amends block 15** with the issue-#47 typed non-swizzled K/V store fix, net tree `a3dc4bbb…`.
   `beta/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
   gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
   `wip/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
@@ -1073,7 +1080,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`84e76d8a2`, blocks tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`): `git format-patch --start-number 0` the block
+`84e76d8a2`, blocks tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

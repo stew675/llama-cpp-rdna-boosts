@@ -6,16 +6,17 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (release `v16-84e76d8a2-r8`, 2026-09-25):** the delivery is the **16-patch set**
+**Current state (release `v16-84e76d8a2-r9`, 2026-09-26):** the delivery is the **16-patch set**
 against fork point **`84e76d8a2`**, now with the **28 `beta/mmb-general` patches folded into the
 blocks** — applying the 16 patches alone reproduces the full campaign tree
-**`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`),
-release **`v16-84e76d8a2-r8`**: `mmb`/prefill core in **block 08**, the catch-all
+**`24bb0f5acb…`** plus r9's issue-#47 typed-store fix, canonical tip
+`b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
+**`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`**, release **`v16-84e76d8a2-r9`**: `mmb`/prefill core in **block 08**, the catch-all
 host-buffer/CPU fixes in **block 06**, the `mmb` fusion stand-downs + MMVQ band in **blocks 13/14**,
-and `qsa3`/indexer/HC/sparse-MTP in **block 15**.  Strict `git am` 16/16, `validate-set.sh` PASS,
-gfx1201 build clean.  `beta/mmb-general/` is now only the historical verification record and
-`apply-beta.sh` was removed.  Plan/record: `wip/beta-integration/integration.md`; `WORKLOG.md`
-2026-09-25.
+and `qsa3`/indexer/HC/sparse-MTP + the r9 MMA-FA typed-store fix in **block 15**.  Strict `git am`
+16/16, `validate-set.sh` PASS, gfx1201 build clean.  `beta/mmb-general/` is now only the historical
+verification record and `apply-beta.sh` was removed.  Plan/record:
+`wip/beta-integration/integration.md`; `WORKLOG.md` 2026-09-26 (r9).
 
 **Previous `main` state (2026-09-25, r6→r7):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip

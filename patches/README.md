@@ -3,6 +3,18 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
+**Current release `v16-84e76d8a2-r9` (2026-09-26)** is a block-15 amendment (issue #47): the generic
+MMA FA K/V loader's non-`cp_async` (the only AMD-reachable) arm stores through
+`(char *) tile_KV + swizzle_bytes<swz, half2>(…)`; with `swz` false on every AMD target the address is
+unchanged but the byte pointer drops the `half2` alignment and HIP splits the 16-byte shared store.
+The typed store (`tile_KV + i*stride_tile + k*h2_per_chunk`) is restored under `if constexpr (!swz)`;
+the two block-15 native loaders already kept that guard.  Canonical tip
+`b48fb3f686fe2681f55aa406a8ed52313ad80875`, tree `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`; only
+`0015` changed, `scripts/validate-set.sh` green (strict 16/16 `git am`).  Measured on gfx1201:
+reporter's 27B UD-Q4_K_XL q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s (+4.4 %), f16 @ d16000 +1.3 %,
+`FLASH_ATTN_EXT` prefill shapes +2-7 %, decode flat, width probe and the plain/`n3`/`n7` text gate
+byte-identical.  See `WORKLOG.md` (2026-09-26 r9).
+
 **Since release `v16-84e76d8a2-r8` (2026-09-25, in `main`) the 28 `beta/mmb-general` patches are
 folded into these 16 blocks**: applying `patches/*` alone to `84e76d8a2` now reproduces the campaign
 tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (release `v16-84e76d8a2-r8`,
@@ -388,6 +400,49 @@ margin absorbing the measured ~0.4 GiB/device error on 27B Q8_0; block 15's FA *
 is not counted by either fit (bounded, RDNA4/RDNA3_0 only, and `fattn_stage_try_get`'s issue #33 fallback
 degrades to the native K/V read rather than failing); and a user-pinned lopsided `-ts` lowers the
 effective budget, which the log makes visible.
+
+## 2026-09-26 block-15 amendment (r9): restore the typed non-swizzled K/V store in the MMA FA loader (issue #47)
+
+**Release** `v16-84e76d8a2-r9`, tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
+`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`.  Only **block 15** changed; blocks 00-14 are byte-identical
+(their patch files are unchanged, `From <sha>` included).
+
+**The defect.**  Upstream `1884824fd` (PR #28536, the FA smem-swizzle refactor, in the 149-commit
+re-base onto `84e76d8a2`) replaced the generic K/V loader's `if constexpr (swz) … else typed` store
+with an unconditional `ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), src)`.
+`swizzle_bytes<false>` computes the same byte offset the typed form did, but the `char *` base loses
+the `half2` alignment, so HIP emits split shared stores for the 16-byte copy instead of one `ds_write`.
+`swz` is false on every AMD target (`ggml_cuda_fattn_mma_get_swizzled()` needs `turing_mma_available()`),
+so this is an AMD-only prefill regression (the reporter measured 2-6 % against `v16-ebbb18522-r11`, and
+14-40 % on the `hsk=256` MMA prefill microbench); upstream is neutral on NVIDIA.
+
+The delivery's two block-15 native loaders (`flash_attn_ext_f16_load_tile_native`, `_bf16`) had kept
+the guard through the re-base; only the upstream generic loader lost it.  All four `swizzle_bytes`
+sites were audited: the two native loaders and this generic `ggml_cuda_memcpy_1<16>` site get the typed
+`!swz` store, and the remaining `cp_async_cg_16` site is an `unsigned int` shared address in a branch
+HIP never reaches.
+
+**The fix.**  In `flash_attn_ext_f16_load_tile()`'s non-`cp_async` arm:
+
+```c
+if constexpr (swz) {
+    ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), src);
+} else {
+    ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*h2_per_chunk, src);
+}
+```
+
+**Measured (gfx1201, ROCm 7.14.1, same tree, pre vs post).**  `test-backend-ops perf FLASH_ATTN_EXT`,
+`hsk=256` f16: `nr23=[4,1]` kv 4096 nb 4096 10780 -> 10046 us (**+6.8 %**), `nr23=[8,1]` kv 4096 nb 4096
+21046 -> 20269 (**+3.7 %**), `nr23=[4,1]` kv 16384 nb 256 2687 -> 2504 (**+6.8 %**).  `llama-bench`
+4B Q8_0 pp20480 `-ub 2048` 7045 -> 7204 t/s (**+2.3 %**), tg128 flat.  Reporter's exact model
+`Qwen3.8-27B-UD-Q4_K_XL` (gqa 6, head 256, 1 GPU): q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s
+(**+4.4 %**; reporter 885.5 -> 922.0 = +4.1 %), f16 pp4096 @ d16000 +1.3 %.
+
+**Gates.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0**; `test-logits-width-probe` 4B
+W=1..8 f16 + q8_0 `width_purity=PASS` with every hash identical pre/post; 27B text gate
+`--spec-type none` / `draft-mtp` n3 / n7 x f16 / q8_0 all `818 chars sha=336bb8dcfbf3` (4B plain
+`753 chars sha=c125609eb012`).  `scripts/validate-set.sh` strict 16/16, applied tree `a3dc4bbb…`.
 
 ## 2026-09-25 block-15 amendment (r6): the bf16 native K/V arm is default-ON
 
