@@ -109,7 +109,6 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
-│   ├── apply-beta.sh      # (historical) applies the beta set; superseded by the folded patches
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
@@ -245,8 +244,9 @@ kernel work is heavily adapted from **[pwilkin](https://github.com/pwilkin)**'s
 
 > **Historical record only.**  [`beta/mmb-general/`](beta/mmb-general/) (the 28 patch files, the
 > `mmb-general.patch`, `BETA-TESTING.md`, the gfx1201/gfx1100 records) is kept as the campaign's
-> verification record; its patches are **no longer applied separately** and
-> `scripts/apply-beta.sh` is **superseded**.  Its gfx1151 beta-window re-validation was **GREEN**
+> verification record; its patches are **no longer applied separately** and the `apply-beta.sh`
+> helper has been **removed** (the delivery itself now contains the campaign).  Its gfx1151
+> beta-window re-validation was **GREEN**
 > (2026-09-25 — the four gates + the recurrent rollback; see `BETA-TESTING.md` §8), which is what
 > the fold relies on.
 
@@ -395,8 +395,8 @@ for per-block verification and `BASELINE.md` for provenance.
   `qsa3`, the fused indexer, HC16, `hc_gate_mix`, sparse MTP-draft and the MMVQ band in **block 15**
   (with block 14's pair stand-down and block 13's GLU stand-down).  Strict `git am` 16/16
   reproduces the full campaign tree `24bb0f5acb…` and the gfx1201 build is clean.
-  `beta/mmb-general/` is kept as the historical verification record; `scripts/apply-beta.sh` is
-  superseded.  See [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
+  `beta/mmb-general/` is kept as the historical verification record and the `apply-beta.sh` helper
+  has been removed.  See [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
 - **The RDNA4 GQA-6 decode/verify FA band covers f16 (and, through its native arm, bf16) too
   (block 15, r5, 2026-09-25, issue #45 follow-up, reported by
   [@DanoPTT](https://github.com/DanoPTT)):** the

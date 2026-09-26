@@ -1,5 +1,50 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (`beta-integration`) — the 28 `beta/mmb-general` patches are folded into the 16 delivery blocks
+
+**Branch** `beta-integration` (cut from `main` at `0699a3d`).  The delivery is now the **16 amended
+patches**: applying them to `84e76d8a2` reproduces the former 28-patch beta campaign tree
+**`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** exactly.  Canonical tip
+`f373450de489dd0fafba5bd285e71844109cd0ec`, release candidate `v16-84e76d8a2-r8-integrated`.
+`main` still carries the un-integrated `v16-84e76d8a2-r7` delivery + the separate beta set.
+
+**Why.**  The beta campaign had served its beta window (gfx1151 re-validation GREEN, gfx1201/gfx1100
+ported and gated).  The maintainer asked for the patches to be absorbed into the block set rather
+than kept as a separate opt-in layer, and for the docs to be swept to match (the `apply-beta.sh`
+helper was removed).
+
+**Method.**  A fresh linear rebuild in `~/llama-integration` (branch `beta-integration`): each of the
+16 delivery block commits was cherry-picked onto `84e76d8a2`, the mapped beta patches were folded
+into it with `git cherry-pick -n`, and the conflicts were resolved to the net final content.  The
+final `git diff` against `mmb-beta` is empty.
+
+**Fold mapping.**  block 06 (catch-all) <- 0025/0028; block 08 (prefill/MMB) <- 0001/0003/0006-0010/
+0012/0014/0015; block 13 <- the MMB stand-down of the swiglu->mmq fusion; block 14 <- the MMB
+pair-fusion stand-down + 0027 (MMVQ band); block 15 (campaign memory/attention) <- 0002/0003-qwen4exp/
+0004/0005/0008/0011/0013/0016-0024/0026.  The qwen4exp/QSA/HC/indexer group lands in block 15 (not 14)
+because block 15 owns the intervening `qwen4exp.cpp`/`ggml-cuda.cu` code the beta series was authored
+against; the alternative is per-hunk splits with a less clean intermediate history (recorded in
+`wip/beta-integration/integration.md` as the open review question).
+
+**Validation.**
+- Rebuilt tip tree == `mmb-beta` tree (`24bb0f5acb…`); `git diff` empty.
+- Fresh `84e76d8a2` + strict `git am` of the 16 regenerated patches -> tree `24bb0f5acb…` (16/16).
+- `scripts/validate-set.sh` PASS (checksums + strict apply + tree/count).
+- gfx1201 `~/bin/build-llama-rocm-714` EXIT 0.
+- Runtime gates were not re-run individually: the tree is byte-identical to the already-validated beta
+  tree, so the campaign's gfx1151/gfx1201/gfx1100 gate records carry over unchanged.
+
+**Artifacts.**  `patches/` (16 regenerated), `rdna-boosts-all.patch`, `release.json`
+(`v16-84e76d8a2-r8-integrated`, tip `f373450de…`, tree `24bb0f5acb…`).  Docs swept: `README.md`,
+`AGENTS.md`, `MANIFESTS.md`, `BASELINE.md`, `TODO.md`, `patches/README.md`, and the
+`beta/mmb-general/` banner; `scripts/apply-beta.sh` removed.
+
+**Defaults.**  The folded campaign was default-ON in the beta set, so the folded delivery is too
+(`GGML_CUDA_MMB` defaults to 1 and `=0` disables, etc.).  The env kill-switches are unchanged -
+see `beta/mmb-general/BETA-TESTING.md` §0/§3.
+
+---
+
 ## 2026-09-25 (r7) — `v16-84e76d8a2-r7`: the multi-device scheduler race gate learns the Meta tensor-split backend (block 14)
 
 **Release** `v16-84e76d8a2-r7`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),

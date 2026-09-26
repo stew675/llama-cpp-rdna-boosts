@@ -14,6 +14,12 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
+> **`beta-integration` branch (2026-09-25):** the fork point is unchanged at **`84e76d8a2`**, but the
+> 16 patches on that branch absorb the 28 `beta/mmb-general` patches, so the applied tree is now the
+> campaign tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de…`, release
+> candidate `v16-84e76d8a2-r8-integrated`).  `main` still carries the un-integrated r7 delivery
+> (`7726e514…`) described below.  See `wip/beta-integration/integration.md`.
+
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
 > the fork point of release **`v16-84e76d8a2-r7`** (canonical tip
 > `596a22dbfbde571728e93acf986a02200aaf46ee`, tree

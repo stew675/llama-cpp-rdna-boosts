@@ -6,7 +6,18 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-25, r6):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-25, `beta-integration` branch):** the delivery is the **16-patch set**
+against fork point **`84e76d8a2`**, now with the **28 `beta/mmb-general` patches folded into the
+blocks** — applying the 16 patches alone reproduces the full campaign tree
+**`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`),
+release candidate **`v16-84e76d8a2-r8-integrated`**: `mmb`/prefill core in **block 08**, the catch-all
+host-buffer/CPU fixes in **block 06**, the `mmb` fusion stand-downs + MMVQ band in **blocks 13/14**,
+and `qsa3`/indexer/HC/sparse-MTP in **block 15**.  Strict `git am` 16/16, `validate-set.sh` PASS,
+gfx1201 build clean.  `beta/mmb-general/` is now only the historical verification record and
+`apply-beta.sh` was removed.  Plan/record: `wip/beta-integration/integration.md`; `WORKLOG.md`
+2026-09-25.  (`main` still carries the un-integrated r7 release described below.)
+
+**Previous `main` state (2026-09-25, r6→r7):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
 **`b3c3051a72df21f600f5ae13b244c8212210ca2e`** (tree `504894e61e17c6616b54871abee9fb23beda38bd`),
 release **`v16-84e76d8a2-r6`** — r6 = the block-15 bf16 native K/V default flip

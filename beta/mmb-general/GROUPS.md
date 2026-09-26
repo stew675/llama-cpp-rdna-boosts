@@ -1,5 +1,10 @@
 # GROUPS.md — the WIP patch set as 5 "like items"
 
+> **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
+> record.**  The group/patch descriptions below document the campaign; the patches are no longer
+> applied separately (see `../../wip/beta-integration/integration.md` and `../../WORKLOG.md`,
+> 2026-09-25).
+
 **Why this file exists.**  The WIP started as 38 commits and is now **5 thematic patches** (`patches/`,
 one per theme, applied in order on top of the r12 delivery tree).  This is the triage sheet for a
 reviewer (or an agent) on **another architecture**: what each group is, which parts are gated, what is

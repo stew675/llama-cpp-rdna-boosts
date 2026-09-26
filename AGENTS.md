@@ -3,6 +3,13 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
+> **`beta-integration` branch (2026-09-25): the 28 `beta/mmb-general` patches are folded into the
+> 16 delivery blocks.**  On that branch `patches/*` alone reproduce the full campaign tree
+> `24bb0f5acb…` (release candidate `v16-84e76d8a2-r8-integrated`); `beta/mmb-general/` is retained
+> only as the historical verification record and the `apply-beta.sh` helper has been removed.  The
+> `main` branch still carries the un-integrated r7 delivery + the separate beta set.  The working
+> plan, per-patch mapping and validation record are in `wip/beta-integration/integration.md`.
+
 ## What this repo is
 
 A **delivery repo**: it packages the RDNA/ROCm work of the
@@ -515,7 +522,6 @@ explicitly requests it.**
 | `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README |
 | `release.json` | **delivery single source of truth** (fork point, canonical tip/tree, block count, per-artifact sha256) — read by `apply-all.sh`, `validate-set.sh` and CI; regenerate with `scripts/make-release.sh`, never hand-edit the hashes |
 | `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-15, automatic `git am -3` fallback on a drifted base); on the strict path it asserts the applied tree == `release.json.tree` |
-| `scripts/apply-beta.sh` | base-aware apply of the opt-in `beta/mmb-general` set **on top of** the delivery: if the delivery is already applied it goes straight to the beta patches, else it runs `apply-all.sh` first; applies on a new `mmb-beta` branch with strict `git am` + the beta-tree assertion (`RDNA_BETA_BRANCH`/`RDNA_BETA_TREE` overrides) |
 | `scripts/make-patches.sh` | regenerates the set from the fork (then run `scripts/make-release.sh`) |
 | `scripts/make-release.sh` | regenerates `release.json` (patch hashes + metadata; metadata is inherited unless `--base`/`--tip`/`--tree` are given) |
 | `scripts/validate-set.sh` | cheap delivery gate: checksums + strict apply on a fresh tarball of `release.json.base` + base/applied tree match (runs in `validate.yml`; ~1 min, no Docker) |
@@ -524,7 +530,7 @@ explicitly requests it.**
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work (currently `wip/nwarps/` — the per-M `nwarps` impurity — plus `wip/bf16-native-prefill/`, `wip/q8-prefill-tuning/`, `wip/build-time-regression/` and the other live trees); completed trees are archived under `archive/work/` (see the WIP rule below) |
-| `beta/` | **promoted-from-WIP staging** — currently holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and **consolidated with the `closing-the-gap` campaign 2026-09-25: 28 patches**, r13-based, gfx1151 + gfx1201 + gfx1100, awaiting the gfx1151 re-validation in its `BETA-TESTING.md`; apply with `scripts/apply-beta.sh`).  Previously staged campaigns have been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
+| `beta/` | **historical campaign record** — holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and consolidated with the `closing-the-gap` campaign 2026-09-25).  It is **no longer applied separately**: the 28 patches are folded into the 16 delivery blocks on the `beta-integration` branch, so `patches/*` alone reproduce the campaign tree `24bb0f5acb…`, and `apply-beta.sh` was removed.  Kept for the campaign's verification record (`BETA-TESTING.md`, the gfx1201/gfx1100 measurement records).  Previously staged campaigns were promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  See the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
@@ -871,17 +877,20 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   present their results as delivery claims, **unless the user explicitly
   asks you to work with a specific item**. They are kept for future
   re-evaluation only.  (2026-09-12: the completed `wip/` trees were moved to
-  `archive/work/`; `wip/` now holds only the active `iq4nl-prefill/` and `mmb-general/` handoffs.)
+  `archive/work/`; `wip/` now holds the live trees (`nwarps/`, `bf16-native-prefill/`,
+  `q8-prefill-tuning/`, `build-time-regression/`, the campaign handoffs, and `beta-integration/`).)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
-- **WIP branch (updated 2026-09-21 — the campaign was promoted to beta):** the `mmb-general` campaign
-  is now **`beta/mmb-general/` on `main`** (12 patches, tree `bca69f23dd…`), staged for its beta
-  window; the gfx1151 re-validation checklist is `beta/mmb-general/BETA-TESTING.md` and a session
-  picking it up should read `beta/mmb-general/HANDOVER.md`.  The branch name `wip-mmb-general` (and
-  the code worktree branch of the same name) is kept as the campaign's working branch.  The
-  **`wip/nwarps/`** tree is the one piece deliberately left behind (default-OFF, breaks `W=1..8`
-  width purity — the open impurity to investigate).  Everything unpromoted stays on a branch and is
-  committed **there, never to `main`**; `main` is only advanced when the maintainer calls a
-  promotion or a rebase.
+- **`beta-integration` branch (2026-09-25) — the campaign is folded into the delivery.**  The
+  `mmb`/`qsa3`/indexer campaign (formerly `beta/mmb-general/`, 28 patches) was folded into the 16
+  delivery blocks: apply `patches/*` alone to `84e76d8a2` and you get the campaign tree
+  `24bb0f5acb…` (release candidate `v16-84e76d8a2-r8-integrated`, canonical tip `f373450de…`).
+  `beta/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
+  gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
+  `wip/beta-integration/integration.md`.  `main` still carries r7 + the separate beta set until the
+  maintainer promotes the branch.  The **`wip/nwarps/`** tree is the one piece deliberately left
+  behind (default-OFF, breaks `W=1..8` width purity — the open impurity to investigate).  Everything
+  unpromoted stays on a branch and is committed **there, never to `main`**; `main` is only advanced
+  when the maintainer calls a promotion or a rebase.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:
   `archive/work/block-15-campaign-wins/`), each win gets an environment kill-switch so
