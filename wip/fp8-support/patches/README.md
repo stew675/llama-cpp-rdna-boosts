@@ -11,6 +11,9 @@ is unpushed.
 | size | 23 commits, **45 files, +6653/-79** |
 | net diff | `../cllm-fp8-full.diff` (same range, for a squash or an overview) |
 
+**Verified 2026-09-26:** replaying all 23 patches with `git am` from `6ea215d17` in a scratch
+worktree reproduces the `cllm` tree exactly (`1cb6db288db5cc5cb48bf196337f3a57d1a8dfe5`).
+
 ## Apply
 
 ```bash
