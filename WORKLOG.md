@@ -1,5 +1,27 @@
 # WORKLOG - dated delivery records
 
+## 2026-09-30 (WIP, branch `wip/issues-59-60`) - r27 re-integration + the issue #60 fit fix (NOT a release)
+
+**Not a release, not tagged, not on `main`.**  The branch is re-integrated onto `main` = r27 (one
+squashed commit on top of `7d68a31`; pre-r27 head kept as tag `wip-59-60-pre-r27`).  Fork tip
+**`8aa6d0443`**, tree **`a8c7380efdabd167a2bc93318d6c6e364460791e`**, release string
+`v16-84e76d8a2-wip-issue59-60`, `validate-set.sh` strict **16/16**.  Full record:
+`wip/issues-59-60/SESSION-2026-09-30-r27-wi2.md`.
+
+* **#59 closed.**  The reporter confirmed the r21 head: default equals `GGML_CUDA_QSA3=0`,
+  `GGML_CUDA_QSA3=1` reproduces the loss, oracles match, and same-seed greedy is byte-identical to r20.
+* **#60 fix: the auto fused switch moves from `score_bytes > 128 MiB` to
+  `LLAMA_QSA_SCORE_WMMA_MB` MiB, default 64** (`0` = always fused).  The unfused chain's unchunked
+  `mul_mat` and a separate `relu` peaked at 2x the score just under the old cutoff, which the 196K
+  prefill crossed.  The two chain `relu`s are now `ggml_relu_inplace`, removing that duplication
+  (bit-identical).  On the reporter's `r=4` geometry 64 MiB is `n_kv` about 64K, so d30K and d64K keep
+  the faster chain and the deep end takes the fused op.
+* **Local gfx1100 (r27+fix):** `FLASH_ATTN_QSA` 23/23, `LIGHTNING_INDEXER` 225/225, `TOPK_QSA` 4/4,
+  `FLASH_ATTN_EXT` 6354/6354 (first run hit one marginal f16 case, ERR 0.000501 vs the 0.0005 bound,
+  that then passed 3/3 in isolation), dense 27B same-seed `1acb04bd9104` identical to r20.
+* **Open (external):** the reporter re-runs `llama-bench -p 196608 -n 0` on this r27 head; promotion
+  waits on that.
+
 ## 2026-09-30 (r27) - block-15 amendment: four contributor PRs + the issue-#71 RDNA4 rows fix
 
 **Release `v16-84e76d8a2-r27`** (canonical tip `7fe4fca497f8ef2c6e440d5405a95452cdd3c230`, tree

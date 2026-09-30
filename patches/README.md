@@ -1,5 +1,15 @@
 # rdna-boosts patch set (delivery)
 
+> **WIP branch `wip/issues-59-60` (2026-09-30, NOT a release, not on `main`):** carries the
+> issue-#59/#60 gfx1100 fix, re-integrated on r27 as a single squashed commit.  Fork tip
+> `8aa6d0443`, tree `a8c7380efdabd167a2bc93318d6c6e364460791e`, release string
+> `v16-84e76d8a2-wip-issue59-60`, strict 16/16.  The fix gates qsa3 off on RDNA3_0, makes the
+> fused-vs-unfused 4-head indexer prefill score geometry-aware (`LLAMA_QSA_SCORE_WMMA` and
+> `LLAMA_QSA_SCORE_WMMA_MB`, default 64 MiB), uses `ggml_relu_inplace` in the unfused chain, and
+> counts the FA prefill staging arena in `llama_get_memory_breakdown`/`--fit`.  #59 is closed; the
+> reporter's 196K confirmation on this head is outstanding.  See `wip/issues-59-60/`.  The release
+> header below describes `main`.
+
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
