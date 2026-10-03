@@ -1,0 +1,40 @@
+From fa2e30730d50ad55bf87b50f3e821e9eeb67cb02 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Sat, 3 Oct 2026 19:27:21 +0000
+Subject: [PATCH] spec: LLAMA_MTP_DRAFT_OP_OFFLOAD=0 keeps the MTP draft
+ context ops on the host
+
+With -otd exps=CPU the MTP layer's experts live in host memory, and the draft
+context's op offload stages full-size device copies of them for prefill-sized
+draft batches: 2,550 MiB of compute buffer for the qwen4exp Q8_0 head.  The env
+switch builds the draft context with op_offload = false so those ops run on the
+host in place.  The target context is unchanged; unset = current behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2c7149122..fe5968969 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2788,6 +2788,15 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+     if (spec_mtp) {
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++
++        // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
++        // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
++        // for prefill-sized batches.  The offload stages full-size copies of those weights in the
++        // draft context's compute buffer (3 x 850 MiB for the qwen4exp Q8_0 head).
++        const char * env = getenv("LLAMA_MTP_DRAFT_OP_OFFLOAD");
++        if (env != nullptr && atoi(env) == 0) {
++            cparams.op_offload = false;
++        }
+     }
+ 
+     // the draft context holds as many tokens per sequence as the target context
+-- 
+2.53.0
+
