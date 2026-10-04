@@ -1,0 +1,322 @@
+From 0da488109a06a9d39d5e17458c089b040b87c2eb Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 22:03:34 +0800
+Subject: [PATCH] ggml-cuda: RDNA4 verify-step fusions: GLU -> Q8_1, GDN conv
+ at 2..255 tokens, batched state-snapshot copies
+
+Three speculative-verify fusions, each bit-identical, default-on on RDNA4 and with its own kill switch:
+
+- GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0 off): when the next node (or the one after a reshape) is a verify-band
+  mmvq matmul over an F32 GLU, the GLU launcher also writes that matmul's Q8_1 activation into the quantize
+  cache, so the matmul skips its quantize_q8_1 launch. It reuses unary_gated_q8_1_op_kernel (the unary * mul
+  -> Q8_1 fold), which now optionally also writes the F32 output. ggml_cuda_try_fuse records the GLU / matmul
+  pair in two ggml_backend_cuda_context fields that every try_fuse call resets and the GLU launcher consumes.
+  The decision goes through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true), so it is RDNA4-only and follows
+  GGML_CUDA_FUSE_Q8_1_VERIFY as well.
+- GDN conv at 2..255 tokens (GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 off): gdn_conv_check also accepts T >= 2 on RDNA4,
+  so the verify step's CONCAT is no longer a generic non-contiguous copy per layer. Same kernels.
+- Batched copy (GGML_CUDA_FUSE_CPY_BATCH=0 off; RDNA4, not with concurrent streams): consecutive f32 CPY nodes
+  with the same source and destination layout (the per-position conv-state snapshots, with the VIEW nodes
+  between them) go out as one launch, after checking that no copy's destination overlaps another copy's source
+  or destination. GGML_CUDA_FUSE_CPY_BATCH_DEBUG=1 prints every run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh    |   6 ++
+ ggml/src/ggml-cuda/cpy-batch.cu  | 108 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/cpy-batch.cuh |   9 +++
+ ggml/src/ggml-cuda/gdn-conv.cu   |   6 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  38 +++++++++++
+ ggml/src/ggml-cuda/unary.cu      |  34 +++++++++-
+ 6 files changed, 198 insertions(+), 3 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
+ create mode 100644 ggml/src/ggml-cuda/cpy-batch.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 9a5b825f0..b5bc8a3a7 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1641,6 +1641,12 @@ struct ggml_backend_cuda_context {
+     };
+     char * q8_1_arena = nullptr;
+     size_t q8_1_arena_size = 0;
++
++    // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
++    // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
++    // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
++    const ggml_tensor * glu_q8_1_node = nullptr;
++    const ggml_tensor * glu_q8_1_mm   = nullptr;
+     std::vector<q8_1_cache_entry> q8_1_cache;
+     size_t q8_1_arena_pos = 0;
+ 
+diff --git a/ggml/src/ggml-cuda/cpy-batch.cu b/ggml/src/ggml-cuda/cpy-batch.cu
+new file mode 100644
+index 000000000..1561188c2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/cpy-batch.cu
+@@ -0,0 +1,108 @@
++#include "cpy-batch.cuh"
++
++namespace {
++
++constexpr int CB_MAX = 16;
++
++bool cb_on() {
++    static const bool on = getenv("GGML_CUDA_FUSE_CPY_BATCH") == nullptr || atoi(getenv("GGML_CUDA_FUSE_CPY_BATCH")) != 0; // default on
++    return on;
++}
++
++struct cb_args {
++    const char * src[CB_MAX];
++    char *       dst[CB_MAX];
++    int64_t      sne[4], snb[4];   // source shape / byte strides (shared by the run)
++    int64_t      dne[4], dnb[4];   // destination shape / byte strides (shared by the run)
++};
++
++// blockIdx.y = copy; element i in ggml_cpy's flat order, located separately in the source and the destination layouts
++__global__ void cb_kernel(const cb_args a, const int64_t n) {
++    const int c = blockIdx.y;
++    const char * __restrict__ s = a.src[c];
++    char * __restrict__ d = a.dst[c];
++    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
++        int64_t r = i;
++        const int64_t s0 = r % a.sne[0]; r /= a.sne[0];
++        const int64_t s1 = r % a.sne[1]; r /= a.sne[1];
++        const int64_t s2 = r % a.sne[2]; const int64_t s3 = r / a.sne[2];
++        r = i;
++        const int64_t d0 = r % a.dne[0]; r /= a.dne[0];
++        const int64_t d1 = r % a.dne[1]; r /= a.dne[1];
++        const int64_t d2 = r % a.dne[2]; const int64_t d3 = r / a.dne[2];
++        *(float *) (d + d0 * a.dnb[0] + d1 * a.dnb[1] + d2 * a.dnb[2] + d3 * a.dnb[3]) =
++            *(const float *) (s + s0 * a.snb[0] + s1 * a.snb[1] + s2 * a.snb[2] + s3 * a.snb[3]);
++    }
++}
++
++bool cb_member(const ggml_tensor * n) {
++    if (n->op != GGML_OP_CPY) return false;
++    const ggml_tensor * s = n->src[0], * d = n->src[1];
++    return s && d && s->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32 && ggml_nelements(s) == ggml_nelements(d);
++}
++
++// nodes that compute nothing (the views a copy reads / writes through sit between the copies in the node list)
++bool cb_noop(const ggml_tensor * n) {
++    return n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE ||
++           n->op == GGML_OP_NONE;
++}
++
++bool cb_same(const ggml_tensor * a, const ggml_tensor * b) {
++    for (int k = 0; k < 4; ++k) if (a->ne[k] != b->ne[k] || a->nb[k] != b->nb[k]) return false;
++    return true;
++}
++
++// byte span touched by a (possibly strided) view
++void cb_span(const ggml_tensor * t, uintptr_t & lo, uintptr_t & hi) {
++    lo = (uintptr_t) t->data;
++    size_t last = 0;
++    for (int k = 0; k < 4; ++k) last += (size_t) (t->ne[k] - 1) * t->nb[k];
++    hi = lo + last + ggml_type_size(t->type);
++}
++
++} // namespace
++
++int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
++    if (!cb_on() || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) return 0;
++    ggml_tensor * first = cgraph->nodes[i];
++    if (!cb_member(first)) return 0;
++    // the run: copies with the first one's layouts, possibly separated by no-op view nodes (consumed with the run)
++    int idx[CB_MAX] = {i}, n = 1, last = i;
++    for (int j = i + 1; j < cgraph->n_nodes && n < CB_MAX; ++j) {
++        const ggml_tensor * b = cgraph->nodes[j];
++        if (cb_noop(b)) continue;
++        if (!cb_member(b) || !cb_same(b->src[0], first->src[0]) || !cb_same(b->src[1], first->src[1])) break;
++        idx[n++] = j; last = j;
++    }
++    if (n < 2) return 0;
++    // the copies of a run must be independent: no destination may touch another copy's source or destination
++    for (int a = 0; a < n; ++a) {
++        uintptr_t dlo, dhi;
++        cb_span(cgraph->nodes[idx[a]]->src[1], dlo, dhi);
++        for (int b = 0; b < n; ++b) {
++            uintptr_t lo, hi;
++            cb_span(cgraph->nodes[idx[b]]->src[0], lo, hi);
++            if (dlo < hi && lo < dhi) return 0;
++            if (b != a) {
++                cb_span(cgraph->nodes[idx[b]]->src[1], lo, hi);
++                if (dlo < hi && lo < dhi) return 0;
++            }
++        }
++    }
++    cb_args args{};
++    for (int k = 0; k < 4; ++k) {
++        args.sne[k] = first->src[0]->ne[k]; args.snb[k] = first->src[0]->nb[k];
++        args.dne[k] = first->src[1]->ne[k]; args.dnb[k] = first->src[1]->nb[k];
++    }
++    for (int c = 0; c < n; ++c) {
++        args.src[c] = (const char *) cgraph->nodes[idx[c]]->src[0]->data;
++        args.dst[c] = (char *) cgraph->nodes[idx[c]]->src[1]->data;
++    }
++    const int64_t ne = ggml_nelements(first->src[0]);
++    const int blocks = (int) std::min<int64_t>(256, (ne + 255) / 256);
++    cb_kernel<<<dim3(blocks, n), 256, 0, ctx.stream()>>>(args, ne);
++    CUDA_CHECK(cudaGetLastError());
++    static const bool dbg = getenv("GGML_CUDA_FUSE_CPY_BATCH_DEBUG") != nullptr;
++    if (dbg) fprintf(stderr, "cpy_batch: %d copies over nodes %d..%d (%lld elements each)\n", n, i, last, (long long) ne);
++    return last - i + 1;
++}
+diff --git a/ggml/src/ggml-cuda/cpy-batch.cuh b/ggml/src/ggml-cuda/cpy-batch.cuh
+new file mode 100644
+index 000000000..867c8010d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/cpy-batch.cuh
+@@ -0,0 +1,9 @@
++#pragma once
++#include "common.cuh"
++// Batched copy (RDNA4; GGML_CUDA_FUSE_CPY_BATCH=0 turns it off): runs a run of consecutive f32 GGML_OP_CPY nodes that
++// share the source shape / strides and the destination shape / strides (only the data addresses differ) as one launch, e.g. the
++// per-position DeltaNet conv-state snapshots of a speculative verify batch (one copy per drafted position and layer).  Element
++// copies in ggml_cpy's flat order: bit-identical.
++// Returns the number of graph nodes it consumed (the copies plus the no-op view nodes between them, >= 2), or 0 when the node
++// at i does not start such a run.  GGML_CUDA_FUSE_CPY_BATCH_DEBUG=1 prints every run.
++int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index cf0049c8d..8ce69d3fb 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -66,7 +66,11 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
+     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
+-    if (T < 256 || C % 256 != 0) return false;
++    // On RDNA4 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
++    // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
++    static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
++    const bool verify_ok = conv_verify && T >= 2 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++    if ((T < 256 && !verify_ok) || C % 256 != 0) return false;
+     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+     int64_t tail_from = T + 3; int conv = -1;
+     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index beb823666..767453a28 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -38,6 +38,7 @@
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmb.cuh"
+ #include "ggml-cuda/moe-expert-cache.h"
++#include "ggml-cuda/cpy-batch.cuh"
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+@@ -4738,6 +4739,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // batched copy (GGML_CUDA_FUSE_CPY_BATCH=0: off): consecutive same-layout f32 copies as one launch
++    if (node->op == GGML_OP_CPY && cuda_ctx->stream_context().concurrent_events.empty()) {
++        const int taken = ggml_cuda_cpy_batch(*cuda_ctx, cgraph, i);
++        if (taken >= 2) {
++            return taken - 1;
++        }
++    }
++
++    // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0: off): an F32 GLU whose next node (or the one after a reshape) is a verify-band
++    // mmvq matmul over it is marked here (RDNA4 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
++    // GLU launcher then also writes the matmul's Q8_1 blocks into the quantize cache, which the matmul finds.
++    static const bool fuse_glu_q8_1 = getenv("GGML_CUDA_FUSE_GLU_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GLU_Q8_1")) != 0;
++    cuda_ctx->glu_q8_1_node = nullptr;
++    cuda_ctx->glu_q8_1_mm   = nullptr;
++    if (node->op == GGML_OP_GLU && fuse_glu_q8_1 && node->type == GGML_TYPE_F32 &&
++            node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % QK8_1 == 0) {
++        const ggml_tensor * mm = nullptr;
++        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
++            mm = cgraph->nodes[i + 1];
++        } else if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
++                   cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT) {
++            mm = cgraph->nodes[i + 2];
++        }
++        if (mm != nullptr) {
++            const ggml_tensor * a = mm->src[1];
++            const ggml_tensor * a_root = a;
++            while (a_root->view_src != nullptr) {
++                a_root = a_root->view_src;
++            }
++            if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&
++                    a->ne[1] >= 2 && ggml_is_quantized(mm->src[0]->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
++                cuda_ctx->glu_q8_1_node = node;
++                cuda_ctx->glu_q8_1_mm   = mm;
++            }
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
+         const int outputs[] = { i + 2, i + 5 };
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 26ada516f..4b34b83ff 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -350,7 +350,7 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+ template <float (*op)(float), typename T>
+ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, block_q8_1 * y,
+         const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+-        const int64_t row_len) {
++        const int64_t row_len, T * dst_f32) {
+     ggml_cuda_pdl_lc();
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+@@ -362,6 +362,9 @@ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, bloc
+     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+ 
+     const float v = op((float)x[j0]) * (float)g[j1];
++    if (dst_f32 != nullptr) {
++        dst_f32[i] = (T)v; // GLU -> Q8_1: the F32 output is written too
++    }
+ 
+     const int warp = threadIdx.x / 32;
+     const int lane = threadIdx.x % 32;
+@@ -437,7 +440,7 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+     const int64_t row_len = mm->src[1]->ne[0]; // the matmul's quantize row (flat per channel)
+     ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op, float>, lp,
+             (const float *) unary_src->data, (const float *) other_src->data, (block_q8_1 *) y,
+-            k, nc, unary_stride / sizeof(float), other_stride / sizeof(float), row_len);
++            k, nc, unary_stride / sizeof(float), other_stride / sizeof(float), row_len, (float *) nullptr);
+ }
+ 
+ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+@@ -517,6 +520,33 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             src1_p += swapped ? 0 : nc;
+         }
+ 
++        // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1): ggml_cuda_try_fuse marked this GLU, whose consumer mm is a verify-band
++        // mmvq matmul; also write the Q8_1 blocks mm would quantize, keyed like its own quantize
++        const ggml_tensor * mm = ctx.glu_q8_1_node == dst ? ctx.glu_q8_1_mm : nullptr;
++        ctx.glu_q8_1_node = nullptr;
++        ctx.glu_q8_1_mm   = nullptr;
++        if (mm != nullptr) {
++            const ggml_tensor * a = mm->src[1];
++            const ggml_tensor * a_key = a;
++            while (a_key->view_src != nullptr) {
++                a_key = a_key->view_src;
++            }
++            const int64_t ne10_padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
++            const size_t q8_1_size = a->ne[3]*a->ne[2] * a->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
++            bool cached = false;
++            void * y = ctx.q8_1_cache_get(a_key, ctx.curr_stream_no, q8_1_size, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
++                                          a->nb[1]/sizeof(float), a->nb[2]/sizeof(float), a->nb[3]/sizeof(float), cached);
++            if (!cached) {
++                const int64_t k = ggml_nelements(dst);
++                const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++                const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
++                ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op, float>, lp,
++                        (const float *) src0_p, (const float *) src1_p, (block_q8_1 *) y,
++                        k, nc, src0_o / sizeof(float), src1_o / sizeof(float), a->ne[0], (float *) dst_d);
++                return;
++            }
++        }
++
+         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+     }
+ }
+-- 
+2.43.0
+
