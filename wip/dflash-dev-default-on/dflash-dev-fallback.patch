@@ -1,0 +1,93 @@
+From 88e30b652445b4f8de9860ce75c0e81f06dce452 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 23:30:03 +0800
+Subject: [PATCH] F1: warn and fall back to the host path when the device
+ layer-input buffers cannot be allocated; default on (GGML_LF_DFLASH_DEV=0
+ off)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 13 ++++++++-----
+ src/llama-context.cpp  | 14 +++++++++++++-
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index fe657d31d..460bd32d6 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -993,8 +993,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+ 
+-    // Llama-Frankenstein F1 (GGML_LF_DFLASH_DEV=1, single sequence): the target keeps its extracted layer inputs
+-    // on the device and the injection batch carries the target rows as token ids, so the features never leave the GPU
++    // Llama-Frankenstein F1 (single sequence; default on, GGML_LF_DFLASH_DEV=0 turns it off): the target keeps its extracted
++    // layer inputs on the device and the injection batch carries the target rows as token ids, so the features never leave
++    // the GPU. If the target cannot allocate its device buffers, it keeps the host path and so does the draft.
+     bool        lf_dev = false;
+     llama_batch batch_inject_tok = {};
+ 
+@@ -1130,7 +1131,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+         {
+             const char * lf_env = getenv("GGML_LF_DFLASH_DEV");
+-            lf_dev = lf_env != nullptr && atoi(lf_env) != 0 && n_seq == 1;
++            const bool   lf_on  = lf_env == nullptr || atoi(lf_env) != 0;
++            lf_dev = lf_on && n_seq == 1;
+             if (lf_dev) {
+                 llama_lf_set_layer_inp_dev(ctx_tgt, true);
+                 batch_inject_tok = llama_batch_init(llama_n_ubatch(ctx_dft), 0, n_seq);
+@@ -1138,7 +1140,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     free(batch_inject_tok.pos);
+                     batch_inject_tok.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+                 }
+-                LOG_INF("%s: F1: target features stay on the device (GGML_LF_DFLASH_DEV)\n", __func__);
++                LOG_INF("%s: F1: target features stay on the device (default on, GGML_LF_DFLASH_DEV=0 turns it off)\n", __func__);
+             } else if (lf_env != nullptr && atoi(lf_env) != 0) {
+                 LOG_WRN("%s: F1 needs a single sequence (n_seq = %d), using the host path\n", __func__, (int) n_seq);
+             }
+@@ -1223,7 +1225,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+         // F1: the target wrote its layer inputs to device buffers on its own stream; the draft reads them on its
+         // stream, and the target must not overwrite them before the draft is done
+-        const bool use_dev = lf_dev && has_tokens;
++        // the target falls back to the host path when its device buffers could not be allocated
++        const bool use_dev = lf_dev && has_tokens && llama_lf_get_layer_inp_dev(ctx_tgt, (uint32_t) target_layer_ids[0]) != nullptr;
+         if (use_dev) {
+             llama_synchronize(ctx_tgt);
+         }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f70ee7034..5d0736424 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2603,14 +2603,26 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+                 lf_layer_dev.assign(n_layers, nullptr);
+                 ggml_init_params ip = { ggml_tensor_overhead() * n_layers, nullptr, true };
+                 lf_layer_ctx.reset(ggml_init(ip));
++                size_t need = 0;
+                 for (uint32_t l = 0; l < n_layers; ++l) {
+                     if (cparams.embeddings_layer_inp[l]) {
+                         lf_layer_dev[l] = ggml_new_tensor_2d(lf_layer_ctx.get(), GGML_TYPE_F32, t->ne[0], cparams.n_batch);
+                         ggml_format_name(lf_layer_dev[l], "lf_layer_inp_dev-%u", l);
++                        need += ggml_nbytes(lf_layer_dev[l]);
+                     }
+                 }
+                 lf_layer_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lf_layer_ctx.get(), ggml_backend_get_default_buffer_type(backend)));
+-                GGML_ASSERT(lf_layer_buf && "failed to allocate device layer-input buffers");
++                if (!lf_layer_buf) {
++                    // not enough device memory: stay on the host path for the rest of this context (the host buffers
++                    // are always reserved). The draft sees llama_lf_get_layer_inp_dev() return null and gathers the
++                    // features from the host buffers instead, so the output does not change.
++                    LLAMA_LOG_WARN("%s: F1: could not allocate the device layer-input buffers (%.1f MiB), using the host path\n",
++                        __func__, need / (1024.0 * 1024.0));
++                    lf_layer_dev.clear();
++                    lf_layer_ctx.reset();
++                    cparams.lf_layer_inp_dev = false;
++                    return extract_layer_inputs(res, token_offset, n_tokens);
++                }
+                 LLAMA_LOG_INFO("%s: F1 device layer-input buffers: %.1f MiB\n", __func__,
+                     ggml_backend_buffer_get_size(lf_layer_buf.get()) / (1024.0 * 1024.0));
+             }
+-- 
+2.43.0
+
