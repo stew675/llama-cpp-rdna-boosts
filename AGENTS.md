@@ -14,8 +14,9 @@ release history here — this file is the policy layer, not the log.
 A **delivery repo**. It packages the RDNA/ROCm work of the [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp)
 fork (`rdna-boosts` branch) as a **17-patch set** (block 00 + blocks 01-16) that applies to a clean
 llama.cpp checkout at the fork point named in `release.json`. This repo is NOT the fork: the fork
-lives at `~/llama.cpp` and its branch is **disposable** (delete and re-apply from `patches/`, never
-push). `patches/` is the deliverable; `scripts/` is the apply/regenerate/validate flow; `README.md`
+lives at `~/llama.cpp`; its `rdna-boosts` branch is re-cut from `patches/` on every release and
+force-pushed to the personal fork so it never goes stale (see the Pushing policy). `patches/` is the
+deliverable; `scripts/` is the apply/regenerate/validate flow; `README.md`
 is the consumer overview; `MANIFESTS.md` and `BASELINE.md` are dated history; `GREEDY-PURITY.md` is
 the purity rulebook.
 
@@ -30,20 +31,29 @@ amendment, or a note in the relevant record).
 
 ## Pushing policy (MANDATORY — read before any `git push`)
 
-**Never push anything out of the `~/llama.cpp` fork checkout — never to upstream llama.cpp, and never
-to the personal fork unless the maintainer explicitly requests it.**
+**Never push to upstream llama.cpp.** The only permitted push targets are this repo (the delivery,
+`github.com:stew675/llama-cpp-rdna-boosts`) and the maintainer's personal fork
+(`git@github.com:stew675/llama.cpp.git`). A bare `git push` in `~/llama.cpp` targets upstream
+`ggml-org/llama.cpp` — never acceptable; repeated attempts can get the account banned.
 
 - All deliverable changes live in THIS repo (`llama-cpp-rdna-boosts`) as the `patches/` set. That is
-  the only thing that gets pushed (to this repo's own `origin`, `github.com:stew675/llama-cpp-rdna-boosts`).
+  the primary thing that gets pushed.
+- **Every release MUST refresh the fork's `rdna-boosts` branch.**  Consumers clone the personal fork
+  and check out `rdna-boosts` instead of applying the patch set, so a stale branch is what produced
+  the 2026-10 Reddit "rdna-boosts is slow" incident (the branch was a month behind).  On every
+  release (and whenever the block set changes), do a clean apply and push the branch:
+  1. In a clean `~/llama.cpp`, check out upstream `master` at the **baseline point** — the `.base`
+     commit in `release.json`, never the tip of `master`.
+  2. Delete the existing `rdna-boosts` branch and re-create it with `scripts/apply-all.sh` (strict
+     `git am`; the applied tree must equal `release.json`'s `.tree`).
+  3. Build it and run the coherence + MTP gates; `scripts/validate-set.sh` must be green.
+  4. `git push --force-with-lease origin rdna-boosts` — the **personal fork only**, never upstream;
+     never a bare `--force`.
 - The `~/llama.cpp` checkout exists to host the block commits and to apply/test the diff set locally.
-  Its `rdna-boosts` branch is **disposable**: the sanctioned flow is to delete the pre-patched branch
-  and re-apply our diff set (`scripts/apply-all.sh` on a fresh checkout at the fork point) — never to
-  push the branch anywhere.
-- If the maintainer explicitly asks to push a fork sub-branch, the ONLY permitted target is the
-  personal fork (`git@github.com:stew675/llama.cpp.git`, the `fork` remote). NEVER push to upstream
-  `ggml-org/llama.cpp` (the `origin` remote in `~/llama.cpp`) — a bare `git push` there targets upstream.
-- Confirm the exact branch name and intent before any such push; for history rewrites use
-  `--force-with-lease`, never a bare `--force`.
+  Apart from the release-time branch refresh above it is disposable: delete the pre-patched branch and
+  re-apply rather than editing history in place.
+- Confirm the exact branch name and remote before any push: the branch is always `rdna-boosts`, the
+  permitted target is always `git@github.com:stew675/llama.cpp.git` (the personal fork).
 - Repeated attempts to push directly to llama.cpp can result in an account ban. When in doubt: don't
   push, ask.
 
@@ -204,7 +214,7 @@ go-ahead. Anything also applicable to unadulterated upstream gets a copy under `
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout <release.json.base>
-bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 16 commits
+bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 17 commits
 ```
 
 ### Verify (the coherence gate — mandatory after any change)
@@ -250,8 +260,8 @@ detail in `archive/work/build-time-regression/`.
 - Do not `git apply` the concatenated block series (drops hunks); use `scripts/apply-all.sh`.
 - Do not hand-edit the committed patches as a permanent drift fix — regenerate and re-verify.
 - Do not mix the historical `baseline/*` branches or `block/*` tags with the current `patches/`.
-- Do not push anything from the `~/llama.cpp` checkout (see the Pushing policy). The only permitted
-  push target outside this repo is the personal fork, and only on explicit maintainer request.
+- Do not push anything from the `~/llama.cpp` checkout except the release-time `rdna-boosts` refresh
+  to the personal fork (see the Pushing policy). Never push to upstream `ggml-org/llama.cpp`.
 - Do not present old docs as current: MANIFESTS/BASELINE and the dated records are history; current
   claims are the header sections + `patches/README.md` + `release.json`.
 - Do not add new WIP experiments to the delivery set, and **never apply anything from `wip/`** or
