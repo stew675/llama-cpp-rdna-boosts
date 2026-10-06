@@ -1,0 +1,242 @@
+From 35f2df12b9868b1ec41186cca7039531f74fc45a Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 13:52:03 +0800
+Subject: [PATCH] ggml-cuda: optional GPU keep-alive (GGML_CUDA_KEEPALIVE_MS=N
+ ms, 0/unset = off)
+
+A background thread per device launches one tiny kernel on its own stream once the device has had
+no graph submission or synchronize for N ms and every submitted graph has finished (event per
+submitting stream), so it never runs during prefill or decode.  For systems that power down an idle
+discrete GPU and move all of its memory out (seen on Windows with the desktop on an APU).  Touches
+only its own 4-byte buffer: outputs unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu  |   6 ++
+ ggml/src/ggml-cuda/keepalive.cu  | 143 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/keepalive.cuh |  18 ++++
+ 3 files changed, 167 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/keepalive.cu
+ create mode 100644 ggml/src/ggml-cuda/keepalive.cuh
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 19357b774..361c4a192 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5,6 +5,7 @@
+ 
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
++#include "ggml-cuda/keepalive.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+ #include "ggml-cuda/arange.cuh"
+@@ -3278,6 +3279,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
+ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++    ggml_cuda_keepalive_detach(cuda_ctx->device);
+     delete cuda_ctx;
+     delete backend;
+ }
+@@ -3456,6 +3458,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ 
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
++    const ggml_cuda_keepalive_busy keepalive_busy(cuda_ctx->device);
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
+@@ -7266,6 +7269,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     const cuda_gc_timer cuda_gc_timer_inst(cgraph);
+     int64_t t_gc = g_cgc_on ? ggml_time_us() : 0;
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const ggml_cuda_keepalive_busy keepalive_busy(cuda_ctx->device, cuda_ctx->stream());
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+@@ -9365,6 +9369,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+     // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
+     moe_cache_init(device);
+ 
++    ggml_cuda_keepalive_attach(device);
++
+     ggml_backend_t cuda_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cuda_guid(),
+         /* .iface   = */ ggml_backend_cuda_interface,
+diff --git a/ggml/src/ggml-cuda/keepalive.cu b/ggml/src/ggml-cuda/keepalive.cu
+new file mode 100644
+index 000000000..6bbcb2a24
+--- /dev/null
++++ b/ggml/src/ggml-cuda/keepalive.cu
+@@ -0,0 +1,143 @@
++// Optional keep-alive for an idle GPU, see keepalive.cuh.
++#include "common.cuh"
++#include "keepalive.cuh"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <mutex>
++#include <map>
++#include <thread>
++
++#if defined(GGML_USE_HIP)
++#define KA_EVENT_QUERY hipEventQuery
++#define KA_NOT_READY   hipErrorNotReady
++#else
++#define KA_EVENT_QUERY cudaEventQuery
++#define KA_NOT_READY   cudaErrorNotReady
++#endif // defined(GGML_USE_HIP)
++
++static int ka_interval_ms() {
++    static const int ms = [] {
++        const char * s = getenv("GGML_CUDA_KEEPALIVE_MS");
++        if (s == nullptr || *s == '\0') return 0;
++        char * end = nullptr;
++        const long v = strtol(s, &end, 10);
++        if (end == s || *end != '\0' || v < 0 || v > 3600000) {
++            GGML_LOG_WARN("GGML_CUDA_KEEPALIVE_MS=%s not recognized (0 = off, or milliseconds 1..3600000), keep-alive off\n", s);
++            return 0;
++        }
++        return (int) v;
++    }();
++    return ms;
++}
++
++static int64_t ka_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static __global__ void ka_kernel(int * p) {
++    p[0] += 1;
++}
++
++struct ka_state {
++    std::mutex              mutex;
++    std::condition_variable cv;
++    std::thread             thread;
++    int                     refs = 0;
++    bool                    stop = false;
++    std::atomic<int>        busy{0};
++    std::atomic<int64_t>    last{0};
++    std::mutex                          ev_mutex;
++    std::map<cudaStream_t, cudaEvent_t> ev;   // per submitting stream: an event recorded after its latest graph
++};
++
++// never destroyed: a thread still running at process exit is simply ended with the process
++static ka_state * ka_states() {
++    static ka_state * st = new ka_state[GGML_CUDA_MAX_DEVICES];
++    return st;
++}
++
++static void ka_loop(const int device, const int ms) {
++    ka_state & st = ka_states()[device];
++    ggml_cuda_set_device(device);
++    cudaStream_t stream = nullptr;
++    int * buf = nullptr;
++    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess || cudaMalloc((void **) &buf, sizeof(int)) != cudaSuccess) {
++        (void) cudaGetLastError();
++        GGML_LOG_WARN("GGML_CUDA_KEEPALIVE_MS: could not set up the keep-alive on device %d, off\n", device);
++        if (stream) (void) cudaStreamDestroy(stream);
++        return;
++    }
++    static std::atomic<bool> told{false};   // backend contexts come and go during model loading; say it once
++    if (!told.exchange(true)) {
++        fprintf(stderr, "GGML_CUDA_KEEPALIVE_MS=%d: device %d gets a tiny kernel after %d ms without work\n", ms, device, ms);
++    }
++    std::unique_lock<std::mutex> lock(st.mutex);
++    while (!st.stop) {
++        st.cv.wait_for(lock, std::chrono::milliseconds(ms));
++        if (st.stop) break;
++        if (st.busy.load() > 0 || ka_now_ms() - st.last.load() < ms) continue;   // prefill / decode in progress
++        lock.unlock();
++        bool gpu_idle = true;
++        {
++            std::lock_guard<std::mutex> eg(st.ev_mutex);
++            for (auto & [s, e] : st.ev) {
++                const cudaError_t q = KA_EVENT_QUERY(e);
++                if (q == KA_NOT_READY) { gpu_idle = false; break; }
++            }
++        }
++        (void) cudaGetLastError();
++        if (!gpu_idle) { st.last.store(ka_now_ms()); lock.lock(); continue; }   // the GPU is still working on submitted graphs
++        ka_kernel<<<1, 1, 0, stream>>>(buf);
++        (void) cudaStreamSynchronize(stream);
++        (void) cudaGetLastError();
++        lock.lock();
++    }
++    lock.unlock();
++    (void) cudaFree(buf);
++    (void) cudaStreamDestroy(stream);
++}
++
++void ggml_cuda_keepalive_attach(int device) {
++    const int ms = ka_interval_ms();
++    if (ms <= 0 || device < 0 || device >= GGML_CUDA_MAX_DEVICES) return;
++    ka_state & st = ka_states()[device];
++    std::lock_guard<std::mutex> guard(st.mutex);
++    if (st.refs++ == 0) {
++        st.stop = false;
++        st.last.store(ka_now_ms());
++        st.thread = std::thread(ka_loop, device, ms);
++    }
++}
++
++void ggml_cuda_keepalive_detach(int device) {
++    if (ka_interval_ms() <= 0 || device < 0 || device >= GGML_CUDA_MAX_DEVICES) return;
++    ka_state & st = ka_states()[device];
++    std::thread th;
++    {
++        std::lock_guard<std::mutex> guard(st.mutex);
++        if (st.refs == 0 || --st.refs > 0) return;
++        st.stop = true;
++        th = std::move(st.thread);
++    }
++    st.cv.notify_all();
++    if (th.joinable()) th.join();
++    std::lock_guard<std::mutex> eg(st.ev_mutex);
++    for (auto & [s, e] : st.ev) (void) cudaEventDestroy(e);
++    st.ev.clear();
++}
++
++void ggml_cuda_keepalive_mark(int device, bool begin, cudaStream_t submitted) {
++    if (ka_interval_ms() <= 0 || device < 0 || device >= GGML_CUDA_MAX_DEVICES) return;
++    ka_state & st = ka_states()[device];
++    if (!begin && submitted != nullptr) {
++        std::lock_guard<std::mutex> eg(st.ev_mutex);
++        cudaEvent_t & e = st.ev[submitted];
++        if (e == nullptr && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { e = nullptr; (void) cudaGetLastError(); }
++        if (e != nullptr) (void) cudaEventRecord(e, submitted);
++    }
++    if (begin) st.busy.fetch_add(1); else st.busy.fetch_sub(1);
++    st.last.store(ka_now_ms());
++}
+diff --git a/ggml/src/ggml-cuda/keepalive.cuh b/ggml/src/ggml-cuda/keepalive.cuh
+new file mode 100644
+index 000000000..6893d9c82
+--- /dev/null
++++ b/ggml/src/ggml-cuda/keepalive.cuh
+@@ -0,0 +1,18 @@
++#pragma once
++// Optional keep-alive for an idle GPU (GGML_CUDA_KEEPALIVE_MS=N, 0 or unset = off).
++// On some systems (seen on Windows with the desktop on another GPU) an idle discrete GPU is powered down and all of its
++// memory is moved out; the next request then waits for the model to come back.  With N > 0, a background thread per
++// device launches one tiny kernel on its own stream when, for N ms, no graph was submitted, no synchronize ran and all
++// submitted graphs have finished on the GPU, so it stays quiet during prefill and decode.  It touches only its own 4-byte
++// buffer, so results are unchanged.
++
++void ggml_cuda_keepalive_attach(int device);   // a backend context for this device was created
++void ggml_cuda_keepalive_detach(int device);   // ... and freed (the thread stops with the last one)
++void ggml_cuda_keepalive_mark(int device, bool begin, cudaStream_t submitted);   // submitted: stream of a graph just queued
++
++struct ggml_cuda_keepalive_busy {
++    const int          device;
++    const cudaStream_t stream;
++    explicit ggml_cuda_keepalive_busy(int dev, cudaStream_t s = nullptr) : device(dev), stream(s) { ggml_cuda_keepalive_mark(device, true, nullptr); }
++    ~ggml_cuda_keepalive_busy() { ggml_cuda_keepalive_mark(device, false, stream); }
++};
+-- 
+2.43.0
+
