@@ -1,0 +1,222 @@
+From d9399750c79869f42bb4a1447bc744ec548a5373 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 19:39:03 +0000
+Subject: [PATCH 2/2] allreduce-hip: opt-in P2P push path with lightweight
+ fences (GGML_CUDA_AR_P2P=1)
+
+With GGML_CUDA_AR_P2P=1 (2 devices, not fused) each device writes its wire data and arrival token into the
+PEER's fine-grained VRAM (hipExtMallocWithFlags(..., hipDeviceMallocFinegrained)) instead of the host ring, and
+reads its peer's data from its own VRAM.  Because that memory is fine-grained, the path does not need the host
+path's three all-thread __threadfence_system() (an L2 write-back / invalidate per wavefront): it waits for its
+stores to post (s_wait_storecnt 0), publishes the arrival with one system-scope release store (PCIe keeps posted
+writes to one peer in order), and reads with vector loads and no acquire fence.  GGML_CUDA_AR_P2P_LITE=0 keeps
+the full fences for comparison.  The fence discipline is the one radiance uses for the same two-R9700 case
+(codeberg StillDeadcode/radiance, libr4d/r4d_ar_oneshot_2rank_exact.hip).  Bit-identical.
+
+2 x R9700 (PCIe 5.0 x8 each), Flash-Next -sm tensor, AR profiler: phase 1 (write + signal) 4.7 -> 0.6 us, call
+p50 19.8 -> 12.9 us.  One-token decode 14.56 -> 14.17 ms/token (the same P2P path with the full fences:
+14.83); with MTP n-max 3 no measurable change (kernel dispatch gaps dominate there).  Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/allreduce-hip.cu | 88 +++++++++++++++++++++++++----
+ 1 file changed, 76 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
+index d41a184f6..e27e7d0a2 100644
+--- a/ggml/src/ggml-cuda/allreduce-hip.cu
++++ b/ggml/src/ggml-cuda/allreduce-hip.cu
+@@ -180,7 +180,17 @@ static __global__ void ggml_cuda_ar_kernel(
+         const ggml_cuda_ar_stage_control * __restrict__ control,  // fused-stage state; NULL disables fast path
+         bool                        write_next_control,           // last chunk: publish control for the next call
+         int         *               poison_dev,                   // host-mapped flag; written on spin timeout; NULL disables
+-        uint64_t                    spin_budget_cycles) {         // max clock64() cycles per peer wait; 0 = unbounded
++        uint64_t                    spin_budget_cycles,           // max clock64() cycles per peer wait; 0 = unbounded
++        T_wire       *              wire_write_base,              // where OUR wire data goes: == host_wire_base, or the peer's VRAM (P2P)
++        int          *              arrival_write_base,           // where OUR arrival token goes: == arrival_base, or the peer's VRAM (P2P)
++        bool                        p2p,                          // the read bases are this device's fine-grained VRAM, written by the peer
++        bool                        lite) {                       // P2P only: store-count drain + release flag, no system fences
++    // `lite` (radiance's discipline for fine-grained peer VRAM): the peer scratch and flags are fine-grained, so
++    // writes go straight to the fabric and reads are not served from a stale L2.  Waiting for this wave's
++    // stores to post (s_wait_storecnt 0) and publishing the flag with a system-scope release store orders the
++    // data before the flag (PCIe keeps posted writes to one peer in order) without the L2 write-back /
++    // invalidate an all-thread __threadfence_system() emits per wavefront; the reader needs no acquire fence.
++    const bool p2p_lite = p2p && lite;
+ 
+     // Vector unit for the wire type, sized to the arch's widest single-instruction
+     // copy (16 B on Volta+/RDNA).  Each phase-1 iter writes one vector to host
+@@ -191,7 +201,7 @@ static __global__ void ggml_cuda_ar_kernel(
+     constexpr size_t BUF_ELEMS = GGML_CUDA_AR_MAX_BYTES / sizeof(T_wire);
+ 
+     // Own slot in the contiguous wire buffer; peers are found the same way.
+-    T_wire * host_mine = host_wire_base + (size_t)(rank * GGML_CUDA_AR_POOL_SIZE + slot) * BUF_ELEMS;
++    T_wire * host_mine = wire_write_base + (size_t)(rank * GGML_CUDA_AR_POOL_SIZE + slot) * BUF_ELEMS;
+ 
+     const int tid       = threadIdx.x;
+     const int nt        = blockDim.x;
+@@ -245,7 +255,11 @@ static __global__ void ggml_cuda_ar_kernel(
+     }
+ 
+     // Commit this block's host writes before signalling.
+-    __threadfence_system();
++    if (p2p_lite) {
++        asm volatile("s_wait_storecnt 0x0" ::: "memory");
++    } else {
++        __threadfence_system();
++    }
+     __syncthreads();
+ 
+     // Set by thread 0 if its peer wait exceeds the budget; after the
+@@ -262,14 +276,18 @@ static __global__ void ggml_cuda_ar_kernel(
+         s_ar_timeout = 0;
+         // Arrival slots are contiguous per rank: ((slot*n + rank)*BLOCKS + bid).
+         const size_t arr_int = (size_t)(slot * n_devices + rank) * GGML_CUDA_AR_KERNEL_BLOCKS + bid;
+-        int * my_slot = arrival_base + arr_int * ARRIVAL_INTS;
++        int * my_slot = arrival_write_base + arr_int * ARRIVAL_INTS;
+ 
+         if (prof_spin != nullptr && bid == 0) {
+             prof_spin[0] = (int64_t) clock64();
+         }
+         if (!stage_done) {
+-            ggml_cuda_ar_signal_set(my_slot, token);
+-            __threadfence_system(); // make our signal visible system-wide
++            if (p2p_lite) {
++                __hip_atomic_store(my_slot, token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
++            } else {
++                ggml_cuda_ar_signal_set(my_slot, token);
++                __threadfence_system(); // make our signal visible system-wide
++            }
+         }
+ 
+         // Wait for EVERY peer's token for this call before reading its data.
+@@ -370,7 +388,9 @@ static __global__ void ggml_cuda_ar_kernel(
+     }
+ 
+     // Acquire peer's host_other writes (this block's stripe of them).
+-    __threadfence_system();
++    if (!p2p_lite) {
++        __threadfence_system();
++    }
+ 
+     // Phase 3: read every peer's T_wire vector, cast both sides through T_wire
+     // for bit-equivalence, sum in float, and write back to recvbuf.  Each rank
+@@ -394,7 +414,13 @@ static __global__ void ggml_cuda_ar_kernel(
+                 own[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+             }
+             T_wire peer[GGML_CUDA_MAX_DEVICES][ELEMS_PER_VEC];
+-            if (stage_done) {
++            if (p2p_lite) {
++                // fine-grained local VRAM: one vector load per peer, as on the host path
++                for (int p = 0; p < n_peers; ++p) {
++                    ggml_cuda_memcpy_1<sizeof(peer[0])>(peer[p], &host_peers[p][off]);
++                }
++            } else if (stage_done || p2p) {
++                // P2P: the peer wrote this VRAM over the bus, behind this GPU's caches.
+                 // Fused path: the peer wire was written by SDMA memcpy NODES,
+                 // which bypass the GPU L2 -- plain cached loads hit STALE
+                 // lines from prior calls.  Volatile loads (glc) refetch from
+@@ -422,7 +448,8 @@ static __global__ void ggml_cuda_ar_kernel(
+         if (bid == 0 && tid < count - tail) {
+             float acc = ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[tail + tid]));
+             for (int p = 0; p < n_peers; ++p) {
+-                acc += ggml_cuda_cast<float>(host_peers[p][tail + tid]);
++                acc += ggml_cuda_cast<float>(p2p && !p2p_lite ? *(const volatile T_wire *)&host_peers[p][tail + tid]
++                                                               : host_peers[p][tail + tid]);
+             }
+             recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(acc);
+         }
+@@ -550,6 +577,7 @@ struct ggml_cuda_ar_pipeline {
+     // polls its own arrival slot, so the call waits for the slowest of them.  Fewer blocks there cut the per-call
+     // latency (8 -> 2 blocks: ~3.7 us per AR on 2 x R9700 at one token; with MTP verify batches 4 blocks measured best).  Larger messages keep the full grid for bandwidth.
+     int                      small_blocks;
++    bool                     p2p_lite;   // GGML_CUDA_AR_P2P_LITE (default 1): radiance-style fences on the P2P path
+     size_t                   small_bytes;
+     hipEvent_t               prof_t0[GGML_CUDA_AR_PROF_MAX];
+     hipEvent_t               prof_t1[GGML_CUDA_AR_PROF_MAX];
+@@ -584,6 +612,11 @@ struct ggml_cuda_ar_pipeline {
+     // memory; CPU never reads/writes -- only the kernel and hipMemset.
+     // Indexed by the kernels via ((slot*n + rank)*BLOCKS + bid) * ARRIVAL_INTS.
+     ggml_cuda_ar_host_mapping arrival;
++    // GGML_CUDA_AR_P2P=1: per-device fine-grained VRAM copies of host_wire / arrival (same layout); the peer
++    // writes into them, the owner polls and reads them locally.
++    bool      p2p = false;
++    uint8_t * p2p_wire[GGML_CUDA_MAX_DEVICES] = {};
++    uint8_t * p2p_arrival[GGML_CUDA_MAX_DEVICES] = {};
+ 
+     // Bounded-spin poison flag: one host-mapped (pinned) int.  Written by the
+     // chunked kernel when a peer wait exceeds spin_timeout_ms; read/cleared by
+@@ -814,6 +847,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     p->prof_enabled     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PROFILE", 0) != 0;
+     p->small_blocks     = (int) std::min<uint64_t>(std::max<uint64_t>(ggml_cuda_ar_env_u64("GGML_CUDA_AR_SMALL_BLOCKS", 4), 1), GGML_CUDA_AR_KERNEL_BLOCKS);
+     p->small_bytes      = (size_t) ggml_cuda_ar_env_u64("GGML_CUDA_AR_SMALL_BYTES", 64 * 1024);
++    p->p2p_lite         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_LITE", 1) != 0;
+     if (p->prof_enabled) {
+         GGML_LOG_WARN("%s: per-call profiling enabled (GGML_CUDA_AR_PROFILE=1); "
+                       "this is WIP tuning instrumentation\n", __func__);
+@@ -923,6 +957,26 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+         return nullptr;
+     }
+ 
++    if (ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P", 0) != 0 && n_devices == 2 && !p->fused) {
++        bool ok = true;
++        for (size_t i = 0; i < n_devices && ok; ++i) {
++            ggml_cuda_set_device(p->devices[i]);
++            const hipError_t pe = hipDeviceEnablePeerAccess(p->devices[1 - i], 0);
++            if (pe != hipSuccess && pe != hipErrorPeerAccessAlreadyEnabled) {
++                ok = false;
++            }
++            (void) hipGetLastError();
++            ok = ok &&
++                 hipExtMallocWithFlags(reinterpret_cast<void **>(&p->p2p_wire[i]), host_wire_total, hipDeviceMallocFinegrained) == hipSuccess &&
++                 hipExtMallocWithFlags(reinterpret_cast<void **>(&p->p2p_arrival[i]), arrival_bytes, hipDeviceMallocFinegrained) == hipSuccess &&
++                 hipMemset(p->p2p_arrival[i], 0, arrival_bytes) == hipSuccess;
++        }
++        p->p2p = ok;
++        GGML_LOG_WARN("%s: P2P push all-reduce (GGML_CUDA_AR_P2P=1): %s\n", __func__,
++                      ok ? "on (wire + arrival in each device's fine-grained VRAM)" : "unavailable, staying on host staging");
++        (void) hipGetLastError();
++    }
++
+     if (p->fused) {
+         // Stage control: device-mapped so the stage kernel (baked into graphs)
+         // and the reduce kernel share per-call slot/token/type state without
+@@ -979,6 +1033,12 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+ }
+ 
+ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
++    if (p != nullptr) {
++        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
++            if (p->p2p_wire[i])    { (void) hipFree(p->p2p_wire[i]);    p->p2p_wire[i] = nullptr; }
++            if (p->p2p_arrival[i]) { (void) hipFree(p->p2p_arrival[i]); p->p2p_arrival[i] = nullptr; }
++        }
++    }
+     if (!p) {
+         return;
+     }
+@@ -1537,8 +1597,8 @@ bool ggml_cuda_ar_allreduce(
+                 ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(ar_blocks), dim3(256), 0, stream>>>( \
+                     reinterpret_cast<const T_dst *>(data), \
+                     reinterpret_cast<T_dst *>(data), \
+-                    reinterpret_cast<T_wire *>(p->host_wire.dev), \
+-                    reinterpret_cast<int *>(p->arrival.dev), \
++                    reinterpret_cast<T_wire *>(p->p2p ? p->p2p_wire[i] : p->host_wire.dev), \
++                    reinterpret_cast<int *>(p->p2p ? p->p2p_arrival[i] : p->arrival.dev), \
+                     i, \
+                     static_cast<int>(n), \
+                     slot, \
+@@ -1550,7 +1610,11 @@ bool ggml_cuda_ar_allreduce(
+                     p->fused ? p->stage_control_dev[i] : nullptr, \
+                     last_chunk && p->fused, \
+                     reinterpret_cast<int *>(p->poison.dev), \
+-                    p->spin_budget_cycles)
++                    p->spin_budget_cycles, \
++                    reinterpret_cast<T_wire *>(p->p2p ? p->p2p_wire[1 - i] : p->host_wire.dev), \
++                    reinterpret_cast<int *>(p->p2p ? p->p2p_arrival[1 - i] : p->arrival.dev), \
++                    p->p2p, \
++                    p->p2p_lite)
+ 
+                 if (use_bf16) {
+                     GGML_ASSERT(input_type == GGML_TYPE_F32);
+-- 
+2.53.0
+
