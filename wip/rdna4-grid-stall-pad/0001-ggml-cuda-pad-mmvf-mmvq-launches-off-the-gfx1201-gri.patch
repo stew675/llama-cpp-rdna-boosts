@@ -1,0 +1,233 @@
+From f909f9e5e170b2239b50f2b1da1ad8c92af0622e Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 18:23:32 +0000
+Subject: [PATCH] ggml-cuda: pad mmvf / mmvq launches off the gfx1201 grid-size
+ dispatch stall
+
+A dispatch whose block count is a multiple of 256 (or whose work-item count is a multiple of 65536) waits
+~6-10 us before it runs on gfx1201 (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634; still open, the newest CP
+firmware does not fix it).  Measured in a graph: 256/512/768/1024 blocks of 256 threads 11-14 us per trivial
+kernel against ~3 us at 520 blocks; a 512-row BF16 GEMV 17.8 us vs 8.8 us at 513 blocks.  The decode step hit it
+~100 times: mul_mat_vec_f at 512 blocks (the BF16 router), mul_mat_vec_q_ksplit at 256 / 1280 blocks,
+mul_mat_vec_q_moe.
+
+ggml_cuda_grid_stall_pad() (common.cuh) says when a launch is on such a size; the three launch sites then add one
+block that returns at once (mmvf: row >= nrows; ksplit: row0 >= nrows_loop, passed only when padded; moe:
+row0 >= nrows_x).  Every row keeps its unchanged computation: bit-identical.
+Flash-Next -sm tensor, 2 x R9700: decode without MTP 14.22 -> 13.91 ms/token (+2.2 %), with MTP n-max 3
+139.6 -> 141.8 t/s (+1.6 %), same greedy sha.  GGML_CUDA_GRID_STALL_PAD=0 turns it off (reproduces the old timing);
+to remove it once AMD fixes the stall, delete the helper and its call sites.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh | 27 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cu    | 32 +++++++++++++++++++-------------
+ ggml/src/ggml-cuda/mmvq.cu    | 15 ++++++++++++++-
+ 3 files changed, 60 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1fa5e3321..448559877 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1607,6 +1607,33 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+     return stage_max_bytes;
+ }
+ 
++// WORKAROUND for the gfx1201 grid-size dispatch stall (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634): a dispatch
++// whose block count is a multiple of 256, or whose work-item count is a multiple of 65536, waits ~6-10 us before it
++// runs (a 512-row BF16 GEMV: 17.8 us vs 8.8 us at 513 blocks).  A launch site that can take one extra block (the
++// kernel returns at once for a block past its last row) asks this helper and adds that block; the arithmetic is
++// unchanged.  Not the only workaround in the tree: mul_mat_vec_f_vb, hc_mix and the RDNA4 mmvq decode grid size
++// their grids around the same stall.
++// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
++// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
++static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
++#if defined(GGML_USE_HIP)
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on) {
++        return false;
++    }
++    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
++    const int64_t nthr = (int64_t) block.x * block.y * block.z;
++    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
++#else
++    GGML_UNUSED(grid);
++    GGML_UNUSED(block);
++    return false;
++#endif // defined(GGML_USE_HIP)
++}
++
+ // Issue/TODO #42: the shared device-allocation helper (defined in ggml-cuda.cu).  It yields the
+ // lowest-priority MoE expert-cache arena when an allocation cannot otherwise be satisfied, so every
+ // device allocation inherits the same fail-soft policy.
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 23b296cff..4451f8d7c 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -10,12 +10,15 @@ static __global__ void mul_mat_vec_f(
+         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
+         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride) {
++        const int ids_stride, const int nrows) {
+     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
+     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+     const int row         = blockIdx.x;
++    if (row >= nrows) {
++        return;   // the padding block of a HIP launch moved off a stalling grid size (see the launch)
++    }
+     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
+     const int channel_dst = blockIdx.y;
+     const int tid         = threadIdx.x;
+@@ -498,7 +501,7 @@ static void mul_mat_vec_f_switch_fusion(
+         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
+         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
++        const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const int nrows, const cudaStream_t stream) {
+ 
+     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+ 
+@@ -508,7 +511,7 @@ static void mul_mat_vec_f_switch_fusion(
+             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows);
+             return;
+        }
+     }
+@@ -518,7 +521,7 @@ static void mul_mat_vec_f_switch_fusion(
+     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
+         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows);
+ 
+ }
+ 
+@@ -599,56 +602,59 @@ void launch_mul_mat_vec_f_cuda(
+ #endif // defined(GGML_USE_HIP)
+ 
+     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+-    const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
++    dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(block_size_best, 1, 1);
++    if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
++        block_nums.x++;   // the kernel returns for row >= nrows
++    }
+     switch (block_size_best) {
+         case   32: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case   64: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 64, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case   96: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 96, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case  128: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 128, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case  160: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 160, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case  192: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 192, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case  224: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 224, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         case  256: {
+             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
+                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
++                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, nrows, stream);
+         } break;
+         default: {
+             GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f2abd281e..4e4a0797c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1119,6 +1119,9 @@ static __global__ void mul_mat_vec_q_ksplit(
+     // instantiation the loop body runs once.
+     constexpr bool row_loop = mmvq_decode_grid_loop_type(type) && ncols_dst == 1 && rows_per_cuda_block <= 2 && nwarps == 1;
+     for (int row0 = rows_per_cuda_block*blockIdx.x; ; row0 += rows_per_cuda_block*gridDim.x) {
++    if (nrows_loop != 0 && uint32_t(row0) >= nrows_loop) {
++        break;   // a padding block (ggml_cuda_grid_stall_pad) or a row loop past the end
++    }
+     dst = dst_ptr;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+@@ -1504,6 +1507,9 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     const uint32_t token_idx   = threadIdx.y;
+     const int      row0        = c_rows_per_block*blockIdx.x;
++    if (row0 >= (int) nrows_x) {
++        return;   // the padding block of ggml_cuda_grid_stall_pad (never block 0)
++    }
+     const int      blocks_per_row_x = ncols_x / qk;
+ 
+     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+@@ -1806,8 +1812,11 @@ static void mul_mat_vec_q_moe_launch(
+     }
+     const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
+     // Upstream's fused shared-expert lane is the last blockIdx.y column.
+-    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
++    dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
+     const dim3 block_dims(warp_size, ncols_dst);
++    if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
++        block_nums.x++;   // the kernel returns for row0 >= nrows_x
++    }
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+@@ -2067,6 +2076,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                     nrows_loop   = nrows_x;
+                     dims.first.x = (nblocks + iters - 1) / iters;
+                 }
++                if (ggml_cuda_grid_stall_pad(dims.first, dims.second)) {
++                    dims.first.x++;          // the kernel stops at nrows_loop
++                    nrows_loop = nrows_x;
++                }
+                 mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, c_rpb, c_long_k>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-- 
+2.53.0
+
