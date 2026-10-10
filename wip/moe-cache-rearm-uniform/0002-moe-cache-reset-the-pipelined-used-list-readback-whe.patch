@@ -1,0 +1,44 @@
+From 2eabaff551ab52bf295d022b623fe2149dfa5939 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 15:43:53 +0000
+Subject: [PATCH 2/3] moe-cache: reset the pipelined used-list readback when a
+ table is re-allocated
+
+alloc_table_locked re-allocates used_dev / used_host / used_host2 on a re-arm, but used_pending and
+used_toggle carried over.  The first moe_cache_promote_host after the re-arm then consumed a buffer no
+readback had written (fresh pinned memory reads as zeros) and admitted expert 0 into slot 0 - in some of a
+layer's tables but not the others, depending on each table's carried-over state.  Every later admission then
+landed one slot further in those tables, so gate and up held the same experts in different slots, and the
+fused gate+up redirect (which reads the up table's remap for both lanes) read the wrong gate expert for about
+half the slots.  Seen with -sm tensor --n-cpu-moe 48 -ub 6144 and a 3072 MiB slab headroom: wrong but stable
+greedy output after the warm-up's eviction/re-arm, a different sha on every server start.
+
+Start the readback pipeline over on a (re)allocation and initialise used_dev to -1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index b31214577..960045c5c 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2271,7 +2271,14 @@ void alloc_table_locked(table_t & t, int slots) {
+                 t.used_dev = nullptr;
+             } else {
+                 t.used_cap = (int64_t) used_cap;
++                (void) cudaMemset(t.used_dev, 0xff, used_cap * sizeof(int32_t));
+             }
++            // A re-allocation (re-arm / re-size) starts the pipelined used-list readback over: no readback
++            // is in flight for these new buffers, so nothing may be consumed from them on the next promote.
++            // A carried-over `used_pending` made that promote read a never-written buffer and admit expert
++            // 0 into slot 0 of some of a layer's tables but not the others, shifting the layer's slot order.
++            t.used_pending = false;
++            t.used_toggle  = 0;
+             // The deferred promotion is per table per token; pageable D2H/H2D staging made it ~60 us
+             // per table.  Pinned staging cuts that by ~5x and keeps the promotion off the critical path.
+             if (t.used_dev != nullptr && cudaMallocHost((void **) &t.used_host, used_cap * sizeof(int32_t)) != cudaSuccess) {
+-- 
+2.53.0
+

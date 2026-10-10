@@ -1,0 +1,54 @@
+From 37fee75ffaf459af06f6c235c209fec89cbfa713 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 16:04:25 +0000
+Subject: [PATCH 3/3] moe-cache: upload the device expert->slot map after the
+ prompt-routing seed
+
+apply_prefill_seed_rank_locked evicts and places residents in a live table and fills the arena, but left the
+device `expert -> slot` map (slot_dev) as it was and did not mark it dirty, so it was only refreshed by a later
+promotion that happened to admit something.  Until then an evicted expert still pointed at its old slot,
+which the seed had refilled with another expert, and a remap-path table read that expert's weights for it.
+Seen with -sm tensor --n-cpu-moe 48 -ub 6144 and a 3072 MiB slab headroom: the second request after start
+(the first one after the seed) gave a different greedy output; a debug check found e.g. layer 42 mapping
+expert 501 to slot 177, which held expert 499, in gate, up and down on both devices.
+
+Upload the map at the end of the seed, as the promotion does (same stream, after the fill).  Device-policy
+tables keep their own map.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 960045c5c..93d4ee2d6 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1881,6 +1881,24 @@ int apply_prefill_seed_rank_locked(table_t & t, const std::vector<int32_t> & ran
+     }
+     if (placed > 0) {
+         t.fills += placed;
++        // The seed evicted and placed residents, so the device `expert -> slot` map must follow before the
++        // next graph reads it: left stale, an evicted expert still pointed at its old slot, which the seed had
++        // refilled with another expert (a remap-path table reads that expert's weights for it).  Same upload
++        // as the promotion's, on the same stream after the fill.  A device-policy table keeps its own map.
++        t.slot_dirty = true;
++        if (!t.policy && t.slot_dev != nullptr && t.slot_pin != nullptr) {
++            for (int i = 0; i < t.n_experts; i++) {
++                t.slot_pin[i] = -1;
++            }
++            for (const auto & kv : t.expert_slot) {
++                if (kv.first >= 0 && kv.first < t.n_experts) {
++                    t.slot_pin[kv.first] = kv.second;
++                }
++            }
++            (void) cudaMemcpyAsync(t.slot_dev, t.slot_pin, (size_t) t.n_experts * sizeof(int32_t),
++                                   cudaMemcpyHostToDevice, (cudaStream_t) stream);
++            t.slot_dirty = false;
++        }
+     }
+     return placed;
+ }
+-- 
+2.53.0
+
