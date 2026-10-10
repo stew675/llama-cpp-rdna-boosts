@@ -1,0 +1,100 @@
+From ab4690dca70896086289168bd23c5b204c73a21c Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 09:52:44 +0000
+Subject: [PATCH 3/3] common_sampler S2 fast path: AVX2 block prefilter (block
+ max + NaN flag)
+
+The exact top-k fast path scans the whole vocabulary (248k on qwen4exp) for every sampled position, and its
+per-64 block max/NaN loop was scalar (no float max reduction without fast-math): 14 % of the server main thread
+in a perf profile.  Same selection: the block max is only a filter and a NaN still sends the caller to the full
+path.  Runtime AVX2 check, scalar fallback.
+
+On Windows the AVX2 check uses IsProcessorFeaturePresent: clang with the MSVC ABI does not link
+compiler-rt, so __builtin_cpu_supports left __cpu_model undefined (fix and report by DanoPTT).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/sampling.cpp | 60 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 8fbc4db60..fe82adfd4 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -109,6 +109,54 @@ struct ring_buffer {
+     std::vector<T> data;
+ };
+ 
++// S2 block prefilter, 64 logits: the block max (only a filter: any logit above the threshold makes it exceed the
++// threshold too) and whether the block holds a NaN (the caller then takes the full path).  The scalar loop is not
++// vectorized by the compiler (a float max reduction without fast-math), and it runs over the whole vocabulary for
++// every sampled position.
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++#include <immintrin.h>
++__attribute__((target("avx2")))
++static void topk_block_scan_avx2(const float * p, float & bm, bool & bn) {
++    __m256 m   = _mm256_set1_ps(-INFINITY);
++    __m256 nan = _mm256_setzero_ps();
++    for (int j = 0; j < 64; j += 8) {
++        const __m256 x = _mm256_loadu_ps(p + j);
++        m   = _mm256_max_ps(m, x);
++        nan = _mm256_or_ps(nan, _mm256_cmp_ps(x, x, _CMP_UNORD_Q));
++    }
++    alignas(32) float v[8];
++    _mm256_store_ps(v, m);
++    float r = v[0];
++    for (int j = 1; j < 8; ++j) {
++        r = v[j] > r ? v[j] : r;
++    }
++    bm = r;
++    bn = _mm256_movemask_ps(nan) != 0;
++}
++#ifdef _WIN32
++// clang with the MSVC ABI does not link compiler-rt, so __builtin_cpu_supports leaves __cpu_model undefined.
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++static bool topk_block_scan_avx2_ok() {
++    static const bool ok = IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != 0;
++    return ok;
++}
++#else
++static bool topk_block_scan_avx2_ok() {
++    static const bool ok = __builtin_cpu_supports("avx2");
++    return ok;
++}
++#endif
++#else
++static void topk_block_scan_avx2(const float *, float &, bool &) {}
++static bool topk_block_scan_avx2_ok() { return false; }
++#endif
++
+ struct common_sampler {
+     common_params_sampling params;
+ 
+@@ -152,10 +200,14 @@ struct common_sampler {
+             const int i1 = std::min(i0 + B, n_vocab);
+             float bm = -INFINITY;
+             bool  bn = false;
+-            for (int i = i0; i < i1; ++i) {
+-                const float x = logits[i];
+-                bm = x > bm ? x : bm;
+-                bn |= x != x;
++            if (i1 - i0 == B && topk_block_scan_avx2_ok()) {
++                topk_block_scan_avx2(logits + i0, bm, bn);
++            } else {
++                for (int i = i0; i < i1; ++i) {
++                    const float x = logits[i];
++                    bm = x > bm ? x : bm;
++                    bn |= x != x;
++                }
+             }
+             bad |= bn;
+             if (!(bm > thr)) {
+-- 
+2.53.0
+

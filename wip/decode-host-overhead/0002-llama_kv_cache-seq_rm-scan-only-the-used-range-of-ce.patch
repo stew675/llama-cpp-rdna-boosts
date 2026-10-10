@@ -1,0 +1,42 @@
+From 68a28cfbf7bd876751727cb7c152a7576d4939b3 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 09:49:51 +0000
+Subject: [PATCH 2/3] llama_kv_cache::seq_rm: scan only the used range of cells
+
+Speculative decoding rolls back rejected drafts with seq_rm on every step; with -c 262144 the loop walked all
+262144 cells (7.9 % of the main thread in a perf profile) although only the used range can match (an empty
+cell has pos -1).  Bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-kv-cache.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 44ae21dff..34848f14f 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -403,7 +403,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         uint32_t new_head = cells.size();
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
++        // only the used range can match: an empty cell's pos is -1 (bounds taken before the loop changes them)
++        const uint32_t i_end = cells.used_max_p1();
++        for (uint32_t i = cells.used_min(); i < i_end; ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+             }
+@@ -427,7 +429,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+             uint32_t new_head = cells.size();
+ 
+-            for (uint32_t i = 0; i < cells.size(); ++i) {
++            const uint32_t i_end = cells.used_max_p1();
++            for (uint32_t i = cells.used_min(); i < i_end; ++i) {
+                 if (!cells.pos_in(i, p0, p1)) {
+                     continue;
+                 }
+-- 
+2.53.0
+

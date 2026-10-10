@@ -1,0 +1,153 @@
+From a34ffccd3b40965c7a9e07f0d993fcc762f62a49 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Fri, 9 Oct 2026 12:16:51 +0000
+Subject: [PATCH 1/3] ggml-cuda: opt-in async graph-input uploads
+ (GGML_CUDA_ASYNC_INPUT=1)
+
+ggml_backend_cuda_buffer_set_tensor waits for every host->device copy.  In a speculative decode step under
+-sm tensor that is ~91 small graph-input uploads per step (~2.6 ms of a ~25 ms step with the host blocked).
+
+With GGML_CUDA_ASYNC_INPUT=1, a write of <= 1 MiB into a COMPUTE buffer is staged through a per-device 16 MiB
+pinned ring and copied asynchronously on cudaStreamPerThread (the stream the synchronous path uses, so a later
+get_tensor stays ordered after it), with an event recorded after it.  The next graph_compute on that device, and
+a device->device cpy_tensor_async out of it, make their stream wait for that event.  The copy itself waits (on
+the GPU) for an event recorded when the previous graph_compute on that device returned, so an input is never
+overwritten while the previous graph may still read it.  The ring is reused after draining the copy stream once
+per lap.  Off by default; any failure to set up the ring falls back to the synchronous path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 99 +++++++++++++++++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c934d3ee5..dcdae6b1d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1591,10 +1591,104 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ }
+ 
+ 
++// GGML_CUDA_ASYNC_INPUT=1: graph inputs (small host -> device writes into a compute buffer) are staged through a
++// per-device pinned ring and copied asynchronously on cudaStreamPerThread (the stream the synchronous path uses, so a
++// later get_tensor stays ordered after it); an event is recorded per copy and the next graph on that device makes its
++// compute stream wait for it (ggml_cuda_async_input_wait).  The host no longer waits for each input copy.  The ring
++// is reused only after a full drain of the copy stream (once per lap).
++struct ggml_cuda_async_input_dev {
++    std::mutex  mtx;
++    char *      ring    = nullptr;
++    size_t      cap     = 0;
++    size_t      head    = 0;
++    cudaEvent_t ev      = nullptr;
++    bool        pending = false;
++    int64_t     hits    = 0;
++    cudaEvent_t done_ev  = nullptr;   // recorded on the compute stream when a graph_compute returns
++    bool        has_done = false;
++};
++static ggml_cuda_async_input_dev g_async_input[GGML_CUDA_MAX_DEVICES];
++static const bool g_async_input_on = [] {
++    const char * e = getenv("GGML_CUDA_ASYNC_INPUT");
++    return e != nullptr && atoi(e) != 0;
++}();
++static constexpr size_t GGML_CUDA_ASYNC_INPUT_MAX  = 1u << 20;
++static constexpr size_t GGML_CUDA_ASYNC_INPUT_RING = 16u << 20;
++
++static bool ggml_cuda_async_input_set(int device, void * dst, const void * src, size_t size) {
++    ggml_cuda_async_input_dev & d = g_async_input[device];
++    std::lock_guard<std::mutex> lock(d.mtx);
++    if (d.ring == nullptr) {
++        if (cudaMallocHost((void **) &d.ring, GGML_CUDA_ASYNC_INPUT_RING) != cudaSuccess ||
++            cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming) != cudaSuccess ||
++            (d.done_ev == nullptr && cudaEventCreateWithFlags(&d.done_ev, cudaEventDisableTiming) != cudaSuccess)) {
++            (void) cudaGetLastError();
++            d.ring = nullptr;
++            return false;
++        }
++        d.cap = GGML_CUDA_ASYNC_INPUT_RING;
++    }
++    const size_t need = (size + 255) & ~(size_t) 255;
++    if (d.head + need > d.cap) {
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));   // every copy out of the ring has completed
++        d.head = 0;
++    }
++    char * slot = d.ring + d.head;
++    d.head += need;
++    memcpy(slot, src, size);
++    if (d.has_done) {
++        // the previous graph on this device may still read this input: copy only after it (a GPU-side wait)
++        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.done_ev, 0));
++    }
++    CUDA_CHECK(cudaMemcpyAsync(dst, slot, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    CUDA_CHECK(cudaEventRecord(d.ev, cudaStreamPerThread));
++    d.pending = true;
++    if (d.hits++ == 0) {
++        GGML_LOG_WARN("%s: device %d: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1)\n", __func__, device);
++    }
++    return true;
++}
++
++struct ggml_cuda_async_input_done_guard {
++    int          device;
++    cudaStream_t stream;
++    ~ggml_cuda_async_input_done_guard() {
++        if (!g_async_input_on) {
++            return;
++        }
++        ggml_cuda_async_input_dev & d = g_async_input[device];
++        std::lock_guard<std::mutex> lock(d.mtx);
++        if (d.done_ev == nullptr && cudaEventCreateWithFlags(&d.done_ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            d.done_ev = nullptr;
++            return;
++        }
++        CUDA_CHECK(cudaEventRecord(d.done_ev, stream));
++        d.has_done = true;
++    }
++};
++
++static void ggml_cuda_async_input_wait(int device, cudaStream_t stream) {
++    if (!g_async_input_on) {
++        return;
++    }
++    ggml_cuda_async_input_dev & d = g_async_input[device];
++    std::lock_guard<std::mutex> lock(d.mtx);
++    if (d.pending) {
++        CUDA_CHECK(cudaStreamWaitEvent(stream, d.ev, 0));
++        d.pending = false;
++    }
++}
++
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    if (g_async_input_on && size <= GGML_CUDA_ASYNC_INPUT_MAX &&
++        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++        ggml_cuda_async_input_set(ctx->device, (char *) tensor->data + offset, data, size)) {
++        return;
++    }
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -4344,6 +4438,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         return false;
+     }
+ 
++    // an async graph-input upload into src may still be in flight (GGML_CUDA_ASYNC_INPUT=1)
++    ggml_cuda_async_input_wait(cuda_ctx_src->device, cuda_ctx_src->stream());
++
+     if (backend_src != backend_dst) {
+         // copy on src stream
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+@@ -8263,6 +8360,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_async_input_wait(cuda_ctx->device, cuda_ctx->stream());
++    const ggml_cuda_async_input_done_guard async_input_done { cuda_ctx->device, cuda_ctx->stream() };
+ 
+     if (g_stream_dbg_on) {
+         static int n = 0;
+-- 
+2.53.0
+
