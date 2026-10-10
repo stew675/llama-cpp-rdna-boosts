@@ -1,0 +1,109 @@
+From adc5ab7f8c4026f94a2a9866d42fff5339efe460 Mon Sep 17 00:00:00 2001
+From: briansp2020 <bsp2020@gmail.com>
+Date: Sun, 4 Oct 2026 17:56:32 +0000
+Subject: [PATCH] ggml-cuda: GGML_CUDA_POOL_CACHE_MB caps cached bytes in the
+ legacy pool
+
+Long prefills request pool temporaries that grow with the KV length; each new,
+larger buffer leaves its predecessors cached, and that idle VRAM starves
+allocations made outside the pool (compute-buffer re-reserves, FA staging).
+With the cap set, the pool flushes its cached buffers before a new device
+allocation once they exceed the cap.  Unset/0 keeps the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 445c5a198..d11165f3e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1369,6 +1369,8 @@ static bool ggml_cuda_pool_floor_refuses(size_t size) {
+     return f < size + floor;
+ }
+ 
++static bool ggml_cuda_graph_capture_active();
++
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+ 
+@@ -1380,9 +1382,17 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+ 
+     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
+     size_t pool_size = 0;
++    // GGML_CUDA_POOL_CACHE_MB: cap on the bytes of FREED buffers the pool keeps cached (unset/0 = unlimited).
++    // Temporaries that grow with the KV length (long prefills) otherwise leave every smaller predecessor cached,
++    // and that idle VRAM starves allocations made outside the pool (graph/compute buffers, FA staging).
++    size_t cached_size = 0;
++    size_t cache_cap   = 0;
+ 
+     explicit ggml_cuda_pool_leg(int device) :
+         device(device) {
++        const char * cap = getenv("GGML_CUDA_POOL_CACHE_MB");
++        const long long mb = cap ? atoll(cap) : 0;
++        cache_cap = mb > 0 ? (size_t) mb << 20 : 0;
+     }
+ 
+     ~ggml_cuda_pool_leg() {
+@@ -1402,6 +1412,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+                 b.size = 0;
+             }
+         }
++        cached_size = 0;
+     }
+ 
+     void * alloc(size_t size, size_t * actual_size) override {
+@@ -1426,6 +1437,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+                         if (!best_diff) {
+                             void * ptr = b.ptr;
+                             *actual_size = b.size;
++                            cached_size -= b.size;
+                             b.ptr = nullptr;
+                             b.size = 0;
+                             return ptr;
+@@ -1438,6 +1450,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+             ggml_cuda_buffer& b = buffer_pool[ibest];
+             void * ptr = b.ptr;
+             *actual_size = b.size;
++            cached_size -= b.size;
+             b.ptr = nullptr;
+             b.size = 0;
+             return ptr;
+@@ -1446,6 +1459,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         size_t look_ahead_size = (size_t) (1.05 * size);
+         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
+         ggml_cuda_set_device(device);
++        // never flush while a CUDA graph is being captured: the sync is illegal and the capture may reference the
++        // cached buffers; the next allocation outside capture flushes instead
++        if (cache_cap && cached_size > cache_cap && !ggml_cuda_graph_capture_active()) {
++            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: %.2f MiB cached exceeds GGML_CUDA_POOL_CACHE_MB, flushing\n",
++                           device, cached_size/1024.0/1024.0);
++            CUDA_CHECK(cudaDeviceSynchronize());
++            clear_pool();
++        }
+         static const bool gc_dbg = getenv("GGML_CUDA_GCDBG") != nullptr;
+         const int64_t t_pl = gc_dbg ? ggml_time_us() : 0;
+         // With the MoE expert cache holding host-expert tables, the first attempt keeps a free-VRAM floor and the
+@@ -1486,6 +1507,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+             if (b.ptr == nullptr) {
+                 b.ptr = ptr;
+                 b.size = size;
++                cached_size += size;
+                 return;
+             }
+         }
+@@ -1668,6 +1690,10 @@ static std::mutex ggml_cuda_lock;
+ static std::condition_variable ggml_cuda_lock_cv;
+ static std::atomic<int> ggml_cuda_lock_counter;
+ 
++static bool ggml_cuda_graph_capture_active() {
++    return ggml_cuda_lock_counter.load(std::memory_order_relaxed) > 0;
++}
++
+ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     ggml_cuda_mmb_release_all();
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+-- 
+2.53.0
+
