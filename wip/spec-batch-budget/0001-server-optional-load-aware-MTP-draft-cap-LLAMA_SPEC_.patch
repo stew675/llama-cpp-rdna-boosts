@@ -1,0 +1,66 @@
+From bfd59c36059b693dd05f42e82a620fff5361d9b2 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 13 Oct 2026 14:59:08 +0000
+Subject: [PATCH] server: optional load-aware MTP draft cap
+ (LLAMA_SPEC_BATCH_BUDGET)
+
+With several generating slots the verify batch is n_slots * (1 + n_draft) tokens, and once it is wide enough each
+extra draft token costs more than it gains.  LLAMA_SPEC_BATCH_BUDGET=N caps each slot's draft at
+max(1, N / n_generating - 1) while more than one slot is generating; a single request is never capped.  Unset = off.
+
+2 x R9700, Qwen3.8-Flash-Next IQ3_XXS all in VRAM, -sm tensor + MTP draft (n-max 3), one binary, budget 8 vs
+unset, two rounds: 4 concurrent requests 166.8 -> 181.3 t/s aggregate (+8.7 %); 2 and 3 concurrent within noise;
+single-request greedy output and speed unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server-context.cpp | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 32765716b..1f9878865 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,3 +1,4 @@
++#include <climits>
+ #include "server-context.h"
+ #include "server-chat.h"
+ #include "server-common.h"
+@@ -3361,6 +3362,25 @@ private:
+         std::vector<server_slot *> generating;
+         std::vector<server_slot *> drafting;
+ 
++        // Load-aware draft cap (LLAMA_SPEC_BATCH_BUDGET=N, off when unset): with several generating slots the
++        // verify batch is n_slots * (1 + n_draft) tokens; above ~8 tokens the decode kernels leave their small-batch
++        // paths and each extra draft token costs more than it gains.  Cap each slot's draft so the batch stays within
++        // the budget, but keep at least one draft token per slot.
++        static const int spec_budget = [] {
++            const char * e = getenv("LLAMA_SPEC_BATCH_BUDGET");
++            return e != nullptr ? std::max(0, atoi(e)) : 0;
++        }();
++        int spec_cap = INT_MAX;
++        if (spec && spec_budget > 0) {
++            int n_gen = 0;
++            for (const auto & slot : slots) {
++                n_gen += slot.state == SLOT_STATE_GENERATING;
++            }
++            if (n_gen > 1) {
++                spec_cap = std::max(1, spec_budget / n_gen - 1);
++            }
++        }
++
+         // determine which slots are generating and drafting
+         iterate(slots, [&](server_slot & slot) {
+             if (slot.state != SLOT_STATE_GENERATING) {
+@@ -3382,7 +3402,7 @@ private:
+                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+ 
+-                const int n_draft_max = slot.get_n_draft_max();
++                const int n_draft_max = std::min(slot.get_n_draft_max(), spec_cap);
+ 
+                 if (n_draft_max > 0) {
+                     GGML_ASSERT(slot.can_speculate());
+-- 
+2.53.0
+
