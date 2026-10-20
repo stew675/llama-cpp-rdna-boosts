@@ -1,5 +1,51 @@
 # WORKLOG - dated delivery records
 
+## 261019.012 (no release) -- `wip/nwarps` RESOLVED: the RDNA3_0 per-shape `nwarps` impurity was the *fusion exclusion*, not a missing reduction-mapping derivation
+
+**Campaign resolved (promotion pending the maintainer; record stays in `wip/nwarps/` until it is promoted or
+dropped).**  Patch `wip/nwarps/patches/per-shape-nwarps-rdna3-0.patch` (sha256 `eb32d36c…`, applies clean to
+the r91 tree `90507dfb5`, `git apply --check` + full apply verified on a fresh worktree), default **OFF** =
+byte-identical to the delivery (width-probe hashes unchanged at threshold 0).  gfx1100 (RX 7900 XTX), ROCm
+10.1.0, single GPU, built with `~/bin/build-llama-rocm`.
+
+**Root cause found.**  The candidate excluded the *fused* single-token launches
+(`small_m = … && !has_fusion && M <= threshold`), so for a scoped tensor the rms_norm→Q8_1 fold / SSM
+gate-beta / shared-expert-down fusion ran at the table's **8** warps at `W = 1` while the plain ksplit launch
+ran at **1** warp at `W = 2..8` — a decode-vs-verify K-split-order split, i.e. the impurity itself.  **No
+reduction-mapping re-derivation was needed**: the ksplit K loop is `kbx = tid/(qi/vdr) + m*blocks_per_iter`
+(a fixed per-thread residue class, independent of `ncols_dst` / `rows_per_block` / token index) and the
+warp + serial cross-warp trees are fixed for a given `nwarps`, so one value per shape *is* the width
+invariance requirement.  Fix: forward the row-scoped value to every launch of the tensor, including the
+three fusion kernels that reproduce a dense weight launch (`ssm_gate_beta`, `ssm_conv_l2_gatebeta`,
+`shexp_down_gate`) — the contract those kernels already document for `long_k`.
+
+**Purity (the blocker) — PASS everywhere** (`test-logits-width-probe` P=1024 ub=512 KV=f16).  All four
+models (35B-A3B Q4_K_M, gemma-26B Q4_K_XL, gemma-12B Q8_0, 27B Q4_K_M) PASS at the recommended `=8192`,
+and every *previously failing* cell is now `PASS maxdiff 0`: 35B 2048 (was 0.150), gemma-26B 4096 (was
+**3.35**), 27B 6144 (was 0.165), and 35B / gemma-26B / gemma-12B / 27B blanket 1e9 (27B was 0.166).
+27B × the eight native KV types at 8192: all PASS.  35B-A3B PPL 5.7861 both thresholds (per-chunk
+losses identical); greedy text coherent.
+
+**Retuned from measurement** (`tg128 -d 16384`, `r=3`): the 35B's win is its **M = 8192** Q8_0 shapes only
+(nothing below 8192: 2048/4096 are flat-to-negative), gemma-26B gains from Q4_0 at *every* row count
+(lm_head worth ~1.8 %), gemma-12B loses 2 % when **M = 15360** flips, 27B loses 0.6 % when its `M = 48 /
+1024` Q8_0 or its Q6_K/IQ4_NL shapes flip.  Shipped rule: `Q4_0/Q4_1/Q5_0/Q5_1` narrow always, `Q8_0`
+narrow for `2048 <= M <= GGML_CUDA_MMVQ_RDNA3_SMALL_M`, `Q6_K/IQ4_NL` unchanged.
+
+**Numbers at the recommended `=8192`:** 35B-A3B tg128 d16384 125.09/125.59 → 127.23/127.38 (**+1.7-2.0 %**);
+gemma-26B 125.14 → **131.45** (**+5.0 %**); gemma-12B d0 54.05 → 54.28 (+0.4 %); 27B d16384 40.14 → 40.16
+(neutral).  35B-A3B MTP n3 (`-n 400 --temp 0`, repeatable): prose 200.6 → **222.0 t/s (+10.7 %)**, code
+235.5 → **250.2 (+6.3 %)**; acceptance 0.653→0.750 / 0.801→0.851, so part of the MTP gain is an
+acceptance shift (a changed reduction order moves near-ties), while the plain-decode gains are kernel time
+only.  **The old record's `+2.1 % MTP / +9 % blanket` figures are superseded** — they were measured with the
+impure patch.
+
+**Cost.**  The template axis is `if constexpr`-gated to the 7 RDNA3_0 wide types and `ncols_dst <= 8`:
+`mmvq.cu.o` 13.64 → 15.36 MiB (+12.6 %), `mul_mat_vec_q_ksplit` symbols 2188 → 2640 (+20.7 %) vs
++41 %/+100 % for the ungated original.  **Promotion recipe** (knob default-on + `GGML_CUDA_MMVQ_RDNA3_SMALL_M=0`
+kill-switch, then the W-probe / four-axis MTP / PPL / batched-bench / prefill-logit gates) is §6 of
+`wip/nwarps/README.md`.
+
 ## 261019.011 (no release) -- rdna35 mmvq fusion: the impurity is the preempted `GLU -> MMQ down` fusion, not the fused gate/up
 
 **Campaign closed (ending B).**  `wip/rdna35-mmvq-fusion-perf/` -> `archive/work/rdna35-mmvq-fusion-perf/`
