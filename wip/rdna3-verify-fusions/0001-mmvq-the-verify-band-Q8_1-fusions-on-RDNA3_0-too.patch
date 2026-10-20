@@ -1,0 +1,67 @@
+From 62c5552cca06edff8f1a4710f5670620ef86c066 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Mon, 19 Oct 2026 19:46:31 -0700
+Subject: [PATCH 1/2] mmvq: the verify-band Q8_1 fusions on RDNA3_0 too
+
+ggml_cuda_should_fuse_mul_mat_vec_q(..., verify_band = true) let the
+2..8-token verify band take the Q8_1 pre-quantize fusions (residual ADD
++ rms_norm -> Q8_1, rms_norm -> Q8_1, gated unary -> Q8_1) on RDNA4
+only.  Those kernels are row-generic and write the values quantize_q8_1
+would write, and nothing else in their matchers is arch-specific, so
+admit RDNA3_0 (gfx1100-1102) as well.  RDNA3_5 stays out (not measured).
+Bit-identical output; GGML_CUDA_FUSE_Q8_1_VERIFY=0 still turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu          | 2 +-
+ ggml/src/ggml-cuda/mmvq.cu               | 5 +++--
+ 3 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 214b5d110..27e750629 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1461,7 +1461,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0: off): an F32 GLU whose next node (or the one after a reshape) is a verify-band
+-    // mmvq matmul over it is marked here (RDNA4 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
++    // mmvq matmul over it is marked here (RDNA4 / RDNA3_0 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
+     // GLU launcher then also writes the matmul's Q8_1 blocks into the quantize cache, which the matmul finds.
+     // GLU -> Q8_1 marking (owned by mmvq.cu).
+     ggml_cuda_glu_q8_1_mark(*cuda_ctx, cgraph, i);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0ace1a3af..2794e7132 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3493,7 +3493,7 @@ bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+ 
+ 
+ // verify_band: callers that only pre-fill the mmvq Q8_1 activation cache (norm -> Q8_1, gated unary -> Q8_1)
+-// and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
++// and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 and RDNA3_0 the verify band
+ // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
+ // stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f5335782f..15653d31f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2909,10 +2909,11 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
++    //we only support fusion for ncols_dst = 1 (the RDNA4 / RDNA3_0 verify band too for verify_band callers)
+     static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
++    const bool verify_band_arch = GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_0(cc);
+     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+-            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
++            !(verify_band && q8_1_verify && verify_band_arch && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+         return false;
+     }
+ 
+-- 
+2.56.0
+

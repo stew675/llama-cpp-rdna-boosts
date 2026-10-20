@@ -1,0 +1,70 @@
+From cce5e5c11c40c8394748e2e0169d599a28ac93a0 Mon Sep 17 00:00:00 2001
+From: "Brian S. Park" <brianspark@hotmail.com>
+Date: Mon, 19 Oct 2026 20:32:24 -0700
+Subject: [PATCH 2/2] cuda: the GDN conv verify path and the batched f32 CPY on
+ RDNA3_0 too
+
+Two launch-count fusions for the speculative verify step were gated to
+RDNA4 only: the direct GDN conv for 2..255-token batches (in place of
+CONCAT + SSM_CONV + SILU; same 4-tap order and silu, the snapshot tail
+still materialized) and the batched run of f32 GGML_OP_CPY nodes (one
+launch for up to 16 same-layout copies).  Neither depends on anything
+RDNA4-specific, so admit RDNA3_0 (gfx1100-1102) as well; RDNA3_5 stays
+out (not measured).  Bit-identical output.
+GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 / GGML_CUDA_FUSE_CPY_BATCH=0 still turn
+them off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/cpy-batch.cu  | 3 ++-
+ ggml/src/ggml-cuda/cpy-batch.cuh | 2 +-
+ ggml/src/ggml-cuda/gdn-conv.cu   | 5 +++--
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/cpy-batch.cu b/ggml/src/ggml-cuda/cpy-batch.cu
+index fe1c21606..a2575b4c1 100644
+--- a/ggml/src/ggml-cuda/cpy-batch.cu
++++ b/ggml/src/ggml-cuda/cpy-batch.cu
+@@ -63,7 +63,8 @@ void cb_span(const ggml_tensor * t, uintptr_t & lo, uintptr_t & hi) {
+ } // namespace
+ 
+ int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+-    if (!cb_on() || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return 0;
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!cb_on() || !(GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_0(cc))) return 0;
+     ggml_tensor * first = cgraph->nodes[i];
+     if (!cb_member(first)) return 0;
+     // the run: copies with the first one's layouts, possibly separated by no-op view nodes (consumed with the run)
+diff --git a/ggml/src/ggml-cuda/cpy-batch.cuh b/ggml/src/ggml-cuda/cpy-batch.cuh
+index 3a0278fdd..f00a6c0ef 100644
+--- a/ggml/src/ggml-cuda/cpy-batch.cuh
++++ b/ggml/src/ggml-cuda/cpy-batch.cuh
+@@ -1,6 +1,6 @@
+ #pragma once
+ #include "common.cuh"
+-// Batched copy (RDNA4; GGML_CUDA_FUSE_CPY_BATCH=0 turns it off): runs a run of consecutive f32 GGML_OP_CPY nodes that
++// Batched copy (RDNA4 / RDNA3_0; GGML_CUDA_FUSE_CPY_BATCH=0 turns it off): runs a run of consecutive f32 GGML_OP_CPY nodes that
+ // share the source shape / strides and the destination shape / strides (only the data addresses differ) as one launch, e.g. the
+ // per-position DeltaNet conv-state snapshots of a speculative verify batch (one copy per drafted position and layer).  Element
+ // copies in ggml_cpy's flat order: bit-identical.
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index 972ec0a7c..28b83ec7c 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -66,10 +66,11 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
+     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
+-    // On RDNA4 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
++    // On RDNA4 and RDNA3_0 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
+     // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
+     static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
+-    const bool verify_ok = conv_verify && T >= 2 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++    const int  cc_verify = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    const bool verify_ok = conv_verify && T >= 2 && (GGML_CUDA_CC_IS_RDNA4(cc_verify) || GGML_CUDA_CC_IS_RDNA3_0(cc_verify));
+     if ((T < 256 && !verify_ok) || C % 256 != 0) return false;
+     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+     int64_t tail_from = T + 3; int conv = -1;
+-- 
+2.56.0
+
