@@ -1,5 +1,29 @@
 # WORKLOG - dated delivery records
 
+## 261019.013 (no release) -- `wip/nwarps` promotion handover: default-on patch cut, fold recipe + per-box gates written
+
+**Handover ready for the main development host; nothing in the delivery changed.**  New
+`wip/nwarps/PROMOTION.md` + `HANDOVER-PROMPT.md`, and the second artifact
+`wip/nwarps/patches/per-shape-nwarps-rdna3-0-promoted.patch` (sha256 `55a7cd76…`, single commit,
+**default-on**).  The existing `…/per-shape-nwarps-rdna3-0.patch` (`eb32d36c…`) stays as the
+default-**off** A/B / beta / bisect variant; the two differ only in the `getenv` default.
+
+**The promoted state is validated, not just inverted.**  On gfx1100, with the environment unset, the
+promoted build reproduces the measured `GGML_CUDA_MMVQ_RDNA3_SMALL_M=8192` result exactly (35B-A3B
+`W = 1..8` probe row-0 hash `9712377b5b34f8f3`, PASS; `tg128` d16384 **127.26** t/s; gemma-26B
+**131.32** t/s) and `GGML_CUDA_MMVQ_RDNA3_SMALL_M=0` reproduces the r91 delivery (row-0
+`7e21f25829185919`, PASS), so the kill-switch is intact.  Both patches `git am` clean on a fresh
+worktree at the r91 tree `90507dfb5`.
+
+**Fold target.**  The change is three files under `ggml/src/ggml-cuda/`: `mmvq-rdna.cuh` and
+`mmvq-rdna-params.cuh` are **created by block 08**, and `mmvq.cu` is additionally touched by blocks
+07/09/10 — so the fold goes into block 08 (keep both sides on a replay conflict; the delivered tree is
+what ships).  `PROMOTION.md` carries the ready-to-paste `ENVIRONMENT.md` §7.4 kill-switch row, the
+`GREEDY-PURITY.md` §19/§25 invariant this campaign paid for ("a shape-scoped launch parameter must be
+forwarded to every kernel that reproduces that launch"), the block-08 `patches/README.md` note, and the
+gate list.  The key gate is free and decisive: **gfx1201 must be byte-identical to r91** (the scope is
+`table_id == MMVQ_PARAMETERS_RDNA3_0` only, so any diff on RDNA4 means the scope leaked).
+
 ## 261019.012 (no release) -- `wip/nwarps` RESOLVED: the RDNA3_0 per-shape `nwarps` impurity was the *fusion exclusion*, not a missing reduction-mapping derivation
 
 **Campaign resolved (promotion pending the maintainer; record stays in `wip/nwarps/` until it is promoted or

@@ -1,11 +1,18 @@
 # `wip/nwarps` — RDNA3_0 per-shape `nwarps` for the dense mmvq weight kernel: **RESOLVED**
 
 **Status: RESOLVED 2026-10-19 (opened 2026-09-21) — the width impurity is fixed, the knob is bit-pure
-at every threshold, and the scope is retuned from measurement.  Promotion-ready; still env-gated OFF
-because this is WIP (not part of the delivery, not in `beta/`).**
+at every threshold, the scope is retuned from measurement, and a default-on promotion patch is cut
+(§6).  Still WIP in this directory (not part of the delivery until the main development host folds it
+into a block; not in `beta/`).**
 
-* Patch: [`patches/per-shape-nwarps-rdna3-0.patch`](patches/per-shape-nwarps-rdna3-0.patch)
-  (sha256 `eb32d36c…`, 3 files, applies to the current `release.json` tree).
+* **Deliverables** (both apply to the current `release.json` tree, `git am`/`git apply` verified):
+  * [`patches/per-shape-nwarps-rdna3-0-promoted.patch`](patches/per-shape-nwarps-rdna3-0-promoted.patch)
+    (sha256 `55a7cd76…`) — **the one to fold into a block**: single commit, **default-on**
+    (`GGML_CUDA_MMVQ_RDNA3_SMALL_M=0` is the kill-switch).
+  * [`patches/per-shape-nwarps-rdna3-0.patch`](patches/per-shape-nwarps-rdna3-0.patch)
+    (sha256 `eb32d36c…`) — the same change **default-off**, for an A/B, a beta test or a bisect.
+  * The two differ only in the `getenv` default.  Fold/promotion instructions, the doc edits that go
+    with it and the per-box gates: [`PROMOTION.md`](PROMOTION.md).
 * The originating record is
   [`archive/work/mmb-general/gfx1100-s9-nwarps-results.md`](../../archive/work/mmb-general/gfx1100-s9-nwarps-results.md)
   (the gfx1100 session that found the candidate and stopped on the impurity).  Its conclusion —
@@ -153,21 +160,22 @@ draft/verify agreement); the plain-decode gains above are kernel-time only.  Pla
 reference: 129.1 t/s (thr 0).  The old record's "+2.1 % MTP / +9 % blanket" numbers were measured with
 the impure patch — do not quote them.
 
-## 6. Promotion (what the maintainer decides)
+## 6. Promotion
 
 The rule is non-negative on all four measured models, so the recommendation is to promote it into a
-block with the knob **default-on** and the usual gates:
+block with the knob **default-on**.  That state is already cut and handed over as
+[`patches/per-shape-nwarps-rdna3-0-promoted.patch`](patches/per-shape-nwarps-rdna3-0-promoted.patch)
+(verified: unset environment == the measured `=8192` build, `=0` == the r91 table).
 
-1. In `mmvq-rdna-params.cuh`, invert the knob: `mmvq_rdna3_0_small_m()` returns `8192` unless
-   `GGML_CUDA_MMVQ_RDNA3_SMALL_M=0` (or a `GGML_CUDA_MMVQ_RDNA3_TABLE=1` kill-switch restoring the
-   wide-block table).  Document it in `ENVIRONMENT.md` as a kill-switch (default-on, set to disable).
-2. Re-run on RDNA3_0: the `W = 1..8` probe (all four models × the eight KV types), the adaptive-MTP
-   four-axis gate (`benchmarks/mtp-adaptive-methodology.md`, `-n 3000`, reasoning pinned), PPL parity,
-   the stock-relative `llama-batched-bench -npl 1,4,8` gate, and `scripts/gate-prefill-logits.sh`
-   (expected to be a no-op — mmvq never runs in prefill — but it is the release gate).
-3. Only `mmvq-rdna*.cuh` + `mmvq.cu` change; no other backend's dispatch is touched (the knob is
-   `table_id == MMVQ_PARAMETERS_RDNA3_0` only), so scope policy is satisfied.  gfx1151/RDNA4 want
-   their own sweeps before any analogous change (they have their own band-uniform tables).
+The fold itself — which block owns which file (the two policy headers are **block 08**'s; `mmvq.cu` is
+shared with 07/09/10), the ready-to-paste `ENVIRONMENT.md` row and `GREEDY-PURITY.md` invariant, the
+per-box gates (including "gfx1201 must be byte-identical" — the scope is RDNA3_0-only), the expected
+RDNA3_0 numbers and the rollback — is [`PROMOTION.md`](PROMOTION.md).
+
+Nothing outside `mmvq-rdna*.cuh` + `mmvq.cu` changes, and the knob is
+`table_id == MMVQ_PARAMETERS_RDNA3_0` only, so no other backend's dispatch is touched (scope policy
+satisfied).  gfx1151/RDNA4 want their own sweeps before any analogous change — they have their own
+band-uniform tables.
 
 ## 7. Reproduce
 
