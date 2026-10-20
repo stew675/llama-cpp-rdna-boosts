@@ -1,28 +1,31 @@
 # halo — architecture-independent fixes found while scoping TODO #56/#57/#71
 
-**Status: OPEN (2026-10-20) — three fixes ready as a self-contained patch; #56 reproduced; #57 does not
+**Status: OPEN (2026-10-20) — three fixes rebased onto r96 and validated; #56 reproduced; #57 does not
 reproduce here.**  Not part of the delivery; the patch is for the main development box to integrate
 (fold each commit into its owning block).  Nothing here is pushed or applied by `apply-all.sh`.
 
-Box: `halo` — gfx1151 (Radeon 8060S), **1 device**, 123 GiB unified, ROCm 10.1.0, r95 tree.
-Branches: delivery `halo/todo-56-57-71`; fork `~/llama.cpp` `halo/todo-56-57-71` (3 commits on the r95
-tree `5129694…`).  The main box's `main` is untouched.
+Box: `halo` — gfx1151 (Radeon 8060S), **1 device**, 123 GiB unified, ROCm 10.1.0, **r96** tree.
+Release: **`v12-097cf33d9-r96`** (base `097cf33d9`, canonical tip `2fc3b2f53`, tree
+`cad83cc3…`); the fork's `origin/rdna-boosts` is `a0bddc9d1` with the same tree.
+Branches: delivery `halo/todo-56-57-71` (rebased onto `origin/main` = `461edf24`); fork
+`~/llama.cpp` `halo/todo-56-57-71-r96` (3 commits on `origin/rdna-boosts`).  The main box's `main` is
+untouched by this work.
 
 Cold start: `AGENTS.md` (report-before-shipping, WIP rules), then this file.
 
 ## The patch (for the main box)
 
-Three commits on top of the r95 tree.  `git format-patch` series and a combined diff are in this
-directory:
+Three commits on top of the r96 tree (fork `halo/todo-56-57-71-r96`, commits `eebdc2f30`, `6537f51d4`,
+`b99817258`).  `git format-patch` series and a combined diff are in this directory:
 
 | file | sha256 |
 |---|---|
-| `0001-halo-MoE-host-expert-accounting-must-not-key-a-devic.patch` | `5dcd8e06…` |
-| `0002-halo-gate-the-QSA-derived-visibility-form-on-the-act.patch` | `3be05ff5…` |
-| `0003-halo-the-rollback-narrow-reserve-must-use-the-real-s.patch` | `445a7973…` |
-| `halo-arch-fixes.patch` (all three, `git diff`) | `fc95de21…` |
+| `0001-halo-MoE-host-expert-accounting-must-not-key-a-devic.patch` | `8a677c98e621b2634d83195d00b702196b6b33205bb879abb09b21495ff9bbda` |
+| `0002-halo-gate-the-QSA-derived-visibility-form-on-the-act.patch` | `3d0494a02c6b94e52ab363f248dd4c0833640da6e44ea3e5824247559a593748` |
+| `0003-halo-the-rollback-narrow-reserve-must-use-the-real-s.patch` | `18718dd2bd7c3ab8d2210d7ab0287a76ed2c3866075d25c5db4aac4f1d0c7f87` |
+| `halo-arch-fixes.patch` (all three, `git diff`) | `d452cf2898b01abd67af5f7134851a80baf2bcc09f9155d2612cea8ddaf8fd5c` |
 
-Apply to a checkout of the r95 tree (or fold per block):
+Apply to a checkout of the r96 tree (or fold per block):
 
 ```bash
 git am /path/to/000{1,2,3}-halo-*.patch
@@ -120,13 +123,22 @@ base value in `TODO.md` #57 (`0.00e+00` with `GGML_QSA_DERIVED_VIS=0`).  So #57'
 
 ## Test matrix
 
-`test-llama-archs -s 42` full sweep on gfx1151: **373/373 passed** with the deepseek2-only host-expert /
-MoE-cache rows skipped (`ARCHS_SKIP_HOST_EXPERTS=1` was a local instrument, not in the patch) — the only
-remaining known failure in the sweep is #56 itself.
+`test-llama-archs -s 42` full sweep on gfx1151 **r96**: **373/373 passed** with the deepseek2-only
+host-expert / MoE-cache rows skipped (`ARCHS_SKIP_HOST_EXPERTS=1` was a local instrument, not in the
+patch) — the only remaining known failure in the sweep is #56 itself.  Re-validated after the r96
+rebase: qwen4exp 3/3, deepseek4 3/3, deepseek2 CPU 1/1, CPU-only `gpt-oss-20b -ngl 0` generates, and
+deepseek2's `MoE cache` row still reproduces the #56 fault.
+
+## Main-box integration
+
+A ready-to-paste prompt for the main build machine is [`MAIN-BOX-PROMPT.md`](MAIN-BOX-PROMPT.md).
+In short: fold 0001 into block 09, 0002 and 0003 into block 10, regenerate with
+`scripts/make-patches.sh` + `scripts/make-release.sh`, and report any gfx1201 difference before shipping.
+No behaviour change on gfx1201 is expected for 0001/0002 (CPU-only / probe), and 0003 only changes the
+synthetic reserve shape (dsv4 keeps its existing shape).
 
 ## Next
 
-1. Main box: fold 0001/0002/0003 into blocks 09/10 and regenerate; no behaviour change on gfx1201 is
-   expected for 0001/0002 (CPU-only / probe), and 0003 only changes the synthetic reserve shape.
+1. Main box: integrate the three commits (see the prompt).
 2. Then back to the TODO items on this box: #56 (now reproducible), #71 (independent), #57 re-checked on
    gfx1201.

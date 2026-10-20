@@ -16,10 +16,10 @@ index f7840ee7c..2f754726d 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6848daa23..b19e369b3 100644
+index 173c878d4..0c99509bb 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1973,6 +1973,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1976,6 +1976,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
      // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
      // reclaiming the wide layout is exactly what used to abort.
@@ -33,7 +33,7 @@ index 6848daa23..b19e369b3 100644
      bool drop_now = false;
      // The work region actually observed before the drop.  The reference must be at least this: the narrow
      // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
-@@ -2020,7 +2027,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2023,7 +2030,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      if (!slab_narrow_pinned && !model.moe_host_expert_bytes.empty() &&
              cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
          slab_narrow_pinned = true;
@@ -42,7 +42,7 @@ index 6848daa23..b19e369b3 100644
          size_t narrow_sizes[16] = {0};
          if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, /*split_only=*/true,
                            narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
-@@ -2088,7 +2095,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2091,7 +2098,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
          // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
          // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
