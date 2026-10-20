@@ -1,0 +1,110 @@
+From 5208d5e8679f66719d3c242a24fb74fff39c20c7 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 20 Oct 2026 09:44:50 -0500
+Subject: [PATCH 2/3] halo: gate the QSA derived-visibility form on the acting
+ backend
+
+The CPU reference implements the mask form of FLASH_ATTN_QSA only, but the
+sparse path allocated cell_vis/q_vis (src[5]/src[6]) whenever derived_bias was
+on, including on a CPU layer, so test-llama-archs aborted in the CPU kernel
+(GPU+CPU) or in the scheduler once the CPU refused the op.
+
+- CPU supports_op now refuses the derived form (src[5] != nullptr), which is
+  the truth: there is no CPU kernel for it.
+- qwen4exp probes the derived form (qsa_derived_vis_supported) and only
+  allocates it / takes the sparse derived path when the acting device (or
+  every child of a Meta split) accepts it; otherwise the dense masked path.
+
+Verified gfx1151: test-llama-archs -a qwen4exp all rows pass (GPU 1.40e-13,
+CPU 0.00e+00, Meta 1.40e-13); the derived path is still taken on ROCm.
+---
+ ggml/src/ggml-cpu/ggml-cpu.cpp |  6 +++++
+ src/models/qwen4exp.cpp        | 44 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index f7840ee7c..2f754726d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -666,6 +666,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_SSM_SCAN:
+             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
++        case GGML_OP_FLASH_ATTN_QSA:
++            // the CPU reference implements the mask form only; the derived-visibility form
++            // (cell_vis/q_vis, src[5]/src[6]) is CUDA-only and aborts here.  Refuse it so the
++            // graph builder's supports_op probe (qsa_derived_vis_supported) and the scheduler
++            // keep it on a CUDA device, or the model takes the dense masked path instead.
++            return op->src[5] == nullptr;
+         default:
+             return true;
+     }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index b986d2879..fa5935b86 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -210,6 +210,43 @@ static bool qsa_op_supported(const llama_model & model, const llama_hparams & hp
+     return ok;
+ }
+ 
++// The sparse QSA op has a second form: the mask is replaced by the compact cell_vis/q_vis keys
++// (src[5]/src[6]).  Only the CUDA kernel derives the visibility inline; the CPU reference
++// implements the mask form and aborts on this one.  Probe the form the graph will actually build,
++// so a device that cannot run it takes the dense masked path (exactly LLAMA_QSA_SPARSE_FA=0)
++// instead of aborting.  Under -sm tensor model.dev_layer() is the Meta device, whose supports_op()
++// requires EVERY child to accept, so this is also the tensor-split safety condition.
++static bool qsa_derived_vis_supported(const llama_model & model, const llama_hparams & hparams, int il, ggml_type type_kv) {
++    ggml_backend_dev_t dev = model.dev_layer(il);
++    if (dev == nullptr) {
++        return false;
++    }
++
++    const ggml_init_params params = {
++        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context * ctx = ggml_init(params);
++    if (ctx == nullptr) {
++        return false;
++    }
++
++    // minimal shapes: the back-end predicate reads the source types and the head size (D) only
++    const int64_t D = hparams.n_embd_head_k(il);
++    ggml_tensor * q        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D,       1, 1, 1);
++    ggml_tensor * k        = ggml_new_tensor_4d(ctx, type_kv,       D,       1, 1, 1);
++    ggml_tensor * v        = ggml_new_tensor_4d(ctx, type_kv,       D,       1, 1, 1);
++    ggml_tensor * idx      = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       1, 1, 1);
++    ggml_tensor * cell_vis = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1,       1);
++    ggml_tensor * q_vis    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1,       1);
++
++    const bool ok = ggml_backend_dev_supports_op(dev,
++            ggml_flash_attn_qsa(ctx, q, k, v, idx, nullptr, 1.0f, 0.0f, cell_vis, q_vis));
++    ggml_free(ctx);
++    return ok;
++}
++
+ // True when the acting device accepts the *packed* (qsa3) QSA op for this layer's cache type.
+ // The packed form is only taken when the packed WMMA kernel is available (the arch policy lives
+ // inside ggml_cuda_flash_attn_qsa3_supported, reached here through ggml_backend_dev_supports_op
+@@ -1428,6 +1465,7 @@ static bool qwen4exp_qsa_sparse(const llama_model & model, const llama_hparams &
+ static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens) {
+     return qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() &&
+             qwen4exp_qsa_sparse(model, hparams, il, cparams) &&
++            qsa_derived_vis_supported(model, hparams, il, cparams.type_k) &&
+             n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
+ }
+ 
+@@ -1642,7 +1680,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     const bool derived_bias = dbias_mode != 0 && blk_bias && n_tokens > 1;
+     // the per-cell half of the same bias (the attention mask) is derived from the visibility
+     // keys too; the mask tensor stays until the flash attention reads the keys as well
+-    const bool derived_vis  = derived_bias && qwen4exp_derived_vis_enabled();
++    // the derived-visibility form is CUDA-only (the CPU reference implements the mask form), so
++    // allocate cell_vis/q_vis only when the acting device accepts that form; otherwise this graph
++    // keeps the mask and the op stays on a backend that can run it.
++    const bool derived_vis  = derived_bias && qwen4exp_derived_vis_enabled() &&
++            qsa_derived_vis_supported(model, hparams, il, cparams.type_k);
+ 
+     // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
+     // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
