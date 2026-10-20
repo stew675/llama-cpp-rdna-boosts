@@ -47,16 +47,19 @@ commits, regenerate the delivery, run the release gates, and prepare the next fu
 5. **Run the release gates** in `wip/rdna3-verify-fusions/PROMOTION.md` section 4:
    - **gfx1201 (RDNA4):** same-seed coherence, `test-logits-width-probe`, `gate-prefill-logits.sh`.
      All must be byte-identical to r93; any diff means the RDNA3_0 scope leaked.
-   - **gfx1100 (RDNA3_0):** `test-logits-width-probe` on 27B, 30B-A3B and 35B-A3B at prefixes 256 and
-     3584 with `q8_0` KV, plus the same-binary kill-switch A/B (`GGML_CUDA_FUSE_Q8_1_VERIFY=0`,
-     `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`, `GGML_CUDA_FUSE_CPY_BATCH=0`); greedy text `none` ==
-     `draft-mtp` at `n_max <= 7`; the four-axis MTP gate at `-n 3000` (R/P/C/K, reasoning pinned) and
-     the phase-switching prompt; stock-relative
+   - **gfx1100 (RDNA3_0), if a box is available:** `test-logits-width-probe` on 27B, 30B-A3B and
+     35B-A3B at prefixes 256 and 3584 with `q8_0` KV, plus the same-binary kill-switch A/B
+     (`GGML_CUDA_FUSE_Q8_1_VERIFY=0`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`,
+     `GGML_CUDA_FUSE_CPY_BATCH=0`); greedy text `none` == `draft-mtp` at `n_max <= 7`; the four-axis
+     MTP gate at `-n 3000` (R/P/C/K, reasoning pinned) and the phase-switching prompt; stock-relative
      `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`; `gate-prefill-logits.sh`;
      `test-backend-ops -b ROCm0 -o RMS_NORM,ADD,MUL_MAT,CPY,CONCAT,SSM_CONV`; and
-     `check-gpu-faults.sh` on the logs.
-   - **gfx1151 (RDNA3_5):** build and coherence only; the change must be inactive.  Record the
-     "not enabled" state, not a performance result.
+     `check-gpu-faults.sh` on the logs.  The candidate-tree evidence is already in `README.md`; if no
+     gfx1100 is reachable, say so in the WORKLOG instead of presenting the candidate evidence as a
+     folded-tree result.
+   - **gfx1151 (RDNA3_5), if a box is available:** build and coherence only; the change must be
+     inactive.  Record the "not enabled" state, not a performance result.  If no box is available,
+     record that the folded tree was not built on gfx1151.
    - **Multi-device RDNA3_0 (if a box is available):** GDN model with MTP under `-sm tensor` and
      `-sm layer`, and the width probe with `SPLIT=tensor`, for the batched-CPY half.  If no box is
      available, record the gap explicitly; do not claim multi-device validation from a single-GPU run.

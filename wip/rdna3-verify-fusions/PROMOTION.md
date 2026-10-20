@@ -70,7 +70,12 @@ decisive ones on the folded tree, and run the full gate set before tagging:
 - Same-seed coherence text, `test-logits-width-probe` (27B, `W=1..8`), and
   `scripts/gate-prefill-logits.sh`.  Any diff means the RDNA3_0 scope leaked into RDNA4.
 
-**gfx1100 (RDNA3_0), the platform the change targets**
+**gfx1100 (RDNA3_0), the platform the change targets, if a box is available**
+
+The candidate tree already has the acceptance evidence in `README.md`.  Re-run the decisive gates on
+the folded tree if this box (or a sibling) has a gfx1100.  If not, the candidate-tree evidence stands
+and the WORKLOG entry must say the folded-tree gfx1100 re-run was not performed; do not re-label the
+candidate evidence as a folded-tree result.
 
 - `test-logits-width-probe` on 27B, 30B-A3B and 35B-A3B (prefix 256 and 3584, `q8_0` KV), plus the
   same-binary kill-switch A/B (`GGML_CUDA_FUSE_Q8_1_VERIFY=0`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`,
@@ -85,10 +90,11 @@ decisive ones on the folded tree, and run the full gate set before tagging:
 - `test-backend-ops -b ROCm0 -o RMS_NORM,ADD,MUL_MAT,CPY,CONCAT,SSM_CONV` (3130/3130 on the unfolded
   tree) and `scripts/check-gpu-faults.sh` on the run logs.
 
-**gfx1151 (RDNA3_5)**
+**gfx1151 (RDNA3_5), if a box is available**
 
 - Unchanged by design (the macros exclude 0x1150-0x11ff).  Build and run the coherence gate; the full
-  gate set is optional.  Record the "not enabled" state rather than a performance result.
+  gate set is optional.  Record the "not enabled" state rather than a performance result.  If no box is
+  available, record that the folded tree was not built on gfx1151.
 
 **Multi-device (open gap)**
 
