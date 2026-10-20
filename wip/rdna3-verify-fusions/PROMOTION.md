@@ -1,12 +1,13 @@
 # Promotion: rdna3-verify-fusions (PR #192 + PR #193)
 
 This is the fold recipe and release-gate checklist for the main development box.  The candidate is
-validated on gfx1100 against the current r93 tree; see `README.md` for the evidence.
+validated on gfx1100 against the current r94 tree; see `README.md` for the evidence.
 
 ## 1. Fold targets in the 12-block set
 
 The two patches are independent.  Fold each hunk into the block commit that owns its pre-image line.
-On the canonical r93 chain (`release.json` base `097cf33d9`, tip `982cbf104`) that is:
+On the canonical r94 chain (`release.json` base `097cf33d9`, tip
+`c6b8107a37c4350cb283e9ae4f1fdb2d7a3046c1`, tree `40d43e3044051ea8168c02cd1a899877b5d8574d`) that is:
 
 | patch / hunk | file | block |
 |---|---|---|
@@ -31,7 +32,7 @@ Notes:
 
 1. In a clean `~/llama.cpp`, check out upstream `master` at `release.json.base` (`097cf33d9`), not the
    tip of `master`.  Run `scripts/apply-all.sh .` to create the 12-block `rdna-boosts` branch.
-2. Apply the two candidate patches as two extra commits (`git am`), so the pre-fold tree is the r93
+2. Apply the two candidate patches as two extra commits (`git am`), so the pre-fold tree is the r94
    tree plus the two fusions.  Build it and run the quick gates below once.  Record the pre-fold tree.
 3. Fold the hunks into the owning block commits (block 09 for `cpy-batch.*`, block 10 for the rest).
    Use `git rebase -i` or apply the 13th/14th commits and `git commit --amend` the owning blocks; keep
@@ -65,7 +66,7 @@ decisive ones on the folded tree, and run the full gate set before tagging:
 - `scripts/apply-all.sh` on a fresh checkout at `release.json.base`, build with
   `~/bin/build-llama-rocm` (or the box's canonical build), and `scripts/validate-set.sh`.
 
-**gfx1201 (RDNA4) scope check, must be byte-identical to r93**
+**gfx1201 (RDNA4) scope check, must be byte-identical to r94**
 
 - Same-seed coherence text, `test-logits-width-probe` (27B, `W=1..8`), and
   `scripts/gate-prefill-logits.sh`.  Any diff means the RDNA3_0 scope leaked into RDNA4.

@@ -13,16 +13,16 @@ commits, regenerate the delivery, run the release gates, and prepare the next fu
 
 ## Context
 
-- Current release: `v12-097cf33d9-r93` (`release.json`: base `097cf33d9`, 12 blocks, tip `982cbf104`,
-  tree `260e6f49f41b9dbd18ce1b2d5214eba1917e8752`).
+- Current release: `v12-097cf33d9-r94` (`release.json`: base `097cf33d9`, 12 blocks, tip
+  `c6b8107a37c4350cb283e9ae4f1fdb2d7a3046c1`, tree `40d43e3044051ea8168c02cd1a899877b5d8574d`).
 - Candidate: `wip/rdna3-verify-fusions/0001-mmvq-the-verify-band-Q8_1-fusions-on-RDNA3_0-too.patch`
   (PR #192) and `wip/rdna3-verify-fusions/0002-cuda-the-GDN-conv-verify-path-and-the-batched-f32-CP.patch`
-  (PR #193).  Both are re-cut against the r93 tree and apply with `git am -3`.
+  (PR #193).  Both are re-cut against the r94 tree and apply with `git am -3`.
 - The gfx1100 acceptance evidence is in `wip/rdna3-verify-fusions/README.md`: W=1..8 probe maxdiff 0 on
   27B, 30B-A3B and 35B-A3B, greedy text identical for `none` and `draft-mtp`, same-binary kill-switch
   identity for all three fusions, prefill-logit KLD 0.000000 / 100.000 %, `test-backend-ops` 3130/3130
-  on ROCm0, no GPU faults, +4.4 % prose / +4.5 % code MTP n3 on 27B, and batched-bench B=4/B=8 no
-  worse.
+  on ROCm0, no GPU faults, +4.1 % prose / +4.2 % code MTP n3 on 27B on r94, and batched-bench B=4/B=8
+  no worse.
 - The change is RDNA3_0-only.  RDNA4 and RDNA3_5 must be unchanged.  The GDN conv fusion keeps its
   pre-existing single-device restriction; the batched f32 CPY does not, and that half has no
   multi-device measurement yet.
@@ -35,18 +35,18 @@ commits, regenerate the delivery, run the release gates, and prepare the next fu
 2. **Build the pre-fold tree.**  In a clean `~/llama.cpp`, check out upstream `master` at
    `release.json.base` (`097cf33d9`), run `scripts/apply-all.sh .` to create the 12-block branch, then
    `git am` the two candidate patches as two extra commits.  Build and confirm the pre-fold tree is
-   the r93 tree plus exactly these two changes.
+   the r94 tree plus exactly these two changes.
 3. **Fold.**  Put the `cpy-batch.cu` / `cpy-batch.cuh` hunk into **block 09**; put the `mmvq.cu`,
    `gdn-conv.cu`, `ggml-cuda.cu` and `ggml-cuda-try-fuse.cu` hunks into **block 10**.  Confirm the
    owning block with `git blame` on the pre-fold tree if a line has moved; the V2.0 map above is what
-   r93 has.  Keep both sides on a replay conflict.  The folded 12-block tree must equal the pre-fold
+   r94 has.  Keep both sides on a replay conflict.  The folded 12-block tree must equal the pre-fold
    tree.
 4. **Regenerate and validate.**  Run `scripts/make-patches.sh`, then `scripts/make-release.sh`, then
    `scripts/validate-set.sh` on a fresh tarball.  Never hand-edit the committed patches or
    `release.json`.
 5. **Run the release gates** in `wip/rdna3-verify-fusions/PROMOTION.md` section 4:
    - **gfx1201 (RDNA4):** same-seed coherence, `test-logits-width-probe`, `gate-prefill-logits.sh`.
-     All must be byte-identical to r93; any diff means the RDNA3_0 scope leaked.
+     All must be byte-identical to r94; any diff means the RDNA3_0 scope leaked.
    - **gfx1100 (RDNA3_0), if a box is available:** `test-logits-width-probe` on 27B, 30B-A3B and
      35B-A3B at prefixes 256 and 3584 with `q8_0` KV, plus the same-binary kill-switch A/B
      (`GGML_CUDA_FUSE_Q8_1_VERIFY=0`, `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`,

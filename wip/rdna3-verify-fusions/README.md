@@ -13,9 +13,10 @@ Origin: two contributor PRs to this repository by `briansp2020` (Brian S. Park):
   verify batches and to the batched run of f32 `GGML_OP_CPY` nodes, both of which were RDNA4-only.
 
 The patches here are the submitted changes re-cut against the **current release tree**
-`v12-097cf33d9-r93` (`release.json`: base `097cf33d9`, tree `260e6f49f41b9dbd18ce1b2d5214eba1917e8752`).
-They apply cleanly with `git am -3`; the only difference from the submitted files is the base commit
-metadata.  They are independent and can be folded separately.
+`v12-097cf33d9-r94` (`release.json`: base `097cf33d9`, tip `c6b8107a37c4350cb283e9ae4f1fdb2d7a3046c1`,
+tree `40d43e3044051ea8168c02cd1a899877b5d8574d`).  They apply cleanly with `git am -3`; the only
+difference from the submitted files is the base commit metadata.  They are independent and can be
+folded separately.
 
 ## What the patches change
 
@@ -39,52 +40,55 @@ metadata.  They are independent and can be folded separately.
 - `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` / `GGML_CUDA_FUSE_CPY_BATCH=0` still turn them off; RDNA3_5 stays
   out; RDNA4 is unchanged.
 
-## Independent validation (gfx1100, this box, 2026-10-20)
+## Independent validation (gfx1100, this box, 2026-10-20, re-run on r94)
 
 Box: RX 7900 XTX (gfx1100, 24 GiB), ROCm 10.1.0-gfx1100, single visible GPU
-(`HIP_VISIBLE_DEVICES=0`).  Build: `~/bin/build-llama-rocm` (`-DGPU_TARGETS=gfx1100`).  Reference is
-the r93 `build-rocm` tree (build `b11583-82c9e6495`); candidate is `build-pr192-193` (build
-`b11585-cce5e5c11`).  Model: Qwen3.8-27B-UD-Q4_K_M, `-fa 1 -ctk q8_0 -ctv q8_0 -t 8`, unless noted.
+(`HIP_VISIBLE_DEVICES=0`).  Build: `~/bin/build-llama-rocm` (`-DGPU_TARGETS=gfx1100`) on the r94
+candidate tree (`build-r94-pr192-193`).  Reference is the same binary with all three fusions disabled
+(the r94 path).  The candidate was first validated on r93; every r93 hash and text below reproduced
+exactly after the r94 rebase, so r94 did not change the logits or the text.
 
 **Bit-identity.**
 
 - `test-logits-width-probe` (the delivery's W=1..8 matrix), `q8_0` KV:
-  - 27B, prefix 256: row 0 `c37241bd00c1d561`, all eight hashes identical across the two builds,
+  - 27B, prefix 256: row 0 `c37241bd00c1d561`, all eight hashes identical between default and all-off,
     `width_purity=PASS (worst maxdiff 0)`.
-  - 27B, prefix 3584: row 0 `86541410b7c618b0`, PASS, maxdiff 0 on both builds.
-  - Qwen3-30B-A3B Q4_K_M (MoE control), prefix 256: row 0 `899608bf91600e1b`, PASS, maxdiff 0 on both.
-  - Qwen3.6-35B-A3B Q4_K_M (GDN hybrid MoE), prefix 256: row 0 `423a5f353f0a0e45`, PASS, maxdiff 0 on
-    both.
+  - 27B, prefix 3584: row 0 `86541410b7c618b0`, PASS, maxdiff 0 for default and all-off.
+  - Qwen3-30B-A3B Q4_K_M (MoE control), prefix 256: row 0 `899608bf91600e1b`, PASS, maxdiff 0 for
+    default and all-off.
+  - Qwen3.6-35B-A3B Q4_K_M (GDN hybrid MoE), prefix 256: row 0 `423a5f353f0a0e45`, PASS, maxdiff 0 for
+    default and all-off.
 - Same-binary kill-switch A/B on 27B, prefix 256: default, `GGML_CUDA_FUSE_Q8_1_VERIFY=0`,
   `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0`, `GGML_CUDA_FUSE_CPY_BATCH=0`, and all three off all produce the
   same per-W hashes and row 0 `c37241bd00c1d561` (maxdiff 0).  The debug switches confirm the paths
   actually fire (`GDN_CONV_DIRECT C=10240 T=2 ...`, `cpy_batch: 2 copies ...`).
 - Greedy text, 400 tokens, seed 42, temp 0, `--no-display-prompt --single-turn`, extracted with
-  `scripts/extract-generated.py`: prose `698b60ce0b5d` and code `c5a4ef044b64` for **both** builds and
-  for **both** `--spec-type none` and `--spec-type draft-mtp --spec-draft-n-max 3`.
+  `scripts/extract-generated.py`: prose `698b60ce0b5d` and code `c5a4ef044b64` for the default and
+  all-off arms, for **both** `--spec-type none` and `--spec-type draft-mtp --spec-draft-n-max 3`, and
+  identical to the r93 result.
 - `test-backend-ops -o RMS_NORM,ADD,MUL_MAT,CPY,CONCAT,SSM_CONV`: **3130/3130 passed on ROCm0** (the
   dGPU).  The iGPU (`ROCm1`, gfx1036) aborts in `ggml_cpy_scalar_cuda` with "invalid kernel file",
   before and independent of this patch; run with `HIP_VISIBLE_DEVICES=0` or `-b ROCm0`.
-- Prefill-logit gate: **mean KLD 0.000000, same-top-p 100.000 %** (PASS; identical to the r93 base).
+- Prefill-logit gate on r94, `--ab` default vs all three fusions off: **mean KLD 0.000000, same-top-p
+  100.000 %** (PASS).
 - `scripts/check-gpu-faults.sh --since "3 hours ago"`: clean on the A/B and batched-bench logs.
 
-**Performance, combined #192 + #193.**  Interleaved 4-round A/B, dense 27B, fixed `draft-mtp` n-max 3,
-400 tokens, order flipped each round:
+**Performance, combined #192 + #193, on r94.**  Interleaved 4-round A/B, dense 27B, fixed `draft-mtp`
+n-max 3, 400 tokens, order flipped each round, default vs all three fusions off:
 
 | arm | prose (t/s) | code (t/s) |
 |---|---|---|
-| r93 reference | 65.3 / 65.8 / 65.9 / 65.9 | 68.3 / 68.5 / 68.5 / 68.5 |
-| r93 + both PRs | 68.6 / 68.5 / 68.6 / 68.7 | 71.6 / 71.6 / 71.4 / 71.5 |
-| mean delta | **+4.4 %** | **+4.5 %** |
+| r94, all three fusions off | 65.8 / 65.9 / 65.8 / 65.8 | 68.6 / 68.6 / 68.6 / 68.5 |
+| r94, default | 68.6 / 68.5 / 68.5 / 68.6 | 71.5 / 71.4 / 71.5 / 71.4 |
+| mean delta | **+4.1 %** | **+4.2 %** |
 
 Plain (one-token) decode is flat, as expected (no verify band): prose 41.4 -> 41.3, code 42.0 -> 42.1.
 The individual PR claims (+1.9 % for #192, +1.3 % for #193) are the author's per-patch numbers on
-r91; the combined effect on r93 is about +4.4 % on this box.
+r91.  The r93 run measured +4.4 / +4.5 %; the r94 run is +4.1 / +4.2 %, the same within noise.
 
 **Stock-relative verify-width gate** (`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, dense 27B,
-`q8_0` KV, 3 interleaved rounds): B=1 flat; B=4 and B=8 are **not worse**, and are about +1 to +3 %
-after the first (cold) round.  The first reference round was visibly cold (its PP was also low), so
-treat the B=4/B=8 deltas as "no regression, small gain", not as a headline.
+`q8_0` KV, 3 interleaved rounds on r94): B=1 flat; B=4 about +2.5 to +3.1 % and B=8 about +1.9 %
+after the first (cold) round, so **no regression** at the verify widths.
 
 ## Limitations and open gates
 
@@ -104,7 +108,7 @@ treat the B=4/B=8 deltas as "no regression, small gain", not as a headline.
 
 ## Files
 
-- `0001-mmvq-the-verify-band-Q8_1-fusions-on-RDNA3_0-too.patch` (PR #192, re-cut on r93)
-- `0002-cuda-the-GDN-conv-verify-path-and-the-batched-f32-CP.patch` (PR #193, re-cut on r93)
+- `0001-mmvq-the-verify-band-Q8_1-fusions-on-RDNA3_0-too.patch` (PR #192, re-cut on r94)
+- `0002-cuda-the-GDN-conv-verify-path-and-the-batched-f32-CP.patch` (PR #193, re-cut on r94)
 - `PROMOTION.md`: fold targets, environment/doc updates, release gate checklist
 - `HANDOVER-PROMPT.md`: the prompt to give the main development box
