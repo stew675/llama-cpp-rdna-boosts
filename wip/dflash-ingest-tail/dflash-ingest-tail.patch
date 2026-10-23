@@ -1,0 +1,159 @@
+From e207d1dffcf74dded91631c24c74859d6f5fe4e0 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 01:17:18 +0800
+Subject: [PATCH] speculative: a DFlash draft whose layers all have a sliding
+ window ingests only the prompt rows it can attend to
+
+Every layer of the Qwen3.8-27B DFlash2 draft attends over a 2048-position sliding window, and its KV cache is sized for
+the window, but process() fed it every prompt row: a 110K prompt was encoded and written into the draft's cache row by
+row, and all but the last 2048 rows were dropped again without being read.  Each prompt ubatch also waited for the target
+before the draft could start, which breaks the queue of the target's ubatches.
+
+- llama_model_n_layer_swa() (new, in the staging header src/llama-ext.h): the number of layers with a sliding window.
+  The per-layer pattern is not reachable through llama_model_meta_val_str() (array values are skipped), so it comes from
+  the hparams.
+- When every draft layer has a window, the DFlash impl takes the prompt end from set_prompt_end() (the server calls it
+  once per prompt) and skips the prompt rows before the last n_swa positions.  A batch left with no rows returns before
+  the wait on the target.  The first generation row resets the threshold, as in the MTP impl, so a later position shift
+  never skips rows.  LLAMA_DFLASH_INGEST_TAIL=0 feeds every row.
+- A draft with a full-attention layer (e.g. the Qwen3.6-35B-A3B DFlash draft: 5 of 6 layers windowed) keeps feeding
+  every row.
+
+The draft never attends to the skipped rows, so its drafts only differ by the rounding of another cell layout, and the
+target verifies every drafted token, so the output does not change.  gfx1201, r120, Qwen3.8-27B UD-Q4_K_XL +
+DFlash2-Q4_K_M, -ub 2048: prefill of 8K / 32K / 110K tokens 6180 / 26945 / 122946 ms -> 6053 / 26600 / 121879 ms
+(-2.1 / -1.3 / -0.9 %); without a draft model it is 5878 / 26360 / 121272 ms, so the draft's share of the prefill drops
+by 42 / 59 / 64 %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 47 ++++++++++++++++++++++++++++++++++++++++++
+ src/llama-ext.h        |  3 +++
+ src/llama-model.cpp    | 11 ++++++++++
+ 3 files changed, 61 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index bd59a2733..d18904c35 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1020,6 +1020,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     bool    is_mrope       = false;
+     int32_t selector_top_k = 0;
+ 
++    // every layer of the draft attends over a sliding window of n_swa positions: a prompt row older than the last n_swa
++    // positions of the prompt never reaches a draft, so it is not ingested (LLAMA_DFLASH_INGEST_TAIL=0: every row)
++    int32_t                ingest_window = 0;
++    std::vector<llama_pos> ingest_from;
++
+     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
+     const bool is_dspark;
+ 
+@@ -1072,6 +1077,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         is_dflash2     = selector_top_k > 0;
+         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+ 
++        {
++            const char *  e     = getenv("LLAMA_DFLASH_INGEST_TAIL");
++            const int32_t n_swa = llama_model_n_swa(model_dft);
++            if ((e == nullptr || atoi(e) != 0) && n_swa > 0 && llama_model_n_layer_swa(model_dft) == llama_model_n_layer(model_dft)) {
++                ingest_window = n_swa;
++            }
++            ingest_from.assign(n_seq, 0);
++        }
++
+         if (is_dspark && this->params.p_min > 0.0f) {
+             char buf[16] = {};
+             const bool has_conf =
+@@ -1086,6 +1100,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
+                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
++        if (ingest_window > 0) {
++            LOG_INF("%s: - every layer has a %d-position window: a prompt is ingested from its last %d positions\n", __func__,
++                    ingest_window, ingest_window);
++        }
+ 
+         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
+         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
+@@ -1198,6 +1216,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+     }
+ 
++    void set_prompt_end(llama_seq_id seq_id, llama_pos n_prompt) override {
++        if (ingest_window > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
++            ingest_from[seq_id] = std::max<llama_pos>(0, n_prompt - ingest_window);
++        }
++    }
++
+     bool process(const common_batch & batch_in) override {
+         if (batch_in.size() <= 0) {
+             return true;
+@@ -1229,6 +1253,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
++        // prompt rows before the draft's window of the prompt's end are never attended to; a batch left with none (a
++        // long prompt's leading ubatches) returns before the wait on the target, so the target's ubatches stay queued
++        if (ingest_window > 0) {
++            bool any = false;
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                while (i_batch_beg[seq_id] >= 0 && i_batch_beg[seq_id] <= i_batch_end[seq_id] &&
++                       batch_in.tokens[i_batch_beg[seq_id]].pos[0] < ingest_from[seq_id]) {
++                    i_batch_beg[seq_id]++;
++                }
++                if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
++                    i_batch_beg[seq_id] = -1;
++                }
++                // generation reached (a row at the prompt end or later): later position shifts never skip rows
++                if (i_batch_end[seq_id] >= 0 && batch_in.tokens[i_batch_end[seq_id]].pos[0] >= ingest_from[seq_id] + ingest_window) {
++                    ingest_from[seq_id] = 0;
++                }
++                any = any || i_batch_beg[seq_id] >= 0;
++            }
++            if (!any) {
++                return true;
++            }
++        }
++
+         auto * ctx_tgt = this->params.ctx_tgt;
+         auto * ctx_dft = this->params.ctx_dft;
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index dd9bf051f..c4936f530 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -165,6 +165,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+ 
+ LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+ 
++// number of layers that attend over a sliding window of llama_model_n_swa() positions
++LLAMA_API int32_t llama_model_n_layer_swa(const struct llama_model * model);
++
+ // returns pointer to the target-model layer indices
+ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+ // returns the number of extracted layers from target model
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ad1dee1fc..5ec9d081f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3762,6 +3762,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
+     return model->hparams.n_swa;
+ }
+ 
++int32_t llama_model_n_layer_swa(const llama_model * model) {
++    if (model->hparams.n_swa == 0) {
++        return 0;
++    }
++    int32_t n = 0;
++    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
++        n += model->hparams.is_swa(il) ? 1 : 0;
++    }
++    return n;
++}
++
+ 
+ uint32_t llama_model_n_cls_out(const struct llama_model * model) {
+     return model->hparams.n_cls_out;
+-- 
+2.43.0
+
