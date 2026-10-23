@@ -1,0 +1,60 @@
+From aa2ead4517a39eecd5fbb09d71d53a33b45a31e8 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 23 Oct 2026 17:33:06 +0000
+Subject: [PATCH] ggml-backend-meta: return a cached split state without
+ copying it
+
+The split-state lookup runs for every tensor of every graph allocation
+under -sm tensor.  On a cache hit it built the 2 KiB
+ggml_backend_meta_split_state in a named local (split_state_entry::get())
+and then copied it into the return slot.  A profile of short server
+turns showed that copy (a 2128-byte rep movsq) as about half of the
+function's own time.
+
+Return entry.get() directly, so the state is built once in the
+caller's object (guaranteed copy elision).  The assertions read the
+same fields from the entry.  Same values, same assertions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend-meta.cpp | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index e76fb184a..8f941c49c 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1736,20 +1736,23 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         it = cache->find(key);
+     }
+ 
+-    ggml_backend_meta_split_state ret = it->second.get();
+-    GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
++    const auto & entry = it->second;
++    GGML_ASSERT(entry.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
+ #ifndef NDEBUG
+-    if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
++    if (entry.axis >= 0 && entry.axis < GGML_MAX_DIMS) {
+         int64_t ne_ret = 0;
+-        for (size_t s = 0; s < ret.n_segments; s++) {
++        for (size_t s = 0; s < entry.n_segments; s++) {
+             for (size_t j = 0; j < n_bufs; j++) {
+-                ne_ret += ret.ne[s*n_bufs + j] * ret.nr[s];
++                ne_ret += entry.ne[s*n_bufs + j] * entry.nr[s];
+             }
+         }
+-        assert(ne_ret == tensor->ne[int(ret.axis)]);
++        assert(ne_ret == tensor->ne[int(entry.axis)]);
+     }
+ #endif // NDEBUG
+-    return ret;
++    // Returned as a prvalue so the ~2 KiB state is built once, directly in the caller's object.  This is the hit path
++    // of every lookup (every tensor of every graph allocation under -sm tensor); copying the state out of a named
++    // local cost more than the hash lookup itself.
++    return entry.get();
+ }
+ 
+ static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+-- 
+2.53.0
+
