@@ -1,0 +1,241 @@
+From bfbc5701626c6800860b04165912d359bfe670a1 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 17 Oct 2026 19:05:00 +0000
+Subject: [PATCH] cuda: the GDN direct conv also writes the recurrent snapshot
+ tails
+
+With the direct conv path on, a GDN layer still ran three launches per step: the CONCAT tail
+materialization, the batched snapshot CPYs (cb_kernel, one per rollback slot) and the direct conv.  The
+direct kernel now writes the 3-column snapshot tails itself, read straight from state / x, so CONCAT and
+the snapshot CPYs launch nothing.  Taken only when nothing between CONCAT and SSM_CONV writes over state / x
+or touches a snapshot destination (checked per graph), and the destinations overlap neither the inputs nor
+each other.  GGML_CUDA_DISABLE_GDN_CONV_SNAP=1 restores the previous path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/gdn-conv.cu           | 108 +++++++++++++++++++++--
+ ggml/src/ggml-cuda/gdn-conv.cuh          |   8 ++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   5 ++
+ 3 files changed, 116 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index 972ec0a7c..d11be9e29 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -28,12 +28,28 @@ static __global__ void gdn_concat_tail(const float * __restrict__ state, const f
+     out[(size_t) c * row_stride + j] = (j < 3) ? state[c * 3 + j] : x[(size_t) (j - 3) * C + c];
+ }
+ 
++struct gdn_conv_snap_args {
++    float * dst[ggml_cuda_gdn_conv_match::SNAP_MAX];
++    int     col[ggml_cuda_gdn_conv_match::SNAP_MAX];
++    int     n;
++};
++
+ template <bool apply_silu, int TT>
+ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ state, const float * __restrict__ x,
+-        const float * __restrict__ w, float * __restrict__ y, const int C, const int T) {
++        const float * __restrict__ w, float * __restrict__ y, const int C, const int T, const gdn_conv_snap_args snap) {
+     const int c  = blockIdx.x * 256 + threadIdx.x;
+     const int t0 = blockIdx.y * TT;
+     if (c >= C) return;
++    // the snapshot CPYs: dst[c*3 + j] = concat[c][col + j], read straight from state / x
++    if (blockIdx.y == 0) {
++        for (int s = 0; s < snap.n; ++s) {
++#pragma unroll
++            for (int j = 0; j < 3; ++j) {
++                const int jp = snap.col[s] + j;
++                snap.dst[s][c * 3 + j] = (jp < 3) ? state[c * 3 + jp] : x[(size_t) (jp - 3) * C + c];
++            }
++        }
++    }
+     float wr[4];
+ #pragma unroll
+     for (int j = 0; j < 4; ++j) wr[j] = w[c * 4 + j];
+@@ -53,6 +69,53 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
+     }
+ }
+ 
++// byte span of a (possibly strided) tensor
++static void gdn_conv_span(const ggml_tensor * t, uintptr_t & lo, uintptr_t & hi) {
++    lo = (uintptr_t) t->data;
++    size_t last = 0;
++    for (int k = 0; k < 4; ++k) last += (size_t) (t->ne[k] - 1) * t->nb[k];
++    hi = lo + last + ggml_type_size(t->type);
++}
++
++static bool gdn_conv_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data) return false;
++    uintptr_t alo, ahi, blo, bhi;
++    gdn_conv_span(a, alo, ahi); gdn_conv_span(b, blo, bhi);
++    return alo < bhi && blo < ahi;
++}
++
++static bool gdn_conv_noop(const ggml_tensor * t) {
++    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
++           t->op == GGML_OP_NONE;
++}
++
++// The fold moves the snapshot writes from the CPY nodes to the SSM_CONV node and reads state / x there.  It is taken only
++// when nothing in between can see the difference: no other node writes over state / x or touches a snapshot destination,
++// and the destinations do not overlap state / x or each other.  GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off.
++static bool gdn_conv_snap_safe(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m) {
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_CONV_SNAP") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GDN_CONV_SNAP")) != 0;
++    if (disabled) return false;
++    for (int a = 0; a < m.n_snap; ++a) {
++        // a skipped CPY also consumes the node after it (try_fuse returns the count of EXTRA nodes): that one must be a no-op
++        const int nx = m.snap_idx[a] + 1;
++        if (nx >= m.conv_idx || !gdn_conv_noop(cgraph->nodes[nx])) return false;
++        if (gdn_conv_overlap(m.snap_dst[a], m.state) || gdn_conv_overlap(m.snap_dst[a], m.x)) return false;
++        for (int b = a + 1; b < m.n_snap; ++b) if (gdn_conv_overlap(m.snap_dst[a], m.snap_dst[b])) return false;
++    }
++    for (int n = m.concat_idx + 1; n < m.conv_idx; ++n) {
++        const ggml_tensor * t = cgraph->nodes[n];
++        bool mine = false;
++        for (int a = 0; a < m.n_snap; ++a) if (m.snap_idx[a] == n) mine = true;
++        if (mine || gdn_conv_noop(t)) continue;
++        if (gdn_conv_overlap(t, m.state) || gdn_conv_overlap(t, m.x)) return false;
++        for (int a = 0; a < m.n_snap; ++a) {
++            if (gdn_conv_overlap(t, m.snap_dst[a])) return false;
++            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (gdn_conv_overlap(t->src[s], m.snap_dst[a])) return false;
++        }
++    }
++    return true;
++}
++
+ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) {
+     if (!gdn_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) return false;
+     const ggml_tensor * cc = cgraph->nodes[i];
+@@ -66,6 +129,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
+     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
++    int n_snap = 0; bool snap_ok = true;
+     // On RDNA4 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
+     // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
+     static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
+@@ -84,7 +148,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+             const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
+             tail_from = std::min(tail_from, col); continue;
+         }
+-        if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
++        if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) { snap_ok = false; continue; }
+         // the shared build_conv_state (qwen35moe/qwen35/qwen3next) writes the snapshot with a raw
+         // view of the concat, while qwen4exp wraps it in a cont.  Accept the snapshot cpy when its
+         // source is a 3-column view of the concat (already accounted for by tail_from above); reject
+@@ -93,6 +157,13 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+             const ggml_tensor * s0 = t->src[0];
+             if (s0 == nullptr || s0->op != GGML_OP_VIEW || s0->view_src != cc ||
+                     s0->ne[0] != 3 || s0->ne[1] != C || s0->ne[2] != 1) return false;
++            const ggml_tensor * d = t->src[1];
++            if (n_snap < ggml_cuda_gdn_conv_match::SNAP_MAX && d && d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) &&
++                    ggml_nelements(d) == 3 * C && s0->nb[1] == cc->nb[1] && s0->view_offs % sizeof(float) == 0) {
++                m.snap_idx[n_snap] = n; m.snap_col[n_snap] = (int) (s0->view_offs / sizeof(float)); m.snap_dst[n_snap] = t->src[1]; ++n_snap;
++            } else {
++                snap_ok = false;
++            }
+             continue;
+         }
+         return false;
+@@ -109,6 +180,8 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+         for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == cv || t->src[s]->view_src == cv) return false; }
+     m.concat_idx = i; m.conv_idx = conv; m.x = x; m.state = st; m.concat = cc; m.w = w; m.conv_out = cgraph->nodes[conv + 1];
+     m.C = C; m.T = T; m.tail_from = tail_from; m.silu = true;
++    m.n_snap = n_snap;
++    m.snap = snap_ok && n_snap > 0 && gdn_conv_snap_safe(cgraph, m);
+     return true;
+ }
+ 
+@@ -132,11 +205,16 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
+ 
+ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
+     static bool dbg = getenv("GGML_CUDA_CONV_DEBUG") != nullptr;
+-    if (dbg) { fprintf(stderr, "GDN_CONV_DIRECT C=%lld T=%lld tail_from=%lld silu=%d\n", (long long) m.C, (long long) m.T, (long long) m.tail_from, (int) m.silu); dbg = false; }
++    if (dbg) { fprintf(stderr, "GDN_CONV_DIRECT C=%lld T=%lld tail_from=%lld silu=%d snap=%d n_snap=%d\n", (long long) m.C, (long long) m.T, (long long) m.tail_from, (int) m.silu, (int) m.snap, m.n_snap); dbg = false; }
+     constexpr int TT = 128;
+     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
++    gdn_conv_snap_args snap{};
++    if (m.snap) {
++        snap.n = m.n_snap;
++        for (int a = 0; a < m.n_snap; ++a) { snap.dst[a] = (float *) m.snap_dst[a]->data; snap.col[a] = m.snap_col[a]; }
++    }
+     gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+-        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T);
++        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, snap);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -153,7 +231,9 @@ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
+     }
+     ggml_cuda_gdn_conv_match gm;
+     if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+-        ggml_cuda_gdn_conv_write_tail(ctx, gm);
++        if (!gm.snap) {
++            ggml_cuda_gdn_conv_write_tail(ctx, gm);
++        }
+         return 1;
+     }
+     if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+@@ -162,3 +242,21 @@ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
+     }
+     return 0;
+ }
++
++// A snapshot CPY whose write the direct kernel already makes (gm.snap): it launches nothing.  Must run before the batched-copy
++// fusion, which would otherwise take the run of snapshot CPYs.  Returns 1 (the CPY and the no-op node after it, which
++// gdn_conv_snap_safe requires) when the node is skipped, 0 otherwise.
++int ggml_cuda_gdn_conv_snap_try_fuse(const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (node->op != GGML_OP_CPY || !node->src[0] || node->src[0]->op != GGML_OP_VIEW) return 0;
++    const ggml_tensor * cc = node->src[0]->view_src;
++    if (!cc || cc->op != GGML_OP_CONCAT) return 0;
++    for (int j = i - 1; j >= 0 && j >= i - 64; --j) {
++        if (cgraph->nodes[j] != cc) continue;
++        ggml_cuda_gdn_conv_match gm;
++        if (!ggml_cuda_gdn_conv_match_at_concat(cgraph, j, gm) || !gm.snap) return 0;
++        for (int a = 0; a < gm.n_snap; ++a) if (gm.snap_idx[a] == i) return 1;
++        return 0;
++    }
++    return 0;
++}
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cuh b/ggml/src/ggml-cuda/gdn-conv.cuh
+index d422a4625..73fde6fb4 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cuh
++++ b/ggml/src/ggml-cuda/gdn-conv.cuh
+@@ -9,9 +9,17 @@ struct ggml_cuda_gdn_conv_match {
+     ggml_tensor * conv_out = nullptr;
+     int64_t C = 0, T = 0, tail_from = 0;  // first concat column that must be materialized
+     bool silu = false;
++    // snapshot fold: the direct kernel also writes the 3-column snapshot tails, CONCAT and the snapshot CPYs launch nothing
++    static constexpr int SNAP_MAX = 8;
++    bool snap = false;
++    int  n_snap = 0;
++    int  snap_idx[SNAP_MAX] = {};         // node indices of the snapshot CPYs
++    int  snap_col[SNAP_MAX] = {};         // first concat column each one copies
++    ggml_tensor * snap_dst[SNAP_MAX] = {};
+ };
+ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
+ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
+ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+ int  ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++int  ggml_cuda_gdn_conv_snap_try_fuse(const ggml_cgraph * cgraph, int i);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 463232ef9..5954d995a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1372,6 +1372,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         return n_hc_combine_mix;
+     }
+ 
++    // GDN snapshot CPYs already written by the direct conv kernel (GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off)
++    if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, i)) {
++        return 1;
++    }
++
+     // batched copy (GGML_CUDA_FUSE_CPY_BATCH=0: off): consecutive same-layout f32 copies as one launch
+     if (const int n_cpy_batch = ggml_cuda_cpy_batch_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_cpy_batch;
+-- 
+2.53.0
+
