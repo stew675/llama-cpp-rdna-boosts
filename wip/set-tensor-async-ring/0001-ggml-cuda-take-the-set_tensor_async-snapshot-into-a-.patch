@@ -1,0 +1,121 @@
+From 4ef508de3817db85a4ccb7a0febf392c2a75963d Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Tue, 20 Oct 2026 04:03:40 +0000
+Subject: [PATCH] ggml-cuda: take the set_tensor_async snapshot into a
+ per-context ring
+
+r90 made ggml_backend_cuda_set_tensor_async snapshot a small
+host-resident split input (a CPU split's output the next ubatch
+rewrites in place) through the graph-input upload ring.  That keeps the
+guarantee, but each such upload also joins the ring's queue: it is
+flushed by a batch kernel, or, if anything drains the queue first, as
+a per-thread-stream copy with cross-stream event waits.
+
+Take the snapshot into a pinned two-half ring owned by the context
+instead, and issue one H2D on the backend's own stream, as before r90:
+it is already ordered after the scheduler's wait.  An event recorded
+when the ring leaves a half is waited before that half is written
+again.  If the pinned ring cannot be allocated, the r90 path is used.
+
+Stock r91: decode, prefill and output unchanged, KLD self-comparison
+100.000 % at -ub 8 and -ub 1.  On a build whose other host-side work
+drains that queue between the upload and the graph, decode +2.7 %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   |  9 +++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 48 +++++++++++++++++++++++++++++----
+ 2 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 25effbbe6..76dde8658 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1738,6 +1738,15 @@ struct ggml_backend_cuda_context {
+     std::vector<splice_pin_slot> splice_pin_ring;
+     int                          splice_pin_idx = 0;
+ 
++    // Pinned two-half ring for the snapshot of a small host-resident split input
++    // (`ggml_backend_cuda_set_tensor_async`).  snap_half_ev[h] is recorded on the copy stream when the
++    // ring leaves half h, and waited before half h is written again.
++    char *      snap_ring       = nullptr;
++    size_t      snap_head       = 0;   // bytes used in the current half
++    int         snap_half       = 0;   // the half being filled
++    bool        snap_failed     = false; // the ring could not be set up: not retried, the r90 path is used
++    cudaEvent_t snap_half_ev[2] = { nullptr, nullptr };
++
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0ace1a3af..f51a80465 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1241,6 +1241,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+         if (s.buf != nullptr) { CUDA_CHECK(hipHostFree(s.buf)); }
+     }
+     splice_pin_ring.clear();
++    for (auto & ev : snap_half_ev) {
++        if (ev != nullptr) { (void) cudaEventSynchronize(ev); CUDA_CHECK(cudaEventDestroy(ev)); ev = nullptr; }
++    }
++    if (snap_ring != nullptr) { CUDA_CHECK(cudaFreeHost(snap_ring)); snap_ring = nullptr; }
+     // a lazy done event still pending on one of these streams is recorded before the stream goes away
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+@@ -4270,14 +4274,48 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     // cannot promise that: the scheduler uses it for a host-resident *split* input, and the one that bites is
+     // a CPU split's output (`node_1` / `model.input_embed` in a ROCm_Host buffer), which the next ubatch's
+     // CPU split rewrites in place.  The copy could read the next ubatch's bytes, or a torn mix.
+-    // Snapshot through the pinned upload ring instead: a ring slot is not reused until the ring wraps, and
+-    // the wrap is guarded by a device sync.  Unconditional -- this is a correctness fix, not an async-path
+-    // optimisation.
++    // Snapshot the caller's bytes now, into a pinned ring owned by this context, and issue the copy itself
++    // as before r90: one H2D on this backend's stream, already ordered after the scheduler's wait.  (Through
++    // the graph-input upload ring each of these small uploads also paid that ring's queue flush -- a batch
++    // kernel, or a per-thread-stream copy with cross-stream event waits -- on every decode step.)
++    // Unconditional -- this is a correctness fix.
+     if (size > 0 && size <= GGML_CUDA_ASYNC_INPUT_MAX &&
+         ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+-        // the ring is per device, and the meta (tensor-split) backend forwards set_tensor_async per child,
+-        // so do not assume the caller left this backend's device current
++        // the meta (tensor-split) backend forwards set_tensor_async per child, so do not assume the
++        // caller left this backend's device current
+         ggml_cuda_set_device(cuda_ctx->device);
++        constexpr size_t half = 4u << 20;   // >= GGML_CUDA_ASYNC_INPUT_MAX
++        if (cuda_ctx->snap_ring == nullptr && !cuda_ctx->snap_failed) {
++            // the ring and both events, or none of them (a failed setup is not retried on every upload)
++            if (cudaMallocHost((void **) &cuda_ctx->snap_ring, 2 * half) != cudaSuccess ||
++                cudaEventCreateWithFlags(&cuda_ctx->snap_half_ev[0], cudaEventDisableTiming) != cudaSuccess ||
++                cudaEventCreateWithFlags(&cuda_ctx->snap_half_ev[1], cudaEventDisableTiming) != cudaSuccess) {
++                (void) cudaGetLastError();
++                for (auto & ev : cuda_ctx->snap_half_ev) {
++                    if (ev != nullptr) { (void) cudaEventDestroy(ev); ev = nullptr; }
++                }
++                if (cuda_ctx->snap_ring != nullptr) { (void) cudaFreeHost(cuda_ctx->snap_ring); cuda_ctx->snap_ring = nullptr; }
++                cuda_ctx->snap_failed = true;
++            }
++        }
++        if (cuda_ctx->snap_ring != nullptr) {
++            const size_t need = (size + 255) & ~(size_t) 255;
++            if (cuda_ctx->snap_head + need > half) {
++                // leave the current half: mark it, then enter the other one once the copies that last used it are done
++                const int h1 = cuda_ctx->snap_half ^ 1;
++                CUDA_CHECK(cudaEventRecord(cuda_ctx->snap_half_ev[cuda_ctx->snap_half], cuda_ctx->stream()));
++                CUDA_CHECK(cudaEventSynchronize(cuda_ctx->snap_half_ev[h1]));
++                cuda_ctx->snap_half = h1;
++                cuda_ctx->snap_head = 0;
++            }
++            char * slot = cuda_ctx->snap_ring + (size_t) cuda_ctx->snap_half * half + cuda_ctx->snap_head;
++            cuda_ctx->snap_head += need;
++            memcpy(slot, data, size);
++            ggml_cuda_async_input_drain(cuda_ctx->device);
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, slot, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
++            return;
++        }
++        // no pinned ring: fall back to r90's snapshot through the graph-input upload ring
+         if (ggml_cuda_async_input_set(cuda_ctx->device, (char *) tensor->data + offset, data, size)) {
+             return;
+         }
+-- 
+2.53.0
+
