@@ -1,0 +1,312 @@
+From c21ebc82be4845db13dc63f9540f447940eee2c2 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:22:31 +0800
+Subject: [PATCH] server: keep idle slots resident with a unified KV cache,
+ reuse prompt cache buffers, make room before a failed restore
+
+With a unified KV cache (--kv-unified, also what --parallel auto selects) and --cache-idle-slots (on by default), every new
+task saved each idle slot to the host prompt cache and cleared it, and the next switch back loaded it again: two conversations taking turns on two slots copied their
+whole state (330 MiB of recurrent state plus the KV of the context, 3.8 GB at 110K tokens) out and back on every switch,
+1.6-2.7 s at 110K.  Most of that is host memory, not the device copy (8 GB/s): the zero-filled std::vector costs about
+2 GB/s to allocate and fault in, and freeing it after a restore 0.4 s more.
+
+- LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): an idle slot keeps its context when a new task starts; the KV-full path
+  (try_clear_idle_slots) clears the least recently used idle slot and saves it to the prompt cache first (it was purged
+  without saving).  0 restores the eager save and clear.
+- A restore can fail for want of KV cells held by another idle slot ("failed to find N available cells"); the slot then
+  recomputed the whole prompt and the save that followed could evict the very entry that failed to load.  The restore now
+  moves idle slots to the prompt cache one at a time, with the entry being restored held out of the eviction, and retries.
+  The same hold covers the save of the slot a task takes over, which runs before the restore and could evict the entry
+  the task was about to restore.  server_prompt_cache::find() is split out of load() for this.
+- LLAMA_SERVER_CACHE_REUSE (on unless 0): buffers of restored or evicted states are kept for the next save (the smallest
+  spare that fits), within the cache size limit together with the cached states.
+
+Measured on r115 (production settings of the reporter, gfx1201) with two conversations alternating at 110K: 1.6-2.7 s -> 0.03 s per switch; three conversations on two slots
+(every switch saves and restores): 17.1 -> 5.4 s outside prompt eval over eight requests; 200K with a second conversation
+that overflows the unified KV cache: the long one is restored (57 tokens evaluated) instead of recomputed (200K tokens,
+135 s).  No arithmetic changes, but a different cache history places KV in other cells, so a near-tie can resolve to
+another token, as a different request order, or a restore instead of a recompute, already can.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server-context.cpp | 71 +++++++++++++++++++++++++++++++--
+ tools/server/server-task.cpp    | 68 +++++++++++++++++++++++++++----
+ tools/server/server-task.h      | 11 +++++
+ 3 files changed, 139 insertions(+), 11 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b16e31467..220324336 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1043,6 +1043,14 @@ private:
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
++    // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
++    // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
++    // take turns on their own slots do not copy their whole state to host memory and back on every switch
++    const bool lazy_idle_slots = [] {
++        const char * e = getenv("LLAMA_SERVER_LAZY_IDLE_SLOTS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     server_metrics metrics;
+ 
+     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
+@@ -1808,9 +1816,21 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
++                // the entry this task will restore is held out of the cache while the slot is saved, so the eviction
++                // that the save may cause cannot drop it
++                std::list<server_prompt_cache_state> held;
++                if (lazy_idle_slots) {
++                    auto it = prompt_cache->find(ret->prompt, task.tokens);
++                    if (it != prompt_cache->states.end()) {
++                        held.splice(held.begin(), prompt_cache->states, it);
++                    }
++                }
++
+                 ret->prompt_save(*prompt_cache);
+ 
+-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                prompt_cache->states.splice(prompt_cache->states.end(), held);
++
++                if (!ret->prompt_load(*prompt_cache, task.tokens) && !prompt_load_with_room(*ret, task.tokens)) {
+                     ret->prompt_clear();
+                 }
+ 
+@@ -1823,18 +1843,63 @@ private:
+         return ret;
+     }
+ 
++    // a restore can fail for want of KV cells that another idle slot holds (unified KV cache): move idle slots to the prompt
++    // cache one at a time, with the entry being restored kept out of the eviction that their saving may cause, and retry
++    bool prompt_load_with_room(server_slot & slot, const server_tokens & tokens) {
++        if (!lazy_idle_slots || !params_base.kv_unified) {
++            return false;
++        }
++        while (true) {
++            auto it = prompt_cache->find(slot.prompt, tokens);
++            if (it == prompt_cache->states.end()) {
++                return false;
++            }
++            std::list<server_prompt_cache_state> held;
++            held.splice(held.begin(), prompt_cache->states, it);
++            const bool cleared = try_clear_idle_slots(&slot);
++            prompt_cache->states.splice(prompt_cache->states.end(), held);
++            if (!cleared) {
++                return false;
++            }
++            SLT_INF(slot, "%s", "retrying the prompt cache restore\n");
++            if (slot.prompt_load(*prompt_cache, tokens)) {
++                return true;
++            }
++        }
++    }
++
+     // return true if at least one slot has been cleared
+     // TODO: improve logic
+     //       - smarter decision which slot to clear (LRU or longest prompt?)
+     //       - move slot to level 2 cache instead of removing?
+     //       - instead of purging, try to store and resume later?
+-    bool try_clear_idle_slots() {
++    bool try_clear_idle_slots(const server_slot * keep = nullptr) {
+         bool res = false;
+ 
+         if (!params_base.kv_unified) {
+             return res;
+         }
+ 
++        if (lazy_idle_slots) {
++            // the least recently used idle slot goes first, and it goes to the prompt cache, so it can be resumed
++            server_slot * lru = nullptr;
++            for (auto & slot : slots) {
++                if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
++                        (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
++                    lru = &slot;
++                }
++            }
++            if (lru == nullptr) {
++                return res;
++            }
++            SRV_WRN("making room in the KV cache: saving and clearing idle slot %d with %zu tokens\n", lru->id, lru->prompt.tokens.size());
++            if (prompt_cache && params_base.cache_idle_slots && lru->prompt_save(*prompt_cache)) {
++                prompt_cache->update();
++            }
++            lru->prompt_clear();
++            return true;
++        }
++
+         for (auto & slot : slots) {
+             if (slot.is_processing()) {
+                 continue;
+@@ -2807,7 +2872,7 @@ private:
+                         break; // drop the task
+                     }
+ 
+-                    if (params_base.cache_idle_slots) {
++                    if (params_base.cache_idle_slots && !lazy_idle_slots) {
+                         for (auto & slot : slots) {
+                             if (!slot.is_processing()) {
+                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 3f30da2cd..592346825 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1711,6 +1711,48 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
++static bool prompt_cache_reuse() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SERVER_CACHE_REUSE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return v;
++}
++
++std::vector<uint8_t> server_prompt_cache::take(size_t n) {
++    // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
++    size_t best = spare.size();
++    for (size_t i = 0; i < spare.size(); ++i) {
++        if (spare[i].capacity() >= n && (best == spare.size() || spare[i].capacity() < spare[best].capacity())) {
++            best = i;
++        }
++    }
++    std::vector<uint8_t> buf;
++    if (best < spare.size()) {
++        buf = std::move(spare[best]);
++        spare.erase(spare.begin() + best);
++    }
++    buf.resize(n);
++    return buf;
++}
++
++void server_prompt_cache::recycle(std::vector<uint8_t> && buf) {
++    if (!prompt_cache_reuse() || buf.capacity() == 0) {
++        return;
++    }
++    spare.push_back(std::move(buf));
++    // the cached states and the spare buffers stay within the cache size limit together; the smallest spares go first
++    size_t total = size();
++    for (const auto & b : spare) {
++        total += b.capacity();
++    }
++    while (!spare.empty() && limit_size > 0 && total > limit_size) {
++        auto it = std::min_element(spare.begin(), spare.end(), [](const auto & a, const auto & b) { return a.capacity() < b.capacity(); });
++        total -= it->capacity();
++        spare.erase(it);
++    }
++}
++
+ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+@@ -1744,6 +1786,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         if (len == (int) it->prompt.tokens.size()) {
+             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+ 
++            recycle(std::move(it->data.main));
++            recycle(std::move(it->data.drft));
+             it = states.erase(it);
+         } else {
+             ++it;
+@@ -1756,6 +1800,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
++            recycle(std::move(states.front().data.main));
++            recycle(std::move(states.front().data.drft));
+             states.pop_front();
+         }
+     }
+@@ -1765,8 +1811,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     // check if we can allocate enough memory for the new state
+     try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
++        state_data_tgt = take(state_size_tgt);
++        state_data_dft = take(state_size_dft);
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+@@ -1793,7 +1839,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const server_prompt & prompt, const server_tokens & tokens_new) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+@@ -1825,8 +1871,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         }
+     }
+ 
++    return it_best;
++}
++
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    auto it_best = find(prompt, tokens_new);
++
+     if (it_best != states.end()) {
+-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++        SRV_TRC(" - found better prompt with length %zu\n", it_best->prompt.tokens.size());
+ 
+         {
+             auto & data = it_best->data.main;
+@@ -1839,8 +1891,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+                 return false;
+             }
+ 
+-            data.clear();
+-            data.shrink_to_fit();
++            recycle(std::move(data));
++            data = {};
+         }
+ 
+         {
+@@ -1857,8 +1909,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+                     return false;
+                 }
+ 
+-                data.clear();
+-                data.shrink_to_fit();
++                recycle(std::move(data));
++                data = {};
+             }
+         }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 50926ec3c..31ed0cbaf 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -674,12 +674,23 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // buffers of states that were restored or evicted, kept for the next save: a large state buffer costs about as much to
++    // zero-fill and fault in as to copy from the device, and as much again to free (LLAMA_SERVER_CACHE_REUSE=0: off)
++    std::vector<std::vector<uint8_t>> spare;
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
+ 
++    // a buffer of n bytes (a spare one if one is large enough), and the way back for a buffer that is no longer needed
++    std::vector<uint8_t> take(size_t n);
++    void recycle(std::vector<uint8_t> && buf);
++
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
++    // the cached prompt that load() would restore for tokens_new into a slot holding prompt (states.end(): none)
++    std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
++
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();
+-- 
+2.43.0
+
