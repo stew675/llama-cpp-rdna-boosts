@@ -1,0 +1,154 @@
+From 890a5c1108a5429c4b40abb6ad66a78f13edb777 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 24 Oct 2026 08:00:00 -0500
+Subject: [PATCH 14/15] rdna-boosts: block 14: MMB per-device arch dispatch (fix mixed-arch multi-GPU)
+
+MMB: key per-arch decisions to the running device, not devices[0]
+
+The MMB dequant-weight GEMM keyed every architecture decision (mmb_enabled,
+mmb_cfg, mmb_dense_flag, mmb_wtype_mask, mmb_dense_tmask) on
+ggml_cuda_info().devices[0].cc -- the primary's compute capability. In a
+mixed-arch multi-GPU setup (gfx1100 primary + gfx1030 secondary) the policy
+froze at the primary's: the gfx1030 secondary ran RDNA3-tuned WMMA MMB
+kernels (mmb_enabled() is false on RDNA2, which has no WMMA) and produced
+byte-exact zero output-projection logits (PPL = vocab size), or garbled
+tail-layer GEMMs when the output projection sat on the healthy primary.
+
+All six sites now use the current device's cc
+(ggml_cuda_info().devices[ggml_cuda_get_device()].cc), the same idiom the
+mmq/mmvq dispatch already uses; mmb_cfg() takes per-arch magic statics and
+the wtype/dense tmask statics move inside the env-override branch so the
+arch policy is resolved per call.
+
+Verified (Qwen3.8-27B Q6_K_XL, gutenberg corpus, 2 GPU -sm layer):
+V620-secondary PPL 248320 -> 2.9844 (200KB) and 2.7546 (772KB); V620-primary
+unchanged at 2.9983 (200KB) / 2.7697 (772KB); the XTX-primary +
+output-on-XTX garble config (PPL 917.54) -> 2.9842.
+---
+ ggml/src/ggml-cuda/mmb.cu |   52 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 34 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index d788cbb71..ab96c8158 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1,3 +1,4 @@
++#include "common.cuh"
+ #include "mmb.cuh"
+ #include "unary.cuh"
+ #include <unordered_map>
+@@ -1570,7 +1571,20 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+ }
+ 
+ static const mmb_arch_cfg & mmb_cfg() {
+-    static const mmb_arch_cfg c = mmb_arch_defaults(ggml_cuda_info().devices[0].cc);
++    /* r121: key the per-arch config to the cc of the device the kernel runs on, not the
++       primary: a mixed-arch setup froze the devices[0] config for every device, so a gfx1030
++       secondary behind a gfx1100 primary ran RDNA3-tuned MMB kernels on RDNA2 (no WMMA) and
++       zeroed its output projection logits (PPL = vocab). */
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        static const mmb_arch_cfg c = mmb_arch_defaults(cc);
++        return c;
++    }
++    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
++        static const mmb_arch_cfg c = mmb_arch_defaults(cc);
++        return c;
++    }
++    static const mmb_arch_cfg c = mmb_arch_defaults(cc);
+     return c;
+ }
+ 
+@@ -1591,7 +1605,7 @@ static void mmb_cfg_dump_once() {
+     const bool on = (getenv("GGML_CUDA_MMB_CFG") && atoi(getenv("GGML_CUDA_MMB_CFG")) != 0) ||
+                     (getenv("GGML_CUDA_MMB_LOG") && atoi(getenv("GGML_CUDA_MMB_LOG")) != 0);
+     if (!on) return;
+-    const int cc = ggml_cuda_info().devices[0].cc;
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const mmb_arch_cfg & c = mmb_cfg();
+     fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
+                     "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
+@@ -1702,7 +1716,7 @@ bool mmb_enabled() {
+     // "two runs of four" fragment (see the shim at the top of the file).  RDNA3_5 (gfx1150/gfx1151),
+     // RDNA4 (gfx1200/gfx1201) and RDNA3_0 (gfx1100/1101/1102, validated by the gfx1100 port) are on;
+     // GGML_CUDA_MMB_RDNA3=0 disables the RDNA3_0 arm.
+-    const int cc = ggml_cuda_info().devices[0].cc;
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     static const bool allow_rdna3 = getenv("GGML_CUDA_MMB_RDNA3") ? atoi(getenv("GGML_CUDA_MMB_RDNA3")) != 0 : true;
+     if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || (allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc))) { mmb_cfg_dump_once(); return true; }
+     return false;
+@@ -1767,7 +1781,7 @@ bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(get
+ bool mmb_dense_flag() {
+     static const int v = getenv("GGML_CUDA_MMB_DENSE") ? atoi(getenv("GGML_CUDA_MMB_DENSE")) : -1;
+     if (v >= 0) return v != 0;
+-    return !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc);
++    return !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+ }
+ // Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
+ // The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
+@@ -1811,10 +1825,6 @@ bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? at
+ // GGML_CUDA_MMB_TYPES=<csv of type names, e.g. iq4_xs,iq3_xxs,q8_0> overrides the set, so a future
+ // gfx1201 per-type re-tune is validated without a rebuild (and without re-cutting the patch).
+ static uint64_t mmb_wtype_mask() {
+-    static uint64_t mask = 0;
+-    static bool init = false;
+-    if (init) return mask;
+-    init = true;
+     const uint64_t IQ_FAMILY = (1ull << GGML_TYPE_IQ4_NL) | (1ull << GGML_TYPE_IQ3_S) |
+                                (1ull << GGML_TYPE_IQ4_XS) | (1ull << GGML_TYPE_IQ3_XXS);
+     const uint64_t K_AND_Q8  = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q5_1) |
+@@ -1824,6 +1834,10 @@ static uint64_t mmb_wtype_mask() {
+     const uint64_t IQ2       = (1ull << GGML_TYPE_IQ2_S) | (1ull << GGML_TYPE_IQ2_XS) | (1ull << GGML_TYPE_IQ2_XXS);
+     const char * e = getenv("GGML_CUDA_MMB_TYPES");
+     if (e && *e) {
++        static uint64_t mask = 0;
++        static bool init = false;
++        if (init) return mask;
++        init = true;
+         static const struct { const char * n; ggml_type t; } tab[] = {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+@@ -1843,8 +1857,8 @@ static uint64_t mmb_wtype_mask() {
+         return mask;
+     }
+     const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
+-    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2);
+-    return mask;
++    /* r121: per-device arch policy (was devices[0], frozen at the primary). */
++    return GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2);
+ }
+ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
+ 
+@@ -1866,12 +1880,12 @@ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_
+ // goes through this same predicate).  GGML_CUDA_MMB_DENSE=1 forces the whole dense path on for A/B;
+ // GGML_CUDA_MMB_DENSE_TYPES=<csv> overrides the set for a future per-type re-tune.
+ static uint64_t mmb_dense_tmask() {
+-    static uint64_t mask = 0;
+-    static bool init = false;
+-    if (init) return mask;
+-    init = true;
+-    const char * e = getenv("GGML_CUDA_MMB_DENSE_TYPES");
++    static const char * e = getenv("GGML_CUDA_MMB_DENSE_TYPES");
+     if (e && *e) {
++        static uint64_t mask = 0;
++        static bool init = false;
++        if (init) return mask;
++        init = true;
+         static const struct { const char * n; ggml_type t; } tab[] = {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+@@ -1888,9 +1902,11 @@ static uint64_t mmb_dense_tmask() {
+         }
+         return mask;
+     }
+-    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc)) mask = (1ull << GGML_TYPE_IQ3_S) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
+-    else mask = ~0ull;   // elsewhere the pre-S10 behaviour stands: mmb_dense_flag() alone gates it
+-    return mask;
++    /* r121: per-device arch policy (was devices[0], frozen at the primary). */
++    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++        return (1ull << GGML_TYPE_IQ3_S) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
++    }
++    return ~0ull;   // elsewhere the pre-S10 behaviour stands: mmb_dense_flag() alone gates it
+ }
+ // The generic quantized dense tile GEMM may run for this weight type: arch policy (mmb_dense_flag)
+ // OR the per-type S10 winner.  The HC tall-M tile (mmb_tall_shape) is model-specific and separate.

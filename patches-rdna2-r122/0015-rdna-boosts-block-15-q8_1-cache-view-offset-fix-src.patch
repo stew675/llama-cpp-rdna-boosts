@@ -1,0 +1,249 @@
+From eb36606301965d4032033e5efe0fa4ff8f4e4ef8 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 24 Oct 2026 08:05:00 -0500
+Subject: [PATCH 15/15] rdna-boosts: block 15: q8_1 cache view-offset mis-hit fix + source range guard
+
+q8_1: gate cache view-reuse on pointer equality + validate source range
+
+The Q8_1 on-the-fly quantize cache is keyed by the ROOT tensor identity, but
+the arena buffer is filled from the (possibly offset) VIEW pointer. An
+offset view stored its rows under the root's identity, so a later op with
+the same root + canonical row layout could hit an entry quantized from a
+different base pointer -- and when the view's compute buffer was
+reallocated (graph replay / compute-buffer pool reuse) the quantize kernel
+read through a stale pointer: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on
+decode, silent stale reads on multi-GPU.
+
+- The mmvq (x4) and unary (x2) src1_key walks now stop at the first pointer
+  change, so offset-free views keep the shared root entry and offset views
+  get their own cache entry (allocated from the existing arena).
+- q8_1_src_range_ok() (common.cuh) checks the source read range against the
+  root buffer's allocation before every quantize_row_q8_1_cuda and fused
+  gated-q8_1 launch; a stale pointer now aborts loudly with the layout
+  logged instead of faulting or reading reused memory.
+
+Verified (Qwen3.8-27B Q6_K_XL, single V620 gfx1030): decode bench
+pp512/tg128 clean (18.5 t/s), PPL 2.9968 default vs 2.9963 with
+GGML_CUDA_Q8_1_CACHE_EXACT=1 (identical), test-backend-ops MUL_MAT 2/2
+passed.
+---
+ ggml/src/ggml-cuda/common.cuh |   48 +++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu    |   36 ++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/unary.cu   |   19 +++++++++++++++-
+ 3 files changed, 93 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 44dc05de1..dfba25616 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1890,6 +1890,54 @@ struct ggml_backend_cuda_context {
+         }
+     }
+ 
++    // Stale-source-pointer guard for the on-the-fly Q8_1 quantize / fused-write launches: the
++    // source read range (the tensor's own ne/nb extent) must lie within the root tensor's
++    // buffer allocation.  A compute buffer that is reallocated while a cache entry still
++    // matches keeps the stored identity true but leaves the source pointer stale; without
++    // this the kernel faults (MEMORY_APERTURE_VIOLATION) or silently reads reused memory.
++    // Log the layout and return false so the caller aborts.  A pointer fully outside the
++    // buffer is not this fault class (some buffer types keep the data elsewhere): let it run.
++    static bool q8_1_src_range_ok(const ggml_tensor * src, const void * src_d) {
++        if (src == nullptr || src_d == nullptr) {
++            return true;
++        }
++        const ggml_tensor * root = src;
++        while (root->view_src != nullptr) {
++            root = root->view_src;
++        }
++        if (root->buffer == nullptr) {
++            return true;
++        }
++        const char * base  = reinterpret_cast<const char *>(ggml_backend_buffer_get_base(root->buffer));
++        const size_t  bsize = ggml_backend_buffer_get_size(root->buffer);
++        if (base == nullptr || bsize == 0) {
++            return true;
++        }
++        const char * p = reinterpret_cast<const char *>(src_d);
++        if (p < base || p >= base + bsize) {
++            return true;
++        }
++        if (src->ne[0] <= 0 || src->ne[1] <= 0 || src->ne[2] <= 0 || src->ne[3] <= 0) {
++            return true;
++        }
++        const size_t bytes = (size_t) src->ne[0] * ggml_element_size(src) +
++                             (size_t) ((src->ne[1] - 1) * src->nb[1] +
++                                       (src->ne[2] - 1) * src->nb[2] +
++                                       (src->ne[3] - 1) * src->nb[3]);
++        if (p + bytes > base + bsize) {
++            GGML_LOG_ERROR("%s: q8_1 source out of range (stale pointer?): tensor '%s' data=%p, root '%s' "
++                         "data=%p, buffer=[%p, %p), bytes=%zu, ne=(%lld, %lld, %lld, %lld), "
++                         "nb=(%llu, %llu, %llu, %llu)\n",
++                         __func__, src->name, (const void *) src_d, root->name, (const void *) root->data,
++                         (const void *) base, (const void *) (base + bsize), bytes,
++                         (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
++                         (unsigned long long) src->nb[0], (unsigned long long) src->nb[1], (unsigned long long) src->nb[2],
++                         (unsigned long long) src->nb[3]);
++            return false;
++        }
++        return true;
++    }
++
+     void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
+                           int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                           int64_t s11, int64_t s12, int64_t s13, bool & found) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 15653d31f..3e3d81475 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2095,9 +2095,11 @@ void ggml_cuda_mul_mat_vec_q(
+     const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+ 
+     // Quantize src1 to Q8_1 once per graph; matmuls sharing the same src1 data
+-    // (views of the same tensor included) reuse the buffer.
++    // (views of the same tensor included) reuse the buffer.  The cache identity is the
++    // root's data pointer, but the buffer is filled from this tensor's pointer, so only
++    // offset-free views may take the root's entry.
+     const ggml_tensor * src1_key = src1;
+-    while (src1_key->view_src != nullptr) {
++    while (src1_key->view_src != nullptr && src1->data == src1_key->data) {
+         src1_key = src1_key->view_src;
+     }
+     const int64_t src1_s11 = src1->nb[1] / ts_src1;
+@@ -2107,6 +2109,9 @@ void ggml_cuda_mul_mat_vec_q(
+     void * src1_q8_1 = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, src1_q8_1_size,
+                                           ne10, ne11, ne12, ne13, src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+     if (!src1_q8_1_cached) {
++        if (!ctx.q8_1_src_range_ok(src1, src1_d)) {
++            GGML_ABORT("fatal error");
++        }
+         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, src1_s11, src1_s12, src1_s13, ne10_padded, ne11, ne12, ne13, stream);
+     }
+ 
+@@ -2228,11 +2233,13 @@ void ggml_cuda_op_ssm_gate_beta(
+     const size_t ts_src1 = ggml_type_size(src1->type);
+ 
+     // Quantize src1 to Q8_1 once per graph; reuse the same buffer as the other
+-    // matmuls over this input.
++    // matmuls over this input.  The cache identity is the root's data pointer, but the
++    // buffer is filled from this tensor's pointer, so only offset-free views may take
++    // the root's entry.
+     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+     const size_t src1_q8_1_size = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+     const ggml_tensor * src1_key = src1;
+-    while (src1_key->view_src != nullptr) {
++    while (src1_key->view_src != nullptr && src1->data == src1_key->data) {
+         src1_key = src1_key->view_src;
+     }
+     const int64_t src1_s11 = src1->nb[1] / ts_src1;
+@@ -2243,6 +2250,9 @@ void ggml_cuda_op_ssm_gate_beta(
+                                           src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                                           src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+     if (!src1_q8_1_cached) {
++        if (!ctx.q8_1_src_range_ok(src1, src1->data)) {
++            GGML_ABORT("fatal error");
++        }
+         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, GGML_TYPE_Q8_0,
+                                src1->ne[0], src1_s11, src1_s12, src1_s13, ne10_padded,
+                                src1->ne[1], src1->ne[2], src1->ne[3], stream);
+@@ -2454,11 +2464,13 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+     const size_t ts_src1 = ggml_type_size(src1->type);
+ 
+     // Quantize src1 to Q8_1 once per graph; reuse the same buffer as the other
+-    // matmuls over this input.
++    // matmuls over this input.  The cache identity is the root's data pointer, but the
++    // buffer is filled from this tensor's pointer, so only offset-free views may take
++    // the root's entry.
+     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+     const size_t src1_q8_1_size = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+     const ggml_tensor * src1_key = src1;
+-    while (src1_key->view_src != nullptr) {
++    while (src1_key->view_src != nullptr && src1->data == src1_key->data) {
+         src1_key = src1_key->view_src;
+     }
+     const int64_t src1_s11 = src1->nb[1] / ts_src1;
+@@ -2469,6 +2481,9 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+                                           src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                                           src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+     if (!src1_q8_1_cached) {
++        if (!ctx.q8_1_src_range_ok(src1, src1->data)) {
++            GGML_ABORT("fatal error");
++        }
+         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, GGML_TYPE_Q8_0,
+                                src1->ne[0], src1_s11, src1_s12, src1_s13, ne10_padded,
+                                src1->ne[1], src1->ne[2], src1->ne[3], stream);
+@@ -2619,10 +2634,12 @@ void ggml_cuda_op_shexp_down_gate(
+     cudaStream_t stream = ctx.stream();
+     const size_t ts_src1 = ggml_type_size(swiglu->type);
+ 
+-    // Quantize the swiglu to Q8_1 once per graph.
++    // Quantize the swiglu to Q8_1 once per graph.  The cache identity is the root's data
++    // pointer, but the buffer is filled from this tensor's pointer, so only offset-free
++    // views may take the root's entry.
+     const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
+     const size_t q8_1_size = swiglu->ne[3]*swiglu->ne[2] * swiglu->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;    const ggml_tensor * src1_key = swiglu;
+-    while (src1_key->view_src != nullptr) {
++    while (src1_key->view_src != nullptr && swiglu->data == src1_key->data) {
+         src1_key = src1_key->view_src;
+     }
+     const int64_t s11 = swiglu->nb[1] / ts_src1;
+@@ -2633,6 +2650,9 @@ void ggml_cuda_op_shexp_down_gate(
+                                          swiglu->ne[0], swiglu->ne[1], swiglu->ne[2], swiglu->ne[3],
+                                          s11, s12, s13, cached);
+     if (!cached) {
++        if (!ctx.q8_1_src_range_ok(swiglu, swiglu->data)) {
++            GGML_ABORT("fatal error");
++        }
+         quantize_row_q8_1_cuda((const float *) swiglu->data, nullptr, y_swiglu, GGML_TYPE_Q8_0,
+                                swiglu->ne[0], s11, s12, s13, ne10_padded,
+                                swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 3346e2c7f..228d53129 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -576,7 +576,9 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+     const int64_t s13 = src1->nb[3] / ts_src1;
+ 
+     const ggml_tensor * src1_key = src1;
+-    while (src1_key->view_src != nullptr) {
++    // The cache identity is the root's data pointer, but the buffer is filled from this
++    // tensor's pointer, so only offset-free views may take the root's entry.
++    while (src1_key->view_src != nullptr && src1->data == src1_key->data) {
+         src1_key = src1_key->view_src;
+     }
+ 
+@@ -612,6 +614,12 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+         float eps;
+         memcpy(&eps, norm->op_params, sizeof(float));
+         GGML_ASSERT(nc == 128 && k % 128 == 0 && unary_stride == 128*(int64_t) sizeof(float));
++        // Stale-source guard (see q8_1_src_range_ok): abort loudly instead of faulting on a
++        // reallocated compute buffer.
++        if (!ctx.q8_1_src_range_ok(unary_src, unary_src->data) || !ctx.q8_1_src_range_ok(xn, xn->data) ||
++            !ctx.q8_1_src_range_ok(w, w->data)) {
++            GGML_ABORT("fatal error");
++        }
+         const ggml_cuda_kernel_launch_params lpn = ggml_cuda_kernel_launch_params((dim3) (k/128), 256, 32*sizeof(float), stream);
+         ggml_cuda_kernel_launch(unary_gated_q8_1_norm_kernel<op>, lpn,
+                 (const float *) unary_src->data, (int64_t) 128, (const float *) xn->data, (int) xn->ne[1],
+@@ -619,6 +627,11 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
+                 (block_q8_1 *) y, k, row_len);
+         return;
+     }
++    // Stale-source guard (see q8_1_src_range_ok): abort loudly instead of faulting on a
++    // reallocated compute buffer.
++    if (!ctx.q8_1_src_range_ok(unary_src, unary_src->data) || !ctx.q8_1_src_range_ok(other_src, other_src->data)) {
++        GGML_ABORT("fatal error");
++    }
+     ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op, float>, lp,
+             (const float *) unary_src->data, (const float *) other_src->data, (block_q8_1 *) y,
+             k, nc, unary_stride / sizeof(float), other_stride / sizeof(float), row_len, (float *) nullptr);
+@@ -709,7 +722,9 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         if (mm != nullptr) {
+             const ggml_tensor * a = mm->src[1];
+             const ggml_tensor * a_key = a;
+-            while (a_key->view_src != nullptr) {
++            // The cache identity is the root's data pointer, but the buffer is filled from
++            // this tensor's pointer, so only offset-free views may take the root's entry.
++            while (a_key->view_src != nullptr && a->data == a_key->data) {
+                 a_key = a_key->view_src;
+             }
+             const int64_t ne10_padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
