@@ -374,7 +374,8 @@ first token, at every ctx size tried, while `-np 2` and `-np 4` ran untouched.  
 the guard their siblings have; `can_reuse` needs nothing (`can_reuse_kq_mask()` reads `ne[]`, never
 `buffer`).  Measured, card idle, `-st -n 128`, 2 reps: `-np 1` abort -> 88.7 / 88.6 t/s; `-np 2` 88.1 /
 85.9 and `-np 4` 87.9 unchanged, the derived form being off at 2+ slots in both builds; greedy output is
-token-identical to `LLAMA_KQ_MASK_DERIVED=0` and to CPU, so nothing reads the skipped fill.  Without the
+token-identical to `LLAMA_KQ_MASK_DERIVED=0` and to CPU (md5 of the 144-char `-n 32 -s 42 --temp 0`
+completion `5ea74e63b02f` on all three), so nothing reads the skipped fill.  Without the
 guard, `LLAMA_KQ_MASK_DERIVED=0` is the work-around and is measured free at this shape (88.5 / 88.8).
 
 **Upstream candidates.**  `fa-kv-split-width` (block 00), `fa-decode-verify-kernel-family`,
