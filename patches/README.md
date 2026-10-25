@@ -40,7 +40,7 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +630 / −214 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask | +5032 / −609 | 289 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ r129: the three kq-mask fills that lacked the sibling's buffer guard - `mem_hybrid_k`, `attn_k_dsa` mla/lid - `-np 1` abort on bailingmoe3) | +5050 / −609 | 289 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM | +2877 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE | +5424 / −440 | 35 |
@@ -360,6 +360,22 @@ A **family switch** (the r102 RDNA3_0 head-512 row set, §46) is judged with
 `scripts/gate-prefill-logits.sh --family-switch`: it passes the same absolute limits at a point inside the
 gate's calibrated domain (0.001778 / 98.967 % at base PPL 2.65) and is reported against a same-kernel
 ubatch control measured on the spot.
+
+**The three kq-mask fills that lacked the guard** (r129 amendment; reported, root-caused and validated by
+@RikshaDriver on RX 7600 `gfx1102`, ROCm 10.1, `bailingmoe3` / Ling-3.0-tiny-IQ4_NL).  The derived kq form
+leaves the packed mask with no consumer at one slot and the allocator gives unconsumed tensors no buffer;
+ten of the thirteen fill sites in `src/llama-graph.cpp` already guard for that, in the form
+[`attn-k-null-mask-guard`](../upstream/attn-k-null-mask-guard/README.md) describes, and three did not:
+`llm_graph_input_attn_k_dsa` (its `mla` and `lid` masks) and `llm_graph_input_mem_hybrid_k`.  The hybrid-K
+class is the one a `bailingmoe3` graph reaches, and only single-sequence contexts enable the derived form
+(`multi_stream = n_seqs > 1 && (!kv_unified || arch == DEEPSEEK4)`) - so `-np 1` aborted at
+`GGML_ASSERT(buffer)` (ggml-backend.cpp:571, via `set_input_kq_mask`'s host-residency assert) before the
+first token, at every ctx size tried, while `-np 2` and `-np 4` ran untouched.  The three sites now carry
+the guard their siblings have; `can_reuse` needs nothing (`can_reuse_kq_mask()` reads `ne[]`, never
+`buffer`).  Measured, card idle, `-st -n 128`, 2 reps: `-np 1` abort -> 88.7 / 88.6 t/s; `-np 2` 88.1 /
+85.9 and `-np 4` 87.9 unchanged, the derived form being off at 2+ slots in both builds; greedy output is
+token-identical to `LLAMA_KQ_MASK_DERIVED=0` and to CPU, so nothing reads the skipped fill.  Without the
+guard, `LLAMA_KQ_MASK_DERIVED=0` is the work-around and is measured free at this shape (88.5 / 88.8).
 
 **Upstream candidates.**  `fa-kv-split-width` (block 00), `fa-decode-verify-kernel-family`,
 `fa-512-rdna-head-cap`, `attn-k-null-mask-guard` — see [`../upstream/`](../upstream/README.md).
