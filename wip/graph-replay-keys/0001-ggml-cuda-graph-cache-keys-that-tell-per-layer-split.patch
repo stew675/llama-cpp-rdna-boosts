@@ -1,0 +1,228 @@
+From 8fb406d22ef7d7a33dd29220080fa796562cbe7e Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 26 Oct 2026 18:26:36 +0000
+Subject: [PATCH] ggml-cuda: graph cache keys that tell per-layer split
+ subgraphs apart, so decode graphs replay
+
+Under -sm tensor (and -sm layer) a decode / MTP verify graph reaches the
+CUDA backend as many small per-layer subgraphs.  Every layer's subgraph
+starts on the same activation buffer, so the (first node data, n_tokens)
+key sent all of them to one cached graph.  Each layer then failed
+ggml_cuda_graph_update_required against the previous layer's properties:
+a source data pointer "moved" by one layer's worth of weights (the
+neighbouring layer's tensor), and the graph ran directly or was
+recaptured on almost every call.
+
+- Key the cache on the first device-resident weight a subgraph reads as
+  well (falls back to nodes[0]->src[0] when the weights are host-resident),
+  plus a cheap shape / name signature (n_nodes, nodes[0] ne and src0 data,
+  last node data, first and last node names), so the routed-MoE splits of
+  different layers and the two expert-width splits of one layer get their
+  own entries.  The key only picks the entry; a replay still needs every
+  node to compare equal.
+- Compare node properties without tensor object identities (src[],
+  view_src, buffer are blanked; op, data, ne, nb, type, op_params, flags,
+  name and every source's data / ne / nb / type are still compared): the
+  Meta rebuild hands out fresh tensor objects for the same data each time.
+- Bump the graph memory generation when the expert cache frees an arena
+  or a remap buffer, so a capture that baked one in is never replayed.
+
+GGML_CUDA_GRAPH_KEY_WEIGHT=0 restores the old key and
+GGML_CUDA_GRAPH_PROPS_STRICT=1 the old property compare (A/B only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh          |  8 ++-
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 81 +++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu |  7 ++-
+ 3 files changed, 92 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index eae6ada60..fd92a8b43 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1463,6 +1463,7 @@ struct ggml_cuda_graph {
+         void *   node_src_data_ptrs[GGML_MAX_SRC];
+         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
++        int32_t  node_src_type[GGML_MAX_SRC];   // F16 / BF16 leaves share size and geometry
+     };
+     std::vector<node_properties> node_props;
+ 
+@@ -1631,9 +1632,12 @@ struct ggml_cuda_stream_context {
+ struct ggml_cuda_graph_key {
+     const void * first_node_ptr;
+     int64_t      n_tokens;
++    const void * first_weight_ptr = nullptr;   // data of the first weight the graph reads (see ggml_cuda_graph_get_key)
++    uint64_t     shape_sig        = 0;         // n_nodes + the first node's shape/source + the last node's data
+ 
+     bool operator==(const ggml_cuda_graph_key & other) const {
+-        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens;
++        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens &&
++               first_weight_ptr == other.first_weight_ptr && shape_sig == other.shape_sig;
+     }
+ };
+ 
+@@ -1641,6 +1645,8 @@ struct ggml_cuda_graph_key_hash {
+     size_t operator()(const ggml_cuda_graph_key & k) const {
+         size_t h = std::hash<const void *>()(k.first_node_ptr);
+         h ^= std::hash<int64_t>()(k.n_tokens) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++        h ^= std::hash<const void *>()(k.first_weight_ptr) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++        h ^= std::hash<uint64_t>()(k.shape_sig) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+         return h;
+     }
+ };
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8377c8d24..585955576 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5197,6 +5197,71 @@ static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
+ // `cgraph->uid` (the meta assigns one per rebuild) forces that check.  So a collision costs a
+ // recapture, never a mismatched replay.  `GGML_CUDA_GRAPH_KEY_DATA=0` restores the object-address
+ // key (A/B and bisect only).
++// The data of the first weight any node reads.  Under -sm tensor a verify-width (n_tokens > 1) graph is split per
++// layer, and every layer's subgraph can start on the same activation buffer (same nodes[0]->data, same n_tokens), so
++// the (first node, n_tokens) key alone sends all layers to ONE cached graph: each layer then fails
++// `ggml_cuda_graph_update_required` against the previous layer's properties and is recaptured on every step (measured,
++// 2 x R9700 Flash-Next MTP decode: 179 recaptures of the 4-token graph per device per 400 tokens, ~2400 kernel launches
++// through the HIP API per verify step).  A layer's weights are fixed and distinct, so they tell the subgraphs apart.
++// Like the first-node pointer it is only a cache key: a replay still requires `ggml_cuda_graph_update_required` to
++// find every node unchanged.  GGML_CUDA_GRAPH_KEY_WEIGHT=0: the old key (A/B and bisect only).
++static const void * ggml_cuda_graph_first_weight(const ggml_cgraph * cgraph) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_GRAPH_KEY_WEIGHT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on) {
++        return nullptr;
++    }
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            const ggml_tensor * src = node->src[j];
++            if (src != nullptr && src->buffer != nullptr && src->data != nullptr &&
++                    ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                return src->data;
++            }
++        }
++    }
++    // No device-resident weight (e.g. a routed-MoE split whose expert table lives in host memory): the first node's own
++    // first source is the next most layer-specific pointer (the expert table / its arena), so key on that instead.
++    const ggml_tensor * n0 = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
++    return n0 != nullptr && n0->src[0] != nullptr ? n0->src[0]->data : nullptr;
++}
++
++// (also gated by GGML_CUDA_GRAPH_KEY_WEIGHT) A cheap structural signature for the key: two subgraphs of one layer can share the first node's data AND the
++// first weight (e.g. the two expert-width MoE splits of a host-expert layer, [384, n_used, n_tok] and
++// [256, n_used, n_tok], both starting on the same output buffer) and would again evict each other every step.
++static uint64_t ggml_cuda_graph_shape_sig(const ggml_cgraph * cgraph) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_GRAPH_KEY_WEIGHT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (!on || cgraph->n_nodes <= 0) {
++        return 0;
++    }
++    const ggml_tensor * n0 = cgraph->nodes[0];
++    const ggml_tensor * nl = cgraph->nodes[cgraph->n_nodes - 1];
++    uint64_t h = 1469598103934665603ull;
++    auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
++    mix((uint64_t) cgraph->n_nodes);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        mix((uint64_t) n0->ne[d]);
++    }
++    mix((uint64_t) (uintptr_t) (n0->src[0] != nullptr ? n0->src[0]->data : nullptr));
++    mix((uint64_t) (uintptr_t) nl->data);
++    // the node names carry the layer index ("ffn_moe_gate-5"): the routed-MoE splits of different layers can match in
++    // every pointer and shape (the expert arena is shared, the per-layer table is host state baked in at capture), and
++    // only `ggml_cuda_graph_update_required`'s name compare tells them apart -- so key on it too, or they evict each other
++    for (const char * c = n0->name; c < n0->name + GGML_MAX_NAME && *c; ++c) {
++        mix((uint64_t) (unsigned char) *c);
++    }
++    for (const char * c = nl->name; c < nl->name + GGML_MAX_NAME && *c; ++c) {
++        mix((uint64_t) (unsigned char) *c);
++    }
++    return h;
++}
++
+ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     static const bool key_by_data = [] {
+         const char * e = getenv("GGML_CUDA_GRAPH_KEY_DATA");
+@@ -5205,7 +5270,8 @@ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     if (key_by_data && cgraph->n_nodes > 0 && cgraph->nodes[0] != nullptr &&
+             cgraph->nodes[0]->data != nullptr) {
+         // only the pointer value is used (hash / equality); it is never dereferenced as a tensor
+-        return ggml_cuda_graph_key { cgraph->nodes[0]->data, ggml_cuda_graph_n_tokens(cgraph) };
++        return ggml_cuda_graph_key { cgraph->nodes[0]->data, ggml_cuda_graph_n_tokens(cgraph), ggml_cuda_graph_first_weight(cgraph),
++                                     ggml_cuda_graph_shape_sig(cgraph) };
+     }
+     return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph) };
+ }
+@@ -5280,12 +5346,25 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_cuda_graph::node_properties prop = {};
+         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
++        // Object identities are not graph properties: under the Meta backend every rebuild maps the nodes to fresh
++        // simple-tensor objects (see ggml_cuda_graph_get_key), so the src / view_src / buffer object pointers change
++        // although nothing the captured kernels read does.  The sources are compared below by what a replay bakes in
++        // (data pointer, ne, nb), so blank the identities.  GGML_CUDA_GRAPH_PROPS_STRICT=1: compare them (A/B).
++        static const bool props_strict = getenv("GGML_CUDA_GRAPH_PROPS_STRICT") != nullptr;
++        if (!props_strict) {
++            for (int j = 0; j < GGML_MAX_SRC; ++j) {
++                prop.node.src[j] = nullptr;
++            }
++            prop.node.view_src = nullptr;
++            prop.node.buffer   = nullptr;
++        }
+ 
+         for (int j = 0; j < GGML_MAX_SRC; ++j) {
+             if (cgraph->nodes[i]->src[j]) {
+                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
+                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
++                prop.node_src_type[j] = (int32_t) cgraph->nodes[i]->src[j]->type;
+             }
+         }
+ 
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index dcd7818fa..2c036b19f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2854,6 +2854,8 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
+     } else {
+         (void) cudaFree(arena);
+     }
++    // a captured graph may bake this arena in (expert reads through the remap): force recapture, never replay freed memory
++    ggml_cuda_graph_mem_freed(device);
+ }
+ 
+ // wip/moe-heatmap-persistence (R2): fold this table's device heat mirror into `heat`, then free the
+@@ -2979,7 +2981,7 @@ static void free_table_buffers_locked(table_t & t) {
+         t.arena_reserved = 0;
+         t.arena = nullptr;
+     }
+-    if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
++    if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; if (t.device >= 0) { ggml_cuda_graph_mem_freed(t.device); } }
+     if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
+     t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
+     free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
+@@ -4125,6 +4127,7 @@ static void stand_down_table_locked(table_t & t, int idx) {
+         }
+         if (old_remap != nullptr) {
+             (void) cudaFree(old_remap);
++            ggml_cuda_graph_mem_freed(old_device);   // captured graphs may bake the old remap in
+         }
+         (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
+     }
+@@ -5922,7 +5925,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             device_guard dg(old_device);
+             // Slab-backed arenas go back to the slab's free list; `cudaFree` can unmap the slab.
+             if (old_arena != nullptr) { free_arena_backing(old_device, old_arena, old_reserved, old_slots, t); }
+-            if (old_remap != nullptr) { (void) cudaFree(old_remap); }
++            if (old_remap != nullptr) { (void) cudaFree(old_remap); ggml_cuda_graph_mem_freed(old_device); }
+             if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
+             t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
+             (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
+-- 
+2.53.0
+
