@@ -1,0 +1,221 @@
+From 3533efe9df3437eba9774d5f1d36bc0dfcdf9200 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 25 Oct 2026 13:55:20 +0000
+Subject: [PATCH] llama-context: pipeline the batched state save / restore
+ copies
+
+The batched checkpoint copy (PR #189 path) ran the host memcpy and the
+device copies back to back: ~5.3 + 6.4 ms per restore and 5.7 + 6.3 ms
+per save of a 112.6 MiB recurrent-state checkpoint (-sm tensor, 2 GPUs),
+once each per short chat turn.  Cut the pieces into up to
+LLAMA_STATE_PIPE_GROUPS (default 8, 1 = off) size-balanced groups: a
+restore queues each group's async sets before packing the next group,
+and a save records one event per (backend, group) and copies a group
+out as soon as its event completes.  Falls back to the single sync when
+a device has no events.  Same bytes, same order.
+
+---
+ src/llama-context.cpp | 132 +++++++++++++++++++++++++++++++++++++-----
+ src/llama-context.h   |   4 ++
+ 2 files changed, 120 insertions(+), 16 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3d538e6a9..e5be164c6 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -873,6 +873,14 @@ llama_context::~llama_context() {
+         ggml_backend_event_free(lf_consumed_ev);
+         lf_consumed_ev = nullptr;
+     }
++    for (auto & be : state_pipe_evs) {
++        for (ggml_backend_event_t ev : be.second) {
++            if (ev != nullptr) {
++                ggml_backend_event_free(ev);
++            }
++        }
++    }
++    state_pipe_evs.clear();
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
+@@ -3958,6 +3966,29 @@ static bool llama_state_async_enabled(size_t total) {
+     return on && total > 0 && total <= max_bytes;
+ }
+ 
++// Pipelined batched state copies: the pieces are cut into up to LLAMA_STATE_PIPE_GROUPS (default 8; 1 = the unpipelined
++// copy) size-balanced groups, so the host memcpy of one group overlaps the device copies of another.  Returns the
++// first piece index of each group plus the end index.  Host DRAM bandwidth bounds the overlap (the memcpy moves
++// twice the bytes the DMA does), so expect a fraction of the sum back, not the max.
++static std::vector<size_t> llama_state_pipe_groups(const std::vector<size_t> & sizes, size_t total) {
++    static const size_t n_groups = [] {
++        const char * e = getenv("LLAMA_STATE_PIPE_GROUPS");
++        const long v = e != nullptr ? atol(e) : 8;
++        return (size_t) std::max(1L, std::min(v, (long) llama_context::n_state_pipe_events));
++    }();
++    std::vector<size_t> first = {0};
++    const size_t g = std::min(n_groups, sizes.size());
++    size_t acc = 0;
++    for (size_t i = 0; i < sizes.size() && first.size() < g; ++i) {
++        acc += sizes[i];
++        if (acc * g >= total * first.size() && i + 1 < sizes.size()) {
++            first.push_back(i + 1);
++        }
++    }
++    first.push_back(sizes.size());
++    return first;
++}
++
+ static void llama_state_sync_all(const std::vector<ggml_backend_t> & bks) {
+     std::vector<ggml_backend_t> done;
+     for (ggml_backend_t b : bks) {
+@@ -3992,16 +4023,54 @@ public:
+         if (stage == nullptr) {
+             return false;
+         }
+-        size_t off = 0;
++        std::vector<size_t> sizes(winfos.size());
+         for (size_t i = 0; i < winfos.size(); ++i) {
+-            ggml_backend_tensor_get_async(bks[i], winfos[i].tensor, stage + off, winfos[i].offset, winfos[i].size);
+-            off += winfos[i].size;
++            sizes[i] = winfos[i].size;
++        }
++        const std::vector<size_t> grp = llama_state_pipe_groups(sizes, total);
++        const size_t n_grp = grp.size() - 1;
++        // one event per (backend, group): an event re-recorded for a later group would move past the earlier one
++        std::vector<std::vector<std::pair<ggml_backend_t, ggml_backend_event_t>>> grp_ev(n_grp);
++        bool piped = n_grp > 1;
++        for (size_t g = 0; piped && g < n_grp; ++g) {
++            for (size_t i = grp[g]; piped && i < grp[g + 1]; ++i) {
++                bool seen = false;
++                for (const auto & be : grp_ev[g]) {
++                    seen = seen || be.first == bks[i];
++                }
++                if (!seen) {
++                    ggml_backend_event_t ev = lctx->state_pipe_event(bks[i], g);
++                    piped = ev != nullptr;
++                    grp_ev[g].emplace_back(bks[i], ev);
++                }
++            }
++        }
++        size_t off = 0;
++        for (size_t g = 0; g < n_grp; ++g) {
++            for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
++                ggml_backend_tensor_get_async(bks[i], winfos[i].tensor, stage + off, winfos[i].offset, winfos[i].size);
++                off += winfos[i].size;
++            }
++            if (piped) {
++                for (const auto & be : grp_ev[g]) {
++                    ggml_backend_event_record(be.second, be.first);
++                }
++            }
++        }
++        if (!piped) {
++            llama_state_sync_all(bks);
+         }
+-        llama_state_sync_all(bks);
+         off = 0;
+-        for (const auto & w : winfos) {
+-            memcpy(w.ptr, stage + off, w.size);
+-            off += w.size;
++        for (size_t g = 0; g < n_grp; ++g) {
++            if (piped) {
++                for (const auto & be : grp_ev[g]) {
++                    ggml_backend_event_synchronize(be.second);
++                }
++            }
++            for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
++                memcpy(winfos[i].ptr, stage + off, winfos[i].size);
++                off += winfos[i].size;
++            }
+         }
+         return true;
+     }
+@@ -4137,16 +4206,25 @@ public:
+         if (stage == nullptr) {
+             return false;
+         }
+-        // the pieces sit between small metadata fields in the caller's buffer, so pack them one by one
+-        size_t off = 0;
+-        for (const auto & r : rinfos) {
+-            memcpy(stage + off, r.ptr, r.size);
+-            off += r.size;
+-        }
+-        off = 0;
++        // the pieces sit between small metadata fields in the caller's buffer, so pack them one by one; a group's device
++        // copies are queued before the next group is packed, so they overlap its memcpy (see llama_state_pipe_groups)
++        std::vector<size_t> sizes(rinfos.size());
+         for (size_t i = 0; i < rinfos.size(); ++i) {
+-            ggml_backend_tensor_set_async(bks[i], rinfos[i].tensor, stage + off, rinfos[i].offset, rinfos[i].size);
+-            off += rinfos[i].size;
++            sizes[i] = rinfos[i].size;
++        }
++        const std::vector<size_t> grp = llama_state_pipe_groups(sizes, total);
++        size_t off = 0;
++        for (size_t g = 0; g + 1 < grp.size(); ++g) {
++            const size_t off_g = off;
++            for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
++                memcpy(stage + off, rinfos[i].ptr, rinfos[i].size);
++                off += rinfos[i].size;
++            }
++            off = off_g;
++            for (size_t i = grp[g]; i < grp[g + 1]; ++i) {
++                ggml_backend_tensor_set_async(bks[i], rinfos[i].tensor, stage + off, rinfos[i].offset, rinfos[i].size);
++                off += rinfos[i].size;
++            }
+         }
+         llama_state_sync_all(bks);   // the stage is reused by the next state copy on this context
+         return true;
+@@ -4588,6 +4666,28 @@ uint8_t * llama_context::state_stage(size_t size) {
+     return (uint8_t *) ggml_backend_buffer_get_base(buf_state_stage.get());
+ }
+ 
++ggml_backend_event_t llama_context::state_pipe_event(ggml_backend_t backend, size_t group) {
++    GGML_ASSERT(group < n_state_pipe_events);
++    for (auto & be : state_pipe_evs) {
++        if (be.first == backend) {
++            return be.second[group];
++        }
++    }
++    std::array<ggml_backend_event_t, n_state_pipe_events> evs = {};
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    for (size_t g = 0; dev != nullptr && g < n_state_pipe_events; ++g) {
++        if ((evs[g] = ggml_backend_event_new(dev)) == nullptr) {
++            for (size_t k = 0; k < g; ++k) {
++                ggml_backend_event_free(evs[k]);
++                evs[k] = nullptr;
++            }
++            break;
++        }
++    }
++    state_pipe_evs.emplace_back(backend, evs);   // all nullptr when the device has no events: the caller falls back
++    return evs[group];
++}
++
+ ggml_backend_t llama_context::state_backend(const ggml_tensor * t) {
+     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+     if (buf == nullptr) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 08b68ba25..2cc324ba4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -174,6 +174,9 @@ struct llama_context {
+     // backend that owns a state tensor's buffer (nullptr if none).  Fold (r96, PR #189).
+     uint8_t *      state_stage(size_t size);
+     ggml_backend_t state_backend(const ggml_tensor * t);
++    // events for the pipelined batched state copies (llama_state_pipe_groups): one per group, created on first use
++    static constexpr size_t n_state_pipe_events = 8;
++    ggml_backend_event_t state_pipe_event(ggml_backend_t backend, size_t group);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
+     bool state_load_file(
+@@ -473,6 +476,7 @@ private:
+     // pinned staging for the batched state reads of llama_io_write_host (see state_stage).  Fold (r96, PR #189):
+     // retained across saves and one buffer per context (state saves on one context must not run concurrently).
+     ggml_backend_buffer_ptr buf_state_stage;
++    std::vector<std::pair<ggml_backend_t, std::array<ggml_backend_event_t, n_state_pipe_events>>> state_pipe_evs;
+ 
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+-- 
+2.53.0
+
