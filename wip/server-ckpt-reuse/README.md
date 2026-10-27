@@ -27,6 +27,14 @@ No arithmetic changes and no KV cell moves, so the output is the same in every s
 | 713 new tokens | 1045 ms | **825 ms** |
 | second turn of a conversation | 727 ms | **580 ms** |
 
+Where the time goes (medians over the 13 requests that resume from a checkpoint, from the `-lv 4` timestamps): the
+re-save where the checkpoint was just restored, 119 ms, is gone (kept); the free of the checkpoint the restore
+invalidated goes from 18 ms to 0 (kept as a spare); the save near the prompt end goes from 119 to 44 ms (into a spare);
+the restore itself stays at 24 ms.  Per request these add up to the measured prompt time (199-233 against 198-232 ms).
+Of a 119 ms fresh save about 34 ms is the copy; the rest is allocating, zero-filling and faulting in the new buffer
+(Ryzen 9 3900X, DDR4, 4 KiB pages), so the buffer reuse is worth less where page faults are cheaper.  These timings are
+from r115, where the change was first made.
+
 Same text, switch off against on, in 19 / 19 sequential requests for each of: 1 slot DFlash2; 4 slots unified KV at
 `-c 65536` (fills up and evicts); 2 slots MTP; 2 slots no draft with `--cache-ram 0`.  A wider cross-test on r144 (this
 change with two other changes of ours that do not change the output, all on against all off) was identical in every
