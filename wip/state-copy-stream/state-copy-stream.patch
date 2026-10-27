@@ -1,0 +1,153 @@
+From 5348f087b316e309f417148c260f421a7aa35dbc Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:46:17 +0800
+Subject: [PATCH] llama: state get: copy the staged bytes with streaming stores
+ on two threads
+
+The batched state read copies the pinned stage to the caller's buffer with
+one memcpy per piece.  That copy is bound by host memory bandwidth: plain
+stores read every destination line into the cache first, so on a Ryzen 9
+3900X a 150 MiB checkpoint of Qwen3.8-27B took 19.4 ms of host copy after
+the 6 ms device copy.  States of 16 MiB and more are now copied in 1 MiB
+chunks with SSE2 streaming stores on LLAMA_STATE_COPY_THREADS threads
+(default 2, 1 = one thread, 0 = the plain memcpy): 11.2 ms, the draft's
+37 MiB 5.0 -> 2.9 ms, and 5-12 ms less time to first token per request on
+the server with checkpoints.  The bytes are the same.
+
+LLAMA_STATE_TIMING=1 logs the enqueue / device wait / host copy time of
+each batched read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 87 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3d538e6a9..487d3a90a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -18,14 +18,21 @@
+ #include "llama-sampler.h"
+ #include "llama.h"
+ 
++#include <atomic>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ 
++#if defined(__SSE2__) || defined(_M_X64)
++#define LLAMA_STATE_COPY_STREAM
++#include <emmintrin.h>
++#endif
++
+ //
+ // llama_context
+ //
+@@ -3968,6 +3975,31 @@ static void llama_state_sync_all(const std::vector<ggml_backend_t> & bks) {
+     }
+ }
+ 
++// copy with streaming (non-temporal) stores where available; the caller fences
++static void llama_copy_stream(uint8_t * dst, const uint8_t * src, size_t n) {
++#ifdef LLAMA_STATE_COPY_STREAM
++    size_t i = 0;
++    for (; i < n && ((uintptr_t) (dst + i) & 15) != 0; ++i) {
++        dst[i] = src[i];
++    }
++    for (; i + 64 <= n; i += 64) {
++        const __m128i a = _mm_loadu_si128((const __m128i *) (src + i));
++        const __m128i b = _mm_loadu_si128((const __m128i *) (src + i + 16));
++        const __m128i c = _mm_loadu_si128((const __m128i *) (src + i + 32));
++        const __m128i d = _mm_loadu_si128((const __m128i *) (src + i + 48));
++        _mm_stream_si128((__m128i *) (dst + i),      a);
++        _mm_stream_si128((__m128i *) (dst + i + 16), b);
++        _mm_stream_si128((__m128i *) (dst + i + 32), c);
++        _mm_stream_si128((__m128i *) (dst + i + 48), d);
++    }
++    if (i < n) {
++        memcpy(dst + i, src + i, n - i);
++    }
++#else
++    memcpy(dst, src, n);
++#endif
++}
++
+ class llama_io_write_host : public llama_io_write_i {
+ public:
+     llama_io_write_host(
+@@ -3992,16 +4024,63 @@ public:
+         if (stage == nullptr) {
+             return false;
+         }
++        // LLAMA_STATE_TIMING=1 logs where the time of each batched read goes
++        static const bool st_timing = getenv("LLAMA_STATE_TIMING") != nullptr;
++        const int64_t s0 = ggml_time_us();
+         size_t off = 0;
+         for (size_t i = 0; i < winfos.size(); ++i) {
+             ggml_backend_tensor_get_async(bks[i], winfos[i].tensor, stage + off, winfos[i].offset, winfos[i].size);
+             off += winfos[i].size;
+         }
++        const int64_t s1 = ggml_time_us();
+         llama_state_sync_all(bks);
+-        off = 0;
+-        for (const auto & w : winfos) {
+-            memcpy(w.ptr, stage + off, w.size);
+-            off += w.size;
++        const int64_t s2 = ggml_time_us();
++        // the staged bytes to their destinations.  The copy is bound by host memory bandwidth (on a Ryzen 9 3900X one thread
++        // with plain stores takes 20 of the 27 ms of saving a 150 MiB checkpoint): streaming stores skip reading the
++        // destination into the cache first, and two threads keep more reads in flight, about 11 ms together
++        // (LLAMA_STATE_COPY_THREADS, default 2; 0 = plain memcpy on one thread).  The bytes are the same.
++        static const int n_copy_threads = [] {
++            const char * e = getenv("LLAMA_STATE_COPY_THREADS");
++            return std::max(0, e != nullptr ? atoi(e) : 2);
++        }();
++        if (n_copy_threads == 0 || total < (16u << 20)) {
++            off = 0;
++            for (const auto & w : winfos) {
++                memcpy(w.ptr, stage + off, w.size);
++                off += w.size;
++            }
++        } else {
++            struct chunk { uint8_t * dst; const uint8_t * src; size_t n; };
++            constexpr size_t chunk_bytes = 1u << 20;
++            std::vector<chunk> chunks;
++            off = 0;
++            for (const auto & w : winfos) {
++                for (size_t o = 0; o < w.size; o += chunk_bytes) {
++                    chunks.push_back({ w.ptr + o, stage + off + o, std::min(chunk_bytes, w.size - o) });
++                }
++                off += w.size;
++            }
++            std::atomic<size_t> next{0};
++            auto copy_chunks = [&]() {
++                for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < chunks.size(); ) {
++                    llama_copy_stream(chunks[i].dst, chunks[i].src, chunks[i].n);
++                }
++#ifdef LLAMA_STATE_COPY_STREAM
++                _mm_sfence();
++#endif
++            };
++            std::vector<std::thread> workers;
++            for (int t = 1; t < n_copy_threads; ++t) {
++                workers.emplace_back(copy_chunks);
++            }
++            copy_chunks();
++            for (auto & th : workers) {
++                th.join();
++            }
++        }
++        if (st_timing) {
++            LLAMA_LOG_INFO("state get: %zu pieces, %.1f MiB: enqueue %.2f ms, copy wait %.2f ms, host memcpy %.2f ms\n", winfos.size(),
++                           total / 1048576.0, (s1 - s0) / 1e3, (s2 - s1) / 1e3, (ggml_time_us() - s2) / 1e3);
+         }
+         return true;
+     }
+-- 
+2.43.0
+
