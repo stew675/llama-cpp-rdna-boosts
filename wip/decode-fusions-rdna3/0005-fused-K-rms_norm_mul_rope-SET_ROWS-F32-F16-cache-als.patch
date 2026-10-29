@@ -1,0 +1,133 @@
+From 7f684f1a604d777a530528d1bd269fcd0d608ac4 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 15:33:25 +0000
+Subject: [PATCH 5/9] fused K rms_norm_mul_rope + SET_ROWS (F32/F16 cache) also
+ writes the V row of the following VIEW + SET_ROWS (same cast as k_set_rows),
+ so the V set_rows launch goes away. Bit-identical; Qwen3-30B tg128 +2.4 %,
+ Qwen3.6 +0.8 % on 7900 XTX. GGML_CUDA_ROPE_SET_ROWS_V=0 off
+
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 48 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cu               | 26 +++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 903dddaab..820503fd8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1007,6 +1007,49 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
+     return true;
+ }
+ 
++// The plain (F32 / F16 cache) K path RMS_NORM, MUL, ROPE, VIEW, SET_ROWS at i, followed at i + 5 / i + 6 by the V row's
++// VIEW and SET_ROWS into a cache of the same type with the same row length: the fused kernel's per-head blocks also write
++// the V row (k_set_rows' cast), so the V set_rows launch goes away.  GGML_CUDA_ROPE_SET_ROWS_V=0: off.
++static bool ggml_cuda_rope_set_rows_v_ok(const ggml_cgraph * cgraph, const int i) {
++    static const bool on = getenv("GGML_CUDA_ROPE_SET_ROWS_V") == nullptr || atoi(getenv("GGML_CUDA_ROPE_SET_ROWS_V")) != 0;
++    if (!on || i + 7 > cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * rope   = cgraph->nodes[i + 2];
++    const ggml_tensor * k_sr   = cgraph->nodes[i + 4];
++    const ggml_tensor * v_view = cgraph->nodes[i + 5];
++    const ggml_tensor * v_sr   = cgraph->nodes[i + 6];
++    const int64_t row_len = rope->ne[0]*rope->ne[1];
++    const int64_t n_tok   = rope->ne[2];
++    if (rope->ne[3] != 1 || k_sr->op != GGML_OP_SET_ROWS || (k_sr->type != GGML_TYPE_F16 && k_sr->type != GGML_TYPE_F32) ||
++            v_view->op != GGML_OP_VIEW || v_view->type != GGML_TYPE_F32 || !ggml_is_contiguous(v_view) ||
++            v_view->ne[0] != row_len || v_view->ne[1] != n_tok || v_view->ne[2] != 1 || v_view->ne[3] != 1 ||
++            v_sr->op != GGML_OP_SET_ROWS || v_sr->src[0] != v_view || v_sr->type != k_sr->type ||
++            v_sr->ne[0] != row_len || v_sr->ne[2] != 1 || v_sr->ne[3] != 1 ||
++            ggml_node_get_use_count(cgraph, i + 5) != 1 || (v_view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
++        return false;
++    }
++    const ggml_tensor * idx = v_sr->src[1];
++    if (idx->type != GGML_TYPE_I64 || !ggml_is_contiguous(idx) || ggml_nelements(idx) != n_tok) {
++        return false;
++    }
++    // the V write must not touch anything the fused kernel reads or the K cache rows it writes
++    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const int64_t a0 = (int64_t) a->data, a1 = a0 + ggml_nbytes(a);
++        const int64_t b0 = (int64_t) b->data, b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    const ggml_tensor * rms_norm = cgraph->nodes[i];
++    const ggml_tensor * mul      = cgraph->nodes[i + 1];
++    const ggml_tensor * mul_src  = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ rms_norm->src[0], mul_src, rope->src[1], k_sr, k_sr->src[1], v_view }) {
++        if (t != nullptr && overlap(v_sr, t)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ // The K path's rms_norm_mul_rope + FWHT (above) followed by its KV-cache write, RESHAPE, VIEW, SET_ROWS (q8_0), and
+ // usually by the V write, VIEW, SET_ROWS (q8_0) of the V row rotated earlier: the fused kernel writes both cache rows
+ // with k_set_rows_q8_0_group's quantization, so the two set_rows launches go away.  Returns the number of fused nodes
+@@ -2642,6 +2685,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        if (kv_allow_v && ggml_cuda_rope_set_rows_v_ok(cgraph, i)) {
++            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4],
++                                                 nullptr, nullptr, cgraph->nodes[i + 6]);
++            return 6;
++        }
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+     }
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index f9c649e50..82706e3b1 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -794,6 +794,12 @@ struct rope_kv_q8_0 {
+     block_q8_0    * v_dst;
+     const int64_t * v_idx;
+     int64_t         v_nb1;
++    // plain (F32 / F16, the K cache's type) V row write next to the non-FWHT K SET_ROWS; vp_src == nullptr: none
++    const float   * vp_src;
++    int64_t         vp_s1;    // floats per token row of vp_src
++    void          * vp_dst;
++    const int64_t * vp_idx;
++    int64_t         vp_nb1;   // bytes per V cache row
+ };
+ 
+ // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
+@@ -848,6 +854,16 @@ static __global__ void rms_norm_mul_rope_f32(
+                 }
+             }
+ 
++            if constexpr (!kv) {
++                // V row slice of this head into the V cache, converted as k_set_rows does (same cast)
++                if (kv_args.vp_src != nullptr) {
++                    D * vrow = (D *) ((char *) kv_args.vp_dst + kv_args.vp_idx[channel]*kv_args.vp_nb1);
++                    for (int c = tid; c < ncols; c += block_size) {
++                        vrow[row*ncols + c] = ggml_cuda_cast<D>(kv_args.vp_src[channel*kv_args.vp_s1 + row*ncols + c]);
++                    }
++                }
++            }
++
+             float tmp = 0.0f;
+ 
+             for (int col = tid; col < ncols; col += block_size) {
+@@ -1113,6 +1129,16 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+         }
+     }
+ 
++    if (k_set_rows == nullptr && v_set_rows != nullptr) {
++        // the V write next to the plain K SET_ROWS (ggml_cuda_rope_set_rows_v_count checked the shapes and types)
++        GGML_ASSERT(fwht == nullptr && set_rows != nullptr && v_set_rows->type == set_rows->type &&
++                    v_set_rows->src[0]->type == GGML_TYPE_F32);
++        kv.vp_src = (const float *) v_set_rows->src[0]->data;
++        kv.vp_s1  = v_set_rows->src[0]->nb[1] / sizeof(float);
++        kv.vp_dst = v_set_rows->data;
++        kv.vp_idx = (const int64_t *) v_set_rows->src[1]->data;
++        kv.vp_nb1 = v_set_rows->nb[1];
++    }
+     if (set_rows != nullptr) {
+         dst_d           = set_rows->data;
+         dst_type        = set_rows->type;
+-- 
+2.53.0
+

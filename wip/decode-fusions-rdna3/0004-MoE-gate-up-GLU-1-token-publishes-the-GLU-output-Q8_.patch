@@ -1,0 +1,147 @@
+From f8c242563a1ad5eacbc20c76c95d1bbf26a7de3f Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 15:04:10 +0000
+Subject: [PATCH 4/9] MoE gate/up+GLU (1 token) publishes the GLU output Q8_1
+ for the down projection via self-resetting (slot, 32-row group) counters,
+ quantize_q8_1 math; the down MUL_MAT_ID skips its quantize launch.
+ Bit-identical; Qwen3-30B tg128 +2.7 %, Qwen3.6 +1.5 % on 7900 XTX.
+ GGML_CUDA_MOE_GLU_Q8=0 off
+
+---
+ ggml/src/ggml-cuda/common.cuh   | 16 ++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
+ ggml/src/ggml-cuda/mmvq-moe.cu  | 34 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 17 +++++++++++++++++
+ 4 files changed, 70 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 4809a1a08..f38fee513 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1773,6 +1773,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+ bool ggml_cuda_fusion_disabled();
+ 
+ #define GGML_CUDA_HC_Q8_CNT 1024
++#define GGML_CUDA_MOE_GLU_Q8_CNT 4096
+ 
+ struct ggml_backend_cuda_context {
+     int device;
+@@ -1894,6 +1895,16 @@ struct ggml_backend_cuda_context {
+     // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
+     // kernel resets every counter it completes)
+     int * hc_q8_cnt = nullptr;
++    int * moe_glu_q8_cnt = nullptr;
++    // (expert slot, 32-row group) counters of the fused MoE gate/up -> Q8_1 publish (mul_mat_vec_q_moe); self-resetting
++    int * moe_glu_q8_counters() {
++        if (moe_glu_q8_cnt == nullptr) {
++            CUDA_CHECK(ggml_cuda_device_malloc((void **) &moe_glu_q8_cnt, GGML_CUDA_MAX_STREAMS*GGML_CUDA_MOE_GLU_Q8_CNT*sizeof(int), device));
++            CUDA_CHECK(cudaMemsetAsync(moe_glu_q8_cnt, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_MOE_GLU_Q8_CNT*sizeof(int), stream()));
++        }
++        return moe_glu_q8_cnt + curr_stream_no*GGML_CUDA_MOE_GLU_Q8_CNT;
++    }
++
+     int * hc_q8_counters() {
+         if (hc_q8_cnt == nullptr) {
+             CUDA_CHECK(ggml_cuda_device_malloc((void **) &hc_q8_cnt, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), device));
+@@ -2764,6 +2775,11 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * shared_gate = nullptr;
+     float * shared_dst = nullptr;
+     uint32_t shared_stride_col_dst = 0;
++    // fused MoE gate/up + GLU (mul_mat_vec_q_moe, 1 token): the GLU output's Q8_1 for the down projection (nullptr = off),
++    // its counters and the Q8_1 blocks per expert slot (padded row / QK8_1)
++    block_q8_1 * glu_q8 = nullptr;
++    int * glu_q8_cnt = nullptr;
++    uint32_t glu_q8_stride_channel = 0;
+     // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
+     // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
+     const void * gb_x2 = nullptr;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 92dcfabb5..abdb2d3ad 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1412,6 +1412,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (hc_q8_cnt != nullptr) {
+         CUDA_CHECK(cudaFree(hc_q8_cnt));
+     }
++    if (moe_glu_q8_cnt != nullptr) {
++        CUDA_CHECK(cudaFree(moe_glu_q8_cnt));
++    }
+     h2d_stage_free();
+ 
+     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index 50a9c0370..00711e216 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -213,6 +213,40 @@ static __global__ void mul_mat_vec_q_moe(
+         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+     }
+ 
++    // GLU output -> Q8_1 for the down projection (fusion.glu_q8, 1 token, routed lanes): the 32 rows of a Q8_1 block come from
++    // 32/rpb blocks, so each block adds its rows to the (slot, group) counter and the block that completes the group quantizes
++    // it with one warp exactly as quantize_q8_1 does (same 32-lane reductions and rounding), then resets the counter.
++    if constexpr (has_fusion) {
++        if (warp_size == 32 && fusion.glu_q8 != nullptr && !shared_expert && use_gate) {
++            const int g = row0 / QK8_1;
++            int * cnt = fusion.glu_q8_cnt + channel_dst*(nrows_x/QK8_1) + g;
++            __threadfence();
++            int prev = 0;
++            if (threadIdx.x == 0) {
++                prev = atomicAdd(cnt, rows_valid);
++            }
++            prev = __shfl_sync(0xFFFFFFFF, prev, 0, 32);
++            if (prev + rows_valid == QK8_1) {
++                __threadfence();
++                if (threadIdx.x < QK8_1) {
++                    const float xi = __builtin_nontemporal_load(&dst[channel_dst*stride_channel_dst + g*QK8_1 + threadIdx.x]);
++                    float amax = fabsf(xi);
++                    float sum  = xi;
++                    amax = warp_reduce_max<QK8_1>(amax);
++                    sum  = warp_reduce_sum<QK8_1>(sum);
++                    const float  d = amax / 127.0f;
++                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++                    block_q8_1 * y = fusion.glu_q8 + channel_dst*fusion.glu_q8_stride_channel + g;
++                    y->qs[threadIdx.x] = q;
++                    if (threadIdx.x == 0) {
++                        y->ds = make_half2(d, sum);
++                        *cnt = 0;
++                    }
++                }
++            }
++        }
++    }
++
+     if constexpr (!has_fusion) {
+         GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
+     } else if constexpr (type != GGML_TYPE_NVFP4) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e18829395..2b642d355 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2096,6 +2096,23 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+         fusion_local.glu_op = fusion->glu_op;
+         fusion_local.glu_limit = fusion->glu_limit;
++        // 1-token fused gate/up + GLU: publish the GLU output's Q8_1 (the down projection's input) from the kernel, so the
++        // down MUL_MAT_ID finds it in the quantize cache and skips its quantize_q8_1 launch.  GGML_CUDA_MOE_GLU_Q8=0: off.
++        static const bool glu_q8_on = getenv("GGML_CUDA_MOE_GLU_Q8") == nullptr || atoi(getenv("GGML_CUDA_MOE_GLU_Q8")) != 0;
++        if (glu_q8_on && ids && fusion->gate && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++                dst->ne[2] == 1 && dst->ne[3] == 1 && dst->ne[0] % QK8_1 == 0 &&
++                ggml_is_contiguous(dst) && dst->ne[1]*(dst->ne[0]/QK8_1) <= GGML_CUDA_MOE_GLU_Q8_CNT) {
++            const int64_t ne0_padded = GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
++            bool found = false;
++            void * q8 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, dst->ne[1]*ne0_padded/QK8_1*sizeof(block_q8_1),
++                                           dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
++                                           dst->nb[1]/ts_dst, dst->nb[2]/ts_dst, dst->nb[3]/ts_dst, found);
++            if (!found) {
++                fusion_local.glu_q8 = (block_q8_1 *) q8;
++                fusion_local.glu_q8_cnt = ctx.moe_glu_q8_counters();
++                fusion_local.glu_q8_stride_channel = (uint32_t) (ne0_padded/QK8_1);
++            }
++        }
+         if (fusion->dst_gate) {
+             GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
+             fusion_local.dst_gate = fusion->dst_gate->data;
+-- 
+2.53.0
+

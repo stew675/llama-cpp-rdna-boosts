@@ -1,0 +1,40 @@
+From ab4843c1baba1efa7ef3b109f7e97c66326f249b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 14:25:43 +0000
+Subject: [PATCH 6/9] MoE GEMV: 4 rows per block on RDNA3_0 when K >= 8 blocks
+ and >= 32 blocks per WGP remain (bit-identical when K-blocks split evenly
+ over the thread groups); Qwen3-30B-A3B gate/up 24.1 -> 19.2 us, tg128 +3.5 %
+ on 7900 XTX. GGML_CUDA_MOE_RPB_WIDE=0 off
+
+---
+ ggml/src/ggml-cuda/mmvq-moe.cu | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index 00711e216..a1e170431 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -321,6 +321,20 @@ void mul_mat_vec_q_moe_launch(
+             rpb = 8;
+         }
+     }
++    // RDNA3_0, K of 8+ blocks: 4 rows per block while that still leaves >= 32 blocks per multiprocessor (HIP counts WGPs, 48 on a
++    // 7900 XTX), so each wave streams twice the rows for the same y load and warp reduction.  gfx1100: Qwen3-30B-A3B gate/up
++    // (768 rows x 8 experts) 24.1 -> 19.2 us; Qwen3.6-35B-A3B gate/up (512 rows x 9) stays at 2 (4 measured 15.4 -> 17.3 us).
++    // Bit-identical: with blocks_per_row_x % n_groups == 0 every row keeps its K-blocks in the same thread group and order, and
++    // the per-row warp reduction does not depend on rows per block.  GGML_CUDA_MOE_RPB_WIDE=0: off.
++    static const bool wide_on = getenv("GGML_CUDA_MOE_RPB_WIDE") == nullptr || atoi(getenv("GGML_CUDA_MOE_RPB_WIDE")) != 0;
++    const int dev = ggml_cuda_get_device();
++    const int n_groups = warp_size / (ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type, true));
++    const int64_t nch = nchannels_dst + (fusion.shared_up != nullptr);
++    if (wide_on && rpb == 2 && blocks_per_row_x >= 8 && n_groups > 0 && blocks_per_row_x % n_groups == 0 &&
++            GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[dev].cc) &&
++            ((int64_t) nrows_x + 3) / 4 * nch >= 32 * (int64_t) ggml_cuda_info().devices[dev].nsm) {
++        rpb = 4;
++    }
+     const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
+     // Upstream's fused shared-expert lane is the last blockIdx.y column.
+     dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
+-- 
+2.53.0
+

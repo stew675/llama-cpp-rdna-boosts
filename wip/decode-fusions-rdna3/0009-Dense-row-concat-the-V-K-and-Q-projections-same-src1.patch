@@ -1,0 +1,253 @@
+From 6993974ed11fff66999b394dcd49c49b585eb0f0 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 16:27:13 +0000
+Subject: [PATCH 9/9] Dense row concat: the V, K and Q projections (same src1,
+ weight type and K) run as one ksplit launch on RDNA3_0, the rows of the
+ smaller weights appended after the largest; a row_cat template instance (the
+ plain kernels are unchanged: an in-kernel check cost q36 2 %). Gate: small_m
+ and rows per block agree for each weight and the total. Bit-identical;
+ Qwen3-30B tg128 +3.2 %, Qwen3.6 flat on 7900 XTX. GGML_CUDA_MMVQ_ROW_CONCAT=0
+ off
+
+---
+ ggml/src/ggml-cuda/common.cuh            |   8 ++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   3 +
+ ggml/src/ggml-cuda/mmvq.cu               | 117 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cuh              |   1 +
+ 4 files changed, 124 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 46aebbbef..fc8c75677 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2782,6 +2782,10 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * shared_up = nullptr;
+     const ggml_tensor * shared_gate = nullptr;
+     ggml_tensor * shared_dst = nullptr;
++    // dense row concat (ggml_cuda_mul_mat_row_concat_try_fuse): up to two more weights over the same src1, their rows
++    // appended after the rows of src0 in the same launch, each written to its own destination
++    const ggml_tensor * cat_x[2] = { nullptr, nullptr };
++    ggml_tensor * cat_dst[2] = { nullptr, nullptr };
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+@@ -2818,6 +2822,10 @@ struct ggml_cuda_mm_fusion_args_device {
+     const float * gb_dt = nullptr;
+     const float * gb_a = nullptr;
+     int gb_nrows = 0;
++    // dense row concat (ksplit, 1 token): rows >= cat_row[k] read cat_x[k] and write cat_dst[k], at row - cat_row[k]
++    const void * cat_x[2] = { nullptr, nullptr };
++    float * cat_dst[2] = { nullptr, nullptr };
++    uint32_t cat_row[2] = { 0, 0 };
+ };
+ 
+ struct ggml_cuda_kernel_launch_params {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index ebc081a2b..13b368257 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2506,6 +2506,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     // Dual-output mmvq fusion (owned by mmvq.cu).
++    if (const int n_row_concat = ggml_cuda_mul_mat_row_concat_try_fuse(*cuda_ctx, cgraph, i)) {
++        return n_row_concat;
++    }
+     if (const int n_dual_output = ggml_cuda_mul_mat_dual_output_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_dual_output;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 35efa9d21..439cd59a1 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1011,7 +1011,7 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
+ // 12-block release kernel (same per-row chunk->group mapping as the old
+ // ncols_dst == 1 path).
+ // ---------------------------------------------------------------------------
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false, bool row_cat = false>
+ __launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k, small_m)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_ksplit(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -1041,11 +1041,25 @@ static __global__ void mul_mat_vec_q_ksplit(
+     // product. For every other
+     // instantiation the loop body runs once.
+     constexpr bool row_loop = mmvq_decode_grid_loop_type(type) && ncols_dst == 1 && rows_per_cuda_block <= 2 && nwarps == 1;
+-    for (int row0 = rows_per_cuda_block*blockIdx.x; ; row0 += rows_per_cuda_block*gridDim.x) {
+-    if (nrows_loop != 0 && uint32_t(row0) >= nrows_loop) {
++    for (int row0_g = rows_per_cuda_block*blockIdx.x; ; row0_g += rows_per_cuda_block*gridDim.x) {
++    if (nrows_loop != 0 && uint32_t(row0_g) >= nrows_loop) {
+         break;   // a padding block (ggml_cuda_grid_stall_pad) or a row loop past the end
+     }
+     dst = dst_ptr;
++    int row0 = row0_g;
++    if constexpr (row_cat) {
++        vx = vx_ptr;
++        // row concat: the rows of the appended weights (segment boundaries are multiples of rows_per_cuda_block)
++        if (fusion.cat_dst[1] != nullptr && uint32_t(row0) >= fusion.cat_row[1]) {
++            vx    = fusion.cat_x[1];
++            dst   = fusion.cat_dst[1];
++            row0 -= fusion.cat_row[1];
++        } else if (fusion.cat_dst[0] != nullptr && uint32_t(row0) >= fusion.cat_row[0]) {
++            vx    = fusion.cat_x[0];
++            dst   = fusion.cat_dst[0];
++            row0 -= fusion.cat_row[0];
++        }
++    }
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+ 
+@@ -1352,7 +1366,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+         GGML_UNUSED(nrows_loop);
+         break;
+     } else {
+-        if (uint32_t(row0) + rows_per_cuda_block*gridDim.x >= nrows_loop) {
++        if (uint32_t(row0_g) + rows_per_cuda_block*gridDim.x >= nrows_loop) {
+             break;
+         }
+     }
+@@ -1419,6 +1433,15 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
+                             fusion.conv_input != nullptr;
+     if constexpr (c_ncols_dst == 1) {
++        if (fusion.cat_dst[0] != nullptr) {
++            GGML_ASSERT(!has_fusion);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
++            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k, small_m, true>, launch_params,
++                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
++            return;
++        }
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+             ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
+@@ -2026,6 +2049,7 @@ void ggml_cuda_mul_mat_vec_q(
+     float         *  dst_d =       (float         *)  dst->data;
+ 
+     ggml_cuda_mm_fusion_args_device fusion_local{};
++    int64_t nrows_launch = ne01;   // + the row-concat weights
+ 
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -2117,6 +2141,15 @@ void ggml_cuda_mul_mat_vec_q(
+             GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
+             fusion_local.dst_gate = fusion->dst_gate->data;
+         }
++        for (int k = 0; k < 2 && fusion->cat_x[k] != nullptr; ++k) {
++            const ggml_tensor * x = fusion->cat_x[k];
++            GGML_ASSERT(!ids && x->type == src0->type && x->ne[0] == ne00 && x->nb[1] == nb01 && ggml_is_matrix(x));
++            GGML_ASSERT(fusion->cat_dst[k]->type == GGML_TYPE_F32 && fusion->cat_dst[k]->ne[0] == x->ne[1]);
++            fusion_local.cat_x[k]   = x->data;
++            fusion_local.cat_dst[k] = (float *) fusion->cat_dst[k]->data;
++            fusion_local.cat_row[k] = nrows_launch;
++            nrows_launch += x->ne[1];
++        }
+     }
+ 
+     // MoE down + weighted reduction fold, armed by ggml_cuda_mwr_fold_mark for this MUL_MAT_ID
+@@ -2195,7 +2228,7 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
++        nrows_launch,      ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+ }
+@@ -3257,6 +3290,80 @@ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, cons
+     return 0;
+ }
+ 
++// Dense row concat: two or three 1-token matmuls over the same activation with the same weight type and K (e.g. the
++// V, K and Q projections of an attention layer) run as one ksplit launch, the rows of the others appended after the
++// largest weight.  Every row keeps its own unchanged dot product; RDNA3_0 only, where the launch config depends on the
++// row count only through small_m and the rows per block, which must agree for each weight and the total.
++// Returns the index offset of the last fused matmul.  GGML_CUDA_MMVQ_ROW_CONCAT=0: off.
++int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool on = getenv("GGML_CUDA_MMVQ_ROW_CONCAT") == nullptr || atoi(getenv("GGML_CUDA_MMVQ_ROW_CONCAT")) != 0;
++    ggml_tensor * node = cgraph->nodes[i];
++    if (!on || node->op != GGML_OP_MUL_MAT ||
++            get_device_table_id(ggml_cuda_info().devices[ctx.device].cc) != MMVQ_PARAMETERS_RDNA3_0) {
++        return 0;
++    }
++    const auto ok = [&](const ggml_tensor * t) {
++        return t->op == GGML_OP_MUL_MAT && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[1] == node->src[1] &&
++               t->src[0]->type == node->src[0]->type && t->src[0]->ne[0] == node->src[0]->ne[0] &&
++               t->src[0]->nb[1] == node->src[0]->nb[1] && ggml_is_matrix(t->src[0]) && t->src[0]->buffer != nullptr &&
++               ggml_backend_buffer_get_usage(t->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++               t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t) &&
++               ggml_cuda_should_fuse_mul_mat_vec_q(t);
++    };
++    if (!ok(node)) {
++        return 0;
++    }
++    ggml_tensor * mm[3] = { node, nullptr, nullptr };
++    int n_mm = 1;
++    int last = i;
++    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8) && n_mm < 3; ++j) {
++        ggml_tensor * t = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(t)) {
++            continue;
++        }
++        if (!ok(t) || t->src[0] == node->src[0]) {
++            break;
++        }
++        mm[n_mm++] = t;
++        last = j;
++    }
++    if (n_mm < 2) {
++        return 0;
++    }
++    int main_k = 0;
++    for (int k = 1; k < n_mm; ++k) {
++        if (mm[k]->ne[0] > mm[main_k]->ne[0]) {
++            main_k = k;
++        }
++    }
++    const ggml_type type = node->src[0]->type;
++    const bool long_k = node->src[0]->ne[0] >= 4096;
++    int64_t total = 0;
++    for (int k = 0; k < n_mm; ++k) {
++        total += mm[k]->ne[0];
++    }
++    const bool small_m = mmvq_rdna3_0_small_m_weight(type, total);
++    const int rpb = calc_rows_per_block_weight(type, 1, MMVQ_PARAMETERS_RDNA3_0, false,
++                                               calc_nwarps_weight(type, 1, MMVQ_PARAMETERS_RDNA3_0, long_k, small_m));
++    for (int k = 0; k < n_mm; ++k) {
++        const int64_t n = mm[k]->ne[0];
++        if (mmvq_rdna3_0_small_m_weight(type, n) != small_m ||
++                (rpb > 1 && (n % rpb != 0 || n < rpb * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS))) {
++            return 0;
++        }
++    }
++    ggml_cuda_mm_fusion_args_host fusion_data{};
++    for (int k = 0, c = 0; k < n_mm; ++k) {
++        if (k != main_k) {
++            fusion_data.cat_x[c]   = mm[k]->src[0];
++            fusion_data.cat_dst[c] = mm[k];
++            ++c;
++        }
++    }
++    ggml_cuda_mul_mat_vec_q(ctx, mm[main_k]->src[0], mm[main_k]->src[1], nullptr, mm[main_k], &fusion_data);
++    return last - i;
++}
++
+ // MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
+ // via the x_scale_channel_dst path.  Returns 1 when fused.  GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1 off.
+ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 10b689844..84dd93992 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -61,6 +61,7 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+-- 
+2.53.0
+

@@ -1,0 +1,375 @@
+From 2bd6d895209e581eb92b7258f80b632ad95312e9 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 16:04:48 +0000
+Subject: [PATCH 8/9] Q and K norm+rope of a layer run as one launch
+ (rms_norm_mul_rope_f32_qk_pair, Q blocks then K blocks with its cache
+ writes); qwen3moe expands V and the raw K projection before the Q norm so the
+ two chains are adjacent (the V matmul reused the freed Q projection buffer in
+ between). Bit-identical; Qwen3-30B tg128 +3.9 %, Qwen3.6 +1.1 % on 7900 XTX.
+ GGML_CUDA_ROPE_QK_PAIR=0 / LLAMA_QK_ADJACENT=0 off
+
+---
+ ggml/src/ggml-cuda/common.cuh            |   5 ++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  95 ++++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cu               | 109 +++++++++++++++++++++--
+ ggml/src/ggml-cuda/rope.cuh              |   6 +-
+ src/models/qwen3moe.cpp                  |  12 +++
+ 5 files changed, 217 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d530c2096..46aebbbef 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1908,6 +1908,11 @@ struct ggml_backend_cuda_context {
+     const ggml_cgraph * mwr_fold_graph   = nullptr;
+     const ggml_cgraph * mwr_done_graph   = nullptr;
+     int                 mwr_done_idx     = -1;
++    // Q norm+rope deferred to its layer's K norm+rope node (one rms_norm_mul_rope_f32_qk_pair launch): the Q chain at
++    // qk_pend_i of qk_pend_graph, the K chain at qk_pend_j
++    const ggml_cgraph * qk_pend_graph = nullptr;
++    int                 qk_pend_i     = -1;
++    int                 qk_pend_j     = -1;
+     // (expert slot, 32-row group) counters of the fused MoE gate/up -> Q8_1 publish (mul_mat_vec_q_moe); self-resetting
+     int * moe_red_counters() {
+         if (moe_red_cnt == nullptr) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 4ad936ce7..ebc081a2b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1007,6 +1007,77 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
+     return true;
+ }
+ 
++static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
++                               std::initializer_list<enum ggml_unary_op> unary_ops);
++
++// Q / K norm+rope pairing: the Q chain RMS_NORM, MUL, ROPE at i (plain F32 output) and the K chain RMS_NORM, MUL, ROPE, VIEW,
++// SET_ROWS of the same layer at j (a few nodes later, after the K / V matmuls) with the same rope parameters and positions run
++// as one launch at j.  Returns j, or 0.  The deferred Q kernel reads the Q chain's inputs at j, so nothing in between (and no
++// cache row the K chain writes) may write over them or over the Q output, and nothing in between may read the Q chain.
++// GGML_CUDA_ROPE_QK_PAIR=0: off.
++static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const bool allow) {
++    static const bool on = getenv("GGML_CUDA_ROPE_QK_PAIR") == nullptr || atoi(getenv("GGML_CUDA_ROPE_QK_PAIR")) != 0;
++    if (!on || !allow) {
++        return 0;
++    }
++    const ggml_tensor * q_norm = cgraph->nodes[i];
++    const ggml_tensor * q_mul  = cgraph->nodes[i + 1];
++    const ggml_tensor * q_rope = cgraph->nodes[i + 2];
++    if (q_rope->type != GGML_TYPE_F32 || q_norm->src[0]->ne[0] >= 1024 || q_rope->src[1] == nullptr) {
++        return 0;
++    }
++    int j = -1;
++    for (int n = i + 3; n < std::min(cgraph->n_nodes, i + 16); ++n) {
++        if (cgraph->nodes[n]->op == GGML_OP_RMS_NORM) {
++            j = n;
++            break;
++        }
++    }
++    if (j < 0 || j + 5 > cgraph->n_nodes ||
++            !ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        return 0;
++    }
++    const ggml_tensor * k_norm = cgraph->nodes[j];
++    const ggml_tensor * k_rope = cgraph->nodes[j + 2];
++    const ggml_tensor * k_sr   = cgraph->nodes[j + 4];
++    if ((k_sr->type != GGML_TYPE_F16 && k_sr->type != GGML_TYPE_F32) || k_norm->src[0]->ne[0] >= 1024 ||
++            memcmp(q_rope->op_params, k_rope->op_params, sizeof(q_rope->op_params)) != 0 ||
++            q_rope->src[1] != k_rope->src[1] || q_rope->src[2] != k_rope->src[2] ||
++            q_norm->src[0]->ne[2] != k_norm->src[0]->ne[2] || q_norm->src[0]->ne[3] != k_norm->src[0]->ne[3]) {
++        return 0;
++    }
++    const ggml_tensor * q_mul_src = q_mul->src[0] == q_norm ? q_mul->src[1] : q_mul->src[0];
++    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const int64_t a0 = (int64_t) a->data, a1 = a0 + ggml_nbytes(a);
++        const int64_t b0 = (int64_t) b->data, b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    const ggml_tensor * q_live[] = { q_norm->src[0], q_mul_src, q_rope->src[1], q_rope->src[2], q_rope };
++    const int last = std::min(cgraph->n_nodes - 1, j + 6);
++    for (int n = i + 3; n <= last; ++n) {
++        const ggml_tensor * t = cgraph->nodes[n];
++        // of the K chain the pair kernel writes only the SET_ROWS destinations (j + 4, and j + 6 with the V row)
++        const bool written = n < j || n == j + 4 || n == j + 6;
++        for (const ggml_tensor * l : q_live) {
++            if (written && l != nullptr && t->data != nullptr && overlap(t, l)) {
++                return 0;
++            }
++        }
++        if (n < j) {
++            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
++                const ggml_tensor * r = t->src[s];
++                while (r->view_src != nullptr) {
++                    r = r->view_src;
++                }
++                if (r == q_norm || r == q_mul || r == q_rope) {
++                    return 0;
++                }
++            }
++        }
++    }
++    return j;
++}
++
+ // The plain (F32 / F16 cache) K path RMS_NORM, MUL, ROPE, VIEW, SET_ROWS at i, followed at i + 5 / i + 6 by the V row's
+ // VIEW and SET_ROWS into a cache of the same type with the same row length: the fused kernel's per-head blocks also write
+ // the V row (k_set_rows' cast), so the V set_rows launch goes away.  GGML_CUDA_ROPE_SET_ROWS_V=0: off.
+@@ -1688,6 +1759,15 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (ggml_cuda_fusion_disabled()) {
+         return 0;
+     }
++    // A deferred Q norm+rope whose K node was passed (taken by another fusion) is launched on its own before anything else.
++    if (cuda_ctx->qk_pend_graph != nullptr && (cuda_ctx->qk_pend_graph != cgraph || i > cuda_ctx->qk_pend_j || i < cuda_ctx->qk_pend_i)) {
++        if (cuda_ctx->qk_pend_graph != cgraph || i < cuda_ctx->qk_pend_i) {
++            GGML_ABORT("deferred Q norm+rope was left in an earlier graph");
++        }
++        const int qi = cuda_ctx->qk_pend_i;
++        cuda_ctx->qk_pend_graph = nullptr;
++        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2], nullptr);
++    }
+     if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
+         cuda_ctx->mwr_fold_experts = nullptr;
+         return 0;
+@@ -2688,6 +2768,15 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        if (cuda_ctx->qk_pend_graph == cgraph && cuda_ctx->qk_pend_j == i) {
++            const int qi = cuda_ctx->qk_pend_i;
++            const bool with_v = kv_allow_v && ggml_cuda_rope_set_rows_v_ok(cgraph, i);
++            cuda_ctx->qk_pend_graph = nullptr;
++            ggml_cuda_op_rms_norm_mul_rope_qk_pair(*cuda_ctx, cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2],
++                                                   node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4],
++                                                   with_v ? cgraph->nodes[i + 6] : nullptr);
++            return with_v ? 6 : 4;
++        }
+         if (kv_allow_v && ggml_cuda_rope_set_rows_v_ok(cgraph, i)) {
+             ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4],
+                                                  nullptr, nullptr, cgraph->nodes[i + 6]);
+@@ -2709,6 +2798,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     // kernel (GGML_CUDA_FUSE_RMS_SCALE) was retired in the r38 re-base.
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
++        if (const int j = ggml_cuda_qk_pair_k_at(cgraph, i, kv_allow_v); j > 0 && cuda_ctx->qk_pend_graph == nullptr) {
++            cuda_ctx->qk_pend_graph = cgraph;
++            cuda_ctx->qk_pend_i     = i;
++            cuda_ctx->qk_pend_j     = j;
++            return 2;
++        }
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
+         return 2;
+     }
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 82706e3b1..2714e153a 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -809,7 +809,7 @@ struct rope_kv_q8_0 {
+ // kv (with fwht_n): the rotated row is written as q8_0 to the K cache instead (and the V row to the V cache), with
+ // k_set_rows_q8_0_group's quantization; row r of the block covers elements [r*ncols, (r+1)*ncols) of the token's row
+ template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false>
+-static __global__ void rms_norm_mul_rope_f32(
++static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
+         const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t s1, const int64_t s2, const int64_t s3,
+@@ -824,10 +824,11 @@ static __global__ void rms_norm_mul_rope_f32(
+         const float * freq_factors,
+         const int64_t * row_indices, const int set_rows_stride,
+         const bool is_neox, const float fwht_scale, const rope_kv_q8_0 kv_args,
+-        const mrope_sections sections, const int mrope) {
++        const mrope_sections sections, const int mrope,
++        const int row_) {
+     static_assert(!kv || fwht_n > 0, "the KV-cache writes need the FWHT path");
+     ggml_cuda_pdl_lc();
+-    const int row = blockIdx.x;
++    const int row = row_;
+     const int tid = threadIdx.x;
+ 
+     extern __shared__ float s_sum[];
+@@ -982,6 +983,56 @@ static __global__ void rms_norm_mul_rope_f32(
+     }
+ }
+ 
++template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false>
++static __global__ void rms_norm_mul_rope_f32(
++        const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
++        const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t s1, const int64_t s2, const int64_t s3,
++        const float eps,
++        const float * mul,
++        const int64_t mul_s01, const int64_t mul_s02, const int64_t mul_s03,
++        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
++        const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
++        const int n_dims, const int32_t * pos,
++        const float freq_scale, const float ext_factor, const float attn_factor,
++        const rope_corr_dims corr_dims, const float theta_scale,
++        const float * freq_factors,
++        const int64_t * row_indices, const int set_rows_stride,
++        const bool is_neox, const float fwht_scale, const rope_kv_q8_0 kv_args,
++        const mrope_sections sections, const int mrope) {
++    rms_norm_mul_rope_f32_dev<block_size, has_ff, D, fwht_n, kv>(x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv_args, sections, mrope, blockIdx.x);
++}
++
++// The launch arguments of one rms_norm_mul_rope_f32<256, has_ff, D> launch (rms_norm_mul_rope_cuda's capture mode).
++template <typename D>
++struct rmr_args {
++    const float * x; D * dst; int ncols; int nrows; int nchannels; int nsamples;
++    int64_t s01, s02, s03, s1, s2, s3; float eps;
++    const float * mul; int64_t mul_s01, mul_s02, mul_s03;
++    uint3 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed;
++    int n_dims; const int32_t * pos; float freq_scale, ext_factor, attn_factor; rope_corr_dims corr_dims; float theta_scale;
++    const float * freq_factors; const int64_t * row_indices; int set_rows_stride; bool is_neox; float fwht_scale;
++    rope_kv_q8_0 kv; mrope_sections sections; int mrope;
++};
++
++// Q and K norm+rope of one attention layer in one launch: blocks [0, q.nrows) are the Q heads, the rest the K heads; each
++// block runs exactly the single launch's body with its own arguments, so the results are those of the two launches.
++template <bool has_ff, typename DQ, typename DK>
++static __global__ void rms_norm_mul_rope_f32_qk_pair(const rmr_args<DQ> q, const rmr_args<DK> k) {
++    if ((int) blockIdx.x < q.nrows) {
++        rms_norm_mul_rope_f32_dev<256, has_ff, DQ>(q.x, q.dst, q.ncols, q.nchannels, q.nsamples, q.s01, q.s02, q.s03, q.s1, q.s2, q.s3,
++            q.eps, q.mul, q.mul_s01, q.mul_s02, q.mul_s03, q.mul_ncols_packed, q.mul_nrows_packed, q.mul_nchannels_packed,
++            q.mul_nsamples_packed, q.n_dims, q.pos, q.freq_scale, q.ext_factor, q.attn_factor, q.corr_dims, q.theta_scale,
++            q.freq_factors, q.row_indices, q.set_rows_stride, q.is_neox, q.fwht_scale, q.kv, q.sections, q.mrope, blockIdx.x);
++    } else {
++        rms_norm_mul_rope_f32_dev<256, has_ff, DK>(k.x, k.dst, k.ncols, k.nchannels, k.nsamples, k.s01, k.s02, k.s03, k.s1, k.s2, k.s3,
++            k.eps, k.mul, k.mul_s01, k.mul_s02, k.mul_s03, k.mul_ncols_packed, k.mul_nrows_packed, k.mul_nchannels_packed,
++            k.mul_nsamples_packed, k.n_dims, k.pos, k.freq_scale, k.ext_factor, k.attn_factor, k.corr_dims, k.theta_scale,
++            k.freq_factors, k.row_indices, k.set_rows_stride, k.is_neox, k.fwht_scale, k.kv, k.sections, k.mrope,
++            (int) blockIdx.x - q.nrows);
++    }
++}
++
+ template <typename D>
+ static void rms_norm_mul_rope_cuda(
+         const float * x, D * dst,
+@@ -999,7 +1050,7 @@ static void rms_norm_mul_rope_cuda(
+         const float * freq_factors,
+         const int64_t * row_indices, const int set_rows_stride,
+         const bool is_neox, const int fwht_n, const float fwht_scale, const rope_kv_q8_0 & kv,
+-        const mrope_sections sections, const int mrope, cudaStream_t stream) {
++        const mrope_sections sections, const int mrope, cudaStream_t stream, rmr_args<D> * capture = nullptr) {
+     GGML_ASSERT(ncols % 2 == 0);
+ 
+     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+@@ -1011,6 +1062,16 @@ static void rms_norm_mul_rope_cuda(
+     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+ 
++    if (capture != nullptr) {
++        // record the plain 256-thread launch instead of making it (rms_norm_mul_rope_f32_qk_pair)
++        GGML_ASSERT(fwht_n == 0 && kv.k_dst == nullptr && ncols < 1024);
++        *capture = { x, dst, ncols, nrows, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps,
++                     mul, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                     n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++                     freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope };
++        return;
++    }
++
+     if constexpr (std::is_same_v<D, float>) {
+         if (fwht_n != 0) {
+             // one head per block, rotated by the in-block FWHT (see rms_norm_mul_rope_f32)
+@@ -1083,7 +1144,7 @@ static void rms_norm_mul_rope_cuda(
+ 
+ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * fwht,
+-        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows) {
++        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, void * capture) {
+     const ggml_tensor * x = rms_norm->src[0];
+     const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+ 
+@@ -1198,20 +1259,50 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+     cudaStream_t stream = ctx.stream();
+ 
+     if (dst_type == GGML_TYPE_F32) {
+-        rms_norm_mul_rope_cuda((const float *) x->data, (float *) dst_d,
++        rms_norm_mul_rope_cuda<float>((const float *) x->data, (float *) dst_d,
+             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
+             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
+             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
+             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+-            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream);
++            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream, (rmr_args<float> *) capture);
+     } else if (dst_type == GGML_TYPE_F16) {
+-        rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
++        rms_norm_mul_rope_cuda<half>((const float *) x->data, (half *) dst_d,
+             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
+             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
+             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
+             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+-            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream);
++            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream, (rmr_args<half> *) capture);
+     } else {
+         GGML_ABORT("fatal error");
+     }
+ }
++
++// Q norm+rope (F32 output) and the K norm+rope + cache SET_ROWS (+ V row) of the same layer in one launch.
++void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
++        ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
++        ggml_tensor * k_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_set_rows, ggml_tensor * v_set_rows) {
++    GGML_ASSERT(q_rope->type == GGML_TYPE_F32 && (k_set_rows->type == GGML_TYPE_F16 || k_set_rows->type == GGML_TYPE_F32));
++    rmr_args<float> q;
++    ggml_cuda_op_rms_norm_mul_rope_fused(ctx, q_norm, q_mul, q_rope, nullptr, nullptr, nullptr, nullptr, &q);
++    const bool has_ff = q.freq_factors != nullptr;
++    const auto launch = [&](auto k_arg) {
++        using DK = std::remove_pointer_t<decltype(k_arg.dst)>;
++        GGML_ASSERT(k_arg.nchannels == q.nchannels && k_arg.nsamples == q.nsamples && (k_arg.freq_factors != nullptr) == has_ff);
++        const dim3 blocks_num(q.nrows + k_arg.nrows, MIN(q.nchannels, UINT16_MAX), MIN(q.nsamples, UINT16_MAX));
++        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(256, 1, 1), 32*sizeof(float), ctx.stream()};
++        if (has_ff) {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_qk_pair<true, float, DK>, launch_params, q, k_arg);
++        } else {
++            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_qk_pair<false, float, DK>, launch_params, q, k_arg);
++        }
++    };
++    if (k_set_rows->type == GGML_TYPE_F16) {
++        rmr_args<half> k;
++        ggml_cuda_op_rms_norm_mul_rope_fused(ctx, k_norm, k_mul, k_rope, k_set_rows, nullptr, nullptr, v_set_rows, &k);
++        launch(k);
++    } else {
++        rmr_args<float> k;
++        ggml_cuda_op_rms_norm_mul_rope_fused(ctx, k_norm, k_mul, k_rope, k_set_rows, nullptr, nullptr, v_set_rows, &k);
++        launch(k);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/rope.cuh b/ggml/src/ggml-cuda/rope.cuh
+index 18227ba20..c97e6cbba 100644
+--- a/ggml/src/ggml-cuda/rope.cuh
++++ b/ggml/src/ggml-cuda/rope.cuh
+@@ -9,4 +9,8 @@ void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
+ 
+ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows,
+-        ggml_tensor * fwht = nullptr, ggml_tensor * k_set_rows = nullptr, ggml_tensor * v_set_rows = nullptr);
++        ggml_tensor * fwht = nullptr, ggml_tensor * k_set_rows = nullptr, ggml_tensor * v_set_rows = nullptr, void * capture = nullptr);
++
++void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
++        ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
++        ggml_tensor * k_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_set_rows, ggml_tensor * v_set_rows);
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index 8ca4eacc9..989364078 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -94,6 +94,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+                     n_embd_head, n_head, n_head_kv, il);
+ 
++            // V and the raw K projection go into the graph ahead of the Q norm, so the Q and K norm+rope chains are
++            // adjacent (the CUDA backend runs them as one launch) and the V matmul no longer sits between them.  Same
++            // nodes in another order.  LLAMA_QK_ADJACENT=0: upstream order.
++            static const bool qk_adjacent = [] {
++                const char * v = getenv("LLAMA_QK_ADJACENT");
++                return !v || atoi(v) != 0;
++            }();
++            if (qk_adjacent) {
++                ggml_build_forward_expand(gf, Vcur);
++                ggml_build_forward_expand(gf, Kcur);
++            }
++
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
+-- 
+2.53.0
+

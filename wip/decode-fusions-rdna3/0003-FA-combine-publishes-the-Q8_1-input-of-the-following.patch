@@ -1,0 +1,98 @@
+From 849a265fbd0e0060262c448c9f19481da910fd44 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 14:45:39 +0000
+Subject: [PATCH 3/9] FA combine publishes the Q8_1 input of the following
+ quantized MUL_MAT (unpadded F32 rows; quantize_q8_1 math), so the attention
+ output projection skips its quantize launch. Bit-identical; Qwen3-30B-A3B
+ tg128 +1.9 % on 7900 XTX. GGML_CUDA_FA_COMBINE_Q8=0 off
+
+---
+ ggml/src/ggml-cuda/fattn-common.cuh | 42 ++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/fattn-qsa.cu     |  2 +-
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 2049ca53a..6fccd3332 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1504,7 +1504,8 @@ static __global__ void flash_attn_combine_results(
+         const float  * VKQ_parts_ptr,
+         const float2 * VKQ_meta_ptr,
+         float * dst_ptr,
+-        const int parallel_blocks) {
++        const int parallel_blocks,
++        block_q8_1 * q8) {
+     ggml_cuda_pdl_lc();
+     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
+     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
+@@ -1553,7 +1554,27 @@ static __global__ void flash_attn_combine_results(
+         VKQ_denominator += KQ_max_scale * meta[l].y;
+     }
+ 
+-    dst[tid] = VKQ_numerator / VKQ_denominator;
++    const float v = VKQ_numerator / VKQ_denominator;
++    dst[tid] = v;
++
++    if (q8 != nullptr) {
++        // The following MUL_MAT's Q8_1 input, made exactly as quantize_q8_1 makes it from dst: a row of the [D*heads, tokens]
++        // view is unpadded (checked at the launch), so element (head, tid) is i_cont = j_dst_unrolled*D + tid and each 32-lane
++        // group of this block holds one whole Q8_1 block.
++        const int64_t i_cont = (int64_t) j_dst_unrolled*D + tid;
++        block_q8_1 * y = q8 + i_cont / QK8_1;
++        const int iqs = i_cont % QK8_1;
++        float amax = fabsf(v);
++        float sum  = v;
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
++        y->qs[iqs] = q;
++        if (iqs == 0) {
++            y->ds = make_half2(d, sum);
++        }
++    }
+ }
+ 
+ // wip/fa-stage-chunking: merge one KV chunk's unnormalized partial into the running accumulator.
+@@ -2457,9 +2478,24 @@ void launch_fattn(
+         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+ 
++        // Publish the Q8_1 copy of the output that the next quantized MUL_MAT (the attention output projection) would make
++        // itself: its quantize_q8_1 launch is skipped when it finds the entry.  Only for an unpadded F32 row layout.
++        // GGML_CUDA_FA_COMBINE_Q8=0: off.
++        static const bool combine_q8 = getenv("GGML_CUDA_FA_COMBINE_Q8") == nullptr || atoi(getenv("GGML_CUDA_FA_COMBINE_Q8")) != 0;
++        block_q8_1 * q8 = nullptr;
++        const int64_t q8_ne10 = KQV->ne[0]*KQV->ne[1];
++        if (combine_q8 && KQV->type == GGML_TYPE_F32 && ggml_is_contiguous(KQV) && DV % QK8_1 == 0 &&
++                q8_ne10 % MATRIX_ROW_PADDING == 0) {
++            const int64_t q8_rows = KQV->ne[2]*KQV->ne[3];
++            bool found = false;
++            void * p = ctx.q8_1_cache_get(KQV, ctx.curr_stream_no, q8_rows*q8_ne10/QK8_1*sizeof(block_q8_1),
++                                          q8_ne10, KQV->ne[2], KQV->ne[3], 1, q8_ne10, q8_ne10*KQV->ne[2], q8_rows*q8_ne10, found);
++            q8 = found ? nullptr : (block_q8_1 *) p;
++        }
++
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
++            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
+index 77b8337ef..8dd188db4 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa.cu
+@@ -644,7 +644,7 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+         const size_t nbytes_shared_combine = n_slices*sizeof(float2);
+         const ggml_cuda_kernel_launch_params launch_params_combine(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+         ggml_cuda_kernel_launch(flash_attn_combine_results<D>, launch_params_combine,
+-            parts.ptr, meta.ptr, (float *) dst->data, n_slices);
++            parts.ptr, meta.ptr, (float *) dst->data, n_slices, (block_q8_1 *) nullptr);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+-- 
+2.53.0
+
