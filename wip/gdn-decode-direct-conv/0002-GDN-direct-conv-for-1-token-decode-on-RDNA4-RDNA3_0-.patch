@@ -1,0 +1,59 @@
+From 4479564b39c4012d6d31d4cfc7585bad1bd7a249 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 13:56:12 +0000
+Subject: [PATCH 2/2] GDN direct conv for 1-token decode on RDNA4 / RDNA3_0
+ (was 2..255 only); the ssm_conv_in epilogue steps aside when the direct conv
+ takes the concat (both fired: the conv read an unwritten matmul output).
+ Bit-identical server replies; Qwen3.6 tg128 +7 % on 7900 XTX
+
+---
+ ggml/src/ggml-cuda/gdn-conv.cu | 7 ++++---
+ ggml/src/ggml-cuda/mmvq.cu     | 7 +++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index cabfeb299..aab841eba 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -110,11 +110,12 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
+     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
+-    // On RDNA4 and RDNA3_0 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
+-    // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
++    // On RDNA4 and RDNA3_0 the 1..255-token batches (decode and the speculative verify step) take the fused path too; otherwise
++    // their CONCAT is a generic non-contiguous copy per layer (decode: the ssm_conv_in epilogue, which steps aside for this path).
++    // Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off for both (the name predates the decode case).
+     static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
+     const int  cc_verify = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    const bool verify_ok = conv_verify && T >= 2 && (GGML_CUDA_CC_IS_RDNA4(cc_verify) || GGML_CUDA_CC_IS_RDNA3_0(cc_verify));
++    const bool verify_ok = conv_verify && (GGML_CUDA_CC_IS_RDNA4(cc_verify) || GGML_CUDA_CC_IS_RDNA3_0(cc_verify));
+     if ((T < 256 && !verify_ok) || C % 256 != 0) return false;
+     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+     int64_t tail_from = T + 3; int conv = -1;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index fb25cd899..e18829395 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "gdn-conv.cuh"
+ #include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
+ #include "quantize.cuh"
+ #include "unary.cuh"
+@@ -3054,6 +3055,12 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+         if (s0 == nullptr || s0->op != GGML_OP_GET_ROWS || s0->type != GGML_TYPE_F32) {
+             continue;
+         }
++        // the GDN direct conv takes this concat (decode included on RDNA4 / RDNA3_0): it reads the plain matmul output
++        // and the conv-state row itself, so this epilogue must not consume the concat
++        ggml_cuda_gdn_conv_match gdn_m;
++        if (ggml_cuda_gdn_conv_match_at_concat(cgraph, j, gdn_m)) {
++            return 0;
++        }
+         // conv_input [cs, C] = states [(cs-1)*C] + qkv [C], dim 0
+         const int64_t C = n->ne[1] * n->ne[2] * n->ne[3];
+         const int64_t cs = n->ne[0];
+-- 
+2.53.0
+

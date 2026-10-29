@@ -1,0 +1,94 @@
+From 5ebf3e9ea1e9c93c64d7a38cb6ef1bb081316d99 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 29 Oct 2026 13:43:40 +0000
+Subject: [PATCH 1/2] rope: compute the M-RoPE section power once (rope_multi
+ and the fused rms_norm_mul_rope); a divergent wave ran powf per arm.
+ Bit-identical; Qwen3.6 K/Q norm+rope 7.96/7.71 -> 6.16/5.97 us, tg128 +0.7 %
+ on 7900 XTX
+
+---
+ ggml/src/ggml-cuda/rope.cu | 37 +++++++++++++++++++++----------------
+ 1 file changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index ff41a2baf..f9c649e50 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -283,26 +283,29 @@ static __global__ void rope_multi(const T *            x,
+     const int sec_w = sections.v[1] + sections.v[0];
+     const int sector = (iw / 2) % sect_dims;
+ 
++    // the same power in every section arm: computed once so a divergent wave does not run powf per arm
++    const float theta_pow = powf(theta_scale, iw / 2.0f);
++
+     float theta_base = 0.0;
+     if (is_imrope) {
+         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * theta_pow;
+         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * theta_pow;
+         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * theta_pow;
+         } else {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * theta_pow;
+         }
+     } else {
+         if (sector < sections.v[0]) {
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * theta_pow;
+         } else if (sector >= sections.v[0] && sector < sec_w) {
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * theta_pow;
+         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * theta_pow;
+         } else if (sector >= sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * theta_pow;
+         }
+     }
+ 
+@@ -898,26 +901,28 @@ static __global__ void rms_norm_mul_rope_f32(
+                     const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+                     const int sec_w     = sections.v[1] + sections.v[0];
+                     const int sector    = (i0 / 2) % sect_dims;
++                    // the same power in every section arm (see rope_multi)
++                    const float theta_pow = powf(theta_scale, i0 / 2.0f);
+                     theta_base = 0.0;
+                     if (mrope == 2) {
+                         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+-                            theta_base = pos[channel + nchannels * 1] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 1] * theta_pow;
+                         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+-                            theta_base = pos[channel + nchannels * 2] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 2] * theta_pow;
+                         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+-                            theta_base = pos[channel] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel] * theta_pow;
+                         } else {
+-                            theta_base = pos[channel + nchannels * 3] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 3] * theta_pow;
+                         }
+                     } else {
+                         if (sector < sections.v[0]) {
+-                            theta_base = pos[channel] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel] * theta_pow;
+                         } else if (sector >= sections.v[0] && sector < sec_w) {
+-                            theta_base = pos[channel + nchannels * 1] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 1] * theta_pow;
+                         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+-                            theta_base = pos[channel + nchannels * 2] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 2] * theta_pow;
+                         } else if (sector >= sec_w + sections.v[2]) {
+-                            theta_base = pos[channel + nchannels * 3] * powf(theta_scale, i0 / 2.0f);
++                            theta_base = pos[channel + nchannels * 3] * theta_pow;
+                         }
+                     }
+                 }
+-- 
+2.53.0
+
