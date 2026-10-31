@@ -11,6 +11,12 @@ Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFES
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
+**Renumbered 2026-10-31 (docs-only).**  The r187-r189 sessions allocated `#190`-`#196` (and `#218`) as if the
+sequence had advanced past a run of closed items, but `#119` was the last handle ever allocated and `#120`-`#189`
+were never used.  They are **`#120`-`#126`** now (plus `#127` for the `cpy_2d_vec16` limitation), so the sequence
+is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old handles; they mean these rows.
+The old numbers are **retired** — do not reuse them.
+
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
 (the 2026-10-25 re-base), release **`v16-6050b467c-r191`**.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
@@ -18,19 +24,15 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 
 | # | subject | kind | status |
 |---|---|---|---|
-  multi-device `-sm tensor` run (the block-15 KV probes look up the backend reg of the Meta wrapper, which has
-  none), and a decided `auto` "no window" was reported as "--fit did not run".  The window is now declined
-  on a tensor split with a message (it is one VMM region per device) and `auto`'s decision reaches the cache
-  as a decision; three `auto` wiring fixes came with it.  **Still open in the campaign: Goal B** (a sparse attended set streamed cheaply — plan + B0/B1 measured, 2026-10-30; B2 implemented, B-A designed (spec in wip/kv-residency/BA-POOL-DESIGN.md)) **and Goal C** (the drafter ring, implemented and measured but not promoted; three questions for the maintainer in `O3-DRAFTER-RING.md` §7), the parking gate's save-and-clear fallback is now graded (A6; the fix is verified and **awaits the maintainer's commit approval** — it used to count the region refusal warning as a park), and a window across a `-sm tensor` split is **designed, not built** (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`: five changes plus four `common/fit.cpp` findings an implementation must honour; the arms need a 2/3-device host).  Records: `wip/kv-residency/A2-MIXED-BACKING.md`, cold start `wip/kv-residency/HANDOVER.md`.
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
-
-| **190** | the r187 quantized-KV decode fusions (`GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`, `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) key on the K/V cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, because that is the quantizer the fused kernels reproduce; `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl` and `bf16` keep their separate launches | parked idea (scope) | **OPEN — not started.**  The win is `q8_0`-only by construction; each further type needs its own fused write kernel (`k_set_rows_<type>_group`'s lane->element map and rounding reproduced in the K kernel / the V rotation) plus the matching `is_row_write` predicate.  No measurement yet; the `q8_0` arm is worth +13.4 % tg128 / +10.1 % @4096 on Qwen3-30B-A3B (gfx1201) and it is that type's own quantize traffic that pays.  Reach: any GGUF whose KV is quantized to `q4_0`-class (`-ctk q4_0 -ctv q4_0` is the common small-memory pairing on 16 GiB cards), so it is worth doing before the next re-base, not after.  Record: `WORKLOG.md` 261031.005, `benchmarks/2026-10-31-kv-rotation-decode.md` |
-| **191** | **Goal C — the MTP drafter ring** (`LLAMA_SPEC_DRAFT_WINDOW`, campaign `wip/kv-residency/O3-DRAFTER-RING.md`): a drafter whose KV is a fixed window instead of `O(-c)` | memory (draft VRAM) | **OPEN — measured, NOT promoted** (the last Goal of `#118`).  Free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation flat) but 7-9 % lost far below the working context, and the VRAM prize (one draft layer, ~1 GiB at `-c 262144`) does not reach the arena.  **Three questions for the maintainer before any promotion:** default-on or opt-in, one window size or per-model, MTP-only or DFlash2 too |
-| **192** | **Goal A `auto` policy — the arena-vs-window trade** (`wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.4 A-C, block 15's `LLAMA_KV_RESIDENT_CELLS=auto`) | decision | **OPEN — measured, the maintainer's call.**  The fit's ordering (weights → arena reserve → `W` from the residue) is settled; what is not is which of the three measured `auto` policies ships as the recommendation |
-| **193** | **grow-on-demand pool mirror** (block 15): the attendance pool's pinned host mirror is allocated **in full at creation** (204 MiB / 1.6 GiB / 2.4 GiB at 16k / 131k / 196k; ~4.9 GiB at 262k) | memory | **OPEN** — shipped as a documented limitation in r190 (bounded by `LLAMA_KV_SPILL_RAM_PCT`, which declines the pool loudly rather than being OOM-killed).  The model is block 15's host half (`grow_cells`/`grow_for`): the mirror should follow the cache watermark.  Until then a short run in a big `-c` pins the whole context |
-| **194** | **Goal A across `-sm tensor`** (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`): a windowed KV on a tensor split needs per-device region bufts wrapped in a split buft plus a fit that sizes them together | memory | **OPEN — designed only, hardware-blocked here** (one 32 GiB card).  Blocks 15 and 16 both decline `-sm tensor` with one message; the refusals are the r181 crash fix, so do not remove them without the arm |
-| **195** | **the sparse decode arm's next item — the radix top-k** (0.9 ms/verify step under MTP, 2.2 ms/token plain at 103k, on a qwen4exp sparse/pooled cache) | performance | **OPEN — optional, needs its own campaign.**  The indexer score chain that used to dominate this list was closed by `#118`'s A13 (r190, block 11: 5.31 -> 2.01 ms/token, plain decode 29.3 -> 36.3 t/s at 103k); the top-k is what is left |
-| **196** | **a stale prefill-logit base at the 35B-A3B UD-Q4_K_M point**: `~/.cache/rdna-boosts/gates/prefill-logit-gfx1201-Qwen3.6-35B-A3B-UD-Q4_K_M.kld` was recorded 2026-10-24 from build `55d421582b7b` (r183-era, host `soar`), and the **shipped r188 and r189 trees both read mean KLD 0.005657 / same-top-p 96.794 %** at it (with and without `ROCBLAS_USE_HIPBLASLT=0`, 40 chunks, ctx 512, f16 KV) — i.e. the point drifted somewhere in **r184-r186** and a strict gate run there fails on the released tree too.  It is not an A12/A13/A14 or r190 defect (nothing in those touches that model's prefill path; the canonical 27B Q8_0 point and the qwen4exp q8_0 point both read 0.000000 / 100.000 %) | gate hygiene | **OPEN** — decide one of: (a) bisect r184-r186 for the divergence (the likely carrier is r186's conv fusion running on every device count, or r183's GDN folds) and re-record the base only if the change is intended; (b) re-record the base from the shipped r189/r191 build and note the re-baseline in its own `WORKLOG` entry (a re-record *accepts* the drift, so it needs the maintainer's ack); (c) retire the 35B point and keep the 27B Q8_0 + qwen4exp q8_0 points as the release gate.  **Also**: the canonical 27B Q8_0 base was re-recorded from the shipped r189 build during r190 (its previous file was overwritten in the process), so its `.meta` now names r189 |
+| **118** | windowed / streamed KV cache (campaign `wip/kv-residency/`): Goal A, a fixed-VRAM resident **window** (`LLAMA_KV_RESIDENT_CELLS`), and Goal B, an **attendance pool** (`LLAMA_KV_REGION_POOL`) — both opt-in, both in **block 15** | performance / memory | **CLOSED for delivery** (2026-10-31: block 15 in r178 (window) and r190 (pool), folded in r191; `WORKLOG.md` 261031.008/261031.009).  The campaign record and its rationale are §118 below.  What is left is decisions and follow-ups, tracked as #121-#126 |
+| **120** | the r187 quantized-KV decode fusions (`GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`, `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) key on the K/V cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, because that is the quantizer the fused kernels reproduce; `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl` and `bf16` keep their separate launches | parked idea (scope) | **OPEN — not started.**  The win is `q8_0`-only by construction; each further type needs its own fused write kernel (`k_set_rows_<type>_group`'s lane->element map and rounding reproduced in the K kernel / the V rotation) plus the matching `is_row_write` predicate.  No measurement yet; the `q8_0` arm is worth +13.4 % tg128 / +10.1 % @4096 on Qwen3-30B-A3B (gfx1201) and it is that type's own quantize traffic that pays.  Reach: any GGUF whose KV is quantized to `q4_0`-class (`-ctk q4_0 -ctv q4_0` is the common small-memory pairing on 16 GiB cards), so it is worth doing before the next re-base, not after.  Record: `WORKLOG.md` 261031.005, `benchmarks/2026-10-31-kv-rotation-decode.md` |
+| **121** | **Goal C — the MTP drafter ring** (`LLAMA_SPEC_DRAFT_WINDOW`, campaign `wip/kv-residency/O3-DRAFTER-RING.md`): a drafter whose KV is a fixed window instead of `O(-c)` | memory (draft VRAM) | **OPEN — measured, NOT promoted** (the last Goal of `#118`).  Free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation flat) but 7-9 % lost far below the working context, and the VRAM prize (one draft layer, ~1 GiB at `-c 262144`) does not reach the arena.  **Three questions for the maintainer before any promotion:** default-on or opt-in, one window size or per-model, MTP-only or DFlash2 too |
+| **122** | **Goal A `auto` policy — the arena-vs-window trade** (`wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.4 A-C, block 15's `LLAMA_KV_RESIDENT_CELLS=auto`) | decision | **OPEN — measured, the maintainer's call.**  The fit's ordering (weights → arena reserve → `W` from the residue) is settled; what is not is which of the three measured `auto` policies ships as the recommendation |
+| **123** | **grow-on-demand pool mirror** (block 15): the attendance pool's pinned host mirror is allocated **in full at creation** (204 MiB / 1.6 GiB / 2.4 GiB at 16k / 131k / 196k; ~4.9 GiB at 262k) | memory | **OPEN** — shipped as a documented limitation in r190 (bounded by `LLAMA_KV_SPILL_RAM_PCT`, which declines the pool loudly rather than being OOM-killed).  The model is block 15's host half (`grow_cells`/`grow_for`): the mirror should follow the cache watermark.  Until then a short run in a big `-c` pins the whole context |
+| **124** | **Goal A across `-sm tensor`** (`wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`): a windowed KV on a tensor split needs per-device region bufts wrapped in a split buft plus a fit that sizes them together | memory | **OPEN — designed only, hardware-blocked here** (one 32 GiB card).  Blocks 15 and 16 both decline `-sm tensor` with one message; the refusals are the r181 crash fix, so do not remove them without the arm |
+| **125** | **the sparse decode arm's next item — the radix top-k** (0.9 ms/verify step under MTP, 2.2 ms/token plain at 103k, on a qwen4exp sparse/pooled cache) | performance | **OPEN — optional, needs its own campaign.**  The indexer score chain that used to dominate this list was closed by `#118`'s A13 (r190, block 11: 5.31 -> 2.01 ms/token, plain decode 29.3 -> 36.3 t/s at 103k); the top-k is what is left |
+| **126** | **a stale prefill-logit base at the 35B-A3B UD-Q4_K_M point**: `~/.cache/rdna-boosts/gates/prefill-logit-gfx1201-Qwen3.6-35B-A3B-UD-Q4_K_M.kld` was recorded 2026-10-24 from build `55d421582b7b` (r183-era, host `soar`), and the **shipped r188 and r189 trees both read mean KLD 0.005657 / same-top-p 96.794 %** at it (with and without `ROCBLAS_USE_HIPBLASLT=0`, 40 chunks, ctx 512, f16 KV) — i.e. the point drifted somewhere in **r184-r186** and a strict gate run there fails on the released tree too.  It is not an A12/A13/A14 or r190 defect (nothing in those touches that model's prefill path; the canonical 27B Q8_0 point and the qwen4exp q8_0 point both read 0.000000 / 100.000 %) | gate hygiene | **OPEN** — decide one of: (a) bisect r184-r186 for the divergence (the likely carrier is r186's conv fusion running on every device count, or r183's GDN folds) and re-record the base only if the change is intended; (b) re-record the base from the shipped r189/r191 build and note the re-baseline in its own `WORKLOG` entry (a re-record *accepts* the drift, so it needs the maintainer's ack); (c) retire the 35B point and keep the 27B Q8_0 + qwen4exp q8_0 points as the release gate.  **Also**: the canonical 27B Q8_0 base was re-recorded from the shipped r189 build during r190 (its previous file was overwritten in the process), so its `.meta` now names r189 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -91,7 +93,7 @@ call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
-* **`cpy_2d_vec16` covers F32 only** (r189, `TODO` **#218**).  The vectorised fallback for the 2-D block copies
+* **`cpy_2d_vec16` covers F32 only** (r189, `TODO` **#127**).  The vectorised fallback for the 2-D block copies
   r183's guard refuses is restricted to two **F32** tensors with 16-B-aligned width and pitches — the reachable
   case (qwen4exp's indexer key cache, which is F32 by construction).  Every other type and every unaligned
   geometry keeps `cpy_scalar`, which is bit-identical but element-per-thread.  Nothing in the delivery reaches a
@@ -249,7 +251,6 @@ call.
 
 ## Where the current lists live
 
-
 - **Open campaigns and scoping notes:** [`wip/CAMPAIGNS.md`](wip/CAMPAIGNS.md) (the index for `wip/`).
 - **Closed campaigns, with their evidence:** `archive/work/<campaign>/` (`RESOLUTION.md` where the campaign
   closed with a finding).
@@ -266,26 +267,7 @@ call.
 
 ---
 
-## Where the current lists live
-
-
-- **Open campaigns and scoping notes:** [`wip/CAMPAIGNS.md`](wip/CAMPAIGNS.md) (the index for `wip/`).
-- **Closed campaigns, with their evidence:** `archive/work/<campaign>/` (`RESOLUTION.md` where the campaign
-  closed with a finding).
-- **Remaining gfx1151 work + the 2026-09-12 audit:** `archive/work/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md`.
-- **QSA sparse-regime width purity (items 4/7 disposition):** `archive/work/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
-- **Environment, instruments, reference hashes and the landing procedure for KV/FA work:**
-  `archive/work/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` (its §0 status and its
-  items 1/5 and F3 are **superseded** — see `WORKLOG.md`).
-- **Delivery verification contract + dated records:** `MANIFESTS.md`, `patches/README.md`, `WORKLOG.md`,
-  `AGENTS.md` headers.
-- **Purity/invariant analysis and the instrument rules:** `GREEDY-PURITY.md`.
-- **Benchmarks + gates:** `benchmarks/` (the adaptive-MTP baseline gate: `mtp-adaptive-methodology.md`).
-- **Upstream PR candidates:** `upstream/README.md`.
-
----
-
-## 118. Windowed / streamed KV cache — scope decision 2026-10-29 (campaign `wip/kv-residency/`)
+## 118. Windowed / streamed KV cache — campaign record 2026-10-29 .. 2026-10-31 (campaign `wip/kv-residency/`)
 
 **Number note (2026-10-29).**  The campaign's records cited "TODO #117" for three sessions, but `TODO.md`
 never had a `#117` row — the reference was dangling.  Item **117** was then allocated to the separate MoE
@@ -349,7 +331,7 @@ device mapping made the next `cuMemCreate`(HOST)/`cuMemMap` zero a *live* host-l
 `vmm_map` now takes (`LLAMA_KV_REGION_QUARANTINE`, default on).  Purity is claimed for **spilling** windowed arms
 (prefill-logit −0.000000 / 100.000 %).  The narrative is `A2-MIXED-BACKING.md` §3.7.8.
 
-**What is actually left (2026-10-30, end of A6):**
+**Status at 2026-10-30 (end of A6) — superseded by the CLOSED block below, kept as the dated record:**
 
 * **`auto` policy** — the maintainer's call, unchanged by r181: `auto` sizes the window to
   `free − margin − everything-but-the-KV` (the margin includes the arena/slab reserve, so on a `-ncmoe` config the
@@ -375,20 +357,21 @@ q8_0 + the q4/q5 family, byte-identical to the chain on all eight key types, **p
 and 29.3 -> 36.3 t/s** at 103k; block 11).  Records: `wip/kv-residency/BA-POOL-DESIGN.md` §7-§10,
 `COLD-START-PROMPT.md` (the next session's list).
 
-**Open for Goal B, in order:** (1) re-measure the **180k** row on the A12+A13 build (the only stale number);
-(2) the **delivery placement** of A12 (block 10) and A13 (block 11) — each owes a `WORKLOG` entry, a
-`patches/README.md` note and the release gates, and both need a re-base onto the current release (the tree moved to
-r188 while they were built); (3) the **promotion decision** for the pool itself (the maintainer's): a block in
-`patches/`, `ENVIRONMENT.md` §, the pool's VRAM in `--fit`'s arithmetic, a **grow-on-demand mirror** (today the whole
-`-c` is pinned at creation: 0.2 / 1.6 / 2.4 GiB at 16k / 131k / 196k), the release-flow gates, and a default-off
-call (it forces the sparse arm, so it is a fittability feature like block 15, not a speed one).  Two accepted
-limitations: k-quant indexer keys stay on the per-op chain (a 256-element superblock does not divide `idx_dim` =
-128), and the pool declines a `-sm tensor` split (one page table per device would need a per-device pool and a
-split-aware resolve) — the latter needs the maintainer's multi-GPU host.
+**CLOSED for delivery (2026-10-31).**  All three Goal B items above shipped: the 180k row was re-measured
+on the A12+A13 build (r190), A12 went in as r189 (block 10) and A13 as r190 (block 11), and the pool itself is
+**block 15** (r190 shipped it as its own block 16; r191 folded it into block 15 on the maintainer's call,
+tree-identical: `LLAMA_KV_REGION_POOL`, opt-in, and `--fit` charges the mirror to host RAM).  Records:
+`WORKLOG.md` 261031.007, 261031.008 and 261031.009, `patches/README.md` (block 15).  Two accepted limitations
+stand: k-quant indexer keys stay on the per-op chain (a 256-element superblock does not divide `idx_dim` = 128),
+and the pool declines a `-sm tensor` split (one page table per device would need a per-device pool and a
+split-aware resolve).
 
-**Nothing from `wip/kv-residency/` is in `patches/` or `release.json`, and nothing may be applied from it
-without an explicit go-ahead.**  The slice-1/2 code is the record, not a candidate: sub-slice 2's *growth*
-must not be promoted; its KV **buffer-type skeleton** (a custom buft carrying a host master + device pool +
-page table, selected per device with a plain-buft fallback) is the container O2 needs and is worth reusing.
+**What remains is decisions and follow-ups, not a campaign:** #121 (Goal C, the drafter ring), #122 (the Goal A
+`auto` policy), #123 (the grow-on-demand mirror), #124 (Goal A across `-sm tensor`) and #125 (the sparse arm's
+radix top-k).  **Nothing else from `wip/kv-residency/` may be applied without an explicit go-ahead** — block 15
+is the promoted part; what remains in the campaign is the record, not a candidate.  Sub-slice 2's *growth* must
+not be promoted, but its KV **buffer-type skeleton** (a custom buft carrying a host master + device pool +
+page table, selected per device with a plain-buft fallback) is the container a device-resident variant would
+reuse.
 
 ---

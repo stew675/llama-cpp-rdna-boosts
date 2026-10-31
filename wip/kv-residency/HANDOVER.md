@@ -627,9 +627,9 @@ cannot stand in for attendance, and neither can the region's unit granularity.
 > (quantized indexer keys); A12 shipped separately as r189.  The `--fit` blocker (§12.2) was **fixed**, so the
 > rollback criterion did not apply: the mirror is charged to the host bucket in `memory_breakdown()`,
 > `llama_get_kv_pool_bytes()` reports the split, and the fit refuses to interpolate `-c` while the pool is
-> active.  The grow-on-demand mirror (§12.3) shipped as a **documented limitation**, now `TODO` **#193**.
-> `TODO` #118 is closed by `WORKLOG.md` 261031.008; what remains of the campaign is `TODO` #191 (Goal C),
-> #192 (the Goal A `auto` policy), #194 (Goal A across `-sm tensor`), #195 (the radix top-k) and #193.
+> active.  The grow-on-demand mirror (§12.3) shipped as a **documented limitation**, now `TODO` **#123**.
+> `TODO` #118 is closed by `WORKLOG.md` 261031.008; what remains of the campaign is `TODO` #121 (Goal C),
+> #122 (the Goal A `auto` policy), #124 (Goal A across `-sm tensor`), #125 (the radix top-k) and #123.
 > The gate list of §12.5 is recorded in `patches/README.md` block 15 and in the WORKLOG entries; the numbers
 > reproduce this document's bit for bit (the pool's prefill-logit base is the same PPL 2.9225 / sha256
 > `acfb4145…` this campaign recorded).

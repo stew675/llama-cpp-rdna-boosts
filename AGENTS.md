@@ -308,7 +308,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   rotation runs as before and no cache entry is created), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and
   `GGML_CUDA_FUSE_ROPE_FWHT` (rope + rotation for models without Q/K norm — **the only one that runs in prefill
   too**, so it carries the prefill-logit obligation; it fires on gpt-oss on our models, not on qwen/gemma).
-  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #190), and
+  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #120), and
   they are worth **+13.4 % tg128 / +10.1 % @4096** on a 30B-A3B q8_0-KV arm (gfx1201) with **f16 KV unchanged** —
   so **a coherence or perf claim about them must name a `q8_0` KV arm**, and multi-device arms are mandatory
   (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,

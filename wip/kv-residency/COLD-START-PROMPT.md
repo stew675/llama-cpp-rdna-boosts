@@ -13,7 +13,7 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
 
  What is left is decisions and follow-ups, not a campaign:
 
- ## 1. Goal C — the MTP drafter ring (`O3-DRAFTER-RING.md`, `TODO` #191) — the maintainer's call
+ ## 1. Goal C — the MTP drafter ring (`O3-DRAFTER-RING.md`, `TODO` #121) — the maintainer's call
 
  Measured, **not** promoted: free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation
  flat), 7-9 % lost far below the working context, and the VRAM prize (one draft layer, ~1 GiB at `-c 262144`)
@@ -22,20 +22,20 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
  default-off rationale like blocks 15/16, and it owes the MTP draft-determinism gates
  (`benchmarks/mtp-adaptive-methodology.md`).
 
- ## 2. The Goal A `auto` policy (`A2-MIXED-BACKING.md` §3.7.11.4 A-C, `TODO` #192) — the maintainer's call
+ ## 2. The Goal A `auto` policy (`A2-MIXED-BACKING.md` §3.7.11.4 A-C, `TODO` #122) — the maintainer's call
 
  The fit's ordering is settled (weights -> arena reserve -> `W` from the residue); what is not is which of the
  three measured `auto` policies ships as the recommendation.  No new measurement needed.
 
- ## 3. Follow-ups opened by r190 (`TODO` #193-#196)
+ ## 3. Follow-ups opened by r190 (`TODO` #123-#126)
 
- * **#193 grow-on-demand pool mirror**: the mirror is allocated in full at creation (2.4 GiB at `-c 196608`,
+ * **#123 grow-on-demand pool mirror**: the mirror is allocated in full at creation (2.4 GiB at `-c 196608`,
    ~4.9 GiB at 262144), bounded by `LLAMA_KV_SPILL_RAM_PCT`.  The model is block 15's host-half growth
    (`grow_cells`/`grow_for`).
- * **#195 the radix top-k** (0.9 ms/verify step under MTP, 2.2 ms/token plain at 103k on a sparse/pooled
+ * **#125 the radix top-k** (0.9 ms/verify step under MTP, 2.2 ms/token plain at 103k on a sparse/pooled
    qwen4exp cache): the largest sparse-arm item left after A13 (which took the indexer score chain from 5.31 to
    2.01 ms/token).  Optional, needs its own campaign.
- * **#194 Goal A across `-sm tensor`**: designed only (`A6-TENSOR-SPLIT-WINDOW.md`), hardware-blocked on this
+ * **#124 Goal A across `-sm tensor`**: designed only (`A6-TENSOR-SPLIT-WINDOW.md`), hardware-blocked on this
    one-card box.  Both blocks decline a tensor split with one message (the r181 crash fix) — do not remove
    those refusals without a multi-device arm.
 

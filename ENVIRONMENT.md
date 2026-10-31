@@ -611,7 +611,7 @@ see `../WORKLOG.md` 261017.008).
 > `GGML_CUDA_FUSE_ROPE_FWHT` all key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0`, because that is the
 > quantizer the fused kernels reproduce.  `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl`, `bf16` … keep their separate
 > launches (correct, just not fused); extending the set needs each type's own write kernel, which is
-> `TODO.md` #190.
+> `TODO.md` #120.
 
 | variable | default | notes |
 |---|---|---|

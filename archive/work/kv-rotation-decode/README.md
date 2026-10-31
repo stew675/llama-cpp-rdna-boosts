@@ -21,7 +21,7 @@ The series restores them, one default-on term each:
 | 0005 | `GGML_CUDA_FUSE_ROPE_FWHT` | a ROPE with no norm in front (Llama-style) runs as `rms_norm_mul_rope_f32<.., no_norm = true>` + the K/V cache writes.  **Any token count, so prefill takes it** |
 
 All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — the quantizer they reproduce.  Other KV types keep
-their launches: `TODO.md` #190.
+their launches: `TODO.md` #120.
 
 ## Assessment (gfx1201, 3x R9700, ROCm 10.1.0; full numbers in `benchmarks/2026-10-31-kv-rotation-decode.md`)
 

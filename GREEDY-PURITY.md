@@ -2525,7 +2525,7 @@ pair, the combine's Q8_1 publish and both `fwht_cuda` launches were all gone.  r
    rope-only form).
 
 **Scope.**  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — that is the quantizer they reproduce.
-`q4_0`/`q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #190.
+`q4_0`/`q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #120.
 
 **Numbers** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `llama-bench -r 3`, 3 interleaved rounds, same build dir):
 Qwen3-30B-A3B Q4_K_M `-ctk/-ctv q8_0` tg128 **141.2 -> 160.1 t/s (+13.4 %)**, @4096 **127.3 -> 140.1 (+10.1 %)**;

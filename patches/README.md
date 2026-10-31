@@ -1392,7 +1392,7 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
     does, so it carries the prefill-logit obligation (`gate-prefill-logits.sh --ab
     "GGML_CUDA_FUSE_ROPE_FWHT=0"`, plus the `--ub 1` arm).  Fires on gpt-oss on our models, not on
     qwen/gemma (their ROPE follows a norm).
-  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`** (`TODO` #190 covers the other KV types).
+  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`** (`TODO` #120 covers the other KV types).
   Measured on gfx1201 1 GPU, Qwen3-30B-A3B Q4_K_M q8_0 KV: tg128 **141.2 -> 160.1 t/s (+13.4 %)**,
   @4096 **127.3 -> 140.1 (+10.1 %)**, launches/token **726 -> 510**; F16 KV unchanged (162.7 vs 163.1);
   gpt-oss-20b q8_0 **+4.0 % / +6.1 %**.  Records: `WORKLOG.md` 261031.005,

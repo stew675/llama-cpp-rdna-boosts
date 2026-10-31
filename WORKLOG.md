@@ -1,6 +1,28 @@
 # WORKLOG - dated delivery records
 
-## 261031.009 (r191) -- block 15 absorbs the attendance pool (a 16-block set again, tree-identical) + the stale 35B prefill-logit base filed as TODO #196
+## 261031.010 (docs) -- TODO.md housekeeping: the r187-r189 handles `#190`-`#196`/`#218` become `#120`-`#126`/`#127`, and the tracker table is whole again
+
+**Docs-only; no delivery change** (`patches/`, `release.json` and every block are untouched).
+
+`TODO.md` had three defects worth one pass.  (1) **The number gap.**  `#119` was the last TODO handle ever
+allocated (closed), but the r187-r189 sessions allocated `#190`-`#196` (the other-KV-quant follow-up, Goal C,
+the `auto` policy, the grow-on-demand mirror, the `-sm tensor` window, the radix top-k, the stale 35B
+prefill-logit base) and `#218` (the `cpy_2d_vec16` limitation), skipping ~70 handles that nothing had ever
+used.  They are now **`#120`-`#126`** and **`#127`**, so the sequence is contiguous; the file's header records
+that the old numbers are **retired, not free**, and every live reference was updated with them (`AGENTS.md`,
+`patches/README.md`, `ENVIRONMENT.md`, `GREEDY-PURITY.md`, `wip/CAMPAIGNS.md`, `wip/kv-residency/*`,
+`archive/work/kv-rotation-decode/README.md` and the r187-r191 `WORKLOG.md` entries).  The r187-r190 **commit
+messages** still carry the old handles; the header note maps them.  (2) **The broken table.**  The `#118` row
+had lost its `| **118** |` lead-in, leaving four lines of prose inside the table body, and the `#190`-`#196`
+rows had lost their header row (a GFM table with no header renders as one paragraph).  It is now one header
+plus `#116`, `#118`, `#120`-`#126`, with `#118` restored as a row whose status is **CLOSED for delivery**
+(Goal A r178, Goal B r190, folded into block 15 in r191) and which points at the remaining handles.
+(3) **Duplicated and stale content.**  "Where the current lists live" appeared twice byte-identically, and
+§118 still carried its 2026-10-30 "Open for Goal B, in order" work list after all of it had shipped.  One copy
+remains, and §118's forward-looking block is replaced by a CLOSED statement plus `#121`-`#125`, with the dated
+2026-10-30 status kept as history.
+
+## 261031.009 (r191) -- block 15 absorbs the attendance pool (a 16-block set again, tree-identical) + the stale 35B prefill-logit base filed as TODO #126
 
 **Released as `v16-6050b467c-r191` (16 blocks; block 15 now carries BOTH opt-in placements of the KV).**
 Canonical tip `561696677`, tree `2d76fe97a349ddcc4fc63f0b1bc208907cdd8288` — **the same tree r190 had**, so this
@@ -21,12 +43,12 @@ is byte-identical, so the applied tree is still `2d76fe97a`); `release.json` re-
 16 folded into block 15 as `### The attendance pool (Goal B, r190)` + the index row merged into row 15;
 `MANIFESTS.md` (16 blocks, the apply-order row merged, the verification rows merged), `AGENTS.md` (16 blocks,
 block 15 = both placements + the default-off rationale), `README.md`, `ENVIRONMENT.md` (§17 is now "the
-streamed KV": §17.0 the window, §17.1 the pool), `TODO.md` (current state; #193's block reference), and the
+streamed KV": §17.0 the window, §17.1 the pool), `TODO.md` (current state; #123's block reference), and the
 campaign record (`wip/kv-residency` HANDOVER/BA-POOL-DESIGN/CAMPAIGNS/COLD-START-PROMPT/goal-b README).
 `v17-6050b467c-r190` is left in place as the published tag it is (the tree is the same; the images built for
 it are the same images).
 
-**Filed for the maintainer (new `TODO` #196).**  The **35B-A3B UD-Q4_K_M** prefill-logit base in
+**Filed for the maintainer (new `TODO` #126).**  The **35B-A3B UD-Q4_K_M** prefill-logit base in
 `~/.cache/rdna-boosts/gates/` is r183-era (build `55d421582b7b`, host `soar`) and the **shipped r188 and r189
 trees both read mean KLD 0.005657 / same-top-p 96.794 %** at it (40 chunks, ctx 512, f16 KV, with *and*
 without `ROCBLAS_USE_HIPBLASLT=0`): that point drifted somewhere in r184-r186, so a strict gate run there
@@ -108,10 +130,10 @@ clean; the OOM baseline above.
 **Default OFF, and that is deliberate.**  The pool is a **fittability** feature like block 15: on a config
 whose KV fits it costs the sparse-vs-dense gap and buys nothing, so `LLAMA_KV_REGION_POOL` unset stays
 byte-identical including its OOM.  `TODO` #118 is closed by this entry; what remains of the campaign is
-carried as its own items -- **#191** Goal C (the drafter ring, measured and not promoted: three questions for
-the maintainer), **#192** the Goal A `auto` policy (measured, the maintainer's call), **#193** a
-grow-on-demand pool mirror (shipped as a documented limitation), **#194** Goal A across `-sm tensor`
-(hardware-blocked) and **#195** the sparse arm's radix top-k.  `wip/kv-residency/` stays (Goal C is open).
+carried as its own items -- **#121** Goal C (the drafter ring, measured and not promoted: three questions for
+the maintainer), **#122** the Goal A `auto` policy (measured, the maintainer's call), **#123** a
+grow-on-demand pool mirror (shipped as a documented limitation), **#124** Goal A across `-sm tensor`
+(hardware-blocked) and **#125** the sparse arm's radix top-k.  `wip/kv-residency/` stays (Goal C is open).
 
 **Also recorded.**  `patches/README.md` block 16 (+ the r190 notes in blocks 11/15), `MANIFESTS.md` apply order
 (rows 15 and 16 -- 15 had never been added, and the "15/15" counts are now 17/17), `ENVIRONMENT.md` §18,
@@ -170,7 +192,7 @@ earlier); per-block build gate `--changed-from 0e42c6bc2 --fast` **2/2**; no GPU
 explicit signal; record it as a regression fix and quote the arm; a fresh-process text run still needs
 `ROCBLAS_USE_HIPBLASLT=0`); `patches/README.md` block 10 (index row + the r189 subsection); `MANIFESTS.md` block-10
 row; `AGENTS.md` (the r183 bullet corrected — its "no other model reaches the path" claim was wrong for Flash-Next
-+ q8_0, and the fallback is now vectorised); `TODO.md` #218 (vec16 is F32-only); `benchmarks/2026-10-31-cpy-2d-vec16.md`;
++ q8_0, and the fallback is now vectorised); `TODO.md` #127 (vec16 is F32-only); `benchmarks/2026-10-31-cpy-2d-vec16.md`;
 `archive/work/cpy-2d-vec16/` (the promoted beta: patch, `README-beta.md`, `BETA-TESTING.md`, and the assessment);
 `archive/work/cpy-2d-memcpy-guard/README.md` (the r183 note plus the r189 follow-up).
 
@@ -288,7 +310,7 @@ reproduce that quantizer's write exactly, the elided tensor must be single-use a
 publish only on the path that fills it, and a deferring pass owes the reverse hazard check);
 `ENVIRONMENT.md` §7.4 (five variables + the q8_0-only scope); `patches/README.md` block 10 / block 11;
 `MANIFESTS.md` release gate 1 and the block-10 verification row; `benchmarks/2026-10-31-kv-rotation-decode.md`;
-`archive/work/kv-rotation-decode/README.md`; `TODO.md` #190 (the other KV quant types are not fused).
+`archive/work/kv-rotation-decode/README.md`; `TODO.md` #120 (the other KV quant types are not fused).
 
 ## 261031.004 (r186) -- PR #194 (`set-tensor-async-ring`) re-assessed on the r186 tree and CLOSED; no delivery change
 
