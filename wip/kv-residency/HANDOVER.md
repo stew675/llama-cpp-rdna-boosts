@@ -54,7 +54,7 @@ build — **§3.7.11 is this session**) and [`MIXED-BACKING.md`](MIXED-BACKING.m
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch `main`, **pushed** (`origin` = `git@github.com:stew675/llama-cpp-rdna-boosts.git`) |
 | delivery release | **r181** (`v16-6050b467c-r181`, `release.json`; r178 = the block with a fit/probe regression, r179 = its hotfix, r180 = PR #252 in block 10, r181 = the multi-device `--fit` crash + three `auto` wiring defects) — 16 blocks; **block 15 is this campaign's Goal A**, cut against r177's tip.  The campaign's own patch series is still cut against **r174** (`5bdec04ab`) and is the *measurement* tree, not the shipped one |
-| the campaign's TODO handle | **#118** (`TODO.md` §118 + the table row; the older text says `#117`, which was a dangling reference — see the number note there) |
+| the campaign's TODO handle | **#118** (retired from `TODO.md` once delivered; `WORKLOG.md` 261031.008 closes it and 261031.011 records the retirement.  The older text says `#117`, which was a dangling reference) |
 | campaign code | **fork branch `wip-kv-residency`** in `~/llama.cpp`, **pushed to the personal fork** `git@github.com:stew675/llama.cpp.git`, tip **`7c7769e50`** (A5 (ii): the tensor-placement fix `0013` and the park decline `0014`, on top of the A4 tip).  The **shipped** form is the delivery's `rdna-boosts` at **`83d2c391a`** (`release.json.tip`), which carries r181's fixes and differs from this branch |
 | the A1 fallback | fork branch `wip-kv-residency-a1-two-base` (`e49e1cef4`), also pushed (superseded; unchanged this session) |
 | `rdna-boosts` | **never touched by this campaign.**  Locally `5bdec04ab`; the fork's branch follows the delivery releases (r177) |

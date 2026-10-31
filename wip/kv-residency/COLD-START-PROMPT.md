@@ -1,4 +1,4 @@
-# Cold-session prompt — `wip/kv-residency` (TODO #118, remaining work)
+# Cold-session prompt — `wip/kv-residency` (Goal C + the follow-ups; `TODO` #118's delivery ask is closed)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from a previous
 session's context).  **Rewritten 2026-10-31, end of session A14.**
@@ -11,7 +11,8 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
 
  ---
 
- What is left is decisions and follow-ups, not a campaign:
+ What is left is Goal C and a short set of decisions/follow-ups.  The campaign directory stays under `wip/`
+ until the last one closes (`HANDOVER.md` §12.4) — do not archive it while Goal C is open:
 
  ## 1. Goal C — the MTP drafter ring (`O3-DRAFTER-RING.md`, `TODO` #121) — the maintainer's call
 

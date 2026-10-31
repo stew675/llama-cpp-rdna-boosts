@@ -1,14 +1,21 @@
-# wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN, scoping)
+# wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN — Goal A+B delivered, Goal C + follow-ups remain)
 
 **Cold start: read [`HANDOVER.md`](HANDOVER.md) first** — it is self-contained and says what to do in the
-first 30 minutes.
+first 30 minutes (§12.4 is the close-out plan).
 
-**Status: OPEN — scoping complete, implementation started (2026-10-29).  Nothing here is in `patches/`, and
-nothing is scheduled.  The campaign's code lives on fork branch `wip-kv-residency` (cut from the r174 tip
-`5bdec04ab`); what exists is [`IMPLEMENTATION.md`](IMPLEMENTATION.md).**
-**`TODO` #118 is the permanent handle** for the subject (it was cited as `#117` before that number went to the
-MoE band-predicate item; see `TODO.md` §118) (old and future records that cite `#117` mean this
-document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
+**Status: OPEN — Goal A and Goal B are DELIVERED, the campaign is not finished (2026-10-31).**  Goal A (the
+resident window) is **block 15** in r178 and Goal B (the attendance pool) is the same block 15 in r190, folded
+together in r191 (`WORKLOG.md` 261031.008/261031.009); `TODO` #118's delivery ask is therefore closed.  What
+remains is the campaign's own work, carried as its own `TODO` items — #121 (Goal C, the drafter ring: measured,
+not promoted, three questions in [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) §7), #122 (the Goal A `auto` policy),
+#123 (the grow-on-demand mirror), #124 (Goal A on a `-sm tensor` split) and #125 (the radix top-k) — so this
+directory **stays under `wip/` until the last item closes** (`HANDOVER.md` §12.4: do not archive it while Goal C
+is open).  The shipped form is `patches/` block 15; the campaign's measurement code lives on fork branch
+`wip-kv-residency` (cut from the r174 tip `5bdec04ab`), and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) is the O1
+record.
+**`TODO` #118 is the permanent (retired) handle** for the subject (it was cited as `#117` before that number
+went to the MoE band-predicate item; see `WORKLOG.md` 261031.008 and 261031.011) (old and future records
+that cite `#117` mean this document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
 
 **Scope decision (maintainer, 2026-10-29): the subject is the KV cache.**  "Reduce the GPU-resident
 metadata" is read as *the KV cache* — the K/V tensors, the qwen4exp/DSA indexer cache, and the bookkeeping

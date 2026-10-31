@@ -1,5 +1,31 @@
 # WORKLOG - dated delivery records
 
+## 261031.011 (docs) -- TODO #118 retired from the table (its delivery ask is closed; the campaign itself is still open)
+
+**Docs-only; no delivery change.**
+
+`TODO` **#118** was the only open-table item the campaign record says is done: Goal A (the resident window)
+shipped as **block 15** in r178, Goal B (the attendance pool) as the same block 15 in r190, and r191 folded
+them together.  `wip/CAMPAIGNS.md`, `wip/kv-residency/COLD-START-PROMPT.md` and `patches/README.md` (block 15)
+all say so, and `WORKLOG.md` 261031.008 closes it.  Per `TODO.md`'s own rule a closed item is not kept there,
+so its row and its `## 118` section are gone; a pointer under "Where the current lists live" keeps the
+campaign reachable.  Nothing is lost: the section's narrative was duplicated in `wip/kv-residency/`
+(`README.md` §0, `O2-PLAN.md` §5, `A2-MIXED-BACKING.md` §3.7, `BA-POOL-DESIGN.md` §7-§10, `HANDOVER.md`).  The
+`#117` number note (cited for three sessions, never a row; then allocated to the MoE band-predicate finding
+and closed in r176, so the campaign took `#118`) is recorded here instead.
+
+**Still open, deliberately not retired:** #120 (the r187 KV rotations are `q8_0`-only), #121 (Goal C, the
+maintainer's three questions), #122 (the `auto` policy), #123 (the grow-on-demand pool mirror), #124 (Goal A
+on a `-sm tensor` split), #125 (the radix top-k) and #126 (the stale 35B prefill-logit base -- re-checked: the
+cached base is still build `55d421582b7b`, r183-era).  Two `wip/` pointers that cited `TODO.md` §118 now cite
+this entry.
+
+`wip/kv-residency/README.md` also said "Status: OPEN ... nothing here is in `patches/`", false since r178; its
+header now says Goal A+B delivered, campaign open, and points at #121-#125.  **The campaign directory stays
+under `wip/`**: `HANDOVER.md` §12.4 is explicit -- "Do not archive `wip/kv-residency/` while Goal C is still
+open -- the campaign directory stays, shrunk to the open work, and the archived copy happens when the last item
+closes."  So this entry retires the *handle* #118, not the campaign.
+
 ## 261031.010 (docs) -- TODO.md housekeeping: the r187-r189 handles `#190`-`#196`/`#218` become `#120`-`#126`/`#127`, and the tracker table is whole again
 
 **Docs-only; no delivery change** (`patches/`, `release.json` and every block are untouched).
