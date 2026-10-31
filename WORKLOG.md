@@ -1,5 +1,56 @@
 # WORKLOG - dated delivery records
 
+## 261031.007 (r189) -- the r183 2-D copy guard gets a vectorised fallback (`cpy_2d_vec16`, from the KV campaign) -- a regression fix, bit-identical
+
+**Released as `v16-6050b467c-r189` (16 blocks; block 10 amended, blocks 11-15 re-cut unchanged).**  Canonical tip
+`50d9e90ee`, tree `03c56ed1e5476d3e8bd10b28c1004625c20d6953` (r188 was `0e42c6bc2` / `61a892357`).  `release.json`
+refreshed; `scripts/validate-set.sh` OK (16/16).
+
+**What shipped.**  The KV campaign's session A12 (`wip-kv-residency-b` commit `f8e47e392`, staged here as
+`beta/0016-copy-2d-vec16/`) found that r183's driver-refusal guard in `ggml_cuda_cpy_as_memcpy_2d` sends a refused
+2-D block copy to `cpy_scalar<cpy_1_scalar<float,float>>` — three integer divisions and three modulos **per
+element** — and that the delivery *reaches* it: qwen4exp with a quantized indexer key cache (`-ctk q8_0`; the fused
+`INDEXER_SCORE`/`INDEXER_FILL` path is F32/BF16/F16 only) takes the per-op chain and makes one refused copy per
+layer per **prefill chunk** (`w=512 sp=2048 dp=512`, `h` = the QSA index-block count).  `cpy_2d_vec16` copies that
+block with one 16-byte unit per thread, row index from the grid (no division): bit-identical, F32 and 16-B-aligned
+only, every other geometry unchanged, and **the guard itself untouched**.
+
+**The fold is the beta patch plus one hardening.**  "The guard refused" is now an explicit `guard_refused`
+out-parameter instead of the beta's `width != 0` inference: `ggml_cuda_cpy_as_memcpy_2d` also writes `width` before
+rejecting `spitch < width || dpitch < width`, and *that* refusal (self-overlapping rows) must keep the flat element
+mapping — the inference would have sent it to a row-per-row copy.  `GREEDY-PURITY.md` §76.  Folded into block 10
+(which owns `cpy.cu`) with blocks 11-15 replayed unchanged; the folded tree is the measured one (the only delta
+after measurement was a comment).
+
+**Reach, proven** (a throw-away instrumented build logging every refusal, gfx1201, Flash-Next GSQ-IQ3_XXS,
+`-ncmoe 48`, `-ctk/-ctv q8_0`, 105k prompt): 48 `w=512` refusals per prefill chunk (one per layer), all taking the
+vec16 path; the r183 `w=2 h=10240` case (a 20 KiB copy) correctly stays on `cpy_scalar`; **no decode-phase refused
+copy** on the resident arm or with `LLAMA_KV_RESIDENT_CELLS=2048`.
+
+**Measured — and it is a regression fix, not a speed-up.**  Refused-copy kernel time on that prefill
+(`rocprofv3`): **1010 -> 637 ms** (`cpy_scalar<float,float>` 1433.75 ms / 12428 calls -> 423.91 / 2732, plus
+`cpy_2d_vec16` 636.77 ms / 9696); whole run 329.16 vs 329.28 s.  **Wall time flat**: `llama-bench -p 16384 -n 0`
+339.30/339.37/339.34 vs 339.37/339.32/339.34; `-n 64 -d 49152` 26.69/26.74/26.75 vs 26.70/26.06/26.79; deep-arm
+generation 30.9 vs 30.4 t/s.  The campaign's `5.20 -> 1.83 ms/token` is its sparse/pool **decode** shape; no
+delivery-only arm reproduced a per-step refused copy, so that number is quoted with its arm and not claimed here.
+
+**Purity.**  Greedy text byte-identical: qwen4exp q8_0 at 4k (`905 6b9e214d3b59`) and at **105k depth**
+(`94 fe7775042f82`), 3-GPU `-sm tensor -ncmoe 48` qwen4exp (`611 15561552e5d1`), dense 27B Q8_0 3-GPU
+(`678 692c3f7ca639`) — all with `ROCBLAS_USE_HIPBLASLT=0` (one run without it read `953 46bd85e08529`, the
+per-start hipBLASLt pick of issue #67, §44 — recorded because it looks exactly like a purity break).
+Prefill-logit: qwen4exp q8_0 **0.000000 / 100.000 %** (8 chunks, base recorded on the r188 build) and the canonical
+dense 27B **-0.000000 / 100.000 %**.  `test-backend-ops -o CPY` **251/251**; **the r183 load arm still works**
+(Flash-Next GSQ-IQ3_XXS, 3 GPUs, `-sm tensor -ncmoe 48` loads and generates — the arm that aborted on r182 and
+earlier); per-block build gate `--changed-from 0e42c6bc2 --fast` **2/2**; no GPU faults.
+
+**Also recorded.**  `GREEDY-PURITY.md` §76 (a conservative guard owes a non-pathological fallback; the refusal is an
+explicit signal; record it as a regression fix and quote the arm; a fresh-process text run still needs
+`ROCBLAS_USE_HIPBLASLT=0`); `patches/README.md` block 10 (index row + the r189 subsection); `MANIFESTS.md` block-10
+row; `AGENTS.md` (the r183 bullet corrected — its "no other model reaches the path" claim was wrong for Flash-Next
++ q8_0, and the fallback is now vectorised); `TODO.md` #218 (vec16 is F32-only); `benchmarks/2026-10-31-cpy-2d-vec16.md`;
+`archive/work/cpy-2d-vec16/` (the promoted beta: patch, `README-beta.md`, `BETA-TESTING.md`, and the assessment);
+`archive/work/cpy-2d-memcpy-guard/README.md` (the r183 note plus the r189 follow-up).
+
 ## 261031.006 (r188) -- PR #259 accepted: the shared-expert lane publishes its GLU output's Q8_1 (block 10 amended) -- one launch/layer, +1.1 % gfx1201 / +2.6 % gfx1100, bit-identical
 
 **Released as `v16-6050b467c-r188` (16 blocks; block 10 amended, blocks 11-15 re-cut unchanged).**  Canonical

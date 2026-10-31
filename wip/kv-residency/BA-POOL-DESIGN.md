@@ -459,7 +459,11 @@ multiples of 16 B (and both pointers are 16-B aligned), copy the same block with
 thread**, the row index taken from the grid so there is no division at all.  Bit-identical by construction
 (16 B = four whole floats, same type, same offsets); every other geometry falls back exactly as before, and
 **the guard itself is untouched**, so the r183 load fix stands.  Commit `f8e47e392` on the campaign branch;
-it belongs in **block 10** (`ggml/src/ggml-cuda/cpy.cu`).
+it belongs in **block 10** (`ggml/src/ggml-cuda/cpy.cu`).  **PROMOTED: shipped in `v16-6050b467c-r189`**
+(block 10, plus an explicit `guard_refused` flag instead of the `width != 0` inference -- see
+`archive/work/cpy-2d-vec16/`, `GREEDY-PURITY.md` §76, `benchmarks/2026-10-31-cpy-2d-vec16.md`; the delivery's
+own arms show the copies are *prefill*-phase, so the r189 record carries it as a regression fix, and the
+decode-side numbers above are this campaign's pool/sparse shape).
 
 | measured (103k, `-n 512`, MTP-4, q8_0; arms interleaved) | rebased r186 | with the fix | r182-era |
 |---|---|---|---|

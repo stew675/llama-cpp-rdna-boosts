@@ -135,6 +135,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
 | **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model **and device-count** property (r186 removed the single-device gate — multi-device reach is empirical, gate it with a multi-device width-probe arm), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183 PR #256 + r186; `benchmarks/2026-10-30-gdn-decode-folds.md`, `benchmarks/2026-10-31-conv-fusion-multi-device.md`) |
+| **§76** | a conservative guard that declines a fast path owes a fallback that is not pathological, and the refusal must be a distinct signal rather than inferred from a partially-filled out-parameter: a guard whose false positive routes a *large* copy to an element-per-thread kernel (three divisions and three modulos per element) is a regression waiting for a model that reaches it — so keep the guard, vectorise the fallback (bit-identical, alignment-checked), and never let a *different* refusal geometry (overlapping rows, which need the flat mapping) share the fallback's condition | doctrine + fix (r189, from the KV campaign's `f8e47e392`; `benchmarks/2026-10-31-cpy-2d-vec16.md`) |
 | **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
 | **§74** | a fusion that exists for one cache-*quantizer* path is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
 
@@ -2592,3 +2593,45 @@ flat at 4/8.
 
 **Record:** `WORKLOG.md` 261031.006, `patches/README.md` (block 10), `ENVIRONMENT.md` §7.4,
 `benchmarks/2026-10-31-shared-glu-q8.md`, `archive/work/shared-glu-q8/`.
+
+## 76. A conservative guard owes a fallback that is not pathological, and the refusal must be signalled (r189, from the KV campaign)
+
+**Claim.**  r183's driver-refusal guard in `ggml_cuda_cpy_as_memcpy_2d` (keep `cudaMemcpy2DAsync` only while a
+copy's padded span fits the tensor) is correct and stays, but its fallback was
+`cpy_scalar<cpy_1_scalar<float,float>>` — three integer divisions and three modulos **per element**.  The
+delivery reaches that path: qwen4exp with a quantized indexer key cache (`-ctk q8_0`; the fused
+`INDEXER_SCORE`/`INDEXER_FILL` path is F32/BF16/F16 only) takes the per-op chain and makes one refused copy per
+layer per prefill chunk (`w=512 sp=2048 dp=512`, `h` = the QSA index-block count).  r189 adds `cpy_2d_vec16`
+(one 16-byte unit per thread, row from the grid) for the F32, 16-B-aligned case.
+
+**Rule.**
+
+1. **The guard stays; the fallback is what gets fixed.**  Narrowing a guard whose exact driver rule is
+   unverified would trade a silent wrong answer (or a load abort) for speed; making the fallback fast costs
+   nothing and keeps the r183 load fix (re-verify that arm: Flash-Next GSQ-IQ3_XXS, 3 GPUs, `-sm tensor
+   -ncmoe 48`).
+2. **Vectorise only where alignment makes it bit-identical.**  F32 with `width`, `spitch` and `dpitch` all
+   multiples of 16 B and both pointers 16-B aligned: 16 B is four whole floats at the same offsets.  Every
+   other type and every unaligned geometry keeps the scalar kernel; the grid limits (`65535` per dim) are
+   checked so a taller copy falls back rather than truncating.
+3. **The refusal must be its own signal.**  `ggml_cuda_cpy_as_memcpy_2d` also writes `width` before rejecting
+   `spitch < width || dpitch < width` — a *different* case (self-overlapping rows, which need the flat element
+   mapping).  Inferring "the guard refused" from `width != 0` would send that geometry to a row-per-row copy
+   that reads and writes the wrong bytes.  Pass an explicit flag (r189: `guard_refused`).
+4. **Record it as a regression fix, and quote the arm.**  On the delivery's own arms the copies are
+   prefill-phase and the wall time is flat (1010 -> 637 ms of a 105k prefill's copy time, ~0.3 % of its kernel
+   time); the campaign that found it measures 5.20 -> 1.83 ms/token on its sparse/pool **decode** shape, which
+   no delivery-only arm reproduced.  A "regression fix" that is presented as a speed-up gets re-litigated.
+5. **A fresh-process text comparison still needs `ROCBLAS_USE_HIPBLASLT=0`.**  One verification run of this
+   change without it read a different hash (the per-start hipBLASLt solution pick, §44), which looks exactly
+   like a purity break.  Re-run with the env set before believing it.
+
+**Numbers** (gfx1201, 1 GPU, Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, `-ctk/-ctv q8_0`): refused copies
+**1010 -> 637 ms** of a 105k-token prefill; whole run 329.16 vs 329.28 s; `pp16384` 339.3 both, `tg64 @
+d49152` 26.7 both, deep generation 30.9 vs 30.4 t/s.  Purity: text identical at 4k and 105k depth, 3-GPU
+qwen4exp and dense 27B; prefill-logit 0.000000 / 100.000 % (qwen4exp q8_0) and -0.000000 / 100.000 % (dense
+27B); `test-backend-ops -o CPY` 251/251; the r183 load arm loads; no GPU faults.
+
+**Record:** `WORKLOG.md` 261031.007, `patches/README.md` (block 10), `benchmarks/2026-10-31-cpy-2d-vec16.md`,
+`archive/work/cpy-2d-vec16/` (promoted beta, campaign commit `f8e47e392`), `archive/work/cpy-2d-memcpy-guard/`
+(the r183 note, with the r189 follow-up).

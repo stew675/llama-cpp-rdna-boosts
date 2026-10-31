@@ -1252,9 +1252,19 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `Flash-Next GSQ-IQ3_XXS -sm tensor -ncmoe 48` abort at load on r182 and earlier (`ggml_cuda_cpy`, device 1,
   qwen4exp's `blk.1.ple_conv1d.weight` column view; `-sm layer` and `GGML_CUDA_SLAB=0` both loaded).  The exact
   driver rule is unverified (shrinking the 2-D copy by one row still failed), so the guard is deliberately
-  conservative; the scalar kernels are bit-identical and no other model we hold reaches the path (0 2-D copies
-  in an instrumented run of 35B-A3B / 4B / 27B / gpt-oss).  Do not restore the unconditional fast path without
-  reproducing the arm.  `archive/work/cpy-2d-memcpy-guard/README.md`.
+  conservative and **stays**.  What it does *not* leave alone is the fallback: r183's "no other model reaches
+  the path" was wrong for Flash-Next, which with a **quantized indexer key cache** (`-ctk q8_0`; the fused
+  `INDEXER_SCORE`/`INDEXER_FILL` path is F32/BF16/F16 only) takes qwen4exp's per-op chain and makes one refused
+  copy per layer per prefill chunk — and `cpy_scalar` costs three divisions and three modulos **per element**
+  (1010 ms of a 105k prefill).  Since **r189** the refused F32/16-B-aligned case is copied by `cpy_2d_vec16`
+  (one 16-byte unit per thread, row from the grid, bit-identical): 1010 -> 637 ms there, wall time unchanged on
+  our arms (a **regression fix**, not a speed-up — the campaign's 5.20 -> 1.83 ms/token is its sparse/pool
+  decode shape, which no delivery-only arm reproduced).  "The guard refused" is an **explicit flag**, never
+  inferred from a partially-filled geometry: the `spitch < width || dpitch < width` rejection is a different
+  case (overlapping rows need the flat mapping) and must not reach a row-per-row copy
+  (`GREEDY-PURITY.md` §76).  Do not restore the unconditional fast path without reproducing the arm, and do not
+  narrow the guard without the driver's actual rule.
+  `archive/work/cpy-2d-memcpy-guard/README.md`, `archive/work/cpy-2d-vec16/README.md`.
 - **A `-sm tensor` model load uploads tensors through a pinned staging buffer, one alloc/free per
   tensor** (`ggml_backend_cuda_buffer_set_tensor_2d`, 678 pairs = 2.2 s + 1.1 s of a ~10.7 s load on a 27B
   Q8_0 at 3 devices).  This is *load* time, not decode.  Since **r116** the staging buffer is grow-only

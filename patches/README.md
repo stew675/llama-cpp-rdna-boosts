@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish) | +14913 / −5064 | 83 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses) | +14966 / −5067 | 83 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1941,6 +1941,42 @@ byte-identical at 1 GPU, 2 GPU `-sm tensor` (both x8 pairs), 3 GPU `-sm tensor`,
 (inert) and on a firing MoE arm (35B-A3B `UD-Q4_K_M` with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`);
 `test-backend-ops -o MUL_MAT_ID` 931/931; no GPU faults.  Rule: `GREEDY-PURITY.md` §75.  Numbers:
 `benchmarks/2026-10-31-shared-glu-q8.md`; record `archive/work/shared-glu-q8/README.md`.
+
+#### r189 — the r183 2-D copy guard gets a vectorised fallback (`cpy_2d_vec16`)
+
+**What it is.**  r183's guard (above, `ggml_cuda_cpy_as_memcpy_2d`) keeps `cudaMemcpy2DAsync` only while a copy's
+**padded** span fits the tensor, and sends everything else to `cpy_scalar<cpy_1_scalar<float,float>>` — three
+integer divisions and three modulos per element.  That fallback is reached in the delivery: qwen4exp with a
+quantized indexer key cache (`-ctk q8_0`; the fused `INDEXER_SCORE`/`INDEXER_FILL` path is F32/BF16/F16 only)
+takes the per-op chain and makes **one refused copy per layer per prefill chunk** (`w=512 sp=2048 dp=512`,
+`h` = the QSA index-block count).  r189 adds `cpy_2d_vec16`: when the guard refuses a 2-D copy of two **F32**
+tensors whose width and pitches are multiples of 16 B (both pointers 16-B aligned), copy the same block with one
+16-byte unit per thread and the row index from the grid — bit-identical, no division.  Every other type, every
+unaligned geometry and every copy the guard allows is unchanged, and **the guard itself is untouched**.
+
+**The refusal is signalled, not inferred.**  `ggml_cuda_cpy_as_memcpy_2d` writes `width` before its
+`spitch < width || dpitch < width` rejection as well, and that rejection is a *different* case (self-overlapping
+rows, which need the flat element mapping), so the caller gets an explicit `guard_refused` out-parameter.  A
+"non-zero width means the guard refused" test would send such a geometry to a row-per-row copy.  Rule:
+`GREEDY-PURITY.md` §76.
+
+**Worth — a regression fix, not a perf win, and it must be recorded as one.**  Refused-copy kernel time on a
+105k-token prefill (gfx1201): **1010 -> 637 ms** (`cpy_scalar<float,float>` 1433.75 ms / 12428 calls ->
+423.91 ms / 2732 + `cpy_2d_vec16` 636.77 ms / 9696); wall time **flat** — `pp16384` 339.3 vs 339.3, `tg64 @
+d49152` 26.7 vs 26.7, deep-arm generation 30.9 vs 30.4 t/s — because on the delivery's arms the copies are
+prefill-phase and ~0.3 % of the prefill's kernel time.  The campaign that found it measures 5.20 -> 1.83
+ms/token on its sparse/pool **decode** shape; the delivery's refused copies stay prefill-phase even with
+`LLAMA_KV_RESIDENT_CELLS` set (no per-step refused copy appears), so that decode delta is the campaign's arm,
+not ours.
+
+**Gates.**  Greedy text byte-identical at 4k (`905 6b9e214d3b59`) and **105k depth** (`94 fe7775042f82`), 3-GPU
+`-sm tensor -ncmoe 48` qwen4exp q8_0 (`611 15561552e5d1`) and dense 27B 3-GPU (`678 692c3f7ca639`);
+prefill-logit **0.000000 / 100.000 %** on qwen4exp q8_0 and **-0.000000 / 100.000 %** on the canonical dense
+27B; `test-backend-ops -o CPY` 251/251; the r183 load arm (Flash-Next GSQ-IQ3_XXS, 3 GPUs, `-sm tensor
+-ncmoe 48`) loads and generates; no GPU faults.  One trap: a fresh-process text run without
+`ROCBLAS_USE_HIPBLASLT=0` read a different hash — the per-start hipBLASLt pick of issue #67 (§44), not a change.
+Numbers: `benchmarks/2026-10-31-cpy-2d-vec16.md`; record `archive/work/cpy-2d-vec16/README.md` (the promoted
+`beta/0016`, from the KV campaign's `f8e47e392`).
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 

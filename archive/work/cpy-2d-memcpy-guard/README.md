@@ -42,3 +42,25 @@ UD-Q4_K_XL and gpt-oss-20b records **zero** 2-D copies.  A conservative guard th
 measurable, while narrowing it further would need the driver's actual rule.
 
 A future model that does reach the path in a slack buffer loses the fast path, not correctness.
+
+## r189 follow-up (2026-10-31) — the reach this note denied does exist, and the fallback is now vectorised
+
+The last sentence above ("a future model that does reach the path in a slack buffer loses the fast path, not
+correctness") turned out to matter sooner than expected, and the loss is not free:
+
+* **A shipped model does reach it.**  qwen4exp (Flash-Next) with a **quantized indexer key cache**
+  (`-ctk q8_0`) cannot use the fused `INDEXER_SCORE`/`INDEXER_FILL` path (F32/BF16/F16 only), so it takes the
+  per-op indexer chain, which makes one refused 2-D copy per layer per prefill chunk (`w=512`, `sp=2048`,
+  `dp=512`, `h` = the QSA index-block count, 48 layers).  r183's "0 2-D copies in an instrumented run of
+  35B-A3B, 4B Q8_0, 27B and gpt-oss" was true — Flash-Next was simply not in that set.
+* **The scalar fallback is pathological on a copy that size**: `cpy_scalar` does three integer divisions and
+  three modulos per element, so the refused copies cost **1010 ms** of a 105k-token prefill on gfx1201
+  (1433.75 ms of `cpy_scalar<float,float>` in the whole run) and, on the KV campaign's sparse/pool decode
+  shape, **5.20 ms/token**.
+* **r189** therefore gives the refused case its own kernel, `cpy_2d_vec16` (one 16-byte unit per thread, row from
+  the grid): the same copies cost 637 ms instead of 1010 ms.  **The guard itself is unchanged**, so the load
+  fix above still stands (re-verified: Flash-Next GSQ-IQ3_XXS, 3 GPUs, `-sm tensor -ncmoe 48` loads and
+  generates).
+
+Record: `archive/work/cpy-2d-vec16/README.md`, `benchmarks/2026-10-31-cpy-2d-vec16.md`, `GREEDY-PURITY.md` §76,
+`WORKLOG.md` 261031.007.

@@ -85,6 +85,16 @@ call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
+* **`cpy_2d_vec16` covers F32 only** (r189, `TODO` **#218**).  The vectorised fallback for the 2-D block copies
+  r183's guard refuses is restricted to two **F32** tensors with 16-B-aligned width and pitches — the reachable
+  case (qwen4exp's indexer key cache, which is F32 by construction).  Every other type and every unaligned
+  geometry keeps `cpy_scalar`, which is bit-identical but element-per-thread.  Nothing in the delivery reaches a
+  padded block copy of another type today (the census in `benchmarks/2026-10-31-cpy-2d-vec16.md` is F32-only), so
+  this is a "extend it if a BF16/F16 copy shows up" note rather than work: the same 16-B unit is four whole floats
+  but only **eight** halves, so a wider version needs its own alignment rule and its own oracle.  Re-check it when
+  the KV campaign's sparse/pool arm is promoted (that arm is where the copy is made per *decode* step).
+
+
 * **A verify step whose slot cannot draft at all still splits into two ubatches** (TODO #111, investigated and
   declined 2026-10-28).  A slot with `get_n_draft_max() <= 0` -- its last token of the response, or a full
   context waiting for a shift -- presents its sampled row alone while its neighbour presents `n_draft + 1`, so
