@@ -562,6 +562,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   same-kernel ubatch change measures 0.105 / 85 %) and always prints a same-kernel control, so the
   absolute limits stay the criterion without an insensitive point waving a bad change through.
   Protocol: `benchmarks/prefill-logit-methodology.md`, `GREEDY-PURITY.md` §46.
+  **A base is per ROCm line (r192, TODO #126).**  The `.meta` records the ROCm line the base's binary
+  linked, and a compare against a build on a different line is **refused** (`--allow-base-mismatch` shows
+  the number anyway): the same tree reads 0.005657 / 96.794 % on 10.1.0 and 0.005688 / 96.765 % on 7.14.1
+  at the 35B-A3B point, i.e. a cross-line "divergence" is the compiler.  When a gate failure appears at a
+  point that used to pass, check `.meta`'s `build=`/`rocm=` and the `gate-prefill-logits.sh` header line
+  before suspecting the change: a stale base read as a gate failure for six releases (#126) because the
+  r161 re-record was written on another host.
 - **The sequences that verify in one step must present the same row count (r153, issue #234).**
   `llama_memory_hybrid::init_batch()` splits a decode with `llama_batch_allocr::split_equal()`, which takes one
   token per sequence set per round and **stops at the shortest set**, so two slots verifying different draft

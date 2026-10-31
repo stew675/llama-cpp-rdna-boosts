@@ -1,4 +1,59 @@
-# WORKLOG - dated delivery records
+## 261031.012 (tooling, post-r191) -- TODO #126 closed: the 35B prefill-logit base was an r125-era recording, so the "r184-r186 drift" was a stale reference; re-recorded, and the gate now refuses a cross-toolchain compare
+
+**Not a release; no delivery change** (`patches/`, `release.json` and every block are untouched; `scripts/`
+and the docs only).  Box: one R9700, `HIP_VISIBLE_DEVICES=0`, nothing else running.
+
+**What was believed.**  `TODO` #126 carried the 35B-A3B UD-Q4_K_M prefill-logit point as a divergence that
+appeared "somewhere in r184-r186" — the shipped r188/r189 trees read `0.005657 / 96.794 %` against the cached
+base, i.e. a strict gate run *fails on released code*.  The suspicion (r186's conv fusion, r183's GDN folds)
+was wrong, and so was the window: the base was stale by far more than six releases.
+
+**The bisect (each step: build that tip in `build-rocm` from the canonical tree, run the gate at the recorded
+point — model, corpus sha, ctx 512, chunks 40, f16 KV, default arm).**
+
+| tree | KLD / same-top-p | verdict |
+|---|---|---|
+| `55d421582` = **r125's tip** (the `.meta`'s `build=`) | **-0.000000 / 99.990 %** | PASS — the base is faithful to its own recording |
+| `f38bfa9dd` (an Oct-21 tree, ROCm **7.14** build) | -0.000000 / 99.990 % | PASS — the host/toolchain is not a factor either |
+| **`760ac6aaf` = r126's tip** | **0.005073 / 97.118 %** | **FAIL — the first bad release** |
+| `0c28ef86c` = r127's tip | (object missing from the fork clone — not testable) | — |
+| `828be32a7`/`99a2736fb`/`6950f7ad1`/`01851831e` = r128/r129/r133/r142 | 0.005944 / 96.559 % (identical at each) | FAIL, plateaued |
+| `561696677` = **r191's tip**, ROCm 10.1 | 0.005657 / 96.794 % | FAIL (the number `TODO` #126 reported) |
+| r191's tree rebuilt with ROCm **7.14.1** | 0.005688 / 96.765 % | FAIL — the toolchain is not the carrier |
+
+**The carrier is r126** — "the RDNA4 MMA band row is no longer also the prefill row: deep-context prefill
+recovers (block 05, `TODO` #98)" — with r127's re-base onto `3f03b1772` (261 upstream commits) taking the
+rest (0.005073 -> 0.005944).  Both are *intended* prefill-kernel changes (a different reduction order in the
+FA prefill row, then the upstream merge), the same class as `GREEDY-PURITY.md` §68 (Q6_K VDR) and §44: the
+values move at ~0.006 KLD with PPL 5.8239 -> 5.8257 (+0.03 %), which is an association order, not a defect.
+No r18x release touched this point at all.  Also explained: why r159 and r161 read the *identical*
+`0.005657 / 96.794 %` (recorded in 261028.001) — they were reading this same pre-r126 file.
+
+**Why it survived the r161 re-record.**  261028.001 says the base was re-recorded from `build-r159`
+(`base_ppl 5.8257`).  The file on this host was still the r125-era one (`base_ppl 5.8239`, `build=55d421582`,
+`host=soar`; this host is `radix`), so that re-record was written somewhere else and this box kept comparing
+against the pre-r126 reference.  A re-record is only as durable as the cache directory it lands in.
+
+**The fix (all three parts).**
+1. **Re-recorded** the 35B-A3B UD-Q4_K_M base from the shipped r191 build: `base_ppl 5.8257`, build
+   `561696677`, sha256 `75d116c9c1de2734…`; the gate then reads **-0.000000 / 100.000 %** (self-compare).
+   The superseded r125-era pair is kept at `~/.cache/rdna-boosts/gates/legacy/…r125-era.kld{,.meta}` so the
+   attribution above is reproducible.
+2. **Gate hygiene, so this cannot be misread again.**  The `.meta` now records `rocm=` (derived from the
+   binary's linked `libamdhip64`, not from `PATH` or a CMake cache) and the preview line prints it; a compare
+   against a build on a **different ROCm line is refused** with the measured reason (10.1 vs 7.14 move the low
+   bits: 0.005657 vs 0.005688 at this point), `--allow-base-mismatch` being the escape.  Legacy bases without
+   the field are left alone.  Verified both ways: the 7.14 binary is refused with the message, the re-recorded
+   10.1 base passes.
+3. **Docs**: `AGENTS.md`'s prefill-logit bullet and `scripts/README.md` gain the per-ROCm-line rule, and
+   `TODO` #126 is retired to this entry.
+
+**Sanity after the change**: the 27B Q8_0 release point still reads `0.000000 / 100.000 %` on the shipped
+r191 build (its base is a legacy, field-less file, so the toolchain check correctly stays silent), and
+`bash -n` on the gate is clean.
+
+**Do not re-derive**: r126 is the carrier, not r184-r186; the 35B point is not a defect and needs no bisect
+of the delivery's kernel work; and a `.kld` base is a *per-toolchain* artifact.
 
 ## 261031.011 (docs) -- TODO #118 retired from the table (its delivery ask is closed; the campaign itself is still open)
 

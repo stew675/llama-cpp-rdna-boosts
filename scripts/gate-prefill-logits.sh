@@ -270,7 +270,7 @@ echo "    ppl=$LLAMA_PPL"
 echo "    model=$MODEL"
 echo "    corpus=$CORPUS  (sha256=${CORPUS_SHA:0:16}...)"
 echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS"
-echo "    base=$BASE"
+echo "    base=$BASE$( [ -f "$META" ] && { r="$(sed -n 's/^rocm=//p' "$META" | head -1)"; [ -n "$r" ] && printf '  (recorded with ROCm %s)' "$r"; } )"
 echo "    thresholds: mean KLD <= $MAX_KLD, same-top-p >= ${MIN_TOPP}%"
 [ "$FAMILY_SWITCH" -eq 1 ] && echo "    mode=family-switch (control ubatch=$CONTROL_UB, max point PPL=$FAMILY_MAX_PPL)"
 [ "$RECORD" -eq 1 ] && echo "    mode=record${RECORD_ENV:+ (base arm: $RECORD_ENV)}"
@@ -319,6 +319,20 @@ build_ref() {
         sha256sum "$LLAMA_PPL" | awk '{print substr($1,1,12)}'
     fi
 }
+# The ROCm line the BINARY links (not the one on PATH, and not the checkout's CMakeCache): a base
+# recorded on one line is not a rounding-level reference for another.  Measured 2026-10-31 at the
+# 35B-A3B point: the same r191 tree reads 0.005657 / 96.794 % on 10.1.0 and 0.005688 / 96.765 % on
+# 7.14.1 -- a different compiler moves the low bits of every prefill kernel, so a cross-line compare
+# reports a "divergence" that is the toolchain (TODO #126: the 35B base was an r125-era recording of
+# the pre-r126 FA prefill row, and it read as a gate failure for six releases).
+rocm_line() {
+    local p
+    p="$(ldd "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*=> \(/opt/rocm[^/]*\)/.*#\1#p' | head -1)"
+    if [ -z "$p" ] && command -v readelf >/dev/null 2>&1; then
+        p="$(readelf -d "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*\[\(/opt/rocm[^]:]*\)[:/].*#\1#p' | head -1)"
+    fi
+    printf '%s\n' "${p##*/}"
+}
 le() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 <= b+0) }'; }
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 >= b+0) }'; }
 
@@ -351,6 +365,20 @@ check_base_compat() {
             fail "base $BASE does not match the current model/corpus/settings; re-record it (--record) or pass --allow-base-mismatch"
         fi
     fi
+
+    # the TOOLCHAIN the base was recorded with: a legacy base has no `rocm=` field and is left alone
+    local b_rocm c_rocm
+    b_rocm="$(base_meta_field rocm)"
+    c_rocm="$(rocm_line)"
+    if [ -n "$b_rocm" ] && [ -n "$c_rocm" ] && [ "$b_rocm" != "$c_rocm" ]; then
+        if [ "$ALLOW_BASE_MISMATCH" -eq 1 ]; then
+            echo "    WARN: base was recorded with $b_rocm, this build links $c_rocm (--allow-base-mismatch)"
+        else
+            fail "base $BASE was recorded with ROCm '$b_rocm' but this build links '$c_rocm'
+       a cross-toolchain compare is not rounding-level (the low bits of every prefill kernel move);
+       record one base per ROCm line (--record), or pass --allow-base-mismatch to see the number anyway"
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -378,6 +406,7 @@ if [ "$RECORD" -eq 1 ]; then
         echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "host=$(hostname)"
         echo "arch=$ARCH"
+        echo "rocm=$(rocm_line)"
         echo "build=$b_ref"
         echo "model=$MODEL"
         echo "corpus=$CORPUS"
