@@ -1,5 +1,91 @@
 # WORKLOG - dated delivery records
 
+## 261031.008 (r190) -- Goal B delivered: block 16 (the attendance pool), a streamed cache takes the sparse arm (block 15), and the fused indexer scorer reads QUANTIZED keys (block 11)
+
+**Released as `v17-6050b467c-r190` (17 blocks; block 15 and block 11 amended, block 16 new).**  Canonical tip
+`36e8aecb1`, tree `2d76fe97a349ddcc4fc63f0b1bc208907cdd8288` (r189 was `50d9e90ee` / `03c56ed1e`).
+`release.json` refreshed; `scripts/validate-set.sh` green (17/17 strict `git am` on a fresh tarball, tree
+equality, 286 files through the Windows portability lint).  The set applies to `6050b467c`, unchanged base.
+
+**What shipped.**  All three are the KV campaign's (`wip/kv-residency`, `TODO` #118) remaining deliverables,
+rebased onto the r189 tree and folded into the blocks that own them:
+
+1. **block 16 (new) -- the ATTENDANCE POOL** (`LLAMA_KV_REGION_POOL=<cells>`, **opt-in**): the attention KV's
+   authoritative copy in a **pinned host mirror** (cell-indexed, so the writers, state I/O, the K-shift,
+   defrag and `seq_park` work on it unchanged -- the writer rule) plus a compact **device pool** of pages of
+   one indexer block with a page table.  `GGML_OP_KV_POOL` (mark / claim / map+fill, three launches per layer
+   per step) resolves a decode step through it, and the QSA reader takes a second id list so its K/V gather
+   follows the page table while the mask stays cell-indexed.  22 files, +1239/−34 (the campaign's B-A pool
+   commit + its async-state mirror handling + this session's `--fit` accounting).
+2. **block 15 (amended) -- a STREAMING cache takes the sparse decode arm**: `is_streaming()` + a qwen4exp arm
+   policy, the campaign's B2.  A windowed (or pooled) cache that the used extent has passed now takes the
+   sparse arm; a resident cache is untouched.
+3. **block 11 (amended) -- the fused indexer scorer accepts QUANTIZED keys** (q8_0 + the q4/q5 family +
+   iq4_nl), the campaign's A13: `indexer_score_ld_chan` addresses quantized rows in `nb0K`-byte blocks and
+   dequantizes with ggml's own `dequantize_*`, so the fused `INDEXER_SCORE`/`INDEXER_FILL` path serves
+   `-ctk q8_0` instead of the per-op chain.
+
+**The `--fit` blocker is closed (the campaign's shipping condition).**  The pool's mirror is a device buffer
+type over a pinned host allocation, so `--fit` had booked its bytes as VRAM -- 1.6-2.4 GiB at 103k-180k, i.e.
+it handed back the arena the pool exists to free.  `llama_kv_cache::memory_breakdown()` now charges the mirror
+to the host bucket (block 15's spill treatment), `llama_get_kv_pool_bytes()` reports the split, and the fit
+prints both numbers and **skips the context-reduction interpolation** while the pool is active (that
+interpolation divides by a near-zero bytes-per-context delta there and would hand back a huge context whose
+pinned mirror could OOM the host).  Evidence, `-c 262144` Flash-Next: `-fitp` moves **3 264 MiB from the device
+row to Host** (device context 3 784 -> 728 MiB); `-ncmoe 21`/`22` are **refused without the pool and accepted
+with it**; and an arm that aborts with `cudaMalloc failed: out of memory` / `failed to allocate buffer for kv
+cache` unset **runs** with the pool (`-ncmoe 16`).
+
+**Goal B's numbers (unchanged from the campaign's final build; the 180k row was the one stale one and is now
+measured on the final build).**  Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, PLE flags, arms interleaved,
+`-n 512`, MTP depth 4, gen t/s:
+
+| depth (ctx) | dense | sparse | **pool (204 MiB)** | text (`-n 64`) |
+|---|---|---|---|---|
+| 5 298 (16 384) | 72.09 | 71.58 | **71.27** | pool == sparse `332 dd1981213373` |
+| 102 899 (131 072) | 59.10 | 54.70 | **54.65** | dense differs (a regime change) |
+| 180 035 (196 608) | **48.94** | **43.16** | **43.41** | pool == sparse `861 263c7f2be4d9` |
+
+The pool lands **on the sparse ceiling at every depth** (+0.5 / +0.6 / +0.58 %), so its placement is free and
+the residual against a resident KV (−7 % / −11 % at depth) is the sparse arm's own indexer cost, not the KV's
+storage.  A 204 MiB pool replaces 1 632 MiB (103k) / 2 448 MiB (180k) of resident attention KV, and the freed
+VRAM goes to the arena: 103k plain decode `-n 2000`, **23 579.8 -> 25 018.6 MiB** (+1 438.8 MiB, +18
+slots/table), expert hit **96.26 -> 97.02 %**, cold reads **42.0 -> 31.6 GiB**.  The pool's own cost is
+**0.10-0.11 ms/token** with fills 0.03-0.05 ms/step at 92-99 % hits -- so the page policy (LRU / F-LRU / heat
+prior) is measured **dead** and was not touched.  A13 is worth **+24 %** on plain decode at 103k on the
+delivery KV type (indexer bucket 5.31 -> 2.01 ms/token, 29.3 -> 36.3 t/s) and +0.8 % under MTP-4.
+
+**Purity/gates (all on the `r190` tree).**  Greedy text: pool == the resident sparse arm at 5.3k
+(`332 dd1981213373`), 51 475 (`854 43b30de151b9`) and 180k (`861 263c7f2be4d9`), dense differing as documented
+(`GREEDY-PURITY.md` §45/§63); `LLAMA_KV_POOL_VERIFY=1` **bad 0** on every arm (hit 96.0 / 91.6 / 93.3 %);
+`gate-prefill-logits.sh --ab "LLAMA_KV_REGION_POOL=16416"` **0.000000 KLD / 100.000 % top-p** with base PPL
+**2.9225** and sha256 `acfb4145…` -- **bit-identical to the campaign's own recorded base**, i.e. the pool is
+numerically transparent and the delivery reproduces the campaign's logits exactly; the standard **27B Q8_0**
+point **0.000000 / 100.000 %** against a base recorded on the shipped r189 build; A13's chain A/B at `--ub 1`
+**0.000000 / 100.000 %** and fused == chain on all eight key types (A13's own grid, unchanged); B2's resident
+arm byte-identical; `gate-park-idle-slots.sh` **PASS** (6 park + 2 unpark moves traced, `park == lazyoff` on
+all four requests), `gate-ckpt-reuse.sh` **PASS** (keep 3, 5 checkpoints vs 8, every request's text equal),
+`gate-state-pipe.sh` **PASS** (5/5 arms); `test-backend-ops -o FLASH_ATTN_QSA` 26/26; `check-gpu-faults.sh`
+clean; the OOM baseline above.
+
+**Default OFF, and that is deliberate.**  The pool is a **fittability** feature like block 15: on a config
+whose KV fits it costs the sparse-vs-dense gap and buys nothing, so `LLAMA_KV_REGION_POOL` unset stays
+byte-identical including its OOM.  `TODO` #118 is closed by this entry; what remains of the campaign is
+carried as its own items -- **#191** Goal C (the drafter ring, measured and not promoted: three questions for
+the maintainer), **#192** the Goal A `auto` policy (measured, the maintainer's call), **#193** a
+grow-on-demand pool mirror (shipped as a documented limitation), **#194** Goal A across `-sm tensor`
+(hardware-blocked) and **#195** the sparse arm's radix top-k.  `wip/kv-residency/` stays (Goal C is open).
+
+**Also recorded.**  `patches/README.md` block 16 (+ the r190 notes in blocks 11/15), `MANIFESTS.md` apply order
+(rows 15 and 16 -- 15 had never been added, and the "15/15" counts are now 17/17), `ENVIRONMENT.md` §18,
+`AGENTS.md` naming (17 blocks) and the default-off rationale, `TODO.md`, `README.md`.  One finding for the
+maintainer: the **35B-A3B UD-Q4_K_M** prefill-logit base in `~/.cache/rdna-boosts/gates/` is r183-era and the
+shipped r188/r189 trees read **0.005657 / 96.794 %** at it (with and without `ROCBLAS_USE_HIPBLASLT=0`), i.e.
+that point drifted in r184-r186 and the base is stale -- it is not an r190 defect (A12/A13 touch neither that
+model's prefill path), but a strict run at that point fails on the released tree too.  The canonical 27B Q8_0
+base was re-recorded from the shipped r189 build for this release (its previous file was overwritten in the
+process).
+
 ## 261031.007 (r189) -- the r183 2-D copy guard gets a vectorised fallback (`cpy_2d_vec16`, from the KV campaign) -- a regression fix, bit-identical
 
 **Released as `v16-6050b467c-r189` (16 blocks; block 10 amended, blocks 11-15 re-cut unchanged).**  Canonical tip

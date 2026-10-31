@@ -269,9 +269,9 @@ bucket, with the call-count filter).
 | **102 899** (`131072`) | resident dense | **58.27** | 2.83 | 715 / 331 (46.3 %) | 518.3 |
 | | resident sparse | **53.92** (−7.5 %) | 2.84 | 715 / 332 (46.4 %) | 518.0 |
 | | pool (204 MiB, mirror 1.6 GiB) | **54.20** (−7.0 %) | 2.84 | 715 / 332 | 491.4 (−5.1 %) |
-| **180 035** (`196608`) | resident dense | **48.73** (48.72 / 48.74) | 2.75 | 739 / 326 (44.1 %) | 482.3 |
-| | resident sparse | **42.93** (−11.9 %) | 2.71 | 745 / 323 (43.4 %) | 482.0 |
-| | pool (204 MiB, mirror 2.4 GiB) | **43.09** (−11.6 %) | 2.71 | 745 / 323 | 443.8 (−8.0 %) |
+| **180 035** (`196608`) | resident dense | **48.94** (A11: 48.73) | 2.75 | 739 / 326 (44.1 %) | 480.9 |
+| | resident sparse | **43.16** (−11.8 %) (A11: 42.93) | 2.71 | 745 / 323 (43.4 %) | 480.9 |
+| | pool (204 MiB, mirror 2.4 GiB) | **43.41** (−11.3 %) (A11: 43.09) | 2.71 | 745 / 323 | 443.6 (−7.8 %) |
 
 * **The pool lands on the sparse ceiling at every depth** (+0.5 % / +0.6 % / +0.35 % vs the forced-sparse arm —
   i.e. all noise), so the pool's *placement* is free and the remaining gap to a resident KV is the sparse decode
@@ -289,6 +289,15 @@ bucket, with the call-count filter).
   **204 MiB pool instead of the resident attention KV's 1 632 MiB (103k) / 2 448 MiB (180k)** — plus the arena
   gain of §7.5.  (§7.4's "816 MiB resident KV" was the `-c 65536` arm's KV at a 103k-deep prompt, not the 103k
   arm's; a q8_0 cell is 1 088 B × 12 layers, so `-c × 13 056 B`.)
+* **The 180k row was re-measured on the final build (2026-10-31, A14: the r188 base with A12 + A13)**, since it
+  was the one row that predated both fixes: dense **48.94** / sparse **43.16** / pool **43.41** t/s at 2.75 /
+  2.71 / 2.71 tokens per step (739/326, 745/323, 745/323 drafts), prefill 480.9 / 480.9 / 443.6, pool hits
+  **93.34 %** of ids over 2 268 resolves.  The sparse penalty is **−11.8 %** and the pool lands on the sparse
+  ceiling (**+0.58 %**, i.e. noise), exactly as the A11 row did.  Text at this depth (`-n 64`): pool == sparse
+  **861 chars `263c7f2be4d9`**, dense **835 chars `0024435b7077`** (a different attention regime,
+  `GREEDY-PURITY.md` §45/§63) — the same shape as 5.3k and 51 475.  Re-gated on the r190 delivery build:
+  pool == sparse `332 dd1981213373` (5.3k), `854 43b30de151b9` (51 475), `861 263c7f2be4d9` (180k), pool verify
+  `bad 0`, prefill-logit 0.000000 / 100.000 % against this campaign's own base (PPL 2.9225, sha256 `acfb4145…`).
 * Pool hit rate: **99.25 %** (5.3k), **92.5 %** (103k), **93.4 %** (180k) of ids; 2 160-2 268 resolves.
 * Text: pool **==** sparse at every depth measured (5.3k `332 chars dd1981213373`, 51 475
   `854 chars 43b30de151b9`); dense differs from both (the documented regime change, `GREEDY-PURITY.md`
@@ -584,6 +593,10 @@ The A/B is the **pre-change per-op chain**, `GGML_CUDA_QSA_INDEXER_SCORE=0` — 
   **+0.3 % / +8.5 % / +7.9 %** on the three arms, and plain decode is 27.02 → 17.73 ms/token (**−34 %**).
 
 ### 10.3 What is left
+
+> **PROMOTED in `v17-6050b467c-r190`** (block 11, TODO #118): the quantized-key fused scorer is in the delivery,
+> together with A12 (block 10, r189) and the pool itself (block 16) and B2 (block 15).  §10.3's items 1-2 are
+> therefore done; k-quant indexer keys (item 3) remain the accepted limitation.
 
 1. **Re-measure the other two depths on this build** (5.3k and 180k, `-n 512`) — the 180k row predates A12 and A13.
 2. **Where A12 and A13 land in the delivery** (the maintainer's call): A12's `cpy_2d_vec16` repairs r183's guard

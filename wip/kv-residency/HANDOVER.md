@@ -619,6 +619,21 @@ cannot stand in for attendance, and neither can the region's unit granularity.
 
 ## 12. Goal B close-out plan — the next session's job (deliver it, don't re-measure it)
 
+> **STATUS 2026-10-31 (A14): DONE — Goal B shipped in `v17-6050b467c-r190`.**  All twelve rows of §12.1 below
+> were carried out: the 180k acceptance row was measured on the final build (§8.2), the campaign branch was
+> re-based onto the released r189 tree, and the three deliverables were folded into the blocks that own them --
+> **block 16 = the attendance pool** (the pool + its async-state mirror handling + this session's `--fit`
+> accounting), **block 15 = B2** (a streamed cache takes the sparse decode arm) and **block 11 = A13**
+> (quantized indexer keys); A12 shipped separately as r189.  The `--fit` blocker (§12.2) was **fixed**, so the
+> rollback criterion did not apply: the mirror is charged to the host bucket in `memory_breakdown()`,
+> `llama_get_kv_pool_bytes()` reports the split, and the fit refuses to interpolate `-c` while the pool is
+> active.  The grow-on-demand mirror (§12.3) shipped as a **documented limitation**, now `TODO` **#193**.
+> `TODO` #118 is closed by `WORKLOG.md` 261031.008; what remains of the campaign is `TODO` #191 (Goal C),
+> #192 (the Goal A `auto` policy), #194 (Goal A across `-sm tensor`), #195 (the radix top-k) and #193.
+> The gate list of §12.5 is recorded in `patches/README.md` block 16 and in the WORKLOG entry; the numbers
+> reproduce this document's bit for bit (the pool's prefill-logit base is the same PPL 2.9225 / sha256
+> `acfb4145…` this campaign recorded).
+
 **The maintainer's decision (2026-10-31): Goal B is to be finalised, wrapped up and DELIVERED into the delivery
 repo.**  Goal C and the two open Goal A items are carried forward, not dropped.  Report any finding to the
 maintainer before each delivery-affecting commit (AGENTS.md), but the *promotion itself is decided*: do not stop to

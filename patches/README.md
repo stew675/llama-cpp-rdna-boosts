@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
-**16 blocks** (block 00 + blocks 01-15) against `release.json.base` (**`6050b467c`** as of
-`v16-6050b467c-r178`; the base is the 2026-10-25 re-base), one
+**17 blocks** (block 00 + blocks 01-16) against `release.json.base` (**`6050b467c`**; the base is the
+2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -47,11 +47,12 @@ only as a rough shape.
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
 | 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses) | +14966 / −5067 | 83 |
-| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
+| 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228; + r190: the fused indexer scorer and the derived indexer pool read **quantized** indexer keys (q8_0 + the q4/q5 family + iq4_nl), so `-ctk q8_0` takes the fast path, TODO #118) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11 |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV |
+| 16 | `0016-…-block-16-attendance-pool-a-compact-dev` | **attendance pool** (opt-in, `LLAMA_KV_REGION_POOL=<cells>`): the attention KV's authoritative copy in a **pinned host mirror** (cell-indexed, so every existing path works unchanged) plus a compact **device pool** of indexer-block pages with a page table; a decode step resolves its top-k through it (`GGML_OP_KV_POOL`: mark / claim / map+fill) and the QSA reader gathers K/V at the pool slots.  A 204 MiB pool replaces the resident KV's 1.6-2.4 GiB at 103k-180k depth and lands **on the sparse decode ceiling** at every depth measured.  It is a **fittability** feature (block 15's sibling): unset = plain device buffer, byte-identical including the OOM.  See its section |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -2127,6 +2128,46 @@ survives upstream's #30640/#30965 reworks.  The DFlash layer-input tap is upstre
 `graph::build_hc_mean()` (TODO #94), so the delivery dropped its own copy; deepseek4 and glm5-next
 keep their `build_hc_mean`.
 
+#### r190 — the fused indexer scorer (and the derived indexer pool) accept QUANTIZED keys (TODO #118)
+
+**What it is.**  The fused indexer path — `GGML_OP_INDEXER_SCORE`, which replaces `get_rows -> pool -> scale ->
+rms_norm -> rope_multi -> score mul_mat -> relu -> head-sum -> bias add` — and the derived incremental indexer
+cache (`GGML_OP_INDEXER_FILL`, `GGML_CUDA_QSA_INDEXER_CACHE`) both read raw cache rows natively and supported
+**F32/BF16/F16 only**, so a quantized indexer key cache took the per-op chain and `pool_create` logged
+*"derived indexer cache pool skipped (q8_0 keys)"*.  Since `-ctk` drives the indexer cache, that is
+`-ctk q8_0` — the delivery's large-context KV type, and the type block 15's window and block 16's pool take by
+construction (r189's copy fix above is what made the *chain* affordable there; this makes it unnecessary).
+`indexer_score_ld_chan(row, c, nb0K, ktype)` replaces the element-address loader: a quantized row is addressed
+in `nb0K`-byte blocks and dequantized with **ggml's own** `dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl` — the
+same values `get_rows` gives the chain, which is what keeps the two paths byte-identical.  Two packings matter:
+q8_0 holds one element per byte, while a 4/5-bit type puts a byte's low nibble at channel `b` and its high
+nibble at `b + 16`.
+
+Supported: **q8_0, the q4/q5 family and iq4_nl** — every quantized type whose 32-element block divides
+`idx_dim` = 128.  **k-quants stay on the chain** (a 256-element superblock does not divide 128, so a row is not
+a whole number of blocks) and that is an accepted limitation, not a TODO.  One predicate,
+`ggml_indexer_key_type_supported()` (`ggml.h`/`ggml.c`), is what the two constructors, the CUDA kernels and the
+memory layer all ask; `qwen4exp.cpp`'s `idx_key_float` became `idx_key_fused`, and
+`llama-memory-hybrid-idx.cpp`'s `pool_create` builds the derived pool for the same set.  The A/B arm is the
+per-op chain (`GGML_CUDA_QSA_INDEXER_SCORE=0`, pre-existing; `GGML_CUDA_QSA_INDEXER_CACHE=0` drops just the
+derived pool).
+
+**Worth** (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, 103k): plain decode decode-GPU-kernel time
+**23.68 -> 17.73 ms/token** (**29.3 -> 36.3 t/s, +24 %**), the indexer bucket **5.31 -> 2.01 ms/token** — the
+whole prize the bf16-key proxy arm had (17.83) with no KV-type change.  Under MTP-4 the chain is amortised over
+~2.84 tokens/step, so the same change is **+0.8 %** there (sparse 54.26 -> 54.70, pool 54.52 -> 54.65, dense
+58.63 -> 59.10).  The log now reads *"derived indexer cache (pool) = 12 layers x 128 dims x 1 streams,
+ENABLED"* for q8_0.
+
+**Gates.**  Greedy text **fused == chain on all eight key types at 5.3k** (q8_0 `296 91ef8940d66e` dense /
+`332 dd1981213373` sparse — the pre-change hashes; f16 `333 c42a586a6d13`, bf16 `296 91ef8940d66e`, q4_0 and
+q4_1 `307 097ff06194d6`, q5_0 `336 b82b7ed544c`, q5_1 `296 3205db133b1d`, iq4_nl `323 d7aba1c58e0c`), and q8_0
+with `GGML_CUDA_QSA_INDEXER_CACHE=0` (fused, no derived pool) is the same hash, so the raw-pooling branch is
+covered too; 51 475 depth q8_0 `854 43b30de151b9` (== pre-change) and q4_0 `841 65097e7c8630`;
+`gate-prefill-logits.sh --ab "GGML_CUDA_QSA_INDEXER_SCORE=0" --ub 1` (the decode graph, chain as the base)
+**0.000000 KLD / 100.000 % top-p**; `test-backend-ops -o FLASH_ATTN_QSA` pass.  Numbers and the census:
+`../wip/kv-residency/BA-POOL-DESIGN.md` §9.3-§10.
+
 ## Block 12 — campaign remainder
 
 **What it is.**  The tail of the campaigns: CPU wins, the backend-iface fills that every non-CUDA backend
@@ -2856,6 +2897,129 @@ byte-identical to a build without this block, including its OOM.
   provably spill (`FLIP > 0`).
 * **Not in this block:** Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
   `LLAMA_SPEC_DRAFT_WINDOW`), and the superseded A1 two-base FA read.
+
+#### r190 — a STREAMED cache takes the sparse decode arm
+
+**What it is.**  A window below the depth the run actually reaches makes the tail of every KV read a PCIe read
+instead of a VRAM read, so the *dense* QSA decode arm — which reads the whole used extent every step — becomes
+the wrong arm there, while on a resident KV it is the right one (VRAM is ~10x the link).  The arch policy only
+knew **depth** (`qsa_dense_decode_until`), never the cache's placement.  `llama_kv_cache::is_streaming(n_kv)`
+(and the context accessor) answers "a window is active and the used extent has passed it" — or "this cache is
+pooled" (block 16) — and `qwen4exp_kv_streams()` skips the dense decode arm when it holds.
+`LLAMA_QSA_DENSE_DECODE_STREAM=0` restores the pre-r190 behaviour.
+
+**Worth** (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, q8_0, 1 GPU, `-n 400`, 2 reps, ±0.2 %): with a windowed KV a
+streamed cache decodes **+34.3 %** at 102 899 depth (23.42 -> 31.43 t/s) and **+47.3 %** at 180 035
+(16.51 -> 24.31); a resident KV is unchanged (`853 77a40bf40be1` with the switch on and off), and the arena on
+the streamed arms was 25 338.3 / 22 701 MiB.
+
+**Purity.**  This is a decode-ARM choice, i.e. a different attention regime: a *streamed* cache's greedy text
+differs from the old dense-arm text by construction (`GREEDY-PURITY.md` §45/§63), while a **resident** cache is
+byte-identical (`853 77a40bf40be1`).  Prefill is untouched (always QSA), so the prefill-logit gate is
+unaffected.  Gate it with the text identity of the two resident arms plus a streamed arm's sparse-vs-default
+identity.
+
+## Block 16 — the attendance pool (`LLAMA_KV_REGION_POOL`, **opt-in**)
+
+Promoted from the `wip/kv-residency` campaign (Goal B of `TODO` #118) in **r190**.  Block 15's sibling: where
+the window keeps a positional tail of the KV in VRAM, the pool keeps the **whole** context in pinned host RAM
+and only the pages a decode step actually attends to in VRAM.  Opt-in: with `LLAMA_KV_REGION_POOL` unset (or
+`0`) the attention KV takes the plain device buffer and the run is byte-identical to a build without this
+block, including its OOM.
+
+**What it is.**
+
+* The attention cache's **cell-indexed tensors become the pinned host MIRROR** and stay **authoritative**, so
+  every existing path — the `set_rows` writers, `state_write`/`state_read`, the rope shift behind
+  `defrag`/`seq_add`, `seq_park`, `get_k`/`get_v`, the kq mask — works on it **unchanged**.  That is the
+  writer rule, and it is why the state, context-checkpoint and parking gates need no pool-specific code.
+* A compact **DEVICE POOL** holds `LLAMA_KV_REGION_POOL` cells per layer as pages of **one indexer block**
+  (`compress_ratio` cells), with a page table `tbl[block] -> slot`, its inverse, a per-slot epoch mark and one
+  shared counter block.  At the measured shape that is **204 MiB** against the resident KV's 816 MiB
+  (`-c 65536`) / 1 632 MiB (131 072) / 2 448 MiB (196 608).
+* **`GGML_OP_KV_POOL`** resolves a decode step in three launches per layer: **MARK** (`use[slot] = epoch` for
+  every page this launch reads and every page the batch just wrote, queueing the written ones for re-fill),
+  **CLAIM** (one slot per *distinct* missing block, never one MARK protected), **MAP+FILL** (write each
+  selected cell's pool position into the reader's id list and copy the claimed and dirty pages from the mirror;
+  K and V share slots).
+* The QSA reader takes a **second id list** (`ggml_flash_attn_qsa_set_kv_idx`), so the K/V gather follows the
+  page table while the mask and visibility keys stay indexed by the **cell** number.
+
+**Invariants (each one cost real time; the greedy text caught all three defects).**
+
+1. **MARK then CLAIM** — a claim must never evict a page the same launch reads.  Without MARK the round-robin
+   victim could be a page another row still needed (text diverged ~400 chars in; a pool larger than the whole
+   cache hid it completely).
+2. **Claim attempts are not distinct blocks** — a slot per *id* attempt wrapped the cursor within one 4-row
+   batch, so two blocks shared a slot and a just-resolved block went unresident.  The table CAS dedupes first;
+   `kv_pool_serves()` bounds the distinct count, and the pool is floored at one decode band's worth of blocks.
+3. **No transient scratch in a captured graph** — the fill list lived in a `ggml_cuda_pool_alloc` freed at the
+   end of the op, and a captured graph bakes the pointer, so a replay wrote into whatever op had been handed
+   that block ("values verify clean, text differs run to run").  It lives in the counters tensor now.
+4. **The mirror is authoritative** — an eviction costs nothing and nothing is invalidated, *except* by a path
+   that rewrites cells in place without going through the writers (the K-shift, a state restore), which calls
+   `kv_pool_invalidate()`.
+5. **Eligibility is narrow on purpose** — one stream, non-MLA, K and V both present, `!v_trans`, a uniform
+   `compress_ratio` and cell geometry, **no window active**, a device-offloaded cache, and only the **trunk**
+   context of a qwen4exp model (the MTP draft's cache is read densely: pooling it would only make its reads
+   leave VRAM).  Anything else declines with one message and the KV is unchanged.
+
+**Knobs.**  `LLAMA_KV_REGION_POOL=<cells>` (unset/`0` = off), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
+selected page compared byte-for-byte with the mirror at read time, 0 mismatches expected),
+`LLAMA_KV_POOL_STATS=<path>` (a **path**, appended at teardown: a line on stderr would sit inside the generated
+text).  `ENVIRONMENT.md` §18.
+
+**`--fit` (r190).**  The mirror is a *device* buffer type over a pinned host allocation, so `--fit` would
+otherwise book its bytes as VRAM — at 103k-180k that reserves 1.6-2.4 GiB for memory that is really host RAM,
+i.e. it hands back the very arena the pool exists to free.  `llama_kv_cache::memory_breakdown()` charges the
+mirror to the **host** bucket (the same treatment block 15's spill gets), so the device tier is the compact
+pool alone; `llama_get_kv_pool_bytes()` reports the split for the fit's report; and the fit **skips the
+context-reduction interpolation** while the pool is active, because this KV's VRAM is fixed — reducing `-c`
+frees nothing there and the interpolation would divide by a near-zero bytes-per-context delta and hand back a
+nonsense (huge) context whose pinned mirror could OOM the host.
+
+**What it is worth** (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, the PLE flags, arms interleaved,
+`-n 512`, MTP depth 4):
+
+| depth (ctx) | dense | sparse | **pool (204 MiB)** | text (`-n 64`) |
+|---|---|---|---|---|
+| 5 298 (16 384) | 72.09 | 71.58 | **71.27** | pool == sparse `332 dd1981213373` |
+| 102 899 (131 072) | 59.10 | 54.70 | **54.65** | dense differs (a regime change) |
+| 180 035 (196 608) | 48.94 | 43.16 | **43.41** | pool == sparse `861 263c7f2be4d9` |
+
+The pool lands **on the sparse ceiling** at every depth (+0.5 / +0.6 / +0.6 %, i.e. noise), so its placement is
+free and what remains against a resident KV (−1 % at 5.3k, −7 % at 103k, −11 % at 180k) is the **sparse decode
+arm's own indexer cost** (block 11), not the KV's storage.  The freed VRAM goes to the expert arena: 103k plain
+decode, `-n 2000`, 23 579.8 -> **25 018.6 MiB** (+1 438.8 MiB, +18 slots/table), expert hit **96.26 -> 97.02 %**,
+cold reads **42.0 -> 31.6 GiB**.  The pool's own cost is **0.10-0.11 ms/token** (mark/claim/map+fill) with fills
+0.03-0.05 ms/step at 92-99 % hits — which is why a better page policy (LRU / F-LRU / a heat prior) is **dead**
+at this shape: the measured ceiling was 90.2 % vs 90.05 % observed.  At 51 475 depth a `-c 65536` run reports
+**0 mismatches** and 91.5 % hits; at 5.3k, 96.0-99.3 %.
+
+**Default OFF — do not "fix" that.**  It is a **fittability** feature like block 15, not a speed one: on a
+config whose KV fits, the pool costs the sparse-vs-dense gap (−7 % at 103k, −11 % at 180k) and buys nothing.
+It is worth it only where the resident KV does not fit — then the 204 MiB pool *is* the run (a Flash-Next arm
+at `-c 262144 -ncmoe 16` aborts with `cudaMalloc failed: out of memory` / `failed to allocate buffer for kv
+cache` with the knob unset and **runs** with it), and the arena it frees is worth +1.44 GiB.
+
+**Not in this block:** the pool declines a tensor split (one page table per device would need a per-device pool
+and a split-aware resolve — block 15's window has the same limitation), the *mirror* is allocated in full at
+creation (a grow-on-demand mirror is `TODO.md`'s open follow-up; the pinned-RAM ceiling
+`LLAMA_KV_SPILL_RAM_PCT` bounds it and declines the pool loudly rather than being OOM-killed), and k-quant
+indexer keys stay on the chain (block 11's loader needs a 32-element block that divides `idx_dim`).
+
+**Gates (r190, on the final base).**  Greedy text pool == the resident sparse arm at 5.3k
+(`332 dd1981213373`), 51 475 depth (`854 43b30de151b9`) and 180k (`861 263c7f2be4d9`), with the dense arm
+differing as documented; `LLAMA_KV_POOL_VERIFY=1` **0 mismatches** on every arm; `gate-prefill-logits.sh --ab
+"LLAMA_KV_REGION_POOL=16416"` **0.000000 KLD / 100.000 % top-p** (base PPL 2.9225 — bit-identical to the
+campaign's own recorded base, sha256 `acfb4145…`); `gate-park-idle-slots.sh` **PASS** (6 park + 2 unpark moves
+traced, `park == lazyoff` on all four requests); `gate-ckpt-reuse.sh` **PASS** (keep 3, 5 checkpoints created vs
+8, every request's text identical); `gate-state-pipe.sh` **PASS** (all five arms); `test-backend-ops -o
+FLASH_ATTN_QSA` pass; `check-gpu-faults.sh` clean; the standard 27B Q8_0 prefill-logit point 0.000000 /
+100.000 % against a base recorded on the shipped r189 build; `--fit` accepts the arms that only fit with the
+pool (`-ncmoe 21`/`22` at `-c 262144`: refused without it, accepted with it) and reports both numbers
+(`-fitp`: device context 3 784 -> 728 MiB, Host context 0 -> 3 264 MiB).  Numbers and the full campaign record:
+[`../wip/kv-residency/BA-POOL-DESIGN.md`](../wip/kv-residency/BA-POOL-DESIGN.md) §7-§10.
 
 ## Dated history
 

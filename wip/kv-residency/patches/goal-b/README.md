@@ -1,42 +1,43 @@
-# `patches/goal-b` — the Goal B series (B-A + the two delivery fixes), self-contained
+# `patches/goal-b` — the Goal B series (`git am` reproduction of the campaign branch)
 
-**Not delivery work** (same rule as the parent directory): nothing here is in `patches/`,
-`release.json` or `rdna-boosts-all.patch`, and nothing may be applied to the fork's `rdna-boosts`
-branch without the promotion go-ahead.  Stored so a cold session can reproduce the exact tree the
-campaign's Goal B numbers were measured on, without depending on the fork branch existing.
+**STATUS 2026-10-31: PROMOTED.**  Goal B is delivered — the pool is **block 16** of
+`v17-6050b467c-r190`, B2 is block 15 and A13 is block 11 (A12 shipped separately as r189).  **The delivery is
+now the reference**: `patches/README.md` block 16 holds the block's own notes, gates and numbers, and the
+`--fit` accounting this series does not carry (session A14) is in that commit too.  This directory is kept only
+so a later session can reproduce the exact tree the campaign's Goal B **numbers** were measured on, without the
+fork branch existing; it is **not** delivery work and nothing here is applied by `apply-all.sh`.
 
 ## How to reproduce the tree
 
-The series applies to the **r186** release tip, `8f9dad0be` (`v16-6050b467c-r186`; tree
-`0bd26dbe195185072019fe99926177d4daa7718b`, which is `release.json`'s tree at r186).  Re-cut it with
-`scripts/apply-all.sh` from an older checkout if needed (`RDNA_BRANCH=rebase-r186`).
+The series applies to the **r188** release tip `0e42c6bc2` (`v16-6050b467c-r188`).
 
 ```bash
-cd ~/llama.cpp && git checkout -b wip-kv-residency-b rebase-r186
-git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/goal-b/00*.patch     # 0001..0007, in order
+cd ~/llama.cpp && git checkout -b wip-kv-residency-b 0e42c6bc2
+git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/goal-b/*.patch     # 0001..0007, in order
 ~/bin/build-llama-rocm
 ```
 
-**Verified 2026-10-31:** `git am` 7/7 clean, applied tree **`14e76aa2af4135b13cd3657895f04460d3d80774`**,
-which equals the campaign branch tip `wip-kv-residency-b` (`b98cb3e43`).  `SHA256SUMS` has the
-per-patch digests; `diffstat.txt` is the net (22 files, +1360/−69).
+**Verified 2026-10-31 (A14):** `git am` 7/7 clean on `0e42c6bc2`, applied tree
+**`4a049e8a9aae23dacc2d9d87ed5b3b271b650202`** (= the campaign branch's tree `266882ee7`), build OK.
+
+`0001` (B1's per-cache window override) and `0003` (B1(c)'s attended-set census) are **campaign diagnostics**
+and are deliberately **not** in the delivery; `0006`/`0007` shipped as block 10 (r189) and block 11 (r190), and
+`0002`/`0004`/`0005` as block 15 and block 16.
 
 ## The series
 
-| # | commit | what |
-|---|---|---|
-| 0001 | `b86b47e51` | **B1**: per-cache window override — DIAGNOSTIC, campaign only (lets one of Flash-Next's two KV caches take the block-15 window) |
-| 0002 | `7a4a03571` | **B2**: a *streaming* KV takes the sparse QSA decode arm (`qwen4exp_kv_streams`, `LLAMA_QSA_DENSE_DECODE_STREAM=0` = A/B) |
-| 0003 | `8725d885a` | **B1(c)**: attended-set census (top-k trace + `qsa-census.py` replayer) — diagnostic |
-| 0004 | `7649f4898` | **B-A**: `LLAMA_KV_REGION_POOL` — pinned host mirror + compact device pool + page table + `GGML_OP_KV_POOL` resolve; a second id list for the QSA reader |
-| 0005 | `922604069` | **B-A**: the pool mirror is host memory — accept it in the async state copies (the ckpt/state gates) |
-| 0006 | `f8e47e392` | **A12 — a DELIVERY fix, not campaign code**: `cpy_2d_vec16`, a vectorised fallback for the 2-D copy r183's guard refuses (block 10 candidate; also staged as `beta/0016-copy-2d-vec16/`) |
-| 0007 | `b98cb3e43` | **A13 — a DELIVERY fix**: the fused indexer scorer accepts quantized keys (q8_0 + the q4/q5 family + iq4_nl), byte-identical to the per-op chain on all eight types (block 11 candidate) |
+<!-- regenerate with: for f in *.patch; do git -C <a checkout at the base> apply --numstat "$f" | …; done -->
 
-Numbers, gates and the reasoning: `../BA-POOL-DESIGN.md` §7 (B-A), §8 (the acceptance table), §9
-(A12 + the root cause), §10 (A13).  The next session's list: `../COLD-START-PROMPT.md`.
+```
+0001  B1   per-cache window override (DIAGNOSTIC, campaign only)
+0002  B2   a STREAMING KV takes the sparse QSA decode arm (+34 / +47 %)
+0003  B1c  attended-set census (top-k trace + replayer)
+0004  B-A  the attendance pool for the attention KV
+0005  B-A  the pool mirror is host memory — accept it in the async state copies
+0006  A12  a vectorised fallback for the 2-D copy the r183 guard refuses
+0007  A13  the fused indexer scorer accepts QUANTIZED keys
+```
 
-**0006 and 0007 are delivery fixes in their own right** — they repair a shipped regression (r183's
-copy fallback) and a shipped performance gate (quantized indexer keys skipped the fused scorer) and
-do not depend on the pool being promoted.  If the pool is dropped they still land (blocks 10/11);
-if they land first, this series' remaining five patches are the pool itself.
+`diffstat.txt` and `SHA256SUMS` are generated.  The campaign's design, gates and every number:
+[`../../BA-POOL-DESIGN.md`](../../BA-POOL-DESIGN.md) §7-§10; the open work that remains:
+[`../../COLD-START-PROMPT.md`](../../COLD-START-PROMPT.md).

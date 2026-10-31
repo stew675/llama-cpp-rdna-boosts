@@ -1,4 +1,4 @@
-From 7649f4898e4b28d9f00f590a0cb198f34aa6f802 Mon Sep 17 00:00:00 2001
+From 604e708872f141aa1eda572d43c00fc2c05d483d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 00:07:16 -0500
 Subject: [PATCH 4/7] wip/kv-residency B-A: the attendance pool for the
@@ -147,7 +147,7 @@ index 2f754726d..8d1dcd6f4 100644
              // the CPU reference implements the mask form only; the derived-visibility form
              // (cell_vis/q_vis, src[5]/src[6]) is CUDA-only and aborts here.  Refuse it so the
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
-index 8dd188db4..bfb80b5ae 100644
+index 5fab03a2b..d7eef3e80 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
 @@ -49,6 +49,7 @@ static __global__ void flash_attn_qsa(
@@ -303,7 +303,7 @@ index e17d4bf60..93fc0641f 100644
          return false;
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a098a5523..44272fa98 100644
+index 7f97d8894..e77493ef7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -407,7 +407,7 @@ index a098a5523..44272fa98 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -8750,6 +8830,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8829,6 +8909,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -422,7 +422,7 @@ index a098a5523..44272fa98 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8779,7 +8867,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8858,7 +8946,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -432,7 +432,7 @@ index a098a5523..44272fa98 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -9200,6 +9289,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
+@@ -9279,6 +9368,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
  
  static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
      GGML_UNUSED(reg);
@@ -1666,3 +1666,6 @@ index de29b02ea..253355bf8 100644
          // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
          // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
          // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
+-- 
+2.55.0
+

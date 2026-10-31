@@ -892,6 +892,28 @@ including its OOM.  The opt-in semantics are deliberate: a window below the dept
 | `LLAMA_KV_REGION_SPILL_SKIP` | unset (**diagnostic only**) | Comma-separated tensor indices of a windowed buffer that stay fully resident; it bisected the A4 purity hunt and is not shipped behaviour. |
 
 
+## 18. Attendance pool (block 16, **opt-in**)
+
+The attention KV lives twice: its **authoritative** copy in a **pinned host mirror** (cell-indexed, so the
+writers, `state_write`/`state_read`, the K-shift, defrag and parking all work on it unchanged) and a compact
+**device pool** of pages of one indexer block in VRAM, with a page table `block -> slot`.  A decode step
+resolves its top-k selection through the table and fills the pages it missed from the mirror; the QSA reader
+gathers K/V at the pool slots while the mask stays cell-indexed.  **Default: off** — with the variable unset
+the KV takes the plain device buffer and the run is byte-identical to a build without the block, including its
+OOM.  Opt-in is deliberate: it is a **fittability** feature like block 15 (a 204 MiB pool instead of a 1.6-2.4
+GiB resident KV at 103k-180k depth), and on a config whose KV already fits it costs the sparse-vs-dense decode
+gap (7-12 % at depth, `patches/README.md` block 16).
+
+| variable | default | what it does |
+|---|---|---|
+| `LLAMA_KV_REGION_POOL` | **unset = off** | Pool size in **CELLS per layer**.  Pages are one indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots; it is floored at one decode band's worth of blocks and padded to the cache's own cell alignment, so the effective size can be slightly larger (204 MiB at the measured shape).  `0` = off.  Declines (one message, KV unchanged) on anything but a single-stream, non-MLA, uniformly-geometried, device-offloaded qwen4exp trunk cache with no window active, and when the pinned mirror would exceed `LLAMA_KV_SPILL_RAM_PCT`.  **`--fit` sees the pool**: the mirror is charged to host RAM and only the pool to VRAM, so a context that only fits with the pool is accepted with it (r190). |
+| `LLAMA_KV_POOL_VERIFY` | unset (presence) | The oracle: every page selected by a decode step is compared byte-for-byte with the mirror at read time and a mismatch is counted (the teardown line reports `bad`).  Expected **0**.  It costs a second pass over the selected pages, so never quote a timing from this arm. |
+| `LLAMA_KV_POOL_STATS` | unset (**a path**) | At every cache teardown append one line -- pages x cells, claims, misses, ids, hit %, dirty re-fills, resolves, `bad` -- to this file.  A **path**, not a flag: a line on stderr would land between the generated text and `llama-cli`'s perf line and break `scripts/extract-generated.py`.  Reads the counters back once, so it is not default-on. |
+
+The mirror is allocated **in full at creation** (`-c` cells); a grow-on-demand mirror is an open follow-up in
+`TODO.md`, and `LLAMA_KV_SPILL_RAM_PCT` (block 15's ceiling) is what bounds it.
+
+
 ## Maintaining this file
 
 The tables were derived from the code, so re-derive rather than trust them after a block change:
