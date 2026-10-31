@@ -34,8 +34,10 @@ with graphs disabled, on the speculator arm only (plain decode is flat at every 
 and fast, and a code-size probe on the unpatched tree free — while **gfx1100 and gfx1151 are flat for both**
 (#260: 89.1 vs 89.1; #262: 90.4 vs 90.6 / 98.4 vs 98.1).  So it is not either patch's logic: it is a gfx1201-only
 property of this box + driver (the same class as the documented launch-time pathology #6689), filed as `TODO` #128.
-**r192 is therefore NOT tagged**: shipping either patch would make our flagship arm 7 % slower on our own primary
-architecture for a reason we cannot yet name.
+**r192 is therefore NOT tagged**, and both PRs are **rejected for this release and returned to the submitter**
+(GitHub comments on #260 and #262 carry the full evidence, the exact build/run steps and the bisect we want back):
+shipping either patch would make our flagship arm 7 % slower on our own primary architecture for a reason we cannot
+name, and three hours of attribution work on our side is the submitter's to finish — they hold both architectures.
 `benchmarks/2026-10-31-kv-fold-q4_0-assessment.md` carries the whole record; in short: it is **correct**
 (`--kv q4_0 --ub 1` A/B **-0.000000 KLD / 100.000 %**, greedy text identical on 1 GPU, 3 GPU `-sm tensor`,
 gpt-oss-20B and 35B `-ncmoe`, census 6346 -> 4618 = the `q8_0` count), and **beneficial on the RDNA3 family** on an
