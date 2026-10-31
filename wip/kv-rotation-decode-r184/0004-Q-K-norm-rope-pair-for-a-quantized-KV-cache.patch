@@ -1,0 +1,266 @@
+From 8dedd7dca09249e9938c27a0149e5d135d6e3a66 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 06:13:08 +0000
+Subject: [PATCH 4/4] Q / K norm+rope pair for a quantized KV cache
+
+Q's norm + rope + FWHT is deferred to the V-rotation + K site seven nodes
+later (only views in between, the QK rotate order) and both run as one
+rms_norm_mul_rope_f32_qk_pair<has_ff, float, float, fwht_n, true> launch.
+Each block runs the single launch's body. Q's rotation output is checked
+against every read of the K half, the K / V cache rows against every read
+of the Q half. The orphaned-Q fallback launches the FWHT form when that is
+what was deferred. Bit-identical.
+
+Qwen3-30B-A3B q8_0 KV, 7900 XTX: 510 launches per token (= F16 KV),
+tg128 +4.4 % over 0001-0003. GGML_CUDA_QK_PAIR_FWHT=0: off.
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 116 ++++++++++++++++++-----
+ ggml/src/ggml-cuda/rope.cu               |  37 +++++++-
+ ggml/src/ggml-cuda/rope.cuh              |   7 ++
+ 3 files changed, 133 insertions(+), 27 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 71d16b81e..3c612fe25 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1337,6 +1337,33 @@ static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+     return done ? j + 1 - i : j - 1 - i;
+ }
+ 
++// V's Hadamard MUL_MAT (64 wide) at i + its RESHAPE, directly in front of the 10-node K chain + K / V q8_0 cache writes,
++// whose V VIEW reads that RESHAPE (the QK rotate's order with a quantized KV cache): the fused K kernel can rotate the
++// V row itself.  GGML_CUDA_FUSE_V_FWHT=0: off.
++static bool ggml_cuda_v_fwht_fold_at(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
++    static const bool v_fwht_on = getenv("GGML_CUDA_FUSE_V_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_V_FWHT")) != 0;
++    if (!v_fwht_on || i < 0 || i + 12 > cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (!ggml_cuda_op_mul_mat_use_fwht(node) || node->src[0]->ne[0] != 64 || node->src[1]->type != GGML_TYPE_F32 ||
++            ggml_cuda_info().devices[ctx.device].warp_size != 32 ||
++            cgraph->nodes[i + 1]->op != GGML_OP_RESHAPE || cgraph->nodes[i + 1]->src[0] != node ||
++            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
++            (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
++            ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i + 2, true) != 10 ||
++            cgraph->nodes[i + 10]->src[0] != cgraph->nodes[i + 1] || cgraph->nodes[i + 2]->ne[0] % 64 != 0) {
++        return false;
++    }
++    const ggml_tensor * vin = node->src[1];
++    const auto ov = [&](const ggml_tensor * w) {
++        const int64_t a0 = (int64_t) w->data, a1 = a0 + ggml_nbytes(w);
++        const int64_t b0 = (int64_t) vin->data, b1 = b0 + ggml_nbytes(vin);
++        return a0 < b1 && b0 < a1;
++    };
++    return !ov(cgraph->nodes[i + 9]) && !ov(cgraph->nodes[i + 11]);
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -1956,7 +1983,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         }
+         const int qi = cuda_ctx->qk_pend_i;
+         cuda_ctx->qk_pend_graph = nullptr;
+-        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2], nullptr);
++        // the FWHT form (quantized KV) writes its rotation output instead of the ROPE output
++        ggml_tensor * q_fwht = qi + 4 < cgraph->n_nodes && cgraph->nodes[qi + 3]->op == GGML_OP_RESHAPE &&
++                               ggml_cuda_op_mul_mat_use_fwht(cgraph->nodes[qi + 4]) ? cgraph->nodes[qi + 4] : nullptr;
++        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2], nullptr, q_fwht);
+     }
+     if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
+         cuda_ctx->mwr_fold_experts = nullptr;
+@@ -2908,28 +2938,20 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     // QK rotate leaves with a quantized KV cache): the K kernel rotates the V row itself, so the FWHT launch goes away.
+     // The rotated F32 V is only read by those cache writes (single use).  Same FWHT and quantization code: bit-identical.
+     // GGML_CUDA_FUSE_V_FWHT=0: off.
+-    {
+-        static const bool v_fwht_on = getenv("GGML_CUDA_FUSE_V_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_V_FWHT")) != 0;
+-        if (v_fwht_on && kv_allow_v && i + 12 <= cgraph->n_nodes && ggml_cuda_op_mul_mat_use_fwht(node) &&
+-                node->src[0]->ne[0] == 64 && node->src[1]->type == GGML_TYPE_F32 &&
+-                ggml_cuda_info().devices[cuda_ctx->device].warp_size == 32 &&
+-                cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 1]->src[0] == node &&
+-                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+-                (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+-                ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i + 2, true) == 10 &&
+-                cgraph->nodes[i + 10]->src[0] == cgraph->nodes[i + 1] && cgraph->nodes[i + 2]->ne[0] % 64 == 0) {
+-            const ggml_tensor * vin = node->src[1];
+-            const auto ov = [&](const ggml_tensor * w) {
+-                const int64_t a0 = (int64_t) w->data, a1 = a0 + ggml_nbytes(w);
+-                const int64_t b0 = (int64_t) vin->data, b1 = b0 + ggml_nbytes(vin);
+-                return a0 < b1 && b0 < a1;
+-            };
+-            if (!ov(cgraph->nodes[i + 9]) && !ov(cgraph->nodes[i + 11])) {
+-                ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], nullptr,
+-                                                     cgraph->nodes[i + 6], cgraph->nodes[i + 9], cgraph->nodes[i + 11], nullptr, node);
+-                return 11;
+-            }
++    if (kv_allow_v && ggml_cuda_v_fwht_fold_at(*cuda_ctx, cgraph, i)) {
++        if (cuda_ctx->qk_pend_graph == cgraph && cuda_ctx->qk_pend_j == i) {
++            // the layer's Q norm+rope+FWHT, deferred at its own node (see below): one launch for both
++            const int qi = cuda_ctx->qk_pend_i;
++            cuda_ctx->qk_pend_graph = nullptr;
++            ggml_cuda_op_rms_norm_mul_rope_qk_pair_fwht(*cuda_ctx,
++                cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2], cgraph->nodes[qi + 4],
++                cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 6],
++                cgraph->nodes[i + 9], cgraph->nodes[i + 11], node);
++            return 11;
+         }
++        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], nullptr,
++                                             cgraph->nodes[i + 6], cgraph->nodes[i + 9], cgraph->nodes[i + 11], nullptr, node);
++        return 11;
+     }
+     if (const int n_kv = ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i, kv_allow_v)) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4],
+@@ -2938,6 +2960,56 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     if (ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(cgraph, i)) {
++        // Quantized KV cache, QK rotate order: Q chain (RMS_NORM, MUL, ROPE, RESHAPE, Hadamard) at i, its RESHAPE and V's
++        // 2-D view (no kernels), then V's rotation + the K chain + K / V cache writes at j = i + 7 (ggml_cuda_v_fwht_fold_at).
++        // Defer Q to j and run both in one launch (rms_norm_mul_rope_f32_qk_pair<.., fwht_n, true>): each block runs the
++        // single launch's body, so the results are the same.  Nothing runs in between; the pair kernel's writes (Q's
++        // rotation, the K / V cache rows) must not touch what the other half reads.  GGML_CUDA_QK_PAIR_FWHT=0: off.
++        static const bool pair_fwht_on = getenv("GGML_CUDA_QK_PAIR_FWHT") == nullptr || atoi(getenv("GGML_CUDA_QK_PAIR_FWHT")) != 0;
++        const int j = i + 7;
++        if (pair_fwht_on && kv_allow_v && cuda_ctx->qk_pend_graph == nullptr && j + 12 <= cgraph->n_nodes &&
++                ggml_cuda_is_view_or_noop(cgraph->nodes[i + 5]) && ggml_cuda_is_view_or_noop(cgraph->nodes[i + 6]) &&
++                ggml_cuda_v_fwht_fold_at(*cuda_ctx, cgraph, j)) {
++            const ggml_tensor * q_norm = node;
++            const ggml_tensor * q_mul  = cgraph->nodes[i + 1];
++            const ggml_tensor * q_rope = cgraph->nodes[i + 2];
++            const ggml_tensor * q_had  = cgraph->nodes[i + 4];
++            const ggml_tensor * v_had  = cgraph->nodes[j];
++            const ggml_tensor * k_norm = cgraph->nodes[j + 2];
++            const ggml_tensor * k_mul  = cgraph->nodes[j + 3];
++            const ggml_tensor * k_rope = cgraph->nodes[j + 4];
++            const ggml_tensor * k_had  = cgraph->nodes[j + 6];
++            const ggml_tensor * k_sr   = cgraph->nodes[j + 9];
++            const ggml_tensor * v_sr   = cgraph->nodes[j + 11];
++            const ggml_tensor * q_mul_src = q_mul->src[0] == q_norm ? q_mul->src[1] : q_mul->src[0];
++            const ggml_tensor * k_mul_src = k_mul->src[0] == k_norm ? k_mul->src[1] : k_mul->src[0];
++            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++                if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
++                    return false;
++                }
++                const int64_t a0 = (int64_t) a->data, a1 = a0 + ggml_nbytes(a);
++                const int64_t b0 = (int64_t) b->data, b1 = b0 + ggml_nbytes(b);
++                return a0 < b1 && b0 < a1;
++            };
++            const ggml_tensor * k_reads[] = { k_norm->src[0], k_mul_src, k_rope->src[1], k_rope->src[2], k_sr->src[1], v_had->src[1], v_sr->src[1] };
++            const ggml_tensor * q_reads[] = { q_norm->src[0], q_mul_src, q_rope->src[1], q_rope->src[2] };
++            // (no op_params comparison as in ggml_cuda_qk_pair_k_at: each half of the pair carries its own rope arguments)
++            bool ok = q_rope->src[1] == k_rope->src[1] && q_rope->src[2] == k_rope->src[2] &&
++                      q_norm->src[0]->ne[2] == k_norm->src[0]->ne[2] && q_norm->src[0]->ne[3] == k_norm->src[0]->ne[3] &&
++                      q_had->src[0]->ne[0] == k_had->src[0]->ne[0];
++            for (const ggml_tensor * r : k_reads) {
++                ok = ok && !overlap(q_had, r);
++            }
++            for (const ggml_tensor * r : q_reads) {
++                ok = ok && !overlap(k_sr, r) && !overlap(v_sr, r);
++            }
++            if (ok) {
++                cuda_ctx->qk_pend_graph = cgraph;
++                cuda_ctx->qk_pend_i     = i;
++                cuda_ctx->qk_pend_j     = j;
++                return 4;
++            }
++        }
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4]);
+         return 4;
+     }
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 21666e2e8..9f9b80899 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -1036,19 +1036,21 @@ struct rmr_args {
+     int n_dims; const int32_t * pos; float freq_scale, ext_factor, attn_factor; rope_corr_dims corr_dims; float theta_scale;
+     const float * freq_factors; const int64_t * row_indices; int set_rows_stride; bool is_neox; float fwht_scale;
+     rope_kv_q8_0 kv; mrope_sections sections; int mrope;
++    int fwht_n; // 0, or the FWHT form's rotation width (rms_norm_mul_rope_f32_qk_pair's fwht_n)
+ };
+ 
+ // Q and K norm+rope of one attention layer in one launch: blocks [0, q.nrows) are the Q heads, the rest the K heads; each
+ // block runs exactly the single launch's body with its own arguments, so the results are those of the two launches.
+-template <bool has_ff, typename DQ, typename DK>
++// fwht_n > 0: the quantized-KV form (Q: rms_norm_mul_rope_f32<256, has_ff, float, fwht_n>, K: the same with kv).
++template <bool has_ff, typename DQ, typename DK, int fwht_n = 0, bool kv = false>
+ static __global__ void rms_norm_mul_rope_f32_qk_pair(const rmr_args<DQ> q, const rmr_args<DK> k) {
+     if ((int) blockIdx.x < q.nrows) {
+-        rms_norm_mul_rope_f32_dev<256, has_ff, DQ>(q.x, q.dst, q.ncols, q.nchannels, q.nsamples, q.s01, q.s02, q.s03, q.s1, q.s2, q.s3,
++        rms_norm_mul_rope_f32_dev<256, has_ff, DQ, fwht_n, false>(q.x, q.dst, q.ncols, q.nchannels, q.nsamples, q.s01, q.s02, q.s03, q.s1, q.s2, q.s3,
+             q.eps, q.mul, q.mul_s01, q.mul_s02, q.mul_s03, q.mul_ncols_packed, q.mul_nrows_packed, q.mul_nchannels_packed,
+             q.mul_nsamples_packed, q.n_dims, q.pos, q.freq_scale, q.ext_factor, q.attn_factor, q.corr_dims, q.theta_scale,
+             q.freq_factors, q.row_indices, q.set_rows_stride, q.is_neox, q.fwht_scale, q.kv, q.sections, q.mrope, blockIdx.x);
+     } else {
+-        rms_norm_mul_rope_f32_dev<256, has_ff, DK>(k.x, k.dst, k.ncols, k.nchannels, k.nsamples, k.s01, k.s02, k.s03, k.s1, k.s2, k.s3,
++        rms_norm_mul_rope_f32_dev<256, has_ff, DK, fwht_n, kv>(k.x, k.dst, k.ncols, k.nchannels, k.nsamples, k.s01, k.s02, k.s03, k.s1, k.s2, k.s3,
+             k.eps, k.mul, k.mul_s01, k.mul_s02, k.mul_s03, k.mul_ncols_packed, k.mul_nrows_packed, k.mul_nchannels_packed,
+             k.mul_nsamples_packed, k.n_dims, k.pos, k.freq_scale, k.ext_factor, k.attn_factor, k.corr_dims, k.theta_scale,
+             k.freq_factors, k.row_indices, k.set_rows_stride, k.is_neox, k.fwht_scale, k.kv, k.sections, k.mrope,
+@@ -1087,11 +1089,12 @@ static void rms_norm_mul_rope_cuda(
+ 
+     if (capture != nullptr) {
+         // record the plain 256-thread launch instead of making it (rms_norm_mul_rope_f32_qk_pair)
+-        GGML_ASSERT(fwht_n == 0 && kv.k_dst == nullptr && ncols < 1024);
++        // the FWHT form (F32 rows, ncols == fwht_n) records its width for the pair kernel's template
++        GGML_ASSERT(ncols < 1024 && (fwht_n == 0 ? kv.k_dst == nullptr : (std::is_same_v<D, float> && ncols == fwht_n)));
+         *capture = { x, dst, ncols, nrows, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps,
+                      mul, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                      n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+-                     freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope };
++                     freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope, fwht_n };
+         return;
+     }
+ 
+@@ -1309,6 +1312,30 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+     }
+ }
+ 
++void ggml_cuda_op_rms_norm_mul_rope_qk_pair_fwht(ggml_backend_cuda_context & ctx,
++        ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope, ggml_tensor * q_had,
++        ggml_tensor * k_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_had,
++        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, ggml_tensor * v_had) {
++    rmr_args<float> q;
++    rmr_args<float> k;
++    ggml_cuda_op_rms_norm_mul_rope_fused(ctx, q_norm, q_mul, q_rope, nullptr, q_had, nullptr, nullptr, &q);
++    ggml_cuda_op_rms_norm_mul_rope_fused(ctx, k_norm, k_mul, k_rope, nullptr, k_had, k_set_rows, v_set_rows, &k, v_had);
++    const bool has_ff = q.freq_factors != nullptr;
++    GGML_ASSERT(q.fwht_n == k.fwht_n && q.kv.k_dst == nullptr && k.kv.k_dst != nullptr &&
++                k.nchannels == q.nchannels && k.nsamples == q.nsamples && (k.freq_factors != nullptr) == has_ff);
++    const dim3 blocks_num(q.nrows + k.nrows, MIN(q.nchannels, UINT16_MAX), MIN(q.nsamples, UINT16_MAX));
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(256, 1, 1), 32*sizeof(float), ctx.stream()};
++    const auto launch = [&](auto kernel) {
++        ggml_cuda_kernel_launch(kernel, launch_params, q, k);
++    };
++    switch (q.fwht_n) {
++        case  64: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float,  64, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float,  64, true>); break;
++        case 128: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 128, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 128, true>); break;
++        case 256: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 256, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 256, true>); break;
++        default: GGML_ABORT("fatal error");
++    }
++}
++
+ // Q norm+rope (F32 output) and the K norm+rope + cache SET_ROWS (+ V row) of the same layer in one launch.
+ void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
+         ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
+diff --git a/ggml/src/ggml-cuda/rope.cuh b/ggml/src/ggml-cuda/rope.cuh
+index 12ef10183..e688c1860 100644
+--- a/ggml/src/ggml-cuda/rope.cuh
++++ b/ggml/src/ggml-cuda/rope.cuh
+@@ -12,6 +12,13 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx, ggml_
+         ggml_tensor * fwht = nullptr, ggml_tensor * k_set_rows = nullptr, ggml_tensor * v_set_rows = nullptr, void * capture = nullptr,
+         ggml_tensor * v_fwht = nullptr);
+ 
++// Quantized-KV form: Q norm+rope+FWHT (q_had's rotated rows) and the K norm+rope+FWHT + q8_0 K / V cache writes (V rotated
++// in the kernel when v_had != nullptr) of the same layer in one launch.
++void ggml_cuda_op_rms_norm_mul_rope_qk_pair_fwht(ggml_backend_cuda_context & ctx,
++        ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope, ggml_tensor * q_had,
++        ggml_tensor * k_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_had,
++        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, ggml_tensor * v_had);
++
+ void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
+         ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
+         ggml_tensor * k_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_set_rows, ggml_tensor * v_set_rows);
+-- 
+2.53.0
+

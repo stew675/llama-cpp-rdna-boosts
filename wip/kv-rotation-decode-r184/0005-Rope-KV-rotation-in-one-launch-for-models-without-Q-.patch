@@ -1,0 +1,306 @@
+From ba0c1d8b99d39294d329145f400af4b11b2f8070 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 06:38:31 +0000
+Subject: [PATCH] Rope + KV rotation in one launch for models without Q / K
+ norm
+
+With a quantized KV cache, a ROPE with no RMS_NORM / MUL in front (Llama-
+style attention) followed by the KV rotation (RESHAPE, Hadamard MUL_MAT)
+runs as one rms_norm_mul_rope_f32<.., no_norm = true> launch: the fused
+norm+rope kernel with the norm skipped, x read as is. For K it also takes
+the RESHAPE, VIEW and q8_0 SET_ROWS that follow, and the V row's VIEW and
+q8_0 SET_ROWS when allowed. Same rope arithmetic as rope_norm / rope_neox
+(n_offs 0, full rotation), the same FWHT and the same q8_0 quantization;
+the same hazard checks as the norm form. Any token count. Bit-identical.
+
+Llama-3.2-1B q8_0 KV, 7900 XTX: 293 -> 229 launches per token (= F16 KV),
+tg128 +5.2 % over 0001-0004. GGML_CUDA_FUSE_ROPE_FWHT=0: off.
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 109 +++++++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cu               |  67 ++++++++++----
+ 2 files changed, 159 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 3c612fe25..01a83eabb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1061,6 +1061,108 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(const ggml_cgraph * cgr
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
+                                std::initializer_list<enum ggml_unary_op> unary_ops);
+ 
++// ROPE alone (no Q / K norm, e.g. Llama) followed by the quantized-KV rotation: ROPE, RESHAPE, Hadamard MUL_MAT at i run as
++// one rms_norm_mul_rope_f32<.., no_norm> launch writing the rotated rows (Q: returns 2), and for K also the RESHAPE, VIEW,
++// q8_0 SET_ROWS that follow (returns 5), with the V row's VIEW, q8_0 SET_ROWS after that when allow_v (returns 7).  The
++// kernel reads x as is and runs the same rope arithmetic as rope_norm / rope_neox (the norm+rope fusion's), the same
++// FWHT as fwht_cuda and the same q8_0 quantization as k_set_rows_q8_0_group.  0: no match.
++// GGML_CUDA_FUSE_ROPE_FWHT=0: off.
++static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, const bool allow_v) {
++    static const bool on = getenv("GGML_CUDA_FUSE_ROPE_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_ROPE_FWHT")) != 0;
++    if (!on || i + 3 > cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * rope    = cgraph->nodes[i];
++    const ggml_tensor * reshape = cgraph->nodes[i + 1];
++    const ggml_tensor * mm      = cgraph->nodes[i + 2];
++    if (rope->op != GGML_OP_ROPE || rope->type != GGML_TYPE_F32 || rope->src[0]->type != GGML_TYPE_F32 ||
++            !ggml_is_contiguous_rows(rope->src[0]) || rope->src[0]->nb[0] != sizeof(float) || rope->ne[3] != 1) {
++        return 0;
++    }
++    const int mode   = ((const int32_t *) rope->op_params)[2];
++    const int n_dims = ((const int32_t *) rope->op_params)[1];
++    const int n_offs = ((const int32_t *) rope->op_params)[15];
++    if ((mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) || n_dims != rope->ne[0] || n_offs != 0) {
++        return 0;
++    }
++    if (!ggml_node_has_n_uses(cgraph, i, 1) || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != rope ||
++            ggml_node_get_use_count(cgraph, i + 1) != 1 || (reshape->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            mm->op != GGML_OP_MUL_MAT || mm->src[1] != reshape || !ggml_cuda_op_mul_mat_use_fwht(mm) ||
++            (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++        return 0;
++    }
++    const int64_t n = mm->src[0]->ne[0];
++    if (rope->ne[0] != n || (n != 64 && n != 128 && n != 256) || !ggml_is_contiguous(rope)) {
++        return 0;
++    }
++    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const int64_t a0 = (int64_t) a->data, a1 = a0 + ggml_nbytes(a);
++        const int64_t b0 = (int64_t) b->data, b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    // the rotation output may alias x exactly (each block reads its whole row before it writes it), nothing else
++    const ggml_tensor * x = rope->src[0];
++    for (const ggml_tensor * r : { rope->src[1], rope->src[2] }) {
++        if (r != nullptr && overlap(mm, r)) {
++            return 0;
++        }
++    }
++    if (overlap(mm, x) && !(x->data == mm->data && ggml_is_contiguous(x))) {
++        return 0;
++    }
++
++    // K: RESHAPE, VIEW, q8_0 SET_ROWS of the rotated rows (+ V's VIEW, q8_0 SET_ROWS)
++    if (i + 6 > cgraph->n_nodes) {
++        return 2;
++    }
++    const ggml_tensor * reshape2 = cgraph->nodes[i + 3];
++    const ggml_tensor * k_view   = cgraph->nodes[i + 4];
++    const ggml_tensor * k_sr     = cgraph->nodes[i + 5];
++    const int64_t row_len = rope->ne[0]*rope->ne[1];
++    const int64_t n_tok   = rope->ne[2];
++    const auto is_row_write = [&](const ggml_tensor * view, const ggml_tensor * sr) {
++        const ggml_tensor * idx = sr->src[1];
++        return view->op == GGML_OP_VIEW && view->type == GGML_TYPE_F32 && ggml_is_contiguous(view) &&
++               view->ne[0] == row_len && view->ne[1] == n_tok && view->ne[2] == 1 && view->ne[3] == 1 &&
++               sr->op == GGML_OP_SET_ROWS && sr->src[0] == view && sr->type == GGML_TYPE_Q8_0 &&
++               sr->ne[0] == row_len && sr->ne[2] == 1 && sr->ne[3] == 1 &&
++               idx->type == GGML_TYPE_I64 && ggml_is_contiguous(idx) && idx->ne[0] == n_tok && ggml_nelements(idx) == n_tok;
++    };
++    const auto single_use = [&](const int j) {
++        return ggml_node_get_use_count(cgraph, j) == 1 && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
++    };
++    if (row_len % QK8_0 != 0 || reshape2->op != GGML_OP_RESHAPE || reshape2->src[0] != mm || k_view->src[0] != reshape2 ||
++            !single_use(i + 2) || !single_use(i + 3) || !single_use(i + 4) || !is_row_write(k_view, k_sr)) {
++        return 2;
++    }
++    bool with_v = false;
++    if (allow_v && i + 8 <= cgraph->n_nodes) {
++        with_v = is_row_write(cgraph->nodes[i + 6], cgraph->nodes[i + 7]) && single_use(i + 6);
++    }
++    std::vector<const ggml_tensor *> reads = { x, rope->src[1], k_sr->src[1] };
++    if (rope->src[2] != nullptr) {
++        reads.push_back(rope->src[2]);
++    }
++    std::vector<const ggml_tensor *> writes = { k_sr };
++    if (with_v) {
++        const ggml_tensor * v_sr = cgraph->nodes[i + 7];
++        reads.push_back(v_sr->src[0]);
++        reads.push_back(v_sr->src[1]);
++        writes.push_back(v_sr);
++    }
++    for (const ggml_tensor * w : writes) {
++        for (const ggml_tensor * r : reads) {
++            if (overlap(w, r)) {
++                return 2;
++            }
++        }
++    }
++    if (with_v && overlap(writes[0], writes[1])) {
++        with_v = false;
++    }
++    return with_v ? 7 : 5;
++}
++
+ // Q / K norm+rope pairing: the Q chain RMS_NORM, MUL, ROPE at i (plain F32 output) and the K chain RMS_NORM, MUL, ROPE, VIEW,
+ // SET_ROWS of the same layer at j (a few nodes later, after the K / V matmuls) with the same rope parameters and positions run
+ // as one launch at j.  Returns j, or 0.  The deferred Q kernel reads the Q chain's inputs at j, so nothing in between (and no
+@@ -2938,6 +3040,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     // QK rotate leaves with a quantized KV cache): the K kernel rotates the V row itself, so the FWHT launch goes away.
+     // The rotated F32 V is only read by those cache writes (single use).  Same FWHT and quantization code: bit-identical.
+     // GGML_CUDA_FUSE_V_FWHT=0: off.
++    if (node->op == GGML_OP_ROPE) {
++        if (const int n_rf = ggml_cuda_rope_fwht_count(cgraph, i, kv_allow_v)) {
++            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, nullptr, nullptr, node, nullptr, cgraph->nodes[i + 2],
++                                                 n_rf >= 5 ? cgraph->nodes[i + 5] : nullptr, n_rf == 7 ? cgraph->nodes[i + 7] : nullptr);
++            return n_rf;
++        }
++    }
+     if (kv_allow_v && ggml_cuda_v_fwht_fold_at(*cuda_ctx, cgraph, i)) {
+         if (cuda_ctx->qk_pend_graph == cgraph && cuda_ctx->qk_pend_j == i) {
+             // the layer's Q norm+rope+FWHT, deferred at its own node (see below): one launch for both
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 9f9b80899..01bc29294 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -810,7 +810,8 @@ struct rope_kv_q8_0 {
+ // memory into fwht_cuda's in-warp FWHT (scaled by fwht_scale) and only the rotated row is written to dst
+ // kv (with fwht_n): the rotated row is written as q8_0 to the K cache instead (and the V row to the V cache), with
+ // k_set_rows_q8_0_group's quantization; row r of the block covers elements [r*ncols, (r+1)*ncols) of the token's row
+-template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false>
++// no_norm: ROPE alone (no RMS_NORM / MUL in front, x read as is), for the rope + FWHT forms
++template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false, bool no_norm = false>
+ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
+         const int64_t s01, const int64_t s02, const int64_t s03,
+@@ -829,6 +830,7 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+         const mrope_sections sections, const int mrope,
+         const int row_) {
+     static_assert(!kv || fwht_n > 0, "the KV-cache writes need the FWHT path");
++    static_assert(!no_norm || fwht_n > 0, "the rope-only form is an FWHT form");
+     ggml_cuda_pdl_lc();
+     const int row = row_;
+     const int tid = threadIdx.x;
+@@ -888,16 +890,19 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+                 }
+             }
+ 
+-            float tmp = 0.0f;
++            float scale = 1.0f;
++            if constexpr (!no_norm) {
++                float tmp = 0.0f;
+ 
+-            for (int col = tid; col < ncols; col += block_size) {
+-                const float xi = xc[col];
+-                tmp += xi * xi;
+-            }
++                for (int col = tid; col < ncols; col += block_size) {
++                    const float xi = xc[col];
++                    tmp += xi * xi;
++                }
+ 
+-            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+ 
+-            const float scale = rsqrtf(tmp/ncols + eps);
++                scale = rsqrtf(tmp/ncols + eps);
++            }
+ 
+             int64_t idst = sample*s3 + channel*s2 + row*s1;
+             if (set_rows_stride != 0) {
+@@ -924,8 +929,8 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+                     ix1 = i0 + 1;
+                 }
+ 
+-                const float x0 = scale * xc[ix0] * mulc[fastmodulo(ix0, mul_ncols_packed)];
+-                const float x1 = scale * xc[ix1] * mulc[fastmodulo(ix1, mul_ncols_packed)];
++                const float x0 = no_norm ? xc[ix0] : scale * xc[ix0] * mulc[fastmodulo(ix0, mul_ncols_packed)];
++                const float x1 = no_norm ? xc[ix1] : scale * xc[ix1] * mulc[fastmodulo(ix1, mul_ncols_packed)];
+ 
+                 if (i0 >= n_dims) {
+                     store(ix0, x0);
+@@ -1006,7 +1011,7 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+     }
+ }
+ 
+-template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false>
++template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false, bool no_norm = false>
+ static __global__ void rms_norm_mul_rope_f32(
+         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
+         const int64_t s01, const int64_t s02, const int64_t s03,
+@@ -1023,7 +1028,7 @@ static __global__ void rms_norm_mul_rope_f32(
+         const int64_t * row_indices, const int set_rows_stride,
+         const bool is_neox, const float fwht_scale, const rope_kv_q8_0 kv_args,
+         const mrope_sections sections, const int mrope) {
+-    rms_norm_mul_rope_f32_dev<block_size, has_ff, D, fwht_n, kv>(x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv_args, sections, mrope, blockIdx.x);
++    rms_norm_mul_rope_f32_dev<block_size, has_ff, D, fwht_n, kv, no_norm>(x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv_args, sections, mrope, blockIdx.x);
+ }
+ 
+ // The launch arguments of one rms_norm_mul_rope_f32<256, has_ff, D> launch (rms_norm_mul_rope_cuda's capture mode).
+@@ -1075,7 +1080,8 @@ static void rms_norm_mul_rope_cuda(
+         const float * freq_factors,
+         const int64_t * row_indices, const int set_rows_stride,
+         const bool is_neox, const int fwht_n, const float fwht_scale, const rope_kv_q8_0 & kv,
+-        const mrope_sections sections, const int mrope, cudaStream_t stream, rmr_args<D> * capture = nullptr) {
++        const mrope_sections sections, const int mrope, cudaStream_t stream, rmr_args<D> * capture = nullptr,
++        const bool no_norm = false) {
+     GGML_ASSERT(ncols % 2 == 0);
+ 
+     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+@@ -1112,6 +1118,25 @@ static void rms_norm_mul_rope_cuda(
+                     freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale, kv, sections, mrope);
+             };
+             const bool has_ff = freq_factors != nullptr;
++            if (no_norm) {
++                GGML_ASSERT(capture == nullptr);
++                if (kv.k_dst != nullptr) {
++                    switch (fwht_n) {
++                        case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, true, true>); break;
++                        case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, true, true>); break;
++                        case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, true, true>); break;
++                        default: GGML_ABORT("fatal error");
++                    }
++                } else {
++                    switch (fwht_n) {
++                        case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, false, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, false, true>); break;
++                        case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, false, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, false, true>); break;
++                        case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, false, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, false, true>); break;
++                        default: GGML_ABORT("fatal error");
++                    }
++                }
++                return;
++            }
+             if (kv.k_dst != nullptr) {
+                 switch (fwht_n) {
+                     case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, true>); break;
+@@ -1132,6 +1157,7 @@ static void rms_norm_mul_rope_cuda(
+     } else {
+         GGML_ASSERT(fwht_n == 0 && kv.k_dst == nullptr);
+     }
++    GGML_ASSERT(!no_norm);
+ 
+     if (ncols < 1024) {
+         const dim3 block_dims(256, 1, 1);
+@@ -1171,11 +1197,16 @@ static void rms_norm_mul_rope_cuda(
+ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * fwht,
+         ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, void * capture, ggml_tensor * v_fwht) {
+-    const ggml_tensor * x = rms_norm->src[0];
+-    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++    // rms_norm == nullptr: ROPE alone (the rope + FWHT forms); x is the ROPE's input, the MUL operand a dummy
++    const bool no_norm = rms_norm == nullptr;
++    GGML_ASSERT(!no_norm || (fwht != nullptr && capture == nullptr));
++    const ggml_tensor * x = no_norm ? rope->src[0] : rms_norm->src[0];
++    const ggml_tensor * mul_src = no_norm ? x : (mul->src[0] == rms_norm ? mul->src[1] : mul->src[0]);
+ 
+     float eps = 0.0f;
+-    memcpy(&eps, rms_norm->op_params, sizeof(float));
++    if (!no_norm) {
++        memcpy(&eps, rms_norm->op_params, sizeof(float));
++    }
+     GGML_ASSERT(eps >= 0.0f);
+ 
+     GGML_ASSERT(x->type == GGML_TYPE_F32);
+@@ -1299,8 +1330,10 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
+             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
+             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+-            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream, (rmr_args<float> *) capture);
++            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, fwht_scale, kv, sections, mrope, stream, (rmr_args<float> *) capture,
++            no_norm);
+     } else if (dst_type == GGML_TYPE_F16) {
++        GGML_ASSERT(!no_norm);
+         rms_norm_mul_rope_cuda<half>((const float *) x->data, (half *) dst_d,
+             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
+             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
+-- 
+2.53.0
+

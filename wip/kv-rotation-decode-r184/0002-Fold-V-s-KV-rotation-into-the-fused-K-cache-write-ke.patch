@@ -1,0 +1,143 @@
+From 9d44d8287316789102dadf535046a3e9ead2fcbd Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 06:13:08 +0000
+Subject: [PATCH 2/4] Fold V's KV rotation into the fused K cache-write kernel
+
+After the QK rotate, V's 64-wide Hadamard MUL_MAT sits directly in front of
+the K chain whose fused kernel (norm + rope + FWHT + q8_0 K / V SET_ROWS)
+writes the V row. That kernel now takes the unrotated V and rotates it with
+the same ggml_cuda_fwht_warp<64, 32> and ggml_cuda_quantize_q8_0_group lane
+map, so the fwht_cuda launch goes away. Single-use rotated V, input not
+overlapping the cache rows, 32-wide warps only. Bit-identical.
+
+Qwen3-30B-A3B q8_0 KV, 7900 XTX: tg128 +1.5 % over the QK rotate.
+GGML_CUDA_FUSE_V_FWHT=0: off.
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 27 ++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cu               | 36 ++++++++++++++++++++++--
+ ggml/src/ggml-cuda/rope.cuh              |  3 +-
+ 3 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index b7b4b243d..0b12b7f7a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2855,6 +2855,33 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     const bool kv_allow_v = cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty();
++    // V's Hadamard rotation (64-wide, fwht_cuda) directly in front of the K chain + K and V cache writes (the order the
++    // QK rotate leaves with a quantized KV cache): the K kernel rotates the V row itself, so the FWHT launch goes away.
++    // The rotated F32 V is only read by those cache writes (single use).  Same FWHT and quantization code: bit-identical.
++    // GGML_CUDA_FUSE_V_FWHT=0: off.
++    {
++        static const bool v_fwht_on = getenv("GGML_CUDA_FUSE_V_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_V_FWHT")) != 0;
++        if (v_fwht_on && kv_allow_v && i + 12 <= cgraph->n_nodes && ggml_cuda_op_mul_mat_use_fwht(node) &&
++                node->src[0]->ne[0] == 64 && node->src[1]->type == GGML_TYPE_F32 &&
++                ggml_cuda_info().devices[cuda_ctx->device].warp_size == 32 &&
++                cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 1]->src[0] == node &&
++                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
++                (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
++                ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i + 2, true) == 10 &&
++                cgraph->nodes[i + 10]->src[0] == cgraph->nodes[i + 1] && cgraph->nodes[i + 2]->ne[0] % 64 == 0) {
++            const ggml_tensor * vin = node->src[1];
++            const auto ov = [&](const ggml_tensor * w) {
++                const int64_t a0 = (int64_t) w->data, a1 = a0 + ggml_nbytes(w);
++                const int64_t b0 = (int64_t) vin->data, b1 = b0 + ggml_nbytes(vin);
++                return a0 < b1 && b0 < a1;
++            };
++            if (!ov(cgraph->nodes[i + 9]) && !ov(cgraph->nodes[i + 11])) {
++                ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], nullptr,
++                                                     cgraph->nodes[i + 6], cgraph->nodes[i + 9], cgraph->nodes[i + 11], nullptr, node);
++                return 11;
++            }
++        }
++    }
+     if (const int n_kv = ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i, kv_allow_v)) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4],
+                                              cgraph->nodes[i + 7], n_kv == 10 ? cgraph->nodes[i + 9] : nullptr);
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 2714e153a..f73fa1886 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -791,6 +791,8 @@ struct rope_kv_q8_0 {
+     int64_t         k_nb1;    // bytes per cache row
+     const float   * v_src;    // nullptr: no V write
+     int64_t         v_s1;     // floats per token row of v_src
++    int             v_fwht_n; // 0: v_src is the rotated V row; 64: v_src is the unrotated row, rotated here (fwht_cuda<64>)
++    float           v_fwht_scale;
+     block_q8_0    * v_dst;
+     const int64_t * v_idx;
+     int64_t         v_nb1;
+@@ -848,7 +850,28 @@ static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
+ 
+             if constexpr (kv) {
+                 // V row slice of this block: whole 32-lane groups since ncols % 32 == 0 and ncols <= block_size
+-                if (kv_args.v_src != nullptr && tid < ncols) {
++                constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++                if constexpr (warp_size == 32) {
++                    if (kv_args.v_src != nullptr && kv_args.v_fwht_n == 64) {
++                        // V's rotation folded in: warp w rotates the 64-element V row slice [row*ncols + 64*w, +64) with
++                        // fwht_cuda<64>'s in-warp FWHT (lane l holds elements l and 32 + l), then quantizes both 32-element
++                        // groups with the same lane -> element map as below
++                        const int w    = tid / warp_size;
++                        const int lane = tid % warp_size;
++                        if (w < ncols/64) {
++                            const int col0 = row*ncols + 64*w;
++                            float reg[64/warp_size];
++                            ggml_cuda_fwht_warp<64, warp_size>(kv_args.v_src + channel*kv_args.v_s1 + col0, kv_args.v_fwht_scale, reg, lane);
++                            block_q8_0 * vrow = (block_q8_0 *) ((char *) kv_args.v_dst + kv_args.v_idx[channel]*kv_args.v_nb1);
++#pragma unroll
++                            for (int e = 0; e < 64/warp_size; ++e) {
++                                const int col = col0 + e*warp_size + lane;
++                                ggml_cuda_quantize_q8_0_group(reg[e], vrow + col/QK8_0, col % QK8_0);
++                            }
++                        }
++                    }
++                }
++                if (kv_args.v_src != nullptr && kv_args.v_fwht_n == 0 && tid < ncols) {
+                     const int col = row*ncols + tid;
+                     block_q8_0 * vrow = (block_q8_0 *) ((char *) kv_args.v_dst + kv_args.v_idx[channel]*kv_args.v_nb1);
+                     ggml_cuda_quantize_q8_0_group(kv_args.v_src[channel*kv_args.v_s1 + col], vrow + col/QK8_0, col % QK8_0);
+@@ -1144,7 +1167,7 @@ static void rms_norm_mul_rope_cuda(
+ 
+ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * fwht,
+-        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, void * capture) {
++        ggml_tensor * k_set_rows, ggml_tensor * v_set_rows, void * capture, ggml_tensor * v_fwht) {
+     const ggml_tensor * x = rms_norm->src[0];
+     const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+ 
+@@ -1187,6 +1210,15 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+             kv.v_dst = (block_q8_0 *) v_set_rows->data;
+             kv.v_idx = (const int64_t *) v_set_rows->src[1]->data;
+             kv.v_nb1 = v_set_rows->nb[1];
++            if (v_fwht != nullptr) {
++                // V's Hadamard MUL_MAT folded in: read its unrotated input (same contiguous layout as the rotated rows
++                // the SET_ROWS view reads) and rotate in the kernel with fwht_cuda's scale
++                GGML_ASSERT(v_fwht->src[0]->ne[0] == 64 && v_fwht->src[1]->type == GGML_TYPE_F32 &&
++                            ggml_is_contiguous(v_fwht->src[1]) && ggml_are_same_shape(v_fwht->src[1], v_fwht));
++                kv.v_src        = (const float *) v_fwht->src[1]->data + (((const float *) v_set_rows->src[0]->data) - ((const float *) v_fwht->data));
++                kv.v_fwht_n     = 64;
++                kv.v_fwht_scale = 1 / sqrtf(64);   // as in ggml_cuda_op_fwht_impl
++            }
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/rope.cuh b/ggml/src/ggml-cuda/rope.cuh
+index c97e6cbba..12ef10183 100644
+--- a/ggml/src/ggml-cuda/rope.cuh
++++ b/ggml/src/ggml-cuda/rope.cuh
+@@ -9,7 +9,8 @@ void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
+ 
+ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows,
+-        ggml_tensor * fwht = nullptr, ggml_tensor * k_set_rows = nullptr, ggml_tensor * v_set_rows = nullptr, void * capture = nullptr);
++        ggml_tensor * fwht = nullptr, ggml_tensor * k_set_rows = nullptr, ggml_tensor * v_set_rows = nullptr, void * capture = nullptr,
++        ggml_tensor * v_fwht = nullptr);
+ 
+ void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
+         ggml_tensor * q_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
+-- 
+2.53.0
+

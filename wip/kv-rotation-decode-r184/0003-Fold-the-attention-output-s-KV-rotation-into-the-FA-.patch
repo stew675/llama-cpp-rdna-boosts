@@ -1,0 +1,306 @@
+From 630d8f2d7f3d3a962d3761c35630bf3605b5d165 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 06:13:08 +0000
+Subject: [PATCH 3/4] Fold the attention output's KV rotation into the FA
+ combine kernel
+
+At a 1-token FLASH_ATTN_EXT followed by the 64-wide output rotation and an
+mmvq projection (the fwht_q8_1 pattern), the dispatcher offers the rotation
+to the FA launch. When the combine kernel runs, flash_attn_combine_results
+<D, true> also does fwht_cuda<64, float, true>'s FWHT, stores and Q8_1
+rounding, so the projection finds its Q8_1 input and the FWHT launch goes
+away. Otherwise the rotation runs as before; the Q8_1 entry is only created
+on the path that fills it. The plain <D> instantiation is unchanged.
+Include guards on fwht.cuh / fattn.cuh. Bit-identical.
+
+Qwen3-30B-A3B q8_0 KV, 7900 XTX: tg128 +3.4 % over 0001-0002.
+GGML_CUDA_FA_COMBINE_FWHT=0: off.
+---
+ ggml/src/ggml-cuda/fattn-common.cuh      | 87 ++++++++++++++++++++++--
+ ggml/src/ggml-cuda/fattn-qsa.cu          |  2 +-
+ ggml/src/ggml-cuda/fattn.cu              |  2 +
+ ggml/src/ggml-cuda/fattn.cuh             | 12 ++++
+ ggml/src/ggml-cuda/fwht.cuh              |  2 +
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 49 +++++++++++++
+ ggml/src/ggml-cuda/rope.cu               |  4 +-
+ 7 files changed, 150 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 6fccd3332..7ec9f3c7f 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -3,6 +3,8 @@
+ #include "common.cuh"
+ #include "convert.cuh"
+ #include "vecdotq.cuh"
++#include "fwht.cuh"
++#include "fattn.cuh"
+ 
+ #include <cstdint>
+ 
+@@ -1498,14 +1500,17 @@ static __global__ void flash_attn_stream_k_fixup_general(
+     }
+ }
+ 
+-template<int D> // D == head size
++// had_dst != nullptr: also the following Hadamard MUL_MAT (64-wide FWHT of the output rows, as fwht_cuda<64, float, true>):
++// had_dst gets the rotated rows and q8 the output projection's Q8_1 input made from them (instead of from dst)
++template<int D, bool has_had = false> // D == head size
+ __launch_bounds__(D, 1)
+ static __global__ void flash_attn_combine_results(
+         const float  * VKQ_parts_ptr,
+         const float2 * VKQ_meta_ptr,
+         float * dst_ptr,
+         const int parallel_blocks,
+-        block_q8_1 * q8) {
++        block_q8_1 * q8,
++        float * had_dst) {
+     ggml_cuda_pdl_lc();
+     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
+     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
+@@ -1557,6 +1562,52 @@ static __global__ void flash_attn_combine_results(
+     const float v = VKQ_numerator / VKQ_denominator;
+     dst[tid] = v;
+ 
++    if constexpr (has_had && !(D % 64 == 0 && ggml_cuda_get_physical_warp_size() == 32)) {
++        NO_DEVICE_CODE; // the launcher only picks <D, true> for D % 64 == 0 on 32-wide warps
++    } else if constexpr (has_had) {
++        {
++            // fwht_cuda<64, float, true> on the rows [64*w, 64*w + 64) of this output row: same in-warp FWHT (from shared
++            // memory instead of global), same stores, same Q8_1 reduction and rounding
++            constexpr int warp_size = 32;
++            __shared__ float s_v[D];
++            s_v[tid] = v;
++            __syncthreads();
++            const int w    = tid / warp_size;
++            const int lane = tid % warp_size;
++            if (w < D/64) {
++                const int64_t r = ((int64_t) j_dst_unrolled*D + 64*w) / 64;
++                float reg[64/warp_size];
++                ggml_cuda_fwht_warp<64, warp_size>(s_v + 64*w, 1 / sqrtf(64), reg, lane);
++#pragma unroll
++                for (int e = 0; e < 64/warp_size; ++e) {
++                    had_dst[r*64 + e*warp_size + lane] = reg[e];
++                }
++#pragma unroll
++                for (int e = 0; e < 64/warp_size; ++e) {
++                    const int64_t i_cont = r*64 + e*warp_size + lane;
++                    const int64_t ib     = i_cont / QK8_1;
++                    const int     iqs    = i_cont % QK8_1;
++
++                    const float xi = reg[e];
++                    float amax = fabsf(xi);
++                    float sum  = xi;
++
++                    amax = warp_reduce_max<QK8_1>(amax);
++                    sum  = warp_reduce_sum<QK8_1>(sum);
++
++                    const float  d = amax / 127.0f;
++                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++                    q8[ib].qs[iqs] = q;
++                    if (iqs == 0) {
++                        q8[ib].ds = make_half2(d, sum);
++                    }
++                }
++            }
++            return;
++        }
++    }
++
+     if (q8 != nullptr) {
+         // The following MUL_MAT's Q8_1 input, made exactly as quantize_q8_1 makes it from dst: a row of the [D*heads, tokens]
+         // view is unpadded (checked at the launch), so element (head, tid) is i_cont = j_dst_unrolled*D + tid and each 32-lane
+@@ -2483,8 +2534,29 @@ void launch_fattn(
+         // GGML_CUDA_FA_COMBINE_Q8=0: off.
+         static const bool combine_q8 = getenv("GGML_CUDA_FA_COMBINE_Q8") == nullptr || atoi(getenv("GGML_CUDA_FA_COMBINE_Q8")) != 0;
+         block_q8_1 * q8 = nullptr;
++        float * had_dst = nullptr;
+         const int64_t q8_ne10 = KQV->ne[0]*KQV->ne[1];
+-        if (combine_q8 && KQV->type == GGML_TYPE_F32 && ggml_is_contiguous(KQV) && DV % QK8_1 == 0 &&
++        // the attention output's Hadamard rotation offered by the fusion dispatcher (ggml_cuda_fa_had_try_fuse checked the
++        // pattern: rotation input = this output, 64 wide, its RESHAPE feeds an mmvq projection over unpadded rows)
++        const ggml_tensor * had = ggml_cuda_fa_had.had;
++        if (had != nullptr && DV % 64 == 0 && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++                KQV->type == GGML_TYPE_F32 && ggml_is_contiguous(KQV) && had->src[1]->data == KQV->data &&
++                ggml_nelements(had) == ggml_nelements(KQV)) {
++            const ggml_tensor * rs = ggml_cuda_fa_had.reshape;
++            const size_t  ts          = ggml_type_size(rs->type);
++            const int64_t ne10        = rs->ne[0];
++            const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++            const size_t  q8_1_size   = rs->ne[3]*rs->ne[2] * rs->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
++            bool cached = false;
++            void * y = ctx.q8_1_cache_get(had, ctx.curr_stream_no, q8_1_size, ne10, rs->ne[1], rs->ne[2], rs->ne[3],
++                                          rs->nb[1]/ts, rs->nb[2]/ts, rs->nb[3]/ts, cached);
++            if (!cached) {
++                q8      = (block_q8_1 *) y;
++                had_dst = (float *) had->data;
++                ggml_cuda_fa_had.done = true;
++            }
++        }
++        if (had_dst == nullptr && combine_q8 && KQV->type == GGML_TYPE_F32 && ggml_is_contiguous(KQV) && DV % QK8_1 == 0 &&
+                 q8_ne10 % MATRIX_ROW_PADDING == 0) {
+             const int64_t q8_rows = KQV->ne[2]*KQV->ne[3];
+             bool found = false;
+@@ -2494,8 +2566,13 @@ void launch_fattn(
+         }
+ 
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8);
++        if (had_dst != nullptr) {
++            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, true>, launch_params,
++                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8, had_dst);
++        } else {
++            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
++                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8, (float *) nullptr);
++        }
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
+index 8dd188db4..5fab03a2b 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa.cu
+@@ -644,7 +644,7 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+         const size_t nbytes_shared_combine = n_slices*sizeof(float2);
+         const ggml_cuda_kernel_launch_params launch_params_combine(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+         ggml_cuda_kernel_launch(flash_attn_combine_results<D>, launch_params_combine,
+-            parts.ptr, meta.ptr, (float *) dst->data, n_slices, (block_q8_1 *) nullptr);
++            parts.ptr, meta.ptr, (float *) dst->data, n_slices, (block_q8_1 *) nullptr, (float *) nullptr);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index e3a9707f3..38134c491 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -900,6 +900,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     return f16_extra.end - (uintptr_t) dst->data;
+ }
+ 
++thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
++
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+diff --git a/ggml/src/ggml-cuda/fattn.cuh b/ggml/src/ggml-cuda/fattn.cuh
+index f9a7e15fb..70581659c 100644
+--- a/ggml/src/ggml-cuda/fattn.cuh
++++ b/ggml/src/ggml-cuda/fattn.cuh
+@@ -1,7 +1,19 @@
++#pragma once
++
+ #include "common.cuh"
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// The attention output's Hadamard rotation (64-wide FWHT) + Q8_1 publish for the output projection, offered by the fusion
++// dispatcher to the FLASH_ATTN_EXT it runs next (reshape: the rotation's RESHAPE that the projection reads); done: the
++// combine kernel did it.  Set and cleared around one ggml_cuda_flash_attn_ext call on the dispatching thread.
++struct ggml_cuda_fa_had_req {
++    const ggml_tensor * had     = nullptr;
++    const ggml_tensor * reshape = nullptr;
++    bool                done    = false;
++};
++extern thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
++
+ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
+ 
+ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/fwht.cuh b/ggml/src/ggml-cuda/fwht.cuh
+index 74a06cc32..77ae8cb1f 100644
+--- a/ggml/src/ggml-cuda/fwht.cuh
++++ b/ggml/src/ggml-cuda/fwht.cuh
+@@ -1,3 +1,5 @@
++#pragma once
++
+ #include "common.cuh"
+ #include "convert.cuh"
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 0b12b7f7a..71d16b81e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1292,6 +1292,51 @@ static int ggml_cuda_fwht_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const g
+     return 1;
+ }
+ 
++// FLASH_ATTN_EXT followed (through views) by the output rotation's Hadamard MUL_MAT (64 wide), its RESHAPE and the
++// output projection (the fwht_q8_1 pattern): the attention's combine kernel also does the rotation and the projection's
++// Q8_1 input, so the fwht_cuda launch goes away.  The rotation's F32 output is still written.  If the combine kernel does
++// not run (one parallel block), the FWHT runs as usual.  Returns the index offset of the last node done, or 0 (FA not
++// run).  1-token graphs.  GGML_CUDA_FA_COMBINE_FWHT=0: off.
++static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
++    static const bool on = getenv("GGML_CUDA_FA_COMBINE_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FA_COMBINE_FWHT")) != 0;
++    ggml_tensor * fa = cgraph->nodes[i];
++    if (!on || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[1] != 1 || fa->type != GGML_TYPE_F32 ||
++            ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) {
++        return 0;
++    }
++    int j = i + 1;
++    while (j < std::min(cgraph->n_nodes, i + 4) && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++        ++j;
++    }
++    if (j < i + 2 || j + 2 >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * had     = cgraph->nodes[j];
++    const ggml_tensor * reshape = cgraph->nodes[j + 1];
++    const ggml_tensor * mm      = cgraph->nodes[j + 2];
++    if (had->op != GGML_OP_MUL_MAT || !ggml_cuda_op_mul_mat_use_fwht(had) || had->src[1]->type != GGML_TYPE_F32 ||
++            had->src[0]->ne[0] != 64 || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != had ||
++            mm->op != GGML_OP_MUL_MAT || mm->src[1] != reshape || !ggml_is_quantized(mm->src[0]->type) ||
++            !ggml_cuda_should_fuse_mul_mat_vec_q(mm, true) ||
++            reshape->ne[0] % 64 != 0 || reshape->ne[0] % MATRIX_ROW_PADDING != 0 || !ggml_is_contiguous(reshape)) {
++        return 0;
++    }
++    // the rotation reads the attention output through the views in between, and only the views and it read them
++    const ggml_tensor * r = had->src[1];
++    while (r->view_src) {
++        r = r->view_src;
++    }
++    if (r != fa || ggml_node_get_use_count(cgraph, j) != 1 || (had->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
++        return 0;
++    }
++    ggml_cuda_fa_had = { had, reshape, false };
++    ggml_cuda_flash_attn_ext(ctx, fa);
++    const bool done = ggml_cuda_fa_had.done;
++    ggml_cuda_fa_had = {};
++    // done: FA, the views and the rotation (its RESHAPE is a no-op, the projection follows); else FA and the views
++    return done ? j + 1 - i : j - 1 - i;
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -2854,6 +2899,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         return n_fwht_q8_1;
+     }
+ 
++    if (const int n_fa_had = ggml_cuda_fa_had_try_fuse(*cuda_ctx, cgraph, i)) {
++        return n_fa_had;
++    }
++
+     const bool kv_allow_v = cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty();
+     // V's Hadamard rotation (64-wide, fwht_cuda) directly in front of the K chain + K and V cache writes (the order the
+     // QK rotate leaves with a quantized KV cache): the K kernel rotates the V row itself, so the FWHT launch goes away.
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index f73fa1886..21666e2e8 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -1213,9 +1213,9 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+             if (v_fwht != nullptr) {
+                 // V's Hadamard MUL_MAT folded in: read its unrotated input (same contiguous layout as the rotated rows
+                 // the SET_ROWS view reads) and rotate in the kernel with fwht_cuda's scale
+-                GGML_ASSERT(v_fwht->src[0]->ne[0] == 64 && v_fwht->src[1]->type == GGML_TYPE_F32 &&
++                GGML_ASSERT(v_set_rows->src[0]->view_src == v_fwht && v_fwht->src[0]->ne[0] == 64 && v_fwht->src[1]->type == GGML_TYPE_F32 &&
+                             ggml_is_contiguous(v_fwht->src[1]) && ggml_are_same_shape(v_fwht->src[1], v_fwht));
+-                kv.v_src        = (const float *) v_fwht->src[1]->data + (((const float *) v_set_rows->src[0]->data) - ((const float *) v_fwht->data));
++                kv.v_src        = (const float *) ((const char *) v_fwht->src[1]->data + v_set_rows->src[0]->view_offs); // the VIEW's offset into the rotated rows (its view_src is v_fwht)
+                 kv.v_fwht_n     = 64;
+                 kv.v_fwht_scale = 1 / sqrtf(64);   // as in ggml_cuda_op_fwht_impl
+             }
+-- 
+2.53.0
+

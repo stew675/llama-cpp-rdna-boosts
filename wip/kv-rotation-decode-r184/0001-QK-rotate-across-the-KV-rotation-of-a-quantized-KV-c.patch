@@ -1,0 +1,145 @@
+From 4a5c31bb7443295ec9f417d6c890e2144256b841 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 06:13:08 +0000
+Subject: [PATCH 1/4] QK rotate across the KV rotation of a quantized KV cache
+
+With -ctk/-ctv quantized, build_attn rotates Q, K and V (RESHAPE, Hadamard
+MUL_MAT, RESHAPE). The graph_optimize QK rotate bailed at Q's rotation, and
+V's rotation sat between the V and K projections, so the V / K / Q row
+concat never fired. Take Q's rotation with the Q chain and move V's
+rotation (the Hadamard MUL_MATs between the chains, the views they read and
+everything downstream) behind it. 1-token graphs only; skipped if an early
+node would read a deferred one. Same nodes, one stream: bit-identical.
+
+Qwen3-30B-A3B q8_0 KV, 7900 XTX: -3 launches per layer, tg128 +2.8 %.
+GGML_CUDA_QK_ROTATE_HADAMARD=0: off.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 87 +++++++++++++++++++++++++++++++--
+ 1 file changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a098a5523..7f97d8894 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7480,6 +7480,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
+         // size.  GGML_CUDA_QK_ROTATE=0: off.
+         static const bool qk_rotate = getenv("GGML_CUDA_QK_ROTATE") == nullptr || atoi(getenv("GGML_CUDA_QK_ROTATE")) != 0;
++        // Quantized KV cache: build_attn rotates Q, K and V (RESHAPE, Hadamard MUL_MAT, RESHAPE after each).  The Q
++        // chain then ends with its rotation, and V's rotation sits between the V and K projections, which stops the
++        // row concat.  Take Q's rotation along with the Q chain and move V's rotation (the Hadamard MUL_MATs between the
++        // chains, the views they read and everything downstream of them) behind the Q chain.  Same nodes, one stream:
++        // bit-identical.  1-token graphs only (the row concat is a 1-token fusion; prefill keeps the stock order).
++        // GGML_CUDA_QK_ROTATE_HADAMARD=0: off (the Q chain then ends at its ROPE, as before).
++        static const bool qk_rotate_had = getenv("GGML_CUDA_QK_ROTATE_HADAMARD") == nullptr || atoi(getenv("GGML_CUDA_QK_ROTATE_HADAMARD")) != 0;
++        const auto is_had = [](const ggml_tensor * t) {
++            return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
++        };
+         for (int i = 0; qk_rotate && i + 8 < cgraph->n_nodes; ++i) {
+             ggml_tensor ** n = cgraph->nodes;
+             if (n[i]->op != GGML_OP_MUL_MAT || n[i + 1]->op != GGML_OP_RESHAPE || n[i + 1]->src[0] != n[i] ||
+@@ -7490,9 +7500,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             }
+             // the K chain RMS_NORM, MUL, ROPE with the same rope parameters and positions; between them only V / K
+             // projections and views that read none of the Q nodes (the Q nodes come first, so they read none of them)
++            // q_end: the last Q node, its ROPE or (quantized KV) the RESHAPE after its Hadamard MUL_MAT
++            const bool had = qk_rotate_had && n[i]->ne[1] == 1;
++            int q_end = i + 4;
++            if (had &&
++                    n[i + 5]->op == GGML_OP_RESHAPE && n[i + 5]->src[0] == n[i + 4] &&
++                    is_had(n[i + 6]) && n[i + 6]->src[1] == n[i + 5] &&
++                    n[i + 7]->op == GGML_OP_RESHAPE && n[i + 7]->src[0] == n[i + 6]) {
++                q_end = i + 7;
++            }
+             int j = -1;
+             bool ok = true;
+-            for (int k = i + 5; k < std::min(cgraph->n_nodes - 2, i + 16) && ok; ++k) {
++            for (int k = q_end + 1; k < std::min(cgraph->n_nodes - 2, q_end + 16) && ok; ++k) {
+                 const ggml_tensor * t = n[k];
+                 if (t->op == GGML_OP_RMS_NORM) {
+                     j = k;
+@@ -7504,18 +7523,78 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     while (r->view_src) {
+                         r = r->view_src;
+                     }
+-                    for (int q = i; q <= i + 4; ++q) {
++                    for (int q = i; q <= q_end; ++q) {
+                         ok = ok && r != n[q];
+                     }
+                 }
+             }
+-            if (!ok || j < 0 || j == i + 5 || n[j + 1]->op != GGML_OP_MUL || n[j + 1]->src[0] != n[j] ||
++            if (!ok || j < 0 || j == q_end + 1 || n[j + 1]->op != GGML_OP_MUL || n[j + 1]->src[0] != n[j] ||
+                     n[j + 2]->op != GGML_OP_ROPE || n[j + 2]->src[0] != n[j + 1] ||
+                     n[j + 2]->src[1] != n[i + 4]->src[1] || n[j + 2]->src[2] != n[i + 4]->src[2] ||
+                     memcmp(n[j + 2]->op_params, n[i + 4]->op_params, sizeof(n[i + 4]->op_params)) != 0) {
+                 continue;
+             }
+-            std::rotate(n + i, n + i + 5, n + j);
++            // Between the chains (at most 15 nodes): a Hadamard MUL_MAT, the RESHAPE / VIEW it reads and every node that
++            // reads one of those are deferred behind the Q chain; the projections stay in front of it.
++            bool late[16] = {};
++            bool any_late = false;
++            if (had) {
++                for (int k = q_end + 1; k < j; ++k) {
++                    bool l = is_had(n[k]);
++                    for (int s = 0; s < GGML_MAX_SRC && n[k]->src[s] && !l; ++s) {
++                        for (int m = q_end + 1; m < k && !l; ++m) {
++                            l = late[m - q_end - 1] && n[k]->src[s] == n[m];
++                        }
++                    }
++                    late[k - q_end - 1] = l;
++                }
++                for (int k = q_end + 1; k < j; ++k) {
++                    if (!is_had(n[k])) {
++                        continue;
++                    }
++                    for (int m = q_end + 1; m < k; ++m) {
++                        if (n[k]->src[1] == n[m] && (n[m]->op == GGML_OP_RESHAPE || n[m]->op == GGML_OP_VIEW)) {
++                            late[m - q_end - 1] = true;
++                        }
++                    }
++                }
++                for (int k = q_end + 1; k < j; ++k) {
++                    any_late = any_late || late[k - q_end - 1];
++                }
++            }
++            // an early node must not read a deferred one (the builder never does this; checked, not assumed)
++            bool early_reads_late = false;
++            for (int k = q_end + 1; any_late && k < j; ++k) {
++                for (int s = 0; s < GGML_MAX_SRC && n[k]->src[s] && !late[k - q_end - 1]; ++s) {
++                    for (int m = q_end + 1; m < j; ++m) {
++                        early_reads_late = early_reads_late || (late[m - q_end - 1] && n[k]->src[s] == n[m]);
++                    }
++                }
++            }
++            if (early_reads_late) {
++                continue;
++            }
++            if (!any_late) {
++                std::rotate(n + i, n + q_end + 1, n + j);
++            } else {
++                // stable order: the projections, the Q chain, the deferred rotations
++                ggml_tensor * tmp[24];
++                int nt = 0;
++                for (int k = q_end + 1; k < j; ++k) {
++                    if (!late[k - q_end - 1]) {
++                        tmp[nt++] = n[k];
++                    }
++                }
++                for (int k = i; k <= q_end; ++k) {
++                    tmp[nt++] = n[k];
++                }
++                for (int k = q_end + 1; k < j; ++k) {
++                    if (late[k - q_end - 1]) {
++                        tmp[nt++] = n[k];
++                    }
++                }
++                std::copy(tmp, tmp + nt, n + i);
++            }
+             i = j + 2;
+         }
+ 
+-- 
+2.53.0
+
