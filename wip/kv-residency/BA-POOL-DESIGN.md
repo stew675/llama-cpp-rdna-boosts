@@ -594,8 +594,8 @@ The A/B is the **pre-change per-op chain**, `GGML_CUDA_QSA_INDEXER_SCORE=0` — 
 
 ### 10.3 What is left
 
-> **PROMOTED in `v17-6050b467c-r190`** (block 11, TODO #118): the quantized-key fused scorer is in the delivery,
-> together with A12 (block 10, r189) and the pool itself (block 16) and B2 (block 15).  §10.3's items 1-2 are
+> **PROMOTED in r190** (block 11, TODO #118): the quantized-key fused scorer is in the delivery,
+> together with A12 (block 10, r189), the pool itself (block 15) and B2 (block 15).  §10.3's items 1-2 are
 > therefore done; k-quant indexer keys (item 3) remain the accepted limitation.
 
 1. **Re-measure the other two depths on this build** (5.3k and 180k, `-n 512`) — the 180k row predates A12 and A13.

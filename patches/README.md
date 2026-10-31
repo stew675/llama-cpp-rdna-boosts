@@ -1,6 +1,6 @@
 # The delivery patches — what each block is and what it does
 
-**17 blocks** (block 00 + blocks 01-16) against `release.json.base` (**`6050b467c`**; the base is the
+**16 blocks** (block 00 + blocks 01-15) against `release.json.base` (**`6050b467c`**; the base is the
 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
@@ -51,8 +51,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV |
-| 16 | `0016-…-block-16-attendance-pool-a-compact-dev` | **attendance pool** (opt-in, `LLAMA_KV_REGION_POOL=<cells>`): the attention KV's authoritative copy in a **pinned host mirror** (cell-indexed, so every existing path works unchanged) plus a compact **device pool** of indexer-block pages with a page table; a decode step resolves its top-k through it (`GGML_OP_KV_POOL`: mark / claim / map+fill) and the QSA reader gathers K/V at the pool slots.  A 204 MiB pool replaces the resident KV's 1.6-2.4 GiB at 103k-180k depth and lands **on the sparse decode ceiling** at every depth measured.  It is a **fittability** feature (block 15's sibling): unset = plain device buffer, byte-identical including the OOM.  See its section |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV  **The same block carries the ATTENDANCE POOL** (r190, Goal B of the same campaign): the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages, resolved by `GGML_OP_KV_POOL` -- a 204 MiB pool instead of 1.6-2.4 GiB of resident KV at 103k-180k depth, landing on the sparse decode ceiling, `--fit`-visible (the mirror is host RAM).  Both placements are **opt-in and default OFF** (fittability features; unset = byte-identical including the OOM) and mutually exclusive.  See the block section |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -2135,7 +2134,7 @@ rms_norm -> rope_multi -> score mul_mat -> relu -> head-sum -> bias add` — and
 cache (`GGML_OP_INDEXER_FILL`, `GGML_CUDA_QSA_INDEXER_CACHE`) both read raw cache rows natively and supported
 **F32/BF16/F16 only**, so a quantized indexer key cache took the per-op chain and `pool_create` logged
 *"derived indexer cache pool skipped (q8_0 keys)"*.  Since `-ctk` drives the indexer cache, that is
-`-ctk q8_0` — the delivery's large-context KV type, and the type block 15's window and block 16's pool take by
+`-ctk q8_0` — the delivery's large-context KV type, and the type block 15's window and this block's pool takes by
 construction (r189's copy fix above is what made the *chain* affordable there; this makes it unnecessary).
 `indexer_score_ld_chan(row, c, nb0K, ktype)` replaces the element-address loader: a quantized row is addressed
 in `nb0K`-byte blocks and dequantized with **ggml's own** `dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl` — the
@@ -2857,9 +2856,13 @@ byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op witho
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
 
-## Block 15 — the windowed KV (`LLAMA_KV_RESIDENT_CELLS`, **opt-in**)
+## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`) and the attendance POOL (`LLAMA_KV_REGION_POOL`), both **opt-in**
 
-Promoted from the `wip/kv-residency` campaign (Goal A of `TODO` #118) in **r178**.  Opt-in: with
+This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: **two** opt-in placements of the same cache.  The **window** (Goal A of `TODO` #118, r178) keeps the newest `W` cells in VRAM and spills the tail to pinned system RAM in the same VA reservation.  The **pool** (Goal B, r190) keeps the authoritative copy of the *whole* context in a pinned host mirror and only the pages a decode step attends to in VRAM, resolved through a page table.  They answer the same question from opposite ends (newest cells vs attended cells), they are mutually exclusive by construction (the pool declines while a window is active), and each is byte-identical to a build without it when its knob is unset.  Both report `is_streaming()`, so a streamed cache takes the sparse QSA decode arm (also this block: B2).
+
+### The window (Goal A, r178)
+
+Promoted from the `wip/kv-residency` campaign in **r178**.  Opt-in: with
 `LLAMA_KV_RESIDENT_CELLS` unset (or `0`) the KV takes the **plain device buffer** and the run is
 byte-identical to a build without this block, including its OOM.
 
@@ -2895,35 +2898,14 @@ byte-identical to a build without this block, including its OOM.
   27B, −0.000000 / 99.994 % on a spilling Flash-Next (two KV caches), and every text arm byte-identical to
   its plain reference.  The state, context-checkpoint and MTP verify-width gates all pass on arms that
   provably spill (`FLIP > 0`).
-* **Not in this block:** Goal B (a sparse attended set) and Goal C (the MTP drafter ring,
-  `LLAMA_SPEC_DRAFT_WINDOW`), and the superseded A1 two-base FA read.
+* **Not in the window's own part:** Goal C (the MTP drafter ring, `LLAMA_SPEC_DRAFT_WINDOW`) and the
+  superseded A1 two-base FA read (Goal B is the pool below).
 
-#### r190 — a STREAMED cache takes the sparse decode arm
+### The attendance pool (Goal B, r190)
 
-**What it is.**  A window below the depth the run actually reaches makes the tail of every KV read a PCIe read
-instead of a VRAM read, so the *dense* QSA decode arm — which reads the whole used extent every step — becomes
-the wrong arm there, while on a resident KV it is the right one (VRAM is ~10x the link).  The arch policy only
-knew **depth** (`qsa_dense_decode_until`), never the cache's placement.  `llama_kv_cache::is_streaming(n_kv)`
-(and the context accessor) answers "a window is active and the used extent has passed it" — or "this cache is
-pooled" (block 16) — and `qwen4exp_kv_streams()` skips the dense decode arm when it holds.
-`LLAMA_QSA_DENSE_DECODE_STREAM=0` restores the pre-r190 behaviour.
-
-**Worth** (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, q8_0, 1 GPU, `-n 400`, 2 reps, ±0.2 %): with a windowed KV a
-streamed cache decodes **+34.3 %** at 102 899 depth (23.42 -> 31.43 t/s) and **+47.3 %** at 180 035
-(16.51 -> 24.31); a resident KV is unchanged (`853 77a40bf40be1` with the switch on and off), and the arena on
-the streamed arms was 25 338.3 / 22 701 MiB.
-
-**Purity.**  This is a decode-ARM choice, i.e. a different attention regime: a *streamed* cache's greedy text
-differs from the old dense-arm text by construction (`GREEDY-PURITY.md` §45/§63), while a **resident** cache is
-byte-identical (`853 77a40bf40be1`).  Prefill is untouched (always QSA), so the prefill-logit gate is
-unaffected.  Gate it with the text identity of the two resident arms plus a streamed arm's sparse-vs-default
-identity.
-
-## Block 16 — the attendance pool (`LLAMA_KV_REGION_POOL`, **opt-in**)
-
-Promoted from the `wip/kv-residency` campaign (Goal B of `TODO` #118) in **r190**.  Block 15's sibling: where
-the window keeps a positional tail of the KV in VRAM, the pool keeps the **whole** context in pinned host RAM
-and only the pages a decode step actually attends to in VRAM.  Opt-in: with `LLAMA_KV_REGION_POOL` unset (or
+Promoted from the `wip/kv-residency` campaign in **r190** (the window above is Goal A of the same campaign;
+this is Goal B).  Where the window keeps a positional tail of the KV in VRAM, the pool keeps the **whole**
+context in pinned host RAM and only the pages a decode step actually attends to in VRAM.  Opt-in: with `LLAMA_KV_REGION_POOL` unset (or
 `0`) the attention KV takes the plain device buffer and the run is byte-identical to a build without this
 block, including its OOM.
 
@@ -2996,7 +2978,7 @@ cold reads **42.0 -> 31.6 GiB**.  The pool's own cost is **0.10-0.11 ms/token** 
 at this shape: the measured ceiling was 90.2 % vs 90.05 % observed.  At 51 475 depth a `-c 65536` run reports
 **0 mismatches** and 91.5 % hits; at 5.3k, 96.0-99.3 %.
 
-**Default OFF — do not "fix" that.**  It is a **fittability** feature like block 15, not a speed one: on a
+**Default OFF — do not "fix" that.**  It is a **fittability** feature like the window above, not a speed one: on a
 config whose KV fits, the pool costs the sparse-vs-dense gap (−7 % at 103k, −11 % at 180k) and buys nothing.
 It is worth it only where the resident KV does not fit — then the 204 MiB pool *is* the run (a Flash-Next arm
 at `-c 262144 -ncmoe 16` aborts with `cudaMalloc failed: out of memory` / `failed to allocate buffer for kv
@@ -3020,6 +3002,28 @@ FLASH_ATTN_QSA` pass; `check-gpu-faults.sh` clean; the standard 27B Q8_0 prefill
 pool (`-ncmoe 21`/`22` at `-c 262144`: refused without it, accepted with it) and reports both numbers
 (`-fitp`: device context 3 784 -> 728 MiB, Host context 0 -> 3 264 MiB).  Numbers and the full campaign record:
 [`../wip/kv-residency/BA-POOL-DESIGN.md`](../wip/kv-residency/BA-POOL-DESIGN.md) §7-§10.
+
+
+#### r190 — a STREAMED cache takes the sparse decode arm
+
+**What it is.**  A window below the depth the run actually reaches makes the tail of every KV read a PCIe read
+instead of a VRAM read, so the *dense* QSA decode arm — which reads the whole used extent every step — becomes
+the wrong arm there, while on a resident KV it is the right one (VRAM is ~10x the link).  The arch policy only
+knew **depth** (`qsa_dense_decode_until`), never the cache's placement.  `llama_kv_cache::is_streaming(n_kv)`
+(and the context accessor) answers "a window is active and the used extent has passed it" — or "this cache is
+pooled" (this block's pool) — and `qwen4exp_kv_streams()` skips the dense decode arm when it holds.
+`LLAMA_QSA_DENSE_DECODE_STREAM=0` restores the pre-r190 behaviour.
+
+**Worth** (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, q8_0, 1 GPU, `-n 400`, 2 reps, ±0.2 %): with a windowed KV a
+streamed cache decodes **+34.3 %** at 102 899 depth (23.42 -> 31.43 t/s) and **+47.3 %** at 180 035
+(16.51 -> 24.31); a resident KV is unchanged (`853 77a40bf40be1` with the switch on and off), and the arena on
+the streamed arms was 25 338.3 / 22 701 MiB.
+
+**Purity.**  This is a decode-ARM choice, i.e. a different attention regime: a *streamed* cache's greedy text
+differs from the old dense-arm text by construction (`GREEDY-PURITY.md` §45/§63), while a **resident** cache is
+byte-identical (`853 77a40bf40be1`).  Prefill is untouched (always QSA), so the prefill-logit gate is
+unaffected.  Gate it with the text identity of the two resident arms plus a streamed arm's sparse-vs-default
+identity.
 
 ## Dated history
 

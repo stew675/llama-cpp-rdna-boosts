@@ -870,7 +870,14 @@ with it every compute buffer, so `set_sampler()` asks for one only when it has t
 |---|---|---|---|
 | `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE` | **on** | kill-switch (r169, contributor PR #245, block 12) | the compute buffers remember what they were reserved with (`sampling.reserved`: per sequence, the backend sampler chain's node count, `llama_sampler_backend_n_nodes()`) and `set_sampler()` reserves only when a sequence gets a **wider** chain than that, or has no record yet.  A chain set again, a narrower one, or a removal asks for none: the graph is rebuilt anyway (the samplers are part of the graph-reuse check), the output buffers are sized per decode, and the graph allocator grows a buffer if a chain needs more bytes.  The key is the **node count**, not the sequence id, because a reserve is the only thing that recomputes `graph_max_nodes()` — which sizes the graph's node capacity (`llm_graph_result::max_nodes` -> `ggml_new_graph_custom`), the scheduler's node/leaf arrays and the compute-metadata arena — and the allocator's growth covers buffer sizes only.  `0` restores the pre-r169 behaviour (a reserve on every set and every removal: 4 `sched_reserve: reserving ...` lines over three requests instead of 2, and +68.7 ms of median prompt time per sampled request on a 27B at `-c 65536 --parallel 2 --kv-unified`).  No arithmetic changes: request text and the prefill logits are byte-identical across the arms.  Only reaches a context that sets a backend sampler — `llama-cli`/`llama-bench` and a `-sm tensor` context (backend sampling is refused there) never touch it. |
 
-## 17. Windowed KV (block 15, **opt-in**)
+## 17. The streamed KV (block 15, **opt-in**): the resident window and the attendance pool
+
+Block 15 carries **two** opt-in placements of the attention KV, mutually exclusive by construction (the pool
+declines while a window is active).  Both are **default off** and byte-identical to a build without them when
+their knobs are unset, and both are **fittability** features: on a config whose KV fits, each costs the
+sparse-vs-dense decode gap.  §17.0 is the window, §17.1 the pool.
+
+### 17.0 The resident window (`LLAMA_KV_RESIDENT_CELLS`)
 
 The KV cache's VRAM cost becomes a **resident window** of the newest `W` cells; the cells below it live in
 pinned system RAM, in the same VA reservation (so no kernel and no op changes).  **Default: off** — with the
@@ -892,7 +899,8 @@ including its OOM.  The opt-in semantics are deliberate: a window below the dept
 | `LLAMA_KV_REGION_SPILL_SKIP` | unset (**diagnostic only**) | Comma-separated tensor indices of a windowed buffer that stay fully resident; it bisected the A4 purity hunt and is not shipped behaviour. |
 
 
-## 18. Attendance pool (block 16, **opt-in**)
+
+### 17.1 The attendance pool (`LLAMA_KV_REGION_POOL`, **opt-in**)
 
 The attention KV lives twice: its **authoritative** copy in a **pinned host mirror** (cell-indexed, so the
 writers, `state_write`/`state_read`, the K-shift, defrag and parking all work on it unchanged) and a compact
@@ -902,7 +910,7 @@ gathers K/V at the pool slots while the mask stays cell-indexed.  **Default: off
 the KV takes the plain device buffer and the run is byte-identical to a build without the block, including its
 OOM.  Opt-in is deliberate: it is a **fittability** feature like block 15 (a 204 MiB pool instead of a 1.6-2.4
 GiB resident KV at 103k-180k depth), and on a config whose KV already fits it costs the sparse-vs-dense decode
-gap (7-12 % at depth, `patches/README.md` block 16).
+gap (7-12 % at depth, `patches/README.md` block 15).
 
 | variable | default | what it does |
 |---|---|---|

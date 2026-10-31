@@ -1,8 +1,9 @@
 # `patches/goal-b` — the Goal B series (`git am` reproduction of the campaign branch)
 
-**STATUS 2026-10-31: PROMOTED.**  Goal B is delivered — the pool is **block 16** of
-`v17-6050b467c-r190`, B2 is block 15 and A13 is block 11 (A12 shipped separately as r189).  **The delivery is
-now the reference**: `patches/README.md` block 16 holds the block's own notes, gates and numbers, and the
+**STATUS 2026-10-31: PROMOTED.**  Goal B is delivered — the pool and B2 are **block 15** of
+`v16-6050b467c-r191` (r190 shipped the pool as its own block 16; r191 folded it into block 15) and A13 is
+block 11 (A12 shipped separately as r189).  **The delivery is
+now the reference**: `patches/README.md` block 15 holds the block's own notes, gates and numbers, and the
 `--fit` accounting this series does not carry (session A14) is in that commit too.  This directory is kept only
 so a later session can reproduce the exact tree the campaign's Goal B **numbers** were measured on, without the
 fork branch existing; it is **not** delivery work and nothing here is applied by `apply-all.sh`.
@@ -22,7 +23,7 @@ git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/goal-b/*.patch     # 000
 
 `0001` (B1's per-cache window override) and `0003` (B1(c)'s attended-set census) are **campaign diagnostics**
 and are deliberately **not** in the delivery; `0006`/`0007` shipped as block 10 (r189) and block 11 (r190), and
-`0002`/`0004`/`0005` as block 15 and block 16.
+`0002`/`0004`/`0005` as block 15.
 
 ## The series
 

@@ -619,18 +619,18 @@ cannot stand in for attendance, and neither can the region's unit granularity.
 
 ## 12. Goal B close-out plan — the next session's job (deliver it, don't re-measure it)
 
-> **STATUS 2026-10-31 (A14): DONE — Goal B shipped in `v17-6050b467c-r190`.**  All twelve rows of §12.1 below
+> **STATUS 2026-10-31 (A14): DONE — Goal B shipped in r190 (`v16-6050b467c-r191` after the fold).**  All twelve rows of §12.1 below
 > were carried out: the 180k acceptance row was measured on the final build (§8.2), the campaign branch was
 > re-based onto the released r189 tree, and the three deliverables were folded into the blocks that own them --
-> **block 16 = the attendance pool** (the pool + its async-state mirror handling + this session's `--fit`
-> accounting), **block 15 = B2** (a streamed cache takes the sparse decode arm) and **block 11 = A13**
+> **block 15 = the attendance pool** (the pool + its async-state mirror handling + this session's `--fit`
+> accounting, folded together with the window that was already block 15) and **B2** (a streamed cache takes the sparse decode arm) and **block 11 = A13**
 > (quantized indexer keys); A12 shipped separately as r189.  The `--fit` blocker (§12.2) was **fixed**, so the
 > rollback criterion did not apply: the mirror is charged to the host bucket in `memory_breakdown()`,
 > `llama_get_kv_pool_bytes()` reports the split, and the fit refuses to interpolate `-c` while the pool is
 > active.  The grow-on-demand mirror (§12.3) shipped as a **documented limitation**, now `TODO` **#193**.
 > `TODO` #118 is closed by `WORKLOG.md` 261031.008; what remains of the campaign is `TODO` #191 (Goal C),
 > #192 (the Goal A `auto` policy), #194 (Goal A across `-sm tensor`), #195 (the radix top-k) and #193.
-> The gate list of §12.5 is recorded in `patches/README.md` block 16 and in the WORKLOG entry; the numbers
+> The gate list of §12.5 is recorded in `patches/README.md` block 15 and in the WORKLOG entries; the numbers
 > reproduce this document's bit for bit (the pool's prefill-logit base is the same PPL 2.9225 / sha256
 > `acfb4145…` this campaign recorded).
 
@@ -693,7 +693,8 @@ does (`llama_kv_cache`'s `grow_cells`/`grow_for` is the model).  Decide, record,
 
 ### 12.4 Packaging the pool as a block (task 5, the pieces)
 
-* **Number**: the set is 16 blocks (`00` + `01`-`15`), so the pool is **block 16** (`patches/0016-…`).  Note the
+* **Number**: r190 gave the pool its own block 16; **r191 folds it into block 15** on the maintainer's call
+  (the block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work), tree-identical.  Note the
   `beta/0016-copy-2d-vec16/` directory is a *beta apply-order* prefix, not this block number — rename it if that
   reads badly after the fact.
 * **Block note** in `patches/README.md`: the mirror-is-authoritative writer rule, the three invariants

@@ -3,7 +3,7 @@
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from a previous
 session's context).  **Rewritten 2026-10-31, end of session A14.**
 
-> **Goal A and Goal B are DELIVERED.**  Goal A = block 15 (`LLAMA_KV_RESIDENT_CELLS`, r178); Goal B = block 16
+> **Goal A and Goal B are DELIVERED.**  Goal A = block 15 (`LLAMA_KV_RESIDENT_CELLS`, r178); Goal B = the same block 15
 > (`LLAMA_KV_REGION_POOL`, r190) plus the two repairs it exposed (r189's `cpy_2d_vec16` in block 10, r190's
 > quantized indexer keys in block 11) and B2 (a streamed cache takes the sparse decode arm, block 15).  `TODO`
 > #118 is closed by `WORKLOG.md` 261031.008.  **Do not re-measure any of it** — `BA-POOL-DESIGN.md` §7-§10 and
@@ -27,7 +27,7 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
  The fit's ordering is settled (weights -> arena reserve -> `W` from the residue); what is not is which of the
  three measured `auto` policies ships as the recommendation.  No new measurement needed.
 
- ## 3. Follow-ups opened by r190 (`TODO` #193-#195)
+ ## 3. Follow-ups opened by r190 (`TODO` #193-#196)
 
  * **#193 grow-on-demand pool mirror**: the mirror is allocated in full at creation (2.4 GiB at `-c 196608`,
    ~4.9 GiB at 262144), bounded by `LLAMA_KV_SPILL_RAM_PCT`.  The model is block 15's host-half growth
@@ -48,6 +48,6 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
    separate `-v` run; always `--single-turn --no-display-prompt`; always `timeout`.
  * A pool arm's gates are `LLAMA_KV_POOL_VERIFY=1` (0 mismatches), `LLAMA_KV_POOL_STATS=<path>` (a path, never
    stderr), the pool-vs-sparse text identity, and `gate-park-idle-slots.sh` / `gate-ckpt-reuse.sh` /
-   `gate-state-pipe.sh` on a **pooled** cache (`patches/README.md` block 16).
+   `gate-state-pipe.sh` on a **pooled** cache (`patches/README.md` block 15).
  * Never push to upstream llama.cpp; the only push targets are `stew675/llama-cpp-rdna-boosts` and
    `git@github.com:stew675/llama.cpp.git`.

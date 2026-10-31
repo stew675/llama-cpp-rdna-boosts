@@ -1,5 +1,42 @@
 # WORKLOG - dated delivery records
 
+## 261031.009 (r191) -- block 15 absorbs the attendance pool (a 16-block set again, tree-identical) + the stale 35B prefill-logit base filed as TODO #196
+
+**Released as `v16-6050b467c-r191` (16 blocks; block 15 now carries BOTH opt-in placements of the KV).**
+Canonical tip `561696677`, tree `2d76fe97a349ddcc4fc63f0b1bc208907cdd8288` — **the same tree r190 had**, so this
+is a re-cut, not a behaviour change: no kernel, no knob and no number moves.  `release.json` refreshed
+(`n_blocks` 17 -> 16, one patch fewer); `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh
+tarball, tree equality, 286 files through the Windows portability lint).
+
+**Why.**  r190 shipped Goal B as its own block 16 on the close-out plan's numbering; the maintainer's
+preference is that the pool stay **unified with the windowed KV in block 15** — they are the same piece of
+work (`TODO` #118's "the KV does not have to be `O(-c)` of VRAM"), they are mutually exclusive by
+construction (the pool declines while a window is active), they share the streaming arm policy, and each is
+inert with its knob unset.  Block 15 is now titled *the streamed KV -- a fixed-VRAM resident WINDOW (Goal A)
+and an attendance POOL (Goal B), both opt-in*; its commit message carries three parts (window / pool /
+streaming arm) and its failure-mode list, and the pool's contents are otherwise unchanged.
+
+**What changed on disk.**  `patches/0016-*.patch` is gone and `patches/0015-*.patch` carries both (the tree
+is byte-identical, so the applied tree is still `2d76fe97a`); `release.json` re-cut; `patches/README.md` block
+16 folded into block 15 as `### The attendance pool (Goal B, r190)` + the index row merged into row 15;
+`MANIFESTS.md` (16 blocks, the apply-order row merged, the verification rows merged), `AGENTS.md` (16 blocks,
+block 15 = both placements + the default-off rationale), `README.md`, `ENVIRONMENT.md` (§17 is now "the
+streamed KV": §17.0 the window, §17.1 the pool), `TODO.md` (current state; #193's block reference), and the
+campaign record (`wip/kv-residency` HANDOVER/BA-POOL-DESIGN/CAMPAIGNS/COLD-START-PROMPT/goal-b README).
+`v17-6050b467c-r190` is left in place as the published tag it is (the tree is the same; the images built for
+it are the same images).
+
+**Filed for the maintainer (new `TODO` #196).**  The **35B-A3B UD-Q4_K_M** prefill-logit base in
+`~/.cache/rdna-boosts/gates/` is r183-era (build `55d421582b7b`, host `soar`) and the **shipped r188 and r189
+trees both read mean KLD 0.005657 / same-top-p 96.794 %** at it (40 chunks, ctx 512, f16 KV, with *and*
+without `ROCBLAS_USE_HIPBLASLT=0`): that point drifted somewhere in r184-r186, so a strict gate run there
+fails on the released tree too and it is not an A12/A13/A14/r190 defect (the canonical 27B Q8_0 and the
+qwen4exp q8_0 points both read 0.000000 / 100.000 %).  The item lists the three ways out — bisect
+r184-r186 and re-record only if the change is intended, re-record and note the re-baseline (which *accepts*
+the drift, so it needs the maintainer's ack), or retire the 35B point.  Also noted there: the canonical 27B
+Q8_0 base was re-recorded from the shipped r189 build during r190 (its previous file was overwritten in the
+process), so its `.meta` names r189.
+
 ## 261031.008 (r190) -- Goal B delivered: block 16 (the attendance pool), a streamed cache takes the sparse arm (block 15), and the fused indexer scorer reads QUANTIZED keys (block 11)
 
 **Released as `v17-6050b467c-r190` (17 blocks; block 15 and block 11 amended, block 16 new).**  Canonical tip
