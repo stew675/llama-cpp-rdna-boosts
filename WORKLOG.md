@@ -1,3 +1,69 @@
+## 261031.013 (r192) -- the dense row concat takes a `K-quant x Q6_K` weight pair (PR #260, block 10); PR #262's `q4_0` KV write fold is measured, found beneficial on RDNA3 and HELD after an unexplained gfx1201 MTP cost
+
+**No tag: nothing shipped.**  Both PRs of this session are **held** (see below); the delivery tree, `patches/`,
+`release.json` and every block are unchanged from **r191**, and this entry plus the two `benchmarks/` records are
+docs-only.  Everything below is the evidence for that decision, prepared as a ready-to-tag r192 cut
+(`e52d0bab9` / tree `ad5a3e43c` = r191 + #260, `validate-set.sh` green, block-10 build gate green, canonical
+prefill-logit 0.000000 / 100.000 %, greedy text identical) that is **not** published.
+
+**Reverted release header (kept for the record):**  Canonical tip `e52d0bab9`,
+tree `ad5a3e43c3eeec8ebeb49445b3331dfeaadd6653` (r191 was `561696677` / `2d76fe97a`).  `release.json` refreshed;
+`scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball, tree equality, 286 files
+through the Windows portability lint).  The re-cut reproduced the r191 tip exactly (`561696677`) before the
+amendment, so the chain is deterministic.  Numbers: `benchmarks/2026-10-31-r192-row-concat-mixed.md`; rules:
+`GREEDY-PURITY.md` §79.  Box: 3x R9700 (gfx1201) plus two contributor-arch boxes, one job at a time.
+
+**Shipped -- #260 (PR #260, `briansp2020`): the dense row concat takes a `{Q4_K, Q5_K, IQ4_XS} x Q6_K` pair.**  In
+the K-quant "M" files `attn_v` is `Q6_K` in about half the layers (Qwen3-Coder-30B-A3B Q4_K_M: 24 of 48), so V ran
+as its own launch there.  `mul_mat_vec_q_ksplit` becomes a device body plus the same global wrapper, and
+`mul_mat_vec_q_ksplit_cat2<type, Q6_K>` runs the `Q6_K` body (with that segment's own row stride) for the `Q6_K`
+segment's row blocks and the launch type's body for the rest; both types must take the same `nwarps` (a
+`static_assert`) and each row keeps its own one-warp dot product, so every row computes what its standalone launch
+computes.  The type is chosen once per block, so these launches keep the full grid (the RDNA4 decode grid loop is
+off) and a block cannot straddle a segment; the matcher needs the launch tensor to be the largest segment (the row
+guards are offsets sized by it) and takes either graph order.  Kill switch `GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0`.
+Worth **+1.2 % tg128 / +0.9 % @4096** on Qwen3-30B-A3B (`f16` KV) and **+1.2 %** at 3 GPU `-sm tensor` (the
+submitter marked multi-GPU untested), inert on the 27B/35B `UD` files (their attention weights are `Q8_0`, so the
+pair does not exist) — census: `cat2` x216 replaces 216 of the 225 standalone `Q6_K` launches.
+
+**Held -- #262 (PR #262, `briansp2020`): the `q4_0` KV cache write fold**, held together with a **new finding
+that applies to BOTH patches**: on gfx1201 an MTP decode arm measures **5-7 % slower with either patch in the tree**
+(dense 27B, `draft-mtp`, bf16 or `q4_0` KV, 76.2 -> 70.7 t/s at 1 GPU, 133.4 -> 126.4 at 3 GPU `-sm tensor`), with
+an identical kernel census, graph census, compute buffers, text and acceptance, with the fold's kill switch off,
+with graphs disabled, on the speculator arm only (plain decode is flat at every depth), each *half* of #262 inert
+and fast, and a code-size probe on the unpatched tree free — while **gfx1100 and gfx1151 are flat for both**
+(#260: 89.1 vs 89.1; #262: 90.4 vs 90.6 / 98.4 vs 98.1).  So it is not either patch's logic: it is a gfx1201-only
+property of this box + driver (the same class as the documented launch-time pathology #6689), filed as `TODO` #128.
+**r192 is therefore NOT tagged**: shipping either patch would make our flagship arm 7 % slower on our own primary
+architecture for a reason we cannot yet name.
+`benchmarks/2026-10-31-kv-fold-q4_0-assessment.md` carries the whole record; in short: it is **correct**
+(`--kv q4_0 --ub 1` A/B **-0.000000 KLD / 100.000 %**, greedy text identical on 1 GPU, 3 GPU `-sm tensor`,
+gpt-oss-20B and 35B `-ncmoe`, census 6346 -> 4618 = the `q8_0` count), and **beneficial on the RDNA3 family** on an
+idle box of each: gfx1100 **+11.8 % tg128 / +11.4 % @4096** (30B-A3B `q4_0` KV, 174.3 -> 194.9 / 160.0 -> 178.2,
+switch-off 175.9 / 161.7 — the submitter's +11.2 % / +9.7 % reproduces) and gfx1151 **+2.6 % / +2.5 %**
+(30B-A3B Q8_0, 53.8 -> 55.2 / 51.6 -> 52.9).  But on **gfx1201** the same tree costs **5-7 % of MTP decode**
+(dense 27B, `draft-mtp`, bf16 or `q4_0` KV, 1 and 3 GPU: 133.5 -> 126.5 t/s) **with the fold's kill switch off**,
+with an identical kernel census, graph census, compute buffers, text and acceptance, with graphs disabled, on the
+speculator arm only (plain decode is flat at every depth), with each half of the patch alone inert and fast, and
+with a semantics-free code-layout probe not moving it.  An **arch gate** (the fold admitted only on
+`RDNA3_0`/`RDNA3_5`, wave32) was implemented and built: on gfx1201 the fold becomes inert (30B-A3B `q4_0` KV reads
+stock) and **the MTP cost stays** — so gating the runtime path cannot remove it, and shipping the code on the
+primary architecture would cost 5-7 % of our flagship decode arm for a feature that does not fire there.  The PR
+reply asks the submitter to re-check the MTP arm on their RDNA4 card and bisect; `TODO` #120 keeps the item open
+with this evidence (the `q4_0` half is done and waiting for a fix).
+
+**Reviewed, and nits fixed in the submitted code** (#260 is otherwise the contributor's work verbatim): the
+`GGML_ABORT` tripwire now says *unreachable* with the reason, and the `n_b > 1` same-type-prefix fallback and the
+"launch tensor must be largest" check are commented.  Claim corrections recorded rather than carried: #260's
+"24 fewer launches per token" is its config's mixed-layer count (12/step here).
+
+**Gates.**  `validate-set.sh` green; `gate-per-block-build.sh --fast --changed-from r191` rebuilt block 10 (362 s —
+`common.cuh` is a widely included header, so that is the whole delta) and the tip (97 s); the canonical `all` build
+at the tip is the `~/bin/build-llama-rocm` tree, and every coherence/prefill-logit arm ran on it: greedy text
+identical to `bin-r191` on 4B Q8_0, 27B Q8_0, 30B-A3B (`f16` and `q4_0` KV), 35B `-ncmoe 40` and 3 GPU
+`-sm tensor`; `gate-prefill-logits.sh` at the canonical 27B Q8_0 point **0.000000 / 100.000 %**; the MTP arm is
+back to r191 (133.3 / 133.8 vs 133.5).  `TODO` #120 stays open for the `q4_0` hold plus `q5_0`/`iq4_nl`/`bf16`.
+
 ## 261031.012 (tooling, post-r191) -- TODO #126 closed: the 35B prefill-logit base was an r125-era recording, so the "r184-r186 drift" was a stale reference; re-recorded, and the gate now refuses a cross-toolchain compare
 
 **Not a release; no delivery change** (`patches/`, `release.json` and every block are untouched; `scripts/`
