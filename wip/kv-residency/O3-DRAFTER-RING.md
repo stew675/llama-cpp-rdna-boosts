@@ -168,6 +168,56 @@ double the indirection for no gain.
 estimate knows about the window (`common/draft-reserve.h` / the `--fit` measurement of the extra model).  O2
 does not fix that; it makes it matter more.
 
+## 2.3 A15 (2026-10-31) -- the adaptive policy, and the reserve conversion that makes it pay
+
+Branch `wip-kv-residency-c` (off the r191 tip, commit `fa914676e`, pushed).  The maintainer's decisions:
+**MTP only** (DFlash2 later), the window is **adaptive** -- a quarter of the context, clamped to
+**[32768, 65536] cells** -- the user override stays, and the default follows the delivery's own rule: **on when
+it measures positive, opt-in when it measures negative**.  It is measured positive, so the unset default is
+the adaptive policy and `LLAMA_SPEC_DRAFT_WINDOW=0` is the kill switch.
+
+**Two pieces, and the second is what makes the first worth shipping.**
+1. `llama_spec_draft_window_cells()` (`src/llama-ext.h`, implemented beside `get_rope_factors`) holds the
+   policy; `create_memory()`'s MTP branch builds the draft cache at `min(n_ctx, W + n_ubatch)` cells with
+   `n_swa = W`.  Unchanged from §2.2 otherwise: the reclaim in `find_slot` *is* the ring.
+2. **The O3 §2.2 blocker is now fixed.**  An MTP draft has no GGUF of its own, so `draft_reserve` was never
+   derived for it: the slab held the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` (3584 MiB) and the freed
+   VRAM stayed unspent (`SLAB_INIT` arena identical, which is the note's own finding).  For an MTP draft whose
+   window is active, `common_draft_reserve_estimate()` now runs on the **target's** metadata with the weights
+   zeroed (`shares_model`; they are the target's) and the KV term sized by the window: **aux 3.50 GiB ->
+   0.76 GiB**, i.e. the arena gains ~2.8 GiB.  Without an active window nothing changes (the flat constant
+   stays), so no existing run moves.
+
+**Measured (one R9700, 1 GPU, `-n 2000`, static depth 3, `--single-turn --no-display-prompt`, interleaved pairs).**
+
+| arm | arena | residency | generation | drafts accepted |
+|---|---|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 48 -c 262144` q8_0 KV, 51 433-token prompt, window **0** | 20 910 MiB | 64.1 % | 108.5 / 111.8 t/s | 1315/2052 |
+| the same, **auto** (65536) | **23 715** | **72.7 %** | **114.0 / 114.9** (+4.9 / +2.8 %) | 1315/2052 (**identical**) |
+| the same, `W=32768` (the truncating case) | 23 715 | 72.7 % | 110.3 (+1.7 %) | 1308/2071 (-1.4 % rel) |
+| dense 27B UD-Q4_K_XL `-c 102400`, window 0 -> auto | -- | -- | 66.6 -> **68.6** (+3.0 %) | 1925/1357 (identical) |
+
+Prefill moved +3.4 % on the arena arm (1095.1 -> 1132.8).  Target greedy text is **byte-identical** across
+off / auto / 4096 (27B, `-c 102400`, `-n 64`: 303 chars `sha=c437759e06e3`, the §2.2 hash).  At `-c 16384` the
+adaptive window is absent (32768 >= `n_ctx`) and no log line appears -- "nothing to save" is the designed case.
+
+**A correction to §2.1.**  The "one real hazard" there -- that a ring must be excluded from
+`kq_mask_derivable()` because its `tok_lo`/`tok_hi` assume cell order ≈ position order -- **is not a hazard**:
+the predicate is `tok_lo <= cell_pos <= tok_hi` over the **per-cell position** (`cells.pos_get(j)`), and `lo`
+is a position bound (`p1 - n_swa + 1`), so a recycled cell reports its new position.  The measured text
+identity is the same statement from the other side.  Nothing is owed here; do not add the exclusion.
+
+**Still owed before it is delivered into block 15** (the maintainer's rule for any Goal-C promotion):
+* MTP Protocol A at `-n 3000` (`-n 2000` floor), reasoning-pinned, **both split modes**, device count quoted --
+  the §2.2.1 "free" reading came from `-n 400` arms, which is below the methodology's floor;
+* the **Step C rollback oracle** (§5), never run: W=512 against a 3000-token run, `seq_rm`/`seq_cp`, "no
+  reused cell attended after a rollback", target text unchanged;
+* `gate-park-idle-slots.sh` / `gate-ckpt-reuse.sh` / `gate-state-pipe.sh` on a **windowed draft** (the draft
+  context is a second context with its own cache, so a state path could still reject it);
+* the `--fit` half: its preflight still books the flat 3584 MiB for the draft (`common_get_device_memory_data`
+  -> the probe preflight), so `--fit` reserves ~2.8 GiB more than the slab now does.  Conservative (it can
+  only under-size the arena), but it is the same number and should be the same value.
+
 ## 3. Invariants the slice must keep
 
 1. **The target is untouched.**  Only the draft context's cache gets a window.  A wrong draft is a slower
