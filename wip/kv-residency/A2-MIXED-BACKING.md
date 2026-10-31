@@ -798,6 +798,20 @@ therefore usually the arena reservation showing up in `margins[0]`, not a sizing
 
 ---
 
+## 3.7.14 DECISION (2026-10-31, maintainer) — P1 is the `auto` policy; P2 is rejected, P3 is not promoted
+
+Of the three candidates §3.7.11.4 A-C left open, **P1 (fittability only) ships**: `auto` sizes a window only
+when the KV does not fit at the pinned `-c`, and the expert arena keeps winning the VRAM through `margins[0]`.
+**P2 (unconditional arena-first)** is rejected: a fit cannot know the depth the run will use, and table B
+measures a `W` 35k cells below the depth at -11..-26 %, against the +3.8 % the arena half pays where residency
+is starved (122B-A10B).  **P3 (an explicit per-token spill budget, so the user buys arena with a printed
+cost)** is the right *shape* for that opt-in but is not promoted until it measures better than P1 as a
+default -- it needs its own `fit.cpp` change and a measurement, so it stays a parked idea rather than a
+recommendation.
+
+What remains owed is documentation only: block 15's note should say P1 is the recommendation and that the
+arena half of Goal A needs a numeric `W` (a numeric `W` at or above the run's depth is what tables A/B reward).
+
 # §3.7.13 A6 (2026-10-30, tenth session) — the parking gate's fallback blindness, and the split-window design
 
 Session scope: the campaign's remainder in HANDOVER §11.  Two items were actionable on this box; the rest are
