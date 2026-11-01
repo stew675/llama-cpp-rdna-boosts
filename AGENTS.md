@@ -1139,6 +1139,21 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   `--cache-reuse`).  The per-sequence tracker is block 03's (`prepare()` folds in every ubatch;
   `LLAMA_RS_ROLLBACK_DEBUG=1` shows `RSPREP`/`RSROLL`).  Record + probe:
   `archive/work/rs-rollback-boundary/`.
+- **A recurrent cell that `find_slot` moves keeps its rollback snapshot planes (r195, PR #261, block 03).**
+  `build_rs` relocates the "extra states" (the cells inside `[head, head + n_rs)` that no sequence of the
+  ubatch uses); it used to copy **plane 0 only**, so from 3 cells on a moved cell's planes `1..n_rs_seq`
+  stayed at the old index and were overwritten by the cells that took their place, and that sequence's next
+  rollback read another sequence's snapshot: silent wrong text on a multi-slot server, no log line.  It now
+  also copies planes `1..n_rs_seq` through the new input `s_copy_extra`, gathered **before** the ubatch's
+  snapshot writes (**node order is the only ordering guarantee**: two views of one tensor create no
+  dependency edge), with the ids from `s_src()` because `s_copy()` *consumes* the sequence's pending
+  rollback index.  Where `n_rs == n_seqs` (every single-sequence batch, and a 2-cell cache) the graph does
+  not change, so every single-sequence gate (coherence, prefill-logit, the four-axis MTP protocol) is blind
+  to it, as is text in general (the wrong read is still fluent).  The defect is **upstream's** (`6050b467c`
+  and master `0ec4027a2` both carry it), so the same change is kept as an upstream candidate.  Gate:
+  `test-recurrent-state-depth`'s **Phase C** (two-arm replay-logit comparison; 15/15 arms differ by
+  2.94-9.64 logits on r194 and by 0 on r195, 1 GPU and 3 GPU `-sm tensor`).  Record:
+  `archive/work/recurrent-moved-cell-snapshots/`, `GREEDY-PURITY.md` §79.
 - **Test baselines are per box *and* per model: never compare to a number in this file.**  E.g.
   `test-recurrent-state-depth` on Qwen3.6-35B-A3B-UD-Q3_K_M: **130** failures on gfx1201, **153** on
   gfx1151; the gate is that the per-arm FAIL/PASS set is unchanged, not that the count is zero.  Run it

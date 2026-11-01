@@ -1,3 +1,81 @@
+## 261031.016 (r195) -- recurrent: a cell that `find_slot` moves keeps its rollback snapshots (contributor PR #261, block 03 amended)
+
+**Released as `v16-6050b467c-r195` (16 blocks, block 03 amended).**  Contribution by **overdoingism**
+(PR #261, written with Claude), integrated after assessment; the defect is **llama.cpp's own**, so the same
+change is kept as an upstream candidate (`upstream/recurrent-moved-cell-snapshots/`, both patches verified to
+apply on `6050b467c` and on master `0ec4027a2`).
+
+**The defect.**  `build_rs` relocates the "extra states" -- the cells inside `[head, head + n_rs)` that no
+sequence of this ubatch uses -- and copied **plane 0 only**.  The `n_rs_seq` rollback-snapshot planes of such
+a cell therefore stayed at its OLD index, where the cells that took its place then overwrite them, and that
+sequence's next rollback read another sequence's snapshot (or zeroed rows): unrelated text, an early stop, no
+log line.  It is reachable from **3 cells on**: `find_slot` computes `min`/`max` over the ubatch's sequences
+*before* its gather-and-reorder, so a batch of `[seq 0, seq 2]` on a 3-cell cache spans all three cells and the
+third becomes an extra state.  Verified on the tree, not just in theory: `build_rs_inp_impl` logs
+`n_rs=3 n_seqs=1` and `n_rs=3 n_seqs=2` at `head=0` on a 3-slot MTP server (35B-A3B UD-Q4_K_M, `-sm tensor`,
+3x R9700), i.e. the path is not reserve-only.
+
+**The fix (+70/-1, four files, plus the gate).**  `build_rs` also copies planes `1..n_rs_seq` of the extra
+states, through a new graph input `s_copy_extra`, gathered **before** this ubatch writes its snapshots.  Three
+conditions make it correct and each was checked: the gather's node order is the only ordering guarantee (the
+two views of the state tensor create no dependency edge, and the GDN/conv snapshot writes are expanded after
+`build_rs` in the same layer); the source ids come from a new `s_src()`, never `s_copy()`, because `s_copy()`
+consumes the sequence's pending rollback index; and the extra input exists only where `n_rs > n_seqs`, so a
+single-sequence batch (and a 2-cell cache) builds a byte-identical graph.
+
+**New gate: `tests/test-recurrent-state-depth.cpp` Phase C** (block 03 owns the fix; the test lives with the
+fix).  Three sequences, seq 1 verifies a K-token batch, then `[seq 0, seq 2]` decodes one token each either as
+ONE ubatch (moves seq 1) or as two single-sequence ubatches (no move); then seq 1 is rolled back `r` tokens and
+the replayed logits are compared.  `n_rs_seq` 1/2/4/8 x `r` = 1..n: **r194 fails 15/15** (largest logit
+difference **2.94 - 9.64**), **r195 passes 15/15** on 1 GPU and with `-sm tensor` on 3 GPUs.  The existing
+Phase A/B FAIL set is **unchanged** (130 failures on this box, Qwen3.5-4B Q8_0/gfx1201), so the fold changes
+nothing where it does not apply.  A pre-r195 baseline therefore carries 15 extra Phase-C FAIL lines; the
+contract is still "compare the per-arm FAIL/PASS set".
+
+**Release gates.**
+1. **Coherence** (byte-identical to the kept r194 build, `ROCBLAS_USE_HIPBLASLT` unset both sides): 4B Q8_0
+   1 GPU `6ff72e08d38b`, 4B 2 GPU `-sm tensor` `2a8a08015c3c`, 35B-A3B UD-Q4_K_M `-ncmoe 40` 2 GPU `-sm
+   tensor` `6976aa655f04`.
+2. **MTP** (Protocol A, `-n 3000`, `prompts/prose-rdna-boosts.txt`, 3 devices, r194 vs r195): dense 27B
+   UD-Q4_K_XL `-sm tensor` draft **124.17 -> 124.06** t/s and plain 53.45, acceptance **0.80385
+   (1377/1713) identical**; `-sm layer` draft **62.78 -> 62.75**, acceptance **0.81015 (1485/1833)
+   identical**; 35B-A3B UD-Q4_K_M `-ncmoe 40` 2 GPU draft **183.47 -> 183.52**, acceptance **0.73569
+   (1247/1695) identical**; adaptive R axis (`draft-mtp-adaptive`, `--reasoning on`, 27B 3 GPU tensor,
+   `prompts/recall.txt`) **110.66 -> 110.67** t/s, acceptance **0.67564 (2008/2972) identical**.
+   `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` (27B 3 GPU tensor): 57.13/173.45/271.07 vs r194
+   57.21/173.01/269.39 t/s.
+3. **Prefill logits** (27B Q8_0, ctx512 x 40, f16 KV, `gate-prefill-logits.sh`): **0.000000 / 100.000 %**.
+4. **Per-block build** (`--changed-from d7e708f08`, `all` profile): 2/2 (block 03, block 15 tip).
+5. **GPU faults**: `check-gpu-faults.sh` clean over the kernel journal and every arm log.
+9. **Speculative verify-batch alignment** (`gate-spec-align.sh --ngpu "2 3"`, i.e. the multi-slot recurrent
+   rollback path this fold touches): **PASS** -- 2 GPU 119.3 -> 145.3 t/s, 3 GPU 139.1 -> 177.9, host-expert
+   126.2 -> 151.1, equal-length arms inert, single-slot text byte-identical, `n_seq==1` text `b8775233a93a`.
+6. Gate 6 (parking), 7 (HC fusions), 8 (state pipe), 10 (graph census), 11 (checkpoint reuse), 12 (spec
+   checkpoint), 13 (verify width), 14 (GDN width probe) are **not triggered**: no parking, HC, state-io,
+   graph-cache, checkpoint, `align_draft_caps` or conv-fold/matcher code is touched, and the new nodes are a
+   `GET_ROWS` + `CPY` on the state tensor (they never read the conv `CONCAT`, so the direct-conv matcher's
+   forward scan is unaffected -- `gate-spec-align.sh`'s 3-GPU RDNA4 arms run the fused path clean).
+
+**Cost.**  One binary with the copy toggled off (the only difference), 35B-A3B UD-Q4_K_M, MTP `n_max 5`
+(`n_rs_seq` 5), 3 concurrent requests x 200 tokens, 3 rounds interleaved: 3 slots **115.95/115.53 (off) vs
+115.95/114.74 (on)** t/s, 4 slots **94.57/95.25 (off) vs 94.75/96.26 (on)** -- inside the arm's own spread.
+Worst case, if an extra cell is copied on every step: `n_rs_seq x (R_row + S_row) x recurrent layers` =
+5 x (96 KiB + 2 MiB) x 30 ~ **315 MiB read plus the same written per token** on this model, so a deeper draft
+(or several extras per step) is where it would show; re-measure there if a server arm is ever tuned around it.
+
+**What changed in the repo.**  `patches/0003` + `rdna-boosts-all.patch` regenerated; `release.json` ->
+`v16-6050b467c-r195`, tip `aec3bcd7f`, tree `37aa320b6`.  The contributor's `wip/` entry is **retired** (no
+stub) and its record moved to `archive/work/recurrent-moved-cell-snapshots/` with the delivery-side evidence
+(the Phase C logs, the two 4B sweeps, the 3-GPU arm); `upstream/README.md` and the candidate's README now name
+block 03 (r195).  Documents: this entry, `patches/README.md` (block 03), `MANIFESTS.md` (block 03 row),
+`AGENTS.md` (critical fact), `GREEDY-PURITY.md` §79, `archive/work/recurrent-moved-cell-snapshots/`.
+
+**Not done, deliberately.**  The upstream PR was **not** filed at `ggml-org/llama.cpp` (the maintainer's
+call); `upstream/recurrent-moved-cell-snapshots/` carries the copy and the gate travels with it.  The
+contributor's server-level empty-reply table is their measurement and was not re-run: the deterministic gate
+above is the delivery's evidence, and the multi-slot behaviour it predicts is covered by
+`gate-spec-align.sh`.
+
 ## 261031.015 (r194) -- block 15 corner-case fixes: the attention pool is capped at the cache, the draft window no longer sizes a separate draft's reserve, and the VRAM cliff is documented
 
 **Released as `v16-6050b467c-r194` (16 blocks, block 15 amended).**  Both fixes came out of a configuration

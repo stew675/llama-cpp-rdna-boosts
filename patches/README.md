@@ -298,6 +298,17 @@ speculative rewind into a prefill safe.
   sequence that ran in a non-final ubatch keep an earlier prefill chunk as its "last batch", which is what
   the issue-#131 warning was reporting.
 * `LLAMA_RS_ROLLBACK_DEBUG` (`RSPREP`/`RSROLL`) is the instrument that proved both.
+* **A cell that `find_slot` moves keeps its rollback snapshot planes** (r195, contributor PR #261).
+  `build_rs` relocates the "extra states" — the cells inside `[head, head + n_rs)` that no sequence of
+  this ubatch uses — and used to copy **plane 0 only**, so from 3 cells on a moved cell's planes
+  `1..n_rs_seq` stayed at the old index, where the cells that took their place overwrite them.  That
+  sequence's next rollback then read another sequence's snapshot (or zeroed rows): silent wrong text on a
+  multi-slot server, no log line.  `build_rs` now also copies planes `1..n_rs_seq` of the extra states
+  through the new input `s_copy_extra`, gathered **before** this ubatch writes its snapshots (node order
+  is the only ordering guarantee), with the source ids from `s_src()` rather than `s_copy()` because
+  `s_copy()` consumes the sequence's pending rollback index.  Where `n_rs == n_seqs` (every
+  single-sequence batch and a 2-cell cache) the graph does not change.  The defect is upstream's, so the
+  same change is an upstream candidate (`upstream/recurrent-moved-cell-snapshots/`).
 
 **Knobs.**  `GGML_CUDA_GDN_CHUNKED=0` forces the sequential kernel (bit-identical, slow),
 `GGML_CUDA_GDN_CHUNKED_BF16=0` forces the F32 chunked path, `LLAMA_RS_ROLLBACK_DEBUG` (diagnostic),
@@ -309,8 +320,10 @@ enabled speculator (`common_speculative_n_max() + 1`, every draft *and* ngram ty
 never take the chunked path (`GREEDY-PURITY.md` §27).  The BF16 chunked path was the issue-#113 prefill-logit
 regression: **run `scripts/gate-prefill-logits.sh` on any change here.**
 
-**Gates.**  `test-backend-ops -o GATED_DELTA_NET`, `test-recurrent-state-depth`,
-`test-recurrent-state-rollback` (compare the per-arm FAIL/PASS *set*, never the count — it is per box).
+**Gates.**  `test-backend-ops -o GATED_DELTA_NET`, `test-recurrent-state-depth` (**Phase C since r195**
+is the moved-cell gate: 15/15 arms differ by 2.94-9.64 logits before the fold and by 0 after, on one GPU
+and with `-sm tensor` on three), `test-recurrent-state-rollback` (compare the per-arm FAIL/PASS *set*,
+never the count — it is per box, and a pre-r195 baseline has 15 extra Phase-C FAIL lines).
 
 **This is the only chunked GDN kernel the delivery dispatches (r127, gfx1151 A/B).**  Upstream's
 `gated_delta_net_mma` kernel (in the re-base window, `62df1815b`) is *eligible* on RDNA3.5 at
