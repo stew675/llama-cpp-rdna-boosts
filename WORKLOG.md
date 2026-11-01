@@ -1,3 +1,55 @@
+## 261101.010 (issues #263 / #265, TODO #130) -- the gfx1100 "kill-switch arm" impurity was the same softplus; issue #263 closed (block 10 amended: the 33-case oracle that r201 claimed but did not ship)
+
+**Released as `v16-6050b467c-r202` (16 blocks; block 10 amended, tests only).**  Canonical tip `18001ddd7`,
+tree `85a00394ab2a7228b5f1bda18d3cc3a4ab8e5dc8` (r201 was `7fe2b7829` / `f122dff7`).  The tree delta against
+r201 is **one file, `tests/test-fusion-gate-beta-multiseq.cpp`** -- no kernel, no library source.  Record:
+`benchmarks/2026-11-01-kill-switch-arm-130.md`.
+
+**Finding 1: TODO #130 was not a separate W=1-only try-fuse pass -- it was issue #265's softplus, seen
+through the fusion's always-on decode arm.**  `GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates **only the verify
+band** (`mmvq.cu`: `ne[1] == 1 || (fuse_gate_beta_verify && ne[1] <= MMVQ_MAX_BATCH_SIZE)`), so the switch
+produces exactly "W=1 fused vs W>=2 chain".  Pre-r201 those disagreed, i.e. one axis of one defect at one
+width.  Proven by restoring `logf(1.0f + expf(x))` in `ssm_op_softplus` and re-running
+`test-logits-width-probe P=4096` on the 27B UD-Q4_K_M / gfx1100: fuse-off W=1 `7def98c5` (fused) vs W>=2
+`5e1cbbb4` (chain), **maxdiff 0.138269** -- the recorded pair and the recorded 0.138 exactly.  On the r202
+build every arm reads the chain value `5e1cbbb4` (default, `FUSE_GATE_BETA_VERIFY=0`,
+`GGML_CUDA_DISABLE_FUSION=1`; `e8ebd3de` with `KV=q8_0`) and all PASS.  The wrong side was the **fused
+kernel**; the chain, `DISABLE_FUSION=1` and the fixed build agree.
+
+**Finding 2: the default path WAS affected before r201, so #263's gfx1100 delta is this defect and is now
+zero (this corrects `261101.008`).**  The default build takes the fused kernel at *every* width, so before
+r201 it was width-uniform while sitting on the wrong value -- invisible to a width probe, which is why #130
+read it as a kill-switch-only artifact.  Acceptance (`draft-mtp n_max 2`, q8_0 KV, 1200 tok, 437-token
+reasoning prompt): pre-fix default **977/710 `sha=eca29f334d6a`**, pre-fix fuse-off **988/704
+`sha=152af1d9feb7`**, r202 default **988/704 `sha=152af1d9feb7`**, r202 fuse-off **988/704
+`sha=152af1d9feb7`** -- 4/4 post-fix runs identical in both counts and text.  So the gfx1100 default arm
+did move with the r201 fix, by exactly the gap r201 attributed to #130; the previous entry's "gfx1100 is
+unchanged by the fix" was wrong.  The reporter's 73.0 % at r162 is the 72.7 % wrong-softplus value;
+corrected numerics read 71.3 % on this arm (acceptance is not a quality oracle).  The reported 14-point
+magnitude at 60k is still not reproduced on this box.
+
+**Finding 3: the 33-case oracle extension `261101.008` claimed never shipped.**  The delivered tree still
+carried the 11-case BF16-at-1024 matrix (`k = 1024` hardcoded, no `GGML_TYPE_Q8_0` case) -- the exact
+blindness that let #265 live, since no delivered GDN model runs that type or that contraction length
+(`ssm_alpha/beta.weight` is Q8_0, K = 5120).  Block 10 is amended with that extension: `{BF16, 1024}`,
+`{Q8_0, 1024}`, `{Q8_0, 5120}` x the same 11 `(T,S)` shapes, **33/33 bit-identical and all fused**.
+
+**Gates (gfx1100, 1 GPU, `ROCBLAS_USE_HIPBLASLT=0`, arms run alone).**  `test-logits-width-probe P=4096`:
+PASS on default / fuse-off / `DISABLE_FUSION=1` (maxdiff 0), and on both arms at `KV=q8_0`.
+`gate-prefill-logits.sh --ab "GGML_CUDA_FUSE_GATE_BETA_VERIFY=0"` at **`--ub 1`** and **`--ub 4`**:
+**-0.000000 / 100.000 %** both (the `--ub 4` arm is the one that decides it; `--ub 1` is vacuous because at
+one token both arms take the fused decode path -- the r201 lesson).  Canonical `gate-prefill-logits.sh`:
+0.000050 / 99.667 % against the gfx1100 base.  `test-fusion-gate-beta-multiseq`: **33/33**.
+`scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball, tree equality, 286
+files through the Windows portability lint); `scripts/fork-refresh.sh --build --gates` re-cut the branch from
+the base and reproduced tree `85a00394` + tip `18001ddd7`.
+
+**Items.**  `TODO.md` **#130 closed** (removed; a closed item is this entry); `GREEDY-PURITY.md` **§81**
+extended with the switch's two arms and the "width-uniformity is not purity" rule; `patches/README.md`
+(blocks 08 and 10), `AGENTS.md` (the §81 critical-facts bullet: the RDNA3_0 residual it named is gone and a
+fuse-off A/B is a valid control again), `MANIFESTS.md` (release gate 10 now expects 33/33),
+`benchmarks/2026-11-01-kill-switch-arm-130.md`.
+
 ## 261101.009 (docs) -- r201 published: CI, the fork branch and the issue replies
 
 No delivery change.  `v16-6050b467c-r201` is tagged and pushed; `main` is at the r201 commit.  CI: **Validate

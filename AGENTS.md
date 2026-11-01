@@ -1295,10 +1295,15 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   fusion: `gate-prefill-logits.sh --ab "<its kill switch>=0"` at **`--ub 1` AND `--ub 4`**, plus
   `test-logits-width-probe P=4096` on the arms, and extend the type-correct unit oracle rather than trusting a
   sibling (`test-fusion-gate-beta-multiseq` covered BF16-at-1024 while every delivered GDN model runs Q8_0 at
-  K=5120).  Known residual: on **RDNA3_0** the `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` arm itself is not
-  width-uniform (W=1 vs W>=2, maxdiff 0.138) while the default build is -- `TODO.md` #130, a dedicated-session
-  item, and the reason a fuse-off A/B on gfx1100 is not a clean control.  `GREEDY-PURITY.md` §81,
-  `benchmarks/2026-11-01-ssm-softplus-265.md`.
+  K=5120).  **`GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates only the VERIFY band** -- the `ne[1] == 1` decode arm is
+  unconditional -- so pre-r201 the *default* build ran the wrong-softplus kernel at every width: width-uniform,
+  0-diff against itself, and wrong (issue #263's gfx1100 acceptance delta; the gfx1100 default arm moved
+  977/710 `sha=eca29f334d6a` -> 988/704 `sha=152af1d9feb7` with the fix, and its fuse-off arm now reads the same
+  numbers -- `v16-6050b467c-r202`).  So judge a fusion against **`GGML_CUDA_DISABLE_FUSION=1` (the chain)**, never
+  against the default, and treat a width-uniform PASS as no evidence of purity when the switch covers only part
+  of the band.  That also retires the "RDNA3_0 kill-switch arm is not width-uniform" residual: it was this same
+  softplus, and a fuse-off A/B on gfx1100 is a clean control again.  `GREEDY-PURITY.md` §81,
+  `benchmarks/2026-11-01-ssm-softplus-265.md`, `benchmarks/2026-11-01-kill-switch-arm-130.md`.
 - **The GDN decode folds are a 1-GPU win (r183, block 10, PR #256).**  The direct GDN conv now also writes the
   recurrent **snapshot tails** (`GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` off) and reads the **conv-cache row itself**
   for `build_rs`'s deferred `GET_ROWS` (`GGML_CUDA_FUSE_GDN_CONV_GATHER=0` off), and the 1-token direct conv

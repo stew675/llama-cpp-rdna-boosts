@@ -1,4 +1,4 @@
-From 4e7c50a15f175862f987045942013a79f7e50790 Mon Sep 17 00:00:00 2001
+From 852fd71983c8c9aaaac71e050ee495395f33e451 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -288,6 +288,13 @@ draft/accept counts (362/203); a --parallel 2 --kv-unified server run is clean (
 batch declines the gather deferral).  Flash-Next GSQ-IQ3_XXS `-sm tensor -ncmoe 48 -c 4096 -fa 1
 -ctk q8_0 -ctv q8_0` now loads and decodes (it aborted on r182 in ggml_cuda_cpy at cpy.cu:479,
 device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
+
+The gate/beta fusions' unit oracle covers both weight types at the delivered models' contraction length
+(r202, issue #265 follow-up): tests/test-fusion-gate-beta-multiseq.cpp runs {BF16, 1024}, {Q8_0, 1024}
+and {Q8_0, 5120} over the same 11 (T,S) shapes = 33 cases, because BF16-at-1024 alone is neither the
+type nor the shape any delivered GDN model runs (blk.N.ssm_alpha/beta.weight is Q8_0, K=5120) and that
+blindness is what let the softplus rounding difference ship for ten releases.  33/33 bit-identical and
+all fused on gfx1100 and gfx1201.
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
@@ -370,10 +377,10 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  src/llama-model.cpp                           |   80 +-
  src/llama-model.h                             |    7 +-
  tests/test-backend-ops.cpp                    |   60 +-
- tests/test-fusion-gate-beta-multiseq.cpp      |  278 +
+ tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 84 files changed, 15544 insertions(+), 5415 deletions(-)
+ 84 files changed, 15571 insertions(+), 5415 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -25162,10 +25169,10 @@ index 92601c191..87cd4b6d5 100644
      for (const auto & fa : {std::tuple<int,int,int,int,int>{256, 256, 8, 4, 256},
 diff --git a/tests/test-fusion-gate-beta-multiseq.cpp b/tests/test-fusion-gate-beta-multiseq.cpp
 new file mode 100644
-index 000000000..03ac81bd2
+index 000000000..cde9cdb3b
 --- /dev/null
 +++ b/tests/test-fusion-gate-beta-multiseq.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,305 @@
 +// Multi-sequence regression test for the GDN gate/beta decode fusions (issue #204).
 +//
 +// The GPU gate/beta fusions (GGML_CUDA_FUSE_GATE_BETA_BF16, mmvf.cu, and its Q8_0 sibling
@@ -25247,15 +25254,15 @@ index 000000000..03ac81bd2
 +// build the chain; `unfused` adds one extra consumer of the ADD output, which makes the fusion
 +// window ineligible (the intermediate would be read outside the window) while leaving the
 +// arithmetic identical.
-+static graph_t build_graph(int64_t nr, int64_t k, int64_t T, int64_t S, bool unfused) {
++static graph_t build_graph(int64_t nr, int64_t k, int64_t T, int64_t S, bool unfused, ggml_type wtype) {
 +    graph_t g;
 +    // no_alloc: the tensors are allocated below, into one backend buffer
 +ggml_init_params ip = { /*.mem_size =*/ 16 * 1024 * 1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
 +    g.ctx = ggml_init(ip);
 +    if (!g.ctx) { fprintf(stderr, "ggml_init failed\n"); exit(1); }
 +
-+    g.alpha_w = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, k, nr);
-+    g.beta_w  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_BF16, k, nr);
++    g.alpha_w = ggml_new_tensor_2d(g.ctx, wtype, k, nr);
++    g.beta_w  = ggml_new_tensor_2d(g.ctx, wtype, k, nr);
 +    g.y       = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32,  k, T * S);
 +    g.ssm_a   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32,  nr);
 +
@@ -25293,16 +25300,16 @@ index 000000000..03ac81bd2
 +};
 +
 +static result_t run_graph(graph_t & g, ggml_backend_t backend,
-+                          const std::vector<ggml_bf16_t> & wa,
-+                          const std::vector<ggml_bf16_t> & wb,
++                          const void * wa, size_t wa_bytes,
++                          const void * wb, size_t wb_bytes,
 +                          const std::vector<float> & y,
 +                          const std::vector<float> & dt,
 +                          const std::vector<float> & ssm_a) {
 +    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
 +    if (!buf) { fprintf(stderr, "alloc_ctx_tensors failed\n"); exit(1); }
 +
-+    ggml_backend_tensor_set(g.alpha_w, wa.data(), 0, wa.size() * sizeof(ggml_bf16_t));
-+    ggml_backend_tensor_set(g.beta_w,  wb.data(), 0, wb.size() * sizeof(ggml_bf16_t));
++    ggml_backend_tensor_set(g.alpha_w, wa, 0, wa_bytes);
++    ggml_backend_tensor_set(g.beta_w,  wb, 0, wb_bytes);
 +    ggml_backend_tensor_set(g.y,       y.data(),  0, y.size()  * sizeof(float));
 +    ggml_backend_tensor_set(g.ssm_a, ssm_a.data(), 0, ssm_a.size() * sizeof(float));
 +    ggml_backend_tensor_set(g.dt, dt.data(), 0, dt.size() * sizeof(float));
@@ -25363,7 +25370,6 @@ index 000000000..03ac81bd2
 +    if (!backend) { fprintf(stderr, "backend init failed\n"); return 1; }
 +
 +    const int64_t nr = 48;      // n_v_heads, as in the GDN models the fusion fires on
-+    const int64_t k  = 1024;    // contraction length (n_embd of the smallest such models is larger)
 +    const case_t cases[] = {
 +        { 1, 1 }, { 2, 1 }, { 3, 1 }, { 4, 1 },
 +        { 1, 2 }, { 1, 3 }, { 1, 4 },            // the multi-sequence shapes (#204)
@@ -25373,11 +25379,6 @@ index 000000000..03ac81bd2
 +    std::mt19937 gen(42);
 +    std::normal_distribution<float> dis(0.0f, 0.1f);
 +
-+    std::vector<ggml_bf16_t> wa(nr * k), wb(nr * k);
-+    for (int64_t i = 0; i < nr * k; ++i) {
-+        wa[i] = ggml_fp32_to_bf16(dis(gen));
-+        wb[i] = ggml_fp32_to_bf16(dis(gen));
-+    }
 +    std::vector<float> ssm_a(nr);
 +    for (int64_t i = 0; i < nr; ++i) {
 +        ssm_a[i] = -fabsf(dis(gen));   // -A_log.exp(), negative as in the models
@@ -25385,54 +25386,87 @@ index 000000000..03ac81bd2
 +
 +    int n_fired = 0;
 +    int n_failed = 0;
++    int n_shapes = 0;
 +
-+    for (const case_t & c : cases) {
-+        std::vector<float> y(k * c.T * c.S);
-+        std::vector<float> dt(nr);
-+        for (auto & v : y)  { v = dis(gen); }
-+        for (auto & v : dt) { v = dis(gen); }
++    // both siblings: GGML_TYPE_BF16 is the mmvf (GGML_CUDA_FUSE_GATE_BETA_BF16) epilogue and GGML_TYPE_Q8_0
++    // the mmvq one (GGML_CUDA_FUSE_GATE_BETA_VERIFY).  The quantized one is what every delivered GDN model
++    // actually runs (blk.N.ssm_alpha/beta.weight are Q8_0 in the qwen3.5/3.6/3.8 GGUFs), and k = 5120 is
++    // that model's contraction length.
++    const struct { ggml_type type; int64_t k; } wt[] = {
++        { GGML_TYPE_BF16, 1024 },
++        { GGML_TYPE_Q8_0, 1024 },
++        { GGML_TYPE_Q8_0, 5120 },
++    };
 +
-+        graph_t ga = build_graph(nr, k, c.T, c.S, /*unfused =*/ false);
-+        graph_t gb = build_graph(nr, k, c.T, c.S, /*unfused =*/ true);
-+
-+        const result_t a = run_graph(ga, backend, wa, wb, y, dt, ssm_a);
-+        const result_t b = run_graph(gb, backend, wa, wb, y, dt, ssm_a);
-+
-+        double max_diff = 0.0;
-+        size_t n_bad = 0;
-+        auto compare = [&](const std::vector<float> & x, const std::vector<float> & z) {
-+            for (size_t i = 0; i < x.size(); ++i) {
-+                if (memcmp(&x[i], &z[i], sizeof(float)) != 0) {
-+                    ++n_bad;
-+                    max_diff = std::max(max_diff, (double) fabsf(x[i] - z[i]));
-+                }
++    for (const auto & w : wt) {
++        const int64_t k = w.k;
++        std::vector<float> wa_f32(nr * k), wb_f32(nr * k);
++        for (int64_t i = 0; i < nr * k; ++i) {
++            wa_f32[i] = dis(gen);
++            wb_f32[i] = dis(gen);
++        }
++        // the weight blob the backend is given: BF16 rows, or the quantized block layout for Q8_0
++        std::vector<char> wa_buf(ggml_row_size(w.type, k) * nr);
++        std::vector<char> wb_buf(wa_buf.size());
++        if (w.type == GGML_TYPE_BF16) {
++            for (int64_t i = 0; i < nr * k; ++i) {
++                ((ggml_bf16_t *) wa_buf.data())[i] = ggml_fp32_to_bf16(wa_f32[i]);
++                ((ggml_bf16_t *) wb_buf.data())[i] = ggml_fp32_to_bf16(wb_f32[i]);
 +            }
-+        };
-+        compare(a.gate, b.gate);
-+        compare(a.beta, b.beta);
++        } else {
++            ggml_quantize_chunk(w.type, wa_f32.data(), wa_buf.data(), 0, nr, k, nullptr);
++            ggml_quantize_chunk(w.type, wb_f32.data(), wb_buf.data(), 0, nr, k, nullptr);
++        }
 +
-+        // at n_tokens == 1 the ADD->SOFTPLUS->MUL chain also has its own fold (GGML_CUDA_FUSE_GDN_GATE,
-+        // unary.cu), which skips the softplus node as well, so the sentinel cannot tell the two apart
-+        // there and the reference arm is not guaranteed to be unfused.  From n_tokens >= 2 that fold is
-+        // out of band and "softplus untouched" is specific to the gate/beta fusion.
-+        const bool strict_ref = c.T * c.S > 1;
-+        const bool ok = (n_bad == 0) && (!strict_ref || !b.fused);
-+        if (!ok) { ++n_failed; }
-+        if (a.fused) { ++n_fired; }
++        for (const case_t & c : cases) {
++            std::vector<float> y(k * c.T * c.S);
++            std::vector<float> dt(nr);
++            for (auto & v : y)  { v = dis(gen); }
++            for (auto & v : dt) { v = dis(gen); }
 +
-+        printf("nr=%2lld k=%4lld T=%lld S=%lld  fused=%s  reference_fused=%s  "
-+               "maxdiff=%.9g  mismatches=%zu  %s\n",
-+               (long long) nr, (long long) k, (long long) c.T, (long long) c.S,
-+               a.fused ? "yes" : "no ", b.fused ? "YES" : "no ", max_diff, n_bad,
-+               ok ? "OK" : "FAIL");
++            graph_t ga = build_graph(nr, k, c.T, c.S, /*unfused =*/ false, w.type);
++            graph_t gb = build_graph(nr, k, c.T, c.S, /*unfused =*/ true,  w.type);
 +
-+        ggml_free(ga.ctx);
-+        ggml_free(gb.ctx);
++            const result_t a = run_graph(ga, backend, wa_buf.data(), wa_buf.size(), wb_buf.data(), wb_buf.size(), y, dt, ssm_a);
++            const result_t b = run_graph(gb, backend, wa_buf.data(), wa_buf.size(), wb_buf.data(), wb_buf.size(), y, dt, ssm_a);
++
++            double max_diff = 0.0;
++            size_t n_bad = 0;
++            auto compare = [&](const std::vector<float> & x, const std::vector<float> & z) {
++                for (size_t i = 0; i < x.size(); ++i) {
++                    if (memcmp(&x[i], &z[i], sizeof(float)) != 0) {
++                        ++n_bad;
++                        max_diff = std::max(max_diff, (double) fabsf(x[i] - z[i]));
++                    }
++                }
++            };
++            compare(a.gate, b.gate);
++            compare(a.beta, b.beta);
++
++            // at n_tokens == 1 the ADD->SOFTPLUS->MUL chain also has its own fold (GGML_CUDA_FUSE_GDN_GATE,
++            // unary.cu), which skips the softplus node as well, so the sentinel cannot tell the two apart
++            // there and the reference arm is not guaranteed to be unfused.  From n_tokens >= 2 that fold is
++            // out of band and "softplus untouched" is specific to the gate/beta fusion.
++            const bool strict_ref = c.T * c.S > 1;
++            const bool ok = (n_bad == 0) && (!strict_ref || !b.fused);
++            if (!ok) { ++n_failed; }
++            if (a.fused) { ++n_fired; }
++            ++n_shapes;
++
++            printf("type=%s nr=%2lld k=%4lld T=%lld S=%lld  fused=%s  reference_fused=%s  "
++                   "maxdiff=%.9g  mismatches=%zu  %s\n",
++                   ggml_type_name(w.type), (long long) nr, (long long) k, (long long) c.T, (long long) c.S,
++                   a.fused ? "yes" : "no ", b.fused ? "YES" : "no ", max_diff, n_bad,
++                   ok ? "OK" : "FAIL");
++
++            ggml_free(ga.ctx);
++            ggml_free(gb.ctx);
++        }
 +    }
 +
 +    ggml_backend_free(backend);
 +
-+    printf("\n%d/%zu shapes fused; %d failed\n", n_fired, sizeof(cases) / sizeof(cases[0]), n_failed);
++    printf("\n%d/%d shapes fused; %d failed\n", n_fired, n_shapes, n_failed);
 +    if (n_fired == 0) {
 +        printf("FAIL: no shape exercised the fusion - the test verified nothing on %s\n", dev_name);
 +        return 2;

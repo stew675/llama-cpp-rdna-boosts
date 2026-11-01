@@ -516,7 +516,13 @@ gate chain's `MUL` as the `mmvf` dst, which gave the launch `n_seq_tokens` colum
 flat one-channel `y`, so every sequence but the first got sequence 0's alpha/beta gates (invisible to
 single-stream text/MTP gates; only multi-sequence serving saw it).  The switch still exists as an A/B
 kill-switch, and `tests/test-fusion-gate-beta-multiseq.cpp` is the gate that covers it — no model needed, so
-run it after touching any fusion that consumes a reshaped chain (`GREEDY-PURITY.md` §49).
+run it after touching any fusion that consumes a reshaped chain (`GREEDY-PURITY.md` §49; **r202**: 33 cases —
+`{BF16,1024}`, `{Q8_0,1024}`, `{Q8_0,5120}` x 11 `(T,S)` shapes — because a delivered GDN model's
+`ssm_alpha/beta.weight` is Q8_0 at K=5120, and BF16-at-1024 alone hid the softplus rounding for ten
+releases).  **`GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates only the VERIFY band**: the `ne[1] == 1` decode arm is
+unconditional, so `=0` compares the fused kernel at one token against the chain from two tokens on (a valid
+control -- it was an invalid one only while the fused kernel was not the chain, r201/r202), and the *default*
+build is the fused kernel at every width (`GREEDY-PURITY.md` §81).
 
 The same idiom — and therefore also default-on despite the name — covers
 `GGML_CUDA_DISABLE_IDX_RELU_SUM`, `GGML_CUDA_CONCAT_VERIFY`, (r46, block 15) `GGML_CUDA_FUSE_GDN_STATE_GATHER` and
