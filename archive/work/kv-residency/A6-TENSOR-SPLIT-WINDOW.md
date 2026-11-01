@@ -1,6 +1,13 @@
 # A6 — a windowed KV across a `-sm tensor` split: design note
 
-**Status: DESIGN ONLY — not implemented, not measurable on this box (one R9700).**  r181 ships the window
+**Status: SHIPPED in r204 (`TODO` #124) — this note is kept as the design record.**  It was written against a
+one-R9700 box (the delivery was developed before this host had three), so "not measurable here" below is about
+*that* box; on the 3x R9700 host C1-C5 were implemented and every arm was measured
+(`benchmarks/2026-11-01-kv-window-tensor-split-124.md`, gate `scripts/gate-kv-window-split.sh`).  The open
+questions in §8 were answered as: a split window is wanted (it now runs), a MIRRORED cache declines it, and the
+split `estimate()` conservatism outside the window arm stays its own item.
+
+**Then-status: DESIGN ONLY — not implemented, not measurable on that box (one R9700).**  r181 ships the window
 **single-device only**: the region buffer type is reached through `ggml_backend_dev_backend_reg(dev)`, and a
 Meta (tensor-split) device has no reg, so the window is declined with one message (HANDOVER invariant 13,
 `WORKLOG.md` 261030.005).  This note is the plan for closing that gap, plus the cross-check against

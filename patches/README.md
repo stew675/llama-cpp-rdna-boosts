@@ -51,7 +51,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248; + r203: PR #266's `g_dr_key_to_id` reindex in `moe_cache_forget_all` and the `heat_dec` tally in the lag policy) | +5261 / −947 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV  **The same block carries the ATTENDANCE POOL** (r190, Goal B of the same campaign): the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages, resolved by `GGML_OP_KV_POOL` -- a 204 MiB pool instead of 1.6-2.4 GiB of resident KV at 103k-180k depth, landing on the sparse decode ceiling, `--fit`-visible (the mirror is host RAM).  Both placements are **opt-in and default OFF** (fittability features; unset = byte-identical including the OOM) and mutually exclusive.  See the block section |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV  **The same block carries the ATTENDANCE POOL** (r190, Goal B of the same campaign): the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages, resolved by `GGML_OP_KV_POOL` -- a 204 MiB pool instead of 1.6-2.4 GiB of resident KV at 103k-180k depth, landing on the sparse decode ceiling, `--fit`-visible (the mirror is host RAM).  Both placements are **opt-in and default OFF** (fittability features; unset = byte-identical including the OOM) and mutually exclusive.  See the block section   + r204: the window also runs on a **tensor split** (`TODO` #124) -- one region per child device, the grow fanned out to every child, `--fit` charging the physical `W x cell_bytes` against the split's per-device budget; a mirrored dsv4/HRM cache declines it |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -3082,12 +3082,37 @@ byte-identical to a build without this block, including its OOM.
   a `no_alloc` probe that declines a window — so the probe takes the region buffer explicitly
   (`llama_kv_region_set_probe`, internal).  Without that (r178) the fit could not see the KV, reported an
   over-budget config and aborted instead of sizing the window (fixed in r179).
-* **One device only (r181).**  The window is one VMM region per device, and a tensor split (`-sm tensor`) has
-  no per-device region buffer type to hand out: its KV lives on the Meta wrapper, which has no backend reg, so
-  the region proc addresses cannot be reached through it.  A tensor split therefore **declines** the window
-  (one message from the fit and one from the cache, naming the split) and keeps the KV fully resident;
-  `-sm layer` and one device are unaffected.  Before r181 the reg lookup was an assert, so default `--fit`
-  aborted on **every** multi-device `-sm tensor` run (see the block-15 note in `WORKLOG.md` 261030.005).
+* **A tensor split (`-sm tensor`) carries the same window since r204 (`TODO` #124).**  The window is still one
+  VMM region **per device**: the Meta (tensor-split) device gets a Meta buffer type whose children are the
+  per-device region buffer types (`ggml_backend_meta_kv_region_buft`; all of them, or it declines), every child
+  commits the same `W` cells of **its own slice** at its own cell stride, and the cell watermark's grow fans out
+  to every child (`ggml_backend_meta_kv_region_grow`; a child it cannot reach is a refusal, never the silent 0
+  the CUDA hook returns for "not a region buffer" -- that 0 is a batch that faults the GPU).  `--fit` sizes it
+  for the split: the window is charged at its **physical** `W x cell_bytes` (the sum over devices), the per-device
+  check is the ratio-scaled `min_i(target_i / ratio_i)` the branch already fits against, and the Meta entry's
+  margin is the **sum** of the children's (it used to be child 0's, which omitted `(n_devices - 1) x -fitt`).
+  A MIRRORED cache (dsv4 / HRM, where every device holds the whole cache) is **declined**: `n_devices x W` cells
+  for one window, and the pinned-spill plan is per logical cache, so it would under-book by the device count.
+  Before r204 the Meta device had no backend reg, so the region proc addresses were unreachable through it and
+  the window was declined with one message (the r181 crash fix; see the block-15 note in `WORKLOG.md`
+  261030.005).
+* **Two paths a split exposed, fixed in the same block (r204).**  (a) The window's **init-time commit** was
+  rounded up to a whole map unit past the tensor's own extent; on a split every child region is its own VA
+  reservation, so the last tensor's inflated window ran past the end of a child reservation and its commit was
+  refused (`the KV window (4.00 MiB) could not be committed in VRAM on device 1`).  It is now clamped to the
+  region's end, in whole units.  (b) The **batched state save** issued one 2-D D2H per device
+  (`ggml_backend_cuda_get_tensor_2d_async`), and a 2-D copy needs a device-resident source: a windowed region's
+  spilled cells are pinned **host** memory mapped into its VA, so the checkpoint save failed
+  (`ROCm error: invalid argument`, `cache_k_l64 (view)`) and a restore wrote into the region's VA without mapping
+  the destination cells first (`grow_for` is what maps the right kind).  Both directions now go through the
+  region buffer's own copy for a region-backed tensor (contiguous rows in one copy), ordered behind the compute
+  stream like the pool mirror, and the projection (`set_tensor_2d`) is kept to a tight block only when **both**
+  pitches equal the width -- a caller's destination pitch is the split's full row, wider than one device's slice.
+  `scripts/gate-state-pipe.sh` with `LLAMA_KV_RESIDENT_CELLS` set is the arm that covers this.  (c) The slide
+  itself now flips **several whole mappings** in one `ensure_span` call: one batch can advance the boundary by
+  more than one unit, and a region whose unit is floored to the driver's granularity has smaller mappings than
+  the unit it was asked for (r204 measured it at a 1 MiB request on a 2 MiB granularity).  A request that covers
+  a mapping only in part is still refused.
 * **`-nkvo` declines the window, and the streamed arm keys on the PLACEMENT (r197).**  A window is one VMM
   region per device plus a pinned host tail, and the per-layer buffer type is chosen inside `if (offload)`:
   with `-nkvo` the cache is pageable host RAM end to end, so there is nothing to window.  The plan block's

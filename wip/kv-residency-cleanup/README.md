@@ -36,9 +36,11 @@ Shipped description: `patches/README.md` (block 15), `ENVIRONMENT.md` §17.  His
 
 **Out of scope here** (delivery items, not campaign work): `TODO` #128 (the gfx1201 decode-module MTP
 cost), #120 (`q4_0`/`q5_0`/`iq4_nl`/`bf16` KV write folds), #127 (`cpy_2d_vec16` is F32-only), #116 (FP8).
-`TODO` #124 (Goal A across `-sm tensor`) stays a TODO row with its design in
-[`archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`](../../archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md);
-it is hardware-blocked on a one-card box — **do not remove the placements' split refusals** without its arms.
+`TODO` #124 (Goal A across `-sm tensor`) **shipped in r204** — the window runs on a tensor split (one region per
+child device), so its design note
+[`archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`](../../archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md)
+is history and its arms are `scripts/gate-kv-window-split.sh` (plus the `LLAMA_KV_RESIDENT_CELLS` run of
+`scripts/gate-state-pipe.sh`); a MIRRORED dsv4/HRM cache still declines the window, deliberately.
 
 ---
 
@@ -142,7 +144,8 @@ open:
 * **O6 / a portable (non-RDNA) provider** (`README.md` §8 P5): close it — the delivery is RDNA-first by
   policy and a non-RDNA provider has no consumer.
 * **"The target context"** (`B1-STRATA-PLAN.md` §7(2)): record the answer — the single-GPU `-c 262144`
-  Flash-Next runme shape is this campaign's target; the multi-device `-ncmoe` server shape is `TODO` #124's.
+  Flash-Next runme shape is this campaign's target; the multi-device `-ncmoe` server shape is now supported by
+  the split window (r204, `TODO` #124) and measured there.
 * **The per-cache window exemption** (`B1-STRATA-PLAN.md` §7(3), a wip-only `LLAMA_KV_RESIDENT_CELLS_IDX`
   knob): close it — never built, and moot, because the pool keeps the indexer resident by construction.
 * **k-quant indexer keys** (accepted limitation: a 256-element superblock does not divide `idx_dim` = 128;

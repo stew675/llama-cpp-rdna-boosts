@@ -1346,3 +1346,51 @@ change), and let `WORKLOG.md` carry the narrative.
   (`gate-prefill-logits.sh` defaults to `~/llama.cpp/build-rocm/bin/llama-perplexity` for exactly this
   reason), and never read a cross-build text difference as a numeric change without checking
   `grep GGML_CUDA_FA_QUANTS <build>/CMakeCache.txt` on both sides.
+
+## The KV window on a tensor split (r204, `TODO` #124)
+
+- **A Meta (tensor-split) device carries no backend reg, so every KV-region answer for it must come from
+  `ggml_backend_meta_kv_region_*`.**  Those resolve each proc through a **child device's** reg and require
+  *every* child to answer: a region buffer type built for only some children is a window that covers part of
+  the cache and reports as if it covered all of it.  The same helpers are what `--fit` uses
+  (`ggml_backend_meta_kv_region_is_kv_buft`), because the CUDA predicate is an identity on the *child's*
+  `alloc_buffer` and cannot answer for a Meta buffer type.
+- **The grow hook must never return 0 for a buffer it does not understand.**  `ggml_backend_cuda_kv_region_grow`
+  returns 0 = "not a region buffer", which `llama_kv_cache::grow_regions` treats as success — for a Meta buffer
+  that is a silent success on unmapped VA and the next batch **faults the GPU** (not an error).  A Meta buffer
+  is fanned out by `ggml_backend_meta_kv_region_grow`, and a child buffer it cannot reach is a **refusal**
+  (-1), never a 0.
+- **A windowed region's initial commit must stay inside its own reservation and on the map grid.**  The commit
+  rounds each tensor's window UP to a whole map unit; on a split each child is its own VA reservation, so the
+  last tensor's inflated window ran past the end of a child reservation and was refused (`the KV window
+  (4.00 MiB) could not be committed in VRAM on device 1`).  Clamp to the region end, in whole units — a
+  shorter commit only loses at most the last partial unit, and nothing mapped is only ever a fresh host
+  mapping, never a partial flip.
+- **`ensure_span` may flip SEVERAL whole mappings in one request, but never a partial one.**  One batch can
+  advance the spill boundary by more than one unit, and a region whose unit is floored to the driver's
+  granularity has mappings smaller than the unit it was asked for (measured at `LLAMA_KV_REGION_UNIT_MIB=1` on a
+  2 MiB granularity: the request covered two mappings and the old exact-match check refused it, aborting the
+  batch).  A request that covers a mapping **in part** is still refused: a partial rewrite of a mapping loses
+  bytes on this driver.
+- **A 2-D device copy cannot serve a mixed host/VRAM region, and the batched state path is 2-D.**  A windowed
+  region's spilled cells are pinned host memory mapped into its VA, so `hipMemcpy2DAsync` D2H fails with
+  `invalid argument` on a range that begins in the host mapping (`cache_k_l64 (view)`, 1024 B x 4782 rows on a
+  2-GPU split's checkpoint save).  The region-backed directions of `get/set_tensor_2d_async` must fall back to
+  the region buffer's own copy (contiguous rows in one 1-D copy), **ordered behind the compute stream** like the
+  pool mirror — a blocking default-stream copy does not wait for it, and a state saved mid-batch is torn.
+  A tight block is only legal when **both** pitches equal the width: the caller's destination pitch is the
+  split's full row, wider than one device's slice (r204 shipped that bug for one gate run and the state-pipe
+  gate caught it).
+- **A MIRRORED cache (dsv4 / HRM) declines the window on a split.**  Every device holds the whole cache, so one
+  window costs `n_devices x W x cell_bytes` while the pinned-spill plan is built per logical cache — it would
+  under-book the spill by the device count and the run-time ceiling would then refuse a mapping mid-run.
+  `llama_model::kv_cache_split_mirrored()` is the one predicate (it mirrors the split-state callback's rule for
+  `cache_k_*`/`cache_v_*`).
+- **A split's window is sized against its per-device budget, not aggregate free VRAM.**  `--fit`'s Meta entry
+  used to carry child 0's `-fitt` margin; it is now the **sum** over the children (otherwise
+  `(n_devices - 1) x target` silently vanished from the budget).  The window is charged at its physical
+  `W x cell_bytes` (aggregate, because that is what all devices commit together), which makes the aggregate
+  check imply every device's: the loader shards the KV along the KV-head axis by the same `tensor_split` ratio
+  it shards the weights by, and `budget = min_i(target_i / ratio_i)`.  This correction applies **only** where a
+  window was asked for — a run without `LLAMA_KV_RESIDENT_CELLS` keeps the branch's old (conservative)
+  arithmetic exactly, so the split's pre-existing `ntd x` KV over-count is unchanged outside the window arm.

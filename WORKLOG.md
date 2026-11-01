@@ -1,3 +1,63 @@
+## 261101.016 (r204) -- the windowed KV across a `-sm tensor` split: `TODO` #124 closed, and four path defects fixed with it
+
+**Delivery change.  Block 15 amended** (the streamed KV), fork point unchanged (`6050b467c`), new tip
+**`aaf30b6b4`**, tree **`6260370949c1975c1ec5cb085bf5e937a2677cf1`**, release **`v16-6050b467c-r204`**.
+`TODO` #124 is **retired**: the release is its record, the gate is `scripts/gate-kv-window-split.sh`, and the
+numbers are in [`benchmarks/2026-11-01-kv-window-tensor-split-124.md`](benchmarks/2026-11-01-kv-window-tensor-split-124.md).
+
+**What #124 was.**  Block 15's resident window (`LLAMA_KV_RESIDENT_CELLS`) was single-device only: the window is
+one VMM region per device, a Meta (tensor-split) device has no backend reg of its own, so the region proc
+addresses were unreachable through it and the cache declined with one message (the r181 crash fix).  The design
+note (`archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md`, five changes C1-C5) was written against a
+one-GPU box and never implemented.  This box has three R9700s, so it was implemented and measured.
+
+**The change (block 15).**  `ggml_backend_meta_kv_region_buft/is_kv_buft/grow` (new, `ggml-backend.h`): the Meta
+buffer type over the per-child region buffer types (all children or nothing), the is-a-region predicate `--fit`
+needs, and a grow that fans out to every child and **refuses** (-1) where a child cannot be reached -- the CUDA
+hook returns 0 for "not a region buffer", and for a Meta buffer that 0 was a silent success on unmapped VA, i.e.
+a batch that page-faults the GPU.  `llama_kv_cache` resolves capability/buft/budget/link through the Meta side,
+declines a MIRRORED cache (dsv4/HRM: `llama_model::kv_cache_split_mirrored()`, `n_devices x` cost and an
+under-booked pinned spill) with its own message, and `common/fit.cpp` sizes the window for the split in the
+tensor-split branch: charged at its physical `W x cell_bytes`, checked against `min_i(target_i / ratio_i)`, with
+the Meta entry's margin now the **sum** of the children's (it was child 0's, so `(n_devices - 1) x -fitt` vanished
+from the budget).  The corrected KV term applies **only** where a window is asked for -- a run without the knob
+keeps the branch's old arithmetic exactly, and the split's pre-existing `n_devices x` KV over-count is left for
+its own item.
+
+**Four defects found by the arms, all fixed here** (each one would have shipped a lie or a crash):
+(a) the init-time window commit was rounded up past the tensor's extent, and on a split each child is its own VA
+reservation -- the last tensor's inflated window was refused (`the KV window (4.00 MiB) could not be committed in
+VRAM on device 1/2`, twice per 4B/split run); it is now clamped to the region end in whole units (clamping to the
+tensor's own extent is wrong: it leaves a short mapping off the grid and the next slide refuses to flip);
+(b) `ensure_span` refused a request covering several whole mappings -- one batch can advance the boundary by more
+than one unit and a 1 MiB unit is floored to the driver's 2 MiB granularity, which aborted the batch on
+`win2fine`; whole mappings now flip one at a time, a *partial* coverage is still refused;
+(c) the **batched state save** issued a 2-D D2H per device, and `hipMemcpy2DAsync` fails (`invalid argument`) when
+the range begins in a spilled region's pinned host mapping -- the tensor-split checkpoint save aborted
+(`cache_k_l64 (view)`, 1024 B x 4782 rows, found on the `draft-mtp` arm); the region-backed directions now fall
+back to the region buffer's own copy, ordered behind the compute stream (without that wait the save is torn);
+(d) that fallback's "contiguous rows = one copy" shortcut ignored the caller's destination pitch, which for a
+split splice is the **full** row (wider than one device's slice) -- the state-pipe gate failed on every cycle of
+all four async arms until both pitches were required to equal the width.  (c) and (d) are why
+`scripts/gate-state-pipe.sh` with `LLAMA_KV_RESIDENT_CELLS` set is now a required companion arm.
+
+**Verified** (all on gfx1201, `ROCBLAS_USE_HIPBLASLT=0` for every fresh-process pair): text byte-identical on
+`win3 == ref3` (3 devices, 4B, `057ea27b1009`) and `win2 == ref2 == win2mtp == ref2mtp` (2 devices, 27B, 5246-token
+prompt, `7a7430617465`, draft acceptance 0.46154 in both MTP arms), also at a 1 MiB map unit; the spill is real on
+**every** device (32 mapping flips each at 4 MiB, 128 at 1 MiB); a `-c 1048576` 2-device split (64 GiB of f16 KV)
+runs only because of the window; the single-device and `-nkvo` arms are unchanged; `--fit` on the split reports a
+WINDOWED cache and keeps the pinned `-c 524288` (also the pinned-RAM ceiling's widen and drop arms, and
+`LLAMA_KV_REGION=0` silent); **coherence identical to the r203 build** on four no-window arms (3-GPU 4B
+`057ea27b1009`, 2-GPU and 1-GPU 27B `7a7430617465`, 2-GPU host-expert 35B-A3B `e9db5cb8db0b`); prefill-logit
+**0.000000 / 100.000 %**; Protocol A four-axis R/P/C/K **1.91x/2.43x/2.58x/2.74x**, acceptance
+0.5869/0.8391/0.9112/0.9920 (the r90 shape: decode untouched); `gate-spec-draft-window.sh` 6/6 `win == win0`;
+`gate-state-pipe.sh` 2-GPU `-sm tensor` PASS both with and without the window (the windowed arm was FAIL before (c)
+and (d)); `GGML_CUDA_VMM_REGION_SELFTEST=1` PASS with a new multi-mapping-flip arm; per-block build 1/1 (block 15,
+26 s); `validate-set.sh` strict 16/16 tree `6260370d`; `check-gpu-faults.sh` clean on the kernel journal and every
+windowed/split/MTP/state-pipe log.  Docs: `patches/README.md` (block 15), `MANIFESTS.md` (block row, new release
+gate 16, per-block row), `ENVIRONMENT.md`, `INVARIANTS.md` (a new section: six facts), `scripts/README.md`,
+`TODO.md` (`#124` removed), `benchmarks/2026-11-01-kv-window-tensor-split-124.md`.
+
 ## 261101.015 (docs) -- GREEDY-PURITY.md compressed to the claim/rule/numbers/record shape; every narrative preserved in the findings archive
 
 No delivery change (docs only; no tag).  The rulebook went **2730 -> 2201 lines** while
