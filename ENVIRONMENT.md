@@ -317,6 +317,14 @@ MTP draft buffer (762 MiB), the FA-QSA workspace (762 MiB), hipBLASLt's Tensile 
 workspace, and the workspace-pool high-water mark.  So ~200-350 MiB free is normal, and raising the headroom
 raises it one-for-one (8192 -> ~4.3 GiB free) at the cost of an equal amount of arena.
 
+> **At the VRAM cliff, raise the headroom instead of dropping hipBLASLt (r194).**  Measured on Flash-Next
+> (qwen4exp, `-ncmoe 48`, q8_0 KV, `-c 262144`, block 15's attention pool, one R9700, 1 slot): the default
+> 768 MiB left `hipBLASLt out of memory` on the **first prefill** (`hipblaslt.cpp:169`) while the server stayed
+> healthy and the request failed with no reply.  `GGML_CUDA_SLAB_HEADROOM_MIB=1536` served 3/3 requests clean
+> with the arena at 19.12 GiB instead of 19.88, and `ROCBLAS_USE_HIPBLASLT=0` also worked (up to -15 % decode).
+> The same config is fine at `-c 131072` with the default.  So this is a budget fact of running a 262144-token
+> context on a 32 GiB card, not a pool bug: every MiB of headroom is arena you chose not to take.
+
 > **Do not disable hipBLASLt to buy headroom.**  The ROCm BLAS stack allocates its own Tensile code objects
 > and workspace behind the application's back, and that class of allocation CANNOT be routed into the slab.
 > Measured with `ROCBLAS_USE_HIPBLASLT=0` at `GGML_CUDA_SLAB_HEADROOM_MIB=2048`: the output was CORRUPT
@@ -936,7 +944,7 @@ gap (7-12 % at depth, `patches/README.md` block 15).
 
 | variable | default | what it does |
 |---|---|---|
-| `LLAMA_KV_REGION_POOL` | **unset = off** | Pool size in **CELLS per layer**.  Pages are one indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots; it is floored at one decode band's worth of blocks and padded to the cache's own cell alignment, so the effective size can be slightly larger (204 MiB at the measured shape).  `0` = off.  Declines (one message, KV unchanged) on anything but a single-stream, non-MLA, uniformly-geometried, device-offloaded qwen4exp trunk cache with no window active, and when the pinned mirror would exceed `LLAMA_KV_SPILL_RAM_PCT`.  **`--fit` sees the pool**: the mirror is charged to host RAM and only the pool to VRAM, so a context that only fits with the pool is accepted with it (r190). |
+| `LLAMA_KV_REGION_POOL` | **unset = off** | Pool size in **CELLS per layer**, **capped at the cache's own cell count** (r194: a request bigger than the context used to take a 12.4 GiB device pool of 250 000 pages on a 262 144-cell cache; pages past the last block are never claimed), floored at one decode band and padded to the cache's cell alignment.  Pages are one indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots; it is floored at one decode band's worth of blocks and padded to the cache's own cell alignment, so the effective size can be slightly larger (204 MiB at the measured shape).  `0` = off.  Declines (one message, KV unchanged) on anything but a single-stream, non-MLA, uniformly-geometried, device-offloaded qwen4exp trunk cache with no window active, and when the pinned mirror would exceed `LLAMA_KV_SPILL_RAM_PCT`.  **`--fit` sees the pool**: the mirror is charged to host RAM and only the pool to VRAM, so a context that only fits with the pool is accepted with it (r190). |
 | `LLAMA_KV_POOL_VERIFY` | unset (presence) | The oracle: every page selected by a decode step is compared byte-for-byte with the mirror at read time and a mismatch is counted (the teardown line reports `bad`).  Expected **0**.  It costs a second pass over the selected pages, so never quote a timing from this arm. |
 | `LLAMA_KV_POOL_STATS` | unset (**a path**) | At every cache teardown append one line -- pages x cells, claims, misses, ids, hit %, dirty re-fills, resolves, `bad` -- to this file.  A **path**, not a flag: a line on stderr would land between the generated text and `llama-cli`'s perf line and break `scripts/extract-generated.py`.  Reads the counters back once, so it is not default-on. |
 

@@ -3075,6 +3075,37 @@ differ as required), `gate-state-pipe.sh` (35B, `-c 65536`: all five arms) — a
 window = 32768 cells` in the logs.  Release gates: `validate-set.sh` 16/16 + tree equality, per-block build,
 and the MTP Protocol A arm above.
 
+**r194 — three corners the r193 release hit in practice.**  Found by running the released build against
+Flash-Next (qwen4exp, `-ncmoe 48`, `-c 262144`, the pool) in a configuration battery:
+
+* **The pool is now capped at the cache.**  `LLAMA_KV_REGION_POOL=1000000` used to allocate a 12.4 GiB device
+  pool of 250 000 pages on a 262 144-cell context (65 536 blocks).  Pages past the cache's last block are never
+  claimed, so the request is clamped to the cache's cell count: the same arm now takes 3264 MiB / 65 536 pages,
+  which is the most it can use.  A small context is clamped the same way (`-c 8192` -> 2048 pages, the whole
+  cache).  Requested sizes below one decode band are still floored to the band, and a non-page-multiple is
+  still padded.
+* **The draft KV window no longer sizes a SEPARATE draft's reserve.**  Flash-Next's MTP head is a `-md` GGUF
+  whose draft context keeps its full `-c` cache, but the reserve estimate applied the window to it anyway:
+  921 MiB derived where the honest number is 1566 (kv 217 instead of 862) at `-c 262144`.  That is the
+  under-charge direction the reserve header warns about.  The window now enters the estimate only for a
+  `shares_model` draft, i.e. the embedded-head cache `create_memory` actually windows (35B stays at 776 MiB).
+* **The VRAM cliff needs a bigger outside cushion, and that is a config fact, not a code change.**  At
+  `-c 262144` on a 32 GiB card with experts on the host, the slab's default headroom (768 MiB on one GPU) is
+  one hipBLASLt workspace short: the first *prefill* fails with a hard `hipBLASLt out of memory` while the
+  server stays healthy.  `GGML_CUDA_SLAB_HEADROOM_MIB=1536` is 3/3 requests clean (arena 19.12 instead of
+  19.88 GiB), and `ROCBLAS_USE_HIPBLASLT=0` is the other way out at up to -15 % decode.  Documented in
+  `ENVIRONMENT.md` §1.3.
+
+**The battery's other verdicts (all as designed, no code change):** pool + `LLAMA_KV_RESIDENT_CELLS` declines
+("the windowed KV is already active"); `LLAMA_KV_SPILL_RAM_PCT=1` declines loudly ("no room for the mirror")
+while `=0` (no cap) enables; `-np 2` without `--kv-unified` declines (single stream required) and **with**
+`--kv-unified` it is eligible and text-identical to the pool-off arm on both a short and a 4 194-token prompt
+(0 verify mismatches, two concurrent requests); `--fit on` with `-c 0` sizes and runs; q4_0 and bf16 KV both
+work (108 / 385 MiB pools); `-c 8192` pools the whole cache; and a run without MTP is unaffected.  One
+pre-existing failure is *not* ours: `-nkvo` with host experts (`-ncmoe 48`) aborts in
+`ggml_backend_sched_copy_input` (`GGML_ASSERT(id >= 0 && id < n_expert)`) with the pool off, with no
+speculation, and on the released r191 binary too.  Filed as `TODO` #129.
+
 **Goal A's `auto` policy is P1 and stays P1** (the arena keeps winning the VRAM; the arena half of Goal A
 needs a numeric `W`).  P2 (unconditional arena-first) was rejected — a fit cannot know the run's depth and a
 `W` 35k cells below it costs 11-26 % — and P3 (an explicit per-token spill budget) is parked until measured.

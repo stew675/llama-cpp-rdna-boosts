@@ -1,4 +1,4 @@
-From ed8605eb4761041d6fada38c180083096a3cbc54 Mon Sep 17 00:00:00 2001
+From 9803bed38ba84453d995f0477f9f5589b8a98cea Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -248,9 +248,20 @@ Measured (1 GPU; one R9700; `-n 2000`/`-n 3000`; static depth 3; interleaved):
 * gates on a windowed draft: `gate-park-idle-slots.sh` (35B, -ncmoe 48, `-c 65536`: 3 park moves, park ==
   lazyoff), `gate-ckpt-reuse.sh` (4B, `-c 131072`: draft cache 33280 of 131072), `gate-state-pipe.sh` (35B,
   `-c 65536`: all five arms) -- all PASS with `MTP draft KV window = 32768 cells` in their logs.
+
+r194 corner fixes (found by a configuration battery against Flash-Next after r193):
+* LLAMA_KV_REGION_POOL is capped at the cache's own cell count.  =1000000 on a 262144-cell context used to
+  take a 12451 MiB device pool of 250000 pages where only 65536 blocks exist (never claimed, arena -4 GiB);
+  it is now 3264 MiB / 65536 pages, and a small context clamps the same way.
+* the draft KV window sizes only the reserve of the cache it actually windows.  A separate -md MTP head
+  (Flash-Next) keeps its full -c cache, but the reserve was derived with the window: 921 MiB where the
+  honest number is 1566 (kv 217 vs 862) at -c 262144, the under-charge direction.  Embedded heads
+  (qwen3.5/3.6/3.8) are unchanged (776 MiB on the 35B).
+The VRAM cliff at -c 262144 is documented (not code): the 768 MiB default headroom is one hipBLASLt
+workspace short for the first prefill, GGML_CUDA_SLAB_HEADROOM_MIB=1536 is 3/3 requests clean.
 ---
  common/common.cpp                          |   20 +-
- common/draft-reserve.cpp                   |   34 +-
+ common/draft-reserve.cpp                   |   38 +-
  common/draft-reserve.h                     |    6 +-
  common/fit.cpp                             |  278 ++++-
  ggml/include/ggml-rpc.h                    |    4 +-
@@ -269,7 +280,7 @@ Measured (1 GPU; one R9700; `-n 2000`/`-n 3000`; static depth 3; interleaved):
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
  src/llama-ext.h                            |   51 +
- src/llama-kv-cache.cpp                     |  823 ++++++++++++-
+ src/llama-kv-cache.cpp                     |  827 +++++++++++++-
  src/llama-kv-cache.h                       |   94 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
  src/llama-memory-hybrid-idx.h              |    4 +-
@@ -278,7 +289,7 @@ Measured (1 GPU; one R9700; `-n 2000`/`-n 3000`; static depth 3; interleaved):
  src/llama-memory.h                         |   15 +
  src/llama-model.cpp                        |   82 +-
  src/models/qwen4exp.cpp                    |   58 +-
- 29 files changed, 4330 insertions(+), 53 deletions(-)
+ 29 files changed, 4338 insertions(+), 53 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -319,7 +330,7 @@ index 5a137512e..a60b0279f 100644
          }
      }
 diff --git a/common/draft-reserve.cpp b/common/draft-reserve.cpp
-index c16a68e69..bd99e1f12 100644
+index c16a68e69..2c1581c87 100644
 --- a/common/draft-reserve.cpp
 +++ b/common/draft-reserve.cpp
 @@ -4,6 +4,8 @@
@@ -371,7 +382,7 @@ index c16a68e69..bd99e1f12 100644
      if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
          r.note = "draft GGUF has no usable block_count";
          gguf_free(g);
-@@ -197,7 +214,13 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -197,7 +214,17 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                                : 0.0;
      // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
@@ -380,13 +391,17 @@ index c16a68e69..bd99e1f12 100644
 +    // The MTP drafter's KV window (llama-ext.h) is honoured here for the same reason the cache takes it: the
 +    // estimate is what the slab holds back in `aux_reserve`, so an un-windowed estimate leaves the freed VRAM
 +    // unspent instead of handing it to the expert arena.
-+    const uint32_t draft_window = llama_spec_draft_window_cells(n_ctx, n_ubatch);
++    // The draft KV window applies ONLY to an embedded MTP head (`shares_model`), which is the cache
++    // `create_memory`'s plain kv_cache branch builds.  A separate draft GGUF (qwen4exp's `-md` MTP head) keeps
++    // its full `-c` cache, so sizing ITS reserve by the window under-charges it by (n_ctx - W) cells -- the
++    // direction the file's header calls dangerous.
++    const uint32_t draft_window = shares_model ? llama_spec_draft_window_cells(n_ctx, n_ubatch) : 0;
 +    const uint32_t kv_cells     = draft_window != 0 ? std::min(n_ctx, draft_window + n_ubatch) : n_ctx;
 +    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
  
      // --- compute + slack: measured tiers -------------------------------------------------------
      // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
-@@ -211,13 +234,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -211,13 +238,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      r.ok    = r.total > 0;
  
      LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"
@@ -4147,7 +4162,7 @@ index 0079595f5..75a1794ed 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..5d4eabdee 100644
+index b3f3a9c87..ba27f112c 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,242 @@ static bool ggml_is_power_of_2(int n) {
@@ -4403,7 +4418,7 @@ index b3f3a9c87..5d4eabdee 100644
      model(model), hparams(hparams), v_trans(v_trans),
      n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
      n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_type(swa_type),
-@@ -187,6 +424,226 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +424,230 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -4603,6 +4618,10 @@ index b3f3a9c87..5d4eabdee 100644
 +                const uint32_t band = 8;   // the QSA decode band (`QSA_DECODE_BAND` in qwen4exp.cpp)
 +                uint32_t cells = std::max<uint32_t>(req, band*blocks_row*page);
 +                cells = GGML_PAD(cells, n_pad > 1 ? n_pad : page);
++                // a pool bigger than the cache can never be more than 100 % resident, and pages past the
++                // cache's last block are never claimed: clamp, or `LLAMA_KV_REGION_POOL=1000000` on a
++                // 262144-cell context took a 12.4 GiB device pool (250000 pages) for 65536 usable ones.
++                cells = std::min<uint32_t>(cells, (uint32_t) kv_size);
 +                const uint32_t n_pages  = (cells + page - 1)/page;
 +                const uint32_t n_blocks = (uint32_t) ((kv_size + page - 1)/page);
 +
@@ -4630,7 +4649,7 @@ index b3f3a9c87..5d4eabdee 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +700,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +704,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -4671,7 +4690,7 @@ index b3f3a9c87..5d4eabdee 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -252,11 +743,24 @@ llama_kv_cache::llama_kv_cache(
+@@ -252,11 +747,24 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -4698,7 +4717,7 @@ index b3f3a9c87..5d4eabdee 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -265,13 +769,38 @@ llama_kv_cache::llama_kv_cache(
+@@ -265,13 +773,38 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -4739,7 +4758,7 @@ index b3f3a9c87..5d4eabdee 100644
      }
  
      if (reuse) {
-@@ -319,6 +848,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -319,6 +852,29 @@ llama_kv_cache::llama_kv_cache(
          ctxs_bufs.emplace_back(std::move(ctx), buf);
      }
  
@@ -4769,7 +4788,7 @@ index b3f3a9c87..5d4eabdee 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -425,6 +977,9 @@ void llama_kv_cache::clear(bool data) {
+@@ -425,6 +981,9 @@ void llama_kv_cache::clear(bool data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
@@ -4779,7 +4798,7 @@ index b3f3a9c87..5d4eabdee 100644
      }
  }
  
-@@ -743,6 +1298,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -743,6 +1302,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -4790,7 +4809,7 @@ index b3f3a9c87..5d4eabdee 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -798,6 +1357,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -798,6 +1361,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -4824,7 +4843,7 @@ index b3f3a9c87..5d4eabdee 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1023,9 +1609,32 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1023,9 +1613,32 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      for (const auto & [ctx, buf] : ctxs_bufs) {
          ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
  
@@ -4858,7 +4877,7 @@ index b3f3a9c87..5d4eabdee 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1035,6 +1644,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1035,6 +1648,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -4893,7 +4912,7 @@ index b3f3a9c87..5d4eabdee 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1551,6 +2188,149 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1551,6 +2192,149 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -5043,7 +5062,7 @@ index b3f3a9c87..5d4eabdee 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1612,6 +2392,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1612,6 +2396,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -5070,7 +5089,7 @@ index b3f3a9c87..5d4eabdee 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -1890,6 +2690,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1890,6 +2694,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -5080,7 +5099,7 @@ index b3f3a9c87..5d4eabdee 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3314,6 +4117,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3314,6 +4121,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -5090,7 +5109,7 @@ index b3f3a9c87..5d4eabdee 100644
      return true;
  }
  
-@@ -3487,6 +4293,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3487,6 +4297,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  

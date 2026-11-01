@@ -1,3 +1,50 @@
+## 261031.015 (r194) -- block 15 corner-case fixes: the attention pool is capped at the cache, the draft window no longer sizes a separate draft's reserve, and the VRAM cliff is documented
+
+**Released as `v16-6050b467c-r194` (16 blocks, block 15 amended).**  Both fixes came out of a configuration
+battery run against Flash-Next (qwen4exp, `-ncmoe 48`, q8_0 KV, `-c 262144`, block 15's attention pool, one
+R9700) after the r193 release, i.e. the corners are the ones a real user of the runme shape hits.
+
+**Fixed.**
+1. **`LLAMA_KV_REGION_POOL` is capped at the cache.**  `=1000000` on a 262 144-cell context allocated a
+   **12 451 MiB device pool of 250 000 pages**, where the cache only has 65 536 blocks: pages past the last
+   block are never claimed, and the arena dropped to 7.88 GiB for nothing.  The pool is now clamped to the
+   cache's cell count (3264 MiB / 65 536 pages at that context), and a small context clamps the same way
+   (`-c 8192` -> 2048 pages, the whole cache).
+2. **The draft KV window sizes only the reserve of the cache it actually windows.**  Flash-Next's MTP head is
+   a separate `-md` GGUF, whose draft context keeps its full `-c` cache, but `common_draft_reserve_estimate`
+   applied the window to it anyway: **921 MiB** derived where the honest number is **1566** (kv 217 instead of
+   862) at `-c 262144`.  That is the under-charge the reserve header calls dangerous (in the run, the draft's
+   compute region took 1.5 GiB back from the arena).  The window now enters the estimate only for a
+   `shares_model` draft, the embedded-head cache `create_memory` windows; the 35B embedded-head arm is
+   unchanged at 776 MiB.
+
+**Documented, not code: the VRAM cliff.**  At `-c 262144` the slab's default outside cushion (768 MiB on one
+GPU) is one hipBLASLt workspace short: the first **prefill** dies with `hipBLASLt out of memory`
+(`hipblaslt.cpp:169`) while the server stays healthy and the request fails with no reply.  It is
+order-dependent (`hipBLASLt` picks its solution per process), so it looks flaky.  `GGML_CUDA_SLAB_HEADROOM_MIB=1536`
+served **3/3** requests clean with the arena at 19.12 instead of 19.88 GiB; `ROCBLAS_USE_HIPBLASLT=0` also
+worked, at up to -15 % decode.  `-c 131072` is fine at the default.  `ENVIRONMENT.md` §1.3 and block 15's note
+carry it, and the local `runme` in the Flash-Next directory sets 1536.
+
+**The battery's other verdicts, all as designed.**  pool + `LLAMA_KV_RESIDENT_CELLS` declines ("the windowed KV
+is already active"); `LLAMA_KV_SPILL_RAM_PCT=1` declines loudly ("no room for the mirror") while `=0` (no cap)
+enables; `=1` cell is floored to one decode band (4104 pages) and `=16001` is padded to it; `-np 2` without
+`--kv-unified` declines (single stream required) and **with** `--kv-unified` it is eligible and **text
+identical** to the pool-off arm on a short and a 4 194-token prompt (two concurrent requests, 0 verify
+mismatches); `--fit on -c 0` sizes and runs; q4_0 and bf16 KV both work (108 / 385 MiB pools); `-c 8192` pools
+the whole cache; no-MTP is unaffected; and the deep arms at `-c 131072`/`262144` produce the same text with
+`LLAMA_KV_POOL_VERIFY=1` and 0 mismatches.
+
+**One pre-existing failure is NOT ours**, now `TODO` #129: `-nkvo` with host experts (`-ncmoe 48`) aborts in
+`ggml_backend_sched_copy_input` (`GGML_ASSERT(id >= 0 && id < n_expert)`, the expert-cache fallback's host ids
+read) with the pool off, with `--spec-type none`, and **on the released r191 binary**.  A dense model with
+`-nkvo` is fine; the host-expert combination is what fails.  It needs its own session.
+
+**Release mechanics.**  Block 15 amended on the `rdna-boosts` branch, the 16-patch set regenerated from the new
+tip, `release.json` refreshed (`v16-6050b467c-r194`), `scripts/validate-set.sh` green, `fork-refresh.sh
+--build --gates` on the re-cut, tag pushed and the fork's `rdna-boosts` branch force-pushed to the re-cut tip
+(https push, per the A10 note about ssh auth on this box).
+
 ## 261031.014 (r193) -- Goal C delivered: block 15 gains the MTP draft window (default ON), and an embedded MTP head's slab reserve is derived with it (arena +2.8 GiB)
 
 **Released as `v16-6050b467c-r193` (16 blocks, block 15 amended).**  Canonical tip `f9471b969`, tree
