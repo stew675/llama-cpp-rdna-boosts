@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses) | +14966 / −5067 | 83 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses; + r198: PR #260's mixed K-quant x Q6_K row concat, its `.inc` ksplit body and the codegen fix for the r192 MTP hold) | +15445 / −5415 | 84 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228; + r190: the fused indexer scorer and the derived indexer pool read **quantized** indexer keys (q8_0 + the q4/q5 family + iq4_nl), so `-ctk q8_0` takes the fast path, TODO #118) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1781,6 +1781,55 @@ reproduce; their gfx1100 +3.5 % is their box.
 `llama-batched-bench -npl 1,4,8` flat (124.3 -> 127.2 / 322.5 -> 319.5 / 414.7 -> 417.3), the canonical
 27B Q8_0 prefill-logit gate **0.000000 / 100.000 %**, per-block build 2/2, `validate-set.sh` green, no GPU
 faults.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
+
+#### r198 — the dense row concat across a K-quant x Q6_K pair (PR #260)
+
+**What it is.**  The r177 RDNA4 row concat required all three Q/K/V weights to share a type, but in the
+K-quant "M" mixes `attn_v` is `Q6_K` in about half the layers while Q/K are `Q4_K`, `Q5_K` or `IQ4_XS`
+(Qwen3-Coder-30B-A3B Q4_K_M: 12 of 48 attention layers; Qwen3.6-35B-A3B: 6 of 10), so V kept its own
+launch.  `mul_mat_vec_q_ksplit_cat2<type, Q6_K>` runs the `Q6_K` body (with that segment's own row stride)
+for V's row blocks and the launch type's body for the rest; both types must take the same nwarps (a
+`static_assert`), every segment's row count must be even (a 2-row block must not straddle a boundary), and
+the launch tensor must be the largest segment (its row count sizes the row guards).  The matcher takes
+either graph order (the r180 rotate puts V first) and, in the mixed case, requires every segment that runs
+the **launch** type's body to share the launch tensor's `nb[1]` as well as its type — the kernel passes one
+row stride for those blocks, so a padded view would otherwise be read at the wrong offset.  Kill switch
+`GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0` (it restores exactly the same-type-only matcher).
+
+**The codegen lesson (this is why the first cut cost 7 % of MTP).**  The first submission turned
+`mul_mat_vec_q_ksplit` into an inlined `__device__` body called by the kernel.  That compiled the
+**multi-column verify kernels** differently on gfx1201 (Q4_K ncols 5: 118 -> 97 VGPRs, 864 -> 1029
+instructions), and cost **6-7 % of MTP decode** (dense 27B, `draft-mtp`, 1 GPU 76.2 -> 70.7 t/s, 3 GPU
+`-sm tensor` 133.4 -> 126.4) with an identical kernel/graph census, compute buffers, text and acceptance.
+The re-cut moves the body verbatim into `mmvq-ksplit-body.inc` and `#include`s it into the unchanged kernel
+and into the cat2 launch, so the pre-existing kernel's source tokens (and its compiled code) are unchanged —
+verified with a per-kernel VGPR census of the MTP profile (the only new kernels are the two cat2
+instantiations).  This is `GREEDY-PURITY.md` §80 and closed `TODO` #128.
+
+**Reach and worth.**  Fires only on a GGUF whose attention mixes a K-quant with `Q6_K` (the UD files carry
+`Q8_0` attention and are inert).  Qwen3-Coder-30B-A3B Q4_K_M, f16 KV, 3 interleaved rounds: tg128
+**161.54 -> 162.57 t/s (+0.6 %)**, @4096 **137.69 -> 139.14 (+1.05 %)**, 3 GPU `-sm tensor` tg128
+**171.62 -> 173.53 (+1.1 %)**.  Census: 168 `cat2` launches replace 168 standalone `Q6_K` launches over the
+8-step run.  The MTP arm is fully restored: 1 GPU **76.4/76.4/76.3/76.5/76.3 -> 76.3/76.2/76.3/76.4/76.3**
+and 3 GPU tensor **133.0/134.1/133.9 -> 133.8/134.2/133.8**, drafts 417/360 and 670/575 identical.
+
+**Purity.**  Every row still computes its own one-warp dot product, so the concat is bit-identical: 30B-A3B
+greedy text `1065 chars sha=000d77b327e9` (f16), `1131 chars sha=9fb5b1832d34` (q8_0 KV) and
+`1019 chars sha=bbdb61ea2adb` (3 GPU tensor) identical base vs patch; 27B `draft-mtp n3`
+`1270 chars sha=5dbf95984c65` identical.  `gate-prefill-logits.sh --ub 1 --ab
+"GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0"` on the 30B (the model that reaches the cat2 path) reads **0.000000 KLD
+/ 100.000 %**, and the canonical 27B Q8_0 gate **0.000000 / 100.000 %**.
+
+**Cross-arch.**  The cat2 body is compiled out off RDNA4 (`if constexpr (table_id == RDNA4)`, else
+`NO_DEVICE_CODE`): gfx1100 and gfx1151 build clean, run **0** cat2 launches, read byte-identical text
+(`30B-A3B 1263 chars sha=8392d4044a0e` gfx1100, `35B-A3B 1177 chars sha=21eee00556dd` gfx1151) and decode
+flat (gfx1100 208.99/211.03 -> 211.30/211.30 t/s, gfx1151 63.31/63.13 -> 63.03/63.03).
+
+**Gates.**  The four-axis adaptive gate at `-n 3000` (27B, 1 GPU) is identical on every axis, including
+acceptance: R 58.5/58.4 t/s (3303/1897 both), P 72.0/72.0 (2160/1730), C 80.0/80.1 (2408/2196), K 85.5/85.8
+(375/372).  Rule-5 `llama-batched-bench -npl 1,4,8` (27B, q8_0 KV, 3 GPU tensor) **48.96/159.88/267.24 ->
+49.91/162.90/270.66**.  `test-backend-ops -o MUL_MAT` 2445/2445; per-block build 2/2; no GPU faults.
+Numbers: `benchmarks/2026-11-01-row-concat-mixed-r198.md`.
 
 #### r182 — the 1-token router fold (PR #253)
 

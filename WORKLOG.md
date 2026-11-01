@@ -1,3 +1,60 @@
+## 261101.004 (r198) -- PR #260's mixed-type row concat lands in block 10; the gfx1201 MTP cost is named and fixed (TODO #128 retired)
+
+**Released as `v16-6050b467c-r198` (16 blocks; block 10 amended).**  Canonical tip
+`85667deadc1f941dc89d2c5c7ac5a0f02255f1f2`, tree `52337cb38a1e4e4ebdaa941f6b8f801ab6aeac32` (r197 was
+`ba7c2b7b8` / `eaf673210a`).  `release.json` refreshed; patches regenerated from `6050b467c..r198-chain`;
+`scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball, tree equality, 286
+files through the Windows portability lint); `fork-refresh.sh --build --gates` re-cut the branch from the
+base, reproduced the tree and passed coherence + the canonical prefill-logit gate (**0.000000 / 100.000 %**,
+build `85667dead`).  Record: `benchmarks/2026-11-01-row-concat-mixed-r198.md`.
+
+### PR #260, re-cut
+
+The r192 session held PR #260 for a **6-7 % gfx1201 MTP decode regression** that was behaviourally
+invisible (identical kernel/graph census, compute buffers, text and acceptance).  The submitter reproduced it
+on their R9700 (ROCm 10.0 and 10.1) and **named it**: the first cut turned `mul_mat_vec_q_ksplit` into an
+inlined `__device__` body, which recompiled the **multi-column verify kernels** (Q4_K ncols 5: 118 -> 97
+VGRPs, 864 -> 1029 instructions).  The re-cut moves the body verbatim into **`mmvq-ksplit-body.inc`**,
+`#include`d into the unchanged kernel and into the new cat2 launch, so every pre-existing kernel compiles to
+r197's code.  Their device-code claim reproduces here as a per-kernel VGPR census of the MTP profile: the
+pre-existing ksplit set is identical; only the two `cat2` instantiations are new.
+
+The change itself: the RDNA4 1-token Q/K/V row concat now takes a **K-quant x Q6_K** pair (in the K-quant
+"M" mixes `attn_v` is Q6_K while Q/K are Q4_K/Q5_K/IQ4_XS), via `mul_mat_vec_q_ksplit_cat2<type, Q6_K>`
+running the Q6_K body with that segment's own row stride for V's row blocks.  Kill switch
+`GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0`.  Integration added one hardening: every segment that runs the **launch**
+type's body must share the launch tensor's `nb[1]` (the kernel passes one row stride for those blocks, so a
+padded view would be read at the wrong offset).
+
+### Measured (this box)
+
+* **MTP fully restored**, dense 27B UD-Q4_K_XL, `draft-mtp n3`, bf16 KV, `ROCBLAS_USE_HIPBLASLT=0`:
+  1 GPU `-c 16384 -n 500`, five interleaved rounds **76.4 / 76.4 / 76.3 / 76.5 / 76.3 -> 76.3 / 76.2 / 76.3 /
+  76.4 / 76.3**, drafts 417/360 both; 3 GPU `-sm tensor -c 102400 -n 800` **133.0 / 134.1 / 133.9 -> 133.8 /
+  134.2 / 133.8**, drafts 670/575 both.  (The first cut read 70.7 / 126.4.)
+* **Four-axis adaptive gate** (27B, 1 GPU, `-n 3000`, `-c 32768`, bf16 KV, reasoning pinned): R 58.5 -> 58.4,
+  P 72.0 -> 72.0, C 80.0 -> 80.1, K 85.5 -> 85.8 t/s, **acceptance identical on every axis** (3303/1897,
+  2160/1730, 2408/2196, 375/372).
+* **Decode** (Qwen3-Coder-30B-A3B Q4_K_M, f16 KV, 3 interleaved rounds): tg128 **161.54 -> 162.57 (+0.6 %)**,
+  @4096 **137.69 -> 139.14 (+1.05 %)**, 3 GPU `-sm tensor` tg128 **171.62 -> 173.53 (+1.1 %)**.  Census: 168
+  `cat2` launches replace 168 standalone Q6_K launches.  The submitter's re-cut measured +0.6 / +1.2 %.
+* **Purity**: `--ub 1 --ab "GGML_CUDA_MMVQ_ROW_CONCAT_MIXED=0"` on the firing 30B-A3B **0.000000 / 100.000 %**;
+  canonical 27B Q8_0 gate **0.000000 / 100.000 %**; greedy text identical base vs pat on 30B f16
+  (`1065 chars sha=000d77b327e9`), 30B q8_0 KV (`1131 chars sha=9fb5b1832d34`), 30B 3 GPU tensor
+  (`1019 chars sha=bbdb61ea2adb`) and 27B `draft-mtp n3` (`1270 chars sha=5dbf95984c65`).
+* **Rule 5** `llama-batched-bench -npl 1,4,8` (27B, q8_0 KV, 3 GPU tensor): 48.96/159.88/267.24 ->
+  49.91/162.90/270.66.  `test-backend-ops -o MUL_MAT` **2445/2445**.  Per-block build **2/2**.  No GPU faults.
+* **Cross-arch**: gfx1100 (RX 7900 XTX) and gfx1151 (Strix Halo) build clean, **0** cat2 launches, greedy text
+  byte-identical (30B `1263 chars sha=8392d4044a0e`, 35B `1177 chars sha=21eee00556dd`) and decode flat
+  (208.99/211.03 -> 211.30/211.30; 63.31/63.13 -> 63.03/63.03).  The path is compiled out off RDNA4.
+
+### Docs / items
+
+`patches/README.md` (block 10, r198 subsection), `ENVIRONMENT.md` (the new kill switch), `GREEDY-PURITY.md`
+**§80** (a shared device body changes its callers' codegen; share it with an `#include` and judge it by a
+per-kernel VGPR census + the MTP arm), `TODO.md` (**#128 retired**; **#120** now stands only for PR #262's own
+un-named MTP cost) and the benchmark record.  The r192 measurement record stays as the history of the hold.
+
 ## 261101.003 (docs, post-r197) -- the KV-residency campaign is ARCHIVED; its residue becomes `wip/kv-residency-cleanup/`
 
 **No delivery change** (`patches/`, `release.json` and every block are untouched; docs only).  The campaign
