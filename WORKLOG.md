@@ -69,6 +69,13 @@ the per-stream arm — the under-charge direction the reserve header warns about
   `check-gpu-faults.sh` clean.  Not measured (1-GPU box, see the NB above): the multi-device prefill-logit arm,
   Protocol A at 3 devices in both split modes, `gate-spec-align.sh`, `gate-spec-width-band.sh`,
   `gate-hc-fusions.sh` (no qwen4exp weight class was touched) — none of them reaches this code.
+* **Ship.** The fork's `rdna-boosts` branch was force-with-lease pushed to `2ed3997f5` (the fork's
+  `rdna-boosts` was still at r199's `d5f241572`; `fork-refresh.sh --push` first refused with `stale info`
+  because the local tracking ref predated r199's own push, so the lease was confirmed against
+  `git ls-remote` and pushed with `--force-with-lease=rdna-boosts:d5f241572`).  The delivery repo and the tag
+  `v16-6050b467c-r200` are pushed: CI **Validate delivery set** + **Release patch set** green (39 s / 14 s),
+  the GitHub Release carries `patches.tar.gz`, `rdna-boosts-all.patch`, `release.json` and `SHA256SUMS`, and
+  the ROCm container images are the `radiance` watcher's job (picks the tag up within 10 minutes).
 
 **Docs.**  `patches/README.md` (block 15: the per-sequence bullet + the r199 note), `AGENTS.md` (the
 per-sequence rule and its gate), `ENVIRONMENT.md` §17.2, `MANIFESTS.md` (release gate 15 + the block-15 row),
