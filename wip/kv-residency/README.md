@@ -1,7 +1,8 @@
 # wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN — Goal A+B delivered, Goal C + follow-ups remain)
 
-**Cold start: read [`HANDOVER.md`](HANDOVER.md) first** — it is self-contained and says what to do in the
-first 30 minutes (§12.4 is the close-out plan).
+**Cold start: read [`HANDOVER-A18.md`](HANDOVER-A18.md) first** — it is the self-contained handover for what is
+left (written at the end of A17, when Goals A, B and C were all delivered).  [`HANDOVER.md`](HANDOVER.md) stays
+as the A-era record of how Goals A and B were built and is still the source for their commands.
 
 **Status: OPEN — Goals A, B and C are DELIVERED, the campaign is not finished (2026-10-31).**  Goal A (the
 resident window) is **block 15** in r178, Goal B (the attendance pool) the same block 15 in r190 (folded in
