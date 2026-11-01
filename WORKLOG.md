@@ -1,3 +1,21 @@
+## 261101.012 (docs) -- r203 published: CI, the fork branch, and PR #266
+
+No delivery change.  `v16-6050b467c-r203` is tagged and pushed; `main` is at the r203 commit.  CI: **Validate
+delivery set** green on both the `main` push and the tag push (strict 16/16 apply on a fresh tarball, tree
+equality, the Windows portability lint), **Release patch set** green (assets `patches.tar.gz`,
+`rdna-boosts-all.patch`, `release.json`, `SHA256SUMS`).  The personal fork's `rdna-boosts` branch was
+force-pushed to `baa382608` by `scripts/fork-refresh.sh --push` (re-cut from `6050b467c`, tree `2d132710`
+reproduced, `release.json.tip` matched).  `--force-with-lease` rejected the first attempt as *stale info*
+because r202's tip had been pushed from another tree since our last fetch; the lease was re-anchored on
+`18001ddd7` after a `git fetch origin rdna-boosts` and the push went through — worth remembering when two
+sessions share this checkout.  The ROCm images are built and pushed off-host by the worker watcher
+(`radiance`), which polls for the tag.
+
+**PR #266**: accepted and closed, with a reply recording what was reproduced on our box (the submitter's
++12.3 % / +7.6 % on a 7900 XTX read +8.4 % / +4.8 % here), the two changes he asked us to verify being
+inert by design (the CUDA `atomicExch` flag arm is fail-safe, `-sm tensor` declines) and the one accepted
+limitation (`TODO` #131).  The submission is preserved in `archive/work/pinned-decode-remap/submission/`.
+
 ## 261101.011 (PR #266) -- host-expert decode without the per-op routing sync; the pool serves a resident miss in place (blocks 09 + 10 + 12 amended)
 
 **Released as `v16-6050b467c-r203` (16 blocks; blocks 09, 10 and 12 amended).**  Canonical tip `baa382608`,
