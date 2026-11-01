@@ -170,6 +170,11 @@ does not fix that; it makes it matter more.
 
 ## 2.3 A15 (2026-10-31) -- the adaptive policy, and the reserve conversion that makes it pay
 
+> **DELIVERED in r193** (`v16-6050b467c-r193`, block 15 amended): `LLAMA_SPEC_DRAFT_WINDOW`, default ON with
+> the adaptive policy.  The gates listed as owed at the end of this section were run and passed before the
+> fold; `WORKLOG.md` 261031.014 has the numbers and `patches/README.md` block 15 ("r193") is the shipped
+> description.  What remains of the campaign is `TODO` #123-#125 and the decided-but-undocumented `#122`.
+
 Branch `wip-kv-residency-c` (off the r191 tip, commit `fa914676e`, pushed).  The maintainer's decisions:
 **MTP only** (DFlash2 later), the window is **adaptive** -- a quarter of the context, clamped to
 **[32768, 65536] cells** -- the user override stays, and the default follows the delivery's own rule: **on when

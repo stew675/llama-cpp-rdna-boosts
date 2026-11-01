@@ -1,3 +1,60 @@
+## 261031.014 (r193) -- Goal C delivered: block 15 gains the MTP draft window (default ON), and an embedded MTP head's slab reserve is derived with it (arena +2.8 GiB)
+
+**Released as `v16-6050b467c-r193` (16 blocks, block 15 amended).**  Canonical tip `f9471b969`, tree
+`2375d656962b191c64767e01377d8c442948958a` (r191 was `561696677` / `2d76fe97a`).  The revision number skips
+**r192** on purpose: 261031.013 prepared an r192 cut for PR #260/#262 and never tagged it, so that number stays
+attached to the held PR work.  `release.json` refreshed (block count still 16); `scripts/validate-set.sh` green
+(16/16 strict `git am` on a fresh `6050b467c` tarball, tree equality, 286 files through the Windows
+portability lint); `gate-per-block-build.sh --changed-from 561696677` 1/1 in 12 s; the standard 27B Q8_0
+prefill-logit point **0.000000 / 100.000 %**.
+
+**The maintainer's decision (2026-10-31):** Goal C ships *in block 15* (the block is the delivery's "the KV
+does not have to be `O(-c)` of VRAM" work, and the draft cache is the same claim), MTP only, the window
+**adaptive** (a quarter of the context, clamped to `[32768, 65536]` cells), the user override kept, and the
+default follows measurement: **on when it measures positive** -- it does.  Goal A's `auto` stays **P1**
+(fittability only; P2 rejected, P3 parked until measured), so the arena keeps winning the VRAM through
+`margins[0]`.
+
+**What the block now carries** (`patches/README.md` block 15 "r193", `ENVIRONMENT.md` §17.2):
+
+* `LLAMA_SPEC_DRAFT_WINDOW`: unset/`auto` = the adaptive policy, `0` = off (byte-identical), `N` = cells
+  (floored at one ubatch; dropped when it would hold the whole cache, so `-c <= 32768` keeps today's shape).
+  The ring is the shipped `find_slot` reclaim (`n_swa`), not a new allocator, and the derived kq mask needs no
+  exclusion -- its predicate compares each cell's **position**, so a recycled cell reports its new one (the
+  `wip` note's "hazard" is a reading error, corrected in `O3-DRAFTER-RING.md` §2.3).
+* **The reserve is what makes it pay.**  An *embedded* MTP head has no GGUF of its own, so the slab's draft
+  reserve was the flat 3584 MiB and the freed VRAM never reached the arena.  With a window active the reserve
+  is derived from the model's own metadata with the weights zeroed (they are the target's) and the KV sized by
+  the window: **aux 3.50 -> 0.76 GiB, arena +2.8 GiB**.  A separate MTP draft GGUF (qwen4exp/Flash-Next) and
+  every un-windowed run keep the flat constant exactly, and a *declined* arena preflight now re-evaluates when
+  the smaller real value arrives instead of latching on the load-time estimate.
+
+**Measured (1 GPU -- one R9700; `-n 2000`/`-n 3000`; static depth 3; interleaved).**
+
+| arm | arena | residency | decode | drafts |
+|---|---|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 48 -c 262144` q8_0 KV, 51 433-token prompt, window 0 | 20 910 MiB | 64.1 % | 111.2 t/s | 1995/3011 |
+| the same, `auto` (65 536) | **23 715** | **72.7 %** | **113.7** (+2.2 % at `-n 3000`; +2.8-4.9 % at `-n 2000`) | 1995/3011 (**identical**) |
+| the same, `W=32768` (truncating) | 23 715 | 72.7 % | 110.3 at `-n 2000` (+1.7 %) | 1308/2071 |
+| dense 27B UD-Q4_K_XL `-c 102400`, Protocol A `-n 3000`, reasoning pinned | -- | -- | layer 71.9 -> 72.1, tensor 72.6 -> 72.5 (neutral) | 2083/2747 in all four arms |
+
+Prefill +3.4 % on the arena arm (1095.1 -> 1132.8).  **Purity:** target greedy text byte-identical across
+off/auto/4096 (27B, `-c 102400`, `-n 64`: 303 chars `sha=c437759e06e3`), and plain == draft-mtp ==
+draft-mtp(`W=512`) at `-c 16384` with a 5256-token prompt and 3000 generated tokens (10 158 chars
+`sha=99b267e8dc3e`) -- constant cell reuse, a 1280-cell draft cache against a 768-cell window, moves no token.
+
+**The gates on a windowed draft** (all PASS, each with `MTP draft KV window = 32768 cells` in its log):
+`gate-park-idle-slots.sh` (35B, `-ncmoe 48`, `-c 65536`: 3 park moves, `park == lazyoff` on A-D),
+`gate-ckpt-reuse.sh` (4B, `-c 131072`: draft cache 33 280 of 131 072, keep/eager differ as required) and
+`gate-state-pipe.sh` (35B, `-c 65536`: all five arms).  Two of the scripts needed a note for the next run:
+`gate-ckpt-reuse.sh` only passes `--spec-type` when `DRAFT` is set (so `EXTRA_ARGS="... --spec-type draft-mtp
+--spec-draft-n-max 3"` is how an embedded-head MTP arm is run), and `gate-park-idle-slots.sh` defaults `DRAFT`
+to the Flash-Next sidecar (pass `DRAFT=` for a non-qwen4exp model, or the MTP context fails on a shape check).
+
+**`TODO` #121 is closed to this entry.**  What stays open in the campaign: `#122` is decided (P1), `#123`
+(grow-on-demand pool mirror), `#124` (Goal A on a `-sm tensor` split, hardware-blocked) and `#125` (the radix
+top-k).  The campaign directory stays under `wip/` until those close.
+
 ## 261031.013 (r192) -- the dense row concat takes a `K-quant x Q6_K` weight pair (PR #260, block 10); PR #262's `q4_0` KV write fold is measured, found beneficial on RDNA3 and HELD after an unexplained gfx1201 MTP cost
 
 **No tag: nothing shipped.**  Both PRs of this session are **held** (see below); the delivery tree, `patches/`,

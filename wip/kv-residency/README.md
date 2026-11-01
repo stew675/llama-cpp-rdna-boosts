@@ -3,12 +3,12 @@
 **Cold start: read [`HANDOVER.md`](HANDOVER.md) first** — it is self-contained and says what to do in the
 first 30 minutes (§12.4 is the close-out plan).
 
-**Status: OPEN — Goal A and Goal B are DELIVERED, the campaign is not finished (2026-10-31).**  Goal A (the
-resident window) is **block 15** in r178 and Goal B (the attendance pool) is the same block 15 in r190, folded
-together in r191 (`WORKLOG.md` 261031.008/261031.009); `TODO` #118's delivery ask is therefore closed.  What
+**Status: OPEN — Goals A, B and C are DELIVERED, the campaign is not finished (2026-10-31).**  Goal A (the
+resident window) is **block 15** in r178, Goal B (the attendance pool) the same block 15 in r190 (folded in
+r191) and Goal C (the MTP draft window) again block 15 in **r193** (`WORKLOG.md` 261031.008/261031.009/261031.014); `TODO` #118's delivery ask is therefore closed.  What
 remains is the campaign's own work, carried as its own `TODO` items — #121 (Goal C, the drafter ring: measured,
 not promoted, three questions in [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) §7), #122 (the Goal A `auto` policy),
-#123 (the grow-on-demand mirror), #124 (Goal A on a `-sm tensor` split) and #125 (the radix top-k) — so this
+#123 (the grow-on-demand mirror), #124 (Goal A on a `-sm tensor` split) and #125 (the radix top-k) — with #121 closed (Goal C shipped in r193, default ON) and #122 decided (P1) — so this
 directory **stays under `wip/` until the last item closes** (`HANDOVER.md` §12.4: do not archive it while Goal C
 is open).  The shipped form is `patches/` block 15; the campaign's measurement code lives on fork branch
 `wip-kv-residency` (cut from the r174 tip `5bdec04ab`), and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) is the O1

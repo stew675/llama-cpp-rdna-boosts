@@ -1,8 +1,9 @@
-# Cold-session prompt — `wip/kv-residency` (Goal C + the follow-ups; `TODO` #118's delivery ask is closed)
+# Cold-session prompt — `wip/kv-residency` (the follow-ups; Goals A, B and C are all delivered)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from a previous
 session's context).  **Rewritten 2026-10-31, end of session A14.**
 
+> **Goals A, B and C are DELIVERED** (all three live in block 15; `WORKLOG.md` 261031.014 is the last one).
 > **Goal A and Goal B are DELIVERED.**  Goal A = block 15 (`LLAMA_KV_RESIDENT_CELLS`, r178); Goal B = the same block 15
 > (`LLAMA_KV_REGION_POOL`, r190) plus the two repairs it exposed (r189's `cpy_2d_vec16` in block 10, r190's
 > quantized indexer keys in block 11) and B2 (a streamed cache takes the sparse decode arm, block 15).  `TODO`
@@ -11,24 +12,23 @@ session's context).  **Rewritten 2026-10-31, end of session A14.**
 
  ---
 
- What is left is Goal C and a short set of decisions/follow-ups.  The campaign directory stays under `wip/`
- until the last one closes (`HANDOVER.md` §12.4) — do not archive it while Goal C is open:
+ What is left is the follow-up set (#123/#124/#125) — the campaign directory stays under `wip/` until the last
+ one closes (`HANDOVER.md` §12.4):
 
- ## 1. Goal C — the MTP drafter ring (`O3-DRAFTER-RING.md`, `TODO` #121) — the maintainer's call
+ ## 1. Goal C — DONE (delivered in r193 as part of block 15)
 
- Measured, **not** promoted: free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation
- flat), 7-9 % lost far below the working context, and the VRAM prize (one draft layer, ~1 GiB at `-c 262144`)
- does not reach the expert arena.  Three questions before any promotion: **default-on or opt-in, one window
- size or per-model, MTP-only or DFlash2 too.**  If it is promoted it becomes its own block (17) with a
- default-off rationale like blocks 15/16, and it owes the MTP draft-determinism gates
- (`benchmarks/mtp-adaptive-methodology.md`).
+ `LLAMA_SPEC_DRAFT_WINDOW`, default **ON** with the adaptive policy (a quarter of the context, clamped to
+ `[32768, 65536]` cells), MTP-only and embedded-head-only, plus the reserve derivation that lets the freed VRAM
+ reach the arena.  `WORKLOG.md` 261031.014, `patches/README.md` block 15 ("r193"), `O3-DRAFTER-RING.md` §2.3.
+ Do not re-decide it and do not re-measure it.
 
- ## 2. The Goal A `auto` policy (`A2-MIXED-BACKING.md` §3.7.11.4 A-C, `TODO` #122) — the maintainer's call
+ ## 2. The Goal A `auto` policy — DONE (decided: P1)
 
- The fit's ordering is settled (weights -> arena reserve -> `W` from the residue); what is not is which of the
- three measured `auto` policies ships as the recommendation.  No new measurement needed.
+ P1 (fittability only) ships; P2 was rejected (a fit cannot know the run's depth and a `W` 35k cells below it
+ costs 11-26 %) and P3 (an explicit per-token spill budget) is parked until measured.  `A2-MIXED-BACKING.md`
+ §3.7.14, `TODO` #122.
 
- ## 3. Follow-ups opened by r190 (`TODO` #123-#126)
+ ## 3. Follow-ups (`TODO` #123-#125; #126 was closed as a stale base, #121 as delivered)
 
  * **#123 grow-on-demand pool mirror**: the mirror is allocated in full at creation (2.4 GiB at `-c 196608`,
    ~4.9 GiB at 262144), bounded by `LLAMA_KV_SPILL_RAM_PCT`.  The model is block 15's host-half growth

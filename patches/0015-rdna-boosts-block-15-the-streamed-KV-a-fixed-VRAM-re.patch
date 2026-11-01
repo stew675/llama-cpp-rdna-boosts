@@ -1,4 +1,4 @@
-From 979be18a31a7248a33e6aa43d74ffc91160c0829 Mon Sep 17 00:00:00 2001
+From ed8605eb4761041d6fada38c180083096a3cbc54 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -216,7 +216,42 @@ Neither knob is a speed feature on a config whose KV fits: the window costs the 
 the pool costs the sparse-vs-dense gap (-7 % at 103k, -11 % at 180k).  They are FITTABILITY features -- they
 turn an OOM into a run and they hand the freed VRAM to the expert arena -- so both are opt-in and both stay
 byte-identical, including the OOM, with their knobs unset.  Do not "fix" the defaults.
+
+Goal C (the MTP drafter ring, TODO #121) joins the same block -- it is the same claim applied to the draft
+context, and its default follows the delivery's own rule because it measures positive.
+
+`LLAMA_SPEC_DRAFT_WINDOW` gives the MTP draft context a sliding window instead of a `-c`-sized KV: unset or
+`auto` is the adaptive policy (a quarter of the context, clamped to [32768, 65536] cells), `0` is off
+(byte-identical to a build without it) and `N` is a cell count.  The drafter reads its last few thousand
+tokens, so a window at or above that is free and one far below it costs 7-9 % of decode; the clamps keep it
+above that band, and the target verifies every token it proposes, so a truncated draft can only be slower.
+The ring is the shipped reclaim in `llama_kv_cache::find_slot` (`n_swa`), not a new allocator, and the derived
+kq mask stays valid -- its predicate compares each cell's POSITION, so a recycled cell reports its new one.
+
+The VRAM win needed one more piece: an embedded MTP head has no GGUF of its own, so the slab's draft reserve
+was the flat 3584 MiB and the freed VRAM never reached the expert arena.  For an embedded MTP head with an
+active window the reserve is now derived from the model's own metadata with the weights zeroed (they are the
+target's) and the KV sized by the window: aux 3.50 -> 0.76 GiB, i.e. the arena gains ~2.8 GiB.  A separate
+MTP draft GGUF (qwen4exp/Flash-Next) and an un-windowed run keep the flat constant exactly as before, and a
+declined arena preflight now re-evaluates when the smaller real value arrives instead of latching on the
+load-time estimate.
+
+Measured (1 GPU; one R9700; `-n 2000`/`-n 3000`; static depth 3; interleaved):
+* 35B-A3B Q8_0 `-ncmoe 48 -c 262144` q8_0 KV, 51 433-token prompt: arena 20 910 -> 23 715 MiB (residency
+  64.1 -> 72.7 %), decode 111.2 -> 113.7 t/s at `-n 3000` (+2.2 %; +2.8-4.9 % at `-n 2000`), prefill +3.4 %,
+  drafts byte-for-byte the same count (1995/3011) -- the window truncates nothing the drafter used.
+* dense 27B UD-Q4_K_XL `-c 102400`, MTP Protocol A `-n 3000`, reasoning-pinned: layer 71.9 -> 72.1, tensor
+  72.6 -> 72.5 (neutral), acceptance 2083/2747 identical in all four arms.
+* target greedy text byte-identical across off/auto/4096, and plain == draft-mtp == draft-mtp(W=512) at
+  `-c 16384` with a 5256-token prompt and 3000 generated tokens (10 158 chars, sha 99b267e8dc3e), i.e. no
+  wrong answer under constant cell reuse.
+* gates on a windowed draft: `gate-park-idle-slots.sh` (35B, -ncmoe 48, `-c 65536`: 3 park moves, park ==
+  lazyoff), `gate-ckpt-reuse.sh` (4B, `-c 131072`: draft cache 33280 of 131072), `gate-state-pipe.sh` (35B,
+  `-c 65536`: all five arms) -- all PASS with `MTP draft KV window = 32768 cells` in their logs.
 ---
+ common/common.cpp                          |   20 +-
+ common/draft-reserve.cpp                   |   34 +-
+ common/draft-reserve.h                     |    6 +-
  common/fit.cpp                             |  278 ++++-
  ggml/include/ggml-rpc.h                    |    4 +-
  ggml/include/ggml.h                        |   42 +
@@ -228,11 +263,12 @@ byte-identical, including the OOM, with their knobs unset.  Do not "fix" the def
  ggml/src/ggml-cuda/ggml-cuda.cu            |  994 +++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 ++++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu     |    9 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   83 +-
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
- src/llama-ext.h                            |   33 +
+ src/llama-ext.h                            |   51 +
  src/llama-kv-cache.cpp                     |  823 ++++++++++++-
  src/llama-kv-cache.h                       |   94 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
@@ -240,14 +276,151 @@ byte-identical, including the OOM, with their knobs unset.  Do not "fix" the def
  src/llama-memory-hybrid.cpp                |   12 +-
  src/llama-memory-hybrid.h                  |    7 +-
  src/llama-memory.h                         |   15 +
- src/llama-model.cpp                        |    3 +-
+ src/llama-model.cpp                        |   82 +-
  src/models/qwen4exp.cpp                    |   58 +-
- 25 files changed, 4178 insertions(+), 39 deletions(-)
+ 29 files changed, 4330 insertions(+), 53 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
+diff --git a/common/common.cpp b/common/common.cpp
+index 5a137512e..a60b0279f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1268,11 +1268,27 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+             } else {
+                 // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
+                 // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
++                //
++                // An MTP draft has no GGUF of its own (it runs the target's nextn layer), and its KV window
++                // only reaches the expert arena if this reserve shrinks with it: the slab reserves `aux`
++                // BEFORE the draft context exists, and the surplus is not handed back.  So for an MTP draft
++                // whose window is active, estimate from the target's own metadata with the weights zeroed
++                // (they are shared) -- which is the draft's real post-slab footprint.  Without a window the
++                // flat constant stays, so no existing run changes.
++                // ONLY an embedded-head MTP draft (no `-md`: qwen3.5/3.6/3.8) -- that is the draft whose KV this
++                // window can actually shrink (`create_memory`'s plain kv_cache branch).  A separate MTP draft
++                // GGUF (qwen4exp/Flash-Next) keeps the flat constant: its context has its own geometry (and an
++                // indexer cache) and the window does not apply to it, so deriving 48 layers of KV from the
++                // target's metadata would cut the arena for a draft that is not windowed at all.
++                const bool mtp_shared = params.speculative.has_mtp() &&
++                                        params.speculative.draft.mparams.path.empty() &&
++                                        llama_spec_draft_window_cells(params.n_ctx, params.n_ubatch) != 0;
+                 draft_reserve = common_draft_reserve_estimate(
+-                        params.speculative.draft.mparams.path,
++                        mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
+                         params.n_ctx,
+                         params.n_ubatch,
+-                        params.cache_type_k, params.cache_type_v);
++                        params.cache_type_k, params.cache_type_v,
++                        mtp_shared);
+             }
+         }
+     }
+diff --git a/common/draft-reserve.cpp b/common/draft-reserve.cpp
+index c16a68e69..bd99e1f12 100644
+--- a/common/draft-reserve.cpp
++++ b/common/draft-reserve.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "gguf.h"
+ 
++#include "../src/llama-ext.h"
++
+ #include <algorithm>
+ #include <cstring>
+ #include <vector>
+@@ -100,7 +102,8 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+                                                    uint32_t n_ctx,
+                                                    uint32_t n_ubatch,
+                                                    ggml_type type_k,
+-                                                   ggml_type type_v) {
++                                                   ggml_type type_v,
++                                                   bool shares_model) {
+     common_draft_reserve r;
+ 
+     if (path.empty()) {
+@@ -130,7 +133,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+     for (int64_t i = 0; i < n_tensors; ++i) {
+         weights += gguf_get_tensor_size(g, i);
+     }
+-    r.weights = weights;
++    // a shared-weights draft (an embedded MTP head) owns no weights: it runs the target's nextn layer, and
++    // charging them again is what the flat constant did
++    r.weights = shares_model ? 0 : weights;
+ 
+     // `n_ctx == 0` means "from the model": estimating the KV with 0 would UNDER-estimate the reserve (the
+     // dangerous direction), so fall back to the context the draft itself declares as its trained maximum.
+@@ -145,6 +150,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+     uint32_t block_count = 0;
+     uint32_t n_nextn      = 0;
+     (void) read_u32_max(g, arch + ".nextn_predict_layers", n_nextn);   // absent for a standalone draft
++
++    // `shares_model` (an MTP draft with no GGUF of its own) is only right for a model that DECLARES its MTP
++    // head: qwen3.5/3.6/3.8 carry `nextn_predict_layers`, while qwen4exp/Flash-Next keeps its head in a
++    // separate `mtp-*.gguf` -- and that file's path is not known yet when this estimate runs, so reading the
++    // TARGET would charge 48 layers of KV to a draft the window does not even apply to.  Decline instead,
++    // and the caller keeps the flat constant.
++    if (shares_model && n_nextn == 0) {
++        r.note = "the model declares no embedded MTP head (nextn_predict_layers); keeping the flat constant";
++        gguf_free(g);
++        return r;
++    }
++
+     if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
+         r.note = "draft GGUF has no usable block_count";
+         gguf_free(g);
+@@ -197,7 +214,13 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+                               ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
+                               : 0.0;
+     // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
+-    r.kv = (size_t) ((double) n_ctx * (attn_per_tok + idx_per_tok) * 1.10);
++    //
++    // The MTP drafter's KV window (llama-ext.h) is honoured here for the same reason the cache takes it: the
++    // estimate is what the slab holds back in `aux_reserve`, so an un-windowed estimate leaves the freed VRAM
++    // unspent instead of handing it to the expert arena.
++    const uint32_t draft_window = llama_spec_draft_window_cells(n_ctx, n_ubatch);
++    const uint32_t kv_cells     = draft_window != 0 ? std::min(n_ctx, draft_window + n_ubatch) : n_ctx;
++    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
+ 
+     // --- compute + slack: measured tiers -------------------------------------------------------
+     // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
+@@ -211,13 +234,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+     r.ok    = r.total > 0;
+ 
+     LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"
+-            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u)\n",
++            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u, kv cells %u%s%s)\n",
+             __func__, path.c_str(),
+             (double) r.weights / 1048576.0, (double) r.kv / 1048576.0, kv_own, kv_layers, n_head_kv,
+             k_len, v_len, have_indexer ? "yes" : "no",
+             shares_kv ? ", KV shared with the target (0 owned)" : "",
+             (double) r.compute / 1048576.0, (double) r.slack / 1048576.0, (double) r.total / 1048576.0,
+-            n_ctx);
++            n_ctx, kv_cells, draft_window != 0 ? ", MTP draft window" : "",
++            shares_model ? ", weights shared with the target (0 charged)" : "");
+ 
+     return r;
+ }
+diff --git a/common/draft-reserve.h b/common/draft-reserve.h
+index 8e65564b6..fdca58c78 100644
+--- a/common/draft-reserve.h
++++ b/common/draft-reserve.h
+@@ -37,8 +37,12 @@ struct common_draft_reserve {
+ };
+ 
+ // Estimate the post-slab VRAM `path` (a draft GGUF) will need for `n_ctx` with the given KV types.
++// `shares_model`: the draft runs the TARGET's weights (an embedded MTP head), so the weights term is 0 and
++// `path` is the target's GGUF -- the caller only passes `true` when the draft's KV window is active, so an
++// un-windowed run keeps the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` it has always had.
+ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+                                                    uint32_t n_ctx,
+                                                    uint32_t n_ubatch,
+                                                    ggml_type type_k,
+-                                                   ggml_type type_v);
++                                                   ggml_type type_v,
++                                                   bool shares_model = false);
 diff --git a/common/fit.cpp b/common/fit.cpp
 index 29d9dbbd0..cf172c469 100644
 --- a/common/fit.cpp
@@ -3680,6 +3853,26 @@ index 000000000..448399a58
 +// wip/kv-residency (TODO #118) B-A: resolve a QSA selection through a page table (GGML_OP_KV_POOL).
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 38881d54a..cc928b2a9 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -3986,9 +3986,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+     }
+     // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
+     // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
+-    // keep a cache that the with-draft projection would have declined.
+-    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux) {
+-        return g_enabled;   // latch: the call with the largest aux so far decides
++    // keep a cache that the with-draft projection would have declined -- and re-run it while the cache is
++    // DECLINED even for a smaller aux: a windowed MTP draft (LLAMA_SPEC_DRAFT_WINDOW) derives a much
++    // smaller reserve than the flat constant the load-time call can only use, so that call is the
++    // pessimistic one, and a decline it reached must not survive the real number.
++    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux && g_enabled) {
++        return g_enabled;   // latch while the cache is on: the call with the largest aux so far decides
+     }
+     g_preflight_done = true;
+     g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
 index 7343e230d..b3b113388 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
@@ -3888,7 +4081,7 @@ index bae1b81c7..f80389890 100644
      // training
      //
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 0079595f5..63631010c 100644
+index 0079595f5..75a1794ed 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -102,6 +102,11 @@ LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model,
@@ -3903,7 +4096,7 @@ index 0079595f5..63631010c 100644
  // the backend buffers that a state write of this memory would touch - empty caches report none
  LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
  
-@@ -216,3 +221,31 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
+@@ -216,3 +221,49 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
  
  // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
  LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
@@ -3931,6 +4124,24 @@ index 0079595f5..63631010c 100644
 +// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
 +// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
 +LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
++
++//
++// The speculative draft's KV window (the MTP drafter's ring).
++//
++// The MTP draft context carries a KV cache of its own, sized `-c` cells, although the drafter only ever reads
++// its recent prefix (measured: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144` -- one draft layer).
++// `LLAMA_SPEC_DRAFT_WINDOW` makes it a sliding window instead, which is an APPROXIMATION the target verifies
++// (a wrong draft is a slower run, never a wrong answer).
++//
++//   unset / `auto`  the adaptive policy: a quarter of the context, clamped to [32768, 65536] cells -- a window
++//                   at or above the context the drafter actually works over costs nothing measurable, and one
++//                   far below it is a real 7-9 % decode loss, so the clamps are the safety rails
++//   `0`             no window: today's behaviour, byte-identical
++//   `N`             N cells (floored at one ubatch, and at the context where it would exceed it)
++//
++// Returns the window in cells, or 0 for "no window" (nothing to save at this context, or disabled).  MTP only:
++// a DFlash2/`-md` draft keeps its own `-c` cache.
++LLAMA_API uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch);
 +
 +// Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
@@ -5164,10 +5375,63 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 17cd2b9d4..0171f2cd4 100644
+index 17cd2b9d4..32801f102 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3573,7 +3573,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3109,6 +3109,52 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+     return layers[il].rope_short;
+ }
+ 
++// The MTP drafter's KV window policy (see llama-ext.h).  `LLAMA_SPEC_DRAFT_WINDOW` = unset/`auto` (the
++// adaptive policy), `0` (off, today's shape) or a cell count.
++//
++// The adaptive policy is a quarter of the context clamped to [32768, 65536] cells: the drafter reads its last
++// few thousand tokens, so a window at or above the context it works over is free (measured: -2.3 % relative
++// acceptance, generation flat, at a 46k context with a 32768 window) while a window far below it costs 7-9 % of
++// decode.  The lower clamp keeps the window above that band at any context; the upper clamp stops a very large
++// `-c` from keeping a window bigger than anything the policy needs (one draft layer, ~1 GiB at `-c 262144`).
++uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch) {
++    const char * env = getenv("LLAMA_SPEC_DRAFT_WINDOW");
++
++    if (n_ctx_seq == 0) {
++        return 0;
++    }
++
++    // one ubatch must always be placeable (`llama_kv_cache::find_slot` refuses a batch wider than the cache)
++    const uint32_t floor_cells = GGML_PAD(n_ubatch + 256, 256);
++
++    uint32_t w;
++    if (env == nullptr || env[0] == '\0' || strcmp(env, "auto") == 0) {
++        w = n_ctx_seq / 4;
++        if (w < 32768) {
++            w = 32768;
++        }
++        if (w > 65536) {
++            w = 65536;
++        }
++    } else {
++        const long v = atol(env);
++        if (v <= 0) {
++            return 0;
++        }
++        w = (uint32_t) v;
++    }
++
++    if (w < floor_cells) {
++        w = floor_cells;
++    }
++    // nothing to save: the window would hold the whole cache
++    if (w >= n_ctx_seq) {
++        return 0;
++    }
++
++    return w;
++}
++
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
+@@ -3573,7 +3619,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
@@ -5177,6 +5441,55 @@ index 17cd2b9d4..0171f2cd4 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
+@@ -3679,6 +3726,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+                     } else {
+                         GGML_ASSERT(!hparams.is_swa_any());
+ 
++                        // The MTP drafter's KV window (llama-ext.h).  The draft context is created AFTER the
++                        // target, so this is the only place its cell count exists.
++                        //
++                        // A sliding window, not a ring allocator: `find_slot` already reclaims a cell whose
++                        // position is more than `n_swa` behind the newest one for its sequence, which IS the
++                        // ring, and `set_input_kq_mask` reads THIS cache's `n_swa`, so the packed mask windows
++                        // consistently and `hparams` (shared with the target) is untouched.  The derived mask
++                        // stays valid as well -- its predicate is `tok_lo <= cell_pos <= tok_hi` over the
++                        // per-cell POSITION, so a recycled cell reports its new position (a position range, not
++                        // a cell-index range).  Only the drafter loses the tokens older than the window, and
++                        // the target verifies every token it proposes.
++                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
++                        uint32_t mtp_n_swa   = hparams.n_swa;
++                        llama_swa_type mtp_swa_type = hparams.swa_type;
++                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++                            const uint32_t win = llama_spec_draft_window_cells(cparams.n_ctx_seq, cparams.n_ubatch);
++                            if (win != 0) {
++                                // the iswa sizing shape: a whole ubatch must always find room to be placed
++                                mtp_kv_size  = GGML_PAD(std::min(cparams.n_ctx_seq, win + cparams.n_ubatch), 256);
++                                mtp_n_swa    = win;
++                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
++                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells (draft cache %u of %u cells; "
++                                               "LLAMA_SPEC_DRAFT_WINDOW -- the target still verifies every token)\n",
++                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq);
++                            }
++                        }
++
+                         res = new llama_kv_cache(
+                                 *this,
+                                 hparams,
+@@ -3687,11 +3761,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+                                 !cparams.flash_attn,
+                                 cparams.offload_kqv,
+                                 cparams.kv_unified,
+-                                cparams.n_ctx_seq,
++                                mtp_kv_size,
+                                 cparams.n_seq_max,
+                                 1,
+-                                hparams.n_swa,
+-                                hparams.swa_type,
++                                mtp_n_swa,
++                                mtp_swa_type,
+                                 nullptr,
+                                 filter,
+                                 nullptr,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
 index 071fe38cc..230efe5b1 100644
 --- a/src/models/qwen4exp.cpp

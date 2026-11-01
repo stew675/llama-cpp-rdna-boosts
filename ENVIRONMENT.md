@@ -870,12 +870,14 @@ with it every compute buffer, so `set_sampler()` asks for one only when it has t
 |---|---|---|---|
 | `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE` | **on** | kill-switch (r169, contributor PR #245, block 12) | the compute buffers remember what they were reserved with (`sampling.reserved`: per sequence, the backend sampler chain's node count, `llama_sampler_backend_n_nodes()`) and `set_sampler()` reserves only when a sequence gets a **wider** chain than that, or has no record yet.  A chain set again, a narrower one, or a removal asks for none: the graph is rebuilt anyway (the samplers are part of the graph-reuse check), the output buffers are sized per decode, and the graph allocator grows a buffer if a chain needs more bytes.  The key is the **node count**, not the sequence id, because a reserve is the only thing that recomputes `graph_max_nodes()` — which sizes the graph's node capacity (`llm_graph_result::max_nodes` -> `ggml_new_graph_custom`), the scheduler's node/leaf arrays and the compute-metadata arena — and the allocator's growth covers buffer sizes only.  `0` restores the pre-r169 behaviour (a reserve on every set and every removal: 4 `sched_reserve: reserving ...` lines over three requests instead of 2, and +68.7 ms of median prompt time per sampled request on a 27B at `-c 65536 --parallel 2 --kv-unified`).  No arithmetic changes: request text and the prefill logits are byte-identical across the arms.  Only reaches a context that sets a backend sampler — `llama-cli`/`llama-bench` and a `-sm tensor` context (backend sampling is refused there) never touch it. |
 
-## 17. The streamed KV (block 15, **opt-in**): the resident window and the attendance pool
+## 17. The streamed KV (block 15): the resident window, the attendance pool and the MTP draft window
 
 Block 15 carries **two** opt-in placements of the attention KV, mutually exclusive by construction (the pool
 declines while a window is active).  Both are **default off** and byte-identical to a build without them when
 their knobs are unset, and both are **fittability** features: on a config whose KV fits, each costs the
-sparse-vs-dense decode gap.  §17.0 is the window, §17.1 the pool.
+sparse-vs-dense decode gap.  §17.0 is the window, §17.1 the pool, §17.2 the MTP draft window (r193) -- the one
+knob in this section that is **default on**, because it measures non-negative.
+
 
 ### 17.0 The resident window (`LLAMA_KV_RESIDENT_CELLS`)
 
@@ -898,6 +900,26 @@ including its OOM.  The opt-in semantics are deliberate: a window below the dept
 | `GGML_CUDA_VMM_REGION_SELFTEST` | unset (presence) | Run the provider's selftest at backend init: prefix/span growth, a HOST-backed span, aligned window flips (a straddling request is refused), the **host-mapping hazard** (a whole flip sequence re-verified) and the watermark contract.  Must print **PASS**, and must print **FAIL** with `LLAMA_KV_REGION_QUARANTINE=0` — a release gate asks for it explicitly. |
 | `LLAMA_KV_REGION_SPILL_SKIP` | unset (**diagnostic only**) | Comma-separated tensor indices of a windowed buffer that stay fully resident; it bisected the A4 purity hunt and is not shipped behaviour. |
 
+
+
+### 17.2 The MTP draft window (`LLAMA_SPEC_DRAFT_WINDOW`, **default ON** since r193)
+
+The MTP draft context carries its own KV, sized `-c` cells, although the drafter only ever reads its recent
+prefix (one draft layer: 400 MiB at `-c 102400` on the 27B, ~1 GiB at `-c 262144`).  This makes it a sliding
+window, and -- unlike §17.0/§17.1 -- it is **default on**, because it measures **non-negative everywhere and
+positive where it pays**: the freed VRAM reaches the expert arena, and a window at or above the context the
+drafter works over changes no draft at all.
+
+| variable | default | what it does |
+|---|---|---|
+| `LLAMA_SPEC_DRAFT_WINDOW` | **unset = `auto`** (**this is the ON default**; `0` = **kill switch**) | `N` = a window of `N` cells (floored at one ubatch, and the window is dropped when it would hold the whole cache); `auto`/unset = the adaptive policy: **a quarter of the context, clamped to `[32768, 65536]` cells**.  The clamps are the safety rails -- a window far below the context the drafter uses costs 7-9 % of decode, one at or above it is free, and with the lower clamp a `-c <= 32768` run keeps its whole draft cache (no window, no log line).  **MTP only, and only an embedded MTP head** (qwen3.5/3.6/3.8): a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full cache.  `-c`-sized draft KV, `n_swa` = the window; the target still verifies every token, so a truncated draft can only be slower.  **`--fit` sees it**: an embedded MTP head with an active window derives its slab reserve from the model's own metadata with the weights zeroed, `aux 3.50 -> 0.76 GiB` (arena +2.8 GiB); without a window, or for a separate draft GGUF, the flat 3584 MiB constant stays. |
+
+Measured (1 GPU, `-n 2000`/`-n 3000`, static depth 3): 35B-A3B Q8_0 `-ncmoe 48 -c 262144` arena
+20 910 -> 23 715 MiB (residency 64.1 -> 72.7 %), decode 111.2 -> 113.7 t/s, prefill +3.4 %, **drafts
+identical**; dense 27B `-c 102400` Protocol A neutral (71.9 vs 72.1 layer, 72.6 vs 72.5 tensor, acceptance
+2083/2747 in all four arms); target text byte-identical off/auto/4096 and plain == draft-mtp == draft-mtp
+(`W=512`) at `-c 16384`.  Records: `patches/README.md` block 15, `WORKLOG.md` 261031.014,
+`wip/kv-residency/O3-DRAFTER-RING.md` §2.3.
 
 
 ### 17.1 The attendance pool (`LLAMA_KV_REGION_POOL`, **opt-in**)

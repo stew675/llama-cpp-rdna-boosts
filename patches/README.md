@@ -2856,9 +2856,9 @@ byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op witho
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
 
-## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`) and the attendance POOL (`LLAMA_KV_REGION_POOL`), both **opt-in**
+## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`), the attendance POOL (`LLAMA_KV_REGION_POOL`) and the MTP draft WINDOW (`LLAMA_SPEC_DRAFT_WINDOW`, **default on**)
 
-This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: **two** opt-in placements of the same cache.  The **window** (Goal A of `TODO` #118, r178) keeps the newest `W` cells in VRAM and spills the tail to pinned system RAM in the same VA reservation.  The **pool** (Goal B, r190) keeps the authoritative copy of the *whole* context in a pinned host mirror and only the pages a decode step attends to in VRAM, resolved through a page table.  They answer the same question from opposite ends (newest cells vs attended cells), they are mutually exclusive by construction (the pool declines while a window is active), and each is byte-identical to a build without it when its knob is unset.  Both report `is_streaming()`, so a streamed cache takes the sparse QSA decode arm (also this block: B2).
+This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: **two** opt-in placements of the same cache, plus the third variant that is **default on** because it measures non-negative (the MTP draft window, r193).  The **window** (Goal A of `TODO` #118, r178) keeps the newest `W` cells in VRAM and spills the tail to pinned system RAM in the same VA reservation.  The **pool** (Goal B, r190) keeps the authoritative copy of the *whole* context in a pinned host mirror and only the pages a decode step attends to in VRAM, resolved through a page table.  They answer the same question from opposite ends (newest cells vs attended cells), they are mutually exclusive by construction (the pool declines while a window is active), and each is byte-identical to a build without it when its knob is unset.  Both report `is_streaming()`, so a streamed cache takes the sparse QSA decode arm (also this block: B2).
 
 ### The window (Goal A, r178)
 
@@ -3024,6 +3024,61 @@ differs from the old dense-arm text by construction (`GREEDY-PURITY.md` §45/§6
 byte-identical (`853 77a40bf40be1`).  Prefill is untouched (always QSA), so the prefill-logit gate is
 unaffected.  Gate it with the text identity of the two resident arms plus a streamed arm's sparse-vs-default
 identity.
+
+#### r193 — Goal C: the MTP draft window, and the reserve that makes it pay
+
+The MTP draft context's KV is a sliding window instead of `-c` cells.  **This is the one knob in this block
+that is default ON**, because it measures non-negative everywhere and positive where the freed VRAM has
+somewhere to go — the delivery's own rule (a beneficial, gated feature is on; the env var only disables).
+
+* `LLAMA_SPEC_DRAFT_WINDOW`: unset or `auto` = the adaptive policy (**a quarter of the context, clamped to
+  `[32768, 65536]` cells**), `0` = off (byte-identical to a build without it), `N` = that many cells (floored
+  at one ubatch).  The clamps are the safety rails: a window far below the context the drafter uses costs
+  7-9 % of decode, a window at or above it is free, and at `-c <= 32768` the window is dropped entirely.
+* **The ring is the shipped reclaim**, not a new allocator: `llama_kv_cache::find_slot` already reclaims a
+  cell more than `n_swa` behind, and `set_input_kq_mask` reads *this cache's* `n_swa`, so `hparams` (shared
+  with the target) is untouched.  The derived kq mask stays valid as well — its predicate compares each
+  cell's **position**, not its index, so a recycled cell reports its new one.  (The `wip` design note listed
+  that as a hazard; it is not one.)
+* **MTP only, and only an embedded MTP head** (qwen3.5/3.6/3.8).  A separate MTP draft GGUF (qwen4exp /
+  Flash-Next) keeps its full cache and its flat reserve — its draft model's path is not known where the
+  reserve is derived, so that case is deliberately left alone.
+* **The reserve is what makes it worth shipping.**  An embedded MTP head has no GGUF of its own, so the slab's
+  draft reserve was the flat 3584 MiB and the freed VRAM never reached the arena.  With the window active the
+  reserve is now derived from the model's own metadata with the weights zeroed (they are the target's) and
+  the KV sized by the window: **aux 3.50 -> 0.76 GiB, arena +2.8 GiB**.  An un-windowed run keeps the flat
+  constant exactly, and a *declined* arena preflight now re-evaluates when the smaller real value arrives
+  instead of latching on the load-time estimate.
+* **`--fit`:** the draft part of the fit's margin is the derived reserve (`common_draft_reserve_estimate`), so
+  a windowed MTP head is budgeted at its real size; the load-time arena preflight still books the flat
+  constant (the model metadata is all it has), which is the conservative direction and is why the preflight
+  re-evaluates.
+
+**Measured (1 GPU, one R9700, `-n 2000`/`-n 3000`, static depth 3, interleaved).**
+
+| arm | arena | residency | decode | drafts |
+|---|---|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 48 -c 262144` q8_0 KV, 51 433-token prompt, window 0 | 20 910 MiB | 64.1 % | 111.2 t/s | 1995/3011 |
+| the same, `auto` (65536) | **23 715** | **72.7 %** | **113.7** (+2.2 %; +2.8-4.9 % at `-n 2000`) | 1995/3011 (**identical**) |
+| the same, `W=32768` (truncating) | 23 715 | 72.7 % | 110.3 at `-n 2000` (+1.7 %) | 1308/2071 |
+| dense 27B UD-Q4_K_XL `-c 102400`, Protocol A `-n 3000` | — | — | layer 71.9 -> 72.1, tensor 72.6 -> 72.5 (neutral) | 2083/2747 all four |
+
+Prefill +3.4 % on the arena arm.  **Purity:** target greedy text byte-identical across off/auto/4096, and
+plain == draft-mtp == draft-mtp(W=512) at `-c 16384` with a 5256-token prompt and 3000 generated tokens
+(10 158 chars, `sha=99b267e8dc3e`) — constant cell reuse moves no token.  The standard 27B Q8_0 prefill-logit
+point reads 0.000000 / 100.000 % on the shipped tree (the change is decode-only by construction: every path
+is gated on `ctx_type == MTP`).
+
+**Gates on a windowed draft:** `gate-park-idle-slots.sh` (35B, `-ncmoe 48`, `-c 65536`: 3 park moves, park ==
+lazyoff on A-D), `gate-ckpt-reuse.sh` (4B, `-c 131072`: draft cache 33 280 of 131 072, keep/eager arms
+differ as required), `gate-state-pipe.sh` (35B, `-c 65536`: all five arms) — all PASS with `MTP draft KV
+window = 32768 cells` in the logs.  Release gates: `validate-set.sh` 16/16 + tree equality, per-block build,
+and the MTP Protocol A arm above.
+
+**Goal A's `auto` policy is P1 and stays P1** (the arena keeps winning the VRAM; the arena half of Goal A
+needs a numeric `W`).  P2 (unconditional arena-first) was rejected — a fit cannot know the run's depth and a
+`W` 35k cells below it costs 11-26 % — and P3 (an explicit per-token spill budget) is parked until measured.
+
 
 ## Dated history
 
