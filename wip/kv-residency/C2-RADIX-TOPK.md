@@ -1,7 +1,7 @@
 # C2 — the indexer top-k at plain decode (the radix path, `TODO` #125)
 
-**Status: implemented and gated on branch `wip-kv-residency-125` (`83513d733`, off `rdna-boosts` r194).
-NOT promoted to the delivery yet.**
+**Status: PROMOTED in `v16-6050b467c-r196`** (block 11 amended; campaign branch `wip-kv-residency-125`,
+`83513d733`, off r194).  Release record: `WORKLOG.md` 261101.001.
 
 ## What the item actually was
 

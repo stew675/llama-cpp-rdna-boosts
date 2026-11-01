@@ -947,9 +947,14 @@ gap (7-12 % at depth, `patches/README.md` block 15).
 | `LLAMA_KV_REGION_POOL` | **unset = off** | Pool size in **CELLS per layer**, **capped at the cache's own cell count** (r194: a request bigger than the context used to take a 12.4 GiB device pool of 250 000 pages on a 262 144-cell cache; pages past the last block are never claimed), floored at one decode band and padded to the cache's cell alignment.  Pages are one indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots; it is floored at one decode band's worth of blocks and padded to the cache's own cell alignment, so the effective size can be slightly larger (204 MiB at the measured shape).  `0` = off.  Declines (one message, KV unchanged) on anything but a single-stream, non-MLA, uniformly-geometried, device-offloaded qwen4exp trunk cache with no window active, and when the pinned mirror would exceed `LLAMA_KV_SPILL_RAM_PCT`.  **`--fit` sees the pool**: the mirror is charged to host RAM and only the pool to VRAM, so a context that only fits with the pool is accepted with it (r190). |
 | `LLAMA_KV_POOL_VERIFY` | unset (presence) | The oracle: every page selected by a decode step is compared byte-for-byte with the mirror at read time and a mismatch is counted (the teardown line reports `bad`).  Expected **0**.  It costs a second pass over the selected pages, so never quote a timing from this arm. |
 | `LLAMA_KV_POOL_STATS` | unset (**a path**) | At every cache teardown append one line -- pages x cells, claims, misses, ids, hit %, dirty re-fills, resolves, `bad` -- to this file.  A **path**, not a flag: a line on stderr would land between the generated text and `llama-cli`'s perf line and break `scripts/extract-generated.py`.  Reads the counters back once, so it is not default-on. |
+| `LLAMA_KV_POOL_MIRROR_UNIT_MIB` | **`1`** | The mirror's **grow unit** in MiB (r196).  The mirror reserves its full `-c` as VA but pins only the units the run's cell watermark reaches, one `cudaHostRegister` per unit; a larger value pins more per tensor up front (a short run in a big `-c` then costs more RAM), a tiny one is the "grow on every step" diagnostic arm. |
 
-The mirror is allocated **in full at creation** (`-c` cells); a grow-on-demand mirror is an open follow-up in
-`TODO.md`, and `LLAMA_KV_SPILL_RAM_PCT` (block 15's ceiling) is what bounds it.
+The mirror is **grown on demand** (r196, `TODO` #123): the buffer type reserves the whole `-c` as one
+page-aligned `mmap` range but pins only the units a run actually reaches, so a 5 298-token run in a
+`-c 262144` context pins **72 MiB** instead of 3264.  Every write grows first (a state restore included) and a
+read above the pinned extent is refused loudly; `LLAMA_KV_SPILL_RAM_PCT` (block 15's ceiling) bounds it.
+Parking on a pooled cache **declines** to the server's save-and-clear fallback: a park packs to the top of the
+cache, so growing the mirror to its destination would pin the whole context again.
 
 
 ## Maintaining this file

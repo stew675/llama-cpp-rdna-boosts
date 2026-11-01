@@ -2180,6 +2180,33 @@ covered too; 51 475 depth q8_0 `854 43b30de151b9` (== pre-change) and q4_0 `841 
 **0.000000 KLD / 100.000 % top-p**; `test-backend-ops -o FLASH_ATTN_QSA` pass.  Numbers and the census:
 `../wip/kv-residency/BA-POOL-DESIGN.md` §9.3-§10.
 
+#### r196 — plain decode takes the indexer top-k's BLOCK radix path (TODO #125)
+
+The fused top-k (`GGML_OP_INDEXER_TOPK`, `indexer-topk.cu`) was already a radix select: four 8-bit passes over
+the ordered F32 keys plus a deterministic ascending-cell gather, and a block key-shared path that does three of
+the four passes at block granularity.  The gap was that **plain decode could not use the block path**: at
+`n_tokens == 1` the graph passed the uploaded attention mask as the op's per-cell additive, and a per-cell
+additive breaks the "every cell of a block shares one key" premise, so the op fell back to the cell-level radix
+and re-read the `[n_kv]` F16 mask on every pass.  (The verify/MTP width already used the block path — derived
+bias + derived visibility — so its 0.9 ms/step is unchanged by this.)
+
+The per-cell half is now derived at ANY width: `build_qsa_top_k` hands the top-k `cell_vis`/`q_vis` instead of
+the mask while the per-block bias stays the uploaded tensor (the fused decode score op applies it), so at
+`n_tokens == 1` the block key is the score itself and `blk_idx`/`blk_tail` may be null.  The attention still
+reads the mask (`qwen4exp_want_derived_vis` keeps its own `n_tokens > 1` gate), so this changes the top-k only.
+`llm_graph_input_qsa::can_reuse` compares the same predicate through a stored `vis_supported` flag (the device
+query needs the layer), and `indexer_topk_histogram_blocks` guards its incomplete-block skip on a non-null
+`blk_idx`.  A new `test-backend-ops` case covers the null-`blk_idx` form against the CPU reference.
+
+**Worth** (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, pool, plain decode, 103k, rocprofv3
+short/long): the top-k bucket **2.062 -> 1.143 ms/token**, total decode kernel time **17.520 -> 16.363
+ms/token**; wall A/B `-n 512`, interleaved, **40.48/40.48 -> 42.11/42.11 t/s (+4.0 %, -0.95 ms/token)**.
+**Purity:** greedy text byte-identical to r194 at 5.3k (`332 dd1981213373`) and 103k
+(`834 263da53898a3`), to `LLAMA_INDEXER_NOBLOCK=1` (block vs grouped-cell), and on the MTP `draft-mtp` depth-4
+`-n 512` arm (`2259 f3553fb82f82`).  `INDEXER_TOPK` 4/4, `FLASH_ATTN_QSA` 26/26, prefill-logit 0.000000 /
+100.000 % (decode-only), no GPU faults.  `GGML_QSA_DERIVED_VIS=0` is the kill switch for the derived per-cell
+form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_NOBLOCK=1` is the isolation arm).
+
 ## Block 12 — campaign remainder
 
 **What it is.**  The tail of the campaigns: CPU wins, the backend-iface fills that every non-CUDA backend
@@ -2998,10 +3025,10 @@ at `-c 262144 -ncmoe 16` aborts with `cudaMalloc failed: out of memory` / `faile
 cache` with the knob unset and **runs** with it), and the arena it frees is worth +1.44 GiB.
 
 **Not in this block:** the pool declines a tensor split (one page table per device would need a per-device pool
-and a split-aware resolve — block 15's window has the same limitation), the *mirror* is allocated in full at
-creation (a grow-on-demand mirror is `TODO.md`'s open follow-up; the pinned-RAM ceiling
-`LLAMA_KV_SPILL_RAM_PCT` bounds it and declines the pool loudly rather than being OOM-killed), and k-quant
-indexer keys stay on the chain (block 11's loader needs a 32-element block that divides `idx_dim`).
+and a split-aware resolve — block 15's window has the same limitation), the *mirror* grows on demand (r196) and
+is bounded by the pinned-RAM ceiling `LLAMA_KV_SPILL_RAM_PCT`, which declines the pool loudly rather than being
+OOM-killed, and k-quant indexer keys stay on the chain (block 11's loader needs a 32-element block that
+divides `idx_dim`).
 
 **Gates (r190, on the final base).**  Greedy text pool == the resident sparse arm at 5.3k
 (`332 dd1981213373`), 51 475 depth (`854 43b30de151b9`) and 180k (`861 263c7f2be4d9`), with the dense arm
@@ -3122,6 +3149,23 @@ speculation, and on the released r191 binary too.  Filed as `TODO` #129.
 **Goal A's `auto` policy is P1 and stays P1** (the arena keeps winning the VRAM; the arena half of Goal A
 needs a numeric `W`).  P2 (unconditional arena-first) was rejected — a fit cannot know the run's depth and a
 `W` 35k cells below it costs 11-26 % — and P3 (an explicit per-token spill budget) is parked until measured.
+
+**r196 — the attendance pool's mirror grows on demand (`TODO` #123).**  The mirror used to be one
+`cudaMallocHost` of the cache's whole cell-indexed size at creation (3264 MiB at `-c 262144` q8_0, 1632 at
+131072), so a short run in a big `-c` pinned the whole context in non-swappable RAM.  The buffer type now
+reserves one page-aligned `mmap` range and pins 1 MiB units with `cudaHostRegister` as the cell watermark
+reaches them (host and device see the same UVA pointer, so every host path still works on `tensor->data`); a
+unit is never unmapped, every write grows first (a state restore included), and a read above the pinned extent
+is refused loudly.  `grow_regions()` drives it through the same padded `n_kv` the window uses.  Windows keeps
+the one-shot pinned allocation.  `LLAMA_KV_POOL_MIRROR_UNIT_MIB` (default 1) is the grow unit.  **Parking on a
+pooled cache declines to the server's save-and-clear fallback**: a park packs to the top of the cache, so
+growing the mirror to its destination would pin the whole context again (the park gate reports a declined park
+as a legitimate PASS and `park == lazyoff` still holds).  Measured: **72 MiB pinned of 3264** at `-c 262144`
+and a 5 298-token prompt, **1296 of 1632** at 103k (used extent 1281).  Text is byte-identical to r194 on the
+grown 103k arm (`834 263da53898a3`) and 5.3k (`332 dd1981213373`); `LLAMA_KV_POOL_VERIFY=1` 0 mismatches; a
+fresh-process slot-file restore (525 MB state) restores 5313 tokens and prefills 4 with the same text;
+park/ckpt/state gates PASS; `LLAMA_KV_SPILL_RAM_PCT=1` declines and pins 0; `--fit` still charges the full
+mirror to the host bucket (it cannot know the run's depth).
 
 
 ## Dated history

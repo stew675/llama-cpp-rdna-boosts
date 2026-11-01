@@ -1,7 +1,7 @@
 # C1 — the attendance pool's mirror grows on demand (`TODO` #123)
 
-**Status: implemented and gated on branch `wip-kv-residency-123` (`d51aedd93`, off `rdna-boosts` r194).
-NOT promoted to the delivery yet.**
+**Status: PROMOTED in `v16-6050b467c-r196`** (block 15 amended; campaign branch `wip-kv-residency-123`,
+`d51aedd93`, off r194).  Release record: `WORKLOG.md` 261101.001.
 
 ## What was wrong
 

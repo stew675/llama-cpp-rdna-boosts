@@ -1,3 +1,76 @@
+## 261101.001 (r196) -- block 11 takes the indexer top-k's BLOCK radix path at plain decode (#125), and block 15's attendance-pool mirror grows on demand (#123)
+
+**Released as `v16-6050b467c-r196` (16 blocks; block 11 and block 15 amended).**  Canonical tip
+`bb6599e801c32be0fb457e6cefb8e99a999de358`, tree `164070eecdb4db3b7fba057dca1ba90cdec0ca34` (r195 was
+`aec3bcd7f` / `37aa320b`; r194 `d7e708f08` / `977faeaa`).  **r195 was already published by another agent**
+(PR #261, block 03's moved-recurrent-cell snapshots), so this promotion is cut on top of that chain rather
+than on r194; the two changes below do not touch block 03's files (`llama-graph.*`,
+`llama-memory-recurrent.*`, `test-recurrent-state-depth.cpp`).  `release.json` refreshed; patches regenerated
+from `6050b467c..fold-r196`; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c`
+tarball, tree equality, 286 files through the Windows portability lint).
+
+### #125 -- plain decode takes the top-k's block radix path (block 11)
+
+`TODO` #125 described the indexer top-k as if it were a sort to replace.  It was already a radix select; the
+gap was that **plain decode could not use its block key-shared path**.  At `n_tokens == 1` the graph passed
+the uploaded attention mask as the op's per-cell additive, which breaks "every cell of a block shares one
+key", so the op fell back to the cell-level radix and re-read the `[n_kv]` F16 mask on every pass.  The
+verify/MTP width already used the block path (derived bias + derived visibility), so its 0.9 ms/step is
+unchanged.
+
+The per-cell half is now derived at **any** width: `build_qsa_top_k` hands the top-k `cell_vis`/`q_vis`
+instead of the mask while the per-block bias stays the uploaded tensor (the fused decode score op applies
+it), so the block key is the score itself and `blk_idx`/`blk_tail` may be null.  The attention still reads
+the mask (`qwen4exp_want_derived_vis` keeps its own `n_tokens > 1` gate), so this changes the top-k only.
+`llm_graph_input_qsa::can_reuse` compares the same predicate through a stored `vis_supported` flag (the
+device query needs the layer), and `indexer_topk_histogram_blocks` guards its incomplete-block skip on a
+non-null `blk_idx`.  A new `test-backend-ops` case covers the null-`blk_idx` form against the CPU reference.
+
+**Worth** (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0, pool, plain decode, 103k, `rocprofv3`
+short/long): top-k **2.062 -> 1.143 ms/token**, total decode kernel time **17.520 -> 16.363 ms/token**; wall
+A/B `-n 512`, interleaved: **40.48/40.48 -> 42.11/42.11 t/s (+4.0 %, -0.95 ms/token)**.
+
+**Purity:** greedy text byte-identical to r194 at 5.3k (`332 dd1981213373`) and 103k
+(`834 263da53898a3`), to `LLAMA_INDEXER_NOBLOCK=1` (block vs grouped-cell), and on the MTP `draft-mtp`
+depth-4 `-n 512` arm (`2259 f3553fb82f82`).  `INDEXER_TOPK` 4/4, `FLASH_ATTN_QSA` 26/26, the standard 27B
+Q8_0 prefill-logit point **0.000000 / 100.000 %** (decode-only), no GPU faults.  `GGML_QSA_DERIVED_VIS=0`
+is the kill switch for the derived per-cell form; note it is **not a no-op A/B** (disabling it also changes
+the prefill scorer's strip trimming and can flip the `LLAMA_QSA_SCORE_WMMA` auto choice, and the r194 binary
+reads different text with it too), so `LLAMA_INDEXER_NOBLOCK=1` is the isolation arm.
+
+### #123 -- the attendance pool's mirror grows on demand (block 15)
+
+The pool's authoritative mirror was one `cudaMallocHost` of the cache's whole cell-indexed size at creation
+(3264 MiB at `-c 262144` q8_0, 1632 at 131072) for a 204 MiB device pool, so a short run in a big `-c`
+pinned the whole context in non-swappable RAM.  The buffer type now reserves one page-aligned `mmap` range
+and pins **1 MiB units** with `cudaHostRegister` as the cell watermark reaches them (host and device see the
+same UVA pointer, so every existing host path still works on `tensor->data`); a unit is never unmapped, every
+write grows first (a state restore included), and a read above the pinned extent is refused loudly.
+`grow_regions()` drives it through the same padded `n_kv` the window uses; Windows keeps the one-shot pinned
+allocation.  `LLAMA_KV_POOL_MIRROR_UNIT_MIB` (default **1**) is the grow unit.
+**Parking on a pooled cache now declines to the server's save-and-clear fallback** (a park packs to the top
+of the cache, so growing the mirror to its destination would pin the whole context again); the park gate
+reports a declined park as a legitimate PASS and `park == lazyoff` still holds.
+
+**Measured:** **72 MiB pinned of 3264** at `-c 262144` with a 5 298-token prompt, **1296 of 1632** at 103k
+(used extent 1281).  Text is byte-identical to r194 on the grown 103k arm (`834 263da53898a3`) and 5.3k
+(`332 dd1981213373`); `LLAMA_KV_POOL_VERIFY=1` **bad 0**; a fresh-process slot-file restore (a 525 MB state)
+restores 5 313 tokens, prefills **4** and generates the same text (the `set_tensor` grow path);
+`gate-park-idle-slots.sh` PASS (declined fallback, `park == lazyoff` on A-D), `gate-ckpt-reuse.sh` PASS,
+`gate-state-pipe.sh` PASS (5/5); `LLAMA_KV_SPILL_RAM_PCT=1` declines and pins **0**; `--fit` still charges
+the full mirror to the host bucket (it cannot know the run's depth); no GPU faults.
+
+**Release gates run on the r196 tip:** `validate-set.sh` (16/16, tree equality); `gate-per-block-build.sh
+--changed-from aec3bcd7f --fast` **2/2** (blocks 11 and 15) plus the full `all` build; `INDEXER_TOPK` 4/4;
+`FLASH_ATTN_QSA` 26/26; the 5.3k/103k/MTP text arms above; the park gate; the standard 27B Q8_0 prefill-logit
+point **0.000000 / 100.000 %**; `check-gpu-faults.sh` clean.
+
+**`TODO` #123 and #125 are closed to this entry.**  Still open in the campaign: `#129` (`-nkvo` + host
+experts aborts, pre-existing), `#124` (Goal A across `-sm tensor`, hardware-blocked), `#120`/`#127` (block 10
+adjacent), and the two candidates in `HANDOVER-A19.md` (the qwen4exp separate MTP draft is not windowed; a
+pool-size policy for a 200k+ working set).  Records: `wip/kv-residency/C1-MIRROR-GROW.md`,
+`wip/kv-residency/C2-RADIX-TOPK.md`; the next cold start is `wip/kv-residency/HANDOVER-A19.md`.
+
 ## 261031.016 (r195) -- recurrent: a cell that `find_slot` moves keeps its rollback snapshots (contributor PR #261, block 03 amended)
 
 **Released as `v16-6050b467c-r195` (16 blocks, block 03 amended).**  Contribution by **overdoingism**
