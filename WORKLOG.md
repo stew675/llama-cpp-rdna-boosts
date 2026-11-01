@@ -1,3 +1,18 @@
+## 261101.009 (docs) -- r201 published: CI, the fork branch and the issue replies
+
+No delivery change.  `v16-6050b467c-r201` is tagged and pushed; `main` is at the r201 commit.  CI: **Validate
+delivery set** green on both the `main` push and the tag push (strict 16/16 apply on a fresh tarball, tree
+equality, the Windows portability lint), **Release patch set** green (assets `patches.tar.gz`,
+`rdna-boosts-all.patch`, `release.json`).  The personal fork's `rdna-boosts` branch was force-pushed to
+`7fe2b7829` by `scripts/fork-refresh.sh --build --gates`, which also re-cut the branch from `6050b467c`,
+reproduced tree `f122dff7` and ran the canonical prefill-logit gate (**0.000000 / 100.000 %**).  The ROCm images
+are built and pushed off-host by the worker watcher (`radiance`), which polls for the tag.
+
+Issues: **#265 closed** (the fix, with the numbers, and a request to re-test r201); **#263 commented, left
+OPEN** -- the #265-class cause is fixed and its acceptance/text difference is gone, the reported 14-point
+magnitude was not reproduced, and the remaining gfx1100 lead is `TODO.md` **#130**, handed to a dedicated
+7900 XTX session with a two-minute reproducer per arm.
+
 ## 261101.008 (issues #265 / #263) -- the SSM gate/beta fusions computed softplus in a different rounding than the chain (blocks 08 + 10 amended)
 
 **Released as `v16-6050b467c-r201` (16 blocks; blocks 08 and 10 amended).**  Canonical tip `7fe2b7829`, tree
