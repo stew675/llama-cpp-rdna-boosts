@@ -22,6 +22,13 @@ paste into a fresh session and it points here.
   two are follow-ups a user would notice (memory pinned in full, a 2 ms top-k), one is hardware-blocked, and
   one is a pre-existing abort in an unrelated combination (`-nkvo` + host experts).
 
+**A18 progress (this session).**  #123 and #125 are implemented and gated on their own branches off `rdna-boosts`
+(`wip-kv-residency-123` `d51aedd93`, `wip-kv-residency-125` `83513d733`); **neither is promoted to the delivery**.
+Records: [`C1-MIRROR-GROW.md`](C1-MIRROR-GROW.md) (the mirror pins 72 MiB of 3264 at a 5.3k run in `-c 262144`;
+1296 of 1632 at 103k, text identical to r194) and [`C2-RADIX-TOPK.md`](C2-RADIX-TOPK.md) (the op was already a
+radix select; plain decode was on its cell-level form, now the block path: **2.062 -> 1.143 ms/token**, +4.0 %
+plain decode, MTP unchanged).
+
 ## 2. What is delivered — do not redo any of it
 
 | delivered | knob / feature | record |
@@ -221,15 +228,19 @@ campaign items stall.
 | [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | the window: design, purity hunt (§3.7.8), spill cost (§3.7.9), the re-measurement (§3.7.11.4), the `auto` decision (§3.7.14) |
 | [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md) | the tensor-split design (`#124`) |
 | [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) | the MTP draft window (§2.3 is the delivered session) |
+| [`C1-MIRROR-GROW.md`](C1-MIRROR-GROW.md) | **A18**: the attendance pool's mirror grown on demand (#123) — branch `wip-kv-residency-123`, not promoted |
+| [`C2-RADIX-TOPK.md`](C2-RADIX-TOPK.md) | **A18**: plain decode takes the indexer top-k's block radix path (#125) — branch `wip-kv-residency-125`, not promoted |
 | [`HANDOVER.md`](HANDOVER.md) | the A-era cold start (Goals A and B), still the source for their commands |
 | `patches/README.md` block 15 | the shipped description, including the r194 corner fixes |
 | `WORKLOG.md` 261030.002/.003/.005, 261031.007-.009, .013-.015 | the dated delivery records |
 
 ## 9. Suggested order for A18
 
-1. **`#123`** — it is the only remaining item whose absence a user feels in RAM, and it is pure infrastructure
-   (no numerics), so it is the safest place to start.  Gate it on the pool's own arms.
-2. **`#125`** — the last real performance item in the sparse arm; it needs a census first, then a kernel.
+1. **`#123`** — **DONE on `wip-kv-residency-123`** (see `C1-MIRROR-GROW.md`); the one open decision is whether a
+   pooled cache should decline parking (the shipped arm: saves the pinned RAM) or grow the mirror to the park
+   bound (keeps the park, pins the context).
+2. **`#125`** — **DONE on `wip-kv-residency-125`** (see `C2-RADIX-TOPK.md`); the MTP half was already the block
+   path, so the win is plain decode only.
 3. **`#129`** — separate it from the campaign: it is a pre-existing abort in a combination nobody validated.
 4. **`#120`/`#127`** if the session has time.
 5. **`#124`** only on a multi-device host.
