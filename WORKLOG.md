@@ -53,7 +53,10 @@ greedy text byte-identical on six arms (1 GPU, 3 GPU `-sm tensor`, gpt-oss head 
 `-ncmoe 40`, `q4_0`, `-n 3000`) plain 79.1 / `draft-mtp` **178.6** (**0.877**), and with `GGML_CUDA_DISABLE_FUSION=1`
 131.4 / 0.894 (the fused multi-token path did not diverge).  Band gate `llama-batched-bench -npl 1,4,8` flat
 (bf16 56.67/172.55/267.04 -> 55.96/172.81/267.50; `q4_0` 53.47/170.42/263.43 -> 53.80/170.68/262.83).
-`check-gpu-faults.sh --since "3 hours ago"`: clean.
+`check-gpu-faults.sh --since "3 hours ago"`: clean.  The fork's `rdna-boosts` branch was force-with-lease
+pushed to `d5f241572` (`fork-refresh.sh --push`), the delivery repo and the tag are pushed (CI: Validate delivery
+set + Release patch set green), and the ROCm container images are the `radiance` watcher's job (it picks the tag up
+within 10 minutes).
 
 **`TODO` #120 now stands only for `q5_0` / `iq4_nl` / `bf16`** (`q5_0` has the same shape as `q4_0`, `iq4_nl`
 searches its scale, `bf16` has no fused write kernel); #128 was already retired by r198.
