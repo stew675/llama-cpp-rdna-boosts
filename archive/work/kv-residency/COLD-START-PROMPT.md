@@ -1,11 +1,11 @@
-# Cold-session prompt — `wip/kv-residency` (the remaining items)
+# Cold-session prompt — `archive/work/kv-residency` (the remaining items)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from a previous
 session's context).  **Written 2026-11-01, end of session A18 (the r196 release).**
 
 ---
 
- Read [`wip/kv-residency/HANDOVER-A19.md`](HANDOVER-A19.md) first: it is the self-contained cold start and it
+ Read [`archive/work/kv-residency/HANDOVER-A19.md`](HANDOVER-A19.md) first: it is the self-contained cold start and it
  supersedes `HANDOVER-A18.md` (which stays as the A17-era plan and the Goal A/B/C record).
 
  **Done, do not redo.** Goals A (the resident window, `LLAMA_KV_RESIDENT_CELLS`), B (the attendance pool,

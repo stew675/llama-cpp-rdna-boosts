@@ -1,19 +1,18 @@
-# wip/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (OPEN — Goal A+B delivered, Goal C + follow-ups remain)
+# archive/work/kv-residency — the KV cache in VRAM: how much, where, and how little can be resident (**ARCHIVED 2026-11-01** — Goals A+B+C shipped as block 15; what was left moved to `wip/kv-residency-cleanup/`)
 
-**Cold start: read [`HANDOVER-A18.md`](HANDOVER-A18.md) first** — it is the self-contained handover for what is
-left (written at the end of A17, when Goals A, B and C were all delivered).  [`HANDOVER.md`](HANDOVER.md) stays
-as the A-era record of how Goals A and B were built and is still the source for their commands.
+**Archived record — read [`CLOSEOUT.md`](CLOSEOUT.md) first** (the disposition).  For the history:
+[`HANDOVER-A19.md`](HANDOVER-A19.md) is the last state-of-the-campaign handover, [`HANDOVER.md`](HANDOVER.md) is
+the A-era record of how Goals A and B were built and remains the source for their commands, and
+[`HANDOVER-A18.md`](HANDOVER-A18.md) is the earlier plan-of-record snapshot.
 
-**Status: OPEN — Goals A, B and C are DELIVERED, the campaign is not finished (2026-10-31).**  Goal A (the
-resident window) is **block 15** in r178, Goal B (the attendance pool) the same block 15 in r190 (folded in
-r191) and Goal C (the MTP draft window) again block 15 in **r193** (`WORKLOG.md` 261031.008/261031.009/261031.014); `TODO` #118's delivery ask is therefore closed.  What
-remains is the campaign's own work, carried as its own `TODO` items — #121 (Goal C, the drafter ring: measured,
-not promoted, three questions in [`O3-DRAFTER-RING.md`](O3-DRAFTER-RING.md) §7), #122 (the Goal A `auto` policy),
-#123 (the grow-on-demand mirror), #124 (Goal A on a `-sm tensor` split) and #125 (the radix top-k) — with #121 closed (Goal C shipped in r193, default ON) and #122 decided (P1) — so this
-directory **stays under `wip/` until the last item closes** (`HANDOVER.md` §12.4: do not archive it while Goal C
-is open).  The shipped form is `patches/` block 15; the campaign's measurement code lives on fork branch
-`wip-kv-residency` (cut from the r174 tip `5bdec04ab`), and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) is the O1
-record.
+**Status: ARCHIVED 2026-11-01 (r197).**  Goals A (the resident window, r178), B (the attendance pool, r190)
+and C (the MTP draft window, r193) are all delivered in **block 15**, and `TODO` #118's delivery ask is closed;
+so are `#121`-`#125` and `#129`.  The campaign's remaining items — the residency gate, O1's go/no-go, a window
+for a *separate* draft model, a pool-size policy above ~200k, and the record hygiene they imply — moved to
+[`wip/kv-residency-cleanup/`](../../../wip/kv-residency-cleanup/README.md).  Nothing in this directory is active
+work; it is the record.  [`CLOSEOUT.md`](CLOSEOUT.md) is the disposition (what shipped, what was declined,
+where to read first).  The shipped form is `patches/` block 15.
+
 **`TODO` #118 is the permanent (retired) handle** for the subject (it was cited as `#117` before that number
 went to the MoE band-predicate item; see `WORKLOG.md` 261031.008 and 261031.011) (old and future records
 that cite `#117` mean this document).  `wip/` is never applied to the fork (`AGENTS.md`, WIP rules).
@@ -239,7 +238,7 @@ This is the design constraint the ask names, and it is achievable because the la
 
 ```bash
 # the link constant this campaign turns on (28.8 GB/s here; read the ROOT PORT's width, not the card's)
-/opt/rocm-10.1.0-gfx120X/bin/hipcc -O3 --offload-arch=gfx1201 wip/kv-residency/bw-probe.cc -o /tmp/bw-probe
+/opt/rocm-10.1.0-gfx120X/bin/hipcc -O3 --offload-arch=gfx1201 archive/work/kv-residency/bw-probe.cc -o /tmp/bw-probe
 HIP_VISIBLE_DEVICES=0 /tmp/bw-probe 512 5
 ```
 

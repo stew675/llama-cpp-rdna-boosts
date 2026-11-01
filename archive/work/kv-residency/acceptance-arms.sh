@@ -42,7 +42,7 @@ arm() {  # arm <tag> [ENV=VAL ...]
   local tag=$1; shift
   ( [ $# -gt 0 ] && export "$@"
     timeout 2400 "$CLI" "${BASE[@]}" -c "$CTX" -f "$PROMPT" -n "$N" -v > "$OUT/$tag.log" 2>&1
-    python3 "$REPO/wip/kv-residency/arm-row.py" "$OUT/$tag.log" "$tag" )
+    python3 "$REPO/archive/work/kv-residency/arm-row.py" "$OUT/$tag.log" "$tag" )
 }
 
 for r in $(seq "$REPS"); do

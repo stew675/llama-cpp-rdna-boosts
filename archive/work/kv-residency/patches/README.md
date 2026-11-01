@@ -1,6 +1,6 @@
-# `wip/kv-residency/patches` — the campaign's code, self-contained
+# `archive/work/kv-residency/patches` — the campaign's code, self-contained
 
-**Not delivery work.**  These patches belong to the `wip/kv-residency` campaign (`TODO` **#118**; the commit messages inside say
+**Not delivery work.**  These patches belong to the `archive/work/kv-residency` campaign (`TODO` **#118**; the commit messages inside say
 `#117`, which is the handle the campaign used before that number was allocated to another item).  They are not
 in `patches/`, not in `release.json`, and no block in the delivery reads them.  Nothing here may be applied to
 `~/llama.cpp`'s `rdna-boosts` branch, and folding any of it into the delivery is the promotion rule's job
@@ -26,7 +26,7 @@ because the campaign is not promoted.  A promotion re-cuts the series from the t
 cd ~/llama.cpp
 git checkout rdna-boosts && git checkout 5bdec04ab        # or: scripts/apply-all.sh after a fresh clone
 git checkout -b wip-kv-residency
-git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/00*.patch     # 0001..0014, in order
+git am ~/llama-cpp-rdna-boosts/archive/work/kv-residency/patches/00*.patch     # 0001..0014, in order
 ~/bin/build-llama-rocm
 ```
 

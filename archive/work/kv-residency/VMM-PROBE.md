@@ -1,11 +1,11 @@
 # The ROCm VMM probe — what the driver actually allows (and the two traps)
 
-`wip/kv-residency/vmm-probe.cc`, run on r174's box (gfx1201, ROCm 10.1.0, HIP 7.16, 1x R9700).
+`archive/work/kv-residency/vmm-probe.cc`, run on r174's box (gfx1201, ROCm 10.1.0, HIP 7.16, 1x R9700).
 Build (the `-isystem` is mandatory — without it HIP resolves from Fedora's ROCm 7.1 in `/usr/include`):
 
 ```bash
 hipcc -O3 --offload-arch=gfx1201 -isystem /opt/rocm-10.1.0-gfx120X/include \
-      wip/kv-residency/vmm-probe.cc -o /tmp/vmm-probe
+      archive/work/kv-residency/vmm-probe.cc -o /tmp/vmm-probe
 HIP_VISIBLE_DEVICES=0 /tmp/vmm-probe --va-mib 2048
 ```
 

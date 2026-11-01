@@ -299,7 +299,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   layer's routed ops together) so the pruning and the cache keep working.  Measured on one R9700, a 24-layer
   128-expert MoE at `-ncmoe 24 -nkvo`: abort -> 24.6 -> 82.7 t/s against 176 with the KV on the GPU; text
   byte-identical to the default arms on bailingmoe3/35B-A3B (± `draft-mtp`)/gpt-oss-20b/Flash-Next/dense.
-  `patches/README.md` (block 09), `wip/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
+  `patches/README.md` (block 09), `archive/work/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
 - **A cross-device copy must ask `ggml_cuda_slab_peer_copy_ok()` first (r121).**  The slab's
   peer-access grant is per-device and **best effort**: with three ~29 GiB slabs the driver refuses it for the
   second and third device (the peers have no free VRAM to build a 29 GiB peer mapping), and a

@@ -1,6 +1,6 @@
 # cpy_2d_vec16 — a vectorised fallback for the 2-D copy the r183 guard refuses — PROMOTED in r189
 
-**Origin:** the KV-residency campaign (`wip/kv-residency`), session A12 (2026-10-31), commit `f8e47e392` on the
+**Origin:** the KV-residency campaign (`archive/work/kv-residency`), session A12 (2026-10-31), commit `f8e47e392` on the
 fork branch `wip-kv-residency-b`.  Staged for promotion as `beta/0016-copy-2d-vec16/` (this directory's
 `copy-2d-vec16.patch`, `README-beta.md`, `BETA-TESTING.md`), folded into **block 10** and released as
 `v16-6050b467c-r189` (`ggml/src/ggml-cuda/cpy.cu`).

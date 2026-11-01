@@ -15,7 +15,7 @@ Build (the `-isystem` is mandatory — otherwise HIP resolves from Fedora's ROCm
 
 ```bash
 hipcc -O3 --offload-arch=gfx1201 -isystem /opt/rocm-10.1.0-gfx120X/include \
-      wip/kv-residency/mixed-backing-probe.cc -o /tmp/mixed-probe
+      archive/work/kv-residency/mixed-backing-probe.cc -o /tmp/mixed-probe
 HIP_VISIBLE_DEVICES=0 /tmp/mixed-probe [--mib N] [--t8-mib N]
 ```
 

@@ -123,7 +123,7 @@ indirection for nothing.
 | **O3** drafter ring | **Goal C — built, and last in priority (not a detour any more, once stated).** Built (patch `0003`), pure, measured: ~free at a usable window, but the prize is one draft layer (~1 GiB at `-c 262144`) and the freed VRAM does not reach the arena (`O3-DRAFTER-RING.md` §2.2).  Not a step toward O2; revisit only as a *companion* to O2 (§2.2.2), never as a standalone project. |
 | **O4** indexer diet, **O5** non-KV metadata, **O6** provider P0 | not started; O6 is partly subsumed by O2's pool. |
 
-Nothing from `wip/kv-residency/` is in `patches/`, `release.json` or any block, and none of it may be
+Nothing from `archive/work/kv-residency/` is in `patches/`, `release.json` or any block, and none of it may be
 promoted.  The fork branch `wip-kv-residency` is the record.
 
 ---

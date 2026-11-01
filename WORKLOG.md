@@ -1,3 +1,40 @@
+## 261101.003 (docs, post-r197) -- the KV-residency campaign is ARCHIVED; its residue becomes `wip/kv-residency-cleanup/`
+
+**No delivery change** (`patches/`, `release.json` and every block are untouched; docs only).  The campaign
+(`TODO` #118) had no mechanism work left — Goals A (window, r178), B (attendance pool, r190) and C (MTP draft
+window, r193) all ship in block 15, and `#121`-`#125` and `#129` are closed — so per the WIP rule it left
+`wip/` instead of drifting: `git mv wip/kv-residency archive/work/kv-residency`, with a new
+[`archive/work/kv-residency/CLOSEOUT.md`](archive/work/kv-residency/CLOSEOUT.md) as the disposition (what
+shipped, what was measured and declined, where to read first) and the campaign README's status block rewritten
+to ARCHIVED.  Every repo path reference to the old location was rewritten (`WORKLOG.md`, `MANIFESTS.md`,
+`TODO.md`, `patches/README.md`, `GREEDY-PURITY.md`, `AGENTS.md`, `ENVIRONMENT.md`, `README.md`, `benchmarks/`,
+`archive/work/cpy-2d-vec16/`), so no link depends on a stub; the campaign's own `patches/` snapshot and the
+`.cc` header comments keep the old name because they are immutable/dated content.
+
+**What is left of the campaign is its own campaign: [`wip/kv-residency-cleanup/`](wip/kv-residency-cleanup/README.md)**
+— written as a self-contained cold start (its README carries the inherited state, the rules that cost
+sessions, and the gate recipes, so a new session does not have to wade through the campaign notes).  Its items,
+in the order it suggests:
+
+1. **the residency gate the plan said it could not ship without** (`README.md` §8 P0): resident vs
+   deliberately-undersized arms, byte-identical text, identical acceptance, hit/miss counters both ways.  The
+   pool shipped on a substitute (`LLAMA_KV_POOL_VERIFY=1` + a hand-run 5.3k/103k/180k table) and no
+   `scripts/gate-*.sh` covers it, so a pool regression between releases is currently invisible.  **S-M**;
+2. **O1 "KV-grow" go/no-go** (`§8 P1`, `§11(5)`): the grow-only provider exists but is used only by `--fit`'s
+   probe; shipping it needs its refusal mode gated, closing it is one line. **S** to decide;
+3. **a window for a *separate* draft model** (`O3-DRAFTER-RING.md` §7(3)): r193 shipped MTP/embedded-head only,
+   so Flash-Next's MTP sidecar and DFlash2 keep the full `-c`.  Different access pattern (injection graph on
+   the main scheduler + decoder graph on the alt one), so it must be measured.  **M**;
+4. **a pool-size policy above ~200k** (A17: `=16416` = 97.9 % at 5 246 and 86.0 % at 102 800; `=32768` bought
+   0.2 points and no speed): a fixed cell count is fine at our shapes, nobody has asked about `-c 262144`.
+   **S-M** (measurement);
+5. **close-outs** (no code): O6's portable provider, B1 §7(2) "the target context", B1 §7(3)'s per-cache window
+   exemption (moot — the pool keeps the indexer resident), k-quant indexer keys into `TODO.md`'s accepted
+   limitations, and retiring `TODO` #122's decided row.
+
+`TODO` #124 (Goal A across `-sm tensor`) stays a TODO row with its design in the archive; it is
+hardware-blocked on this one-card box.  `#128`, `#120`, `#127` and `#116` are delivery items, not campaign work.
+
 ## 261101.002 (r197) -- block 09: a routed host-weight op whose routing ids are computed by its own split (#129); block 15: `-nkvo` declines the window, and the streamed arm keys on the placement
 
 **Released as `v16-6050b467c-r197` (16 blocks; block 09 and block 15 amended).**  Canonical tip
@@ -6,7 +43,7 @@
 refreshed; patches regenerated from `6050b467c..r197-chain` (blocks 10-14 carry new `From` lines from the
 rebase, identical bodies); `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c`
 tarball, tree equality, 286 files through the Windows portability lint); `fork-refresh.sh` re-cut the branch
-from the base and reproduced the tree.  Campaign record: `wip/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
+from the base and reproduced the tree.  Campaign record: `archive/work/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
 
 ### #129 -- `-nkvo` + host experts aborted (block 09) — CLOSED
 
@@ -145,8 +182,8 @@ point **0.000000 / 100.000 %**; `check-gpu-faults.sh` clean.
 **`TODO` #123 and #125 are closed to this entry.**  Still open in the campaign: `#129` (`-nkvo` + host
 experts aborts, pre-existing), `#124` (Goal A across `-sm tensor`, hardware-blocked), `#120`/`#127` (block 10
 adjacent), and the two candidates in `HANDOVER-A19.md` (the qwen4exp separate MTP draft is not windowed; a
-pool-size policy for a 200k+ working set).  Records: `wip/kv-residency/C1-MIRROR-GROW.md`,
-`wip/kv-residency/C2-RADIX-TOPK.md`; the next cold start is `wip/kv-residency/HANDOVER-A19.md`.
+pool-size policy for a 200k+ working set).  Records: `archive/work/kv-residency/C1-MIRROR-GROW.md`,
+`archive/work/kv-residency/C2-RADIX-TOPK.md`; the next cold start is `archive/work/kv-residency/HANDOVER-A19.md`.
 
 ## 261031.016 (r195) -- recurrent: a cell that `find_slot` moves keeps its rollback snapshots (contributor PR #261, block 03 amended)
 
@@ -461,10 +498,10 @@ of the delivery's kernel work; and a `.kld` base is a *per-toolchain* artifact.
 
 `TODO` **#118** was the only open-table item the campaign record says is done: Goal A (the resident window)
 shipped as **block 15** in r178, Goal B (the attendance pool) as the same block 15 in r190, and r191 folded
-them together.  `wip/CAMPAIGNS.md`, `wip/kv-residency/COLD-START-PROMPT.md` and `patches/README.md` (block 15)
+them together.  `wip/CAMPAIGNS.md`, `archive/work/kv-residency/COLD-START-PROMPT.md` and `patches/README.md` (block 15)
 all say so, and `WORKLOG.md` 261031.008 closes it.  Per `TODO.md`'s own rule a closed item is not kept there,
 so its row and its `## 118` section are gone; a pointer under "Where the current lists live" keeps the
-campaign reachable.  Nothing is lost: the section's narrative was duplicated in `wip/kv-residency/`
+campaign reachable.  Nothing is lost: the section's narrative was duplicated in `archive/work/kv-residency/`
 (`README.md` §0, `O2-PLAN.md` §5, `A2-MIXED-BACKING.md` §3.7, `BA-POOL-DESIGN.md` §7-§10, `HANDOVER.md`).  The
 `#117` number note (cited for three sessions, never a row; then allocated to the MoE band-predicate finding
 and closed in r176, so the campaign took `#118`) is recorded here instead.
@@ -475,9 +512,9 @@ on a `-sm tensor` split), #125 (the radix top-k) and #126 (the stale 35B prefill
 cached base is still build `55d421582b7b`, r183-era).  Two `wip/` pointers that cited `TODO.md` §118 now cite
 this entry.
 
-`wip/kv-residency/README.md` also said "Status: OPEN ... nothing here is in `patches/`", false since r178; its
+`archive/work/kv-residency/README.md` also said "Status: OPEN ... nothing here is in `patches/`", false since r178; its
 header now says Goal A+B delivered, campaign open, and points at #121-#125.  **The campaign directory stays
-under `wip/`**: `HANDOVER.md` §12.4 is explicit -- "Do not archive `wip/kv-residency/` while Goal C is still
+under `wip/`**: `HANDOVER.md` §12.4 is explicit -- "Do not archive `archive/work/kv-residency/` while Goal C is still
 open -- the campaign directory stays, shrunk to the open work, and the archived copy happens when the last item
 closes."  So this entry retires the *handle* #118, not the campaign.
 
@@ -491,7 +528,7 @@ the `auto` policy, the grow-on-demand mirror, the `-sm tensor` window, the radix
 prefill-logit base) and `#218` (the `cpy_2d_vec16` limitation), skipping ~70 handles that nothing had ever
 used.  They are now **`#120`-`#126`** and **`#127`**, so the sequence is contiguous; the file's header records
 that the old numbers are **retired, not free**, and every live reference was updated with them (`AGENTS.md`,
-`patches/README.md`, `ENVIRONMENT.md`, `GREEDY-PURITY.md`, `wip/CAMPAIGNS.md`, `wip/kv-residency/*`,
+`patches/README.md`, `ENVIRONMENT.md`, `GREEDY-PURITY.md`, `wip/CAMPAIGNS.md`, `archive/work/kv-residency/*`,
 `archive/work/kv-rotation-decode/README.md` and the r187-r191 `WORKLOG.md` entries).  The r187-r190 **commit
 messages** still carry the old handles; the header note maps them.  (2) **The broken table.**  The `#118` row
 had lost its `| **118** |` lead-in, leaving four lines of prose inside the table body, and the `#190`-`#196`
@@ -525,7 +562,7 @@ is byte-identical, so the applied tree is still `2d76fe97a`); `release.json` re-
 `MANIFESTS.md` (16 blocks, the apply-order row merged, the verification rows merged), `AGENTS.md` (16 blocks,
 block 15 = both placements + the default-off rationale), `README.md`, `ENVIRONMENT.md` (§17 is now "the
 streamed KV": §17.0 the window, §17.1 the pool), `TODO.md` (current state; #123's block reference), and the
-campaign record (`wip/kv-residency` HANDOVER/BA-POOL-DESIGN/CAMPAIGNS/COLD-START-PROMPT/goal-b README).
+campaign record (`archive/work/kv-residency` HANDOVER/BA-POOL-DESIGN/CAMPAIGNS/COLD-START-PROMPT/goal-b README).
 `v17-6050b467c-r190` is left in place as the published tag it is (the tree is the same; the images built for
 it are the same images).
 
@@ -547,7 +584,7 @@ process), so its `.meta` names r189.
 `release.json` refreshed; `scripts/validate-set.sh` green (17/17 strict `git am` on a fresh tarball, tree
 equality, 286 files through the Windows portability lint).  The set applies to `6050b467c`, unchanged base.
 
-**What shipped.**  All three are the KV campaign's (`wip/kv-residency`, `TODO` #118) remaining deliverables,
+**What shipped.**  All three are the KV campaign's (`archive/work/kv-residency`, `TODO` #118) remaining deliverables,
 rebased onto the r189 tree and folded into the blocks that own them:
 
 1. **block 16 (new) -- the ATTENDANCE POOL** (`LLAMA_KV_REGION_POOL=<cells>`, **opt-in**): the attention KV's
@@ -614,7 +651,7 @@ byte-identical including its OOM.  `TODO` #118 is closed by this entry; what rem
 carried as its own items -- **#121** Goal C (the drafter ring, measured and not promoted: three questions for
 the maintainer), **#122** the Goal A `auto` policy (measured, the maintainer's call), **#123** a
 grow-on-demand pool mirror (shipped as a documented limitation), **#124** Goal A across `-sm tensor`
-(hardware-blocked) and **#125** the sparse arm's radix top-k.  `wip/kv-residency/` stays (Goal C is open).
+(hardware-blocked) and **#125** the sparse arm's radix top-k.  `archive/work/kv-residency/` stays (Goal C is open).
 
 **Also recorded.**  `patches/README.md` block 16 (+ the r190 notes in blocks 11/15), `MANIFESTS.md` apply order
 (rows 15 and 16 -- 15 had never been added, and the "15/15" counts are now 17/17), `ENVIRONMENT.md` §18,
@@ -1226,7 +1263,7 @@ tokens/request, 1 R9700/gfx1201):
   35B's) needs a **numeric** `W` at or above the run depth; a policy that spills to grow the arena is not
   adopted (a percentage-of-slab form of `W` stays deferred).
 * **A window across a `-sm tensor` split stays parked** — designed in
-  `wip/kv-residency/A6-TENSOR-SPLIT-WINDOW.md` (design only; its `common/fit.cpp` cross-check lists four things
+  `archive/work/kv-residency/A6-TENSOR-SPLIT-WINDOW.md` (design only; its `common/fit.cpp` cross-check lists four things
   an implementation must honour, `margins[0]` first).  It is picked up on the multi-GPU development host.
 * **Goal B (a sparse attended set streamed cheaply) is next**, developed **inside `wip/` only** until it is
   promoted; `patches/` is left alone while the other delivery work is in flight.
@@ -1289,7 +1326,7 @@ that arm; 35B-A3B (1 GPU and 2-GPU `-sm tensor`), dense 27B and the canonical 27
 it, now by design and with a message), and the `auto` **policy** questions are unchanged by this fix — `auto`
 still only spills a `-c` the user pinned, and it still sizes the window against the VRAM left after the
 expert-cache arena reserve, so on a `-ncmoe` config the arena wins the VRAM.  Both are recorded in
-`wip/kv-residency/A2-MIXED-BACKING.md` §3.7.12 for the campaign's resume.
+`archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.12 for the campaign's resume.
 
 ## 261030.004 (r180) -- PR #252's GDN small-projection gather ships (block 10): +2.8 % decode on the quantized-GDN shape, bit-identical
 
@@ -1346,7 +1383,7 @@ stays preserved in `archive/work/graph-order-r176/` (now all three patches taken
 `-sm tensor` run** in r178/r179 — the KV probes block 15 added to `common/fit.cpp` look up the backend reg of
 the **Meta** device, which has none, so `ggml_backend_reg_get_proc_address(NULL, …)` asserts at model load.
 Reproduced with the plain r179 binary on two models; `--fit off` completes.  The null-reg guard is parked
-with the campaign that owns block 15 (`wip/kv-residency/fit-meta-reg-guard.patch`, noted in its HANDOVER);
+with the campaign that owns block 15 (`archive/work/kv-residency/fit-meta-reg-guard.patch`, noted in its HANDOVER);
 the maintainer is handling the multi-GPU/KV interaction separately, so the r180 PR gates ran their 2- and
 3-device arms with `--fit off`.  Numbers: `benchmarks/2026-10-30-graph-order-0003-r180.md`.
 
@@ -1378,7 +1415,7 @@ workaround was `--fit off` + a numeric `W` (verified); r179 does not need it.
 ## 261030.002 (r178) -- the windowed KV ships as block 15 (Goal A of #118): an opt-in fixed-VRAM resident window with a pinned-host tail
 
 **Released as `v16-6050b467c-r178` (16 blocks, 00-15; block 15 is new).**  Promoted from the
-`wip/kv-residency` campaign (TODO **#118**, Goal A).  Opt-in: `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; with it
+`archive/work/kv-residency` campaign (TODO **#118**, Goal A).  Opt-in: `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`; with it
 unset the KV takes the plain device buffer and a run is byte-identical to r177, **including its OOM**
 (verified: `5ba44647188f`, and `cudaMalloc failed: out of memory` on the 27B Q8_0 `-c 262144` baseline).
 

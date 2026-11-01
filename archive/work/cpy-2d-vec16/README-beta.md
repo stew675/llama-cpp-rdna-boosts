@@ -7,7 +7,7 @@ into **block 10** (`ggml/src/ggml-cuda/cpy.cu`, where r183's guard lives).
 
 * patch: `copy-2d-vec16.patch` (106 lines, +37/−1, one file)
 * sha256: `51d3c8c2f7cca0733dd108be40f5cad155272ff357fa1cad594cf335583ec892`
-* origin: campaign branch `wip-kv-residency-b` commit `f8e47e392` (`wip/kv-residency A12`, TODO #118)
+* origin: campaign branch `wip-kv-residency-b` commit `f8e47e392` (`archive/work/kv-residency A12`, TODO #118)
 
 ## What it fixes (a regression r183 introduced)
 

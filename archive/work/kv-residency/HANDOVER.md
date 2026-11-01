@@ -1,4 +1,4 @@
-# HANDOVER — `wip/kv-residency` (TODO **#118**), cold-session start
+# HANDOVER — `archive/work/kv-residency` (TODO **#118**), cold-session start
 
 **Rewritten 2026-10-30 at the end of the tenth session (A6 — the promotion).**  Read this top to bottom
 before touching anything; it is self-contained.  Then read [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) (the measured state of the
@@ -286,7 +286,7 @@ ROCBLAS_USE_HIPBLASLT=0 $P/scripts/gate-prefill-logits.sh --record \
 #   4B -c 16384 -W 1024 : plain 26 sha=158c1671e511, windowed must match
 # the isolated reproducer (from the delivery repo; default FAILS, --grab 4 PASSES)
 hipcc -O3 --offload-arch=gfx1201 -isystem /opt/rocm-10.1.0-gfx120X/include \
-  $P/wip/kv-residency/hostmap-hazard-probe.cc -o /tmp/hh && HIP_VISIBLE_DEVICES=0 /tmp/hh [--grab 4]
+  $P/archive/work/kv-residency/hostmap-hazard-probe.cc -o /tmp/hh && HIP_VISIBLE_DEVICES=0 /tmp/hh [--grab 4]
 ```
 
 **Added in A5 (item 1 + item 2, all pass on arms that PROVABLY spill — `FLIP > 0`, `KVREGION_FREE … host=` > 0):**
@@ -655,7 +655,7 @@ branch is on r186 and the delivery has moved on (r188 at the time of writing) �
 | 4 | **Decide grow-on-demand mirror** (12.3): implement, or ship it as a documented limitation | decision recorded in the block note + `TODO.md` |
 | 5 | **Package the pool as a block** (12.4): `patches/0016-*`, `release.json` via `scripts/make-release.sh`, `patches/README.md` block entry, `ENVIRONMENT.md` §, `MANIFESTS.md` apply order + verification contract, `AGENTS.md` naming (16 → 17 blocks), `WORKLOG.md` entry, `TODO.md` #118 closed to that entry | `validate-set.sh` + the tier-1 CI workflow green; the block's own gate list (12.5) recorded |
 | 6 | **Release it**: tag, `scripts/fork-refresh.sh --build --gates --push`, then the container watcher picks the tag up (never build the images on the primary box) | tag pushed, fork `rdna-boosts` tip == `release.json.tip`, images published by the worker |
-| 7 | **Refresh the campaign record**: re-export `wip/kv-residency/patches/goal-b/` from the final branch, update `SHA256SUMS`/`diffstate`, and shrink `COLD-START-PROMPT.md` to what is left (Goal C + the Goal A `auto` decision) | the patch series reproduces the branch tree; the prompt names only open work |
+| 7 | **Refresh the campaign record**: re-export `archive/work/kv-residency/patches/goal-b/` from the final branch, update `SHA256SUMS`/`diffstate`, and shrink `COLD-START-PROMPT.md` to what is left (Goal C + the Goal A `auto` decision) | the patch series reproduces the branch tree; the prompt names only open work |
 
 ### 12.2 The `--fit` blocker (task 3, in detail)
 
@@ -709,7 +709,7 @@ does (`llama_kv_cache`'s `grow_cells`/`grow_for` is the model).  Decide, record,
   costs the sparse-vs-dense gap (7-12 % at depth), so it is opt-in like block 15 — state that plainly in the block
   note so nobody "fixes" the default.
 * **`TODO.md` #118** closes to a single `WORKLOG.md` entry (Goal B delivered; Goal C + the `auto` policy remain, as
-  their own items).  Do **not** archive `wip/kv-residency/` while Goal C is still open — the campaign directory
+  their own items).  Do **not** archive `archive/work/kv-residency/` while Goal C is still open — the campaign directory
   stays, shrunk to the open work, and the archived copy happens when the last item closes.
 
 ### 12.5 The gate list the block owes on the final base (§6 has the commands)

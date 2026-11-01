@@ -76,7 +76,7 @@ what that turns into.
 > present cost model and every earlier t/s figure in this campaign must be re-measured before it is compared.
 > See `A2-MIXED-BACKING.md` §3.7 for the new numbers and the re-run probe output.
 
-`wip/kv-residency/bw-probe.cc` (`hipcc -O3 --offload-arch=gfx1201`), 512 MiB per arm, 5 reps, best of:
+`archive/work/kv-residency/bw-probe.cc` (`hipcc -O3 --offload-arch=gfx1201`), 512 MiB per arm, 5 reps, best of:
 
 ```
 device: AMD Radeon AI PRO R9700 (gfx1201), 512 MiB per arm, 5 reps

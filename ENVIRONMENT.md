@@ -927,7 +927,7 @@ Measured (1 GPU, `-n 2000`/`-n 3000`, static depth 3): 35B-A3B Q8_0 `-ncmoe 48 -
 identical**; dense 27B `-c 102400` Protocol A neutral (71.9 vs 72.1 layer, 72.6 vs 72.5 tensor, acceptance
 2083/2747 in all four arms); target text byte-identical off/auto/4096 and plain == draft-mtp == draft-mtp
 (`W=512`) at `-c 16384`.  Records: `patches/README.md` block 15, `WORKLOG.md` 261031.014,
-`wip/kv-residency/O3-DRAFTER-RING.md` §2.3.
+`archive/work/kv-residency/O3-DRAFTER-RING.md` §2.3.
 
 
 ### 17.1 The attendance pool (`LLAMA_KV_REGION_POOL`, **opt-in**)

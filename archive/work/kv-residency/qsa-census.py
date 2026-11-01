@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QSA attended-set census (wip/kv-residency B1(c), TODO #118).
+"""QSA attended-set census (archive/work/kv-residency B1(c), TODO #118).
 
 Reads the binary the diagnostic in `ggml/src/ggml-cuda/indexer-topk.cu` writes when
 `LLAMA_QSA_STREAM_CENSUS=<path>` is set (campaign branch only), and answers the one question a residency

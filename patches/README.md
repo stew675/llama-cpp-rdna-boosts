@@ -51,7 +51,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −16 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../wip/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV  **The same block carries the ATTENDANCE POOL** (r190, Goal B of the same campaign): the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages, resolved by `GGML_OP_KV_POOL` -- a 204 MiB pool instead of 1.6-2.4 GiB of resident KV at 103k-180k depth, landing on the sparse decode ceiling, `--fit`-visible (the mirror is host RAM).  Both placements are **opt-in and default OFF** (fittability features; unset = byte-identical including the OOM) and mutually exclusive.  See the block section |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>|auto`): the KV's VRAM cost is a **resident window** of the newest `W` cells, the rest in pinned system RAM, in **one VA reservation** — so `set_rows`, the rope shift, `state_write/read`, the kq mask and the FA kernels keep addressing one contiguous range (**no kernel or op change**).  The window slides in whole map units.  Payoffs: a context that OOMs now runs, and the VRAM the KV does not need *yet* goes to the expert-cache arena.  Unset = plain device buffer, byte-identical including the OOM.  Two driver hazards are held (a kind flip zeroes a neighbouring live host mapping without the `LLAMA_KV_REGION_QUARANTINE` hold; every tensor must start on the map granularity), and an idle-slot park is refused on a region-backed cache.  See below and `../archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.9/§3.7.11.  + r190: a cache that is **streaming** at the depth it reads (a window that the used extent has passed, or an attendance pool) takes the **sparse** QSA decode arm — measured +34 % (51k) / +47 % (180k) on a spilled KV  **The same block carries the ATTENDANCE POOL** (r190, Goal B of the same campaign): the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages, resolved by `GGML_OP_KV_POOL` -- a 204 MiB pool instead of 1.6-2.4 GiB of resident KV at 103k-180k depth, landing on the sparse decode ceiling, `--fit`-visible (the mirror is host RAM).  Both placements are **opt-in and default OFF** (fittability features; unset = byte-identical including the OOM) and mutually exclusive.  See the block section |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -2199,7 +2199,7 @@ with `GGML_CUDA_QSA_INDEXER_CACHE=0` (fused, no derived pool) is the same hash, 
 covered too; 51 475 depth q8_0 `854 43b30de151b9` (== pre-change) and q4_0 `841 65097e7c8630`;
 `gate-prefill-logits.sh --ab "GGML_CUDA_QSA_INDEXER_SCORE=0" --ub 1` (the decode graph, chain as the base)
 **0.000000 KLD / 100.000 % top-p**; `test-backend-ops -o FLASH_ATTN_QSA` pass.  Numbers and the census:
-`../wip/kv-residency/BA-POOL-DESIGN.md` §9.3-§10.
+`../archive/work/kv-residency/BA-POOL-DESIGN.md` §9.3-§10.
 
 #### r196 — plain decode takes the indexer top-k's BLOCK radix path (TODO #125)
 
@@ -2923,7 +2923,7 @@ This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: 
 
 ### The window (Goal A, r178)
 
-Promoted from the `wip/kv-residency` campaign in **r178**.  Opt-in: with
+Promoted from the `archive/work/kv-residency` campaign in **r178**.  Opt-in: with
 `LLAMA_KV_RESIDENT_CELLS` unset (or `0`) the KV takes the **plain device buffer** and the run is
 byte-identical to a build without this block, including its OOM.
 
@@ -2974,7 +2974,7 @@ byte-identical to a build without this block, including its OOM.
 
 ### The attendance pool (Goal B, r190)
 
-Promoted from the `wip/kv-residency` campaign in **r190** (the window above is Goal A of the same campaign;
+Promoted from the `archive/work/kv-residency` campaign in **r190** (the window above is Goal A of the same campaign;
 this is Goal B).  Where the window keeps a positional tail of the KV in VRAM, the pool keeps the **whole**
 context in pinned host RAM and only the pages a decode step actually attends to in VRAM.  Opt-in: with `LLAMA_KV_REGION_POOL` unset (or
 `0`) the attention KV takes the plain device buffer and the run is byte-identical to a build without this
@@ -3072,7 +3072,7 @@ FLASH_ATTN_QSA` pass; `check-gpu-faults.sh` clean; the standard 27B Q8_0 prefill
 100.000 % against a base recorded on the shipped r189 build; `--fit` accepts the arms that only fit with the
 pool (`-ncmoe 21`/`22` at `-c 262144`: refused without it, accepted with it) and reports both numbers
 (`-fitp`: device context 3 784 -> 728 MiB, Host context 0 -> 3 264 MiB).  Numbers and the full campaign record:
-[`../wip/kv-residency/BA-POOL-DESIGN.md`](../wip/kv-residency/BA-POOL-DESIGN.md) §7-§10.
+[`../archive/work/kv-residency/BA-POOL-DESIGN.md`](../archive/work/kv-residency/BA-POOL-DESIGN.md) §7-§10.
 
 
 #### r190 — a STREAMED cache takes the sparse decode arm

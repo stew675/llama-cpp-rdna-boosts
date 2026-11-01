@@ -14,7 +14,7 @@ The series applies to the **r188** release tip `0e42c6bc2` (`v16-6050b467c-r188`
 
 ```bash
 cd ~/llama.cpp && git checkout -b wip-kv-residency-b 0e42c6bc2
-git am ~/llama-cpp-rdna-boosts/wip/kv-residency/patches/goal-b/*.patch     # 0001..0007, in order
+git am ~/llama-cpp-rdna-boosts/archive/work/kv-residency/patches/goal-b/*.patch     # 0001..0007, in order
 ~/bin/build-llama-rocm
 ```
 

@@ -118,7 +118,7 @@ entirely unless the input is a **host** expert weight, so a full-GPU arm takes n
    `CONT`, so upstream copies the whole table.  The reachability came with block 09's generalised
    consumer search, so this is a delivery regression and there is nothing to file upstream.
 3. `-nkvo` + host experts stays a *fittability* combination, not a recommended one: 82.7 vs 176 t/s on
-   the Ling arm (the `-nkvo` penalty itself, `wip/kv-residency/INVENTORY.md` §"38.71 vs 100.67").
+   the Ling arm (the `-nkvo` penalty itself, `archive/work/kv-residency/INVENTORY.md` §"38.71 vs 100.67").
    Worth a line in `ENVIRONMENT.md`/block 09's note only if it ships.
 
 ## 6. Reproduction

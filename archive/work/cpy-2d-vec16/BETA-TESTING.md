@@ -49,7 +49,7 @@ which copy kernel ran:
 # census: two lengths of the SAME arm, then subtract (prefill and the lazy loads cancel)
 rocprofv3 --kernel-trace --stats -f csv -o short -- ./build-rocm/bin/llama-cli $BASE -c 131072 -f /tmp/prompt-103k.txt -n 200  -v
 rocprofv3 --kernel-trace --stats -f csv -o long  -- ./build-rocm/bin/llama-cli $BASE -c 131072 -f /tmp/prompt-103k.txt -n 2000 -v
-~/llama-cpp-rdna-boosts/wip/kv-residency/kv-kernel-census.py short_kernel_stats.csv long_kernel_stats.csv 200 2000
+~/llama-cpp-rdna-boosts/archive/work/kv-residency/kv-kernel-census.py short_kernel_stats.csv long_kernel_stats.csv 200 2000
 #   FAIL (bug present) : cpy_scalar<cpy_1_scalar<float,float>> ~5.2 ms/token, total ~27.0
 #   PASS (fix active)  : cpy_2d_vec16 ~1.8 ms/token, cpy_scalar <0.05, total ~23.7
 ```
