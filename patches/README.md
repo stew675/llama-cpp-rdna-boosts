@@ -3199,7 +3199,7 @@ somewhere to go — the delivery's own rule (a beneficial, gated feature is on; 
   a windowed MTP head is budgeted at its real size; the load-time arena preflight still books the flat
   constant (the model metadata is all it has), which is the conservative direction and is why the preflight
   re-evaluates.
-* **The window is per SEQUENCE, and a UNIFIED cache is sized per sequence (r199, issue #264).**  With
+* **The window is per SEQUENCE, and a UNIFIED cache is sized per sequence (r200, issue #264).**  With
   `--kv-unified` the one draft cache holds every sequence, so its cell count is
   `(win + one batch) x n_seq_max`, capped at the context; a `win + n_ubatch` cache was shared by all of them
   and a second sequence had no cell left to place a batch in once the first had filled the window.  A
@@ -3284,7 +3284,7 @@ fresh-process slot-file restore (525 MB state) restores 5313 tokens and prefills
 park/ckpt/state gates PASS; `LLAMA_KV_SPILL_RAM_PCT=1` declines and pins 0; `--fit` still charges the full
 mirror to the host bucket (it cannot know the run's depth).
 
-**r199 — the draft window is granted per sequence (issue #264).**  See the per-sequence bullet above.
+**r200 — the draft window is granted per sequence (issue #264).**  See the per-sequence bullet above.
 Reported on `--kv-unified -np 2` (dense 27B, `-c 262144`, `-ctk/-ctv q8_0`): after slot 0 held ~100 k tokens,
 every request on slot 1 answered HTTP 500 `decode() failed: failed to process speculative batch` with
 `W decode: failed to find a memory slot for batch of size 1024` in the log; `LLAMA_SPEC_DRAFT_WINDOW=0`

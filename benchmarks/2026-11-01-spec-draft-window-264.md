@@ -1,16 +1,18 @@
-# The MTP draft KV window is granted per sequence — issue #264 (r199)
+# The MTP draft KV window is granted per sequence — issue #264 (r200)
 
 **Question.** `LLAMA_SPEC_DRAFT_WINDOW` (block 15 Goal C, r193, default on) gives the MTP draft context a
 sliding window instead of a `-c`-sized KV. Under `--kv-unified` that one cache holds every sequence, so what
 is the cell count, and does a second sequence's batch still find room once the first has filled the window?
 
-**Answer (r199).** It did not: the r193-r199 shape (`win + n_ubatch` cells, shared by all sequences) left the
+**Answer (r200; the bug shipped in r193-r199).** It did not: the r193-r199 shape (`win + n_ubatch` cells, shared by all sequences) left the
 second slot nowhere to place a batch, and every request on it answered HTTP 500. The cache is now sized
 `(win + one batch) x n_seq_max` (capped at the context) via `llama_spec_draft_kv_cells()`, the same function
 the slab's draft reserve and `common`'s "is a window active" test call.
 
-Recorded 2026-11-01, gfx1201 (one R9700), ROCm 10.1.0, `ROCBLAS_USE_HIPBLASLT=0` for every fresh-process
-comparison, `-t 8`.
+Recorded 2026-11-01, gfx1201 (one R9700, box `radix`), ROCm 10.1.0, `ROCBLAS_USE_HIPBLASLT=0` for every
+fresh-process comparison, `-t 8`.  **Every arm is single-device** (this box has one R9700): the geometry below
+depends on `n_seq_max` / `kv_unified` / the cell counts, not on the device count, and the 2-slot unified server
+arm is the one that reaches it.
 
 ## The defect
 
@@ -35,9 +37,9 @@ tokens:
 
 | build | draft cache | slot 0 (10 498 tok) | slot 1 (580 tok) |
 |---|---|---|---|
-| r199 pre-fix, window 8192 | 8 704 | OK | **HTTP 500** `failed to process speculative batch` |
-| r199 pre-fix, `LLAMA_SPEC_DRAFT_WINDOW=0` | 40 960 | OK | OK |
-| r199 fixed, window 8192 | 17 408 = `(8192+512)x2` | OK | OK |
+| r199 (pre-fix), window 8192 | 8 704 | OK | **HTTP 500** `failed to process speculative batch` |
+| r199 (pre-fix), `LLAMA_SPEC_DRAFT_WINDOW=0` | 40 960 | OK | OK |
+| r200 (fixed), window 8192 | 17 408 = `(8192+512)x2` | OK | OK |
 
 The same comparison in the new gate (`WIN=1024`, `-c 8192 -np 2 --kv-unified`, 2 slots, 6 requests) fails
 3 checks on the pre-fix build — `failed to find a memory slot for batch of size 953`, the second slot's HTTP
@@ -85,7 +87,7 @@ Measured: `-np 6 -c 8192` (per_seq 1 365 < 1 536) declines with no window log li
   both complete.
 * **`--no-kv-unified`** is untouched (each stream already had its own window).
 
-## Release-gate arms run for r199 (this fix)
+## Release-gate arms run for r200 (this fix)
 
 | arm | result |
 |---|---|

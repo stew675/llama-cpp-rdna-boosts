@@ -202,7 +202,7 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
-- **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r199,
+- **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r200,
   issue #264).**  Under `--kv-unified` the one draft cache holds every sequence, so its cell count is
   `(win + one batch) x n_seq_max` (capped at the context) — the r193-r199 `win + n_ubatch` shape was shared by
   all of them and the second sequence had no cell to place a batch in once the first had filled the window

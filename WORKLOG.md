@@ -1,9 +1,20 @@
-## 261101.006 (issue #264) — the MTP draft KV window is granted PER SEQUENCE (block 15 amended; delivery-set update, no version bump)
+## 261101.007 (issue #264) — the MTP draft KV window is granted PER SEQUENCE (block 15 amended)
 
-**Not a release.**  Block 15 is amended in place: `patches/` regenerated, `release.json` hashes/tip/tree
-refreshed (tip `2ed3997f5`, tree `c6c2f03de8`), the release tag left at `v16-6050b467c-r199`; no tag, no
-GitHub Release, no container image.  The next release carries this and will be re-cut when the other box's
-release lands (a re-base is already planned).  Record: `benchmarks/2026-11-01-spec-draft-window-264.md`.
+**Released as `v16-6050b467c-r200` (16 blocks; block 15 amended).**  Canonical tip `2ed3997f5`, tree
+`c6c2f03de9ea2d13590b15ef77364665d8579466` (r199 was `d5f241572` / `d461bd014b`).  `release.json` refreshed;
+`patches/` regenerated from `6050b467c..r200-chain`; `scripts/validate-set.sh` green (16/16 strict `git am` on
+a fresh `6050b467c` tarball, tree equality, 286 files through the Windows portability lint);
+`gate-per-block-build.sh --fast --changed-from d5f241572` 1/1 (block 15 only, 20 s);
+`fork-refresh.sh --build --gates` re-cut the branch from the base and reproduced tree `c6c2f03d` + tip
+`2ed3997f5`.  Record: `benchmarks/2026-11-01-spec-draft-window-264.md`.
+
+**NB — this session's box is `radix`: ONE R9700, no 2nd/3rd device** (the 9800X3D box; `-sm tensor` with
+`HIP_VISIBLE_DEVICES=0,1,2` reaches the gfx1036 iGPU and aborts with `ROCm error: invalid kernel file`, which
+is the documented AGENTS trap, not a defect).  Every arm below is a **1-GPU** arm; the multi-device release
+gates (`gate-prefill-logits.sh --sm tensor --device 0,1,2`, Protocol A at 3 devices both split modes,
+`gate-spec-align.sh`, `gate-spec-width-band.sh`) are **not runnable here** and are recorded as not measured.
+That is sufficient for this change: the draft cache's geometry depends only on `n_seq_max` / `kv_unified` /
+the cell counts, never on the device count, and the 2-slot unified server arm is the one that exercises it.
 
 **The defect (issue #264, reported on r195 by `DanoPTT`).**  Since r193 the MTP draft context's KV is a
 sliding window (`LLAMA_SPEC_DRAFT_WINDOW`, default ON).  Under `--kv-unified` that ONE draft cache holds every
@@ -47,11 +58,17 @@ the per-stream arm — the under-charge direction the reserve header warns about
 * **Purity**: `plain == draft-mtp == draft-mtp(W=1024) == draft-mtp(W=0)`, 876 chars `sha=8c8fd395402f`
   (27B UD-Q4_K_XL, `-c 16384`, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`,
   `ROCBLAS_USE_HIPBLASLT=0`).
+* **MTP Protocol A** (dense 27B UD-Q4_K_XL, 1 GPU, `-c 102400`, bf16 KV, `-n 3000`, reasoning-pinned,
+  `ROCBLAS_USE_HIPBLASLT=0`): `--spec-type none` **29.9 t/s**, `draft-mtp` **61.0 t/s** (+104 %), acceptance
+  **0.6166** (1946/3156), mean len 2.85.  The single-sequence geometry is r198's exactly (1 536 cells at
+  `-c 8192` / `W=1024`), so this arm is expected to be unchanged, and it is in line with the r199 record.
 * **Gates**: `validate-set.sh` strict 16/16 (tree `c6c2f03d`, 286 files through the Windows lint);
   `gate-per-block-build.sh --fast --changed-from d5f241572` 1/1; `gate-prefill-logits.sh` **0.000000 /
-  100.000 %** (build `2ed3997f5`); `fork-refresh.sh` re-cut from `6050b467c` reproduced tree `c6c2f03d` and
-  tip `2ed3997f5`; `check-gpu-faults.sh` clean.  The MTP Protocol A / four-axis arms were not re-run: the
-  single-sequence geometry is byte-identical (the cell counts above are the proof), so no decode arm can move.
+  100.000 %** (build `2ed3997f5`); `gate-ckpt-reuse.sh` PASS (its log still sizes the draft cache from the
+  window); `fork-refresh.sh` re-cut from `6050b467c` reproduced tree `c6c2f03d` and tip `2ed3997f5`;
+  `check-gpu-faults.sh` clean.  Not measured (1-GPU box, see the NB above): the multi-device prefill-logit arm,
+  Protocol A at 3 devices in both split modes, `gate-spec-align.sh`, `gate-spec-width-band.sh`,
+  `gate-hc-fusions.sh` (no qwen4exp weight class was touched) — none of them reaches this code.
 
 **Docs.**  `patches/README.md` (block 15: the per-sequence bullet + the r199 note), `AGENTS.md` (the
 per-sequence rule and its gate), `ENVIRONMENT.md` §17.2, `MANIFESTS.md` (release gate 15 + the block-15 row),
