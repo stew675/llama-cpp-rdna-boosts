@@ -336,9 +336,13 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   rotation runs as before and no cache entry is created), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and
   `GGML_CUDA_FUSE_ROPE_FWHT` (rope + rotation for models without Q/K norm — **the only one that runs in prefill
   too**, so it carries the prefill-logit obligation; it fires on gpt-oss on our models, not on qwen/gemma).
-  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #120), and
+  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0`, and since **r199** also `GGML_TYPE_Q4_0` on a wave32
+  device (`ggml_cuda_quantize_q4_0_group`, PR #262: +10.8 % tg128 on a `q4_0`-KV 30B-A3B, kill switch
+  `GGML_CUDA_KV_FOLD_Q4_0=0`, bit-identical — a runtime quantizer select cost the `q8_0` kernel 12.8 -> 15.1 us, so
+  the cache type stays the kernels' compile-time `kv` template value; `q5_0`/`iq4_nl`/`bf16` keep their launches,
+  `TODO` #120), and
   they are worth **+13.4 % tg128 / +10.1 % @4096** on a 30B-A3B q8_0-KV arm (gfx1201) with **f16 KV unchanged** —
-  so **a coherence or perf claim about them must name a `q8_0` KV arm**, and multi-device arms are mandatory
+  so **a coherence or perf claim about them must name a `q8_0` (or `q4_0`) KV arm**, and multi-device arms are mandatory
   (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,
   `archive/work/kv-rotation-decode/`.  QSA's own combine passes the new `had_dst` as `nullptr` (block 11).
 - **A Q8_1 publish only pays where its consumer's node still exists, and the quant decides that (r188, block 10, PR

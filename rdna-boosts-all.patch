@@ -29040,10 +29040,10 @@ index 000000000..62c61f5d3
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..01a83eabb
+index 000000000..5e305b720
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3293 @@
+@@ -0,0 +1,3306 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -30109,11 +30109,21 @@ index 000000000..01a83eabb
 +
 +// ROPE alone (no Q / K norm, e.g. Llama) followed by the quantized-KV rotation: ROPE, RESHAPE, Hadamard MUL_MAT at i run as
 +// one rms_norm_mul_rope_f32<.., no_norm> launch writing the rotated rows (Q: returns 2), and for K also the RESHAPE, VIEW,
-+// q8_0 SET_ROWS that follow (returns 5), with the V row's VIEW, q8_0 SET_ROWS after that when allow_v (returns 7).  The
++// cache SET_ROWS that follow (returns 5), with the V row's VIEW, cache SET_ROWS after that when allow_v (returns 7).  The
 +// kernel reads x as is and runs the same rope arithmetic as rope_norm / rope_neox (the norm+rope fusion's), the same
-+// FWHT as fwht_cuda and the same q8_0 quantization as k_set_rows_q8_0_group.  0: no match.
++// FWHT as fwht_cuda and the same quantization as the cache's own 32-lane group quantizer (k_set_rows_q8_0_group's for
++// q8_0, ggml_cuda_quantize_q4_0_group for q4_0 -- see ggml_cuda_kv_fold_type_ok).  0: no match.
 +// GGML_CUDA_FUSE_ROPE_FWHT=0: off.
-+static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, const bool allow_v) {
++// cache types the fused K / V cache writes reproduce: q8_0, and q4_0 (GGML_CUDA_KV_FOLD_Q4_0=0: q8_0 only).
++// warp_size is the device the gate runs on (the caller's ctx.device -- never a per-call device query and never the
++// primary device): the q4_0 group quantizer ballots and shuffles over one 32-lane wave, so a wave64 device keeps
++// its separate launches.
++static bool ggml_cuda_kv_fold_type_ok(const ggml_type t, const int warp_size) {
++    static const bool q4 = getenv("GGML_CUDA_KV_FOLD_Q4_0") == nullptr || atoi(getenv("GGML_CUDA_KV_FOLD_Q4_0")) != 0;
++    return t == GGML_TYPE_Q8_0 || (q4 && t == GGML_TYPE_Q4_0 && warp_size == 32);
++}
++
++static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, const bool allow_v, const int warp_size) {
 +    static const bool on = getenv("GGML_CUDA_FUSE_ROPE_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_ROPE_FWHT")) != 0;
 +    if (!on || i + 3 > cgraph->n_nodes) {
 +        return 0;
@@ -30157,7 +30167,7 @@ index 000000000..01a83eabb
 +        return 0;
 +    }
 +
-+    // K: RESHAPE, VIEW, q8_0 SET_ROWS of the rotated rows (+ V's VIEW, q8_0 SET_ROWS)
++    // K: RESHAPE, VIEW, cache SET_ROWS of the rotated rows (+ V's VIEW, cache SET_ROWS)
 +    if (i + 6 > cgraph->n_nodes) {
 +        return 2;
 +    }
@@ -30170,7 +30180,7 @@ index 000000000..01a83eabb
 +        const ggml_tensor * idx = sr->src[1];
 +        return view->op == GGML_OP_VIEW && view->type == GGML_TYPE_F32 && ggml_is_contiguous(view) &&
 +               view->ne[0] == row_len && view->ne[1] == n_tok && view->ne[2] == 1 && view->ne[3] == 1 &&
-+               sr->op == GGML_OP_SET_ROWS && sr->src[0] == view && sr->type == GGML_TYPE_Q8_0 &&
++               sr->op == GGML_OP_SET_ROWS && sr->src[0] == view && ggml_cuda_kv_fold_type_ok(sr->type, warp_size) &&
 +               sr->ne[0] == row_len && sr->ne[2] == 1 && sr->ne[3] == 1 &&
 +               idx->type == GGML_TYPE_I64 && ggml_is_contiguous(idx) && idx->ne[0] == n_tok && ggml_nelements(idx) == n_tok;
 +    };
@@ -30183,7 +30193,8 @@ index 000000000..01a83eabb
 +    }
 +    bool with_v = false;
 +    if (allow_v && i + 8 <= cgraph->n_nodes) {
-+        with_v = is_row_write(cgraph->nodes[i + 6], cgraph->nodes[i + 7]) && single_use(i + 6);
++        // the plain V write folds only into a K write of its own type (r187 refuses mixed K / V cache types anyway)
++        with_v = is_row_write(cgraph->nodes[i + 6], cgraph->nodes[i + 7]) && cgraph->nodes[i + 7]->type == k_sr->type && single_use(i + 6);
 +    }
 +    std::vector<const ggml_tensor *> reads = { x, rope->src[1], k_sr->src[1] };
 +    if (rope->src[2] != nullptr) {
@@ -30320,12 +30331,14 @@ index 000000000..01a83eabb
 +    return true;
 +}
 +
-+// The K path's rms_norm_mul_rope + FWHT (above) followed by its KV-cache write, RESHAPE, VIEW, SET_ROWS (q8_0), and
-+// usually by the V write, VIEW, SET_ROWS (q8_0) of the V row rotated earlier: the fused kernel writes both cache rows
-+// with k_set_rows_q8_0_group's quantization, so the two set_rows launches go away.  Returns the number of fused nodes
-+// (10 with the V write, 8 without, 0 if the pattern doesn't match).  GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS turns it off.
-+// allow_v: false inside a concurrent-stream region (GGML_CUDA_GRAPH_OPT=1), where the V row comes from another stream.
-+static int ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(const ggml_cgraph * cgraph, const int i, const bool allow_v) {
++// The K path's rms_norm_mul_rope + FWHT (above) followed by its KV-cache write, RESHAPE, VIEW, SET_ROWS (the cache's
++// quant type), and usually by the V write, VIEW, SET_ROWS of the V row rotated earlier: the fused kernel writes both
++// cache rows with the cache's own group quantizer, so the two set_rows launches go away.  Returns the number of fused
++// nodes (10 with the V write, 8 without, 0 if the pattern doesn't match).  GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS turns
++// it off.  allow_v: false inside a concurrent-stream region (GGML_CUDA_GRAPH_OPT=1), where the V row comes from
++// another stream.  warp_size: the running device's (ggml_cuda_kv_fold_type_ok).
++static int ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(const ggml_cgraph * cgraph, const int i, const bool allow_v,
++                                                          const int warp_size) {
 +    static const bool disabled = getenv("GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS") != nullptr;
 +    if (disabled || i + 8 > cgraph->n_nodes || !ggml_cuda_should_fuse_rms_norm_mul_rope_fwht(cgraph, i)) {
 +        return 0;
@@ -30338,14 +30351,14 @@ index 000000000..01a83eabb
 +    const ggml_tensor * k_view   = cgraph->nodes[i + 6];
 +    const ggml_tensor * k_sr     = cgraph->nodes[i + 7];
 +
-+    // one contiguous F32 row of nrows*ncols per token written as q8_0 cache rows through I64 indices
++    // one contiguous F32 row of nrows*ncols per token written as cache rows through I64 indices
 +    const int64_t row_len = rope->ne[0]*rope->ne[1];
 +    const int64_t n_tok   = rope->ne[2];
 +    const auto is_row_write = [&](const ggml_tensor * view, const ggml_tensor * sr) {
 +        const ggml_tensor * idx = sr->src[1];
 +        return view->op == GGML_OP_VIEW && view->type == GGML_TYPE_F32 && ggml_is_contiguous(view) &&
 +               view->ne[0] == row_len && view->ne[1] == n_tok && view->ne[2] == 1 && view->ne[3] == 1 &&
-+               sr->op == GGML_OP_SET_ROWS && sr->src[0] == view && sr->type == GGML_TYPE_Q8_0 &&
++               sr->op == GGML_OP_SET_ROWS && sr->src[0] == view && ggml_cuda_kv_fold_type_ok(sr->type, warp_size) &&
 +               sr->ne[0] == row_len && sr->ne[2] == 1 && sr->ne[3] == 1 &&
 +               idx->type == GGML_TYPE_I64 && ggml_is_contiguous(idx) && idx->ne[0] == n_tok && ggml_nelements(idx) == n_tok;
 +    };
@@ -30362,7 +30375,7 @@ index 000000000..01a83eabb
 +    if (allow_v && i + 10 <= cgraph->n_nodes) {
 +        const ggml_tensor * v_view = cgraph->nodes[i + 8];
 +        const ggml_tensor * v_sr   = cgraph->nodes[i + 9];
-+        with_v = is_row_write(v_view, v_sr) && single_use(i + 8);
++        with_v = is_row_write(v_view, v_sr) && v_sr->type == k_sr->type && single_use(i + 8);
 +    }
 +
 +    // the cache writes must not touch anything the fused kernel reads, nor each other
@@ -30499,7 +30512,7 @@ index 000000000..01a83eabb
 +            cgraph->nodes[i + 1]->op != GGML_OP_RESHAPE || cgraph->nodes[i + 1]->src[0] != node ||
 +            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
 +            (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
-+            ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i + 2, true) != 10 ||
++            ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i + 2, true, ggml_cuda_info().devices[ctx.device].warp_size) != 10 ||
 +            cgraph->nodes[i + 10]->src[0] != cgraph->nodes[i + 1] || cgraph->nodes[i + 2]->ne[0] % 64 != 0) {
 +        return false;
 +    }
@@ -32087,7 +32100,7 @@ index 000000000..01a83eabb
 +    // The rotated F32 V is only read by those cache writes (single use).  Same FWHT and quantization code: bit-identical.
 +    // GGML_CUDA_FUSE_V_FWHT=0: off.
 +    if (node->op == GGML_OP_ROPE) {
-+        if (const int n_rf = ggml_cuda_rope_fwht_count(cgraph, i, kv_allow_v)) {
++        if (const int n_rf = ggml_cuda_rope_fwht_count(cgraph, i, kv_allow_v, ggml_cuda_info().devices[cuda_ctx->device].warp_size)) {
 +            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, nullptr, nullptr, node, nullptr, cgraph->nodes[i + 2],
 +                                                 n_rf >= 5 ? cgraph->nodes[i + 5] : nullptr, n_rf == 7 ? cgraph->nodes[i + 7] : nullptr);
 +            return n_rf;
@@ -32108,7 +32121,7 @@ index 000000000..01a83eabb
 +                                             cgraph->nodes[i + 6], cgraph->nodes[i + 9], cgraph->nodes[i + 11], nullptr, node);
 +        return 11;
 +    }
-+    if (const int n_kv = ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i, kv_allow_v)) {
++    if (const int n_kv = ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(cgraph, i, kv_allow_v, ggml_cuda_info().devices[cuda_ctx->device].warp_size)) {
 +        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4],
 +                                             cgraph->nodes[i + 7], n_kv == 10 ? cgraph->nodes[i + 9] : nullptr);
 +        return n_kv - 1;
@@ -69434,7 +69447,7 @@ index 5f08dcbfe..76e09ee49 100644
 +                                    const int       n_chunks,
                                      cudaStream_t    stream);
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index 45e813406..01bc29294 100644
+index 45e813406..d54f440f3 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -1,7 +1,20 @@
@@ -69607,13 +69620,25 @@ index 45e813406..01bc29294 100644
          } else {
              GGML_ABORT("fatal error");
          }
-@@ -724,10 +783,36 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
+@@ -724,10 +783,51 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
      ggml_cuda_op_rope_impl<true>(ctx, rope, set_rows);
  }
  
++// the K/V cache write of one 32-element group (lane = element) in the cache's block type
++template <bool q4>
++static __device__ __forceinline__ void rope_kv_quantize_group(const float v, const void * row, const int col) {
++    if constexpr (q4) {
++        ggml_cuda_quantize_q4_0_group(v, (block_q4_0 *) row + col/QK4_0, col % QK4_0);
++    } else {
++        ggml_cuda_quantize_q8_0_group(v, (block_q8_0 *) row + col/QK8_0, col % QK8_0);
++    }
++}
++
 +// KV-cache writes folded into the fwht_n kernel: SET_ROWS (q8_0) of the rotated K row and, optionally, of the V row
 +// (already rotated, F32), for one token per channel
 +struct rope_kv_q8_0 {
++    // q4_0 K (and V) cache instead of q8_0 (GGML_CUDA_KV_FOLD_Q4_0): the kernels' kv template value 2
++    bool            k_q4;
 +    block_q8_0    * k_dst;    // K cache view; the rotated row goes here instead of dst
 +    const int64_t * k_idx;    // destination cache row per token
 +    int64_t         k_nb1;    // bytes per cache row
@@ -69638,15 +69663,18 @@ index 45e813406..01bc29294 100644
 -static __global__ void rms_norm_mul_rope_f32(
 +// fwht_n > 0 (ncols == fwht_n): the KV rotation's Hadamard MUL_MAT follows; the roped row goes through shared
 +// memory into fwht_cuda's in-warp FWHT (scaled by fwht_scale) and only the rotated row is written to dst
-+// kv (with fwht_n): the rotated row is written as q8_0 to the K cache instead (and the V row to the V cache), with
-+// k_set_rows_q8_0_group's quantization; row r of the block covers elements [r*ncols, (r+1)*ncols) of the token's row
++// kv (with fwht_n): the rotated row is written into the K cache instead (and the V row into the V cache), with the
++// cache's own group quantizer (k_set_rows_q8_0_group's for q8_0, ggml_cuda_quantize_q4_0_group for q4_0), chosen by
++// the template value kv (0 = no write, 1 = the cache is q8_0, 2 = it is q4_0 -- a template value because a runtime
++// select measured 12.8 -> 15.1 us on the q8_0 kernel); row r of the block covers elements [r*ncols, (r+1)*ncols) of
++// the token's row
 +// no_norm: ROPE alone (no RMS_NORM / MUL in front, x read as is), for the rope + FWHT forms
-+template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false, bool no_norm = false>
++template <int block_size, bool has_ff, typename D, int fwht_n = 0, int kv = 0, bool no_norm = false>
 +static __device__ __forceinline__ void rms_norm_mul_rope_f32_dev(
          const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
          const int64_t s01, const int64_t s02, const int64_t s03,
          const int64_t s1, const int64_t s2, const int64_t s3,
-@@ -741,12 +826,17 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -741,12 +841,17 @@ static __global__ void rms_norm_mul_rope_f32(
          const rope_corr_dims corr_dims, const float theta_scale,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
@@ -69666,7 +69694,7 @@ index 45e813406..01bc29294 100644
  
      ggml_cuda_pdl_sync();
  
-@@ -760,16 +850,59 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -760,16 +865,59 @@ static __global__ void rms_norm_mul_rope_f32(
              const uint32_t mul_sample  = fastmodulo(sample,  mul_nsamples_packed);
              const float * mulc = mul + mul_sample*mul_s03 + mul_channel*mul_s02 + mul_row*mul_s01;
  
@@ -69689,7 +69717,7 @@ index 45e813406..01bc29294 100644
 +#pragma unroll
 +                            for (int e = 0; e < 64/warp_size; ++e) {
 +                                const int col = col0 + e*warp_size + lane;
-+                                ggml_cuda_quantize_q8_0_group(reg[e], vrow + col/QK8_0, col % QK8_0);
++                                rope_kv_quantize_group<kv == 2>(reg[e], vrow, col);
 +                            }
 +                        }
 +                    }
@@ -69697,7 +69725,7 @@ index 45e813406..01bc29294 100644
 +                if (kv_args.v_src != nullptr && kv_args.v_fwht_n == 0 && tid < ncols) {
 +                    const int col = row*ncols + tid;
 +                    block_q8_0 * vrow = (block_q8_0 *) ((char *) kv_args.v_dst + kv_args.v_idx[channel]*kv_args.v_nb1);
-+                    ggml_cuda_quantize_q8_0_group(kv_args.v_src[channel*kv_args.v_s1 + col], vrow + col/QK8_0, col % QK8_0);
++                    rope_kv_quantize_group<kv == 2>(kv_args.v_src[channel*kv_args.v_s1 + col], vrow, col);
 +                }
 +            }
  
@@ -69732,7 +69760,7 @@ index 45e813406..01bc29294 100644
  
              int64_t idst = sample*s3 + channel*s2 + row*s1;
              if (set_rows_stride != 0) {
-@@ -777,10 +910,18 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -777,10 +925,18 @@ static __global__ void rms_norm_mul_rope_f32(
              }
              D * dstc = dst + idst;
  
@@ -69752,7 +69780,7 @@ index 45e813406..01bc29294 100644
                      ix0 = i0/2;
                      ix1 = i0/2 + n_dims/2;
                  } else {
-@@ -788,24 +929,78 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -788,24 +944,78 @@ static __global__ void rms_norm_mul_rope_f32(
                      ix1 = i0 + 1;
                  }
  
@@ -69826,7 +69854,7 @@ index 45e813406..01bc29294 100644
 +#pragma unroll
 +                        for (int i = 0; i < fwht_n / warp_size; ++i) {
 +                            const int col = row*ncols + i*warp_size + tid;
-+                            ggml_cuda_quantize_q8_0_group(reg[i], krow + col/QK8_0, col % QK8_0);
++                            rope_kv_quantize_group<kv == 2>(reg[i], krow, col);
 +                        }
 +                    } else {
 +#pragma unroll
@@ -69838,11 +69866,12 @@ index 45e813406..01bc29294 100644
              }
  
              if constexpr (block_size > WARP_SIZE) {
-@@ -816,6 +1011,58 @@ static __global__ void rms_norm_mul_rope_f32(
+@@ -816,6 +1026,60 @@ static __global__ void rms_norm_mul_rope_f32(
      }
  }
  
-+template <int block_size, bool has_ff, typename D, int fwht_n = 0, bool kv = false, bool no_norm = false>
++// kv: the cache's quant type for the KV-cache writes (0/1/2, see rms_norm_mul_rope_f32_dev)
++template <int block_size, bool has_ff, typename D, int fwht_n = 0, int kv = 0, bool no_norm = false>
 +static __global__ void rms_norm_mul_rope_f32(
 +        const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
 +        const int64_t s01, const int64_t s02, const int64_t s03,
@@ -69877,8 +69906,9 @@ index 45e813406..01bc29294 100644
 +
 +// Q and K norm+rope of one attention layer in one launch: blocks [0, q.nrows) are the Q heads, the rest the K heads; each
 +// block runs exactly the single launch's body with its own arguments, so the results are those of the two launches.
-+// fwht_n > 0: the quantized-KV form (Q: rms_norm_mul_rope_f32<256, has_ff, float, fwht_n>, K: the same with kv).
-+template <bool has_ff, typename DQ, typename DK, int fwht_n = 0, bool kv = false>
++// fwht_n > 0: the quantized-KV form (Q: rms_norm_mul_rope_f32<256, has_ff, float, fwht_n>, K: the same with kv, the
++// K cache's quant type -- 1 = q8_0, 2 = q4_0).
++template <bool has_ff, typename DQ, typename DK, int fwht_n = 0, int kv = 0>
 +static __global__ void rms_norm_mul_rope_f32_qk_pair(const rmr_args<DQ> q, const rmr_args<DK> k) {
 +    if ((int) blockIdx.x < q.nrows) {
 +        rms_norm_mul_rope_f32_dev<256, has_ff, DQ, fwht_n, false>(q.x, q.dst, q.ncols, q.nchannels, q.nsamples, q.s01, q.s02, q.s03, q.s1, q.s2, q.s3,
@@ -69897,7 +69927,7 @@ index 45e813406..01bc29294 100644
  template <typename D>
  static void rms_norm_mul_rope_cuda(
          const float * x, D * dst,
-@@ -832,7 +1079,9 @@ static void rms_norm_mul_rope_cuda(
+@@ -832,7 +1096,9 @@ static void rms_norm_mul_rope_cuda(
          const rope_corr_dims corr_dims,
          const float * freq_factors,
          const int64_t * row_indices, const int set_rows_stride,
@@ -69908,7 +69938,7 @@ index 45e813406..01bc29294 100644
      GGML_ASSERT(ncols % 2 == 0);
  
      const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
-@@ -844,6 +1093,72 @@ static void rms_norm_mul_rope_cuda(
+@@ -844,6 +1110,92 @@ static void rms_norm_mul_rope_cuda(
      const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
      const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
  
@@ -69940,11 +69970,21 @@ index 45e813406..01bc29294 100644
 +            if (no_norm) {
 +                GGML_ASSERT(capture == nullptr);
 +                if (kv.k_dst != nullptr) {
-+                    switch (fwht_n) {
-+                        case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, true, true>); break;
-+                        case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, true, true>); break;
-+                        case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, true, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, true, true>); break;
-+                        default: GGML_ABORT("fatal error");
++                    // the cache's quant type is a template value: 2 = q4_0, 1 = q8_0
++                    if (kv.k_q4) {
++                        switch (fwht_n) {
++                            case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, 2, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, 2, true>); break;
++                            case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, 2, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, 2, true>); break;
++                            case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, 2, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, 2, true>); break;
++                            default: GGML_ABORT("fatal error");
++                        }
++                    } else {
++                        switch (fwht_n) {
++                            case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, 1, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, 1, true>); break;
++                            case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, 1, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, 1, true>); break;
++                            case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, 1, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, 1, true>); break;
++                            default: GGML_ABORT("fatal error");
++                        }
 +                    }
 +                } else {
 +                    switch (fwht_n) {
@@ -69957,11 +69997,21 @@ index 45e813406..01bc29294 100644
 +                return;
 +            }
 +            if (kv.k_dst != nullptr) {
-+                switch (fwht_n) {
-+                    case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, true>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, true>); break;
-+                    case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, true>); break;
-+                    case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, true>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, true>); break;
-+                    default: GGML_ABORT("fatal error");
++                // the cache's quant type is a template value: 2 = q4_0, 1 = q8_0
++                if (kv.k_q4) {
++                    switch (fwht_n) {
++                        case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, 2>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, 2>); break;
++                        case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, 2>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, 2>); break;
++                        case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, 2>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, 2>); break;
++                        default: GGML_ABORT("fatal error");
++                    }
++                } else {
++                    switch (fwht_n) {
++                        case  64: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D,  64, 1>) : launch(rms_norm_mul_rope_f32<256, false, D,  64, 1>); break;
++                        case 128: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 128, 1>) : launch(rms_norm_mul_rope_f32<256, false, D, 128, 1>); break;
++                        case 256: has_ff ? launch(rms_norm_mul_rope_f32<256, true, D, 256, 1>) : launch(rms_norm_mul_rope_f32<256, false, D, 256, 1>); break;
++                        default: GGML_ABORT("fatal error");
++                    }
 +                }
 +            } else {
 +                switch (fwht_n) {
@@ -69981,7 +70031,7 @@ index 45e813406..01bc29294 100644
      if (ncols < 1024) {
          const dim3 block_dims(256, 1, 1);
          const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
-@@ -852,13 +1167,13 @@ static void rms_norm_mul_rope_cuda(
+@@ -852,13 +1204,13 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
@@ -69997,7 +70047,7 @@ index 45e813406..01bc29294 100644
          }
      } else {
          const dim3 block_dims(1024, 1, 1);
-@@ -868,24 +1183,30 @@ static void rms_norm_mul_rope_cuda(
+@@ -868,24 +1220,30 @@ static void rms_norm_mul_rope_cuda(
                  x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
@@ -70034,7 +70084,7 @@ index 45e813406..01bc29294 100644
      GGML_ASSERT(eps >= 0.0f);
  
      GGML_ASSERT(x->type == GGML_TYPE_F32);
-@@ -897,6 +1218,54 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -897,6 +1255,59 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
      const int64_t * row_indices     = nullptr;
      int             set_rows_stride = 0;
  
@@ -70051,14 +70101,19 @@ index 45e813406..01bc29294 100644
 +
 +    rope_kv_q8_0 kv = {};
 +    if (k_set_rows != nullptr) {
-+        // q8_0 SET_ROWS of the rotated K row (and of the V row) instead of the F32 rotation output; the matcher
-+        // checked the shapes (one contiguous [nrows*ncols] row per token, I64 indices, q8_0 cache views)
-+        GGML_ASSERT(fwht != nullptr && k_set_rows->type == GGML_TYPE_Q8_0);
++        // the cache's quantized SET_ROWS of the rotated K row (and of the V row) instead of the F32 rotation output;
++        // the matcher checked the shapes (one contiguous [nrows*ncols] row per token, I64 indices) and the cache type
++        GGML_ASSERT(fwht != nullptr && (k_set_rows->type == GGML_TYPE_Q8_0 || k_set_rows->type == GGML_TYPE_Q4_0));
++        // q4_0's group quantizer is one 32-lane wave, so it is wave32 only (the matcher gates the type on it as well)
++        GGML_ASSERT(k_set_rows->type != GGML_TYPE_Q4_0 || ggml_cuda_info().devices[ctx.device].warp_size == 32);
++        kv.k_q4  = k_set_rows->type == GGML_TYPE_Q4_0;
 +        kv.k_dst = (block_q8_0 *) k_set_rows->data;
 +        kv.k_idx = (const int64_t *) k_set_rows->src[1]->data;
 +        kv.k_nb1 = k_set_rows->nb[1];
 +        if (v_set_rows != nullptr) {
-+            GGML_ASSERT(v_set_rows->type == GGML_TYPE_Q8_0 && v_set_rows->src[0]->type == GGML_TYPE_F32);
++            GGML_ASSERT((v_set_rows->type == GGML_TYPE_Q8_0 || v_set_rows->type == GGML_TYPE_Q4_0) &&
++                        v_set_rows->src[0]->type == GGML_TYPE_F32);
++            GGML_ASSERT(v_set_rows->type == k_set_rows->type);   // the matchers fold V only into a K write of its type
 +            kv.v_src = (const float *) v_set_rows->src[0]->data;
 +            kv.v_s1  = v_set_rows->src[0]->nb[1] / sizeof(float);
 +            kv.v_dst = (block_q8_0 *) v_set_rows->data;
@@ -70089,7 +70144,7 @@ index 45e813406..01bc29294 100644
      if (set_rows != nullptr) {
          dst_d           = set_rows->data;
          dst_type        = set_rows->type;
-@@ -928,6 +1297,11 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -928,6 +1339,11 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
  
      const float * freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
  
@@ -70101,7 +70156,7 @@ index 45e813406..01bc29294 100644
      rope_corr_dims corr_dims;
      ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
  
-@@ -951,20 +1325,76 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+@@ -951,20 +1367,86 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
      cudaStream_t stream = ctx.stream();
  
      if (dst_type == GGML_TYPE_F32) {
@@ -70145,11 +70200,21 @@ index 45e813406..01bc29294 100644
 +    const auto launch = [&](auto kernel) {
 +        ggml_cuda_kernel_launch(kernel, launch_params, q, k);
 +    };
-+    switch (q.fwht_n) {
-+        case  64: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float,  64, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float,  64, true>); break;
-+        case 128: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 128, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 128, true>); break;
-+        case 256: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 256, true>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 256, true>); break;
-+        default: GGML_ABORT("fatal error");
++    // the K cache's quant type is a template value: 2 = q4_0, 1 = q8_0
++    if (k.kv.k_q4) {
++        switch (q.fwht_n) {
++            case  64: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float,  64, 2>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float,  64, 2>); break;
++            case 128: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 128, 2>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 128, 2>); break;
++            case 256: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 256, 2>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 256, 2>); break;
++            default: GGML_ABORT("fatal error");
++        }
++    } else {
++        switch (q.fwht_n) {
++            case  64: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float,  64, 1>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float,  64, 1>); break;
++            case 128: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 128, 1>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 128, 1>); break;
++            case 256: has_ff ? launch(rms_norm_mul_rope_f32_qk_pair<true, float, float, 256, 1>) : launch(rms_norm_mul_rope_f32_qk_pair<false, float, float, 256, 1>); break;
++            default: GGML_ABORT("fatal error");
++        }
 +    }
 +}
 +
@@ -70304,10 +70369,10 @@ index 465997065..0ee78aed5 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/set-rows.cuh b/ggml/src/ggml-cuda/set-rows.cuh
-index c140c0873..7e43bc490 100644
+index c140c0873..cabd47ef6 100644
 --- a/ggml/src/ggml-cuda/set-rows.cuh
 +++ b/ggml/src/ggml-cuda/set-rows.cuh
-@@ -4,4 +4,23 @@
+@@ -4,4 +4,55 @@
  
  #define CUDA_SET_ROWS_BLOCK_SIZE 256
  
@@ -70328,6 +70393,38 @@ index c140c0873..7e43bc490 100644
 +        blk->d = d;
 +    }
 +    blk->qs[lane] = roundf(v*id);
++}
++
++// One q4_0 block from the 32 lanes of one wave (lane = element), bit-identical to quantize_f32_q4_0_block: the scale
++// comes from the element its sequential `amax < fabsf(v)` scan keeps -- the FIRST of largest |v| on a tie (an fmaxf
++// butterfly for the maximum, then a ballot for its lowest lane), never a NaN (fmaxf skips one and `NaN == amax` is
++// false), and vmax = +0 when every |v| is 0 -- and every element is rounded with the reference's two statements,
++// lane j packing element j with element j + QK4_0/2.  Used by the KV-cache writes of the fused rope + FWHT kernel
++// for a q4_0 cache (GGML_CUDA_KV_FOLD_Q4_0).
++// WAVE32 ONLY: the ballot and both shuffles are one 32-lane group, so a 64-lane wave would mix two blocks.  The host
++// gates it (ggml_cuda_kv_fold_type_ok checks the running device's warp_size) and the launch sites assert it.
++static __device__ __forceinline__ void ggml_cuda_quantize_q4_0_group(const float v, block_q4_0 * blk, const int lane) {
++    float amax = fabsf(v);
++#pragma unroll
++    for (int offset = QK4_0/2; offset > 0; offset >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, QK4_0));
++    }
++    const uint64_t at  = (uint64_t) __ballot_sync(0xFFFFFFFFULL, amax > 0.0f && fabsf(v) == amax) & 0xFFFFFFFFULL;
++    const int      src = at ? __ffsll((long long) at) - 1 : 0;   // the lowest lane holding the maximum (first on a tie)
++    const float    bv  = __shfl_sync(0xffffffff, v, src, QK4_0);
++    const float vmax = at ? bv : 0.0f;
++    const float d  = vmax / -8;
++    const float id = d ? 1.0f/d : 0.0f;
++
++    const float   x     = v*id;   // the reference's two statements
++    const uint8_t xi    = min(15, (int8_t)(x + 8.5f));
++    const uint8_t xi_hi = __shfl_sync(0xffffffff, (int) xi, lane + QK4_0/2, QK4_0);   // element lane + QK4_0/2 (high nibble)
++    if (lane == 0) {
++        blk->d = d;
++    }
++    if (lane < QK4_0/2) {
++        blk->qs[lane] = xi | (xi_hi << 4);
++    }
 +}
 +
  void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

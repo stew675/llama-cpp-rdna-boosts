@@ -1,5 +1,11 @@
 # The `q4_0` KV cache-write fold (PR #262) — assessment record, HELD out of r192
 
+> **SUPERSEDED 2026-11-01 (r199): this PR was ACCEPTED and folded into block 10.**  The gfx1201 MTP cost that
+> held it did not reproduce at r198 (r198's `mmvq-ksplit-body.inc` removed the compiled-code effect it was
+> following, the same one that cost PR #260 6-7 %), so the fold shipped as measured.  Current numbers, gates and
+> the on-the-way-in fixes: [`2026-11-01-kv-fold-q4_0-promotion.md`](2026-11-01-kv-fold-q4_0-promotion.md).  The
+> measurements below are kept as the r192 evidence.
+
 Dated assessment (r192 session, `WORKLOG.md` 261031.013).  **Nothing from this PR is in the delivery.**  It is
 recorded here because the measurements are the only cross-arch evidence we have and because the outcome is a
 finding in its own right: the fold is **correct and beneficial on the RDNA3 family** and carries an

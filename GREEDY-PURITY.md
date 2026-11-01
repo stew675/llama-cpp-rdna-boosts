@@ -138,7 +138,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§76** | a conservative guard that declines a fast path owes a fallback that is not pathological, and the refusal must be a distinct signal rather than inferred from a partially-filled out-parameter: a guard whose false positive routes a *large* copy to an element-per-thread kernel (three divisions and three modulos per element) is a regression waiting for a model that reaches it — so keep the guard, vectorise the fallback (bit-identical, alignment-checked), and never let a *different* refusal geometry (overlapping rows, which need the flat mapping) share the fallback's condition | doctrine + fix (r189, from the KV campaign's `f8e47e392`; `benchmarks/2026-10-31-cpy-2d-vec16.md`) |
 | **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
 | **§79** | a memory module that relocates a live cell between two of one sequence's batches owes the relocation of **everything** that sequence's next batch reads from that cell: a rollback snapshot plane is part of the cell, not a side table.  Three conditions carry it, and each is a way the fix can be silently wrong: the copy must run **before** the ubatch writes its own snapshots (node order is the only ordering guarantee, since two views of one tensor create no dependency edge), the source ids must come from an accessor that does **not** consume the sequence's pending rollback index (`s_copy()` does, `s_src()` does not), and the new input must be created only where the batch really has an extra cell (`n_rs > n_seqs`), so every single-sequence batch and a 2-cell cache keep a byte-identical graph.  The instrument is a **two-arm logit comparison** (a batch that moves the cell vs the same tokens decoded alone), never text: the wrong read is another sequence's state, which the model still renders as fluent text.  The mechanism is upstream's, so the fix ships with the upstream copy | doctrine + fix (r195, PR #261, block 03; `archive/work/recurrent-moved-cell-snapshots/`) |
-| **§74** | a fusion that exists for one cache-*quantizer* path is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
+| **§74** | a fusion that exists for one cache-*quantizer* path (now q8_0 **and** q4_0, wave32) is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
 
 | **§77** | a cache that keeps its **authoritative** copy where it is cheap and a cache of the hot part where it is fast must make the CHEAP copy authoritative, so every existing path (the `set_rows` writers, `state_write`/`state_read`, the K-shift, defrag, parking, `get_k`/`get_v`) needs no pool-aware code; the resolve then owes three rules — **mark before claim** (a claim must never evict a page the same launch reads), **distinct blocks only** (a claim per *attempt* wraps the cursor within one batch), and **no transient scratch inside a captured graph** (a fill list in a pool allocation bakes a pointer a replay then reuses) — plus a residency floor of one decode band so a verify batch cannot exhaust the slots; a cache that is pooled or windowed reports it is **streaming**, and taking the sparse arm there is a different attention **regime** (like §45/§63), so the oracle is the pooled arm against the resident **sparse** arm and a resident arm against itself, never a dense-vs-pooled text diff | doctrine + fix (r190, block 16; `../archive/work/kv-residency/BA-POOL-DESIGN.md` §7-§8) |
 | **§78** | fuse a kernel over a *quantized* cache only by dequantizing with the library's own block decoder (`dequantize_q8_0/q4_0/…`), addressed in whole `nb0K` blocks, so the fused path returns the exact values the per-op chain's `get_rows` does — and gate it on **every** supported type plus the no-derived-cache arm, because the two paths must stay byte-identical per type (q8_0's one-element-per-byte packing and a 4/5-bit byte's low/high nibble split at `b` and `b + 16` are the two that differ).  A type whose block does not divide the indexed row (k-quants' 256-element superblock vs `idx_dim` 128) is an accepted limitation on the chain, not a defect | doctrine + fix (r190, block 11, from the KV campaign's A13; `../archive/work/kv-residency/BA-POOL-DESIGN.md` §9.3-§10) |
@@ -2526,8 +2526,21 @@ pair, the combine's Q8_1 publish and both `fwht_cuda` launches were all gone.  r
    bit-identical to the all-off reference, single device and 3-GPU tensor/layer, on the one model that reaches the
    rope-only form).
 
-**Scope.**  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — that is the quantizer they reproduce.
-`q4_0`/`q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #120.
+6. **A second cache quantizer is admitted on its own quantizer alone, and its wave width is part of the
+   predicate.**  Since r199 the same five folds also serve a **`q4_0`** cache (PR #262) through
+   `ggml_cuda_quantize_q4_0_group`, which reproduces `quantize_f32_q4_0_block` statement for statement — the
+   sequential scan's **first** largest `|v|` (an `fmaxf` butterfly, then a ballot for its lowest lane), a NaN
+   never winning, `vmax = +0` for an all-zero group, and lane `j` packing element `j` with element `j + 16`.
+   Its accumulator is **one 32-lane wave**, so `ggml_cuda_kv_fold_type_ok` takes the **running device's**
+   `warp_size` (the caller's `ctx.device` — never a per-node `ggml_cuda_get_device()` and never the primary
+   device) and the launch sites assert it: on a wave64 device the ballot would mix two blocks.  The quantizer
+   must also stay a **compile-time** choice (the kernels' `kv` template value 0/1/2): a runtime select cost the
+   q8_0 kernel 12.8 -> 15.1 us, i.e. it taxes the arm it was not added for.  `GGML_CUDA_KV_FOLD_Q4_0=0` is the
+   kill switch; `q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #120.
+
+**Scope.**  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — that is the quantizer they reproduce —
+or, since r199, `GGML_TYPE_Q4_0` on a wave32 device (rule 6).  `q5_0`/`iq4_nl`/`bf16` KV keep their separate
+launches (correct, unfused): `TODO.md` #120.
 
 **Numbers** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `llama-bench -r 3`, 3 interleaved rounds, same build dir):
 Qwen3-30B-A3B Q4_K_M `-ctk/-ctv q8_0` tg128 **141.2 -> 160.1 t/s (+13.4 %)**, @4096 **127.3 -> 140.1 (+10.1 %)**;
@@ -2538,8 +2551,21 @@ last digit**, 0.61351 / 0.83360 / 0.89815 / 0.99200), prefill-logit `0.000000 / 
 bases for both f16 and q8_0 KV, `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` 7059/7059.  The submitter's own
 gaps (multi-GPU/`-sm tensor`, and the rope-only prefill arm) are covered here.
 
-**Record:** `WORKLOG.md` 261031.005, `patches/README.md` (block 10 / block 11), `ENVIRONMENT.md` §7.4,
-`benchmarks/2026-10-31-kv-rotation-decode.md`, `archive/work/kv-rotation-decode/`.
+**Numbers, `q4_0` (r199, PR #262).**  Same arms and box, `-ctk/-ctv q4_0`: Qwen3-30B-A3B Q4_K_M tg128
+**145.9 -> 161.6 t/s (+10.7 %)** and @4096 **129.5 -> 141.7 (+9.5 %)** on gfx1201, **176.4 -> 197.5 (+12.0 %) /
+161.6 -> 179.7 (+11.2 %)** on gfx1100 and **53.9 -> 55.3 (+2.5 %) / 51.5 -> 52.9 (+2.6 %)** on gfx1151;
+f16 and q8_0 KV unchanged, and the kill-switch arm reads stock on all three.  Census on gfx1201 (graphs off)
+**8547 -> 6915** launches per 12-step decode — the q8_0 arm's count.  Purity: `--kv q4_0 --ub 1` prefill-logit
+`-0.000000 / 100.000 %`, the same at the default ubatch on gpt-oss (its rope-only form is the one of the five that
+runs in prefill), `test-logits-width-probe` identical at `P=3584`/`P>=4096` (dense 27B and gpt-oss), greedy text
+byte-identical on six arms and on all three arches, `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT`
+7059/7059, and MTP flat (1 GPU bf16 76.5 vs 76.4 t/s, q4_0 74.6 vs 74.5, 3 GPU tensor q4_0 130.9 vs 130.1,
+acceptance identical) — the r191-era gfx1201 MTP cost that held this PR out of r192 does not reproduce at r198
+(it was the compiled verify kernels, the same class r198's `mmvq-ksplit-body.inc` fixed for PR #260).
+
+**Record:** `WORKLOG.md` 261031.005, `WORKLOG.md` 261101.005 (r199, `q4_0`), `patches/README.md` (block 10 /
+block 11), `ENVIRONMENT.md` §7.4, `benchmarks/2026-10-31-kv-rotation-decode.md`,
+`benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`, `archive/work/kv-rotation-decode/`.
 
 ## 75. A Q8_1 publish that extends an existing one must be armed by the predicate the kernel implements, and its reach is a quant property (r188, PR #259)
 

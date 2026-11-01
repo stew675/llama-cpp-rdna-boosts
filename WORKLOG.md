@@ -1,3 +1,63 @@
+## 261101.005 (r199) -- PR #262's `q4_0` KV cache write fold lands in block 10; the r192 MTP hold does not reproduce at r198 (TODO #120's `q4_0` half retired)
+
+**Released as `v16-6050b467c-r199` (16 blocks; block 10 amended).**  Canonical tip
+`d5f2415722bbd8d690135aac705716ffde612aee`, tree `d461bd014bd153ac83abbcc84b70e5bf3703470f` (r198 was
+`85667dead` / `52337cb38a`).  `release.json` refreshed; `patches/` regenerated from `6050b467c..r199-chain`;
+`scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball, tree equality, 286 files
+through the Windows portability lint); `gate-per-block-build.sh --fast --changed-from 85667dead` 2/2 (block 10 +
+the tip); `fork-refresh.sh --build --gates` re-cut the branch from the base and **reproduced tree `d461bd014` and
+tip `d5f241572`** (the deterministic re-cut still holds with an amended block) and passed coherence + the
+canonical prefill-logit gate (**0.000000 / 100.000 %**).  Record:
+`benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`.
+
+**Shipped -- #262 (PR #262, `briansp2020`): the fused K/V cache write for a `q4_0` KV cache.**  The r187
+quantized-KV decode folds (`GREEDY-PURITY.md` §74) keyed on the cache `SET_ROWS` being `q8_0`, so a `q4_0` cache
+kept K's and V's own `k_set_rows_quant`, V's own `fwht_cuda<64>` and the two single Q / K norm+rope launches
+(702 launches per token on a 30B-A3B against 510 for the `q8_0` arm).  `ggml_cuda_quantize_q4_0_group` quantizes one
+block from the 32 lanes of a wave, bit-identical to `quantize_f32_q4_0_block` — the sequential scan's **first**
+element of largest |v| (an `fmaxf` butterfly, then a ballot for its lowest lane), a NaN never winning, `vmax = +0`
+for an all-zero group, the same two rounding statements, lane `j` packing element `j` with element `j + 16` — and
+the rope + FWHT kernels take the cache type as a **template value** (`kv`: 0 = no write, 1 = q8_0, 2 = q4_0), so the
+`q8_0` instantiations are untouched (a runtime select cost the `q8_0` kernel 12.8 -> 15.1 us on a 256-wide
+rotation).  Wave32 only; `GGML_CUDA_KV_FOLD_Q4_0=0` is the kill switch.  Census (gfx1201, graphs off, 12-token
+decode): **8547 -> 6915**, the `q8_0` arm's count, via `rms_norm_mul_rope_f32_qk_pair<..,128,2>` x336 and
+`rms_norm_mul_rope_f32<..,128,2>` x288.  Worth **+10.8 % tg128 / +9.4 % @4096 on gfx1201**, **+12.0 % / +11.2 % on
+gfx1100** and **+2.5 % / +2.6 % on gfx1151** (30B-A3B `q4_0` KV, `llama-bench -r 5`, 3 interleaved rounds per box),
+with `f16` and `q8_0` KV unchanged and the kill-switch arm reading stock on all three.
+
+**On the way in (nothing functional):** the three `if (kv.k_q4) { switch … }` dispatches were re-indented (the PR
+emitted them at column 0), the `kv` template value documented, `__ffsll(at) - 1` replaces `__builtin_ctzll`, and
+`ggml_cuda_kv_fold_type_ok` now takes the **running device's** `warp_size` from the caller's `ctx.device` (r132
+doctrine, and it drops a per-node `ggml_cuda_get_device()` from a hot matcher) with a matching launch-site assert.
+
+**The r192 hold is resolved, and not by this patch.**  r192 held this PR for a **7 % gfx1201 MTP decode cost**
+(dense 27B `draft-mtp`: 76.2 -> 70.7 t/s at 1 GPU, 133.4 -> 126.4 at 3 GPU) that appeared for it *and* for PR #260,
+with an identical kernel/graph census and with each patch's kill switch off — while gfx1100 and gfx1151 were flat.
+r198's `mmvq-ksplit-body.inc` named and removed that effect for #260 (an inlined `__device__` ksplit body changed
+the compiled multi-column verify kernels), and at **r198** the same arms are flat for #262 on this box and on the
+submitter's R9700 (his five interleaved rounds, ROCm 10.0.0 **and** 10.1.0): 1 GPU bf16 **76.5 vs 76.4** t/s, 1 GPU
+`q4_0` **74.6 vs 74.5**, 3 GPU `-sm tensor` `q4_0` **130.9 vs 130.1**, draft/acceptance identical (139/132, 140/132,
+225/212).  So the cost followed the compiled code, not the runtime path — as the r192 record predicted — and nothing
+here is an arch gate: the fold is default-on wherever the cache is `q4_0` on a wave32 device.
+
+**Purity (no objection).**  `gate-prefill-logits.sh --kv q4_0 --ub 1 --chunks 8 --ab "GGML_CUDA_KV_FOLD_Q4_0=0"`
+**-0.000000 KLD / 100.000 %**; the same at the **default** ubatch on gpt-oss-20b (**-0.000000 / 99.971 %**), whose
+rope-only `FUSE_ROPE_FWHT` form is the one of the five that runs in prefill; `test-logits-width-probe` `KV=q4_0` at
+`P=3584` and `P>=4096` on dense 27B and gpt-oss — every `W=1..8` row hash identical to r198, `width_purity=PASS`;
+greedy text byte-identical on six arms (1 GPU, 3 GPU `-sm tensor`, gpt-oss head 64, 35B `-ncmoe 40`, dense 27B,
+`q8_0` KV) and on gfx1100/gfx1151, always r198 == patched == switch-off; the same at `-c 102400` under
+`--spec-type none` vs `draft-mtp n-max 7`; `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` **7059/7059**.
+
+**Other release gates.**  MTP Protocol A (`-n 3000`, reasoning off, 3 GPU `-sm tensor`, dense 27B): bf16 plain 56.2
+/ `draft-mtp` **143.2** t/s (acceptance **0.898**), `q4_0` plain 53.3 / **144.2** (**0.928**); MoE (35B-A3B
+`-ncmoe 40`, `q4_0`, `-n 3000`) plain 79.1 / `draft-mtp` **178.6** (**0.877**), and with `GGML_CUDA_DISABLE_FUSION=1`
+131.4 / 0.894 (the fused multi-token path did not diverge).  Band gate `llama-batched-bench -npl 1,4,8` flat
+(bf16 56.67/172.55/267.04 -> 55.96/172.81/267.50; `q4_0` 53.47/170.42/263.43 -> 53.80/170.68/262.83).
+`check-gpu-faults.sh --since "3 hours ago"`: clean.
+
+**`TODO` #120 now stands only for `q5_0` / `iq4_nl` / `bf16`** (`q5_0` has the same shape as `q4_0`, `iq4_nl`
+searches its scale, `bf16` has no fused write kernel); #128 was already retired by r198.
+
 ## 261101.004 (r198) -- PR #260's mixed-type row concat lands in block 10; the gfx1201 MTP cost is named and fixed (TODO #128 retired)
 
 **Released as `v16-6050b467c-r198` (16 blocks; block 10 amended).**  Canonical tip

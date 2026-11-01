@@ -614,15 +614,16 @@ see `../WORKLOG.md` 261017.008).
 
 ### 7.4 Other kernel tuning
 
-> **The r187 quantized-KV decode fusions are `q8_0`-only.**  `GGML_CUDA_QK_ROTATE_HADAMARD`,
+> **The r187 quantized-KV decode fusions are `q8_0`-only, plus `q4_0` since r199.**  `GGML_CUDA_QK_ROTATE_HADAMARD`,
 > `GGML_CUDA_FUSE_V_FWHT`, `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT` and
-> `GGML_CUDA_FUSE_ROPE_FWHT` all key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0`, because that is the
-> quantizer the fused kernels reproduce.  `-ctk/-ctv q4_0`, `q5_0`, `iq4_nl`, `bf16` … keep their separate
-> launches (correct, just not fused); extending the set needs each type's own write kernel, which is
-> `TODO.md` #120.
+> `GGML_CUDA_FUSE_ROPE_FWHT` all key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` *or* (r199, PR #262,
+> wave32 devices) `GGML_TYPE_Q4_0`, because those are the quantizers the fused kernels reproduce.
+> `-ctk/-ctv q5_0`, `iq4_nl`, `bf16` … keep their separate launches (correct, just not fused); extending the
+> set needs each type's own write kernel, which is `TODO.md` #120.
 
 | variable | default | notes |
 |---|---|---|
+| `GGML_CUDA_KV_FOLD_Q4_0` | on (r199, block 10) | kill-switch | whether the fused rope + FWHT kernel also writes a **q4_0** K/V cache row (and a q4_0 V row), i.e. whether `ggml_cuda_kv_fold_type_ok` admits `GGML_TYPE_Q4_0` beside `Q8_0`.  `0` restores the pre-r199 arm (a q4_0 cache keeps its separate `k_set_rows_quant` launches, its own `fwht_cuda<64>` and the single Q / K norm+rope launches).  **Wave32 devices only** (`ggml_cuda_quantize_q4_0_group` ballots and shuffles over one 32-lane wave), which is every RDNA target; a wave64 device keeps the separate launches whatever this says.  Bit-identical: `--kv q4_0 --ub 1` prefill-logit A/B `-0.000000 / 100.000 %`, the width probe matches at `P=3584`/`P>=4096`, greedy text identical on gfx1201/gfx1100/gfx1151.  Worth **+10.7 % tg128 / +10.2 % @4096** on gfx1201 (30B-A3B `q4_0` KV), **+12.0 % / +11.2 %** on gfx1100 and **+2.5 % / +2.6 %** on gfx1151, with f16 and q8_0 KV unchanged; `GREEDY-PURITY.md` §74, `benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`. |
 | `GGML_CUDA_MMQ_J_MAX` | tuning | MMQ `J` tile width cap. |
 | `GGML_CUDA_MMVQ_RDNA3_SMALL_M` | `8192`, RDNA3_0 only — **kill-switch / tuning** (block 08) | row-count `M` band for the dense mmvq *weight* kernel's narrow (1-warp) block.  `Q4_0/Q4_1/Q5_0/Q5_1` always take it; `Q8_0` takes it for `2048 <= M <= this`; `Q6_K`/`IQ4_NL` never do.  `M` is the weight's row count, i.e. a tensor property, so all widths `W = 1..8` of a tensor take the same branch — and the three fusion kernels that reproduce a dense weight launch (`ggml_cuda_op_ssm_gate_beta`, `_ssm_conv_l2_gatebeta`, `_shexp_down_gate`) take the same value, which is the width-purity requirement (`GREEDY-PURITY.md` §19).  `0` restores the pre-2026-10-19 wide-block table (byte-identical to r91).  Measured on gfx1100: 35B-A3B MTP n3 **+10.7 %** (prose) / **+6.3 %** (code), gemma-26B `tg128` **+5.0 %**, 35B-A3B `tg128` @ d16384 **+1.7-2.0 %**, gemma-12B +0.4 %, 27B neutral; `W = 1..8` probe PASS on all four models and all eight KV types.  Record: `archive/work/nwarps/`. |
 | `GGML_Q6_COMPACT_J` | tuning | Q6 compact-`J` variant. |
