@@ -312,6 +312,25 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   128-expert MoE at `-ncmoe 24 -nkvo`: abort -> 24.6 -> 82.7 t/s against 176 with the KV on the GPU; text
   byte-identical to the default arms on bailingmoe3/35B-A3B (± `draft-mtp`)/gpt-oss-20b/Flash-Next/dense.
   `patches/README.md` (block 09), `archive/work/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
+- **The decode band's routing readback is optional, and its slot map is the one thing that must never go stale
+  (r203, PR #266, block 09).**  The eager hook pays a device synchronize per routed op to read `ids` back; since
+  r203 a backend that implements the new iface member `moe_cache_remap` (appended **last**; NULL in meta/cpu/rpc,
+  so `-sm tensor` keeps the eager path) is offered the split input first, and a kernel maps the device routing
+  through a per-table expert -> slot map into `remap_dev` (`slots + e` = cold, read in place from the pinned
+  master) while writing the routing into mapped pinned memory -- the residency policy then runs on it **one call
+  late** and re-uploads the map only after a residency change.  Each expert is read from the same bytes, so the
+  output is unchanged (byte-identical text, identical MTP acceptance, prefill KLD 0.000000); the win is **+8.4 %
+  TG** on 35B-A3B `-ncmoe 40` (1 x R9700), +14.1 %/+9.2 % at 4/8 slots, inert under `-sm tensor`.  Two invariants:
+  the map is rebuilt from **`slot_dirty`**, which every slot mutation must set (fill, eviction, stand-down, slab
+  eviction, shrink, migration, re-arm) -- a stale map reads the wrong arena slot, and the `slots + e` cold
+  encoding also depends on the slot COUNT, so a count change without a rebuild reads past the master -- and the
+  lag is policy-only (a stale lag may admit the wrong expert, never change a read address).  Scope is pinned
+  master, one unslice table, no identity table, band only, after `g_sized`.  `GGML_MOE_DEVREMAP=0` is the eager
+  arm.  `MOE_HOST_POOL_COLD` (same fold) reads a **pool**-resident miss in place (cold id `n_res + pool slot`,
+  `moe_cache_get_cold` returns the pool base): +4.8 % TG on the pool arm, and it is safe **only** because the
+  eager path it rides synchronizes the backend before the hook -- a change that removes that sync must gate it.
+  `ENVIRONMENT.md` §1.2 records that the r40 device-*policy* family stays removed and why this is not it;
+  `GREEDY-PURITY.md` §82.
 - **A cross-device copy must ask `ggml_cuda_slab_peer_copy_ok()` first (r121).**  The slab's
   peer-access grant is per-device and **best effort**: with three ~29 GiB slabs the driver refuses it for the
   second and third device (the peers have no free VRAM to build a 29 GiB peer mapping), and a

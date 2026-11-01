@@ -1,4 +1,4 @@
-From 13ea6764c22b76a8042b9c6545a8f4b4d6e6475a Mon Sep 17 00:00:00 2001
+From b89e133c671d3ea7ed3c6345623cb03f4801c7b4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -307,6 +307,40 @@ Measured on 1 x R9700: a 24-layer 128-expert MoE at `-ncmoe 24 -nkvo` aborts bef
 176, flat pre/post).  Text byte-identical between the `-nkvo` and default arms on bailingmoe3, 35B-A3B
 (also with draft-mtp), gpt-oss-20b, Flash-Next/qwen4exp and a dense 4B, and identical to the pre-fix
 default arms.
+
+Fold (r202, PR #266, briansp2020): the decode band no longer reads the routing back to the host.  The
+eager hook synchronizes the backend once per routed op to read `ids` (the scheduler's `input_backend`
+sync plus the ids readback's own sync), runs the residency policy and uploads the remap.  A new iface
+member `moe_cache_remap` is offered the split input FIRST (last struct member; NULL in the meta, cpu
+and rpc backends, so `-sm tensor` keeps the eager path): a kernel maps the device routing through a
+per-table expert -> slot map (`slots + e` = cold, read in place from the pinned master) into that
+table's `remap_dev`, and writes the routing into mapped pinned memory; the residency policy consumes
+that routing at the NEXT call (one call late) and re-uploads the map only after a residency change
+(`slot_dirty`).  One launch serves a layer's tables (gate / up / down) when they were served the same
+routing tensor on the same stream.  Every expert is read from the same bytes it was read from before --
+an arena slot, or the same pinned master the cold read already used -- so the output does not change:
+byte-identical greedy text (35B-A3B `-ncmoe 40` and gpt-oss-20b at 128 and 1000 tokens, including a
+2048 MiB arena under eviction pressure, pinned and `--host-experts pool`), identical MTP acceptance
+(0.76089 / 1387-of-1836 both arms, n=3000), prefill KLD 0.000000 / 100.000 %.  Worth **+8.4 % TG**
+(60.6 -> 65.7 t/s, 1 x R9700, `-ncmoe 40`) and +2.3 % on the MTP arm, and it is inert under `-sm
+tensor` (98.0 vs 98.1 t/s, identical text).  `GGML_MOE_DEVREMAP=0` restores the eager path.
+
+Scope, by construction: a pinned master (`table_cold_ok`), one unsplit table, no identity table, no
+`-sm tensor`, the decode/verify band only (`ne[2] <= band`), and `g_sized` (the eager path primes,
+sizes and re-primes).  The map is rebuilt from `slot_dirty` on EVERY slot mutation (fill, eviction,
+stand-down, slab eviction, shrink, migration, re-arm), which is the one invariant to keep: a stale map
+reads the wrong arena slot, and the cold encoding `slots + e` additionally depends on the slot COUNT,
+so a slot-count change without a rebuild would read past the master.  `devremap_free_locked` bumps
+`ggml_cuda_graph_mem_freed` (the map/lag buffers are kernel arguments of a captured graph).
+
+Also `MOE_HOST_POOL_COLD` (default on): `--host-experts pool` has a pageable master, so the in-place
+cold read stands down and every decode miss was an arena fill even when the expert was already in the
+pinned pool.  Such a miss is now read cold from its pool slot through the pool's device alias (cold id
+`n_res + pool slot`, `moe_cache_get_cold` returns the pool base), i.e. the same bytes the fill would
+have copied.  Safe because the demand path never evicts a pool resident, a retiring slot (state 2) is
+excluded, and the eager path it rides synchronizes the backend before the hook; single visible device,
+single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 misses served in place,
++4.9 % TG (57.5 -> 60.4 t/s), identical text.  `MOE_HOST_POOL_COLD=0` restores the fill-every-miss arm.
 ---
  common/CMakeLists.txt                         |    2 +
  common/arg.cpp                                |   21 +-
@@ -323,26 +357,26 @@ default arms.
  ggml/include/ggml-alloc.h                     |    1 +
  ggml/include/ggml-backend.h                   |  123 +
  ggml/src/ggml-alloc.c                         |   85 +-
- ggml/src/ggml-backend-impl.h                  |  221 +
- ggml/src/ggml-backend-meta.cpp                | 1505 ++++-
- ggml/src/ggml-backend.cpp                     | 1272 +++-
+ ggml/src/ggml-backend-impl.h                  |  226 +
+ ggml/src/ggml-backend-meta.cpp                | 1506 +++-
+ ggml/src/ggml-backend.cpp                     | 1283 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    7 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    7 +
  ggml/src/ggml-cpu/amx/amx.cpp                 |    3 +
- ggml/src/ggml-cpu/ggml-cpu.cpp                |  205 +-
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |  206 +-
  ggml/src/ggml-cuda/CMakeLists.txt             |    6 +
  ggml/src/ggml-cuda/common.cuh                 |  643 +-
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2693 +++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2702 +++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 5737 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  323 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 6112 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  328 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
- ggml/src/ggml-cuda/vendors/hip.h              |    5 +
+ ggml/src/ggml-cuda/vendors/hip.h              |    6 +
  ggml/src/ggml-et/ggml-et.cpp                  |    7 +
  ggml/src/ggml-hexagon/ggml-hexagon.cpp        |    7 +
  ggml/src/ggml-hip/CMakeLists.txt              |    6 +
@@ -350,7 +384,7 @@ default arms.
  ggml/src/ggml-moe-weighted-reduction.h        |  160 +
  ggml/src/ggml-opencl/ggml-opencl.cpp          |    7 +
  ggml/src/ggml-openvino/ggml-openvino.cpp      |    7 +
- ggml/src/ggml-rpc/ggml-rpc.cpp                |   29 +
+ ggml/src/ggml-rpc/ggml-rpc.cpp                |   30 +
  ggml/src/ggml-sycl/ggml-sycl.cpp              |    7 +
  ggml/src/ggml-virtgpu/ggml-backend.cpp        |    7 +
  ggml/src/ggml-vulkan/ggml-vulkan.cpp          |    7 +
@@ -374,7 +408,7 @@ default arms.
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 66 files changed, 15533 insertions(+), 537 deletions(-)
+ 66 files changed, 15941 insertions(+), 538 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -2298,7 +2332,7 @@ index 022ff710e..d83b3fb76 100644
 +    galloc->layout_valid = false;
 +}
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..f24c39bb4 100644
+index dc7367dec..5fa04b580 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -30,6 +30,26 @@ extern "C" {
@@ -2365,7 +2399,7 @@ index dc7367dec..f24c39bb4 100644
      };
  
      struct ggml_backend_i {
-@@ -152,8 +195,83 @@ extern "C" {
+@@ -152,8 +195,88 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -2446,10 +2480,15 @@ index dc7367dec..f24c39bb4 100644
 +        // readback, the per-layer split grouping and rebalance) off it.  NULL = the historical 8.
 +        int64_t (*moe_cache_band)(ggml_backend_t backend);
 +        bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
++        // Sync-free decode device remap (GGML_MOE_DEVREMAP): the backend turns the device routing `ids` into slot ids
++        // itself, so the scheduler skips the ids readback and its synchronize.  The residency policy runs one call late
++        // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
++        // backends' positional initializers stay valid (NULL).
++        bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
      };
  
      struct ggml_backend {
-@@ -216,6 +334,109 @@ extern "C" {
+@@ -216,6 +339,109 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -2560,7 +2599,7 @@ index dc7367dec..f24c39bb4 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 479ed3ae3..ce3d1ae13 100644
+index 479ed3ae3..598dadd52 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -4476,7 +4515,7 @@ index 479ed3ae3..ce3d1ae13 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2593,9 +3703,20 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2593,9 +3703,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_plan_update       = */ nullptr,
      /* .graph_plan_compute      = */ nullptr,
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
@@ -4497,11 +4536,12 @@ index 479ed3ae3..ce3d1ae13 100644
 +    /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
 +    /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
++    /* .moe_cache_remap         = */ nullptr,   // not forwarded: -sm tensor keeps the eager path
  };
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 22e5fd9c7..4ef1e44a5 100644
+index 22e5fd9c7..73ffc25e0 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,21 @@
@@ -5496,7 +5536,7 @@ index 22e5fd9c7..4ef1e44a5 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -1834,31 +2665,316 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -1834,31 +2665,327 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -5674,6 +5714,17 @@ index 22e5fd9c7..4ef1e44a5 100644
 +                }
 +            }
 +
++            // Sync-free decode device remap (GGML_MOE_DEVREMAP): the backend turns the device
++            // routing into slot ids itself, so this input needs no ids readback and no synchronize.  Only when the ids
++            // were not substituted from another backend (they are then ordered on this split backend's stream).
++            if (node->ne[2] <= sched_moe_cache_band(split_backend) && ids_backend == split_backend &&
++                ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
++                split_backend->iface.moe_cache_remap != NULL &&
++                split_backend->iface.moe_cache_remap(split_backend, input, input_cpy, ids_tensor, true) &&
++                split_backend->iface.moe_cache_remap(split_backend, input, input_cpy, ids_tensor, false)) {
++                return;
++            }
++
 +            // wip/moe-expert-cache (B2): device-side expert gather.  Copy only the routed
 +            // experts from the host master into `input_cpy`, reading the routing on the device,
 +            // so the host ids readback and its full device synchronize are skipped.  A backend
@@ -5833,7 +5884,7 @@ index 22e5fd9c7..4ef1e44a5 100644
      }
  }
  
-@@ -1867,12 +2983,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1867,12 +2994,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      struct ggml_backend_sched_split * splits = sched->splits;
  
      int prev_backend_id = -1;
@@ -5849,7 +5900,7 @@ index 22e5fd9c7..4ef1e44a5 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1887,12 +3006,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1887,12 +3017,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -5864,7 +5915,7 @@ index 22e5fd9c7..4ef1e44a5 100644
              }
          }
  
-@@ -1940,6 +3059,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1940,6 +3070,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -5879,7 +5930,7 @@ index 22e5fd9c7..4ef1e44a5 100644
          prev_backend_id = split_backend_id;
      }
  
-@@ -1959,14 +3086,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1959,14 +3097,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -5896,7 +5947,7 @@ index 22e5fd9c7..4ef1e44a5 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2003,7 +3130,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2003,7 +3141,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -5912,7 +5963,7 @@ index 22e5fd9c7..4ef1e44a5 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2012,6 +3146,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2012,6 +3157,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -5978,7 +6029,7 @@ index 22e5fd9c7..4ef1e44a5 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2026,6 +3219,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2026,6 +3230,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -5989,7 +6040,7 @@ index 22e5fd9c7..4ef1e44a5 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2090,6 +3287,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2090,6 +3298,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -6007,7 +6058,7 @@ index 22e5fd9c7..4ef1e44a5 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2127,6 +3335,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2127,6 +3346,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -6016,7 +6067,7 @@ index 22e5fd9c7..4ef1e44a5 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2592,6 +3802,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2592,6 +3813,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -6026,7 +6077,7 @@ index 22e5fd9c7..4ef1e44a5 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2617,6 +3830,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2617,6 +3841,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -6087,7 +6138,7 @@ index e90c2797f..9bd0e7052 100644
          /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ new ggml::cpu::amx::extra_buffer_type(),
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 81ff5d79f..e26fd5095 100644
+index 81ff5d79f..7e624d38e 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,7 +7,9 @@
@@ -6284,7 +6335,7 @@ index 81ff5d79f..e26fd5095 100644
  
      if (cpu_ctx->work_size < cplan.work_size) {
          delete[] cpu_ctx->work_data;
-@@ -206,7 +380,18 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+@@ -206,7 +380,19 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
      /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
      /* .event_record            = */ NULL,
      /* .event_wait              = */ NULL,
@@ -6300,10 +6351,11 @@ index 81ff5d79f..e26fd5095 100644
 +    /* .moe_cache_take_over     = */ NULL,
 +    /* .moe_cache_band          = */ NULL,
 +    /* .moe_cache_gather        = */ NULL,
++    /* .moe_cache_remap         = */ NULL,
  };
  
  static ggml_guid_t ggml_backend_cpu_guid(void) {
-@@ -507,6 +692,24 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+@@ -507,6 +693,24 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
      /* .event_new            = */ NULL,
      /* .event_free           = */ NULL,
      /* .event_synchronize    = */ NULL,
@@ -7351,7 +7403,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1d15c57be..90308b5af 100644
+index 1d15c57be..ecb4e7c37 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -33,6 +33,7 @@
@@ -9081,12 +9133,14 @@ index 1d15c57be..90308b5af 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -1069,8 +2638,56 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
-     return size;
- }
+@@ -1066,11 +2635,59 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+         }
+     }
  
--static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
--    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
+-    return size;
++    return size;
++}
++
 +// RDNA/ROCm (TODO #42): the graph allocator reserves the compute buffer from a *measure* graph, but a
 +// runtime graph can carry a different live-tensor set (host-expert staging, MTP taps) and need a little
 +// more -- measured +3.3 % (6564 -> 6780 MiB; the cli case was a 11765.52 MiB allocation).  Growing it is
@@ -9134,8 +9188,10 @@ index 1d15c57be..90308b5af 100644
 +#else
 +    return 0;
 +#endif
-+}
-+
+ }
+ 
+-static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
+-    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
 +static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
      /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .alloc_buffer_n      = */ NULL,
@@ -9198,11 +9254,11 @@ index 1d15c57be..90308b5af 100644
 +        };
 +        init[device] = true;
 +    }
-+
-+    return &bufts[device];
-+}
  
 -    return &ggml_backend_cuda_buffer_type_host;
++    return &bufts[device];
++}
++
 +ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 +    return ggml_backend_cuda_host_buffer_type_dev(0);
  }
@@ -10032,7 +10088,7 @@ index 1d15c57be..90308b5af 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -6746,6 +8811,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6746,6 +8811,186 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -10210,10 +10266,16 @@ index 1d15c57be..90308b5af 100644
 +    return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
 +}
 +
++// Sync-free decode device remap (GGML_MOE_DEVREMAP; see the iface comment).
++static bool ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    return moe_cache_remap_dev(weight, weight_cpy, ids, ctx->stream(), ctx->device, check_only);
++}
++
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -6762,7 +9001,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -6762,7 +9007,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -10229,10 +10291,11 @@ index 1d15c57be..90308b5af 100644
 +    /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
 +    /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
++    /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -7032,8 +9282,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -7032,8 +9289,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -10243,7 +10306,7 @@ index 1d15c57be..90308b5af 100644
  }
  
  // TODO: move these functions here
-@@ -7537,6 +9787,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -7537,6 +9794,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -10260,7 +10323,7 @@ index 1d15c57be..90308b5af 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -7571,6 +9831,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -7571,6 +9838,137 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -10398,7 +10461,7 @@ index 1d15c57be..90308b5af 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -7587,6 +9978,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7587,6 +9985,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -10426,7 +10489,7 @@ index 1d15c57be..90308b5af 100644
  };
  
  // backend reg
-@@ -7766,6 +10178,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -7766,6 +10185,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -10761,10 +10824,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..959be4187
+index 000000000..bbbcf56e7
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,5737 @@
+@@ -0,0 +1,6112 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -10879,6 +10942,23 @@ index 000000000..959be4187
 +    int64_t     remap_n_tok = 0;
 +    std::vector<int32_t> remap_host;    // persistent staging (the async H2D must not race its source)
 +    std::vector<int32_t> hook_experts;  // the routing the hook last consumed (read-check only)
++    // Sync-free decode device remap (GGML_MOE_DEVREMAP): expert -> slot map (slots + e = cold) on the device, its
++    // pinned staging, and the previous call's routing written back by the remap kernel into mapped pinned memory.
++    int         dr_device   = -1;
++    int64_t     dr_cap      = 0;
++    int32_t *   dr_map_dev  = nullptr;
++    int32_t *   dr_map_host = nullptr;
++    int32_t *   dr_lag_host = nullptr;
++    int32_t *   dr_lag_dev  = nullptr;
++    cudaEvent_t dr_map_ev   = nullptr;
++    cudaEvent_t dr_lag_ev   = nullptr;
++    int64_t     dr_lag_n    = 0;
++    int32_t     dr_lag_seq  = 0;
++    bool        dr_lag_flag = false;
++    bool        dr_map_ok   = false;
++    bool        dr_failed   = false;
++    const void * dr_last_ids    = nullptr;   // routing buffer and stream of the last take-over: a sibling joins a launch
++    void *       dr_last_stream = nullptr;   // only when both match, so a launch never touches another context's table
 +
 +    // Prefill residency snapshot (PRS): a small device copy of
 +    // `expert_slot` (-1 = not resident) consumed ONLY by the prefill staging kernel.  It is rebuilt from
@@ -10927,6 +11007,7 @@ index 000000000..959be4187
 +// Consumer alias: the tensor the op actually reads (the redirected `input_cpy`, or a per-device simple
 +// tensor under `-sm tensor`) -> table.  Refreshed each hook call.
 +std::unordered_map<const void*, int>       g_alias_to_id;
++static std::map<std::pair<const void *, int>, int> g_dr_key_to_id;   // (host master, device) -> table (device remap)
 +std::set<std::pair<const void*, long long>> g_heads_zeroed;   // (buffer, expert_bytes) whose expert heads were zeroed once
 +// Semantic key (layer, normalized role, device) -> table.  Robust under `-sm tensor`, where the
 +// per-device simple tensor a hook saw may be a different pointer than the one the op reads after a meta
@@ -11278,6 +11359,25 @@ index 000000000..959be4187
 +    }
 +};
 +
++// Sync-free decode device remap (GGML_MOE_DEVREMAP): free a table's map / lag buffers (defined here, inside the
++// namespace, for the free sites below).
++static void devremap_free_locked(table_t & t) {
++    if (t.dr_device < 0) {
++        return;
++    }
++    device_guard dg(t.dr_device);
++    if (t.dr_map_dev  != nullptr) { (void) cudaFree(t.dr_map_dev); }
++    if (t.dr_map_host != nullptr) { (void) cudaFreeHost(t.dr_map_host); }
++    if (t.dr_lag_host != nullptr) { (void) cudaFreeHost(t.dr_lag_host); }
++    if (t.dr_map_ev   != nullptr) { (void) cudaEventDestroy(t.dr_map_ev); }
++    if (t.dr_lag_ev   != nullptr) { (void) cudaEventDestroy(t.dr_lag_ev); }
++    (void) cudaGetLastError();
++    t.dr_map_dev = t.dr_lag_dev = t.dr_map_host = t.dr_lag_host = nullptr;
++    t.dr_map_ev = t.dr_lag_ev = nullptr;
++    ggml_cuda_graph_mem_freed(t.dr_device);   // the map / lag buffers are kernel arguments of captured graphs
++    t.dr_cap = 0; t.dr_device = -1; t.dr_lag_n = 0; t.dr_map_ok = false;
++}
++
 +// Resolve the pinned host master's device-accessible alias once.  `t.src_off` is folded in by
 +// `moe_cache_get_cold`, so the alias is always the base of the host tensor.
 +//
@@ -11314,6 +11414,33 @@ index 000000000..959be4187
 +// table takes the fill-every-miss path instead (issue #116).
 +static inline bool table_cold_ok(const table_t & t) {
 +    return g_cold_uva && t.cold_safe && t.host_dev != nullptr;
++}
++
++// MOE_HOST_POOL_COLD (default 1): a pool-backed table (`--host-experts pool`, pageable master, so no in-place
++// read of the master) serves a miss whose expert is RESIDENT in the pinned pool by reading the pool slot in place
++// through the pool's device alias, instead of filling an arena slot from it first.  The bytes are the ones the
++// fill would have copied, so the result is unchanged.  The slot stays valid for the read: the demand path never
++// evicts a pool resident (TODO #87) and the scheduler synchronizes the backend before the next hook, i.e.
++// before any rerank / retire could touch it.  Single device and the historical single slice only (the pool is
++// process-wide and holds whole experts; the cold encoding is `n_res + pool slot` with the pool's base).
++static bool g_pool_cold = true;
++static host_pool_t * table_pool_locked(table_t & t);
++static int pool_cold_slot_locked(table_t & t, int32_t expert) {
++    if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.src_off != 0 ||
++            ggml_cuda_info().device_count != 1) {
++        return -1;
++    }
++    host_pool_t * p = table_pool_locked(t);
++    if (p == nullptr || p->failed || p->base_dev == nullptr || p->host_bytes != t.host_bytes ||
++            expert < 0 || expert >= p->n_experts) {
++        return -1;
++    }
++    const auto it = p->expert_slot.find(expert);
++    if (it == p->expert_slot.end()) {
++        return -1;
++    }
++    const int ps = it->second;
++    return ps >= 0 && ps < p->slots && p->slot_state[(size_t) ps] == 1 ? ps : -1;
 +}
 +
 +// Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
@@ -11408,6 +11535,7 @@ index 000000000..959be4187
 +    // reads the pinned host slice in place (the same bytes the H2D fill would have placed in the
 +    // slot), and it also lets a small arena represent an overflow (`id = slots + e`).
 +    g_cold_uva = env_int("MOE_EXPERT_CACHE_COLD_UVA", 1) != 0;
++    g_pool_cold = env_int("MOE_HOST_POOL_COLD", 1) != 0;
 +    g_stage_cache = env_int("GGML_MOE_CACHE_STAGE", 1) != 0;
 +    // Admission: `touch` (measured best at every arena size): a first-touch expert is served cold and
 +    // only a re-touch is admitted, so one-shot experts stop churning the arena - which raises `h` as
@@ -12218,7 +12346,7 @@ index 000000000..959be4187
 +                              bool * out_cold = nullptr) {
 +    // The cold read indexes the host master with the table's own host geometry (`moe_cache_get_cold`
 +    // returns the per-expert and per-row strides), so a Phase 3 slice is servable in place too.
-+    const bool cold_ok = table_cold_ok(t);
++    const bool cold_ok = table_cold_ok(t) || pool_cold_slot_locked(t, expert) >= 0;
 +    const auto is_protected = [&](int32_t e) {
 +        for (int i = 0; i < n_protect; i++) {
 +            if (protect[i] == e) {
@@ -13189,6 +13317,7 @@ index 000000000..959be4187
 +        t.arena = nullptr;
 +    }
 +    if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
++    devremap_free_locked(t);
 +    if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
 +    t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
 +    free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
@@ -13975,6 +14104,8 @@ index 000000000..959be4187
 +}
 +
 +} // namespace
++
++static void devremap_batch_clear_locked();   // device remap: drop the pending sibling batches (defined with g_dr_batch)
 +
 +
 +
@@ -15720,6 +15851,7 @@ index 000000000..959be4187
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
++    t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
 +
 +    // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never
 +    // cache-managed (the arena serves the decode band only), but its routing is the strongest available
@@ -15781,6 +15913,7 @@ index 000000000..959be4187
 +        const size_t old_reserved = t.arena_reserved;
 +        void *       old_arena    = t.arena;
 +        void *       old_remap    = t.remap_dev;
++        devremap_free_locked(t);
 +        free_heat_dev_locked(t);   // the mirror lives on the OLD device; fold + free before the move
 +        t.arena        = nullptr;
 +        t.remap_dev    = nullptr;
@@ -15874,6 +16007,7 @@ index 000000000..959be4187
 +    if (weight_cpy != nullptr) {
 +        g_alias_to_id[weight_cpy] = table;
 +    }
++    g_dr_key_to_id[{ (const void *) weight, device }] = table;   // the device remap finds its table by the host master
 +
 +    if (t.remap_dev == nullptr) {
 +        const int64_t cap = (int64_t) n_experts * 8;
@@ -15975,6 +16109,11 @@ index 000000000..959be4187
 +                // region of the id space - the kernel reads `id - n_res_slots` from the host alias.
 +                remap[(size_t) tok * n_used + j] = n_res_slots + e;
 +                g_cold_reaches++;
++            } else if (const int ps = pool_cold_slot_locked(t, e); ps >= 0) {
++                // MOE_HOST_POOL_COLD: the expert's pinned pool slot, read in place (`moe_cache_get_cold` returns
++                // the pool's base for this table)
++                remap[(size_t) tok * n_used + j] = n_res_slots + ps;
++                g_cold_reaches++;
 +            } else {
 +                all = false;   // evicted and not re-admitted, or slots == 0: fall back
 +            }
@@ -16003,13 +16142,309 @@ index 000000000..959be4187
 +    return true;
 +}
 +
++// ---- Sync-free decode device remap (GGML_MOE_DEVREMAP) ------------------------------------------------------------
++// The eager path reads the routing back to the host (one synchronize per routed op), runs the residency policy and
++// uploads the remap.  Here a kernel maps the device routing through a per-table expert -> slot map (slots + e = cold,
++// read in place from the pinned master) and writes the routing into mapped pinned memory; the policy runs on that
++// routing at the next call (one call late) and re-uploads the map when residency changed.  The bytes each expert is
++// read from are the same (arena slot or the pinned master), so the output does not change.  Pinned masters only
++// (`table_cold_ok`), single slice, no identity table.  GGML_MOE_DEVREMAP=0: off (the eager path).
++#define MOE_DEVREMAP_MAX_JOBS 4
++struct moe_devremap_jobs {
++    const int32_t * map[MOE_DEVREMAP_MAX_JOBS];
++    int32_t *       remap[MOE_DEVREMAP_MAX_JOBS];
++    int32_t *       lag[MOE_DEVREMAP_MAX_JOBS];
++    int32_t *       seq[MOE_DEVREMAP_MAX_JOBS];      // the lag completion flag (nullptr: the host uses the event)
++    int32_t         seq_val[MOE_DEVREMAP_MAX_JOBS];
++};
++
++static __global__ void moe_cache_remap_kernel(const int32_t * __restrict__ ids, int64_t ids_s1, int n_used, int n_tok,
++                                              int n_experts, const moe_devremap_jobs jobs) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n_used * n_tok) {
++        int32_t e = ids[(int64_t) (i / n_used) * ids_s1 + i % n_used];
++        e = e >= 0 && e < n_experts ? e : 0;   // router ids are always in range; never index outside the map
++        jobs.remap[blockIdx.y][i] = jobs.map[blockIdx.y][e];
++        jobs.lag[blockIdx.y][i]   = e;
++    }
++    // single-block jobs only (the host sets seq only then): every lag write of the job is in this block
++    if (jobs.seq[blockIdx.y] != nullptr) {
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            __threadfence_system();
++#if defined(GGML_USE_HIP)
++            __hip_atomic_store(jobs.seq[blockIdx.y], jobs.seq_val[blockIdx.y], __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
++#else
++            atomicExch(jobs.seq[blockIdx.y], jobs.seq_val[blockIdx.y]);
++#endif
++        }
++    }
++}
++
++static bool g_devremap = [] {
++    const char * e = getenv("GGML_MOE_DEVREMAP");
++    return e == nullptr || atoi(e) != 0;
++}();
++static bool g_devremap_batch = [] {
++    const char * e = getenv("GGML_MOE_DEVREMAP_BATCH");
++    return e == nullptr || atoi(e) != 0;
++}();
++static int64_t g_devremap_calls = 0;
++
++struct devremap_batch_t {
++    const void *     ids    = nullptr;
++    int64_t          s1     = 0;
++    int64_t          n_used = 0;
++    int64_t          n_tok  = 0;
++    std::vector<int> pending;   // table ids already served by this layer's first call
++};
++static std::map<int, devremap_batch_t> g_dr_batch;
++
++static void devremap_batch_clear_locked() {
++    g_dr_batch.clear();
++}
++
++
++static bool devremap_alloc_locked(table_t & t) {
++    device_guard dg(t.device);
++    t.dr_device = t.device;
++    t.dr_cap    = t.remap_cap;
++    const size_t mb = (size_t) t.n_experts * sizeof(int32_t);
++    const size_t lb = (size_t) (t.dr_cap + 1) * sizeof(int32_t);   // + the lag completion flag
++    if (cudaMalloc((void **) &t.dr_map_dev, mb) != cudaSuccess ||
++        cudaHostAlloc((void **) &t.dr_map_host, mb, cudaHostAllocPortable) != cudaSuccess ||
++        cudaHostAlloc((void **) &t.dr_lag_host, lb, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
++        cudaHostGetDevicePointer((void **) &t.dr_lag_dev, t.dr_lag_host, 0) != cudaSuccess ||
++        cudaEventCreateWithFlags(&t.dr_map_ev, cudaEventDisableTiming) != cudaSuccess ||
++        cudaEventCreateWithFlags(&t.dr_lag_ev, cudaEventDisableTiming) != cudaSuccess) {
++        (void) cudaGetLastError();
++        devremap_free_locked(t);
++        t.dr_failed = true;
++        GGML_LOG_WARN("%s: device remap buffers failed for layer=%d role=%s: the eager path serves it\n",
++                      __func__, t.layer, t.role.c_str());
++        return false;
++    }
++    t.dr_map_ok  = false;
++    t.dr_lag_n   = 0;
++    t.dr_lag_host[t.dr_cap] = 0;
++    t.dr_lag_seq  = 0;
++    t.dr_lag_flag = false;
++    t.dr_last_ids    = nullptr;
++    t.dr_last_stream = nullptr;
++    return true;
++}
++
++// Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
++static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
++    return g_sized && !t.dr_failed && table_cold_ok(t) && !t.identity &&
++           t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
++           n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
++           (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
++}
++
++// The one-call-late policy and the map upload for one table.  False: decline (the eager path serves the input).
++static bool devremap_prep_locked(table_t & t, void * stream) {
++    if (t.dr_device < 0 && !devremap_alloc_locked(t)) {
++        return false;
++    }
++    const cudaStream_t s = (cudaStream_t) stream;
++    // 1. The residency policy on the previous call's routing (never block: not back yet = skip this call's policy).
++    if (t.dr_lag_n > 0) {
++        const bool lag_ready = t.dr_lag_flag ? __atomic_load_n(&t.dr_lag_host[t.dr_cap], __ATOMIC_ACQUIRE) == t.dr_lag_seq
++                                             : cudaEventQuery(t.dr_lag_ev) == cudaSuccess;
++        if (!lag_ready) {
++            (void) cudaGetLastError();
++            t.dr_lag_n = 0;
++        }
++    }
++    if (t.dr_lag_n > 0) {
++        const int n = (int) t.dr_lag_n;
++        t.dr_lag_n = 0;
++        if (g_heat_on) {   // the decode-band tally the eager path keeps, one call late
++            if ((int) t.heat.size() != t.n_experts)     { t.heat.assign((size_t) t.n_experts, 0); }
++            for (int i = 0; i < n; i++) {
++                const int32_t e = t.dr_lag_host[i];
++                if (e >= 0 && e < t.n_experts) {
++                    if (t.heat[(size_t) e] != 0xffffffffu)     { t.heat[(size_t) e]++;     g_heat_dirty = true; }
++                }
++            }
++        }
++        for (int i = 0; i < n; i++) {
++            bool cold = false;
++            (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
++        }
++        if (t.arena == nullptr || t.slots <= 0) {
++            return false;
++        }
++    }
++    // 2. The device map, re-uploaded only after a residency change.
++    if (t.slot_dirty || !t.dr_map_ok) {
++        if (cudaEventQuery(t.dr_map_ev) != cudaSuccess) {   // the previous upload still reads the staging: decline
++            (void) cudaGetLastError();
++            return false;
++        }
++        for (int e = 0; e < t.n_experts; e++) {
++            t.dr_map_host[e] = t.slots + e;
++        }
++        for (int sl = 0; sl < t.slots && sl < (int) t.slot_expert.size(); sl++) {
++            const int32_t e = t.slot_expert[sl];
++            if (e >= 0 && e < t.n_experts) {
++                t.dr_map_host[e] = sl;
++            }
++        }
++        if (cudaMemcpyAsync(t.dr_map_dev, t.dr_map_host, (size_t) t.n_experts * sizeof(int32_t),
++                            cudaMemcpyHostToDevice, s) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.dr_map_ok = false;
++            return false;
++        }
++        (void) cudaEventRecord(t.dr_map_ev, s);
++        t.slot_dirty = false;
++        t.dr_map_ok  = true;
++    }
++    return true;
++}
++
++bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids,
++                         void * stream, int device, bool check_only) {
++    if (!g_enabled || !g_devremap || weight == nullptr || weight_cpy == nullptr || ids == nullptr ||
++        ids->data == nullptr || stream == nullptr || ids->type != GGML_TYPE_I32) {
++        return false;
++    }
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++    if (n_used <= 0 || n_tok <= 0 || n_tok > MOE_EXPERT_CACHE_MAX_TOK ||
++        ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const auto it = g_dr_key_to_id.find({ (const void *) weight, device });
++    if (it == g_dr_key_to_id.end() || it->second < 0 || it->second >= (int) g_tables.size()) {
++        return false;   // not seen by the eager path yet (priming / sizing run there)
++    }
++    const int id = it->second;
++    table_t & t = g_tables[id];
++    const bool ok = devremap_ok_locked(t, n_used, n_tok, device);
++    if (check_only) {
++        return ok;
++    }
++    g_write_seq++;
++    const auto decline = [&]() {
++        t.remap_n_used = 0;
++        t.dr_lag_n     = 0;
++        return false;
++    };
++    const int64_t n  = n_used * n_tok;
++    const int64_t s1 = (int64_t) (ids->nb[1] / sizeof(int32_t));
++    const auto publish = [&]() {
++        t.dr_lag_n     = n;
++        t.remap_n_used = n_used;
++        t.remap_n_tok  = n_tok;
++        g_alias_to_id[weight_cpy] = id;
++        t.dr_last_ids    = ids->data;
++        t.dr_last_stream = stream;
++        g_takeover++;
++        g_devremap_calls++;
++        return true;
++    };
++    // A sibling of this layer's first call with the same routing: its remap was already written in that launch.
++    devremap_batch_t & b = g_dr_batch[device];
++    const auto pit    = std::find(b.pending.begin(), b.pending.end(), id);
++    const bool served = pit != b.pending.end() && b.ids == ids->data && b.s1 == s1 && b.n_used == n_used &&
++                        b.n_tok == n_tok;
++    if (served) {
++        b.pending.erase(pit);
++    } else {
++        b.pending.clear();
++    }
++    if (!ok) {
++        return decline();
++    }
++    if (served) {
++        return publish();
++    }
++    device_guard       dg(t.device);
++    const cudaStream_t s = (cudaStream_t) stream;
++    if (!devremap_prep_locked(t, stream)) {
++        return decline();
++    }
++    moe_devremap_jobs jobs = {};
++    int               job_id[MOE_DEVREMAP_MAX_JOBS];
++    int               n_jobs = 0;
++    const auto add_job = [&](table_t & u, int uid) {
++        jobs.map[n_jobs]   = u.dr_map_dev;
++        jobs.remap[n_jobs] = u.remap_dev;
++        jobs.lag[n_jobs]   = u.dr_lag_dev;
++        job_id[n_jobs++]   = uid;
++    };
++    add_job(t, id);
++    // The layer's other tables on this device read the same routing (gate / up / down): serve them in this launch.
++    if (g_devremap_batch && t.layer >= 0) {
++        for (int k = 0; k < (int) g_tables.size() && n_jobs < MOE_DEVREMAP_MAX_JOBS; k++) {
++            table_t & u = g_tables[k];
++            if (k == id || u.layer != t.layer || u.device != device || u.n_experts != t.n_experts ||
++                u.dr_last_ids != ids->data || u.dr_last_stream != stream ||
++                !devremap_ok_locked(u, n_used, n_tok, device)) {
++                continue;
++            }
++            if (!devremap_prep_locked(u, stream)) {
++                u.remap_n_used = 0;
++                u.dr_lag_n     = 0;
++                continue;   // its own call retries
++            }
++            add_job(u, k);
++        }
++    }
++    // Routing -> slot ids; the kernel also writes the routing into the mapped pinned lag buffer for the next call's
++    // policy, with a completion flag (one block per job) or, for wider batches, an event per table.
++    const bool use_flag = n <= 256;
++    for (int j = 0; j < n_jobs; j++) {
++        table_t & u = g_tables[job_id[j]];
++        u.dr_lag_flag   = use_flag;
++        jobs.seq[j]     = use_flag ? u.dr_lag_dev + u.dr_cap : nullptr;
++        jobs.seq_val[j] = use_flag ? ++u.dr_lag_seq : 0;
++    }
++    moe_cache_remap_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) n_jobs), 256, 0, s>>>(
++            (const int32_t *) ids->data, s1, (int) n_used, (int) n_tok, t.n_experts, jobs);
++    if (cudaGetLastError() != cudaSuccess) {
++        return decline();
++    }
++    if (!use_flag) {
++        for (int j = 0; j < n_jobs; j++) {
++            (void) cudaEventRecord(g_tables[job_id[j]].dr_lag_ev, s);
++        }
++    }
++    b.ids    = ids->data;
++    b.s1     = s1;
++    b.n_used = n_used;
++    b.n_tok  = n_tok;
++    b.pending.assign(job_id + 1, job_id + n_jobs);
++    return publish();
++}
++
 +bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
 +                        size_t * cold_channel_bytes, size_t * cold_row_bytes) {
 +    if (!g_enabled || !g_cold_uva || arena == nullptr) {
 +        return false;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    for (const table_t & t : g_tables) {
++    for (table_t & t : g_tables) {
++        if (t.arena == arena && t.slots > 0 && t.host_dev == nullptr) {
++            // MOE_HOST_POOL_COLD: a pool-backed table's cold region is the pinned pool, indexed by pool slot
++            host_pool_t * p = (g_cold_uva && g_pool_cold && t.cold_safe && t.src_off == 0 &&
++                               ggml_cuda_info().device_count == 1) ? table_pool_locked(t) : nullptr;
++            if (p != nullptr && !p->failed && p->base_dev != nullptr && p->host_bytes == t.host_bytes) {
++                *cold_base = (char *) p->base_dev;
++                *n_res     = t.slots;
++                if (cold_channel_bytes) {
++                    *cold_channel_bytes = p->host_bytes;
++                }
++                if (cold_row_bytes) {
++                    *cold_row_bytes = t.host_pitch;
++                }
++                return true;
++            }
++        }
 +        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe) {
 +            continue;
 +        }
@@ -16258,6 +16693,9 @@ index 000000000..959be4187
 +    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
 +                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
 +                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
++    if (g_devremap_calls > 0) {
++        GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
++    }
 +    if (g_pool_enabled) {
 +        int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
 +        for (const auto & kv : g_host_pools) {
@@ -16504,10 +16942,10 @@ index 000000000..959be4187
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..e8da0c952
+index 000000000..a7196b800
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,328 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -16755,6 +17193,11 @@ index 000000000..e8da0c952
 +// `slice_off`/`split_axis` are the per-device slice geometry under `-sm tensor` (see `moe_cache_table`);
 +// they are `0`/`-1` for an unsplit table (1 GPU and `-sm layer`).  When the split backend is the Meta
 +// backend it computes them per device and forwards here once per simple device.
++// Sync-free decode device remap (GGML_MOE_DEVREMAP): remap the device routing `ids` to slot ids on `stream` with the
++// residency policy one call late; true = the op reads the arena through the table's remap.  `check_only`: report
++// whether the call would take the input, change nothing.
++bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
++                         void * stream, int device, bool check_only);
 +bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
 +                           const int32_t * ids, int64_t n_used, int64_t n_tok,
 +                           size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -16884,10 +17327,18 @@ index 96566d080..5b41d8bce 100644
  bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node);
 +int  ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index 8e8f5a4ee..7343e230d 100644
+index 8e8f5a4ee..da519acfe 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
-@@ -85,6 +85,11 @@
+@@ -64,6 +64,7 @@
+ #define cudaEventDisableTiming hipEventDisableTiming
+ #define cudaEventRecord hipEventRecord
+ #define cudaEventSynchronize hipEventSynchronize
++#define cudaEventQuery hipEventQuery
+ #define cudaEvent_t hipEvent_t
+ #define cudaEventDestroy hipEventDestroy
+ #define cudaFree hipFree
+@@ -85,6 +86,11 @@
  #define cudaLaunchHostFunc hipLaunchHostFunc
  #define cudaMalloc hipMalloc
  #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
@@ -17176,10 +17627,10 @@ index 22b2f45e2..7f8e826f9 100644
  };
  
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 49f11073e..18d3ff787 100644
+index 49f11073e..f6cd0e679 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1312,7 +1312,18 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+@@ -1312,7 +1312,19 @@ static ggml_backend_i ggml_backend_rpc_interface = {
      /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
      /* .event_record            = */ ggml_backend_rpc_event_record,
      /* .event_wait              = */ ggml_backend_rpc_event_wait,
@@ -17195,10 +17646,11 @@ index 49f11073e..18d3ff787 100644
 +    /* .moe_cache_take_over     = */ NULL,
 +    /* .moe_cache_band          = */ NULL,
 +    /* .moe_cache_gather        = */ NULL,
++    /* .moe_cache_remap         = */ NULL,
  };
  
  ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
-@@ -2935,6 +2946,24 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2935,6 +2947,24 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .event_new            = */ ggml_backend_rpc_device_event_new,
      /* .event_free           = */ ggml_backend_rpc_device_event_free,
      /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,

@@ -18,7 +18,7 @@ is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old
 The old numbers are **retired** — do not reuse them.
 
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v16-6050b467c-r202`** (read `.release` in `release.json` -- it is the
+(the 2026-10-25 re-base), release **`v16-6050b467c-r203`** (read `.release` in `release.json` -- it is the
 source of truth, not this line).  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
@@ -88,6 +88,15 @@ if it ever gets there: a new weight type + kernels + loader + converter is a **l
 call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+* **`MOE_HOST_POOL_COLD` needs a single VISIBLE device** (r203, `TODO` **#131**).  The in-place pool read keys on
+  `ggml_cuda_info().device_count == 1`, which is process-wide: on a multi-GPU box running a one-GPU arm (three
+  R9700s plus the iGPU are four HIP devices here) it is **silently off**, costing that arm the +4.8 % TG the
+  same config gets with `HIP_VISIBLE_DEVICES` pinned to one device.  The restriction is deliberate — the pinned
+  pool is process-wide and its layout re-rank is not device-scoped — so it is a "widen it with a per-device
+  layout epoch if a multi-device pool arm ever matters" note, not work.  The remap half (`GGML_MOE_DEVREMAP`)
+  has no such limit (it is per-table, `t.device == device`) but declines on a pool-backed table anyway.  Record:
+  `benchmarks/2026-11-01-host-expert-device-remap.md`, `GREEDY-PURITY.md` §82.
 
 * **`cpy_2d_vec16` covers F32 only** (r189, `TODO` **#127**).  The vectorised fallback for the 2-D block copies
   r183's guard refuses is restricted to two **F32** tensors with 16-B-aligned width and pitches — the reachable

@@ -1,4 +1,4 @@
-From 76962ed348693f8882fe5a15145fd5d9109b6db3 Mon Sep 17 00:00:00 2001
+From 94171ff42ab7b12cdc53442c9cf6877da5fa43f3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -376,7 +376,7 @@ index b8ed24630..d85f97a9c 100644
      // custom operators
  
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index bf7d09c52..5add03502 100644
+index e66e46922..b976d6c38 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1523,6 +1523,40 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -451,7 +451,7 @@ index bf7d09c52..5add03502 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 0d12a3029..42c3e40b1 100644
+index 44430bf75..e148754e4 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1345,6 +1345,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -470,7 +470,7 @@ index 0d12a3029..42c3e40b1 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -3509,6 +3518,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -3520,6 +3529,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -556,10 +556,10 @@ index 53d39d249..b26d47d3e 100644
                      {
                          GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index e26fd5095..c9ecef563 100644
+index 7e624d38e..0157bfbee 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -666,6 +666,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+@@ -667,6 +667,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_SSM_SCAN:
              return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
@@ -2878,7 +2878,7 @@ index 5cd4d080d..5e305b720 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7ec8c4a45..da775239f 100644
+index 53236a517..42ae64bed 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -27,6 +27,9 @@
@@ -3060,7 +3060,7 @@ index 7ec8c4a45..da775239f 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -7783,8 +7921,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7784,8 +7922,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;

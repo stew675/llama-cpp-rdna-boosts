@@ -1,3 +1,79 @@
+## 261101.011 (PR #266) -- host-expert decode without the per-op routing sync; the pool serves a resident miss in place (blocks 09 + 10 + 12 amended)
+
+**Released as `v16-6050b467c-r203` (16 blocks; blocks 09, 10 and 12 amended).**  Canonical tip `baa382608`,
+tree `2d1327101827899b05834468b5554a672476ccca` (r202 was `18001ddd7` / `85a00394`).  `release.json`
+refreshed; `patches/` regenerated from a chain built on the r202 tree (r202's 33-case oracle in
+`tests/test-fusion-gate-beta-multiseq.cpp` is carried unchanged); `scripts/validate-set.sh` green (16/16
+strict `git am` on a fresh `6050b467c` tarball, tree equality, 286 files through the Windows portability
+lint); `scripts/fork-refresh.sh` re-cut the branch from the base and reproduced the tree.  Record:
+`benchmarks/2026-11-01-host-expert-device-remap.md`; rule: `GREEDY-PURITY.md` §82; submission kept in
+`archive/work/pinned-decode-remap/`.
+
+**The submission.**  PR #266 (`briansp2020`, `wip/pinned-decode-r196`): two patches against r196, each with
+its own kill switch, covering the two host-expert decode paths.  It is a **narrow** re-introduction of a
+device remap — the r40 removal family (`DEVMAP`/`DEVPOLICY`/`KSLOT`/device mirrors/promotion) stays removed,
+and `ENVIRONMENT.md` §1.2 now records both halves of that history instead of a flat prohibition (maintainer
+decision this release).  The assessment question was whether it is that machinery again: it is not — the
+**policy stays on the host** (`access_locked` still decides every admission and eviction), only the slot-id
+lookup moves to a kernel, and the path is confined to a pinned master, one unsliced table, no identity table,
+the decode/verify band, and after the eager path has sized the cache.  It declines under `-sm tensor`
+(the new iface member is NULL in the meta/cpu/rpc backends), on a pool-backed table and on a sliced table.
+
+**What it does.**  `GGML_MOE_DEVREMAP` (default on): the scheduler offers a split input to the backend first
+(`moe_cache_remap`, appended **last** to `ggml_backend_i`); a kernel maps the device routing through a
+per-table expert -> slot map into that table's `remap_dev` (`slots + e` = cold, read in place from the pinned
+master) and copies the raw routing into mapped pinned memory; the residency policy consumes that routing
+**one call late** and re-uploads the map only after a residency change (`slot_dirty`).  One launch serves a
+layer's gate/up/down tables.  `MOE_HOST_POOL_COLD` (default on): a `--host-experts pool` miss whose expert is
+resident in the pinned pool is read in place through the pool's device alias (cold id `n_res + pool slot`,
+`moe_cache_get_cold` returns the pool base) instead of being filled into an arena slot first — the eager arm
+measured `colds=0`, i.e. every such miss was an arena fill.
+
+**Purity.**  Every expert is read from the same bytes it was read from before, and the arms are identical on
+every deterministic oracle: greedy text at 128 and 1000 tokens (pinned and pool, both switches and both
+crossed), a 2048 MiB arena under eviction pressure, gpt-oss-20b MXFP4, and a 2-slot server driven
+sequentially (slot switching included) — 8/8 arms `sha=1b3aa35865e1` / `52eb99f71f16`.  MTP acceptance is
+identical to five decimals and the same accepted counts (`0.76089` = 1397/1836 prose, `0.83340` =
+2141/2569 reasoning, `acc per pos` unchanged), and the canonical prefill-logit gate reads **0.000000 /
+100.000 %**.  A *concurrent* two-slot text diff is not an oracle here (the unchanged eager build disagrees
+with itself run to run: `869 80d26000974c` vs `768 5452fe998dc6`) — `GREEDY-PURITY.md` §38.
+
+**Performance** (1 x R9700, gfx1201; 35B-A3B UD-Q4_K_M `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=8000`, alternating
+rounds): pinned **+8.4 %** TG (`-npp 64 -ntg 512`: 60.6 -> 65.7 t/s; the submitter measured +12.3 % on a
+7900 XTX), pool **+4.8 %** (57.6 -> 60.4; they measured +7.6 %), `-npl 4` **+14.1 %** (177.0 -> 206.1) and
+`-npl 8` **+9.2 %** (261.4 -> 287.3), MTP +2.4 % (P) / +3.3 % (R), `pp512` unchanged (band-only path), and
+inert under `-sm tensor` (98.02 vs 98.06 t/s, identical text).  Pool mechanism: fills 21747 -> 15270 with
+8445 misses served in place.
+
+**Gates.**  `gate-prefill-logits.sh` PASS (0.000000 / 100.000 %, base recorded from the r201 chain);
+`llama-batched-bench -npl 1,4,8` as above; MTP Protocol A (`-n 3000`) on the P and R axes as above;
+`gate-per-block-build.sh --fast --changed-from 7fe2b7829` **4/4 built** (blocks 09, 10, 12, 15 -- 719 s);
+`test-backend-ops -o MUL_MAT_ID` 931/931; `test-fusion-gate-beta-multiseq` 33/33 (r202's oracle on the new
+tree); `check-windows-portability.sh` and `check-windows-paths.sh` clean; `check-gpu-faults.sh` clean over the
+session; the tip builds `all` with no new warnings.
+
+**Where it lives, and why not one block.**  The engine, the scheduler hook, the iface member and its NULL
+fills, the `cudaEventQuery` HIP mapping and `MOE_HOST_POOL_COLD` are **block 09**; the CUDA hook wrapper moves
+to block 10's `ggml-cuda-moe-cache-hooks.cu`/`.cuh` at the block-10 stop (where block 10 already relocates the
+`moe_cache_band`/`moe_cache_gather` wrappers) along with the `n_slices == 0` term, which is that block's field;
+the `g_dr_key_to_id` reindex + `devremap_batch_clear_locked()` (inside `moe_cache_forget_all`) and the
+`heat_dec` tally are **block 12**, which owns both.  So a block selection cannot take the remap without the
+block that owns its bookkeeping.
+
+**Invariants recorded** (`AGENTS.md`, `ENVIRONMENT.md` §1.2, `GREEDY-PURITY.md` §82, `patches/README.md`
+block 09): the map is rebuilt from `slot_dirty`, which every slot mutation must set (fill, eviction,
+stand-down, slab eviction, shrink, migration, re-arm) — a stale map reads the wrong arena slot, and the
+`slots + e` cold encoding also depends on the slot COUNT, so a count change without a rebuild reads past the
+master; the lag is policy-only (it can admit the wrong expert, never move a read address); and the pool-cold
+read is safe **because** the eager path it rides synchronizes the backend before the hook, so a change that
+removes that sync must gate it.  Accepted limitation `TODO.md` **#131**: the pool-cold arm keys on a
+process-wide device count of 1, so a multi-GPU box running a one-GPU arm silently loses it (pin
+`HIP_VISIBLE_DEVICES`).
+
+**Not this release's issue.**  The submitter flagged `alias_find_checked: ignoring a stale MoE-cache alias
+(table device 0 layer N, op device 0 layer N-1); 1 refused so far`; it appears in our runs and on the
+unpatched tree, the guard refuses the lookup and the op falls back, so it is pre-existing and unchanged here.
+
 ## 261101.010 (issues #263 / #265, TODO #130) -- the gfx1100 "kill-switch arm" impurity was the same softplus; issue #263 closed (block 10 amended: the 33-case oracle that r201 claimed but did not ship)
 
 **Released as `v16-6050b467c-r202` (16 blocks; block 10 amended, tests only).**  Canonical tip `18001ddd7`,

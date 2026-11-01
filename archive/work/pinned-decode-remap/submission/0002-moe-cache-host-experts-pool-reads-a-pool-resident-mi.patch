@@ -1,0 +1,111 @@
+From 203dc095dfe82691754f5f93157d5e1f4080158c Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 20:53:58 +0000
+Subject: [PATCH 2/2] moe cache: --host-experts pool reads a pool-resident miss
+ in place (MOE_HOST_POOL_COLD)
+
+A pool-backed table has a pageable master, so the in-place cold read stood down and every decode miss was
+an arena fill, even when the expert was resident in the pinned pool.  Such a miss is now served cold from
+its pool slot through the pool's device alias (cold id n_res + pool slot; moe_cache_get_cold returns the
+pool base for the table), the same bytes the fill would have copied.  The slot stays valid for the read:
+the demand path never evicts a pool resident and the scheduler synchronizes the backend before the next
+hook.  Single device, single slice.  MOE_HOST_POOL_COLD=0: off.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 53 +++++++++++++++++++++++++-
+ 1 file changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8f84ebae8..334931ecd 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -651,6 +651,33 @@ static inline bool table_cold_ok(const table_t & t) {
+     return g_cold_uva && t.cold_safe && t.host_dev != nullptr;
+ }
+ 
++// MOE_HOST_POOL_COLD (default 1): a pool-backed table (`--host-experts pool`, pageable master, so no in-place
++// read of the master) serves a miss whose expert is RESIDENT in the pinned pool by reading the pool slot in place
++// through the pool's device alias, instead of filling an arena slot from it first.  The bytes are the ones the
++// fill would have copied, so the result is unchanged.  The slot stays valid for the read: the demand path never
++// evicts a pool resident (TODO #87) and the scheduler synchronizes the backend before the next hook, i.e.
++// before any rerank / retire could touch it.  Single device and the historical single slice only (the pool is
++// process-wide and holds whole experts; the cold encoding is `n_res + pool slot` with the pool's base).
++static bool g_pool_cold = true;
++static host_pool_t * table_pool_locked(table_t & t);
++static int pool_cold_slot_locked(table_t & t, int32_t expert) {
++    if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.n_slices > 0 || t.src_off != 0 ||
++            ggml_cuda_info().device_count != 1) {
++        return -1;
++    }
++    host_pool_t * p = table_pool_locked(t);
++    if (p == nullptr || p->failed || p->base_dev == nullptr || p->host_bytes != t.host_bytes ||
++            expert < 0 || expert >= p->n_experts) {
++        return -1;
++    }
++    const auto it = p->expert_slot.find(expert);
++    if (it == p->expert_slot.end()) {
++        return -1;
++    }
++    const int ps = it->second;
++    return ps >= 0 && ps < p->slots && p->slot_state[(size_t) ps] == 1 ? ps : -1;
++}
++
+ // wip/host-expert-master-drop (TODO #55): the master is not pinned, so it lives in the read-only model
+ // mapping and every device-side byte must come through the pinned pool (or the per-table bounce).
+ static inline bool table_master_pageable(const table_t & t) {
+@@ -766,6 +793,7 @@ void parse_env() {
+     // reads the pinned host slice in place (the same bytes the H2D fill would have placed in the
+     // slot), and it also lets a small arena represent an overflow (`id = slots + e`).
+     g_cold_uva = env_int("MOE_EXPERT_CACHE_COLD_UVA", 1) != 0;
++    g_pool_cold = env_int("MOE_HOST_POOL_COLD", 1) != 0;
+     g_stage_cache = env_int("GGML_MOE_CACHE_STAGE", 1) != 0;
+     // Admission: `touch` (measured best at every arena size): a first-touch expert is served cold and
+     // only a re-touch is admitted, so one-shot experts stop churning the arena - which raises `h` as
+@@ -1977,7 +2005,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                               bool * out_cold = nullptr) {
+     // The cold read indexes the host master with the table's own host geometry (`moe_cache_get_cold`
+     // returns the per-expert and per-row strides), so a Phase 3 slice is servable in place too.
+-    const bool cold_ok = table_cold_ok(t);
++    const bool cold_ok = table_cold_ok(t) || pool_cold_slot_locked(t, expert) >= 0;
+     const auto is_protected = [&](int32_t e) {
+         for (int i = 0; i < n_protect; i++) {
+             if (protect[i] == e) {
+@@ -6322,6 +6350,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+                 // region of the id space - the kernel reads `id - n_res_slots` from the host alias.
+                 remap[(size_t) tok * n_used + j] = n_res_slots + e;
+                 g_cold_reaches++;
++            } else if (const int ps = pool_cold_slot_locked(t, e); ps >= 0) {
++                // MOE_HOST_POOL_COLD: the expert's pinned pool slot, read in place (`moe_cache_get_cold` returns
++                // the pool's base for this table)
++                remap[(size_t) tok * n_used + j] = n_res_slots + ps;
++                g_cold_reaches++;
+             } else {
+                 all = false;   // evicted and not re-admitted, or slots == 0: fall back
+             }
+@@ -6638,7 +6671,23 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+         return false;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+-    for (const table_t & t : g_tables) {
++    for (table_t & t : g_tables) {
++        if (t.arena == arena && t.slots > 0 && t.host_dev == nullptr) {
++            // MOE_HOST_POOL_COLD: a pool-backed table's cold region is the pinned pool, indexed by pool slot
++            host_pool_t * p = (g_cold_uva && g_pool_cold && t.cold_safe && t.n_slices == 0 && t.src_off == 0 &&
++                               ggml_cuda_info().device_count == 1) ? table_pool_locked(t) : nullptr;
++            if (p != nullptr && !p->failed && p->base_dev != nullptr && p->host_bytes == t.host_bytes) {
++                *cold_base = (char *) p->base_dev;
++                *n_res     = t.slots;
++                if (cold_channel_bytes) {
++                    *cold_channel_bytes = p->host_bytes;
++                }
++                if (cold_row_bytes) {
++                    *cold_row_bytes = t.host_pitch;
++                }
++                return true;
++            }
++        }
+         if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_slices > 0) {
+             continue;
+         }
+-- 
+2.53.0
+

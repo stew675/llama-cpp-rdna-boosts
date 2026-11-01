@@ -100,6 +100,8 @@ the slack up front moves the cost to before the arena is sized.
 | `MOE_EXPERT_TRACE` | unset = off | **diagnostic** | **offline routing trace** (r110, block 09, TODO #61 P1): writes the raw routing of every `mul_mat_id` to this path, in a text format that `scripts/moe-trace-replay.py` replays to score cache policies (the shipped F-LRU, static top-f, a per-layer capacity quota, pass-start pre-admission) against a real workload.  DECODE records come from the scheduler hook, where the ids are already on the host (no readback, no sync); PREFILL records come from the device entry, because the staged prefill path never brings them to the host -- that costs one readback per prefill op (a prefill ubatch is never CUDA-graph captured, so it is safe).  A fully-resident (identity) table's decode band is not traced: it cannot miss.  It is a *diagnostic*, never default-on, and the replayer's absolute hit rate is a model of the cache, not the cache -- judge policies by their delta. |
 | `MOE_EXPERT_TRACE_MIB` | `1024` | tuning | cap on the trace file, in MiB (r110).  Recording stops at the cap with one warning; the records already written are kept.  A 296-token prompt + 128 decode tokens on a 40-layer MoE is ~2 MiB. |
 | `GGML_MOE_CACHE_MAX_TOK` | device MMVQ band (16 on RDNA4; 8 on RDNA3, NVIDIA) | kill-switch | caps the expert-cache **decode/verify band** (routed `MUL_MAT_ID` tokens the cache serves from the arena).  It defaults to the routed-expert MMVQ kernel's own band on the device since r31; `8` restores the pre-r31 band (band widening in `archive/work/moe-cache-band16/`).  A non-numeric value silently yields 1. |
+| `GGML_MOE_DEVREMAP` | `1` | kill-switch | **sync-free decode-band device remap** (r203, PR #266, block 09).  The eager hook synchronizes the backend once per routed op to read the routing back (`ggml_backend_synchronize(input_backend)` + the ids readback's own sync), runs the residency policy and uploads the slot remap.  On: the scheduler offers the split input to the backend first and a kernel maps the device routing through a per-table expert -> slot map (`slots + e` = cold, read in place from the pinned master) straight into the table's `remap_dev`; the policy consumes that routing one call late and re-uploads the map only after a residency change.  Each expert is read from the same bytes as before, so the output is unchanged (byte-identical greedy text, identical MTP acceptance, prefill KLD 0.000000).  Worth **+8.4 % TG** on 35B-A3B `-ncmoe 40` (1 x R9700), +14.1 % / +9.2 % at 4 / 8 slots, +2.4 % under `--spec-type draft-mtp`.  Scope **by construction**: a pinned master, one unsplit table, no identity table, no `-sm tensor` (the meta backend's iface member is NULL), the decode/verify band only (`ne[2] <= band`), and after the eager path has sized the cache.  `0` restores the eager path (A/B and bisect).  Invariant: the map is rebuilt from `slot_dirty` on every slot mutation -- a stale map reads the wrong arena slot, and the `slots + e` cold encoding also depends on the slot COUNT.  See §1.2's "device remap" note below before extending it. |
+| `MOE_HOST_POOL_COLD` | `1` | kill-switch | **`--host-experts pool` reads a pool-resident miss in place** (r203, PR #266, block 09).  A pool-backed table has a pageable master, so the in-place cold read stood down and every decode miss was an arena fill even when the expert was already in the pinned pool.  On: such a miss is read cold from its pool slot through the pool's device alias (cold id `n_res + pool slot`, `moe_cache_get_cold` returns the pool base) -- the same bytes the fill would have copied.  Measured (pool arm, 1 x R9700, 35B-A3B): fills 21747 -> 15270 with 8445 misses served in place, **+4.8 % TG** (57.6 -> 60.4 t/s), text identical.  Safe because the demand path never evicts a pool resident, a retiring slot (`slot_state == 2`) is excluded, and the eager path it rides synchronizes the backend before the hook.  `0` restores the fill-every-miss arm. |
 | `GGML_MOE_GATHER_ONCE` | off | diagnostic | gather each expert once per pass. |
 
 > **Heat map (r60; unified naming r75).**  The per-expert heat map is **on by default** whenever the
@@ -139,16 +141,28 @@ the slack up front moves the cost to before the arena is sized.
 > used (`ranked by the prompt tally` / `ranked by expert id (no tally)`).  With `MOE_EXPERT_HEATMAP=0`
 > there is no tally and the historical id order remains.
 
-> **REMOVED — do not reintroduce (2026-10-10, released r40).**  The device-remap path and its whole family
-> (`MOE_EXPERT_CACHE_DEVMAP`, `MOE_EXPERT_CACHE_DEVPOLICY`, `MOE_EXPERT_CACHE_DEVPOLICY_SPLIT`,
-> `MOE_EXPERT_CACHE_KSLOT`, `MOE_EXPERT_CACHE_DEV_EAGER`) plus the device-policy knob `MOE_HOST_POOL_POLICY`
-> were **deleted from the code base**.  The eager
-> host-routing path (materialized remap) is the only `-sm tensor` split policy; it is MTP-pure on qwen4exp
-> (`none == n3`), within noise of the old `DEVMAP=0` performance, and resolves `TODO.md` #50.  The device
-> path's divergence was a layout-sensitive **hipBLASLt** solution flip (issue #67), not a cache bug; the
-> only workaround (`ROCBLAS_USE_HIPBLASLT=0`) costs ~12-17 % prefill on gfx1201/ROCm 7.14, and ROCm 10.1.0
-> does not fix it.  See `wip/moe-verify-fusions/FINDINGS-devmap-removal.md`.  Do **not** add any
-> `*DEVMAP*`/`*KSLOT*`/`*DEVPOLICY*` variable or device slot-map path back. |
+> **REMOVED IN r40, narrowly RE-INTRODUCED IN r203 — read this before touching either.**  The 2026-10-10
+> decision (released r40) deleted the *device-remap family* from the code base: `MOE_EXPERT_CACHE_DEVMAP`,
+> `MOE_EXPERT_CACHE_DEVPOLICY[_SPLIT]`, `MOE_EXPERT_CACHE_KSLOT`, `MOE_EXPERT_CACHE_DEV_EAGER`,
+> `MOE_HOST_POOL_POLICY`, `g_devmap`/`g_devpolicy`/`g_kslot`/`g_dev_eager`, the device mirrors
+> (`slot_dev`/`count_dev`/`ghost_dev`/`last_dev`/`slot_prov_dev`/`policy_dev_t`), the device **policy**
+> kernel, the KSLOT in-kernel slot lookup, deferred promotion, the device prefill tally / lazy seed, the
+> cache-aware in-place prefill read, and the `moe_cache_promote`/`moe_cache_inplace` hooks (2684 deletions,
+> `archive/work/moe-verify-fusions/FINDINGS-devmap-removal.md`).  That machinery is **not** coming back: it
+> was a multi-session time sink, it made prefill slower, its decode advantage was unproven, and the
+> divergence it was blamed for turned out to be the per-start hipBLASLt solution pick (issue #67, §44), not
+> the map.  **Do not re-add any of it.**
+>
+> r203 adds a **deliberately minimal** device remap instead (`GGML_MOE_DEVREMAP`, PR #266), and the
+> difference is the whole point: the *policy stays on the host* (the eager `access_locked` still decides
+> every admission/eviction from the previous call's routing), and only the **slot-id lookup** moves to a
+> kernel that writes `remap_dev` -- one small kernel, one per-table expert->slot map, one mapped-pinned lag
+> buffer per table, no device policy state, no device mirrors, no KSLOT, no promotion, no prefill path.  It
+> is confined to the decode/verify band on a **pinned** master, declines under `-sm tensor` (the Meta iface
+> member is NULL) and on a pool-backed table, and it exists because the measurement is now positive and
+> repeatable where r40's was not: **+8.4 % TG** (`-ncmoe 40`, 1 x R9700), prefill untouched (band-only),
+> byte-identical text and identical MTP acceptance.  If you extend it, keep it host-policy-only and re-run the
+> four arms in `GREEDY-PURITY.md` §82.
 
 > The arena is the **lowest-priority** VRAM consumer: without a slab, any device allocation that runs short
 > frees the largest table (then the whole arena) and retries.  With the slab on (the default, see §1.3) that
