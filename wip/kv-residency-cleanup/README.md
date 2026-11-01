@@ -111,7 +111,7 @@ standalone `mtp-*.gguf`.
 **Why it is not a one-liner.**  Such a draft context is not the embedded head's shape: it alternates a KV
 *injection* graph (target features, up to `-ub` rows, main scheduler) with a noise-block decoder graph
 (≤ `n_seq × block` rows, the **alt** scheduler chosen by batch kind — see the draft-reserve rule in
-`AGENTS.md`).  A window must be sized for the injection's width and must not disturb the alt-scheduler
+`INVARIANTS.md`).  A window must be sized for the injection's width and must not disturb the alt-scheduler
 split, or graph reuse collapses.
 
 **Gates.**  Target greedy text **byte-identical** with the window off and on (the target verifies, so a
@@ -161,7 +161,7 @@ open:
 3. **Arena numbers:** `-n 2000` and `-ncmoe` at the model's **full** layer count (35B-A3B and Flash-Next 48,
    122B-A10B 48).  Never quote a 128-token arena.
 4. **Speculative arms:** `-n 512`+ and check `draft_n` / `draft_n_accepted` before reading t/s; static MTP
-   depth ≤ 4 for reference arms; always quote the device count (the `AGENTS.md` reference arm is 3 devices;
+   depth ≤ 4 for reference arms; always quote the device count (the `INVARIANTS.md` reference arm is 3 devices;
    this box is 1).
 5. **`ROCBLAS_USE_HIPBLASLT=0`** for every fresh-process numeric comparison (the library picks its solution
    per process start), and never judge run-to-run determinism on a greedy text hash.

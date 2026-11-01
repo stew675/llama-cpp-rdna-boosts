@@ -1,3 +1,30 @@
+## 261101.013 (docs) -- AGENTS.md is policy again: the engineering facts move to INVARIANTS.md
+
+No delivery change (docs only; `patches/`, `release.json` and the fork branch are untouched, so no tag).
+`AGENTS.md` had grown to 1773 lines, ~1300 of them the *Critical facts (do not re-derive)* list, which is a
+reference layer rather than policy: it buried the rules a change actually has to obey and it duplicated what
+`GREEDY-PURITY.md`, `patches/README.md`, `ENVIRONMENT.md` and `WORKLOG.md` already own.
+
+**What moved.**  The critical-facts list is now [`INVARIANTS.md`](INVARIANTS.md) (105 entries, the text
+unchanged apart from a header and the two build facts that used to sit in the build notes: "a re-base is a
+decode and prefill change" and the `GGML_CUDA_FA_QUANTS` cache-string/`greedy-text` rule).  Its header
+records that older `WORKLOG.md`/`wip/` references to "`AGENTS.md`'s <X> bullet" point there, and that it is
+**current state** (correct an entry in place with the `rNN`) unlike `WORKLOG.md`.
+
+**What AGENTS.md is now** (375 lines): what the repo is, the four mandatory policies (report findings,
+pushing, scope, default-on, WIP/promotion), a 12-item "before you change anything" list that carries the
+rules which damage immediately *without* their numbers (each pointing at `INVARIANTS.md`), the docs map, the
+common tasks (apply / verify / pick-the-gate / regenerate / build / containers), what NOT to do, and the
+docs-editing rules.  Two essays that duplicated other docs were replaced by the gate-selection table (the
+full contract stays in `MANIFESTS.md` → Release gates) and by a one-paragraph container section (the detail
+is `CONTAINERS.md`).  The **CI three-tier table** that lived in the container section is a verification-contract
+statement, so it moved to `MANIFESTS.md` → Release gates rather than being dropped.
+
+**Reference updates** (live docs, not dated records): `scripts/validate-gpu.sh` and
+`wip/vram-resident-slots/README.md`, `wip/kv-residency-cleanup/README.md` now cite `INVARIANTS.md` for the
+facts they used to cite `AGENTS.md` for.  Dated records (`WORKLOG.md`, `benchmarks/2026-*`) are untouched —
+`INVARIANTS.md` says where their references land.
+
 ## 261101.012 (docs) -- r203 published: CI, the fork branch, and PR #266
 
 No delivery change.  `v16-6050b467c-r203` is tagged and pushed; `main` is at the r203 commit.  CI: **Validate

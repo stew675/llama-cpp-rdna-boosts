@@ -9,7 +9,7 @@
 #     * tier 3  the release flow -- the `all` build, coherence, MTP Protocol A, arch sweeps.
 #   Tier 2 is the one that actually catches a bad patch set, because almost every delivery
 #   block is a CUDA/HIP kernel change and a hosted runner has no ROCm.  It is the automation
-#   behind "a re-base is a decode AND prefill change" (AGENTS.md): it re-applies the set from
+#   behind "a re-base is a decode AND prefill change" (INVARIANTS.md): it re-applies the set from
 #   scratch on the box, so a patch that no longer applies, a block whose tree does not build,
 #   a broken op and a shifted prefill all fail here, unattended.
 #

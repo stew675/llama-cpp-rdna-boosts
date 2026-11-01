@@ -69,6 +69,23 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 
+**Where the gates run.**  There are three tiers, and which one a change hits is what keeps the cheap gate
+cheap:
+
+| tier | where | what | trigger |
+|---|---|---|---|
+| 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, and a conflict-marker/subject scan of every block tree | every push and PR, ~20 s |
+| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, `gate-per-block-build.sh --fast`, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
+| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps | before a tag |
+
+Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
+tier 1 cannot compile any of it.  It is the automation behind "a re-base is a decode AND prefill change"
+(`INVARIANTS.md`).  It holds its own `flock` and **skips while a container build holds the watcher's lock**,
+so the two worker jobs never contend; summaries land in `~/.cache/rdna-validate/runs/<sha>/summary.txt`, and
+a rev is retried at most `MAX_ATTEMPTS` times (3) before the script stops and names the `failed-<sha>` file
+to remove.  The release container images are built **off-host by the worker** and are not a CI tier
+([`CONTAINERS.md`](CONTAINERS.md)).
+
 `scripts/validate-set.sh` covers patch integrity only (checksums + a fresh-tarball strict apply) and runs
 in CI.  The model-level gates are manual:
 

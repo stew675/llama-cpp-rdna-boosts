@@ -91,7 +91,7 @@ which is the *point*.
 
 **Costs VRAM that the MoE arena wants.**  On the shape this repo actually benchmarks (27B/Flash-Next with
 `-ncmoe` + the expert-cache arena) there is no spare VRAM: the slab parks nearly all free VRAM by design
-(`AGENTS.md`, r37), so a snapshot allocation either fails into the OOM chain (§4.2) or evicts arena residency
+(`INVARIANTS.md`, r37), so a snapshot allocation either fails into the OOM chain (§4.2) or evicts arena residency
 — the identity cliff (r117: 46.7 -> 65.0 t/s) and the `tensor`-vs-`layer` gap at low residency (+38 %,
 r144).  So the feature is realistic on a **dense or fully-resident model** and needs an explicit budget plus a
 refusal policy everywhere else.
@@ -159,7 +159,7 @@ anything on its own.
   MiB budget (a new arg or a `--cache-ram` sibling), a headroom check that declines instead of triggering the
   OOM chain, LRU eviction, spill-to-host on pressure, and invalidation on context recreation.
 * **P2 — `--fit` accounting.**  A term for the device tier in `common/fit.cpp`, so an over-budget config is
-  reported (the over-budget rule in `AGENTS.md`: report, never silently repair).
+  reported (the over-budget rule in `INVARIANTS.md`: report, never silently repair).
 * **P3 — a recurrent/hybrid answer.**  Either multi-range support in `llama_memory_recurrent`'s device write
   (its blob is a fixed-size recurrent state plus a cell map, so it is a layout question, not a copy question)
   or an explicit per-model decline that keeps the interleaved slot on the host path.  The decline is the
