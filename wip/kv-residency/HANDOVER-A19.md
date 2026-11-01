@@ -179,6 +179,7 @@ refusals without the arms**.  Nothing here can be done on this box.
 |---|---|
 | [`C1-MIRROR-GROW.md`](C1-MIRROR-GROW.md) | **r196**: the pool mirror grown on demand (#123) — implementation, numbers, gates, the park decision |
 | [`C2-RADIX-TOPK.md`](C2-RADIX-TOPK.md) | **r196**: plain decode takes the top-k block radix path (#125) — the census, the purity arms, the `DERIVED_VIS` note |
+| [`C3-NKVO-HOST-EXPERTS.md`](C3-NKVO-HOST-EXPERTS.md) | **A19, on branch `wip-kv-residency-129` (not shipped)**: `-nkvo` + host experts (#129) — the split-pass root cause, the two-hunk fix in block 09, the arms |
 | [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) | the pool: design, invariants, §7-§10 measured |
 | [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) | Goal B's plan of record, the placement matrix |
 | [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | the window: design, purity hunt, spill cost, the `auto` decision |
