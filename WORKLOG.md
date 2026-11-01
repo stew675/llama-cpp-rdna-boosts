@@ -1,3 +1,62 @@
+## 261101.006 (issue #264) — the MTP draft KV window is granted PER SEQUENCE (block 15 amended; delivery-set update, no version bump)
+
+**Not a release.**  Block 15 is amended in place: `patches/` regenerated, `release.json` hashes/tip/tree
+refreshed (tip `2ed3997f5`, tree `c6c2f03de8`), the release tag left at `v16-6050b467c-r199`; no tag, no
+GitHub Release, no container image.  The next release carries this and will be re-cut when the other box's
+release lands (a re-base is already planned).  Record: `benchmarks/2026-11-01-spec-draft-window-264.md`.
+
+**The defect (issue #264, reported on r195 by `DanoPTT`).**  Since r193 the MTP draft context's KV is a
+sliding window (`LLAMA_SPEC_DRAFT_WINDOW`, default ON).  Under `--kv-unified` that ONE draft cache holds every
+sequence of the context, and it was sized `win + n_ubatch` regardless of the sequence count.  Once the first
+sequence had filled its window the only free cells left were the `n_ubatch` + 256 headroom cells — which is
+exactly where that sequence's own ring writes — and `find_slot`'s SWA reclaim frees a cell by its **owner's**
+newest position, so an idle sequence's cells are never reclaimable by another.  A second sequence's first
+batch therefore had no contiguous run: `W decode: failed to find a memory slot for batch of size 1024`, then
+`E spec process: llama_process(ctx_dft) failed` and HTTP 500 `decode() failed: failed to process speculative
+batch` on every request on that slot.  `LLAMA_SPEC_DRAFT_WINDOW=0` worked, and the target KV has room — only
+the drafter's cache was starved.
+
+**The fix.**  `llama_spec_draft_kv_cells()` (new, `src/llama-ext.h`) is the one geometry function:
+`(win + one batch) x n_seq_max` cells for a unified cache (capped at the context), today's exact per-stream
+expression for `--no-kv-unified`.  `create_memory`'s MTP branch, `common_draft_reserve_estimate` (the slab's
+draft reserve) and `common`'s "is a window active" test all call it, so the reserve can no longer under-charge
+an allocation.  `llama_spec_draft_window_cells()` stays the policy (a per-sequence window).  The window is
+**declined**, not lowered, when `win + n_ubatch > n_ctx_seq / n_seq_max`: a window that small would save one
+batch of cells per sequence and mask the drafter's newest cells to do it.  Also fixed while there: the reserve
+charged only ONE stream for a per-stream (`--no-kv-unified`) multi-slot draft cache; it now charges
+`n_seq_max` streams (35B-A3B `-ncmoe 40 -np 2 -c 8192`, window 1024: 3 072 cells on both arms, 1 536 before on
+the per-stream arm — the under-charge direction the reserve header warns about).
+
+**Single-sequence is untouched**: `n_seq_max == 1` returns r198's exact expression, so every
+`llama-cli`/`llama-bench`/`-np 1` arm measures the same draft cache (1 536 cells for a 1 024-cell window at
+`-c 8192`).  At the reporter's shape the draft cache becomes 132 096 cells (`(65536 + 512) x 2`) against the
+262 144-cell full mirror, i.e. the window still saves 130 048 cells.
+
+**Validation.**
+
+* **Reproduced pre-fix and fixed** on dense 27B UD-IQ4_NL, 1 GPU, `-c 40960 -np 2 --kv-unified`, window 8192,
+  slot 0 = 10 498 tokens then slot 1 = 580: pre-fix HTTP 500 (draft cache 8 704), window 0 OK, fixed OK
+  (17 408 cells).  The reporter's own shape (`auto` at `-c 67584`, 36 743-token prompt then a second slot):
+  OK, 66 560 cells.  `-np 6 -c 8192`: window declined, both slots OK.  Concurrent 2-slot decode: OK.
+* **New gate** `scripts/gate-spec-draft-window.sh` (2 slots, 1 024-cell window, 6 requests: fill, the second
+  slot's own batch, both slots re-prefilled with the other slot's prompt so both rings wrap, then re-used from
+  cache): **PASS** — draft cache 3 072 = `(1024 + 512) x 2`, all 6 steps byte-identical to
+  `LLAMA_SPEC_DRAFT_WINDOW=0`, acceptance identical (17/36 prose, 23/23 mixed).  On the pre-fix build it
+  **FAILs** 3 checks (HTTP 500 on slot 1, `failed to find a memory slot`, 1 536 vs 3 072 cells) — the
+  negative control.
+* **Purity**: `plain == draft-mtp == draft-mtp(W=1024) == draft-mtp(W=0)`, 876 chars `sha=8c8fd395402f`
+  (27B UD-Q4_K_XL, `-c 16384`, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`,
+  `ROCBLAS_USE_HIPBLASLT=0`).
+* **Gates**: `validate-set.sh` strict 16/16 (tree `c6c2f03d`, 286 files through the Windows lint);
+  `gate-per-block-build.sh --fast --changed-from d5f241572` 1/1; `gate-prefill-logits.sh` **0.000000 /
+  100.000 %** (build `2ed3997f5`); `fork-refresh.sh` re-cut from `6050b467c` reproduced tree `c6c2f03d` and
+  tip `2ed3997f5`; `check-gpu-faults.sh` clean.  The MTP Protocol A / four-axis arms were not re-run: the
+  single-sequence geometry is byte-identical (the cell counts above are the proof), so no decode arm can move.
+
+**Docs.**  `patches/README.md` (block 15: the per-sequence bullet + the r199 note), `AGENTS.md` (the
+per-sequence rule and its gate), `ENVIRONMENT.md` §17.2, `MANIFESTS.md` (release gate 15 + the block-15 row),
+`scripts/README.md` (the new gate), and the benchmark record.
+
 ## 261101.005 (r199) -- PR #262's `q4_0` KV cache write fold lands in block 10; the r192 MTP hold does not reproduce at r198 (TODO #120's `q4_0` half retired)
 
 **Released as `v16-6050b467c-r199` (16 blocks; block 10 amended).**  Canonical tip

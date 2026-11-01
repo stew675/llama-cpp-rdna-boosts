@@ -201,7 +201,19 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   kill switch), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
   +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
-  needs **no** exclusion, because its predicate compares each cell's *position*.  Every `block NN`
+  needs **no** exclusion, because its predicate compares each cell's *position*.
+- **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r199,
+  issue #264).**  Under `--kv-unified` the one draft cache holds every sequence, so its cell count is
+  `(win + one batch) x n_seq_max` (capped at the context) — the r193-r199 `win + n_ubatch` shape was shared by
+  all of them and the second sequence had no cell to place a batch in once the first had filled the window
+  (`find_slot`'s SWA reclaim frees a cell by its OWNER's position, so an idle sequence's cells are not
+  reclaimable by another), i.e. HTTP 500 `decode() failed: failed to process speculative batch` on every
+  request of slot 1.  `llama_spec_draft_kv_cells()` is the one geometry function: `create_memory`, the slab's
+  draft reserve estimate and `common`'s "is a window active" test all call it, so a reserve can never
+  under-charge the allocation.  A per-stream cache (`--no-kv-unified`) is unchanged, `n_seq_max == 1` (every
+  `llama-cli`/`llama-bench` run) measures exactly what it did, and the window is DECLINED rather than lowered
+  when it cannot fit per sequence.  Gate: `scripts/gate-spec-draft-window.sh` (2 slots, both rings wrapping,
+  windowed output must equal `LLAMA_SPEC_DRAFT_WINDOW=0` byte for byte).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,

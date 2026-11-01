@@ -3177,9 +3177,10 @@ that is default ON**, because it measures non-negative everywhere and positive w
 somewhere to go — the delivery's own rule (a beneficial, gated feature is on; the env var only disables).
 
 * `LLAMA_SPEC_DRAFT_WINDOW`: unset or `auto` = the adaptive policy (**a quarter of the context, clamped to
-  `[32768, 65536]` cells**), `0` = off (byte-identical to a build without it), `N` = that many cells (floored
-  at one ubatch).  The clamps are the safety rails: a window far below the context the drafter uses costs
-  7-9 % of decode, a window at or above it is free, and at `-c <= 32768` the window is dropped entirely.
+  `[32768, 65536]` cells), `0` = off (byte-identical to a build without it), `N` = that many cells **per
+  sequence** (floored at one ubatch).  The clamps are the safety rails: a window far below the context the
+  drafter uses costs 7-9 % of decode, a window at or above it is free, and at `-c <= 32768` the window is
+  dropped entirely.
 * **The ring is the shipped reclaim**, not a new allocator: `llama_kv_cache::find_slot` already reclaims a
   cell more than `n_swa` behind, and `set_input_kq_mask` reads *this cache's* `n_swa`, so `hparams` (shared
   with the target) is untouched.  The derived kq mask stays valid as well — its predicate compares each
@@ -3198,6 +3199,17 @@ somewhere to go — the delivery's own rule (a beneficial, gated feature is on; 
   a windowed MTP head is budgeted at its real size; the load-time arena preflight still books the flat
   constant (the model metadata is all it has), which is the conservative direction and is why the preflight
   re-evaluates.
+* **The window is per SEQUENCE, and a UNIFIED cache is sized per sequence (r199, issue #264).**  With
+  `--kv-unified` the one draft cache holds every sequence, so its cell count is
+  `(win + one batch) x n_seq_max`, capped at the context; a `win + n_ubatch` cache was shared by all of them
+  and a second sequence had no cell left to place a batch in once the first had filled the window.  A
+  per-stream cache (`--no-kv-unified`) already sized each stream separately and is unchanged, and
+  `n_seq_max == 1` (every `llama-cli`/`llama-bench` run) sizes exactly what it did before.
+  `llama_spec_draft_kv_cells()` is the one geometry function — the cache, the slab's draft reserve and
+  `common`'s "is a window active" test all call it, so a reserve can never under-charge an allocation.  The
+  window is **declined**, not lowered, when `win` per sequence does not fit the context (a smaller window
+  would save one batch of cells per sequence and mask the drafter's newest cells to do it).  Gate:
+  `scripts/gate-spec-draft-window.sh`.
 
 **Measured (1 GPU, one R9700, `-n 2000`/`-n 3000`, static depth 3, interleaved).**
 
@@ -3272,6 +3284,27 @@ fresh-process slot-file restore (525 MB state) restores 5313 tokens and prefills
 park/ckpt/state gates PASS; `LLAMA_KV_SPILL_RAM_PCT=1` declines and pins 0; `--fit` still charges the full
 mirror to the host bucket (it cannot know the run's depth).
 
+**r199 — the draft window is granted per sequence (issue #264).**  See the per-sequence bullet above.
+Reported on `--kv-unified -np 2` (dense 27B, `-c 262144`, `-ctk/-ctv q8_0`): after slot 0 held ~100 k tokens,
+every request on slot 1 answered HTTP 500 `decode() failed: failed to process speculative batch` with
+`W decode: failed to find a memory slot for batch of size 1024` in the log; `LLAMA_SPEC_DRAFT_WINDOW=0`
+passed.  Cause: 66 048 cells = 65 536 (sequence 0's window) + 512, and that 512-cell tail is where sequence
+0's own ring writes, so sequence 1's first batch had no contiguous run — `find_slot`'s SWA reclaim frees a
+cell by its OWNER's position, so an idle sequence's cells are not reclaimable by another.  The cache is now
+132 096 cells for that config (`(65536 + 512) x 2`), still 130 048 cells short of the full `-c` mirror.
+The reserve estimate (§r193) now also charges `n_seq_max` streams for a **per-stream** (`--no-kv-unified`)
+draft cache — it charged one stream, under-charging by `(n_seq_max - 1) x (win + n_ubatch)` cells
+(35B-A3B `-ncmoe 40 -np 2 -c 8192`, window 1024: 3 072 cells reported on both arms now, 1 536 on the
+per-stream arm before).
+Reproduced and gated here with a forced 8192-cell window (before the fix: HTTP 500 on slot 1, draft cache
+8 704 cells) and with a 1 024-cell window in the new gate: 6 requests over 2 slots (both rings wrapping,
+prompts re-prefilled by swapping them between slots, then re-used from cache) are **byte-identical to
+`LLAMA_SPEC_DRAFT_WINDOW=0` on every step** with identical draft acceptance (17/36, 23/23 per prompt).
+`plain == draft-mtp == draft-mtp(W=1024) == draft-mtp(W=0)` at `-c 16384` (876 chars, `sha=8c8fd395402f`).
+Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and `-np 6` at `-c 8192`
+**declines** the window (per sequence it cannot hold a batch) and runs both slots with no window.
+`validate-set.sh` 16/16 (tree `c6c2f03d`), the re-cut tip is `2ed3997f5`, prefill-logit **0.000000 / 100.000 %**
+(build `2ed3997f5`); record `benchmarks/2026-11-01-spec-draft-window-264.md`.
 
 ## Dated history
 

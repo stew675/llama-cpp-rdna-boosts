@@ -1,4 +1,4 @@
-From d5f2415722bbd8d690135aac705716ffde612aee Mon Sep 17 00:00:00 2001
+From 2ed3997f54b91a3c9dd0bd4e93ac25c244f3d661 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -272,10 +272,42 @@ now declines once, with the reason (the pool already declines on `!offload`), so
 streamed placement"; `is_streaming()` tests `kv_region`, the placement actually taken, which also covers
 a device cache whose region buft the backend refused.  Text is unchanged in every arm (the decline is a
 no-op: `-nkvo` + window already read as `-nkvo` alone).
+
+Amendment (issue #264): the draft window is PER SEQUENCE, and under `--kv-unified` its cell count is
+`(win + one batch) x n_seq_max`.
+
+A unified cache holds every sequence in ONE stream, so the r193 sizing (`win + n_ubatch` cells) was shared
+by all of them: once the first sequence had filled its window the tail was all the room left, the tail is
+where that sequence's own ring writes, and a second sequence's first batch had no contiguous run to be
+placed in -- `find_slot` refused, and every request on that slot answered `decode() failed: failed to
+process speculative batch` (HTTP 500) while the drafter ran.  Reported on `--kv-unified -np 2` with a
+65 536-cell window at `-c 262144` after slot 0 held ~100k tokens; reproduced here with a forced 8192-cell
+window.  A per-stream cache (no `--kv-unified`) already sized each stream separately and is unchanged.
+
+`llama_spec_draft_kv_cells()` is now the one geometry function -- the cache (`create_memory`), the slab's
+draft reserve estimate and the "is a window active" test in `common` all call it, so the reserve can never
+under-charge an allocation.  It grants `win` per sequence plus one placeable batch (`(win + n_ubatch) *
+n_seq_max`, capped at the context), and DECLINES the window when that does not fit the context per sequence
+rather than lowering it to `per_seq - n_ubatch`: a window that small saves one batch of cells per sequence
+and masks the drafter's newest cells to do it.  `llama_spec_draft_window_cells()` stays the policy (it is
+the per-sequence window).  n_seq_max == 1 -- every `llama-cli`/`llama-bench` run -- measures exactly what it
+did (cells 1536 for a 1024-cell window at `-c 8192`), so no single-sequence arm changes at all.
+
+Measured (dense 27B, 1 GPU, `-np 2 --kv-unified`): the issue's scenario now answers both slots, and
+`scripts/gate-spec-draft-window.sh` (new) drives 6 requests over 2 slots with a 1024-cell window -- both
+rings wrapping, prompts full re-prefilled by swapping them between slots -- with output byte-identical to
+`LLAMA_SPEC_DRAFT_WINDOW=0` on every step and draft acceptance identical (17/36, 23/23).  Greedy text
+`plain == draft-mtp == draft-mtp(W=1024) == draft-mtp(W=0)` (876 chars, sha 8c8fd395402f) at `-c 16384`.
+
+And the reserve now charges a per-STREAM (no `--kv-unified`) draft cache for every stream it allocates:
+`n_seq_max x` the per-stream cell count.  Before, a multi-slot windowed MTP server without `--kv-unified`
+(35B-A3B `-ncmoe 40 -np 2 -c 8192`, window 1024: 2 x 1536 = 3072 cells allocated, 1536 charged) under-charged
+the slab's aux reserve by one stream's window -- the direction the reserve header calls dangerous.  Measured:
+3072 cells reported on both the unified and the per-stream arm now.
 ---
- common/common.cpp                          |   20 +-
- common/draft-reserve.cpp                   |   38 +-
- common/draft-reserve.h                     |    6 +-
+ common/common.cpp                          |   27 +-
+ common/draft-reserve.cpp                   |   55 +-
+ common/draft-reserve.h                     |   11 +-
  common/fit.cpp                             |  278 ++++-
  ggml/include/ggml-rpc.h                    |    4 +-
  ggml/include/ggml.h                        |   42 +
@@ -292,7 +324,7 @@ no-op: `-nkvo` + window already read as `-nkvo` alone).
  ggml/src/ggml.c                            |   83 +-
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
- src/llama-ext.h                            |   51 +
+ src/llama-ext.h                            |   68 +
  src/llama-kv-cache.cpp                     |  869 ++++++++++++-
  src/llama-kv-cache.h                       |   94 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
@@ -300,19 +332,19 @@ no-op: `-nkvo` + window already read as `-nkvo` alone).
  src/llama-memory-hybrid.cpp                |   12 +-
  src/llama-memory-hybrid.h                  |    7 +-
  src/llama-memory.h                         |   15 +
- src/llama-model.cpp                        |   82 +-
+ src/llama-model.cpp                        |  133 +-
  src/models/qwen4exp.cpp                    |   58 +-
- 29 files changed, 4696 insertions(+), 53 deletions(-)
+ 29 files changed, 4793 insertions(+), 53 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 5a137512e..a60b0279f 100644
+index 5a137512e..e16e1cb5e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1268,11 +1268,27 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+@@ -1268,11 +1268,34 @@ common_init_result::common_init_result(common_params & params, bool model_only,
              } else {
                  // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
                  // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
@@ -328,9 +360,15 @@ index 5a137512e..a60b0279f 100644
 +                // GGUF (qwen4exp/Flash-Next) keeps the flat constant: its context has its own geometry (and an
 +                // indexer cache) and the window does not apply to it, so deriving 48 layers of KV from the
 +                // target's metadata would cut the arena for a draft that is not windowed at all.
++                // The window predicate is the CACHE's own geometry function, not the bare policy: with
++                // `--kv-unified` a window can be declined for the sequence count (issue #264), and a reserve
++                // derived from a window the cache did not take would under-charge the draft's KV.
++                uint32_t mtp_win = 0;
 +                const bool mtp_shared = params.speculative.has_mtp() &&
 +                                        params.speculative.draft.mparams.path.empty() &&
-+                                        llama_spec_draft_window_cells(params.n_ctx, params.n_ubatch) != 0;
++                                        llama_spec_draft_kv_cells(params.n_ctx, params.n_ubatch,
++                                                                  (uint32_t) params.n_parallel, params.kv_unified,
++                                                                  &mtp_win) != 0;
                  draft_reserve = common_draft_reserve_estimate(
 -                        params.speculative.draft.mparams.path,
 +                        mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
@@ -338,12 +376,13 @@ index 5a137512e..a60b0279f 100644
                          params.n_ubatch,
 -                        params.cache_type_k, params.cache_type_v);
 +                        params.cache_type_k, params.cache_type_v,
-+                        mtp_shared);
++                        mtp_shared,
++                        (uint32_t) params.n_parallel, params.kv_unified);
              }
          }
      }
 diff --git a/common/draft-reserve.cpp b/common/draft-reserve.cpp
-index c16a68e69..2c1581c87 100644
+index c16a68e69..c95ac0d64 100644
 --- a/common/draft-reserve.cpp
 +++ b/common/draft-reserve.cpp
 @@ -4,6 +4,8 @@
@@ -355,17 +394,19 @@ index c16a68e69..2c1581c87 100644
  #include <algorithm>
  #include <cstring>
  #include <vector>
-@@ -100,7 +102,8 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -100,7 +102,10 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                     uint32_t n_ctx,
                                                     uint32_t n_ubatch,
                                                     ggml_type type_k,
 -                                                   ggml_type type_v) {
 +                                                   ggml_type type_v,
-+                                                   bool shares_model) {
++                                                   bool shares_model,
++                                                   uint32_t n_seq_max,
++                                                   bool kv_unified) {
      common_draft_reserve r;
  
      if (path.empty()) {
-@@ -130,7 +133,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -130,7 +135,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      for (int64_t i = 0; i < n_tensors; ++i) {
          weights += gguf_get_tensor_size(g, i);
      }
@@ -376,7 +417,7 @@ index c16a68e69..2c1581c87 100644
  
      // `n_ctx == 0` means "from the model": estimating the KV with 0 would UNDER-estimate the reserve (the
      // dangerous direction), so fall back to the context the draft itself declares as its trained maximum.
-@@ -145,6 +150,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -145,6 +152,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      uint32_t block_count = 0;
      uint32_t n_nextn      = 0;
      (void) read_u32_max(g, arch + ".nextn_predict_layers", n_nextn);   // absent for a standalone draft
@@ -395,7 +436,7 @@ index c16a68e69..2c1581c87 100644
      if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
          r.note = "draft GGUF has no usable block_count";
          gguf_free(g);
-@@ -197,7 +214,17 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -197,7 +216,32 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                                : 0.0;
      // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
@@ -408,47 +449,67 @@ index c16a68e69..2c1581c87 100644
 +    // `create_memory`'s plain kv_cache branch builds.  A separate draft GGUF (qwen4exp's `-md` MTP head) keeps
 +    // its full `-c` cache, so sizing ITS reserve by the window under-charges it by (n_ctx - W) cells -- the
 +    // direction the file's header calls dangerous.
-+    const uint32_t draft_window = shares_model ? llama_spec_draft_window_cells(n_ctx, n_ubatch) : 0;
-+    const uint32_t kv_cells     = draft_window != 0 ? std::min(n_ctx, draft_window + n_ubatch) : n_ctx;
++    //
++    // The cell count comes from `llama_spec_draft_kv_cells()`, the same function the cache itself uses, so the
++    // reserve cannot disagree with the allocation: under `--kv-unified` the window is granted per SEQUENCE and
++    // the cache is `(win + one batch) x n_seq_max` cells (issue #264).
++    //
++    // A per-STREAM cache (no `--kv-unified`) gets one `kv_size`-cell stream per sequence, so the TOTAL is
++    // `n_seq_max x` the returned per-stream count -- charging one stream for a multi-slot server would
++    // under-charge the reserve by `(n_seq_max - 1) x (win + n_ubatch)` cells (the direction the header calls
++    // dangerous).  An un-windowed estimate already returns `n_ctx` cells, which IS the total.
++    uint32_t draft_win = 0;
++    const uint32_t draft_cells = shares_model
++                               ? llama_spec_draft_kv_cells(n_ctx, n_ubatch, n_seq_max, kv_unified, &draft_win)
++                               : 0;
++    const size_t   kv_cells     = draft_cells != 0
++                                ? (size_t) draft_cells
++                                  * (size_t) (kv_unified ? 1u : std::max<uint32_t>(1, n_seq_max))
++                                : (size_t) n_ctx;
 +    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
  
      // --- compute + slack: measured tiers -------------------------------------------------------
      // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
-@@ -211,13 +238,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -211,13 +255,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      r.ok    = r.total > 0;
  
      LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"
 -            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u)\n",
-+            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u, kv cells %u%s%s)\n",
++            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u, kv cells %zu%s%s)\n",
              __func__, path.c_str(),
              (double) r.weights / 1048576.0, (double) r.kv / 1048576.0, kv_own, kv_layers, n_head_kv,
              k_len, v_len, have_indexer ? "yes" : "no",
              shares_kv ? ", KV shared with the target (0 owned)" : "",
              (double) r.compute / 1048576.0, (double) r.slack / 1048576.0, (double) r.total / 1048576.0,
 -            n_ctx);
-+            n_ctx, kv_cells, draft_window != 0 ? ", MTP draft window" : "",
++            n_ctx, kv_cells, draft_cells != 0 ? ", MTP draft window" : "",
 +            shares_model ? ", weights shared with the target (0 charged)" : "");
  
      return r;
  }
 diff --git a/common/draft-reserve.h b/common/draft-reserve.h
-index 8e65564b6..fdca58c78 100644
+index 8e65564b6..e6074f888 100644
 --- a/common/draft-reserve.h
 +++ b/common/draft-reserve.h
-@@ -37,8 +37,12 @@ struct common_draft_reserve {
+@@ -37,8 +37,17 @@ struct common_draft_reserve {
  };
  
  // Estimate the post-slab VRAM `path` (a draft GGUF) will need for `n_ctx` with the given KV types.
 +// `shares_model`: the draft runs the TARGET's weights (an embedded MTP head), so the weights term is 0 and
 +// `path` is the target's GGUF -- the caller only passes `true` when the draft's KV window is active, so an
 +// un-windowed run keeps the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` it has always had.
++// `n_seq_max` / `kv_unified` size the MTP draft window the same way the cache does
++// (`llama_spec_draft_kv_cells()`): a unified cache holds every sequence in one stream, so its window is
++// granted per sequence and its cell count is `(win + one batch) x n_seq_max` (issue #264).
  common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                     uint32_t n_ctx,
                                                     uint32_t n_ubatch,
                                                     ggml_type type_k,
 -                                                   ggml_type type_v);
 +                                                   ggml_type type_v,
-+                                                   bool shares_model = false);
++                                                   bool shares_model = false,
++                                                   uint32_t n_seq_max = 1,
++                                                   bool kv_unified = false);
 diff --git a/common/fit.cpp b/common/fit.cpp
 index 29d9dbbd0..cf172c469 100644
 --- a/common/fit.cpp
@@ -4427,7 +4488,7 @@ index bae1b81c7..f80389890 100644
      // training
      //
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 0079595f5..75a1794ed 100644
+index 0079595f5..194325816 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -102,6 +102,11 @@ LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model,
@@ -4442,7 +4503,7 @@ index 0079595f5..75a1794ed 100644
  // the backend buffers that a state write of this memory would touch - empty caches report none
  LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
  
-@@ -216,3 +221,49 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
+@@ -216,3 +221,66 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
  
  // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
  LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
@@ -4485,9 +4546,26 @@ index 0079595f5..75a1794ed 100644
 +//   `0`             no window: today's behaviour, byte-identical
 +//   `N`             N cells (floored at one ubatch, and at the context where it would exceed it)
 +//
-+// Returns the window in cells, or 0 for "no window" (nothing to save at this context, or disabled).  MTP only:
-+// a DFlash2/`-md` draft keeps its own `-c` cache.
++// Returns the PER-SEQUENCE window in cells, or 0 for "no window" (nothing to save at this context, or
++// disabled).  MTP only: a DFlash2/`-md` draft keeps its own `-c` cache.  This is the policy; the cache's cell
++// count comes from `llama_spec_draft_kv_cells()` below.
 +LLAMA_API uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch);
++
++// The draft cache's geometry for that window, as the cache has to actually allocate it: writes the window the
++// cache will use to `win_out` (0 = no window, i.e. the full `-c` cache with `n_swa` 0) and returns its cell
++// count, 0 meaning "no window".
++//
++// The window is PER SEQUENCE, so a UNIFIED cache -- which holds every sequence in ONE stream -- must be sized
++// per sequence: `(win + one batch) x n_seq_max`, capped at the context.  Sizing it as `win + n_ubatch` while
++// several sequences share it is the r193 defect (issue #264): once the first sequence filled the window no
++// cell was left for a second sequence's batch, `find_slot` had no contiguous run to place it in and the server
++// answered `decode() failed: failed to process speculative batch` on that slot for every request.  A
++// per-stream cache (no `--kv-unified`) already sizes each stream separately, so its shape is unchanged.
++//
++// The window is lowered when `win` per sequence does not fit the context, and declined when what is left
++// cannot hold one batch: `LLAMA_SPEC_DRAFT_WINDOW` is a VRAM saving, never a reason a batch cannot be placed.
++LLAMA_API uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max,
++                                             bool kv_unified, uint32_t * win_out);
 +
 +// Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
@@ -5767,10 +5845,10 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 17cd2b9d4..32801f102 100644
+index 17cd2b9d4..74d90be8e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3109,6 +3109,52 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+@@ -3109,6 +3109,94 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
      return layers[il].rope_short;
  }
  
@@ -5820,10 +5898,52 @@ index 17cd2b9d4..32801f102 100644
 +    return w;
 +}
 +
++// The cache's cell count for that window (see llama-ext.h).  One function so the cache, the slab's reserve
++// estimate (common/draft-reserve.cpp) and the "is a window active" test cannot disagree about the geometry.
++uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max, bool kv_unified,
++                                   uint32_t * win_out) {
++    GGML_ASSERT(win_out != nullptr);
++    *win_out = 0;
++
++    if (n_ctx_seq == 0) {
++        return 0;
++    }
++
++    const uint32_t win = llama_spec_draft_window_cells(n_ctx_seq, n_ubatch);
++    if (win == 0) {
++        return 0;
++    }
++
++    // one whole batch must always be placeable on top of the window (the `iswa` sizing shape)
++    const uint32_t batch = std::max<uint32_t>(1, n_ubatch);
++
++    if (!kv_unified) {
++        // one stream per sequence: each stream already owns `n_ctx_seq` cells and its own `n_swa`
++        *win_out = win;
++        return GGML_PAD(std::min(n_ctx_seq, win + batch), 256);
++    }
++
++    // A unified cache holds every sequence in ONE stream, so the window has to be granted per sequence or the
++    // first sequence to fill it starves the rest (issue #264).  `per_seq` is the most any one sequence can ever
++    // own, and the window may only claim what leaves a batch of room beside it: a window that does not is
++    // declined rather than lowered, because lowering it to `per_seq - batch` saves `batch` cells per sequence
++    // and masks the drafter's newest cells to do it.
++    const uint32_t n_seq   = std::max<uint32_t>(1, n_seq_max);
++    const uint32_t per_seq = n_ctx_seq / n_seq;
++
++    if (win + batch > per_seq) {
++        return 0;
++    }
++
++    *win_out = win;
++
++    return std::min(n_ctx_seq, GGML_PAD((win + batch)*n_seq, 256));
++}
++
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
-@@ -3573,7 +3619,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3573,7 +3661,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
@@ -5833,7 +5953,7 @@ index 17cd2b9d4..32801f102 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
-@@ -3679,6 +3726,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3679,6 +3768,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
@@ -5848,26 +5968,35 @@ index 17cd2b9d4..32801f102 100644
 +                        // per-cell POSITION, so a recycled cell reports its new position (a position range, not
 +                        // a cell-index range).  Only the drafter loses the tokens older than the window, and
 +                        // the target verifies every token it proposes.
++                        //
++                        // The window is per SEQUENCE: under `--kv-unified` this cache holds every sequence in
++                        // one stream, so `llama_spec_draft_kv_cells()` multiplies the cell count by
++                        // `n_seq_max` (issue #264 -- a `win + n_ubatch` cache left a second sequence no cell to
++                        // place its batch in, and every request on that slot failed).
 +                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
 +                        uint32_t mtp_n_swa   = hparams.n_swa;
 +                        llama_swa_type mtp_swa_type = hparams.swa_type;
 +                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-+                            const uint32_t win = llama_spec_draft_window_cells(cparams.n_ctx_seq, cparams.n_ubatch);
-+                            if (win != 0) {
-+                                // the iswa sizing shape: a whole ubatch must always find room to be placed
-+                                mtp_kv_size  = GGML_PAD(std::min(cparams.n_ctx_seq, win + cparams.n_ubatch), 256);
++                            uint32_t win = 0;
++                            const uint32_t cells = llama_spec_draft_kv_cells(cparams.n_ctx_seq, cparams.n_ubatch,
++                                                                             cparams.n_seq_max, cparams.kv_unified,
++                                                                             &win);
++                            if (cells != 0) {
++                                mtp_kv_size  = cells;
 +                                mtp_n_swa    = win;
 +                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
-+                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells (draft cache %u of %u cells; "
++                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells per sequence (draft cache %u "
++                                               "of %u cells per stream, n_seq_max %u, %s; "
 +                                               "LLAMA_SPEC_DRAFT_WINDOW -- the target still verifies every token)\n",
-+                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq);
++                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq, cparams.n_seq_max,
++                                               cparams.kv_unified ? "unified" : "per-sequence streams");
 +                            }
 +                        }
 +
                          res = new llama_kv_cache(
                                  *this,
                                  hparams,
-@@ -3687,11 +3761,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3687,11 +3812,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,

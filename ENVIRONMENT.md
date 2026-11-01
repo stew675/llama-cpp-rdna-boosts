@@ -922,13 +922,15 @@ drafter works over changes no draft at all.
 
 | variable | default | what it does |
 |---|---|---|
-| `LLAMA_SPEC_DRAFT_WINDOW` | **unset = `auto`** (**this is the ON default**; `0` = **kill switch**) | `N` = a window of `N` cells (floored at one ubatch, and the window is dropped when it would hold the whole cache); `auto`/unset = the adaptive policy: **a quarter of the context, clamped to `[32768, 65536]` cells**.  The clamps are the safety rails -- a window far below the context the drafter uses costs 7-9 % of decode, one at or above it is free, and with the lower clamp a `-c <= 32768` run keeps its whole draft cache (no window, no log line).  **MTP only, and only an embedded MTP head** (qwen3.5/3.6/3.8): a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full cache.  `-c`-sized draft KV, `n_swa` = the window; the target still verifies every token, so a truncated draft can only be slower.  **`--fit` sees it**: an embedded MTP head with an active window derives its slab reserve from the model's own metadata with the weights zeroed, `aux 3.50 -> 0.76 GiB` (arena +2.8 GiB); without a window, or for a separate draft GGUF, the flat 3584 MiB constant stays. |
+| `LLAMA_SPEC_DRAFT_WINDOW` | **unset = `auto`** (**this is the ON default**; `0` = **kill switch**) | `N` = a window of `N` cells **per sequence** (floored at one ubatch, and the window is dropped when it would hold the whole cache); `auto`/unset = the adaptive policy: **a quarter of the context, clamped to `[32768, 65536]` cells**.  The clamps are the safety rails -- a window far below the context the drafter uses costs 7-9 % of decode, one at or above it is free, and with the lower clamp a `-c <= 32768` run keeps its whole draft cache (no window, no log line).  **MTP only, and only an embedded MTP head** (qwen3.5/3.6/3.8): a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full cache.  `-c`-sized draft KV, `n_swa` = the window; the target still verifies every token, so a truncated draft can only be slower.  **The window is per sequence:** under `--kv-unified` the one draft cache holds every sequence, so its cell count is `(win + one batch) x n_seq_max` (capped at the context) and that is what the log line and the reserve report -- the r193-r199 `win + n_ubatch` shape starved a second slot (issue #264), and a window that cannot fit per sequence is declined rather than lowered.  **`--fit` sees it**: an embedded MTP head with an active window derives its slab reserve from the model's own metadata with the weights zeroed, `aux 3.50 -> 0.76 GiB` (arena +2.8 GiB); without a window, or for a separate draft GGUF, the flat 3584 MiB constant stays. |
 
 Measured (1 GPU, `-n 2000`/`-n 3000`, static depth 3): 35B-A3B Q8_0 `-ncmoe 48 -c 262144` arena
 20 910 -> 23 715 MiB (residency 64.1 -> 72.7 %), decode 111.2 -> 113.7 t/s, prefill +3.4 %, **drafts
 identical**; dense 27B `-c 102400` Protocol A neutral (71.9 vs 72.1 layer, 72.6 vs 72.5 tensor, acceptance
 2083/2747 in all four arms); target text byte-identical off/auto/4096 and plain == draft-mtp == draft-mtp
-(`W=512`) at `-c 16384`.  Records: `patches/README.md` block 15, `WORKLOG.md` 261031.014,
+(`W=512`) at `-c 16384`.  A unified 2-slot cache sizes the window per sequence, and the windowed drafter's
+text is byte-identical to `LLAMA_SPEC_DRAFT_WINDOW=0` on both slots of `--kv-unified -np 2` (issue #264).
+Records: `patches/README.md` block 15, `WORKLOG.md` 261031.014 and 261101.006,
 `archive/work/kv-residency/O3-DRAFTER-RING.md` §2.3.
 
 
