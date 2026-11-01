@@ -1,15 +1,16 @@
 # Greedy purity — the rulebook
 
-**What this is.**  The delivery's purity contract, one entry per finding: the claim, the rule a change
-must satisfy, the numbers that back it, and where the record lives.  Read the entry for the `§` you are
-about to touch; read the seven invariants before shipping anything that changes a decode or prefill
-kernel.
+**What this is.**  The delivery's purity contract: one entry per finding, in one shape -- the claim, the
+**rule** a change must satisfy, the **numbers** that back it, and **where the record lives**.  Read the entry
+for the `§` you are about to touch, and read the invariants below before shipping anything that changes a
+decode or prefill kernel.
 
-**Where the rest is.**  The investigation narratives (how each finding was made, which instruments failed,
-which false trails were ruled out) are in
-[`archive/docs/GREEDY-PURITY-FINDINGS.md`](archive/docs/GREEDY-PURITY-FINDINGS.md) under the same `§`
-numbers.  The delivery-side record of each amendment is in `patches/README.md` and `WORKLOG.md`.  Section
-numbers are **stable** — dozens of docs cite them — so they are never renumbered; new findings append.
+**Where the rest is.**  This file is the *current state* of every purity rule: correct an entry in place,
+tagged with the revision that changed it.  The dated narrative -- how a finding was made, which instruments
+failed, which false trails were ruled out -- is in `WORKLOG.md` and the `benchmarks/` record the entry names,
+plus [`archive/docs/GREEDY-PURITY-FINDINGS.md`](archive/docs/GREEDY-PURITY-FINDINGS.md) for the pre-r100
+findings (`§§1-42`, under the same numbers).  Section numbers are **stable** -- dozens of docs cite them -- so
+they are never renumbered; a new finding appends and takes the next number.
 
 > **Numbering.**  This document uses the **V2.1 block** numbering for new text (16 blocks, `00`-`15`; r109
 > split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp, and moved the campaign
@@ -48,7 +49,12 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
    op over whole rows, a rotation `mul_mat` over a whole contraction, and a flash-attention K/V slice that
    is whole on one device.  The straddling case must stay a hard refusal with a message saying it needs a
    cross-device reduction (§45).
-10. **A cross-start comparison is only a purity measurement if the external solution selection is pinned.**
+10. **A device-side fast path for a host readback is pure only while the state it replaces the readback
+    with is fresh.**  When a synchronized readback is removed in favour of a device map (or any cached
+    residency state), every mutation of that state must invalidate the map -- a stale entry selects the
+    wrong data and produces fluent wrong output, not a crash -- and the policy that consumes the state may
+    only ever change *what is admitted*, never an address (`§82`, r203).
+11. **A cross-start comparison is only a purity measurement if the external solution selection is pinned.**
    On ROCm before the `rocm-libraries` fix, hipBLASLt picks its solution for an untuned FP32 GEMM size in
    heap order — a **per-process-start** lottery (§44).  Compare fresh-process arms with
    `ROCBLAS_USE_HIPBLASLT=0`, and attribute a per-start difference to the library before blaming a kernel,
@@ -96,7 +102,7 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§34** | a K/V staging policy is a decode-depth policy (and can be a load margin) | doctrine |
 | **§35** | a prefill kernel config must be arch- and split-keyed | doctrine |
 | **§36** | §14's `W=1..8` purity is a *measured* claim; relax it for the coarse quants | doctrine |
-| **§37** | a fully-masked KV group is an exact no-op; the skip must stay prefill-only | doctrine |
+| **§37** | a fully-masked KV group is an exact no-op, so skipping it is bit-identical — in prefill and, since r133, in the decode/verify band too (`GGML_CUDA_FA_BAND_SKIP=0` turns the band arm off; `GGML_CUDA_FA_MASK_SKIP=0` disables the whole mechanism) | doctrine + fix (r133, PR #223) |
 | **§38** | the guarantee is scoped to a fixed batch; `--kv-unified` serving is not deterministic | doctrine |
 | **§39** | a decode-only fusion must match the standalone launch it replaces | doctrine |
 | **§39b** | the MoE expert-cache band follows the routed MMVQ band | current |
@@ -135,120 +141,59 @@ numbers are **stable** — dozens of docs cite them — so they are never renumb
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
 | **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model **and device-count** property (r186 removed the single-device gate — multi-device reach is empirical, gate it with a multi-device width-probe arm), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183 PR #256 + r186; `benchmarks/2026-10-30-gdn-decode-folds.md`, `benchmarks/2026-10-31-conv-fusion-multi-device.md`) |
-| **§76** | a conservative guard that declines a fast path owes a fallback that is not pathological, and the refusal must be a distinct signal rather than inferred from a partially-filled out-parameter: a guard whose false positive routes a *large* copy to an element-per-thread kernel (three divisions and three modulos per element) is a regression waiting for a model that reaches it — so keep the guard, vectorise the fallback (bit-identical, alignment-checked), and never let a *different* refusal geometry (overlapping rows, which need the flat mapping) share the fallback's condition | doctrine + fix (r189, from the KV campaign's `f8e47e392`; `benchmarks/2026-10-31-cpy-2d-vec16.md`) |
-| **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
-| **§79** | a memory module that relocates a live cell between two of one sequence's batches owes the relocation of **everything** that sequence's next batch reads from that cell: a rollback snapshot plane is part of the cell, not a side table.  Three conditions carry it, and each is a way the fix can be silently wrong: the copy must run **before** the ubatch writes its own snapshots (node order is the only ordering guarantee, since two views of one tensor create no dependency edge), the source ids must come from an accessor that does **not** consume the sequence's pending rollback index (`s_copy()` does, `s_src()` does not), and the new input must be created only where the batch really has an extra cell (`n_rs > n_seqs`), so every single-sequence batch and a 2-cell cache keep a byte-identical graph.  The instrument is a **two-arm logit comparison** (a batch that moves the cell vs the same tokens decoded alone), never text: the wrong read is another sequence's state, which the model still renders as fluent text.  The mechanism is upstream's, so the fix ships with the upstream copy | doctrine + fix (r195, PR #261, block 03; `archive/work/recurrent-moved-cell-snapshots/`) |
 | **§74** | a fusion that exists for one cache-*quantizer* path (now q8_0 **and** q4_0, wave32) is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
-
+| **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
+| **§76** | a conservative guard that declines a fast path owes a fallback that is not pathological, and the refusal must be a distinct signal rather than inferred from a partially-filled out-parameter: a guard whose false positive routes a *large* copy to an element-per-thread kernel (three divisions and three modulos per element) is a regression waiting for a model that reaches it — so keep the guard, vectorise the fallback (bit-identical, alignment-checked), and never let a *different* refusal geometry (overlapping rows, which need the flat mapping) share the fallback's condition | doctrine + fix (r189, from the KV campaign's `f8e47e392`; `benchmarks/2026-10-31-cpy-2d-vec16.md`) |
 | **§77** | a cache that keeps its **authoritative** copy where it is cheap and a cache of the hot part where it is fast must make the CHEAP copy authoritative, so every existing path (the `set_rows` writers, `state_write`/`state_read`, the K-shift, defrag, parking, `get_k`/`get_v`) needs no pool-aware code; the resolve then owes three rules — **mark before claim** (a claim must never evict a page the same launch reads), **distinct blocks only** (a claim per *attempt* wraps the cursor within one batch), and **no transient scratch inside a captured graph** (a fill list in a pool allocation bakes a pointer a replay then reuses) — plus a residency floor of one decode band so a verify batch cannot exhaust the slots; a cache that is pooled or windowed reports it is **streaming**, and taking the sparse arm there is a different attention **regime** (like §45/§63), so the oracle is the pooled arm against the resident **sparse** arm and a resident arm against itself, never a dense-vs-pooled text diff | doctrine + fix (r190, block 16; `../archive/work/kv-residency/BA-POOL-DESIGN.md` §7-§8) |
-| **§82** | a synchronized readback that a fast path removes must be replaced by a device-side map whose **freshness is the only thing that can make it wrong**: the decode band's slot-remap map is keyed on `slot_dirty` (set by every slot mutation -- fill/eviction/stand-down/slab eviction/shrink/migration/re-arm) and its cold encoding (`slots + e`) also depends on the slot COUNT, so a count change without a rebuild reads the **wrong expert / past the master** while a *stale policy* can only admit the wrong expert, never move a read address.  Keep the policy on the host, keep the lag policy-only, and prove it with byte-identical text plus identical MTP acceptance (r203, PR #266, block 09: 0.76089 = 1397/1836 both arms, prefill KLD 0.000000, +8.4 % TG) | doctrine + fix (r203, PR #266; `benchmarks/2026-11-01-host-expert-device-remap.md`, `archive/work/pinned-decode-remap/`) |
 | **§78** | fuse a kernel over a *quantized* cache only by dequantizing with the library's own block decoder (`dequantize_q8_0/q4_0/…`), addressed in whole `nb0K` blocks, so the fused path returns the exact values the per-op chain's `get_rows` does — and gate it on **every** supported type plus the no-derived-cache arm, because the two paths must stay byte-identical per type (q8_0's one-element-per-byte packing and a 4/5-bit byte's low/high nibble split at `b` and `b + 16` are the two that differ).  A type whose block does not divide the indexed row (k-quants' 256-element superblock vs `idx_dim` 128) is an accepted limitation on the chain, not a defect | doctrine + fix (r190, block 11, from the KV campaign's A13; `../archive/work/kv-residency/BA-POOL-DESIGN.md` §9.3-§10) |
-| **§81** | a fused kernel that stands in for a ggml chain must call that chain's **transcendental op verbatim**, and a decode-band fusion owes its purity check at the **verify width**, not only at `--ub 1`.  The SSM gate/beta fusions computed `logf(1.0f + expf(x))` where `unary.cu`'s `op_softplus` -- the node they replace -- computes `log1pf(expf(x))`; that is not the same float, and it made the fused path disagree with the chain at the widths an MTP verify batch runs (`gate-prefill-logits --ub 4`: 0.000562 KLD / 99.000 % on gfx1201, 0.000565 / 98.971 % on gfx1100) while `--ub 1` read 0.000000 -- **vacuously**, because at one token the SSM pre-scan fusion takes those same nodes on qwen3.5/3.6/3.8, so the Q8_0 sibling had no oracle at all.  The defect moved the target's own greedy text (4771 chars `sha=0ac05e4cb358` fused vs 4628 `sha=8631f9a3a623` chain on 27B `draft-mtp n3`) and its MTP acceptance (782/1247 vs 780/1257).  So: `--ub 1` **and** `--ub 4` for a decode-band fusion, `test-logits-width-probe` for a width-only fold, the type-correct unit oracle (extend `test-fusion-gate-beta-multiseq` to the Q8_0 sibling and the model's real K -- the test only exercised BF16 at K=1024), and a decoy width is not a substitute for the real one.  **A width-uniform result is not purity (r202, TODO #130 closed):** `GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates **only the verify band** (the `ne[1] == 1` decode arm is unconditional), so pre-r201 the default build ran the wrong-softplus kernel at *every* width -- 0-diff against itself, and a width probe called it PASS -- while a fuse-off arm (W=1 fused vs W>=2 chain) was the only place the defect showed (gfx1100 `maxdiff 0.138`, `7def98c5` vs `5e1cbbb4`).  So a fusion whose switch covers only part of the band owes *three* arms: default, the switch, and `GGML_CUDA_DISABLE_FUSION=1` (the chain) -- and the chain is the reference, never the default | doctrine + fix (r201, issue #265; r202, issue #263; `benchmarks/2026-11-01-ssm-softplus-265.md`, `benchmarks/2026-11-01-kill-switch-arm-130.md`) |
+| **§79** | a memory module that relocates a live cell between two of one sequence's batches owes the relocation of **everything** that sequence's next batch reads from that cell: a rollback snapshot plane is part of the cell, not a side table.  Three conditions carry it, and each is a way the fix can be silently wrong: the copy must run **before** the ubatch writes its own snapshots (node order is the only ordering guarantee, since two views of one tensor create no dependency edge), the source ids must come from an accessor that does **not** consume the sequence's pending rollback index (`s_copy()` does, `s_src()` does not), and the new input must be created only where the batch really has an extra cell (`n_rs > n_seqs`), so every single-sequence batch and a 2-cell cache keep a byte-identical graph.  The instrument is a **two-arm logit comparison** (a batch that moves the cell vs the same tokens decoded alone), never text: the wrong read is another sequence's state, which the model still renders as fluent text.  The mechanism is upstream's, so the fix ships with the upstream copy | doctrine + fix (r195, PR #261, block 03; `archive/work/recurrent-moved-cell-snapshots/`) |
 | **§80** | a refactor that shares a device kernel body changes the codegen of **every** instantiation, so a behaviourally inert change can move a dispatch-bound decode by 5-7 %: on gfx1201 an inlined `__device__` ksplit body recompiled the multi-column verify kernels (Q4_K ncols 5: 118 -> 97 VGPRs, 864 -> 1029 instructions) and cost 6-7 % of MTP decode with an identical kernel/graph census, compute buffers, text and acceptance, while gfx1100/gfx1151 were flat.  Share the body with an `#include` so the pre-existing kernel's source tokens are unchanged, prove it with a per-kernel VGPR/device-code census **and** the MTP arm (text and KLD are blind to it), and quote the arch.  A mixed-type continuation of a fusion must also route each segment's row stride explicitly (and keep every same-type segment on the launch tensor's stride), not infer it from the launch | doctrine + fix (r198, PR #260, block 10; `benchmarks/2026-11-01-row-concat-mixed-r198.md`) |
+| **§81** | a fused kernel that stands in for a ggml chain must call that chain's **transcendental op verbatim**, and a decode-band fusion owes its purity check at the **verify width**, not only at `--ub 1`.  The SSM gate/beta fusions computed `logf(1.0f + expf(x))` where `unary.cu`'s `op_softplus` -- the node they replace -- computes `log1pf(expf(x))`; that is not the same float, and it made the fused path disagree with the chain at the widths an MTP verify batch runs (`gate-prefill-logits --ub 4`: 0.000562 KLD / 99.000 % on gfx1201, 0.000565 / 98.971 % on gfx1100) while `--ub 1` read 0.000000 -- **vacuously**, because at one token the SSM pre-scan fusion takes those same nodes on qwen3.5/3.6/3.8, so the Q8_0 sibling had no oracle at all.  The defect moved the target's own greedy text (4771 chars `sha=0ac05e4cb358` fused vs 4628 `sha=8631f9a3a623` chain on 27B `draft-mtp n3`) and its MTP acceptance (782/1247 vs 780/1257).  So: `--ub 1` **and** `--ub 4` for a decode-band fusion, `test-logits-width-probe` for a width-only fold, the type-correct unit oracle (extend `test-fusion-gate-beta-multiseq` to the Q8_0 sibling and the model's real K -- the test only exercised BF16 at K=1024), and a decoy width is not a substitute for the real one.  **A width-uniform result is not purity (r202, TODO #130 closed):** `GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates **only the verify band** (the `ne[1] == 1` decode arm is unconditional), so pre-r201 the default build ran the wrong-softplus kernel at *every* width -- 0-diff against itself, and a width probe called it PASS -- while a fuse-off arm (W=1 fused vs W>=2 chain) was the only place the defect showed (gfx1100 `maxdiff 0.138`, `7def98c5` vs `5e1cbbb4`).  So a fusion whose switch covers only part of the band owes *three* arms: default, the switch, and `GGML_CUDA_DISABLE_FUSION=1` (the chain) -- and the chain is the reference, never the default | doctrine + fix (r201, issue #265; r202, issue #263; `benchmarks/2026-11-01-ssm-softplus-265.md`, `benchmarks/2026-11-01-kill-switch-arm-130.md`) |
+| **§82** | a synchronized readback that a fast path removes must be replaced by a device-side map whose **freshness is the only thing that can make it wrong**: the decode band's slot-remap map is keyed on `slot_dirty` (set by every slot mutation -- fill/eviction/stand-down/slab eviction/shrink/migration/re-arm) and its cold encoding (`slots + e`) also depends on the slot COUNT, so a count change without a rebuild reads the **wrong expert / past the master** while a *stale policy* can only admit the wrong expert, never move a read address.  Keep the policy on the host, keep the lag policy-only, and prove it with byte-identical text plus identical MTP acceptance (r203, PR #266, block 09: 0.76089 = 1397/1836 both arms, prefill KLD 0.000000, +8.4 % TG) | doctrine + fix (r203, PR #266; `benchmarks/2026-11-01-host-expert-device-remap.md`, `archive/work/pinned-decode-remap/`) |
 ---
 
----
+**How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
+behaviour · `fix` = a closed finding, kept because the *rule* it produced still binds.  The entries exist in
+three shapes: `§§1-10` are the **Background** block below (the k-quant rounding-order doctrine they all rest
+on), `§§11-76` and `§82` are full entries, and `§§77-81` are **row-only** -- their whole record is the row plus
+the `WORKLOG.md` entry it names.  A fact that changes is corrected in place, tagged with the revision that
+changed it; the dated narrative is always `WORKLOG.md` or the `benchmarks/` record.
 
-## 1. The one-sentence version
+## Background: why a rounding-order change matters (§§1-10)
 
-The k-quant VDR work (pre-V2.0 "block 10", now **block 07**) does not make decode more or less *correct*
-than stock — it computes the **same real-number result** through a **different order of fp32 additions**.
-Stock is not the mathematically special order; it is the *reference standard* that shipped first and that
-everything else reproduces.
+All of these are one shape: **the same real-number result through a different order of fp32 additions**.
+Stock is not the mathematically special order; it is the *reference standard* that shipped first, so
+"bit-identical to stock" is a **reproducibility** requirement (golden vectors, audit trails,
+`verify == decode`), never a correctness one.
 
-## 2. What block 10 changes
-
-Two mechanisms, both in the `mmvq` decode path, and nothing else in the block changes production numerics
-(the MMQ scale-load hoist, the MoE `mmid` whitelist and the perf-harness cases are arithmetic-preserving or
-test-only):
-
-| mechanism | change | effect |
-|---|---|---|
-| **VDR** | `VDR_Q4_K/Q5_K/Q8_0 2→4`, `VDR_Q6_K 1→2` | each thread accumulates 4 (or 2) chunk partials serially instead of 2 (or 1) |
-| **RDNA3_5 parameter table** | split from the RDNA2 fallback, `nwarps=2` for Q8_0 on gfx1151 | fewer warps → different cross-warp combine tree |
-
-## 3. The reduction structure
-
-The dot products are **exact** (`ggml_cuda_dp4a` is an integer SIMD dot product; the scale multiplies are
-single multiplies); only the **fp32 accumulation** can round.  The per-thread serial chain
-(`tmp[j][i] += vec_dot(...)` once per `blocks_per_iter`) and the cross-thread combine (shared-memory across
-warps, then `warp_reduce_sum`'s hard-coded `16,8,4,2,1` shuffle butterfly) are **identical** in stock and
-in the boosted path.  What changes is *which* partial sums feed which leaves of that tree.
-
-## 4. Why VDR changes the rounding path
-
-`blocks_per_iter = vdr * nwarps*warp_size / qi` and `kqs = vdr * (tid % (qi/vdr))`, so VDR sets the
-per-thread serial chain length and the thread-to-chunk assignment.  The *set* of partial products is
-unchanged; the **association order** is not.
-
-*A note on "fewer rounding accumulations".*  VDR=4 does **fewer** serial rounding steps per thread, not
-more (the outer `tmp +=` chain runs half as often, ~17 % fewer serial fp32 adds).  "The boosted path rounds
-more" is the wrong intuition, and neither path is provably closer to the exact result.
-
-## 5. What "correctness" means here
-
-* **Same real-number result** — no approximation is introduced.
-* **Stock is not more correct** — its ordering was chosen for performance on the hardware of the day.
-* **Bit-identity is a reproducibility requirement, not a correctness one** — golden vectors, cross-build
-  harnesses, `verify == decode` batches, audit trails.  Reproducing stock's bits means reproducing its
-  exact association order, which is why the block is structured as one excludable patch.
-
-## 6. Speculative decoding composes orthogonally
-
-The verify batch runs the *same* `mmvq` kernels at `ncols_dst = n_draft+1`.  Two invariants keep it
-bounded: **VDR is per-type, not per-column-count**, and the `ncols_dst <= MMVQ_MAX_BATCH_SIZE` rule forces
-the verify batch onto decode's `nwarps`.  So the acceptance criterion still reproduces the target
-distribution exactly.
-
-| | temp = 0 (greedy) | temp > 0 (stochastic) |
-|---|---|---|
-| effect | a ≤0.184 logit drift can flip near-tie acceptances → a different greedy stream | the drift perturbs probabilities, not decisions; acceptance *rate* may shift slightly |
-| correctness | none — both are valid deterministic paths | none — the distribution is preserved; PPL is bit-unchanged |
-
-## 7. Measured magnitude of the variance
-
-| metric (gfx1201, ROCm 7.14) | value |
-|---|---|
-| max abs logit diff, block 10 in vs out | **0.184** |
-| same, flash-attn on vs off (yardstick) | 0.203 |
-| per-token probability change at the worst logit (t=1.0) | ~20 % |
-| top-2 logit gap typically | 0.5-5 nats (0.184 is ~9 % of a 2-nat gap) |
-| PPL (wikitext-2, Q8_0) | identical to pre-block-10 |
-| greedy streams | deterministic within a build; 1 of 3 prompts diverged at one character |
-
-**Honest framing:** 0.184 is *not* vanishingly small (~20 % relative probability on the single worst
-token), but it is a **max** over all tokens, PPL is bit-identical, and greedy flips need a near-tie.  If you
-need stock's bits, exclude the block; if you need a correct, deterministic, high-quality model, the block
-is fine.
-
-## 8. Practical guidance
-
-* Within a build, greedy output is fully deterministic — the variance appears only across *builds*.
-* To reproduce stock bits, exclude the k-quant block (**V2.0 `0007`**).  In V2.0 that is **no longer a
-  one-line drop**: `0007` is mid-series and later blocks edit the same `mmvq.cu` region, so the set must
-  be re-cut without it (pre-V2.0 it was the last patch).  Do not apply it partially or hand-tune VDR in
-  production.
-* A/B on **distributions** (PPL, benchmark scores, sampling quality), not individual greedy tokens.
-
-## 9. The fused-MoE `mmvq` rewrite is a second decode-numerics source
-
-Pre-V2.0 block 13 (now **block 08**) replaces the §3 K-split loop with an item-split over
-(token, row, kblock) plus an RDNA `rows_per_block` override, feeding different partial sums into the same
-tree.  The 2026-09-02 fix restored `ncols 2..8` and `ncols==1` with `K >= 4096` to the K-split kernel, so
-dense long-K decode is back to block-10-only variance; the remaining surface is `ncols==1` with `K < 4096`
-(MoE down/router and other short-K projections).  Multi-token MoE decode takes the unfused path (the
-`rms_norm`→Q8_1 fold is gated off `MUL_MAT_ID`), and single-token MoE carries fusion-ordering drift.
-
-**Consequence:** reproducing stock bits with this block installed is not a one-line drop; the `ksplit`
-dispatch condition in `mul_mat_vec_q_switch_ncols_dst` is the gate.
-
-## 10. Block 00 makes the verify width irrelevant on the small-batch FA path
-
-`launch_fattn`'s `parallel_blocks` keyed off `ntiles_dst` (a function of `Q->ne[1]`), so single-token
-decode and a verify batch grouped the online-softmax/PV partials differently and produced different logits
-(issue #25).  Block 00 evaluates the heuristic as if `n_q == 1` for every `n_q <= 8`, so decode and every
-verify width reduce identically.  `n_q = 1` can still differ from a verify batch because the FA *kernel* is
-selected from `Q->ne[1]` — a decode-vs-verify difference, not a draft-length one.
+* **§1** the k-quant VDR work (pre-V2.0 "block 10", now **block 07**) does not make decode more or less
+  correct than stock; it computes the same real-number result in a different addition order.
+* **§2** two mechanisms only: the VDR constants (`VDR_Q4_K/Q5_K/Q8_0 2->4`, `VDR_Q6_K 1->2`) and the
+  RDNA3_5 parameter table (`nwarps=2` for Q8_0 on gfx1151, split out of the RDNA2 fallback).
+* **§3** the dot products are exact (`ggml_cuda_dp4a` is an integer SIMD dot, the scale is one multiply);
+  only the fp32 accumulation rounds, and the per-thread serial chain and the cross-thread butterfly are
+  identical to stock.
+* **§4** `blocks_per_iter = vdr * nwarps*warp_size / qi` and `kqs = vdr * (tid % (qi/vdr))`, so VDR changes
+  which partials feed which leaves -- and it does **fewer** serial rounding steps per thread (~17 % fewer
+  fp32 adds), not more.
+* **§5** "bit-identical to stock" is reproducibility, not correctness; reproducing it means reproducing
+  stock's exact association order, which is why the block is structured as one excludable patch.
+* **§6** speculative verify runs the same `mmvq` kernels at `ncols_dst = n_draft + 1`, and VDR is per-type
+  with `ncols_dst <= MMVQ_MAX_BATCH_SIZE` forcing decode's `nwarps`, so the drift composes orthogonally
+  (greedy may flip a near-tie; a stochastic sampler's distribution is preserved, PPL bit-unchanged).
+* **§7** measured on gfx1201/ROCm 7.14: max abs logit diff **0.184** against a build without the block
+  (flash-attn on/off is the 0.203 yardstick), ~20 % relative probability on that one token, **PPL
+  bit-identical**, 1 of 3 greedy prompts diverging at one character.
+* **§8** greedy output is fully deterministic *within* a build (the variance is across builds), so judge a
+  change on distributions and on within-build text identity; to reproduce stock bits, drop block **07**
+  (V2.1) and re-cut the series -- it is mid-series and later blocks edit the same `mmvq.cu` region.
+* **§9** the fused-MoE `mmvq` rewrite (block 08) is a **second** decode-numerics source: the 2026-09-02 fix
+  restored `ncols 2..8` and `ncols == 1` with `K >= 4096` to the K-split kernel, leaving `ncols == 1` with
+  `K < 4096` (MoE down/router and other short-K projections) as the remaining surface.
+* **§10** `launch_fattn`'s `parallel_blocks` used to key off `ntiles_dst` (a function of `Q->ne[1]`), so a
+  decode and a verify grouped the online-softmax partials differently (issue #25); block 00 evaluates it
+  as if `n_q == 1` for every `n_q <= 8`.  `n_q == 1` can still differ from a verify batch, because the FA
+  *kernel* is chosen from `Q->ne[1]` -- a decode-vs-verify difference, not a draft-length one.
 
 ## 11. The real purity range: `n_max <= 7`
 
@@ -2675,56 +2620,38 @@ qwen4exp and dense 27B; prefill-logit 0.000000 / 100.000 % (qwen4exp q8_0) and -
 ## 82. Removing a synchronized readback from the decode band is pure only while the device map it replaces is fresh (r203, PR #266)
 
 **The claim.**  The host-expert decode band can skip the per-op routing readback (and the device
-`synchronize` it forces) by mapping the routing to slot ids **on the device**, as long as (a) every expert
-is still read from the bytes it was read from before and (b) the map is rebuilt whenever the residency
-changes.  Both hold in the r203 fold, and the arm is bit-identical to the eager one on every deterministic
-oracle.
+`synchronize` it forces) by mapping the routing to slot ids on the device, as long as every expert is still
+read from the bytes it was read from before **and** the map is rebuilt whenever the residency changes.  Both
+hold in r203's fold: the arm is bit-identical to the eager one on every deterministic oracle, with identical
+MTP acceptance and prefill KLD 0.000000.
 
-**The rule.**  Three things a change must keep:
+**The rule -- three things a change must keep:**
 
-1. **`slot_dirty` is the map's only freshness signal, and every slot mutation must set it.**  Fill,
-   eviction, stand-down, slab eviction (`moe_cache_evict_slab_range`), the shrink path, device migration and
-   re-arm all do; `free_table_buffers_locked` additionally frees the devremap state, and the re-arm path
-   calls it per table.  A stale map reads a slot that now holds a **different** expert -- fluent, wrong text
-   -- and the cold encoding makes it worse: cold ids are `slots + e`, so a *slot-count* change without a
-   rebuild indexes the pinned master at the wrong offset (or past it).  This is a silent-wrong-answer class,
-   not a crash, so it cannot be caught by "the text looks fine" on one arm.
-2. **The lag is policy-only.**  The policy consumes the previous call's routing, i.e. it may admit the wrong
-   expert for one step.  That is safe *because* it cannot move a read address: an id is either a resident
-   slot (read from the arena) or `slots + e` (read cold from the master), and both are the bytes that expert
-   has.  Keep it that way -- a device-side *policy* (the r40 family, `ENVIRONMENT.md` §1.2) is a different
-   thing and stays removed.
+1. **`slot_dirty` is the map's only freshness signal, and every slot mutation must set it.**  Fill, eviction,
+   stand-down, slab eviction (`moe_cache_evict_slab_range`), shrink, device migration and re-arm all do;
+   `free_table_buffers_locked` also frees the devremap state.  A stale map reads a slot that now holds a
+   *different* expert (fluent wrong text), and the cold encoding makes it worse: cold ids are `slots + e`, so
+   a slot-*count* change without a rebuild indexes the pinned master at the wrong offset, or past it.  Silent
+   wrong answers, not a crash -- one clean-looking arm proves nothing.
+2. **The lag is policy-only.**  The policy consumes the previous call's routing, so it may admit the wrong
+   expert for one step.  That is safe because it cannot move a read address: an id is either a resident slot
+   (arena) or `slots + e` (cold, pinned master), and both are that expert's bytes.  A device-side *policy* is
+   the r40 family (`ENVIRONMENT.md` §1.2) and stays removed.
 3. **An in-place read from the pinned host pool is guarded by the eager path's synchronize.**  The pool's
-   demand path never evicts a resident and a retiring slot is excluded, but the pool *layout* re-rank
-   (`pool_rerank_from_heat_locked`) rewrites slots with plain host copies -- today reachable only from
-   `moe_cache_update_host`, which runs after `ggml_backend_synchronize(input_backend)` and the ids readback's
-   sync.  Remove that sync and both the pool-cold read and the pool-sourced fills lose their guard.
+   demand path never evicts a resident and retiring slots are excluded, but `pool_rerank_from_heat_locked`
+   rewrites slots with plain host copies from `moe_cache_update_host`, which runs after
+   `ggml_backend_synchronize(input_backend)` and the ids readback's sync.  Remove that sync and the pool-cold
+   read -- and the pool-sourced fills -- lose their guard.
 
-**The oracles that can see it** (and the ones that cannot): a *two-slot* text comparison cannot -- concurrent
-decoding is not deterministic (`§38`), and we measured the eager arm disagreeing with itself run to run
-(`869 chars 80d26000974c` vs `768 5452fe998dc6` on one unchanged binary).  Use single-sequence arms
-(`llama-cli`, and a 2-slot server driven **sequentially**, which also exercises slot switching), plus the
-MTP acceptance counts and the prefill-logit gate.
+**The oracle.**  Not a concurrent two-slot text diff (`§38`: the unchanged eager build read two text basins
+run to run here).  Use single-sequence arms, a *sequentially* driven 2-slot server, the MTP acceptance counts
+and the prefill-logit gate.
 
-**Numbers** (gfx1201, 1 x R9700, 35B-A3B UD-Q4_K_M `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=8000` unless stated):
+**Numbers** (gfx1201, 1 x R9700, 35B-A3B UD-Q4_K_M `-ncmoe 40`): 8/8 text arms identical (pinned x pool,
+both switches, 128 and 1000 tokens, a 2048 MiB thrash arena, gpt-oss-20b MXFP4, sequential 2-slot); MTP
+acceptance 0.76089 = 1397/1836 (P) and 0.83340 = 2141/2569 (R) on both arms; prefill KLD 0.000000 /
+100.000 %; **+8.4 %** TG pinned (60.6 -> 65.7), **+4.8 %** pool (57.6 -> 60.4), +14.1 % / +9.2 % at
+`-npl 4`/`-npl 8`, inert under `-sm tensor` (98.0 vs 98.1 t/s).
 
-| arm | eager (`GGML_MOE_DEVREMAP=0`) | remap (default) |
-|---|---|---|
-| greedy text, prose, `-n 1000` | `3657 chars sha=52eb99f71f16` | same |
-| greedy text, recall, `-n 128` | `942 sha=1b3aa35865e1` | same |
-| 2048 MiB arena (thrash), `-n 192` | `1217 sha=03da3104f3eb` | same |
-| gpt-oss-20b MXFP4 `-ncmoe 20`, `-n 192` | `1317 sha=50b884c1febf` | same |
-| 2-slot server, sequential (s0 / s1 / s0) | `450 0b3b17b32e25` / `393 69fc927b3441` / `450 0b3b17b32e25` | same |
-| MTP `draft-mtp` `-n 3000` prose | acc 0.76089 = 1397/1836, len 3.28, 110.5 t/s | acc identical, **113.2 t/s** |
-| MTP `draft-mtp` `-n 3000` reasoning | acc 0.83340 = 2141/2569, 117.9 t/s | acc identical, **121.8 t/s** |
-| `llama-batched-bench -npl 1,4,8` TG | 54.09 / 180.60 / 263.20 | 54.48 / **206.14** / **287.31** |
-| `-sm tensor` 2 GPU (declines), TG | 98.02 | 98.06 (inert) |
-| prefill logits vs the r201 base | -- | **0.000000 / 100.000 %** |
-| pool arm `-ntg 512` TG (`MOE_HOST_POOL_COLD`) | 57.6 (`=0`) | **60.4** |
-
-Coherence 8/8 arms identical, `test-backend-ops -o MUL_MAT_ID` 931/931, GPU faults clean, no new warnings,
-`gate-per-block-build --fast` 4/4, `validate-set.sh` green, Windows-portability lint clean.
-
-**Record:** `WORKLOG.md` 261101.011, `patches/README.md` (block 09), `ENVIRONMENT.md` §1.2,
-`benchmarks/2026-11-01-host-expert-device-remap.md`, `archive/work/pinned-decode-remap/` (the submission and
-the evidence), PR #266 (`briansp2020`).
+**Record:** `WORKLOG.md` 261101.011, `benchmarks/2026-11-01-host-expert-device-remap.md`,
+`archive/work/pinned-decode-remap/`, `patches/README.md` (block 09).

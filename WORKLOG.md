@@ -1,3 +1,48 @@
+## 261101.014 (docs) -- GREEDY-PURITY.md audited and trimmed: the index is ordered again, §37 is corrected, the background is one block
+
+No delivery change (docs only; `patches/`, `release.json` and the fork branch are untouched, so no tag).
+`GREEDY-PURITY.md` was 2730 lines -- not because it repeats itself (each of its 79 findings carries a
+distinct fact) but because it had accumulated structural drift.  The audit found and fixed:
+
+* **The index had gone out of order** (… §73, §76, §75, §79, §74, then §77, §82, §78, §81, §80 -- nine
+  appends landed wherever they were added).  It is now sorted by `§` (with `39b`/`40b` adjacent to their
+  parents), every row still has its claim + status, and the table parses (84 rows, 4 pipes each).
+* **§37's index row contradicted its own entry**: the row still said "the skip must stay prefill-only"
+  while the entry has documented the decode/verify band arm since r133 (`GGML_CUDA_FA_BAND_SKIP`, PR #223).
+  The row now states the r133 scope and both switches.  This was the only stale row: a token-level check of
+  every row against its entry body (rNN / PR / issue / decimal / long-integer tokens) found no other row
+  carrying superseded guidance.
+* **A stray duplicated `---`** sat between the index and the first entry; gone.
+* **The header overstated where the narratives live**: it claimed all investigation narratives are in
+  `archive/docs/GREEDY-PURITY-FINDINGS.md`, but that file stops at `§42` (pre-r100).  The header now says
+  the narrative is `WORKLOG.md` + the `benchmarks/` record each entry names, with the `§§1-42` narratives in
+  the findings archive.  `AGENTS.md` and `README.md` said the same thing and are corrected.
+* **Five entries had no stated shape**: `§§77-81` are row-only (their whole record is the row + the
+  `WORKLOG.md` entry).  That is now the documented convention, and a "how to read an entry" note says which
+  range is which (`§§1-10` background, `§§11-76`+`§82` full, `§§77-81` row-only).
+
+**Trim.**  The ten background entries (`§1-§10`, ~99 lines of pedagogy about the k-quant VDR rounding order,
+written under the pre-V2.0 block numbering) are now one **Background** block of ten labelled bullets
+(~50 lines) that keeps every number (0.184, the 0.203 yardstick, ~17 % fewer serial adds, PPL bit-identical,
+`131072` all-reduce crossover, the `blocks_per_iter`/`kqs` formulas) and every `§` handle, so the citations
+from `AGENTS.md`, `INVARIANTS.md` and the earlier entries still resolve.  `§82` (this release's entry) is
+compressed to claim / rule / oracle / numbers / record, with the detail it used to carry living in
+`benchmarks/2026-11-01-host-expert-device-remap.md` and `INVARIANTS.md`.  Net **2730 -> 2657 lines**, and the
+top layer (invariants + index + background) now reads as a rulebook rather than a chronicle.
+
+**Consistency checks run** (all clean after the fixes): index rows vs entry bodies; index ordering; `§`
+references with no row/entry; the new `§82` against the 11 invariants; and a spot-check of numbers quoted in
+both this file and `INVARIANTS.md` (`0.184`, `50.8 -> 41.7 ms/step`, `131072`, the 16/8-token cache band) --
+identical.  A new invariant 11 records the r203 rule (a device-side fast path for a readback is pure only
+while the state it replaces the readback with is fresh).
+
+**What is left, deliberately.**  The remaining ~60 entries are 20-100 lines each because they carry the
+evidence behind a rule that a gate or a block note quotes (e.g. `§44` hipBLASLt, `§63` verify alignment,
+`§74` the KV-rotation folds).  Compressing them to a uniform claim/rule/numbers/record shape means moving each
+one's investigation narrative into `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` number, which is
+a mechanical but sizeable editorial pass (~1300 lines to read and split).  That is a docs-only session of its
+own, not something to fold into a release; the file states the shape so a future pass can follow it.
+
 ## 261101.013 (docs) -- AGENTS.md is policy again: the engineering facts move to INVARIANTS.md
 
 No delivery change (docs only; `patches/`, `release.json` and the fork branch are untouched, so no tag).

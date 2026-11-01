@@ -118,18 +118,19 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ```
 ├── README.md              # this file: overview + consumer workflow
-├── AGENTS.md              # working guide for LLM agents in this repo
+├── AGENTS.md              # the policy layer: what is mandatory, scope, how a release is cut
+├── INVARIANTS.md          # the engineering facts: measured invariants / "do not re-derive" (pre-ship reading)
 ├── MANIFESTS.md           # apply order + the verification contract (release gates per block)
 ├── BASELINE.md            # fork point, what the patches are, how they are cut, drift policy
 ├── TODO.md                # forward-looking tracker: open items, limitations, parked ideas only
 ├── GREEDY-PURITY.md       # purity rulebook: invariants + one summary entry per finding (read before shipping)
-│                          #   narratives/evidence: archive/docs/GREEDY-PURITY-FINDINGS.md (same § numbers)
+│                          #   narratives/evidence: WORKLOG.md + benchmarks/ (and pre-r100: archive/docs/GREEDY-PURITY-FINDINGS.md)
 ├── WORKLOG.md             # dated delivery records (newest first; the only release history)
 ├── ENVIRONMENT.md         # every env var the set adds or repoints, with its default and class
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
-├── rdna-boosts-all.patch  # convenience: the entire 12-patch net as ONE patch
-├── patches/               # the delivery set: 0000-0011 (one `git am` block each)
+├── rdna-boosts-all.patch  # convenience: the entire 16-block net as ONE patch
+├── patches/               # the delivery set: 0000-0015 (one `git am` block each)
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
