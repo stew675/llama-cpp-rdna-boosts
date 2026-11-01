@@ -1,3 +1,37 @@
+## 261101.015 (docs) -- GREEDY-PURITY.md compressed to the claim/rule/numbers/record shape; every narrative preserved in the findings archive
+
+No delivery change (docs only; no tag).  The rulebook went **2730 -> 2201 lines** while
+`archive/docs/GREEDY-PURITY-FINDINGS.md` grew **1620 -> 3091** with the verbatim pre-compression text of every
+compressed entry.  Nothing was deleted: the archive's new "Part 2" holds each entry's original body under its
+own `§` number, and the rulebook entry keeps a `*Narrative:*` pointer to it.
+
+**What the pass did.**  Every entry that carried an investigation narrative now has the one shape the file's own
+header promises -- **claim** (what is true), **rule** (what a change must satisfy), **numbers** (the arm-
+qualified values a gate or a block note quotes), **record** (where the dated evidence lives).  Compressed:
+§§11, 19, 37, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 63, 65, 66, 68, 69, 70
+(28 entries, −529 lines).  The biggest: §63 (a verify batch is only as cheap as its widest sequence set) 100 ->
+47, §61 (a fused op reproduces the model's own chain) 83 -> 43, §44 (the hipBLASLt per-start lottery) 81 -> 38,
+§60 (the RMS-norm grouping reference) 50 -> 36, §37 (fully-masked KV groups) 27 -> 27 after the r133 scope
+correction.
+
+**What was deliberately left alone.**  §§62, 64, 67, 71, 72, 73, 74, 75, 76 (34-82 lines each) are already
+claim/rule/numbers: their length is the *rules* (six numbered conditions on a fold, the per-quant numbers of two
+folds, the op-test oracles) and cutting them would remove contract, not narrative.  §82 is this release's own
+entry and was written in the target shape.  The measured conclusion: the rulebook's remaining size is rules and
+arm-qualified numbers, not chronicle -- which is why the machine-readable check found so little narrative left
+to move.
+
+**How it was done** (so a future entry can follow it): the narrative markers are `**Evidence (...)`, `**What
+happened`, `**What was reported`, `**Two traps`, `**What it costs`, `**Historical correction`, `**Why no gate
+caught it` -- a paragraph under one of those moves to the archive and the entry keeps a `*Narrative:*` pointer.
+An entry that keeps its **Rule** blocks and its **Numbers** blocks loses nothing a gate uses: spot-checked after
+the pass, the quoted values are all still in the rulebook (`140.6`, `0.021542`, `50.8 -> 41.7`, `6.1e-14`,
+`0.001778`, `0.611`, `104.14`, `0.199764`, `0.000511`).
+
+**Verified.**  84 index rows, 69 detail entries (§§11-76 + §82), §§1-10 in the Background block, §§77-81
+row-only as documented; every section has a body; the index table parses; all 28 `*Narrative:*` pointers resolve
+to a unique archive block; no archive duplicates (three from the first, re-run pass were collapsed).
+
 ## 261101.014 (docs) -- GREEDY-PURITY.md audited and trimmed: the index is ordered again, §37 is corrected, the background is one block
 
 No delivery change (docs only; `patches/`, `release.json` and the fork branch are untouched, so no tag).
