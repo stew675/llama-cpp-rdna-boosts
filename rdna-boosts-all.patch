@@ -55102,7 +55102,7 @@ index 565ed1481..eef461c05 100644
 +int ggml_cuda_mul_mat_q_swiglu_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 752d28c4f..da5319343 100644
+index 752d28c4f..b10eed32d 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -2,21 +2,35 @@
@@ -55219,22 +55219,24 @@ index 752d28c4f..da5319343 100644
      float value = sumf[tid];
  
      if constexpr (has_fusion) {
-@@ -377,6 +428,14 @@ static __global__ void mul_mat_vec_f(
+@@ -377,6 +428,16 @@ static __global__ void mul_mat_vec_f(
          }
      }
  
 +    if constexpr (gate_beta) {
 +        if (!gb_beta) {
-+            // add_softplus_mul_bcast_f32 (unary.cu) on the value the plain kernel would store: bit-identical
++            // add_softplus_mul_bcast_f32 (unary.cu) on the value the plain kernel would store: bit-identical.
++            // `log1pf(expf(x))`, NOT `logf(1.0f + expf(x))` -- the latter is a different rounding and the chain
++            // this epilogue replaces uses `op_softplus` (issue #265; the Q8_0 sibling in mmvq.cu).
 +            const float xb = value + fusion.gb_dt[row];
-+            value = ((xb > 20.0f) ? xb : logf(1.0f + expf(xb))) * fusion.gb_a[row];
++            value = ((xb > 20.0f) ? xb : log1pf(expf(xb))) * fusion.gb_a[row];
 +        }
 +    }
 +
      dst[tid*stride_col_dst + row] = value;
  
      if constexpr (!has_fusion) {
-@@ -384,6 +443,94 @@ static __global__ void mul_mat_vec_f(
+@@ -384,6 +445,94 @@ static __global__ void mul_mat_vec_f(
      }
  }
  
@@ -55329,7 +55331,7 @@ index 752d28c4f..da5319343 100644
  template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
  static void mul_mat_vec_f_switch_fusion(
          const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -391,17 +538,39 @@ static void mul_mat_vec_f_switch_fusion(
+@@ -391,17 +540,39 @@ static void mul_mat_vec_f_switch_fusion(
          const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
          const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
          const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -55371,7 +55373,7 @@ index 752d28c4f..da5319343 100644
              return;
         }
      }
-@@ -411,7 +580,7 @@ static void mul_mat_vec_f_switch_fusion(
+@@ -411,7 +582,7 @@ static void mul_mat_vec_f_switch_fusion(
      ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
          x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
          channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -55380,7 +55382,7 @@ index 752d28c4f..da5319343 100644
  
  }
  
-@@ -452,57 +621,107 @@ void launch_mul_mat_vec_f_cuda(
+@@ -452,57 +623,107 @@ void launch_mul_mat_vec_f_cuda(
  
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
  
@@ -55505,7 +55507,7 @@ index 752d28c4f..da5319343 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -600,6 +819,174 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+@@ -600,6 +821,174 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
                   stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
                   nsamples_dst, ids_stride, stream);
              break;
@@ -55680,7 +55682,7 @@ index 752d28c4f..da5319343 100644
          default:
              GGML_ABORT("fatal error");
      }
-@@ -631,7 +1018,7 @@ static void mul_mat_vec_f_cuda(
+@@ -631,7 +1020,7 @@ static void mul_mat_vec_f_cuda(
  }
  
  void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -55689,7 +55691,7 @@ index 752d28c4f..da5319343 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
      GGML_ASSERT(         dst->type == GGML_TYPE_F32);
-@@ -681,6 +1068,23 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -681,6 +1070,23 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
      }
@@ -55713,7 +55715,7 @@ index 752d28c4f..da5319343 100644
  
      const int64_t s01 = src0->nb[1] / ts_src0;
      const int64_t s11 = src1->nb[1] / ts_src1;
-@@ -718,7 +1122,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -718,7 +1124,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
          } break;
          case GGML_TYPE_BF16: {
              const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
@@ -55722,7 +55724,7 @@ index 752d28c4f..da5319343 100644
                  ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                  ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
          } break;
-@@ -886,3 +1290,148 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+@@ -886,3 +1292,148 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
              return false;
      }
  }
@@ -57111,7 +57113,7 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 930f1adc4..f578ceba3 100644
+index 930f1adc4..0fcff23ce 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,6 @@
@@ -58743,7 +58745,7 @@ index 930f1adc4..f578ceba3 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1580,23 +1972,603 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1580,23 +1972,608 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -58760,8 +58762,13 @@ index 930f1adc4..f578ceba3 100644
 -    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
 -    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
 -    const int64_t src1_padded_row_size, cudaStream_t stream) {
++// This MUST be unary.cu's `op_softplus` verbatim: `logf(1.0f + expf(x))` is NOT `log1pf(expf(x))` (log1p is
++// exact for a small argument, log(1+y) loses the low bits), and the fused SSM kernels are contractually
++// bit-identical to the ADD -> SOFTPLUS -> MUL chain they replace (issue #265: the last-ulp difference was a
++// 0.000562 KLD / 99.0 % top-p divergence at `-ub 4`, i.e. at the width an MTP verify batch actually runs, and
++// it moved the target's greedy text as well).  GREEDY-PURITY.md §81.
 +static __device__ __forceinline__ float ssm_op_softplus(float x) {
-+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
++    return (x > 20.0f) ? x : log1pf(expf(x));
 +}
  
 -    const int64_t ne00 = src0->ne[0];
@@ -59358,7 +59365,7 @@ index 930f1adc4..f578ceba3 100644
  
      const int64_t ne0 = dst->ne[0];
  
-@@ -1616,3 +2588,875 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1616,3 +2593,875 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

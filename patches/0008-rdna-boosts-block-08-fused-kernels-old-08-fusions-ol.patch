@@ -1,4 +1,4 @@
-From 82892344ed2e9a4991fbb504db9e48c8d972c85e Mon Sep 17 00:00:00 2001
+From 8d4a69513a96e13d3cd9f3363dcf9be37cd26877 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused kernels (old-08 fusions +
@@ -67,7 +67,7 @@ text; prefill-logit KLD -0.000000 / same-top-p 100.000 %).
  ggml/src/ggml-cuda/mmq.cuh                    |  454 +++-
  ggml/src/ggml-cuda/mmvq-rdna-params.cuh       |  179 ++
  ggml/src/ggml-cuda/mmvq-rdna.cuh              |   78 +
- ggml/src/ggml-cuda/mmvq.cu                    | 1959 +++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cu                    | 1964 +++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   31 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  246 ++-
  ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    3 +-
@@ -90,7 +90,7 @@ text; prefill-logit KLD -0.000000 / same-top-p 100.000 %).
  ggml/src/ggml-cuda/unary.cu                   |  231 ++
  ggml/src/ggml-cuda/unary.cuh                  |   12 +
  tests/test-backend-ops.cpp                    |    2 +-
- 35 files changed, 5541 insertions(+), 436 deletions(-)
+ 35 files changed, 5546 insertions(+), 436 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/mmvq-rdna-params.cuh
@@ -2926,7 +2926,7 @@ index 000000000..c845ce7c5
 +    return 0;
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 31859d7ef..b761f319f 100644
+index 31859d7ef..12a70e968 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -129,6 +129,8 @@ enum mmvq_parameter_table_id {
@@ -4454,7 +4454,7 @@ index 31859d7ef..b761f319f 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1664,12 +2485,592 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1664,12 +2485,597 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -4465,8 +4465,13 @@ index 31859d7ef..b761f319f 100644
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
  }
  
++// This MUST be unary.cu's `op_softplus` verbatim: `logf(1.0f + expf(x))` is NOT `log1pf(expf(x))` (log1p is
++// exact for a small argument, log(1+y) loses the low bits), and the fused SSM kernels are contractually
++// bit-identical to the ADD -> SOFTPLUS -> MUL chain they replace (issue #265: the last-ulp difference was a
++// 0.000562 KLD / 99.0 % top-p divergence at `-ub 4`, i.e. at the width an MTP verify batch actually runs, and
++// it moved the target's greedy text as well).  GREEDY-PURITY.md §81.
 +static __device__ __forceinline__ float ssm_op_softplus(float x) {
-+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
++    return (x > 20.0f) ? x : log1pf(expf(x));
 +}
 +
 +static __device__ __forceinline__ float ssm_op_sigmoid(float x) {
@@ -5048,7 +5053,7 @@ index 31859d7ef..b761f319f 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1700,3 +3101,159 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1700,3 +3106,159 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

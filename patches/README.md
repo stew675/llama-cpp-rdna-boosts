@@ -779,6 +779,13 @@ must be **bit-identical** to what it replaces at the widths it serves.
   2 and 3 devices on the dense 27B and Flash-Next GSQ `-ncmoe 48`.  `GGML_CUDA_STAGE_PIN=0` restores
   the per-call allocation.
 
+**r201 (issue #265): the SSM gate/beta fusion computes the chain's softplus, verbatim.**  `ssm_op_softplus`
+is now `(x > 20) ? x : log1pf(expf(x))` -- the same expression as `unary.cu`'s `op_softplus`, the node the
+fusion replaces.  It was `logf(1.0f + expf(x))`, a different rounding, so the fused path was not the chain at
+the widths an MTP verify batch runs (0.000562 KLD at `-ub 4`, and it moved the target's greedy text); the
+r183 gate's `--ub 1` arm could not see it because at one token the SSM pre-scan fusion owns those nodes on
+qwen3.5/3.6/3.8.  `GREEDY-PURITY.md` §81.
+
 **Knobs.**  `GGML_CUDA_DISABLE_FUSION` (master), `_DISABLE_MOE_MMQ_FUSION`, `_DISABLE_MMQ_ROUTED`,
 `_DISABLE_TOPK_MOE_FUSION`, `_DISABLE_CONV_FUSION`, `_DISABLE_NORM_ROWS`, `GGML_CUDA_TOPK_SORTED`,
 `GGML_CUDA_FUSE_GDN_GATE`, `GGML_CUDA_FUSE_Q8_1_VERIFY`, `GGML_CUDA_MMVQ_RDNA3_SMALL_M`,
@@ -1304,6 +1311,13 @@ weighted-down reduction, the PLE conv fusion) stays here with the TU that owns i
 block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 marking pass) is block 11.
 
 **Contents.**
+* **The BF16 gate/beta epilogue computes the chain's softplus (r201, issue #265).**  `mmvf.cu`'s `gate_beta`
+  epilogue (`GGML_CUDA_FUSE_GATE_BETA_BF16`) had the same `logf(1.0f + expf(x))` vs `op_softplus`'s
+  `log1pf(expf(x))` rounding as the Q8_0 sibling in block 08; it now calls `log1pf` too.
+  `tests/test-fusion-gate-beta-multiseq.cpp` (owned here) now covers **both** weight types and the delivered
+  models' real contraction length -- `{BF16, 1024}`, `{Q8_0, 1024}`, `{Q8_0, 5120}`, 11 `(T,S)` shapes, 33
+  cases -- because BF16-at-1024 was the only arm the unit oracle had, and no GDN model in the delivery runs
+  that.  `GREEDY-PURITY.md` §81.
 * **The slab** (`ggml-cuda-slab.cu`, `ggml-cuda-arena.cu`): one VMM reserve per device split by a movable
   boundary — compute below, MoE arena above, no HIP call at runtime.  Plus the narrow-band learning, the
   wide-phase auxiliary region, pool-wide routing, and the slab transient absorption.

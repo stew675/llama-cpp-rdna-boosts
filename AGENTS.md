@@ -1285,6 +1285,20 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   reported — judge per node (~1-2 us) or by `FIRSTUSE`.  Also measured there: `hipFuncGetAttributes` in
   these runs is **librccl** (NCCL init), not ours.  Tooling (probe extension + an `LD_PRELOAD` HIP
   call-site interposer): `archive/work/decode-warmup-stall/`.
+- **A fused kernel that replaces a ggml chain must call that chain's transcendental op VERBATIM, and a
+  decode-band fusion owes its purity check at the VERIFY width, not only at `--ub 1` (r201, issue #265).**  Both
+  SSM gate/beta fusions computed `logf(1.0f + expf(x))` while `unary.cu`'s `op_softplus` (the node they replace)
+  computes `log1pf(expf(x))`: a 0.000562 KLD divergence at `-ub 4` that **moved the target's own greedy text**
+  (4771 `sha=0ac05e4cb358` fused vs 4628 `sha=8631f9a3a623` chain) and its MTP acceptance, and it survived r183
+  through r200 because the r183 gate's `--ub 1` arm is **vacuous** here -- at one token the SSM pre-scan fusion
+  owns those nodes on qwen3.5/3.6/3.8, so the fusion under test never ran.  So for any change to a decode-band
+  fusion: `gate-prefill-logits.sh --ab "<its kill switch>=0"` at **`--ub 1` AND `--ub 4`**, plus
+  `test-logits-width-probe P=4096` on the arms, and extend the type-correct unit oracle rather than trusting a
+  sibling (`test-fusion-gate-beta-multiseq` covered BF16-at-1024 while every delivered GDN model runs Q8_0 at
+  K=5120).  Known residual: on **RDNA3_0** the `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` arm itself is not
+  width-uniform (W=1 vs W>=2, maxdiff 0.138) while the default build is -- `TODO.md` #130, a dedicated-session
+  item, and the reason a fuse-off A/B on gfx1100 is not a clean control.  `GREEDY-PURITY.md` §81,
+  `benchmarks/2026-11-01-ssm-softplus-265.md`.
 - **The GDN decode folds are a 1-GPU win (r183, block 10, PR #256).**  The direct GDN conv now also writes the
   recurrent **snapshot tails** (`GGML_CUDA_DISABLE_GDN_CONV_SNAP=1` off) and reads the **conv-cache row itself**
   for `build_rs`'s deferred `GET_ROWS` (`GGML_CUDA_FUSE_GDN_CONV_GATHER=0` off), and the 1-token direct conv

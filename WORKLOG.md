@@ -1,3 +1,51 @@
+## 261101.008 (issues #265 / #263) -- the SSM gate/beta fusions computed softplus in a different rounding than the chain (blocks 08 + 10 amended)
+
+**Released as `v16-6050b467c-r201` (16 blocks; blocks 08 and 10 amended).**  Canonical tip `7fe2b7829`, tree
+`f122dff75c79a30f4bec0b870a3c92ca91fb0ba9` (r200 was `2ed3997f5` / `c6c2f03d`).  `release.json` refreshed;
+`patches/` regenerated; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball,
+tree equality, 286 files through the Windows portability lint); `scripts/fork-refresh.sh --build --gates`
+re-cut the branch from the base, reproduced tree `f122dff7` + tip `7fe2b7829`, built and passed the canonical
+`gate-prefill-logits.sh` (**0.000000 / 100.000 %**); the fork's `rdna-boosts` branch is force-pushed to
+`7fe2b7829`.  Record: `benchmarks/2026-11-01-ssm-softplus-265.md`.
+
+**The defect (issue #265, reported on r195 by `DanoPTT`; and the #263 acceptance loss).**  Both SSM gate/beta
+fusions -- `ssm_gate_beta_fused_q8_0` (mmvq.cu, `GGML_CUDA_FUSE_GATE_BETA_VERIFY`) and the BF16 sibling's
+epilogue in `mmvf.cu` (`GGML_CUDA_FUSE_GATE_BETA_BF16`) -- computed the gate as
+`logf(1.0f + expf(x))`, while `unary.cu`'s `op_softplus`, the node they replace, computes
+`log1pf(expf(x))`.  The two differ in the last bits for ordinary arguments, so the fused path was **not** the
+chain: measured on the r200 build at the width an MTP verify batch actually runs,
+`gate-prefill-logits.sh --ub 4 --ab "GGML_CUDA_FUSE_GATE_BETA_VERIFY=0"` read **0.000562 KLD / 99.000 %**
+(dense 27B Q8_0, gfx1201) and **0.000565 / 98.971 %** (dense 27B UD-Q4_K_M, gfx1100).  It was invisible to the
+r183 gate because that was `--ub 1`, which on qwen3.5/3.6/3.8 is **vacuous** for this fusion: at one token the
+SSM pre-scan fusion owns those nodes, so the fusion under test never ran.
+
+The visible consequences were exactly the class the two reporters describe: the target's **own greedy text
+changed** with the fusion toggled (27B UD-Q4_K_XL, `draft-mtp n3`, 1 GPU: 4771 chars `sha=0ac05e4cb358`
+fused vs 4628 chars `sha=8631f9a3a623` chain, reproduced 2/2) and its MTP acceptance moved (782/1247 vs
+780/1257).  After the fix the two arms are **byte-identical**: 4628 chars `sha=8631f9a3a623`, 780/1257, and
+the same draft count, on gfx1201; gfx1100 (`n_max 2`, 710/977 `sha=eca29f334d6a`) is unchanged by the fix
+because that box's residual difference comes from the kill-switch arm, not from this kernel (see #130 below).
+
+**The fix (2 lines + comments).**  `ssm_op_softplus` in `mmvq.cu` and the BF16 epilogue in `mmvf.cu` now call
+`log1pf(expf(x))`, i.e. `op_softplus` verbatim, with a comment naming the invalidity of the old form.
+
+**The oracles, extended (this is the part that must not be dropped).**
+* `tests/test-fusion-gate-beta-multiseq.cpp` (block 10) now covers **both** siblings and the model's real
+  contraction length: `{BF16, k=1024}`, `{Q8_0, k=1024}`, `{Q8_0, k=5120}` x 11 `(T,S)` shapes = **33/33
+  bit-identical, all fused** on gfx1201 and gfx1100.  The shipped test only exercised BF16 at k=1024, which is
+  not the type or the shape any delivered GDN model runs (`blk.N.ssm_alpha/beta.weight` is Q8_0, K=5120).
+* `gate-prefill-logits.sh --ub 4 --ab "GGML_CUDA_FUSE_GATE_BETA_VERIFY=0"` is the gate that sees it:
+  **-0.000000 / 100.000 %** after the fix (gfx1201).
+* `test-logits-width-probe P=4096`: the **default** build is width-uniform on both boxes (gfx1201 and gfx1100,
+  maxdiff 0).  On gfx1100 the `GGML_CUDA_FUSE_GATE_BETA_VERIFY=0` arm is **not** (W=1 vs W>=2, maxdiff
+  0.138) -- a pre-existing kill-switch-arm impurity, tracked as `TODO.md` #130, and the reason a
+  fuse-off A/B on RDNA3_0 is not a clean control.
+
+**Items.**  `GREEDY-PURITY.md` **§81** (verbatim transcendental + gate a decode-band fusion at the verify
+width), `MANIFESTS.md` (release gate: the `--ub 4` arm joins `--ub 1` for any change to a decode-band fusion),
+`TODO.md` **#130** (the RDNA3_0 kill-switch arm), `AGENTS.md` (one critical-facts bullet), `patches/README.md`
+(blocks 08 and 10).
+
 ## 261101.007 (issue #264) — the MTP draft KV window is granted PER SEQUENCE (block 15 amended)
 
 **Released as `v16-6050b467c-r200` (16 blocks; block 15 amended).**  Canonical tip `2ed3997f5`, tree

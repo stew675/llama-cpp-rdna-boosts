@@ -92,6 +92,11 @@ in CI.  The model-level gates are manual:
    The default arm is an **f16 KV cache**, which skips the quantized-cache prefill paths (the F16 FA staging
    arena, `GGML_CUDA_FA_KV_NATIVE`'s tile read); a change to those also needs `--kv q8_0` (its own base file,
    r156).
+   **A change to a decode-band fusion owes two more arms (r201, `GREEDY-PURITY.md` §81):** the same
+   `--ab "<fusion kill switch>=off"` at `--ub 4` (a verify width) as well as at `--ub 1`, and
+   `test-logits-width-probe P=4096` on the arms.  `--ub 1` alone is **vacuous** where another single-token
+   fusion owns the same nodes (the SSM pre-scan fusion does exactly that on qwen3.5/3.6/3.8), which is how
+   the gate/beta softplus rounding survived r183..r200.  Quote both arms.
    A **kernel-family switch** (a new tile/WMMA head cap, e.g. block 05's RDNA3_0 head-512 rows) uses the
    script's `--family-switch` mode, which judges the same absolute limits **at a point inside the gate's
    calibrated domain** and always prints a same-kernel reordering control measured on the spot:
