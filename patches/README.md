@@ -804,6 +804,27 @@ fitting the whole model on the device: a pinned host master, a per-op H2D stagin
 can hand an op to a host-resident table, and the MoE expert cache that keeps the hottest experts in
 whatever VRAM is left.
 
+**A host expert table's routing must be computed before the split that prunes its upload (r197, `TODO`
+#129).**  `ggml_backend_sched_copy_input` prunes a host master's per-op upload to the experts the routing
+selects, and that readback happens when the split's INPUTS are copied -- i.e. before the split computes.
+This block looks for **any** `MUL_MAT_ID` consumer of the input inside the split (upstream only considers the
+split's *first* node, and that generalisation is what lets one merged split hook the gate, up and down
+tables), while the split pass only starts a new split for a host weight once the split already has an input
+to reuse.  A config whose attention runs on the host (`-nkvo`) defeats that: the GPU split begins at the
+attention output with no input yet, swallows the router chain and the routed op, and the readback then
+returns the previous split's leftover memory -- `GGML_ASSERT(id >= 0 && id < n_expert)`, or, when a stale
+word happens to land in `[0, n_expert)`, a **silent wrong-expert selection**.  Two parts, both here: when
+the ids root (the `view_src` chain of `node->src[2]`) is a node of the split being copied, every
+routing-dependent shortcut stands down (the pruned upload, the device gather and `moe_cache_update`) and the
+general input path copies the whole table -- which is upstream's behaviour for that shape; and the split
+pass starts the split AT such a routed op, after the router chain (`next_moe_layer` keeps one layer's routed
+ops in the split that starts there), so the pruning and the expert cache keep working.  Measured on one
+R9700, a 24-layer 128-expert MoE at `-ncmoe 24 -nkvo`: abort -> **24.6 t/s** (stand-down alone) -> **82.7
+t/s** (both), against **176** with the KV on the GPU.  Text is byte-identical between the `-nkvo` and
+default arms on bailingmoe3, 35B-A3B (also under `draft-mtp`), gpt-oss-20b, Flash-Next/qwen4exp and a dense
+4B, and identical to the pre-r197 default arms.  The stand-down is also the invariant for the existing
+multi-consumer case, whose in-range garbage ids would otherwise be silent.
+
 **The verify batch of a multi-slot step is bounded by the band as a WHOLE (r153, issue #234).**
 `LLAMA_SPEC_ALIGN` (block 02) makes every sequence that verifies in one step present the same row count, so a
 batch is `n_drafting * (n_draft + 1)` rows.  The aligned depth is therefore bounded by
@@ -2921,6 +2942,16 @@ byte-identical to a build without this block, including its OOM.
   (one message from the fit and one from the cache, naming the split) and keeps the KV fully resident;
   `-sm layer` and one device are unaffected.  Before r181 the reg lookup was an assert, so default `--fit`
   aborted on **every** multi-device `-sm tensor` run (see the block-15 note in `WORKLOG.md` 261030.005).
+* **`-nkvo` declines the window, and the streamed arm keys on the PLACEMENT (r197).**  A window is one VMM
+  region per device plus a pinned host tail, and the per-layer buffer type is chosen inside `if (offload)`:
+  with `-nkvo` the cache is pageable host RAM end to end, so there is nothing to window.  The plan block's
+  guard did not test `offload`, so it still logged "WINDOWED KV ENABLED" (measured: a plain `CPU KV buffer`
+  holding the whole context while announcing a 64-cell VRAM window), reserved pinned spill budget and left
+  `kv_resident_cells` set -- which `is_streaming()` turned into qwen4exp's sparse decode arm for a KV with
+  no region at all.  The window now declines once, with the reason (the pool already declined on
+  `!offload`), and `is_streaming()` tests `kv_region`, the placement actually taken, which also covers a
+  device cache whose region buft the backend refused.  Text is unchanged in every arm: the decline is a
+  no-op, since `-nkvo` + window already read as `-nkvo` alone.
 * **`auto` is a decision, not a guess (r181).**  The fit hands down three distinct states — a window, "the KV
   fits fully resident, keep it" (silent), and "nobody decided" (which still warns) — and it only takes the
   pinned-RAM clamp while the widened window still meets the VRAM target.  If the `MemAvailable` ceiling would

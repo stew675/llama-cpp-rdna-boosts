@@ -1,4 +1,4 @@
-From 8a29ad2e6fb0e9cd09afa96b5fd2fbfc2d5f6a82 Mon Sep 17 00:00:00 2001
+From b3fdf1ccdd37a55ffa972ed6d65200f08211a312 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -259,6 +259,19 @@ r194 corner fixes (found by a configuration battery against Flash-Next after r19
   (qwen3.5/3.6/3.8) are unchanged (776 MiB on the 35B).
 The VRAM cliff at -c 262144 is documented (not code): the 768 MiB default headroom is one hipBLASLt
 workspace short for the first prefill, GGML_CUDA_SLAB_HEADROOM_MIB=1536 is 3/3 requests clean.
+
+Amendment (TODO #129's sibling): `-nkvo` declines the window, and the streamed arm keys on the placement.
+
+The window is a DEVICE region plus a pinned host tail, but its guard did not test `offload`: with
+`-nkvo` the per-layer buffer is chosen inside `if (offload)` and stays plain pageable host memory, while
+the plan block still logged "WINDOWED KV ENABLED", reserved pinned-RAM spill budget and left
+`kv_resident_cells` set.  `is_streaming()` then keyed the streamed (sparse) decode arm on that plan --
+qwen4exp consumes it -- for a KV with no region at all.  Measured: `-nkvo LLAMA_KV_RESIDENT_CELLS=64`
+built a plain `CPU KV buffer` of the whole context while announcing a 64-cell VRAM window.  The window
+now declines once, with the reason (the pool already declines on `!offload`), so `-nkvo` means "no
+streamed placement"; `is_streaming()` tests `kv_region`, the placement actually taken, which also covers
+a device cache whose region buft the backend refused.  Text is unchanged in every arm (the decline is a
+no-op: `-nkvo` + window already read as `-nkvo` alone).
 ---
  common/common.cpp                          |   20 +-
  common/draft-reserve.cpp                   |   38 +-
@@ -280,7 +293,7 @@ workspace short for the first prefill, GGML_CUDA_SLAB_HEADROOM_MIB=1536 is 3/3 r
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
  src/llama-ext.h                            |   51 +
- src/llama-kv-cache.cpp                     |  851 ++++++++++++-
+ src/llama-kv-cache.cpp                     |  869 ++++++++++++-
  src/llama-kv-cache.h                       |   94 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
  src/llama-memory-hybrid-idx.h              |    4 +-
@@ -289,7 +302,7 @@ workspace short for the first prefill, GGML_CUDA_SLAB_HEADROOM_MIB=1536 is 3/3 r
  src/llama-memory.h                         |   15 +
  src/llama-model.cpp                        |   82 +-
  src/models/qwen4exp.cpp                    |   58 +-
- 29 files changed, 4678 insertions(+), 53 deletions(-)
+ 29 files changed, 4696 insertions(+), 53 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -4480,7 +4493,7 @@ index 0079595f5..75a1794ed 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..6ebab6aec 100644
+index b3f3a9c87..ff5e6b0bc 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,259 @@ static bool ggml_is_power_of_2(int n) {
@@ -4753,7 +4766,7 @@ index b3f3a9c87..6ebab6aec 100644
      model(model), hparams(hparams), v_trans(v_trans),
      n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
      n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_type(swa_type),
-@@ -187,6 +441,230 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +441,246 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -4795,6 +4808,22 @@ index b3f3a9c87..6ebab6aec 100644
 +                               "Meta (tensor-split) device, which has no buffer type of its own; the KV stays "
 +                               "fully resident.  Use one device, or -sm layer, for the window "
 +                               "(LLAMA_KV_RESIDENT_CELLS).\n", __func__);
++            }
++            w = 0;
++        }
++        // A window is a DEVICE region plus a pinned host tail.  A cache that is not device-offloaded
++        // (`-nkvo`) is pageable host RAM from end to end -- the per-layer buffer is chosen inside
++        // `if (offload)` below -- so there is nothing to window, and leaving the plan set would make
++        // `is_streaming()` (and with it qwen4exp's sparse decode arm) and the pinned-RAM spill reserve
++        // describe a placement this cache does not have.  Decline it, once, with the reason.
++        if (w != 0 && !offload) {
++            static bool warned_not_offloaded = false;
++            if (!warned_not_offloaded) {
++                warned_not_offloaded = true;
++                LLAMA_LOG_WARN("%s: the windowed KV was declined: it is one VMM region per device plus a pinned "
++                               "host tail, and this cache is not device-offloaded (`-nkvo`: the whole KV is already "
++                               "pageable host RAM), so there is nothing to window.  The KV cache is unchanged.\n",
++                               __func__);
 +            }
 +            w = 0;
 +        }
@@ -4984,7 +5013,7 @@ index b3f3a9c87..6ebab6aec 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +721,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +737,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -5025,7 +5054,7 @@ index b3f3a9c87..6ebab6aec 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -252,11 +764,24 @@ llama_kv_cache::llama_kv_cache(
+@@ -252,11 +780,24 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -5052,7 +5081,7 @@ index b3f3a9c87..6ebab6aec 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -265,13 +790,38 @@ llama_kv_cache::llama_kv_cache(
+@@ -265,13 +806,38 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -5093,7 +5122,7 @@ index b3f3a9c87..6ebab6aec 100644
      }
  
      if (reuse) {
-@@ -319,6 +869,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -319,6 +885,29 @@ llama_kv_cache::llama_kv_cache(
          ctxs_bufs.emplace_back(std::move(ctx), buf);
      }
  
@@ -5123,7 +5152,7 @@ index b3f3a9c87..6ebab6aec 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -425,6 +998,9 @@ void llama_kv_cache::clear(bool data) {
+@@ -425,6 +1014,9 @@ void llama_kv_cache::clear(bool data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
@@ -5133,7 +5162,7 @@ index b3f3a9c87..6ebab6aec 100644
      }
  }
  
-@@ -743,6 +1319,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -743,6 +1335,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -5144,7 +5173,7 @@ index b3f3a9c87..6ebab6aec 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -798,6 +1378,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -798,6 +1394,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -5183,7 +5212,7 @@ index b3f3a9c87..6ebab6aec 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1023,9 +1635,32 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1023,9 +1651,32 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      for (const auto & [ctx, buf] : ctxs_bufs) {
          ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
  
@@ -5217,7 +5246,7 @@ index b3f3a9c87..6ebab6aec 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1035,6 +1670,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1035,6 +1686,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -5252,19 +5281,21 @@ index b3f3a9c87..6ebab6aec 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1551,6 +2214,149 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1551,6 +2230,151 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
 +bool llama_kv_cache::is_streaming(uint32_t n_kv) const {
-+    // The window is a CELL count and it is only ever set when the region provider is in use; a cell at or
-+    // above it is backed by pinned host RAM (the slide is monotone).  `n_kv` is the extent the graph is
-+    // about to read, so this answers the question the arm choice actually asks.
++    // The dense decode arm would read `O(depth)` KV bytes per step over the link whenever the cells the
++    // graph is about to read are NOT device-resident, so this is the placement question, not the plan one:
++    // `kv_region` is set only where the per-layer buffer type was actually taken (see `offload` above), and
++    // `kv_resident_cells` alone also names a plan whose buft the backend declined.  Keying on the plan made
++    // a `-nkvo` cache (or a refused region buft) pick the streamed arm for a fully host/fully resident KV.
 +    //
 +    // wip/kv-residency (TODO #118) B-A: an ACTIVE ATTENDANCE POOL streams too -- the cell-indexed cache is the
 +    // pinned host mirror there, so the DENSE decode arm would read `O(depth)` bytes per step over the link.
 +    // The pool exists to serve the sparse arm, so the pool turning the dense arm off is part of its contract.
-+    return has_kv_pool() || (kv_resident_cells != 0 && n_kv > kv_resident_cells);
++    return has_kv_pool() || (kv_region && kv_resident_cells != 0 && n_kv > kv_resident_cells);
 +}
 +
 +bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
@@ -5402,7 +5433,7 @@ index b3f3a9c87..6ebab6aec 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1612,6 +2418,28 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1612,6 +2436,28 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -5431,7 +5462,7 @@ index b3f3a9c87..6ebab6aec 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -1890,6 +2718,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1890,6 +2736,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -5441,7 +5472,7 @@ index b3f3a9c87..6ebab6aec 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3314,6 +4145,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3314,6 +4163,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -5451,7 +5482,7 @@ index b3f3a9c87..6ebab6aec 100644
      return true;
  }
  
-@@ -3487,6 +4321,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3487,6 +4339,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  

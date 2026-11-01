@@ -1,9 +1,10 @@
 # C3 — `-nkvo` + host experts (TODO #129): a routed op whose ids are computed by its own split
 
-Session A19, 2026-11-01.  Branch `wip-kv-residency-129` in `~/llama.cpp` (commit `e6ec2f9c2`),
-cut from the r196 tree (`bb6599e80`).  **Not in `patches/` and not in a release** — the delivery still
-aborts on this combination; the change is ready for an amendment to **block 09** once the maintainer
-approves it.
+Session A19, 2026-11-01.  Developed on branch `wip-kv-residency-129` in `~/llama.cpp` (commit
+`e6ec2f9c2`) cut from the r196 tree, then **delivered as `r197`**: the two hunks are an amendment to **block
+09** and the sibling window guard below is an amendment to **block 15** (`WORKLOG.md` 261101.002,
+`release.json` tip `ba7c2b7b8`).  `TODO` #129 is closed.  What follows is the diagnosis as written before the
+release, plus §7 for the delivery.
 
 ---
 
@@ -106,11 +107,12 @@ entirely unless the input is a **host** expert weight, so a full-GPU arm takes n
   change — the default path's splits are unchanged, and `gate-prefill-logits.sh` compares the default
   27B Q8_0 point, so it is owed at the release that ships this, not by this change).
 
-## 5. Left for the release (needs the maintainer)
+## 5. Delivery (done in r197)
 
-1. Amend **block 09** with the two hunks (regenerate `patches/0009-…`, `release.json`, then the normal
-   release flow: `validate-set.sh`, `gate-per-block-build.sh --changed-from`, the prefill-logit point at
-   the 27B Q8_0, coherence + MTP Protocol A, `fork-refresh.sh`).
+1. ~~Amend **block 09** with the two hunks.~~  **Done in r197** (`patches/0009-…` regenerated,
+   `release.json` tip `ba7c2b7b80252e313197e758b0070246d2ef0952` / tree
+   `eaf673210a4b03c2121eccae2f10302310b2ae62`, `validate-set.sh` 16/16, per-block build 2/2, prefill-logit
+   0.000000 / 100.000 %, coherence + MTP arms in `WORKLOG.md` 261101.002).
 2. ~~An `upstream/` candidate.~~  **No** — upstream cannot reach it: its prune callback only fires when
    the routed op is the split's *first* node, and this shape's split starts at the attention-output
    `CONT`, so upstream copies the whole table.  The reachability came with block 09's generalised
@@ -129,3 +131,25 @@ HIP_VISIBLE_DEVICES=0 timeout 300 build-rocm/bin/llama-cli \
   --single-turn --no-display-prompt
 # compare against the same command without -nkvo (must be the same text)
 ```
+
+## 7. The delivery (r197)
+
+Both hunks are an amendment to block 09, and the sibling fault found while validating them is an amendment
+to block 15:
+
+* **block 15 — `-nkvo` declines the window.**  A window is a DEVICE region plus a pinned host tail, but the
+  plan block's guard never tested `offload`, so `-nkvo LLAMA_KV_RESIDENT_CELLS=64` announced "WINDOWED KV
+  ENABLED: the newest 64 of 4096 cells stay in VRAM" and then built a plain **pageable CPU buffer** of the
+  whole context (`CPU KV buffer size = 27.00 MiB`), reserved pinned spill budget for a cache that cannot
+  spill, and left `kv_resident_cells` set — which `is_streaming()` turned into **qwen4exp's sparse decode
+  arm** for a KV with no region at all (that arm's premise is a pinned host mirror resolved through a device
+  pool).  The window now declines once with the reason (the pool already declined on `!offload`), and
+  `is_streaming()` tests `kv_region` — the placement actually taken — which also covers a device cache whose
+  region buft the backend refused.  Text unchanged everywhere: `-nkvo` + window already read as `-nkvo`
+  alone (251 chars `caa1f08f0a5e`), the GPU-window arm still enables (`ROCmKVRegion0+win64c`).
+
+Release gates recorded in `WORKLOG.md` 261101.002: coherence on nine arms (dense 27B/4B, Ling, 35B-A3B ±
+`draft-mtp`, gpt-oss-20b, Flash-Next default/`-nkvo`/attendance-pool, the Ling window and `--host-experts
+pool` arms), MTP prose `-n 3000` (`draft-mtp` == `none`, acceptance 1449/1791 identical, t/s flat), the
+stock batched-bench `-npl 1,4,8` arm, prefill-logit **0.000000 / 100.000 %**, per-block build **2/2**, park
+PASS, ckpt-reuse PASS, state-pipe PASS, `check-gpu-faults.sh` clean.

@@ -1,3 +1,80 @@
+## 261101.002 (r197) -- block 09: a routed host-weight op whose routing ids are computed by its own split (#129); block 15: `-nkvo` declines the window, and the streamed arm keys on the placement
+
+**Released as `v16-6050b467c-r197` (16 blocks; block 09 and block 15 amended).**  Canonical tip
+`ba7c2b7b80252e313197e758b0070246d2ef0952`, tree `eaf673210a4b03c2121eccae2f10302310b2ae62` (r196 was
+`bb6599e801c32be0fb457e6cefb8e99a999de358` / `164070eecdb4db3b7fba057dca1ba90cdec0ca34`).  `release.json`
+refreshed; patches regenerated from `6050b467c..r197-chain` (blocks 10-14 carry new `From` lines from the
+rebase, identical bodies); `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c`
+tarball, tree equality, 286 files through the Windows portability lint); `fork-refresh.sh` re-cut the branch
+from the base and reproduced the tree.  Campaign record: `wip/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
+
+### #129 -- `-nkvo` + host experts aborted (block 09) — CLOSED
+
+`-ncmoe <n> -nkvo` aborted during the first graph (`GGML_ASSERT(id >= 0 && id < n_expert)`,
+`ggml_backend_sched_copy_input`).  The cause is **not** the expert cache and **not** block 15: this block
+prunes a host master's per-op upload using the routing, and reads the ids when the split's inputs are
+copied; it searches for **any** `MUL_MAT_ID` consumer of the input inside the split (upstream only considers
+the split's first node — that generalisation exists so one merged split hooks the gate, up and down tables),
+while the split pass starts a new split for a host weight only once the split already has an input to reuse.
+`-nkvo` puts the attention on the host, so the GPU split starts at its output with `n_inputs == 0`, swallows
+the router chain and the routed op, and the readback reads the previous split's memory — out of range
+aborted, **in range silently selected the wrong experts**.  So this is a **delivery-introduced reachability**
+(not an upstream bug: upstream cannot get there, and its whole-table copy is the fallback part A restores).
+
+The fix is two hunks: when the ids root (`view_src` chain of `node->src[2]`) is a node of the split being
+copied, the routing-dependent shortcuts stand down (pruned upload, device gather, `moe_cache_update`) and the
+general path copies the whole table; and the split pass starts the split AT such a routed op, after the
+router chain (`next_moe_layer` keeps the layer's routed ops together), so the pruning and the expert cache
+keep working.  **Measured** (1 x R9700, interleaved, `-n 128 -r 2`): Ling-3.0-tiny `-ncmoe 24 -nkvo` — abort
+-> **24.6 t/s** (stand-down alone) -> **82.7 t/s** (both) against **176** with the KV on the GPU; the
+pre-fill loss on that arm (4480 vs 6600) is the `-nkvo` attention on the CPU, identical with and without the
+split boundary.  Cache arm (`MOE_EXPERT_CACHE_MIB=3000`, `-nkvo`): arena 2998.3 MiB, **17547/22584 = 0.777
+reach**, so the update hook is fed again (under the stand-down alone it never is).  Graph census
+`direct=708 replay=7198 capture=118 properties_changed=96` over 64 decode tokens: the new boundary still
+captures and replays.
+
+### The window declines under `-nkvo` (block 15)
+
+A sibling fault found while validating #129: the window's guard never tested `offload`, so `-nkvo` +
+`LLAMA_KV_RESIDENT_CELLS=64` logged "WINDOWED KV ENABLED: the newest 64 of 4096 cells stay in VRAM" and then
+built a plain **pageable CPU buffer** of the whole context (`CPU KV buffer size = 27.00 MiB`), reserved
+pinned spill budget for a cache that cannot spill, and left `kv_resident_cells` set — which
+`is_streaming()` turned into **qwen4exp's sparse decode arm** for a KV with no region (its premise, a pinned
+host mirror resolved through a device pool, does not exist there).  The window now declines once with the
+reason (the pool already declined on `!offload`, and on an active window), and `is_streaming()` tests
+`kv_region` — the placement actually taken — which also covers a device cache whose region buft the backend
+refused.  Text is unchanged (`-nkvo` + window already read as `-nkvo` alone: 251 chars `caa1f08f0a5e`), and
+the GPU-window arm still enables (`ROCmKVRegion0+win64c`).
+
+### Gates
+
+* **Coherence** (same-seed, `-n 48`, seed 42, temp 0, r196 vs r197, r197 additionally with `-nkvo`): Ling
+  `-ncmoe 24` `caa1f08f0a5e` / 35B-A3B UD-Q4_K_M `-ncmoe 48` `cf7f8b23f404` / 35B-A3B `draft-mtp`
+  `a2bf5eebdd09` / gpt-oss-20b `-ncmoe 24` `7800c9430515` / Flash-Next GSQ-IQ3_XXS `-ncmoe 48 -c 8192`
+  `ffed60de47ae` (default and `-nkvo`) / dense 27B Q8_0 `da2e2d192e21` / dense 4B Q8_0 `6ff72e08d38b`;
+  Ling window(64) and `--host-experts pool` arms `caa1f08f0a5e`; Flash-Next **attendance-pool** arm
+  (`LLAMA_KV_REGION_POOL=4096`, q8_0, `LLAMA_KV_POOL_VERIFY=1`, `LLAMA_KV_POOL_STATS`) `ffed60de47ae`, stats
+  `2048 pages x 4 cells/layer, bad 0`, identical on both builds.  **r196 still aborts** on the Ling and
+  35B-A3B `-nkvo` arms; r197 is identical to the default arms.  `check-gpu-faults.sh` clean.
+* **MTP** (dense 27B UD-Q4_K_XL, prose axis, `-n 3000`, bf16 KV, `--reasoning off`): `draft-mtp`
+  72.95 -> 72.77 t/s, `none` 29.64 -> 29.66, **draft 1791 / accepted 1449 identical**; text at `-n 600`
+  byte-identical r196 vs r197 **and** `draft-mtp` == `none` (`1736 chars b1514bb3eda0`).  Stock-relative
+  `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` (35B-A3B `-ncmoe 48`): TG 93.2/293.7/419.7 (r196) vs
+  93.7/290.6/420.1 (r197), PP within noise.
+* **Prefill logits** (canonical 27B Q8_0 point): **0.000000 KLD / 100.000 % same-top-p**.
+* **Per-block build**: `--changed-from bb6599e80 --fast` -> **2/2** (block 09 505 s, block 15 8 s); the
+  unchanged blocks are skipped by patch-id.
+* **Parking** (`gate-park-idle-slots.sh`, 35B-A3B `-ncmoe 48`, 1 GPU, `SM=layer`): PASS — 3 park + 1 unpark
+  moves traced, park == lazyoff on A-D, parkoff differs on B (the workload reproduces #210).
+* **Checkpoint reuse** (`gate-ckpt-reuse.sh`, 35B-A3B): PASS — keep/eager arms move no token and differ in
+  the mechanism; no GPU fault.
+* **State pipe** (`gate-state-pipe.sh`): PASS — 5 arms; pipelined -6.8 %, threaded copy -7.3 % vs the plain
+  memcpy arm, server save+load 33.2 ms (pipe) vs 40.5 (sync).
+* Not applicable (no change to those surfaces): the hyper-connection fusion gate (no qwen4exp HC edit), the
+  qwen4exp quant-coherence gate and `test-backend-ops` (no kernel or op change: both hunks are host-side
+  scheduler/placement code).  **No upstream candidate**: upstream's `sched_copy_experts` only prunes when the
+  routed op is the split's first node, so it never reads ids its split has not computed.
+
 ## 261101.001 (r196) -- block 11 takes the indexer top-k's BLOCK radix path at plain decode (#125), and block 15's attendance-pool mirror grows on demand (#123)
 
 **Released as `v16-6050b467c-r196` (16 blocks; block 11 and block 15 amended).**  Canonical tip

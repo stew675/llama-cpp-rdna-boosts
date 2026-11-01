@@ -11,17 +11,16 @@ session's context).  **Written 2026-11-01, end of session A18 (the r196 release)
  **Done, do not redo.** Goals A (the resident window, `LLAMA_KV_RESIDENT_CELLS`), B (the attendance pool,
  `LLAMA_KV_REGION_POOL`, plus the streamed cache taking the sparse decode arm) and C (the MTP draft window,
  `LLAMA_SPEC_DRAFT_WINDOW`, default on) are delivered inside **block 15**. `TODO` #123 (the pool's mirror
- grows on demand) and #125 (plain decode takes the top-k's block radix path) closed in **r196**.  The current
- release is `v16-6050b467c-r196` (tip `bb6599e80`, tree `164070eec…`); r195 was PR #261 (block 03). `TODO`
- #121 is closed, #122 is decided (P1).  Do not re-measure or re-decide any of it; the numbers and the records
- are in the handover.
+ grows on demand) and #125 (plain decode takes the top-k's block radix path) closed in **r196**; **#129 closed in
+ r197** (block 09's routing-readiness fix + the block-15 `-nkvo` window guard,
+ `C3-NKVO-HOST-EXPERTS.md`).  The current release is `v16-6050b467c-r197` (tip `ba7c2b7b8`, tree
+ `eaf673210…`); r195 was PR #261 (block 03). `TODO` #121 is closed, #122 is decided (P1).  Do not re-measure or
+ re-decide any of it; the numbers and the records are in the handover.
 
  **What is left**, in the order the handover suggests:
- * **#129** `-nkvo` with host experts aborts (pre-existing; reproduces on the r191 binary, not our block).
  * **#128** the gfx1201 decode-module MTP cost (blocks #120's `q4_0` re-land and any decode-module change here).
  * **#120** / **#127** adjacent block-10 items (remaining KV write types; the F32-only 2-D copy), if there is time.
  * **#124** the `-sm tensor` window, hardware-blocked here (one card) and designed only.
- * **#116** the parked FP8 campaign.
  Plus two candidates the handover lists for a decision: the qwen4exp *separate* MTP draft is not windowed, and a
  pool-size policy for a 200k+ working set.
 

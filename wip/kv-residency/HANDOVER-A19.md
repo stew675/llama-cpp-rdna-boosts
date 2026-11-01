@@ -8,8 +8,11 @@ A/B/C history.  [`COLD-START-PROMPT.md`](COLD-START-PROMPT.md) is the block to p
 
 ## 1. Where things stand
 
-* **The current release is `v16-6050b467c-r196`** (16 blocks, canonical tip `bb6599e80…`, tree
-  `164070eec…`; `release.json` is the source of truth).  It contains:
+* **The current release is `v16-6050b467c-r197`** (16 blocks, canonical tip `ba7c2b7b8…`, tree
+  `eaf673210…`; `release.json` is the source of truth).  r197 (A19) closed `TODO` #129 — block 09's
+  routing-readiness fix — and fixed the block-15 sibling (`-nkvo` now declines the window, and the streamed arm
+  keys on the placement); [`C3-NKVO-HOST-EXPERTS.md`](C3-NKVO-HOST-EXPERTS.md), `WORKLOG.md` 261101.002.  It
+  contains:
   * **r195** (from another agent, PR #261): block 03's moved-recurrent-cell snapshots
     (`test-recurrent-state-depth` Phase C).  **Do not redo it**; it was already published while A18 was in
     flight.
@@ -28,7 +31,6 @@ A/B/C history.  [`COLD-START-PROMPT.md`](COLD-START-PROMPT.md) is the block to p
 
 | item | what | size | blocked by |
 |---|---|---|---|
-| **#129** `-nkvo` + host experts aborts | pre-existing: `-ncmoe 48 -nkvo` on qwen4exp aborts in `ggml_backend_sched_copy_input` (`GGML_ASSERT(id >= 0 && id < n_expert)`); reproduces on r191 and with the pool off | S-M | nothing |
 | **#128** the gfx1201 decode-module MTP cost | a decode-module change costs ~7 % of MTP decode on this box while behaviourally inert; it **blocks #120's q4_0 re-land** and any decode-module change on gfx1201 | investigation | needs a per-node/kernel census + a driver check (7.14 vs 10.1) |
 | **#120** the r187 KV rotations are `q8_0`-only | `q4_0` is done/assessed and returned to the submitter (PR #262, blocked by #128 on gfx1201); remaining `q5_0`, `iq4_nl`, `bf16` | M | #128 for `q4_0` |
 | **#127** `cpy_2d_vec16` is F32-only | the vectorised 2-D fallback covers F32 / 16-byte-aligned; extend it if a BF16/F16 copy shows up | S | nothing |
@@ -44,17 +46,15 @@ Two **candidates** from A17 that are still not TODO rows (decide whether to open
   86.0 % at 102 800, and `=32768` bought 0.2 points and no speed.  The fixed cell count is fine at the shapes
   we run; nobody has asked what it should be at 200k+.
 
-### 2.1 `TODO` #129 — `-nkvo` + host experts (pre-existing, not ours)
+### 2.1 `TODO` #129 — `-nkvo` + host experts — **CLOSED in r197**
 
-Repro on the released **r191** binary too: `-ncmoe 48 -nkvo`, qwen4exp, aborts in
-`ggml_backend_sched_copy_input` (`ggml-backend.cpp:2920`, `GGML_ASSERT(id >= 0 && id < n_expert)`) while
-reading the routing ids on the host in the expert-cache fallback.  Reproduces with `LLAMA_KV_REGION_POOL=0` and
-`--spec-type none`; a dense model with `-nkvo` is fine.
-
-**Plan.**  Shrink it to a small MoE (a 4B-class MoE if one is on disk, else the 35B-A3B), then read that path:
-which backend the ids tensor is on, whether the producer's stream is synced before the `get_async`, and what
-`ids_backend` resolves to when the KV and the inputs are host-side.  Fix, then gate with a text arm against
-`-nkv` on the same config plus the standard coherence sweep.
+Full record: [`C3-NKVO-HOST-EXPERTS.md`](C3-NKVO-HOST-EXPERTS.md).  It was never the expert cache and never
+block 15: block 09's generalised consumer search reads the routing ids when a split's inputs are copied, and
+with `-nkvo` the GPU split began at the host attention output with no input yet, so it swallowed the router
+chain and the routed op and read ids that split had not computed (out of range aborted, in range silently
+picked the wrong experts — a **delivery reachability**, not upstream's, which copies the whole table).  Fixed
+with a whole-table stand-down plus a split boundary at such a routed op; the block-15 sibling (the window now
+declines under `-nkvo`, `is_streaming()` keys on `kv_region`) shipped in the same release.
 
 ### 2.2 `TODO` #128 / #120 — the gfx1201 decode-module cost, then the remaining KV write types
 
@@ -179,7 +179,7 @@ refusals without the arms**.  Nothing here can be done on this box.
 |---|---|
 | [`C1-MIRROR-GROW.md`](C1-MIRROR-GROW.md) | **r196**: the pool mirror grown on demand (#123) — implementation, numbers, gates, the park decision |
 | [`C2-RADIX-TOPK.md`](C2-RADIX-TOPK.md) | **r196**: plain decode takes the top-k block radix path (#125) — the census, the purity arms, the `DERIVED_VIS` note |
-| [`C3-NKVO-HOST-EXPERTS.md`](C3-NKVO-HOST-EXPERTS.md) | **A19, on branch `wip-kv-residency-129` (not shipped)**: `-nkvo` + host experts (#129) — the split-pass root cause, the two-hunk fix in block 09, the arms |
+| [`C3-NKVO-HOST-EXPERTS.md`](C3-NKVO-HOST-EXPERTS.md) | **r197**: `-nkvo` + host experts (#129, closed) — the split-pass root cause, the two-hunk block-09 fix, the block-15 window guard, the arms |
 | [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) | the pool: design, invariants, §7-§10 measured |
 | [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) | Goal B's plan of record, the placement matrix |
 | [`A2-MIXED-BACKING.md`](A2-MIXED-BACKING.md) | the window: design, purity hunt, spill cost, the `auto` decision |

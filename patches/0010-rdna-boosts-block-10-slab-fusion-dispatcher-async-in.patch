@@ -1,4 +1,4 @@
-From 88a3784375cad0ac33b29b542dac5a66962a8ff8 Mon Sep 17 00:00:00 2001
+From 68462198614686f2024f968883bef87d053590e1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -917,7 +917,7 @@ index ce3d1ae13..bf7d09c52 100644
          off += simple_tensor->nb[ss.axis + 1];
      }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 3fcf7e425..6cf1614cf 100644
+index 4ef1e44a5..0d12a3029 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -336,6 +336,42 @@ void ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm) {
@@ -978,7 +978,7 @@ index 3fcf7e425..6cf1614cf 100644
  void ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
      // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region.  Optional hook; a backend
      // without a slab (or that never set it) is a no-op.
-@@ -2218,15 +2262,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2263,15 +2307,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              }
          }
  
@@ -1034,7 +1034,7 @@ index 3fcf7e425..6cf1614cf 100644
          }
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -2804,7 +2882,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2871,7 +2949,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  const bool took = split_backend->iface.moe_cache_update(
                          split_backend, input, input_cpy, ids.data(),
                          ids_tensor->ne[0], ids_tensor->ne[1],

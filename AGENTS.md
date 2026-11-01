@@ -190,7 +190,12 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
   top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
   **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
-  A run with both knobs unset keeps the plain device buffer and its OOM.  **15 also carries Goal C** (r193,
+  A run with both knobs unset keeps the plain device buffer and its OOM.  **They are placements of the KV, so
+  each declines rather than fighting another placement (r197):** the pool declines on an active window and on
+  `!offload`, and the window now declines on `!offload` too — with `-nkvo` the cache is pageable host RAM end to
+  end, so there is nothing to window (before r197 it announced a VRAM window and then built a plain `CPU KV
+  buffer`, and `is_streaming()` took qwen4exp's sparse arm off that plan).  `is_streaming()` therefore keys on
+  `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **15 also carries Goal C** (r193,
   `LLAMA_SPEC_DRAFT_WINDOW`): the MTP draft context's KV is a *window* instead of `-c` cells, **default ON**
   because it measures non-negative (adaptive = a quarter of the context clamped to [32768, 65536], `0` is the
   kill switch), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
@@ -278,6 +283,23 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   offset, and do not drop the `cparams.lf_layer_inp_dev_store` term from `llm_graph_params::allow_reuse()`:
   `GGML_LF_DFLASH_DEV_GRAPH=0` is the A/B arm that restores the pre-r163 shape.  `GREEDY-PURITY.md` §66,
   `WORKLOG.md` 261028.005.
+- **A host expert table's routing must be computed before the split that prunes its upload (r197, `TODO` #129
+  closed).**  `ggml_backend_sched_copy_input` reads the routing ids to prune a host master's per-op upload, and
+  it does that when the split's **inputs** are copied — before the split computes.  Block 09 searches for *any*
+  `MUL_MAT_ID` consumer of the input inside the split (upstream only considers the split's *first* node; that
+  generalisation is what lets one merged split hook the gate/up/down tables), while the split pass starts a new
+  split for a host weight only once the split already has an input to reuse — so a config whose attention runs
+  on the host (`-nkvo`) began its GPU split at the attention output with `n_inputs == 0`, swallowed the router
+  chain and the routed op, and the readback read the previous split's memory.  That is a **delivery reachability,
+  not upstream's bug** (upstream cannot get there and copies the whole table).  Two invariants: when the ids root
+  (the `view_src` chain of `node->src[2]`) is a node of the split being copied, every routing-dependent shortcut
+  (pruned upload, `moe_cache_gather`, `moe_cache_update`) must stand down and the general path copy the whole
+  table — an out-of-range stale id aborted, an **in-range one silently selected the wrong experts**; and the
+  split pass starts the split AT such a routed op (`sched_host_weight_layer`, `next_moe_layer` keeping one
+  layer's routed ops together) so the pruning and the cache keep working.  Measured on one R9700, a 24-layer
+  128-expert MoE at `-ncmoe 24 -nkvo`: abort -> 24.6 -> 82.7 t/s against 176 with the KV on the GPU; text
+  byte-identical to the default arms on bailingmoe3/35B-A3B (± `draft-mtp`)/gpt-oss-20b/Flash-Next/dense.
+  `patches/README.md` (block 09), `wip/kv-residency/C3-NKVO-HOST-EXPERTS.md`.
 - **A cross-device copy must ask `ggml_cuda_slab_peer_copy_ok()` first (r121).**  The slab's
   peer-access grant is per-device and **best effort**: with three ~29 GiB slabs the driver refuses it for the
   second and third device (the peers have no free VRAM to build a 29 GiB peer mapping), and a
