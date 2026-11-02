@@ -1,3 +1,190 @@
+## 261102.005 (wip) -- host-expert window: ONE residency tier works -- +35-40 % decode, byte-identical, the pinned pool deleted; the two "bugs" do not reproduce
+
+No delivery change.  Continues `261102.004`; `wip/host-expert-pinned-window/` (`PROTOTYPE.md` v4,
+`prototype-v4-onetier.patch`), work on the r206 tree in `~/llama-scratch`.  Two new campaign tools so an arm
+is one command: `oracle.sh <label>` (the deterministic greedy oracle) and `bench.sh <label>` (`llama-bench
+-p 256 -n 128 -r 2`), both selecting the arm from the caller's environment.
+
+**Result (1x R9700 @ PCIe 5.0 x16, ROCm 10.1.0, 35B-A3B Q4_K_M, `-ncmoe 40`, arena 4096, pool 2048):**
+
+| arm | pp256 | tg128 | peak RSS | text |
+|---|---|---|---|---|
+| `--host-experts pinned` (delivery default) | 686-689 | 53.8 / 56.6 | -- | `4ac3a523160f` |
+| `--host-experts pool` (delivery) | 687-722 | 52.3-56.9 | 15.4 GB | `4ac3a523160f` |
+| pool + window, ring of 8, no registration | 685-687 | 52.1 / 53.1 | **13.4 GB** | `4ac3a523160f` |
+| **one tier** (`MOE_EXPERT_WINDOW=1 MOE_EXPERT_TENSOR_REG=1`) | 687-722 | **72.6-77.9** | 19.8 GB | `4ac3a523160f` |
+
+So the maintainer's target shape is real: register the host master once, read non-resident experts **in
+place**, and the pinned copy has nothing left to do.  `table_pool_locked` now returns null for a registered
+table, so there is no per-table pinned allocation, prewarm or rerank at all -- the residency is the arena plus
+the **page cache**, one tier, and `MOE_HOST_POOL_MIB` degrades to a fallback ring (32 / 2048 / absent measure
+75.9 / 74.0 / 72.4 t/s, i.e. its size no longer matters).
+
+**Attribution, one switch at a time** (each against the same one-tier arm): `MOE_EXPERT_CACHE_COLD_UVA=0` ->
+**53.5 t/s**, i.e. the whole win is the in-place cold read (with it off the arm is exactly the delivery's
+53.8); `GGML_MOE_DEVREMAP=0` -> 67.9, so the registration also unlocks the sync-free decode remap that was
+gated to pinned masters (+9 %); `-ncmoe 48` -> 77.0 vs pool 56.9.  `--host-experts pinned` gets **no** benefit
+from the same cold read and never beats the pool: a `hipHostMalloc` range is the slowest source for device
+access (the campaign's own copy-path probe: 241 us vs 155 us for a registered mapping), so the existing
+pinned-master tier is paying for an aperture, not for the copy.
+
+**The registration is a mapping, not a lock** -- which is why the design is safe.  `hipHostRegister` makes a
+range device-addressable (UVA alias, 0.6 us, `Mlocked` 0.00 GB throughout); the pages stay reclaimable.  In
+situ: the whole arm runs correctly inside a `MemoryMax=10G` cgroup on a 22.6 GB mapping, i.e. the device is
+reading pages the kernel is reclaiming and re-faulting underneath it.  The +4.4 GB of peak RSS against the
+pool arm is the page cache holding the expert set, not a pin.
+
+**The ring sweep was a clamp, not a sweep.**  `pin_slots = 8` segfaulted because the pool kept a slot table
+(larger than the allocation), so two resident slots could alias one ring entry -- converting every
+`p.base + slot*host_bytes` site to `slot % pin_slots` would have fixed the crash and left the silent
+corruption.  `host_pool_t` now has **one** number (`slots`), `base` holds exactly that many experts, so a slot
+index IS a ring index and every site is in bounds by construction.  The sweep that the ring made visible is
+pure deletion: the per-slot backing vectors (`slot_base`/`slot_dev`/`slot_reg*`, written and never read), the
+per-slot registration pair (`if (true) return false`), and `pool_slot_locked`/`pool_slot_sync` (no caller
+left).  `MOE_EXPERT_WINDOW=1` alone is RSS 15.4 -> 13.4 GB at parity: the memory half, on its own.
+
+**Bugs A and B do not reproduce** (`PROTOTYPE.md` §5.3).  On the saved `prototype-v3` tree,
+`MOE_EXPERT_WINDOW=1 MOE_EXPERT_TENSOR_REG=1` gives the 150-char reference while the device remap encodes
+**200 cold experts of 256 on every table** (1916 map rebuilds), and re-enabling the alias fill reproduces the
+reported counters (10 570 D2D fills, 0 cold reads) with byte-identical text.  The likely reading is that both
+were measured while the *per-slot* registration was still live beside the whole-tensor one (v3's own comment
+records 3881 `cudaHostRegister` refusals from that overlap).  Recorded as **not reproduced**, not as fixed.
+The real defect they hid is fixed: the registration was per **table**, and a `-sm tensor` split has three
+per-device children over one host master, so the 2nd/3rd would have been refused as an overlap and left with
+no alias -- PR #266's restriction, reached by accident.  It is now keyed by the **host tensor** with a
+refcount (`g_win_tensors`).  Also fixed: `moe_cache_gather_host` (which the registration newly makes
+reachable) reads `t.host_dev` instead of `weight->data`, so it no longer relies on the UVA alias happening to
+equal the host pointer.
+
+**Opt-in, deliberately** (`MOE_EXPERT_TENSOR_REG=1`, off by default): the MTP four-axis protocol, the
+prefill-logit gate, the `-ncmoe` matrix and the `-sm tensor` arm are all still owed, and per `AGENTS.md`
+default-on policy the flip belongs at promotion, in the same change that gates it.  Nothing here touches
+`patches/`.
+
+## 261102.004 (wip) -- host-expert window: the cold read is legal without mlock, but two integration bugs stand between the prototype and the memory win
+
+No delivery change.  Continues `261102.003`; `wip/host-expert-pinned-window/` (`PROTOTYPE.md` §5, patches
+`prototype-v1/-v2/-v3`), work on the r206 tree in `~/llama-scratch`.  Direction: (c) then (a); multi-GPU deferred.
+
+**(c) established, by probe.**  A GPU *kernel* read of a **registered** mapping range is **data-identical** --
+resident, after `MADV_PAGEOUT`, and under **70 GiB of real anonymous memory pressure** (`probe-cold-read`); an
+*unregistered* pageable read is the fatal `Page not present` fault issue #116 describes (reproduced).  So the
+cold read needs **registration, not `mlock`** -- the campaign's earlier "registration does not protect the pages"
+reading was an instrument error (`mincore`/`Mlocked` measure PTEs / mlock accounting, not device access).  The
+alias transport is also byte-stable at 64 MiB-1 GiB registrations (`probe-alias-d2d`, 0/24 bad).
+
+**Two integration bugs, both in the cold/alias area, both now default-off:**
+(A) filling the arena with a D2D from the *whole-tensor* alias gives a deterministic wrong answer in situ
+(287 chars `1e68091940d0` vs the 150-char reference, 10 560 alias fills, 0 cold reads) even though the same copy
+is byte-stable in the probe -- the shortcut is withdrawn; (B) with the per-tensor registration on, the cold read
+engages and the answer is wrong at every arena size (279 chars) -- suspects are the remap/DEVREMAP cold encoding
+(it does not bump `g_cold_reaches`, so the cold read may be reached by an encoding the eager-path validation
+never covered) and the cold geometry handed to the kernel.
+
+**Verified state (v3 = v2 + the cold-read switch, off by default).**  1x R9700, 35B-A3B Q4_K_M, `-ncmoe 40`,
+`--host-experts pool`, arena 4096, pool 2048: text **3/3 runs identical** (`sha=4ac3a523160f`, same as the pool
+arm) and `llama-bench -p 256 -n 128 -r 2` **parity** -- pool tg128 48.3/45.1 vs window 48.7/48.4.  The memory
+half (`pin_slots = 8`, RSS 21.3 -> 18.8 GB) still segfaults: not every consumer of `p.base + slot*host_bytes` is
+on the per-slot ring index yet, which is a mechanical sweep.
+
+Deterministic-oracle note for the record: **a `--fit`-sized run is not a greedy oracle on Qwen3.6** (the chat
+template injects per-run content, so the same seed gives different tokens).  Pin `-c` and keep `-lv 2` off; that
+combination reproduced byte-identically every time.
+
+## 261102.003 (wip) -- prototype v2: ONE host-expert residency tier (the pool's slots backed by the mapping) is at decode parity; the memory half hits a runtime SIGSEGV
+
+No delivery change (WIP; `wip/host-expert-pinned-window/PROTOTYPE.md`, patches `prototype-v1-*.patch` /
+`prototype-v2-*.patch`, both against the r206 tree in `~/llama-scratch`).  Direction from the maintainer: the
+pool and the pinned master should be **one integrated system** whose only variable is how much is pinned, plus
+the mechanism that makes the needed experts resident (design B); and it must not inherit PR #266's
+`-sm tensor` restriction.
+
+**v2 (the one that works).**  The pool keeps its slots, policy, LRU/rerank and cold read; a slot's *backing*
+becomes either a pinned copy (today) or a **registered view of the read-only model mapping**
+(`MOE_EXPERT_WINDOW=1`, on top of `--host-experts pool`, which is what gives the mapping-backed master -- so
+no llama.cpp loader change at all).  Registration goes through `pool_slot_register_win_locked`, the alias
+through `cudaHostGetDevicePointer`, and the fill becomes a D2D from the view: **no copy on the fill path**.
+Releasing a view drains the slot first (unregistering under a queued copy is a SIGSEGV in libamdhip64's
+staging memmove -- measured).  Measured on 1x R9700 @ PCIe 5.0 x16, 35B-A3B Q4_K_M, `-ncmoe 40`,
+`MOE_EXPERT_CACHE_MIB=4096`, `MOE_HOST_POOL_MIB=2048`, `llama-bench -p 256 -n 128 -r 2`, alternating:
+pool tg128 **54.0 / 56.7** vs window **53.7 / 54.0** -- parity, and the text is byte-identical
+(`sha=4ac3a523160f` for pool, window and window-with-no-arena).
+
+**v1 (superseded, kept for the four lessons).**  A per-table window with its own budget and a hook ahead of the
+pool: byte-identical but **12 t/s** vs the pool's ~50.  Four independent causes, all fixed in v2: (1)
+`cudaMemcpyHostToDevice` from a *registered* range is staged by ROCm as a **pageable** upload -- resolve the UVA
+alias and copy D2D (the pool's transport); (2) demoting on the promote path can never succeed during a burst
+(every entry is in flight), so the fill fell through to the per-table *bounce*, the slowest path -- use a
+per-call boundary event; (3) the per-entry demote check was a device query inside a rescan loop, i.e. O(n^2)
+queries per call (~90 ms/token) -- one query per boundary, batch release; (4) a per-fill LRU window keeps
+nothing (118 hits in 11 776 promotes) because the arena is the real cache -- the window must be the pool's
+*storage*, which is the maintainer's point.
+
+**Open blocker (the memory half).**  Shrinking the pool's pinned allocation to a small fallback ring
+(`pin_slots = 8`) drops peak RSS **21.3 -> 18.8 GB**, i.e. it is the "remove the wasted copies" win, but the
+decode phase then SIGSEGVs inside `libamdhip64`'s staging memmove (`__memmove_avx512 -> libamdhip64`), with the
+full-size base stable.  Not our arithmetic; candidate causes (a copy the runtime decides to stage from a view,
+or a reused ring slot racing a queued copy) are listed in `PROTOTYPE.md` §5 and need a profiler session.  Until
+then v2 is a fill-path change only.  `-sm tensor` is untestable on this box (single usable GPU) but the design
+carries no single-device gate: the pool is keyed by the master and the Meta backend already forwards
+`moe_cache_update`/`moe_cache_take_over` per child, unlike `GGML_MOE_DEVREMAP` and `MOE_HOST_POOL_COLD`.
+
+## 261102.002 (wip) -- the `--host-experts pool` bounce buffer is priced against a registered window over the mapping (campaign opened)
+
+No delivery change.  New campaign [`wip/host-expert-pinned-window/`](wip/host-expert-pinned-window/README.md),
+asking whether the **pool** tier can shed its pinned duplicate and let the page cache be the only cache: the pool
+exists because the read-only GGUF mapping is pageable and a no-XNACK GPU cannot read it (issue #116), and a miss
+costs a synchronous `memcpy` out of the page cache on the token's critical path (`moe-expert-cache.cu:1368`,
+`:274`).  The arena stays in every variant -- the question is only what the **fill** reads.
+
+Probe: `wip/host-expert-pinned-window/probe-pinned-window.cpp` (§1-§11) + `probe-copy-path.cpp`
+(`rocprofv3 --memory-copy-trace`).  1x R9700 (gfx1201) at **PCIe 5.0 x16**, ROCm 10.1.0, 35B-A3B Q4_K_M, one
+1.66 MiB expert blob, 40 runs per arm, medians, every arm byte-checked.  Log:
+`runs/probe-20261102-080314.log`.
+
+**Miss path (arena fill), 1.66 MiB expert:** pool `memcpy`+CE **137.3 µs** (host memcpy 50.1 + CE 66.4) vs
+**B (register the mapping range in place + CE) 62.1 µs** (register 1.3 + CE 43.2) -- **2.2x**; 0.75x at 256 KiB,
+**0.40x at 32 MiB**; deferred-unregister B 48.0 µs.  Cold page-cache miss (8 MiB, real disk): pool memcpy
+**17.0 ms** vs register **2.3 ms**.  Sustained from a registered window: **55.7 GB/s** (the x16 ceiling).
+Registration itself is free (0.6 µs at any size up to 256 MiB; the pin is deferred -- one-time 3.0 ms on the
+process's first copy out of registered memory, then full rate).
+
+**A (zero-copy SM read) is not better than B**: 42.3 GB/s in place vs 40.3 GB/s via the CE, equal at every size
+-- so keep the arena and let B serve the fill.  This also retires the "device gather is 35 % slower" worry for
+the *read* itself: the SM saturates the link here, so the in-tree gather's loss is compute interference / the
+head-zero guard / multi-ubatch effects, not read bandwidth (`GGML_SCHED_DEVGATHER` stays default-off).
+
+**Pin / demote contract (the design's steady state), measured:** `hipHostRegister` alone does **not** hold the
+pages -- 8 MiB copies 191 µs warm and **15.1 ms** after `MADV_PAGEOUT` (fault-speed refill), bytes still
+identical (slow, not wrong).  `mlock` + register **is** a hold: 4 MiB warm baseline 92.8 µs, `mlock`+`PAGEOUT`
+**92.3 µs (held)**; demote (`munlock`+`hipHostUnregister`) **92.3 µs** with the pages still cached, re-promote
+**91.4 µs full rate**; 20x demote/re-promote loop: register 0.6 µs, copy 166.7 µs, **no degradation**.
+Constraint: `RLIMIT_MEMLOCK` is **8 MiB** here, so a GiB window needs `LimitMEMLOCK=infinity`/`CAP_IPC_LOCK`;
+without `mlock` the window is "cached but reclaimable" (correct, but a reclaim costs a fault-speed refill).
+
+**No `madvise` in the runtime path:** demote is `munlock` + `hipHostUnregister` and nothing else -- reclaim is
+the default state of a file page, so there is nothing to advise.  `MADV_PAGEOUT` is only the probe's pressure
+source (the test must try to take the pages away to know whether `mlock` holds); the design consequence is the
+SLO, not a call: a demoted range can be reclaimed at any moment, so a re-promote is "cached if we are lucky"
+and the fill must absorb a ~13 ms/8 MiB refill.
+
+**Kept as designed:** the pool still owns the bulk/prefill policy and the "host set larger than RAM" case (§5.5)
+-- a page-cache window cannot prefetch a set that does not fit.  The window is the decode/verify fill tier.
+
+Measurement traps recorded (each produced a wrong number first): `/tmp` is tmpfs here (a cold-page test there
+measures RAM); `POSIX_FADV_DONTNEED` skips pages with PTEs; **`MADV_DONTNEED` cannot test reclaim on a
+`MAP_SHARED` file mapping** -- it drops only the process's PTEs (`VmRSS` fell exactly the 8 MiB of the test
+range) while the page cache keeps the pages (host re-read afterwards 95.7 us for 4 MiB, a cache hit, vs ~8.7 ms
+cold), so it frees no memory and does no I/O; it is also a poor *demote* primitive, because it unpins nothing
+and makes the next **device** fill cost ~1.9 ms/4 MiB while the driver re-establishes its mapping over the
+zapped PTEs.  `madvise(MADV_PAGEOUT)` is used instead -- the only user-space call that asks the kernel to
+reclaim, i.e. to behave like memory pressure; `mincore` is not authoritative for "pinned"; a
+blocking `hipMemcpy` busy-waits at 100 % of wall, so host CPU time cannot separate DMA from a bounce; and a
+host-DRAM contention test gave **opposite verdicts on two runs** (marked VOID in the probe).
+`rocprofv3 --memory-copy-trace` shows one H2D per source and **no kernel**, with the registered source at
+155.6 µs vs the pageable control at 155.9 µs (a `hipHostMalloc` source is *slower*, 241 µs) -- so "direct DMA
+vs internal bounce" remains unresolved, and it does not change any measured number.  No delivery change, no tag.
+
 ## 261102.001 (tool) -- `moe-trace-replay.py` scores the decode band by default, so it now calibrates to <0.3 %
 
 No delivery change (a tool fix: no `patches/`, no `release.json`, no new tag).  The replayer's `--score-band`

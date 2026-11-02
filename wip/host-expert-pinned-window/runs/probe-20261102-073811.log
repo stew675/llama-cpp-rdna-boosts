@@ -1,0 +1,49 @@
+=== wip/host-expert-pinned-window probe ===
+device 0          : AMD Radeon AI PRO R9700 (gfxgfx1201), pci bus 03, 1 device(s) visible
+hostRegister      : supported=1  readOnlyFlag=0  unifiedAddr=0  managedMem=1
+source            : /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+mapping           : 21613 MiB MAP_SHARED PROT_READ
+
+--- 1. registration of a read-only MAP_SHARED file mapping ---
+flags                        hipHostRegister        hipHostGetDevicePointer us
+default(0)                   ok                     see above              88
+ReadOnly                     ok                     see above              316
+Portable|Mapped              ok                     see above              209
+ReadOnly|Portable|Mapped     ok                     see above              197
+unaligned +64 B              ACCEPTED (no page-alignment constraint)
+
+--- 2. register+unregister cost vs range size (page-cache resident) ---
+range        register us    unregister us  us/MiB        
+0.25 MiB     0.7            0.3            4.1           
+0.50 MiB     0.7            0.3            2.0           
+1.66 MiB     0.7            0.3            0.6           
+4.00 MiB     0.7            0.3            0.3           
+16.00 MiB    0.8            0.3            0.1           
+64.00 MiB    0.8            0.3            0.0           
+
+--- 3. miss path per 1.66 MiB expert, 40 runs, median [p10..p90] ---
+arm                        host us          total us         device us      GB/s
+pool: memcpy + CE H2D      41.0             129.8            66.4           26.2   [125.3..132.9]
+B: register + CE H2D       0.8              61.0             43.3           40.2   [60.0..61.8]
+B: register + CE H2D (defer) 1.0              60.0             43.2           40.3   [59.5..60.8]
+A: SM read, 8 blocks       0.0              64.3             46.3           37.6   [63.4..67.8]
+A: SM read, 32 blocks      0.0              59.0             41.0           42.5   [58.6..61.7]
+A: SM read, 128 blocks     0.0              58.9             41.0           42.5   [58.4..61.1]
+A: SM read, 512 blocks     0.0              59.0             41.2           42.3   [58.5..61.5]
+ref: CE D2D                0.0              11.1             11.1           156.5   [11.0..11.3]
+ref: SM VRAM copy, 64 blk  0.0              11.2             11.2           156.0   [11.1..11.3]
+
+--- 4. byte check (VRAM copy vs the file's bytes) ---
+pool    : identical
+B       : identical
+A       : identical
+
+--- 5. unregister with the copy still queued (must NOT be relied on) ---
+unregister returned Success (NOT a safety guarantee)
+bytes    : identical  (a mismatch here is exactly why the demote needs an event)
+
+--- 6. cold-page cost: page cache dropped for one expert, then read ---
+memcpy out of a dropped range: 31.2 us (56 MB/s) -- the pool's synchronous fill
+hipHostRegister of the same dropped range: 1.8 us (941 MB/s) -- B's fill
+
+--- done ---

@@ -1,0 +1,855 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 334931ecd..bbf23d251 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -17,6 +17,7 @@
+ #if !defined(_WIN32)
+ #include <dirent.h>
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #endif
+@@ -91,12 +92,18 @@ struct table_t {
+     void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
+     bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
+     bool        host_pinned = false;    // `host` is pinned (cudaHostGetDevicePointer succeeded): the in-place reads need it
++    // wip/host-expert-pinned-window: a PAGEABLE (mapping) master becomes device-addressable by registering
++    // the whole tensor once, which gives the in-place COLD read a legal alias (and keeps it without mlock:
++    // measured data-identical under 70 GiB of real pressure).  Released with the table.
++    void *      win_reg_base = nullptr;
++    size_t      win_reg_len  = 0;
+     // wip/host-expert-master-drop (TODO #55): pinned per-table bounce ring for a PAGEABLE master, grown on
+     // demand (see `expert_host_src`).  Empty for a pinned master.
+     std::vector<bounce_t> bounce;
+     int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
+ 
+-    int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
++    int         slots       = 0;
++    int         pin_slots   = 0;         // wip/host-expert-pinned-window: slots actually allocated pinned        // 0 => disabled (no budget / alloc failed)
+     bool        primed      = false;    // registered on a previous (uncached) pass
+     bool        allocated   = false;    // arena decided (allocated, or deliberately 0 slots)
+     void *      arena       = nullptr;
+@@ -236,6 +243,7 @@ struct host_pool_t {
+                                          // fill source (a plain H2D from `base` on another ROCm context is
+                                          // treated as pageable and crashes in the runtime's staging memmove)
+     int         slots       = 0;
++    int         pin_slots   = 0;         // wip/host-expert-pinned-window: slots actually allocated pinned
+     size_t      host_bytes  = 0;
+     int         n_experts   = 0;
+     std::string path;                    // GGUF path
+@@ -260,6 +268,16 @@ struct host_pool_t {
+     // `slot * GGML_CUDA_MAX_DEVICES + device`, nullptr = never used; created lazily on the recording
+     // device (a single event per slot + a cross-device record/sync fails with `invalid resource handle`).
+     std::vector<cudaEvent_t>             slot_ev;
++    // wip/host-expert-pinned-window: per-slot BACKING.  A slot is either a pinned copy (`base` + s*hb,
++    // the historical mode) or, with the window on, a REGISTERED VIEW of the read-only model mapping: the
++    // expert's bytes stay where the page cache put them and are DMA'd from the UVA alias.  The slot
++    // bookkeeping, the policy, the rerank and the cold read are shared -- only the copy disappears.
++    std::vector<char *>  slot_base;   // host pointer of this slot's expert bytes (mapping or pinned)
++    std::vector<char *>  slot_dev;    // device alias of `slot_base` (the fill source)
++    std::vector<uint8_t> slot_reg;    // 1 = a registration to release on reuse
++    std::vector<char *>  slot_reg_host;   // page-aligned registration base
++    std::vector<size_t>  slot_reg_len;    // registered length
++    std::vector<uint8_t> slot_reg_locked; // mlock()ed too
+     std::vector<int64_t>                 last;          // per expert, last use
+     int64_t     clock       = 0;
+     int64_t     hits        = 0;
+@@ -346,6 +364,18 @@ static int alias_find_checked(const void * key, int device, int layer) {
+ }
+ bool                                g_enabled    = false;
+ bool                                g_init_done  = false;
++// wip/host-expert-pinned-window: the window budget / counters (see the tier section near `expert_host_src`).
++static void     win_trace_dump();        // MOE_EXPERT_WINDOW_TRACE: one line at exit (llama-bench hides WARN)
++static size_t   g_win_budget   = 0;      // bytes, process-wide; 0 => window off
++bool            g_win_on       = false;
++static bool     g_win_mlock    = true;
++static size_t   g_win_bytes    = 0;
++static int64_t  g_win_clock    = 0;
++static int64_t  g_win_promotes = 0, g_win_hits = 0, g_win_demotes = 0;
++static int64_t  g_win_reg_fail = 0, g_win_mlock_fail = 0, g_win_mlocked = 0, g_win_denied = 0;
++static int64_t  g_win_d2d = 0, g_win_h2d = 0;
++static bool     g_win_trace = false;     // MOE_EXPERT_WINDOW_TRACE=1: stderr progress (llama-bench hides WARN)
++static bool     g_win_tensor = false;    // MOE_EXPERT_TENSOR_REG=1: register the WHOLE host tensor (cold read)
+ bool                                g_report     = true;
+ bool                                g_fill       = false;   // opt-in: copy the master into the slot
+ int                                 g_device     = -1;
+@@ -633,9 +663,40 @@ void bind_host_dev_locked(table_t & t) {
+         return;
+     }
+     (void) cudaGetLastError();
+-    // A pageable master (`--host-experts pool` places the tensors in the read-only model mapping): the
+-    // in-place cold read stands down and every GPU read is staged through the pool instead, so the miss
+-    // cost is a pool fill rather than a fault (issue #116).
++    // A pageable master (`--host-experts pool` places the tensors in the read-only model mapping) maps to no
++    // device address, so the in-place cold read cannot use it as-is (issue #116).
++    //
++    // wip/host-expert-pinned-window: REGISTER THE WHOLE TENSOR once and use the alias.  Measured: an SM read
++    // of a registered range is data-identical even under 70 GiB of real memory pressure, so the cold read
++    // needs registration and NOT mlock (an UNREGISTERED pageable read is a fatal "page not present" GPU
++    // fault, which is issue #116).  This is what finally lets the mapping-backed master use the cold read
++    // (`id = n_res + e`), which only a pinned master could before.
++    if (g_win_on && g_win_tensor && t.host != nullptr && t.host_bytes > 0 && t.n_experts > 0) {
++        const size_t page = 4096;
++        const size_t len  = (size_t) t.n_experts * t.host_bytes;
++        char * base = (char *) ((size_t) t.host & ~(page - 1));
++        const size_t alen = (((size_t) t.host + len + page - 1) & ~(page - 1)) - (size_t) base;
++        void * alias = nullptr;
++        if (cudaHostRegister(base, alen, hipHostRegisterDefault) == cudaSuccess) {
++            if (cudaHostGetDevicePointer(&alias, base, 0) == cudaSuccess && alias != nullptr) {
++                t.win_reg_base = base;
++                t.win_reg_len  = alen;
++                t.host_dev     = (char *) alias + ((size_t) t.host - (size_t) base);
++                t.host_pinned  = false;   // registered, not pinned: the cold read is legal, mlock is separate
++                g_win_promotes++;
++                return;
++            }
++            (void) cudaHostUnregister(base);
++        }
++        (void) cudaGetLastError();
++        static bool warned2 = false;
++        if (!warned2) {
++            warned2 = true;
++            GGML_LOG_WARN("%s: could not register the host expert tensor for the cold read; misses are "
++                          "served by a fill\n", __func__);
++        }
++        return;
++    }
+     static bool warned = false;
+     if (!warned && g_cold_uva) {
+         warned = true;
+@@ -667,6 +728,7 @@ static int pool_cold_slot_locked(table_t & t, int32_t expert) {
+     }
+     host_pool_t * p = table_pool_locked(t);
+     if (p == nullptr || p->failed || p->base_dev == nullptr || p->host_bytes != t.host_bytes ||
++            p->pin_slots != p->slots ||   // window slots are per-expert views: no fixed pool stride
+             expert < 0 || expert >= p->n_experts) {
+         return -1;
+     }
+@@ -785,6 +847,33 @@ void parse_env() {
+                           "(MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, (long long) moe_host_pool_mib());
+         }
+     }
++    // wip/host-expert-pinned-window: the window budget.  0 = off (fall back to the pool/bounce); N MiB
++    // caps the registered (and mlocked) bytes process-wide.  Requires a pageable master, i.e.
++    // `--host-experts pool`; with the default pinned master there is nothing to register.
++    // `MOE_EXPERT_WINDOW=1` is the mode switch: the pool's slots become REGISTERED VIEWS of the model
++    // mapping instead of pinned copies (the residency policy, the budget and the cold read are unchanged).
++    // `MOE_EXPERT_WINDOW_MIB` is retained as an alternative way to turn it on (and as the registration
++    // budget when a fixed one is wanted); with only the flag set the budget is unbounded here because the
++    // POOL's slot count is what sizes the residency.
++    const size_t win_mib = (size_t) env_int("MOE_EXPERT_WINDOW_MIB", 0);
++    g_win_on      = env_int("MOE_EXPERT_WINDOW", 0) != 0 || win_mib > 0;
++    g_win_budget  = win_mib > 0 ? win_mib * 1024 * 1024 : (size_t) -1;
++    g_win_mlock   = env_int("MOE_EXPERT_WINDOW_MLOCK", 0) != 0;
++    // the per-tensor registration exists to give the COLD read a legal alias; it is on whenever the window
++    // is on (and can be forced off with MOE_EXPERT_TENSOR_REG=0 for an A/B).
++    // DEFAULT OFF: enabling it turns on the cold read (which does no copy at all) but currently produces a
++    // WRONG answer once the arena is smaller than the expert set -- open, see PROTOTYPE.md §5.  The window's
++    // verified behaviour (pool-backed fills, byte-identical text) does not need it.
++    g_win_tensor  = env_int("MOE_EXPERT_TENSOR_REG", 0) != 0;
++    g_win_trace   = env_int("MOE_EXPERT_WINDOW_TRACE", 0) != 0;
++    if (g_win_trace) {
++        atexit(win_trace_dump);
++    }
++    if (g_win_on) {
++        GGML_LOG_INFO("%s: MoE host-expert WINDOW: %zu MiB process-wide, %s; the pool is replaced by the "
++                      "registered mapping (one residency budget, no second pinned copy)\n", __func__,
++                      g_win_budget / 1048576, g_win_mlock ? "mlock on" : "mlock off");
++    }
+     g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
+     g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
+     g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
+@@ -1285,13 +1374,25 @@ static host_pool_t * table_pool_locked(table_t & t) {
+                   t.host_bytes, (double) ((int64_t) slots * (int64_t) t.host_bytes) / (1024.0 * 1024.0));
+     device_guard pdg(t.device);
+     host_pool_t p;
++    // wip/host-expert-pinned-window: with the window on, the slots are registered VIEWS of the mapping, so
++    // the pinned allocation only needs to be a small FALLBACK ring (a registration that fails, or a table
++    // with no mapping source).  This is the memory half of the campaign: the pool's `slots x host_bytes` of
++    // non-swappable RAM becomes a few experts' worth, and the residency itself lives in the page cache.
++    // The window serves every fill from the tensor alias, so the pool's pinned base is only a fallback (a
++    // registration that failed, a table with no mapping).  Pin a handful of slots instead of the whole set:
++    // this is the memory half of the campaign -- `slots x host_bytes` of non-swappable RAM becomes a few
++    // experts' worth, and the residency itself lives in the page cache.
++    // OPEN (campaign PROTOTYPE.md §5): `pin_slots = 8` is the memory win (RSS 21.3 -> 18.8 GB) but it
++    // segfaults once the pool is actually exercised -- not every consumer of `p.base + slot*host_bytes` has
++    // been converted to the per-slot ring index yet.  Keeping the full-size base until that sweep is done.
++    int pin_slots = slots;
+     if (slots >= 1) {
+         void * mem = nullptr;
+         // PORTABLE + MAPPED pinned memory: the pool is process-wide, so a device other than the one that
+         // allocated the pool copies out of it.  Plain `cudaMallocHost` is tied to the allocating ROCm
+         // context; a cross-device H2D from it falls back to a pageable staging memmove that crashes on a
+         // 2-D strided copy.  The mapped UVA alias is copied from with cudaMemcpyDeviceToDevice instead.
+-        if (cudaHostAlloc(&mem, (size_t) slots * t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess) {
++        if (cudaHostAlloc(&mem, (size_t) pin_slots * t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess) {
+             p.base        = (char *) mem;
+             void * dev    = nullptr;
+             if (cudaHostGetDevicePointer(&dev, mem, 0) != cudaSuccess) {
+@@ -1299,6 +1400,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
+                 dev = mem;
+             }
+             p.base_dev    = dev;
++            p.pin_slots   = pin_slots;
+             p.slots       = slots;
+             p.host_bytes  = t.host_bytes;
+             p.n_experts   = t.n_experts;
+@@ -1307,6 +1409,19 @@ static host_pool_t * table_pool_locked(table_t & t) {
+             p.src_host    = t.host;
+             p.slot_expert.assign((size_t) slots, -1);
+             p.slot_state.assign((size_t) slots, 0);
++            // wip/host-expert-pinned-window: every slot defaults to its pinned copy; the window repoints a
++            // slot at the mapping range (and its alias) when it registers one.
++            p.slot_base.assign((size_t) slots, nullptr);
++            p.slot_dev.assign((size_t) slots, nullptr);
++            p.slot_reg.assign((size_t) slots, 0);
++            p.slot_reg_host.assign((size_t) slots, nullptr);
++            p.slot_reg_len.assign((size_t) slots, 0);
++            p.slot_reg_locked.assign((size_t) slots, 0);
++            for (int s_ = 0; s_ < slots; s_++) {
++                const int r_ = s_ % (pin_slots > 0 ? pin_slots : 1);
++                p.slot_base[(size_t) s_] = p.base + (size_t) r_ * p.host_bytes;
++                p.slot_dev[(size_t) s_]  = (char *) p.base_dev + (size_t) r_ * p.host_bytes;
++            }
+             p.last.assign((size_t) t.n_experts, 0);
+             p.slot_ev.assign((size_t) slots * GGML_CUDA_MAX_DEVICES, nullptr);   // lazily created per device
+         } else {
+@@ -1365,7 +1480,99 @@ static void pool_reap_locked(host_pool_t & p) {
+ // memcpy out of the page cache: no syscall, no second copy, and the pages stay reclaimable (the kernel drops
+ // them under pressure and re-faults from the GGUF -- the disk tier).  `MOE_HOST_POOL_DIO=1` keeps the file
+ // read with O_DIRECT, which is the only mode that bypasses the page cache.  Caller holds `g_mutex`.
+-static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
++// wip/host-expert-pinned-window: release one slot's registration (called before the slot is reused, after
++// its in-flight copies have drained).  A no-op for a pinned-copy slot.
++static void pool_slot_sync(host_pool_t & p, int slot);
++static void pool_slot_release_win_locked(host_pool_t & p, int slot) {
++    if (slot < 0 || slot >= p.slots || slot >= (int) p.slot_reg.size() || p.slot_reg[(size_t) slot] == 0) {
++        return;
++    }
++    // A copy out of this range may still be in flight.  Unregistering it under the runtime's staging
++    // memmove is a SIGSEGV inside libamdhip64 (measured), so drain the slot first -- this runs only on
++    // slot reuse/teardown, never on the fill path.
++    pool_slot_sync(p, slot);
++    char *  base = p.slot_reg_host[(size_t) slot];
++    size_t  len  = p.slot_reg_len[(size_t) slot];
++    if (base != nullptr && len > 0) {
++        (void) cudaHostUnregister(base);
++        (void) cudaGetLastError();
++#if !defined(_WIN32)
++        if (p.slot_reg_locked[(size_t) slot]) {
++            (void) munlock(base, len);
++        }
++#endif
++        g_win_demotes++;
++        if (g_win_bytes >= len) { g_win_bytes -= len; } else { g_win_bytes = 0; }
++    }
++    p.slot_reg[(size_t) slot]        = 0;
++    p.slot_reg_host[(size_t) slot]  = nullptr;
++    p.slot_reg_len[(size_t) slot]   = 0;
++    p.slot_reg_locked[(size_t) slot] = 0;
++    const int ring = p.pin_slots > 0 ? slot % p.pin_slots : slot;
++    p.slot_base[(size_t) slot]      = p.base + (size_t) ring * p.host_bytes;
++    p.slot_dev[(size_t) slot]       = (char *) p.base_dev + (size_t) ring * p.host_bytes;
++}
++
++// wip/host-expert-pinned-window: back this slot with a REGISTERED VIEW of the model mapping.  False when
++// the window is off, the master is not the mapping, the file tier is in use, or registration fails -- the
++// caller then takes the historical pinned-copy path, so the window is an optimisation, never a requirement.
++static bool pool_slot_register_win_locked(host_pool_t & p, int slot, int expert) {
++    // Superseded by the per-TENSOR registration (`bind_host_dev_locked`): a per-expert range would overlap
++    // it and `cudaHostRegister` refuses overlapping ranges (measured: 3881 refusals in one 32-token run), and
++    // the tensor alias already serves every fill from `expert_host_src` above.  Kept as the record of the
++    // per-slot design; it is unreachable while the tensor registration is what the window uses.
++    if (true) {
++        (void) p; (void) slot; (void) expert;
++        return false;
++    }
++    if (!g_win_on || p.src_host == nullptr || g_pool_dio || slot < 0 || slot >= p.slots) {
++        return false;
++    }
++    if (slot >= (int) p.slot_reg.size()) {
++        p.slot_reg.resize((size_t) p.slots, 0);
++        p.slot_reg_host.resize((size_t) p.slots, nullptr);
++        p.slot_reg_len.resize((size_t) p.slots, 0);
++        p.slot_reg_locked.resize((size_t) p.slots, 0);
++    }
++    const size_t page = 4096;
++    const char * src  = (const char *) p.src_host + (size_t) expert * p.host_bytes;
++    const char * base = (const char *) ((size_t) src & ~(page - 1));
++    const size_t len  = (((size_t) src + p.host_bytes + page - 1) & ~(page - 1)) - (size_t) base;
++    if (cudaHostRegister((void *) base, len, hipHostRegisterDefault) != cudaSuccess) {
++        (void) cudaGetLastError();
++        g_win_reg_fail++;
++        return false;
++    }
++    void * alias = nullptr;
++    if (cudaHostGetDevicePointer(&alias, (void *) base, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        (void) cudaHostUnregister((void *) base);
++        (void) cudaGetLastError();
++        g_win_reg_fail++;
++        return false;
++    }
++    bool locked = false;
++#if !defined(_WIN32)
++    if (g_win_mlock && mlock((void *) base, len) == 0) {
++        locked = true;
++    }
++#endif
++    p.slot_reg[(size_t) slot]         = 1;
++    p.slot_reg_host[(size_t) slot]    = (char *) base;
++    p.slot_reg_len[(size_t) slot]     = len;
++    p.slot_reg_locked[(size_t) slot]  = locked ? 1 : 0;
++    p.slot_base[(size_t) slot]        = (char *) src;
++    p.slot_dev[(size_t) slot]         = (char *) alias + ((size_t) src - (size_t) base);
++    g_win_bytes  += len;
++    g_win_promotes++;
++    return true;
++}
++
++static bool pool_fill_slot_locked(host_pool_t & p, int slot, int expert, char * dst) {
++    // The window: no copy at all -- the slot IS the mapping range, device-readable through its alias.
++    if (pool_slot_register_win_locked(p, slot, expert)) {
++        return true;
++    }
+     const size_t rel = (size_t) expert * p.host_bytes;
+     if (!g_pool_dio && p.src_host != nullptr) {
+         memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
+@@ -1427,7 +1634,9 @@ static char * pool_peek_locked(host_pool_t & p, int expert, int * out_slot) {
+     if (out_slot != nullptr) {
+         *out_slot = hs;
+     }
+-    return p.base + (size_t) hs * p.host_bytes;
++    // the slot's own backing: a pinned copy or (with the window) the registered mapping view
++    return p.slot_dev.size() > (size_t) hs && p.slot_dev[(size_t) hs] != nullptr
++               ? p.slot_dev[(size_t) hs] : p.base + (size_t) hs * p.host_bytes;
+ }
+ 
+ // A resident-slot test that touches NO policy state (no hit counter, no LRU clock): the arena exchange
+@@ -1464,6 +1673,9 @@ static void pool_free_locked(host_pool_t & p) {
+         pool_close_file(p.fd);
+         p.fd = -1;
+     }
++    for (int s_ = 0; s_ < (int) p.slot_reg.size(); s_++) {
++        pool_slot_release_win_locked(p, s_);
++    }
+     (void) cudaGetLastError();   // fail soft: a bad free must not abort a model teardown
+     p.slots = 0;
+     p.failed = true;
+@@ -1517,8 +1729,9 @@ static char * pool_fill_empty_locked(host_pool_t & p, int expert, int * out_slot
+     if (slot < 0) {
+         return nullptr;
+     }
+-    char * dst = p.base + (size_t) slot * p.host_bytes;
+-    if (!pool_fill_slot_locked(p, expert, dst)) {
++    const int ring0 = p.pin_slots > 0 ? slot % p.pin_slots : slot;
++    char * dst = p.base + (size_t) ring0 * p.host_bytes;
++    if (!pool_fill_slot_locked(p, slot, expert, dst)) {
+         p.failed = true;
+         return nullptr;
+     }
+@@ -1550,7 +1763,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+             if (out_slot != nullptr) {
+                 *out_slot = hs;
+             }
+-            return p.base + (size_t) hs * p.host_bytes;
++            return p.slot_dev.size() > (size_t) hs && p.slot_dev[(size_t) hs] != nullptr
++                       ? p.slot_dev[(size_t) hs] : p.base + (size_t) hs * p.host_bytes;
+         }
+         // State 2: retiring (its copy into the arena is still in flight).  Never duplicate the read; return
+         // null so the caller serves this miss from the bounce instead.
+@@ -1586,6 +1800,7 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+             if (sync_on_evict) {
+                 pool_slot_sync(p, slot);
+             }
++            pool_slot_release_win_locked(p, slot);
+             p.expert_slot.erase(victim);
+             p.slot_expert[(size_t) slot] = -1;
+             p.evictions++;
+@@ -1594,8 +1809,9 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+     if (slot < 0) {
+         return nullptr;
+     }
+-    char *       dst = p.base + (size_t) slot * p.host_bytes;
+-    const bool ok = pool_fill_slot_locked(p, expert, dst);
++    const int    ring = p.pin_slots > 0 ? slot % p.pin_slots : slot;
++    char *       dst  = p.base + (size_t) ring * p.host_bytes;
++    const bool ok = pool_fill_slot_locked(p, slot, expert, dst);
+     if (!ok) {
+         p.failed = true;
+         return nullptr;
+@@ -1833,6 +2049,340 @@ static int bounce_acquire(table_t & t) {
+ //   pageable master while every copy path verified byte-exact).  The delivery snapshots pageable uploads
+ //   for exactly this reason elsewhere (`set_tensor_2d_async`, the async-input ring).
+ //
++// ---- wip/host-expert-pinned-window: the registered WINDOW tier --------------------------------------
++// ONE residency mechanism for a pageable (model-mapping-backed) host master, replacing the pool and the
++// per-table bounce on the fill path: register the mapping range covering an expert IN PLACE and DMA from
++// the page cache, instead of copying the expert into a second pinned buffer and DMAing from that.
++// Measured (wip/host-expert-pinned-window/README.md): a 1.66 MiB expert fill is 62 us vs the pool's 137 us,
++// and a cold (page-cache miss) fill is 2.3 ms vs 17 ms.
++//
++// Registered bytes ARE the budget: `MOE_EXPERT_WINDOW_MIB` caps them process-wide and the least recently
++// used range is released when the cap is exceeded, so "how much of the host expert set is pinned" is the
++// only knob -- 100 % is the old pinned master, a fraction is the old pool, and there is no second tier.
++//
++// A demote releases the registration (and the mlock); the pages stay in the page cache, so a re-promote is
++// cheap until the kernel reclaims them.  Residency is therefore a HOPE and the budget is the invariant:
++// nothing may assume a re-promote is free.  `MOE_EXPERT_WINDOW_MLOCK=1` (default) makes residency
++// deterministic (capped by RLIMIT_MEMLOCK; a refusal is counted and the window keeps working).
++//
++// Keyed by (host master, page-aligned offset) so the children of a `-sm tensor` split SHARE one registration
++// per expert blob, with per-device drain markers (`pool_slot_event`'s pattern).  A demote only runs for a
++// range every device's copy has finished reading -- never on a device synchronize.
++
++struct win_entry {
++    const void * host   = nullptr;   // the table's host master base
++    size_t       off    = 0;         // page-aligned byte offset into it
++    size_t       len    = 0;         // page-aligned length
++    bool         locked = false;     // mlock() succeeded
++    void *       dev    = nullptr;   // device alias of `host + off` (UVA); the fill copies D2D from it
++    int64_t      last   = 0;         // LRU clock
++    int64_t      call   = 0;         // the hook-call boundary this range was last promoted/used in
++    std::vector<cudaEvent_t> ev;     // per device: drain marker of the last copy out of this range
++};
++static std::vector<win_entry> g_win;
++static int64_t  g_win_call   = 0;                          // hook-call boundary counter
++static cudaEvent_t g_win_call_ev[GGML_CUDA_MAX_DEVICES] = {nullptr};  // "everything before this drained"
++
++static size_t win_page() {
++    static const size_t p = (size_t) sysconf(_SC_PAGESIZE);
++    return p != 0 ? p : 4096;
++}
++
++static cudaEvent_t win_ev(win_entry & e, int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return nullptr;
++    }
++    if ((int) e.ev.size() <= device) {
++        e.ev.resize((size_t) GGML_CUDA_MAX_DEVICES, nullptr);
++    }
++    if (e.ev[(size_t) device] == nullptr) {
++        device_guard dg(device);
++        cudaEvent_t ev = nullptr;
++        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return nullptr;
++        }
++        e.ev[(size_t) device] = ev;
++    }
++    return e.ev[(size_t) device];
++}
++
++// True when no device's copy may still be reading this range.
++static bool win_idle(const win_entry & e) {
++    for (cudaEvent_t ev : e.ev) {
++        if (ev == nullptr) {
++            continue;
++        }
++#if defined(GGML_USE_HIP)
++        const bool pending = hipEventQuery((hipEvent_t) ev) == hipErrorNotReady;
++#else
++        const bool pending = cudaEventQuery(ev) == cudaErrorNotReady;
++#endif
++        (void) cudaGetLastError();
++        if (pending) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Drop one registration: unregister the range, release the mlock, destroy the drain events.
++static void win_release_locked(size_t idx) {
++    win_entry & e = g_win[idx];
++    if (e.host != nullptr && e.len > 0) {
++        (void) cudaHostUnregister((void *) ((const char *) e.host + e.off));
++        (void) cudaGetLastError();
++#if !defined(_WIN32)
++        if (e.locked) {
++            (void) munlock((const char *) e.host + e.off, e.len);
++            g_win_mlocked--;
++        }
++#endif
++    }
++    for (cudaEvent_t ev : e.ev) {
++        if (ev != nullptr) {
++            (void) cudaEventDestroy(ev);
++        }
++    }
++    if (g_win_bytes >= e.len) {
++        g_win_bytes -= e.len;
++    } else {
++        g_win_bytes = 0;
++    }
++    g_win_demotes++;
++    // swap-and-pop: `e` is dead after this
++    g_win[idx] = g_win.back();
++    g_win.pop_back();
++}
++
++// One hook call's fills are issued back to back on the compute stream, so during a burst almost every
++// entry is still in flight and nothing is demotable.  Demoting on the promote path therefore fails
++// exactly when the window is working hardest -- and the fill then fell through to the per-table BOUNCE
++// (a host memcpy), which is the one path this campaign exists to delete (measured: 4x decode regression
++// with the burst-trim policy).  Instead a burst may overshoot the budget by this slack, and the trim runs
++// ONCE at the next call boundary, when the previous call's copies have drained.
++static size_t win_slack() {
++    const size_t quarter = g_win_budget / 4;
++    return quarter > (64u << 20) ? quarter : (size_t) (64u << 20);
++}
++
++// Called once per hook call (a boundary on the compute stream).  A range promoted in call N is safe to
++// demote once the event recorded at the end of call N+1 has fired, so the whole set is classified with ONE
++// device query per call instead of one per entry -- the per-entry version was a device query inside a
++// rescan loop, i.e. O(n^2) queries per call, and measured as a 4x decode regression.
++// Residency is spread over g_win; demotion only ever touches ranges whose copies have provably drained.
++static void win_boundary_locked(int device) {
++    g_win_call++;
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    cudaEvent_t & ev = g_win_call_ev[device];
++    if (ev == nullptr) {
++        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            ev = nullptr;
++        }
++    }
++}
++
++static void win_trim_to_budget_locked(int device) {
++    if (!g_win_on || g_win.empty() || g_win_bytes <= g_win_budget) {
++        return;
++    }
++    // Everything promoted at or before call N-1 is drained once the event recorded at boundary N-1 has
++    // fired; query it ONCE.
++    bool drained_prev = true;
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && g_win_call_ev[device] != nullptr) {
++#if defined(GGML_USE_HIP)
++        drained_prev = hipEventQuery((hipEvent_t) g_win_call_ev[device]) != hipErrorNotReady;
++#else
++        drained_prev = cudaEventQuery(g_win_call_ev[device]) != cudaErrorNotReady;
++#endif
++        (void) cudaGetLastError();
++    }
++    const int64_t safe_before = g_win_call - 1;   // entries with call <= safe_before are drained
++    if (!drained_prev) {
++        return;                                   // still in flight: overshoot for one call (the slack)
++    }
++    // Release LRU-first, all drained entries at once (no rescan, no per-entry query).
++    std::vector<size_t> cand;
++    cand.reserve(g_win.size());
++    for (size_t i = 0; i < g_win.size(); i++) {
++        if (g_win[i].call <= safe_before) {
++            cand.push_back(i);
++        }
++    }
++    std::sort(cand.begin(), cand.end(), [](size_t a, size_t b) { return g_win[a].last < g_win[b].last; });
++    for (size_t k = 0; k < cand.size() && g_win_bytes > g_win_budget; k++) {
++        // the vector swaps the last element into a released slot, so re-find by identity
++        const void * h = g_win[cand[k]].host;
++        const size_t o = g_win[cand[k]].off;
++        for (size_t i = 0; i < g_win.size(); i++) {
++            if (g_win[i].host == h && g_win[i].off == o) {
++                win_release_locked(i);
++                break;
++            }
++        }
++    }
++}
++
++// Free at least `need` bytes, used only when the budget refuses a promote.  Safety first: a candidate must
++// be from an earlier boundary AND its own drain event must have fired, so this can never unregister a range a
++// queued copy still reads.  Bounded work (at most 64 probes) because it sits on the fill path.
++static bool win_trim_locked(size_t need) {
++    for (int tries = 0; tries < 64 && g_win_bytes + need > g_win_budget; tries++) {
++        int best = -1;
++        for (int i = 0; i < (int) g_win.size(); i++) {
++            if (g_win[(size_t) i].call >= g_win_call) {
++                continue;   // promoted during THIS call: a copy may be queued for it
++            }
++            if (best < 0 || g_win[(size_t) i].last < g_win[(size_t) best].last) {
++                best = i;
++            }
++        }
++        if (best < 0) {
++            return false;
++        }
++        if (!win_idle(g_win[(size_t) best])) {
++            g_win[(size_t) best].call = g_win_call;   // still in flight: do not consider it again here
++            continue;
++        }
++        win_release_locked((size_t) best);
++    }
++    return g_win_bytes + need <= g_win_budget;
++}
++
++// Promote the page-rounded range covering `expert`'s whole host blob (which covers `src_off` and every
++// fused slice of a `-sm tensor` child).  Caller holds `g_mutex`; returns the entry index.
++static bool win_promote_locked(const table_t & t, int32_t expert, size_t * out_off, void ** out_dev) {
++    if (!g_win_on || t.host == nullptr || t.host_bytes == 0 || expert < 0 || expert >= t.n_experts) {
++        return false;
++    }
++    const size_t page = win_page();
++    const size_t off0 = (size_t) expert * t.host_bytes;
++    const size_t aoff = off0 & ~(page - 1);
++    const size_t aend = (off0 + t.host_bytes + page - 1) & ~(page - 1);
++    const size_t len  = aend - aoff;
++    if (len == 0 || aend > t.host_bytes * (size_t) t.n_experts) {
++        return false;
++    }
++    for (size_t i = 0; i < g_win.size(); i++) {
++        win_entry & e = g_win[i];
++        if (e.host == t.host && e.off == aoff && e.len == len) {
++            e.last = ++g_win_clock;
++            e.call = g_win_call;
++            g_win_hits++;
++            *out_off = aoff;
++            *out_dev = e.dev;
++            return true;
++        }
++    }
++    if (len > g_win_budget) {
++        g_win_denied++;
++        return false;   // a single expert blob cannot fit the window
++    }
++    if (g_win_bytes + len > g_win_budget + win_slack() && !win_trim_locked(len)) {
++        g_win_denied++;
++        return false;
++    }
++    device_guard dg(t.device >= 0 ? t.device : 0);
++    void * base = (void *) ((const char *) t.host + aoff);
++    if (cudaHostRegister(base, len, hipHostRegisterDefault) != cudaSuccess) {
++        const cudaError_t err = cudaGetLastError();
++        g_win_reg_fail++;
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: window register FAILED (off=%zu len=%zu): %s\n", __func__, aoff, len,
++                          cudaGetErrorString(err));
++        }
++        return false;
++    }
++    if (g_win_trace && (g_win_promotes & 255) == 0) {
++        fprintf(stderr, "WINDOW promotes=%lld hits=%lld demotes=%lld d2d=%lld h2d=%lld reg_fail=%lld "
++                "denied=%lld cold=%lld bytes=%zu/%zu\n", (long long) g_win_promotes, (long long) g_win_hits,
++                (long long) g_win_demotes, (long long) g_win_d2d, (long long) g_win_h2d,
++                (long long) g_win_reg_fail, (long long) g_win_denied, (long long) g_cold_reaches,
++                g_win_bytes, g_win_budget);
++    }
++    bool locked = false;
++#if !defined(_WIN32)
++    if (g_win_mlock) {
++        if (mlock(base, len) == 0) {
++            locked = true;
++            g_win_mlocked++;
++        } else {
++            g_win_mlock_fail++;
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                GGML_LOG_WARN("%s: the host-expert window cannot mlock (RLIMIT_MEMLOCK?); residency is "
++                              "page-cache best-effort from here\n", __func__);
++            }
++        }
++    }
++#endif
++    // The copy kind is what decides the transport.  `cudaMemcpyHostToDevice` from a registered range is
++    // treated as a PAGEABLE upload by ROCm (staged through an internal bounce, ~1/4 the rate and known to
++    // tear under back-to-back use, see `expert_host_src`'s comment) even though the range is registered.
++    // Resolving the UVA alias and copying D2D from it takes the same fast path the pool's device alias
++    // does -- and this is why the pool's fill beat the first version of this window by 4x.
++    void * dev_alias = nullptr;
++    if (cudaHostGetDevicePointer(&dev_alias, (void *) ((const char *) t.host + aoff), 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        dev_alias = nullptr;
++    }
++    win_entry e;
++    e.host   = t.host;
++    e.off    = aoff;
++    e.len    = len;
++    e.dev    = dev_alias;
++    e.locked = locked;
++    e.call   = g_win_call;
++    e.last   = ++g_win_clock;
++    e.ev.assign((size_t) GGML_CUDA_MAX_DEVICES, nullptr);
++    g_win.push_back(std::move(e));
++    g_win_bytes += len;
++    g_win_promotes++;
++    *out_off = aoff;
++    *out_dev = dev_alias;
++    return true;
++}
++
++// Record the drain marker for a promoted range AFTER its copy has been issued.
++static void win_done_locked(const void * host, size_t off, int device, void * stream) {
++    if (host == nullptr || stream == nullptr) {
++        return;
++    }
++    for (size_t i = 0; i < g_win.size(); i++) {
++        win_entry & e = g_win[i];
++        if (e.host == host && e.off == off) {
++            cudaEvent_t ev = win_ev(e, device);
++            if (ev != nullptr) {
++                (void) cudaEventRecord(ev, (cudaStream_t) stream);
++            }
++            return;
++        }
++    }
++}
++
++// A model (or a device) is going away: release every range registered over that master.
++static void win_forget_host_locked(const void * host) {
++    for (int i = (int) g_win.size() - 1; i >= 0; i--) {
++        if (g_win[(size_t) i].host == host) {
++            win_release_locked((size_t) i);
++        }
++    }
++}
++
++static void win_trace_dump() {
++    fprintf(stderr, "WINDOW EXIT promotes=%lld hits=%lld demotes=%lld d2d=%lld h2d=%lld reg_fail=%lld "
++            "denied=%lld cold_reaches=%lld reg_bytes=%zu budget=%zu\n",
++            (long long) g_win_promotes, (long long) g_win_hits, (long long) g_win_demotes,
++            (long long) g_win_d2d, (long long) g_win_h2d, (long long) g_win_reg_fail,
++            (long long) g_win_denied, (long long) g_cold_reaches, g_win_bytes, g_win_budget);
++}
++
+ // A source is "acquired" here and "released" by `expert_src_done` once the copy has been issued, which
+ // records the drain marker: a pool slot records its per-(slot,device) event (so a later hand-over to an
+ // arena victim, or a retire, waits for every in-flight read) and a bounce entry stays busy until its event
+@@ -1843,6 +2393,10 @@ struct expert_src_t {
+     int            pool_slot = -1;
+     bool           pool_hit  = false;     // the slot was already resident (not newly filled from disk)
+     int            bounce    = -1;
++    // wip/host-expert-pinned-window: the registered range this source came from (keyed by master+offset,
++    // NOT by entry index, so a trim between acquire and done cannot mis-attribute the drain marker).
++    const void *   win_host  = nullptr;
++    size_t         win_off   = 0;
+ };
+ 
+ // TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
+@@ -1859,14 +2413,36 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         out->kind = cudaMemcpyHostToDevice;
+         return true;
+     }
++    // wip/host-expert-pinned-window: ONE registration per host tensor (`bind_host_dev_locked` registers the
++    // whole mapping and keeps the alias in `t.host_dev`) makes every expert's bytes device-readable in place,
++    // so the fill is a plain D2D from the mapping alias -- no pinned copy, no pool slot, no bounce, and no
++    // per-expert registration (which cannot even be done: it would overlap the tensor's registration).  A
++    // per-tensor registration is also cheap: ~0.6 us of API plus deferred page-table work, and it does not
++    // pin RAM (an SM read of a registered range is data-identical even under 70 GiB of real pressure).
++    // WITHDRAWN (campaign PROTOTYPE.md §5): filling the arena with a D2D from the registered TENSOR alias
++    // can give a wrong answer in situ (measured: a deterministic 287-char answer where the reference is 150,
++    // 10 560 alias fills, zero cold reads), while the same transport is byte-stable in the probe at 64-1024 MiB
++    // registrations.  Fills therefore stay on the pool path (pinned copy or per-slot registered view); the
++    // tensor registration is used ONLY by the cold read, which is byte-identical and does no copy at all.
++    if (false && g_win_on && g_win_tensor && t.host_dev != nullptr) {
++        out->base = (const char *) t.host_dev + (size_t) expert * t.host_bytes;
++        out->kind = cudaMemcpyDeviceToDevice;
++        g_win_d2d++;
++        g_win_hits++;
++        return true;
++    }
+     if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
+         int    s = -1;
+         char * p = pool_peek_locked(*pool, expert, &s);
+         if (p != nullptr && s >= 0) {
+-            out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++            out->base      = pool->slot_dev[(size_t) s] != nullptr ? pool->slot_dev[(size_t) s]
++                                                                   : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+             out->kind      = cudaMemcpyDeviceToDevice;
+             out->pool_slot = s;
+             out->pool_hit  = true;
++            if (pool->slot_reg.size() > (size_t) s && pool->slot_reg[(size_t) s]) {
++                g_win_hits++;
++            }
+             return true;
+         }
+         if (allow_empty_fill) {
+@@ -1943,6 +2519,9 @@ static void expert_src_done(table_t & t, host_pool_t * pool, const expert_src_t
+         (void) cudaEventRecord(t.bounce[(size_t) src.bounce].ev, st);
+         t.bounce[(size_t) src.bounce].busy = true;
+     }
++    if (src.win_host != nullptr) {
++        win_done_locked(src.win_host, src.win_off, dev, stream);
++    }
+ }
+ 
+ // wip/fix-gemma-4 (TODO #77/C): copy ONE expert's device slot from a pre-acquired host source.  One place
+@@ -3050,6 +3629,9 @@ static bool heat_dev_ensure_locked(table_t & t, int device) {
+ static void free_table_buffers_locked(table_t & t) {
+     device_guard dg(t.device >= 0 ? t.device : 0);
+     (void) cudaDeviceSynchronize();   // an identity/seed fill may still be in flight on stream 0
++    // NOTE: the window's TENSOR registration is deliberately NOT released here.  This function runs on every
++    // arena re-size, and `host_dev` (the registration's alias) outlives it, so unregistering here leaves a
++    // dangling device alias -- measured as a GPU page fault.  It is released at model teardown instead.
+     // Everything below is a raw device pointer a captured graph can hold as a launch parameter: the arena
+     // and the heat mirrors bump for themselves, the remap/routing staging does not.  Bump once here so no
+     // buffer this function frees can be replayed against.
+@@ -4460,6 +5042,21 @@ void moe_cache_forget_all(int device) {
+             t.src_fd = -1;
+         }
+     }
++    // The window registrations are keyed by the master: release the per-expert ones and the per-table
++    // whole-tensor one (its alias is `t.host_dev`, which the cold read uses).
++    for (int i : drop) {
++        table_t & t = g_tables[i];
++        if (t.win_reg_base != nullptr) {
++            (void) cudaHostUnregister(t.win_reg_base);
++            (void) cudaGetLastError();
++            t.win_reg_base = nullptr;
++            t.win_reg_len  = 0;
++            t.host_dev     = nullptr;
++        }
++    }
++    for (const void * h : dead_hosts) {
++        win_forget_host_locked(h);
++    }
+     // The host pool is keyed by the master and holds PINNED memory: it must not outlive the model either.
+     for (const void * h : dead_hosts) {
+         const auto it = g_host_pools.find(h);
+@@ -6000,6 +6597,15 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
+         return false;
+     }
++    if (g_win_on) {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        win_trim_to_budget_locked(device);
++        win_boundary_locked(device);
++        cudaEvent_t & ev = g_win_call_ev[device >= 0 && device < GGML_CUDA_MAX_DEVICES ? device : 0];
++        if (ev != nullptr && stream != nullptr) {
++            (void) cudaEventRecord(ev, (cudaStream_t) stream);
++        }
++    }
+     const int layer = name_layer(weight);
+     if (layer < 0) {
+         return false;
+@@ -6676,7 +7282,8 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+             // MOE_HOST_POOL_COLD: a pool-backed table's cold region is the pinned pool, indexed by pool slot
+             host_pool_t * p = (g_cold_uva && g_pool_cold && t.cold_safe && t.n_slices == 0 && t.src_off == 0 &&
+                                ggml_cuda_info().device_count == 1) ? table_pool_locked(t) : nullptr;
+-            if (p != nullptr && !p->failed && p->base_dev != nullptr && p->host_bytes == t.host_bytes) {
++            if (p != nullptr && !p->failed && p->base_dev != nullptr && p->host_bytes == t.host_bytes &&
++                p->pin_slots == p->slots) {   // window slots are per-expert views: no single cold base
+                 *cold_base = (char *) p->base_dev;
+                 *n_res     = t.slots;
+                 if (cold_channel_bytes) {
+@@ -6933,6 +7540,15 @@ void moe_cache_report() {
+     }
+     const int64_t total = hits + misses;
+     const double h = total > 0 ? (double) hits / (double) total : 0.0;
++    if (g_win_on) {
++        GGML_LOG_WARN("%s: host-expert WINDOW: %lld promotes, %lld hits, %lld demotes, %lld reg_fail, "
++                      "%lld denied, %lld mlocked (%lld mlock_fail); %zu MiB registered of %zu MiB budget\n",
++                      __func__,
++                      (long long) g_win_promotes, (long long) g_win_hits, (long long) g_win_demotes,
++                      (long long) g_win_reg_fail, (long long) g_win_denied,
++                      (long long) g_win_mlocked, (long long) g_win_mlock_fail,
++                      g_win_bytes / 1048576, g_win_budget / 1048576);
++    }
+     GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
+                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
+                   n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());

@@ -1,0 +1,79 @@
+=== wip/host-expert-pinned-window probe ===
+device 0          : AMD Radeon AI PRO R9700 (gfx1201), pci bus 03, 1 device(s) visible
+hostRegister      : supported=1  readOnlyFlag=0  unifiedAddr=0  managedMem=1
+source            : /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+mapping           : 21613 MiB MAP_SHARED PROT_READ
+
+--- 1. registration of a read-only MAP_SHARED file mapping ---
+flags                        hipHostRegister        hipHostGetDevicePointer    us
+default(0)                   ok                     ok (same VA)               46
+ReadOnly                     ok                     ok (same VA)               314
+Portable|Mapped              ok                     ok (same VA)               203
+ReadOnly|Portable|Mapped     ok                     ok (same VA)               191
+unaligned +64 B              ACCEPTED (no page-alignment constraint)
+
+--- 2. register+unregister cost vs range size, and is the PIN eager or deferred? ---
+range        register us  unreg us     us/MiB     Mlocked delta  Unevictable delta
+256 KiB      0.6          0.3          3.56       0              0
+512 KiB      0.6          0.2          1.74       0              0
+1.66 MiB     0.6          0.2          0.53       0              0
+4.00 MiB     0.7          0.3          0.23       0              0
+16.00 MiB    0.7          0.2          0.06       0              0
+64.00 MiB    0.7          0.3          0.01       0              0
+256.00 MiB   0.7          0.2          0.00       0              0
+
+--- 3. miss path per 1.66 MiB expert, 40 runs, median [p10..p90] ---
+arm                            host us      total us     device us    GB/s
+pool: memcpy + CE H2D          54.8         142.8        66.4         26.2   [138.7..145.6]
+B: register + CE H2D           1.4          62.4         43.4         40.1   [61.6..62.9]
+B: register + CE H2D (defer)   0.8          48.2         0.0          0.0   [48.0..48.5]
+A: SM read, 8 blocks           0.0          64.3         46.7         37.3   [63.5..65.2]
+A: SM read, 32 blocks          0.0          59.2         41.3         42.2   [58.7..59.6]
+A: SM read, 128 blocks         0.0          59.0         41.2         42.3   [58.5..59.3]
+ref: CE D2D (VRAM hit)         0            11.0         11.0         158.2
+ref: SM VRAM copy, 64 blk      0            11.6         11.6         150.1
+
+--- 3e. pool vs B vs A across blob sizes (median total us) ---
+blob         pool           B              A (32 blk)     B vs pool
+256 KiB      45.7           34.7           31.7           +0.76x
+512 KiB      58.9           39.4           36.5           +0.67x
+1.66 MiB     124.9          61.1           58.9           +0.49x
+4.00 MiB     229.7          105.9          103.4          +0.46x
+16.00 MiB    836.4          326.9          325.0          +0.39x
+32.00 MiB    1609.7         628.5          625.1          +0.39x
+
+--- 3f. 8 fresh 8 MiB ranges, one CE copy each (lazy pin: per range or one-time?) ---
+   fresh range 0, 1st copy :   3049.8 us (2.8 GB/s)    2nd copy:   161.3 us (52.0 GB/s)
+   fresh range 1, 1st copy :    175.2 us (47.9 GB/s)    2nd copy:   164.2 us (51.1 GB/s)
+   fresh range 2, 1st copy :    162.5 us (51.6 GB/s)    2nd copy:   164.0 us (51.1 GB/s)
+   fresh range 3, 1st copy :    162.6 us (51.6 GB/s)    2nd copy:   166.5 us (50.4 GB/s)
+   fresh range 4, 1st copy :    162.8 us (51.5 GB/s)    2nd copy:   164.1 us (51.1 GB/s)
+   fresh range 5, 1st copy :    162.9 us (51.5 GB/s)    2nd copy:   164.1 us (51.1 GB/s)
+   fresh range 6, 1st copy :    162.7 us (51.6 GB/s)    2nd copy:   164.1 us (51.1 GB/s)
+   fresh range 7, 1st copy :    162.9 us (51.5 GB/s)    2nd copy:   164.0 us (51.2 GB/s)
+
+--- 4. byte check (VRAM copy vs the file's bytes) ---
+pool    : identical
+B       : identical
+A       : identical
+
+--- 5. unregister with the copy still queued (must NOT be relied on) ---
+unregister returned Success (NOT a safety guarantee)
+bytes    : identical  (a mismatch here is exactly why the demote needs an event)
+
+--- 6. cold read: a file the page cache has never held (on the model volume, NOT tmpfs) ---
+   resident pages after the drop: 0 of 2048
+   memcpy out of a COLD 8.00 MiB range      :  17658.3 us (  0.5 GB/s)  <- the pool's fill
+   hipHostRegister of a COLD 8.00 MiB range :   1884.9 us (  4.5 GB/s)  <- B/A's fill
+
+--- 7. does memory pressure evict a registered window? (control: unregistered) ---
+   before pressure: window 2048/2048 resident, control 2048/2048
+   control after MADV_PAGEOUT: 0/2048 (evicted -- test is live)
+   window  after MADV_PAGEOUT: 0/2048 (EVICTABLE!)
+   device read of the window after reclaim: identical
+
+--- 8. 256 MiB copy rates (the CPU column is VOID: a blocking copy busy-waits) ---
+   registered file mapping      4817.6 us ( 55.7 GB/s)   host cpu:  4815.0 us (100 % of wall)
+   hipHostMalloc buffer         4823.2 us ( 55.7 GB/s)   host cpu:  4819.0 us (100 % of wall)
+
+--- done ---
