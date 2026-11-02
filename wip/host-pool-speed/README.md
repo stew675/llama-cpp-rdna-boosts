@@ -588,8 +588,9 @@ replayer's error was the score band, not its dynamics — the runtime's `h=` is 
 So: **the pool is -20.5 % on decode and -7.5 % on prefill on the reference arm, and the `DIO` boolean is not
 what costs it** (forced `O_DIRECT` == auto to 0.3 %; the buffered arm is the *unstable* one).  The pool streams
 ~90 GiB more from disk per run (53.7 of it the one-shot prepopulate), yet it moves the same host-link bytes as
-`pinned` — so the next suspect is the **copy kind** out of the pool (D2D from the mapped alias vs the pinned
-arm's H2D), not bandwidth.  `HANDOVER.md` §5.1-5.3 and §3.1.
+`pinned`.  Two hypotheses were then tested and one closed: the **copy kind** out of the pool (D2D from the mapped
+alias vs the pinned arm's H2D) makes **no difference** (17.76/17.80 vs 17.79/17.78, `HANDOVER.md` §3.1), while
+**pool coverage** is decisive — see below.
 
 **Pool coverage is the decode lever (measured, `FRAC` swept on the same arm).**  `pinned` 22.34; `pool` at
 `FRAC` 100 (256/256 slots, 67.1 GiB pinned) **20.59**; at `FRAC` 80 (the shipped default, 204/256) **17.76**; at
