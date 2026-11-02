@@ -35,7 +35,17 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-_None — both candidates held here were promoted in `v12-097cf33d9-r86` (2026-10-19)._
+* **`0016-host-experts-window`** (2026-11-02) — `--host-experts window`: a third host-expert mode that
+  registers each host expert tensor **in place** so the page cache itself is device-readable, and the
+  pinned pool stops being a tier at all.  1 GPU: **+17-35 % decode** and **−24.8 GB peak RSS** on the
+  cells that spill, MTP four-axis acceptance identical to 5 decimals, every kill-switch arm
+  byte-identical, correct inside a 10 GiB cgroup.  **Held for the multi-GPU / `-sm tensor` arm**: the
+  per-host-tensor registration refcount (three per-device children over one master) has never run on
+  more than one device.  Patch sha256 `3502e334…`, applied tree `5101f0e4…`.  Record:
+  [`0016-host-experts-window/README.md`](0016-host-experts-window/README.md) and
+  `WORKLOG.md` 261102.006.
+
+(Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 
 ## Recently promoted
 

@@ -1,13 +1,18 @@
 # PROTOTYPE — one residency tier: the pool's slots backed by the mapping
 
-**State (2026-11-02, v4): the window WORKS and is worth +35-40 % decode.**  With the host master registered
-once and read in place, `--host-experts pool` measures **tg128 72.6-77.9 t/s against its own 52.3-56.9**, text
-byte-identical on four arms x three prompts, and it needs no pinned host copy at all: the pool is deleted
-(`table_pool_locked` returns null) and the residency is the **arena + the page cache, one tier**
-(`prototype-v4-onetier.patch`).  The two failures §5 used to carry (**bug A** wrong text from the alias fill,
-**bug B** wrong text from the cold read) **do not reproduce on the saved v3 tree** and were an artefact of a
-state that was never committed — see §5.  Nothing here is in `patches/`; the prototypes are loose patches in
-this directory (`prototype-v1`, `-v2`, `-v3`, `-v4`).
+**State (2026-11-02, v5): the window is a MODE — `--host-experts window` — and it is staged in
+[`beta/0016-host-experts-window/`](../../beta/0016-host-experts-window/README.md) awaiting the 3-GPU
+`-sm tensor` arm.**  With the host master registered once and read in place, the pool stops being a tier at
+all (`table_pool_locked` returns null) and the residency is the **arena + the page cache, one tier**.
+Measured on 1x R9700: **+35 %** decode at a sub-residency arena (Q4_K_M 52.3-56.9 -> 72.6-77.9 tg128),
+**+17-26 %** and **-24.8 GB peak RSS** on a model that genuinely does not fit (Q8_0, 37.8 GB on a 34.2 GB
+card), **parity with `pinned`** when the arena holds the set, and MTP acceptance identical to 5 decimals in
+every cell (§8).  The two failures §5 used to carry (**bug A** wrong text from the alias fill, **bug B**
+wrong text from the cold read) **do not reproduce on the saved v3 tree** and were an artefact of a state
+that was never committed — see §5.3.
+
+Nothing here is in `patches/`; the prototypes are loose patches in this directory (`prototype-v1`, `-v2`,
+`-v3`, `-v4`) and the candidate itself is `beta/0016-host-experts-window/host-experts-window.patch`.
 
 ## 1. What the prototype is trying to be
 
@@ -222,3 +227,56 @@ extended.  Untestable here; §5.3 records the one thing that would have broken i
    window on, drop the value, or implement windowing deliberately.
 6. **The `moe_cache_gather_host` reachability** the registration created is fixed (it reads `t.host_dev`);
    `GGML_SCHED_DEVGATHER` stays default-off and out of scope.
+
+## 8. v5: the mode, the gates, and what the beta is for
+
+`--host-experts window` (`prototype-v5` = the v4 prototype + the mode plumbing) is 13 files, `+368 -130`:
+`include/llama.h` (the enum), `common/arg.cpp` (the value + help), `src/llama-model-loader.cpp`
+(`host_expert_buft`, `llama_host_experts_mode_apply`, the no-mmap warning), `tools/llama-bench/`
+(the name/parser/help), the device iface (`ggml-backend.h`, `ggml-backend-impl.h`, `ggml-backend.cpp`,
+the CUDA wrapper, explicit nulls for cpu/rpc/meta) and `moe-expert-cache.{h,cu}`.  The env surface is now
+only the A/B: `MOE_EXPERT_TENSOR_REG` (kill switch, on in window mode), `MOE_EXPERT_WINDOW_MLOCK`,
+`MOE_EXPERT_WINDOW_TRACE`, `MOE_EXPERT_WINDOW_ALIAS_FILL`.  `MOE_EXPERT_WINDOW` and
+`MOE_EXPERT_WINDOW_MIB` are **deleted** — the registration is whole-tensor and does not hold the pages
+(`VmLock` 0.00 MB throughout), so there is nothing for a budget to bound.
+
+### 8.1 Gate results (1x R9700)
+
+| gate | result |
+|---|---|
+| greedy text, Q4_K_M + Q8_0, `-c 2048 -n 32` | reference `150 chars sha=4ac3a523160f` in **every** arm (pinned / pool / window / each kill switch), 3/3 runs per arm |
+| greedy text, 3 prompts x `n 96`, four arms | byte-identical (`ae39ec41bc1e` / `ab19f28d1868` / `b754e59af6c0`) |
+| kill switches (`MOE_EXPERT_TENSOR_REG=0`, `GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0`, all three) | byte-identical |
+| MTP four-axis, Q4_K_M, `-n 3000`, nmax 3 | acceptance 0.81370 / 0.75408 / 0.89175 / 0.98148, mean len 3.44 / 3.26 / 3.68 / 3.94 — **identical pool vs window**; `none` == `draft-mtp` text on all four axes; window 118.3 / 110.4 / 121.5 / 138.3 t/s vs pool 71.8 / 71.3 / 76.5 / 84.1 |
+| MTP four-axis, Q8_0 (does not fit), auto arena | acceptance 0.75118 / 0.75379 / 0.87798 / 0.98667, **identical across arms and identical text**; plain 79.1-82.6 vs 64.6-67.0, MTP 143.3-160.7 vs 132.2-154.2 |
+| `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` (Q4_K_M, arena 4096) | S_TG 55.4 / 108.2 / 56.9 -> **73.4 / 206.5 / 281.4**; S_PP 332-585 -> 381-634 |
+| reclaim | correct inside `MemoryMax=10G` over a 22.6 GB mapping, `Mlocked` 0.00 GB sampled every 200 ms |
+| `-sm tensor` / multi-device | **NOT RUN** — the reason the candidate is in `beta/` |
+
+Full table, cells and caveats: `beta/0016-host-experts-window/README.md`.
+
+### 8.2 Where the win lives (three cells, three answers)
+
+| residency | cell | window vs `pinned` | window vs `pool` |
+|---|---|---|---|
+| ~22 % (arena 4096) | Q4_K_M | **+35 %** | **+35 %** |
+| ~80 % (arena auto, 26.56 GiB of 33.0) | Q8_K_XL (plain decode only, see 8.3) | **parity** (58.6-63.3 vs 58.8-65.7) | +13 % (pool auto pins 27 GiB) |
+| 37.8 GB model on a 34.2 GB card, auto | Q8_0 | — | **+17-26 %**, **-24.8 GB RSS** |
+
+So: the window is a **miss-path** optimisation.  With the set resident it is `pinned`-equal and
+`pool`-better (the pool's copy still costs, and its pin is real RAM); as the set stops fitting, the gap
+grows and the pinned-RAM advantage does too.  That is the honest shape of the win, and it means a box
+whose expert set fits comfortably should see little of it.
+
+### 8.3 Two findings that are not this campaign's, recorded so nobody re-derives them
+
+* **Q8_K_XL's MTP head is damaged** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`): acceptance is ~0 in
+  **every** mode on the same binary — `pinned` 0.00000, `window` 0.00000, `pool` 0.00589 — while
+  `Qwen3.6-35B-A3B-Q8_0.gguf` and the UD-Q4_K_M give 0.878 / 0.892 on the identical command.  The file
+  does carry `blk.40.nextn.*`, so the head is present but unusable.  A model-file defect; no `TODO`
+  (maintainer's call 2026-11-02), just do not use that file as an MTP gate model.
+* **`pool` and `window` can give different greedy text** on a MoE model (Q8_K_XL: 96 chars `a81c7ef7ec69`
+  vs 50 chars `8e7cb6422ad1`, each stable 3/3; Q4_K_M and Q8_0 agree exactly).  Not root-caused — and
+  not an arena-alignment artefact (both per-expert strides are page multiples: Q8_K_XL 1114112 B,
+  Q4_K_M 720896 B).  It is the `INVARIANTS.md` rule in practice: on MoE, **cross-config** text is not a
+  purity gate.  Gate on in-mode identity + acceptance.

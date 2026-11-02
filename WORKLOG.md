@@ -1,3 +1,62 @@
+## 261102.006 (wip) -- host-expert window promoted to `--host-experts window` and staged as `beta/0016-host-experts-window/`; all 1-GPU gates green, `-sm tensor` owed
+
+No delivery change to `patches/`/`release.json`/`rdna-boosts-all.patch`.  Continues `261102.005`;
+`wip/host-expert-pinned-window/` (`PROTOTYPE.md` §8) and the new
+[`beta/0016-host-experts-window/`](beta/0016-host-experts-window/README.md).  Per the maintainer: the
+feature becomes a **mode** (`--host-experts window`), opt-in, and the candidate is a `beta/` patch so the
+3-GPU box can apply and build it with one flag while multi-GPU validation continues.
+
+**The mode.**  13 files, `+368 -130`: `include/llama.h` (`LLAMA_HOST_EXPERTS_MODE_WINDOW`),
+`common/arg.cpp`, `src/llama-model-loader.cpp` (`host_expert_buft` + `llama_host_experts_mode_apply` + the
+no-mmap warning), `tools/llama-bench/`, a new device iface entry
+`ggml_backend_dev_moe_cache_set_host_window` (backend.h / backend-impl.h / backend.cpp / the CUDA wrapper,
+explicit nulls in cpu, rpc and meta) and `moe-expert-cache.{h,cu}`.  The env surface is now only the A/B:
+`MOE_EXPERT_TENSOR_REG` (kill switch, on in window mode), `MOE_EXPERT_WINDOW_MLOCK`,
+`MOE_EXPERT_WINDOW_TRACE`, `MOE_EXPERT_WINDOW_ALIAS_FILL`.  **`MOE_EXPERT_WINDOW` and
+`MOE_EXPERT_WINDOW_MIB` are deleted**: the registration is whole-tensor and does not hold the pages
+(`VmLock` 0.00 MB throughout, and the arm is correct inside a `MemoryMax=10G` cgroup over a 22.6 GB
+mapping), so there is nothing for a byte budget to bound -- the answer to "how much gets pinned at once"
+is *none*.  `MOE_HOST_POOL_MIB` now only sizes a fallback ring.
+
+**Gates, all on 1x R9700 (gfx1201, PCIe 5.0 x16, ROCm 10.1.0, 35B-A3B, `-ncmoe 40`).**
+
+* greedy text: reference `150 chars sha=4ac3a523160f` in **every** arm -- `pinned`, `pool`, `window`, and
+  `window` with `MOE_EXPERT_TENSOR_REG=0`, `GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0` and all three --
+  3/3 runs per arm, on Q4_K_M and on Q8_0; 3 prompts x `n 96` byte-identical on four arms.
+* **MTP four-axis** (`-n 3000`, nmax 3, reasoning pinned per axis): Q4_K_M acceptance
+  **0.81370 / 0.75408 / 0.89175 / 0.98148**, mean len 3.44 / 3.26 / 3.68 / 3.94 -- **identical `pool` vs
+  `window`** -- with `none` == `draft-mtp` text on all four axes, and window 118.3 / 110.4 / 121.5 / 138.3
+  t/s against pool 71.8 / 71.3 / 76.5 / 84.1.  Q8_0: 0.75118 / 0.75379 / 0.87798 / 0.98667, identical
+  across arms and identical text; plain 79.1-82.6 vs 64.6-67.0.
+* `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8`: S_TG 55.4 / 108.2 / 56.9 -> **73.4 / 206.5 / 281.4**.
+
+**Where the win is (three cells, three answers).**  Sub-residency arena (Q4_K_M, arena 4096, ~22 % of the
+host set): **+35 %** over both `pool` and `pinned`.  High residency (arena auto = 26.56 GiB of 33.0):
+`window` == `pinned` (58.6-63.3 vs 58.8-65.7) and +13 % over `pool`.  A model that does not fit (Q8_0,
+37.8 GB on a 34.2 GB card, auto sizing): **+17-26 %** and **peak RSS 58.5 -> 33.7 GB** (the pool's auto
+80 % is 25 GB of non-swappable `cudaHostAlloc`).  So the window is a miss-path optimisation, `>= pinned`
+everywhere, and its margin grows exactly as the host set stops fitting.
+
+**Two findings recorded as campaign notes, no `TODO` (maintainer's call).**  (a) The **Q8_K_XL file's MTP
+head is damaged**: acceptance ~0 in *every* mode on the same binary (`pinned` 0.00000, `window` 0.00000,
+`pool` 0.00589) where `Q8_0` and `UD-Q4_K_M` give 0.878 / 0.892 -- a model-file defect, not a mode one, so
+it is not a gate model.  (b) `pool` and `window` can give **different greedy text** on a MoE (Q8_K_XL: 96
+chars vs 50, each stable 3/3; Q4_K_M and Q8_0 agree exactly), not root-caused and not an arena-alignment
+artefact (both per-expert strides are page multiples).  That is `INVARIANTS.md`'s existing rule in
+practice: gate on **in-mode** identity plus acceptance, never on cross-config text.
+
+**The beta.**  `beta/0016-host-experts-window/` (`README.md`, `BETA-TESTING.md`,
+`host-experts-window.patch` sha256 `3502e334d674b985a22dcb803e5216a00a726b96f961601172fe66d4b9704da6`),
+cut against `release.json`'s tree `1bac1001…`; a fresh `scripts/apply-all.sh --include-beta` on
+`6050b467c` gives 16 blocks + beta commit `142b06212` / tree
+**`5101f0e43ecf889394bc9d6b24f349faaadd96b5`**, which is byte-identical to the tree these numbers were
+measured on, and a cold `cmake` build of it was verified clean.  The one open item is the reason it is a
+beta: the registration is keyed by the **host tensor with a refcount** because a `-sm tensor` split has
+three per-device children over one master and a second `cudaHostRegister` of the same range is refused as
+an overlap -- untested on more than one device.  `BETA-TESTING.md` §3 names the assertion
+(`MOE_EXPERT_WINDOW_TRACE=1` `tensors=` must be the *host tensor* count, not one third of it, with
+`reg_fail=0` and `cold_dev>0`).
+
 ## 261102.005 (wip) -- host-expert window: ONE residency tier works -- +35-40 % decode, byte-identical, the pinned pool deleted; the two "bugs" do not reproduce
 
 No delivery change.  Continues `261102.004`; `wip/host-expert-pinned-window/` (`PROTOTYPE.md` v4,

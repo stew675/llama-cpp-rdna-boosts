@@ -19,8 +19,11 @@ shift || true
 
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
-export MOE_EXPERT_CACHE_MIB=${MIB:-4096}
-export MOE_HOST_POOL_MIB=${MOE_HOST_POOL_MIB:-2048}
+# AUTO_ARENA=1 / AUTO_POOL=1 leave the arena / the pool at the delivery's own AUTO sizing (the real
+# scenario); the campaign's pinned 4096/2048 exist for A/B comparability.
+if [ -z "${AUTO_ARENA:-}" ]; then export MOE_EXPERT_CACHE_MIB=${MIB:-4096}; fi
+if [ -z "${AUTO_POOL:-}"  ]; then export MOE_HOST_POOL_MIB=${MOE_HOST_POOL_MIB:-2048}; fi
+NCMA=${NCMA:-40}
 
 env "$@" "$BIN" -m "$MODEL" -ngl 99 -ncmoe "${NCMOE:-40}" --host-experts "${HOSTEXP:-pool}" \
     -p 256 -n 128 -r 2 -o json 2>/dev/null \

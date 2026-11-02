@@ -188,7 +188,19 @@ same alias makes `table_cold_ok()` true for a pool-backed master, which unlocks 
 host tiers measure the *same* ~55 t/s without it — a `hipHostMalloc` master is the slowest source for device
 access (§5.4's copy-path probe: 241 µs vs 155 µs for a registered mapping).
 
-## 6. If promoted, the shape of the change (not yet written)
+## 6. The shape of the change — written, and staged (`--host-experts window`)
+
+It is now a **mode**, not an env variable: `--host-experts window` (the loader's
+`host_expert_buft`/`llama_host_experts_mode_apply`, a device entry point
+`ggml_backend_dev_moe_cache_set_host_window`, and `g_win_on` owned by the mode).  The env surface is
+only the A/B: `MOE_EXPERT_TENSOR_REG=0` declines the registration (window then behaves exactly as
+`pool`), plus `MOE_EXPERT_WINDOW_MLOCK` / `_TRACE` / `_ALIAS_FILL`.  `MOE_EXPERT_WINDOW` and
+`MOE_EXPERT_WINDOW_MIB` are deleted — nothing is pinned (`VmLock` 0.00 MB), so there is no budget to
+set.  The candidate, its gates and the `-sm tensor` ask are in
+[`beta/0016-host-experts-window/`](../../beta/0016-host-experts-window/README.md); the measurements are
+`PROTOTYPE.md` §8.  The design notes below are the original plan, kept because they still describe the
+contract (promote/demote on a stream event, refuse rather than rely on reclaim, keep `pool` for the bulk
+policy and for a set larger than RAM).
 
 * Replaces the **pool** for single-device, whole-expert tables; keeps the pinned `ROCm_Host` master as the
   fallback (and for anything the window declines: `-sm tensor` slices, fused multi-slice tables, Windows — the
@@ -217,6 +229,8 @@ and B do not reproduce).  Patches: `prototype-v1-window-tier.patch`,
 * `PROTOTYPE.md` — the live design + results (start here).
 * `oracle.sh` — the deterministic greedy-text oracle (one line per arm; the arm is the caller's environment).
 * `bench.sh` — `llama-bench -p 256 -n 128 -r 2` for one arm (same convention).
+* `four-axis.sh` — the adaptive-MTP four-axis gate for one arm (same env convention; `AXES=`, `N=`,
+  `NMAX=`, `AUTO_ARENA=1`, `AUTO_POOL=1`).
 * `probe-pinned-window.cpp` — the probe (§1-§11 as printed above), no llama.cpp dependency.
 * `probe-copy-path.cpp` + `trace-copy-path.sh` — the `rocprofv3 --memory-copy-trace` probe for §5.4.
 * `build.sh` / `run-probe.sh` — ROCm 10.1 prefix, `--offload-arch=gfx1201`, `HIP_VISIBLE_DEVICES=0` pinned.

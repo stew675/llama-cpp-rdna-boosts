@@ -7,8 +7,10 @@
 # arm it measures:
 #
 #   ./oracle.sh pool                                  # reference: 150 chars sha=4ac3a523160f
-#   MOE_EXPERT_WINDOW=1 ./oracle.sh window
-#   MOE_EXPERT_WINDOW=1 MOE_EXPERT_TENSOR_REG=1 ./oracle.sh window-cold
+#   HOSTEXP=window ./oracle.sh window
+#   HOSTEXP=window MOE_EXPERT_TENSOR_REG=0 ./oracle.sh window-off
+#
+# HOSTEXP selects `--host-experts` (pinned|pool|window); everything else is the caller's environment.
 #
 # Why the flags are pinned (do not "simplify" them): `-c 2048` and no `--fit` make the run
 # reproducible -- Qwen3.6's chat template injects per-run content, so a --fit-sized run gives
@@ -23,8 +25,10 @@ OUT=${OUT:-$HOME/llama-cpp-rdna-boosts/wip/host-expert-pinned-window/runs}
 
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}   # the gfx1036 iGPU must stay out of the enumeration
-export MOE_EXPERT_CACHE_MIB=${MOE_EXPERT_CACHE_MIB:-4096}
-export MOE_HOST_POOL_MIB=${MOE_HOST_POOL_MIB:-2048}
+# AUTO_ARENA=1 / AUTO_POOL=1 leave the arena / the pool at the delivery's own AUTO sizing, which is
+# what a real box does -- the campaign's pinned 4096/2048 is for A/B comparability, not realism.
+if [ -z "${AUTO_ARENA:-}" ]; then export MOE_EXPERT_CACHE_MIB=${MOE_EXPERT_CACHE_MIB:-4096}; fi
+if [ -z "${AUTO_POOL:-}"  ]; then export MOE_HOST_POOL_MIB=${MOE_HOST_POOL_MIB:-2048}; fi
 
 mkdir -p "$OUT"
 LOG="$OUT/oracle-$(date +%Y%m%d-%H%M%S)-$LABEL.log"
