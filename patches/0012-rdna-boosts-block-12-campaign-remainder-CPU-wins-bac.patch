@@ -1,4 +1,4 @@
-From af9b02e643f3a9797d21b000ba8888e5ccf0e031 Mon Sep 17 00:00:00 2001
+From 1a79ee3d8db9dfdd7ad6d72ccb57b4219c527373 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1781,10 +1781,10 @@ index 21fb976bd..accf66f03 100644
          void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
          if (pin == nullptr) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index acc4262f2..62c61f5d3 100644
+index bab71d893..ad00d6773 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -979,7 +979,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -989,7 +989,23 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
  // The size is FIXED at the first establishment: narrow-2 is anchored at the top (`off = size - floor`), so
  // a later, larger request would move a live view's base.  In practice the first request is the draft's
  // `sched_reserve` pp layout, which is its widest graph, so the region never needs to grow.
@@ -1809,7 +1809,7 @@ index acc4262f2..62c61f5d3 100644
      if (!s.inited || bytes == 0) {
          return 0;
      }
-@@ -991,9 +1007,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1001,9 +1017,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
          const size_t off = s.size - nf2;
          const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
          // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable
@@ -1821,7 +1821,7 @@ index acc4262f2..62c61f5d3 100644
              GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB narrow-2 region above the work region "
                            "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); "
                            "the draft compute buffer stays on the cudaMalloc path\n",
-@@ -1002,38 +1017,156 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1012,38 +1027,156 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
                            (double) s.mapped / (1ull << 30));
              return 0;
          }
@@ -1995,7 +1995,7 @@ index acc4262f2..62c61f5d3 100644
  }
  
  // This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
-@@ -1082,6 +1215,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+@@ -1092,6 +1225,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
  // when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
  // boundary move (evicting the COLDEST tables), not an independent arena eviction.
  void * ggml_cuda_slab_work_alloc(int device, size_t need) {
@@ -2007,7 +2007,7 @@ index acc4262f2..62c61f5d3 100644
      size_t lo = 0, hi = 0;
      bool   move = false;
      size_t ret_off = 0;
-@@ -1096,36 +1234,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1106,36 +1244,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              if (!ggml_cuda_slab_init_locked(device, s, need)) {
                  return nullptr;
              }

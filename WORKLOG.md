@@ -1,3 +1,69 @@
+## 261101.020 (r206) -- the slab headroom default is `1152 + 128 x n_gpu` MiB, and block 15 gets the residency gate it shipped without
+
+**Released as `v16-6050b467c-r206` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
+tip **`efaa60db0`**, tree **`1bac1001f1780a5907fbce256ceeeaac8b8561ec`** (r205 was `7afa30c8e` / `d6e7190119`).
+The working chain read `261e22d7d` (same tree).  `release.json` refreshed; `patches/` regenerated from
+`6050b467c..r206-chain`; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball,
+tree `1bac1001f`, 286 files through the Windows portability lint); `gate-per-block-build.sh --fast
+--changed-from 7afa30c8e --tip 261e22d7d` 2/2 (block 10 + the tip).
+
+**Shipped -- one default, not a code path (block 10).**  `GGML_CUDA_SLAB_HEADROOM_MIB` is the steady-state free
+VRAM the movable-boundary slab leaves outside itself; the default was `640 + 128 x n_gpu` (768 / 896 / 1024 MiB
+for 1 / 2 / 3 GPUs) since r86.  It is now **`1152 + 128 x n_gpu`**, i.e. **1280 / 1408 / 1536 MiB**.  The 640
+base was sized on the field GSQ / `-ub 4096` shape, whose widest outside transient is ~300 MiB per device, and
+block 15's `-c 262144` host-expert runme is a harder one: r194's record is that the then-default 768 left
+`hipBLASLt out of memory` on the first prefill and 1536 was the workaround, i.e. the shipped default was one
+workspace short on a documented configuration.  A default that needs the operator to know that shape is the
+wrong default; `1280` covers it with the ~1.2x margin the header asks for.
+
+**`1280` is margin, not a demonstrated fix -- say so.**  This session did **not** reproduce the r194 cliff on any
+arm it could build: Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`, q8_0 KV, `-c 262144`, at a 5 246, a 25 763 and a
+51 475-token prefix, at 768 **and** at 1280 -- every arm completed and every arm produced the same text.  r194
+itself calls the failure order-dependent, so one clean pass proves nothing either way.  What is measured is the
+**cost**: field shape (1 GPU, `-ncmoe 48`, `-c 32768` q8_0, 5 246-token prompt, `-n 2000`, interleaved,
+`ROCBLAS_USE_HIPBLASLT=0`) 768 -> arena **24 691.7 MiB**, `h` **0.9603**, **47.95 t/s** vs 1280 -> arena
+**24 576.4 MiB**, `h` **0.9602**, **47.98 t/s**, i.e. **-115 MiB of arena, -0.01 pt of expert hit rate, decode
+flat**.  An explicit value is still taken verbatim, so 768 stays one env var away.
+
+**Coherence (no objection).**  Byte-identical to the pre-change build on every arm: dense 4B Q8_0
+(`d2ffb97ccb76`), host-expert 35B-A3B UD-Q4_K_M `-ncmoe 24` (`727d7d1558b4`), Flash-Next GSQ + MTP-4
+`-c 32768` (`f260d1824ab3`), and the `-c 262144` arms (`7c5a512a8447` at 5 246 tokens, `7a3474cbe5f1` at
+25 763, `6c0561298cf1` at 51 475) agreeing across 768/1280.  `gate-prefill-logits.sh` **0.000000 KLD /
+100.000 %** on the 27B Q8_0 point (build `efaa60db0`); MTP Protocol A P axis (dense 27B UD-Q4_K_XL, 1 GPU,
+`-c 102400` bf16 KV, `-n 3000`, prose): plain **30.1** t/s vs `draft-mtp` **55.3** t/s with **byte-identical**
+text (`b9c10f46b5ae`, 11 413 chars); `check-gpu-faults.sh --since "6 hours ago"` clean.  `fork-refresh.sh
+--build --gates` re-cut the branch from `6050b467c`, reproduced tree `1bac1001f` and printed the canonical tip
+**`efaa60db0`** (now `release.json.tip`).
+
+**Block 15 gets the gate it shipped without (campaign `wip/kv-residency-cleanup/` §2.1 = the archive plan's
+phase P0).**  `scripts/gate-kv-residency.sh` is repo tooling, not a patch: two placements, each with a resident
+arm and a forced-miss one, on one binary, with same-seed text (and the drafter's acceptance) as the oracle and
+the residency numbers as the proof that the arm left the resident placement.  Window: `wref`/`wres` (`W=8192`,
+above the run depth)/`wspill` (`W=2048`).  Pool: `pref` (the sparse arm the pool replaces)/`pres`
+(`LLAMA_KV_REGION_POOL=32768`, the whole cache)/`pfloor` (`=512`).  It also prints a per-cache **KV accounting**
+block from the log -- the P0 report -- and `REUSE=1 KEEPOUT=<dir>` re-grades a run instead of re-running it.
+Measured: `wref == wres == wspill` (`be904e86f248`) with 0 flips and 0 host MiB on `wres` and 16 flips /
+64 MiB host-backed on `wspill`; `pref == pres == pfloor` (`f260d1824ab3`) with draft 71/43 on all three,
+`bad 0`, 8 192 pages vs 4 104, 252 resolves on both, **144.3 -> 218.4 claims/resolve** and **90.95 -> 89.64 %**
+hits.  **Negative-tested** as the plan demands: an off-by-one pool slot in `kv_pool_map_fill_kernel` diverges
+the text and the acceptance and the gate FAILs (and `LLAMA_KV_POOL_VERIFY=1` stays `bad 0` under it -- VERIFY
+compares the pool's bytes, so a wrong READER index is invisible to it, which is exactly why the text oracle is
+the gate).
+
+**Three things the plan's own arm design got wrong** (recorded in the campaign file and the script header, so
+they are not re-derived): a pool cannot be made "deliberately undersized" in cells -- `LLAMA_KV_REGION_POOL` is
+floored to one decode band, so `512` *becomes* 4 104 pages; a resident pool does **not** report ~0 misses (the
+claim cursor is round-robin and the top-k selection moves: 144 claims/resolve with the whole cache resident);
+and `hits %` can never read 100 % (a block claimed by the same launch is neither hit nor miss).
+
+**`TODO` #122 retired in this session** (`WORKLOG.md` 261101.019, docs only): the Goal A `auto` policy is P1 and
+block 15's note already said so.  `TODO.md` now carries no decision rows.
+
+**Wiring.**  `scripts/README.md` (command list + the table row), `MANIFESTS.md` release gate **17** (and "run the
+GPU gates alone"), `AGENTS.md`'s change-to-gate table, `wip/kv-residency-cleanup/README.md` §2.1 (DONE, with the
+three corrections and the numbers) and `wip/CAMPAIGNS.md`.  Not wired into `scripts/validate-gpu.sh`: the worker
+has one gfx1151 card and no Flash-Next GGUF, so this stays a by-hand release gate like park/ckpt/state.
+
 ## 261101.019 (docs) -- `TODO` #122 retired: the Goal A `auto` policy is P1, and the note already said so
 
 No delivery change (nothing outside `patches/*.patch` moved, so no new tag for this entry).  #122 was the

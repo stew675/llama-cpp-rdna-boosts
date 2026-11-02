@@ -334,6 +334,30 @@ in CI.  The model-level gates are manual:
    the split branch of `common/fit.cpp` or `llama_model::kv_cache_split_mirrored`; every release that touches
    block 15.
 
+17. **KV residency** — `scripts/gate-kv-residency.sh` (r206, the archive plan's phase **P0**,
+   `wip/kv-residency-cleanup/` §2.1): for the **window** and the **attendance pool**, a resident arm and a
+   deliberately under-sized arm, on one binary.  A residency defect is a *wrong answer*, not a crash, so the
+   oracle is same-seed text (plus the drafter's acceptance) -- and that is only an oracle if the arm provably
+   LEFT the resident placement, which is why the gate fails when the two arms report the same residency.  Window
+   arms (4B, `-c 16384` f16, 5 246-token prompt): `wref` (no knob), `wres` (`W=8192`, above the run depth:
+   **must** never flip a mapping nor map a host byte) and `wspill` (`W=2048`: **must** do both, `FLIP device 0`
+   > 0 and `of which host` > 0), text byte-identical on all three.  Pool arms (Flash-Next GSQ-IQ3_XXS + its MTP
+   sidecar, 1 GPU, `-ncmoe 48`, q8_0, `-c 32768`, 25 763-token prefix, MTP depth 4): `pref` (no pool, the
+   SPARSE arm the pool replaces), `pres` (`LLAMA_KV_REGION_POOL=32768` = the whole cache, 8 192 pages) and
+   `pfloor` (`=512`, **floored** to one decode band = 4 104 pages, with `LLAMA_KV_POOL_VERIFY=1`); text and
+   `draft_n`/`draft_n_accepted` identical across all three, `bad 0`, claims/resolves/hits non-zero, `pres`
+   holding exactly `-c/4` pages, and on the SAME resolve count `pfloor` claiming more per resolve and hitting
+   less.  `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
+   log (cells, bytes, the buffer the placement got, host-backed MiB, pool geometry, the counters line).
+   **The counters that cannot be asserted are in the script header**: `hits %` can never read 100 % (a block
+   claimed by the same launch is neither hit nor miss) and a resident pool does not reach ~0 misses (the claim
+   cursor is round-robin and the top-k selection moves) -- at `-c 32768`, depth 25 763 and 8 192 pages,
+   144 claims/resolve is the resident arm's floor, and the floor-vs-resident delta is what the gate compares.
+   **Negative-tested**: an off-by-one pool slot in `kv_pool_map_fill_kernel` (a wrong-page resolve) diverges the
+   text and the acceptance, and the gate FAILs.  Required for any change to the window/region provider, the
+   pool, `is_streaming()`, the sparse decode arm, block 15's `--fit` interaction or `memory_breakdown()`'s KV
+   accounting; every release that touches block 15.  ~15 s (`--window-only`), ~5 min (`--pool-only`).
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

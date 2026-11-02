@@ -1417,3 +1417,15 @@ change), and let `WORKLOG.md` carry the narrative.
   and would have flipped cache bytes; with the serial order the `--ub 1` A/B is `-0.000000 / 100.000 %`.  The
   `q5_0` group needs no such care (a per-element quantizer) but its `qh` word is only reachable as one ballot —
   bit `j` = lane `j`'s 5th bit — so it is wave32 only, like `q4_0`'s ballot.
+- **The slab headroom default is `1152 + 128 x n_gpu` MiB and its cost is measured, not assumed (r206).**  It was
+  `640 + 128 x n_gpu` (768 / 896 / 1024 for 1 / 2 / 3 GPUs) from r86 to r205; one GPU now leaves **1280** MiB
+  outside the slab.  The 640 base was sized on the field GSQ / `-ub 4096` shape, whose widest outside transient is
+  ~300 MiB per device, so block 15's `-c 262144` host-expert runme needed 1536 there (r194's `hipBLASLt out of
+  memory` on the first prefill) — a shipped default that is one workspace short on a documented config is the
+  wrong default.  **The bump is margin, not a demonstrated fix**: the r194 cliff is order-dependent and r206 did
+  not reproduce it (5 246 / 25 763 / 51 475-token prefixes at `-c 262144`, at 768 and at 1280, every arm clean and
+  text-identical).  What the bump COSTS, measured on the field shape (Flash-Next GSQ-IQ3_XXS, 1 GPU, `-ncmoe 48`,
+  `-c 32768` q8_0, 5 246-token prompt, `-n 2000`, interleaved arms, `ROCBLAS_USE_HIPBLASLT=0`): 768 -> arena
+  24 691.7 MiB / `h` 0.9603 / 47.95 t/s vs 1280 -> **24 576.4 MiB / 0.9602 / 47.98 t/s**, i.e. **-115 MiB of
+  arena, -0.01 pt of expert hit rate, decode flat**, text byte-identical.  An explicit `GGML_CUDA_SLAB_HEADROOM_MIB`
+  is still taken verbatim (no per-GPU addition), so the old value stays one env var away.

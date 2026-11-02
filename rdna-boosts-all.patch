@@ -27460,10 +27460,10 @@ index 000000000..310a748ca
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 new file mode 100644
-index 000000000..62c61f5d3
+index 000000000..ad00d6773
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -0,0 +1,1948 @@
+@@ -0,0 +1,1958 @@
 +// Movable-boundary slab (OPEN 2 / r42): the per-device VMM reserve + work/arena boundary move.
 +// Split out of ggml-cuda.cu (an upstream hub); the API is declared in ggml-cuda-vmm.h.
 +
@@ -27933,8 +27933,18 @@ index 000000000..62c61f5d3
 +// the allocations that can still appear later.  `0` disables the extension (the slab then keeps exactly
 +// the reserve it took at creation).
 +//
-+// DEFAULT: **640 MiB per GPU, plus 128 MiB for every additional GPU** (wip/slab-transient-absorption,
-+// 2026-10-18): 1 GPU -> 768, 2 -> 896, 3 -> 1024 MiB.  See `ggml_cuda_slab_headroom_bytes`.
++// DEFAULT: **1152 MiB per GPU, plus 128 MiB for every additional GPU** (wip/slab-transient-absorption,
++// 2026-10-18; base raised 640 -> 1152 in r206): 1 GPU -> 1280, 2 -> 1408, 3 -> 1536 MiB.  See
++// `ggml_cuda_slab_headroom_bytes`.
++//
++// 2026-11-01 (r206): the base moved 640 -> 1152 (+512 on every config) so that ONE GPU gets 1280 MiB.  The
++// 640 base was sized on the field GSQ / `-ub 4096` shape, whose widest transient is ~300 MiB per device; the
++// `-c 262144` Flash-Next runme (`-ncmoe 48`, q8_0 KV, host experts) is a harder one and OOMed its first
++// prefill with 768 ("one hipBLASLt workspace short", block 15's r194 note, where 1536 was the workaround).  A
++// default that needs the operator to know that shape is the wrong default: 1280 covers it with the ~1.2x
++// margin the comment below asks for, and still leaves the arena the majority of the freed reserve.  The
++// cost is the documented trade (~1 pt of expert hit rate per GiB withheld) -- on the field GSQ shape the
++// arena loses 512 MiB and the hit rate ~0.5 pt.
 +//
 +// 2026-10-18: the base moved 512 -> 640 (+128 on every config).  The 2-GPU MTP measurement
 +// (`Qwen3.8-Flash-Next` IQ4_NL, `-ncmoe 48`, 131k ctx, 73k-token prefill) left the cards at **148 MiB free
@@ -27961,8 +27971,8 @@ index 000000000..62c61f5d3
 +//   ---------+-------------------------------------+-----------------------+---------------+-------------
 +//       512  | floor 214.5 MiB                     | drop 471 MiB          | -             | -
 +//       600  | floor 346.5 MiB                     | -                     | -             | 209.5 MiB/dev
-+//       640  | floor 346.5 MiB  <- 1-GPU default   | ~559 (T=41)           | -             | -
-+//       768  | -                                   | -                     | -             | 401.5 MiB/dev <- 2-GPU default
++//       640  | floor 346.5 MiB  (pre-r206 1-GPU)   | ~559 (T=41)           | -             | -
++//       768  | -                                   | -                     | -             | 401.5 MiB/dev (pre-r206 2-GPU)
 +//      1024  | floor 714.5 MiB                     | drop 983 MiB          | 1552.5 /dev   | 657.5 MiB/dev
 +//      2048  | -                                   | -                     | 2576.5 /dev   | 1681.5 MiB/dev
 +//
@@ -27987,8 +27997,8 @@ index 000000000..62c61f5d3
 +// `GGML_CUDA_SLAB_HEADROOM_MIB` sets the value VERBATIM (no per-GPU addition), like every other explicit
 +// override; the per-GPU scaling applies only to the default.  The value is the steady-state free VRAM kept
 +// outside the slab after `ggml_cuda_slab_extend` reclaims the reserve.
-+#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 640   // base; the default is 640 + 128 x n_gpu
-+#define GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU 128   // per device, so 1->768, 2->896, 3->1024 MiB
++#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 1152  // base; the default is 1152 + 128 x n_gpu
++#define GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU 128   // per device, so 1->1280, 2->1408, 3->1536 MiB
 +
 +static size_t g_slab_headroom_min_mib = 0;
 +void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
@@ -28002,12 +28012,12 @@ index 000000000..62c61f5d3
 +        env_set = env != NULL;
 +        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
 +    }
-+    // The outside transients are PER DEVICE, so the default grows with the number of cards (`640 + 128 x n`,
-+    // i.e. 768 / 896 / 1024 MiB for 1 / 2 / 3 GPUs); an explicit `GGML_CUDA_SLAB_HEADROOM_MIB` is taken
++    // The outside transients are PER DEVICE, so the default grows with the number of cards (`1152 + 128 x n`,
++    // i.e. 1280 / 1408 / 1536 MiB for 1 / 2 / 3 GPUs); an explicit `GGML_CUDA_SLAB_HEADROOM_MIB` is taken
 +    // verbatim (an operator asks for a total, not a per-card value).
 +    size_t eff = mib;
 +    if (!env_set) {
-+        // `640 + 128 x n_devices`: 1 GPU -> 768, 2 -> 896, 3 -> 1024 MiB.
++        // `1152 + 128 x n_devices`: 1 GPU -> 1280, 2 -> 1408, 3 -> 1536 MiB.
 +        const int n_phys = std::max(1, ggml_cuda_info().physical_device_count);
 +        eff += (size_t) n_phys * GGML_CUDA_SLAB_HEADROOM_MIB_PER_GPU;
 +    }
