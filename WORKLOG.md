@@ -1,3 +1,28 @@
+## 261101.019 (docs) -- `TODO` #122 retired: the Goal A `auto` policy is P1, and the note already said so
+
+No delivery change (nothing outside `patches/*.patch` moved, so no new tag for this entry).  #122 was the
+`LLAMA_KV_RESIDENT_CELLS=auto` policy question -- the arena-vs-window trade the campaign left open in
+`archive/work/kv-residency/A2-MIXED-BACKING.md` §3.7.11.4 A-C.  The maintainer decided it on 2026-10-31
+(§3.7.14): **P1 (fittability only) ships**, `auto` sizes a window only when the KV does not fit at the pinned
+`-c` and the expert arena keeps the VRAM through `margins[0]`; **P2** (unconditional arena-first) is rejected
+because a fit cannot know the run's depth (a `W` 35k cells below it costs 11-26 %); **P3** (an explicit
+per-token spill budget) stays parked until it measures better than P1 as a default.
+
+What was owed on the row was one line of block 15's note, and **it was already there** (r193,
+`patches/README.md`): the sentence asserted P1 and the numeric-`W` requirement before the decision was
+formally recorded.  So the retirement is bookkeeping plus three doc corrections:
+
+* the block-15 line now names the decision, its date and its record (§3.7.14, `TODO` #122), instead of reading
+  as a self-evident statement;
+* `wip/kv-residency-cleanup/README.md` drops the #122 close-out bullet, and its knob table loses a stale
+  row that still said the window is declined on `-sm tensor` and is "one device only" -- r204 shipped the
+  split window (`TODO` #124), so the line described a limitation two releases old;
+* `TODO.md` loses the row (numbers are permanent handles and are not reused).
+
+The engineering facts did not change, so no measurement is recorded here: `auto` behaves exactly as r181's
+"a decision, not a guess" note describes, and §3.7.11.4's tables A/B (a `W` at the depth is free and worth
++2.2..+2.9 GiB of arena; a `W` 35k below it costs 11-26 %) remain the numbers of record.
+
 ## 261101.018 (docs) -- r205 published: CI green on both pushes, the fork branch at `7afa30c8e`
 
 No delivery change (docs only; no new tag).  `v16-6050b467c-r205` is tagged and pushed; `main` is at the r205

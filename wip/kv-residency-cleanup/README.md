@@ -20,7 +20,7 @@ Block 15 is **three opt-in placements of the attention KV, one default-on draft 
 
 | knob | default | what it does |
 |---|---|---|
-| `LLAMA_KV_RESIDENT_CELLS` | off (`0`/unset) | the **window**: newest `W` cells in VRAM, the tail in pinned system RAM in one VA reservation (no kernel change).  `auto` = `--fit` sizes it.  `-sm tensor` declines it; `-nkvo` declines it (r197); one device only |
+| `LLAMA_KV_RESIDENT_CELLS` | off (`0`/unset) | the **window**: newest `W` cells in VRAM, the tail in pinned system RAM in one VA reservation (no kernel change).  `auto` = `--fit` sizes it, and only for a `-c` the user pinned (the decision `TODO` #122 records: P1, fittability only).  `-nkvo` declines it (r197); a `-sm tensor` split carries it, one region per child device (r204, `TODO` #124); a MIRRORED dsv4/HRM cache declines it |
 | `LLAMA_KV_REGION_POOL` | off (`0`/unset) | the **pool**: the authoritative KV in a pinned host mirror + a compact device pool of indexer-block pages, resolved in-graph by `GGML_OP_KV_POOL`.  qwen4exp/QSA only (it is the sparse reader's page table); declines while a window is active, on `!offload` and on a `-sm tensor` split |
 | `LLAMA_SPEC_DRAFT_WINDOW` | **on** (`auto`) | the **MTP draft window**: the embedded MTP head's draft KV is a quarter of the context clamped to [32768, 65536] cells, `0` = off.  MTP + embedded head only |
 | `LLAMA_KV_SPILL_RAM_PCT` / `LLAMA_KV_POOL_MIRROR_UNIT_MIB` | 85 % / 1 MiB | the pinned-RAM ceilings and the mirror's grow unit |
@@ -151,8 +151,6 @@ open:
 * **k-quant indexer keys** (accepted limitation: a 256-element superblock does not divide `idx_dim` = 128;
   `HANDOVER.md` §12.6, `BA-POOL-DESIGN.md` §10.3): add it to `TODO.md`'s **accepted limitations** list, so a
   reader of `TODO.md` alone can find it.
-* **`TODO` #122** (the Goal A `auto` policy): decided (P1) and its owed `patches/README.md` line is present,
-  so the row can be retired to one `WORKLOG.md` entry whenever the maintainer wants.
 
 ---
 

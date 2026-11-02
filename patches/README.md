@@ -3392,9 +3392,11 @@ pre-existing failure is *not* ours: `-nkvo` with host experts (`-ncmoe 48`) abor
 `ggml_backend_sched_copy_input` (`GGML_ASSERT(id >= 0 && id < n_expert)`) with the pool off, with no
 speculation, and on the released r191 binary too.  Filed as `TODO` #129.
 
-**Goal A's `auto` policy is P1 and stays P1** (the arena keeps winning the VRAM; the arena half of Goal A
-needs a numeric `W`).  P2 (unconditional arena-first) was rejected — a fit cannot know the run's depth and a
-`W` 35k cells below it costs 11-26 % — and P3 (an explicit per-token spill budget) is parked until measured.
+**Goal A's `auto` policy is P1 — the recommendation (maintainer, 2026-10-31, `TODO` #122; the arena keeps
+winning the VRAM, and the arena half of Goal A needs a numeric `W`).**  P2 (unconditional arena-first) was
+rejected — a fit cannot know the run's depth and a `W` 35k cells below it costs 11-26 % — and P3 (an explicit
+per-token spill budget) is parked until measured.  Decision record:
+[`../archive/work/kv-residency/A2-MIXED-BACKING.md`](../archive/work/kv-residency/A2-MIXED-BACKING.md) §3.7.14.
 
 **r196 — the attendance pool's mirror grows on demand (`TODO` #123).**  The mirror used to be one
 `cudaMallocHost` of the cache's whole cell-indexed size at creation (3264 MiB at `-c 262144` q8_0, 1632 at
