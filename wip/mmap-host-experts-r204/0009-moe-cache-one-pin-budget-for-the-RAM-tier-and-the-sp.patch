@@ -1,0 +1,232 @@
+From 29f677a35239116ac728fbd7779c48b34fe46313 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 21:24:45 +0000
+Subject: [PATCH 09/10] moe cache: one pin budget for the RAM tier and the
+ sparse registration (GGML_MOE_PIN_BUDGET_MIB), a partial tier (hottest tables
+ first) instead of all-or-nothing, the warm-up bounded too
+
+The tier fit test counts only the registrations that stay (the tables already left without a tier), so the sizing
+does not drop the warm-up registrations (that evicted the page cache the tiers are built from).  An expert whose
+registration fails for any reason is not retried until the next trim (a retry per call churned mlock/munlock).
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 114 +++++++++++++++++++++----
+ 1 file changed, 98 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 34b001ad3..b3e9eff13 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -106,6 +106,7 @@ struct table_t {
+     std::vector<uint8_t> stage_pack;    // ... and the host copy they are uploaded from
+     void *      route_dev   = nullptr;  // small-prefill routed fill: per-entry source, expert id, cold flag (device)
+     std::vector<uint8_t> route_pack;    // ... and its host copy
++    mutable std::vector<uint8_t> sreg_refused;   // experts whose registration the pin budget refused (cleared by a trim)
+     // RAM tier (sparse masters): an owned pinned copy of exactly the experts the arena does not hold, in the arena's
+     // compact layout.  An admission swaps arena <-> RAM, so nothing is read from the file after sizing.
+     char *      ram_base    = nullptr;
+@@ -744,6 +745,26 @@ static std::atomic<bool> g_any_sparse{false};            // some table has a spa
+ static const size_t SREG_PAD = 8192;                     // > the MMQ K-tile over-read past an expert's last row
+ 
+ // Register every page of [lo, hi) that is not registered yet (as new disjoint runs).  False on a refusal.
++// One budget for the host memory this feature pins (mlock + GPU registration): the RAM tier of the mmap tables plus the
++// sparse registration of the tables without a tier.  GGML_MOE_PIN_BUDGET_MIB; default min(60 % of RAM, RAM - 8 GiB).
++// The tier is built hottest layer first (the sizing order) while it fits; the other tables register their cold experts
++// within what is left, and a read whose registration does not fit declines to the scheduler path.  The warm-up before the
++// sizing registers on demand within the same budget, and each table's tier then replaces its own registration, so the
++// pinned total stays within the budget (plus one table's tier during its build).
++static int64_t pin_budget_bytes() {
++    static const int64_t v = [] {
++        const char * e = getenv("GGML_MOE_PIN_BUDGET_MIB");
++        if (e != nullptr) {
++            return (int64_t) atoll(e) << 20;
++        }
++        const int64_t ram = (int64_t) sreg_phys_bytes();
++        return std::max<int64_t>(0, std::min<int64_t>(ram / 10 * 6, ram - ((int64_t) 8 << 30)));
++    }();
++    return v;
++}
++static int64_t g_tier_bytes  = 0;   // RAM tier bytes pinned (all tables)
++static int64_t g_sreg_capped       = 0;   // registrations refused by the pin budget
++
+ static bool sreg_ensure(uintptr_t lo, uintptr_t hi) {
+     const size_t pg = sreg_page();
+     lo &= ~(uintptr_t) (pg - 1);
+@@ -763,6 +784,10 @@ static bool sreg_ensure(uintptr_t lo, uintptr_t hi) {
+             }
+         }
+         const uintptr_t gap_end = (it == g_sreg.end()) ? hi : std::min<uintptr_t>(hi, it->first);
++        if (g_tier_bytes + (int64_t) (g_sreg_bytes + (gap_end - cur)) > pin_budget_bytes()) {
++            g_sreg_capped++;
++            return false;   // over the pin budget: the read declines (served by the scheduler path)
++        }
+         sreg_willneed(cur, gap_end - cur);   // large readahead instead of 4 KiB faults
+         // hipHostRegister does not pin (HMM mirror): without the lock the kernel reclaims these GPU-only-read pages
+         // first and the KFD restore worker re-reads them from disk with the queues stopped.
+@@ -799,6 +824,15 @@ static void sparse_span(const table_t & t, int32_t e, uintptr_t & lo, uintptr_t
+ }
+ 
+ // Make expert `e` of a sparse table device-readable.  False when it cannot be (the caller must not let a GPU read it).
++// Registered bytes inside [lo, hi) (whole runs that start there).
++static size_t sreg_bytes_in(uintptr_t lo, uintptr_t hi) {
++    size_t n = 0;
++    for (auto it = g_sreg.lower_bound(lo & ~(uintptr_t) (sreg_page() - 1)); it != g_sreg.end() && it->first < hi; ++it) {
++        n += it->second;
++    }
++    return n;
++}
++
+ static bool sparse_need_locked(const table_t & t, int32_t e) {
+     if (!t.host_sparse || t.host_dev == nullptr || t.ram_base != nullptr) {
+         return true;   // (a RAM-tier table reads its cold experts from the tier)
+@@ -806,12 +840,25 @@ static bool sparse_need_locked(const table_t & t, int32_t e) {
+     if (e < 0 || e >= t.n_experts) {
+         return false;
+     }
++    if ((size_t) e < t.sreg_refused.size() && t.sreg_refused[(size_t) e]) {
++        return false;   // refused by the pin budget since the last trim
++    }
+     uintptr_t lo, hi;
+     sparse_span(t, e, lo, hi);
+-    if (sreg_ensure(lo, hi + SREG_PAD)) {
++    const int64_t capped = g_sreg_capped;
++    if (sreg_ensure(lo, hi + SREG_PAD) || sreg_ensure(lo, hi)) {   // (the pad may run past the mapping)
+         return true;
+     }
+-    return sreg_ensure(lo, hi);   // the pad may run past the mapping
++    // refused by the budget, or the registration itself failed: either way not retried until the next trim (a failed
++    // register already paid an mlock + munlock of the span, and every call would repeat it)
++    (void) capped;
++    {
++        if (t.sreg_refused.size() != (size_t) t.n_experts) {
++            t.sreg_refused.assign((size_t) t.n_experts, 0);
++        }
++        t.sreg_refused[(size_t) e] = 1;
++    }
++    return false;
+ }
+ 
+ // Read [lo, hi) of a pageable mapping into the page cache with several threads (one synchronous fault stream reads
+@@ -889,8 +936,8 @@ static bool sparse_stage_fill_locked(const table_t & t, int k) {
+ // ---- RAM tier.  On for every sparse table or for none: one budget decision, and a drop (budget, allocation failure,
+ // stand-down, re-size) turns every table back to the file alias path at once.
+ static bool    g_tier_off   = false;   // dropped: the file alias path
+-static int64_t g_tier_bytes = 0;
+ static int64_t g_tier_swaps = 0;
++static int64_t g_tier_partial = 0;   // tables left without a tier by the pin budget
+ static int64_t g_tier_swaps_d2h = 0;   // swaps that copied the victim back on the compute stream
+ static int64_t g_tier_nospare   = 0;   // misses served cold because no spare RAM slot (or precopy of the victim) was ready
+ static int64_t g_pc_issued = 0, g_pc_used = 0, g_pc_reclaimed = 0;
+@@ -1021,11 +1068,28 @@ static void tier_drop_all_locked(const char * why) {
+ }
+ 
+ // Build the tier of a sized sparse table: copy every expert the arena does not hold from the (populated) mapping.
++static int64_t tier_kept_reg_bytes_locked(const table_t & t) {
++    int64_t n = (int64_t) g_sreg_bytes;
++    for (const table_t & o : g_tables) {
++        if (o.host_sparse && o.host_dev != nullptr && o.ram_base == nullptr && (&o == &t || !o.allocated)) {
++            n -= (int64_t) sreg_bytes_in((uintptr_t) o.host_dev, (uintptr_t) o.host_dev + (size_t) o.n_experts * o.host_bytes);
++        }
++    }
++    return std::max<int64_t>(0, n);
++}
++
+ static bool tier_build_locked(table_t & t) {
+     static const int64_t budget = [] {
+         const char * s = getenv("GGML_MOE_RAM_TIER_MIB");
+-        return s != nullptr ? (int64_t) atoll(s) << 20 : (int64_t) (sreg_phys_bytes() / 10 * 6);
++        const int64_t pb = pin_budget_bytes();
++        return s != nullptr ? std::min<int64_t>((int64_t) atoll(s) << 20, pb) : pb;
+     }();
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        GGML_LOG_INFO("moe_cache RAM tier: pin budget %.0f MiB (GGML_MOE_PIN_BUDGET_MIB; RAM %.0f MiB)\n",
++                      budget / 1048576.0, sreg_phys_bytes() / 1048576.0);
++    }
+     if (g_tier_off || t.ram_base != nullptr) {
+         return false;
+     }
+@@ -1045,13 +1109,22 @@ static bool tier_build_locked(table_t & t) {
+     // last RAM slot holds an expert too
+     int    n_spare = g_tier_spares;
+     size_t bytes   = (size_t) (n_cold + n_spare) * t.expert_bytes + SREG_PAD;
+-    if (n_spare > 1 && g_tier_bytes + (int64_t) bytes > budget) {
++    const int64_t kept_reg = tier_kept_reg_bytes_locked(t);
++    if (n_spare > 1 && g_tier_bytes + kept_reg + (int64_t) bytes > budget) {
+         n_spare = 1;   // the extra spares do not fit: the single-spare layout
+         bytes   = (size_t) (n_cold + 1) * t.expert_bytes + SREG_PAD;
+     }
+-    if (g_tier_bytes + (int64_t) bytes > budget) {
+-        tier_drop_all_locked("over GGML_MOE_RAM_TIER_MIB");
+-        return false;
++    // Registrations count only where they stay: the tables already left without a tier (a later, smaller table must not
++    // overshoot by them).  This table's own span and the not-yet-sized tables' warm-up registrations are replaced by
++    // their tiers (the sized trim after each build), so the pinned total stays within the budget plus one table.
++    if (g_tier_bytes + kept_reg + (int64_t) bytes > budget) {
++        g_tier_partial++;
++        if (g_tier_partial == 1) {
++            GGML_LOG_WARN("moe_cache RAM tier: the pin budget (%.0f MiB) is reached after %.0f MiB: this and the colder "
++                          "tables read their cold experts through the registered file mapping (slower)\n",
++                          budget / 1048576.0, g_tier_bytes / 1048576.0);
++        }
++        return false;   // partial tier: the hotter tables keep theirs
+     }
+     device_guard dg(t.device);
+     // a failure frees cold_ptrs again (built once, at sizing: no graph holds it yet), so the decode kernel never
+@@ -1348,6 +1421,9 @@ static bool sparse_in_ram_locked(const table_t & t, int32_t e) {
+ // Unregister every run no GPU read can reach: experts resident in every table of their master.  Synchronizes every
+ // device first (a queued fill or cold read may still use a run).
+ static void sparse_trim_locked(const char * why) {
++    for (const table_t & t : g_tables) {
++        t.sreg_refused.clear();   // the trim frees room: refused experts may register again
++    }
+     bool any = false;
+     std::vector<std::pair<uintptr_t, uintptr_t>> need;
+     for (table_t & t : g_tables) {
+@@ -7434,20 +7510,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // Sparse registration: re-trim to the cold set every 10 s (an admitted expert stays registered until then), but only
+     // while the registration is over its budget: each trim remaps the dropped runs, which costs the GPU a mapping
+     // update, and a model whose master fits the budget gains nothing from it.
+-    static const size_t sreg_budget = [] {
++    static const int64_t sreg_env = [] {
+         const char * e = getenv("GGML_MOE_SREG_BUDGET_MIB");
+-        if (e != nullptr) {
+-            return (size_t) atoll(e) << 20;
+-        }
+-        return sreg_phys_bytes() / 10 * 4;   // 40 % of RAM
++        return e != nullptr ? (int64_t) atoll(e) << 20 : (int64_t) -1;
+     }();
+-    if (!g_sreg.empty() && g_sreg_bytes > sreg_budget) {
++    // default: what the tier leaves of the pin budget, at most 40 % of RAM (the previous threshold); a registration the
++    // pin budget refused also asks for a trim, so admitted experts' registrations are given back to the cold set
++    const size_t sreg_budget = (size_t) (sreg_env >= 0 ? sreg_env
++                                         : std::max<int64_t>(0, std::min<int64_t>(pin_budget_bytes() - g_tier_bytes,
++                                                                                  (int64_t) (sreg_phys_bytes() / 10 * 4))));
++    static int64_t capped_seen = 0;
++    if (!g_sreg.empty() && (g_sreg_bytes > sreg_budget || g_sreg_capped > capped_seen)) {
+         static int64_t last_us = 0;
+         const int64_t now_us = ggml_time_us();
+         if (last_us == 0) {
+             last_us = now_us;
+         } else if (now_us - last_us > 10 * 1000 * 1000) {
+             last_us = now_us;
++            capped_seen = g_sreg_capped;
+             sparse_trim_locked("periodic");
+         }
+     }
+@@ -8351,8 +8431,10 @@ void moe_cache_report() {
+                       (long long) g_route_fills);
+     }
+     if (g_tier_swaps > 0 || g_tier_bytes > 0) {
+-        GGML_LOG_WARN("%s: RAM tier: %.1f MiB pinned, %lld swaps%s\n", __func__, g_tier_bytes / 1048576.0,
+-                      (long long) g_tier_swaps, g_tier_off ? " (off)" : "");
++        GGML_LOG_WARN("%s: RAM tier: %.1f MiB pinned, %lld swaps%s; pin budget %.0f MiB, %lld tables without a tier, "
++                      "%lld registrations refused by it\n", __func__, g_tier_bytes / 1048576.0, (long long) g_tier_swaps,
++                      g_tier_off ? " (off)" : "", pin_budget_bytes() / 1048576.0, (long long) g_tier_partial,
++                      (long long) g_sreg_capped);
+         GGML_LOG_WARN("%s: RAM tier: %d spares, precopy %s: %lld issued, %lld used (%lld waited), %lld reclaimed; %lld swaps copied back "
+                       "in-stream; %lld misses cold for lack of a spare\n", __func__, g_tier_spares, g_precopy ? "on" : "off",
+                       (long long) g_pc_issued, (long long) g_pc_used, (long long) g_pc_waited, (long long) g_pc_reclaimed,
+-- 
+2.53.0
+

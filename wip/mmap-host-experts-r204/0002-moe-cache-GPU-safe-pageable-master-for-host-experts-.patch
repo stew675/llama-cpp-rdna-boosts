@@ -1,0 +1,1168 @@
+From 3aa8943c20d366ccc0a64a6ada363fb318d04d70 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 23:32:06 +0000
+Subject: [PATCH 02/10] moe cache: GPU-safe pageable master for --host-experts
+ mmap through a sparse registration
+
+With --host-experts mmap the expert master is the pageable model mapping, which a GPU without XNACK cannot read (issue
+cache, no extra RAM) and registers (madvise + mlock + hipHostRegister ReadOnly) exactly the expert ranges a GPU read
+touches: the experts not resident in the arena.  Every cold read takes its id from the eager remap, which registers
+the expert first; every arena fill, seed fill and routed fill registers its source expert and copies it with a kernel
+from the alias.  Runs no GPU read can reach are unregistered by a trim that synchronizes every device first: at
+sizing, and every 10 s while the registration is over GGML_MOE_SREG_BUDGET_MIB (default 40 % of RAM).
+
+At sizing a table reads its master in parallel, fills its empty arena with provisional experts through a pinned
+staging buffer and registers its cold set.  A prefill reads the arena + the registered alias too: a small prefill
+ubatch gets the routed experts (and the tail-pad neighbour) copied to their offsets in the op's input, a staged one
+gets the whole table assembled on the copy stream (moe_cache_stage_table, ordered after the compute stream as the
+pinned staging is); the pinned staging declines a non-pinned master.  The warm-up pass (every expert) is declined and
+streamed by the scheduler from the page cache.  Under -sm layer a routed op stays on the device that owns its tables.
+A master that cannot be aliased or registered is declined by the cache (the scheduler's copy serves it), never read
+pageable.  Pinned and pool masters are unchanged.  POSIX only: on Windows no alias is made.
+GGML_MOE_CACHE_SPARSE_REG=0: decline every pageable master.
+---
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   7 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   9 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 873 +++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.h         |   9 +
+ 4 files changed, 883 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index accf66f03..efdc295b9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -37,6 +37,13 @@ static bool ggml_backend_cuda_stage_from_cache(ggml_backend_cuda_context * cuda_
+         return false;
+     }
+     cudaStream_t s = cuda_ctx->copy_stream();
++    // A sparse (mmap) master: its table is assembled from the arena + the registered alias, so a prefill never reads
++    // the pageable master (from disk, when the model is larger than RAM).  Declines for any other table.  The table's
++    // own geometry gives the source stride (`stride_src` is not needed).
++    if (moe_cache_stage_table(src, offset, width * n_copies, dst, dev, cuda_ctx->stream(), s, order_ev[dev])) {
++        CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
++        return true;
++    }
+     if (!moe_cache_stage_table(dev, src, offset, width, stride_src, n_copies, dst,
+                                cuda_ctx->stream(), s, order_ev[dev])) {
+         return false;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fad68b433..cf6e09723 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9415,6 +9415,15 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
+     // consumer can read the compact arena.  ONLY within the decode band: above it the cache is not
+     // involved, and forcing offload there took the >8-token batched decode off its normal path
+     // (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s with the cache merely enabled).
++    // -sm layer: a routed op whose cache tables all live on another device stays off this one.  The scheduler
++    // offloads a host-weight op to the FIRST device that accepts it; with a non-device host master (mmap) that was
++    // always device 0, for every layer.
++    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID && op->src[0] != nullptr) {
++        const int owner = moe_cache_owner_device(op->src[0]->data);
++        if (owner >= 0 && owner != dev_ctx->device) {
++            return false;
++        }
++    }
+     if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID &&
+         op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+         return true;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 334931ecd..6469b0617 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -6,6 +6,10 @@
+ #include "common.cuh"
+ #include "mmvq.cuh"
+ 
++#if defined(GGML_USE_HIP) && !defined(cudaErrorInvalidValue)
++#define cudaErrorInvalidValue hipErrorInvalidValue
++#endif
++
+ #include <algorithm>
+ #include <atomic>
+ #include <cerrno>
+@@ -17,12 +21,14 @@
+ #if !defined(_WIN32)
+ #include <dirent.h>
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #endif
+ #include <set>
+ #include <mutex>
+ #include <string>
++#include <thread>
+ #include <tuple>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -94,6 +100,12 @@ struct table_t {
+     // wip/host-expert-master-drop (TODO #55): pinned per-table bounce ring for a PAGEABLE master, grown on
+     // demand (see `expert_host_src`).  Empty for a pinned master.
+     std::vector<bounce_t> bounce;
++    bool        host_sparse = false;    // pageable `host`: only the experts a GPU may read are registered (see sreg_*)
++    bool        sparse_off  = false;    // pageable master that could not be registered: the cache declines this table
++    void *      stage_dev   = nullptr;  // prefill staging: per-expert source pointers + cold flags (device copy)
++    std::vector<uint8_t> stage_pack;    // ... and the host copy they are uploaded from
++    void *      route_dev   = nullptr;  // small-prefill routed fill: per-entry source, expert id, cold flag (device)
++    std::vector<uint8_t> route_pack;    // ... and its host copy
+     int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
+ 
+     int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
+@@ -608,6 +620,425 @@ static void devremap_free_locked(table_t & t) {
+     t.dr_cap = 0; t.dr_device = -1; t.dr_lag_n = 0; t.dr_map_ok = false;
+ }
+ 
++// ---- sparse registration of a pageable host master (--host-experts mmap) ---------------------------------------
++// RDNA has no XNACK, so a kernel cannot read a pageable host address (issue #116).  A pageable expert master is made
++// GPU-readable without pinning all of it: a second read-only MAP_SHARED mapping of the model file (the same page
++// cache, no extra RAM) is registered with hipHostRegister only where a GPU may read it - the experts not resident in
++// the arena of some table of that master - and a registered range is device-readable at its CPU address.
++// Invariant: every expert a GPU may read from the host (a cold read, or a fill from the alias) is registered when
++// the read is enqueued and stays registered until it has completed (the trim synchronizes every device first).
++
++// OS portability of the sparse registration: every mapping, locking and page-cache call goes through
++// these helpers.  On Windows `file_alias_locked` finds no alias, so no master is sparse (the cache declines a pageable
++// master) and none of them is reached; the stubs keep the build compiling.
++#if defined(_WIN32)
++typedef long long sreg_off_t;
++static size_t sreg_page() { return 4096; }
++static size_t sreg_phys_bytes() { return 0; }
++static void   sreg_willneed(uintptr_t a, size_t n) { (void) a; (void) n; }
++static void   sreg_populate_range(uintptr_t a, size_t n) { (void) a; (void) n; }
++static bool   sreg_mlock(const void * p, size_t n) { (void) p; (void) n; return false; }
++static void   sreg_munlock(const void * p, size_t n) { (void) p; (void) n; }
++static bool   sreg_map_fixed(uintptr_t a, size_t n, int fd, sreg_off_t off) { (void) a; (void) n; (void) fd; (void) off; return false; }
++static bool   sreg_resident(uintptr_t a, size_t n, unsigned char * vec) { (void) a; (void) n; (void) vec; return false; }
++#else
++typedef off_t sreg_off_t;
++static size_t sreg_page() {
++    static const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
++    return pg;
++}
++static size_t sreg_phys_bytes() {
++    const long pages = sysconf(_SC_PHYS_PAGES);
++    return pages > 0 ? (size_t) pages * sreg_page() : 0;
++}
++static void sreg_willneed(uintptr_t a, size_t n) {
++    (void) madvise((void *) a, n, MADV_WILLNEED);
++}
++static void sreg_populate_range(uintptr_t a, size_t n) {
++#ifndef MADV_POPULATE_READ
++#define MADV_POPULATE_READ 22
++#endif
++    (void) madvise((void *) a, n, MADV_POPULATE_READ);
++}
++static bool sreg_mlock(const void * p, size_t n) {
++    return mlock(p, n) == 0;
++}
++static void sreg_munlock(const void * p, size_t n) {
++    (void) munlock(p, n);
++}
++// [a, a + n) of an alias replaced by a fresh read-only mapping of `fd` from `off`
++static bool sreg_map_fixed(uintptr_t a, size_t n, int fd, sreg_off_t off) {
++    return mmap((void *) a, n, PROT_READ, MAP_SHARED | MAP_FIXED, fd, off) != MAP_FAILED;
++}
++// every page of the page-aligned [a, a + n) is in the page cache (`vec`: n / page entries)
++static bool sreg_resident(uintptr_t a, size_t n, unsigned char * vec) {
++    if (mincore((void *) a, n, vec) != 0) {
++        return false;
++    }
++    for (size_t i = 0; i < n / sreg_page(); i++) {
++        if (!(vec[i] & 1)) {
++            return false;
++        }
++    }
++    return true;
++}
++#endif
++
++static std::map<uintptr_t, size_t> g_sreg;              // registered runs: page-aligned start -> bytes (disjoint)
++static size_t  g_sreg_bytes = 0;
++static size_t  g_sreg_peak  = 0;
++static int64_t g_sreg_fail  = 0;                         // hipHostRegister refusals
++static int64_t g_sreg_calls = 0;                         // successful hipHostRegister calls (runs created)
++static int64_t g_sreg_keep  = 0;                         // admissions skipped because a registration failed
++static int64_t g_sreg_stay  = 0;                         // admissions skipped because the victim left the page cache
++static int64_t g_sreg_nolock = 0;                        // registered runs that could not be mlocked (reclaimable)
++static int64_t g_stage_tables = 0;                       // prefill tables staged from the arena + registered alias
++static int64_t g_route_fills  = 0;                       // small-prefill routed fills from the arena + registered alias
++static int64_t g_sreg_remaps = 0;                        // unregistered runs remapped (drops the driver's SVM range)
++struct sreg_alias_t { uintptr_t lo, hi; int fd; sreg_off_t off; };
++static std::vector<sreg_alias_t> g_sreg_alias;           // every alias mapping: [lo, hi) maps `fd` from `off`
++
++// Replace [a, a + len) of an alias with a fresh mapping of the same file pages.  hipHostUnregister leaves KFD's SVM
++// range behind: when the kernel later reclaims one of its pages the driver re-faults the WHOLE range from disk
++// (svm_range_restore_work).  Unmapping the range removes it.
++static void sreg_remap(uintptr_t a, size_t len) {
++    static const bool off = getenv("GGML_MOE_SREG_NOREMAP") != nullptr && atoi(getenv("GGML_MOE_SREG_NOREMAP")) != 0;
++    if (off) {
++        return;
++    }
++    for (const sreg_alias_t & m : g_sreg_alias) {
++        if (a >= m.lo && a + len <= m.hi) {
++            if (sreg_map_fixed(a, len, m.fd, m.off + (sreg_off_t) (a - m.lo))) {
++                g_sreg_remaps++;
++            }
++            return;
++        }
++    }
++}
++static int64_t g_sreg_trims = 0;
++static std::atomic<bool> g_any_sparse{false};            // some table has a sparse (mmap) master
++static const size_t SREG_PAD = 8192;                     // > the MMQ K-tile over-read past an expert's last row
++
++// Register every page of [lo, hi) that is not registered yet (as new disjoint runs).  False on a refusal.
++static bool sreg_ensure(uintptr_t lo, uintptr_t hi) {
++    const size_t pg = sreg_page();
++    lo &= ~(uintptr_t) (pg - 1);
++    hi  = (hi + pg - 1) & ~(uintptr_t) (pg - 1);
++    uintptr_t cur = lo;
++    while (cur < hi) {
++        auto it = g_sreg.lower_bound(cur);
++        if (it != g_sreg.end() && it->first == cur) {
++            cur += it->second;
++            continue;
++        }
++        if (it != g_sreg.begin()) {
++            auto p = std::prev(it);
++            if (p->first + p->second > cur) {
++                cur = p->first + p->second;
++                continue;
++            }
++        }
++        const uintptr_t gap_end = (it == g_sreg.end()) ? hi : std::min<uintptr_t>(hi, it->first);
++        sreg_willneed(cur, gap_end - cur);   // large readahead instead of 4 KiB faults
++        // hipHostRegister does not pin (HMM mirror): without the lock the kernel reclaims these GPU-only-read pages
++        // first and the KFD restore worker re-reads them from disk with the queues stopped.
++        static const bool nolock = getenv("GGML_MOE_SREG_NOMLOCK") != nullptr && atoi(getenv("GGML_MOE_SREG_NOMLOCK")) != 0;
++        if (!nolock && !sreg_mlock((void *) cur, gap_end - cur) && g_sreg_nolock++ < 2) {
++            GGML_LOG_WARN("moe_cache sparse registration: mlock %p + %zu failed: %s (registered pages stay reclaimable)\n",
++                          (void *) cur, (size_t) (gap_end - cur), strerror(errno));
++        }
++        const cudaError_t err = cudaHostRegister((void *) cur, gap_end - cur, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            sreg_munlock((void *) cur, gap_end - cur);
++            if (g_sreg_fail++ < 2) {
++                GGML_LOG_WARN("moe_cache sparse registration: register %p + %zu failed: %s\n", (void *) cur,
++                              (size_t) (gap_end - cur), cudaGetErrorString(err));
++            }
++            return false;
++        }
++        g_sreg[cur]   = gap_end - cur;
++        g_sreg_bytes += gap_end - cur;
++        g_sreg_peak   = std::max(g_sreg_peak, g_sreg_bytes);
++        g_sreg_calls++;
++        cur = gap_end;
++    }
++    return true;
++}
++
++// The bytes of expert `e` THIS table (device) reads in place: its own slice when the slice is contiguous (an axis-1
++// split: gate/up under -sm tensor), else the whole expert (an axis-0 slice interleaves with the other device row by row).
++static void sparse_span(const table_t & t, int32_t e, uintptr_t & lo, uintptr_t & hi) {
++    const bool strided = t.split_axis == 0 && t.host_pitch != 0;
++    lo = (uintptr_t) t.host_dev + (uintptr_t) e * t.host_bytes + (strided ? 0 : (uintptr_t) t.src_off);
++    hi = lo + (strided ? t.host_bytes : t.expert_bytes);
++}
++
++// Make expert `e` of a sparse table device-readable.  False when it cannot be (the caller must not let a GPU read it).
++static bool sparse_need_locked(const table_t & t, int32_t e) {
++    if (!t.host_sparse || t.host_dev == nullptr) {
++        return true;
++    }
++    if (e < 0 || e >= t.n_experts) {
++        return false;
++    }
++    uintptr_t lo, hi;
++    sparse_span(t, e, lo, hi);
++    if (sreg_ensure(lo, hi + SREG_PAD)) {
++        return true;
++    }
++    return sreg_ensure(lo, hi);   // the pad may run past the mapping
++}
++
++// Read [lo, hi) of a pageable mapping into the page cache with several threads (one synchronous fault stream reads
++// the NVMe at a fraction of its bandwidth).
++static void sparse_populate(uintptr_t lo, uintptr_t hi) {
++    const size_t pg = sreg_page();
++    lo &= ~(uintptr_t) (pg - 1);
++    const int       n_thr = 8;
++    const uintptr_t step  = ((hi - lo) / n_thr + pg - 1) & ~(uintptr_t) (pg - 1);
++    std::vector<std::thread> thr;
++    for (int i = 0; i < n_thr; i++) {
++        const uintptr_t a = lo + (uintptr_t) i * step, b = std::min<uintptr_t>(hi, a + step);
++        if (a < b) {
++            thr.emplace_back([a, b] { sreg_populate_range(a, b - a); });
++        }
++    }
++    for (auto & th : thr) {
++        th.join();
++    }
++}
++
++// Copy this device's slice of expert `e` from the (populated) mapping to `dst` in the arena's compact layout.
++static void sparse_pack_expert(const table_t & t, int32_t e, char * dst) {
++    const char * src = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
++    if (t.split_axis == 0 && t.host_pitch != 0) {
++        const size_t rows = t.host_bytes / t.host_pitch, row_bytes = t.expert_bytes / rows;
++        for (size_t r = 0; r < rows; r++) {
++            memcpy(dst + r * row_bytes, src + r * t.host_pitch, row_bytes);
++        }
++    } else {
++        memcpy(dst, src, t.expert_bytes);
++    }
++}
++
++// Copy experts 0..k-1 of a sparse table into arena slots 0..k-1 through a pinned staging buffer: the master stays
++// unregistered (registering, then dropping, what the arena holds costs a register call per expert).
++static bool sparse_stage_fill_locked(const table_t & t, int k) {
++    static char *  stage     = nullptr;
++    static size_t  stage_cap = 0;
++    const bool     do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t  rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 1;
++    if (rows <= 0 || t.expert_bytes % (size_t) rows != 0) {
++        return false;
++    }
++    const size_t need = std::max<size_t>(t.expert_bytes, 64u << 20);
++    if (stage_cap < need) {
++        if (stage != nullptr) {
++            (void) cudaFreeHost(stage);
++        }
++        stage = nullptr;
++        stage_cap = 0;
++        if (cudaMallocHost((void **) &stage, need) != cudaSuccess) {
++            (void) cudaGetLastError();
++            stage = nullptr;
++            return false;
++        }
++        stage_cap = need;
++    }
++    device_guard dg(t.device);
++    const int per = (int) (stage_cap / t.expert_bytes);
++    for (int e0 = 0; e0 < k; e0 += per) {
++        const int n = std::min(per, k - e0);
++        for (int j = 0; j < n; j++) {
++            sparse_pack_expert(t, e0 + j, stage + (size_t) j * t.expert_bytes);
++        }
++        if (cudaMemcpy((char *) t.arena + (size_t) e0 * t.expert_bytes, stage, (size_t) n * t.expert_bytes,
++                       cudaMemcpyHostToDevice) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++    }
++    return true;
++}
++
++// Expert `e` of a sparse table is entirely in the page cache (so registering it reads nothing from disk).
++static bool sparse_in_ram_locked(const table_t & t, int32_t e) {
++    const size_t    pg = sreg_page();
++    uintptr_t lo, hi;
++    sparse_span(t, e, lo, hi);
++    lo &= ~(uintptr_t) (pg - 1);
++    hi  = (hi + pg - 1) & ~(uintptr_t) (pg - 1);
++    static std::vector<unsigned char> vec;
++    vec.resize((hi - lo) / pg);
++    return sreg_resident(lo, hi - lo, vec.data());
++}
++
++// Unregister every run no GPU read can reach: experts resident in every table of their master.  Synchronizes every
++// device first (a queued fill or cold read may still use a run).
++static void sparse_trim_locked(const char * why) {
++    bool any = false;
++    std::vector<std::pair<uintptr_t, uintptr_t>> need;
++    for (table_t & t : g_tables) {
++        if (!t.host_sparse || t.host_dev == nullptr) {
++            continue;
++        }
++        any = true;
++        if (!t.allocated || t.sparse_off || t.arena == nullptr || t.slots <= 0) {
++            continue;   // no arena: nothing reads this master in place (update_host / get_cold decline the table)
++        }
++        const uintptr_t base = (uintptr_t) t.host_dev;
++        if (t.expert_slot.empty()) {
++            need.emplace_back(base, base + (uintptr_t) t.n_experts * t.host_bytes + SREG_PAD);
++            continue;
++        }
++        std::vector<uint8_t> res((size_t) t.n_experts, 0);
++        for (const auto & kv : t.expert_slot) {
++            if (kv.first >= 0 && kv.first < t.n_experts) {
++                res[(size_t) kv.first] = 1;
++            }
++        }
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (!res[(size_t) e]) {
++                uintptr_t lo, hi;
++                sparse_span(t, e, lo, hi);
++                need.emplace_back(lo, hi + SREG_PAD);
++            }
++        }
++    }
++    if (!any) {
++        return;
++    }
++    int n_dev = 0;
++    (void) cudaGetDeviceCount(&n_dev);
++    for (int d = 0; d < n_dev; d++) {
++        device_guard dg(d);
++        (void) cudaDeviceSynchronize();
++    }
++    const size_t pg = sreg_page();
++    for (auto & iv : need) {
++        iv.first  &= ~(uintptr_t) (pg - 1);
++        iv.second  = (iv.second + pg - 1) & ~(uintptr_t) (pg - 1);
++    }
++    std::sort(need.begin(), need.end());
++    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
++    for (const auto & iv : need) {
++        if (!merged.empty() && iv.first <= merged.back().second) {
++            merged.back().second = std::max(merged.back().second, iv.second);
++        } else {
++            merged.push_back(iv);
++        }
++    }
++    const size_t before = g_sreg_bytes;
++    size_t k = 0;
++    for (auto it = g_sreg.begin(); it != g_sreg.end();) {
++        const uintptr_t a = it->first, b = it->first + it->second;
++        while (k < merged.size() && merged[k].second <= a) {
++            k++;
++        }
++        const bool needed = k < merged.size() && merged[k].first < b;
++        if (!needed) {
++            (void) cudaHostUnregister((void *) a);
++            (void) cudaGetLastError();
++            sreg_munlock((void *) a, it->second);
++            sreg_remap(a, it->second);
++            g_sreg_bytes -= it->second;
++            it = g_sreg.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    g_sreg_trims++;
++    int64_t n_res = 0, n_all = 0;
++    for (const table_t & t : g_tables) {
++        n_res += (int64_t) t.expert_slot.size();
++        n_all += t.n_experts;
++    }
++    if (strcmp(why, "periodic") != 0 || before != g_sreg_bytes) {
++        GGML_LOG_INFO("moe_cache sparse registration (%s): %.0f -> %.0f MiB of the pageable expert master registered "
++                      "(%zu runs, %lld failed, %lld register calls); resident %lld / %lld\n", why, before / 1048576.0,
++                      g_sreg_bytes / 1048576.0, g_sreg.size(), (long long) g_sreg_fail, (long long) g_sreg_calls,
++                      (long long) n_res, (long long) n_all);
++    }
++}
++
++// A second read-only MAP_SHARED mapping of the file backing [p, p + len) (same page cache, no extra RAM), or nullptr.
++// Each new alias is probe-registered on its first page (and the registration dropped at once): an alias hipHostRegister
++// refuses is replaced by another mapping (seen under -sm layer).  Probing the whole range pinned - i.e. read from disk - the
++// entire tensor at load.
++static void * file_alias_locked(const void * p, size_t len) {
++#if defined(_WIN32)
++    (void) p; (void) len;
++    return nullptr;   // POSIX only (see the OS helpers above): a pageable master is declined on Windows
++#else
++    static std::map<const void *, void *> cache;
++    const auto c = cache.find(p);
++    if (c != cache.end()) {
++        return c->second;
++    }
++    FILE * f = fopen("/proc/self/maps", "r");
++    if (f == nullptr) {
++        return nullptr;
++    }
++    char line[4096];
++    void * out = nullptr;
++    const uintptr_t a = (uintptr_t) p;
++    while (fgets(line, sizeof(line), f) != nullptr) {
++        unsigned long lo = 0, hi = 0, off = 0, inode = 0;
++        char perms[8] = {}, dev[32] = {}, path[2048] = {};
++        if (sscanf(line, "%lx-%lx %7s %lx %31s %lu %2047[^\n]", &lo, &hi, perms, &off, dev, &inode, path) < 7) {
++            continue;
++        }
++        if (a < lo || a >= hi || path[0] != '/') {
++            continue;
++        }
++        const size_t pg       = sreg_page();
++        const size_t file_off = (size_t) off + (size_t) (a - lo);
++        const size_t al       = file_off & ~(pg - 1);
++        const size_t delta    = file_off - al;
++        struct stat st{};
++        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
++            break;   // not a regular file (a device mapping, a memfd): no alias
++        }
++        const int fd = open(path, O_RDONLY);
++        if (fd >= 0) {
++            std::vector<void *> refused;
++            for (int attempt = 0; attempt < 16 && out == nullptr; attempt++) {
++                void * m = mmap(nullptr, len + delta, PROT_READ, MAP_SHARED, fd, (off_t) al);
++                if (m == MAP_FAILED) {
++                    break;
++                }
++                if (cudaHostRegister(m, std::min(len + delta, pg), cudaHostRegisterPortable | cudaHostRegisterReadOnly) == cudaSuccess) {
++                    (void) cudaHostUnregister(m);
++                    out = (char *) m + delta;
++                    const int keep = dup(fd);
++                    if (keep >= 0) {
++                        g_sreg_alias.push_back({ (uintptr_t) m, (uintptr_t) m + len + delta, keep, (off_t) al });
++                        sreg_remap((uintptr_t) m, pg);   // the probe's own SVM range
++                    }
++                } else {
++                    (void) cudaGetLastError();
++                    refused.push_back(m);
++                }
++            }
++            for (void * r : refused) {
++                (void) munmap(r, len + delta);
++            }
++            close(fd);
++        }
++        break;
++    }
++    fclose(f);
++    cache[p] = out;
++    return out;
++#endif
++}
++
++// One expert of a sparse table from the registered alias into `dst`, on the GPU (defined after the copy helper).
++// Never a host-API copy from the alias: with SREG_PAD every expert spans two registered runs, and a host copy across
++// runs fails.  The caller has registered `e`.
++static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream);
++
+ // Resolve the pinned host master's device-accessible alias once.  `t.src_off` is folded in by
+ // `moe_cache_get_cold`, so the alias is always the base of the host tensor.
+ //
+@@ -633,6 +1064,46 @@ void bind_host_dev_locked(table_t & t) {
+         return;
+     }
+     (void) cudaGetLastError();
++    if (!g_pool_requested) {
++        // --host-experts mmap: the master is the pageable model mapping.  Already pinned or registered (for example by
++        // another device's table): the host pointer is device-readable as is.
++    #if defined(GGML_USE_HIP)
++        hipPointerAttribute_t pa{};
++        const bool pinned_elsewhere = hipPointerGetAttributes(&pa, t.host) == hipSuccess && pa.type == hipMemoryTypeHost;
++    #else
++        cudaPointerAttributes pa{};
++        const bool pinned_elsewhere = cudaPointerGetAttributes(&pa, t.host) == cudaSuccess && pa.type == cudaMemoryTypeHost;
++    #endif
++        (void) cudaGetLastError();
++        if (pinned_elsewhere) {
++            t.host_dev    = (void *) t.host;
++            t.host_pinned = true;
++            return;
++        }
++        // Otherwise register only what a GPU reads, on a second read-only mapping of the file (see sreg_*).  The sparse
++        // fills know only the single-slice geometry, so a fused (multi-slice) table declines below instead.
++        static const bool sparse = env_int("GGML_MOE_CACHE_SPARSE_REG", 1) != 0;
++        if (sparse && t.n_slices == 0 && t.n_experts > 0 && t.host_bytes > 0) {
++            void * alias = file_alias_locked(t.host, (size_t) t.n_experts * t.host_bytes + SREG_PAD);
++            if (alias != nullptr) {
++                t.host_dev    = alias;
++                t.host_sparse = true;   // registered when its arena is decided (alloc_table_locked)
++                g_any_sparse  = true;
++                return;
++            }
++        }
++        (void) cudaGetLastError();
++        // No registration (GGML_MOE_CACHE_SPARSE_REG=0, or no alias): the cache declines the table and the scheduler's
++        // copy serves it.  (Filling the arena with pageable copies instead gave wrong results under -sm tensor.)
++        t.sparse_off = true;
++        static bool warned_off = false;
++        if (!warned_off) {
++            warned_off = true;
++            GGML_LOG_WARN("%s: the host expert master has no device mapping (pageable model mapping?); "
++                          "the expert cache declines its tables and the scheduler copies them\n", __func__);
++        }
++        return;
++    }
+     // A pageable master (`--host-experts pool` places the tensors in the read-only model mapping): the
+     // in-place cold read stands down and every GPU read is staged through the pool instead, so the miss
+     // cost is a pool fill rather than a fault (issue #116).
+@@ -681,7 +1152,14 @@ static int pool_cold_slot_locked(table_t & t, int32_t expert) {
+ // wip/host-expert-master-drop (TODO #55): the master is not pinned, so it lives in the read-only model
+ // mapping and every device-side byte must come through the pinned pool (or the per-table bounce).
+ static inline bool table_master_pageable(const table_t & t) {
+-    return t.host != nullptr && !t.host_pinned;
++    // (a sparse-registered `--host-experts mmap` master is device-readable through its alias)
++    return t.host != nullptr && !t.host_pinned && !t.host_sparse;
++}
++
++// The pool-backed staging / upload paths apply only in `--host-experts pool`.  Under `--host-experts mmap` a master
++// that is not pinned is either sparse-registered or declined by the cache.
++static inline bool table_pool_backed(const table_t & t) {
++    return g_pool_requested && table_master_pageable(t);
+ }
+ 
+ // Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
+@@ -2000,11 +2478,22 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+     return err;
+ }
+ 
++// One seed / sizing fill of expert `e` into `dst`, synchronous on the legacy stream: a sparse master copies from its
++// registered alias (registering it first), any other master through fill_slot_from_host.
++static cudaError_t seed_fill_slot_locked(table_t & t, void * dst, int32_t e) {
++    if (t.host_sparse && t.host_dev != nullptr) {
++        return sparse_need_locked(t, e) ? sparse_fill_locked(t, dst, e, nullptr) : cudaErrorInvalidValue;
++    }
++    return fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
++}
++
+ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                               const int32_t * protect = nullptr, int n_protect = 0,
+                               bool * out_cold = nullptr) {
+     // The cold read indexes the host master with the table's own host geometry (`moe_cache_get_cold`
+     // returns the per-expert and per-row strides), so a Phase 3 slice is servable in place too.
++    // (Sparse masters register lazily: every in-place cold read takes its expert id from the pass-2 remap of
++    // moe_cache_update_host, which registers that expert first; fills register their source expert.)
+     const bool cold_ok = table_cold_ok(t) || pool_cold_slot_locked(t, expert) >= 0;
+     const auto is_protected = [&](int32_t e) {
+         for (int i = 0; i < n_protect; i++) {
+@@ -2092,11 +2581,29 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             return { nullptr, false };
+         }
+         if (slot >= 0) {
++            // sparse master: the victim turns cold, so its bytes must still be in RAM (pinned now; a victim whose pages
++            // left the page cache stays resident and the incoming expert is read cold - no disk read per eviction).
++            // The incoming expert is filled from the alias, so it must be registered too.
++            if (t.host_sparse) {
++                const bool victim_prov = slot < (int) t.slot_prov.size() && t.slot_prov[slot] != 0;
++                if (!victim_prov && !sparse_in_ram_locked(t, victim)) {   // a never-hit placeholder is always evictable
++                    g_sreg_stay++;
++                    return { nullptr, false };
++                }
++                if (!sparse_need_locked(t, expert) || !sparse_need_locked(t, victim)) {
++                    g_sreg_keep++;
++                    return { nullptr, false };
++                }
++            }
+             t.expert_slot.erase(victim);
+             t.slot_expert[slot] = -1;
+             t.evictions++;
+         }
+     }
++    if (slot >= 0 && victim < 0 && t.host_sparse && !sparse_need_locked(t, expert)) {
++        g_sreg_keep++;   // an empty slot, but the incoming expert cannot be made device-readable: no admission
++        return { nullptr, false };
++    }
+     if (slot < 0) {
+         if (cold_ok && out_cold != nullptr) {
+             *out_cold = true;
+@@ -2137,13 +2644,26 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+         // policy within 250 MiB of the others' L3 reads, against a 15x difference for the pool's CONTENT.
+         expert_src_t hsrc;
+         cudaError_t  err = cudaSuccess;
+-        if (!expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc)) {
++        bool         local_src = false;   // the sparse alias copied the expert itself
++        if (t.host_sparse && t.host_dev != nullptr) {
++            local_src = true;
++            // the expert was cold, so it is registered: a device copy from the alias
++            err = sparse_fill_locked(t, dst, expert, stream);
++            if (err != cudaSuccess) {
++                // never fall back to a pageable copy (the 2-D form faults on ROCm 7.14): undo the admission
++                GGML_LOG_WARN("%s: sparse fill failed table layer=%d role=%s expert=%d: %s\n",
++                              __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(err));
++                t.expert_slot.erase(expert);
++                t.slot_expert[slot] = -1;
++                return { nullptr, false };
++            }
++        } else if (!expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc)) {
+             err = cudaErrorInvalidDeviceFunction;
+         }
+-        if (err == cudaSuccess) {
++        if (err == cudaSuccess && !local_src) {
+             err = copy_slot_from_src(t, dst, hsrc, (cudaStream_t) stream);
+         }
+-        if (err == cudaSuccess) {
++        if (err == cudaSuccess && !local_src) {
+             // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
+             // being in VRAM now does not mean the pool should forget where to find it next time.
+             expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
+@@ -2227,7 +2747,7 @@ void apply_prefill_seed_locked(table_t & t) {
+         void *        dst = (char *) t.arena + (size_t) i * t.expert_bytes;
+         // wip/host-expert-master-drop (TODO #55): one geometry-aware source (pinned master / pinned pool /
+         // pageable fallback), so a seeded table is byte-identical to a lazily filled one.
+-        const cudaError_t err = fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
++        cudaError_t err = seed_fill_slot_locked(t, dst, e);
+         if (err != cudaSuccess) {
+             (void) cudaGetLastError();
+             ok = false;
+@@ -2849,6 +3369,231 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
+ // parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
+ // thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
+ // thread and dominated the kernel.
++// One expert's bytes, by this block: a strided axis-0 slice row by row (`rows` rows of `row_bytes`, `host_pitch` apart
++// in the source), else 4 KiB chunks.  Grid-strided over blockIdx.x.  Shared by the one-fill, stage and route kernels.
++static __device__ __forceinline__ void moe_cache_expert_copy(char * __restrict__ d, const char * __restrict__ s,
++                                                             int64_t expert_bytes, int64_t rows, int64_t row_bytes,
++                                                             int64_t host_pitch, bool rowwise) {
++    if (rowwise) {
++        for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
++            moe_cache_policy_copy(d + (size_t) r * (size_t) row_bytes, s + (size_t) r * (size_t) host_pitch,
++                                  (size_t) row_bytes, threadIdx.x, blockDim.x);
++        }
++        return;
++    }
++    const int64_t chunk = 4096;
++    for (int64_t o = (int64_t) blockIdx.x * chunk; o < expert_bytes; o += (int64_t) gridDim.x * chunk) {
++        const int64_t n = expert_bytes - o < chunk ? expert_bytes - o : chunk;
++        moe_cache_policy_copy(d + o, s + o, (size_t) n, threadIdx.x, blockDim.x);
++    }
++}
++
++static __global__ void moe_cache_one_fill_kernel(char * __restrict__ dst, const char * __restrict__ src,
++                                                 int64_t expert_bytes, int64_t rows, int64_t row_bytes,
++                                                 int64_t host_pitch, int do2d) {
++    moe_cache_expert_copy(dst, src, expert_bytes, rows, row_bytes, host_pitch, do2d != 0);
++}
++
++static cudaError_t sparse_fill_locked(const table_t & t, void * dst, int32_t e, void * stream) {
++    const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    if (do2d && rows <= 0) {
++        return cudaErrorInvalidValue;
++    }
++    (void) cudaGetLastError();
++    device_guard dg(t.device);   // a kernel launch needs the stream's device current
++    moe_cache_one_fill_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(
++        (char *) dst, (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off,
++        (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++        (int64_t) t.host_pitch, do2d ? 1 : 0);
++    return cudaGetLastError();
++}
++
++// One expert per blockIdx.y: a resident expert is a contiguous arena slot; a cold one is read from the registered
++// alias with the table's host geometry (a strided axis-0 slice row by row).  dst is the compacted device slice.
++static __global__ void moe_cache_sparse_stage_kernel(char * __restrict__ dst, const char * const * __restrict__ srcs,
++                                              const uint8_t * __restrict__ cold, int64_t expert_bytes, int64_t rows,
++                                              int64_t row_bytes, int64_t host_pitch, int do2d) {
++    const int e = blockIdx.y;
++    char *       d = dst + (size_t) e * (size_t) expert_bytes;
++    const char * s = srcs[e];
++    moe_cache_expert_copy(d, s, expert_bytes, rows, row_bytes, host_pitch, cold[e] && do2d);
++}
++
++// Routed fill: entry `blockIdx.y` copies expert ids[j] (a resident arena slot, or a cold expert from the registered
++// alias with the host geometry) to its ORIGINAL offset in the op's input, as the scheduler's host copy would.
++static __global__ void moe_cache_route_kernel(char * __restrict__ dst, const char * const * __restrict__ srcs,
++                                              const int32_t * __restrict__ eids, const uint8_t * __restrict__ cold,
++                                              int64_t expert_bytes, int64_t rows, int64_t row_bytes, int64_t host_pitch,
++                                              int do2d) {
++    const int    j = blockIdx.y;
++    char *       d = dst + (size_t) eids[j] * (size_t) expert_bytes;
++    const char * s = srcs[j];
++    moe_cache_expert_copy(d, s, expert_bytes, rows, row_bytes, host_pitch, cold[j] && do2d);
++}
++
++// Where a device-side copy reads expert `e`: its arena slot (contiguous, cold 0), or the registered alias of the
++// sparse master with the host geometry (cold 1, registered here).  False: an alias that cannot be registered.
++static bool expert_copy_src_locked(const table_t & t, int32_t e, const char ** src, uint8_t * cold) {
++    const auto it = t.expert_slot.find(e);
++    if (it != t.expert_slot.end() && t.arena != nullptr) {
++        *src  = (const char *) t.arena + (size_t) it->second * t.expert_bytes;
++        *cold = 0;
++    } else {
++        if (!sparse_need_locked(t, e)) {
++            return false;
++        }
++        *src  = (const char *) t.host_dev + (size_t) e * t.host_bytes + t.src_off;
++        *cold = 1;
++    }
++    return true;
++}
++
++// Fill the routed experts of a small prefill ubatch into `dst` (the op's device input).  Every used expert, plus the
++// expert after each run of used ones (the scheduler's host copy carries up to 512 bytes of it as the MMQ tail pad;
++// copying the whole neighbour keeps those bytes identical).  False: nothing usable was queued, the host path serves.
++static bool sparse_fill_routed_locked(table_t & t, void * dst, const int32_t * ids, int64_t n_used, int64_t n_tok,
++                                      size_t ids_nb0, size_t ids_nb1, void * stream) {
++    if (!t.host_sparse || t.sparse_off || t.host_dev == nullptr || dst == nullptr || n_used >= t.n_experts) {
++        return false;   // the warm-up pass (every expert) streams through the host path
++    }
++    const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++    const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++    if (do2d && rows <= 0) {
++        return false;
++    }
++    std::vector<uint8_t> want((size_t) t.n_experts, 0);
++    for (int64_t tok = 0; tok < n_tok; tok++) {
++        for (int64_t j = 0; j < n_used; j++) {
++            const int32_t e = *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
++            if (e < 0 || e >= t.n_experts) {
++                return false;
++            }
++            want[(size_t) e] = 1;
++        }
++    }
++    for (int32_t e = 0; e + 1 < t.n_experts; e++) {
++        if (want[(size_t) e] == 1 && want[(size_t) e + 1] == 0) {
++            want[(size_t) e + 1] = 2;   // tail pad
++        }
++    }
++    const size_t n = (size_t) t.n_experts;
++    t.route_pack.resize(n * (sizeof(void *) + sizeof(int32_t) + 1));
++    const char ** srcs = (const char **) t.route_pack.data();
++    int32_t *     eids = (int32_t *) (t.route_pack.data() + n * sizeof(void *));
++    uint8_t *     cold = t.route_pack.data() + n * (sizeof(void *) + sizeof(int32_t));
++    unsigned k = 0;
++    for (int32_t e = 0; e < t.n_experts; e++) {
++        if (!want[(size_t) e]) {
++            continue;
++        }
++        if (!expert_copy_src_locked(t, e, &srcs[k], &cold[k])) {
++            return false;
++        }
++        eids[k] = e;
++        k++;
++    }
++    if (k == 0) {
++        return false;
++    }
++    device_guard dg(t.device);
++    if (t.route_dev == nullptr && cudaMalloc(&t.route_dev, t.route_pack.size()) != cudaSuccess) {
++        (void) cudaGetLastError();
++        t.route_dev = nullptr;
++        return false;
++    }
++    (void) cudaGetLastError();
++    if (cudaMemcpyAsync(t.route_dev, t.route_pack.data(), t.route_pack.size(), cudaMemcpyHostToDevice,
++                        (cudaStream_t) stream) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    const char * rd = (const char *) t.route_dev;
++    moe_cache_route_kernel<<<dim3(16, k), 256, 0, (cudaStream_t) stream>>>(
++        (char *) dst, (const char * const *) rd, (const int32_t *) (rd + n * sizeof(void *)),
++        (const uint8_t *) (rd + n * (sizeof(void *) + sizeof(int32_t))),
++        (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++        (int64_t) t.host_pitch, do2d ? 1 : 0);
++    if (cudaGetLastError() != cudaSuccess) {
++        return false;
++    }
++    g_route_fills++;
++    return true;
++}
++
++} // namespace (moe_cache_stage_table is the public entry point)
++
++bool moe_cache_stage_table(const void * src, size_t offset, size_t total, void * dst, int device,
++                           void * compute_stream, void * stream, void * order_event) {
++    if (!g_enabled || !g_any_sparse || src == nullptr) {
++        return false;
++    }
++    static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (table_t & t : g_tables) {
++        if (t.host != src || t.device != device || !t.host_sparse || t.sparse_off || t.host_dev == nullptr ||
++                (size_t) t.src_off != offset || (size_t) t.n_experts * t.expert_bytes != total) {
++            continue;
++        }
++        const bool    do2d = t.split_axis == 0 && t.host_pitch != 0;
++        const int64_t rows = do2d ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
++        if (do2d && rows <= 0) {
++            return false;
++        }
++        const size_t n = (size_t) t.n_experts;
++        t.stage_pack.resize(n * sizeof(void *) + n);
++        const char ** srcs = (const char **) t.stage_pack.data();
++        uint8_t *     cold = t.stage_pack.data() + n * sizeof(void *);
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (!expert_copy_src_locked(t, e, &srcs[e], &cold[e])) {
++                return false;   // the caller copies the whole table from the master (correct, just slow)
++            }
++        }
++        device_guard dg(t.device);
++        if (t.stage_dev == nullptr && cudaMalloc(&t.stage_dev, t.stage_pack.size()) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.stage_dev = nullptr;
++            return false;
++        }
++        (void) cudaGetLastError();
++        if (cudaMemcpyAsync(t.stage_dev, t.stage_pack.data(), t.stage_pack.size(), cudaMemcpyHostToDevice,
++                            (cudaStream_t) stream) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        // As in the pinned staging: order the copy stream after the compute stream only when a decode hook may have
++        // written the arena since the last staging on this device.
++        const uint64_t seq = g_write_seq.load();
++        if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && ordered_seq[device] != seq) {
++            if (cudaEventRecord((cudaEvent_t) order_event, (cudaStream_t) compute_stream) != cudaSuccess ||
++                cudaStreamWaitEvent((cudaStream_t) stream, (cudaEvent_t) order_event, 0) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++            ordered_seq[device] = seq;
++        }
++        moe_cache_sparse_stage_kernel<<<dim3(16, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(
++            (char *) dst, (const char * const *) t.stage_dev, (const uint8_t *) t.stage_dev + n * sizeof(void *),
++            (int64_t) t.expert_bytes, rows, rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0,
++            (int64_t) t.host_pitch, do2d ? 1 : 0);
++        if (cudaGetLastError() != cudaSuccess) {
++            return false;
++        }
++        // the host pack is per table and re-filled only by the next ubatch's staging of this table (the scheduler
++        // synchronizes between ubatches), so the async upload has consumed it by then
++        g_stage_tables++;
++        return true;
++    }
++    static int n_miss = 0;
++    if (n_miss++ < 4) {
++        GGML_LOG_INFO("moe_cache_stage_table: no sparse table for src=%p offset=%zu total=%zu device=%d\n", src, offset,
++                      total, device);
++    }
++    return false;
++}
++
++namespace {
++
+ static __global__ void moe_cache_gather_kernel(
+         char * __restrict__ dst_base, const char * __restrict__ src_base,
+         const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
+@@ -3217,11 +3962,11 @@ void alloc_table_locked(table_t & t, int slots) {
+     // because the arena is not read until a later token.  A partial copy rolls the table back to the
+     // normal remap path.
+     t.identity = false;
+-    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0 && heat_seed_above_floor(t)) {
++    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0 && !t.sparse_off && heat_seed_above_floor(t)) {
+         bool ok = true;
+         for (int e = 0; e < t.n_experts && ok; ++e) {
+             void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
+-            const cudaError_t err = fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
++            const cudaError_t err = seed_fill_slot_locked(t, dst, e);
+             if (err != cudaSuccess) {
+                 (void) cudaGetLastError();
+                 ok = false;
+@@ -3263,6 +4008,36 @@ void alloc_table_locked(table_t & t, int slots) {
+     // complement, ranked by the same prior.  Doing it here (not only at the first decode pass) is what
+     // makes the PREFILL's staging read from the pool instead of the file.
+     pool_rerank_from_heat_locked(t);
++    // Sparse registration, at sizing (one sequential pass over the master during load, instead of first-touch
++    // registrations in the decode hook): read the table in parallel, fill the empty arena with provisional experts
++    // through a pinned staging buffer (count 0: evicted first, like the prefill seed; never registered), drop any
++    // earlier registration of what the table now holds, then register every expert it may read in place (its cold set).
++    if (t.host_sparse && !t.sparse_off && t.host_dev != nullptr && t.arena != nullptr && t.slots > 0) {
++        sparse_populate((uintptr_t) t.host_dev, (uintptr_t) t.host_dev + (size_t) t.n_experts * t.host_bytes);
++        if (!t.identity && t.expert_slot.empty()) {
++            const int k = std::min(t.slots, t.n_experts);
++            if (k > 0 && sparse_stage_fill_locked(t, k)) {
++                for (int i = 0; i < k; i++) {
++                    t.slot_expert[i] = i;
++                    t.expert_slot[i] = i;
++                    if (i < (int) t.slot_prov.size()) {
++                        t.slot_prov[i] = 1;
++                    }
++                    t.count[i] = 0;
++                    t.ghost[i] = 0;
++                    t.last[i]  = 0;
++                }
++                t.fills     += k;
++                t.slot_dirty = true;
++            }
++        }
++        sparse_trim_locked("sized");   // (synchronizes the devices: no seed fill still reads the alias)
++        for (int32_t e = 0; e < t.n_experts; e++) {
++            if (t.expert_slot.find(e) == t.expert_slot.end() && !sparse_need_locked(t, e)) {
++                break;   // registration refused: the rest registers on first touch (pass 2), or the read declines
++            }
++        }
++    }
+     // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
+     // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
+     g_arena_bytes += (int64_t) slots * t.expert_bytes;
+@@ -5041,6 +5816,25 @@ static void attach_host_src_locked(table_t & t, const void * host) {
+     t.src_known = true;
+ }
+ 
++// The device that owns every cache table of `host` (-sm layer), or -1 (no table, or tables on several devices).
++int moe_cache_owner_device(const void * host) {
++    if (!g_enabled || host == nullptr || !g_any_sparse) {
++        return -1;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    int owner = -1;
++    for (const table_t & t : g_tables) {
++        if (t.host != host || t.device < 0) {
++            continue;
++        }
++        if (owner >= 0 && owner != t.device) {
++            return -1;
++        }
++        owner = t.device;
++    }
++    return owner;
++}
++
+ // wip/host-expert-dio-cache Phase 1 (plumbing, inert).  See the header for the contract.
+ void moe_cache_set_host_pool(bool on) {
+     // `--host-experts pool`: enable the bounded host pool.  The loader calls this before any table is
+@@ -5513,7 +6307,7 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+     std::lock_guard<std::mutex> lock(g_mutex);
+     const char * s = (const char *) src_host;
+     for (table_t & t : g_tables) {
+-        if (t.device != device || t.host == nullptr || t.host_pinned || t.n_experts <= 0 || t.host_bytes == 0) {
++        if (t.device != device || t.host == nullptr || !table_pool_backed(t) || t.n_experts <= 0 || t.host_bytes == 0) {
+             continue;
+         }
+         const char * base = (const char *) t.host;
+@@ -5596,7 +6390,7 @@ bool moe_cache_source_pageable(const void * p) {
+     std::lock_guard<std::mutex> lock(g_mutex);
+     const char * c = (const char *) p;
+     for (const table_t & t : g_tables) {
+-        if (t.host == nullptr || t.host_pinned || t.host_bytes == 0 || t.n_experts <= 0) {
++        if (t.host == nullptr || !table_pool_backed(t) || t.host_bytes == 0 || t.n_experts <= 0) {
+             continue;
+         }
+         const char * b = (const char *) t.host;
+@@ -5669,7 +6463,8 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             bool accessible = false;
+             if (table >= 0) {
+                 std::lock_guard<std::mutex> lock(g_mutex);
+-                accessible = g_tables[table].host_dev != nullptr;
++                // a sparse master's host_dev is the alias, but the kernel reads `weight->data` = the pageable map
++                accessible = g_tables[table].host_dev != nullptr && !g_tables[table].host_sparse;
+             }
+             if (!accessible) {
+                 return false;
+@@ -5755,11 +6550,12 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
+         // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
+         // pageable master must never reach the ring through the pageable upload).
+-        if (t.host_pinned && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe)) {
++        if (!table_pool_backed(t) && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe ||
++                                        !t.host_pinned)) {   // a sparse mmap table declines
+             g_stage_decline_usable++;
+             return false;
+         }
+-        if (t.host_pinned && !g_sized) {
++        if (!table_pool_backed(t) && !g_sized) {
+             return false;
+         }
+         const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
+@@ -5797,7 +6593,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         // `<= -2` pool slot `-v-2`, `-1` in neither), so the kernel needs no extra bookkeeping; the experts
+         // in NEITHER tier are still copied here, one at a time, because each of those is a distinct read
+         // from the mapping/disk.
+-        if (!t.host_pinned) {
++        if (table_pool_backed(t)) {   // (not a sparse mmap table)
+             host_pool_t * pool = table_pool_locked(t);
+             cudaError_t   err  = cudaSuccess;
+             {
+@@ -6025,6 +6821,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         moe_trace_emit('D', layer, sem_role(weight).c_str(), (int) n_tok, (int) n_used, ids_host.data(),
+                        (int) weight->ne[2], weight->nb[2] > 0 ? (size_t) weight->nb[2] : 0);
+     }
++    // Above the band the meta backend forwards every table; only a sparse (mmap) master is served there (a pinned
++    // -sm tensor run keeps exactly its old behaviour: no table work on a prefill ubatch).
++    if (n_tok > MOE_EXPERT_CACHE_MAX_TOK && split_axis >= 0 && !g_any_sparse) {
++        return false;
++    }
+     const int    n_experts    = (int) weight->ne[2];
+     // `host_bytes` is the full host-master expert stride; `expert_bytes` is THIS device's slice, which
+     // the op reads and the arena stores.  They are equal for an unsplit table (1 GPU / `-sm layer`).
+@@ -6080,6 +6881,31 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     std::lock_guard<std::mutex> lock(g_mutex);
+     table_t & t = g_tables[table];
+     t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
++    if (t.sparse_off) {
++        g_decline_all++;   // pageable master without registration: the scheduler path serves it
++        return false;
++    }
++
++    // Sparse registration: re-trim to the cold set every 10 s (an admitted expert stays registered until then), but only
++    // while the registration is over its budget: each trim remaps the dropped runs, which costs the GPU a mapping
++    // update, and a model whose master fits the budget gains nothing from it.
++    static const size_t sreg_budget = [] {
++        const char * e = getenv("GGML_MOE_SREG_BUDGET_MIB");
++        if (e != nullptr) {
++            return (size_t) atoll(e) << 20;
++        }
++        return sreg_phys_bytes() / 10 * 4;   // 40 % of RAM
++    }();
++    if (!g_sreg.empty() && g_sreg_bytes > sreg_budget) {
++        static int64_t last_us = 0;
++        const int64_t now_us = ggml_time_us();
++        if (last_us == 0) {
++            last_us = now_us;
++        } else if (now_us - last_us > 10 * 1000 * 1000) {
++            last_us = now_us;
++            sparse_trim_locked("periodic");
++        }
++    }
+ 
+     // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never
+     // cache-managed (the arena serves the decode band only), but its routing is the strongest available
+@@ -6106,7 +6932,9 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             }
+             t.prefill_tokens += n_tok;
+         }
+-        return false;   // decode/verify band only
++        // a small prefill ubatch on a sparse master: the routed experts come from the arena / registered alias
++        return t.host_sparse && weight_cpy != nullptr &&
++               sparse_fill_routed_locked(t, weight_cpy->data, ids, n_used, n_tok, ids_nb0, ids_nb1, stream);
+     }
+ 
+     // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
+@@ -6269,6 +7097,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         return *(const int32_t *) ((const char *) ids + (size_t) tok * ids_nb1 + (size_t) j * ids_nb0);
+     };
+ 
++    if (t.host_sparse && n_used >= t.n_experts) {
++        g_decline_all++;   // the warm-up pass (every expert): the scheduler streams it from the page cache
++        return false;
++    }
++
+     std::vector<int32_t> & remap = t.remap_host;
+     if (remap.size() < (size_t) n_used * n_tok) {
+         remap.resize((size_t) n_used * n_tok);
+@@ -6345,7 +7178,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             const auto it = t.expert_slot.find(e);
+             if (it != t.expert_slot.end()) {
+                 remap[(size_t) tok * n_used + j] = it->second;
+-            } else if (g_cold_uva && t.cold_safe && t.host_dev != nullptr && e >= 0 && e < t.n_experts) {
++            } else if (g_cold_uva && t.cold_safe && t.host_dev != nullptr && e >= 0 && e < t.n_experts &&
++                       sparse_need_locked(t, e)) {   // sparse master: the cold read needs the expert registered
+                 // Phase 1b: not resident (never admitted / rejected / evicted).  Encode it in the COLD
+                 // region of the id space - the kernel reads `id - n_res_slots` from the host alias.
+                 remap[(size_t) tok * n_used + j] = n_res_slots + e;
+@@ -6939,6 +7773,15 @@ void moe_cache_report() {
+     if (g_devremap_calls > 0) {
+         GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
+     }
++    if (g_sreg_calls > 0 || g_sreg_fail > 0) {
++        GGML_LOG_WARN("%s: sparse registration: %.1f MiB registered now (peak %.1f), %zu runs, %lld register calls, "
++                      "%lld refused, %lld admissions skipped, %lld kept (victim not in RAM), %lld trims, %lld not mlocked, "
++                      "%lld tables staged from the cache, %lld remaps, %lld routed fills\n",
++                      __func__, g_sreg_bytes / 1048576.0, g_sreg_peak / 1048576.0, g_sreg.size(), (long long) g_sreg_calls,
++                      (long long) g_sreg_fail, (long long) g_sreg_keep, (long long) g_sreg_stay, (long long) g_sreg_trims,
++                      (long long) g_sreg_nolock, (long long) g_stage_tables, (long long) g_sreg_remaps,
++                      (long long) g_route_fills);
++    }
+     if (g_pool_enabled) {
+         int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
+         for (const auto & kv : g_host_pools) {
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 86e3f6c53..3f609181e 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -303,6 +303,15 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
+                            size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
+                            void * order_event);
++// The same for a sparse (`--host-experts mmap`) master: the whole table `[offset, offset + total)` assembled into `dst`
++// on `copy_stream` from the arena and the registered file alias, so a prefill never reads the pageable
++// master through a host copy; ordered after `compute_stream` (through `order_event`) as above.  False for any other
++// table (the caller then tries the call above).
++bool moe_cache_stage_table(const void * src, size_t offset, size_t total, void * dst, int device,
++                           void * compute_stream, void * copy_stream, void * order_event);
++
++// The device that owns every cache table of `host` (-sm layer), or -1 (no table, or tables on several devices).
++int  moe_cache_owner_device(const void * host);
+ 
+ // Kernel consumer seam.  Given the op (`op`) and the (redirected) expert table the op will read
+ // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
+-- 
+2.53.0
+

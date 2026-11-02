@@ -1,0 +1,213 @@
+From 209204e4bee92169e8f4c8f85a7267e69126db7e Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 31 Oct 2026 22:34:10 +0000
+Subject: [PATCH 01/10] llama: restore --host-experts mmap (host-resident MoE
+ experts stay in the pageable model mapping)
+
+r33 removed the mode because a pageable host master faults on a no-XNACK GPU (issue #116).  This restores the
+loader / CLI / llama-bench side only: with --host-experts mmap the `-ncmoe` / `-cmoe` expert weights stay in the
+mmap'd CPU buffer instead of the device's pinned ROCm_Host buffer, and the host-expert accounting stays keyed by the
+GPU so the MoE preflight still runs.  The expert cache (next patches) makes the GPU reads safe through a sparse
+registration of a read-only file alias.  Selected only by the explicit flag; auto stays pinned.
+---
+ common/arg.cpp                    |  4 +--
+ include/llama.h                   |  4 +--
+ src/llama-model-loader.cpp        | 53 +++++++++++++++++++------------
+ src/llama-model-loader.h          |  6 +++-
+ tools/llama-bench/llama-bench.cpp |  6 ++--
+ 5 files changed, 43 insertions(+), 30 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 9c613053a..37d419647 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2724,12 +2724,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default 25% of the host expert bytes).\n"
+         "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+         "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
+-        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
++        "- mmap: pageable model mapping (CPU_Mapped), read by the GPU through a sparse registration of a file alias - reclaimable RAM",
+         [](common_params & params, const std::string & value) {
+             /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+             else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+             else if (value == "pool")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_POOL;   }
+-            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
++            else if (value == "mmap"   || value == "0")          { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_MMAP;   }
+             else { throw std::invalid_argument("invalid value"); }
+         }
+     ));
+diff --git a/include/llama.h b/include/llama.h
+index 6b0f13693..87a82a72e 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -233,9 +233,9 @@ extern "C" {
+ 
+     // how host-resident MoE expert weights (the `-ncmoe`/`-cmoe` GGML_OP_MUL_MAT_ID tables) are backed
+     enum llama_host_experts_mode {
+-        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
++        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned
+         LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
+-        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
++        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // leave them in the pageable model mmap (CPU_Mapped) - reclaimable RAM
+         LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // NO full pinned master: the tensors live in the read-only model
+                                              // mapping and every GPU read is served through the bounded
+                                              // pinned host pool (MOE_HOST_POOL_MIB/FRAC).  Costs some prefill
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index c3eb1948d..43c3fa36b 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -26,14 +26,11 @@ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+ static const size_t GiB = 1024*MiB;
+ 
+-// Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+-// place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+-// `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+-static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
+-    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
+-        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
+-                       "by a no-XNACK GPU, issue #116); using pinned instead\n", func);
+-    }
++// Host-resident expert weights: pinned (`ROCm_Host`) by default (fast H2D uploads / device-readable host master).
++// `--host-experts mmap` keeps them in the pageable model mapping (`CPU_Mapped`), which a no-XNACK GPU reads through
++// the expert cache's sparse registration of a file alias.  Returns true for the mmap master.
++static bool llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
++    const bool mmap = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP;
+     if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
+         // issue #130: route through the device API (the pool is global in ggml-cuda, so any device serves;
+         // a backend without the callback is a no-op).
+@@ -45,6 +42,7 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
+                        "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes, "
+                        "O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n", func);
+     }
++    return mmap;
+ }
+ 
+ // wip/host-expert-master-drop (TODO #55): POOL mode drops the FULL PINNED host expert master.  The
+@@ -614,11 +612,11 @@ llama_model_loader::llama_model_loader(
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+ 
+-    // Host-resident expert weights are pinned by default (`ROCm_Host`): the GPU reads the host master in
+-    // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+-    // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+-    this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
+-    llama_host_experts_mode_apply(host_experts_mode, __func__);
++    // Host-resident expert weights are pinned by default (`ROCm_Host`).  `--host-experts mmap` keeps them in the
++    // pageable model mapping (read by the GPU through the expert cache's sparse registration); `--host-experts pool`
++    // places them in the backend's pool-backed master (TODO #55).
++    this->host_experts_mode = host_experts_mode;
++    this->mmap_host_experts = llama_host_experts_mode_apply(host_experts_mode, __func__);
+     if (this->host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL && !this->use_mmap) {
+         // The pool-backed master is a MODEL MAPPING: without mmap there is no mapping to place the tensors in,
+         // so the full pinned master has to stay (a pageable full copy would be no better than pinned, and the
+@@ -1311,7 +1309,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return it->second.get();
+     };
+ 
++    // The GPU whose pinned host buffer type a MoE expert weight would have used, when --host-experts mmap moved it
++    // to the mmap'd CPU buffer.  The host-expert accounting is keyed by that GPU, as it is for a pinned expert: keyed
++    // by the CPU device, the MoE preflight (which also arms the slab) never ran for an mmap'd model.
++    ggml_backend_dev_t expert_host_dev = nullptr;
+     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
++        expert_host_dev = nullptr;
+         if (!t_meta) {
+             if (flags & TENSOR_NOT_REQUIRED) {
+                 return nullptr;
+@@ -1519,14 +1522,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         }
+ 
+         // avoid using a host buffer when using mmap
+-        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type stays in the
+-        // device's PINNED host buffer (`ROCm_Host`).  The expert cache reads the master in place on the
+-        // GPU, and a pageable `CPU_Mapped` master has no device mapping without XNACK (issue #116); the
+-        // scheduler's per-op H2D from pageable memory also faults/stalls on ROCm 7.14.  Pinning the
+-        // expert set costs non-swappable RAM but is the only safe host master on RDNA.
++        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
++        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
++        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
++        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
++        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
++        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
++        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  `--host-experts mmap` restores the mmap
++        // downgrade; the expert cache then makes the GPU reads safe (sparse registration of a file alias).
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+-                op != GGML_OP_MUL_MAT_ID) {
++                !(!mmap_host_experts && op == GGML_OP_MUL_MAT_ID)) {
++            if (op == GGML_OP_MUL_MAT_ID) {
++                expert_host_dev = buft_dev;
++            }
+             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+             if (!cpu_dev) {
+                 throw std::runtime_error("no CPU backend found");
+@@ -1588,7 +1597,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return nullptr;
+         }
+         if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+-            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
++            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2],
++                    expert_host_dev ? ggml_backend_dev_host_buffer_type(expert_host_dev) : buft, buft_list_layer);
+         }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+@@ -1641,7 +1651,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return nullptr;
+     }
+     if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+-        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
++        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2],
++                expert_host_dev ? ggml_backend_dev_host_buffer_type(expert_host_dev) : buft, buft_list_layer);
+     }
+ 
+     ggml_context * ctx = ctx_for_buft(buft);
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 0870f80e0..230fcbe39 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -82,13 +82,17 @@ struct llama_model_loader {
+     // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`) unless the caller
+     // selected `--host-experts pool`: in that mode the backend may offer a pageable, file-mapping-backed
+     // master buffer type and every GPU read is served through the bounded pinned host pool (TODO #55).
+-    // The pageable `--host-experts mmap` mode was removed (issue #116).
++    // `--host-experts mmap` is the separate flag below.
+     llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
+ 
+     // The buffer type a host-resident expert weight (`-ncmoe`/`-cmoe`, a `MUL_MAT_ID` table) should use on
+     // `dev`: the pinned host buffer by default, or the backend's pool-backed master buffer in POOL mode
+     // when the load is file-mapped (a non-mmap load has no mapping to place the tensors in).
+     ggml_backend_buffer_type_t host_expert_buft(ggml_backend_dev_t dev) const;
++
++    // true: host-resident expert weights (`-ncmoe`/`-cmoe`) stay in the pageable model mmap
++    // false (default): keep them in the device's pinned host buffer (ROCm_Host)
++    bool mmap_host_experts = false;
+     bool check_tensors;
+     bool no_alloc;
+     bool load_mtp;
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 5e3469510..2dd689d1f 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -491,7 +491,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
+     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+-    printf("  --host-experts <pinned|auto|pool>                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
++    printf("  --host-experts <pinned|mmap|auto|pool>            (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
+     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
+     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
+     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
+@@ -863,9 +863,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                     } else if (m == "pool") {
+                         mode = LLAMA_HOST_EXPERTS_MODE_POOL;
+                     } else if (m == "mmap" || m == "0") {
+-                        fprintf(stderr, "error: --host-experts mmap is not supported (pageable host masters fault without XNACK, issue #116)\n");
+-                        invalid_param = true;
+-                        break;
++                        mode = LLAMA_HOST_EXPERTS_MODE_MMAP;
+                     } else {
+                         invalid_param = true;
+                         break;
+-- 
+2.53.0
+

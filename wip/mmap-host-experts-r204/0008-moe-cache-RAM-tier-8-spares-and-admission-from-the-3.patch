@@ -1,0 +1,50 @@
+From e1f37e83cf940617ccb5ad85c81deb7383cc978d Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 18:04:52 +0000
+Subject: [PATCH 08/10] moe cache RAM tier: 8 spares and admission from the 3rd
+ touch by default with the copy-back ahead (GGML_MOE_TIER_TOUCH)
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index f136c8d8f..34b001ad3 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -901,11 +901,21 @@ static const bool g_precopy = [] {
+     return e == nullptr || atoi(e) != 0;
+ }();
+ // GGML_MOE_TIER_SPARES=K: spare RAM slots per tier table (K - 1 can hold precopies, one stays free for the in-stream
+-// fallback).  Default 4 with precopy, 1 without (the previous layout).
++// fallback).  Default 8 with precopy, 1 without (the previous layout).
+ static const int g_tier_spares = [] {
+     const char * e = getenv("GGML_MOE_TIER_SPARES");
+-    return e != nullptr && atoi(e) > 0 ? atoi(e) : (g_precopy ? 4 : 1);
++    return e != nullptr && atoi(e) > 0 ? atoi(e) : (g_precopy ? 8 : 1);
+ }();
++// GGML_MOE_TIER_TOUCH=N: the `touch` admission threshold for RAM-tier tables (MOE_EXPERT_CACHE_TOUCH for the others).
++// With several spares a tier table can admit every re-touched expert, and a short detour of the routing then evicts the
++// hot set; admitting from the 3rd touch damps that churn.  Default 3 with precopy, else MOE_EXPERT_CACHE_TOUCH.
++static int64_t tier_touch() {
++    static const int64_t v = [] {
++        const char * e = getenv("GGML_MOE_TIER_TOUCH");
++        return e != nullptr && atoi(e) > 0 ? (int64_t) atoi(e) : (int64_t) (g_precopy ? 3 : 0);
++    }();
++    return v;
++}
+ 
+ static __global__ void moe_cache_set_ptr_kernel(uintptr_t * ptrs, int32_t e, uintptr_t v) {
+     ptrs[e] = v;
+@@ -3048,7 +3058,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                     reject = t.ghost[expert] <= t.count[victim];
+                 } else if (admit == 2) {
+                     // touch: a first-touch expert is served cold; admit from the Nth touch on.
+-                    reject = t.ghost[expert] < g_touch;
++                    reject = t.ghost[expert] < (t.ram_base != nullptr && tier_touch() > 0 ? tier_touch() : g_touch);
+                 }
+             }
+         }
+-- 
+2.53.0
+

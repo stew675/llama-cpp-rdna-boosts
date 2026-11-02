@@ -1,0 +1,70 @@
+From b0845a5064a0aacddc7f7b5e2b8a6e4219427d65 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 2 Nov 2026 00:05:12 +0000
+Subject: [PATCH 10/10] moe cache: a declined read of a sparse (mmap) master
+ goes through the per-table pinned bounce
+
+The scheduler fallback for a read the cache declines issued a pageable cudaMemcpyAsync from the file mapping.  ROCclr
+pins each pageable source range; under a tight pin budget those pins exhausted KFD's system memory limit (millions of
+"exceeds resident system memory limit" refusals), and the next lazy code-object load failed with "no kernel image is
+available" (the first two-sequence ssm_conv launch).  The pageable copies also tear: with them the greedy output was
+wrong even at the default budget.  The pool-backed masters already took this path.  The bounce ring is capped at 8
+entries per table (a full ring waits for one copy), so a declined whole-table read cannot pin a copy of the master.
+
+No kill switch: the old path gives wrong output.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index b3e9eff13..af1809b12 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -100,6 +100,7 @@ struct table_t {
+     // wip/host-expert-master-drop (TODO #55): pinned per-table bounce ring for a PAGEABLE master, grown on
+     // demand (see `expert_host_src`).  Empty for a pinned master.
+     std::vector<bounce_t> bounce;
++    int                   bounce_rr = 0;   // next entry to wait for when the bounce ring is full
+     bool        host_sparse = false;    // pageable `host`: only the experts a GPU may read are registered (see sreg_*)
+     bool        sparse_off  = false;    // pageable master that could not be registered: the cache declines this table
+     void *      stage_dev   = nullptr;  // prefill staging: per-expert source pointers + cold flags (device copy)
+@@ -6920,6 +6921,10 @@ static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
+ // Only the 1:1 geometry is served (an unsplit table: the same byte offset in the master and in `dst`).  A
+ // split/meta table's copies are issued by the meta backend per device, where `set_tensor_2d_async` already
+ // snapshots a pageable source through its pinned ring.
++//
++// A sparse (mmap) master is served the same way: its declined reads would otherwise be pageable copies, and ROCclr pins
++// each pageable source range, which under a tight pin budget exhausts KFD's system memory limit (the next lazy
++// code-object load then fails), and back-to-back pageable copies tear (measured as wrong output even at the default budget).
+ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, void * stream, int device) {
+     if (dst == nullptr || src_host == nullptr || size == 0 || !g_enabled) {
+         return false;
+@@ -6927,7 +6932,8 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+     std::lock_guard<std::mutex> lock(g_mutex);
+     const char * s = (const char *) src_host;
+     for (table_t & t : g_tables) {
+-        if (t.device != device || t.host == nullptr || !table_pool_backed(t) || t.n_experts <= 0 || t.host_bytes == 0) {
++        const bool served = table_pool_backed(t) || (t.host_sparse && t.host_dev != nullptr);
++        if (t.device != device || t.host == nullptr || !served || t.n_experts <= 0 || t.host_bytes == 0) {
+             continue;
+         }
+         const char * base = (const char *) t.host;
+@@ -6965,6 +6971,15 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+                 idx = i;
+                 break;
+             }
++            // At most 8 entries per table: a declined sparse read can be a whole master, and an unbounded ring would pin
++            // a copy of it outside the pin budget.  A full ring waits for one copy and reuses its entry.
++            if (idx < 0 && t.bounce.size() >= 8) {
++                idx         = t.bounce_rr % (int) t.bounce.size();
++                t.bounce_rr = idx + 1;
++                (void) cudaEventSynchronize(t.bounce[(size_t) idx].ev);
++                (void) cudaGetLastError();
++                t.bounce[(size_t) idx].busy = false;
++            }
+             if (idx < 0) {
+                 device_guard dg(t.device);
+                 void *      mem = nullptr;
+-- 
+2.53.0
+

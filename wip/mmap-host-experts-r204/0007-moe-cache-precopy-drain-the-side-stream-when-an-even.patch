@@ -1,0 +1,36 @@
+From 62334848610907296d9d69832b1ef522fec4dc61 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 16:15:27 +0000
+Subject: [PATCH 07/10] moe cache precopy: drain the side stream when an event
+ record fails after a launch; a failed wait fails the swap
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 1d4d2d03b..f136c8d8f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1231,6 +1231,8 @@ static void precopy_plan_locked(table_t & t, void * stream, const int32_t * prot
+         moe_cache_copy_kernel<<<32, 256, 0, ss>>>(t.ram_base + (size_t) q * eb,
+                                                   (const char *) t.arena + (size_t) rs->second * eb, eb);
+         if (cudaGetLastError() != cudaSuccess || cudaEventRecord(ev, ss) != cudaSuccess) {
++            (void) cudaGetLastError();
++            (void) cudaStreamSynchronize(ss);   // a copy may be in flight into q: drain it before q is reused
+             (void) cudaGetLastError();
+             t.precopy_idle.push_back(ev);   // a failed record leaves it unrecorded; the slot stays free
+             return;
+@@ -1262,7 +1264,8 @@ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t
+             g_pc_waited++;
+         }
+         if (cudaStreamWaitEvent(s, pc->ev, 0) != cudaSuccess) {
+-            return cudaGetLastError();
++            (void) cudaGetLastError();
++            return cudaErrorInvalidValue;
+         }
+         set_e = victim;
+         set_v = (uintptr_t) (t.ram_base + (size_t) q * eb);
+-- 
+2.53.0
+

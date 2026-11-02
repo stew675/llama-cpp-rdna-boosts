@@ -1,0 +1,344 @@
+From 61faa7dd0761428e9d71eec24b594a7580a2c5f6 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 15:44:01 +0000
+Subject: [PATCH 06/10] moe cache RAM tier: K spare slots + copy-back ahead on
+ a side stream (GGML_MOE_TIER_PRECOPY, GGML_MOE_TIER_SPARES)
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 226 ++++++++++++++++++++++++-
+ 1 file changed, 218 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 70ceb13a1..1d4d2d03b 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -111,11 +111,19 @@ struct table_t {
+     char *      ram_base    = nullptr;
+     size_t      ram_bytes   = 0;
+     std::vector<int32_t> ram_slot;      // expert -> RAM slot, -1 while resident
+-    std::vector<int32_t> ram_free;      // free RAM slots (one spare: where an evicted expert lands)
++    std::vector<int32_t> ram_free;      // free RAM slots (the spares: where an evicted expert lands)
+     std::vector<int32_t> ram_pending;   // RAM slots freed by a swap whose H2D may still be pending: reusable only after
+                                         // `swap_ev` (tier_release_pending_locked), never within the same call
+     uintptr_t * cold_ptrs   = nullptr;  // device, expert -> its cold bytes (low bit: host geometry); kept once set
+     cudaEvent_t swap_ev     = nullptr;  // after the last swap (its spare RAM slot is reusable after it)
++    // Copy-back ahead (GGML_MOE_TIER_PRECOPY): spare RAM slots that already hold a copy of a resident the policy is likely
++    // to evict next (D2H on the device's side stream, done when `ev` fires), so its admission needs no D2H on the compute
++    // stream.  The copy stays valid while the expert is resident (weights never change); an entry is consumed by the swap
++    // that evicts it, or reclaimed once its copy completed and the expert is no longer a candidate.
++    struct precopy_t { int32_t expert; int32_t ram; cudaEvent_t ev; };
++    std::vector<precopy_t>   precopy;
++    std::vector<cudaEvent_t> precopy_idle;   // recorded-and-done or never-recorded events, for reuse
++    cudaEvent_t pol_ev      = nullptr;  // compute stream, after a policy pass: the side stream waits it before a D2H
+     int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
+ 
+     int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
+@@ -883,6 +891,21 @@ static bool sparse_stage_fill_locked(const table_t & t, int k) {
+ static bool    g_tier_off   = false;   // dropped: the file alias path
+ static int64_t g_tier_bytes = 0;
+ static int64_t g_tier_swaps = 0;
++static int64_t g_tier_swaps_d2h = 0;   // swaps that copied the victim back on the compute stream
++static int64_t g_tier_nospare   = 0;   // misses served cold because no spare RAM slot (or precopy of the victim) was ready
++static int64_t g_pc_issued = 0, g_pc_used = 0, g_pc_reclaimed = 0;
++static int64_t g_pc_waited = 0;   // admissions whose precopy had not completed yet (the GPU waited for it)
++// GGML_MOE_TIER_PRECOPY=0: no copy-back ahead (each swap copies its victim back on the compute stream, as before).
++static const bool g_precopy = [] {
++    const char * e = getenv("GGML_MOE_TIER_PRECOPY");
++    return e == nullptr || atoi(e) != 0;
++}();
++// GGML_MOE_TIER_SPARES=K: spare RAM slots per tier table (K - 1 can hold precopies, one stays free for the in-stream
++// fallback).  Default 4 with precopy, 1 without (the previous layout).
++static const int g_tier_spares = [] {
++    const char * e = getenv("GGML_MOE_TIER_SPARES");
++    return e != nullptr && atoi(e) > 0 ? atoi(e) : (g_precopy ? 4 : 1);
++}();
+ 
+ static __global__ void moe_cache_set_ptr_kernel(uintptr_t * ptrs, int32_t e, uintptr_t v) {
+     ptrs[e] = v;
+@@ -907,6 +930,27 @@ static __global__ void moe_cache_copy_kernel(char * __restrict__ dst, const char
+     }
+ }
+ 
++// The H2D of an admission with the victim's cold pointer write folded in (copy-back ahead: one launch per admission).
++static __global__ void moe_cache_copy_set_kernel(char * __restrict__ dst, const char * __restrict__ src, size_t n,
++                                                 uintptr_t * ptrs, int32_t e, uintptr_t v) {
++    if (blockIdx.x == 0 && threadIdx.x == 0 && e >= 0) {
++        ptrs[e] = v;
++    }
++    const size_t stride = (size_t) gridDim.x * blockDim.x;
++    size_t       i      = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if ((((uintptr_t) dst | (uintptr_t) src | n) & 15) == 0) {
++        uint4 *       d = (uint4 *) dst;
++        const uint4 * q = (const uint4 *) src;
++        for (; i < n / 16; i += stride) {
++            d[i] = q[i];
++        }
++        return;
++    }
++    for (; i < n; i += stride) {
++        dst[i] = src[i];
++    }
++}
++
+ static uintptr_t tier_file_ptr(const table_t & t, int32_t e) {
+     return ((uintptr_t) t.host_dev + (uintptr_t) e * t.host_bytes + t.src_off) | 1;   // low bit: host geometry
+ }
+@@ -943,6 +987,10 @@ static void tier_drop_all_locked(const char * why) {
+         t.ram_slot.clear();
+         t.ram_free.clear();
+         t.ram_pending.clear();
++        for (const table_t::precopy_t & c : t.precopy) {
++            t.precopy_idle.push_back(c.ev);
++        }
++        t.precopy.clear();
+         std::vector<uintptr_t> ptrs((size_t) t.n_experts);
+         for (int32_t e = 0; e < t.n_experts; e++) {
+             ptrs[(size_t) e] = tier_file_ptr(t, e);
+@@ -985,7 +1033,12 @@ static bool tier_build_locked(table_t & t) {
+     }
+     // + SREG_PAD: the decode kernels read a little past an expert's last row (the file path has the same pad), and the
+     // last RAM slot holds an expert too
+-    const size_t bytes = (size_t) (n_cold + 1) * t.expert_bytes + SREG_PAD;
++    int    n_spare = g_tier_spares;
++    size_t bytes   = (size_t) (n_cold + n_spare) * t.expert_bytes + SREG_PAD;
++    if (n_spare > 1 && g_tier_bytes + (int64_t) bytes > budget) {
++        n_spare = 1;   // the extra spares do not fit: the single-spare layout
++        bytes   = (size_t) (n_cold + 1) * t.expert_bytes + SREG_PAD;
++    }
+     if (g_tier_bytes + (int64_t) bytes > budget) {
+         tier_drop_all_locked("over GGML_MOE_RAM_TIER_MIB");
+         return false;
+@@ -1041,7 +1094,10 @@ static bool tier_build_locked(table_t & t) {
+     }
+     t.ram_base  = base;
+     t.ram_bytes = bytes;
+-    t.ram_free.assign(1, j);   // the spare
++    t.ram_free.clear();
++    for (int k = 0; k < n_spare; k++) {
++        t.ram_free.push_back(j + k);   // the spares
++    }
+     g_tier_bytes += (int64_t) bytes;
+     return true;
+ }
+@@ -1073,15 +1129,149 @@ static void tier_release_file_locked(const table_t & t) {
+ // Admit expert `e` (in the tier) into arena slot `dst`, moving `victim` (the slot's resident, or -1) into the tier:
+ // victim -> the spare RAM slot (D2H), then e's RAM slot -> the arena (H2D); e's RAM slot becomes the spare.  All on
+ // the admission stream, which every reader of this table's arena and tier (bar the prefill staging) shares.
++static std::vector<table_t::precopy_t>::iterator precopy_find(table_t & t, int32_t e) {
++    return std::find_if(t.precopy.begin(), t.precopy.end(), [e](const table_t::precopy_t & c) { return c.expert == e; });
++}
++
++// Copy-back ahead (GGML_MOE_TIER_PRECOPY): after a policy pass, copy the residents the policy would evict next (its own
++// order: smallest decaying count, then oldest use; this call's experts excluded) into free spare RAM slots on the
++// device's side stream, so their later eviction is only the H2D of the incoming expert.  One spare always stays free
++// for the in-stream fallback.  Nothing reads a spare, and an expert's arena bytes do not change while it is resident;
++// the side stream first waits for the compute stream's work so far (a recent fill of a candidate has landed).
++static cudaStream_t precopy_stream(int device) {
++    static std::map<int, cudaStream_t> streams;
++    const auto it = streams.find(device);
++    if (it != streams.end()) {
++        return it->second;
++    }
++    cudaStream_t ss = nullptr;
++    if (cudaStreamCreateWithFlags(&ss, cudaStreamNonBlocking) != cudaSuccess) {
++        (void) cudaGetLastError();
++        ss = nullptr;
++    }
++    streams[device] = ss;
++    return ss;
++}
++
++static void precopy_plan_locked(table_t & t, void * stream, const int32_t * protect, int n_protect) {
++    const int want = g_tier_spares - 1;
++    if (!g_precopy || want <= 0 || g_tier_off || t.ram_base == nullptr || stream == nullptr || t.arena == nullptr ||
++        t.slots <= 0 || t.device < 0) {
++        return;
++    }
++    device_guard dg(t.device);
++    std::vector<int32_t> cand;
++    cand.reserve((size_t) t.slots);
++    for (int sl = 0; sl < t.slots; sl++) {
++        const int32_t e = t.slot_expert[(size_t) sl];
++        if (e < 0 || std::find(protect, protect + n_protect, e) != protect + n_protect) {
++            continue;
++        }
++        cand.push_back(e);
++    }
++    const auto lower = [&](int32_t a, int32_t b) {
++        return t.count[a] < t.count[b] || (t.count[a] == t.count[b] && t.last[a] < t.last[b]);
++    };
++    const size_t n_cand = std::min(cand.size(), (size_t) want);
++    std::partial_sort(cand.begin(), cand.begin() + n_cand, cand.end(), lower);
++    cand.resize(n_cand);
++
++    // reclaim the precopies of residents that are no longer candidates (only once their copy is done)
++    for (auto it = t.precopy.begin(); it != t.precopy.end(); ) {
++        if (std::find(cand.begin(), cand.end(), it->expert) == cand.end() && cudaEventQuery(it->ev) == cudaSuccess) {
++            t.ram_free.push_back(it->ram);
++            t.precopy_idle.push_back(it->ev);
++            it = t.precopy.erase(it);
++            g_pc_reclaimed++;
++        } else {
++            (void) cudaGetLastError();
++            ++it;
++        }
++    }
++
++    cudaStream_t ss    = nullptr;
++    int          n_new = 0;
++    for (const int32_t e : cand) {
++        if (n_new >= 2) {
++            break;   // bounds the hook's host time per call; later calls continue
++        }
++        if (t.ram_free.size() <= 1) {
++            break;   // keep one spare for the in-stream fallback
++        }
++        if (precopy_find(t, e) != t.precopy.end()) {
++            continue;
++        }
++        const auto rs = t.expert_slot.find(e);
++        if (rs == t.expert_slot.end() || rs->second < 0) {
++            continue;
++        }
++        if (ss == nullptr) {
++            ss = precopy_stream(t.device);
++            if (ss == nullptr) {
++                return;
++            }
++            if ((t.pol_ev == nullptr && cudaEventCreateWithFlags(&t.pol_ev, cudaEventDisableTiming) != cudaSuccess) ||
++                cudaEventRecord(t.pol_ev, (cudaStream_t) stream) != cudaSuccess ||
++                cudaStreamWaitEvent(ss, t.pol_ev, 0) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return;
++            }
++        }
++        cudaEvent_t ev = nullptr;
++        if (!t.precopy_idle.empty()) {
++            ev = t.precopy_idle.back();
++            t.precopy_idle.pop_back();
++        } else if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++        const int32_t q  = t.ram_free.back();
++        const size_t  eb = t.expert_bytes;
++        // the copy kernel, not hipMemcpyAsync (see moe_cache_copy_kernel); a small grid leaves the CUs to the op
++        moe_cache_copy_kernel<<<32, 256, 0, ss>>>(t.ram_base + (size_t) q * eb,
++                                                  (const char *) t.arena + (size_t) rs->second * eb, eb);
++        if (cudaGetLastError() != cudaSuccess || cudaEventRecord(ev, ss) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.precopy_idle.push_back(ev);   // a failed record leaves it unrecorded; the slot stays free
++            return;
++        }
++        t.ram_free.pop_back();
++        t.precopy.push_back({ e, q, ev });
++        g_pc_issued++;
++        n_new++;
++    }
++}
++
+ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t victim, void * stream) {
+-    const int32_t p = e >= 0 && e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
+-    if (p < 0 || stream == nullptr || (victim >= 0 && t.ram_free.empty())) {
++    const int32_t p  = e >= 0 && e < (int32_t) t.ram_slot.size() ? t.ram_slot[(size_t) e] : -1;
++    const auto    pc = victim >= 0 ? precopy_find(t, victim) : t.precopy.end();
++    if (p < 0 || stream == nullptr || (victim >= 0 && pc == t.precopy.end() && t.ram_free.empty())) {
+         return cudaErrorInvalidValue;
+     }
+     device_guard       dg(t.device);
+     const cudaStream_t s  = (cudaStream_t) stream;
+     const size_t       eb = t.expert_bytes;
+-    if (victim >= 0) {
++    int32_t   set_e = -1;   // copy-back ahead: the victim's cold pointer, written by the H2D kernel
++    uintptr_t set_v = 0;
++    if (pc != t.precopy.end()) {
++        // The victim's bytes are already in RAM slot pc->ram (or will be once pc->ev fires): wait for that copy on the
++        // GPU before the H2D below overwrites the victim's arena slot; the H2D kernel points its cold reads at the copy.
++        const int32_t q = pc->ram;
++        if (cudaEventQuery(pc->ev) != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_pc_waited++;
++        }
++        if (cudaStreamWaitEvent(s, pc->ev, 0) != cudaSuccess) {
++            return cudaGetLastError();
++        }
++        set_e = victim;
++        set_v = (uintptr_t) (t.ram_base + (size_t) q * eb);
++        t.precopy_idle.push_back(pc->ev);   // reusable: the wait above captured this record
++        t.precopy.erase(pc);
++        t.ram_slot[(size_t) victim] = q;
++        g_pc_used++;
++    } else if (victim >= 0) {
++        g_tier_swaps_d2h++;
+         const int32_t q  = t.ram_free.back();
+         char *        vr = t.ram_base + (size_t) q * eb;
+         moe_cache_copy_kernel<<<128, 256, 0, s>>>(vr, (const char *) dst, eb);
+@@ -1093,7 +1283,12 @@ static cudaError_t tier_swap_locked(table_t & t, void * dst, int32_t e, int32_t
+         t.ram_free.pop_back();
+         t.ram_slot[(size_t) victim] = q;
+     }
+-    moe_cache_copy_kernel<<<128, 256, 0, s>>>((char *) dst, t.ram_base + (size_t) p * eb, eb);
++    if (set_e >= 0) {
++        moe_cache_copy_set_kernel<<<128, 256, 0, s>>>((char *) dst, t.ram_base + (size_t) p * eb, eb, t.cold_ptrs,
++                                                      set_e, set_v);
++    } else {
++        moe_cache_copy_kernel<<<128, 256, 0, s>>>((char *) dst, t.ram_base + (size_t) p * eb, eb);
++    }
+     const cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+         return err;
+@@ -2815,7 +3010,11 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+     }
+     // A tier table evicts into a free RAM slot; with none free this call (the spare is still the source of a pending
+     // copy), the miss is served cold and the expert can be admitted on a later call.
+-    if (slot < 0 && (t.ram_base == nullptr || !t.ram_free.empty())) {
++    if (slot < 0 && t.ram_base != nullptr && t.ram_free.empty() && t.precopy.empty()) {
++        g_tier_nospare++;
++    }
++    // With copy-back ahead the victim may also leave through its precopy; the victim choice itself is unchanged.
++    if (slot < 0 && (t.ram_base == nullptr || !t.ram_free.empty() || !t.precopy.empty())) {
+         // evict the resident with the smallest decaying count; tie -> oldest use.
+         for (int s = 0; s < t.slots; s++) {
+             const int32_t e = t.slot_expert[s];
+@@ -2826,6 +3025,11 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                 slot   = s;
+             }
+         }
++        if (t.ram_base != nullptr && victim >= 0 && t.ram_free.empty() && precopy_find(t, victim) == t.precopy.end()) {
++            victim = -1;   // the victim has nowhere to go this call: served cold, as with no spare
++            slot   = -1;
++            g_tier_nospare++;
++        }
+         // Phase 1b fill-vs-cold admission.  Only meaningful when a cold read is actually available
+         // (`COLD=uva`); with no cold path a rejected miss could not be served at all, so every mode
+         // fills and the policy is a no-op.  A rejected miss is still a miss and is served from the
+@@ -7496,6 +7700,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         bool cold = false;
+         (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
+     }
++    precopy_plan_locked(t, stream, used.data(), (int) used.size());
+ 
+     // Pass 2: build the remap from the FINAL map.  Nothing evicts between here and the read.
+     //
+@@ -7688,6 +7893,7 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+         if (t.arena == nullptr || t.slots <= 0 || (t.host_sparse && t.ram_base == nullptr)) {
+             return false;
+         }
++        precopy_plan_locked(t, stream, t.dr_lag_host, n);
+     }
+     // 2. The device map, re-uploaded only after a residency change.
+     if (t.slot_dirty || !t.dr_map_ok) {
+@@ -8134,6 +8340,10 @@ void moe_cache_report() {
+     if (g_tier_swaps > 0 || g_tier_bytes > 0) {
+         GGML_LOG_WARN("%s: RAM tier: %.1f MiB pinned, %lld swaps%s\n", __func__, g_tier_bytes / 1048576.0,
+                       (long long) g_tier_swaps, g_tier_off ? " (off)" : "");
++        GGML_LOG_WARN("%s: RAM tier: %d spares, precopy %s: %lld issued, %lld used (%lld waited), %lld reclaimed; %lld swaps copied back "
++                      "in-stream; %lld misses cold for lack of a spare\n", __func__, g_tier_spares, g_precopy ? "on" : "off",
++                      (long long) g_pc_issued, (long long) g_pc_used, (long long) g_pc_waited, (long long) g_pc_reclaimed,
++                      (long long) g_tier_swaps_d2h, (long long) g_tier_nospare);
+     }
+     if (g_pool_enabled) {
+         int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
+-- 
+2.53.0
+

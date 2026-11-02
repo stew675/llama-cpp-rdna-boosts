@@ -1,0 +1,85 @@
+From 3d212c58164bd8027b9b589a372af1141fbf56de Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 18:03:56 +0000
+Subject: [PATCH 05/10] moe cache: device remap for RAM-tier (mmap) tables; the
+ pool cold read never on a RAM-tier table
+
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index e17bdc6b0..70ceb13a1 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1398,8 +1398,9 @@ static inline bool table_cold_ok(const table_t & t) {
+ static bool g_pool_cold = true;
+ static host_pool_t * table_pool_locked(table_t & t);
+ static int pool_cold_slot_locked(table_t & t, int32_t expert) {
+-    if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.n_slices > 0 || t.src_off != 0 ||
+-            ggml_cuda_info().device_count != 1) {
++    // cold_ptrs: a RAM-tier table encodes `n_res + expert` in the same cold id range, so a table never uses both
++    if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.cold_ptrs != nullptr ||
++            t.n_slices > 0 || t.src_off != 0 || ggml_cuda_info().device_count != 1) {
+         return -1;
+     }
+     host_pool_t * p = table_pool_locked(t);
+@@ -7547,10 +7548,11 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+ // ---- Sync-free decode device remap (GGML_MOE_DEVREMAP) ------------------------------------------------------------
+ // The eager path reads the routing back to the host (one synchronize per routed op), runs the residency policy and
+ // uploads the remap.  Here a kernel maps the device routing through a per-table expert -> slot map (slots + e = cold,
+-// read in place from the pinned master) and writes the routing into mapped pinned memory; the policy runs on that
+-// routing at the next call (one call late) and re-uploads the map when residency changed.  The bytes each expert is
+-// read from are the same (arena slot or the pinned master), so the output does not change.  Pinned masters only
+-// (`table_cold_ok`), single slice, no identity table.  GGML_MOE_DEVREMAP=0: off (the eager path).
++// read in place from the pinned master or the RAM tier) and writes the routing into mapped pinned memory; the policy
++// runs on that routing at the next call (one call late) and re-uploads the map when residency changed.  The bytes each
++// expert is read from are the same (arena slot, pinned master or RAM tier), so the output does not change.  Single
++// slice, no identity table; a sparse (mmap) table only with its RAM tier: without it the host must register a cold
++// expert before the read, which needs the routing on the host.  GGML_MOE_DEVREMAP=0: off (the eager path).
+ #define MOE_DEVREMAP_MAX_JOBS 4
+ struct moe_devremap_jobs {
+     const int32_t * map[MOE_DEVREMAP_MAX_JOBS];
+@@ -7639,6 +7641,7 @@ static bool devremap_alloc_locked(table_t & t) {
+ // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
+ static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
+     return g_sized && !t.dr_failed && table_cold_ok(t) && t.n_slices == 0 && !t.identity &&
++           (!t.host_sparse || (!g_tier_off && t.ram_base != nullptr && t.cold_ptrs != nullptr)) &&
+            t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
+            n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
+            (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
+@@ -7650,6 +7653,8 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+         return false;
+     }
+     const cudaStream_t s = (cudaStream_t) stream;
++    // RAM-tier slots freed by earlier swaps, if those swaps are done (never block; a miss is served cold meanwhile)
++    tier_release_pending_locked(t, false);
+     // 1. The residency policy on the previous call's routing (never block: not back yet = skip this call's policy).
+     if (t.dr_lag_n > 0) {
+         const bool lag_ready = t.dr_lag_flag ? __atomic_load_n(&t.dr_lag_host[t.dr_cap], __ATOMIC_ACQUIRE) == t.dr_lag_seq
+@@ -7676,8 +7681,11 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+         for (int i = 0; i < n; i++) {
+             bool cold = false;
+             (void) access_locked(t, t.dr_lag_host[i], stream, t.dr_lag_host, n, &cold);
++            if (t.host_sparse && t.ram_base == nullptr) {
++                break;   // a failed swap dropped the RAM tier: the eager path serves this table from here on
++            }
+         }
+-        if (t.arena == nullptr || t.slots <= 0) {
++        if (t.arena == nullptr || t.slots <= 0 || (t.host_sparse && t.ram_base == nullptr)) {
+             return false;
+         }
+     }
+@@ -7833,7 +7841,8 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+     for (table_t & t : g_tables) {
+-        if (t.arena == arena && t.slots > 0 && t.host_dev == nullptr) {
++        if (t.arena == arena && t.slots > 0 && t.host_dev == nullptr && t.cold_ptrs == nullptr) {
++            // (never with cold_ptrs: a RAM-tier table's cold ids mean `n_res + expert`, not a pool slot)
+             // MOE_HOST_POOL_COLD: a pool-backed table's cold region is the pinned pool, indexed by pool slot
+             host_pool_t * p = (g_cold_uva && g_pool_cold && t.cold_safe && t.n_slices == 0 && t.src_off == 0 &&
+                                ggml_cuda_info().device_count == 1) ? table_pool_locked(t) : nullptr;
+-- 
+2.53.0
+

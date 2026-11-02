@@ -1,0 +1,152 @@
+From bef8c23545a78dcef48a55a5316784a8faff5aaf Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 1 Nov 2026 00:54:57 +0000
+Subject: [PATCH 03/10] slab / context: keep the expert-cache arena across
+ prefill transitions
+
+Changes that stop a prefill from evicting expert-cache arena tables on a slab the arena fills.  Each eviction costs a
+table its residency until it re-arms, and drops a RAM tier (next patch) for good.
+
+- The narrow-2 (draft compute) region stays on its cudaMalloc fallback when that fits outside the slab, instead of
+  evicting the arena to make room for the pin.
+- GGML_CUDA_SLAB_RING_PREFILL=0 selects the r66 placement: no early narrow floor, no buffer drop on a decode ->
+  prefill transition, the slab sizes the prefill view by size alone, and r87's forced drop for `n_tokens_prev > 8`
+  is skipped (issue #187).  r67's above-ring prefill placement evicts arena tables on configs whose arena fills the
+  slab; with it, the forced drop stays, since it is what gives the chunks back.  The default (unset) keeps the
+  current behaviour, except under `--host-experts mmap`, which defaults it to 0.
+
+Measured on Qwen3.8-Flash-Next IQ3_S, 1 x R9700, -ncmoe 47, MTP, --host-experts pinned: the default placement has
+17 arena slab evictions per run (stock r191 the same, 71.8 / 71.3 t/s greedy); =0 has none (73.0 / 72.2 t/s).
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 26 +++++++++++++++++++++++---
+ src/llama-context.cpp                | 18 +++++++++++++++---
+ src/llama-model-loader.cpp           | 12 ++++++++++++
+ 3 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 62c61f5d3..46b7ef6d0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -1019,6 +1019,23 @@ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s,
+         }
+         // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
+         // re-enters the slab through `arena_free`, so it cannot run under this lock).
++        if (off < s.mapped) {
++            // Evicting is only needed when the cudaMalloc fallback cannot fit outside the slab (the
++            // tensor-split drafter case above).  When it can, keep the arena: an eviction drops every RAM
++            // tier on this device for good, which costs far more than the draft buffer's share of headroom.
++            size_t free_b = 0, total_b = 0;
++            ggml_cuda_set_device(device);
++            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
++                (void) cudaGetLastError();
++                free_b = 0;
++            }
++            if (free_b >= nf2 + s.chunk) {
++                GGML_LOG_WARN("%s: device %d: the %.2f GiB narrow-2 region fits outside the slab (%.2f GiB free); "
++                              "the draft compute buffer stays on the cudaMalloc path instead of evicting arena tables\n",
++                              __func__, device, (double) nf2 / (1ull << 30), (double) free_b / (1ull << 30));
++                return 0;
++            }
++        }
+         *evict = off < s.mapped;
+         return off;
+     }
+@@ -1257,7 +1274,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // carved ring region was never armed (`ring_slot_capacity() == 0`): the H2D staging fell back to a
+         // capped cudaMalloc and the prefill streamed.  Only force it when a region was actually carved, so
+         // a no-ring model keeps the plain size classification.
+-        const bool   ring_wide = s.ring_region > 0 && s.ring_requested && s.narrow_floor > 0;
++        // GGML_CUDA_SLAB_RING_PREFILL=0: size-only classification (r66), see llama_slab_ring_prefill in llama-context.cpp
++        static const bool ring_prefill = [] { const char * e = getenv("GGML_CUDA_SLAB_RING_PREFILL"); return e == nullptr || atoi(e) != 0; }();
++        const bool   ring_wide = ring_prefill && s.ring_region > 0 && s.ring_requested && s.narrow_floor > 0;
+         // A view that is NOT a requested wide (prefill) pass belongs to the always-resident narrow band even
+         // when it is wider than the floor established so far.  The ring region is only carved while a wide
+         // pass is live, so when it is not (`boundary <= narrow_floor` and the ring is disarmed) a wider
+@@ -1274,8 +1293,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // unrelated narrow view) -- treating either as "the ring may not move" stopped the band from
+         // being learned on a single device: measured gfx1100 `-ncmoe 40`, floor 1280 MiB against a
+         // 1536 MiB decode view, one arena eviction per prefill -> decode transition.
+-        const bool   narrow   = s.narrow_floor > 0 && !ring_wide && (!s.ring_armed || need <= s.narrow_floor);
+-        if (narrow && need > s.narrow_floor) {
++        const bool   narrow   = ring_prefill ? s.narrow_floor > 0 && !ring_wide && (!s.ring_armed || need <= s.narrow_floor)
++                                             : s.narrow_floor > 0 && need <= s.narrow_floor;
++        if (ring_prefill && narrow && need > s.narrow_floor) {
+             // Learn the band from the real graph: the floor is estimated before the first carve from a
+             // reserve that is not necessarily the widest narrow layout (the `n_rs_batch` probe measures
+             // 1792 MiB where the MTP decode/verify graph needs 2304), and `ggml_cuda_slab_set_narrow_floor`
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 56f2a3366..44e38821c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2253,6 +2253,15 @@ bool llama_context::set_adapter_cvec(
+     // one), so 512 MiB is comfortably below anything worth reclaiming.
+     static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
+ 
++// GGML_CUDA_SLAB_RING_PREFILL=0: the r66 slab placement (no early narrow floor, no buffer drop on a decode -> prefill
++// transition; the slab then sizes the prefill view by size alone).  `--host-experts mmap` defaults it to 0 (see
++// llama_host_experts_mode_apply).  r67's above-ring prefill placement evicts expert-cache
++// arena on configs whose arena fills the slab, and the drop repeats it on every new prompt.
++static bool llama_slab_ring_prefill() {
++    static const bool v = [] { const char * e = getenv("GGML_CUDA_SLAB_RING_PREFILL"); return e == nullptr || atoi(e) != 0; }();
++    return v;
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -2314,7 +2323,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             // `drop_observed` is the WIDE prefill region, so an equally-wide SECOND prefill would compare
+             // equal and never release the wide layout or re-arm the arena (r85 regression: the second
+             // request keeps the wide work buffer and a small arena, decode ~half speed).
+-            if (n_tokens_prev > 8 || cur >= was + (size_t) GGML_DROP_RESERVE_SLACK_BYTES) {
++            // r87's forced drop (`n_tokens_prev > 8`) stays with the ring prefill placement: its prefill evicts arena
++            // tables, and only the drop gives the chunks back.  The r66 placement takes none, so it skips the drop
++            // (issue #187: under it the drop itself evicted the arena on every new prompt).
++            if ((llama_slab_ring_prefill() && n_tokens_prev > 8) || cur >= was + (size_t) GGML_DROP_RESERVE_SLACK_BYTES) {
+                 drop_now = true;
+                 break;
+             }
+@@ -2333,7 +2345,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // afterwards).  Measure the narrow layout once with a size-only reserve and pin the floor BEFORE the
+     // first wide view is placed, so the ring is carved for that prefill too.  The size-only reserve is
+     // the same probe the `drop_now` path already uses (`split_only`, no allocation).
+-    if (!slab_narrow_pinned && !model.moe_host_expert_bytes.empty() &&
++    if (llama_slab_ring_prefill() && !slab_narrow_pinned && !model.moe_host_expert_bytes.empty() &&
+             cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+         slab_narrow_pinned = true;
+         const uint32_t n_rs_seqs = std::max<uint32_t>(1, dsv4_cache ? ubatch.n_seqs : ubatch.n_seqs_unq);
+@@ -2395,7 +2407,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // re-reserves above the ring (`ring_set` has already marked the request wide).  Symmetric with the
+         // `drop_now` wide -> narrow transition below; consecutive prefill ubatches (`n_tokens_prev >= 64`)
+         // keep the wide buffer.
+-        if (ring_carved && ring_arm && n_tokens_prev < 64) {
++        if (llama_slab_ring_prefill() && ring_carved && ring_arm && n_tokens_prev < 64) {
+             ggml_backend_sched_drop_buffers(sched.get());
+         }
+     }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c3fa36b..cc5796b92 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -31,6 +31,18 @@ static const size_t GiB = 1024*MiB;
+ // the expert cache's sparse registration of a file alias.  Returns true for the mmap master.
+ static bool llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
+     const bool mmap = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP;
++    if (mmap) {
++        // The r66 slab placement (GGML_CUDA_SLAB_RING_PREFILL=0) unless the user set it: the ring prefill placement
++        // evicts arena tables on every new prompt, and an eviction drops an mmap master's RAM tier for good (the cold
++        // reads then go through the registered file alias).  Read lazily by the slab and the context, after this.
++#if defined(_WIN32)
++        if (getenv("GGML_CUDA_SLAB_RING_PREFILL") == nullptr) {
++            _putenv_s("GGML_CUDA_SLAB_RING_PREFILL", "0");
++        }
++#else
++        setenv("GGML_CUDA_SLAB_RING_PREFILL", "0", 0);
++#endif
++    }
+     if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
+         // issue #130: route through the device API (the pool is global in ggml-cuda, so any device serves;
+         // a backend without the callback is a no-op).
+-- 
+2.53.0
+
