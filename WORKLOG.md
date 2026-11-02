@@ -44,8 +44,9 @@ above the run depth)/`wspill` (`W=2048`).  Pool: `pref` (the sparse arm the pool
 block from the log -- the P0 report -- and `REUSE=1 KEEPOUT=<dir>` re-grades a run instead of re-running it.
 Measured: `wref == wres == wspill` (`be904e86f248`) with 0 flips and 0 host MiB on `wres` and 16 flips /
 64 MiB host-backed on `wspill`; `pref == pres == pfloor` (`f260d1824ab3`) with draft 71/43 on all three,
-`bad 0`, 8 192 pages vs 4 104, 252 resolves on both, **144.3 -> 218.4 claims/resolve** and **90.95 -> 89.64 %**
-hits.  **Negative-tested** as the plan demands: an off-by-one pool slot in `kv_pool_map_fill_kernel` diverges
+`bad 0`, 8 192 pages vs 4 104, 252 resolves on both, **144.2 -> 216.5 claims/resolve** and **90.91 -> 90.03 %**
+hits (on the released tree; the counters move ~1 % run to run because the claim cursor is an `atomicAdd`, so
+the gate asserts a strict inequality and never an absolute).  **Negative-tested** as the plan demands: an off-by-one pool slot in `kv_pool_map_fill_kernel` diverges
 the text and the acceptance and the gate FAILs (and `LLAMA_KV_POOL_VERIFY=1` stays `bad 0` under it -- VERIFY
 compares the pool's bytes, so a wrong READER index is invisible to it, which is exactly why the text oracle is
 the gate).

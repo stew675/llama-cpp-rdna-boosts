@@ -76,6 +76,9 @@ it did not read before: 144 claims/resolve at `-c 32768` with the pool holding t
 separation is claim pressure and hit rate (144 -> 218 claims/resolve, 90.95 -> 89.64 % hits), not an absolute.
 3. **`hits %` can never read 100 %**: an id whose block another thread of the SAME launch just claimed is
 neither a hit nor a miss.
+4. **The counters move run to run**: the claim cursor is an `atomicAdd`, so the same two arms read 144.3/218.4
+claims per resolve in one run and 144.2/216.5 in the next (hits 90.95/89.64 vs 90.91/90.03).  The gate asserts
+a strict inequality between the arms, never an absolute threshold.
 
 **Negative test (the plan's "shown to fail").**  An off-by-one pool slot in `kv_pool_map_fill_kernel` (a
 wrong-page resolve) makes `pres`/`pfloor` diverge in text AND in acceptance, and the gate FAILs on all three.

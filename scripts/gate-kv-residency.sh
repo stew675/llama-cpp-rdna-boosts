@@ -32,6 +32,11 @@
 #                   misses, and `LLAMA_KV_POOL_VERIFY=1` on this arm (the churn arm is where a wrong-page
 #                   resolve would show)
 #
+#   The counters also move a little RUN TO RUN (the claim cursor is an atomicAdd, so which slots the
+#   launches of one step hand out is not fixed): the same two arms read 144.3/218.4 claims per resolve in one
+#   run and 144.2/216.5 in the next, with the hit rates 90.95/89.64 vs 90.91/90.03.  So the assertions below
+#   are STRICT INEQUALITIES between the two arms, never absolute thresholds.
+#
 #   What the pool counters CAN and CANNOT show (measured, r206 -- do not re-derive):
 #     * `hits %` is a per-ID probe rate, and an ID whose block another thread of the SAME launch just claimed
 #       counts as neither hit nor miss, so it can never read 100 %.
