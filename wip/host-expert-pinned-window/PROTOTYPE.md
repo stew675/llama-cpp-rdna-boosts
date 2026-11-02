@@ -268,6 +268,28 @@ So: the window is a **miss-path** optimisation.  With the set resident it is `pi
 grows and the pinned-RAM advantage does too.  That is the honest shape of the win, and it means a box
 whose expert set fits comfortably should see little of it.
 
+### 8.2b THE PROMOTION BLOCKER (2026-11-02): window prefill is 1.95x slower than `pinned`, and it is systemic
+
+Measured with a **persistent** `llama-server` (prompt cache off, three sequential requests, same 5246-token
+prompt, 2000 tokens out) on Flash-Next GSQ-RCO-IQ3_XXS (75.8 GB), 1x R9700, `-ncmoe 48`, arena auto
+(25.38 GiB of a 40.0 GiB host set = 63 % resident), `-c 8192`, q8_0 KV.  Instrument:
+`srv-test.sh`; hand-over: `HANDOVER-PREFILL-PARITY.md`.
+
+| arm | prefill req1 -> req2 -> req3 | gen (req3) | disk reads req2/3 | RSS |
+|---|---|---|---|---|
+| `pinned` | 652.7 -> 734.4 -> **734.0** | 59.5 | 0.00 / 0.00 GB | 68.5 GB |
+| `window` | 342.8 -> 373.4 -> **375.9** | 60.2 | 0.00 / 0.00 GB | 75.2 GB |
+| `window` + `ALIAS_FILL=1` | 476.3 -> 532.9 -> **532.8** | 60.5 | 0.00 / 0.00 GB | 68.5 GB |
+
+Zero disk I/O on requests 2-3 and the number does not move, so it is **not** a page-cache fill: it is
+`moe_cache_stage_table` dispatching on `t.host_pinned`.  A `pinned` master stages the whole table with ONE
+kernel launch reading `host_dev` in place; a registered (window) master does not match that predicate, so
+it takes the pool branch, where with no pool every expert falls back to one `expert_host_src` + copy, and
+the source is the per-table **bounce** -- a host memcpy of each staged expert per table per ubatch.  The
+alias-fill arm proves the mechanism (same faults, same I/O, memcpy removed: +42 % prefill, -6.7 GB of
+bounce-ring RSS) and the fix is to let a registered master take the `pinned` path.  Decode is at parity
+throughout (60.2 / 60.5 vs 59.5), so prefill is the only open axis.
+
 ### 8.3 Two findings that are not this campaign's, recorded so nobody re-derives them
 
 * **Q8_K_XL's MTP head is damaged** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`): acceptance is ~0 in

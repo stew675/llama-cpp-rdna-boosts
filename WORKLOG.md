@@ -1,3 +1,48 @@
+## 261102.007 (wip) -- host-expert window: PREFILL is the promotion blocker (1.95x behind pinned, and systemic); hand-over written for the fix
+
+No delivery change (`patches/`/`release.json` untouched); the beta candidate is unchanged and still staged.
+Continues `261102.006`.  New: `wip/host-expert-pinned-window/HANDOVER-PREFILL-PARITY.md` and the
+instrument `wip/host-expert-pinned-window/srv-test.sh`; `PROTOTYPE.md` §8.2b.
+
+**Why this is a blocker.**  Multi-device is looking fine on the 3-GPU box, but a **persistent**
+`llama-server` (prompt cache off, three sequential requests, same 5246-token prompt, 2000 tokens out --
+Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set =
+63 % resident, `-c 8192`, q8_0 KV) shows window prefill **1.95x behind pinned**, steady state:
+
+| arm | prefill req1 -> req2 -> req3 | gen (req3) | disk reads req2/3 | RSS |
+|---|---|---|---|---|
+| `pinned` | 652.7 -> 734.4 -> **734.0** | 59.5 | 0.00 / 0.00 GB | 68.5 GB |
+| `window` | 342.8 -> 373.4 -> **375.9** | 60.2 | 0.00 / 0.00 GB | 75.2 GB |
+| `window` + `MOE_EXPERT_WINDOW_ALIAS_FILL=1` | 476.3 -> 532.9 -> **532.8** | 60.5 | 0.00 / 0.00 GB | 68.5 GB |
+
+**It is not a page-cache fill.**  Requests 2 and 3 read **exactly zero** bytes from the block device
+(`/proc/<pid>/io`), the mapping stays resident, RSS is flat -- and prefill still sits at 375.9, with only a
++9 % first-request transient (342.8 -> 373.4).  The process-restarting `llama-cli` numbers quoted earlier
+(346.6 / 353.3) were the partially-warm case; steady state is 375.9 and the gap does not close.
+
+**Cause.**  `moe_cache_stage_table` dispatches on `t.host_pinned`, not on device-readability: a `pinned`
+master stages the whole table with **one** kernel launch reading `host_dev` in place, while a registered
+(window) master falls into the pool branch, where -- with no pool -- every expert becomes one
+`expert_host_src` + copy whose source is the per-table **bounce**, i.e. a host `memcpy` of each staged
+expert per table per ubatch (~144 tables x 256 experts of per-copy issues instead of one launch).  The
+alias-fill arm is the proof it is the copy and not the faults: identical I/O, identical page state, memcpy
+removed -> **+42 % prefill and -6.7 GB RSS** (that RSS is the bounce ring, i.e. window mode today carries a
+second pinned copy -- the thing it exists to delete).
+
+**The plan, in the hand-over.**  (1) Flip `MOE_EXPERT_WINDOW_ALIAS_FILL` to default-on in window mode --
+one line, byte-identical, +42 % prefill, -6.7 GB; keep the env var as the kill switch per the default-on
+policy.  (2) The true fix: make the staging dispatch test **device-readability** (`t.host_dev != nullptr`,
+which `bind_host_dev_locked` sets for a pinned *and* a registered master) instead of `t.host_pinned`, so a
+registered master takes the same single-launch path -- expected to land at `pinned`'s ~734 t/s.  Known
+consequence to decide deliberately: that path requires a built arena, so window mode would decline the
+pre-sizing prefill the pool branch serves (`pinned` has always behaved that way); the fallback shape (keep
+the pool branch and pass the alias as its second source via the existing `-(s+2)` encoding, with the expert
+id as the index) is written out in §3.2 of the hand-over.
+
+**Also recorded.**  Decode is at parity or slightly better throughout (60.2 / 60.5 vs 59.5), so prefill is
+the only open axis; and the three arms produce identical text on the *server* path
+(`5851 chars sha=381dedfe3567`), which is a useful extra datapoint for the host-expert-hook gate.
+
 ## 261102.006 (wip) -- host-expert window promoted to `--host-experts window` and staged as `beta/0016-host-experts-window/`; all 1-GPU gates green, `-sm tensor` owed
 
 No delivery change to `patches/`/`release.json`/`rdna-boosts-all.patch`.  Continues `261102.005`;
