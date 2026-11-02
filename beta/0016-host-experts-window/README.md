@@ -7,11 +7,11 @@ checkout never contains it.
 | | |
 |---|---|
 | patch | [`host-experts-window.patch`](host-experts-window.patch) |
-| sha256 | `3502e334d674b985a22dcb803e5216a00a726b96f961601172fe66d4b9704da6` |
+| sha256 | `56dd1dfeff4d8aac150e53fc97ced7adea69f46d9ae0b3f51ca82eff4ead147e` |
 | applies to | `release.json` base `6050b467c` + the 16-block set (`v16-6050b467c-r206`), i.e. **after block 15** |
-| beta commit / tree | `142b06212` / **`5101f0e43ecf889394bc9d6b24f349faaadd96b5`** (verified by a fresh `apply-all.sh --include-beta`) |
+| beta commit / tree | `8417ede3c` / **`2344889727ce4b2746b918232ab16cb2a245f5e1`** (verified by a fresh `apply-all.sh --include-beta`) |
 | release tree it is cut against | `1bac1001f1780a5907fbce256ceeeaac8b8561ec` |
-| size | 13 files, `+368 −130` (`moe-expert-cache.cu` is `+424 −130` of it) |
+| size | 13 files, `+410 −133` (`moe-expert-cache.cu` is `+466 −133` of it) |
 | tested at | 1x R9700 (gfx1201), PCIe 5.0 x16, ROCm 10.1.0 |
 
 ## What it adds
@@ -78,7 +78,8 @@ either), and `window ≥ pinned` on throughput in every cell measured — at **z
 * Nothing else changes: `pinned` and `pool` keep their exact behaviour (all 16 blocks untouched), and
   the env surface is `MOE_EXPERT_TENSOR_REG` (kill switch, default **on in window mode**),
   `MOE_EXPERT_WINDOW_MLOCK` (opt-in `mlock` of the registration; refuses on `RLIMIT_MEMLOCK`),
-  `MOE_EXPERT_WINDOW_TRACE` (one line at exit) and `MOE_EXPERT_WINDOW_ALIAS_FILL` (opt-in, see below).
+  `MOE_EXPERT_WINDOW_TRACE` (one line at exit) and `MOE_EXPERT_WINDOW_ALIAS_FILL` (**default on** in
+  window mode; `=0` is the kill switch — see *Prefill parity* below).
 
 ## Known gaps — what the beta is FOR
 
@@ -90,17 +91,61 @@ either), and `window ≥ pinned` on throughput in every cell measured — at **z
    is the only place to prove it.  Look for **all children registering** (`MOE_EXPERT_WINDOW_TRACE=1`
    prints `tensors=N`; it must equal the host tensor count × devices, not ×1) and for the DevREMAP/cold
    arms being live on every device.
-2. **`MOE_EXPERT_WINDOW_ALIAS_FILL=1`** (fill the arena with a D2D from the registered alias instead of
-   through the pool) is byte-identical and marginally faster here, but inside noise at 1 GPU.  It is the
-   piece expected to matter **when the host expert set does not fit in RAM** (the probe measured a cold
-   fill at 2.3 ms registered vs 17.0 ms copied for 8 MiB), which no cell on this box exercises hard
-   enough to separate.  Leave it off unless you are testing that case.
+2. **Prefill is 5.7 % behind `pinned`** on the persistent-server cell that matters (693 against 735 t/s
+   at a host expert set that does not fit the arena; it was 375.9 — 1.95× behind — as first cut).  The
+   remaining difference is *not* dispatch: the two arms now issue the same kernels with the same launch
+   counts, and the same kernels each run 7-21 % slower, worst on the latency-bound ones
+   (`moe_cache_stage_kernel` +21 %, `build_mmq_routed_descriptors` +31 %, `mm_ids_helper` +18 %, the big
+   matmuls +2 %).  The master's read *bandwidth* is not it (a probe measures 52 GiB/s for a pinned
+   buffer and for the registered mapping alike, including the exact in-situ copy shape), and neither is
+   page size.  Recorded as the next campaign step; see the *Prefill parity* section and
+   `wip/host-expert-pinned-window/HANDOVER-PREFILL-PARITY.md`.
+   `MOE_EXPERT_WINDOW_ALIAS_FILL` itself is no longer a gap: it is byte-identical, it removes the
+   per-table bounce ring (-6.7 GB RSS), and it is now the default.
 3. **`MOE_EXPERT_WINDOW_MIB` / `MOE_EXPERT_WINDOW`**: deleted.  The registration is whole-tensor and
    does not hold pages, so there is no byte budget to set — a budget would need *windowed* registration,
    which is deliberately not implemented.
 4. Not a bug, but worth knowing: on **Q8_K_XL** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`) MTP acceptance
    is ~0 in **every** mode (`pinned` 0.00000, `window` 0.00000, `pool` 0.00589), while the same code
    gives 0.88 on Q4_K_M and Q8_0 — that file's MTP head is damaged.  Do not use it as a gate model.
+
+## Prefill parity (added in the 2026-11-02 revision)
+
+The first cut of this candidate was **1.95× behind `pinned` on prefill** at a host expert set that does
+not fit the arena, and it was systemic, not a cache effect (a persistent `llama-server` re-prefilling the
+same prompt read **zero** bytes from disk on requests 2-3).  Three changes closed most of it:
+
+1. `MOE_EXPERT_WINDOW_ALIAS_FILL` is **on by default** (kill switch `=0`).  It fills from the registered
+   alias by D2D instead of through the per-table bounce, which also deletes that bounce ring.
+2. `moe_cache_upload_pageable` stages a range from the registered alias with **one D2D copy**.  This is
+   the fallback for every table the cache staging declines (a stood-down table, the pre-sizing pass),
+   where a registered master used to pay a **host memcpy** of the whole range per ubatch — while
+   `pinned` pays a direct H2D DMA from its master.
+3. `moe_cache_stage_table` dispatches on **device-readability** (`host_dev != nullptr && cold_safe`)
+   instead of `host_pinned`, so a registered master takes `pinned`'s single-launch staging path.  Before,
+   it fell into the pool branch, where — window mode having no pool — every expert became one
+   `cudaMemcpyAsync`: **400 356** copies for a 5246-token prefill against **1 564** launches for
+   `pinned`, 3.41 s of `__amd_rocclr_copyBuffer` alone.
+
+Persistent server (`wip/host-expert-pinned-window/srv-test.sh`; Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB,
+1× R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set, `-c 8192`, q8_0 KV, request 3):
+
+| arm | prefill req3 | gen | RSS |
+|---|---|---|---|
+| `pinned` | **734.5-735.0** | 59.5 | 68.6 GB |
+| `window`, first cut | 375.9 | 60.2 | 75.2 GB |
+| `window` + (1) | 532.6 | 60.4 | 68.5 GB |
+| `window` + (1)(2)(3) | **693.1-693.7** | 60.4 | 68.5 GB |
+
+(2) alone is neutral (533.0) and (3) alone is a *regression* (515.6, +5 GB RSS): they only work as a
+pair, because (3) sends more tables down the fallback that (2) fixes.
+
+Purity for this revision: prefill-logit gate against a `--host-experts pool` base — mean KLD
+**-0.000000**, maximum 0.000065, same-top-p **100.000 %** (limits 0.005 / 98 %); greedy text 150 chars
+`sha=4ac3a523160f` in all four arms including `window + ALIAS_FILL=0`; 3 prompts × n96 byte-identical
+across the four arms.  **Note:** the `srv-test` request-3 text hash is **not** a reproducible oracle
+(two `pinned` runs gave `4c88b625a400` and `4e2fdac2bfab`, same length class, at 2000 tokens), so gate on
+the short-horizon oracle plus acceptance, exactly as `INVARIANTS.md` says for a MoE.
 
 ## Read this before judging a number
 
@@ -130,3 +175,10 @@ candidate.
 * **2026-11-02 — cut.**  1 GPU: all gates above green; beta commit `142b06212`, applied tree
   `5101f0e4…`, patch sha256 `3502e334…`.  Fresh `apply-all.sh --include-beta` verified (16 blocks +
   this one).  Awaiting the 3-GPU `-sm tensor` arm.
+* **2026-11-02 — prefill parity revision.**  `MOE_EXPERT_WINDOW_ALIAS_FILL` default-on plus the two
+  staging fixes above: prefill **375.9 → 693.7 t/s** on the persistent-server cell (pinned 735.0, so
+  -5.7 %), decode 60.4 (pinned 59.5), RSS 68.5 GB (pinned 68.6), prefill-logit mean KLD -0.000000 /
+  same-top-p 100.000 %, greedy text unchanged.  Beta commit `8417ede3c`, applied tree
+  **`2344889727ce4b2746b918232ab16cb2a245f5e1`**, patch sha256 **`56dd1dfe…`**; fresh
+  `apply-all.sh --include-beta` on `6050b467c` verified and **byte-identical to the tree measured**
+  (`git diff efaa60db0 HEAD` == the work-tree diff).  Still awaiting the 3-GPU `-sm tensor` arm.

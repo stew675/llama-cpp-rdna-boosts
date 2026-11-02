@@ -1,3 +1,92 @@
+## 261102.008 (wip) -- host-expert window: prefill 375.9 -> 693.7 t/s (+84 %), 5.7 % behind `pinned`; the beta candidate is re-cut
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.007`.
+`beta/0016-host-experts-window/` is **re-cut** (patch sha256 `56dd1dfe…`, beta commit `8417ede3c`, applied
+tree `2344889727ce4b2746b918232ab16cb2a245f5e1`, verified on a fresh `6050b467c` +
+`apply-all.sh --include-beta` and byte-identical to the tree measured).
+
+**The prefill blocker is closed as far as the mechanism goes.**  Persistent `llama-server` (`srv-test.sh`:
+Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set,
+`-c 8192`, q8_0 KV, request 3 = steady state, zero disk reads):
+
+| arm | prefill req3 | gen | RSS |
+|---|---|---|---|
+| `pinned` | 734.5-735.0 | 59.5 | 68.6 GB |
+| `window`, beta as first cut | 375.9 | 60.2 | 75.2 GB |
+| + `MOE_EXPERT_WINDOW_ALIAS_FILL` default-on | 532.6 | 60.4 | 68.5 GB |
+| + that, plus the two staging fixes below | **693.1-693.7** | **60.4** | **68.5 GB** |
+
+**The hand-over's diagnosis was right about the mechanism and wrong about the fix.**  §3.1 (dispatch the
+staging on device-readability instead of `host_pinned`) **alone is a regression**: 515.6 t/s and +5 GB RSS,
+because it sends more tables down a fallback that was itself paying a host memcpy.  There were three costs,
+and they have to be paid together:
+
+1. `MOE_EXPERT_WINDOW_ALIAS_FILL` is now **default on** (the env var is the kill switch, per the default-on
+   policy).  Byte-identical, inert where there is no registration, and it deletes the per-table bounce ring
+   that window mode was carrying as a second pinned copy of the host expert set (-6.7 GB RSS).
+2. `moe_cache_upload_pageable` stages a range from the registered alias with **one D2D copy**.  This is the
+   fallback for every table the cache staging declines -- a stood-down table, the pre-sizing pass, ~24 % of
+   the calls here -- and a registered master used to pay a **host memcpy of the whole range into the
+   per-table bounce** on every ubatch, where `pinned` pays a direct H2D DMA from its master.
+3. `moe_cache_stage_table` dispatches on **device-readability** (`host_dev != nullptr && cold_safe`), so a
+   registered master takes `pinned`'s single-launch path.  Before, it fell into the pool branch, where --
+   window mode having no pool tier -- every expert became one `cudaMemcpyAsync`: **400 356** copies for a
+   5246-token prefill against **1 564** launches for `pinned`, 3.41 s of `__amd_rocclr_copyBuffer` alone.
+   §3.2 (the alias as a second source in the pool branch) is therefore not needed.
+
+**PR #266 is not involved.**  Its two mechanisms are decode-band: `GGML_MOE_DEVREMAP` is only reached from
+the decode hook (`moe_cache_update_host` returns early above `MAX_TOK`, `devremap_prep_locked` is gated on
+`table_cold_ok` = `host_dev != nullptr`) and `MOE_HOST_POOL_COLD` requires `host_dev == nullptr`, i.e. it is
+structurally inert for a pinned master.  Measured: pinned pp512/tg256 = 1442.8/101.33 default,
+1449.7/101.16 `DEVREMAP=0`, 1440.3/101.18 `POOL_COLD=0`, 1441.9/101.38 both -- neither switch touches these
+numbers.  The 735 prefill is the block-09 staging engine (TODO #87 / r114) that predates #266.  Consequence
+for the mode-collapse goal: the pinned path is now only needed for *where the bytes live*, not *how they are
+staged*; `DEVREMAP` survives deleting `pinned` (it keys off `host_dev`), and it is `MOE_HOST_POOL_COLD` that
+dies with the pool.
+
+**The residual 5.7 % is a memory-latency effect, and it is measured as such.**  With all three changes the
+two arms issue **the same kernels with identical launch counts** (1254 staging kernels, 3726
+`__amd_rocclr_copyBuffer`, 1692 descriptor builds) and the staging overlaps compute 2.98 s of 3.11 s -- but
+the same kernels each run 7-21 % slower: `moe_cache_stage_kernel` 2.57 -> 3.11 s,
+`build_mmq_routed_descriptors` 0.48 -> 0.63 s, `mm_ids_helper` 0.34 -> 0.40 s, the big matmuls +2 %.
+Eliminated by measurement, one instrument at a time (new `probe-aperture.cpp` in the campaign dir):
+
+* **read bandwidth** -- pinned buffer, registered mapping, and the same mapping collapsed to 2 MiB pages all
+  read at **52 GiB/s**, including the exact in-situ shape (48 tables x 512 blocks x 256 threads, flat
+  473600 B per block: 51.87 vs 51.88 GiB/s) at 2, 8 and 12 GiB working sets;
+* **page size / TLB** -- `MADV_COLLAPSE` really produces huge pages (`FilePmdMapped` 8.4 GB) and moves the
+  number not at all;
+* **geometry** -- this model is `host_pitch = 0`, so the staging kernel does a flat per-expert copy;
+* **cold read / DEVREMAP / the alias fill** -- all inert on the prefill band (`COLD_UVA=0`: 614.5 vs 614.9);
+* **serialization, launch count, a missing fusion** -- identical counts and 96 % overlap, above.
+
+`GGML_SCHED_DEVGATHER=1` measures 676 t/s here and is **discarded, not quoted**: it is the Hole-B path
+(`archive/work/moe-mmq-overread/RESOLUTION.md`) whose numbers the delivery already established were never
+real.  So the remaining levers are the ones the shape implies -- **fewer host bytes per ubatch** (the same
+39 % non-resident set is re-read ~8.7x per request; only residency removes it) or a different registration
+(which is what `pinned` exists for).  Recorded in `PROTOTYPE.md` §8.2c and
+`beta/0016-host-experts-window/README.md`; the next campaign step is the residency/`-ncmoe` axis.
+
+**Purity (this revision, 1 GPU).**  Prefill-logit gate against a `--host-experts pool` base (Q4_K_M,
+`-ncmoe 40`, `-c 512 --chunks 40`): mean KLD **-0.000000**, maximum 0.000065, same-top-p **100.000 %**
+(limits 0.005 / 98 %).  Greedy text 150 chars `sha=4ac3a523160f` in `pinned` / `pool` / `window` /
+`window + ALIAS_FILL=0`; 3 prompts x n96 byte-identical across the four arms; `check-gpu-faults.sh` clean
+on every run (the journal's only faults today are a single 09:00:04 burst, hours before this work).
+
+**Findings recorded for the maintainer, not fixed here.**  (a) `srv-test`'s request-3 text hash is **not** a
+reproducible oracle -- two `pinned` runs gave `4c88b625a400` and `4e2fdac2bfab` -- so the hand-over's
+"server-path text identical across arms" row cannot be a gate; the short-horizon oracle plus acceptance is
+the gate, as `INVARIANTS.md` already says for a MoE.  (b) `llama-bench` badly understates this gap
+(631 vs 645 with no decode between passes, 594 vs 649 with 2000 tokens) while the server shows 693 vs 735:
+the server's 5246-token prompt with arena re-arm/eviction between requests is the only instrument that
+reproduces it.  (c) The first measurement after a cold build read 334.7 t/s for an arm that then measured
+532.1/532.2/532.6 on three consecutive runs -- discard any arm whose first run follows a build.
+
+**Owed before promotion** (the beta exists for this): the 3-GPU `-sm tensor` arm on the other box
+(`reg_fail=0`, `tensors=` = host tensor count, `cold_dev>0`), and the MTP four-axis / batched-bench /
+`-ncmoe` matrix / kill-switch arms that the prefill work did not re-run (the text and prefill-logit gates
+are green above).
+
 ## 261102.007 (wip) -- host-expert window: PREFILL is the promotion blocker (1.95x behind pinned, and systemic); hand-over written for the fix
 
 No delivery change (`patches/`/`release.json` untouched); the beta candidate is unchanged and still staged.

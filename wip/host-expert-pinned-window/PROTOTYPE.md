@@ -290,6 +290,60 @@ alias-fill arm proves the mechanism (same faults, same I/O, memcpy removed: +42 
 bounce-ring RSS) and the fix is to let a registered master take the `pinned` path.  Decode is at parity
 throughout (60.2 / 60.5 vs 59.5), so prefill is the only open axis.
 
+### 8.2c The prefill gap, resolved as far as it goes (2026-11-02, same day)
+
+The hand-over's §3 shape (§3.1: dispatch the staging on device-readability) was implemented, measured, and
+**it alone is a regression** (515.6 t/s against the alias-fill arm's 532.6, +5 GB RSS).  The diagnosis in
+§8.2b was right about the mechanism but incomplete: there were **two** per-expert layers plus one hidden
+host copy, and the fix only works as a pair.
+
+1. `MOE_EXPERT_WINDOW_ALIAS_FILL` **default on** (kill switch `=0`): 375.9 -> 532.6, RSS 75.2 -> 68.5 GB.
+2. `moe_cache_upload_pageable` (the fallback for the ~24 % of tables the staging declines -- stood-down
+   tables, the pre-sizing pass) stages from the registered alias with one **D2D**, where a registered
+   master used to pay a **host memcpy** into the per-table bounce and `pinned` pays a direct H2D DMA.
+3. `moe_cache_stage_table` dispatches on **device-readability** (`host_dev != nullptr && cold_safe`), so a
+   registered master takes `pinned`'s single-launch path: **1 564** launches instead of **400 356**
+   per-expert `cudaMemcpyAsync` (3.41 s of `__amd_rocclr_copyBuffer` for one prefill pass).
+
+| arm (srv-test, req3) | prefill | gen | RSS |
+|---|---|---|---|
+| `pinned` | 734.5-735.0 | 59.5 | 68.6 GB |
+| first cut | 375.9 | 60.2 | 75.2 GB |
+| + (1) | 532.6 | 60.4 | 68.5 GB |
+| + (2) only | 533.0 | 60.4 | 68.5 GB |
+| + (3) only | 515.6 | 60.4 | 73.7 GB |
+| **+ (1)(2)(3)** | **693.1-693.7** | **60.4** | **68.5 GB** |
+
+**The residual 5.7 % is not dispatch.**  With (1)(2)(3) the two arms issue the same kernels with identical
+launch counts (1254 staging kernels, 3726 `__amd_rocclr_copyBuffer`, 1692 descriptor builds) and the staging
+overlaps compute 2.98 s of 3.11 s -- but the same kernels each run 7-21 % slower, worst on the
+latency-bound ones (`moe_cache_stage_kernel` 2.57 -> 3.11 s, `build_mmq_routed_descriptors` 0.48 -> 0.63 s,
+`mm_ids_helper` 0.34 -> 0.40 s, big matmuls +2 %).
+
+Eliminated, each by measurement (`probe-aperture.cpp` is the new instrument):
+
+* **read bandwidth** -- a pinned buffer, the registered mapping and the same mapping with 2 MiB pages all
+  read at **52 GiB/s**, including the exact in-situ shape (48 tables x 512 blocks x 256 threads, flat
+  473 600 B per block: 51.87 vs 51.88 GiB/s), at 2, 8 and 12 GiB working sets;
+* **page size / TLB** -- `MADV_COLLAPSE` really produces huge pages (`FilePmdMapped` 8.4 GB) and moves the
+  number not at all;
+* **geometry** -- this model is `host_pitch = 0`, so the staging kernel does a flat per-expert copy;
+* **the in-place cold read** (`MOE_EXPERT_CACHE_COLD_UVA=0`: 614.5 vs 614.9), **DEVREMAP**,
+  and **the alias fill** are all inert on the prefill band;
+* **serialization / launch count / a missing fusion** -- see above.
+
+What is left is a memory-latency effect on reads from a registered page-cache range, and the levers that
+are left are the ones the shape of the problem implies: **fewer host bytes per ubatch** (the same 39 %
+non-resident set is re-read ~8.7x per request; only residency removes it) or a different registration
+(which is what `pinned` exists for).  `GGML_SCHED_DEVGATHER=1` measures 676 t/s here and is **discarded**:
+it is the Hole-B path (`archive/work/moe-mmq-overread/RESOLUTION.md`) whose numbers the delivery already
+established were never real.
+
+Purity on the revision: prefill-logit mean KLD **-0.000000** (max 0.000065), same-top-p **100.000 %**
+against a `pool` base; greedy 150 chars `sha=4ac3a523160f` in all four arms; 3 prompts x n96 identical.
+**`srv-test`'s request-3 text hash is not a reproducible oracle** (two `pinned` runs gave `4c88b625a400`
+and `4e2fdac2bfab`), which also retires §8.2b's "identical text on the server path" row.
+
 ### 8.3 Two findings that are not this campaign's, recorded so nobody re-derives them
 
 * **Q8_K_XL's MTP head is damaged** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`): acceptance is ~0 in

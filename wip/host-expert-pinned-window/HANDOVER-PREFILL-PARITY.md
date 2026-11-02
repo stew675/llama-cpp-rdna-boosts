@@ -17,6 +17,18 @@ Two tasks, in this order:
 
 ---
 
+> **OUTCOME (2026-11-02, same day) — read this before the plan below.**  §2 was shipped as written
+> (`MOE_EXPERT_WINDOW_ALIAS_FILL` default-on: 375.9 -> 532.6 t/s, RSS 75.2 -> 68.5 GB).  **§3.1 alone is a
+> REGRESSION** (515.6 t/s, +5 GB RSS) and §3.2 is not needed: the diagnosis was right about the mechanism
+> but there are **two** per-expert layers plus one hidden host copy, and the fix only works as a pair.
+> What actually landed is (a) `moe_cache_upload_pageable` serving a registered range with one D2D instead
+> of a host memcpy into the bounce — the fallback for the ~24 % of tables the staging declines — and
+> (b) §3.1's readability dispatch.  Together: **693.1-693.7 t/s**, i.e. 5.7 % behind `pinned`'s 735.0,
+> with decode 60.4 (pinned 59.5) and RSS 68.5 (pinned 68.6).  The residual is **not** the launch count,
+> the aperture bandwidth, page size, geometry, cold reads or a missing fusion: the same kernels with
+> identical launch counts run 7-21 % slower, worst on the latency-bound ones.  Full record:
+> `PROTOTYPE.md` §8.2c and `WORKLOG.md` 261102.008.  The plan below is kept as the design record.
+
 ## 1. The evidence, and why it is systemic
 
 Instrument: [`srv-test.sh`](srv-test.sh) — one long-lived `llama-server`, prompt cache **off**
