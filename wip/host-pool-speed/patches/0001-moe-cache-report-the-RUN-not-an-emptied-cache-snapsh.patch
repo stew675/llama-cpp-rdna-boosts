@@ -1,0 +1,208 @@
+From c64c938aba9042125bdb92452660b600f9f2ecfa Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 2 Nov 2026 07:10:04 -0600
+Subject: [PATCH 1/2] moe-cache: report the RUN, not an emptied cache --
+ snapshot the structural aggregates at teardown, and log a forced
+ MOE_HOST_POOL_DIO fill mode
+
+moe_cache_report() is an atexit hook and moe_cache_forget_all() un-sizes the cache before it runs, so every
+run ended with 'tables=0, slots=0, arena=0.0 MiB' and 'host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned'
+-- in both host-expert modes.  The second line is what made '--host-experts pool did not activate on the
+122B' look like a delivery bug (wip/host-pool-speed, session 1/2): it is printed by every run, including a
+35B one whose pool demonstrably worked.
+
+Fix: capture the report's structural aggregates once, at the first forget (when every device's tables are
+still registered), and have the report prefer the snapshot.  The atexit path keeps doing the heat-map save
+and the cumulative traffic/takeover counters exactly as before, so nothing else changes.
+
+Second fix, same class: a forced MOE_HOST_POOL_DIO=0|1 set g_pool_dio_decided in the env parse, which made
+pool_decide_dio_locked's '(forced by MOE_HOST_POOL_DIO=%d)' branch unreachable -- a forced A/B arm logged no
+fill mode at all, and the env-init line kept saying 'fill mode AUTO'.  The force now only sets the mode; the
+first pool build reports it (and the env-init line reports the effective mode too, which also covers the
+MOE_HOST_POOL_MIB shape that never goes through --host-experts pool).
+
+Verified on the 122B-A10B (1 GPU, -ncmoe 48, --host-experts pool, MOE_HOST_POOL_DIO=0): the teardown report
+now reads '144 tensors, 36864 slots, 67110.0 MiB pinned; h=...' and the fill-mode line reads 'buffered ...
+(forced by MOE_HOST_POOL_DIO=0)'.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 117 ++++++++++++++++++-------
+ 1 file changed, 87 insertions(+), 30 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 334931ecd..9cfea3621 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -347,6 +347,23 @@ static int alias_find_checked(const void * key, int device, int layer) {
+ bool                                g_enabled    = false;
+ bool                                g_init_done  = false;
+ bool                                g_report     = true;
++// Teardown snapshot of the report's STRUCTURAL aggregates (tables/slots/arena, hits/misses/fills/evictions and
++// the host pool's tensors/slots/pinned bytes).  `moe_cache_report` is an `atexit` hook and the model teardown
++// (`moe_cache_forget_all`) un-sizes the cache first, so without this every run ends with
++// "tables=0, slots=0, arena=0.0 MiB" and "host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned" -- in BOTH modes,
++// which reads as "the pool never activated" (it cost one full investigation, 2026-11-02).  The snapshot is taken
++// at the first forget, when every device's tables are still registered, and the report prefers it when present.
++struct moe_report_snapshot {
++    bool    have      = false;
++    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
++    int     n_tables = 0, n_slots = 0;
++    int64_t dev_slots [GGML_CUDA_MAX_DEVICES] = {0};
++    int64_t dev_arena [GGML_CUDA_MAX_DEVICES] = {0};
++    int     dev_tables[GGML_CUDA_MAX_DEVICES] = {0};
++    int64_t arena_bytes = 0;
++    int64_t n_pools = 0, p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
++};
++static moe_report_snapshot g_report_snap;
+ bool                                g_fill       = false;   // opt-in: copy the master into the slot
+ int                                 g_device     = -1;
+ int64_t                             g_period     = 32;   // LFRU decay period, decode steps
+@@ -770,19 +787,26 @@ void parse_env() {
+         g_pool_dio_req = -1;
+     }
+     if (g_pool_dio_req >= 0) {
+-        g_pool_dio         = g_pool_dio_req != 0;
+-        g_pool_dio_decided = true;
++        // Apply the forced mode NOW (no fill may use the other one) but leave `g_pool_dio_decided` clear:
++        // `pool_decide_dio_locked` reports the effective mode once, at the first pool build.  Pre-setting the
++        // flag here is what made that report unreachable (a forced A/B arm logged no fill mode at all).
++        g_pool_dio = g_pool_dio_req != 0;
+     }
+     g_pool_prefetch    = env_int("MOE_HOST_POOL_PREFETCH", 0) != 0;
+     g_pool_stage_batch = env_int("MOE_HOST_POOL_STAGE_BATCH", 1) != 0;
+     g_pool_total_bytes = (g_pool_enabled && !g_pool_auto) ? moe_host_pool_mib() * 1024 * 1024 : 0;
+     if (g_pool_enabled) {
++        // Report the effective fill mode here as well as at the first pool build (`pool_decide_dio_locked`):
++        // this line also serves the `MOE_HOST_POOL_MIB` shape, which never goes through `--host-experts pool`.
++        const char * fill_mode = g_pool_dio_req < 0 ? "AUTO (MOE_HOST_POOL_DIO=0|1 forces it)"
++                               : (g_pool_dio ? "O_DIRECT (forced by MOE_HOST_POOL_DIO=1)"
++                                             : "buffered (forced by MOE_HOST_POOL_DIO=0)");
+         if (g_pool_auto) {
+             GGML_LOG_INFO("%s: MoE host expert pool: AUTO = %d%% of the MoE host expert bytes, pinned; fill "
+-                          "mode AUTO (MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, g_pool_frac);
++                          "mode %s\n", __func__, g_pool_frac, fill_mode);
+         } else {
+-            GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned; fill mode AUTO "
+-                          "(MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, (long long) moe_host_pool_mib());
++            GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned; fill mode %s\n",
++                          __func__, (long long) moe_host_pool_mib(), fill_mode);
+         }
+     }
+     g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
+@@ -4413,11 +4437,48 @@ bool moe_cache_release_arena() {
+ //     auto floor) and un-size the cache: the arena was sized -- and possibly seated in the movable-boundary
+ //     slab -- for the model that just went away, so the next model sizes on its own first band pass instead
+ //     of silently running uncached.
++// Capture the report's structural aggregates before the tables (and their host pools) are dropped.  Taken once,
++// at the first forget: a per-device teardown still sees every device's table, so the first snapshot is the whole
++// run.  Caller holds `g_mutex`.
++static void report_snapshot_locked() {
++    if (g_report_snap.have) {
++        return;
++    }
++    g_report_snap.have = true;
++    for (const table_t & t : g_tables) {
++        g_report_snap.hits += t.hits;
++        g_report_snap.misses += t.misses;
++        g_report_snap.fills += t.fills;
++        g_report_snap.evictions += t.evictions;
++        if (t.slots > 0) {
++            g_report_snap.n_tables++;
++            g_report_snap.n_slots += t.slots;
++            if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES) {
++                g_report_snap.dev_slots [t.device] += t.slots;
++                g_report_snap.dev_arena [t.device] += (int64_t) t.slots * (int64_t) t.expert_bytes;
++                g_report_snap.dev_tables[t.device]++;
++            }
++        }
++    }
++    g_report_snap.arena_bytes = g_arena_bytes;
++    g_report_snap.n_pools     = (int64_t) g_host_pools.size();
++    for (const auto & kv : g_host_pools) {
++        const host_pool_t & p = kv.second;
++        g_report_snap.p_slots  += p.slots;
++        g_report_snap.p_hits   += p.hits;
++        g_report_snap.p_misses += p.misses;
++        g_report_snap.p_fills  += p.fills;
++        g_report_snap.p_evict  += p.evictions;
++        g_report_snap.p_bytes  += (int64_t) p.slots * (int64_t) p.host_bytes;
++    }
++}
++
+ void moe_cache_forget_all(int device) {
+     std::lock_guard<std::mutex> lock(g_mutex);
+     if (g_tables.empty()) {
+         return;
+     }
++    report_snapshot_locked();   // before anything is un-sized: the exit-time report describes the RUN
+     std::vector<char> dropped(g_tables.size(), 0);
+     std::vector<int>  drop;
+     for (int i = 0; i < (int) g_tables.size(); i++) {
+@@ -6915,44 +6976,40 @@ void moe_cache_report() {
+         return;
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+-    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
+-    int n_tables = 0, n_slots = 0;
+-    int64_t dev_slots[GGML_CUDA_MAX_DEVICES]  = {0};
+-    int64_t dev_arena[GGML_CUDA_MAX_DEVICES]  = {0};
+-    int     dev_tables[GGML_CUDA_MAX_DEVICES] = {0};
+-    for (const table_t & t : g_tables) {
+-        hits += t.hits; misses += t.misses; fills += t.fills; evictions += t.evictions;
+-        if (t.slots > 0) {
+-            n_tables++; n_slots += t.slots;
+-            if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES) {
+-                dev_slots [t.device] += t.slots;
+-                dev_arena [t.device] += (int64_t) t.slots * (int64_t) t.expert_bytes;
+-                dev_tables[t.device]++;
+-            }
+-        }
+-    }
++    if (!g_report_snap.have) {
++        report_snapshot_locked();   // no teardown yet (`--help`, a crash handler, a server shutdown)
++    }
++    const int64_t hits      = g_report_snap.hits;
++    const int64_t misses    = g_report_snap.misses;
++    const int64_t fills     = g_report_snap.fills;
++    const int64_t evictions = g_report_snap.evictions;
++    const int     n_tables  = g_report_snap.n_tables;
++    const int     n_slots   = g_report_snap.n_slots;
++    const int64_t arena_b   = g_report_snap.arena_bytes;
++    const int64_t * dev_slots  = g_report_snap.dev_slots;
++    const int64_t * dev_arena  = g_report_snap.dev_arena;
++    const int     * dev_tables = g_report_snap.dev_tables;
+     const int64_t total = hits + misses;
+     const double h = total > 0 ? (double) hits / (double) total : 0.0;
+     GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
+                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
+-                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
++                  n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
+     if (g_devremap_calls > 0) {
+         GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
+     }
+     if (g_pool_enabled) {
+-        int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
+-        for (const auto & kv : g_host_pools) {
+-            const host_pool_t & p = kv.second;
+-            p_slots += p.slots; p_hits += p.hits; p_misses += p.misses;
+-            p_fills += p.fills; p_evict += p.evictions;
+-            p_bytes += (int64_t) p.slots * (int64_t) p.host_bytes;
+-        }
++        const int64_t p_slots  = g_report_snap.p_slots;
++        const int64_t p_hits   = g_report_snap.p_hits;
++        const int64_t p_misses = g_report_snap.p_misses;
++        const int64_t p_fills  = g_report_snap.p_fills;
++        const int64_t p_evict  = g_report_snap.p_evict;
++        const int64_t p_bytes  = g_report_snap.p_bytes;
+         const int64_t ptot = p_hits + p_misses;
+         // WARN, not INFO: llama-cli's default threshold filters INFO, so the pool summary was invisible on a
+         // plain run (it needs `-lv 4`/`-v`).  The pool is a tuning surface, so its summary must be visible.
+         GGML_LOG_WARN("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
+                       "fills=%lld evictions=%lld\n",
+-                      __func__, g_host_pools.size(), (long long) p_slots, (double) p_bytes / (1024 * 1024),
++                      __func__, (size_t) g_report_snap.n_pools, (long long) p_slots, (double) p_bytes / (1024 * 1024),
+                       ptot > 0 ? (double) p_hits / (double) ptot : 0.0, (long long) p_hits, (long long) ptot,
+                       (long long) p_fills, (long long) p_evict);
+     }
+-- 
+2.56.0
+

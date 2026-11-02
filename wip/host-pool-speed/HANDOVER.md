@@ -29,10 +29,15 @@ decode lever is identified.**
 5. **The first screening-passed candidate**: README §4.2's "size the pool by heat mass" is *degenerate* (every
    table routes `n_used` experts per token, so its mass is a constant), but a **concentration**-based sizing
    (`cov90`) separates at **-42 % disk bytes/token** at `FRAC 80` (§4/F6).
+6. **The maintainer's three calls are implemented, gated and measured** (§3.3, `patches/0001-0002`):
+   `cov90` per-table pool sizing (**+7.5 %** decode at `FRAC 80`, **+16.4 %** at `FRAC 60`, identical pinned
+   bytes), **full coverage as the default** (`MOE_HOST_POOL_FRAC=100` -> decode 20.62 vs 17.80, which also makes
+   the pool's raw overhead measurable at **-7.9 %**), and the two diagnostic fixes (the teardown report now
+   describes the run, and a forced `DIO` logs its mode).  All gates green; the one trade is prefill (-13/-15 %).
 
-**Next action, exactly:** implement `cov90` per-table pool sizing (§4/F6) from `heat_dec` under the same
-`RAM_PCT` ceiling, env-gated, and run the arm pair against `data/20261102-frac/`'s FRAC-80 baseline
-(17.76 t/s, ~165 GiB read).  Then the full-coverage default question (§3.2) and the residual 7.8 % at a full pool.
+**Next action, exactly:** re-measure `cov90` on the **2-GPU x8 `-sm tensor`** arm and under the 64 GiB cgroup
+(the field case, where it should pay most), and decide on the prefill trade (§3.3 item 3) before promoting
+`patches/0001-0002` into `patches/` — nothing here is in the delivery set yet.
 
 ## 1. What the campaign is (do not re-derive)
 
@@ -195,6 +200,57 @@ this is a real cross-mode purity result, not three pinned runs: at default verbo
 is WARN-and-above, so the activation was proved by a separate `-lv 4` control.  (`-lv 3` is *not* usable for a
 text hash: the WARN lines that appear during the first decode land inside the extracted span and change it —
 1500 vs 1621 chars in this run — so the hash must be taken with no `-lv` at all.)
+
+### 3.3 The two sizing changes, implemented and measured (2026-11-02, later session)
+
+The maintainer's calls: implement `cov90`, make **full coverage the default** (it is what makes the pool's own
+overhead measurable), and land the two diagnostic fixes.  All three are implemented
+(`patches/0001-*`, `patches/0002-*`), gated, and measured on the reference arm — 7 arms, alternating, 2000-token
+decodes, `data/20261102-sizing/`:
+
+| arm | decode t/s | prefill t/s | arena `h` | pool slots (last table) | pool MiB pinned | disk read | pool hit (teardown) |
+|---|---|---|---|---|---|---|---|
+| `pinned` #1 | **22.39** | 677.2 | 0.7543 | — | — | 65.1 GiB | — |
+| **`pool` default = FRAC 100** | **20.62** | 613.4 | 0.7596 | 256/256 | 67,110.0 | 111.6 GiB | **0.9169** |
+| `pool` FRAC 80 uniform (the old default) | 17.80 | 637.0 | 0.7623 | 204/256 | 53,478.3 | 153.7 GiB | 0.6200 |
+| `pool` FRAC 80 **cov90** | **19.14** | 554.3 | 0.7601 | 160/256 | 53,477.2 | 131.1 GiB | 0.6785 |
+| `pool` FRAC 60 uniform (sub-full / field-like) | 13.60 | 443.2 | 0.7664 | 153/256 | 40,108.7 | 271.8 GiB | 0.3405 |
+| `pool` FRAC 60 **cov90** | **15.83** | 377.3 | 0.7600 | 112/256 | 40,108.3 | 210.4 GiB | **0.4416** |
+| `pinned` #2 | 22.38 | 689.4 | 0.7543 | — | — | 61.7 GiB | — |
+
+**1. Full coverage by default measures the pool's raw overhead at -7.9 %** (20.62 vs 22.38): at `FRAC 100` the
+pool pins 67,110 MiB — exactly what the pinned master occupies — and its own hit rate is 0.9169.  That -7.9 % is
+now the number the mode reports about itself, and the only decode item left on this arm.
+
+**2. `cov90` sizing wins wherever the budget is not already full, at identical pinned bytes**
+(53,478.3 vs 53,477.2 MiB; 40,108.7 vs 40,108.3 MiB):
+
+| `FRAC` | uniform | cov90 | decode gain | disk read | pool hit |
+|---|---|---|---|---|---|
+| 60 | 13.60 | **15.83** | **+16.4 %** | 271.8 -> 210.4 GiB (-23 %) | 0.3405 -> 0.4416 |
+| 80 | 17.80 | **19.14** | **+7.5 %** | 153.7 -> 131.1 GiB (-15 %) | 0.6200 -> 0.6785 |
+| 100 | 20.62 | (identical: full coverage leaves no split to make) | — | — | — |
+
+The fit itself: `144 host tensors, budget 40108.7 MiB, alpha=1.108, 22059 slots vs 22032 uniform (100.1 %)` — i.e.
+the same budget, redistributed by concentration.  The gain grows as the budget tightens, which is the field case
+(a 30 GiB box cannot hold a 67 GiB set), so this is the campaign's first *measured* pool win that is not a bug fix.
+
+**3. The trade to record: cov90 costs prefill.**  637 -> 554 t/s at FRAC 80 (-13 %), 443 -> 377 (-15 %) at FRAC 60.
+Mechanism (hypothesis, not yet isolated): the pool's content is ranked by the *decode* prior, and concentration
+sizing gives each table fewer slots, so a prefill ubatch — whose routing is nearly uniform over all 256 experts —
+finds less of what it needs.  In wall clock it is still a clear net win for a 2000-token request (FRAC 60: prefill
++2.0 s, decode -19.3 s; FRAC 80: prefill +1.2 s, decode -7.3 s).  A prefill-friendly alternative (stage from the
+mapping rather than the pool, or reserve a prefill share) is a candidate for the next session, not a fix.
+
+**Gates (all green):** greedy text byte-identical across `pinned` / FRAC 60 uniform / FRAC 60 cov90 / FRAC 100
+default (`270 chars sha=cacea85d5705`, hashed with no `-lv`, `data/20261102-sizing-purity/`);
+`MOE_HOST_POOL_VERIFY=1` on a cov90 arm: **0** `POOLREAD MISMATCH`; `scripts/check-gpu-faults.sh` clean on all 7
+arms; no swap growth (`SwapFree` 132.91 -> 132.90 GiB).
+
+**Diagnostics (patches/0001):** the teardown report now snapshots its structural aggregates before
+`moe_cache_forget_all` un-sizes the cache, so it reads the RUN (`144 tensors, 36864 slots, 67110.0 MiB pinned;
+h=0.9169`) instead of zeros — which is why the table above has a pool hit rate at all.  A forced
+`MOE_HOST_POOL_DIO=0|1` now logs its effective mode (the `(forced by ...)` branch was unreachable dead code).
 
 ## 4. Findings
 
@@ -380,6 +436,14 @@ That is a sizeable, cheap, **screening-passed** candidate for the next session (
 Screening tools: `tools/pool-sizing-sim.py` (sizing candidates), `tools/replayer-calib.py` (model calibration).
 Every number above is reproducible from `data/traces/trace-122b-ncmoe48-devremap0.txt.gz` with no GPU.
 
+**F6 is now IMPLEMENTED and MEASURED** (`patches/0002`, `MOE_HOST_POOL_SIZING=1`, §3.3): **+16.4 %** decode at
+`FRAC 60` (13.60 -> 15.83 t/s, disk 272 -> 210 GiB) and **+7.5 %** at `FRAC 80` (17.80 -> 19.14, disk 154 -> 131
+GiB) at *identical* pinned bytes, with the pool's own hit rate up 10 points at the tight budget.  The measured
+gain is smaller than the -42 % disk-bytes screen — the screen assumed a `heat-complement` pool init and reported
+its L3 number (48.7 MiB/token) while the run's total disk read also carries the ~70 GiB model load — but the
+direction and the budget dependence match.  The one cost: prefill -13/-15 %, from a pool content ranked for
+decode serving a nearly uniform prefill routing (§3.3, item 3).
+
 ## 5. `O_DIRECT` vs buffered — the analysis and the proposed shape
 
 The shipped rule (`pool_decide_dio_locked`) decides **once per box, at the first pool build**: buffered iff
@@ -483,28 +547,27 @@ All three are screenable in the replayer (`pool-*` policies) now that F2 calibra
 F2 reconciled and the two-tier model calibrated against the disk tier (§4), and README §4.2's sizing candidate
 re-specified into a screening-passed one (§4/F6).  What is left, in priority order:
 
-1. **`cov90` per-table pool sizing (§4/F6)** — the only screening-passed decode candidate this session produced:
-   -42 % disk bytes/token at `FRAC 80` in the calibrated model, i.e. a predicted ~18 s of the 21 s decode
-   deficit.  Implement from `heat_dec` under the same `RAM_PCT` ceiling, env-gated, then run the arm pair
-   (`pinned` + pool) against `data/20261102-frac/`'s FRAC-80 baseline (17.76 t/s, ~165 GiB read).
-2. **Full-coverage default (§3.2)**: at `FRAC 100` the pool holds the whole set, the RAM clamp does not bind on
-   this box, and decode is 20.59 vs 17.76 at the shipped `FRAC 80` (+16 %).  The memory cost equals `pinned`'s.
-   Decide the *policy* (auto: ask for full coverage when the set fits under the ceiling) — but validate on the
-   field boxes (30 GiB cannot) and the 3-GPU arms first, and keep `pinned` as the choice when the pool would
-   hold nothing extra.
-3. **The residual 7.8 % at a full pool** (§3.2): the only decode item left on this arm once coverage is
-   complete.  Candidates: the per-fill event/`bounce_acquire` bookkeeping (pool-only), the eager path's per-op
-   sync (present in `pinned` too), and P0-a's remap (which is the +8 % mechanism on 35B-A3B).  Instrument before
-   changing: the copy kind is already excluded (§3.1).
-4. **`mincore` per-read residency + a page-cache budget** (§5.3), on the sub-full-pool / 64 GiB cgroup arms —
+1. ~~`cov90` per-table pool sizing~~ **DONE** (§3.3): implemented as `MOE_HOST_POOL_SIZING=1` (`patches/0002`),
+   measured +7.5 % (FRAC 80) / +16.4 % (FRAC 60) decode at identical pinned bytes.  Next: gate it on the 2-GPU
+   x8 `-sm tensor` arm and the 64 GiB cgroup, then flip its default (default-on policy) if it holds.
+2. ~~Full-coverage default~~ **DONE** (§3.3): `MOE_HOST_POOL_FRAC` now defaults to 100 (ceiling-clamped), decode
+   20.62 vs 17.80, and the pool's raw overhead is measurable at -7.9 %.  Next: the field boxes (a 30 GiB box
+   clamps, which is the interesting arm) and the 3-GPU arms before it ships in `patches/`.
+3. **The cov90 prefill trade** (§3.3 item 3): -13/-15 % prefill for +7.5/+16.4 % decode.  Isolate it (is it the
+   content ranking or the smaller slot count?) and decide: accept, or give prefill its own staging path.
+4. **The residual 7.9 % at a full pool** (§3.3): the only decode item left on this arm once coverage is
+   complete, and the pool's own overhead by definition.  Candidates: the per-fill event/`bounce_acquire`
+   bookkeeping (pool-only), the eager path's per-op sync (present in `pinned` too), and P0-a's remap (which is
+   the +8 % mechanism on 35B-A3B).  Instrument before changing: the copy kind is already excluded (§3.1).
+5. **`mincore` per-read residency + a page-cache budget** (§5.3), on the sub-full-pool / 64 GiB cgroup arms —
    now measurable against a calibrated L3 model, and still the honest answer to the maintainer's
    "re-streamed from disk" report for boxes where the set cannot be covered.
-5. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still blocked on freshness (a pool layout
+6. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still blocked on freshness (a pool layout
    epoch in the cold id, or a decode-band layout freeze).  Judge it on 35B-A3B where its ceiling was measured;
    on the 122B the remap is invisible (§3).
-6. Then the remaining P1 items in `README.md`: demand precopy (§4.3) and the two standalone #267 borrows — the
+7. Then the remaining P1 items in `README.md`: demand precopy (§4.3) and the two standalone #267 borrows — the
    bounce-ring cap (0010) and arena-across-prefill (0003) (§4.4).
-7. Only then the Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
+8. Only then the Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
    (which the maintainer places at the very end, as a Flash-Next + PLE effect).
 
 ## 7. Traps (all bitten today or previously)
@@ -546,9 +609,16 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
 - **D6 — two more `scripts/moe-trace-replay.py` fixes** (the `pool-shipped` `p_map` leak and the pool-resident
   cold-read accounting, §4/F2 part 2).  Both are model-fidelity bugs, both validated against measured disk bytes,
   both recorded in `WORKLOG.md` 261102.001; neither changes the single-tier calibration.
-- **D7 — `cov90` sizing is NOT implemented tonight.**  It is the top next item (§6.1), but it changes how the
-  pinned budget is split (a global fit across 144 tables, plus the no-prior fallback) and that deserves a
-  maintainer decision before it lands even as a wip patch — the simulation is the screen, the run is the gate.
+- ~~**D7 — `cov90` sizing is NOT implemented**~~ **Superseded by the maintainer's call**: it is implemented,
+  gated and measured (§3.3), as is the full-coverage default and both diagnostic fixes.  The changes live on the
+  fork's local branch `wip/host-pool-speed-pool-sizing` and are exported as `patches/0001-*` and
+  `patches/0002-*`; **nothing is in the delivery set** (`patches/` and `release.json` untouched), and the
+  `--host-experts pool` help text, `ENVIRONMENT.md` and `patches/README.md` notes for `MOE_HOST_POOL_SIZING` /
+  `MOE_HOST_POOL_COV_PCT` / the `FRAC` default must ride with the promotion, not before it.
+- **D8 — the fork is left on `wip/host-pool-speed-pool-sizing`** with `build-rocm` built from it, because the
+  next step is to gate these changes.  `git checkout rdna-boosts` + `build-llama-rocm` restores the r206 binary
+  (the campaign's earlier numbers were all taken on it; note that on this branch `MOE_HOST_POOL_FRAC` defaults to
+  100, so a re-measure of the old default needs `MOE_HOST_POOL_FRAC=80` explicitly).
 
 **Questions for the maintainer:**
 
@@ -593,7 +663,16 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
   the delivery's two-tier model.
 - `tools/run-arms-1gpu-frac.sh`, `tools/run-text-purity-1gpu.sh` — the coverage gradient and the no-`-lv`
   text-hash runners.
+- `data/20261102-sizing/`, `data/20261102-sizing-purity/`, `data/20261102-sizing-verify/`, `data/20261102-diag*` —
+  the sizing matrix (§3.3), the no-`-lv` text hashes, the `MOE_HOST_POOL_VERIFY=1` arm, and the diagnostics
+  controls.
+- `tools/run-arms-1gpu-sizing.sh` — the sizing/default matrix runner.
 - `patches/h2d-experiment.patch` — the fork-local `MOE_HOST_POOL_H2D` switch (§3.1).  **Not in `patches/`**: the
   experiment is finished and the fork's tree is reverted, so this file is the record, not a queued change.
+- `patches/0001-moe-cache-report-the-RUN-*.patch` — the diagnostics fixes (§3.3), `git format-patch` from the
+  fork's `wip/host-pool-speed-pool-sizing` branch.
+- `patches/0002-host-pool-full-coverage-default-*.patch` — full-coverage default + `cov90` sizing (§3.3).
+  Both apply on the r206 tip (`efaa60db0`).  **Not in `patches/`** until they are gated on the arms §6.1-6.2
+  names.
 - PR #267 (not adopted): the submitter's branch `brian/wip-mmap-host-experts-r204`, directory
   `wip/mmap-host-experts-r204/`.

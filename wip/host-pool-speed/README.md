@@ -216,8 +216,10 @@ all of them and "allocate by heat mass" reproduces the uniform rule exactly (mea
 `tools/pool-sizing-sim.py`).  What differs is each table's **concentration**, so the candidate becomes
 `cov_t` = the slots a table needs to hold `t` of its own mass (t = 0.90), fitted to the same byte budget.  On the
 reference trace that is **-42 % L3 (disk) bytes per decode token at `FRAC` 80** (-29 % at `FRAC` 50) with `h`
-unchanged, i.e. a predicted ~18 s of the 21 s decode deficit — **screening-passed**, implement next.  Numbers and
-caveats: `HANDOVER.md` §4/F6.
+unchanged — **screening-passed**, and then **implemented and measured**: `MOE_HOST_POOL_SIZING=1` gives **+7.5 %**
+decode at `FRAC` 80 (17.80 -> 19.14 t/s) and **+16.4 %** at `FRAC` 60 (13.60 -> 15.83), at identical pinned bytes,
+with the disk reads down 15/23 % and the pool's own hit rate up 6/10 points — at a cost of 13-15 % prefill.
+Numbers, trade and gates: `HANDOVER.md` §3.3 and §4/F6.
 
 ### 4.3 P1-c: precopy / spare slots (PR #267's 0006-0008), in pool terms
 
@@ -601,8 +603,18 @@ trails `pinned` by 7.8 %** (the maintainer's observation, now a number, with the
 pinned master uses), and **the shipped `FRAC 80` default costs 16 % decode against a full pool on this box** (the
 `RAM_PCT` clamp did not bind).  `HANDOVER.md` §3.2.
 
+**The sizing changes, measured** (`HANDOVER.md` §3.3, 7 alternating arms): the **full-coverage default**
+(`MOE_HOST_POOL_FRAC=100`) gives **20.62** t/s against `pinned` 22.38 — so the pool's raw overhead, with the pool
+pinning exactly what the pinned master does (67,110 MiB), is **-7.9 %** and its own hit rate is 0.9169.  **`cov90`
+per-table sizing** (`MOE_HOST_POOL_SIZING=1`) is **+7.5 %** at `FRAC` 80 (17.80 -> 19.14) and **+16.4 %** at
+`FRAC` 60 (13.60 -> 15.83) at *identical* pinned bytes (disk reads -15/-23 %, pool hit rate 0.62 -> 0.68 and
+0.34 -> 0.44), for **-13/-15 % prefill** — the one trade, recorded in §3.3.  Both implemented as
+`patches/0001-0002` (gated, not yet in the delivery set), with the two diagnostic fixes: the teardown report now
+describes the run instead of an emptied cache, and a forced `DIO` logs its mode.
+
 **Greedy text across modes:** pinned / `pool` D2D / `pool` H2D all give `270 chars sha=cacea85d5705` at `-n 64`
-(hash with **no** `-lv`; `-lv 3` pollutes the extracted span).
+(hash with **no** `-lv`; `-lv 3` pollutes the extracted span), and so do the FRAC 60 uniform / FRAC 60 cov90 /
+FRAC 100 default arms — the sizing changes are layout-only.
 
 What session 2 changed in the campaign's plan:
 

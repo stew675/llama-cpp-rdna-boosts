@@ -1,0 +1,273 @@
+From 016488017567bfe455b718df7df5868665ba305c Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 2 Nov 2026 07:10:12 -0600
+Subject: [PATCH 2/2] host pool: full-coverage default (MOE_HOST_POOL_FRAC=100)
+ + per-table sizing from routing concentration (MOE_HOST_POOL_SIZING=1)
+
+Two changes, both from the measured pool baseline (wip/host-pool-speed, 1 x R9700, 122B-A10B, -ncmoe 48,
+5258-token prompt + 2000-token decode, arms alternating, ~163/~53/~13 MiB of demand disk read per decode
+token at FRAC 50/80/100):
+
+1. FULL COVERAGE BY DEFAULT.  The pool's decode cost is dominated by the experts it does not hold: decode
+   17.76 t/s at FRAC 80 (the old default) vs 20.59 at FRAC 100 against 22.34 pinned, with the disk reads
+   falling 165 -> 100 GiB per run.  Over half of the -20.5 % gap was that uncovered fraction.  The
+   MOE_HOST_POOL_RAM_PCT ceiling still clamps the pinned total to 85 % of MemAvailable whatever FRAC asks
+   for, so a box the set does not fit in is unchanged -- and at full coverage the pool pins exactly what the
+   pinned master would, so the remaining gap is the mode's own overhead (the number this makes visible).
+
+2. PER-TABLE SIZING BY CONCENTRATION (opt-in, MOE_HOST_POOL_SIZING=1).  MOE_HOST_POOL_FRAC gives every host
+   table the same slot count, so the pinned bytes go to a table with a long cold tail exactly as to one with
+   a flat hot set.  A table's TOTAL routed mass cannot discriminate -- a top-k router hands every table
+   n_used experts per token, so it is a constant, and sizing by heat mass reproduces the uniform rule
+   exactly -- but its CONCENTRATION can: cov_t = the slots it needs to hold MOE_HOST_POOL_COV_PCT of its own
+   prior mass, fitted to the same total byte budget (one-shot, at the first pool build, when every host
+   tensor is registered, so it stays order-independent).  Offline on the reference trace at FRAC 80 this
+   takes the disk tier from 48.7 to 28.5 MiB per decode token with h unchanged
+   (wip/host-pool-speed/tools/pool-sizing-sim.py, HANDOVER section 4/F6).  Default stays uniform until gated.
+
+Also updates the two help/log texts that named the old 80 % default.
+---
+ common/arg.cpp                         |   3 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 161 ++++++++++++++++++++++++-
+ src/llama-model-loader.cpp             |   5 +-
+ 3 files changed, 165 insertions(+), 4 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 9c613053a..05fa12a0e 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2721,7 +2721,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+         "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+         "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
+-        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default 25% of the host expert bytes).\n"
++        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default MOE_HOST_POOL_FRAC=100% of\n"
++        "        the host expert bytes, capped by MOE_HOST_POOL_RAM_PCT of MemAvailable).\n"
+         "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+         "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
+         "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 9cfea3621..070330fd4 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -315,6 +315,17 @@ bool    g_pool_stage_batch = true;   // MOE_HOST_POOL_STAGE_BATCH=0: one cudaMem
+ bool    g_pool_prefetch   = false; // MOE_HOST_POOL_PREFETCH=1: speculatively warm the pool from the routing
+                                    //   (a net loss unless the pool nears full residency -- long-prompt sweep)
+ int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all registered host tensors)
++// wip/host-pool-speed: per-table pool SIZING.  `MOE_HOST_POOL_FRAC` gives every host table the same slot count
++// (`n_experts * FRAC/100`), so the pinned bytes go to a table with a long cold tail exactly as to one with a flat
++// hot set.  What differs between tables is not their routed mass (a top-k router hands every table `n_used`
++// experts per token, so the total is a constant) but its CONCENTRATION: `cov` sizing asks for the slots a table
++// needs to hold `MOE_HOST_POOL_COV_PCT` of its own prior mass, fitted to the same total byte budget.  Offline on
++// the 122B-A10B trace at FRAC 80 that takes the disk tier from 48.7 to 28.5 MiB per decode token with `h`
++// unchanged (`wip/host-pool-speed/tools/pool-sizing-sim.py`, HANDOVER §4/F6).  0 = uniform (default until gated).
++int     g_pool_sizing      = 0;      // MOE_HOST_POOL_SIZING: 0 = uniform, 1 = cov
++int     g_pool_cov_pct     = 90;     // MOE_HOST_POOL_COV_PCT: the mass fraction `cov` sizing targets
++bool    g_pool_cov_fit     = false;  // the one-shot fit has run
++std::map<const void *, int> g_pool_cov_slots;   // host tensor -> pool slots (the fit's result)
+ 
+ // An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
+ // several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
+@@ -765,13 +776,24 @@ void parse_env() {
+     // cache is not a second copy competing for RAM.
+     g_pool_enabled     = moe_host_pool_on();
+     g_pool_auto        = g_pool_enabled && (moe_host_pool_mib() < 0);
+-    g_pool_frac        = env_int("MOE_HOST_POOL_FRAC", 80);
++    // DEFAULT = FULL COVERAGE (100 % of each host expert tensor), subject to the `MOE_HOST_POOL_RAM_PCT`
++    // ceiling below.  The pool's decode cost is dominated by misses it does not hold: at `-ncmoe 48` on the
++    // 122B-A10B (1 x R9700, 96 GiB, 67.1 GiB of host experts) decode was 17.76 t/s at 80 %, 20.59 at 100 %
++    // against 22.34 pinned, with the disk reads falling 165 -> 100 GiB per run as the uncovered fraction went
++    // away; every remaining point of the gap at full coverage is the pool's own overhead, which is the number
++    // the mode now makes visible by default (2026-11-02, wip/host-pool-speed).  The ceiling still protects a
++    // box the set does not fit in: it clamps the pinned total to 85 % of MemAvailable whatever FRAC asks for.
++    g_pool_frac        = env_int("MOE_HOST_POOL_FRAC", 100);
+     if (g_pool_frac < 1) {
+         g_pool_frac = 1;
+     }
+     if (g_pool_frac > 100) {
+         g_pool_frac = 100;
+     }
++    g_pool_sizing      = env_int("MOE_HOST_POOL_SIZING", 0);
++    g_pool_cov_pct     = env_int("MOE_HOST_POOL_COV_PCT", 90);
++    if (g_pool_cov_pct < 1)   { g_pool_cov_pct = 1;  }
++    if (g_pool_cov_pct > 100) { g_pool_cov_pct = 100; }
+     g_pool_ram_pct     = env_int("MOE_HOST_POOL_RAM_PCT", 85);
+     if (g_pool_ram_pct < 0) {
+         g_pool_ram_pct = 0;
+@@ -1140,6 +1162,136 @@ static int64_t pool_available_ram_bytes() {
+ #endif
+ }
+ 
++// wip/host-pool-speed: the slots `t` needs to hold `cov_pct` of its own prior mass, or -1 when there is no
++// prior to rank by (the caller then falls back to the uniform ask).  `t.heat` is the persisted long-horizon
++// prior applied at registration (`heat_apply_loaded_locked`) -- the same ranking the pool's content uses, so a
++// table that has never been seen falls back rather than being sized from noise.  Caller holds `g_mutex`.
++static int table_cov_slots_locked(const table_t & t, int cov_pct) {
++    if (t.n_experts <= 0) {
++        return 1;
++    }
++    if ((int) t.heat.size() != t.n_experts) {
++        return -1;
++    }
++    std::vector<uint32_t> h(t.heat.begin(), t.heat.end());
++    std::sort(h.begin(), h.end(), std::greater<uint32_t>());
++    uint64_t tot = 0;
++    for (uint32_t v : h) {
++        tot += v;
++    }
++    if (tot == 0) {
++        return -1;   // a prior with no mass at all: nothing to concentrate on
++    }
++    uint64_t cum = 0;
++    for (int i = 0; i < t.n_experts; i++) {
++        cum += h[(size_t) i];
++        if (cum * 100 >= tot * (uint64_t) cov_pct) {
++            return i + 1;
++        }
++    }
++    return t.n_experts;
++}
++
++// One-shot fit of the per-table pool slots by concentration, to the SAME total byte budget the uniform rule
++// would spend (`MOE_HOST_POOL_FRAC` of the host expert set).  Runs at the first pool build, when every host
++// tensor is registered, so it is order-independent (which is what the per-tensor FRAC rule exists to guarantee).
++// `MOE_HOST_POOL_MIB` (an explicit process-wide byte budget) keeps the uniform split.  Caller holds `g_mutex`.
++static void pool_fit_cov_locked() {
++    if (g_pool_cov_fit) {
++        return;
++    }
++    g_pool_cov_fit = true;
++    struct plan_t { const void * host; int k; int n_exp; size_t bytes; };
++    std::vector<plan_t> plan;
++    std::set<const void *> seen;
++    int64_t budget = 0;
++    int64_t uniform_slots = 0;
++    for (const table_t & t : g_tables) {
++        if (!t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
++            continue;
++        }
++        if (!seen.insert(t.host).second) {
++            continue;   // one plan per host TENSOR (the pool is shared across a split's per-device tables)
++        }
++        const int uni = std::max(1, std::min(t.n_experts, (int) ((int64_t) t.n_experts * g_pool_frac / 100)));
++        int k = table_cov_slots_locked(t, g_pool_cov_pct);
++        if (k < 0) {
++            k = uni;    // no prior: ask for what the uniform rule asks for
++        }
++        k = std::max(1, std::min(k, t.n_experts));
++        budget         += (int64_t) uni * (int64_t) t.host_bytes;
++        uniform_slots += uni;
++        plan.push_back({ t.host, k, t.n_experts, t.host_bytes });
++    }
++    if (plan.empty() || budget <= 0) {
++        return;
++    }
++    // slots_i = clamp(round(alpha * k_i), 1, n_exp_i); find the largest alpha whose byte total fits.
++    auto alloc = [&](double alpha, std::vector<int> * out) {
++        int64_t bytes = 0;
++        if (out != nullptr) {
++            out->assign(plan.size(), 0);
++        }
++        for (size_t i = 0; i < plan.size(); i++) {
++            const plan_t & c = plan[i];
++            int sl = (int) std::llround(alpha * (double) c.k);
++            sl = std::max(1, std::min(c.n_exp, sl));
++            bytes += (int64_t) sl * (int64_t) c.bytes;
++            if (out != nullptr) {
++                (*out)[i] = sl;
++            }
++        }
++        return bytes;
++    };
++    double lo = 0.0, hi = 1.0;
++    while (alloc(hi, nullptr) <= budget && hi < 1e9) {
++        hi *= 2.0;
++    }
++    for (int it = 0; it < 80; it++) {
++        const double mid = 0.5 * (lo + hi);
++        if (alloc(mid, nullptr) <= budget) {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    std::vector<int> slots;
++    int64_t used = alloc(lo, &slots);
++    // Hand the rounding leftovers to the tables that want the most slots (largest k first) while they fit, then
++    // (if a floor overshot) take slots back from the smallest-k tables until the budget is respected.
++    std::vector<size_t> order(plan.size());
++    for (size_t i = 0; i < order.size(); i++) {
++        order[i] = i;
++    }
++    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return plan[a].k > plan[b].k; });
++    for (size_t i : order) {
++        while (slots[i] < plan[i].n_exp && used + (int64_t) plan[i].bytes <= budget) {
++            slots[i]++;
++            used += (int64_t) plan[i].bytes;
++        }
++    }
++    for (auto it = order.rbegin(); it != order.rend() && used > budget; ++it) {
++        const size_t i = *it;
++        while (slots[i] > 1 && used > budget) {
++            slots[i]--;
++            used -= (int64_t) plan[i].bytes;
++        }
++    }
++    int64_t kept = 0;
++    for (size_t i = 0; i < plan.size(); i++) {
++        g_pool_cov_slots[plan[i].host] = slots[i];
++        kept += slots[i];
++    }
++    GGML_LOG_INFO("%s: host pool SIZING = cov%d (concentration, %s): %zu host tensors, budget %.1f MiB, "
++                  "alpha=%.3f, %lld slots vs %lld uniform (%.1f %%) -- per-table slots now follow each table's "
++                  "own routing concentration instead of a flat FRAC (MOE_HOST_POOL_SIZING=0 restores it)\n",
++                  __func__, g_pool_cov_pct,
++                  "MOE_HOST_POOL_COV_PCT of each table's prior mass",
++                  plan.size(), (double) budget / (1024.0 * 1024.0), lo,
++                  (long long) kept, (long long) uniform_slots,
++                  uniform_slots > 0 ? 100.0 * (double) kept / (double) uniform_slots : 0.0);
++}
++
+ // TODO #87 (1): decide whether the pool fills from the page cache or with O_DIRECT.  Called ONCE, from the
+ // first pool build, so every pool and every bounce path in the process agrees.
+ //
+@@ -1161,6 +1313,8 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
+     }
+     g_pool_dio_decided = true;
+     if (g_pool_dio_req >= 0) {
++        // Forced (`MOE_HOST_POOL_DIO=0|1`): `parse_env` already applied it; this is the one place that reports
++        // it, because it runs once, at the first pool build, at a log level the operator can see.
+         g_pool_dio = g_pool_dio_req != 0;
+         GGML_LOG_INFO("%s: host pool fill mode: %s (forced by MOE_HOST_POOL_DIO=%d)\n", __func__,
+                       g_pool_dio ? "O_DIRECT (page cache bypassed)" : "buffered (page cache as L3)",
+@@ -1291,6 +1445,11 @@ static host_pool_t * table_pool_locked(table_t & t) {
+         } else {
+             slots = (int) (((int64_t) g_pool_total_bytes / (int64_t) n_hosts) / (int64_t) t.host_bytes);
+         }
++    } else if (g_pool_sizing == 1) {
++        // wip/host-pool-speed: per-table sizing from routing concentration, same total byte budget.
++        pool_fit_cov_locked();
++        const auto cs = g_pool_cov_slots.find(key);
++        slots = cs != g_pool_cov_slots.end() ? cs->second : (int) ((int64_t) t.n_experts * g_pool_frac / 100);
+     } else {
+         slots = (int) ((int64_t) t.n_experts * g_pool_frac / 100);
+     }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index c3eb1948d..ffcdeb4da 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -42,8 +42,9 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
+         }
+         LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+                        "mapping and every GPU read is served through a bounded pinned pool "
+-                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes, "
+-                       "O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n", func);
++                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=100%% of the host expert bytes capped "
++                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
++                       func);
+     }
+ }
+ 
+-- 
+2.56.0
+
