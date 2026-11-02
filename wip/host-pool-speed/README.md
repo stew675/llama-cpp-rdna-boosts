@@ -24,6 +24,8 @@ separate decision).
   that it does not fit cleanly in the 64 GiB RAM class the mode exists for, it has **no PLE engine** to confound
   memory/disk measurements, and it carries its MTP head **embedded**.  Flash-Next is a **final validation**
   model only.  Earlier pool tuning on 35B-A3B (which fits) is treated as smoke data, not as evidence.
+- **First pass = one GPU and `-sm tensor` on the two x8 GPUs** (§9.4).  The 3-GPU arms and the Flash-Next /
+  PLE / swap / `RAM_PCT` tuning are the campaign's **last** phase, not its first.
 
 **Status of PR #267:** reviewed at the architecture level (see §8) and **not adopted**.  The maintainer's
 decision is to hold it, gather these numbers first, and reply to the submitter later.  Its record lives under
@@ -134,9 +136,12 @@ produce `n_res + pool_slot` and the pool base, and the eager path already consum
   a 2/3-GPU tensor arm where the remap still declines for its own reason (the Meta iface is NULL) — the pool
   campaign does not change that.
 
-### 3.2 P0-b: `MOE_HOST_POOL_RAM_PCT` and swap thrashing
+### 3.2 P0-b: `MOE_HOST_POOL_RAM_PCT` and swap thrashing — **final phase, on Flash-Next**
 
-The maintainer reports swap thrashing on some models at the current default.  Known properties to attack:
+The maintainer's report: the thrash showed up with **Flash-Next**, where the model weights *and* the PLE weights
+are both streaming and the page cache evicts heavily into swap.  That makes it a **Flash-Next / PLE-interaction**
+measurement, so this item is scheduled for the campaign's **final validation phase** (§9.4), on the field box and
+then on the 122B as the PLE-free control.  It is not a Phase-1 blocker.  Properties to attack when we get there:
 
 - 85 % of `MemAvailable` **measured once, at the first pool build** — a box whose availability later shrinks
   (another model, a server, a browser) keeps the old ceiling.
@@ -322,15 +327,52 @@ the emulation with the ceiling expressed explicitly — an equivalent `MOE_HOST_
 recomputed from the cgroup limit — and record which was used.  The code fix (read `/sys/fs/cgroup/memory.max`)
 is itself a P0 item, because containers are the normal deployment shape.
 
-### 9.3 Arms, commands, gates
+### 9.4 Phases, and the first pass's hardware (decided 2026-11-02)
+
+**Phase 1 — first pass (this is the work to start):**
+
+- **One GPU** (the single-GPU pain point) and **`-sm tensor` on two GPUs**, 122B-A10B, embedded MTP on/off,
+  `GGML_MOE_DEVREMAP` × `MOE_HOST_POOL_COLD` crossed, pool **sub-full** and **full**, plus the all-host
+  (`-ncmoe 99`) disk arm.  This is where P0-a (the remap on pool tables) and P1-a/P1-b/P1-d get measured.
+- **The pair must be the two x8 GPUs, never the x4 one.**  Verified on this box (2026-11-02):
+
+| HIP / `-dev` index | PCI | CPU root port | CPU link | uses |
+|---|---|---|---|---|
+| **0** | `03:00.0` | `00:01.1` | **x8** | **yes — first GPU of the pair** |
+| 1 | `06:00.0` | `00:01.2` | **x4** | **never in this campaign** |
+| **2** | `09:00.0` | `00:01.3` | **x8** | **yes — second GPU of the pair** |
+| 3 | `1a:00.0` | `00:08.x` | iGPU `gfx1036` | never (the delivery is gfx1201-only) |
+
+  How it was established: `rocm-smi --showbus` maps HIP index -> PCI, and the **CPU root ports**
+  (`/sys/bus/pci/devices/0000:00:01.{1,2,3}/current_link_width`) read **8 / 4 / 8** — the GPU's own
+  `current_link_width` reads 16 because it sits behind a switch's downstream port, so *do not* trust that file
+  for this question.  This matches `AGENTS.md` (the x8 pair is `HIP_VISIBLE_DEVICES=0,2`).
+- **So the 2-GPU command pins `HIP_VISIBLE_DEVICES=0,2`**, after which the in-process indices are 0 and 1 —
+  `--device 0,1`, `-ts`, `-mg` and any log line refer to those, *not* to physical 0 and 2.  A bare `--device 0,2`
+  under that pin silently selects one device.
+- 1-GPU arms take index 0 of whatever set is visible (`HIP_VISIBLE_DEVICES=0`), always pinned: an unpinned
+  multi-device arm enumerates the iGPU and aborts at load with `invalid kernel file` (the `gfx1036` trap).
+- **Iterating on the 122B is cheap now**: `/llm` is on the faster mount, ~**15 s of disk reads** to load the
+  model, so the big model is the iteration vehicle and the small models are not needed for speed.
+- The 122B on **one** 32.6 GiB card is a genuine host-expert workload: its expert weights are ~1.4 GB per layer
+  (256 x 3 x 1024 x 3072 at UD-Q4_K_XL, derived), so `-ncmoe N` puts roughly `1.4 x N` GB on the host —
+  `-ncmoe 32` is ~45 GB (≈ 42 GiB) of host experts against a ~32 GB card, i.e. the pool is large and the arena
+  is small, which is exactly the churn regime the campaign is about.
+
+**Phase 2 — the last phase (do not start here):** Flash-Next final validation, i.e. the PLE interaction and the
+`RAM_PCT` / page-cache / swap thrash (§3.2): measure with the model weights **and** the PLE stream active, on the
+field box and under the 64 GiB cgroup, against the 122B as the PLE-free control.  The 3-GPU arms also belong
+here (they add the all-reduce and the iGPU trap, and nothing in the first pass needs them).
+
+### 9.5 Arms, commands, gates
 
 - Boxes: **primary** (3 × R9700 gfx1201, 96 GiB, ROCm 10.1) — the tuning box, with the 64 GiB cgroup variant
-  for the tight case.  The field box (gfx1100, ~30 GiB) is the ground truth for the mode's original purpose and
-  is used for the final `RAM_PCT`/`DIO` soak.
-- Model arms: 122B-A10B at `-ncmoe` values that give a **sub-full pool** (the interesting regime), a **full
-  pool** (the maintainer's "big enough for the whole set" case), and one **all-host** (`-ncmoe 99`) arm for the
-  disk-streaming case; `-sm tensor` and `-sm layer`; 1/2/3 device;
-  `--spec-type draft-mtp` on the embedded head vs none.
+  for the tight case.  The field box (gfx1100, ~30 GiB) belongs to Phase 2 (§9.4) and is the ground truth for the
+  mode's original purpose.
+- Model arms (Phase 1): 122B-A10B at `-ncmoe` values that give a **sub-full pool** (the interesting regime), a
+  **full pool** (the maintainer's "big enough for the whole set" case), and one **all-host** (`-ncmoe 99`) arm for
+  the disk-streaming case; **1 GPU** and **`-sm tensor` on the x8 pair**; `--spec-type draft-mtp` on the embedded
+  head vs none.  The 3-GPU arms and the Phase-2 model (Flash-Next) are not Phase 1.
 - Always include the **`pinned` arm in the same run** (the acceptance criterion is a ratio to `pinned`); arms
   alternated, never parallel (`AGENTS.md`); pin `HIP_VISIBLE_DEVICES` on every multi-device arm (the iGPU trap).
 - **Full feature set, every arm** (`AGENTS.md` Default-on policy): no `FOO=1 <bench>` unless the arm *is* the
@@ -347,26 +389,26 @@ is itself a P0 item, because containers are the normal deployment shape.
 
 ## 10. Open questions for the maintainer (decide before the first code change)
 
-1. **Decode target**: parity with `pinned` *with* the remap (65.7 on the r203 cell, i.e. P0-a must land first),
-   or is the honest bar "pool must beat `pinned` eager" (60.6, already met)?
-2. **`RAM_PCT`**: lower the default opportunistically now (a one-line change + a soak), or hold the default
-   until the dynamic-ceiling design lands?  (There is no `TODO` handle for the swap report yet — say the word
-   and one is allocated.)
-3. **The 64 GiB emulation (§9.2)**: is a `memory.max` cgroup acceptable as the campaign's reference, or do you
-   want the real field box measured before any number is published?  And should the cgroup-aware `RAM_PCT`
-   denominator be a P0 code fix in its own right (containers), independent of the campaign's results?
-4. **The tuning model (§9.1)**: confirm 122B-A10B UD-Q4_K_XL as the campaign's reference (73.2 GiB, `qwen35moe`,
-   embedded `nextn`, no PLE) with Flash-Next held for final validation only — and whether the 122B's Q4_K_XL is
-   also the model for the *decode* gap (P0-a) or whether a smaller/faster cell is kept for iteration.
-5. **Knob collapse (§5)**: is a "one `auto` decision, everything else diagnostic" shape the target, or should
+1. ~~**Decode target**~~ — **answered 2026-11-02**: iterate on the 122B (the faster `/llm` mount makes its load
+   ~15 s), and the bar is parity with `pinned` *on the arms the campaign runs*, which means P0-a still has to
+   land before that comparison is meaningful.
+2. ~~**`RAM_PCT` / swap**~~ — **answered 2026-11-02**: the thrash is a **Flash-Next weights + PLE streaming**
+   effect, so it is measured at the **end** of the campaign against Flash-Next (§3.2, §9.4), not in Phase 1.
+   The cgroup-aware denominator (§9.2) is still worth fixing independently, because containers hit it without any
+   PLE involvement — say whether that should be its own small change, or ride with the Phase-2 work.
+3. **Knob collapse (§5)**: is a "one `auto` decision, everything else diagnostic" shape the target, or should
    the existing per-knob defaults stay user-visible for the field configs?
-6. **P3 (§7)**: is the "guaranteed pinned **and** resident" intermediary worth a design note of its own, or is
+4. **P3 (§7)**: is the "guaranteed pinned **and** resident" intermediary worth a design note of its own, or is
    §4.1's residency check enough?
-7. **PR #267**: hold the reply until §3.1 and §4.1 report numbers (current plan), and if it is declined, does
+5. **PR #267**: hold the reply until §3.1 and §4.1 report numbers (current plan), and if it is declined, does
    the reply offer a `wip/` home for the submitter's tier work so it is not lost?
+6. **`TODO` handle**: do you want one for the swap-thrash report / cgroup-aware `RAM_PCT`, so they are tracked
+   outside `wip/`?
 
 ## 11. References
 
+- `AGENTS.md` — the x8 pair (`HIP_VISIBLE_DEVICES=0,2`) and the iGPU load-abort trap; also `COMMUNITY-CONFIG.md`
+  for the `-sm tensor`-vs-`-sm layer` numbers on the x8 ports.
 - `patches/README.md` block 12 — the pool's shipped design and its r111-r114 numbers.
 - `ENVIRONMENT.md` — `MOE_HOST_POOL_*` and `MOE_EXPERT_CACHE_*` rows; the L0/L1/L2 memory-tier model; the
   `RAM_PCT` "not re-measured on the tight box" note.
