@@ -127,7 +127,19 @@ type, note it — that is part of B.
   stale `/tmp/0001-*.patch` from another session silently goes first — it happened once while validating this
   set).
 
-## 7. Where the numbers go
+## 7. Where B's patches currently live (housekeeping, not a review)
+
+While validating this campaign's set, a **different** patch series was found in `/tmp` on the maintainer's box
+(dated 02:03, not mine, left untouched): `/tmp/0001-llama-restore-host-experts-mmap-*.patch` through
+`/tmp/0009-moe-cache-one-pin-budget-*.patch` — i.e. the `--host-experts mmap` + pageable-master + RAM-tier +
+precopy + pin-budget family, nine patches, which reads like the parallel session's approach B (PR #267 lineage).
+
+**`/tmp` is not durable.**  Before the head-to-head, archive that series where the repo's rules put an external
+candidate (`beta/<name>/` for a promotion candidate, or `wip/mmap-host-experts-*/` / `archive/work/<name>/` for a
+campaign record, with a `README.md`), and do not mix it into `patches/`.  This campaign has not read, applied or
+modified those patches; the only thing recorded here is where they were last seen.
+
+## 8. Where the numbers go
 
 Append a dated entry to [`HANDOVER.md`](HANDOVER.md) §3 (or a `benchmarks/2026-11-..-host-expert-showdown.md` if it
 grows beyond a table), keep the per-arm logs under `data/<date>-head-to-head/`, and state which gate each arm
