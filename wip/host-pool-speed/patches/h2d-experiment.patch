@@ -1,0 +1,38 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 334931ecd..4d5acb27f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1860,11 +1860,19 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         return true;
+     }
+     if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
++        // wip/host-pool-speed: the copy KIND out of the pool.  Default keeps the historical D2D from the
++        // mapped UVA alias (`base_dev`), which is required when the copying device is not the one that
++        // allocated the pool (the portable+mapped alias is the only cross-device source that does not fall
++        // back to a pageable staging memmove).  On a single-GPU arm the same pinned memory is a valid H2D
++        // source, and `cudaMemcpyHostToDevice` is the DMA path the pinned master takes -- so this switch
++        // measures how much of pool mode's decode deficit is the D2D-from-alias copy itself.
++        static const bool pool_h2d = getenv("MOE_HOST_POOL_H2D") != nullptr;
+         int    s = -1;
+         char * p = pool_peek_locked(*pool, expert, &s);
+         if (p != nullptr && s >= 0) {
+-            out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+-            out->kind      = cudaMemcpyDeviceToDevice;
++            out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                      : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++            out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+             out->pool_slot = s;
+             out->pool_hit  = true;
+             return true;
+@@ -1872,8 +1880,9 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         if (allow_empty_fill) {
+             p = pool_fill_empty_locked(*pool, expert, &s);
+             if (p != nullptr && s >= 0) {
+-                out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+-                out->kind      = cudaMemcpyDeviceToDevice;
++                out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                          : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++                out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+                 out->pool_slot = s;
+                 out->pool_hit  = false;
+                 return true;

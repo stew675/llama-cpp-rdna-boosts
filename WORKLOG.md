@@ -1,3 +1,29 @@
+## 261102.001 (tool) -- `moe-trace-replay.py` scores the decode band by default, so it now calibrates to <0.3 %
+
+No delivery change (a tool fix: no `patches/`, no `release.json`, no new tag).  The replayer's `--score-band`
+default was `all`, justified in its own docstring as *"what the runtime's logged `h=` counts"*.  That premise is
+false.  The runtime's `h=` comes from `moe_cache_update_host`'s access path, and the PREFILL band returns before
+it (whole-table staging, or a decline), so a prefill position never reaches `hits`/`misses`.  Evidence from the
+`wip/host-pool-speed` reference arm (122B-A10B, `-ncmoe 48`, `GGML_MOE_DEVREMAP=0`, 5258-token prompt + 2000
+generated): `takeover=268272` = 144 tables x 1,863 decode steps, and `hits+fills+colds` = **2,145,816** reaches =
+`144 x 1,863 x 8` exactly, while the same trace carries 423 `P` records holding **740,814** prefill positions
+that contribute zero.  Scoring them anyway biased `shipped` down by ~0.15 and is what made the replayer look
+uncalibrated (the previous session's finding F2, which blocked the campaign's "simulate before implementing"
+rule).  With the decode band it lands on the run's own `h=`:
+
+| arena | run's `h=` | `--score-band all` | `--score-band decode` |
+|---|---|---|---|
+| 3,932 MiB / 15 slots | 0.3488 | 0.1956 (-0.153) | **0.3492 (+0.0004)** |
+| 22,517 MiB / 85 slots | 0.7543 | 0.6328 (-0.122) | **0.7513 (-0.0030)** |
+
+Change: `--score-band` defaults to `decode`; the module docstring's accounting caveat now says why (with the
+reach arithmetic), and the `--measured-h` calibration note points at `--seed sidecar:<the run's .moe-heatmap>`
+and `--slots <the run's per-table count>` (the ±1 slot matters: 0.3390 at 14 slots vs 0.3492 at 15).  `all`
+stays available as a diagnostic.  Two candidate causes were tested and killed in the same pass: the `ghost`
+reset on admission (the real `access_locked` zeroes it when it admits) moves the decode h by 0.0002, and
+`--churn off` fits neither band.  Study, sweep tool and data: `wip/host-pool-speed/` (`HANDOVER.md` §4/F2,
+`tools/replayer-calib.py`, `data/traces/trace-122b-ncmoe48-devremap0.txt.gz`).
+
 ## 261101.021 (docs) -- r206 published: CI green on all three runs, the fork branch at `efaa60db0`
 
 No delivery change (docs only; no new tag).  `v16-6050b467c-r206` is tagged and pushed; `main` is at the r206

@@ -408,6 +408,16 @@ here (they add the all-reduce and the iGPU trap, and nothing in the first pass n
 - Instruments: the cache's own traffic report, `MOE_HOST_POOL_VERIFY`, `/proc/diskstats` (and the cgroup's
   `io.stat`), `VmSwap`/`pswpout`/`memory.events`, plus `scripts/moe-trace-replay.py` (two-tier offline model)
   to screen a layout/sizing candidate before any code changes.
+- **Log level: `-lv 4` for anything out of libllama; `-lv 3` is not enough** (corrected 2026-11-02, session 2).
+  `common/log.cpp` maps a raw `GGML_LOG_LEVEL_INFO` to `LOG_LEVEL_TRACE` (4), so every `LLAMA_LOG_INFO` line —
+  `host_experts_mode=POOL`, `table_pool_locked`, `pool_decide_dio_locked`, `pool_clamp_slots_to_ram`,
+  `apply_heat_seed_locked`, `moe_cache_report: MoE expert cache: h=` — is invisible at `-lv 3`.  `-lv 3` shows
+  `COM_INF`/`COM_WRN` only (`slot print_timing: MoE arena =` is the usable per-turn `h=`).  This is what made
+  session 1 believe the pool never activated (`HANDOVER.md` §4/F3).
+- **The teardown cache report is zero in every mode** (same cause as above, a second time): `moe_cache_report` is
+  an `atexit` hook that runs *after* `moe_cache_forget_all`, so `tables=0, slots=0, arena=0.0 MiB` and
+  `host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned` are printed whether or not a pool existed.  Read the
+  cumulative counters (`takeover=`, `expert access:`, `expert H2D traffic:`) instead, or the per-turn line.
 - Page cache is a *state to control*, not a nuisance: record it (or drop it) before every arm, because on a
   96 GiB box with a 73 GiB model `DIO=auto` picks buffered while on a 64 GiB box it picks `O_DIRECT` — the same
   binary, two different behaviours.  That divergence is exactly what P1-a replaces with a per-read decision.
@@ -546,8 +556,44 @@ item, and it is the one blocker §9.6's "simulate before implementing" rule depe
 (the cache logs `67110 MiB of host experts`) for 22.36 t/s on one card.  That is the number pool mode has to be
 judged against: not a throughput ratio to a leaky baseline, but 65.5 GiB of pinned RAM versus a bounded pool.
 
+**Session 2 corrections to this section (read it before quoting any number above):** two of the five rows in
+§12 were mis-labelled.  The `--host-experts pool` row at 22.4 t/s came from a run with no pool in it, and the
+"`host pool (L2): 0 tensors`" line that made the pool look dead is printed by *every* run in *every* mode (it
+is an `atexit` report that runs after the cache is un-sized).  The pool **does** activate on the 122B; the real
+session-1 pool numbers are 17.73 t/s (`O_DIRECT`) and 18.21 (buffered).  And Finding 2 is **resolved**: the
+replayer's error was the score band, not its dynamics — the runtime's `h=` is decode-band only, and
+`scripts/moe-trace-replay.py` now defaults to that band and calibrates to <0.3 %.  Details and evidence:
+`HANDOVER.md` §4/F2/F3.
+
+### 12.1 Session 2 (2026-11-02, overnight) — the pool baseline, measured properly
+
+1 GPU, `-ncmoe 48`, 5258-token prompt, 2000-token greedy decode, arms **alternated in one run**
+(`HANDOVER.md` §3 has the full table and the counters):
+
+| | decode t/s | prefill t/s | disk read / run |
+|---|---|---|---|
+| **`pinned`** (3 arms) | **22.33 +/- 0.06** | 680 +/- 1 | 63-72 GiB |
+| **`pool`, `DIO` auto = `O_DIRECT`** (3 arms) | **17.76 +/- 0.03** | 629 +/- 3 | 152-170 GiB |
+| `pool`, `DIO=0` buffered (2 arms) | 15.22 / 18.10 (unstable) | 543 / 588 | 152-162 GiB |
+
+So: **the pool is -20.5 % on decode and -7.5 % on prefill on the reference arm, and the `DIO` boolean is not
+what costs it** (forced `O_DIRECT` == auto to 0.3 %; the buffered arm is the *unstable* one).  The pool streams
+~90 GiB more from disk per run (53.7 of it the one-shot prepopulate), yet it moves the same host-link bytes as
+`pinned` — so the next suspect is the **copy kind** out of the pool (D2D from the mapped alias vs the pinned
+arm's H2D), not bandwidth.  `HANDOVER.md` §5.1-5.3 and §3.1.
+
+What session 2 changed in the campaign's plan:
+
+- **F5 re-scoped**: per-read residency (`mincore`) is a *sub-full-pool / cgroup* feature, not the reference-arm
+  lever; the page-cache **budget** is the load-bearing half (the unbounded buffered arm is a thrash source).
+- **F2 fixed** in `scripts/moe-trace-replay.py` (`--score-band` default `decode` + the docstring's caveat), so
+  §9.6's simulate-before-implement is unblocked and a sizing candidate can finally be screened.
+- **Protocol**: `-lv 4`, not `-lv 3`, for anything out of libllama (§9.5).
+
 ## 13. Session state
 
-The cold-start handover for the next session is [`HANDOVER.md`](HANDOVER.md): measured baselines, the five
-findings (including the blocking one — `--host-experts pool` did **not** activate on the 122B, so no pool number
-taken so far means anything), the `O_DIRECT`-vs-buffered analysis, and the ordered next steps.
+The cold-start handover is [`HANDOVER.md`](HANDOVER.md): §0 is the one-line status, §3 the measured baseline,
+§4 the findings (F3 resolved, F2 resolved, F1/F4/F5 current), §5 the `DIO` analysis plus the measured result,
+§6 the ordered next steps (copy kind -> residency+budget -> remap-on-pool), §8 the open questions and the
+decisions taken overnight, §9 the in-repo data/tools (`data/20261102-session2-*`, `tools/run-arms-*.sh`,
+`tools/replayer-calib.py`).

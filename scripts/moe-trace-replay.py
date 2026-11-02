@@ -34,8 +34,14 @@ Accounting caveats (read before quoting a number):
   * An IDENTITY (fully resident) table is not traced on the decode band (its routing is never read
     back).  Such a table cannot miss, so a trace from a fully-resident run has no decode records at
     all -- trace a partially-resident config (e.g. `MOE_EXPERT_CACHE_MIB=4096`).
-  * The trace records the routing, not the timing.  `h` is comparable to the logged `h=`; throughput is
-    not.
+  * The trace records the routing, not the timing.  `h` is comparable to the logged `h=`, but ONLY on the
+    decode band: the runtime's `h=` comes from `moe_cache_update_host`'s access path, and the PREFILL band
+    returns before it (whole-table staging, or a decline), so a prefill position never reaches `hits`/
+    `misses`.  Measured on the 122B-A10B campaign trace: 2,145,816 reaches = 1,863 decode steps x 144 tables
+    x 8 experts, i.e. the trace's 740,814 prefill positions contribute exactly zero.  Scoring them anyway
+    (`--score-band all`, the old default) biases `shipped` low by ~0.15 (0.1956 vs the run's 0.3488 at
+    3,932 MiB, 0.6328 vs 0.7543 at 22,517 MiB); on the decode band the model lands within 0.3 %
+    (0.3492 / 0.7513).  `wip/host-pool-speed/HANDOVER.md` §4/F2 has the table.
 """
 
 import argparse
@@ -839,11 +845,11 @@ def main(argv=None):
                          "suffix first heat-seeds the ARENA with the same prior and then gives the pool "
                          "only the non-resident experts (the real layout, and the one that makes "
                          "arena U pool cover the set)")
-    ap.add_argument("--score-band", choices=("all", "decode"), default="all",
-                    help="which passes the arena policies are scored on (default 'all', which is what the "
-                         "runtime's logged h= counts and therefore what the shipped-vs-measured calibration "
-                         "needs; 'decode' drops the prefill band, whose whole-table staging is not what an "
-                         "arena policy is about -- use it for policy comparisons, never for calibration)")
+    ap.add_argument("--score-band", choices=("all", "decode"), default="decode",
+                    help="which passes the arena policies are scored on (default 'decode', which is what the "
+                         "runtime's logged h= counts: the prefill band returns before the cache's access path, "
+                         "so its positions never reach hits/misses.  'all' includes them and biases `shipped` "
+                         "low by ~0.15 on the 122B trace -- it is a diagnostic, never a calibration)")
     ap.add_argument("--decode-only", action="store_true", default=True,
                     help="score the decode band only (the prefill stages whole tables, so it does not "
                          "discriminate between pool policies); default on")
@@ -1001,9 +1007,9 @@ def main(argv=None):
         if sh and args.measured_h is not None:
             print("calibration: model 'shipped' h=%.4f vs the run's logged h=%.4f (error %+.4f)"
                   % (sh["h"], args.measured_h, sh["h"] - args.measured_h))
-            print("             (the model has no persisted heat prior, no seed and no arena shortfall, so")
-            print("              it is usually a little optimistic; judge POLICIES by their delta, not by")
-            print("              the absolute h)")
+            print("             (pass --seed sidecar:<the run's .moe-heatmap> for the real prior, and --slots <the")
+            print("              run's per-table count> when the log has it -- with both, the decode band lands within")
+            print("              0.3 %.  See wip/host-pool-speed/HANDOVER.md §4/F2)")
         if sh and "quota" in results:
             q = results["quota"]
             print("quota vs shipped: h %+.4f, MiB/token %+.1f%% (%s)"
