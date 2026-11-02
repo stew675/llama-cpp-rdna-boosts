@@ -633,9 +633,13 @@ What session 2 changed in the campaign's plan:
 calibrates, and two changes are **implemented, gated and measured but NOT in the delivery set**: `cov90` per-table
 pool sizing (`MOE_HOST_POOL_SIZING=1`, **+7.5 %/+16.4 %** decode at identical pinned bytes) and the
 **full-coverage default** (`MOE_HOST_POOL_FRAC=100`, decode 20.62 vs 17.80, exposing the pool's **-7.9 %** raw
-overhead), plus the teardown-report and forced-`DIO` diagnostic fixes.  They live as `patches/0001-0002` (exported
-from the fork's local branch `wip/host-pool-speed-pool-sizing`), with the prefill trade and the 2-GPU caveat in
-`HANDOVER.md` §3.3/§4/F7.
+overhead), plus the teardown-report and forced-`DIO` diagnostic fixes.
+
+**Where the work is saved:** [`patches/README.md`](patches/README.md) (the two patches `0001`/`0002`, apply order on
+the r206 tip, knobs, expected numbers, caveats — validated: the applied tree is `0b8cc5a8b`) and
+[`HANDOVER.md`](HANDOVER.md) §3.3/§4.  **Not promoted**: `patches/` (delivery) and `release.json` are untouched.
+The next step the maintainer has planned is a head-to-head against the parallel `--host-experts mmap` /
+pageable-master approach, for which the protocol is prepared in [`HEAD-TO-HEAD.md`](HEAD-TO-HEAD.md).
 
 The cold-start handover is [`HANDOVER.md`](HANDOVER.md): §0 is the one-line status, §3 the measured baseline,
 §4 the findings (F3 resolved, F2 resolved, F1/F4/F5 current), §5 the `DIO` analysis plus the measured result,

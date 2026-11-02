@@ -644,6 +644,10 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
   `patches/0002-*`; **nothing is in the delivery set** (`patches/` and `release.json` untouched), and the
   `--host-experts pool` help text, `ENVIRONMENT.md` and `patches/README.md` notes for `MOE_HOST_POOL_SIZING` /
   `MOE_HOST_POOL_COV_PCT` / the `FRAC` default must ride with the promotion, not before it.
+- **D9 — the work is SAVED, not promoted** (maintainer's call, 2026-11-02): the two patches live in
+  [`patches/`](patches/README.md) with their own README, the campaign docs are current, and
+  [`HEAD-TO-HEAD.md`](HEAD-TO-HEAD.md) is written so this approach can be pitted against the parallel session's
+  `mmap` / pageable-master one before anything is promoted.  Nothing in the delivery set changed.
 - **D8 — the fork is left on `wip/host-pool-speed-pool-sizing`** with `build-rocm` built from it, because the
   next step is to gate these changes.  `git checkout rdna-boosts` + `build-llama-rocm` restores the r206 binary
   (the campaign's earlier numbers were all taken on it; note that on this branch `MOE_HOST_POOL_FRAC` defaults to
@@ -698,6 +702,12 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
 - `tools/run-arms-1gpu-sizing.sh` — the sizing/default matrix runner.
 - `patches/h2d-experiment.patch` — the fork-local `MOE_HOST_POOL_H2D` switch (§3.1).  **Not in `patches/`**: the
   experiment is finished and the fork's tree is reverted, so this file is the record, not a queued change.
+- **[`patches/README.md`](patches/README.md)** — the campaign patch set: what `0001`/`0002` do, the apply order
+  (on the r206 tip `efaa60db0`), the validation (trees match `0b8cc5a8b`), the knobs, the expected numbers and the
+  caveats.  Read it before rebuilding this work anywhere.
+- **[`HEAD-TO-HEAD.md`](HEAD-TO-HEAD.md)** — the prepared protocol for pitting this approach against the
+  `--host-experts mmap` / pageable-master one: the fixed arm matrix, metrics, gates, scoring rules and the traps
+  that would silently make the two sides incomparable.  **Not run yet.**
 - `patches/0001-moe-cache-report-the-RUN-*.patch` — the diagnostics fixes (§3.3), `git format-patch` from the
   fork's `wip/host-pool-speed-pool-sizing` branch.
 - `patches/0002-host-pool-full-coverage-default-*.patch` — full-coverage default + `cov90` sizing (§3.3).
