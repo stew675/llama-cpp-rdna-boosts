@@ -1,3 +1,15 @@
+## 261101.018 (docs) -- r205 published: CI green on both pushes, the fork branch at `7afa30c8e`
+
+No delivery change (docs only; no new tag).  `v16-6050b467c-r205` is tagged and pushed; `main` is at the r205
+commit (`8fe8584e`).  CI: **Validate delivery set** green on both the `main` push and the tag push (strict 16/16
+apply on a fresh tarball, tree `d6e71901`, the Windows path + portability lints), **Release patch set** green
+(assets `patches.tar.gz`, `rdna-boosts-all.patch`, `release.json`, `SHA256SUMS`).  The personal fork's
+`rdna-boosts` branch was force-pushed to **`7afa30c8e`** by `scripts/fork-refresh.sh --push` (re-cut from
+`6050b467c`, tree `d6e71901` reproduced, `release.json.tip` matched; the lease moved `aaf30b6b4...7afa30c8e`).
+The first attempt aborted at the `proceed? [y/N]` prompt because it was driven non-interactively — the script
+needs `--yes`, worth remembering.  The ROCm container images are built and pushed off-host by the worker watcher
+(`radiance`), which polls for the tag.
+
 ## 261101.017 (r205) -- the `q5_0` and `iq4_nl` KV cache write folds land in block 10; `TODO` #120 closed (`bf16` is unreachable, not unfused)
 
 **Released as `v16-6050b467c-r205` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
