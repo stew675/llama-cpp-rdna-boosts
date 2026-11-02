@@ -410,6 +410,31 @@ not a throughput ratio, is what pool mode has to be judged against.
 **F5 — `DIO` is a per-box boolean applied to a per-read problem** (the maintainer's question, 2026-11-02).
 See §5.
 
+**F7 — the 2-GPU `-sm tensor` shape on the 122B is a different regime: `pinned` gets NO expert cache at all,
+and a full pool can stall the load (2026-11-02, preliminary — short decodes, single samples).**  Running the
+campaign's Phase-1 pair arm (`HIP_VISIBLE_DEVICES=0,2`, `-sm tensor`, `-ncmoe 48`, `data/20261102-pair-smoke/`):
+
+* **`pinned`: the cache never sizes.**  The log has **no** `alloc_all_locked` line and no `moe_cache_report`
+  output at all, and the memory breakdown after load shows `Meta() 65248 = 51424 free` — i.e. ~51 GiB of the
+  65 GiB of device memory is untouched.  So on this shape `pinned` decode (14.46 t/s, 8-token run) is the
+  *no-cache* rate, and the earlier claim that pool mode works on 1/2/3-GPU tensor splits has to be re-checked
+  against a model whose MoE op registers per-device tables under the Meta wrapper.  First thing to check next:
+  `llama_model_moe_host_expert_dev_count(model)` under `-sm tensor` (the cache is allocated only when it is
+  non-zero), then the `MUL_MAT_ID` device list the registration sees.
+* **`pool` builds (144 tensors, 256/256 slots, 67110 MiB pinned) and the first attempt STALLED** in the pool
+  prepopulate (rc=137 after 457 s, last log line `table_pool_locked` #125/144, the process sleeping in a
+  nanosleep loop) while the box carried a full model page cache (available RAM had fallen to 54 GiB with 67.1 GiB
+  of pool to pin).  With a clean page cache the same arm **completed** (`112 GiB` read, `rc=0`), so this is
+  over-commitment pressure during the prepopulate, not a pool/layout bug — see the `RAM_PCT` critique (the
+  ceiling does not reserve the model's own page cache).
+* Both pair pool runs *did* get an arena (`MoE arena = 0.8323`) where `pinned` did not, which is why pool mode
+  looks faster than `pinned` on this shape (17.69 vs 14.46, **8-token runs — not a policy number**).
+
+**Consequence for the new default:** `MOE_HOST_POOL_FRAC=100` is measured on **one** host-expert device (§3.3) and
+should stay the default there; on a multi-device tensor split it over-commits (pool 67.1 GiB + a 73 GiB model on
+96 GiB) and needs the page-cache budget, not a bigger FRAC.  The 2-GPU arms must be re-run with 2000-token
+decodes before any conclusion, and the `-sm tensor` registration gap above is the real blocker for that arm.
+
 **F6 — README §4.2's per-table pool sizing candidate, as specified, is DEGENERATE; the right signal is
 concentration.**  The candidate is "allocate each table's pool slots by its decode heat mass".  A top-k router
 hands every table exactly `n_used` experts per token, so a table's *total* decode routed mass is a constant
@@ -555,19 +580,23 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
    clamps, which is the interesting arm) and the 3-GPU arms before it ships in `patches/`.
 3. **The cov90 prefill trade** (§3.3 item 3): -13/-15 % prefill for +7.5/+16.4 % decode.  Isolate it (is it the
    content ranking or the smaller slot count?) and decide: accept, or give prefill its own staging path.
-4. **The residual 7.9 % at a full pool** (§3.3): the only decode item left on this arm once coverage is
+4. **The 2-GPU `-sm tensor` arm** (§4/F7): `pinned` gets no expert cache there at all and a full pool can stall
+   the prepopulate under page-cache pressure — so the *default* is only validated on one host-expert device, and
+   the tensor-split registration gap (`llama_model_moe_host_expert_dev_count` under the Meta wrapper) is the
+   blocker to fix before the pair arm means anything.  Re-run with 2000-token decodes.
+5. **The residual 7.9 % at a full pool** (§3.3): the only decode item left on this arm once coverage is
    complete, and the pool's own overhead by definition.  Candidates: the per-fill event/`bounce_acquire`
    bookkeeping (pool-only), the eager path's per-op sync (present in `pinned` too), and P0-a's remap (which is
    the +8 % mechanism on 35B-A3B).  Instrument before changing: the copy kind is already excluded (§3.1).
-5. **`mincore` per-read residency + a page-cache budget** (§5.3), on the sub-full-pool / 64 GiB cgroup arms —
+6. **`mincore` per-read residency + a page-cache budget** (§5.3), on the sub-full-pool / 64 GiB cgroup arms —
    now measurable against a calibrated L3 model, and still the honest answer to the maintainer's
    "re-streamed from disk" report for boxes where the set cannot be covered.
-6. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still blocked on freshness (a pool layout
+7. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still blocked on freshness (a pool layout
    epoch in the cold id, or a decode-band layout freeze).  Judge it on 35B-A3B where its ceiling was measured;
    on the 122B the remap is invisible (§3).
-7. Then the remaining P1 items in `README.md`: demand precopy (§4.3) and the two standalone #267 borrows — the
+8. Then the remaining P1 items in `README.md`: demand precopy (§4.3) and the two standalone #267 borrows — the
    bounce-ring cap (0010) and arena-across-prefill (0003) (§4.4).
-8. Only then the Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
+9. Only then the remaining Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
    (which the maintainer places at the very end, as a Flash-Next + PLE effect).
 
 ## 7. Traps (all bitten today or previously)
