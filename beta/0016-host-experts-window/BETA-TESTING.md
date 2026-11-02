@@ -79,13 +79,23 @@ done
 WINDOW EXIT tensors=N reg_fail=0 ml_fail=0 alias_d2d=0 reg_bytes=... cold_eager=... cold_dev=... remap_maps=...
 ```
 
-* `tensors` must equal the number of **host expert tensors** (the `-v` line
-  `host pool (...): H host tensors` gives `H`) — **not** `H/3`.  If it is short by a factor of the
-  device count, the children of one master are not sharing the registration correctly: report it with
-  the trace line and `reg_fail`.
-* `reg_fail` must be `0`.
-* `cold_dev > 0` on the decode band (the DEVREMAP is encoding cold experts, i.e. the alias is live on
-  every device).  Compare with `MOE_EXPERT_TENSOR_REG=0`, which must give `tensors=0`.
+Read it in this order:
+
+* **`reg_fail` must be `0` — this is the headline.**  The registration is shared per HOST TENSOR: the
+  first per-device child of a master registers the range and the other children adopt it.  If the
+  refcount is wrong, the 2nd/3rd child issues its own `cudaHostRegister` for the same range, the
+  runtime refuses it as an overlap, and that device silently loses its alias — which shows up as
+  **`reg_fail` = (devices − 1) × H**, *not* as a short `tensors`.  So `tensors = H` alone does not mean
+  it worked; `reg_fail = 0` is what does.
+* `tensors` should equal the number of **host expert tensors**, one per master (the `-v` line
+  `host pool (...): H host tensors` gives `H`).  Cross-check: `MOE_EXPERT_TENSOR_REG=0` must give
+  `tensors=0`.
+* `cold_dev > 0` on the decode band (the DEVREMAP is encoding cold experts at all) and it should move
+  when the registration moves; `cold_dev = 0` while the arena is sub-residency means the cold seam is
+  not live somewhere.
+* The functional check that covers everything the counters cannot: on the `-sm tensor` arm the
+  `window` and `pool` runs must agree on **acceptance** (exactly) and on **text** (expected; if they
+  differ, first re-check with both arms on `MOE_EXPERT_CACHE_MIB` fixed — see §5 of the README).
 
 Also worth one look: 2 devices at `-sm tensor` (the x8 pair, `HIP_VISIBLE_DEVICES=0,2`) at
 `-ncmoe 48`, 2000+ tokens, since the pair is a different regime for the pool.
