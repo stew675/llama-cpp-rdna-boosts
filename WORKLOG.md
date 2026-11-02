@@ -1,3 +1,23 @@
+## 261102.011 (wip) -- host-expert window: forward the gather capability predicate through the meta backend; beta re-cut a third time
+
+No delivery change.  Continues `261102.010`.  Patch sha256 `3548105…`, beta commit `c326828de`, applied tree
+`01e1abc96d9ffb83eea6fef66a71649940ba3996` (fresh `6050b467c` + `apply-all.sh --include-beta`, byte-identical
+to the measured tree).
+
+**Why.**  Writing the 3-GPU validation prompt surfaced a hole in `261102.010`: `moe_cache_gather_ok` was
+added as the **last** member of `ggml_backend_i`, and the other backends' positional initializers leave it
+NULL — which `sched_input_gatherable` reads as "the historical behaviour, skip staging and hope".  On a
+`-sm tensor` split that is the one dangerous case: the meta gather returns false if ANY device declines, and
+the split then falls to the slow host path *after* staging was skipped (the same collapse measured on a
+simple backend with `--host-experts pool`: 49.6 t/s on the first request against 232-285 with the predicate
+in place).  `ggml_backend_meta_moe_cache_gather_ok` now forwards to every simple backend and answers true
+only if all of them will serve their slice.
+
+**Verification.**  1 GPU cannot construct the meta backend, so the 1-GPU arms are unchanged by construction
+(oracle still 150 chars `sha=4ac3a523160f` for `window` and `pinned`) — the forwarding itself is
+**unverified on hardware** and is item 1 of `BETA-TESTING.md` §3, with a cheap on/off prefill comparison as
+the tell.  Recorded honestly rather than left for the 3-GPU box to trip over.
+
 ## 261102.010 (wip) -- host-expert window: the arena-aware device gather lands prefill at parity and beyond (1037.9 vs pinned 1036.3 t/s); beta re-cut again
 
 No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.009`.

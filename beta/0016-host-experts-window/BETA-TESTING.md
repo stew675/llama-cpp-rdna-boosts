@@ -24,12 +24,12 @@ Expected: 16 block commits, then one beta commit, then
 ```
 NOTE: this checkout includes 1 BETA candidate(s) and is NOT the release tree.
       release.json tree: 1bac1001f1780a5907fbce256ceeeaac8b8561ec
-      applied tree:      74e71c13da593e2e38f9829db79858cc83bcd9ff
+      applied tree:      01e1abc96d9ffb83eea6fef66a71649940ba3996
 ```
 
-If the applied tree is not `74e71c13da593e2e38f9829db79858cc83bcd9ff`, stop: your base or your repo
+If the applied tree is not `01e1abc96d9ffb83eea6fef66a71649940ba3996`, stop: your base or your repo
 checkout has drifted (report it, do not chase it).  The patch sha256 is
-`389df8db054d099051e767303bd1a927d70e3fc2579fcf71a65bff6d681e264c`.
+`3548105406642dff8afbfa0fb82422f8d18dd603549451d22691855077927d63`.
 
 Build with the usual flags — **keep the ROCm include-order guard** (`-isystem<rocm>/include`); without
 it Fedora's ROCm 7.1 headers win and every flash-attention TU fails on `__ocml_exp10_f32`:
@@ -97,6 +97,23 @@ Read it in this order:
 * The functional check that covers everything the counters cannot: on the `-sm tensor` arm the
   `window` and `pool` runs must agree on **acceptance** (exactly) and on **text** (expected; if they
   differ, first re-check with both arms on `MOE_EXPERT_CACHE_MIB` fixed — see §5 of the README).
+
+**NEW, UNVERIFIED HERE: the gather's capability predicate under `-sm tensor`.**  The arena-aware gather is
+default-on, and the scheduler now asks `moe_cache_gather_ok` before it skips whole-table staging.  The meta
+backend forwards that query (true only if *every* device says yes) — that forwarding has **never run on
+hardware**, because a 1-GPU box never constructs the meta backend.  Its failure mode is loud and cheap to
+see: if a device declines *after* staging was already skipped, the split drops onto the host path and
+prefill collapses (measured on a simple backend in the pool case: **49.6 t/s** on the first request, versus
+~232-285 for the same arm with the predicate in place).  So measure prefill with the switch **on and off**:
+
+```bash
+# arm A: gather on (the default)   arm B: gather off (staging, the pre-gather baseline)
+for g in 1 0; do GGML_SCHED_DEVGATHER=$g ./build-rocm/bin/llama-bench -m $M -ngl 99 -ncmoe 40 -sm tensor \
+    --host-experts window -p 2048 -n 128 -r 2 2>&1 | tail -3; done
+```
+
+Expected: A >= B for `window` (1 GPU measured 1038 vs 698).  A **far below** B is the forwarding failing —
+report it with the log; it is a scheduler-side bug, not a data one.
 
 Also worth one look: 2 devices at `-sm tensor` (the x8 pair, `HIP_VISIBLE_DEVICES=0,2`) at
 `-ncmoe 48`, 2000+ tokens, since the pair is a different regime for the pool.

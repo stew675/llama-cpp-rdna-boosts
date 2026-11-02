@@ -1,18 +1,20 @@
-From 4aaff809b39d51cdaba004182af83cfe9ea5ea3d Mon Sep 17 00:00:00 2001
+From e94824ad3804a342619b04dbab067a69c42e8c60 Mon Sep 17 00:00:00 2001
 From: stew675 <stew675@users.noreply.github.com>
-Date: Mon, 2 Nov 2026 15:41:48 -0600
+Date: Mon, 2 Nov 2026 15:51:03 -0600
 Subject: [PATCH] rdna-boosts: (BETA) --host-experts window: ONE residency tier
  for host-resident MoE experts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-A new `--host-experts` mode that makes the page cache itself the host expert tier, plus the arena-aware
-device gather that removes the prefill's host traffic altogether.
+A new `--host-experts` mode that makes the page cache itself the host expert tier, the staging fixes that
+close its prefill gap, and the arena-aware device gather that removes the prefill's host traffic altogether.
 
 POOL keeps the host experts in the read-only model mapping but stages every GPU read through a bounded
 PINNED copy, because a no-XNACK GPU cannot read a pageable address (issue #116).  WINDOW keeps the same
 mapping but REGISTERS each host expert tensor in place once (`cudaHostRegister`), which makes the pages
-device-addressable without locking them: a non-resident expert is then read straight out of the page
-cache, so the miss path has no copy at all and the residency is the VRAM arena plus a reclaimable page
-cache.
+device-addressable without locking them: a non-resident expert is then read straight out of the page cache,
+so the miss path has no copy at all and the residency is the VRAM arena plus a reclaimable page cache.
 
 Prefill (persistent `llama-server`, Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto
 25.38 GiB of a 40.0 GiB host set, request 3, zero disk I/O):
@@ -22,7 +24,7 @@ Prefill (persistent `llama-server`, Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700
 
 So window is at pinned's prefill with pinned's VRAM/RSS cost deleted, and BOTH modes gain ~41 %.
 
-Three pieces, and the prefill ones only work together:
+The pieces, and the prefill ones only work together:
 
 1. `MOE_EXPERT_WINDOW_ALIAS_FILL` default-on (kill switch `=0`): byte-identical, inert without a
    registration, and it deletes the per-table bounce ring (-6.7 GB RSS).
@@ -32,14 +34,14 @@ Three pieces, and the prefill ones only work together:
 3. `moe_cache_stage_table` dispatches on device-READABILITY (`host_dev != nullptr && cold_safe`) instead of
    `host_pinned`, so a registered master takes pinned's single-launch staging path: 1564 launches instead
    of 400356 per-expert `cudaMemcpyAsync` (3.41 s of `__amd_rocclr_copyBuffer` for one prefill pass).
-
 4. The DEVICE GATHER is arena-aware and default-on: a routed expert that is RESIDENT is copied from its
    arena slot (VRAM) and only a non-resident one is read from the host master, so a prefill moves ~8 of 256
    experts per table per ubatch instead of the whole non-resident set (which staging re-reads ~8.7x per
    request, 132.6 GiB).  `moe_cache_gather_ok` is a new backend-iface predicate (appended last, so the other
    backends' positional initializers stay valid) so the scheduler only skips whole-table staging when the
-   backend will really serve the table; a `pool` master has no device-readable alias, keeps staging, and is
-   unchanged (285.3 vs 285.3).  `GGML_SCHED_DEVGATHER=0` is the kill switch.
+   backend will really serve the table; it is forwarded by the meta backend (true only if EVERY device says
+   yes), so a `-sm tensor` split cannot fall onto the host path.  A `pool` master has no device-readable
+   alias, keeps staging, and is unchanged (285.3).  `GGML_SCHED_DEVGATHER=0` is the kill switch.
 
 Correctness of the gather was established against the delivery's own corruption record
 (`archive/work/moe-mmq-overread/RESOLUTION.md`, Hole B).  That record's failure mode is reproduced as a
@@ -47,13 +49,15 @@ positive control on the same binary with `GGML_MOE_GATHER_ONCE=1` (the once-only
 2000 chars of repeated-`/` garbage, 2/2 runs.  This candidate's arm is 1009-1040 t/s with the same 5851-char
 text as `pinned`/`pool`, 3/3 oracle runs, the 3-prompt x n96 matrix byte-identical, prefill-logit mean KLD
 -0.000000 / same-top-p 100.000 % against a `pool` base, and `check-gpu-faults.sh` clean.  Note the logit gate
-alone is BLIND to Hole B (the once-only arm passes it too, at either ubatch) -- the srv cell and the control
-are what decide it.
+alone is BLIND to Hole B (the once-only arm passes it too, at `-c 512` and at `-c 4096 -ub 1024`) -- the srv
+cell and the control are what decide it.
+
+Validated on 1 GPU only; the 3-GPU `-sm tensor` arm is owed (see BETA-TESTING.md §3).
 ---
  common/arg.cpp                                |   6 +
  ggml/include/ggml-backend.h                   |   3 +
  ggml/src/ggml-backend-impl.h                  |   9 +
- ggml/src/ggml-backend-meta.cpp                |   1 +
+ ggml/src/ggml-backend-meta.cpp                |  32 +
  ggml/src/ggml-backend.cpp                     |  34 +-
  ggml/src/ggml-cpu/ggml-cpu.cpp                |   1 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  13 +
@@ -65,7 +69,7 @@ are what decide it.
  include/llama.h                               |   9 +
  src/llama-model-loader.cpp                    |  25 +-
  tools/llama-bench/llama-bench.cpp             |   5 +-
- 15 files changed, 571 insertions(+), 181 deletions(-)
+ 15 files changed, 602 insertions(+), 181 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 9c613053a..386411d77 100644
@@ -131,7 +135,7 @@ index 49f691776..f60e74e26 100644
  
          // (optional) allocate this context's COMPUTE buffers outside the slab and without the chunk
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 84926f87f..b53e85b02 100644
+index 84926f87f..ff47a2e5f 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -336,6 +336,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -142,6 +146,51 @@ index 84926f87f..b53e85b02 100644
      /* .moe_cache_set_host_source = */ nullptr,
      /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
      /* .slab_ring_region     = */ nullptr,
+@@ -4401,6 +4402,36 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
+     return n_backends > 0 ? band : 8;
+ }
+ 
++// wip/host-expert-pinned-window: forward the gather's capability query to every simple backend.  The
++// scheduler asks this BEFORE it skips whole-table staging for a gatherable table; a NULL predicate means
++// "the historical behaviour" (skip and hope), and on a `-sm tensor` split a single declining device makes
++// the meta gather return false, which drops the whole split onto the slow host path (measured on a simple
++// backend with `--host-experts pool`: 49.6 t/s prefill on the first request).  So answer honestly: true only
++// if EVERY device says it will serve its slice.
++static bool ggml_backend_meta_moe_cache_gather_ok(ggml_backend_t backend, const struct ggml_tensor * weight,
++        const struct ggml_tensor * weight_cpy) {
++    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2) {
++        return false;
++    }
++    if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
++        return false;
++    }
++    const size_t              n_backends = ggml_backend_meta_n_backends(backend);
++    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
++    if (ss.n_segments != 1 || ss.nr[0] != 1 || ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
++        return false;
++    }
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
++        if (simple_tensor == nullptr || simple_backend->iface.moe_cache_gather_ok == nullptr ||
++                !simple_backend->iface.moe_cache_gather_ok(simple_backend, weight, simple_tensor)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
+         size_t slice_off, int split_axis) {
+@@ -4495,6 +4526,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
+     /* .moe_cache_remap         = */ nullptr,   // not forwarded: -sm tensor keeps the eager path
++    /* .moe_cache_gather_ok    = */ ggml_backend_meta_moe_cache_gather_ok,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 879c52dd3..2784f8064 100644
 --- a/ggml/src/ggml-backend.cpp

@@ -7,9 +7,9 @@ checkout never contains it.
 | | |
 |---|---|
 | patch | [`host-experts-window.patch`](host-experts-window.patch) |
-| sha256 | `389df8db054d099051e767303bd1a927d70e3fc2579fcf71a65bff6d681e264c` |
+| sha256 | `3548105406642dff8afbfa0fb82422f8d18dd603549451d22691855077927d63` |
 | applies to | `release.json` base `6050b467c` + the 16-block set (`v16-6050b467c-r206`), i.e. **after block 15** |
-| beta commit / tree | `b121ebc7d` / **`74e71c13da593e2e38f9829db79858cc83bcd9ff`** (verified by a fresh `apply-all.sh --include-beta`) |
+| beta commit / tree | `c326828de` / **`01e1abc96d9ffb83eea6fef66a71649940ba3996`** (verified by a fresh `apply-all.sh --include-beta`) |
 | release tree it is cut against | `1bac1001f1780a5907fbce256ceeeaac8b8561ec` |
 | size | 15 files, `+571 −181` (`moe-expert-cache.cu` is `+560 −181` of it) |
 | tested at | 1x R9700 (gfx1201), PCIe 5.0 x16, ROCm 10.1.0 |
@@ -221,3 +221,9 @@ candidate.
   (1706.1 t/s + 2000-char garbage vs 5851-char text here); the logit gate is blind to that defect.  Beta
   commit `b121ebc7d`, applied tree **`74e71c13da593e2e38f9829db79858cc83bcd9ff`**, patch sha256
   **`389df8db…`**, fresh `apply-all.sh --include-beta` verified byte-identical to the measured tree.
+* **2026-11-02 — meta forwarding for the gather predicate (re-cut).**  `moe_cache_gather_ok` is forwarded by
+  the meta backend (true only if **every** device says yes), so a `-sm tensor` split cannot skip staging and
+  then land on the host path.  Beta commit `c326828de`, applied tree
+  **`01e1abc96d9ffb83eea6fef66a71649940ba3996`**, patch sha256 **`3548105…`**.  1-GPU behaviour unchanged
+  (the meta backend is unused there: oracle still `4ac3a523160f`); the forwarding itself is **unverified on
+  hardware** — it is the first thing BETA-TESTING.md §3 exercises.
