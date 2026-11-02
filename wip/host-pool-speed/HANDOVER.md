@@ -265,7 +265,10 @@ tier.**  Both were found while screening README §4.2's sizing candidate, and bo
 
    The 100 % residual is page-cache warmth in the measured arm (the pool prepopulate is `O_DIRECT`, the model
    load is not); the 50/80 agreement is within ~10 %.  The single-tier `shipped` calibration is unchanged by
-   either fix (0.3492 / 0.7513).
+   either fix (0.3492 / 0.7513).  **Use `--pool-init heat-complement`** for a calibration: it is the real layout
+   (the arena is heat-seeded, the pool gets the complement).  With plain `heat` the model puts the hottest 204
+   experts in the pool *and* lets the arena refill from the top, so L3 reads 34.2 MiB/token at `FRAC 80` instead
+   of 48.7 — still the right order, but the wrong layout.
 
 Neither change touches `patches/`; both are recorded in `WORKLOG.md` 261102.001.
 
