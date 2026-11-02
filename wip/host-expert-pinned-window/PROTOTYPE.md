@@ -344,6 +344,34 @@ against a `pool` base; greedy 150 chars `sha=4ac3a523160f` in all four arms; 3 p
 **`srv-test`'s request-3 text hash is not a reproducible oracle** (two `pinned` runs gave `4c88b625a400`
 and `4e2fdac2bfab`), which also retires §8.2b's "identical text on the server path" row.
 
+**Four more results from the same afternoon, all negative (they close the candidate list):**
+
+* **the staged volume is byte-identical** -- `prefill cache staging: ok=3762 unusable=891; arena=646107.1 MiB
+  host=407417.9 MiB (H2D 38.7 %)` is the same string for `pinned` and for window+(A)+(B), so the residual
+  is not "window stages more";
+* **the registration does not tax unrelated kernels** -- `probe-pollution.cpp`: a latency-bound VRAM kernel
+  (dependent loads over 256 MiB) runs 4.97 s alone-with-a-stream, 4.97 s against a pinned stream, 4.97 s
+  against the registered stream and 4.97 s against a `MADV_COLLAPSE`d 2 MiB-page stream, with 145 in-situ
+  registrations (32.7 GiB) live.  So the process-global "address-translation pressure" theory is dead too;
+* **residency is not the lever** -- the deficit is a constant ~6 % wherever the set sits: `-ncmoe` 48
+  pinned 734.5 / window 692.8 (-5.7 %), 32: 788.0 / 736.1 (-6.6 %), 16: 1009.6 / 956.0 (-5.3 %);
+* **run order changes window's number by ~4 %** -- window measures 692.7-693.7 on a quiet box and **662.9**
+  when a `pinned` arm ran first, because that arm's 40 GiB `hipHostMalloc` evicts the page cache the window
+  master lives in.  That is the mode's trade-off showing up as a measurement trap: measure window FIRST, or
+  between two `sync`s plus a page-cache refill, never straight after a pinned arm.
+
+So what is left after all of it: the same kernels, same launch counts, same bytes, running ~6 % slower only
+when the bytes come from a registered page-cache range -- and the only mechanism that removes the host
+traffic instead of accelerating it is the **device gather**, which is the delivery's known-unsound path
+(`archive/work/moe-mmq-overread/RESOLUTION.md` Hole B: the destination's 512 B MMQ guard pad is zeroed once
+per buffer and does not survive a multi-ubatch prefill, so NaN routing skipped expert work and its 2650-3060
+t/s were never real).  Its own follow-up list names what a sound version needs: a destination that is
+persistent and never reused by the graph allocator, a per-ubatch re-arm of the guard pad, and the
+`-sm tensor` redirect fix (`RESOLUTION.md` §"What was tried and rejected").  With window's alias that
+gather would read only the ~8 of 256 experts a ubatch actually routes, i.e. ~30x fewer host bytes -- the
+one change that could put window *ahead* of `pinned` instead of 6 % behind, and the one that would let
+`pinned` be deleted rather than kept for its faster aperture.
+
 ### 8.3 Two findings that are not this campaign's, recorded so nobody re-derives them
 
 * **Q8_K_XL's MTP head is damaged** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`): acceptance is ~0 in

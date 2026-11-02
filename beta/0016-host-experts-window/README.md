@@ -140,6 +140,11 @@ Persistent server (`wip/host-expert-pinned-window/srv-test.sh`; Flash-Next GSQ-R
 (2) alone is neutral (533.0) and (3) alone is a *regression* (515.6, +5 GB RSS): they only work as a
 pair, because (3) sends more tables down the fallback that (2) fixes.
 
+Two measurement traps this cell has, both measured here: measure `window` on a **quiet box** — a preceding
+`pinned` run costs it ~4 % (692.7-693.7 against 662.9) because that arm's 40 GiB `hipHostMalloc` evicts the
+page cache the window master lives in; and the deficit is **residency-independent** (`-ncmoe` 48: 734.5/692.8,
+32: 788.0/736.1, 16: 1009.6/956.0), so it is not something a bigger arena removes.
+
 Purity for this revision: prefill-logit gate against a `--host-experts pool` base — mean KLD
 **-0.000000**, maximum 0.000065, same-top-p **100.000 %** (limits 0.005 / 98 %); greedy text 150 chars
 `sha=4ac3a523160f` in all four arms including `window + ALIAS_FILL=0`; 3 prompts × n96 byte-identical

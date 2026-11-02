@@ -1,3 +1,44 @@
+## 261102.009 (wip) -- host-expert window: the residual 5.7 % is chased to the end of the candidate list; the obvious next lever is a sound device gather
+
+No delivery change; continues `261102.008` (which re-cut the beta).  All of it is in
+`wip/host-expert-pinned-window/` (`PROTOTYPE.md` §8.2c, two new probes) and the beta README.
+
+**What the residual is not.**  Window sits at 692.7-693.7 t/s prefill against `pinned`'s 734.5 (persistent
+server, `-ncmoe 48`, request 3).  Each of these was eliminated by measurement today:
+
+* **not the staged volume** -- the exit counter is the *same string* in both arms (`ok=3762 unusable=891;
+  arena=646107.1 MiB host=407417.9 MiB, H2D 38.7 %`);
+* **not a registration tax on unrelated kernels** -- new `probe-pollution.cpp`: a latency-bound VRAM kernel
+  over 256 MiB takes 4.97 s next to a pinned stream, 4.97 s next to the registered stream and 4.97 s next to
+  a `MADV_COLLAPSE`d 2 MiB-page stream, with 145 in-situ registrations (32.7 GiB) live;
+* **not the aperture, the page size, the geometry, the cold read, DEVREMAP or the alias fill** (recorded in
+  `261102.008`);
+* **not residency** -- the deficit is ~constant: `-ncmoe` 48 pinned 734.5 / window 692.8 (-5.7 %), 32:
+  788.0 / 736.1 (-6.6 %), 16: 1009.6 / 956.0 (-5.3 %);
+* **not launch count, serialization or a missing fusion** -- identical kernel sets and counts, 96 % overlap
+  (recorded in `261102.008`).
+
+**A measurement trap worth its own line.**  Window reads **692.7-693.7** on a quiet box and **662.9** when a
+`pinned` arm ran just before it: that arm's 40 GiB `hipHostMalloc` evicts the page cache the window master
+lives in, and the mode's whole premise is that the page cache is the tier.  Measure window first, or accept
+the ~4 % and say so -- do not compare across arms in the wrong order.  (`srv-test.sh` gained `NCMOE=` for the
+residency axis.)
+
+**The one lever left, and it is the strategic one.**  Everything above says the bytes must be *removed*, not
+moved faster, and the only mechanism that removes them is the **device gather**: it copies only the ~8 of 256
+experts a ubatch actually routes (the staging re-reads the whole 39 % non-resident set ~8.7x per request).
+Its shipped form is known-unsound -- `archive/work/moe-mmq-overread/RESOLUTION.md` Hole B, the destination's
+512 B MMQ guard pad is zeroed once per buffer and does not survive a multi-ubatch prefill, so NaN routing
+skipped expert work and the recorded 2650-3060 t/s were never real -- and that document already lists what a
+sound version needs: a persistent destination the graph allocator never reuses, a per-ubatch re-arm of the
+guard pad, and the `-sm tensor` redirect fix.  Reading it from **window's registered alias** is what could put
+window *ahead* of `pinned`, which is the precondition for the end-game the maintainer wants: delete `pinned`
+(and with it PR #266's `GGML_MOE_DEVREMAP` restriction argument), then delete `pool` (and with it `#266`'s
+`MOE_HOST_POOL_COLD`).
+
+**Owed before promotion, unchanged:** the 3-GPU `-sm tensor` arm, and the MTP four-axis / batched-bench /
+`-ncmoe` matrix / kill-switch gates.
+
 ## 261102.008 (wip) -- host-expert window: prefill 375.9 -> 693.7 t/s (+84 %), 5.7 % behind `pinned`; the beta candidate is re-cut
 
 No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.007`.

@@ -21,6 +21,7 @@ BIN=${BIN:-$HOME/llama-scratch/build-rocm/bin/llama-server}
 MODEL=${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
 PROMPT=${PROMPT:-$HOME/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt}
 NPRED=${NPRED:-2000}
+NCMOE=${NCMOE:-48}   # host-resident MoE layers (the residency axis)
 OUT=${OUT:-$HOME/llama-cpp-rdna-boosts/wip/host-expert-pinned-window/runs/srv}
 REQS=${REQS:-3}
 
@@ -32,7 +33,7 @@ log="$OUT/$tag.log"
 json=$(python3 -c 'import json,sys;print(json.dumps({"prompt":open(sys.argv[1]).read(),"n_predict":int(sys.argv[2]),"temperature":0.0,"seed":42,"cache_prompt":False}))' "$PROMPT" "$NPRED")
 
 IFS="," read -r -a envlist <<< "${SRVENV:-}"
-env "${envlist[@]}" "$BIN" -m "$MODEL" -ngl 99 -ncmoe 48 --override-tensor 'per_layer_token_embd.*=CPU' \
+env "${envlist[@]}" "$BIN" -m "$MODEL" -ngl 99 -ncmoe "$NCMOE" --override-tensor 'per_layer_token_embd.*=CPU' \
     -c 8192 --parallel 1 -fa on -ctk q8_0 -ctv q8_0 -t 8 \
     --fit off --cache-ram 0 --host 127.0.0.1 --port "$port" "$@" > "$log" 2>&1 &
 pid=$!
