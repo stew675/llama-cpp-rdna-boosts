@@ -24,12 +24,12 @@ Expected: 16 block commits, then one beta commit, then
 ```
 NOTE: this checkout includes 1 BETA candidate(s) and is NOT the release tree.
       release.json tree: 1bac1001f1780a5907fbce256ceeeaac8b8561ec
-      applied tree:      2344889727ce4b2746b918232ab16cb2a245f5e1
+      applied tree:      74e71c13da593e2e38f9829db79858cc83bcd9ff
 ```
 
-If the applied tree is not `2344889727ce4b2746b918232ab16cb2a245f5e1`, stop: your base or your repo
+If the applied tree is not `74e71c13da593e2e38f9829db79858cc83bcd9ff`, stop: your base or your repo
 checkout has drifted (report it, do not chase it).  The patch sha256 is
-`56dd1dfeff4d8aac150e53fc97ced7adea69f46d9ae0b3f51ca82eff4ead147e`.
+`389df8db054d099051e767303bd1a927d70e3fc2579fcf71a65bff6d681e264c`.
 
 Build with the usual flags — **keep the ROCm include-order guard** (`-isystem<rocm>/include`); without
 it Fedora's ROCm 7.1 headers win and every flash-attention TU fails on `__ocml_exp10_f32`:
@@ -141,11 +141,17 @@ and its visible effect is a **decode-and-prefill RSS** saving, not a text change
 
 Two more numbers from the 2026-11-02 revision, so you can tell "expected" from "broken" on your box:
 
-* **Prefill** on the persistent-server cell is **5.7 % behind `pinned`** (693.1-693.7 against 734.5-735.0
-  t/s, `-ncmoe 48`, arena auto, request 3 of a 5246-token prompt), with decode at 60.4 (pinned 59.5) and
-  RSS at 68.5 GB (pinned 68.6).  It was 375.9 t/s as first cut.  Do **not** read a prefill number from a
-  process-restarting `llama-cli`/`llama-bench` run for this comparison — those mix page-cache fill into
-  the cost and understate the gap badly (bench said 631 vs 645 where the server says 693 vs 735).
+* **Prefill** on the persistent-server cell is **at parity with `pinned`** through the arena-aware device
+  gather (`window` 1037.9 against `pinned` 1036.3 t/s, `-ncmoe 48`, arena auto, request 3 of a 5246-token
+  prompt), decode 60.1 vs 59.1, RSS 68.5 vs 68.6 GB.  With the gather killed (`GGML_SCHED_DEVGATHER=0`)
+  `window` runs the staging path at ~698 against pinned's ~735.  Do **not** read a prefill number from a
+  process-restarting `llama-cli`/`llama-bench` run: those mix page-cache fill into the cost and understate
+  the gap.
+* **The gather must be validated with its positive control, not just for speed.**  `GGML_MOE_GATHER_ONCE=1`
+  restores the shipped-broken once-only guard (Hole B) and *must* reproduce the corruption — 1706 t/s and
+  ~2000 chars of repeated-`/` garbage on this cell.  If it does **not**, your box is not exercising the
+  multi-ubatch prefill and a clean run proves nothing.  The prefill-logit gate is blind to Hole B, so a KLD
+  pass is not evidence of soundness.
 * The `srv-test` **request-3 text hash is not reproducible** (two `pinned` runs gave `4c88b625a400` and
   `4e2fdac2bfab`), so do not use it as a purity gate: use the short-horizon oracle and acceptance.
 

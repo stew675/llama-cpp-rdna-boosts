@@ -1,88 +1,71 @@
-From 13130ed7e15828d5196b4e6c291dacf2fcd0911a Mon Sep 17 00:00:00 2001
+From 4aaff809b39d51cdaba004182af83cfe9ea5ea3d Mon Sep 17 00:00:00 2001
 From: stew675 <stew675@users.noreply.github.com>
-Date: Mon, 2 Nov 2026 14:28:27 -0600
+Date: Mon, 2 Nov 2026 15:41:48 -0600
 Subject: [PATCH] rdna-boosts: (BETA) --host-experts window: ONE residency tier
  for host-resident MoE experts
 
-A new `--host-experts` mode that makes the page cache itself the host expert tier.
+A new `--host-experts` mode that makes the page cache itself the host expert tier, plus the arena-aware
+device gather that removes the prefill's host traffic altogether.
 
-POOL keeps the host experts in the read-only model mapping but stages every GPU read through a
-bounded PINNED copy, because a no-XNACK GPU cannot read a pageable address (issue #116).  That copy
-is why a POOL miss costs a synchronous host memcpy on the token's critical path, and why the mode
-pins a large slice of RAM.  WINDOW keeps the same mapping but REGISTERS each host expert tensor in
-place once (`cudaHostRegister`), which makes the pages device-addressable without locking them: a
-non-resident expert is then read by the kernel straight out of the page cache, so the miss path has
-no copy at all and the residency is the VRAM arena plus a reclaimable page cache.
+POOL keeps the host experts in the read-only model mapping but stages every GPU read through a bounded
+PINNED copy, because a no-XNACK GPU cannot read a pageable address (issue #116).  WINDOW keeps the same
+mapping but REGISTERS each host expert tensor in place once (`cudaHostRegister`), which makes the pages
+device-addressable without locking them: a non-resident expert is then read straight out of the page
+cache, so the miss path has no copy at all and the residency is the VRAM arena plus a reclaimable page
+cache.
 
-Measured (1x R9700, PCIe 5.0 x16, ROCm 10.1.0, 35B-A3B, `-ncmoe 40`, `llama-bench -p 256 -n 128 -r 2`
-and the four-axis MTP gate at `-n 3000`):
+Prefill (persistent `llama-server`, Flash-Next GSQ-RCO-IQ3_XXS 75.8 GB, 1x R9700, `-ncmoe 48`, arena auto
+25.38 GiB of a 40.0 GiB host set, request 3, zero disk I/O):
 
-  Q4_K_M, arena 4096:      pool 52.3-56.9 tg128  -> window 72.6-77.9  (+35 %)
-  Q8_0 (does not fit), auto arena: pool 51.5/55.6 -> window 60.2/64.6 (+17-24 %),
-                           peak RSS 58.5 GB -> 33.7 GB, MTP +4-12 % with identical acceptance
-  Q8_K_XL, auto arena:     window == pinned (58.6-63.3 vs 58.8-65.7), i.e. parity at high residency
+  pinned, staging   734.5 t/s      window, staging   698.4      pool   232-285
+  pinned, gather   1036.3          window, gather   1037.9      gen window 60.1 / pinned 59.1
 
-Correctness: same-seed greedy text identical (four arms x three prompts, 3/3 runs per arm), the
-four-axis MTP gate's `none` == `draft-mtp` text identical on all four axes with acceptance identical
-to 5 decimals, the kill-switch arms (`MOE_EXPERT_TENSOR_REG=0`, `GGML_MOE_DEVREMAP=0`,
-`MOE_HOST_POOL_COLD=0`) identical, and the whole matrix correct inside a 10 GiB cgroup (the
-registration does not hold the pages: `VmLck` 0.00 MB throughout).
+So window is at pinned's prefill with pinned's VRAM/RSS cost deleted, and BOTH modes gain ~41 %.
 
-Opt-in: the default stays `pinned`.  Nothing else changes; POOL and PINNED keep their exact
-behaviour, and `MOE_EXPERT_TENSOR_REG=0` makes WINDOW behave as POOL on the same binary.
+Three pieces, and the prefill ones only work together:
 
-UPDATE 2026-11-02 (prefill parity, this revision)
------------------------------------------------
-The candidate as first cut was 1.95x behind `pinned` on PREFILL at a host expert set that does not fit
-the arena (`wip/host-expert-pinned-window/HANDOVER-PREFILL-PARITY.md`).  Three changes close most of it:
+1. `MOE_EXPERT_WINDOW_ALIAS_FILL` default-on (kill switch `=0`): byte-identical, inert without a
+   registration, and it deletes the per-table bounce ring (-6.7 GB RSS).
+2. `moe_cache_upload_pageable` stages a range from the registered alias with ONE D2D copy.  That is the
+   fallback for every table the cache staging declines (a stood-down table, the pre-sizing pass), where a
+   registered master used to pay a host memcpy of the whole range per ubatch and `pinned` pays a direct H2D.
+3. `moe_cache_stage_table` dispatches on device-READABILITY (`host_dev != nullptr && cold_safe`) instead of
+   `host_pinned`, so a registered master takes pinned's single-launch staging path: 1564 launches instead
+   of 400356 per-expert `cudaMemcpyAsync` (3.41 s of `__amd_rocclr_copyBuffer` for one prefill pass).
 
-1. `MOE_EXPERT_WINDOW_ALIAS_FILL` is now ON by default in window mode (the env var is the kill switch,
-   per the default-on policy).  It is byte-identical, inert where no registration exists, and it is the
-   only fill source that does not go through the per-table bounce -- so it also deletes that bounce ring.
-2. `moe_cache_upload_pageable` stages a range from the registered alias with ONE D2D copy.  It is the
-   fallback for every table the cache staging declines (a stood-down table, the pre-sizing pass), where
-   a registered master used to pay a HOST MEMCPY of the whole range into the per-table bounce on every
-   ubatch -- while `pinned` pays a direct H2D DMA from its master.
-3. `moe_cache_stage_table` dispatches on device-READABILITY (`host_dev != nullptr && cold_safe`), not on
-   `host_pinned`: a registered master now takes the same single-launch staging path as `pinned`
-   (1 moe_cache_stage_kernel per table).  Before, it fell into the pool branch, where -- with no pool in
-   window mode -- every expert became one `cudaMemcpyAsync`, 400356 of them for a 5246-token prefill
-   against 1564 launches for `pinned` (3.41 s of `__amd_rocclr_copyBuffer` alone).
+4. The DEVICE GATHER is arena-aware and default-on: a routed expert that is RESIDENT is copied from its
+   arena slot (VRAM) and only a non-resident one is read from the host master, so a prefill moves ~8 of 256
+   experts per table per ubatch instead of the whole non-resident set (which staging re-reads ~8.7x per
+   request, 132.6 GiB).  `moe_cache_gather_ok` is a new backend-iface predicate (appended last, so the other
+   backends' positional initializers stay valid) so the scheduler only skips whole-table staging when the
+   backend will really serve the table; a `pool` master has no device-readable alias, keeps staging, and is
+   unchanged (285.3 vs 285.3).  `GGML_SCHED_DEVGATHER=0` is the kill switch.
 
-Persistent-server prefill (`wip/host-expert-pinned-window/srv-test.sh`, Flash-Next GSQ-RCO-IQ3_XXS
-75.8 GB, 1x R9700, `-ncmoe 48`, arena auto 25.38 GiB of a 40.0 GiB host set, `-c 8192`, q8_0 KV,
-request 3 = steady state):
-
-  pinned                 734.5-735.0 t/s prefill   59.5 t/s gen   68.6 GB RSS
-  window as first cut    375.9                     60.2           75.2 GB
-  + (1) alias fill       532.6                     60.4           68.5 GB
-  + (1)(2)(3)            693.1-693.7               60.4           68.5 GB
-
-i.e. +30 % over the first cut, decode at or above `pinned`, RSS at `pinned`'s level.  5.7 % of the
-prefill gap remains and is NOT the launch count, the aperture bandwidth, the page size, the geometry or
-a missing fusion: the same kernels with identical launch counts run 7-21 % slower, worst on the
-latency-bound ones (`moe_cache_stage_kernel` +21 %, `build_mmq_routed_descriptors` +31 %,
-`mm_ids_helper` +18 %, the big matmuls +2 %).  Chasing that is the next campaign step.
-
-Purity for this revision: prefill-logit gate against the `--host-experts pool` base -- mean KLD
--0.000000, maximum 0.000065, same-top-p 100.000 % (limits 0.005 / 98 %); greedy text 150 chars
-sha=4ac3a523160f in all four arms (pinned / pool / window / window+ALIAS_FILL=0); 3 prompts x n96
-byte-identical across the four arms; `scripts/check-gpu-faults.sh` clean on every run.
+Correctness of the gather was established against the delivery's own corruption record
+(`archive/work/moe-mmq-overread/RESOLUTION.md`, Hole B).  That record's failure mode is reproduced as a
+positive control on the same binary with `GGML_MOE_GATHER_ONCE=1` (the once-only guard): 1706.1 t/s and
+2000 chars of repeated-`/` garbage, 2/2 runs.  This candidate's arm is 1009-1040 t/s with the same 5851-char
+text as `pinned`/`pool`, 3/3 oracle runs, the 3-prompt x n96 matrix byte-identical, prefill-logit mean KLD
+-0.000000 / same-top-p 100.000 % against a `pool` base, and `check-gpu-faults.sh` clean.  Note the logit gate
+alone is BLIND to Hole B (the once-only arm passes it too, at either ubatch) -- the srv cell and the control
+are what decide it.
 ---
- common/arg.cpp                         |   6 +
- ggml/include/ggml-backend.h            |   3 +
- ggml/src/ggml-backend-impl.h           |   1 +
- ggml/src/ggml-backend-meta.cpp         |   1 +
- ggml/src/ggml-backend.cpp              |   7 +
- ggml/src/ggml-cpu/ggml-cpu.cpp         |   1 +
- ggml/src/ggml-cuda/ggml-cuda.cu        |   6 +
- ggml/src/ggml-cuda/moe-expert-cache.cu | 469 ++++++++++++++++++-------
- ggml/src/ggml-cuda/moe-expert-cache.h  |   9 +-
- ggml/src/ggml-rpc/ggml-rpc.cpp         |   1 +
- include/llama.h                        |   9 +
- src/llama-model-loader.cpp             |  25 +-
- tools/llama-bench/llama-bench.cpp      |   5 +-
- 13 files changed, 410 insertions(+), 133 deletions(-)
+ common/arg.cpp                                |   6 +
+ ggml/include/ggml-backend.h                   |   3 +
+ ggml/src/ggml-backend-impl.h                  |   9 +
+ ggml/src/ggml-backend-meta.cpp                |   1 +
+ ggml/src/ggml-backend.cpp                     |  34 +-
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |   1 +
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  13 +
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   7 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 624 +++++++++++++-----
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  13 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp                |   1 +
+ include/llama.h                               |   9 +
+ src/llama-model-loader.cpp                    |  25 +-
+ tools/llama-bench/llama-bench.cpp             |   5 +-
+ 15 files changed, 571 insertions(+), 181 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 9c613053a..386411d77 100644
@@ -121,10 +104,25 @@ index 917e49d7b..f03a1d586 100644
      // r143: the model owning this device's host-expert masters is going away; drop the tables it registered.
      GGML_API void                  ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 49f691776..fc7eb1315 100644
+index 49f691776..f60e74e26 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -422,6 +422,7 @@ extern "C" {
+@@ -292,6 +292,14 @@ extern "C" {
+         // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
+         // backends' positional initializers stay valid (NULL).
+         bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
++        // wip/host-expert-pinned-window: can this backend serve THIS routed expert table with the device
++        // gather RIGHT NOW?  The scheduler has to know *before* it skips whole-table staging for a
++        // gatherable table, because a backend that then declines leaves the split on the slow host
++        // fallback (measured on `--host-experts pool`: 232 -> 295 t/s prefill at best, 49.6 on the first
++        // request).  The answer depends on the table's host master being device-readable and its arena
++        // being built, so it cannot be inferred from the iface pointer alone.  Cheap, no side effects.
++        // Kept the last member, so the other backends' positional initializers stay valid (NULL).
++        bool (*moe_cache_gather_ok)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy);
+     };
+ 
+     struct ggml_backend {
+@@ -422,6 +430,7 @@ extern "C" {
          // does not forward-declare a ggml-cuda symbol (issue #130).  Appended like the fields above,
          // so every backend that does not set them is zero-initialized.
          void (*moe_cache_set_host_pool)(ggml_backend_dev_t dev, bool on);
@@ -145,7 +143,7 @@ index 84926f87f..b53e85b02 100644
      /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
      /* .slab_ring_region     = */ nullptr,
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 879c52dd3..ad0fa3ab5 100644
+index 879c52dd3..2784f8064 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -328,6 +328,13 @@ void ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_t dev, bool on) {
@@ -162,6 +160,86 @@ index 879c52dd3..ad0fa3ab5 100644
  void ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const void * tensor_data, const char * path, size_t offs, int n_experts, size_t host_bytes, size_t total_bytes) {
      if (dev == nullptr || dev->iface.moe_cache_set_host_source == nullptr) {
          return;
+@@ -2582,11 +2589,12 @@ static void sched_stage_restore(ggml_backend_sched_t sched) {
+ static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
+ 
+ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+-                                   const struct ggml_tensor * input_cpy) {
++                                   const struct ggml_tensor * input_cpy, const struct ggml_tensor * input) {
+     if (!sched->devgather_enabled) {
+         return false;
+     }
+-    if (sched->backends[split->backend_id]->iface.moe_cache_gather == NULL) {
++    const struct ggml_backend_i * iface = &sched->backends[split->backend_id]->iface;
++    if (iface->moe_cache_gather == NULL) {
+         return false;
+     }
+     // The gather serves the below-gate band, where `sched_stage_issue` skips whole-shard staging
+@@ -2603,6 +2611,12 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+         const struct ggml_tensor * cand = split->graph.nodes[ni];
+         if (cand->op == GGML_OP_MUL_MAT_ID && cand->src[0] == input_cpy && cand->src[2] != NULL &&
+             cand->src[2]->ne[1] > sched_moe_cache_band(sched->backends[split->backend_id])) {
++            // wip/host-expert-pinned-window: ask the backend whether it will really serve this table.  A
++            // `NULL` predicate keeps the historical behaviour (the gather is the only gate).
++            if (iface->moe_cache_gather_ok != NULL && input != NULL &&
++                    !iface->moe_cache_gather_ok(sched->backends[split->backend_id], input, input_cpy)) {
++                return false;
++            }
+             return true;
+         }
+     }
+@@ -2631,7 +2645,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+             continue;
+         }
+         struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, in_cpy)) {
++        if (sched_input_gatherable(sched, split, in_cpy, split->inputs[i])) {
+             return;
+         }
+     }
+@@ -2650,7 +2664,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         }
+         // A routed expert table is deferred to the gather (see sched_input_gatherable).
+         struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, input_cpy, split->inputs[i])) {
+             continue;
+         }
+         n_host_inputs++;
+@@ -2683,7 +2697,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+             continue;
+         }
+         struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, input_cpy, input)) {
+             continue;
+         }
+         const size_t size = ggml_nbytes(input);
+@@ -2965,7 +2979,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             // experts from the host master into `input_cpy`, reading the routing on the device,
+             // so the host ids readback and its full device synchronize are skipped.  A backend
+             // that cannot serve the layout (or the gate off) falls through to the host path.
+-            if (sched_input_gatherable(sched, split, input_cpy) &&
++            if (sched_input_gatherable(sched, split, input_cpy, input) &&
+                 ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
+                 split_backend->iface.moe_cache_gather != NULL) {
+                 // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
+@@ -3325,8 +3339,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
+         // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
+         // persistent/never-reused).
++        // wip/host-expert-pinned-window: DEFAULT ON.  The gather used to lose to whole-table staging for
++        // one reason -- it sent every routed expert over PCIe on every ubatch even when the cache already
++        // held it -- and with the resident experts served from the arena it now measures 1009 t/s against
++        // staging's 698 on the `--host-experts window` cell (pinned: 1020 against 735).  It only fires for a
++        // table whose backend reports `moe_cache_gather_ok`, so a mode that cannot serve the table keeps
++        // staging.  `GGML_SCHED_DEVGATHER=0` is the kill switch.
+         const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
+-        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
++        sched->devgather_enabled = devgather_env == NULL || atoi(devgather_env) != 0;
+         if (sched->stage_enabled) {
+             bool stage_capable = false;
+             for (int b = 0; b < sched->n_backends; b++) {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
 index 30898273c..c34913f35 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
@@ -174,11 +252,55 @@ index 30898273c..c34913f35 100644
      /* .moe_cache_set_host_source = */ nullptr,
      /* .slab_compute_plain   = */ nullptr,
      /* .slab_ring_region     = */ nullptr,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index accf66f03..a9be371eb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -252,6 +252,19 @@ bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tenso
+     return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
+ }
+ 
++// wip/host-expert-pinned-window: will the gather really serve this table?  The scheduler asks BEFORE it
++// skips whole-table staging for a gatherable table, because a backend that then declines leaves the split
++// on the slow host fallback (measured on `--host-experts pool`: 232 -> 295 t/s prefill at best, 49.6 on
++// the first request).  Cheap: the gather's own table lookup, no device work.
++bool ggml_backend_cuda_moe_cache_gather_ok(ggml_backend_t backend, const ggml_tensor * weight,
++                                           const ggml_tensor * weight_cpy) {
++    GGML_UNUSED(backend);
++    if (weight == nullptr || weight_cpy == nullptr) {
++        return false;
++    }
++    return moe_cache_gather_ok(weight, weight_cpy);
++}
++
+ // Sync-free decode device remap (GGML_MOE_DEVREMAP; see the iface comment).
+ bool ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only) {
+     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index 310a748ca..18fb4a8a3 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -21,6 +21,7 @@ bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_
+ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
+ bool   ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis);
+ bool   ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only);
++bool   ggml_backend_cuda_moe_cache_gather_ok(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy);
+ size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend);
+ size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
+ size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fad68b433..3b5d118cd 100644
+index fad68b433..3bb1df4a6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -9546,6 +9546,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -8592,6 +8592,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
+     /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
++    /* .moe_cache_gather_ok     = */ ggml_backend_cuda_moe_cache_gather_ok,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+@@ -9546,6 +9547,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
      moe_cache_set_host_pool(on);
  }
  
@@ -190,7 +312,7 @@ index fad68b433..3b5d118cd 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_t dev,
          const void * tensor_data, const char * path, size_t offs,
          int n_experts, size_t host_bytes, size_t total_bytes) {
-@@ -9694,6 +9699,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9694,6 +9700,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_narrow2_floor      = */ ggml_backend_cuda_device_slab_narrow2_floor,
      /* .slab_compute_narrow2    = */ ggml_backend_cuda_device_slab_compute_narrow2,
      /* .moe_cache_set_host_pool   = */ ggml_backend_cuda_device_moe_cache_set_host_pool,
@@ -199,7 +321,7 @@ index fad68b433..3b5d118cd 100644
      /* .slab_compute_plain        = */ ggml_backend_cuda_device_slab_compute_plain,
      /* .slab_ring_region          = */ ggml_backend_cuda_device_slab_ring_region,
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 334931ecd..6e394a534 100644
+index 334931ecd..956805eec 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -17,6 +17,7 @@
@@ -727,7 +849,40 @@ index 334931ecd..6e394a534 100644
                  out->kind      = cudaMemcpyDeviceToDevice;
                  out->pool_slot = s;
                  out->pool_hit  = false;
-@@ -3050,6 +3194,9 @@ static bool heat_dev_ensure_locked(table_t & t, int device) {
+@@ -2851,6 +2995,7 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
+ // thread and dominated the kernel.
+ static __global__ void moe_cache_gather_kernel(
+         char * __restrict__ dst_base, const char * __restrict__ src_base,
++        const char * __restrict__ arena, int slots, const int32_t * __restrict__ prs,
+         const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
+         int n_used, int n_tok, int n_experts, int n_split,
+         int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis) {
+@@ -2878,6 +3023,24 @@ static __global__ void moe_cache_gather_kernel(
+     const int nt  = blockDim.x;
+     char *       dst = dst_base + (int64_t) e * expert_bytes;
+     const char * src = src_base + (int64_t) e * host_bytes + src_off;
++    // wip/host-expert-pinned-window: a RESIDENT expert comes from the arena slot, not from the host master.
++    // The gather used to send every routed expert over PCIe on every ubatch even when the expert was already
++    // in VRAM, which is the whole reason it lost to whole-table staging; the slot is contiguous
++    // `expert_bytes`, so the chunked split is a flat byte range (the `split_axis`/`host_pitch` geometry is a
++    // property of the HOST master and does not apply to an arena slot).
++    const int slot = prs != nullptr && arena != nullptr ? prs[e] : -1;
++    if (slot >= 0 && slot < slots) {
++        const char *       asrc  = arena + (int64_t) slot * expert_bytes;
++        char *             adst  = dst;
++        const int64_t      chunk = (expert_bytes + n_split - 1) / n_split;
++        const int64_t      off   = (int64_t) s * chunk;
++        const int64_t      len   = expert_bytes - off;
++        if (len <= 0) {
++            return;
++        }
++        moe_cache_policy_copy(adst + off, asrc + off, (size_t) (len < chunk ? len : chunk), tid, nt);
++        return;
++    }
+     if (split_axis != 0 || host_pitch == 0) {
+         const int64_t chunk = (expert_bytes + n_split - 1) / n_split;
+         const int64_t off   = (int64_t) s * chunk;
+@@ -3050,6 +3213,9 @@ static bool heat_dev_ensure_locked(table_t & t, int device) {
  static void free_table_buffers_locked(table_t & t) {
      device_guard dg(t.device >= 0 ? t.device : 0);
      (void) cudaDeviceSynchronize();   // an identity/seed fill may still be in flight on stream 0
@@ -737,7 +892,7 @@ index 334931ecd..6e394a534 100644
      // Everything below is a raw device pointer a captured graph can hold as a launch parameter: the arena
      // and the heat mirrors bump for themselves, the remap/routing staging does not.  Bump once here so no
      // buffer this function frees can be replayed against.
-@@ -4460,6 +4607,11 @@ void moe_cache_forget_all(int device) {
+@@ -4460,6 +4626,11 @@ void moe_cache_forget_all(int device) {
              t.src_fd = -1;
          }
      }
@@ -749,7 +904,7 @@ index 334931ecd..6e394a534 100644
      // The host pool is keyed by the master and holds PINNED memory: it must not outlive the model either.
      for (const void * h : dead_hosts) {
          const auto it = g_host_pools.find(h);
-@@ -5050,6 +5202,18 @@ void moe_cache_set_host_pool(bool on) {
+@@ -5050,6 +5221,18 @@ void moe_cache_set_host_pool(bool on) {
      g_pool_requested = on;
  }
  
@@ -768,7 +923,59 @@ index 334931ecd..6e394a534 100644
  void moe_cache_set_host_source(const void * tensor_data, const char * path, size_t offs,
                                 int n_experts, size_t host_bytes, size_t total_bytes) {
      if (tensor_data == nullptr || path == nullptr || path[0] == '\0') {
-@@ -5530,6 +5694,22 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+@@ -5428,6 +5611,51 @@ static void heat_pull_locked() {
+ }
+ 
+ 
++// The per-table PREFILL RESIDENCY snapshot (`prs_dev` / `prs_host`): expert -> arena slot (`>= 0`) or -1.
++// Two consumers read it -- the whole-table staging kernel and the routed device gather -- so it is rebuilt
++// here whenever the cache wrote (`g_write_seq`), the arena moved or the slot count changed, and uploaded on
++// `stream`, which must be ordered before whatever reads it.  Caller holds `g_mutex`.
++static bool prs_refresh_locked(table_t & t, void * stream) {
++    const uint64_t seq = g_write_seq.load();
++    if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
++        if (t.prs_dev != nullptr) {
++            (void) cudaFree(t.prs_dev);
++            t.prs_dev = nullptr;
++        }
++        if (cudaMalloc((void **) &t.prs_dev, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
++            (void) cudaGetLastError();
++            t.prs_dev = nullptr;
++            return false;
++        }
++        t.prs_n   = t.n_experts;
++        t.prs_gen = 0;
++    }
++    if (t.prs_gen == seq && t.prs_arena == (void *) t.arena && t.prs_slots == t.slots) {
++        return true;
++    }
++    if ((int) t.prs_host.size() != t.n_experts) {
++        t.prs_host.assign((size_t) t.n_experts, -1);
++    } else {
++        std::fill(t.prs_host.begin(), t.prs_host.end(), -1);
++    }
++    for (const auto & kv : t.expert_slot) {
++        const int e = kv.first;
++        if (e >= 0 && e < t.n_experts) {
++            t.prs_host[(size_t) e] = kv.second;
++        }
++    }
++    if (cudaMemcpyAsync(t.prs_dev, t.prs_host.data(), (size_t) t.n_experts * sizeof(int32_t),
++                        cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    t.prs_gen   = seq;
++    t.prs_arena = (void *) t.arena;
++    t.prs_slots = t.slots;
++    g_prs_rebuilds++;
++    return true;
++}
++
+ // Device-side expert gather (B2).  `weight` is the host master, `weight_cpy` the device tensor the op
+ // will read, `ids` the routing (device, strided) and `slice_off`/`split_axis` the per-device slice
+ // geometry (`0`/`-1` for an unsplit table).  Launches one kernel on `stream`; true on success.  No host
+@@ -5530,6 +5758,22 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
          // pinned master has no bytes there either, so the stale destination is the same either way, and a
          // pageable copy of that range would read past the mapping.
          const size_t n_total = std::min(size, span - off);
@@ -791,7 +998,38 @@ index 334931ecd..6e394a534 100644
          size_t done = 0;
          while (done < n_total) {
              const size_t n = std::min(n_total - done, t.host_bytes);
-@@ -5657,19 +5837,26 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5607,6 +5851,30 @@ bool moe_cache_source_pageable(const void * p) {
+     return false;
+ }
+ 
++// wip/host-expert-pinned-window: the capability query the scheduler needs before it skips whole-table
++// staging for a gatherable table.  True only when the gather would really serve it: a device-readable
++// master (pinned, or registered in place by `--host-experts window`) AND a built arena to route the
++// resident experts from.  Without the arena the gather degenerates to the pre-window behaviour -- every
++// routed expert over PCIe, which measured *below* staging -- and without `host_dev` (a pool-backed master)
++// it declines entirely, so either way staging must keep the table.
++bool moe_cache_gather_ok(const ggml_tensor * weight, const ggml_tensor * weight_cpy) {
++    if (weight == nullptr || weight_cpy == nullptr) {
++        return false;
++    }
++    const int n_experts = (int) weight->ne[2];
++    if (n_experts <= 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const table_t & t : g_tables) {
++        if (t.host != weight->data || t.n_experts != n_experts) {
++            continue;
++        }
++        return t.host_dev != nullptr && t.cold_safe && t.arena != nullptr && t.slots > 0;
++    }
++    return false;
++}
++
+ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
+                            const ggml_tensor * ids, void * stream, int device,
+                            size_t slice_off, int split_axis) {
+@@ -5657,19 +5925,42 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // missing from that set - the arena then covers only the tables some other path happened to
      // register (observed: the last layer alone), and the decode band falls below the uncached path.
      // Registration is a cheap map insert and does not allocate (the deferred path leaves slots at 0).
@@ -802,6 +1040,9 @@ index 334931ecd..6e394a534 100644
 +    // `t.host_dev`, which is not necessarily `weight->data`: the alias is resolved through the runtime, so
 +    // reading the host pointer from a kernel would be relying on UVA happening to be the identity.
 +    const char * gather_src = (const char *) weight->data;
++    const char * gather_arena = nullptr;
++    const int32_t * gather_prs = nullptr;
++    int gather_slots = 0;
      {
          const int layer = name_layer(weight);
          if (layer >= 0) {
@@ -815,24 +1056,37 @@ index 334931ecd..6e394a534 100644
              if (table >= 0) {
                  std::lock_guard<std::mutex> lock(g_mutex);
 -                accessible = g_tables[table].host_dev != nullptr;
-+                const table_t & t = g_tables[table];
++                table_t & t = g_tables[table];
 +                accessible = t.host_dev != nullptr;
 +                if (accessible && t.host != nullptr) {
 +                    gather_src = (const char *) t.host_dev + ((const char *) weight->data - (const char *) t.host);
 +                }
++                // wip/host-expert-pinned-window: route a RESIDENT expert from the arena instead of the host.
++                // Without this the gather pays PCIe for every routed expert on every ubatch even when the
++                // cache already holds it -- which is exactly why a correct gather measured below staging
++                // (the r31 record) and why the feature stayed an A/B switch.  The snapshot is refreshed on
++                // the COMPUTE stream here (the same stream this kernel runs on), so no cross-stream order is
++                // needed; `moe_cache_stage_table` keeps refreshing it on the copy stream for the staging
++                // kernel, and the `prs_gen`/arena/slots key means neither rebuilds the other's work.
++                if (accessible && t.arena != nullptr && t.slots > 0 && t.n_experts == n_experts &&
++                        prs_refresh_locked(t, stream)) {
++                    gather_arena = (const char *) t.arena;
++                    gather_prs   = t.prs_dev;
++                    gather_slots = t.slots;
++                }
              }
              if (!accessible) {
                  return false;
-@@ -5719,7 +5906,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5719,7 +6010,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
          }
      }
      moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 -        (char *) weight_cpy->data, (const char *) weight->data,
-+        (char *) weight_cpy->data, gather_src,
++        (char *) weight_cpy->data, gather_src, gather_arena, gather_slots, gather_prs,
          (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
          (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis);
      if (cudaGetLastError() != cudaSuccess) {
-@@ -5755,11 +5942,16 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5755,11 +6046,16 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
          // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
          // pageable master must never reach the ring through the pageable upload).
@@ -851,7 +1105,7 @@ index 334931ecd..6e394a534 100644
              return false;
          }
          const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
-@@ -5797,7 +5989,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5797,7 +6093,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          // `<= -2` pool slot `-v-2`, `-1` in neither), so the kernel needs no extra bookkeeping; the experts
          // in NEITHER tier are still copied here, one at a time, because each of those is a distinct read
          // from the mapping/disk.
@@ -860,7 +1114,66 @@ index 334931ecd..6e394a534 100644
              host_pool_t * pool = table_pool_locked(t);
              cudaError_t   err  = cudaSuccess;
              {
-@@ -6529,12 +6721,30 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -5919,48 +6215,17 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+             return true;
+         }
+ 
+-        // Refresh the immutable snapshot when the cache wrote since we built it, or the arena moved.
++        // Refresh the immutable snapshot when the cache wrote since we built it, or the arena moved.  The
++        // snapshot covers the whole arena (no freeze partition): it is rebuilt whenever the cache writes
++        // (`g_write_seq`), the arena moves or the slot count changes, and the decode path never mutates it,
++        // so a resident expert can never change under the staging kernel.  Upload on the COPY stream: the
++        // staging kernel follows it on the same stream, so the map is ordered where it is read, and the copy
++        // stream is NOT forced to wait for the compute stream just because a map was (re)built.  Only an
++        // arena write orders against compute below.  (`prs_refresh_locked` is shared with the gather, which
++        // refreshes on the compute stream for the same reason.)
+         const uint64_t seq = g_write_seq.load();
+-        if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
+-            if (t.prs_dev != nullptr) {
+-                (void) cudaFree(t.prs_dev);
+-                t.prs_dev = nullptr;
+-            }
+-            if (cudaMalloc((void **) &t.prs_dev, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                t.prs_dev = nullptr;
+-                return false;
+-            }
+-            t.prs_n   = t.n_experts;
+-            t.prs_gen = 0;
+-        }
+-        if (t.prs_gen != seq || t.prs_arena != (void *) t.arena || t.prs_slots != t.slots) {
+-            if ((int) t.prs_host.size() != t.n_experts) {
+-                t.prs_host.assign((size_t) t.n_experts, -1);
+-            } else {
+-                std::fill(t.prs_host.begin(), t.prs_host.end(), -1);
+-            }
+-            for (const auto & kv : t.expert_slot) {
+-                const int e = kv.first;
+-                if (e >= 0 && e < t.n_experts) {
+-                    t.prs_host[(size_t) e] = kv.second;
+-                }
+-            }
+-            // The snapshot covers the whole arena (no freeze partition): it is rebuilt whenever the cache
+-            // writes (`g_write_seq`), the arena moves or the slot count changes, and the decode path never
+-            // mutates it, so a resident expert can never change under the staging kernel.
+-            // Upload on the COPY stream: the staging kernel follows it on the same stream, so the map is
+-            // ordered where it is read, and the copy stream is NOT forced to wait for the compute stream
+-            // just because a map was (re)built.  Only an arena write orders against compute below.
+-            if (cudaMemcpyAsync(t.prs_dev, t.prs_host.data(), (size_t) t.n_experts * sizeof(int32_t),
+-                                cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                return false;
+-            }
+-            t.prs_gen   = seq;
+-            t.prs_arena = (void *) t.arena;
+-            t.prs_slots = t.slots;
+-            g_prs_rebuilds++;
++        if (!prs_refresh_locked(t, copy_stream)) {
++            return false;
+         }
+ 
+         // Order the copy stream after the compute stream ONLY when the arena may have been written since
+@@ -6529,12 +6794,30 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
          for (int e = 0; e < t.n_experts; e++) {
              t.dr_map_host[e] = t.slots + e;
          }
@@ -891,7 +1204,7 @@ index 334931ecd..6e394a534 100644
          if (cudaMemcpyAsync(t.dr_map_dev, t.dr_map_host, (size_t) t.n_experts * sizeof(int32_t),
                              cudaMemcpyHostToDevice, s) != cudaSuccess) {
              (void) cudaGetLastError();
-@@ -6933,6 +7143,15 @@ void moe_cache_report() {
+@@ -6933,6 +7216,15 @@ void moe_cache_report() {
      }
      const int64_t total = hits + misses;
      const double h = total > 0 ? (double) hits / (double) total : 0.0;
@@ -908,7 +1221,7 @@ index 334931ecd..6e394a534 100644
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 86e3f6c53..808e18692 100644
+index 86e3f6c53..831790be4 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -225,9 +225,12 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
@@ -927,6 +1240,17 @@ index 86e3f6c53..808e18692 100644
  
  // LFRU residency decision + alias for expert `expert` of `table`.  The single compute-path seam.
  moe_cache_alias moe_cache_alias_get(int table, int expert);
+@@ -281,6 +284,10 @@ bool moe_cache_gather_host(const struct ggml_tensor * weight, const struct ggml_
+                            const struct ggml_tensor * ids, void * stream, int device,
+                            size_t slice_off, int split_axis);
+ 
++// wip/host-expert-pinned-window: whether the device gather can serve this routed expert table right now
++// (device-readable master + a built arena).  The scheduler consults it before skipping whole-table staging.
++bool moe_cache_gather_ok(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy);
++
+ // wip/host-expert-master-drop (TODO #55): true when `p` lies inside a host expert master that is NOT
+ // pinned (the pool-backed, file-mapping-backed master).  A device copy must not treat such a pointer as a
+ // pinned source, and a kernel must not read it in place.
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 index 186b3436b..98bf86787 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp

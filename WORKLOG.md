@@ -1,3 +1,69 @@
+## 261102.010 (wip) -- host-expert window: the arena-aware device gather lands prefill at parity and beyond (1037.9 vs pinned 1036.3 t/s); beta re-cut again
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.009`.
+`beta/0016-host-experts-window/` re-cut: patch sha256 `389df8db…`, beta commit `b121ebc7d`, applied tree
+`74e71c13da593e2e38f9829db79858cc83bcd9ff` (fresh `6050b467c` + `apply-all.sh --include-beta`, verified
+byte-identical to the tree measured).  15 files, `+571 −181`.
+
+**The gather was already there, already sound, and already losing.**  `moe_cache_gather_host` has been in
+the tree since the MoE campaign, r206 already re-arms the MMQ guard pad on **every** gather (Hole B fixed;
+`GGML_MOE_GATHER_ONCE=1` restores the old arm), and it reads `t.host_dev` so a *registered* master works too.
+It stayed default-off because a correct gather still lost to whole-table staging — it sent every routed
+expert over PCIe on every ubatch even when the cache already held it, which is the 132.6 GiB-per-request
+re-read that `261102.009` could not get rid of any other way.
+
+**The change: a resident expert comes from its arena slot.**
+
+1. `moe_cache_gather_kernel` takes (`arena`, `slots`, `prs`); a resident routed expert is a VRAM copy, only
+   a non-resident one is read from the host master, so a prefill moves ~8 of 256 experts per table per
+   ubatch instead of the whole non-resident set.
+2. The residency snapshot is factored into `prs_refresh_locked` and shared with the staging path; the gather
+   refreshes it on the **compute** stream (same stream the kernel runs on), so no cross-stream order is
+   needed and the `prs_gen`/arena/slots key stops either consumer rebuilding the other's work.
+3. Default-on required a capability predicate: the scheduler skips whole-table staging for a gatherable
+   table *before* it knows whether the backend will serve it, and a `pool` master has no device-readable
+   alias — forced on, pool fell to the host path (**49.6 t/s** on the first request).  `moe_cache_gather_ok`
+   is appended to `ggml_backend_i` as the **last** member (so the other backends' positional initializers
+   stay valid, the same rule `moe_cache_remap` documents) and the scheduler asks it before skipping staging.
+
+Persistent server (`-ncmoe 48`, arena auto, request 3, quiet box):
+
+| arm | prefill | gen |
+|---|---|---|
+| `window`, staging | 698.4 | 60.1 |
+| **`window`, gather (default)** | **1037.9-1040.3** | **60.1** |
+| `pinned`, staging | 734.5 | 59.5 |
+| `pinned`, gather (default) | 1036.3-1040.5 | 59.1 |
+| `pool` (staging, unchanged) | 285.3 | 48.8 |
+
+So `window >= pinned` on **prefill and decode** with zero pinned host RAM — the precondition for the
+maintainer's end-game (drop `pinned`; then `pool`, and with it PR #266's `MOE_HOST_POOL_COLD`; `DEVREMAP`
+keys off `host_dev` and survives).  `GGML_SCHED_DEVGATHER=0` is the kill switch.
+
+**Cleared against Hole B with a control, not a speed comparison** -- the point the maintainer raised, and the
+delivery's own record (`archive/work/moe-mmq-overread/RESOLUTION.md`) makes it mandatory:
+
+* `GGML_MOE_GATHER_ONCE=1` on the same binary reproduces the documented corruption exactly: **1706.1 t/s**
+  and **2000 chars** of repeated-`/` garbage, 2/2 runs (the correct arms give 5851 chars, the same text as
+  `pinned`/`pool`);
+* the candidate arm: 1009-1040 t/s, 5851-char text, oracle 150 chars `sha=4ac3a523160f` 3/3 in
+  `window`/`pinned`/`pool`, 3 prompts x n96 byte-identical, prefill-logit mean KLD **-0.000000** / max
+  0.000065 / same-top-p **100.000 %** against a `pool` base, `check-gpu-faults.sh` clean on every log;
+* byte accounting: the gather moves ~97 % fewer host bytes than staging and runs *below* what staging
+  already achieves per byte — the opposite of the 2650-3060 t/s the record condemns (which exceeded the PCIe
+  ceiling for the bytes it had to move).
+
+**Two cautions recorded for the next reader.**  (a) **The prefill-logit gate is blind to Hole B**: the
+once-only arm passes it at rounding level at `-c 512` *and* at `-c 4096 -ub 1024`, so a KLD pass is NOT
+evidence that a gather is sound — the server cell plus the `GGML_MOE_GATHER_ONCE` control decide it.  (b) A
+corrupted gather reads ~1.7x its neighbours, so a gather "win" of that size is a corruption signature.
+
+**Owed before promotion:** the 3-GPU `-sm tensor` arm on the other box (the gather is per device and
+`moe_cache_gather_ok` is per backend, so the tensor path should take it, but that is unproven — `reg_fail=0`,
+`tensors=` = host tensor count, `cold_dev>0`), and the MTP four-axis / batched-bench / `-ncmoe` matrix /
+kill-switch arms (`GGML_SCHED_DEVGATHER=0`, `MOE_EXPERT_WINDOW_ALIAS_FILL=0`, `MOE_EXPERT_TENSOR_REG=0`,
+`GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0`).
+
 ## 261102.009 (wip) -- host-expert window: the residual 5.7 % is chased to the end of the candidate list; the obvious next lever is a sound device gather
 
 No delivery change; continues `261102.008` (which re-cut the beta).  All of it is in

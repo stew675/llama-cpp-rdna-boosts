@@ -7,11 +7,11 @@ checkout never contains it.
 | | |
 |---|---|
 | patch | [`host-experts-window.patch`](host-experts-window.patch) |
-| sha256 | `56dd1dfeff4d8aac150e53fc97ced7adea69f46d9ae0b3f51ca82eff4ead147e` |
+| sha256 | `389df8db054d099051e767303bd1a927d70e3fc2579fcf71a65bff6d681e264c` |
 | applies to | `release.json` base `6050b467c` + the 16-block set (`v16-6050b467c-r206`), i.e. **after block 15** |
-| beta commit / tree | `8417ede3c` / **`2344889727ce4b2746b918232ab16cb2a245f5e1`** (verified by a fresh `apply-all.sh --include-beta`) |
+| beta commit / tree | `b121ebc7d` / **`74e71c13da593e2e38f9829db79858cc83bcd9ff`** (verified by a fresh `apply-all.sh --include-beta`) |
 | release tree it is cut against | `1bac1001f1780a5907fbce256ceeeaac8b8561ec` |
-| size | 13 files, `+410 −133` (`moe-expert-cache.cu` is `+466 −133` of it) |
+| size | 15 files, `+571 −181` (`moe-expert-cache.cu` is `+560 −181` of it) |
 | tested at | 1x R9700 (gfx1201), PCIe 5.0 x16, ROCm 10.1.0 |
 
 ## What it adds
@@ -91,17 +91,11 @@ either), and `window ≥ pinned` on throughput in every cell measured — at **z
    is the only place to prove it.  Look for **all children registering** (`MOE_EXPERT_WINDOW_TRACE=1`
    prints `tensors=N`; it must equal the host tensor count × devices, not ×1) and for the DevREMAP/cold
    arms being live on every device.
-2. **Prefill is 5.7 % behind `pinned`** on the persistent-server cell that matters (693 against 735 t/s
-   at a host expert set that does not fit the arena; it was 375.9 — 1.95× behind — as first cut).  The
-   remaining difference is *not* dispatch: the two arms now issue the same kernels with the same launch
-   counts, and the same kernels each run 7-21 % slower, worst on the latency-bound ones
-   (`moe_cache_stage_kernel` +21 %, `build_mmq_routed_descriptors` +31 %, `mm_ids_helper` +18 %, the big
-   matmuls +2 %).  The master's read *bandwidth* is not it (a probe measures 52 GiB/s for a pinned
-   buffer and for the registered mapping alike, including the exact in-situ copy shape), and neither is
-   page size.  Recorded as the next campaign step; see the *Prefill parity* section and
-   `wip/host-expert-pinned-window/HANDOVER-PREFILL-PARITY.md`.
-   `MOE_EXPERT_WINDOW_ALIAS_FILL` itself is no longer a gap: it is byte-identical, it removes the
-   per-table bounce ring (-6.7 GB RSS), and it is now the default.
+2. **`-sm tensor` / multi-device** is the only structural gap left (see 1).  Prefill parity is **reached**:
+   `window` 1037.9 t/s against `pinned` 1036.3 on the persistent-server cell, because the arena-aware device
+   gather is now default-on for both modes — and `pool` is untouched (285.3 t/s, staging kept by the new
+   capability predicate).  See *Prefill parity* below for the numbers and for the corruption control that
+   this feature must be validated against.
 3. **`MOE_EXPERT_WINDOW_MIB` / `MOE_EXPERT_WINDOW`**: deleted.  The registration is whole-tensor and
    does not hold pages, so there is no byte budget to set — a budget would need *windowed* registration,
    which is deliberately not implemented.
@@ -136,6 +130,7 @@ Persistent server (`wip/host-expert-pinned-window/srv-test.sh`; Flash-Next GSQ-R
 | `window`, first cut | 375.9 | 60.2 | 75.2 GB |
 | `window` + (1) | 532.6 | 60.4 | 68.5 GB |
 | `window` + (1)(2)(3) | **693.1-693.7** | 60.4 | 68.5 GB |
+| `window` + (1)(2)(3) + arena-aware gather | **1037.9-1040.3** | 60.1 | 68.5 GB |
 
 (2) alone is neutral (533.0) and (3) alone is a *regression* (515.6, +5 GB RSS): they only work as a
 pair, because (3) sends more tables down the fallback that (2) fixes.
@@ -145,10 +140,41 @@ Two measurement traps this cell has, both measured here: measure `window` on a *
 page cache the window master lives in; and the deficit is **residency-independent** (`-ncmoe` 48: 734.5/692.8,
 32: 788.0/736.1, 16: 1009.6/956.0), so it is not something a bigger arena removes.
 
+### The arena-aware device gather (default on)
+
+Whole-table staging re-reads the entire **non-resident** part of the host set on every ubatch (~132.6 GiB
+per request on this cell, ~8.7× the set), while a prefill only routes ~8 of 256 experts per table.  The
+device gather copies just those — and, new here, it copies a **resident** expert from its **arena slot**
+instead of from the host, so only a miss crosses PCIe.  Measured on the persistent-server cell:
+
+| arm | prefill req3 | gen |
+|---|---|---|
+| `window`, staging | 698.4 | 60.1 |
+| **`window`, gather (default)** | **1037.9** | **60.1** |
+| `pinned`, staging | 734.5 | 59.5 |
+| `pinned`, gather (default) | 1036.3 | 59.1 |
+| `pool` (staging, unchanged) | 285.3 | 48.8 |
+
+`moe_cache_gather_ok` (a new backend-iface predicate, appended last so the other backends' positional
+initializers stay valid) is what makes this safe to default: the scheduler only skips whole-table staging
+when the backend will really serve the table.  A `pool` master has no device-readable alias, so it keeps
+staging — without the predicate it fell to the slow host path (49.6 t/s on the first request).
+`GGML_SCHED_DEVGATHER=0` is the kill switch.
+
+**Validate it against the delivery's corruption record, not just for speed.**  `archive/work/moe-mmq-overread/
+RESOLUTION.md` (Hole B) is the reason the gather was switched off in 2026-10: if the MMQ guard pad at the
+head of every expert slot is not finite, the over-read poisons the tile, routing goes NaN and expert work is
+*skipped*, which reads as a large fake speed-up.  The once-only guard is still reachable as a **positive
+control** on the same binary — `GGML_MOE_GATHER_ONCE=1` — and it reproduces exactly that: **1706.1 t/s** and
+**2000 chars** of repeated-`/` garbage (2/2 runs), against this candidate's 1009-1040 t/s and the same
+5851-char text as `pinned`/`pool`.  Note the **prefill-logit gate is blind to it** (the once-only arm passes
+it too, at `-c 512` and at `-c 4096 -ub 1024`), so a KLD pass is *not* evidence the gather is sound: use the
+server cell plus the control, and the byte accounting (the gather moves ~97 % fewer host bytes, so its rate
+is *below* what staging already achieves per byte, unlike the 2650-3060 t/s the record condemns).
+
 Purity for this revision: prefill-logit gate against a `--host-experts pool` base — mean KLD
 **-0.000000**, maximum 0.000065, same-top-p **100.000 %** (limits 0.005 / 98 %); greedy text 150 chars
-`sha=4ac3a523160f` in all four arms including `window + ALIAS_FILL=0`; 3 prompts × n96 byte-identical
-across the four arms.  **Note:** the `srv-test` request-3 text hash is **not** a reproducible oracle
+`sha=4ac3a523160f` in `pinned` / `pool` / `window` on the default build; 3 prompts × n96 byte-identical.  **Note:** the `srv-test` request-3 text hash is **not** a reproducible oracle
 (two `pinned` runs gave `4c88b625a400` and `4e2fdac2bfab`, same length class, at 2000 tokens), so gate on
 the short-horizon oracle plus acceptance, exactly as `INVARIANTS.md` says for a MoE.
 
@@ -187,3 +213,11 @@ candidate.
   **`2344889727ce4b2746b918232ab16cb2a245f5e1`**, patch sha256 **`56dd1dfe…`**; fresh
   `apply-all.sh --include-beta` on `6050b467c` verified and **byte-identical to the tree measured**
   (`git diff efaa60db0 HEAD` == the work-tree diff).  Still awaiting the 3-GPU `-sm tensor` arm.
+* **2026-11-02 — arena-aware device gather, default on.**  A routed expert that is resident is now copied
+  from its arena slot, so a prefill moves ~8 of 256 experts per table per ubatch instead of the whole
+  non-resident set: **window 1037.9 vs pinned 1036.3 t/s** (both were ~698/735 on staging), `pool` unchanged
+  at 285.3 via the new `moe_cache_gather_ok` capability predicate, `GGML_SCHED_DEVGATHER=0` the kill
+  switch.  Correctness is established against Hole B with `GGML_MOE_GATHER_ONCE=1` as a **positive control**
+  (1706.1 t/s + 2000-char garbage vs 5851-char text here); the logit gate is blind to that defect.  Beta
+  commit `b121ebc7d`, applied tree **`74e71c13da593e2e38f9829db79858cc83bcd9ff`**, patch sha256
+  **`389df8db…`**, fresh `apply-all.sh --include-beta` verified byte-identical to the measured tree.

@@ -372,6 +372,48 @@ gather would read only the ~8 of 256 experts a ubatch actually routes, i.e. ~30x
 one change that could put window *ahead* of `pinned` instead of 6 % behind, and the one that would let
 `pinned` be deleted rather than kept for its faster aperture.
 
+### 8.2d The gather, rebuilt: prefill parity and then some (2026-11-02, later)
+
+The §8.2c conclusion was "remove the bytes, do not move them faster", and the only mechanism that does that
+is the device gather.  It was already in the tree and already **sound** (r206 re-arms the MMQ guard pad on
+every gather; `GGML_MOE_GATHER_ONCE=1` restores the once-only Hole-B arm), and it was default-off because a
+*correct* gather still lost to staging — it sent every routed expert over PCIe on every ubatch even when the
+cache already held it.
+
+The fix is one idea: **a resident expert comes from its arena slot.**  `moe_cache_gather_kernel` now takes
+(`arena`, `slots`, `prs`), the residency snapshot is factored into `prs_refresh_locked` and shared with the
+staging path (the gather refreshes it on the *compute* stream so no cross-stream order is needed), and the
+result is that a prefill moves ~8 of 256 experts per table per ubatch instead of the whole non-resident set
+(~132.6 GiB per request, re-read ~8.7x).
+
+Default-on needed one more thing: the scheduler skips whole-table staging for a gatherable table *before* it
+knows whether the backend will serve it, and a `pool` master has no device-readable alias — with the switch
+forced on, pool fell to the host path (49.6 t/s on the first request).  `moe_cache_gather_ok`, a predicate
+appended to `ggml_backend_i` (last member, so the other backends' positional initializers stay valid), lets
+the scheduler ask first.  `GGML_SCHED_DEVGATHER=0` is the kill switch; the delivery-wide default is now ON.
+
+| arm (srv-test req3, quiet box) | prefill | gen |
+|---|---|---|
+| `window`, staging | 698.4 | 60.1 |
+| **`window`, gather** | **1037.9** | **60.1** |
+| `pinned`, staging | 734.5 | 59.5 |
+| `pinned`, gather | 1036.3 | 59.1 |
+| `pool` (staging, unchanged by the capability gate) | 285.3 | 48.8 |
+
+**How it was cleared against Hole B.**  The delivery's record condemns this feature's numbers once, so the
+verification is a *control*, not a speed comparison: `GGML_MOE_GATHER_ONCE=1` on the same binary reproduces
+the corruption exactly (1706.1 t/s, 2000 chars of repeated-`/` garbage, 2/2), while the candidate gives
+1009-1040 t/s and the same 5851-char text as `pinned`/`pool`, 3/3 oracle runs, the 3-prompt x n96 matrix
+byte-identical, prefill-logit mean KLD -0.000000 / same-top-p 100.000 % and clean
+`check-gpu-faults.sh` logs.  Two cautions recorded for the future: **the prefill-logit gate is blind to
+Hole B** (the once-only arm passes it at `-c 512` *and* at `-c 4096 -ub 1024`), and the corrupted arm's rate
+is ~1.7x the honest one — so a gather "win" over ~1.7x its neighbours is a corruption signature, not a
+tuning result.
+
+With this, `window >= pinned` on prefill *and* decode at zero pinned host RAM, which is the precondition for
+the maintainer's end-game: delete `pinned` (the mode is now only a *where do the bytes live* choice), then
+`pool` — and with it PR #266's `MOE_HOST_POOL_COLD`.  `GGML_MOE_DEVREMAP` keys off `host_dev`, so it survives.
+
 ### 8.3 Two findings that are not this campaign's, recorded so nobody re-derives them
 
 * **Q8_K_XL's MTP head is damaged** (`/llm/models/Qwen3.6/35B-A3B/Q8_K_XL/`): acceptance is ~0 in
