@@ -6,19 +6,33 @@ the plan; this file holds the state, the measurements taken and the next actions
 
 ## 0. Status, and the ONE thing to do next
 
-**Session 2 (2026-11-02, overnight) — F3 is RESOLVED, and it was not a delivery bug.**  `--host-experts pool`
-activates on the 122B exactly as it does on 35B-A3B (144 host tables, `ROCm_HostMap` buffers, a 204/256-slot
-pool = 53.7 GiB pinned, `pool_decide_dio_locked`/`pool_clamp_slots_to_ram`/`table_pool_locked`/
-`pool_prepopulate_locked`/`pool_rerank_from_heat_locked` all print).  Session 1's three pool measurements were
-mis-read: (1) `-lv 3` cannot print **any** libllama INFO line (`LLAMA_LOG_INFO` maps to verbosity **4**), so the
-lines F3 said to look for were unreachable; (2) `moe_cache_report` is an `atexit` hook that runs **after**
-`moe_cache_forget_all`, so `host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned` is printed by *every* run in
-every mode — the 35B control log reads identically; (3) the 22.34 t/s row labelled `--host-experts pool` had no
-pool in it at all (zero `host pool (L2)` lines vs one for every real pool run), i.e. that invocation did not
-carry the flag.  Full evidence and the corrected session-1 table: §4/F3.
+**Session 2 (2026-11-02, overnight) — the blocking finding was a false alarm, the baseline is measured, and the
+decode lever is identified.**
 
-**Next action, exactly:** the pool-vs-pinned baseline at the real auto arena is now running (`tools/
-run-arms-122b.sh`, §6 step 2); then F5's per-read residency (§5) and F2's replayer reconciliation (§4).
+1. **F3 is RESOLVED and there is no delivery bug** (§4/F3): `--host-experts pool` activates on the 122B exactly as
+   on 35B-A3B (144 host tables, `ROCm_HostMap`, a 204/256-slot pool, clamped, prepopulated, re-ranked).  Session 1
+   mis-read three artifacts: `LLAMA_LOG_INFO` needs `-lv 4` (so `-lv 3` cannot show any of the lines F3 looked
+   for), `moe_cache_report` is an `atexit` hook that prints **after** the cache is un-sized (so
+   `host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned` is printed by every run in every mode — the 35B "control"
+   reads identically), and the 22.34 t/s row labelled "pool" had no pool in it.
+2. **The pool baseline is measured** (§3): `pinned` 22.33 +/- 0.06, `pool`/`O_DIRECT` **17.76 +/- 0.03
+   (-20.5 %)**, `pool`/buffered 15.22-18.10 (unstable).  Prefill -7.5 %.  The `DIO` boolean is *free* here (§5.1).
+3. **The decode lever is pool COVERAGE, through demand disk reads** (§3.2): at `FRAC` 50 / 80 / 100 decode is
+   11.75 / 17.76 / **20.59** t/s with 366 / 165 / 100 GiB read per run (~163 / ~53 / ~13 MiB per decode token).
+   A *full* pool still trails `pinned` by **7.8 %** (the maintainer's observation, with a number), and the shipped
+   `FRAC 80` default costs **16 %** against full coverage on this box.  The copy kind is excluded (D2D == H2D,
+   §3.1).
+4. **F2 is RESOLVED, and the two-tier model is now calibrated against the disk tier** (§4/F2): the runtime's `h=`
+   is decode-band only (`--score-band decode` is now the default; +0.0004 / -0.0030 error), and two pool-model
+   defects are fixed so the model predicts 160 / 49 / 0 MiB of L3 per token at `FRAC` 50 / 80 / 100 against
+   ~163 / ~53 / ~13 measured.
+5. **The first screening-passed candidate**: README §4.2's "size the pool by heat mass" is *degenerate* (every
+   table routes `n_used` experts per token, so its mass is a constant), but a **concentration**-based sizing
+   (`cov90`) separates at **-42 % disk bytes/token** at `FRAC 80` (§4/F6).
+
+**Next action, exactly:** implement `cov90` per-table pool sizing (§4/F6) from `heat_dec` under the same
+`RAM_PCT` ceiling, env-gated, and run the arm pair against `data/20261102-frac/`'s FRAC-80 baseline
+(17.76 t/s, ~165 GiB read).  Then the full-coverage default question (§3.2) and the residual 7.8 % at a full pool.
 
 ## 1. What the campaign is (do not re-derive)
 
@@ -521,8 +535,17 @@ re-specified into a screening-passed one (§4/F6).  What is left, in priority or
   `patches/` change; `all` remains a diagnostic.
 - **D3 — F5 is re-scoped:** per-read residency is a *sub-full-pool / cgroup* feature, not a reference-arm one.
   The reference arm's lever is the copy kind (§5.2), so that is what session 3 chases first.
-- **D4 — `wip/host-pool-speed/data/20261102-session2-*/` keeps every arm log and the gzipped calibration trace
+- **D4 — `wip/host-pool-speed/data/20261102-*/` keeps every arm log and the gzipped calibration trace
   (9.1 MB)** so the numbers above are reproducible without a GPU run.  /tmp is treated as scratch.
+- **D5 — the `MOE_HOST_POOL_H2D` experiment is finished and reverted** (no effect, §3.1).  The fork's tree is
+  clean at `efaa60db0` and `build-rocm` is rebuilt from it (post-revert `pinned` arm: 22.36 t/s ✓).  The patch
+  is kept as `patches/h2d-experiment.patch` for the record only.
+- **D6 — two more `scripts/moe-trace-replay.py` fixes** (the `pool-shipped` `p_map` leak and the pool-resident
+  cold-read accounting, §4/F2 part 2).  Both are model-fidelity bugs, both validated against measured disk bytes,
+  both recorded in `WORKLOG.md` 261102.001; neither changes the single-tier calibration.
+- **D7 — `cov90` sizing is NOT implemented tonight.**  It is the top next item (§6.1), but it changes how the
+  pinned budget is split (a global fit across 144 tables, plus the no-prior fallback) and that deserves a
+  maintainer decision before it lands even as a wip patch — the simulation is the screen, the run is the gate.
 
 **Questions for the maintainer:**
 
