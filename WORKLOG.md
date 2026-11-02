@@ -1,3 +1,58 @@
+## 261102.013 (wip) -- host-expert window: the ORIGINAL design restored in code -- the hold (`mlock`) is a requirement, and every in-place kernel read is gated on it
+
+No delivery change (`patches/`/`release.json` untouched); the beta candidate is amended in the scratch tree and
+needs a re-cut.  Continues `261102.012`.
+
+**What was wrong, in one sentence.**  `hipHostRegister` installs page tables but holds nothing, and on a
+no-XNACK GPU a device read of a page that is not present is a fatal fault — so the code must never let an
+*unheld* registered master reach an in-place kernel read, and it did: the hold was opt-in (`=0` default), a
+refused `mlock` was counted and ignored, and `host_dev` was set for every table regardless.
+
+**The change (three parts).**
+
+1. `MOE_EXPERT_WINDOW_MLOCK` is now **default ON** and is a *requirement*, not an option.  `=0` re-enables the
+   unsafe behaviour and exists for measurement only.
+2. `bind_host_dev_locked` **declines the registration when the hold cannot be taken** — it unregisters, leaves
+   `host_dev` null and returns, so that table falls back to the pinned pool / the per-table bounce, which are
+   safe by construction.  The warning names the fix (`sudo prlimit --memlock=unlimited`, `LimitMEMLOCK`,
+   or fewer `-ncmoe` layers).
+3. A new per-table `host_locked` flag (set from the shared registration's `locked`) gates **every in-place
+   KERNEL read**: `table_master_kernel_readable() = host_dev && cold_safe && (host_pinned || host_locked)` is
+   what the whole-table staging dispatch, the cold read and `moe_cache_gather_ok` now test.  The **copy engine
+   is deliberately exempt**: a CE read of a reclaimed registered page refills through the driver instead of
+   faulting, so the alias-fill D2D keeps using `host_dev` while unheld.
+
+**Verified (1x R9700, IQ4_NL 93.16 GiB, `-ncmoe 44`, `-c 8192`, `--fit off`, memlock lifted with
+`sudo -n prlimit --memlock=unlimited`):**
+
+```
+moe_cache_report: host-expert WINDOW: 88 host tensors registered (0 refused, 0 mlock_fail),
+                  38.7 GiB mapped (held), 0 in-place cold reads, 0 cold ids
+WINDOW EXIT tensors=88 reg_fail=0 ml_fail=0 alias_d2d=16972 reg_bytes=41523970048
+```
+
+and the server answered correctly (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome"`),
+with **no GPU fault and no hang** — where the same cell without the hold hung outright (the earlier 38.7 GB
+`Mlocked` plateau *was* the whole registerable set; the rest of the `mlock` calls were failing silently, which is
+exactly what `ml_fail` now surfaces).  `alias_d2d=16972` confirms the CE alias fill still works unheld-gated.
+
+**Two config traps found while measuring (both cost a run here).**
+
+* **A too-small auto arena silently disables the whole expert cache.**  `-ncmoe 32 -c 8192` gave
+  `auto arena would be 6996.0 MiB < floor 7776.0 MiB -> disabling the MoE expert cache for this run`, so no
+  tables exist, nothing registers (`tensors=0`) and decode runs the uncached path (**24.5 t/s** vs ~39).  Looks
+  exactly like "window is broken"; it is a VRAM-budget decision.  Pass `MOE_EXPERT_CACHE_MIB`, or a smaller
+  `-c`, or fewer GPU layers.
+* **A killed `sudo` wrapper leaves the server holding VRAM.**  `kill $!` after `sudo … &` kills sudo, not the
+  child, and the next model load then fails with `unable to allocate ROCm0 buffer`.  Kill the *child* pid
+  (and note `pkill -f llama-server` also matches the shell that launched it).
+
+**Owed.**  A/ab measurement at the locked config (every number in `261102.010` was measured on the *unlocked*
+build, so the gather prefill figures need re-taking now that the hold gates the gather); a re-cut of the beta
+patch; `ENVIRONMENT.md` entries for the four window variables at promotion; and the 3-GPU arm — where
+`LimitMEMLOCK` must be raised too, or `window` will (correctly, now) decline every registration and measure
+`pool` semantics instead.
+
 ## 261102.012 (wip) -- host-expert window: FATAL on a model larger than RAM (GPU page fault reading a reclaimed registered page); DEVREMAP is one of the two readers
 
 No delivery change (the beta candidate is unchanged); this is a **limitation finding** for `window`, from
