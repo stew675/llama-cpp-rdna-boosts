@@ -1,3 +1,18 @@
+## 261101.021 (docs) -- r206 published: CI green on all three runs, the fork branch at `efaa60db0`
+
+No delivery change (docs only; no new tag).  `v16-6050b467c-r206` is tagged and pushed; `main` is at the r206
+tip commit (`2668977a`).  CI: **Validate delivery set** green on the `main` push and on the tag push (strict
+16/16 apply on a fresh tarball, tree `1bac1001f`, the Windows path + portability lints), **Release patch set**
+green (assets `patches.tar.gz` 1 669 556 B, `rdna-boosts-all.patch` 5 446 468 B, `release.json`, `SHA256SUM`).
+The personal fork's `rdna-boosts` branch was force-pushed to **`efaa60db0`** -- re-cut from `6050b467c` by
+`scripts/fork-refresh.sh`, tree `1bac1001f` reproduced, `release.json.tip` matched.  The first
+`--force-with-lease` was rejected with **`stale info`**: the local `origin/rdna-boosts` tracking ref still named
+`aaf30b6b4` (the r204 tip, because r205's push went out under a different lease), so the lease could not be
+satisfied from a stale ref.  Fix: `git fetch origin rdna-boosts`, then pin the lease explicitly with
+`--force-with-lease=rdna-boosts:<the sha `git ls-remote` reports>` -- worth remembering, because the generic
+`--force-with-lease` cannot recover on its own.  The ROCm container images are built and pushed off-host by the
+worker watcher (`radiance`), which polls for the tag.
+
 ## 261101.020 (r206) -- the slab headroom default is `1152 + 128 x n_gpu` MiB, and block 15 gets the residency gate it shipped without
 
 **Released as `v16-6050b467c-r206` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
