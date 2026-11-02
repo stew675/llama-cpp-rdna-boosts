@@ -19,7 +19,23 @@ rule).  With the decode band it lands on the run's own `h=`:
 Change: `--score-band` defaults to `decode`; the module docstring's accounting caveat now says why (with the
 reach arithmetic), and the `--measured-h` calibration note points at `--seed sidecar:<the run's .moe-heatmap>`
 and `--slots <the run's per-table count>` (the ±1 slot matters: 0.3390 at 14 slots vs 0.3492 at 15).  `all`
-stays available as a diagnostic.  Two candidate causes were tested and killed in the same pass: the `ghost`
+stays available as a diagnostic.
+
+**Two `TwoTier` (pool) model defects fixed in the same change, and the model now predicts the disk tier.**  (a)
+`pool-shipped`'s hand-over evicted the weakest pool entry with `self.p_slot[w] = -1`, which left the evicted
+expert in `p_map` forever — `p_map` grew past `slots_p` (26,769 "resident" experts in 9,216 slots at
+`--pool-frac 25`) and a phantom entry counted as a pool hit; it now calls `p_drop()`, and `p_put()` mirrors
+`pool_slot_assign_locked`'s one-index-per-expert rule.  (b) A cold (admission-rejected) miss was counted as an
+L3/disk read even when the expert was pool-resident, although `MOE_HOST_POOL_COLD` (default 1) reads such an
+expert **in place** from the pool's device alias — a PCIe read of pinned RAM, not a disk read; the new
+`TwoTier.cold_read()` splits `pool_cold` from `l3`, which is what makes `l3` comparable to `/proc/diskstats`.
+Validation against the measured 122B pool arms (`wip/host-pool-speed/HANDOVER.md` §3.2/§4): model L3
+**160.1 / 48.7 / 0.0** MiB per decode token at pool `FRAC` 50 / 80 / 100 against a measured **~163 / ~53 / ~13**
+(the 100 % residual is page-cache warmth in the measured arm).  Before the fix the model said ~460 MiB/token at
+every `FRAC`.  The single-tier `shipped` calibration is unchanged (0.3492 / 0.7513).  With that in place the
+replayer separates a concentration-based per-table pool sizing (`cov90`) from the shipped uniform rule
+(**-42 %** disk bytes/token at `FRAC` 80) and shows that a per-table *heat-mass* sizing is exactly degenerate
+(every table routes `n_used` experts per token, so its total mass is a constant).  Two candidate causes were tested and killed in the same pass: the `ghost`
 reset on admission (the real `access_locked` zeroes it when it admits) moves the decode h by 0.0002, and
 `--churn off` fits neither band.  Study, sweep tool and data: `wip/host-pool-speed/` (`HANDOVER.md` §4/F2,
 `tools/replayer-calib.py`, `data/traces/trace-122b-ncmoe48-devremap0.txt.gz`).

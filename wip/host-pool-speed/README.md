@@ -210,6 +210,15 @@ allocate by each table's **decode heat mass** (`heat_dec`) with a floor of one s
 The **acceptance path** for a sizing candidate is §9.6: simulate it on a real trace first, and implement only what
 the simulated oracle separates.
 
+**Session 2 result — the candidate as written is degenerate; re-specify it as coverage.**  A top-k router gives
+every table exactly `n_used` experts per token, so a table's *total* decode routed mass is the same constant for
+all of them and "allocate by heat mass" reproduces the uniform rule exactly (measured in
+`tools/pool-sizing-sim.py`).  What differs is each table's **concentration**, so the candidate becomes
+`cov_t` = the slots a table needs to hold `t` of its own mass (t = 0.90), fitted to the same byte budget.  On the
+reference trace that is **-42 % L3 (disk) bytes per decode token at `FRAC` 80** (-29 % at `FRAC` 50) with `h`
+unchanged, i.e. a predicted ~18 s of the 21 s decode deficit — **screening-passed**, implement next.  Numbers and
+caveats: `HANDOVER.md` §4/F6.
+
 ### 4.3 P1-c: precopy / spare slots (PR #267's 0006-0008), in pool terms
 
 #267 copies the *likely victims* back to the RAM tier ahead of time on a side stream into K spare slots, so an
@@ -582,6 +591,18 @@ what costs it** (forced `O_DIRECT` == auto to 0.3 %; the buffered arm is the *un
 `pinned` — so the next suspect is the **copy kind** out of the pool (D2D from the mapped alias vs the pinned
 arm's H2D), not bandwidth.  `HANDOVER.md` §5.1-5.3 and §3.1.
 
+**Pool coverage is the decode lever (measured, `FRAC` swept on the same arm).**  `pinned` 22.34; `pool` at
+`FRAC` 100 (256/256 slots, 67.1 GiB pinned) **20.59**; at `FRAC` 80 (the shipped default, 204/256) **17.76**; at
+`FRAC` 50 (128/256) **11.75**.  Disk reads per run: ~70 GiB (`pinned`, i.e. the model load) / 100 / 165 / **366**
+GiB — so the deficit is *demand reads*, ~163 / ~53 / ~13 MiB per decode token at `FRAC` 50 / 80 / 100, and the
+replayer's two-tier model now predicts 160.1 / 48.7 / 0.0 on the same trace.  Two consequences: a **full pool still
+trails `pinned` by 7.8 %** (the maintainer's observation, now a number, with the pool pinning exactly what the
+pinned master uses), and **the shipped `FRAC 80` default costs 16 % decode against a full pool on this box** (the
+`RAM_PCT` clamp did not bind).  `HANDOVER.md` §3.2.
+
+**Greedy text across modes:** pinned / `pool` D2D / `pool` H2D all give `270 chars sha=cacea85d5705` at `-n 64`
+(hash with **no** `-lv`; `-lv 3` pollutes the extracted span).
+
 What session 2 changed in the campaign's plan:
 
 - **F5 re-scoped**: per-read residency (`mincore`) is a *sub-full-pool / cgroup* feature, not the reference-arm
@@ -589,6 +610,9 @@ What session 2 changed in the campaign's plan:
 - **F2 fixed** in `scripts/moe-trace-replay.py` (`--score-band` default `decode` + the docstring's caveat), so
   §9.6's simulate-before-implement is unblocked and a sizing candidate can finally be screened.
 - **Protocol**: `-lv 4`, not `-lv 3`, for anything out of libllama (§9.5).
+- **§4.2's sizing candidate was killed as specified and replaced** by a concentration-based one that screens at
+  -42 % disk bytes/token (§4.2 note, `HANDOVER.md` §4/F6) — the first candidate the replayer has been able to
+  bless since it calibrated.
 
 ## 13. Session state
 

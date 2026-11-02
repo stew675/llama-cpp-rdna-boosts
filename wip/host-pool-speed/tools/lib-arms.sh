@@ -16,9 +16,12 @@ OUT=${OUT:?set OUT to the output directory}
 mkdir -p "$OUT"
 
 # ---- the campaign's reference arm (README §9): 1 GPU, -ncmoe 48, 5258-token prose, 2000 generated ---
+# `LV=0` drops -lv entirely (needed when hashing the generated text: a verbose log interleaves statistics
+# into it, `scripts/extract-generated.py`); `NGEN` overrides -n (short runs are correctness smoke only).
 COMMON=(-m "$MODEL" -ncmoe 48 -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 -fa auto -b 2048 -ub 2048
-        --spec-type none -lv 4 --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt
-        -n 2000 -p "$(cat "$PROMPT")")
+        --spec-type none --seed 42 --temp 0 --reasoning off --single-turn --no-display-prompt
+        -n "${NGEN:-2000}" -p "$(cat "$PROMPT")")
+[ "${LV:-4}" != "0" ] && COMMON+=(-lv "${LV:-4}")
 
 disk_read_sectors() { awk -v d="$DISK" '$3==d {print $6}' /proc/diskstats; }
 mem_state() { awk '/MemAvailable|^Cached|^Buffers|SwapTotal|SwapFree|SwapCached/ {printf "%s=%s ", $1, $2}' /proc/meminfo; }

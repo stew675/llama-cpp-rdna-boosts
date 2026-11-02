@@ -111,6 +111,77 @@ is 4.6 ms/token**.
 
 Session 1's table is superseded (two of its rows were mis-labelled, F3); its re-read form is in §4/F3.
 
+### 3.1 The copy kind (`MOE_HOST_POOL_H2D`) — tested, **no effect**
+
+`MOE_HOST_POOL_H2D=1` (fork-local, `patches/h2d-experiment.patch`) makes a pool hit/fill a
+`cudaMemcpyHostToDevice` from the pool's pinned host pointer instead of the historical
+`cudaMemcpyDeviceToDevice` from its mapped UVA alias (what the pinned arm does on its own master, §5.2).
+`data/20261102-h2d/`:
+
+| arm | decode t/s | prompt t/s | disk read / run |
+|---|---|---|---|
+| `pinned` (3 arms) | 22.36 / 22.35 / 22.37 | 682.0 / 679.3 / 682.4 | 61.5-67.8 GiB |
+| `pool`, D2D from the alias (shipped) | 17.76 / 17.80 | 626.3 / 635.4 | 148.5-165.0 GiB |
+| `pool`, H2D from the pinned pointer | 17.79 / 17.78 | 636.5 / 631.3 | 150.7-161.4 GiB |
+
+**0.1 % apart, inside the arm-to-arm noise: the copy kind is not the deficit.**  The switch is reverted from
+the fork's tree (the patch is kept in the campaign for the record), so no delivery decision is implied.
+
+What the same table *does* show is where the gap is, by wall clock:
+
+| phase | `pinned` | `pool` | delta |
+|---|---|---|---|
+| prefill (5258 tok) | 7.71 s | 8.36 s | **+0.65 s** |
+| decode (1862 tok) | 83.4 s | 104.8 s | **+21.4 s** |
+| disk read per run | ~69 GiB (the model load) | ~169 GiB | **+100 GiB** |
+
+Of that +100 GiB, ~53.7 GiB is the one-shot pool prepopulate and **~46 GiB is demand reads on the
+arena-fill path**.  At this box's ~2 GB/s that is **~23 s**, i.e. the +21.4 s decode deficit almost exactly.
+So the pool's decode cost on this arm is **not** a copy, a sync or a bandwidth problem — it is **disk reads
+caused by the arena drifting off the pool's complement** (an expert the arena evicts is only in the pool with
+probability `FRAC`, so ~20 % of arena misses at FRAC 80 find nothing in the pool and go to the file).  §3.2
+tests that directly by moving `FRAC`.
+
+### 3.2 Pool coverage (`MOE_HOST_POOL_FRAC`) is the decode lever — and the model now predicts it
+
+Same arm, `FRAC` moved (all `DIO auto` = `O_DIRECT`, `data/20261102-frac/`):
+
+| `FRAC` | pool slots/table | pinned pool | decode t/s | prefill t/s | disk read / run | model's L3 MiB/token |
+|---|---|---|---|---|---|---|
+| **50** | 128/256 | 33.5 GiB | **11.75** | 330.1 | 366 GiB | 160.1 |
+| **80** (default) | 204/256 | 53.7 GiB | **17.76 +/- 0.03** | 629 +/- 3 | 152-170 GiB | 48.7 |
+| **100** | 256/256 | 67.1 GiB | **20.59 / 20.61** | 620.4 | 93-108 GiB | 0.0 |
+| `pinned` | — | 67.1 GiB master | **22.34 +/- 0.01** | 680 +/- 1 | 61-71 GiB | — |
+
+Three things fall out of it:
+
+1. **Decode and prefill are monotone in pool coverage, and the disk reads are the mechanism**: 366 -> 165 ->
+   100 GiB per run, i.e. ~163 / ~53 / ~13 MiB of demand read per decode token (measured minus the ~70 GiB
+   model load), and the replayer's L3 prediction is 160 / 49 / 0.0 MiB per token on the same trace.  That
+   agreement is the pool-side calibration of the tool (§4/F2).
+2. **A FULL pool still trails `pinned` by 7.8 %** (20.60 vs 22.34) — the maintainer's "a pool big enough for
+   the whole set still trails pinned", now with a number.  Note the full pool pins **67.1 GiB**, i.e. exactly
+   the RAM the pinned master uses, so at `FRAC 100` the pool has no memory advantage left; the 7.8 % is the
+   residual fill/cold-read path, and it is the *only* decode item left on this arm.
+3. **The shipped default `FRAC 80` costs 16 % decode against a full pool on this box**, and the
+   `MOE_HOST_POOL_RAM_PCT` clamp did *not* bind at `FRAC 100` (256/256 slots were granted; MemAvailable was
+   ~80 GiB so the 85 % ceiling was ~68 GiB >= 67.1 GiB).  So on the 122B at `-ncmoe 48` the pool *can* hold the
+   whole set and the default wastes it.  That is a **default-policy finding** for README §5's "one automatic
+   decision": when the host set fits under the RAM ceiling, ask for full coverage (the memory cost is the same
+   as `pinned`, and the alternative is `pinned`).  It needs the field boxes (a 30 GiB gfx1100 cannot) and the
+   3-GPU arms before it is a shipped default, so it is recorded, not applied.
+
+No swap anywhere (`SwapFree` 133.03 -> 133.05 GiB across the whole matrix), and no `oom`/`gpu fault` in the
+journal.
+
+**Greedy text across modes (first hashed check on the 122B in this campaign):** pinned / `pool` D2D /
+`pool` H2D all produce `270 chars sha=cacea85d5705` at `-n 64` (`data/20261102-text-purity/`, logs without
+`-lv`).  The same flags at `-lv 4` build a pool (`host_experts_mode=POOL`, `table_pool_locked ... 204/256`), so
+this is a real cross-mode purity result, not three pinned runs: at default verbosity the cache's whole report
+is WARN-and-above, so the activation was proved by a separate `-lv 4` control.  (`-lv 3` is *not* usable for a
+text hash: the WARN lines that appear during the first decode land inside the extracted span and change it —
+1500 vs 1621 chars in this run — so the hash must be taken with no `-lv` at all.)
+
 ## 4. Findings
 
 **F1 — a decode routing trace requires `GGML_MOE_DEVREMAP=0`.**  The `D` records are emitted by the eager
@@ -155,6 +226,34 @@ irrelevant *at 4 GiB* (sidecar 0.3492 / heat 0.3492 / none 0.3395) because 232k 
 `--churn off` arm is where the seed shows (sidecar 0.2757 vs none 0.0670).
 
 Screening tool: `tools/replayer-calib.py` (sweeps band x churn x seed x ghost-reset on one trace).
+
+**F2, part 2 (same session): the two-tier pool model had two real defects, and it now predicts the disk
+tier.**  Both were found while screening README §4.2's sizing candidate, and both are fixed in
+`scripts/moe-trace-replay.py`:
+
+1. **`p_map` leak in `pool-shipped`.**  The hand-over evicted the weakest pool entry with
+   `self.p_slot[w] = -1`, which freed the slot but left the expert in `p_map` forever.  `p_map` then grew
+   past `slots_p` (measured: 26,769 "resident" experts in 9,216 slots at `--pool-frac 25`) and a phantom
+   entry counted as a pool hit.  Fixed to `self.p_drop(...)`, and `p_put` now also mirrors
+   `pool_slot_assign_locked`'s "never two indices for one expert".
+2. **A cold (admission-rejected) miss was counted as an L3/disk read even when the expert was pool-resident.**
+   With `MOE_HOST_POOL_COLD` (default 1) the kernel reads a pool-resident expert **in place** from the pool's
+   device alias — a PCIe read of pinned RAM, not a disk read.  `TwoTier.cold_read()` now separates the two
+   (`pool_cold` vs `l3`), which is what makes `l3` comparable to `/proc/diskstats`.  Before the fix the model
+   predicted ~460 MiB/token of L3 at *every* `FRAC`; after it, on the reference trace at `--arena-mib 22517`
+   and `heat-complement` init:
+
+   | pool `FRAC` | model L3 MiB/token | measured demand read/decode token | run decode |
+   |---|---|---|---|
+   | 50 | **160.1** | ~163 | 11.75 t/s |
+   | 80 | **48.7** | ~53 | 17.76 t/s |
+   | 100 | **0.0** | ~13 | 20.59 t/s |
+
+   The 100 % residual is page-cache warmth in the measured arm (the pool prepopulate is `O_DIRECT`, the model
+   load is not); the 50/80 agreement is within ~10 %.  The single-tier `shipped` calibration is unchanged by
+   either fix (0.3492 / 0.7513).
+
+Neither change touches `patches/`; both are recorded in `WORKLOG.md` 261102.001.
 
 **F3 — RESOLVED 2026-11-02 (session 2): the pool activates on the 122B; the diagnosis was three reporting
 artifacts, and there is no delivery bug.**  A `-lv 4` re-run of the same arm (`logs/f3-122b-pool-lv4.log`) is
@@ -238,6 +337,32 @@ not a throughput ratio, is what pool mode has to be judged against.
 **F5 — `DIO` is a per-box boolean applied to a per-read problem** (the maintainer's question, 2026-11-02).
 See §5.
 
+**F6 — README §4.2's per-table pool sizing candidate, as specified, is DEGENERATE; the right signal is
+concentration.**  The candidate is "allocate each table's pool slots by its decode heat mass".  A top-k router
+hands every table exactly `n_used` experts per token, so a table's *total* decode routed mass is a constant
+(`n_used x steps` — 8 x 1899 on this trace) for every table: allocating by mass reproduces the uniform rule
+**exactly** (verified: identical slot vectors at `FRAC` 30/80, `tools/pool-sizing-sim.py`).  What does differ
+between tables is the *shape* of their distribution, so the candidate must be re-specified as
+**`cov_t`: the number of slots a table needs to hold `t` of its own routed mass** (t = 0.90 below), fitted to
+the same byte budget.  On the reference trace (arena 22,517 MiB, `heat-complement` pool init, `pool-shipped`
+policy, decode band):
+
+| sizing | `FRAC` 50 L3 MiB/tok | `FRAC` 80 L3 MiB/tok | h |
+|---|---|---|---|
+| uniform (shipped) | 160.1 | 48.7 | 0.7515 |
+| heat-mass (as specified) | 160.1 (= uniform) | 48.7 (= uniform) | 0.7515 |
+| equal pinned BYTES per table | 160.7 (+0.4 %) | 51.2 (+5 %) | 0.7515 |
+| **`cov90`** | **114.0 (-29 %)** | **28.5 (-42 %)** | 0.7515 |
+
+`h` is unchanged by construction (the arena policy does not move), so the whole effect is in the disk tier:
+-20 MiB/token x 1862 tokens is ~37 GiB less read per run, i.e. ~18 s of the 21 s decode deficit at `FRAC` 80.
+That is a sizeable, cheap, **screening-passed** candidate for the next session (implement from `heat_dec`, same
+`RAM_PCT` ceiling, env-gated first).  Caveat: it is a model result, calibrated against the measured disk tier to
+~10 % on this arm (§4/F2 part 2) — the run is the gate, not the simulation.
+
+Screening tools: `tools/pool-sizing-sim.py` (sizing candidates), `tools/replayer-calib.py` (model calibration).
+Every number above is reproducible from `data/traces/trace-122b-ncmoe48-devremap0.txt.gz` with no GPU.
+
 ## 5. `O_DIRECT` vs buffered — the analysis and the proposed shape
 
 The shipped rule (`pool_decide_dio_locked`) decides **once per box, at the first pool build**: buffered iff
@@ -301,23 +426,25 @@ its `(forced by MOE_HOST_POOL_DIO=%d)` branch is **dead code** — a forced arm 
 while the env-init line keeps saying "fill mode AUTO".  An A/B arm is therefore invisible in the log (it was
 invisible in session 2's own matrix: `pool_decide_dio_locked` appears only in the `auto` arms).
 
-### 5.2 Where the remaining -20.5 % decode is *not* — and the next suspect (copy kind)
+### 5.2 Where the remaining -20.5 % decode is — answered by §3.1
 
-The pool arm and the pinned arm move the same host-link bytes, so the gap is not bandwidth.  What differs is
-the **copy that fills an arena slot**:
+Three suspects were eliminated in session 2, in this order:
 
-* `pinned`: `cudaMemcpyHostToDevice` from the pinned master (`expert_host_src`, `table_master_pageable`
-  false → `out->kind = H2D`).
-* `pool`: `cudaMemcpyDeviceToDevice` **from the pool's mapped UVA alias** (`out->kind = D2D`,
-  `out->base = pool->base_dev + slot`) — chosen deliberately because a *cross-device* H2D from ROCm pinned
-  memory falls back to a pageable staging memmove (comment at the pool allocation, `moe-expert-cache.cu:1288`).
-  On a **single-GPU** arm the copy is same-device, so that constraint does not apply and the D2D-from-alias may
-  simply be the slower path (it is the one that costs `pool->base_dev` to be a zero-copy mapping).
+1. **The copy kind out of the pool** (`D2D` from the mapped alias vs the pinned arm's `H2D`): **no effect**
+   (17.76/17.80 vs 17.79/17.78, §3.1).  The current D2D choice stays; its cross-device rationale is intact.
+2. **Host-link bandwidth**: the pool arm moves *fewer* bytes over the host link than `pinned` (929 vs 958 GiB,
+   §3), and its arena hit rate is slightly *higher* (0.7623 vs 0.7543).
+3. **The `DIO` boolean** (§5.1): free on this arm.
 
-Session 2 tested it: `MOE_HOST_POOL_H2D=1` (fork-local experiment, not in `patches/`) switches a pool hit/fill to
-`cudaMemcpyHostToDevice` from `pool->base`.  Result in §3.1 (below).  If it recovers a large part of the gap
-the fix for the delivery is a per-device rule (H2D when the copying device owns the pool, D2D otherwise), not a
-new mode.
+What is left is **disk reads**: ~46 GiB of demand reads per run (≈23 s at ~2 GB/s), against a +21.4 s decode
+delta.  The mechanism is the r113 design decision that the demand path never evicts and never copies the arena
+victim into the pool: with the pool sized to the arena's *sizing-time* complement, an expert the F-LRU arena
+evicts is in the pool only `FRAC` of the time, and the rest are file reads.  §3.2 measures that dependence.
+If it holds, the campaign's decode lever is **pool coverage/re-fill policy**, not a copy path, and the
+candidates are (a) a higher effective `FRAC` (the `RAM_PCT` clamp allows ~252/256 slots here), (b) filling an
+empty pool slot with the arena victim on eviction (r113 measured the *background-worker* version of that at 2x
+decode; the synchronous version has never been measured), (c) `MOE_HOST_POOL_PREFETCH` against the r113 layout.
+All three are screenable in the replayer (`pool-*` policies) now that F2 calibrates.
 
 ### 5.3 Refined F5 design note (what to keep)
 
@@ -335,26 +462,33 @@ new mode.
 ## 6. Next steps, in order
 
 **Session 2 closed:** F3 resolved (§4, no delivery bug), the pool-vs-pinned baseline + the `DIO` A/B measured
-(§3), F5's boolean measured and its design note re-scoped (§5.1-5.3), and F2 reconciled so the replayer
-calibrates (§4).  What is left, in priority order:
+(§3), the coverage gradient measured (§3.2), F5's boolean measured and its design note re-scoped (§5.1-5.3),
+F2 reconciled and the two-tier model calibrated against the disk tier (§4), and README §4.2's sizing candidate
+re-specified into a screening-passed one (§4/F6).  What is left, in priority order:
 
-1. **The -20.5 % decode gap, and its next suspect is the copy kind** (§5.2): `MOE_HOST_POOL_H2D=1` (a
-   fork-local switch, already built) makes a pool hit/fill an H2D copy from the pool's pinned host pointer
-   instead of a D2D copy from its mapped UVA alias, which is what the pinned arm does.  If it wins, the
-   delivery fix is a per-device rule (H2D when the copying device owns the pool, D2D otherwise) — it needs no
-   new mode and it applies to every split type.  Result: §3.1.
-2. **`mincore` per-read residency + a page-cache budget** (§5.3), on the arm where it can show: a sub-full
-   pool (`MOE_HOST_POOL_FRAC=25`) and/or the 64 GiB cgroup, not the reference arm (`DIO` is already free
-   there).  This is also the honest instrument for the maintainer's "re-streamed from disk" report.
-3. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still the +8 % mechanism on 35B-A3B, still
-   blocked on freshness (a pool layout epoch in the cold id, or a decode-band layout freeze).  On the 122B the
-   remap is invisible (§3), so judge it on 35B-A3B where its ceiling was measured.
-4. Then the P1 items in `README.md`: per-table pool sizing from heat mass (§4.2) — now screenable, the
-   replayer calibrates — demand precopy (§4.3), and the two standalone #267 borrows: the bounce-ring cap
-   (0010) and arena-across-prefill (0003) (§4.4).
-5. Only then the Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
+1. **`cov90` per-table pool sizing (§4/F6)** — the only screening-passed decode candidate this session produced:
+   -42 % disk bytes/token at `FRAC 80` in the calibrated model, i.e. a predicted ~18 s of the 21 s decode
+   deficit.  Implement from `heat_dec` under the same `RAM_PCT` ceiling, env-gated, then run the arm pair
+   (`pinned` + pool) against `data/20261102-frac/`'s FRAC-80 baseline (17.76 t/s, ~165 GiB read).
+2. **Full-coverage default (§3.2)**: at `FRAC 100` the pool holds the whole set, the RAM clamp does not bind on
+   this box, and decode is 20.59 vs 17.76 at the shipped `FRAC 80` (+16 %).  The memory cost equals `pinned`'s.
+   Decide the *policy* (auto: ask for full coverage when the set fits under the ceiling) — but validate on the
+   field boxes (30 GiB cannot) and the 3-GPU arms first, and keep `pinned` as the choice when the pool would
+   hold nothing extra.
+3. **The residual 7.8 % at a full pool** (§3.2): the only decode item left on this arm once coverage is
+   complete.  Candidates: the per-fill event/`bounce_acquire` bookkeeping (pool-only), the eager path's per-op
+   sync (present in `pinned` too), and P0-a's remap (which is the +8 % mechanism on 35B-A3B).  Instrument before
+   changing: the copy kind is already excluded (§3.1).
+4. **`mincore` per-read residency + a page-cache budget** (§5.3), on the sub-full-pool / 64 GiB cgroup arms —
+   now measurable against a calibrated L3 model, and still the honest answer to the maintainer's
+   "re-streamed from disk" report for boxes where the set cannot be covered.
+5. **P0-a — the remap on pool-backed tables** (`README.md` §3.1): still blocked on freshness (a pool layout
+   epoch in the cold id, or a decode-band layout freeze).  Judge it on 35B-A3B where its ceiling was measured;
+   on the 122B the remap is invisible (§3).
+6. Then the remaining P1 items in `README.md`: demand precopy (§4.3) and the two standalone #267 borrows — the
+   bounce-ring cap (0010) and arena-across-prefill (0003) (§4.4).
+7. Only then the Phase-2 items: 2-GPU x8 `-sm tensor` arms, Flash-Next validation, and the `RAM_PCT`/swap soak
    (which the maintainer places at the very end, as a Flash-Next + PLE effect).
-
 
 ## 7. Traps (all bitten today or previously)
 
@@ -418,6 +552,10 @@ calibrates (§4).  What is left, in priority order:
     (`poolmode-probe.log`), the trace/sizing logs.  The *evidence* behind §4/F3 and the corrected table.
   - `data/20261102-session2-f3/` — the `-lv 3` vs `-lv 4` 122B pool controls that resolved F3.
   - `data/20261102-session2-arms/` — the 8-arm pool-vs-pinned + `DIO` matrix (§3) and `summary.tsv`.
+  - `data/20261102-h2d/` — the copy-kind A/B (§3.1): `pinned`, `pool` D2D, `pool` H2D (`MOE_HOST_POOL_H2D=1`).
+  - `data/20261102-frac/` — the coverage gradient (§3.2): `FRAC` 50 / 80 / 100 against `pinned`.
+  - `data/20261102-text-purity/` and `-lv3/` — the greedy-text hashes across modes (§3.2), plus the
+    `pool-control-lv4` arm that proves the pool built for them.
   - `data/traces/trace-122b-ncmoe48-devremap0.txt.gz` — session 1's 122B routing trace (gzipped, 9.1 MB), the
     F2 calibration input; regenerate with the `README.md` §9.6 capture command at `MOE_EXPERT_CACHE_MIB=4096`,
     `GGML_MOE_DEVREMAP=0`.
@@ -425,5 +563,11 @@ calibrates (§4).  What is left, in priority order:
   `HIP_VISIBLE_DEVICES=0`, `-lv 4`, 2000-token decode, disk-read + memory accounting per arm, alternating arms).
 - `tools/replayer-calib.py` — the F2 sweep (band x churn x seed x ghost-reset) over one trace, importing the
   delivery replayer.
+- `tools/pool-sizing-sim.py` — the §4.2/F6 sizing screen (uniform / heat-mass / equal-bytes / `cov90`) through
+  the delivery's two-tier model.
+- `tools/run-arms-1gpu-frac.sh`, `tools/run-text-purity-1gpu.sh` — the coverage gradient and the no-`-lv`
+  text-hash runners.
+- `patches/h2d-experiment.patch` — the fork-local `MOE_HOST_POOL_H2D` switch (§3.1).  **Not in `patches/`**: the
+  experiment is finished and the fork's tree is reverted, so this file is the record, not a queued change.
 - PR #267 (not adopted): the submitter's branch `brian/wip-mmap-host-experts-r204`, directory
   `wip/mmap-host-experts-r204/`.

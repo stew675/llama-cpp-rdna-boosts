@@ -470,7 +470,8 @@ class TwoTier:
 
     __slots__ = ("slots_a", "slots_p", "a_slot", "a_map", "a_count", "a_ghost", "a_last",
                  "p_slot", "p_map", "p_last", "clock", "pclock", "last_decay",
-                 "hits", "misses", "p_hits", "l3", "promote", "handover", "evictions", "p_evict")
+                 "hits", "misses", "p_hits", "p_cold", "l3", "promote", "handover", "evictions",
+                 "p_evict")
 
     def __init__(self, t, slots_a, slots_p):
         self.slots_a = min(slots_a, t.n_experts)
@@ -486,7 +487,7 @@ class TwoTier:
         self.p_last = collections.Counter()
         self.pclock = 0
         self.last_decay = 0
-        self.hits = self.misses = self.p_hits = self.l3 = self.promote = 0
+        self.hits = self.misses = self.p_hits = self.p_cold = self.l3 = self.promote = 0
         self.handover = self.evictions = self.p_evict = 0
 
     # -- pool helpers ---------------------------------------------------------
@@ -510,6 +511,9 @@ class TwoTier:
         old = self.p_slot[slot]
         if old >= 0:
             self.p_map.pop(old, None)
+        prev = self.p_map.get(expert)   # mirror `pool_slot_assign_locked`: never two indices for one expert
+        if prev is not None and prev != slot and 0 <= prev < self.slots_p and self.p_slot[prev] == expert:
+            self.p_slot[prev] = -1
         self.p_slot[slot] = expert
         self.p_map[expert] = slot
         self.p_last[expert] = self.pclock
@@ -520,6 +524,20 @@ class TwoTier:
             self.p_slot[slot] = -1
 
     # -- one routed expert ------------------------------------------------
+    def cold_read(self, e):
+        """A miss that is NOT admitted (or cannot be) still reads the expert's bytes once.  Where from?
+        In pool mode with `MOE_HOST_POOL_COLD` (default 1) a pool-resident expert is read IN PLACE from
+        the pool's device alias -- a PCIe read of pinned RAM, NOT a disk read.  Only an expert in neither
+        tier goes to the mapping/disk (L3).  Mirroring that is what makes `l3` comparable to
+        /proc/diskstats: measured on the 122B at `-ncmoe 48`, the disk reads per decode token are
+        ~163 / ~53 / ~13 MiB at pool FRAC 50 / 80 / 100, and conflating pool cold reads with L3 reads
+        predicted ~460 MiB/token at every FRAC."""
+        if self.slots_p > 0 and e in self.p_map:
+            self.p_cold += 1
+            self.p_last[e] = self.pclock
+            return
+        self.l3 += 1
+
     def access(self, e, policy, protect, period, admit, touch):
         self.clock += 1
         if self.clock - self.last_decay >= period:
@@ -535,7 +553,7 @@ class TwoTier:
         self.misses += 1
         self.a_ghost[e] += 1
         if self.slots_a <= 0:
-            self.l3 += 1                    # served cold straight from L3
+            self.cold_read(e)               # served cold: the pool alias when resident, else L3
             return
         slot = -1
         for s in range(self.slots_a):
@@ -552,13 +570,13 @@ class TwoTier:
                         (self.a_count[v] == self.a_count[victim] and self.a_last[v] < self.a_last[victim]):
                     victim, slot = v, s
             if slot < 0:
-                self.l3 += 1                # every arena slot is protected: served cold
+                self.cold_read(e)           # every arena slot is protected: served cold
                 return
             if admit == "value" and self.a_ghost[e] <= self.a_count[victim]:
-                self.l3 += 1
+                self.cold_read(e)
                 return
             if admit == "touch" and self.a_ghost[e] < touch:
-                self.l3 += 1
+                self.cold_read(e)
                 return
         # ---- where do the incoming bytes come from?
         if self.slots_p > 0 and e in self.p_map:
@@ -587,7 +605,11 @@ class TwoTier:
                     w = self.p_weakest()
                     if w >= 0:
                         self.p_evict += 1
-                        self.p_slot[w] = -1
+                        # 2026-11-02: this was `self.p_slot[w] = -1`, which freed the slot but left the
+                        # evicted expert in `p_map` forever -- p_map then grew past `slots_p` and
+                        # `e in p_map` turned phantom experts into pool hits (measured: 26,769 "resident"
+                        # experts in 9,216 slots at --pool-frac 25).  Drop it properly, as the C++ does.
+                        self.p_drop(self.p_slot[w])
                 free = self.p_free()
                 if free >= 0:
                     self.pclock += 1
@@ -758,6 +780,7 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
     misses = sum(s.misses for s in states.values())
     p_hits = sum(s.p_hits for s in states.values())
     l3 = sum(s.l3 for s in states.values())
+    p_cold = sum(s.p_cold for s in states.values())
     promote = sum(s.promote for s in states.values())
     handover = sum(s.handover for s in states.values())
     evict = sum(s.evictions for s in states.values())
@@ -774,6 +797,8 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
         "policy": policy, "hits": hits, "misses": misses, "reaches": reaches,
         "h": (hits / reaches) if reaches else 0.0,
         "pool_h": (p_hits / misses) if misses else 0.0,
+        "pool_cold": p_cold,
+        "pool_cold_pct": (100.0 * p_cold / misses) if misses else 0.0,
         "l3": l3, "l3_mib": l3_mib, "l3_mib_per_tok": (l3_mib / tokens) if tokens else 0.0,
         "promote_mib": promote_mib, "handover_mib": handover_mib,
         "hostlink_mib": promote_mib + handover_mib,
