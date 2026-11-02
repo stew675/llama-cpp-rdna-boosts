@@ -26,6 +26,15 @@ separate decision).
   model only.  Earlier pool tuning on 35B-A3B (which fits) is treated as smoke data, not as evidence.
 - **First pass = one GPU and `-sm tensor` on the two x8 GPUs** (§9.4).  The 3-GPU arms and the Flash-Next /
   PLE / swap / `RAM_PCT` tuning are the campaign's **last** phase, not its first.
+- **`-ncmoe 48` is the primary arm** (2026-11-02): it stresses the pool hardest and is the VRAM-constrained case —
+  nearly all experts on the host, so the arena is as large as VRAM allows and the arena hit rate is at its best,
+  which is what makes a *pool* policy the remaining variable.
+- **No policy conclusion from a short decode.**  Policy validation runs generate **≥ 2000 tokens** (1000 the
+  floor).  Short runs (128-192 tokens) are for correctness/oracle smoke only: the arena ramps up over the first
+  few hundred tokens, which flatters or disguises a pool policy (§9.5).
+- **Simulate before implementing** (§9.6): capture a routing trace at the campaign's own arm and score candidate
+  pool policies with `scripts/moe-trace-replay.py` (the deliverable already has the replayer and the two-tier
+  pool model).  A candidate that the simulated oracle does not separate is not implemented.
 
 **Status of PR #267:** reviewed at the architecture level (see §8) and **not adopted**.  The maintainer's
 decision is to hold it, gather these numbers first, and reply to the submitter later.  Its record lives under
@@ -198,6 +207,9 @@ MiB of L3 reads per decode token, so a candidate allocation can be screened befo
 allocate by each table's **decode heat mass** (`heat_dec`) with a floor of one slot, subject to the same
 `RAM_PCT` ceiling.
 
+The **acceptance path** for a sizing candidate is §9.6: simulate it on a real trace first, and implement only what
+the simulated oracle separates.
+
 ### 4.3 P1-c: precopy / spare slots (PR #267's 0006-0008), in pool terms
 
 #267 copies the *likely victims* back to the RAM tier ahead of time on a side stream into K spare slots, so an
@@ -334,6 +346,14 @@ is itself a P0 item, because containers are the normal deployment shape.
 - **One GPU** (the single-GPU pain point) and **`-sm tensor` on two GPUs**, 122B-A10B, embedded MTP on/off,
   `GGML_MOE_DEVREMAP` × `MOE_HOST_POOL_COLD` crossed, pool **sub-full** and **full**, plus the all-host
   (`-ncmoe 99`) disk arm.  This is where P0-a (the remap on pool tables) and P1-a/P1-b/P1-d get measured.
+- **`-ncmoe 48` is the primary arm** (49 blocks in the 122B, so 48 hosted layers ≈ **62 GiB** of host experts by
+the per-layer estimate below).  It is the case the pool exists for: nearly every expert lives on the host, so
+VRAM is spent almost entirely on the arena, the arena hit rate is at its best, and the *pool* policy is
+consequently the remaining variable.  It is also the tight one for this box — `FRAC` 80 % asks for ~50 GiB of
+pinned pool out of ~76 GiB `MemAvailable`, leaving ~26 GiB of page cache for a 73 GiB model, i.e. `-ncmoe 48`
+on the 96 GiB box *already* exercises the sub-full-pool and disk-streaming path; the 64 GiB cgroup (§9.2) is the
+field case.  Surrounding arms: `-ncmoe 40` (smaller host set, larger arena) and `-ncmoe 99` (all-host disk arm)
+as gradient points, not as the primary.
 - **The pair must be the two x8 GPUs, never the x4 one.**  Verified on this box (2026-11-02):
 
 | HIP / `-dev` index | PCI | CPU root port | CPU link | uses |
@@ -356,8 +376,9 @@ is itself a P0 item, because containers are the normal deployment shape.
   model, so the big model is the iteration vehicle and the small models are not needed for speed.
 - The 122B on **one** 32.6 GiB card is a genuine host-expert workload: its expert weights are ~1.4 GB per layer
   (256 x 3 x 1024 x 3072 at UD-Q4_K_XL, derived), so `-ncmoe N` puts roughly `1.4 x N` GB on the host —
-  `-ncmoe 32` is ~45 GB (≈ 42 GiB) of host experts against a ~32 GB card, i.e. the pool is large and the arena
-  is small, which is exactly the churn regime the campaign is about.
+  `-ncmoe 32` is ~45 GB (≈ 42 GiB) and `-ncmoe 48` ~67 GB (≈ **62 GiB**) of host experts against a ~32 GB card.
+  On 1 GPU the arena is then ~25 GiB for 62 GiB of experts (~40 % aggregate), and on the 2-GPU x8 pair ~50-55 %:
+  large pool, high-but-not-identity arena hit rate — the churn regime the campaign is about.
 
 **Phase 2 — the last phase (do not start here):** Flash-Next final validation, i.e. the PLE interaction and the
 `RAM_PCT` / page-cache / swap thrash (§3.2): measure with the model weights **and** the PLE stream active, on the
@@ -373,6 +394,10 @@ here (they add the all-reduce and the iGPU trap, and nothing in the first pass n
   **full pool** (the maintainer's "big enough for the whole set" case), and one **all-host** (`-ncmoe 99`) arm for
   the disk-streaming case; **1 GPU** and **`-sm tensor` on the x8 pair**; `--spec-type draft-mtp` on the embedded
   head vs none.  The 3-GPU arms and the Phase-2 model (Flash-Next) are not Phase 1.
+- **Decode length: ≥ 2000 generated tokens for any policy number (1000 is the floor).**  The arena ramps up over
+  the first few hundred tokens, so a 128-192 token decode measures the ramp, not the policy — short runs are for
+  correctness/oracle smoke only.  Under MTP report both the generated and the accepted count, since acceptance
+  changes how many steps the pool sees.
 - Always include the **`pinned` arm in the same run** (the acceptance criterion is a ratio to `pinned`); arms
   alternated, never parallel (`AGENTS.md`); pin `HIP_VISIBLE_DEVICES` on every multi-device arm (the iGPU trap).
 - **Full feature set, every arm** (`AGENTS.md` Default-on policy): no `FOO=1 <bench>` unless the arm *is* the
@@ -386,6 +411,53 @@ here (they add the all-reduce and the iGPU trap, and nothing in the first pass n
 - Page cache is a *state to control*, not a nuisance: record it (or drop it) before every arm, because on a
   96 GiB box with a 73 GiB model `DIO=auto` picks buffered while on a 64 GiB box it picks `O_DIRECT` — the same
   binary, two different behaviours.  That divergence is exactly what P1-a replaces with a per-read decision.
+
+### 9.6 Simulate before implementing — the routing trace and the replayer (decided 2026-11-02)
+
+One GPU run produces a trace; the replayer scores candidate **pool policies** on it in seconds, with no model and
+no GPU.  This is the campaign's candidate filter, and it exists already (r110, `TODO` #61 P1).
+
+**Capture** (the trace is a diagnostic, off by default; `ENVIRONMENT.md` has the format):
+
+```bash
+HIP_VISIBLE_DEVICES=0 MOE_EXPERT_TRACE=/tmp/trace-122b-ncmoe48.txt MOE_EXPERT_CACHE_MIB=4096 \
+  ./build-rocm/bin/llama-cli -m /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf \
+  -ncmoe 48 -ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 --temp 0 --single-turn --no-display-prompt \
+  -n 2000 -p "$(cat prompts/prose-rdna-boosts.txt)"
+```
+
+Always pass `-c`: the model's training context is 262144, and the KV is cheap here (13 KV layers x 2 heads x 256
+x f16 → ~27 KB/token, ~220 MiB at `-c 8192`, half that at `q8_0`), so an unset `-c` silently spends GiB on context
+instead of arena.  The 5246-token prose prompt plus 2000 generated tokens needs `-c 8192`.
+
+**The four gotchas (read before trusting a trace):**
+
+1. A **fully resident (identity) table is not traced on the decode band** — it cannot miss.  Capture from a
+   *partially* resident config (e.g. `MOE_EXPERT_CACHE_MIB=4096` on the `-ncmoe 48` shape); the routing is the
+   model's, the arena size is what the replayer varies, so the stream stays valid while the residency is not.
+2. The trace **dedupes the per-device record** a tensor split produces: the table set is ONE device's and
+   `--arena-mib` is a **per-device** budget → pass `--devices 2` for the x8-pair arms.
+3. **Validate the model first**: `--measured-h <the run's logged h=>`.  If the replayer's `h` does not land on the
+   logged value, no comparison means anything (this is the same trap the r114 replayer defects came from).
+4. **After P0-a the pool tables stop being traced on the decode band** (the remap path never reads the routing
+   back to the host), so traces for the pool work must be captured with `GGML_MOE_DEVREMAP=0` — or before P0-a
+   lands — else they lose exactly the records the campaign needs.
+
+**Score:** `scripts/moe-trace-replay.py <trace> --arena-mib <per-device> --devices <1|2> --pool-frac <N>
+--pool-init heat --mass-band decode --policies shipped,static,quota,window`, then read the two-tier numbers as
+**MiB of L3 reads per decode token** and convert to time with the measured disk/page-cache bandwidth (the
+reference model's full pass is 166 GB, §9.1).  `static` is the oracle upper bound for any placement that cannot
+re-rank at run time; `window` is what a prefetch-on-miss scheme can hope for.
+
+**What it can and cannot answer.**  It scores placement / admission / prefetch / pool size — P1-b, P1-c, P1-d and
+§2's sub-full boundary.  It **cannot** score P0-a, which is a per-op sync cost: that needs real runs, and its
+ceiling is already measured (pinned eager 60.6 → remap 65.7 t/s).  For P1-a it cannot score the copy cost, but it
+*does* predict the benefit (fewer disk bytes per token), which is the half that decides go/no-go.
+
+**Use it to kill candidates, not to bless them.**  The precedents are exactly that: the per-layer capacity quota
+measured **+0.0025 h / −1.6 % traffic** (r110) and long-session adaptation's oracle ceiling was **~6 %** of the L3
+traffic per topic shift (r113) — both dropped on the simulation, before any code.  A candidate the simulated
+oracle does not separate is not implemented.
 
 ## 10. Open questions for the maintainer (decide before the first code change)
 
