@@ -545,3 +545,9 @@ item, and it is the one blocker §9.6's "simulate before implementing" rule depe
 **Finding 3 — the pinned arm's cost, measured.**  `-ncmoe 48` pinned holds **65.5 GiB of non-swappable RAM**
 (the cache logs `67110 MiB of host experts`) for 22.36 t/s on one card.  That is the number pool mode has to be
 judged against: not a throughput ratio to a leaky baseline, but 65.5 GiB of pinned RAM versus a bounded pool.
+
+## 13. Session state
+
+The cold-start handover for the next session is [`HANDOVER.md`](HANDOVER.md): measured baselines, the five
+findings (including the blocking one — `--host-experts pool` did **not** activate on the 122B, so no pool number
+taken so far means anything), the `O_DIRECT`-vs-buffered analysis, and the ordered next steps.
