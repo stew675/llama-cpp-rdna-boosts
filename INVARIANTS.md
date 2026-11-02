@@ -217,8 +217,14 @@ change), and let `WORKLOG.md` carry the narrative.
   All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0`, and since **r199** also `GGML_TYPE_Q4_0` on a wave32
   device (`ggml_cuda_quantize_q4_0_group`, PR #262: +10.8 % tg128 on a `q4_0`-KV 30B-A3B, kill switch
   `GGML_CUDA_KV_FOLD_Q4_0=0`, bit-identical — a runtime quantizer select cost the `q8_0` kernel 12.8 -> 15.1 us, so
-  the cache type stays the kernels' compile-time `kv` template value; `q5_0`/`iq4_nl`/`bf16` keep their launches,
-  `TODO` #120), and
+  the cache quantizer stays the kernels' compile-time `kv` template value), and since **r205** also
+  `GGML_TYPE_Q5_0` and `GGML_TYPE_IQ4_NL` on a wave32 device
+  (`ggml_cuda_quantize_q5_0_group` — the q4_0 seed with the `-16` divisor and `qh` written whole from a ballot of
+  the 32 lanes' 5th bits; `ggml_cuda_quantize_iq4_nl_group` — the q4_0 seed with `kvalues_iq4nl[0]`,
+  `best_index_int8` per element, and the reference's 16-term **scale search** reproduced in its serial `j` order by
+  broadcasting term `j` and adding it one at a time, because a butterfly rounds differently: +10.2 %/+24.8 % tg128
+  on a `q5_0`/`iq4_nl`-KV 30B-A3B, kill switches `GGML_CUDA_KV_FOLD_Q5_0=0`/`GGML_CUDA_KV_FOLD_IQ4_NL=0`,
+  bit-identical), and
   they are worth **+13.4 % tg128 / +10.1 % @4096** on a 30B-A3B q8_0-KV arm (gfx1201) with **f16 KV unchanged** —
   so **a coherence or perf claim about them must name a `q8_0` (or `q4_0`) KV arm**, and multi-device arms are mandatory
   (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,
@@ -1394,3 +1400,20 @@ change), and let `WORKLOG.md` carry the narrative.
   it shards the weights by, and `budget = min_i(target_i / ratio_i)`.  This correction applies **only** where a
   window was asked for — a run without `LLAMA_KV_RESIDENT_CELLS` keeps the branch's old (conservative)
   arithmetic exactly, so the split's pre-existing `ntd x` KV over-count is unchanged outside the window arm.
+- **A non-quantized KV cache has no attention rotation, so the r187/r205 KV folds cannot fire on it (r205, `TODO`
+  #120).**  `llama_kv_cache`'s `attn_rot_k`/`attn_rot_v` both require `ggml_is_quantized(type_k/type_v)`, so
+  `-ctk/-ctv bf16` (or `f16`, `f32`) logs `n_rot_k = 0, n_rot_v = 0` and the graph carries no `attn_inp_k_rot`:
+  the "bf16 has no fused write kernel" premise is wrong, there is no fold pattern to extend.  Measured on a `bf16`
+  KV 30B-A3B: `k_set_rows<float,int64_t,nv_bfloat16>` x960 + `rms_norm_mul_rope_f32<256,false,float,0,0,false>`
+  x960, i.e. zero folded launches.  The one exception is the forced indexer rotation
+  (`LLM_ARCH_DEEPSEEK32/DEEPSEEK4/GLM_DSA/DOTS3NOTE` with `n_embd_head_k_full == indexer_head_size`) — an
+  accepted limitation, no such model fits a 32 GiB card.  A bf16 write arm was implemented and removed rather
+  than shipped unreachable; its `--ub 1` A/B read `-0.000001 / 100.000 %`, which the same-build **noise floor**
+  arm reproduces, so that point cannot decide a bf16 arm at all.
+- **`iq4_nl`'s scale search is order-sensitive: the fold must reproduce the reference's 16-term serial sum (r205).**
+  `quantize_f32_iq4_nl_block` accumulates `sumqx`/`sumq2` over `j = 0..15` one term at a time and then sets
+  `d = sumqx/sumq2`; the lane-parallel form computes term `j` on lane `j` and **broadcasts the terms in `j` order**,
+  adding each one at a time (32 `__shfl_sync` per 32-element block).  A butterfly reduction is not the same float
+  and would have flipped cache bytes; with the serial order the `--ub 1` A/B is `-0.000000 / 100.000 %`.  The
+  `q5_0` group needs no such care (a per-element quantizer) but its `qh` word is only reachable as one ballot —
+  bit `j` = lane `j`'s 5th bit — so it is wave32 only, like `q4_0`'s ballot.

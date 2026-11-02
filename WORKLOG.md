@@ -1,3 +1,92 @@
+## 261101.017 (r205) -- the `q5_0` and `iq4_nl` KV cache write folds land in block 10; `TODO` #120 closed (`bf16` is unreachable, not unfused)
+
+**Released as `v16-6050b467c-r205` (16 blocks; block 10 amended).**  Fork point unchanged (`6050b467c`), new
+tip **`7afa30c8e`**, tree **`d6e7190119879b1847668cd7fc9fab3e31cc56c5`** (r204 was `aaf30b6b4` / `62603709`; this
+session's working chain read `e8f94e05d`, the same tree).  `release.json` refreshed; `patches/` regenerated from
+`6050b467c..r205-chain`; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh `6050b467c` tarball,
+tree `d6e71901`, 286 files through the Windows portability lint); `gate-per-block-build.sh --fast --changed-from
+aaf30b6b4 --tip <shared-chain tip>` 2/2 (block 10 + the tip); `fork-refresh.sh --build --gates` re-cut the branch
+from the base, reproduced tree `d6e71901`, and passed coherence + the canonical prefill-logit gate.  Record:
+[`benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md`](benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md).
+
+**Shipped -- `TODO` #120's last reachable half.**  The r187 quantized-KV decode folds (`GREEDY-PURITY.md` §74)
+keyed on the cache `SET_ROWS` being `q8_0` (r187) or `q4_0` (r199, wave32), so a `q5_0` or `iq4_nl` cache kept
+K's and V's own `k_set_rows_quant`, V's own `fwht_cuda<64>` and the two single Q / K norm+rope launches
+(8547 launches per 12-token decode on a 30B-A3B against 6915 for the `q8_0` arm).
+`ggml_cuda_quantize_q5_0_group` reproduces `quantize_f32_q5_0_block` from one 32-lane wave — q4_0's
+**first-of-largest** seed, the reference's `-16` divisor and `min(31, (int8_t)(x + 16.5f))`, lane `j` packing
+element `j` with `j + 16`, and `qh` (the one 32-bit word of 5th bits) written whole by lane 0 from a **ballot over
+the 32 lanes**.  `ggml_cuda_quantize_iq4_nl_group` reproduces `quantize_f32_iq4_nl_block` — `kvalues_iq4nl[0]`'s
+seed, `best_index_int8` per element, and the reference's **16-term scale search**, which is order-sensitive: lane
+`j` computes term `j` and the terms are broadcast **in `j` order** and added one at a time (32 `__shfl_sync` per
+block), because a butterfly association is a different float and would have flipped cache bytes.  The cache
+quantizer stays the kernels' compile-time `kv` value (now 0..4); the launcher's 3-width x 2-`has_ff` x
+2-`no_norm` arm matrix is written once by a local `RMR_FWHT_LAUNCH(NORM, KV)` macro (and `RMR_PAIR_LAUNCH(KV)` in
+the pair launcher), so a new quantizer is one `case`; both types are wave32 only; `GGML_CUDA_KV_FOLD_Q5_0=0` /
+`GGML_CUDA_KV_FOLD_IQ4_NL=0` are the kill switches.  Census (gfx1201, graphs off, 12-token decode): **8547 ->
+6915** on the 30B-A3B (`rms_norm_mul_rope_f32_qk_pair<..,128,3|4>` x336 + `rms_norm_mul_rope_f32<..,128,3|4>`
+x144) and **9831 -> 9063** on gpt-oss-20b (its rope-only `FUSE_ROPE_FWHT` form, `..,64,3|4,true` x384).
+
+**Measured** (`llama-bench -fa 1 -p 0 -n 128 -d 0,4096 -r 5 -t 8`, 3 interleaved rounds per arm,
+`ROCBLAS_USE_HIPBLASLT=0`, one idle box per arch, baseline = a pristine r204 build of the same tree):
+**gfx1201** Qwen3-Coder-30B-A3B Q4_K_M `q5_0` **+10.2 % tg128 / +8.8 % @4096** (155.9 -> 171.8 / 139.3 ->
+151.5), `iq4_nl` **+24.8 % / +22.1 %** (130.4 -> 162.7 / 120.1 -> 146.6); **gfx1100** the same model
+**+12.2 % / +11.1 %** and **+23.4 % / +22.8 %**; **gfx1151** Qwen3.6-35B-A3B Q4_K_M **-0.1 % / -0.1 %** (flat)
+and **+0.5 % / +0.5 %** — the fold fires there (16139 -> 15839 launches) but a 35B-A3B at 16 ms/token is not
+launch-bound.  `f16`, `q8_0` and `q4_0` KV unchanged against the pristine build (172.5 / 175.7 / 172.7 tg128).
+`iq4_nl` gains most because the standalone `k_set_rows_quant<.., quantize_f32_iq4_nl_block>` is the expensive one
+(a 15-step binary search per element, one thread per block).
+
+**`bf16` is not reachable and was deliberately not shipped — the finding of this session.**  `TODO` #120 assumed
+a bf16 cache "has no fused write kernel".  The premise is wrong: `llama_kv_cache`'s `attn_rot_k`/`attn_rot_v`
+both require `ggml_is_quantized(type_k/type_v)`, so `-ctk/-ctv bf16` logs **`n_rot_k = 0, n_rot_v = 0`** and the
+graph carries no `attn_inp_k_rot` at all — there is no rotation to fold.  A bf16 write arm (`kv = 5`, the plain
+`ggml_cuda_cast<nv_bfloat16>`) was implemented, built and measured: the census on a bf16-KV 30B-A3B is
+`k_set_rows<float,int64_t,nv_bfloat16>` x960 + `rms_norm_mul_rope_f32<256,false,float,0,0,false>` x960, i.e.
+**zero** folded launches, and its `--ub 1` A/B read `-0.000001 / 100.000 %` — which the *noise-floor* arm (both
+sides fold-on, an irrelevant switch in the base) reproduced exactly, so that point cannot decide a bf16 arm at
+all.  The arm was removed rather than shipped unreachable-and-unvalidated.  The only path where a non-quantized
+cache *does* rotate is the forced indexer exception (DeepSeek32 / DeepSeek4 / GLM-DSA / DOTS3NOTE with
+`n_embd_head_k_full == indexer_head_size`); no such model fits this box, so it is an **accepted limitation**
+(`INVARIANTS.md`, `GREEDY-PURITY.md` §74), not shipped code.
+
+**Purity (no objection).**  `gate-prefill-logits.sh --kv q5_0 --ub 1 --chunks 8 --ab "GGML_CUDA_KV_FOLD_Q5_0=0"`
+**0.000000 KLD / 100.000 %**, `--kv iq4_nl` **-0.000000 / 100.000 %**; the gpt-oss-20b default-ubatch arm (its
+rope-only form is the one prefill path) **0.000000 / 99.990 %** and **0.000000 / 100.000 %**;
+`test-logits-width-probe` `KV=q5_0`/`KV=iq4_nl` at `P=3584` and `P>=4096` — every `W=1..8` row hash identical
+on/off, `width_purity=PASS`; greedy text byte-identical on **25 arms** (1 GPU: 30B-A3B `q5_0`/`iq4_nl`/`q8_0`/
+`q4_0`/`f16`, dense 27B `q5_0`, gpt-oss-20b `q5_0`/`iq4_nl`, 35B-A3B `-ncmoe 40` `q5_0`) and on gfx1100 and
+gfx1151, always r204 == patched == switch-off (`a292d7672787`, `fa1e77d808b8`, `c82282369771`, `b133a6de8786`,
+`20db30e33028`, `10a82b5559a9`, `910a68488e03`, `95a2fa898505`, `15787727b69d`, `680ba3a5c15c` /
+`58fea34493f7`, `dae072eeaf78` / `061add8deaba`); `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT`
+**7059/7059**.
+
+**Other release gates.**  MTP Protocol A (dense 27B UD-Q4_K_XL, 1 GPU, `-c 32768`, `q5_0` KV, `-n 3000`,
+`--spec-type none` vs `draft-mtp`): plain **29.3** t/s both arms, `draft-mtp` **67.0 vs 67.1**, drafts **2816 /
+accepted 2059 (0.731)** in both.  Band gate `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` (27B Q8_0, 1 GPU)
+flat (`q5_0` 6.71/7.68/9.24 -> 6.78/7.52/9.26 tg).  Graph replay census `direct=3 replay=5 capture=2
+properties_changed=0`; `check-gpu-faults.sh --since "4 hours ago"` clean.  The multi-device-only gates
+(`gate-spec-align`, `gate-spec-width-band`, `gate-state-pipe`'s 2-GPU arm, `gate-kv-window-split`) cannot run on
+this box (one R9700); they were green in r204 on three, and this change reaches no scheduler, state, checkpoint
+or window path.  The fork's `rdna-boosts` branch was force-with-lease pushed to `7afa30c8e`
+(`fork-refresh.sh --push`), the delivery repo and the tag are pushed, and the ROCm container images are the
+`radiance` watcher's job (it picks the tag up within ~10 minutes).
+
+**Tooling fixed on the way in.**  `scripts/gate-per-block-build.sh` *defaults* `--tip` to
+`release.json`'s `.tip`, i.e. the **last released** chain — so running it before the release commit (with
+`--changed-from <previous tip>`) re-verifies the previous release: every block reads "delta unchanged" and only
+the tip builds, a vacuous pass.  This session hit exactly that (the first run gated `6050b467c..aaf30b6b4` and
+printed 15 skips + one 11 s tip build).  The script now **warns** when the defaulted tip is a strict ancestor of
+the checkout's `HEAD`, prints the `--tip $(git rev-parse HEAD)` invocation to use, and is unchanged otherwise
+(`scripts/`, not a delivered artifact).
+
+**Docs.**  `patches/README.md` (block 10 table row + a new r205 block note), `ENVIRONMENT.md` (the two kill
+switches + the corrected "which cache types are folded" paragraph), `INVARIANTS.md` (the r187 KV-fusion bullet
+corrected in place, plus two new facts: a non-quantized cache has no rotation; `iq4_nl`'s scale search is
+order-sensitive), `GREEDY-PURITY.md` §74 (rule 6 extended to `q5_0`/`iq4_nl` with the association-order rule, the
+Scope paragraph now states the `f16`/`bf16` non-reachability, index row updated), `MANIFESTS.md` (the block-10
+per-block row gains the r205 arm and the bf16 note), `TODO.md` (**#120 removed**).  `TODO` #120 is closed.
+
 ## 261101.016 (r204) -- the windowed KV across a `-sm tensor` split: `TODO` #124 closed, and four path defects fixed with it
 
 **Delivery change.  Block 15 amended** (the streamed KV), fork point unchanged (`6050b467c`), new tip

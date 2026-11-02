@@ -104,6 +104,7 @@ TARGETS="${GATE_TARGETS:-all}"
 TARGETS_GIVEN=0
 BASE=""
 TIP=""
+TIP_GIVEN=0
 
 usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//; /^set -uo/d'; exit "${1:-0}"; }
 
@@ -111,7 +112,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --repo)       REPO="$2"; shift 2 ;;
         --base)       BASE="$2"; shift 2 ;;
-        --tip)        TIP="$2"; shift 2 ;;
+        --tip)        TIP="$2"; TIP_GIVEN=1; shift 2 ;;
         --build-dir)  BUILD_DIR="$2"; shift 2 ;;
         --jobs)       JOBS="$2"; shift 2 ;;
         --rocm)       ROCM_DIR="$2"; shift 2 ;;
@@ -131,6 +132,25 @@ if [ -z "$BASE" ] || [ -z "$TIP" ]; then
     [ -f "$MANIFEST" ] || { echo "ERROR: $MANIFEST not found" >&2; exit 2; }
     [ -n "$BASE" ] || BASE="$(jq -r '.base' "$MANIFEST")"
     [ -n "$TIP" ]  || TIP="$(jq -r '.tip' "$MANIFEST")"
+fi
+
+# A defaulted TIP names release.json's field, i.e. the LAST RELEASED chain -- not the chain in the
+# checkout.  Run before the release commit and that silently re-verifies the previous release: with
+# `--changed-from <prev tip>` every block's delta is unchanged by construction, so the gate prints
+# "[skip] ... (delta unchanged)" for all 15 and a single tip build, i.e. a vacuous PASS (r205 hit
+# exactly this).  The chain being released is a branch head, so say so and name the invocation.
+if [ "$TIP_GIVEN" = 0 ] && command -v git >/dev/null 2>&1 && [ -d "$REPO/.git" ]; then
+    head_rev="$(git -C "$REPO" rev-parse --verify -q HEAD || true)"
+    tip_rev_c="$(git -C "$REPO" rev-parse --verify -q "$TIP" || true)"
+    if [ -n "$head_rev" ] && [ -n "$tip_rev_c" ] && [ "$head_rev" != "$tip_rev_c" ] &&
+       git -C "$REPO" merge-base --is-ancestor "$tip_rev_c" "$head_rev" 2>/dev/null; then
+        echo "WARNING: --tip defaulted to release.json's tip ($(git -C "$REPO" rev-parse --short "$tip_rev_c"))," >&2
+        echo "         but $REPO has $(git -C "$REPO" log -1 --format='%h %s' "$head_rev")" >&2
+        echo "         ahead of it.  This gate would verify the PREVIOUS release's chain (every block then" >&2
+        echo "         reads 'delta unchanged' and only the tip builds).  Pass" >&2
+        echo "           --tip $head_rev" >&2
+        echo "         to gate the chain you are about to release." >&2
+    fi
 fi
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: $REPO is not a git checkout" >&2; exit 2; }
 case "$BUILD_DIR" in /*|..*|*..) echo "ERROR: --build-dir must be a plain relative path" >&2; exit 2 ;; esac

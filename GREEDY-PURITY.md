@@ -143,7 +143,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§71** | a graph-reorder pass is pure only while it moves nodes alone: enumerate the positional consumers (a matcher that anchors at a fixed index and returns a skip count) and exclude every input they depend on, judge it at three ubatch widths, and quote the GGUF with any claim because a reorder's reach is a model property | doctrine + measured (r180, PR #252; `benchmarks/2026-10-30-graph-order-0003-r180.md`) |
 | **§72** | a fold that merges two launches with an in-kernel barrier is pure only where it reproduces the first launch's arithmetic **and** keeps writing its output: the predicate must re-check the dispatcher's route in its own order, the width is the gate (one logits row), the elided launch's store stays, and the cross-block counter is a dedicated slot | doctrine + fix (r182, PR #253; `benchmarks/2026-10-30-router-topk-fold.md`) |
 | **§73** | a fold that elides graph nodes is pure only while every reader it could serve is accounted for: an elided store's destination must be span-checked and reproduced exactly, an elided copy's reader must be the kernel (preload the row before writing it back), a compute-time disjunctive predicate must stay a **superset** of the structural one `graph_optimize` uses, a fold that stores no intermediate needs a whole-graph reader count, reach is a model **and device-count** property (r186 removed the single-device gate — multi-device reach is empirical, gate it with a multi-device width-probe arm), and a launch-order-only fold is judged by the **width probe across runs**, never by text or the single-token KLD | doctrine + fix (r183 PR #256 + r186; `benchmarks/2026-10-30-gdn-decode-folds.md`, `benchmarks/2026-10-31-conv-fusion-multi-device.md`) |
-| **§74** | a fusion that exists for one cache-*quantizer* path (now q8_0 **and** q4_0, wave32) is sound only while it reproduces that quantizer's write exactly: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
+| **§74** | a fusion that exists for one cache-*quantizer* path (now q8_0, q4_0, q5_0 **and** iq4_nl, wave32) is sound only while it reproduces that quantizer's write exactly: an order-sensitive scale search (iq4_nl's 16-term serial sum) must be reproduced in the reference's **association order**, not a butterfly, and a non-quantized cache is out of scope rather than unfused because it carries no rotation at all: the V/rotation folds re-run the standalone kernel's in-warp FWHT and lane->element quantize map on the same row, an F32 intermediate whose only reader is the fold is a single-use (not-a-output) tensor whose source must not overlap the rows the fold writes, the FA-combine fold publishes the projection's Q8_1 **only** where the combine kernel actually runs (never on the fallback path, which would leave a cache entry nobody filled), and a reorder that defers nodes owes the "no remaining node reads a deferred one" check — the oracle is the `--ub 1` A/B plus the width probe, because every one of these is a 1-token-shape fusion except the rope-only form, which is prefill and owes the prefill-logit gate | doctrine + fix (r187, PR #258; `benchmarks/2026-10-31-kv-rotation-decode.md`) |
 | **§75** | a Q8_1 publish that extends an existing one into a **second** consumer must be armed by the very predicate the kernel implements (here it is nested inside the routed term, so no entry can exist that nothing filled), must key the entry on the tensor the consumer looks up (the shared GLU node, never the routed `dst`) with counters in a **disjoint lane**, and must reproduce `quantize_q8_1` exactly; its **reach is a quant property**, because the delivery's own `shexp_down_gate` fusion (Q8_0 `ffn_down_shexp`) consumes the shared down and leaves the publish inert — so reach is measured with a launch census and quoted with the GGUF | doctrine + fix (r188, PR #259; `benchmarks/2026-10-31-shared-glu-q8.md`) |
 | **§76** | a conservative guard that declines a fast path owes a fallback that is not pathological, and the refusal must be a distinct signal rather than inferred from a partially-filled out-parameter: a guard whose false positive routes a *large* copy to an element-per-thread kernel (three divisions and three modulos per element) is a regression waiting for a model that reaches it — so keep the guard, vectorise the fallback (bit-identical, alignment-checked), and never let a *different* refusal geometry (overlapping rows, which need the flat mapping) share the fallback's condition | doctrine + fix (r189, from the KV campaign's `f8e47e392`; `benchmarks/2026-10-31-cpy-2d-vec16.md`) |
 | **§77** | a cache that keeps its **authoritative** copy where it is cheap and a cache of the hot part where it is fast must make the CHEAP copy authoritative, so every existing path (the `set_rows` writers, `state_write`/`state_read`, the K-shift, defrag, parking, `get_k`/`get_v`) needs no pool-aware code; the resolve then owes three rules — **mark before claim** (a claim must never evict a page the same launch reads), **distinct blocks only** (a claim per *attempt* wraps the cursor within one batch), and **no transient scratch inside a captured graph** (a fill list in a pool allocation bakes a pointer a replay then reuses) — plus a residency floor of one decode band so a verify batch cannot exhaust the slots; a cache that is pooled or windowed reports it is **streaming**, and taking the sparse arm there is a different attention **regime** (like §45/§63), so the oracle is the pooled arm against the resident **sparse** arm and a resident arm against itself, never a dense-vs-pooled text diff | doctrine + fix (r190, block 16; `../archive/work/kv-residency/BA-POOL-DESIGN.md` §7-§8) |
@@ -2025,13 +2025,26 @@ pair, the combine's Q8_1 publish and both `fwht_cuda` launches were all gone.  r
    Its accumulator is **one 32-lane wave**, so `ggml_cuda_kv_fold_type_ok` takes the **running device's**
    `warp_size` (the caller's `ctx.device` — never a per-node `ggml_cuda_get_device()` and never the primary
    device) and the launch sites assert it: on a wave64 device the ballot would mix two blocks.  The quantizer
-   must also stay a **compile-time** choice (the kernels' `kv` template value 0/1/2): a runtime select cost the
+   must also stay a **compile-time** choice (the kernels' `kv` template value 0..4): a runtime select cost the
    q8_0 kernel 12.8 -> 15.1 us, i.e. it taxes the arm it was not added for.  `GGML_CUDA_KV_FOLD_Q4_0=0` is the
-   kill switch; `q5_0`/`iq4_nl`/`bf16` KV keep their separate launches (correct, unfused): `TODO.md` #120.
+   kill switch.  **Since r205** the same predicate admits **`q5_0`** and **`iq4_nl`**
+   (`ggml_cuda_quantize_q5_0_group`, `ggml_cuda_quantize_iq4_nl_group`; kill switches
+   `GGML_CUDA_KV_FOLD_Q5_0=0` / `GGML_CUDA_KV_FOLD_IQ4_NL=0`, +10.2 %/+24.8 % tg128 on gfx1201) — and they add
+   the second half of this rule: **a quantizer whose scale is an accumulation must be reproduced in its
+   association order.**  `quantize_f32_iq4_nl_block` sums 16 terms into `sumqx`/`sumq2` one at a time, so the
+   group form computes term `j` on lane `j` and broadcasts the terms in `j` order, adding each one (32 shuffles
+   per block); a butterfly is a different float and would have flipped cache bytes.  A per-element quantizer
+   (`q5_0`) needs no such care, but its `qh` word exists only as one ballot over the 32 lanes (bit `j` = lane
+   `j`'s 5th bit), which is what makes it wave32 only.
 
 **Scope.**  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` — that is the quantizer they reproduce —
-or, since r199, `GGML_TYPE_Q4_0` on a wave32 device (rule 6).  `q5_0`/`iq4_nl`/`bf16` KV keep their separate
-launches (correct, unfused): `TODO.md` #120.
+or, since r199/r205, `GGML_TYPE_Q4_0` / `GGML_TYPE_Q5_0` / `GGML_TYPE_IQ4_NL` on a wave32 device (rule 6).
+`q5_1`/`q4_1` keep their separate launches (no group form yet).  **A non-quantized cache (`f16`, `bf16`, `f32`)
+is not a scope gap at all**: `llama_kv_cache`'s `attn_rot_k`/`attn_rot_v` require
+`ggml_is_quantized(type_k/type_v)`, so such a cache carries no Hadamard rotation (`n_rot_k = 0`) and these
+matchers have no pattern to match — which is why r205 implements and ships **no** bf16 write arm (it was written,
+measured and removed; the one arch family that forces a rotation on a non-quantized cache is the
+DeepSeek32/DeepSeek4/GLM-DSA/DOTS3NOTE indexer exception, an accepted limitation).
 
 **Numbers** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `llama-bench -r 3`, 3 interleaved rounds, same build dir):
 Qwen3-30B-A3B Q4_K_M `-ctk/-ctv q8_0` tg128 **141.2 -> 160.1 t/s (+13.4 %)**, @4096 **127.3 -> 140.1 (+10.1 %)**;
@@ -2054,9 +2067,25 @@ byte-identical on six arms and on all three arches, `test-backend-ops -o ROPE,SE
 acceptance identical) — the r191-era gfx1201 MTP cost that held this PR out of r192 does not reproduce at r198
 (it was the compiled verify kernels, the same class r198's `mmvq-ksplit-body.inc` fixed for PR #260).
 
-**Record:** `WORKLOG.md` 261031.005, `WORKLOG.md` 261101.005 (r199, `q4_0`), `patches/README.md` (block 10 /
-block 11), `ENVIRONMENT.md` §7.4, `benchmarks/2026-10-31-kv-rotation-decode.md`,
-`benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`, `archive/work/kv-rotation-decode/`.
+**Numbers, `q5_0` and `iq4_nl` (r205).**  Qwen3-Coder-30B-A3B Q4_K_M, `llama-bench -fa 1 -p 0 -n 128
+-d 0,4096 -r 5 -t 8`, three interleaved rounds, `ROCBLAS_USE_HIPBLASLT=0`: `q5_0` KV tg128 **155.9 -> 171.8
+(+10.2 %)** / @4096 **139.3 -> 151.5 (+8.8 %)**; `iq4_nl` KV tg128 **130.4 -> 162.7 (+24.8 %)** / @4096
+**120.1 -> 146.6 (+22.1 %)** on gfx1201, **+12.2 %/+11.1 %** and **+23.4 %/+22.8 %** on gfx1100, and
+**-0.1 %/-0.1 %** and **+0.5 %/+0.5 %** on gfx1151 (a 35B-A3B whose decode is not launch-bound; the fold does
+fire there, 16139 -> 15839 launches).  `f16`, `q8_0` and `q4_0` KV unchanged against a pristine r204 build.
+Census (gfx1201, graphs off, 12-token decode) **8547 -> 6915** (the q8_0 count) on the 30B-A3B and
+**9831 -> 9063** on gpt-oss-20b (its rope-only form).  Purity: `--kv q5_0` / `--kv iq4_nl` `--ub 1`
+prefill-logit A/B **0.000000 / -0.000000 / 100.000 %**, the gpt-oss default-ubatch rope-only arm
+**0.000000 / 99.990 %** and **/ 100.000 %**, the width probe identical at `P=3584`/`P>=4096`, greedy text
+byte-identical on 25 arms (three arches, `q8_0`/`q4_0`/`f16` controls included), `test-backend-ops -o
+ROPE,SET_ROWS,FLASH_ATTN_EXT` 7059/7059, and MTP Protocol A flat (67.0 vs 67.1 t/s, drafts 2816 / accepted 2059
+both).  `bf16` was **not** shipped: its arm is unreachable (above) and its `--ub 1` A/B read `-0.000001 /
+100.000 %`, which the same-build noise-floor arm reproduces exactly.
+
+**Record:** `WORKLOG.md` 261031.005, `WORKLOG.md` 261101.005 (r199, `q4_0`), `WORKLOG.md` 261101.017 (r205,
+`q5_0`/`iq4_nl`), `patches/README.md` (block 10 / block 11), `ENVIRONMENT.md` §7.4,
+`benchmarks/2026-10-31-kv-rotation-decode.md`, `benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`,
+`benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md`, `archive/work/kv-rotation-decode/`.
 
 ## 75. A Q8_1 publish that extends an existing one must be armed by the predicate the kernel implements, and its reach is a quant property (r188, PR #259)
 

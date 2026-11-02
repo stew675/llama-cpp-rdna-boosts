@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107; + r203: PR #266's sync-free decode-band device remap and the in-place pool read, `GGML_MOE_DEVREMAP`/`MOE_HOST_POOL_COLD`) | +15941 / −538 | 66 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r199: PR #262's `q4_0` KV cache write fold, `GGML_CUDA_KV_FOLD_Q4_0`; + r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses; + r198: PR #260's mixed K-quant x Q6_K row concat, its `.inc` ksplit body and the codegen fix for the r192 MTP hold; + r202: the fusion-gate oracle's 33-case matrix, tests only; + r203: PR #266's `moe_cache_remap` hook wrapper, relocated here with the other iface wrappers) | +15578 / −5421 | 84 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r199: PR #262's `q4_0` KV cache write fold, `GGML_CUDA_KV_FOLD_Q4_0`; + r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish; + r189: the r183 2-D copy guard gets a vectorised fallback for the copies it refuses; + r198: PR #260's mixed K-quant x Q6_K row concat, its `.inc` ksplit body and the codegen fix for the r192 MTP hold; + r202: the fusion-gate oracle's 33-case matrix, tests only; + r203: PR #266's `moe_cache_remap` hook wrapper, relocated here with the other iface wrappers; + r205: the `q5_0` and `iq4_nl` KV cache write folds, `GGML_CUDA_KV_FOLD_Q5_0` / `GGML_CUDA_KV_FOLD_IQ4_NL`, and the shared `RMR_FWHT_LAUNCH` dispatch — `TODO` #120 closed) | +15578 / −5421 | 84 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228; + r190: the fused indexer scorer and the derived indexer pool read **quantized** indexer keys (q8_0 + the q4/q5 family + iq4_nl), so `-ctk q8_0` takes the fast path, TODO #118) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248; + r203: PR #266's `g_dr_key_to_id` reindex in `moe_cache_forget_all` and the `heat_dec` tally in the lag policy) | +5261 / −947 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1498,8 +1498,10 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
     does, so it carries the prefill-logit obligation (`gate-prefill-logits.sh --ab
     "GGML_CUDA_FUSE_ROPE_FWHT=0"`, plus the `--ub 1` arm).  Fires on gpt-oss on our models, not on
     qwen/gemma (their ROPE follows a norm).
-  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, and since **r199** also **`GGML_TYPE_Q4_0`** on a
-  wave32 device (PR #262; `TODO` #120 covers the remaining KV types).
+  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`**, and since **r199**/**r205** also
+  **`GGML_TYPE_Q4_0`** / **`GGML_TYPE_Q5_0`** / **`GGML_TYPE_IQ4_NL`** on a wave32 device (PR #262, r205); a
+  **non-quantized** cache (`f16`/`bf16`/`f32`) carries no rotation at all, so there is nothing to fold (see the
+  r205 note below).
   Measured on gfx1201 1 GPU, Qwen3-30B-A3B Q4_K_M q8_0 KV: tg128 **141.2 -> 160.1 t/s (+13.4 %)**,
   @4096 **127.3 -> 140.1 (+10.1 %)**, launches/token **726 -> 510**; F16 KV unchanged (162.7 vs 163.1);
   gpt-oss-20b q8_0 **+4.0 % / +6.1 %**.  Records: `WORKLOG.md` 261031.005,
@@ -1528,6 +1530,36 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   (the r191 hold's gfx1201 cost does not reproduce at r198: 1 GPU bf16 76.5 vs 76.4 t/s, q4_0 74.6 vs 74.5, 3 GPU
   tensor q4_0 130.9 vs 130.1), Protocol A passes on dense and MoE, and the band gate is flat.  Record:
   `benchmarks/2026-11-01-kv-fold-q4_0-promotion.md`, `WORKLOG.md` 261101.005.
+* **The `q5_0` and `iq4_nl` KV cache write folds (r205, `TODO` #120 closed).**  The same five folds now serve a
+  **`q5_0`** or **`iq4_nl`** cache, so the last two quantized KV types stop keeping their per-layer write.
+  `ggml_cuda_quantize_q5_0_group` reproduces `quantize_f32_q5_0_block` from one 32-lane wave (q4_0's first-of-largest
+  seed, the reference's `-16` divisor and `min(31, (int8_t)(x + 16.5f))`, lane `j` packing `j` with `j + 16`, and
+  `qh` — the one 32-bit word of 5th bits — written whole by lane 0 from a **ballot over the 32 lanes**);
+  `ggml_cuda_quantize_iq4_nl_group` reproduces `quantize_f32_iq4_nl_block` (`kvalues_iq4nl[0]`'s seed,
+  `best_index_int8` per element, and the reference's **16-term scale search**, which is order-sensitive: lane `j`
+  computes term `j` and the terms are broadcast **in `j` order** and added one at a time, because a butterfly
+  rounds differently).  The cache quantizer stays the kernels' compile-time `kv` value (now 0..4), the launcher's
+  3-width x 2-`has_ff` x 2-`no_norm` matrix is written once by `RMR_FWHT_LAUNCH(NORM, KV)`, both types are
+  wave32-only, and `GGML_CUDA_KV_FOLD_Q5_0=0` / `GGML_CUDA_KV_FOLD_IQ4_NL=0` are the kill switches.  Census
+  (gfx1201, graphs off, 12-token decode): **8547 -> 6915** on Qwen3-Coder-30B-A3B (the q8_0 arm's count;
+  `rms_norm_mul_rope_f32_qk_pair<..,128,3|4>` x336 + `rms_norm_mul_rope_f32<..,128,3|4>` x144 replace the 960
+  `k_set_rows_quant` and 960 plain rope launches) and **9831 -> 9063** on gpt-oss-20b (its rope-only
+  `FUSE_ROPE_FWHT` form).  Measured with `llama-bench -fa 1 -p 0 -n 128 -d 0,4096 -r 5`, 3 interleaved rounds:
+  **gfx1201 `q5_0` +10.2 % tg128 / +8.8 % @4096** (155.9 -> 171.8 / 139.3 -> 151.5) and **`iq4_nl` +24.8 % /
+  +22.1 %** (130.4 -> 162.7 / 120.1 -> 146.6); **gfx1100 +12.2 %/+11.1 %** and **+23.4 %/+22.8 %**; **gfx1151 flat
+  (-0.1 %) and +0.5 %** (a 35B-A3B whose decode is not launch-bound, and where the fold does fire: 16139 -> 15839
+  launches).  `f16`, `q8_0` and `q4_0` KV are unchanged against a pristine r204 build.  Purity: `--kv q5_0` /
+  `--kv iq4_nl` `--ub 1` prefill-logit A/B **0.000000 / -0.000000 / 100.000 %**, the gpt-oss default-ubatch
+  rope-only arm `0.000000 / 99.990 %` and `/ 100.000 %`, `test-logits-width-probe` identical at `P=3584`/`P>=4096`,
+  greedy text byte-identical on 25 arms across gfx1201/gfx1100/gfx1151 (r204 == patched == switch-off, `q8_0`/
+  `q4_0`/`f16` controls included), `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` 7059/7059, MTP Protocol A
+  flat (67.0 vs 67.1 t/s, drafts 2816 / accepted 2059 both), the band gate flat.  **`bf16` is deliberately not
+  shipped**: `attn_rot_k`/`attn_rot_v` require `ggml_is_quantized(type_k/type_v)`, so a bf16 cache has
+  `n_rot_k = 0` and no fold pattern (`k_set_rows<float,int64_t,nv_bfloat16>` x960 + a plain rope x960, zero folded
+  launches); the arm was written, measured and removed, and its `--ub 1` A/B read the same `-0.000001` as the
+  noise-floor arm built from the identical code.  Records:
+  `benchmarks/2026-11-01-kv-fold-q5_0-iq4_nl-promotion.md`, `WORKLOG.md` 261101.017, `GREEDY-PURITY.md` §74,
+  `INVARIANTS.md`.
 * **bf16 RoPE destinations (r103, `TODO` #83, filed and closed in r103)**: `rope.cu` instantiated float/f16 destinations for the NORMAL
   and NEOX modes but not bf16, and since r101 the iSWA `k_cur`/`v_cur` reorder lets the ROPE → VIEW →
   SET_ROWS fusion fire for Gemma's K — so `-ctk bf16 -ctv bf16` prefill aborted at `rope.cu:672`.  The four

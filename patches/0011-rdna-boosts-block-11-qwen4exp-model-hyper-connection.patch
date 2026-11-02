@@ -1,4 +1,4 @@
-From 7a63f35929c72d3d88c0aa16592a67f8416f862b Mon Sep 17 00:00:00 2001
+From b1bcb6d936826fe989f04ccf26c7bfc494c332cd Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -2777,7 +2777,7 @@ index 000000000..e17d4bf60
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 5cd4d080d..5e305b720 100644
+index 3f4a80512..5887851d6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -30,6 +30,9 @@
@@ -2807,7 +2807,7 @@ index 5cd4d080d..5e305b720 100644
  #include "ggml-cuda/ggml-cuda-try-fuse.cuh"
  #include "ggml.h"
  #include <algorithm>
-@@ -1741,6 +1747,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -1749,6 +1755,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -2825,7 +2825,7 @@ index 5cd4d080d..5e305b720 100644
  // wip/moe-expert-cache (H1): while the cache is active, only the fusions that read a routed
  // expert table in the cache band stand down; every other backend fusion (router/topk, GDN, QSA,
  // rope, norms, and the *prefill* MoE fusions) stays on.  The decode/verify MoE must run through
-@@ -2127,6 +2144,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2135,6 +2152,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -2836,7 +2836,7 @@ index 5cd4d080d..5e305b720 100644
  
      // GDN snapshot CPYs already written by the direct conv kernel (GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off)
      if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, i)) {
-@@ -2149,6 +2170,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2157,6 +2178,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_shared_expert;
      }
  
@@ -2847,7 +2847,7 @@ index 5cd4d080d..5e305b720 100644
  
      // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
      // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
-@@ -3215,6 +3240,29 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -3223,6 +3248,29 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      // then read inject's data as block_out. It now reads the live REPEAT output (mul operand).
      // Opt-outs: GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_MIX=1 / GGML_CUDA_DISABLE_HC_COMB=1.
  
