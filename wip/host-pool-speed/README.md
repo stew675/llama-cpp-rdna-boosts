@@ -495,3 +495,53 @@ oracle does not separate is not implemented.
   the 166 GB/pass shard-byte figure, and the staging-vs-gather architecture rule (§9.1).
 - PR #267 files (on the submitter's branch, not in this repo): `wip/mmap-host-experts-r204/0001..0010`,
   `README.md`.
+
+## 12. Measured so far — first session, 2026-11-02
+
+Box: primary, **one R9700** (32.6 GiB), gfx1201, ROCm 10.1, build `b11903-efaa60db0` (the r206 tip).
+Model: the campaign's reference 122B-A10B (§9.1).  Arm: `-ncmoe 48 -ngl 99 -c 8192 -ctk/ctv q8_0 -fa auto
+-b 2048 -ub 2048`, `--spec-type none --seed 42 --temp 0 --reasoning off --single-turn`,
+`prompts/prose-rdna-boosts.txt` (5258 prompt tokens), `-n 2000`.  Host experts: **67,110 MiB** (65.5 GiB).
+
+| arm | arena | residency | `h=` | prompt | decode |
+|---|---|---|---|---|---|
+| **shipped default** (`MOE_EXPERT_CACHE_MIB` unset, auto; `GGML_MOE_DEVREMAP` on) | **22,544.8 MiB** | **33.6 %** | **0.7543** | **682.4 t/s** (1.47 ms/tok) | **22.36 t/s** (44.72 ms/tok) |
+| trace arm (`MOE_EXPERT_CACHE_MIB=4096`, `GGML_MOE_DEVREMAP=0`) | 3,932.2 MiB | 5.5 % | 0.3488 | 157.2 t/s | 12.88 t/s |
+
+Wall clock: 114 s shipped (19 s load + 7.7 s prompt + 83 s decode), 212 s for the trace arm.
+Auto sizing takes the slab's arena region (23.00 GiB): `alloc_all_locked` sizes the cache from what is free
+*after* `--fit`, the graph reserve and the KV cache, so "unset" is not "small" — it is **22.5 GiB**, and
+`MOE_EXPERT_CACHE_MIB=4096` was costing **4.3x the prefill and 42 % of the decode**.  Same for the trace arm:
+restricting the arena is what makes the tables traceable, and it also changes the regime by a factor of two.
+
+**Finding 1 — a decode trace requires `GGML_MOE_DEVREMAP=0` (today, on any pinned table).**  The `D` records
+are emitted by `moe_cache_update_host`, the *eager* hook; the r203 remap path never brings the routing back to
+the host, and the scheduler returns before the eager hook.  With the shipped default the trace stops after the
+two sizing passes (**288 `D` records** for 1864 decode steps).  With `GGML_MOE_DEVREMAP=0`: **268,416 `D`
+records**, 38 MB, 1864 steps × 144 tables ✓.  This is a doc gap in `ENVIRONMENT.md`'s `MOE_EXPERT_TRACE` row and
+in the replayer's docstring (both explain the identity-table caveat but not this one) — worth a one-line fix
+when the campaign next touches docs.
+
+**Finding 2 — the replayer does not calibrate against the delivered allocator.**  Same trace, `--devices 1`,
+`--seed sidecar:<the model's .moe-heatmap>`, scored against each arm's own logged `h=`:
+
+| arena | slots/table | replayer `shipped` | run's `h=` | error |
+|---|---|---|---|---|
+| 3,932 MiB | 14-16 | 0.19-0.20 | 0.349 | **−0.16** |
+| 3,932 MiB, `--churn off` | 15 | 0.2855 | 0.349 | −0.06 |
+| 22,518 MiB | 87-92 | 0.642 | 0.754 | **−0.11** |
+
+The delivered placement (verified from a `-lv 4` run) is a **uniform 15 slots/table** at 4 GiB, seeded from the
+persisted map (`apply_heat_seed_locked: ... heat-seeded 15/15 slots from the persisted map (256 experts, ranked
+by the DECODE band)`), i.e. exactly the shape the replayer models — so the gap is in the *dynamics*, and the
+`--churn off` arm recovers two thirds of it at the low-arena point.  `--seed sidecar` reports only **31.4 % of
+the prior's mass in the seeded slots** at 14 slots, while the run's `h=0.349` is *higher* than that, so the real
+cache is losing less of its seed to eviction than the model does.  Candidates, not yet tested: the seeded-resident
+eviction order (`count=0` → first to be given up), the `MOE_EXPERT_CACHE_PERIOD`/decay interaction, and whether
+the real `access_locked` charge of `t.hits`/`t.misses` includes the band-wide union of a multi-token pass.
+**Until this is reconciled, the replayer's policy deltas are not trustworthy** — it is the campaign's P1 tool
+item, and it is the one blocker §9.6's "simulate before implementing" rule depends on.
+
+**Finding 3 — the pinned arm's cost, measured.**  `-ncmoe 48` pinned holds **65.5 GiB of non-swappable RAM**
+(the cache logs `67110 MiB of host experts`) for 22.36 t/s on one card.  That is the number pool mode has to be
+judged against: not a throughput ratio to a leaky baseline, but 65.5 GiB of pinned RAM versus a bounded pool.
