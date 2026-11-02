@@ -81,6 +81,18 @@ either), and `window ≥ pinned` on throughput in every cell measured — at **z
   `MOE_EXPERT_WINDOW_TRACE` (one line at exit) and `MOE_EXPERT_WINDOW_ALIAS_FILL` (**default on** in
   window mode; `=0` is the kill switch — see *Prefill parity* below).
 
+## Known gap 0 — it is FATAL when the host expert set can be evicted (found 2026-11-02)
+
+`window` registers the model mapping instead of pinning it, so a GPU read needs the page to be **present**,
+and a no-XNACK GPU cannot fault-and-retry.  On a box where the host expert set does not fit comfortably in
+RAM (93.16 GiB model + ~59 GiB host set in 98 GB, 1x R9700) a `-ncmoe 44` run faults on the first
+completion — `mul_mat_vec_q_moe` → `Page not present` — and even with `GGML_MOE_DEVREMAP=0` a
+`llama-bench -p 2048` run dies with a GPU coredump.  `pinned` is unaffected because its pages are never
+evictable, which is precisely the trade this mode claims to win, so **do not treat `window` as a
+fittability mode yet**: it is a mode for a host set that fits in RAM with room to spare.  Workgroups:
+`-ncmoe 32` is clean on that box, `-ncmoe 40/44` is not, and the tell is a **multi-ubatch prefill**
+(`llama-bench -p 2048`), not a short prompt.
+
 ## Known gaps — what the beta is FOR
 
 1. **`-sm tensor` / multi-device is UNTESTED.**  The registration is keyed by the *host tensor* with a

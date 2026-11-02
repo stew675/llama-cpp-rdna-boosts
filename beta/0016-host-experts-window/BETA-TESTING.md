@@ -106,6 +106,15 @@ see: if a device declines *after* staging was already skipped, the split drops o
 prefill collapses (measured on a simple backend in the pool case: **49.6 t/s** on the first request, versus
 ~232-285 for the same arm with the predicate in place).  So measure prefill with the switch **on and off**:
 
+**AND: run a multi-ubatch prefill, not only the 32-token smoke.**  `window` is FATAL when the host expert
+set can be evicted (2026-11-02, `WORKLOG.md` 261102.012): on a box where the set does not fit comfortably in
+RAM, a `-ncmoe 44` run faults the GPU (`mul_mat_vec_q_moe` → `Page not present`) on the first completion,
+and `llama-bench -p 2048` dies even with `GGML_MOE_DEVREMAP=0`; `-ncmoe 32` was clean there.  A short prompt
+does not exercise it.  So for every arm you report, include
+`llama-bench -p 2048 -n 128 -r 2 --host-experts window -lm mmap` at the running `-ncmoe`, and
+`scripts/check-gpu-faults.sh` on the log.  If your box has RAM headroom this will be clean — say so
+explicitly, because it is the difference between "works" and "works on a big-RAM box".
+
 ```bash
 # arm A: gather on (the default)   arm B: gather off (staging, the pre-gather baseline)
 for g in 1 0; do GGML_SCHED_DEVGATHER=$g ./build-rocm/bin/llama-bench -m $M -ngl 99 -ncmoe 40 -sm tensor \

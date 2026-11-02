@@ -1,3 +1,54 @@
+## 261102.012 (wip) -- host-expert window: FATAL on a model larger than RAM (GPU page fault reading a reclaimed registered page); DEVREMAP is one of the two readers
+
+No delivery change (the beta candidate is unchanged); this is a **limitation finding** for `window`, from
+trying to make it the default on the IQ4_NL Flash-Next cell (93.16 GiB model, 98 GB RAM, 1x R9700).
+
+**What happens.**  `--host-experts window -ncmoe 44` faults the GPU on the first completion:
+
+```
+Memory access fault by GPU node-1 on address 0x7f6fc8f4d000. Reason: Page not present or supervisor privilege
+kernel: mul_mat_vec_q_moe<(ggml_type)20, ...>     (also a GPU coredump in llama-bench -p 2048)
+```
+
+It is **not** a stale-address bug: it is the mode's own premise turning against it.  `window` registers the
+model mapping instead of pinning it, so a GPU read requires the page to be **present**; on a no-XNACK GPU
+there is no fault-and-retry.  With a 93 GiB model plus a ~59 GiB host expert set in 98 GB of RAM the kernel
+reclaims expert pages under pressure, and the next GPU read of one is fatal.  `pinned` never sees it because
+those pages are never evictable — which is exactly the trade the mode was supposed to win.
+
+**Measured, this box, this model:**
+
+| config | result |
+|---|---|
+| `pinned`, `-ncmoe 44` | ok — pp2048 452.2 / tg128 39.0 (the previous runme) |
+| `window`, `-ncmoe 44`, `GGML_MOE_DEVREMAP` on | GPU page fault on the first completion *(`mul_mat_vec_q_moe`)* |
+| `window`, `-ncmoe 44`, `GGML_MOE_DEVREMAP=0` | 16-token smoke ok; `llama-bench -p 2048` GPU coredump |
+| `window`, `-ncmoe 32` | ok (smoke, and the config `/llm/models/.../IQ4_NL/runme` now uses) |
+
+So there are at least **two** GPU readers of the registered range that fault once the pages are evictable —
+the decode-band in-place cold read (reachable via `GGML_MOE_DEVREMAP`, which is why killing that switch
+stabilised the short smoke) and the prefill side.  Killing the switch is a workaround, not a fix; the real
+constraint is **the host expert set has to fit comfortably in RAM**, which is the opposite of the
+sub-residency regime the campaign tuned on (40 GiB set in 98 GB) and of the "fittability" case in the
+campaign's own framing.
+
+**Consequences recorded for the maintainer (not fixed here).**
+
+* The 1-GPU campaign cells are unaffected (40 GiB host set, 98 GB box, zero disk I/O, clean); this is the
+  *model-larger-than-RAM* case.
+* `window` must not be promoted as a "fittability" mode for a set that does not fit RAM until either
+  (a) the registration holds what the device may read (`MOE_EXPERT_WINDOW_MLOCK`, refused on this box's
+  8 MiB `RLIMIT_MEMLOCK`, needs root) or (b) the read path tolerates a miss — no XNACK, so that means a
+  pinned tier, i.e. `pool`/`pinned`, i.e. the thing the mode exists to delete.  Worth deciding deliberately
+  before the `pinned`/`pool` removal the maintainer wants.
+* `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/runme` now defaults to `window -ncmoe 32` with
+  `GGML_MOE_DEVREMAP=0`, documents the fault, and keeps the known-good `pinned -ncmoe 44` arm.  Verify any
+  window arm with `llama-bench -p 2048`, **never** a short prompt: the eviction case needs a multi-ubatch
+  prefill to show.
+* Still owed and now more important: the 3-GPU `-sm tensor` arm must run a **multi-ubatch prefill**
+  (`-p 2048+`), not only the 32-token smoke in `BETA-TESTING.md` §3 — a box with more RAM will not
+  reproduce this, and a box with less will fault.
+
 ## 261102.011 (wip) -- host-expert window: forward the gather capability predicate through the meta backend; beta re-cut a third time
 
 No delivery change.  Continues `261102.010`.  Patch sha256 `3548105…`, beta commit `c326828de`, applied tree
