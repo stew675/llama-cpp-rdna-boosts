@@ -82,7 +82,12 @@ misread:
 * `cudaHostRegister` of a read-only `MAP_SHARED` file range is accepted, UVA-aliased, and costs 0.6 µs at any
   size up to 256 MiB, with **no `Mlocked`/`Unevictable` movement** (`README.md` §3, `probe-pinned-window`).
 * a **kernel** read of a registered range is **data-identical** resident, after `MADV_PAGEOUT`, and under
-  **70 GiB of real anonymous pressure** (`probe-cold-read`); an *unregistered* pageable read is the fatal
+  **70 GiB of real anonymous pressure** (`probe-cold-read`) — **THIS WAS VOID** (2026-11-02): the probe reads a
+  hot 8 MiB window, so neither `MADV_PAGEOUT` nor the anonymous pressure ever evicts *that* range; re-run today
+  gives `DATA IDENTICAL` on all arms, including the pressure arm, and the real fault below is reproducible with a
+  59 GB host set.  The conclusion it was used to support ("a window-backed cold read needs no mlock") is WRONG:
+  without XNACK a device read of a non-present page is fatal, so the window must be **locked or provably
+  resident** (see `INVARIANTS.md`); an *unregistered* pageable read is the fatal
   `Page not present` fault issue #116 describes.
 * **in situ**: the whole four-arm matrix below runs to completion and byte-identically inside a
   `MemoryMax=10G` cgroup on a box whose model mapping is 22.6 GB — i.e. the pages the device is reading

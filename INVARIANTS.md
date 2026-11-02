@@ -1429,3 +1429,21 @@ change), and let `WORKLOG.md` carry the narrative.
   24 691.7 MiB / `h` 0.9603 / 47.95 t/s vs 1280 -> **24 576.4 MiB / 0.9602 / 47.98 t/s**, i.e. **-115 MiB of
   arena, -0.01 pt of expert hit rate, decode flat**, text byte-identical.  An explicit `GGML_CUDA_SLAB_HEADROOM_MIB`
   is still taken verbatim (no per-GPU addition), so the old value stays one env var away.
+
+- **Device-visible host memory must be `RESIDENT`, not merely addressable — `hipHostRegister` does not provide
+  residency, and without XNACK there is no fault-and-retry (wip, `beta/0016` / `wip/host-expert-pinned-window`,
+  2026-11-02).**  A registered range installs page tables (UVA alias) but leaves the pages ordinary reclaimable
+  page-cache pages (`Mlocked` stays 0 — that is exactly the property the window campaign advertised).  On a
+  no-XNACK GPU a device read of a page that is **not present** is a fatal `Page not present` fault, so a
+  registered-but-unlocked range is sound ONLY while nothing evicts it.  Measured on 1x R9700, Flash-Next IQ4_NL
+  (93.16 GiB model, 98 GB RAM): `--host-experts window -ncmoe 44` (host set ~59 GB) faults the GPU —
+  `mul_mat_vec_q_moe` → `Page not present` — while `pinned -ncmoe 44` runs (its pages are never evictable) and
+  `-ncmoe 32` is clean.  So "one residency tier, registration instead of pinning" needs **locked or provably
+  resident** pages; `MOE_EXPERT_WINDOW_MLOCK` was written as an optional extra and is in fact a REQUIREMENT
+  (needs `LimitMEMLOCK=infinity`/`CAP_IPC_LOCK`; the hard limit is 8 MiB by default).
+  **And the evidence that claimed otherwise was void**: `probe-cold-read` reads a HOT 8 MiB window, so its
+  `MADV_PAGEOUT` arm and even 70 GiB of anonymous pressure never evict the range (re-verified 2026-11-02: all
+  arms `DATA IDENTICAL`), and every real run before the gather memcpy'd the whole host expert set through the
+  host on each ubatch — an accidental prefetch that re-faulted every page immediately before the device read it.
+  A reclaim-safety test must actually evict the range it reads; the gather (which removed that prefetch) is what
+  finally exposed this.

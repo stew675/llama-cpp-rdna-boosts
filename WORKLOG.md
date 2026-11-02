@@ -49,6 +49,38 @@ campaign's own framing.
   (`-p 2048+`), not only the 32-token smoke in `BETA-TESTING.md` §3 — a box with more RAM will not
   reproduce this, and a box with less will fault.
 
+**Addendum (same entry) — the two follow-ups the maintainer asked for.**
+
+*Does `GGML_SCHED_DEVGATHER=0` fix it?*  **No.**  With the box in today's (warm) pressure state, `window
+-ncmoe 44` passes **both** ways — gather off: pp2048 442.2 / tg128 37.4; gather on (the default): 442.6 / 35.5
+(pinned: 452.2 / 39.0; `-r 1`, `-p 2048`).  The fault is therefore **pressure-dependent, not gate-dependent**:
+the gather only *increases exposure* (it stops the host touching every expert page each ubatch), it is not the
+cause.  Forcing the pressure needed `systemd-run --scope -p MemoryMax=...`, which is refused here (polkit wants
+interactive auth), so the pressure arm could not be run as a cgroup.
+
+*Why was "locked or provably resident" dropped?*  It was dropped in **this campaign's own README**, in three
+recorded steps, and the record now marks them:
+1. §5.2 designed exactly the right policy — `promote: mlock(range) + hipHostRegister(range)`, `demote: munlock
+   + hipHostUnregister` — and measured it as cheap (register 0.6 us, copy rate unchanged, 20x promote loop with
+   no degradation);
+2. §5.3 then reclassified the `RLIMIT_MEMLOCK` cap (8 MiB soft AND hard on this box) as a *"deployment, not a
+   blocker"* caveat and asserted the un-locked variant was **"correct, but a reclaim under pressure turns a fill
+   into a fault-speed refill"** — i.e. it priced a reclaim as a slow *host* refill, which is the wrong model for
+   a no-XNACK device, where the in-place read simply faults;
+3. v4/v5 then moved to whole-tensor registration and stated the virtue as *"does not hold the pages (`VmLock`
+   stays 0), so there is nothing for a budget to bound"* — which deleted the promote/mlock policy altogether and
+   promoted the un-locked registration to *the* design.
+The pincer that made it invisible: **every test was structurally unable to see it.**  `probe-cold-read` reads a
+hot 8 MiB window (re-run today: `DATA IDENTICAL` on all four arms, including under 70.7 GiB of anonymous
+pressure — the range is never actually evicted), and every real run before the gather memcpy'd the entire host
+expert set through the host on every ubatch, re-faulting each page immediately before the device read it.  So
+the campaign validated the property with an instrument that kept the property true, and then removed the
+mechanism (staging) that was keeping it true — which is when it broke.
+
+Recorded as an engineering fact in `INVARIANTS.md` (device-visible host memory must be RESIDENT; registration
+provides addressability only), marked void in `PROTOTYPE.md` §4/§5.3, and stated as a requirement in the beta
+README.  Nothing is promoted, nothing in `patches/` changes.
+
 ## 261102.011 (wip) -- host-expert window: forward the gather capability predicate through the meta backend; beta re-cut a third time
 
 No delivery change.  Continues `261102.010`.  Patch sha256 `3548105…`, beta commit `c326828de`, applied tree
