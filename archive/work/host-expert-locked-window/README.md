@@ -1,4 +1,4 @@
-# wip/host-expert-locked-window — the pool's policy, the mapping's storage, an explicit hold (OPEN)
+# archive/work/host-expert-locked-window — the pool's policy, the mapping's storage, an explicit hold (CLOSED: blocked by the driver)
 
 > **VERDICT 2026-11-03 (P0.5): the sliding window is BLOCKED by the driver — do not build it.**
 > `hipHostRegister` is a hold that lives for the process's life: `hipHostUnregister`, `munmap`, a MAP_FIXED

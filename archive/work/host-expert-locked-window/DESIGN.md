@@ -1,6 +1,6 @@
 # DESIGN — `--host-experts window`: the mapping as the residency tier
 
-Normative document for `wip/host-expert-locked-window/`.  It specifies the mechanism, the ordering rules and
+Normative document for `archive/work/host-expert-locked-window/`.  It specifies the mechanism, the ordering rules and
 the tables; it does **not** specify the policy (that is the pool's, unchanged) and it is **not** a patch.
 Everything here is a design under test — where it says "must", it means "the design is wrong if it does not",
 not "the code does this today".

@@ -1447,6 +1447,20 @@ change), and let `WORKLOG.md` carry the narrative.
   host on each ubatch — an accidental prefetch that re-faulted every page immediately before the device read it.
   A reclaim-safety test must actually evict the range it reads; the gather (which removed that prefetch) is what
   finally exposed this.
+  **CORRECTED 2026-11-03 (`archive/work/host-expert-locked-window/`): `hipHostRegister` DOES take a hold.**  The
+  paragraph above ("maps without pinning", "leaves the pages ordinary reclaimable page-cache pages") is wrong on
+  ROCm 10.1 / kernel 7.2.15 / gfx1201, measured three ways: registering over **absent** pages faults them in
+  (page cache `0/425` -> `425/425`, proven through a *fresh* mapping, never the registered one); a registered
+  window's bytes survive `hipHostUnregister`, `munmap`, a `MAP_FIXED` remap, every registration flag
+  (`ro`/`portable`/`mapped`) and **67 GiB of real anonymous pressure** with cgroup `file` unchanged (1 GiB
+  scratch-file window: +1027.9 MiB at register, still +1037.0 MiB after unmap + pressure); and under a 4 GiB
+  cgroup a 6144 MiB registration returns `ok`, pegs `memory.current` at the limit, leaves 14/16 sampled windows
+  non-resident, and a non-resident window still reads.  So the reason a sliding window cannot be built is that
+  the hold has **no release**, not that it is absent — and "registered-but-unheld" is a state that does not
+  exist for a range that was ever resident at registration time.  The 2026-11-02 fault is not explained by this
+  and did **not** reproduce for a partially-registered range; do not re-cite "maps without pinning", and do not
+  build a sliding host window (successor: `wip/host-expert-eager-push/`).
+
   **And `Mlocked` is not a pinning probe**: a `hipHostMalloc`'d buffer is pinned by the driver yet reports
   `Mlocked: 0 kB` — measured 2026-11-02 with two 256 MiB buffers that stayed data-identical through 61.7 GiB of
   real anonymous pressure (`archive/work/host-expert-pinned-window/probe-host-malloc-mapped.cpp`).  So "`Mlocked`
@@ -1456,3 +1470,19 @@ change), and let `WORKLOG.md` carry the narrative.
   `hipHostMallocDefault` and with `hipHostMallocMapped` alike, and `hipHostGetDevicePointer` returns the identity
   pointer on this platform (`unifiedAddressing` reports NO but `canMapHostMemory` yes), so the `Mapped` flag is
   not what buys anything here — the pinning is.
+
+- **A 1-D copy-engine push out of the pageable model mapping does not tear here (wip, 2026-11-03;
+  `archive/work/host-expert-locked-window/MEASUREMENTS.md` §5/§6).**  The delivery carries "a pageable
+  `cudaMemcpyAsync` ... is staged through a shared internal bounce and tears under back-to-back use (measured:
+  nondeterministic greedy text)" (`ggml-cuda.cu:6255`, prior campaign `PROTOTYPE.md:47`) and that note is what
+  justifies the pool's `memcpy` into a pinned slot.  It has **no dated record, no ROCm line and no
+  reproduction** in the repo, and it does not reproduce for a 1-D push on ROCm 10.1: 8-64 copies in flight
+  (13-128 MiB) over 2-4 streams from one host thread, sources plain pageable / `mlock`ed / registered /
+  `cudaMallocHost`, every copy verified against its own source — **0 torn in 20-100 iterations each**, including
+  repeated pushes from the same page-cache regions (so one-shot semantics buy nothing).  The **2-D** path the
+  note actually names is 4-5x slower (376 us per 1.66 MiB vs 66-93 us 1-D) but also clean here.  What the same
+  probe measures is why the direction is worth pursuing: a CE push straight from the mapping costs **66-93 us
+  hot / 1.32 ms cold** per 1.66 MiB against the pool's **137 us / ~3.5 ms**, i.e. the memcpy is the entire gap.
+  The claim is NOT refuted for ROCm **7.14** (the delivery ships both lines) or for the **async-input ring**
+  (a shared *destination*, a different failure); `wip/host-expert-eager-push/` P1 settles it in the real path
+  before any default flips.

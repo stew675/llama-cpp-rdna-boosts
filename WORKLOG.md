@@ -1,3 +1,40 @@
+## 261103.002 (wip) -- new campaign: `host-expert-eager-push` (never device-pull; the host pushes)
+
+No delivery change.  Seeded at the maintainer's call, the same day its predecessor closed.
+
+**[`wip/host-expert-eager-push/`](wip/host-expert-eager-push/README.md)** — the reframing: the GPU is never given a
+host address to read; every host-resident expert byte reaches VRAM through a copy the host (copy engine) issues,
+ordered by an event, into a slot the policy owns.  `pinned` stays the mode of choice when the set fits in RAM; the
+not-fitting case gets `--host-experts push` (alias `window`), which **deletes the pool's `memcpy`** by DMA-ing
+straight out of the read-only model mapping.  Invariants P1-P7 in `DESIGN.md` (never device-pull; eager; explicit
+slot ownership; no whole-set hold; counted fallback; split-portable; byte-identical).  P0 is inherited from the
+closed campaign: a direct push is **66-93 us hot / 1.32 ms cold** per 1.66 MiB against the pool's **137 us /
+~3.5 ms**, i.e. the memcpy is the entire gap — and the delivery's "tears under back-to-back use" note does not
+reproduce for a 1-D push here.  **P1 is a reproduce-or-refute gate in the real path on both ROCm lines**, because
+that claim is the only thing standing in the way and it has no dated record.  Nothing in `patches/`.
+
+## 261103.001 (wip) -- `--host-experts window` as a bounded sliding hold: CLOSED, blocked by the driver
+
+No delivery change.  The campaign seeded this morning is archived the same day as
+[`archive/work/host-expert-locked-window/`](archive/work/host-expert-locked-window/RESOLUTION.md).
+
+**The mechanism it needed does not exist.**  `hipHostRegister` is an eager, **unreleasable** process-lifetime
+hold: registering over absent pages faults them in (page cache 0/425 -> 425/425, proven through a *fresh* mapping
+on every step), and a window's bytes are still there after `hipHostUnregister`, `munmap`, a MAP_FIXED remap, every
+registration flag (`ro`/`portable`/`mapped`) and **67 GiB of real anonymous pressure** (cgroup `file` unchanged;
+1 GiB scratch-file window: +1027.9 MiB at register, +1037.0 MiB after unmap + pressure).  Under a 4 GiB cgroup a
+6144 MiB registration returns `ok`, pegs `memory.current` at the limit, leaves 14/16 sampled windows non-resident,
+and a non-resident window still reads.  So a bounded sliding window cannot exist, the footprint is the whole
+registered set, and the mode is `pinned` with a longer load — no help for the case `pool` exists for.  Costs kept
+for re-derivation: grant/release 16.35 us / 0.49 us per 1.66 MiB hot (1.2-3.2 ms cold), `mlock2`+populate 375 us
+hot / 18.6 ms cold, a pageable in-place read is a fatal `Page not present`.
+
+**And the claim that made the pool's copy mandatory does not reproduce for a 1-D push**: 8-64 copies in flight
+(13-128 MiB), 2-4 streams, pageable/`mlock`ed/registered/`pinned` — **0 torn** in 20-100 iterations each, with
+re-reads of the same regions.  The 2-D path the warning names is 4-5x slower (376 us per 1.66 MiB) but clean here.
+That is what seeded `wip/host-expert-eager-push/`.  `INVARIANTS.md` carries the corrected fact; `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261102.020 (wip) -- multi-GPU handover written; the campaign's remaining work moves to `soar`
 
 No delivery change.  Continues `261102.019`.
