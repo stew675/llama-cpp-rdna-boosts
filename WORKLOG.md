@@ -32,6 +32,21 @@ forced) and **`5835 chars sha=dc178c29fe89`** across `pinned` / `pool` F80 / `po
 2000-token decode behind a 5258-token **multi-ubatch gather-served prefill** — the exact width the source's own
 "one-time expert-head zero" warning was about.  `check-gpu-faults.sh` clean.
 
+**Is it corruption?  No — checked before the number was quoted.**  `scripts/gate-prefill-logits.sh --ab
+"GGML_SCHED_DEVGATHER=0"` (3 GPUs, `-sm tensor`, `-ncmoe 48`, pool FRAC 95, `-ub 2048`, ctx 2048 × 6 chunks, kv
+f16) reports **mean KLD −0.000000 / same-top-p 100.000 %**, base PPL 3.5537 on both arms — the gather default's
+prefill logits are *bit-identical* to the staging path's.  Greedy text is byte-identical too (5835 chars
+`dc178c29fe89` over 2000 tokens behind a 5258-token gather-served prefill; 257 chars `5531ae33f0f7` on all eight
+mode/device arms).  Physically the rate is achievable because the gather does **not** copy the routine expert
+bytes: it reads them in place from pinned memory through the pool alias (only 1200 neither-tier experts, 1014.5
+MiB H2D, are copied), and the worst-case in-place read is 19 GB/s per device against a measured 28.6 GB/s H2D
+calibration.  Two cautions recorded rather than hidden: the `GGML_MOE_GATHER_ONCE=1` corruption control is
+**vacuous at this width/quant** (it only re-zeros the expert head pad; the text stays correct — a control that no
+longer bites), and **`pinned`'s own prefill is unstable in this box state (75.2-606.9 t/s across runs)** while the
+pool arm repeats tightly (1063-1581), so the "3.2x" is a ratio to a well-behaved pinned arm and the
+`llama-bench pp1024` arm (pool 130 ± 73 vs pinned 271 ± 2.5, i.e. the opposite ordering) is an unexplained regime
+that the head-to-head must re-measure before quoting.
+
 **Still open:** the staging path's own root cause (`TODO` #131 keeps it: reachable only via the kill switch now);
 promotion of `0006` and the `ENVIRONMENT.md` row for the three-valued switch; `HEAD-TO-HEAD.md` (now writable — the
 3-GPU pool arm is legitimate); the pair's remaining decode gap (`TODO` #132, the synchronous demand read).

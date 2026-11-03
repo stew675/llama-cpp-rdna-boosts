@@ -1199,6 +1199,29 @@ first attempt routed *all* pool-table gathers with no band gate and decode fell 
 is served from the arena by the slot-remap read, and the gather must not take it over (`sched_input_gatherable`
 now requires `n_tokens > moe_cache_band`).
 
+**Is the prefill number real, or is it corruption?**  The code's own history says a gather that looks faster
+than the link can carry is skipping work (`SCHED_GATHER_TABLE_MIN_BYTES`'s comment: the 2026-10-04 numbers were
+"from a *corrupted* gather pass"), so it was attacked with the delivery's prefill oracle rather than with
+throughput:
+
+| check (`soar`, 122B `-ncmoe 48`, `-sm tensor` over 3 GPUs, pool FRAC 95) | result |
+|---|---|
+| **`scripts/gate-prefill-logits.sh --ab "GGML_SCHED_DEVGATHER=0"`** — prefill logits of the gather default vs the staging path, `-ub 2048`, ctx 2048 × 6 chunks, kv f16 | **mean KLD −0.000000, same-top-p 100.000 %**, base PPL 3.5537 on both arms → **bit-identical prefill** |
+| greedy text, 2000 tokens, behind a 5258-token multi-ubatch gather-served prefill | `5835 chars sha=dc178c29fe89`, identical for `pinned` / `pool` F80 / `pool` F95 |
+| greedy text, 64 tokens, 2 device counts × 4 modes | `257 chars sha=5531ae33f0f7`, all eight |
+| physics | the gather **does not copy** the routine expert bytes — it reads them in place from pinned memory through the pool alias; only the neither-tier experts are copied (1200 fills = **1014.5 MiB** H2D for the whole prefill).  Worst-case in-place read 144 tables × 3 devices × 3 ubatches × 256 experts × 0.56 MiB = 186 GiB over 3.33 s = **19 GB/s per device**, against a measured per-device H2D calibration of **28.6 GB/s** → inside the link, so no work is being skipped |
+| `GGML_MOE_GATHER_ONCE=1` corruption control | **VACUOUS at this width/quant** — it only restores the once-only expert *head-pad* zeroing and the text stays `5531ae33f0f7`.  Do not cite it as evidence; it is a gate that no longer bites here (§14.4's control was measured on the 1-GPU srv cell) |
+
+**Repeatability, and one number that does NOT reproduce.**  Pool+gather prefill across seven runs: 1063 / 1072 /
+1144 / 1471 / 1507 / 1569 / 1581 t/s.  **`pinned` is the unstable arm in this box state: 75.2 / 380.8 / 471.8 /
+555.1 / 569.2 / 606.9** — so "-0.7 % decode, 3.2x prefill" is a comparison against a *well-behaved* pinned arm
+(471-607), and the honest statement of the prefill claim is "**~1070-1580 t/s against a `pinned` arm that itself
+ranges 75-607**".  Two `llama-bench` cross-checks: `pp2048 -b/-ub 2048` gives pool **1063.4 ± 1.0** (the `pinned`
+arm *core-dumps* at that tool setting, so no pair); `pp1024 -b/-ub 1024` gives `pinned` 271.4 ± 2.5 against pool
+**130.0 ± 73.2** — an outlier regime (repeated 1024-token prefills) that is **not** explained and must be
+re-measured before the head-to-head quotes a `-ub 1024` number.  What the gate above settles is that neither arm
+is producing wrong logits; what it does not settle is why `pinned`'s own prefill is so variable now.
+
 **Correctness of the new default:** `257 chars sha=5531ae33f0f7` on all eight mode/device arms (pair and 3-GPU,
 gather default and forced: `data/20261103-text-purity-b-{pair,g3}`), and **`5835 chars sha=dc178c29fe89` across
 `pinned` / `pool` F80 / `pool` F95 at 3 GPUs with a 2000-token decode behind a 5258-token multi-ubatch

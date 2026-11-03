@@ -280,7 +280,13 @@ now gathers a pool-backed table in the prefill band by default, measured 1502.6-
 `pinned`'s 471.8 at three devices with decode at -0.7 %, and 16.9 t/s with the gather switched off
 (`GGML_SCHED_DEVGATHER=0`).  What remains OPEN is the *root cause inside the staging path*: it is still
 pathologically slow for a pool-backed table at >= 3 devices and is now reachable only through the kill switch, so
-either fix it or delete that branch for pool tables.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
+either fix it or delete that branch for pool tables.  **Verification of the fix (2026-11-03):** the prefill-logit
+KLD gate (`--ab "GGML_SCHED_DEVGATHER=0"`) reads **−0.000000 / 100.000 %** (bit-identical prefill), text is
+byte-identical (5835 chars `dc178c29fe89`), and the rate is physically bounded (in-place pinned reads, 19 GB/s per
+device vs a 28.6 GB/s calibration).  Two caveats worth carrying: `GGML_MOE_GATHER_ONCE=1` no longer produces the
+Hole-B corruption at this width/quant (the control is vacuous — do not cite it), and **`pinned`'s own prefill is
+unstable in this box state (75.2-606.9 t/s)** while the pool arm repeats tightly, so any "N x faster than pinned"
+prefill claim needs a pinned control measured in the same group.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
 three-valued `GGML_SCHED_DEVGATHER`) is the maintainer's call.**  Original finding text follows.
 
 **Found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4), a defect in the DELIVERY's block 12
