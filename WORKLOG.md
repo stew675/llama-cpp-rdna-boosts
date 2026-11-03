@@ -1,3 +1,51 @@
+## 261102.014 (wip) -- window CLOSED and archived; beta 0016 WITHDRAWN; the pool campaign takes the two sound mechanisms
+
+No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.013`.
+
+**`--host-experts window` is closed** — `wip/host-expert-pinned-window/` -> `archive/work/host-expert-pinned-window/`
+with a `RESOLUTION.md`, and **`beta/0016-host-experts-window/` withdrawn** to `archive/work/host-experts-window-beta/`.
+The beta's own gates were green on 1 GPU (prefill taken from 375.9 to 693.7 t/s, 1037.9 with the gather; text,
+MTP acceptance and the prefill-logit gate all clean) and none of that matters: the mode cannot be made sound on a
+no-XNACK GPU.  `hipHostRegister` provides addressability, not residency; a kernel read of a reclaimable page is
+fatal, and holding it is pinning — the RAM saving, which was the entire proposition, disappears.  Measured both
+ways on 261102.012/.013; the fact is in `INVARIANTS.md`.
+
+**What survives, and where it went.**  Two mechanisms are copies rather than in-place reads, so they are sound
+and they are now `wip/host-pool-speed/`'s:
+
+1. **CE copies out of a registered mapping** instead of `memcpy` into the per-table bounce + pinned H2D
+   (`moe_cache_upload_pageable`): measured on the window arm as prefill **375.9 -> 532.6 t/s** and **-6.7 GB
+   RSS** (the bounce ring was a second pinned copy of the host set); Avalon prices the same trick at
+   **fills 115 -> 61 us**, with -8 % prefill for a copy ending outside a registered range and -25 % for one
+   registration per expert (so: per tensor, page-rounded, overlaps merged).
+2. **The arena-aware device gather**, re-pointed at the **pool slots**: the staging kernel's `prs` map already
+   encodes both tiers (`>= 0` arena, `<= -2` pool slot `-v-2`), and a pool slot is `cudaHostAlloc`'d, so an SM read
+   of it needs no hold.  Worth **+41 % prefill** where it applies (`pinned` 735 -> 1036 t/s on the srv cell).
+
+Both are written up in [`wip/host-pool-speed/HANDOVER-2026-11-02.md`](wip/host-pool-speed/HANDOVER-2026-11-02.md),
+which also answers the three questions the maintainer asked at hand-over: **does the gather work with pool** (yes,
+with a third source in the kernel — arena slot, pool slot, bounce; never the pageable master), **is it portable
+to `-sm tensor`** (yes — pool is already split-native, the meta backend forwards both the gather and the new
+capability predicate, and the failure mode if the predicate answers 'no' after staging was skipped is a silent
+5-10x prefill collapse, measured as 49.6 t/s on the single-backend case, so the predicate must be pool-aware and
+the 3-GPU arm must run a `-p 2048+` prefill, not a smoke), and **how pool compares with `pinned`** (2.6x behind on
+prefill and 18 % on decode on the srv cell; that campaign's own reference arm 22.33 vs 17.76 t/s).  It also
+records the plan consequence: **`GGML_MOE_DEVREMAP` is the one piece of PR #266 whose removal would cost real
+throughput, and pool can host it soundly** because pool slots are pinned — so re-implement it over pool slots
+rather than dropping it with the rest of #266.
+
+**Process note, recorded because it cost a day.**  The constraint window violated was written down the whole time,
+in the parallel campaign's `README.md` §7 (*pinned AND resident before the go-ahead; no fallback that copies from
+pageable memory*).  The two campaigns ran simultaneously on different hosts with no cross-reference.  Both
+READMEs now point at each other, and the campaign README's §5.3 — which had called the hold a "deployment, not a
+blocker" caveat and the unheld window "correct, just slower on a refill" — is corrected in place (the earlier
+correction had landed in `PROTOTYPE.md` by mistake; the misleading line was still live).
+
+**Housekeeping.**  The whole window tree as measured is kept for reference as
+`archive/work/host-expert-pinned-window/reference-window-261102.diff` (15 files, +640 -181, against `efaa60db0`) —
+**not applied to anything**.  `~/llama-scratch` is reset to a clean `efaa60db0` for the pool work.  `beta/` is
+empty again (`beta/README.md` says so, and why).
+
 ## 261102.013 (wip) -- host-expert window: the ORIGINAL design restored in code -- the hold (`mlock`) is a requirement, and every in-place kernel read is gated on it
 
 No delivery change (`patches/`/`release.json` untouched); the beta candidate is amended in the scratch tree and
