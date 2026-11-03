@@ -161,7 +161,23 @@ multi-device arm; neither exists while `pinned` has no cache and a full pool can
 **Pass:** gather ≥ staging per split mode at `-p 2048+`, text identical, faults clean, and a `pinned` baseline
 that actually has a cache.
 
-**DONE 2026-11-03 — result: the assertion FAILS, and that is the finding** (`README.md` §18.1/§18.2):
+**DONE 2026-11-03 — twice.**  First pass: the assertion failed on the pair and the pool's prefill was broken at 3
+devices.  Second pass (same day): **fixed** — a pool-backed table now gathers in the prefill band by default
+(`patches/0006`), so the gather is the default *for the mode that needs it* and `pinned` never takes it.  The table
+below is the original measurement; the post-fix one is `README.md` §18.2's resolution block:
+
+| arm (3 × R9700, `-sm tensor`, `-ncmoe 48`, 2000-token decode) | prefill t/s | decode t/s |
+|---|---|---|
+| `pinned` | 471.8 | **67.6** |
+| `pool` FRAC 80 (gather default) | **1502.6** | 67.1 |
+| `pool` FRAC 95 (gather default) | **1569.2** | 67.1 |
+| `pool` FRAC 95, `GGML_SCHED_DEVGATHER=0` (kill switch) | 16.9 | 27.3 |
+
+Text: 257 chars `sha=5531ae33f0f7` on all eight mode/device arms; 5835 chars `sha=dc178c29fe89` across
+`pinned`/`pool` F80/F95 at 3 GPUs with the 2000-token decode behind a 5258-token gather-served prefill; faults
+clean.  The original pass follows.
+
+**Original result: the assertion FAILS on the pair, and that is the finding** (`README.md` §18.1/§18.2):
 
 | arm | pair (`-sm tensor`) | 3 GPUs (`-sm tensor`) |
 |---|---|---|

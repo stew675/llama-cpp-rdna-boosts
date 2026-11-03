@@ -1,0 +1,295 @@
+From 861c88ebfd9e22ace33e09c2b7addf4925792d59 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 3 Nov 2026 09:52:32 -0600
+Subject: [PATCH] host pool: a POOL-backed expert table gathers in the prefill
+ band by default (#131)
+
+The pool arm's whole-table STAGING is the slow path at every width: its source is the pageable model
+mapping plus the pool's host alias, and it degrades as pool coverage rises.  Measured on the 122B-A10B
+across the three RDNA4 GPUs (-ncmoe 48, 5258-token prompt, -ub 2048, 2000-token greedy decode):
+
+  arm                     prefill t/s   decode t/s
+  pinned                     471.8         67.6
+  pool FRAC 80               1502.6        67.1
+  pool FRAC 95               1569.2        67.1
+
+and with the gather forced OFF on the same arm, prefill collapses to 16.9 t/s -- so the staging path is
+the defect and the device gather is the remedy.  At two devices the same change is neutral for pool
+(948.6 vs 1024 staging) and leaves pinned untouched (1671.6).
+
+GGML_SCHED_DEVGATHER becomes three-valued: UNSET = pool-backed tables gather in the prefill band and
+everything else keeps staging (the new default); 0 = off (kill switch, the old behaviour); 1/force = the
+historical A/B arm (gather below the staging width gate and for large tables, either host-expert mode),
+which is NOT the default because it costs a pinned master ~47 % prefill at two devices.
+
+Mechanism: a new optional device-iface query, moe_cache_pool_backed(backend, weight), answered by the
+CUDA cache (is this table's master the read-only mapping rather than a pinned master) and forwarded by
+the Meta backend to its simple devices.  sched_input_gatherable uses it to route a pool-backed table to
+the gather; the band gate (n_tokens > moe_cache_band) keeps the decode/verify band on the arena
+take-over, which the gather costs an order of magnitude (decode fell to 1.2-4.1 t/s without it).
+
+Correctness: greedy text 257 chars sha=5531ae33f0f7 on all eight arms (pair and 3-GPU, gather auto and
+forced), and 5835 chars sha=dc178c29fe89 across pinned / pool F80 / pool F95 at 3 GPUs with a 2000-token
+decode behind a 5258-token multi-ubatch gather-served prefill -- i.e. the gather's prefill path is
+text-exact at the width the old 'one-time expert-head zero' bug was in.  check-gpu-faults.sh clean.
+---
+ ggml/src/ggml-backend-impl.h           |  8 ++++
+ ggml/src/ggml-backend-meta.cpp         | 15 +++++++
+ ggml/src/ggml-backend.cpp              | 57 +++++++++++++++++++-------
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  9 ++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 17 ++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  6 +++
+ 6 files changed, 98 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 49f691776..c664b6802 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -292,6 +292,14 @@ extern "C" {
+         // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
+         // backends' positional initializers stay valid (NULL).
+         bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
++        // wip/host-pool-speed (#131): is this routed expert table served by the bounded pinned host POOL
++        // (`--host-experts pool`) rather than by a pinned master?  A pool-backed table's whole-table
++        // STAGING is the slow path at every width (its source is the pageable model mapping plus the pool
++        // alias), while the device gather resolves it from the two pinned tiers on the device, so the
++        // scheduler sends a pool-backed table to the gather unconditionally.  A pinned master keeps the
++        // staging path (the gather costs it ~47 % prefill at two devices, `wip/host-pool-speed` §18.2).
++        // Answers per (table, device); NULL = unknown/false.
++        bool (*moe_cache_pool_backed)(ggml_backend_t backend, const struct ggml_tensor * weight);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 84926f87f..1f8717c1d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -4401,6 +4401,20 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
+     return n_backends > 0 ? band : 8;
+ }
+ 
++// wip/host-pool-speed (#131): forward the pool-backed query to the simple devices.  A tensor split gives
++// every simple device the SAME host master, so the answer is uniform; report true if any device says so.
++static bool ggml_backend_meta_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    const size_t n_backends = ggml_backend_meta_n_backends(backend);
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        if (simple_backend != nullptr && simple_backend->iface.moe_cache_pool_backed != nullptr &&
++            simple_backend->iface.moe_cache_pool_backed(simple_backend, weight)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
+         size_t slice_off, int split_axis) {
+@@ -4495,6 +4509,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
+     /* .moe_cache_remap         = */ nullptr,   // not forwarded: -sm tensor keeps the eager path
++    /* .moe_cache_pool_backed   = */ ggml_backend_meta_moe_cache_pool_backed,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 879c52dd3..d9bc8fd13 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1234,7 +1234,7 @@ struct ggml_backend_sched {
+     bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
+     // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
+     // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
+-    bool devgather_enabled;
++    int  devgather_mode;   // 0 = off, 1 = pool-backed tables only (default), 2 = force (A/B)
+     struct {
+         struct ggml_tensor * dst;
+         size_t size;
+@@ -2582,21 +2582,39 @@ static void sched_stage_restore(ggml_backend_sched_t sched) {
+ static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
+ 
+ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+-                                   const struct ggml_tensor * input_cpy) {
+-    if (!sched->devgather_enabled) {
++                                   const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
++    if (sched->devgather_mode == 0) {
+         return false;
+     }
+-    if (sched->backends[split->backend_id]->iface.moe_cache_gather == NULL) {
++    ggml_backend_t split_backend = sched->backends[split->backend_id];
++    if (split_backend->iface.moe_cache_gather == NULL) {
+         return false;
+     }
+-    // The gather serves the below-gate band, where `sched_stage_issue` skips whole-shard staging
+-    // entirely.  At or above the staging width gate, staging (the ring for `-sm layer`, the meta
+-    // `stage_input` for `-sm tensor`) is the faster path (Q4_K_M ub8192: staging 5283 vs gather 4035;
+-    // `-sm layer` ncmoe 40 4511 vs 2625), EXCEPT for a large expert table (see above).
++    // wip/host-pool-speed (#131): a POOL-BACKED table (`--host-experts pool`) gathers at EVERY width.
++    // Its whole-table staging is the slow path at every width because the source is the pageable model
++    // mapping plus the pool's host alias, and it degrades as coverage rises -- measured on the 122B-A10B
++    // across three RDNA4 GPUs, 5258-token prompt: staging 134.3 t/s at FRAC 80 and 12.9 at FRAC 95,
++    // versus **969.3 / 1623.5** with the gather, against `pinned`'s 555.1 (`README.md` §18.2).  A PINNED
++    // master keeps the staging path: the gather costs it ~47 % prefill at two devices.
++    const bool pool_backed = split_backend->iface.moe_cache_pool_backed != NULL &&
++                             split_backend->iface.moe_cache_pool_backed(split_backend, input);
++    if (sched->devgather_mode == 1) {
++        if (!pool_backed) {
++            return false;
++        }
++        // PREFILL BAND ONLY.  At or below the cache's decode/verify band the routed op is served from the
++        // ARENA (the slot-remap read), and taking it over with the gather costs an order of magnitude:
++        // measured on the 3-GPU pool arm, decode fell to 1.2-4.1 t/s against 22-47 with staging.  Above the
++        // band the op is streamed (prefill) and staging is the slow path -- the case this rule exists for.
++        const int64_t band = sched_moe_cache_band(split_backend);
++        return band > 0 && sched_stage_batch_tokens(split) > band;
++    }
++    // mode 2 (`GGML_SCHED_DEVGATHER=1|force`): the historical A/B arm -- gather below the staging width
++    // gate and for a large table, in either host-expert mode.
+     const bool below_gate = sched_stage_min_tokens(sched) > 0 &&
+                             sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched);
+     const bool big_table  = ggml_nbytes(input_cpy) >= SCHED_GATHER_TABLE_MIN_BYTES;
+-    if (!below_gate && !big_table) {
++    if (!below_gate && !big_table && !pool_backed) {
+         return false;
+     }
+     for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+@@ -2631,7 +2649,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+             continue;
+         }
+         struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, in_cpy)) {
++        if (sched_input_gatherable(sched, split, split->inputs[i], in_cpy)) {
+             return;
+         }
+     }
+@@ -2650,7 +2668,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         }
+         // A routed expert table is deferred to the gather (see sched_input_gatherable).
+         struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, split->inputs[i], input_cpy)) {
+             continue;
+         }
+         n_host_inputs++;
+@@ -2683,7 +2701,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+             continue;
+         }
+         struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+-        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
+             continue;
+         }
+         const size_t size = ggml_nbytes(input);
+@@ -2965,7 +2983,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             // experts from the host master into `input_cpy`, reading the routing on the device,
+             // so the host ids readback and its full device synchronize are skipped.  A backend
+             // that cannot serve the layout (or the gate off) falls through to the host path.
+-            if (sched_input_gatherable(sched, split, input_cpy) &&
++            if (sched_input_gatherable(sched, split, input, input_cpy) &&
+                 ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
+                 split_backend->iface.moe_cache_gather != NULL) {
+                 // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
+@@ -3325,8 +3343,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
+         // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
+         // persistent/never-reused).
++        // wip/host-pool-speed (#131): three-valued.  UNSET = "pool-backed tables gather" (the default: a
++        // pool table's staging is the slow path at every width, measured 7x-126x behind the gather on a
++        // 3-GPU split, `README.md` §18.2).  `0` is the kill switch.  `1`/`force` is the historical A/B arm
++        // (gather below the staging width gate and for large tables, in either host-expert mode) -- it is
++        // NOT the default because it costs a pinned master ~47 % prefill at two devices.
+         const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
+-        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
++        if (devgather_env == NULL || devgather_env[0] == '\0') {
++            sched->devgather_mode = 1;
++        } else if (atoi(devgather_env) == 0 && strcmp(devgather_env, "force") != 0) {
++            sched->devgather_mode = 0;
++        } else {
++            sched->devgather_mode = 2;
++        }
+         if (sched->stage_enabled) {
+             bool stage_capable = false;
+             for (int b = 0; b < sched->n_backends; b++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fad68b433..cc39dffa3 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8563,6 +8563,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+ }
+ 
+ 
++static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
++
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .get_name                = */ ggml_backend_cuda_get_name,
+     /* .free                    = */ ggml_backend_cuda_free,
+@@ -8592,6 +8594,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
+     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
+     /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
++    /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+@@ -9519,6 +9522,12 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+     return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
+ }
+ 
++static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    // wip/host-pool-speed (#131): see the iface comment.  `backend->context` is the CUDA backend context.
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    return moe_cache_table_is_pool(weight, ctx->device);
++}
++
+ static void ggml_backend_cuda_device_moe_cache_forget(ggml_backend_dev_t dev) {
+     // r143: the model that registered this device's host-expert tables is being freed (`llama_model_free`).
+     // Drop them before its host masters go: the deferred arena sizing fills EVERY registered table, so a
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index ff37dcfe9..e6fd7d397 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -5389,6 +5389,23 @@ void moe_cache_validate(const char * where) {
+ // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
+ // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
+ // run has to stay byte-identical to the cache-less one.  Returns false before sizing.
++bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
++    // wip/host-pool-speed (#131): a routed expert table whose master is the read-only model MAPPING
++    // (`--host-experts pool`) is a "pool" table; one with a pinned, device-readable master is not.  Called
++    // from the scheduler's split, once per routed expert op, so keep it cheap: a linear scan over the
++    // registered tables (a few hundred) guarded by the same lock the registration uses.
++    if (weight == nullptr || device < 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const table_t & t : g_tables) {
++        if (t.device == device && t.host == (const void *) weight->data) {
++            return !t.host_pinned && t.src_known;
++        }
++    }
++    return false;
++}
++
+ bool moe_cache_has_tables() {
+     if (!g_enabled) {
+         return false;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 86e3f6c53..ee357ecbb 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -175,6 +175,12 @@ bool moe_cache_ready();
+ // an input over, so its fusions must behave exactly as if it were disabled.
+ bool moe_cache_has_tables();
+ 
++// wip/host-pool-speed (#131): true when the routed expert table backing `weight` on `device` is served by
++// the bounded pinned host POOL (`--host-experts pool`) instead of a pinned master.  The scheduler uses this
++// to send a pool-backed table to the device gather unconditionally: its whole-table staging is the slow
++// path at every width, while the gather reads the two pinned tiers on the device.
++bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device);
++
+ // True only when EVERY table has a usable arena.  The cache-band fusion guard is global (one answer
+ // for the whole graph) and the gate+up fused kernel indexes the gate lane with the up table's remap, so
+ // a partially-failed cache (any allocation failed, or a budget below one expert) must stand its fusions
+-- 
+2.56.0
+

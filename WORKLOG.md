@@ -1,3 +1,43 @@
+## 261103.010 (wip) -- #131 fixed: a pool-backed expert table gathers in the prefill band (campaign patch 0006)
+
+No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261103.001`.  Record:
+[`wip/host-pool-speed/README.md`](wip/host-pool-speed/README.md) §18.2 (Finding B resolution); set is now **six**
+patches, applied tree `07660557c05bf0a6c462212c4746c5bc6ce40afe` (fresh-worktree `git am` verified).
+
+**The defect.**  `--host-experts pool` whole-table *staging* is the slow path for a pool-backed table — its source
+is the pageable model mapping plus the pool's host alias — and it degrades as pool coverage rises.  Instrumented
+end-to-end: the staging copy is **not** the cost (423 calls = 1.6 s host + 0.7 s device of a 273 s prefill), nor is
+the per-table `cudaMalloc` (0.00 s), nor the GPU kernels (5.04 s vs `pinned`'s 4.08 s at the same prompt), nor the
+page cache (evicting it with `posix_fadvise(DONTNEED)` changes nothing).  What tracks it is the **pool size**: at 3
+devices, FRAC 30 → 206 t/s, FRAC 80 → 134-144, FRAC 95 → 12.9-16.9.  The device gather does not use that path at
+all — which is why it is the fix and why the numbers are so lopsided.
+
+**The fix (`patches/0006`).**  A new optional device-iface query `moe_cache_pool_backed(backend, weight)` (the CUDA
+cache answers "this table's master is the read-only mapping"; the Meta backend forwards it to its simple devices)
+lets `sched_input_gatherable` route a pool-backed table to the gather in the **prefill band only**
+(`n_tokens > moe_cache_band`).  `GGML_SCHED_DEVGATHER` becomes three-valued: unset = pool-backed tables only (the
+new default), `0` = kill switch (old behaviour), `1`/`force` = the historical A/B arm (not the default: it costs a
+`pinned` master ~47 % prefill at two devices).
+
+**Measured** (3 × R9700 `-sm tensor`, 122B-A10B `-ncmoe 48`, 5258-token prompt, `-ub 2048`, 2000-token greedy):
+`pinned` 471.8 prefill / **67.6** decode; `pool` FRAC 80 **1502.6** / 67.1; `pool` FRAC 95 **1569.2** / 67.1;
+`pool` FRAC 95 with `GGML_SCHED_DEVGATHER=0` **16.9** / 27.3.  Neutral elsewhere: pair `pinned` 1671.6 (never
+gathers), pair `pool` 948.6 (staging 1024.1), 1-GPU `pool` F100 734.2 vs `pinned` 755.5.  So on the box's own
+three-device shape the pool is **-0.7 % decode and 3.2x `pinned`'s prefill** — at or past PR #267's published
+envelope.  The first cut had no band gate and decode fell to 1.2-4.1 t/s: the decode band is served from the arena
+by the slot-remap read and the gather must not take it over.
+
+**Correctness.**  `257 chars sha=5531ae33f0f7` on all eight mode/device arms (pair and 3-GPU, gather default and
+forced) and **`5835 chars sha=dc178c29fe89`** across `pinned` / `pool` F80 / `pool` F95 at 3 GPUs with a
+2000-token decode behind a 5258-token **multi-ubatch gather-served prefill** — the exact width the source's own
+"one-time expert-head zero" warning was about.  `check-gpu-faults.sh` clean.
+
+**Still open:** the staging path's own root cause (`TODO` #131 keeps it: reachable only via the kill switch now);
+promotion of `0006` and the `ENVIRONMENT.md` row for the three-valued switch; `HEAD-TO-HEAD.md` (now writable — the
+3-GPU pool arm is legitimate); the pair's remaining decode gap (`TODO` #132, the synchronous demand read).
+
+## 261103.001 (wip) -- host-pool-speed on the multi-GPU box: F7 was an env artefact, the gather's real shape, W3 shipped
+
 ## 261103.009 (wip) -- host-pool-speed on the multi-GPU box: F7 was an env artefact, the gather's real shape, W3 shipped
 
 No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261102.020`.  Measured
