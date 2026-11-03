@@ -638,11 +638,15 @@ What session 2 changed in the campaign's plan:
 
 ## 13. Session state
 
-**Current state (2026-11-02, latest session):** the pool baseline is measured (§12.1), F2 is fixed so the replayer
-calibrates, and two changes are **implemented, gated and measured but NOT in the delivery set**: `cov90` per-table
-pool sizing (`MOE_HOST_POOL_SIZING=1`, **+7.5 %/+16.4 %** decode at identical pinned bytes) and the
-**full-coverage default** (`MOE_HOST_POOL_FRAC=100`, decode 20.62 vs 17.80, exposing the pool's **-7.9 %** raw
-overhead), plus the teardown-report and forced-`DIO` diagnostic fixes.
+**Current state (2026-11-02, session 3 — the 1-GPU host; see §14 for the measured record):** the campaign set is
+now **three** patches on the r206 tip (applied tree `2e7b240d4`): the teardown-report / forced-`DIO` diagnostics,
+the full-coverage default (`FRAC 100`) + `cov90` per-table sizing, and — new this session — **mechanism (b), the
+pool-aware device gather** (`patches/0003`), which takes the srv cell's prefill from 641-647 to **832-878 t/s**
+(pool ahead of `pinned`'s 739) and removes the `MOE_HOST_POOL_COLD` dependency.  Mechanism (a) was **measured and
+dropped** (exposure ≤0.3 % of wall clock), the pool's old `285.3` srv-cell reference is **withdrawn** (a
+window-beta artefact), `RAM_PCT` 85 % does **not** thrash on the PLE-free control, and decode is still **-11 %**
+(srv cell) to **-22 %** (122B) behind `pinned`, so the acceptance criterion is **not met yet** (§14.9).  Nothing
+is promoted: `patches/` (delivery) and `release.json` are untouched.
 
 **Where the work is saved:** [`patches/README.md`](patches/README.md) (the two patches `0001`/`0002`, apply order on
 the r206 tip, knobs, expected numbers, caveats — validated: the applied tree is `0b8cc5a8b`) and
@@ -655,3 +659,160 @@ The cold-start handover is [`HANDOVER.md`](HANDOVER.md): §0 is the one-line sta
 §6 the ordered next steps (copy kind -> residency+budget -> remap-on-pool), §8 the open questions and the
 decisions taken overnight, §9 the in-repo data/tools (`data/20261102-session2-*`, `tools/run-arms-*.sh`,
 `tools/replayer-calib.py`).
+
+## 14. Measured — session 3, 2026-11-02, the 1-GPU host (re-based, mechanism (b) landed)
+
+Box: **one** R9700 (32.6 GiB), gfx1201, ROCm 10.1.0, 9800X3D, 93 GiB RAM, `/llm` on NVMe.  Tree: the
+delivery tip `efaa60db0` + the campaign set, **re-based and extended** (see §14.1).  Data:
+`data/20261102-session3-*`, runners `tools/run-arms-1gpu-261102b.sh`.  **This host has ONE GPU** — the
+`-sm tensor` x8-pair arm of §9.4 is not runnable here (see §14.5).
+
+### 14.1 The re-base was a no-op, and that is the finding
+
+The set was said to be "validated against tree `0b8cc5a8b`, current tip `efaa60db0`".  `0b8cc5a8b` is the
+**applied tree**, not the base: the patches' pre-image blob at `efaa60db0`
+(`ggml/src/ggml-cuda/moe-expert-cache.cu` = `334931ecd`) *is* the patch `index` line, so the two patches apply
+to `efaa60db0` with no fuzz, no 3-way and **no conflict** (the window campaign never touched this tree — its work
+lives only in the archived reference diff).  Verified: fresh worktree at `efaa60db0` + `git am` = tree
+`0b8cc5a8b` exactly.
+
+The set now has three patches (README in [`patches/`](patches/README.md)); applying all three to a fresh
+`efaa60db0` gives **applied tree `2e7b240d409ba5fae1e68a2db626a452b09ae035`**.  Per-patch build: 3/3 clean
+(`llama-cli`, `llama-server`, `llama-batched-bench`, `llama-perplexity` at each level).  Greedy text on the
+re-based build: 150 chars `sha=4ac3a523160f` (the campaign reference).
+
+### 14.2 Phase 1 baseline, 1 GPU — the srv cell (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`)
+
+`srv-test.sh`, persistent `llama-server`, prompt cache off, 3 sequential requests of the 5258-token prose
+prompt, 2000-token greedy decode, **request 3** (steady state).  `pool` arms measured **before** any `pinned`
+arm (the page-cache-order trap); the interleaved `pool-frac80-afterpinned` control cost only ~1 %, not 4 %.
+
+| arm | prefill req3 | gen | RSS | disk read req3 |
+|---|---|---|---|---|
+| `pinned`, staging (the charter's reference) | **739.2** | **60.0** | 41.9 GB | 0 |
+| `pinned`, gather (`GGML_SCHED_DEVGATHER=1`) | 688.9 | 60.1 | 41.9 GB | 0 |
+| `pool` FRAC 80, staging | 646.8 / 641.2 | 52.6 / 53.6 | 75.5 GB | 0 |
+| `pool` FRAC 100, staging | 624.5 | 52.8 | 82.9 GB | 0.06 GB |
+| **`pool` FRAC 80, gather** | **877.8 / 832.3** | 53.5 / 53.5 | 75.5 GB | 0 |
+| `pool` FRAC 80, gather, `-sm tensor` (1 visible device, i.e. through the meta backend) | 877.8 | 53.6 | 75.4 GB | 0 |
+
+The charter's reference (734.5 / 59.5) reproduces on `pinned`.  **The charter's `pool` reference (285.3 / 48.8)
+does NOT reproduce: it is a window-beta artefact.**  That number was taken on the window campaign's beta tree
+(`moe_cache_stage_table` dispatching on device-readability, which WORKLOG 261102.008 records as a *regression*
+for the pool arm); on the delivery + campaign-patch tree the same arm is **641-647 t/s**.  Treat 285.3 as
+withdrawn — pool's prefill was never 2.6x behind `pinned` on this cell.
+
+Two things follow.  (a) `FRAC 100` is **worse** than `FRAC 80` on this cell (624.5 vs 646.8, and 82.9 GB RSS
+against a 75.8 GB model): full coverage over-commits here, which is the multi-device caveat in
+[`patches/README.md`](patches/README.md) showing up on a single GPU too.  (b) with the gather, **the pool is
+faster than `pinned` on prefill** (+18.7 %) and 10.8 % behind on decode.
+
+### 14.3 Phase 1 baseline, 1 GPU — the campaign's reference arm (122B-A10B UD-Q4_K_XL, `-ncmoe 48`)
+
+`llama-cli`, 5258-token prompt, **1862-token greedy decode** (`-n 2000`, the model stops at 1862),
+`-c 8192 -ctk/-ctv q8_0 -b/-ub 2048`, arms alternating, ≥2000 tokens per §9.5.  Host experts **67110 MiB**.
+
+| arm | decode t/s | prefill t/s | disk read / run | pool hit |
+|---|---|---|---|---|
+| `pinned` (2 arms) | **32.82 / 34.20** | **1025.7 / 1067.2** | 64-72 GiB | — |
+| `pinned` + gather (2) | 32.72 / 34.15 | 912.2 / 951.2 | 66-73 GiB | — |
+| `pool` FRAC 80 (3) | 19.31 / 19.94 / 19.25 | 761.1 / 763.2 / 759.0 | 160-165 GiB | 0.606-0.610 |
+| `pool` FRAC 80 + gather (3) | 19.25 / 19.86 / 19.77 | 752.6 / 754.1 / 747.3 | 157-164 GiB | 0.606 |
+| `pool` FRAC 100 | 26.74 | 925.7 | 95.4 GiB | 0.9111 |
+| `pool` FRAC 100 + gather | 26.67 | 921.1 | 95.2 GiB | 0.9123 |
+| `pool` FRAC 80 `MOE_HOST_POOL_COLD=0` | 15.54 | 761.7 | 253.2 GiB | 0.8039 |
+| `pool` FRAC 80 `COLD=0` + gather | **19.57** | 755.2 | 157.1 GiB | 0.6048 |
+
+So on the primary arm: `FRAC 80` is **-42 % decode / -27 % prefill** against `pinned`, and `FRAC 100` (the
+patch-0002 default) is **-22 % decode / -14 % prefill**.  The gather is neutral here (256-expert tables are
+below the 224 MiB always-gather gate, §14.4).  **These are not the soar numbers**: this host's `pinned` arm is
+~1.5x session 2's (32.8-34.2 vs 22.3) at the same h=0.754, so the *ratio* is what carries over, not the t/s.
+
+### 14.4 Mechanism (b) — the pool-aware gather: implemented, and it works where tables are large
+
+`patches/0003`.  The kernel gains the third source the handover specified (arena slot / **pool slot** / caller-
+filled destination), the gather builds its own two-tier residency map on the compute stream (separate buffers
+from staging's `prs_`, uploaded only when the map changes), and an expert in neither tier is copied into the
+destination from a pinned source (`expert_host_src`) before the launch — so **no kernel reads the pageable
+mapping**, in either mode.  The pinned-master arm keeps its old behaviour (`prs == nullptr`).
+
+* srv cell: prefill **641-647 → 832-878 t/s (+29…36 %)**, decode flat, and it puts the pool ahead of `pinned`.
+* 122B: neutral (pool -1 % prefill, decode unchanged); `pinned` **-11 % prefill** when the gather fires (its
+  routed union over a 2048-token ubatch is the whole 180 MB table, so the gather just moves the same bytes
+  through kernel copies instead of the DMA engine).
+* The discriminator is `SCHED_GATHER_TABLE_MIN_BYTES` (224 MiB): Flash-Next's 512-expert tables (360 MB) gather
+  at every width, the 122B's 256-expert tables (180 MB) only below the staging width gate.  The win follows the
+  always-gather path, not sparsity.
+* **OPEN A — answered.**  With the gather, `MOE_HOST_POOL_COLD=0` reads **19.57** against `COLD=1`'s 19.25-19.86,
+  i.e. the gather fully substitutes for the in-place pool-slot read (without it `COLD=0` was 15.54, -20 %).  The
+  gather does not care about `device_count`, so this is the portable form of that win and a `#266` dependency the
+  maintainer can drop.
+* Gates: greedy 150 chars `sha=4ac3a523160f` both arms; prefill-logit **mean KLD -0.000000 / same-top-p
+  100.000 %** (host-expert arm `-ncmoe 40 --host-experts pool`, gate script `--extra`); four-axis **acceptance
+  identical to 5 decimals** (0.81370 / 0.75408 / 0.89175 / 0.98148) with `none` == `draft-mtp` text on all four
+  axes; `llama-batched-bench -npl 1,4,8` within run-to-run noise; `check-gpu-faults.sh` clean; and the
+  **`GGML_MOE_GATHER_ONCE=1` control reproduces Hole B** (2000 chars, `2ef00a0e243f`, 1326.9 t/s = 1.5x the
+  honest arm), so the clean arm is evidence rather than an unfalsifiable pass.
+
+### 14.5 Mechanism (a) — registered-range CE copies: measured, and dropped for pool mode
+
+`moe_cache_upload_pageable` is pool mode's fallback for a table the cache staging declines, and the handover
+priced it at prefill 375.9 → 532.6 t/s and -6.7 GB RSS **on the window arm**.  Both numbers are window-staging
+artefacts, because in pool mode the staging path does not use this function at all (it has its own pool branch).
+Exposure, counted (the counter is part of `patches/0003`):
+
+| cell | ranges | bytes through the bounce | pinned bounce ring |
+|---|---|---|---|
+| srv cell, 3 requests incl. 5258-token prompt x3 | 44 | **56.4 MiB** | 43.3 MiB |
+| 122B, 3 requests (the primary arm) | 1 878 | **3 664 MiB** (0.26 % of a 142 s run) | 831-1 190 MiB |
+
+Implementing (a) would register the whole model mapping (`hipHostRegister`) to save 56 MiB-3.6 GiB of host
+`memcpy` per run — ≤0.3 % of wall clock — while taking on the pin-budget/fragility tail §6 and §8 exist to
+refuse.  **Recommendation: drop (a) from the pool scope**; it is a window-staging fix, not a pool one.
+
+### 14.6 OPEN B — `RAM_PCT` 85 % does not thrash here; lowering it is a cliff
+
+Bounded probe (not a soak — the soak is the charter's final Flash-Next phase): 122B, `-ncmoe 48`, `FRAC 100`,
+2000-token decode, sampling the process's `VmSwap` and the box's `pswpout`.
+
+| `MOE_HOST_POOL_RAM_PCT` | ceiling | tables at full slots | decode | process `VmSwap` | `pswpout` |
+|---|---|---|---|---|---|
+| **85** (shipped default) | 73.5 GiB | **144/144** | **26.29** | 0 | 125 pages (0.5 MiB) |
+| 70 | 60.4 GiB | **129/144** (14 tables starved to **1 slot**) | 15.86 (**-40 %**) | 0 | 0 |
+
+So on the PLE-free control the 85 % default does **not** thrash — and turning it *down* is far worse than
+leaving it: 10 % fewer slots costs 40 % of decode, because the per-table clamp starves the *registration-order
+tail* tables to the one-slot floor instead of shaving every table proportionally.  The defect is the ceiling's
+**distribution**, not its level.  (The Flash-Next/PLE thrash report stays Phase 2.)
+
+### 14.7 `-sm tensor` on the x8 pair — NOT runnable on this host
+
+`rocm-smi`/`lspci` show **one** R9700 (`03:00.0`, x8) plus the Granite Ridge iGPU: `HIP_VISIBLE_DEVICES=0,2`
+enumerates a single ROCm device, so the pair arm cannot be built here.  What *was* runnable is the **meta
+backend with one simple backend** (`-sm tensor` on the one visible device), and the gather is served through it
+(4059 pool-backed calls, 877.8 t/s — identical to the `-sm layer` arm).  **Still owed on `soar`:** a
+multi-device `-sm tensor` prefill of `-p 2048+` (never a 32-token smoke), asserting gather ≥ staging per split
+mode and `check-gpu-faults.sh` clean.  Note the capability-predicate caveat the handover describes does **not**
+exist at `efaa60db0` (§14.8), so that arm is the first thing that would exercise a multi-device decline.
+
+### 14.8 Handover corrections (the code wins)
+
+1. **`moe_cache_gather_ok()` does not exist in this tree.**  That capability predicate was window-campaign code
+   (WORKLOG 261102.010/.011); at `efaa60db0` the scheduler's only test is `iface.moe_cache_gather == NULL` plus
+   `GGML_SCHED_DEVGATHER` (default **off**).  Consequences: the gather is opt-in, and the "predicate answers no
+   after staging was skipped" collapse is reachable only with the switch on — which is exactly why the pool path
+   had to be made to *serve* rather than to decline (§14.4).
+2. **Mechanism (a)'s numbers do not transfer to pool mode** (§14.5).
+3. **The `pool` 285.3 / 48.8 reference is withdrawn** (§14.2).
+4. The handover's `-sm tensor` claim stands as a *plan*, not a measurement: pool is split-native and the meta
+   forwarding works (measured with one device), but the multi-device arm is unrun.
+
+### 14.9 Recommendation
+
+**The acceptance criterion is not met on decode yet.**  On this host, with mechanism (b) landed: prefill is at
+or above `pinned` on the large-table cell (pool 877.8 vs `pinned` 739.2) and only -14 % on the 122B, but decode
+is still **-11 %** (srv cell, FRAC 80) to **-22 %** (122B, FRAC 100) behind `pinned` — and PR #267's `mmap` was
+*equal* to `pinned` (74.7 vs 72.4 t/s, 1189 vs 1278 prefill), so `mmap` still offers an advantage on decode.
+What changed is that the *prefill* half of the acceptance argument is settled and the gather removed a `#266`
+dependency (`MOE_HOST_POOL_COLD`).  The remaining decode gap is the pool's own demand path, i.e. P0-a
+(`GGML_MOE_DEVREMAP` over pool slots), which this session did not start.

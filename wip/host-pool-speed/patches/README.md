@@ -10,6 +10,7 @@ elsewhere (a review, another machine, the head-to-head in [`../HEAD-TO-HEAD.md`]
 |---|---|---|
 | `0001-moe-cache-report-the-RUN-*.patch` | **Diagnostics.** `moe_cache_report()` is an `atexit` hook that runs after `moe_cache_forget_all` has un-sized the cache, so every run ended with `tables=0, slots=0, arena=0.0 MiB` and `host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned` — in *both* host-expert modes.  That line is what made “the pool never activated on the 122B” look like a delivery bug (`../HANDOVER.md` §4/F3).  The patch snapshots the report's structural aggregates at the first forget and has the report prefer them.  It also makes a forced `MOE_HOST_POOL_DIO=0\|1` log its effective mode: the *“(forced by MOE_HOST_POOL_DIO=N)”* branch was unreachable dead code because the env parse pre-set `g_pool_dio_decided`. | `ggml/src/ggml-cuda/moe-expert-cache.cu` |
 | `0002-host-pool-full-coverage-default-*.patch` | **The tuning changes.** (a) `MOE_HOST_POOL_FRAC` now defaults to **100** (full coverage of each host expert tensor), still clamped by `MOE_HOST_POOL_RAM_PCT` of `MemAvailable`.  (b) New **`MOE_HOST_POOL_SIZING=1`**: per-table pool slots from routing *concentration* (`cov_t` = the slots a table needs to hold `MOE_HOST_POOL_COV_PCT` of its own prior mass), fitted one-shot to the same total byte budget at the first pool build.  (c) The `--host-experts pool` help/log text that named the old 80 % default. | `ggml/src/ggml-cuda/moe-expert-cache.cu`, `common/arg.cpp`, `src/llama-model-loader.cpp` |
+| `0003-host-pool-the-device-gather-resolves-arena-POOL-boun.patch` | **Mechanism (b): the device gather resolves arena -> POOL -> bounce.**  A pool-backed table's gather used to decline (no device-readable master), so the pool arm fell to the host path or to whole-table staging.  The kernel now takes the staging path's two-tier residency encoding (`>= 0` arena slot, `<= -2` pool slot `-v-2`), the gather builds its own copy of it on the compute stream (separate buffers from staging's `prs_`, uploaded only when it changes), and an expert in neither tier is copied into the destination from a pinned source before the launch — no kernel ever reads the pageable mapping.  Measured: srv-cell prefill 641-647 -> **832-878 t/s**, decode flat, pool ahead of `pinned` on prefill; 122B neutral; `MOE_HOST_POOL_COLD` no longer needed (`COLD=0` 15.54 -> 19.57 t/s).  Also adds the two diagnostic counters it needs (pageable-master fallback exposure, gather calls) and the gather accounting line. | `ggml/src/ggml-cuda/moe-expert-cache.cu` |
 | `h2d-experiment.patch` | **Not part of the set — a finished experiment, kept for the record.** `MOE_HOST_POOL_H2D=1` switches a pool hit/fill from the historical `cudaMemcpyDeviceToDevice` (from the pool's mapped UVA alias) to `cudaMemcpyHostToDevice` (from its pinned host pointer).  Measured: 17.79/17.78 vs 17.76/17.80 t/s — **no effect**, so the copy kind is excluded as an explanation of the pool's decode deficit (`../HANDOVER.md` §3.1).  Do not apply it unless you want to re-run that A/B. | `ggml/src/ggml-cuda/moe-expert-cache.cu` |
 
 ## Prerequisites and apply order
@@ -24,15 +25,23 @@ git clone git@github.com:stew675/llama.cpp.git && cd llama.cpp && git checkout r
 
 # 2. the campaign patches (strict git am — never `git apply` a concatenated series)
 git am <delivery>/wip/host-pool-speed/patches/0001-moe-cache-report-the-RUN-not-an-emptied-cache-snapsh.patch \
-       <delivery>/wip/host-pool-speed/patches/0002-host-pool-full-coverage-default-MOE_HOST_POOL_FRAC-1.patch
+       <delivery>/wip/host-pool-speed/patches/0002-host-pool-full-coverage-default-MOE_HOST_POOL_FRAC-1.patch \
+       <delivery>/wip/host-pool-speed/patches/0003-host-pool-the-device-gather-resolves-arena-POOL-boun.patch
 
 # 3. build
 ~/bin/build-llama-rocm          # or: cmake --build build-rocm --target llama-cli -j 16
 ```
 
-**Validated 2026-11-02:** a fresh worktree at `efaa60db0` takes both patches with `git am` (no fuzz, no 3-way) and
-produces tree **`0b8cc5a8bd7477747723faa45c6de38992877f3a`**, identical to the fork's local branch
+**Validated 2026-11-02 (session 2):** a fresh worktree at `efaa60db0` takes both patches with `git am` (no fuzz,
+no 3-way) and produces tree **`0b8cc5a8bd7477747723faa45c6de38992877f3a`**, identical to the fork's local branch
 `wip/host-pool-speed-pool-sizing` tip.  (That branch is local only — never pushed; the patches are the artifact.)
+
+**Re-based and extended 2026-11-02 (session 3, the 1-GPU host).**  The "re-base onto `efaa60db0`" was a no-op:
+`0b8cc5a8b` is the *applied tree*, and the patches' pre-image blob at `efaa60db0` (`334931ecd`) is the patch
+`index` line, so 0001/0002 apply with no conflict (the window campaign's work exists only in its archived
+reference diff, never in this tree).  With `0003` added, a fresh worktree at `efaa60db0` + `git am` on all three
+gives applied tree **`2e7b240d409ba5fae1e68a2db626a452b09ae035`**; per-patch build is 3/3 clean and same-seed
+greedy text is `sha=4ac3a523160f`.  See `../README.md` §14.
 
 ## Knobs this set introduces or changes
 
