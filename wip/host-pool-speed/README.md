@@ -1212,15 +1212,20 @@ throughput:
 | physics | the gather **does not copy** the routine expert bytes — it reads them in place from pinned memory through the pool alias; only the neither-tier experts are copied (1200 fills = **1014.5 MiB** H2D for the whole prefill).  Worst-case in-place read 144 tables × 3 devices × 3 ubatches × 256 experts × 0.56 MiB = 186 GiB over 3.33 s = **19 GB/s per device**, against a measured per-device H2D calibration of **28.6 GB/s** → inside the link, so no work is being skipped |
 | `GGML_MOE_GATHER_ONCE=1` corruption control | **VACUOUS at this width/quant** — it only restores the once-only expert *head-pad* zeroing and the text stays `5531ae33f0f7`.  Do not cite it as evidence; it is a gate that no longer bites here (§14.4's control was measured on the 1-GPU srv cell) |
 
-**Repeatability, and one number that does NOT reproduce.**  Pool+gather prefill across seven runs: 1063 / 1072 /
-1144 / 1471 / 1507 / 1569 / 1581 t/s.  **`pinned` is the unstable arm in this box state: 75.2 / 380.8 / 471.8 /
-555.1 / 569.2 / 606.9** — so "-0.7 % decode, 3.2x prefill" is a comparison against a *well-behaved* pinned arm
-(471-607), and the honest statement of the prefill claim is "**~1070-1580 t/s against a `pinned` arm that itself
-ranges 75-607**".  Two `llama-bench` cross-checks: `pp2048 -b/-ub 2048` gives pool **1063.4 ± 1.0** (the `pinned`
-arm *core-dumps* at that tool setting, so no pair); `pp1024 -b/-ub 1024` gives `pinned` 271.4 ± 2.5 against pool
-**130.0 ± 73.2** — an outlier regime (repeated 1024-token prefills) that is **not** explained and must be
-re-measured before the head-to-head quotes a `-ub 1024` number.  What the gate above settles is that neither arm
-is producing wrong logits; what it does not settle is why `pinned`'s own prefill is so variable now.
+**Repeatability.**  Pool+gather prefill across runs: 1063 / 1072 / 1129.6 / 1144 / 1300.4 / 1387.8 / 1471 / 1507 /
+1569 / 1581 t/s.  `pinned` in the **same group, same prompt, saved logs, three back-to-back runs: 394.1 / 425.7 /
+425.2 t/s** (prompt 3049 tokens, `-n 4`), and 471.8-606.9 across the 5258-token runs — i.e. **pinned is stable at
+±4 % within a group too**, and the pool is 2.7-3.7x it.  One earlier `pinned` reading of **75.2 t/s did NOT
+reproduce in three attempts** and is withdrawn: it came from an inline pair whose logs were not kept (the other
+run of that pair read 380.8), and with logs saved the arm is well behaved.  So the honest claim is "**~1130-1580
+t/s against a stable `pinned` at 394-426 (same 3049-token prompt) or 471-607 (5258-token prompt)**", and any ratio
+must quote the pinned control from the same group.
+
+Two `llama-bench` cross-checks remain open: `pp2048 -b/-ub 2048` gives pool **1063.4 ± 1.0** (the `pinned` arm
+*core-dumps* at that tool setting, so there is no pair), and `pp1024 -b/-ub 1024` gave `pinned` 271.4 ± 2.5 against
+pool **130.0 ± 73.2** — the opposite ordering, in the one regime where the CLI and `llama-bench` disagree.  That is
+**not** explained and must be re-measured (a `-r 3` repeat at `-ub 1024`) before the head-to-head quotes a
+`-ub 1024` number; the ±73 variance itself points at a first-iteration effect rather than a steady state.
 
 **Correctness of the new default:** `257 chars sha=5531ae33f0f7` on all eight mode/device arms (pair and 3-GPU,
 gather default and forced: `data/20261103-text-purity-b-{pair,g3}`), and **`5835 chars sha=dc178c29fe89` across

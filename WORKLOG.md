@@ -42,10 +42,11 @@ bytes: it reads them in place from pinned memory through the pool alias (only 12
 MiB H2D, are copied), and the worst-case in-place read is 19 GB/s per device against a measured 28.6 GB/s H2D
 calibration.  Two cautions recorded rather than hidden: the `GGML_MOE_GATHER_ONCE=1` corruption control is
 **vacuous at this width/quant** (it only re-zeros the expert head pad; the text stays correct — a control that no
-longer bites), and **`pinned`'s own prefill is unstable in this box state (75.2-606.9 t/s across runs)** while the
-pool arm repeats tightly (1063-1581), so the "3.2x" is a ratio to a well-behaved pinned arm and the
-`llama-bench pp1024` arm (pool 130 ± 73 vs pinned 271 ± 2.5, i.e. the opposite ordering) is an unexplained regime
-that the head-to-head must re-measure before quoting.
+longer bites), and one earlier `pinned` reading of **75.2 t/s is withdrawn** — it did not reproduce in **three back-to-back
+reruns (394.1 / 425.7 / 425.2 t/s, prompt 3049 tokens, `-n 4`, logs kept)**, so `pinned` is stable at ±4 % within
+a group and the pool is 2.7-3.7x it.  The `llama-bench pp1024` arm (pool 130 ± 73 vs pinned 271 ± 2.5, the
+opposite ordering, in the one regime where the CLI and `llama-bench` disagree) remains unexplained and must be
+re-measured before the head-to-head quotes a `-ub 1024` number.
 
 **Still open:** the staging path's own root cause (`TODO` #131 keeps it: reachable only via the kill switch now);
 promotion of `0006` and the `ENVIRONMENT.md` row for the three-valued switch; `HEAD-TO-HEAD.md` (now writable — the
