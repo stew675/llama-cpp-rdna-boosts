@@ -243,6 +243,30 @@ SUDO=1 ./p2-gate-3gpu.sh 0,1,2 500     # the gate test; see the script header fo
 The script runs the rotate arm and the rotation-off control, prints the pinned-set report (`released`,
 `release_denied`), the text hash and t/s for each, and runs `check-gpu-faults.sh` on both logs.
 
+## 8c. First 3-GPU run (2026-11-03 16:41, control arm only) — what it proved, and what it did not
+
+The log (`~/gate3-20261103-164125-norotate.log`) is the **rotation-off control** on the 3-GPU box, built from
+*that box's* tree (`build 11907 (3cecf3bd8)` — not this repo's history) with `0001`-`0004` applied on top.
+
+**Confirmed on 3 GPUs:** the push transport (35 806 fills DMA'd from the mapping), the pinned working set
+(**511 MiB in 907 experts, seeded=664 from the heat prior, first_use=243, refusals=0**), the rotation kill
+switch (`released=0 release_denied=0`), and no faults or aborts (`check-gpu-faults` clean; the one `abort`
+string is the benign `--fit` message).
+
+**Not proved — the gate.** The arm ran as **llama-server** (a single ~6-token request: `over ~6 tokens`,
+`over 3 boundaries`), so the boundary counter never advanced; and the `rotate` arm was not run at all.  The
+gate test needs a real decode run of both arms.
+
+**And a valuable surprise: the pool is LIVE on that box** —
+`host pool (L2): 61 tensors, 7808 slots, **4712.0 MiB pinned**; h=0.5239, fills=12817`, with
+`pool fills: 12817 mapping memcpys 480 ms, 7.56 GiB (7742 MiB/s effective)`.  On one GPU it reported
+`0 tensors, 0 slots` in every arm, which is why the earlier "push vs pool" comparisons were really against
+the **bounce** path.  So the multi-GPU box is where the real comparator lives — and the numbers make the
+campaign's case for it: **4.7 GiB of pinned pool to delete, against a 512 MiB pinned set that replaces it.**
+
+The script now warns when the resolved binary is really `llama-server` and when the run decoded fewer than
+`GATE_MIN_TOKENS` (default 100) tokens, so a vacuous arm cannot be mistaken for a result again.
+
 ## 9. Additive by construction (the pool path is not touched)
 
 The whole diff against the release tip is **189 insertions, 0 deletions**, and every line is behind an

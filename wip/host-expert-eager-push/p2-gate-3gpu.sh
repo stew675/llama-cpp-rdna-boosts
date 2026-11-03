@@ -22,6 +22,7 @@ cd "$(dirname "$0")"
 REPO=$(cd ../.. && pwd)
 FORK=${FORK:-$HOME/llama.cpp}
 BUILD=${BUILD:-$FORK/build-rocm}
+BIN=${BIN:-$BUILD/bin/llama-cli}
 ROCM=${ROCM:-/opt/rocm-10.1.0-gfx120X}
 MODEL=${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}
 GPUS=${1:-0,1,2}
@@ -38,13 +39,26 @@ run_arm() {   # $1 = tag, $2... = extra env
         ROCBLAS_USE_HIPBLASLT=0 \
         MOE_EXPERT_CACHE_MIB=${CACHE_MIB:-2048} MOE_HOST_POOL_FRAC=${POOL_FRAC:-50} \
         MOE_HOST_PUSH_SRC=mapping MOE_HOST_PUSH_MLOCK_MIB=${MLOCK_MIB:-512} "$@" \
-        "$BUILD/bin/llama-cli" -m "$MODEL" -ngl 99 -sm tensor -mg 0 \
+        "$BIN" -m "$MODEL" -ngl 99 -sm tensor -mg 0 \
             -ncmoe "${NCMOE:-40}" --host-experts pool -c "${CTX:-8192}" -n "$N" \
             -p "The capital of France is" --seed 42 --temp 0 \
             --no-display-prompt --single-turn -lv 4 >"$log" 2>&1
     local rc=$?
-    echo "== $tag  (rc=$rc, gpus=$GPUS)  $log"
-    grep -E "pinned working set .*cumulative|Prompt: |Generation: " "$log" | tail -2
+    echo "== $tag  (rc=$rc, gpus=$GPUS, bin=$(readlink -f "$BIN"))  $log"
+    # 1. did the arm actually run the tool we think it did?  On one box `llama-cli` dispatched to
+    #    llama-server (a short request), which silently made the gate test vacuous: 3 boundaries, no decode.
+    if grep -qE "^[0-9.]+ [IW] srv +" "$log"; then
+        echo "   *** WARN: this ran as llama-server, not llama-cli -- set BIN=<path to the real llama-cli>"
+    fi
+    # 2. how far did it decode?  The gate needs real decode boundaries; a prompt-only run proves nothing.
+    local toks
+    toks=$(grep -oE "over ~[0-9]+ tokens" "$log" | tail -1 | grep -oE "[0-9]+" || echo 0)
+    echo "   decoded ~${toks:-0} tokens (floor ${GATE_MIN_TOKENS:-100}); boundaries: $(grep -oE "over [0-9]+ boundaries" "$log" | tail -1)"
+    if [ "${toks:-0}" -lt "${GATE_MIN_TOKENS:-100}" ]; then
+        echo "   *** WARN: too short to exercise the gate -- increase TOKENS (and check the prompt is generating)"
+    fi
+    grep -E "pinned working set .*cumulative" "$log" | tail -1
+    grep -E "Prompt: |Generation: " "$log" | tail -1
     python3 "$REPO/scripts/extract-generated.py" "$log" 2>/dev/null | tail -1
     bash "$REPO/scripts/check-gpu-faults.sh" --since "10 min ago" --log "$log" 2>&1 | tail -1
     return $rc

@@ -1,3 +1,25 @@
+## 261103.015 (wip) -- eager-push: the first 3-GPU log (control arm) — push/seed confirmed, the gate not yet exercised
+
+No delivery change.  Continues `261103.008`.
+
+**Read `~/gate3-20261103-164125-norotate.log`** (3-GPU box, `build 11907 (3cecf3bd8)` = that box's own tree with
+`patches/0001`-`0004` applied, not this repo's history):
+
+- **Confirmed at 3 GPUs**: the push transport (35 806 mapping fills), the pinned working set
+  (**511 MiB / 907 experts, seeded=664 from the heat prior, first_use=243, refusals=0**), the rotation kill
+  switch (control: `released=0`), and a clean fault check.
+- **Not proved: the gate.**  The arm ran as **llama-server** with a single ~6-token request (`over ~6 tokens`,
+  `over 3 boundaries`), so the boundary counter never advanced; the `rotate` arm was not run.
+- **Surprise, and a strong argument for the campaign: the pool is LIVE on that box** — 61 tensors, 7 808 slots,
+  **4 712.0 MiB pinned**, h=0.5239, 12 817 fills, `12817 mapping memcpys 480 ms (7742 MiB/s)`.  On one GPU it
+  reports `0 tensors` in every arm, which is why the earlier "push vs pool" arms were really against the
+  bounce path.  The multi-GPU box is the real comparator, and the RAM argument is now concrete: **4.7 GiB of
+  pinned pool to delete, replaced by a 512 MiB pinned set.**
+
+`p2-gate-3gpu.sh` now warns when the resolved binary is really `llama-server` and when the run decoded fewer
+than `GATE_MIN_TOKENS` (100) tokens, so a vacuous arm cannot be mistaken for a result.  Next: rerun with the
+`rotate` arm on a real decode run (both arms, 500 tokens), then the 122B cold arm.
+
 ## 261103.014 (r209) -- DELIVERY: Windows host memory folded into blocks 09/11/12/15 (PR #269)
 
 **Delivery change.**  PR #269 (`@overdoingism`, `wip/windows-host-memory/`) is **folded into the blocks that own
