@@ -845,6 +845,84 @@ static int arm_remapram(const char * path, double expert_mib, double win_mib) {
     return 0;
 }
 
+// Can the HOST push an expert straight out of the pageable mapping -- no pinned slot, no registration?
+// That is the "host pushes" direction without the pool's `memcpy`.  ROCm stages a pageable H2D through an
+// internal bounce, so the answer is an empirical one; measure it against the pool's memcpy+CE and against a
+// registered-range CE copy on the SAME bytes.
+static int arm_dmapage(const char * path, double expert_mib) {
+    region r = map_and_register(path, expert_mib);
+    const int n = 16;
+    unsigned char * d = nullptr;
+    HIP_CHECK(hipMalloc(&d, r.expert));
+    unsigned char * back = (unsigned char *) malloc(r.expert);
+    std::vector<double> hot, cold;
+    size_t ok = 0;
+
+    // CE copy straight from pageable (page-cache) pages.
+    for (int i = 0; i < n; i++) {
+        unsigned char * p = r.base + (size_t) i * r.expert;
+        (void) madvise(p, r.expert, MADV_POPULATE_READ);
+        const double a = now_us();
+        HIP_CHECK(hipMemcpyAsync(d, p, r.expert, hipMemcpyHostToDevice, 0));
+        HIP_CHECK(hipDeviceSynchronize());
+        const double b = now_us();
+        HIP_CHECK(hipMemcpy(back, d, r.expert, hipMemcpyDeviceToHost));
+        if (memcmp(back, p, r.expert) == 0) ok++;
+        hot.push_back(b - a);
+    }
+    printf("CE H2D from PAGEABLE, hot   median %8.2f us  (%.1f GB/s)  %zu/%d identical\n",
+           med(hot), r.expert / (med(hot) * 1e-6) / 1e9, ok, n);
+
+    ok = 0;
+    int skipped = 0;
+    unsigned char * coldbase = r.base + r.bytes / 2;
+    for (int i = 0; i < n; i++) {
+        unsigned char * p = coldbase + (size_t) i * r.expert;
+        (void) madvise(p, r.expert, MADV_POPULATE_READ);
+        if (!page_out(p, r.expert)) { skipped++; continue; }
+        const size_t fresh = fresh_resident(r.fd, (size_t) (p - r.base) + r.off, r.expert);
+        // PAGEOUT leaves a handful of pages (measured 6-29 of 425); >= 90 % dropped is a cold source for a
+        // TIMING measurement -- the copy faults the rest in exactly as it would the whole range.
+        if (fresh > 0 && fresh * 10 > r.expert / (size_t) sysconf(_SC_PAGESIZE)) {
+            printf("  (cold skip: %zu/%zu still cached)\n", fresh, r.expert / (size_t) sysconf(_SC_PAGESIZE));
+            skipped++;
+            continue;
+        }
+        const double a = now_us();
+        HIP_CHECK(hipMemcpyAsync(d, p, r.expert, hipMemcpyHostToDevice, 0));
+        HIP_CHECK(hipDeviceSynchronize());
+        const double b = now_us();
+        HIP_CHECK(hipMemcpy(back, d, r.expert, hipMemcpyDeviceToHost));
+        if (memcmp(back, p, r.expert) == 0) ok++;
+        cold.push_back(b - a);
+    }
+    if (cold.empty()) printf("  (cold arm: %d/%d blobs could not be proven non-resident)\n", skipped, n);
+    if (!cold.empty()) {
+        printf("CE H2D from PAGEABLE, cold* median %8.2f us  (%.1f GB/s)  %zu/%zu identical  (*>=90%% paged out)\n",
+               med(cold), r.expert / (med(cold) * 1e-6) / 1e9, ok, cold.size());
+    }
+
+    // Now the same bytes from a REGISTERED range, for the comparison (registration = the permanent hold).
+    HIP_CHECK(hipHostRegister(r.base, r.expert * 64, hipHostRegisterDefault));
+    std::vector<double> reg;
+    for (int i = 0; i < n; i++) {
+        unsigned char * p = r.base + (size_t) (16 + i) * r.expert;
+        (void) madvise(p, r.expert, MADV_POPULATE_READ);
+        const double a = now_us();
+        HIP_CHECK(hipMemcpyAsync(d, p, r.expert, hipMemcpyHostToDevice, 0));
+        HIP_CHECK(hipDeviceSynchronize());
+        const double b = now_us();
+        reg.push_back(b - a);
+    }
+    printf("CE H2D from REGISTERED      median %8.2f us  (%.1f GB/s)  (the prior campaign's arm B)\n",
+           med(reg), r.expert / (med(reg) * 1e-6) / 1e9);
+    printf("   pool for the same blob: memcpy 50.1 us + CE 66.4 us = 137.3 us (prior campaign, same box)\n");
+    free(back);
+    (void) hipFree(d);
+    release_region(r);
+    return 0;
+}
+
 // The clean version of the release test: a SCRATCH file on real disk whose pages cannot already be in the
 // page cache, so `file` in cgroup accounting grows by the window and must come back down when it is
 // released.  Everything the earlier arms got wrong (pages already cached, KiB vs MiB labels) is fixed here.
@@ -1175,12 +1253,13 @@ int main(int argc, char ** argv) {
     if (strcmp(arm, "ram") == 0)         return arm_ram(path, emib, big_mib > 0 ? big_mib : 2048.0);
     if (strcmp(arm, "remap") == 0)       return arm_remap(path, emib, big_mib > 0 ? big_mib : 256.0);
     if (strcmp(arm, "remapram") == 0)    return arm_remapram(path, emib, big_mib > 0 ? big_mib : 512.0);
+    if (strcmp(arm, "dmapage") == 0)     return arm_dmapage(path, emib);
     if (strcmp(arm, "scratch") == 0)     return arm_scratch(path, emib, big_mib > 0 ? big_mib : 1024.0);
     if (strcmp(arm, "big") == 0)         return arm_big(path, emib, big_mib);
     if (strcmp(arm, "pageable") == 0)    return arm_pageable(path, emib);
     if (strcmp(arm, "absent") == 0)      return arm_absent(path, emib);
     if (strcmp(arm, "unheld") == 0)      return arm_unheld(path, emib);
 
-    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|big|unheld)\n", arm);
+    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|dmapage|big|unheld)\n", arm);
     return 64;
 }

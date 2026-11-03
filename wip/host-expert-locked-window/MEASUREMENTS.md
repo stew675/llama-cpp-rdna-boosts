@@ -202,3 +202,35 @@ for the process, so the footprint is the whole registered set.  That is `pinned`
    bounded footprint either way.
 
 Cost of finding out: one session, 12 probe arms, ~30 runs.  That is the campaign paid for itself.
+
+## 5. The alternative the measurements point at: let the copy engine read the page cache
+
+Asked after the verdict: instead of a pinned slot, can the HOST push an expert straight out of the pageable
+mapping (a CE copy from page-cache pages)?  `arm dmapage`, 1.66 MiB blob, 16 iterations, same box:
+
+| source of the CE copy | hot (page cache) | cold (≥90 % paged out) |
+|---|---|---|
+**pageable mapping (no pin, no registration)** | **65.8 / 93.2 µs** (2 runs) | **1 321 µs** (1.3 GB/s) |
+registered mapping (the permanent hold) | 42.9 / 48.5 / 104.2 µs | not measured |
+pool: `memcpy` into a pinned slot + CE | 137.3 µs (prior campaign: 50.1 + 66.4) | ~3.5 ms (17.0 ms/8 MiB, prior campaign) |
+
+So a direct pageable push is **~1.5-2x cheaper hot and ~2.7x cheaper cold** than the pool's
+memcpy-into-a-slot, and it needs no pin, no registration and no hold.  All copies verified byte-identical.
+
+**Why the delivery does not already do it — and this is the whole answer: correctness, not speed.**  A
+pageable `cudaMemcpyAsync` is staged through a **shared internal bounce** in ROCm and *tears under
+back-to-back use*: the delivery measured **nondeterministic greedy text** from it, which is why
+`moe_cache_upload_pageable()` exists (`moe-expert-cache.cu:5509`), why `ggml-cuda.cu:6254` routes a
+pool-backed master through the pinned bounce instead, and why a stray pageable upload logs "this is slow and
+may tear".  This probe synchronises every copy, so it never exercises the overlap that tears.
+
+Also documented and relevant: a **2-D** pageable-source H2D is worse than slow — it can fault
+(`Page not present`) and crashed the `-sm tensor` host-expert load (`ggml-cuda.cu:2152`).  The expert fill is
+1-D, so that is not the blocker here; the tearing is.
+
+**Conclusion for the next campaign:** the tractable question is not "remove the copy" but "can a pageable
+(or registered) push be made *safe* under overlap" — with a **correctness gate first** (same-seed greedy text
+under a back-to-back fill stress, `check-gpu-faults.sh`), because the failure mode is silent corruption, and
+the upside is 1.5-2.7x on the fill path.  If it cannot be made safe without a per-device staging buffer, then
+that buffer *is* the pool and the copy is load-bearing — which is the current design, for the reason now
+measured rather than assumed.
