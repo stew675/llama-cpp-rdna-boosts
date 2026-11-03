@@ -1,3 +1,30 @@
+## 261103.003 (wip) -- promotion assessment: the re-base is 207 upstream commits, so promotion and re-base split
+
+No delivery change.  Continues `261103.002`.  Requested work: rebase, gates, promote.
+
+**The rebase is not "a few commits".**  `git fetch https://github.com/ggml-org/llama.cpp master` puts upstream at
+`6b9c0cfcb`; `6050b467c..upstream/master` is **207 commits**, and the delivery's **very first block already
+conflicts** (`git am -3` of `patches/000*.patch` onto `6b9c0cfcb` fails at block 00 in `ggml/src/ggml-cuda/mmq.cu`,
+`src/llama-graph.cpp`, `src/llama-kv-cache.cpp`, `src/llama-model.cpp`, `src/llama-vocab.cpp`).  Upstream has also
+touched the files this campaign edits and the mechanisms it uses: `ggml-cuda.cu` (7 commits), `llama-model.cpp`
+(13), `llama-graph.cpp` (11), `common/arg.cpp` (5), `llama-model-loader.cpp` (3), `ggml-backend-meta.cpp` (3), and —
+the two that actually overlap our work — **`f5222f25c` "cuda: fuse MoE (MUL_MAT_ID) gate/up and GLU in MMQ"** and
+**`740251a92` "cuda: gather batched tensor reads into mapped host memory"**, plus `8fc037672` (Q8_1 correction sum)
+and `1b6935b22` (flash_attn_ext_rows).
+
+**Recommendation: two releases, not one.**  (a) Promote the six campaign patches onto the *current* base
+`6050b467c` as a **new block 16** (safer than amending blocks 09/12, which would require re-laddering every block
+after them), with the gates still owed.  (b) Treat the 207-commit re-base as its own session: re-cut every block,
+run the per-block ladder, re-record the prefill-logit base on the new base, and review the two overlapping upstream
+commits for semantic conflict — the repo's own rule says a re-base is a decode *and* prefill change and must be
+measured before tagging, not verified.  Mixing the two would produce a change nobody can review or attribute.
+
+**Gates still owed for the promotion** (none run yet, all mandatory per `MANIFESTS.md` for this change class): the
+MTP four-axis protocol (0006 sits in the scheduler's MoE input path; the band gate should keep the verify band on
+the arena), `llama-batched-bench -npl 1,4,8` (multi-sequence decode exceeds the band, so it *does* take the new
+path), and `gate-prefill-logits.sh` with a base recorded on the target tree for both arms.
+`check-gpu-faults.sh` and the greedy-text oracle are already green this session.
+
 ## 261103.002 (wip) -- #131 fixed: a pool-backed expert table gathers in the prefill band (campaign patch 0006)
 
 No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261103.001`.  Record:
