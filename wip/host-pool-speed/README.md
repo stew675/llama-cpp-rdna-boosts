@@ -639,7 +639,7 @@ What session 2 changed in the campaign's plan:
 ## 13. Session state
 
 **Current state (2026-11-02, session 3 — the 1-GPU host; see §14 for the measured record):** the campaign set is
-now **three** patches on the r206 tip (applied tree `2e7b240d4`): the teardown-report / forced-`DIO` diagnostics,
+now **three** patches on the r206 tip (applied tree `6e2b58c83`): the teardown-report / forced-`DIO` diagnostics,
 the full-coverage default (`FRAC 100`) + `cov90` per-table sizing, and — new this session — **mechanism (b), the
 pool-aware device gather** (`patches/0003`), which takes the srv cell's prefill from 641-647 to **832-878 t/s**
 (pool ahead of `pinned`'s 739) and removes the `MOE_HOST_POOL_COLD` dependency.  Mechanism (a) was **measured and
@@ -677,7 +677,7 @@ lives only in the archived reference diff).  Verified: fresh worktree at `efaa60
 `0b8cc5a8b` exactly.
 
 The set now has three patches (README in [`patches/`](patches/README.md)); applying all three to a fresh
-`efaa60db0` gives **applied tree `2e7b240d409ba5fae1e68a2db626a452b09ae035`**.  Per-patch build: 3/3 clean
+`efaa60db0` gives **applied tree `6e2b58c83e4f550f6a0d537216c05ac01754e083`**.  Per-patch build: 3/3 clean
 (`llama-cli`, `llama-server`, `llama-batched-bench`, `llama-perplexity` at each level).  Greedy text on the
 re-based build: 150 chars `sha=4ac3a523160f` (the campaign reference).
 
@@ -693,7 +693,7 @@ arm (the page-cache-order trap); the interleaved `pool-frac80-afterpinned` contr
 | `pinned`, gather (`GGML_SCHED_DEVGATHER=1`) | 688.9 | 60.1 | 41.9 GB | 0 |
 | `pool` FRAC 80, staging | 646.8 / 641.2 | 52.6 / 53.6 | 75.5 GB | 0 |
 | `pool` FRAC 100, staging | 624.5 | 52.8 | 82.9 GB | 0.06 GB |
-| **`pool` FRAC 80, gather** | **877.8 / 832.3** | 53.5 / 53.5 | 75.5 GB | 0 |
+| **`pool` FRAC 80, gather** | **877.8 / 874.8 / 832.3** | 53.5 / 53.6 / 53.5 | 75.2-75.5 GB | 0 |
 | `pool` FRAC 80, gather, `-sm tensor` (1 visible device, i.e. through the meta backend) | 877.8 | 53.6 | 75.4 GB | 0 |
 
 The charter's reference (734.5 / 59.5) reproduces on `pinned`.  **The charter's `pool` reference (285.3 / 48.8)
@@ -736,7 +736,7 @@ from staging's `prs_`, uploaded only when the map changes), and an expert in nei
 destination from a pinned source (`expert_host_src`) before the launch — so **no kernel reads the pageable
 mapping**, in either mode.  The pinned-master arm keeps its old behaviour (`prs == nullptr`).
 
-* srv cell: prefill **641-647 → 832-878 t/s (+29…36 %)**, decode flat, and it puts the pool ahead of `pinned`.
+* srv cell: prefill **641-647 → 833-878 t/s (+29…36 %)**, decode flat, and it puts the pool ahead of `pinned`.
 * 122B: neutral (pool -1 % prefill, decode unchanged); `pinned` **-11 % prefill** when the gather fires (its
   routed union over a 2048-token ubatch is the whole 180 MB table, so the gather just moves the same bytes
   through kernel copies instead of the DMA engine).

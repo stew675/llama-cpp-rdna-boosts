@@ -9,7 +9,7 @@ change is staged uncommitted, see the end).  Continues `261102.014`.  Campaign: 
 patches' pre-image blob at `efaa60db0` (`ggml/src/ggml-cuda/moe-expert-cache.cu` = `334931ecd`) is the patch
 `index` line, so 0001/0002 apply with **no conflict** (the window campaign's edits exist only in its archived
 reference diff).  Verified on a fresh worktree + `git am`, per-patch build 3/3 clean, greedy text 150 chars
-`sha=4ac3a523160f`.
+`sha=4ac3a523160f` (identical in `pool`, `pool`+gather and `pinned` on the final binary).
 
 **A charter reference number is withdrawn, with the cause.** The pool's srv-cell `285.3 / 48.8` was measured on
 the window **beta** tree, whose `moe_cache_stage_table` dispatch WORKLOG 261102.008 itself records as a

@@ -1,4 +1,4 @@
-From 34378cecdbd08b1892ad8045b88ebbaa890b2f37 Mon Sep 17 00:00:00 2001
+From fe2da7c24faa252eed52c60d5c6f137c2b7529d2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 2 Nov 2026 20:03:11 -0600
 Subject: [PATCH] host pool: the device gather resolves arena -> POOL -> bounce
@@ -29,11 +29,11 @@ same-top-p 100.000 %; four-axis acceptance identical to 5 decimals and none == d
 check-gpu-faults clean; the GGML_MOE_GATHER_ONCE=1 control reproduces the Hole-B corruption (2000 chars,
 2ef00a0e243f, 1326.9 t/s vs the honest 877.8) so the clean arm is evidence.
 ---
- ggml/src/ggml-cuda/moe-expert-cache.cu | 205 ++++++++++++++++++++++++-
- 1 file changed, 199 insertions(+), 6 deletions(-)
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 208 ++++++++++++++++++++++++-
+ 1 file changed, 202 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 070330fd4..5cc1a61ce 100644
+index 070330fd4..eef320ac3 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -160,6 +160,19 @@ struct table_t {
@@ -182,7 +182,7 @@ index 070330fd4..5cc1a61ce 100644
                  return false;
              }
          }
-@@ -5938,14 +6004,130 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5938,14 +6004,133 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
                  (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
          }
      }
@@ -200,12 +200,15 @@ index 070330fd4..5cc1a61ce 100644
 +    int            skip_miss   = 0;
 +    if (gpool != nullptr) {
 +        std::lock_guard<std::mutex> lock(g_mutex);
-+        // the table this pool belongs to (the pool carries the identity the gather was called with)
++        // The table is identified by its MASTER POINTER (which is also the pool's key), not by geometry:
++        // two tables of one layer share a geometry, and `table_pool_locked()` allocates on a miss, so it
++        // must never be called on a candidate.
 +        table_t * tp = nullptr;
 +        for (table_t & t : g_tables) {
-+            if (t.device == device && t.n_experts == n_experts && t.host_bytes == host_bytes &&
-+                (size_t) t.expert_bytes == expert_bytes && t.src_off == slice_off && t.host_pitch == host_pitch &&
-+                t.split_axis == split_axis && t.host_dev == nullptr && table_pool_locked(t) == gpool) {
++            if (t.host == weight->data && t.device == device && t.n_experts == n_experts &&
++                t.host_bytes == host_bytes && (size_t) t.expert_bytes == expert_bytes &&
++                t.src_off == slice_off && t.host_pitch == host_pitch && t.split_axis == split_axis &&
++                t.host_dev == nullptr) {
 +                tp = &t;
 +                break;
 +            }
@@ -314,7 +317,7 @@ index 070330fd4..5cc1a61ce 100644
      return true;
  }
  
-@@ -7156,6 +7338,17 @@ void moe_cache_report() {
+@@ -7156,6 +7341,17 @@ void moe_cache_report() {
      if (g_devremap_calls > 0) {
          GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
      }

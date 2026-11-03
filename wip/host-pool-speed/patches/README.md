@@ -40,7 +40,7 @@ no 3-way) and produces tree **`0b8cc5a8bd7477747723faa45c6de38992877f3a`**, iden
 `0b8cc5a8b` is the *applied tree*, and the patches' pre-image blob at `efaa60db0` (`334931ecd`) is the patch
 `index` line, so 0001/0002 apply with no conflict (the window campaign's work exists only in its archived
 reference diff, never in this tree).  With `0003` added, a fresh worktree at `efaa60db0` + `git am` on all three
-gives applied tree **`2e7b240d409ba5fae1e68a2db626a452b09ae035`**; per-patch build is 3/3 clean and same-seed
+gives applied tree **`6e2b58c83e4f550f6a0d537216c05ac01754e083`**; per-patch build is 3/3 clean and same-seed
 greedy text is `sha=4ac3a523160f`.  See `../README.md` §14.
 
 ## Knobs this set introduces or changes
