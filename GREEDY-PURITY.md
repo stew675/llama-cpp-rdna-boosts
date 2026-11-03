@@ -2259,6 +2259,16 @@ and none is owed — the delivery does not implement it and will not.  The figur
 temptation: a 5-12 % generation "win" for silently deleting part of the model, which is exactly the trade the
 `GREEDY-PURITY` invariants exist to refuse.
 
-**Record.**  This entry.  Source analysis: `wip/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
+**This repo already measured it once, in the engine's own log.**  `archive/work/moe-cache-coverage/
+FINDINGS-2026-10-17-coverage-vs-defrag.md` row 3 dissects Strata's `STRATA_ROUTE_TAIL_SKIP=7` (**default ON**;
+`src/core/expert_source.cpp:3702-3712`): a missed expert that every token of the window routes at rank >= 7 is
+*neither copied nor computed*, its contribution dropped **without renormalisation**, and because it is not a
+lookup it is not counted as a miss either.  It is worth **6.5 points** of that engine's reported hit rate, and in
+the maintainer's own run it silently skipped **201 978 experts in one request** — the same run is 98.4 % as
+reported and **91.9 %** on an apples-to-apples "was the expert resident" basis.  That is the exact measurement
+this rule exists to make unnecessary: the "win" is a metric definition, not a speed-up.
+
+**Record.**  This entry.  Source analyses: `archive/work/moe-cache-coverage/FINDINGS-2026-10-17-coverage-vs-defrag.md`
+(row 3, the numbers above — do not re-derive them) and `wip/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
 `c24c03d84`); the no-XNACK constraint that makes such engines reach for it is `INVARIANTS.md`
 (device-visible host memory must be resident).
