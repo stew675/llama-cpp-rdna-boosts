@@ -1,0 +1,188 @@
+
+########################################################################
+# arm: base
+########################################################################
+=== probe-locked-window: arm=base expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+source        /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+expert blob   1.66 MiB (425 pages)
+region        off=7554461696 len=512.00 MiB
+region resident before register  131072/131072 pages
+register      362672.1 us  (708.3440 us/MiB)
+host ptr      0x7fc4fe27f000
+device alias  0x7fc4fe27f000 -> IDENTITY (UVA)
+region resident after register   131072/131072 pages  (a mapping, or a hold?)
+register again (warm)       3.5 us  (0.0068 us/MiB)
+in-place read     69.4 us  25.1 GB/s  DATA IDENTICAL
+sustained     64 x 1.66 MiB read+write in 2278.2 us -> 48.9 GB/s useful (97.8 GB/s link)  last DATA IDENTICAL
+-- arm base: exit 0 (clean)
+
+########################################################################
+# arm: pin
+########################################################################
+=== probe-locked-window: arm=pin expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+-- A. control: NOT registered --
+  populated                          own-ptes 425/425   page-cache 425/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+  after PAGEOUT                      own-ptes   0/425   page-cache   0/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+-- B. registered, never device-read --
+  after register                     own-ptes 425/425   page-cache 425/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+  populate + PAGEOUT                 own-ptes   0/425   page-cache   0/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+-- C. registered, then device-read --
+  device read ok (17296.6 us)
+  after device read                  own-ptes 425/425   page-cache 425/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+  after PAGEOUT                      own-ptes   8/425   page-cache   8/425   VmLck    0 KiB  Mlocked      0 MiB  Unevict    158 MiB
+-- D. the same range, held (mlock2), then PAGEOUT --
+  mlock2 ok
+MADV_PAGEOUT: Invalid argument
+  PAGEOUT refused (EINVAL is expected over a locked VMA)
+  held + PAGEOUT                     own-ptes   8/425   page-cache   8/425   VmLck 1700 KiB  Mlocked      0 MiB  Unevict    158 MiB
+
+  verdict: if 'page-cache' stays at 425/425 after PAGEOUT while 'own-ptes' drops, then the
+  pages are RETAINED (pinned by the driver or simply not reclaimed) and a cold claim needs
+  real pressure, not madvise; if it drops, PAGEOUT is a valid eviction control here.
+-- arm pin: exit 0 (clean)
+
+########################################################################
+# arm: evicted
+########################################################################
+=== probe-locked-window: arm=evicted expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+registered, populated, PAGEOUT -> page-cache 8/425 resident (fresh mapping), NOT held
+*** the page cache did not drop: this arm cannot test the hazard ***
+-- arm evicted: exit 3
+
+########################################################################
+# arm: pageable
+########################################################################
+=== probe-locked-window: arm=pageable expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+pageable (NOT registered), populated 
+Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+
+****************************************************************************
+*** GPU HANG ANALYSIS - VGPU(0x55b684874d40) Queue(0x7f5713dfc000)
+****************************************************************************
+SWq=0x7f5713dfc000, HWq=0x7f56dfe00000, id=1, priority=1, Dispatch Header = 0xc02 (type=2, barrier=0, acquire=2, release=1), setup=3, grid=[108800, 1, 1], workgroup=[256, 1, 1], private_seg_size=0, group_seg_size=0, kernel_obj=0x7f5714b54f00, kernarg_address=0x7f56df800000, completion_signal=0x0, rptr=0, wptr=2
+****************************************************************************
+
+:0:rocdevice.cpp            :3948: 14279844987 us:  [host: radix, GPU index: 0, faulting addr: 0x7f56e8085000, kernel: kern_copy4(HIP_vector_type<unsigned int, 4u> const*, HIP_vector_type<unsigned int, 4u>*, unsigned long)]
+Memory access fault by GPU node-1 (Agent handle: 0x55b684840cb0) on address 0x7f56e8085000. Reason: Page not present or supervisor privilege.
+Failed to write ELF header: Broken pipe
+GPU coredump: handler exited with error (status: 1)
+GPU core dump failed
+timeout: the monitored command dumped core
+./run-probe.sh: line 18:  2906 Aborted                    timeout 300 ./build/probe-locked-window "$ARM" "$GGUF" "$EMIB" 2>&1
+-- arm pageable: exit 134 (SIGABRT: a fatal GPU fault -- EXPECTED only for 'unheld')
+
+########################################################################
+# arm: absent
+########################################################################
+=== probe-locked-window: arm=absent expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+paged out FIRST: page cache 0/425 (fresh mapping)
+registered over absent pages; page cache now 425/425
+device read SUCCEEDED -> registration faulted the pages in (a silent hold)
+-- arm absent: exit 2
+
+########################################################################
+# arm: regcost
+########################################################################
+=== probe-locked-window: arm=regcost expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+grant (hot)   register    16.06 us   verify   194.16 us   unregister     0.33 us   (16/16 identical)
+              register 9.67 us/MiB  = 0.01 ms/MiB
+grant (cold)  register  3231.94 us (1.95 ms/MiB)  over 16 provably non-resident blobs
+              a grant is: the driver faults the range in and holds it (see arm 'absent')
+-- arm regcost: exit 0 (clean)
+
+########################################################################
+# arm: hold-hot
+########################################################################
+=== probe-locked-window: arm=hold-hot expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+budget        8.00 MiB locked -> 4 expert blobs holdable
+mlock2(ONFAULT)  median   369.35 us  (4 ops)
+populate (hot)   median    10.38 us  (6.25 us/MiB)
+munlock          median    16.97 us
+in-place reads   4/4 DATA IDENTICAL
+-- arm hold-hot: exit 0 (clean)
+
+########################################################################
+# arm: hold-cold
+########################################################################
+=== probe-locked-window: arm=hold-cold expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+PAGEOUT proven by mincore   425 -> 0 of 425 pages resident
+mlock2(ONFAULT)      3.58 us  ok
+populate (cold)  18600.85 us  0.09 GB/s  ok
+in-place read     10438.9 us  DATA IDENTICAL
+page cache after 425/425 (fresh mapping)
+-- arm hold-cold: exit 0 (clean)
+
+########################################################################
+# arm: survive
+########################################################################
+=== probe-locked-window: arm=survive expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+held             425/425 resident
+pressure         4096.00 MiB anonymous pages touched
+held expert      425/425 resident after pressure (the guarantee)
+unheld neighbour 425/425 resident (control: pressure is real)
+in-place read     11602.0 us  DATA IDENTICAL
+-- arm survive: exit 1
+
+########################################################################
+# arm: granularity
+########################################################################
+=== probe-locked-window: arm=granularity expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+budget        8.00 MiB
+expert-granular  4 locks of 1.66 MiB  VMAs 129 -> 131 (+2)  per-lock 0.7 us  munlock total 2.7 us
+chunk-granular   1 lock of 8.00 MiB  VMAs 129 -> 131 (+2)  mlock2 1.1 us  ok
+over-budget      lock 72.00 MiB  0.4 us  -> Cannot allocate memory
+mlock (eager)    8.00 MiB  95.7 us  ok  (populates by faulting page-by-page)
+-- arm granularity: exit 0 (clean)
+
+########################################################################
+# arm: unheld
+########################################################################
+=== probe-locked-window: arm=unheld expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+registered + populated + PAGEOUT -> 8/425 resident, NOT held
+*** the unheld read SUCCEEDED: this probe is not evicting its own range, so every
+    'survive' result is VOID ***
+-- arm unheld: exit 2

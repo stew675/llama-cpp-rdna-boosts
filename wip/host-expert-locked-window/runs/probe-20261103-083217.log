@@ -1,0 +1,18 @@
+=== probe-locked-window ===
+source        /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+expert blob   1.66 MiB (1740800 bytes, 425 pages)
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+vm.max_map_count    Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+
+****************************************************************************
+*** GPU HANG ANALYSIS - VGPU(0x5565c6f648c0) Queue(0x7f6378db6000)
+****************************************************************************
+SWq=0x7f6378db6000, HWq=0x7f6349800000, id=1, priority=1, Dispatch Header = 0xc02 (type=2, barrier=0, acquire=2, release=1), setup=3, grid=[1048576, 1, 1], workgroup=[256, 1, 1], private_seg_size=0, group_seg_size=0, kernel_obj=0x7f6378dcc900, kernarg_address=0x7f6349200000, completion_signal=0x0, rptr=0, wptr=2
+****************************************************************************
+
+:0:rocdevice.cpp            :3948: 13973020755 us:  [host: radix, GPU index: 0, faulting addr: 0x7f634c27f000, kernel: kern_copy(unsigned char const*, unsigned char*, unsigned long)]
+Memory access fault by GPU node-1 (Agent handle: 0x5565c6f35c00) on address 0x7f634c27f000. Reason: Page not present or supervisor privilege.
+Failed to write ELF header: Broken pipe
+GPU coredump: handler exited with error (status: 1)
+GPU core dump failed
