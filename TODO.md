@@ -35,6 +35,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 
 | **131** | `--host-experts pool` prefill collapsed under a >=3-device `-sm tensor` split (block 12's staging path; root cause still unidentified) | performance (delivery defect) | **FIXED BY DEFAULT in `patches/0006`** (pool tables gather in the prefill band: 1502-1569 vs `pinned` 471.8 prefill, decode -0.7 %; the kill switch reproduces 16.9 t/s).  **Open:** the staging path's own cost, and the promotion.  See §131 |
 | **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
+| **133** | A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch — 3-GPU `pinned` prefill is *slower* than 1-GPU (471-607 vs 755.5 t/s) at 100 % arena residency | performance (delivery defect, default mode) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §133 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -327,6 +328,28 @@ is now a bigger prize than the tensor-split remap (`#269`, +3.3 %).  Protocol: r
 `scripts/moe-trace-replay.py` first (`wip/host-pool-speed` §9.6 — an overlap does not change placement, so the
 model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
 gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
+
+## 133. A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch
+
+**Status: open, measured 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2).  Delivery performance defect in
+the DEFAULT (`pinned`) mode at a large-arena configuration — not a pool issue.**  At `-ncmoe 48` on three RDNA4
+GPUs the arena is `67110.0 MiB of 67110.0` (256/256 slots/table, i.e. the whole host expert set is *also* fully
+VRAM-resident), and the prefill nevertheless stages **61 GiB for a 3049-token prompt — `arena=61031.5 MiB
+host=510.5 MiB`, i.e. 99.2 % of it read back out of VRAM** into the op's per-split weight buffer, once per table
+per ubatch, serialised against the compute (copy table → compute → copy next).  It runs at ~8 GB/s aggregate
+(2.6 GB/s per device) over a 7.7 s prefill, so it is latency/occupancy-bound, not bandwidth-bound.  Symptoms:
+`pinned` prefill at 3 GPUs (471.8-606.9 t/s) is **slower than at 1 GPU** (755.5) despite 3x the VRAM and 3x the
+compute; the no-copy path (the pool gather, which resolves from the arena) scales normally (734 → 1300-1600).
+Forcing the gather on `pinned` does not help (587.8 vs 564.7) because a pinned table's gather source is the pinned
+*host* master over PCIe.
+
+**Candidate fix:** let an identity (fully resident) table serve the prefill op **in place** — the take-over /
+aliasing path `moe_cache_get_table()` already implements for the decode band, which the scheduler does not use
+above the band (`offload_op` is band-gated).  Needs: the take-over decision above the band for identity tables
+only, a graph-capture audit (the band gate exists because capture bakes the redirect in), and the gates the
+delivery requires for a pref/prefill change — `gate-prefill-logits.sh` must read KLD 0.000000 (the arms are the
+same bytes, so anything else is a bug), same-seed greedy text, `check-gpu-faults.sh`.  **Value:** up to ~3x on the
+default mode's prefill, which is also the baseline every pool claim is divided by.
 
 ## 269. PR #266's disposition: keep the device remap, drop the rest — and the remap must be tensor-split aware
 
