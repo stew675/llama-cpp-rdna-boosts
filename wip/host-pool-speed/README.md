@@ -534,6 +534,8 @@ oracle does not separate is not implemented.
   `archive/work/host-pool-swap-and-prefill/` (r114), `archive/work/moe-cache-coverage/` (the replayer and the
   admission-quality result), `archive/work/moe-cpu-overlap/` (the miss-traffic measurement: 0.1-0.4 % of a
   token at the delivered arena, 7 % at the 2 048 MiB floor — do not re-open CPU/GPU overlap).
+- [`HANDOVER-MULTIGPU.md`](HANDOVER-MULTIGPU.md) — the cold-start handover for the multi-GPU box (state, W1-W4,
+  traps, gates, promotion checklist); [`HANDOVER.md`](HANDOVER.md) is the 1-GPU session-2 record.
 - `scripts/moe-trace-replay.py` — the offline two-tier model (band-split heat, `--pool-frac`).
 - `archive/work/moe-expert-cache/item3-findings-session20.md` — the 122B-A10B `-ncmoe 99 -sm tensor` numbers,
   the 166 GB/pass shard-byte figure, and the staging-vs-gather architecture rule (§9.1).
@@ -651,6 +653,11 @@ What session 2 changed in the campaign's plan:
   bless since it calibrated.
 
 ## 13. Session state
+
+**Next session: [`HANDOVER-MULTIGPU.md`](HANDOVER-MULTIGPU.md)** — a cold-start handover for the multi-GPU box:
+state, the ordered work list (W1 multi-device arms → W2 the tensor-split-aware remap → W3 the `RAM_PCT` clamp →
+W4 the head-to-head), the traps, the gates and the promotion checklist.  The 1-GPU host's work is finished as far
+as it can go.
 
 **Current state (2026-11-02, session 3 — the 1-GPU host; see §14 for the measured record):** the campaign set is
 now **four** patches on the r206 tip (applied tree `ac580a8e3`): the teardown-report / forced-`DIO` diagnostics,

@@ -1,3 +1,26 @@
+## 261102.020 (wip) -- multi-GPU handover written; the campaign's remaining work moves to `soar`
+
+No delivery change.  Continues `261102.019`.
+
+**New: [`wip/host-pool-speed/HANDOVER-MULTIGPU.md`](wip/host-pool-speed/HANDOVER-MULTIGPU.md)** — a cold-start
+handover for the multi-GPU box, because the two remaining items (the tensor-split-aware remap and the multi-device
+arms that gate it) cannot be done on the 1-GPU host.  It carries: the acceptance criterion and what "done" means;
+the tree state (four campaign patches, applied tree `ac580a8e3`, per-patch build 4/4, text `4ac3a523160f`); the
+inherited blocker (F7: under `-sm tensor` `pinned` never sizes the cache and `FRAC 100` stalled a prepopulate
+once — so no pair number means anything until `llama_model_moe_host_expert_dev_count` under the Meta wrapper is
+understood); the ordered work (W1 make the multi-device arms mean something and gate the gather there at
+`-p 2048+`; W2 the remap over pool slots per `TODO` #269, tensor-split aware, with the layout-epoch/freeze
+invariant; W3 the `RAM_PCT` clamp-distribution defect that starves the registration-order tail; W4 the Phase-1
+baseline on `soar` and the `HEAD-TO-HEAD` against #267); every trap that has cost a run (the iGPU pin, the x8 pair
+`0,2`, `-lv 4`, `SRVENV` commas, the below-floor arena, `perf` `-g`/`rocprofv3` caveats and not committing 40-75 MB
+CSVs); the gate table including `--extra` for a host-expert KLD arm; the decisions the maintainer still owes; and a
+promotion checklist.
+
+`HANDOVER.md` keeps its role as the **1-GPU session-2 record** with a supersession pointer at its §0 (its §3
+numbers are `soar`'s own and its §4/F7 is the first blocker the multi-GPU session inherits); `README.md` §13 and
+§11 and `wip/CAMPAIGNS.md` now point at the new handover.  Nothing else changed: `patches/`, `release.json` and
+`rdna-boosts-all.patch` untouched.
+
 ## 261102.019 (wip) -- PR #266's disposition decided (remap stays, tensor-split aware); coalesced multi-expert fills built, measured and REFUTED
 
 No delivery change.  Continues `261102.018`.

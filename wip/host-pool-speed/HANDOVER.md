@@ -6,6 +6,14 @@ the plan; this file holds the state, the measurements taken and the next actions
 
 ## 0. Status, and the ONE thing to do next
 
+> **Superseded for the *next* session (2026-11-02, session 3): if you are starting on the MULTI-GPU box, read
+> [`HANDOVER-MULTIGPU.md`](HANDOVER-MULTIGPU.md) instead — it carries the current state (four campaign patches,
+> the pool-aware gather, P1 closed on evidence, the remap disposition in `TODO` #269) and the ordered work list
+> (W1 multi-device arms → W2 tensor-split-aware remap → W3 the `RAM_PCT` clamp → W4 the head-to-head).**
+> This file remains the **1-GPU host's session-2 record**: its §3 baseline numbers are `soar`'s own, and its
+> §4/F7 (no expert cache for `pinned` under `-sm tensor`) is the first blocker the multi-GPU session inherits.
+> Session 3's measured record is `README.md` §14-§17.
+
 **Session 2 (2026-11-02, overnight) — the blocking finding was a false alarm, the baseline is measured, and the
 decode lever is identified.**
 
