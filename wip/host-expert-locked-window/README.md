@@ -1,5 +1,14 @@
 # wip/host-expert-locked-window — the pool's policy, the mapping's storage, an explicit hold (OPEN)
 
+> **VERDICT 2026-11-03 (P0.5): the sliding window is BLOCKED by the driver — do not build it.**
+> `hipHostRegister` is a hold that lives for the process's life: `hipHostUnregister`, `munmap`, a MAP_FIXED
+> remap and every registration flag (`ro`/`portable`/`mapped`) all leave the window's bytes non-reclaimable
+> under 67 GiB of real pressure (cgroup `file` unchanged).  A bounded *sliding* window therefore cannot exist,
+> and without one the footprint is the whole registered set — `pinned` with a longer load.  The full evidence
+> is `MEASUREMENTS.md` §4; what survives is there too (the pool's copy is the only *releasable* residency
+> primitive here, and a **static** bounded registered subset is the honest pivot).  Read this campaign as a
+> refutation, not as a plan.
+
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in
 `patches/` or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a
 separate decision).

@@ -1,0 +1,26 @@
+=== probe-locked-window: arm=remap expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+window 128.00 MiB at a fixed VA (0x7f7f39e00000)
+  baseline                   cgroup cur  1038 MiB  file 846204  anon 191868  unevict     0  slab 17324 MiB   MemAvailable 90381 MiB
+register window: 11.3 ms
+  window 1 registered        cgroup cur  1043 MiB  file 850312  anon 193036  unevict     0  slab 17357 MiB   MemAvailable 90374 MiB
+  unregistered (VMA still mapped) cgroup cur  1129 MiB  file 867804  anon 262840  unevict     0  slab 17399 MiB   MemAvailable 90372 MiB
+  unmapped                   cgroup cur  1129 MiB  file 867804  anon 262840  unevict     0  slab 17399 MiB   MemAvailable 90372 MiB
+  window 2 (different offset) cgroup cur  1129 MiB  file 867804  anon 262840  unevict     0  slab 17392 MiB   MemAvailable 90372 MiB
+Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+
+****************************************************************************
+*** GPU HANG ANALYSIS - VGPU(0x55d0fe91f3c0) Queue(0x7f7f6dbc6000)
+****************************************************************************
+SWq=0x7f7f6dbc6000, HWq=0x7f7f31200000, id=1, priority=1, Dispatch Header = 0x1502 (type=2, barrier=1, acquire=2, release=2), setup=3, grid=[108800, 1, 1], workgroup=[256, 1, 1], private_seg_size=0, group_seg_size=0, kernel_obj=0x7f7f6dbd8f00, kernarg_address=0x7f7f30c00000, completion_signal=0x0, rptr=2, wptr=4
+****************************************************************************
+
+:0:rocdevice.cpp            :3948: 14707673980 us:  [host: radix, GPU index: 0, faulting addr: 0x7f7f39e49000, kernel: kern_copy4(HIP_vector_type<unsigned int, 4u> const*, HIP_vector_type<unsigned int, 4u>*, unsigned long)]
+Memory access fault by GPU node-1 (Agent handle: 0x55d0fe8eacd0) on address 0x7f7f39e49000. Reason: Page not present or supervisor privilege.
+Failed to write ELF header: Broken pipe
+GPU coredump: handler exited with error (status: 1)
+GPU core dump failed
+timeout: the monitored command dumped core

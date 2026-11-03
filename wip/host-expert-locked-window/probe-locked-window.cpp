@@ -298,9 +298,24 @@ static region map_and_register(const char * path, double expert_mib) {
     return r;
 }
 
+// LW_REG_FLAGS: the last door on a releasable hold.  `hipHostRegisterReadOnly` is documented as the
+// read-only registration; the prior campaign found it claimed unsupported yet accepted.  If a release
+// exists at all it is most likely here.
+static unsigned int reg_flags() {
+    static unsigned int f = [] {
+        const char * e = getenv("LW_REG_FLAGS");
+        if (e == nullptr) return (unsigned int) hipHostRegisterDefault;
+        if (strcmp(e, "ro") == 0) return (unsigned int) hipHostRegisterReadOnly;
+        if (strcmp(e, "portable") == 0) return (unsigned int) hipHostRegisterPortable;
+        if (strcmp(e, "mapped") == 0) return (unsigned int) hipHostRegisterMapped;
+        return (unsigned int) hipHostRegisterDefault;
+    }();
+    return f;
+}
+
 static void do_register(region & r, double * us_out) {
     const double t0 = now_us();
-    HIP_CHECK(hipHostRegister(r.base, r.bytes, hipHostRegisterDefault));
+    HIP_CHECK(hipHostRegister(r.base, r.bytes, reg_flags()));
     const double t1 = now_us();
     r.registered = true;
     if (us_out) *us_out = t1 - t0;
@@ -604,6 +619,394 @@ static int arm_pin(const char * path, double expert_mib) {
     return 0;
 }
 
+
+// ---- P0.5: cgroup v2 accounting (a registered range's bytes have to show up SOMEWHERE) ----
+static std::string cg_dir() {
+    FILE * f = fopen("/proc/self/cgroup", "r");
+    if (!f) return "";
+    char line[512];
+    std::string path;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+            path = line + 3;
+            while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) path.pop_back();
+        }
+    }
+    fclose(f);
+    return path.empty() ? "" : ("/sys/fs/cgroup" + path);
+}
+
+static long cg_kb(const char * key) {
+    const std::string d = cg_dir();
+    if (d.empty()) return -1;
+    FILE * f = fopen((d + "/memory.stat").c_str(), "r");
+    if (!f) return -1;
+    char k[128];
+    long v = -1;
+    while (fscanf(f, "%127s %ld", k, &v) == 2) {
+        if (strcmp(k, key) == 0) { fclose(f); return v; }
+    }
+    fclose(f);
+    return -1;
+}
+
+static long cg_current_mib() {
+    const std::string d = cg_dir();
+    if (d.empty()) return -1;
+    FILE * f = fopen((d + "/memory.current").c_str(), "r");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v < 0 ? -1 : v / 1048576;
+}
+
+static void ram_report(const char * what) {
+    printf("  %-26s cgroup cur %5ld MiB  file %5ld  anon %5ld  unevict %5ld  slab %4ld MiB   MemAvailable %5ld MiB\n",
+           what, cg_current_mib(), cg_kb("file") / 1024, cg_kb("anon") / 1024, cg_kb("unevictable") / 1024,
+           cg_kb("slab_reclaimable") / 1024, meminfo_kb("MemAvailable") / 1024);
+}
+
+// ---- P0.5 #4: does hipHostUnregister RELEASE the hold?  The window can only slide if it does. ----
+static int arm_release(const char * path, double expert_mib, bool unregister_first) {
+    region r = map_and_register(path, expert_mib);
+    do_register(r, nullptr);
+    (void) madvise(r.base, r.expert, MADV_POPULATE_READ);
+    double us = 0;
+    if (!gpu_read_verify(r.base, r.expert, &us)) { printf("baseline read MISMATCH\n"); return 1; }
+    printf("baseline: registered, populated, device read ok\n");
+
+    if (unregister_first) {
+        const double t0 = now_us();
+        HIP_CHECK(hipHostUnregister(r.base));
+        r.registered = false;
+        const double t1 = now_us();
+        printf("unregister: %.2f us\n", t1 - t0);
+    } else {
+        printf("control arm: NOT unregistered\n");
+    }
+
+    size_t fresh = (size_t) -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (!page_out(r.base, r.expert)) return 3;
+        fresh = fresh_resident(r.fd, r.off, r.expert);
+        if (fresh == 0) break;
+    }
+    printf("page cache after PAGEOUT: %zu/%zu (fresh mapping)\n",
+           fresh, r.expert / (size_t) sysconf(_SC_PAGESIZE));
+    fflush(stdout);
+    alarm(20);
+    const bool ok = gpu_read_verify(r.base, r.expert, &us);
+    printf("device read after PAGEOUT: %s\n", ok ? "SUCCEEDED (the hold was NOT released)" : "mismatch");
+    printf("%s\n", ok ? "  -> unregister did not release (or PAGEOUT cannot drop it): the window cannot\n"
+                        "     slide and the mode is a whole-tensor hold"
+                      : "  -> unheld + dropped is unreadable");
+    return ok ? 2 : 0;
+}
+
+// Does the release actually give the memory BACK, or does the device keep a stale mapping to pages that
+// the kernel may now reuse?  Register, verify, unregister, PAGEOUT, then flood the machine with a
+// distinctive anonymous pattern and read the range again: identical = the driver held the page (RAM not
+// returned); mismatch = the page was reused while the device still mapped it (silent corruption, the worst
+// answer); fault = the mapping went away with the release (what the design needs).
+static int arm_reuse(const char * path, double expert_mib) {
+    region r = map_and_register(path, expert_mib);
+    do_register(r, nullptr);
+    (void) madvise(r.base, r.expert, MADV_POPULATE_READ);
+    double us = 0;
+    if (!gpu_read_verify(r.base, r.expert, &us)) { printf("baseline MISMATCH\n"); return 1; }
+    HIP_CHECK(hipHostUnregister(r.base));
+    r.registered = false;
+    if (!page_out(r.base, r.expert)) return 3;
+    printf("unregistered + PAGEOUT: page cache %zu/%zu\n",
+           fresh_resident(r.fd, r.off, r.expert), r.expert / (size_t) sysconf(_SC_PAGESIZE));
+
+    const size_t press = 8ull << 30;
+    unsigned char * m = (unsigned char *) mmap(nullptr, press, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t touched = 0;
+    if (m != MAP_FAILED) {
+        for (size_t i = 0; i < press; i += (size_t) sysconf(_SC_PAGESIZE)) { m[i] = 0xC5; touched += (size_t) sysconf(_SC_PAGESIZE); }
+        printf("reuse pressure: %s of 0xC5 anonymous pages\n", mib((double) touched).c_str());
+    }
+    printf("page cache now %zu/%zu\n", fresh_resident(r.fd, r.off, r.expert),
+           r.expert / (size_t) sysconf(_SC_PAGESIZE));
+    fflush(stdout);
+    alarm(20);
+    const bool ok = gpu_read_verify(r.base, r.expert, &us);
+    printf("device read after release + reuse pressure: %s\n",
+           ok ? "IDENTICAL (the driver still holds the page: RAM is not returned)"
+              : "*** DATA CHANGED (the page was reused under a live device mapping: corruption) ***");
+    if (m != MAP_FAILED) munmap(m, press);
+    return ok ? 2 : 1;
+}
+
+// P0.5 escape hatch: if `hipHostUnregister` does not release the hold, does unmapping the VMA?  The window
+// could then be a fixed-address mapping that is remapped per slide (the delivery's tensors keep their
+// pointers; the design re-maps AT THE SAME VA).  The measure is cgroup `file`: it must go back down.
+static int arm_remap(const char * path, double expert_mib, double win_mib) {
+    region r = map_and_register(path, expert_mib);
+    const size_t W = tmin<size_t>((size_t) (win_mib * 1048576.0), r.bytes / 4);
+    unsigned char * va = (unsigned char *) mmap(nullptr, W, PROT_NONE,
+                                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (va == MAP_FAILED) { printf("reserve failed: %s\n", strerror(errno)); return 3; }
+    const size_t off1 = r.off;
+    const size_t off2 = r.off + r.bytes / 2;
+
+    auto map_at = [&](size_t off) {
+        void * p = mmap(va, W, PROT_READ, MAP_SHARED | MAP_FIXED, r.fd, (off_t) off);
+        if (p == MAP_FAILED) { printf("mmap at VA failed: %s\n", strerror(errno)); exit(1); }
+        return (unsigned char *) p;
+    };
+    auto dev_read = [&](unsigned char * p) {
+        double us = 0;
+        if (!gpu_read_verify(p, r.expert, &us)) { printf("  read MISMATCH\n"); return false; }
+        return true;
+    };
+
+    printf("window %s at a fixed VA (%p)\n", mib((double) W).c_str(), (void *) va);
+    ram_report("baseline");
+    unsigned char * w1 = map_at(off1);
+    double t = 0;
+    const double t0 = now_us();
+    HIP_CHECK(hipHostRegister(w1, W, hipHostRegisterDefault));
+    t = now_us() - t0;
+    printf("register window: %.1f ms\n", t / 1000.0);
+    (void) madvise(w1, W, MADV_POPULATE_READ);
+    ram_report("window 1 registered");
+    if (!dev_read(w1)) return 1;
+
+    // Release route 1: unregister only.
+    HIP_CHECK(hipHostUnregister(w1));
+    ram_report("unregistered (VMA still mapped)");
+
+    // Release route 2: unmap the VMA.
+    munmap(w1, W);
+    usleep(300 * 1000);
+    ram_report("unmapped");
+
+    // Re-map the SAME VA to a different file offset: pointer-stable windows.
+    unsigned char * w2 = map_at(off2);
+    (void) madvise(w2, W, MADV_POPULATE_READ);
+    ram_report("window 2 (different offset)");
+    if (!dev_read(w2)) return 1;   // unregistered: a device read here must be fatal if the release worked
+    printf("  (an unregistered window was device-readable: the old registration is still in effect)\n");
+    munmap(w2, W);
+    munmap(va, W);
+    release_region(r);
+    return 0;
+}
+
+// The question that decides the campaign: after a window is unmapped, is its RAM really returned?  Use an
+// offset no other arm has touched, so cgroup `file` grows by the window before the test and must come back
+// down by it.  Pressure is real (3/4 of MemAvailable), because PAGEOUT is not.
+static int arm_remapram(const char * path, double expert_mib, double win_mib) {
+    region r = map_and_register(path, expert_mib);
+    const size_t W = tmin<size_t>((size_t) (win_mib * 1048576.0), r.bytes / 2);
+    unsigned char * va = (unsigned char *) mmap(nullptr, W, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (va == MAP_FAILED) return 3;
+    void * p = mmap(va, W, PROT_READ, MAP_SHARED | MAP_FIXED, r.fd, (off_t) (r.off + r.bytes / 2));
+    if (p == MAP_FAILED) { printf("mmap: %s\n", strerror(errno)); return 3; }
+    unsigned char * w = (unsigned char *) p;
+
+    const long file0 = cg_kb("file") / 1024;
+    ram_report("before the window");
+    HIP_CHECK(hipHostRegister(w, W, hipHostRegisterDefault));
+    (void) madvise(w, W, MADV_POPULATE_READ);
+    ram_report("window registered+populated");
+    const long file1 = cg_kb("file") / 1024;
+    printf("  cgroup file grew by %ld MiB (the window is %s)\n", file1 - file0, mib((double) W).c_str());
+    double us = 0;
+    if (!gpu_read_verify(w, r.expert, &us)) { printf("read MISMATCH\n"); return 1; }
+    printf("  device read of the window: ok\n");
+
+    munmap(w, W);                       // release the VMA (the registration's lifetime is the VMA)
+    usleep(300 * 1000);
+    ram_report("window unmapped");
+
+    const long avail_mib = meminfo_kb("MemAvailable") / 1024;
+    const size_t press = (size_t) (avail_mib > 4096 ? (avail_mib * 3 / 4) : 1024) << 20;
+    unsigned char * m = (unsigned char *) mmap(nullptr, press, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t touched = 0;
+    if (m != MAP_FAILED) {
+        for (size_t i = 0; i < press; i += (size_t) sysconf(_SC_PAGESIZE)) { m[i] = 0xA5; touched += (size_t) sysconf(_SC_PAGESIZE); }
+    }
+    printf("  pressure: %s\n", mib((double) touched).c_str());
+    ram_report("after real pressure");
+    const long file2 = cg_kb("file") / 1024;
+    printf("  cgroup file after unmap+pressure: %ld MiB = baseline %+ld MiB\n", file2, file2 - file0);
+    printf("  %s\n", (file1 - file2) >= (long) (W / 1048576) * 3 / 4
+          ? "RELEASED: the window's bytes came back (>= 75% of it) -> a sliding window is viable"
+          : "NOT RELEASED: the driver kept the pages; the hold is not per window");
+    if (m != MAP_FAILED) munmap(m, press);
+    munmap(va, W);
+    release_region(r);
+    return 0;
+}
+
+// The clean version of the release test: a SCRATCH file on real disk whose pages cannot already be in the
+// page cache, so `file` in cgroup accounting grows by the window and must come back down when it is
+// released.  Everything the earlier arms got wrong (pages already cached, KiB vs MiB labels) is fixed here.
+static int arm_scratch(const char * path, double expert_mib, double win_mib) {
+    (void) path; (void) expert_mib;
+    const char * sp = getenv("LW_SCRATCH");
+    const std::string file = sp ? sp : "/home/stew675/lw-scratch.bin";
+    const size_t W = (size_t) (win_mib * 1048576.0);
+    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+
+    const int fd = open(file.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { printf("open %s: %s\n", file.c_str(), strerror(errno)); return 3; }
+    if (ftruncate(fd, (off_t) W) != 0) { printf("ftruncate: %s\n", strerror(errno)); return 3; }
+
+    auto mib_of = [&](const char * k) { return cg_kb(k) / 1048576.0; };
+    auto report = [&](const char * what) {
+        printf("  %-30s file %8.1f MiB  anon %8.1f MiB  unevict %6.1f MiB  cur %6ld MiB  MemAvailable %6ld MiB\n",
+               what, mib_of("file"), mib_of("anon"), mib_of("unevictable"), cg_current_mib(),
+               meminfo_kb("MemAvailable") / 1024);
+    };
+
+    const double f0 = mib_of("file");
+    report("baseline (empty scratch)");
+    unsigned char * w = (unsigned char *) mmap(nullptr, W, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (w == MAP_FAILED) { printf("mmap: %s\n", strerror(errno)); return 3; }
+    HIP_CHECK(hipHostRegister(w, W, reg_flags()));
+    (void) madvise(w, W, MADV_POPULATE_READ);
+    report("window registered+populated");
+    const double f1 = mib_of("file");
+    printf("  file grew by %.1f MiB for a %.1f MiB window (expected ~ the window)\n", f1 - f0, W / 1048576.0);
+
+    unsigned char * d = nullptr;
+    HIP_CHECK(hipMalloc(&d, 1 << 20));
+    kern_launch(w, d, tmin<size_t>(1 << 20, W));
+    HIP_CHECK(hipDeviceSynchronize());
+    printf("  device read of the window: ok\n");
+    (void) hipFree(d);
+
+    munmap(w, W);
+    usleep(300 * 1000);
+    report("window unmapped");
+
+    const long avail = meminfo_kb("MemAvailable") / 1024;
+    const size_t press = (size_t) (avail > 4096 ? (avail * 3 / 4) : 1024) << 20;
+    unsigned char * m = (unsigned char *) mmap(nullptr, press, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t touched = 0;
+    if (m != MAP_FAILED) {
+        for (size_t i = 0; i < press; i += pg) { m[i] = 0xA5; touched += pg; }
+    }
+    printf("  pressure: %.0f MiB anonymous\n", touched / 1048576.0);
+    report("after real pressure");
+    const double f2 = mib_of("file");
+    printf("  file: baseline %.1f -> window %.1f -> released %.1f MiB (delta from baseline %+.1f)\n",
+           f0, f1, f2, f2 - f0);
+    const bool released = (f1 - f2) >= (W / 1048576.0) * 0.75;
+    printf("  %s\n", released
+          ? "RELEASED: the window's bytes came back -> a sliding window is viable (re-map per slide)"
+          : "NOT RELEASED: the bytes stayed -> the hold is not per window, and the mode cannot bound RAM");
+    if (m != MAP_FAILED) munmap(m, press);
+    close(fd);
+    unlink(file.c_str());
+    return released ? 0 : 1;
+}
+
+// ---- P0.5 #3: where do a registered range's bytes live? ----
+static int arm_ram(const char * path, double expert_mib, double ram_mib) {
+    region r = map_and_register(path, expert_mib);
+    const size_t big = tmin<size_t>((size_t) (ram_mib * 1048576.0), r.bytes);
+    printf("region %s\n", mib((double) big).c_str());
+    ram_report("start");
+    (void) madvise(r.base, big, MADV_POPULATE_READ);
+    ram_report("populated (unmapped-by-dev)");
+    do_register(r, nullptr);
+    ram_report("registered");
+    (void) page_out(r.base, big);
+    ram_report("PAGEOUT (driver holds)");
+    printf("  page cache now %zu/%zu (fresh mapping)\n", fresh_resident(r.fd, r.off, big),
+           big / (size_t) sysconf(_SC_PAGESIZE));
+    HIP_CHECK(hipHostUnregister(r.base));
+    r.registered = false;
+    ram_report("unregistered");
+    usleep(300 * 1000);
+    ram_report("unregistered + 300ms");
+    for (int i = 0; i < 3; i++) {
+        (void) page_out(r.base, big);
+        usleep(200 * 1000);
+        ram_report("PAGEOUT after release");
+    }
+    printf("  page cache now %zu/%zu (fresh mapping)\n", fresh_resident(r.fd, r.off, big),
+           big / (size_t) sysconf(_SC_PAGESIZE));
+    // Real pressure: anonymous pages, just over half of what is available.
+    const long avail_mib = meminfo_kb("MemAvailable") / 1024;
+    const size_t press = (size_t) (avail_mib > 4096 ? (avail_mib * 3 / 4) : 1024) << 20;
+    unsigned char * m = (unsigned char *) mmap(nullptr, press, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t touched = 0;
+    if (m != MAP_FAILED) {
+        for (size_t i = 0; i < press; i += (size_t) sysconf(_SC_PAGESIZE)) { m[i] = 0x5A; touched += (size_t) sysconf(_SC_PAGESIZE); }
+    }
+    printf("  pressure: %s anonymous touched\n", mib((double) touched).c_str());
+    ram_report("after real pressure");
+    printf("  page cache now %zu/%zu (fresh mapping)\n", fresh_resident(r.fd, r.off, big),
+           big / (size_t) sysconf(_SC_PAGESIZE));
+    if (m != MAP_FAILED) munmap(m, press);
+    printf("  (cgroup `file` is the page-cache tier: a %s drop means the range was really released)\n",
+           mib((double) big).c_str());
+    release_region(r);
+    return 0;
+}
+
+// ---- P0.5 #1: a registration LARGER than the memory available to it.  Run it under a memory.max
+// cgroup: if the driver faults the whole range in, the registration must fail or the process must be
+// OOM-killed; if it faults in only what it can, some page must be unreadable later.  Either answer is
+// what the design needs to know.
+static int arm_big(const char * path, double expert_mib, double big_mib) {
+    region r = map_and_register(path, expert_mib);
+    // Its OWN region: this arm must be able to register more than the 512 MiB the other arms map.
+    const size_t S = tmin<size_t>((size_t) (big_mib * 1048576.0),
+                                  tmin<size_t>(r.bytes * 16, 8192ull << 20));
+    const size_t np = S / (size_t) sysconf(_SC_PAGESIZE);
+    printf("range to register %s   MemAvailable %ld MiB   cgroup max %ld MiB\n", mib((double) S).c_str(),
+           meminfo_kb("MemAvailable") / 1024, ({ FILE * f = fopen((cg_dir() + "/memory.max").c_str(), "r");
+               long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } v < 0 ? -1L : v / 1048576; }));
+    ram_report("before register");
+    // Map the whole S from the file (the shared region is only 512 MiB).
+    unsigned char * whole = (unsigned char *) mmap(nullptr, S, PROT_READ, MAP_SHARED, r.fd, (off_t) r.off);
+    if (whole == MAP_FAILED) { printf("mmap %s: %s\n", mib((double) S).c_str(), strerror(errno)); return 3; }
+    r.base = whole;
+    r.bytes = S;
+    r.registered = false;
+    const double t0 = now_us();
+    const hipError_t e = hipHostRegister(r.base, S, reg_flags());
+    const double t1 = now_us();
+    printf("hipHostRegister -> %s  (%.1f ms)\n", e == hipSuccess ? "ok" : hipGetErrorString(e), (t1 - t0) / 1000.0);
+    if (e != hipSuccess) { (void) hipGetLastError(); release_region(r); return 10; }
+    r.registered = true;
+    ram_report("after register");
+
+    // Sample residency at 16 evenly spaced expert windows: faulted in, or not?
+    const int ns = 16;
+    size_t resident = 0;
+    for (int i = 0; i < ns; i++) {
+        const size_t off = (size_t) ((double) (S - r.expert) * (double) i / (double) (ns - 1));
+        if (fresh_resident(r.fd, r.off + off, r.expert) == r.expert / (size_t) sysconf(_SC_PAGESIZE)) resident++;
+    }
+    printf("residency sample: %zu/%d windows fully resident\n", resident, ns);
+    if (resident == 0) { printf("nothing faulted in; nothing to read\n"); return 11; }
+
+    // Read the LAST sampled window (highest offset).  If the registration could not fault it in, this is
+    // the fatal case the prior campaign saw.
+    const size_t off = S - r.expert;
+    printf("reading the last window (offset %zu, %s) ...\n", off, mib((double) r.expert).c_str());
+    fflush(stdout);
+    alarm(20);
+    double us = 0;
+    const bool ok = gpu_read_verify(r.base + off, r.expert, &us);
+    printf("device read of the last window: %s\n", ok ? "SUCCEEDED (faulted in)" : "mismatch");
+    (void) hipHostUnregister(r.base);
+    release_region(r);
+    return ok ? 0 : 1;
+}
+
 // Is PAGEOUT alone enough to make a REGISTERED range unreadable?  Its own process, because the answer may
 // be a fatal fault.  This is the sharpest open question in P0: `arm_pin` proves PAGEOUT drops the page
 // cache (through a fresh mapping), yet a device read after it has been seen to succeed -- which would mean
@@ -751,6 +1154,7 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);   // a fatal fault must not swallow the log
 
     const char * arm  = argc > 1 ? argv[1] : "base";
+    double big_mib = argc > 4 ? atof(argv[4]) : 6144.0;
     const char * path = argc > 2 ? argv[2] : "/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
     const double emib = argc > 3 ? atof(argv[3]) : 1.66;
 
@@ -765,10 +1169,18 @@ int main(int argc, char ** argv) {
     if (strcmp(arm, "pin") == 0)         return arm_pin(path, emib);
     if (strcmp(arm, "evicted") == 0)     return arm_evicted(path, emib);
     if (strcmp(arm, "regcost") == 0)     return arm_regcost(path, emib);
+    if (strcmp(arm, "release") == 0)     return arm_release(path, emib, true);
+    if (strcmp(arm, "release-held") == 0) return arm_release(path, emib, false);
+    if (strcmp(arm, "reuse") == 0)       return arm_reuse(path, emib);
+    if (strcmp(arm, "ram") == 0)         return arm_ram(path, emib, big_mib > 0 ? big_mib : 2048.0);
+    if (strcmp(arm, "remap") == 0)       return arm_remap(path, emib, big_mib > 0 ? big_mib : 256.0);
+    if (strcmp(arm, "remapram") == 0)    return arm_remapram(path, emib, big_mib > 0 ? big_mib : 512.0);
+    if (strcmp(arm, "scratch") == 0)     return arm_scratch(path, emib, big_mib > 0 ? big_mib : 1024.0);
+    if (strcmp(arm, "big") == 0)         return arm_big(path, emib, big_mib);
     if (strcmp(arm, "pageable") == 0)    return arm_pageable(path, emib);
     if (strcmp(arm, "absent") == 0)      return arm_absent(path, emib);
     if (strcmp(arm, "unheld") == 0)      return arm_unheld(path, emib);
 
-    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|unheld)\n", arm);
+    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|big|unheld)\n", arm);
     return 64;
 }

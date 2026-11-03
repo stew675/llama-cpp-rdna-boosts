@@ -15,7 +15,10 @@ export HIP_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH="$ROCM/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 {
-for ARM in base pin evicted pageable absent regcost hold-hot hold-cold survive granularity unheld; do
+# `big` wants a cgroup (register more than is available to the process):
+#   sudo -n systemd-run --scope -p MemoryMax=4G -p MemorySwapMax=0 -- \
+#        env HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=$ROCM/lib ./build/probe-locked-window big <gguf> 1.66 6144
+for ARM in base pin absent evicted pageable regcost hold-hot hold-cold survive granularity release release-held reuse remap remapram scratch unheld; do
     echo
     echo "########################################################################"
     echo "# arm: $ARM"

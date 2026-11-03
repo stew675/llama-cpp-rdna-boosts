@@ -1,0 +1,56 @@
+=== release ===
+=== probe-locked-window: arm=release expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+baseline: registered, populated, device read ok
+unregister: 3.54 us
+page cache after PAGEOUT: 8/425 (fresh mapping)
+device read after PAGEOUT: SUCCEEDED (the hold was NOT released)
+  -> unregister did not release (or PAGEOUT cannot drop it): the window cannot
+     slide and the mode is a whole-tensor hold
+=== release-held ===
+=== probe-locked-window: arm=release-held expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+baseline: registered, populated, device read ok
+control arm: NOT unregistered
+page cache after PAGEOUT: 0/425 (fresh mapping)
+device read after PAGEOUT: SUCCEEDED (the hold was NOT released)
+  -> unregister did not release (or PAGEOUT cannot drop it): the window cannot
+     slide and the mode is a whole-tensor hold
+=== reuse ===
+=== probe-locked-window: arm=reuse expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+unregistered + PAGEOUT: page cache 0/425
+reuse pressure: 8192.00 MiB of 0xC5 anonymous pages
+page cache now 425/425
+device read after release + reuse pressure: IDENTICAL (the driver still holds the page: RAM is not returned)
+=== ram 512 ===
+=== probe-locked-window: arm=ram expert=1.66 MiB ===
+RLIMIT_MEMLOCK      soft=8192 KiB  hard=8192 KiB
+                    (soft == hard: cannot be raised without CAP_IPC_LOCK/privilege)
+max_map_count       1000000
+uid                 1000 (cannot raise RLIMIT_MEMLOCK)
+region 512.00 MiB
+  start                      cgroup cur  1041 MiB  file 846892  anon 195224  unevict     0  slab 17362 MiB   MemAvailable 89507 MiB
+  populated (unmapped-by-dev) cgroup cur  1042 MiB  file 846892  anon 195224  unevict     0  slab 17362 MiB   MemAvailable 89506 MiB
+  registered                 cgroup cur  1048 MiB  file 851000  anon 196392  unevict     0  slab 17382 MiB   MemAvailable 89511 MiB
+  PAGEOUT (driver holds)     cgroup cur  1048 MiB  file 851000  anon 196392  unevict     0  slab 17382 MiB   MemAvailable 89510 MiB
+  page cache now 131072/131072 (fresh mapping)
+  unregistered               cgroup cur  1048 MiB  file 851000  anon 196468  unevict     0  slab 17378 MiB   MemAvailable 89519 MiB
+  unregistered + 300ms       cgroup cur  1048 MiB  file 851000  anon 196468  unevict     0  slab 17378 MiB   MemAvailable 89519 MiB
+  PAGEOUT after release      cgroup cur  1048 MiB  file 851000  anon 196468  unevict     0  slab 17378 MiB   MemAvailable 89518 MiB
+  PAGEOUT after release      cgroup cur  1048 MiB  file 851000  anon 196468  unevict     0  slab 17378 MiB   MemAvailable 89518 MiB
+  PAGEOUT after release      cgroup cur  1048 MiB  file 851000  anon 196468  unevict     0  slab 17375 MiB   MemAvailable 89526 MiB
+  page cache now 131072/131072 (fresh mapping)
+  pressure: 67145.00 MiB anonymous touched
+  after real pressure        cgroup cur 68324 MiB  file 851000  anon 68952948  unevict     0  slab 17375 MiB   MemAvailable 22370 MiB
+  page cache now 131072/131072 (fresh mapping)
+  (cgroup `file` is the page-cache tier: a 512.00 MiB drop means the range was really released)

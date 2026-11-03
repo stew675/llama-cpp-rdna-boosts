@@ -144,3 +144,61 @@ cold; `mlock` costs 3-20x more than the grant and is probably unnecessary; a pag
 3. What does a registered range cost in **RAM accounting** (`/proc/meminfo`, cgroup `memory.current`)?
 4. The §1.5 control, per-chunk, and with the hold released behind the op's back (the residency gate's
    negative control that must fault).
+
+## 4. P0.5 — the release question, and the verdict
+
+**Question:** the design needs a *releasable* hold (a window that slides).  Is there one?
+
+**Answer: no.  `hipHostRegister` takes a hold that lives for the life of the process, and no user-space call
+tested releases it.**  Measured two ways — cgroup `memory.stat:file` deltas (the page-cache tier) and real
+reclaim pressure (3/4 of `MemAvailable` as anonymous pages), never `MADV_PAGEOUT` alone:
+
+`arm scratch` (a 1 GiB scratch file on `/llm`, so the pages cannot already be cached; window 512 MiB-1 GiB):
+
+| step | cgroup `file` |
+|---|---|
+baseline (empty scratch) | 826.5 MiB |
+window registered + populated | 1854.4 MiB (**+1027.9** for a 1024 MiB window) |
+after `hipHostUnregister` | unchanged |
+after `munmap` + 300 ms | **1863.5 MiB — unchanged** |
+after **67 GiB** of anonymous pressure | **1863.5 MiB (delta from baseline +1037.0)** |
+
+and every registration flag behaves the same (`LW_REG_FLAGS=ro|portable|mapped`), all `+~512 MiB`, all
+`NOT RELEASED`.
+
+`arm release` / `release-held` (control): after `hipHostUnregister` + PAGEOUT (page cache proven 0/425) the
+device read **still succeeds**; and `arm remap` shows the device mapping *does* die with the VMA — an
+unregistered window re-mapped at the same address faults.  So the lifetime is:
+
+> **the VMA, not the registration** — but the pages themselves stay referenced (unreclaimable) either way.
+
+`arm big` under `sudo systemd-run --scope -p MemoryMax=4G` registering **6144 MiB**: `hipHostRegister`
+returns **ok** (5.8 s), `memory.current` pegs at the 4095 MiB limit, only 2/16 sampled windows are fully
+resident, and the device read of the last (non-resident) window still **succeeds**.  So the driver neither
+refuses an over-budget registration nor faults — it silently fronts the read (an unbounded, unguaranteed
+read path, not a residency guarantee).
+
+### Verdict
+
+**The campaign's stated goal is blocked by the driver, not by the code.**  A bounded *sliding* window cannot
+exist, because the hold cannot be released: registering a window makes its bytes permanently non-reclaimable
+for the process, so the footprint is the whole registered set.  That is `pinned` with a longer load and no
+`RLIMIT_MEMLOCK` — and it cannot help the not-fitting case, which is the only case `pool` exists for.
+
+**Do not build P2/P3 for the sliding window.**  What survives:
+
+1. **The pool's copy is not waste.**  It is the only *releasable* residency primitive on this stack: a pinned
+   slot is bounded and reusable, and releasing it costs nothing because it is an ordinary `cudaMallocHost`
+   buffer.  The bounce exists precisely because the alternative cannot be given back.
+2. **A static, bounded registered subset is viable and is the honest pivot**: register a *fixed*,
+   heat-selected set of experts once (bounded by a budget) and keep the pool for the rest.  That bounds
+   memory (registered set + pool budget), removes the copy for the registered set, and needs no release.  It
+   is the host-RAM analogue of `wip/moe-static-hot-tier/` (the VRAM static tier) and it uses the existing
+   heat map.  It is a different campaign, not this one.
+3. **A re-examination note for the archive**: the withdrawn `beta/0016-host-experts-window` was withdrawn
+   because a registered range faulted fatally on a set larger than RAM.  That fault did **not** reproduce
+   here for a partially-registered range (the driver fronted the read).  If anyone revives the whole-set
+   `window` mode, re-run that case first — but it is not this campaign's business and it does not give a
+   bounded footprint either way.
+
+Cost of finding out: one session, 12 probe arms, ~30 runs.  That is the campaign paid for itself.
