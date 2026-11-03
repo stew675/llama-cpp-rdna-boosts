@@ -140,6 +140,14 @@ for c in $chain; do
 done
 [ "$bad" -eq 0 ] || fail "block-chain scan failed (see above)"
 
+# The delivery repo's OWN files, not just the applied block trees (r208): 7112063b shipped
+# wip/CAMPAIGNS.md with two leftover `<<<<<<< HEAD` lines, because the scan above only ever looks
+# at the applied tree in $src.  A tracked file of this repo is what a consumer reads first, so the
+# same marker check runs here too (cheap, no checkout needed).
+echo "==> scanning the delivery repo's tracked files for conflict markers"
+repo_hits="$(git -C "$REPO_DIR" grep -I -l -e '^<<<<<<< ' -e '^=======$' -e '^>>>>>>> ' -- . 2>/dev/null || true)"
+[ -z "$repo_hits" ] || { echo "FAIL: conflict markers in the delivery repo:" >&2; printf '        %s\n' $repo_hits >&2; fail "delivery-repo marker scan failed (see above)"; }
+
 # Windows portability lint (issue #231): a POSIX-only call in a file the delivery adds is a hard
 # compile error with HIP on Windows, and nothing on a Linux box can compile it.  Cheap (~1 s) and
 # scoped to added files, so it is CI-clean by construction; see the script header for the scope.
