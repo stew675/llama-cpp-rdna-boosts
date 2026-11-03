@@ -23,7 +23,7 @@ finished as far as it can go: what remains needs two or three devices.
 **2026-11-03 (current):** W1 and W3 are closed (§3 below); the pool is at **-1.8 %** decode against a *cached*
 `pinned` on the 3-GPU `-sm tensor` shape (51.03 at `FRAC 95` vs 51.97) and **-34 %** on the pair, where the gap is
 86 % synchronous demand reads.  The next two items, in order: **(1)** the pool's staging path under a ≥3-device
-split (`TODO` #270 — prefill 16.85 vs `pinned` 564.65; the gather works around it), then **(2)** the demand-fill
+split (`TODO` #131 — prefill 16.85 vs `pinned` 564.65; the gather works around it), then **(2)** the demand-fill
 overlap for the multi-device case (ceiling ~25-30 % there; re-screen first, `README.md` §9.6).  W2 (the remap,
 +3.3 %) follows and still needs the `§7` decisions.
 
@@ -179,14 +179,14 @@ that actually has a cache.
    Do not make it default-on for pinned tables.
 3. **The gather is the ONLY workable pool prefill at three devices**: the pool's staging path collapses there
    (16.85 t/s against `pinned`'s 564.65) and the gather restores 1126.8 t/s (+100 % over `pinned`).  This is a
-   **delivery defect in block 12's pool mode under a ≥3-device tensor split** (`TODO` #270), not a campaign
+   **delivery defect in block 12's pool mode under a ≥3-device tensor split** (`TODO` #131), not a campaign
    patch's: it is the pre-existing staging path.  Measured everywhere: `FRAC` 30/80/95, `STAGE_BATCH=0` (31.99),
    `DIO=0`, 2000-token and 64-token runs, so it is not coverage, not the batch arm and not the fill mode; the
    `pinned` arm stages the *same* bytes through the *same* kernel at full speed.
 4. Text identity and faults: `257 chars sha=5531ae33f0f7` on all eight arms (pair and 3-GPU, both gather states);
    `check-gpu-faults.sh --since 04:10` clean.
 5. **Promotion shape**: keep `GGML_SCHED_DEVGATHER` opt-in, and document that `--host-experts pool` on 3+
-   devices needs it on until #270 is fixed.  A pool-only default still needs the truthful per-device capability
+   devices needs it on until #131 is fixed.  A pool-only default still needs the truthful per-device capability
    predicate — the decision is still the maintainer's (this file §7, item 2).
 
 ### W2 — P0-a: the device remap over pool slots, tensor-split aware (`TODO` #269)

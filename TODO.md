@@ -17,6 +17,12 @@ were never used.  They are **`#120`-`#126`** now (plus `#127` for the `cpy_2d_ve
 is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old handles; they mean these rows.
 The old numbers are **retired** — do not reuse them.
 
+> **Handle numbering (corrected 2026-11-03):** the real sequence runs to **#130** (closed, issue #263), so this
+> file's `#268`/`#269` — allocated by the 2026-11-02 session — are themselves out of sequence, the same failure the
+> 2026-10-31 renumbering note below describes.  New items continue from **#131**.  Renumbering `#268`/`#269` would
+> also touch `WORKLOG.md` 261102.* and the campaign records that cite them, so it is left as a decision for the
+> maintainer rather than done here.
+
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
 (the 2026-10-25 re-base), release **`v16-6050b467c-r206`** (read `.release` in `release.json` -- it is the
 source of truth, not this line).  Block 15 is the **streamed KV** (the resident
@@ -27,8 +33,8 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
-| **270** | `--host-experts pool` prefill collapses (16.85 t/s vs `pinned` 564.65) under a ≥3-device `-sm tensor` split — block 12, not a campaign patch; scales with pool size; `STAGE_BATCH=0` / `DIO=0` / `FRAC` do not fix it; the gather does | correctness / performance (delivery defect) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §270 |
-| **271** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
+| **131** | `--host-experts pool` prefill collapses (16.85 t/s vs `pinned` 564.65) under a ≥3-device `-sm tensor` split — block 12, not a campaign patch; scales with pool size; `STAGE_BATCH=0` / `DIO=0` / `FRAC` do not fix it; the gather does | correctness / performance (delivery defect) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §270 |
+| **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -267,7 +273,7 @@ routing speculation — the routing-driven form measured as a net loss when sub-
 `archive/work/host-expert-dio-cache/PHASE2B-FINDINGS.md`).  Do not leave a documented no-op in place: a knob
 that silently does nothing is worse than a missing one (`AGENTS.md`, environment-variable policy).
 
-## 270. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
+## 131. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
 
 **Status: open, found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4).  It is a defect in
 the DELIVERY's block 12 code, not in a campaign patch, and it needs a decision: fix it in block 12, or document the
@@ -280,12 +286,21 @@ through the same kernel at full speed.  Probes that did NOT move it (all at 3 de
 `FRAC 30` (206.30 — i.e. it scales with the PINNED POOL SIZE, 19.9 → 53.5 → 63.7 GiB gives 206 → 16.85 → 15.03).
 Two live candidates: the box is over-committed (73 GiB mapping + 54-64 GiB pinned on 91 GiB RAM) so the staging's
 pageable reads re-read from disk; or the peer-device reads of the pool alias (`pool->base_dev`) are slow and grow
-with the pool's coverage.  **Next measurement:** a per-stage wall-clock breakdown plus the per-stream busy-union
-instrument `README` §16.1 describes; do not re-measure the prefill total, it is already bracketed.  Workaround until
+with the pool's coverage.  **Diagnosis so far (2026-11-03, instrumented — the staging COPY is exonerated):** per-call timing of
+`moe_cache_stage_table` gives **1.04 s of host time for 423 calls** (miss loop 0.76 s) and **0.66 s** for the
+staged copies with a forced copy-stream sync; `rocprofv3` total kernel time is **5.04 s (pool) vs 4.08 s
+(pinned)** at the same prompt with matching per-kernel dispatch counts (except `__amd_rocclr_fillBufferUnAligned`
+3574 vs 1846 ≈ 4 extra allocation/fills per staging call); the host burns 2.3x the task-clock (83.2 vs 35.8 s);
+and `MOE_EXPERT_CACHE_MIB=0` (no arena) recovers 4.3x (50.4 vs 11.8 t/s) while `GGML_MOE_CACHE_STAGE=0` does not
+(16.1).  So the cost is the cache's **per-(table, device) prefill work around** the staging copy — the prime
+suspect is the per-table `cudaMalloc(t.prs_dev)`/`cudaFree` pair (432 of them, 144 tensors × 3 devices) issued
+*inside* the prefill; the fix, if so, is to allocate that 1 KiB map once at registration or use a per-device
+scratch.  Next measurement: time that allocation (instrumented and queued) and the per-split scheduler time; do
+not re-measure the prefill total, it is bracketed.  Workaround until
 then: `GGML_SCHED_DEVGATHER=1` (pool-only use; on `pinned` the gather costs -47 % prefill at 2 devices).  Gates for
 a fix: same-seed greedy text on 2 and 3 devices, `check-gpu-faults.sh`, and the prefill at ≥ `pinned`.
 
-## 271. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
+## 132. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
 
 **Status: open, measured 2026-11-03 (`wip/host-pool-speed` README §18.4).**  On the 2-GPU x8 pair at `FRAC 80` the
 pool decodes 26.08 against `pinned`'s 39.72 (-34 %), and the fill accounting says **86 % of that gap is one
@@ -302,7 +317,7 @@ gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faul
 ## 269. PR #266's disposition: keep the device remap, drop the rest — and the remap must be tensor-split aware
 
 **Status: decided 2026-11-02 (maintainer); 2026-11-03 update — still open, still gated, and now DEMOTED behind
-`#270` (the pool prefill collapse at ≥3 devices) and `#271` (the ~25-30 % demand-fill overlap ceiling on a split).
+`#131` (the pool prefill collapse at ≥3 devices) and `#132` (the ~25-30 % demand-fill overlap ceiling on a split).
 Nothing in the 2026-11-03 multi-GPU session blocks it or changes its condition; the multi-device arm it needs now
 exists and is healthy (F7 was an environment artefact: `MOE_EXPERT_CACHE_MIB=0`, not a `-sm tensor` registration
 gap — `wip/host-pool-speed` §18.1), so the pair/3-GPU `-sm tensor` gates it names are runnable.**  Forward-looking:

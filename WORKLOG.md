@@ -22,7 +22,7 @@ per-device arena, 190 slots/table on each device, h=0.9477** and decodes ~30 t/s
 47.25 / 206.3.  So (a) W1's "gather >= staging per split mode" assertion **fails** on the pair — the gather is a
 large-table / pool-staging-rescue mechanism, not a general prefill win — and (b) **`--host-experts pool` prefill
 collapses at three devices** (16.85 vs 564.65; the `pinned` arm stages the same bytes through the same kernel at
-full speed) while the gather restores it.  That is a **delivery defect in block 12**, tracked as `TODO` #270 with
+full speed) while the gather restores it.  That is a **delivery defect in block 12**, tracked as `TODO` #131 with
 the probes that did not move it (`STAGE_BATCH=0` 31.99, `DIO=0` 8.12, `FRAC 95` 15.03, `FRAC 30` 206.3 — it scales
 with the pinned pool size).  Greedy text `257 chars sha=5531ae33f0f7` on all eight arms; `check-gpu-faults.sh`
 clean from 04:10 (a 03:58:53 burst predates the session).
@@ -34,13 +34,13 @@ concentration plan to the ceiling.  Measured (1 GPU, `-sm layer`, FRAC 100, 2000
 **10.94 -> 17.44 t/s (+59 %)**, **+73 %** with cov90 (18.92), prefill 343 -> 598, at identical pinned bytes;
 `RAM_PCT 85` **19.52 -> 20.97 (+7 %)**; `pinned` control 22.36.
 
-**4. The pair's decode deficit is the synchronous demand read** (`TODO` #271): 20.7 demand fills/token at ~0.55 ms
+**4. The pair's decode deficit is the synchronous demand read** (`TODO` #132): 20.7 demand fills/token at ~0.55 ms
 = **11.3 ms of a 38.3 ms step (29 %)**, against 5.1 fills = 5.2 ms of 56 ms (9 %) on one GPU — i.e. **86 %** of the
 pair's 13.2 ms/token gap to `pinned` is one `O_DIRECT` read per uncovered expert per token, and the overlap
 candidate the 1-GPU ~6 % ceiling declined has a **~25-30 %** ceiling on a split.  On the 3-GPU shape, where the
 arena holds the whole set, the pool is at **-1.8 %** decode (51.03 vs 51.97) — inside PR #267's own envelope.
 
-**Not done / owed:** `HEAD-TO-HEAD.md` (needs a legitimate 3-GPU pool prefill arm = `#270`, plus the 1-GPU control
+**Not done / owed:** `HEAD-TO-HEAD.md` (needs a legitimate 3-GPU pool prefill arm = `#131`, plus the 1-GPU control
 and an MTP arm), `gate-prefill-logits.sh` on this box (no base recorded here), and W2 (`TODO` #269, tensor-split
 remap) — measured as no longer the biggest item, and still waiting on the maintainer's `§7` decisions.
 
