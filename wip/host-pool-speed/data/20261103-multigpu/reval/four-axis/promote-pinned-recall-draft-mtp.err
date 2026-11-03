@@ -1,0 +1,750 @@
+0.00.017.351 I cmn  common_param: common_params_print_info: build 11909 (e23754b5d) with Clang 24.0.0 for Linux x86_64
+0.00.017.353 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.017.353 I cmn  common_param: device_info:
+0.00.017.371 I cmn  common_param:   - ROCm0   : AMD Radeon AI PRO R9700 (gfx1201) (32624 MiB, 32554 MiB free)
+0.00.017.377 I cmn  common_param:   - CPU     : AMD Ryzen 9 9950X3D2 16-Core Processor (93642 MiB, 93642 MiB free)
+0.00.017.433 I cmn  common_param: system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | FA_QUANTS = q4_0-q4_0,q4_1-q4_1,q5_0-q5_0,q5_1-q5_1,q8_0-q8_0,bf16-bf16,f16-f16,iq4_nl-iq4_nl | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.017.466 I srv  init_listene: running without SSL
+0.00.017.649 I srv          init: using 31 threads for HTTP server
+0.00.017.685 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.019.385 I srv    load_model: loading model '/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.00.019.386 I srv    load_model: local path '/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.00.019.400 I cmn  common_init_: fitting params to device memory ...
+0.00.019.400 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.019.417 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.192.892 I common_memory_breakdown_print: | memory breakdown [MiB]             | total    free     self   model   context   compute    unaccounted |
+0.00.192.894 I common_memory_breakdown_print: |   - ROCm0 (AI PRO R9700 (gfx1201)) | 32624 = 32408 + ( 3862 =  2425 +     891 +     546) +       -3646 |
+0.00.192.894 I common_memory_breakdown_print: |   - Host                           |                  19241 = 19177 +       0 +      64                |
+0.00.209.845 I operator(): getting device memory data for the extra model at a context size of 32768:
+0.00.353.942 I common_memory_breakdown_print: | memory breakdown [MiB]             | total    free     self   model   context   compute    unaccounted |
+0.00.353.944 I common_memory_breakdown_print: |   - ROCm0 (AI PRO R9700 (gfx1201)) | 32624 = 32406 + ( 2879 =  2425 +      64 +     390) +       -2661 |
+0.00.353.945 I common_memory_breakdown_print: |   - Host                           |                  19209 = 19177 +       0 +      32                |
+0.00.368.363 W common_params_fit_impl: host-resident MoE experts active: reserving the slab headroom plus the expert-cache arena (auto floor: MOE_EXPERT_CACHE_MIN_MIB / MIN_RES_PCT) in the --fit margin before fitting the context (3615 MiB this pass over 18662 MiB of host experts).  --fit sizes the context around it; the arena then takes any remaining free device memory keeping MOE_EXPERT_CACHE_RESERVE_MIB=1024 MiB per device.
+0.00.368.367 I common_params_fit_impl: projected to use 4317 MiB of device memory vs. 32408 MiB of free device memory
+0.00.368.367 I common_params_fit_impl: will leave 28090 >= 4639 MiB of free device memory, no changes needed
+0.00.368.368 I common_fit_params: successfully fit params to free device memory
+0.00.368.368 I common_fit_params: fitting params to free memory took 0.35 seconds
+0.00.392.996 I llama_model_loader: loaded meta data with 55 key-value pairs and 753 tensors from /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (version GGUF V3 (latest))
+0.00.393.010 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.393.012 I llama_model_loader: - kv   0:                       general.architecture str              = qwen35moe
+0.00.393.013 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.393.013 I llama_model_loader: - kv   2:                     general.sampling.top_k i32              = 20
+0.00.393.014 I llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 0.950000
+0.00.393.015 I llama_model_loader: - kv   4:                      general.sampling.temp f32              = 1.000000
+0.00.393.016 I llama_model_loader: - kv   5:                               general.name str              = Qwen3.6-35B-A3B
+0.00.393.016 I llama_model_loader: - kv   6:                           general.basename str              = Qwen3.6-35B-A3B
+0.00.393.016 I llama_model_loader: - kv   7:                       general.quantized_by str              = Unsloth
+0.00.393.016 I llama_model_loader: - kv   8:                         general.size_label str              = 35B-A3B
+0.00.393.016 I llama_model_loader: - kv   9:                            general.license str              = apache-2.0
+0.00.393.017 I llama_model_loader: - kv  10:                       general.license.link str              = https://huggingface.co/Qwen/Qwen3.6-3...
+0.00.393.018 I llama_model_loader: - kv  11:                           general.repo_url str              = https://huggingface.co/unsloth
+0.00.393.018 I llama_model_loader: - kv  12:                   general.base_model.count u32              = 1
+0.00.393.018 I llama_model_loader: - kv  13:                  general.base_model.0.name str              = Qwen3.6 35B A3B
+0.00.393.019 I llama_model_loader: - kv  14:          general.base_model.0.organization str              = Qwen
+0.00.393.019 I llama_model_loader: - kv  15:              general.base_model.0.repo_url str              = https://huggingface.co/Qwen/Qwen3.6-3...
+0.00.393.020 I llama_model_loader: - kv  16:                               general.tags arr[str,3]       = ["qwen3_5_moe", "qwen", "image-text-t...
+0.00.393.021 I llama_model_loader: - kv  17:                      qwen35moe.block_count u32              = 41
+0.00.393.021 I llama_model_loader: - kv  18:                   qwen35moe.context_length u32              = 262144
+0.00.393.021 I llama_model_loader: - kv  19:                 qwen35moe.embedding_length u32              = 2048
+0.00.393.021 I llama_model_loader: - kv  20:             qwen35moe.attention.head_count u32              = 16
+0.00.393.021 I llama_model_loader: - kv  21:          qwen35moe.attention.head_count_kv u32              = 2
+0.00.393.022 I llama_model_loader: - kv  22:          qwen35moe.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+0.00.393.022 I llama_model_loader: - kv  23:                   qwen35moe.rope.freq_base f32              = 10000000.000000
+0.00.393.023 I llama_model_loader: - kv  24: qwen35moe.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.00.393.023 I llama_model_loader: - kv  25:                     qwen35moe.expert_count u32              = 256
+0.00.393.023 I llama_model_loader: - kv  26:                qwen35moe.expert_used_count u32              = 8
+0.00.393.023 I llama_model_loader: - kv  27:             qwen35moe.attention.key_length u32              = 256
+0.00.393.024 I llama_model_loader: - kv  28:           qwen35moe.attention.value_length u32              = 256
+0.00.393.024 I llama_model_loader: - kv  29:       qwen35moe.expert_feed_forward_length u32              = 512
+0.00.393.024 I llama_model_loader: - kv  30: qwen35moe.expert_shared_feed_forward_length u32              = 512
+0.00.393.024 I llama_model_loader: - kv  31:                  qwen35moe.ssm.conv_kernel u32              = 4
+0.00.393.024 I llama_model_loader: - kv  32:                   qwen35moe.ssm.state_size u32              = 128
+0.00.393.024 I llama_model_loader: - kv  33:                  qwen35moe.ssm.group_count u32              = 16
+0.00.393.025 I llama_model_loader: - kv  34:               qwen35moe.ssm.time_step_rank u32              = 32
+0.00.393.025 I llama_model_loader: - kv  35:                   qwen35moe.ssm.inner_size u32              = 4096
+0.00.393.025 I llama_model_loader: - kv  36:          qwen35moe.full_attention_interval u32              = 4
+0.00.393.025 I llama_model_loader: - kv  37:             qwen35moe.rope.dimension_count u32              = 64
+0.00.393.025 I llama_model_loader: - kv  38:             qwen35moe.nextn_predict_layers u32              = 1
+0.00.393.026 I llama_model_loader: - kv  39:                       tokenizer.ggml.model str              = gpt2
+0.00.393.026 I llama_model_loader: - kv  40:                         tokenizer.ggml.pre str              = qwen35
+0.00.393.027 I llama_model_loader: - kv  41:                      tokenizer.ggml.tokens arr[str,248320]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+0.00.393.027 I llama_model_loader: - kv  42:                  tokenizer.ggml.token_type arr[i32,248320]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.00.393.028 I llama_model_loader: - kv  43:                      tokenizer.ggml.merges arr[str,247587]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+0.00.393.028 I llama_model_loader: - kv  44:                tokenizer.ggml.eos_token_id u32              = 248046
+0.00.393.029 I llama_model_loader: - kv  45:            tokenizer.ggml.padding_token_id u32              = 248055
+0.00.393.029 I llama_model_loader: - kv  46:                tokenizer.ggml.bos_token_id u32              = 248044
+0.00.393.029 I llama_model_loader: - kv  47:               tokenizer.ggml.add_bos_token bool             = false
+0.00.393.030 I llama_model_loader: - kv  48:                    tokenizer.chat_template str              = {%- set image_count = namespace(value...
+0.00.393.030 I llama_model_loader: - kv  49:               general.quantization_version u32              = 2
+0.00.393.030 I llama_model_loader: - kv  50:                          general.file_type u32              = 15
+0.00.393.030 I llama_model_loader: - kv  51:                      quantize.imatrix.file str              = Qwen3.6-35B-A3B-GGUF/imatrix_unsloth....
+0.00.393.031 I llama_model_loader: - kv  52:                   quantize.imatrix.dataset str              = unsloth_calibration_Qwen3.6-35B-A3B.txt
+0.00.393.031 I llama_model_loader: - kv  53:             quantize.imatrix.entries_count u32              = 510
+0.00.393.031 I llama_model_loader: - kv  54:              quantize.imatrix.chunks_count u32              = 77
+0.00.393.031 I llama_model_loader: - type  f32:  368 tensors
+0.00.393.032 I llama_model_loader: - type q8_0:  259 tensors
+0.00.393.032 I llama_model_loader: - type q4_K:   82 tensors
+0.00.393.032 I llama_model_loader: - type q5_K:   38 tensors
+0.00.393.032 I llama_model_loader: - type q6_K:    4 tensors
+0.00.393.032 I llama_model_loader: - type bf16:    2 tensors
+0.00.393.033 I print_info: file format = GGUF V3 (latest)
+0.00.393.034 I print_info: file type   = Q4_K - Medium
+0.00.393.035 I print_info: file size   = 21.10 GiB (5.10 BPW) 
+0.00.393.040 I llama_prepare_model_devices: using device ROCm0 (AMD Radeon AI PRO R9700 (gfx1201)) (0000:03:00.0) - 32406 MiB free
+0.00.428.269 I load: 0 unused tokens
+0.00.439.865 I load: printing all EOG tokens:
+0.00.439.866 I load:   - 248044 ('<|endoftext|>')
+0.00.439.866 I load:   - 248046 ('<|im_end|>')
+0.00.439.867 I load:   - 248063 ('<|fim_pad|>')
+0.00.439.867 I load:   - 248064 ('<|repo_name|>')
+0.00.439.867 I load:   - 248065 ('<|file_sep|>')
+0.00.439.928 I load: special tokens cache size = 33
+0.00.453.019 I load: token to piece cache size = 1.7581 MB
+0.00.453.023 I print_info: arch                  = qwen35moe
+0.00.453.024 I print_info: vocab_only            = 0
+0.00.453.024 I print_info: no_alloc              = 0
+0.00.453.024 I print_info: n_ctx_train           = 262144
+0.00.453.025 I print_info: n_embd_inp            = 2048
+0.00.453.025 I print_info: n_embd                = 2048
+0.00.453.025 I print_info: n_embd_out            = 2048
+0.00.453.025 I print_info: n_layer               = 40
+0.00.453.026 I print_info: n_layer_all           = 41
+0.00.453.030 I print_info: n_head                = 16
+0.00.453.030 I print_info: n_head_kv             = 2
+0.00.453.031 I print_info: n_rot                 = 64
+0.00.453.031 I print_info: n_swa                 = 0
+0.00.453.032 I print_info: is_swa_any            = 0
+0.00.453.032 I print_info: non_causal_type       = 0
+0.00.453.032 I print_info: n_embd_head_k         = 256
+0.00.453.032 I print_info: n_embd_head_v         = 256
+0.00.453.033 I print_info: n_gqa                 = 8
+0.00.453.033 I print_info: n_embd_k_gqa          = 512
+0.00.453.033 I print_info: n_embd_v_gqa          = 512
+0.00.453.034 I print_info: f_norm_eps            = 0.0e+00
+0.00.453.035 I print_info: f_norm_rms_eps        = 1.0e-06
+0.00.453.035 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.453.035 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.453.035 I print_info: f_logit_scale         = 0.0e+00
+0.00.453.035 I print_info: f_attn_scale          = 0.0e+00
+0.00.453.036 I print_info: f_attn_value_scale    = 0.0000
+0.00.453.036 I print_info: n_ff                  = 0
+0.00.453.037 I print_info: n_expert              = 256
+0.00.453.037 I print_info: n_expert_used         = 8
+0.00.453.037 I print_info: n_expert_groups       = 0
+0.00.453.037 I print_info: n_group_used          = 0
+0.00.453.037 I print_info: causal attn           = 1
+0.00.453.038 I print_info: pooling type          = -1
+0.00.453.038 I print_info: rope type             = 40
+0.00.453.038 I print_info: rope scaling          = linear
+0.00.453.038 I print_info: freq_base_train       = 10000000.0
+0.00.453.039 I print_info: freq_scale_train      = 1
+0.00.453.039 I print_info: n_ctx_orig_yarn       = 262144
+0.00.453.039 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.453.040 I print_info: rope_finetuned        = unknown
+0.00.453.040 I print_info: mrope sections        = [11, 11, 10, 0]
+0.00.453.040 I print_info: ssm_d_conv            = 4
+0.00.453.040 I print_info: ssm_d_inner           = 4096
+0.00.453.040 I print_info: ssm_d_state           = 128
+0.00.453.040 I print_info: ssm_dt_rank           = 32
+0.00.453.041 I print_info: ssm_n_group           = 16
+0.00.453.041 I print_info: ssm_dt_b_c_rms        = 0
+0.00.453.041 I print_info: model type            = 35B.A3B
+0.00.453.042 I print_info: model params          = 35.51 B
+0.00.453.042 I print_info: general.name          = Qwen3.6-35B-A3B
+0.00.453.043 I print_info: vocab type            = BPE
+0.00.453.043 I print_info: n_vocab               = 248320
+0.00.453.043 I print_info: n_merges              = 247587
+0.00.453.043 I print_info: BOS token             = 248044 '<|endoftext|>'
+0.00.453.043 I print_info: EOS token             = 248046 '<|im_end|>'
+0.00.453.044 I print_info: EOT token             = 248046 '<|im_end|>'
+0.00.453.044 I print_info: PAD token             = 248055 '<|vision_pad|>'
+0.00.453.044 I print_info: LF token              = 198 'Ċ'
+0.00.453.044 I print_info: FIM PRE token         = 248060 '<|fim_prefix|>'
+0.00.453.044 I print_info: FIM SUF token         = 248062 '<|fim_suffix|>'
+0.00.453.044 I print_info: FIM MID token         = 248061 '<|fim_middle|>'
+0.00.453.045 I print_info: FIM PAD token         = 248063 '<|fim_pad|>'
+0.00.453.045 I print_info: FIM REP token         = 248064 '<|repo_name|>'
+0.00.453.045 I print_info: FIM SEP token         = 248065 '<|file_sep|>'
+0.00.453.045 I print_info: EOG token             = 248044 '<|endoftext|>'
+0.00.453.045 I print_info: EOG token             = 248046 '<|im_end|>'
+0.00.453.045 I print_info: EOG token             = 248063 '<|fim_pad|>'
+0.00.453.046 I print_info: EOG token             = 248064 '<|repo_name|>'
+0.00.453.046 I print_info: EOG token             = 248065 '<|file_sep|>'
+0.00.453.046 I print_info: max token length      = 256
+0.00.453.049 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.00.454.058 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.02.538.146 I load_tensors: offloading output layer to GPU
+0.02.538.150 I load_tensors: offloading 40 repeating layers to GPU
+0.02.538.150 I load_tensors: offloaded 42/42 layers to GPU
+0.02.538.154 I load_tensors:   CPU_Mapped model buffer size =   515.31 MiB
+0.02.538.155 I load_tensors:        ROCm0 model buffer size =  2425.70 MiB
+0.02.538.156 I load_tensors:    ROCm_Host model buffer size = 18662.00 MiB
+0.02.782.126 I heat_map_load_locked: loaded 120 heat entries from /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.moe-heatmap
+0.03.819.846 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.03.819.848 I cmn  common_init_: added <|im_end|> logit bias = -inf
+0.03.819.848 I cmn  common_init_: added <|fim_pad|> logit bias = -inf
+0.03.819.848 I cmn  common_init_: added <|repo_name|> logit bias = -inf
+0.03.819.848 I cmn  common_init_: added <|file_sep|> logit bias = -inf
+0.03.819.877 I common_init_result: keeping the flat 3584 MiB draft reserve (no draft GGUF (shared / embedded MTP head): the weights are the target's, so this estimate does not apply)
+0.03.819.893 I llama_context: constructing llama_context
+0.03.819.899 I llama_context: n_seq_max             = 1
+0.03.819.900 I llama_context: n_ctx                 = 32768
+0.03.819.900 I llama_context: n_ctx_seq             = 32768
+0.03.819.900 I llama_context: n_batch               = 2048
+0.03.819.900 I llama_context: n_ubatch              = 2048
+0.03.819.900 I llama_context: causal_attn           = 1
+0.03.819.901 I llama_context: flash_attn            = auto
+0.03.819.901 I llama_context: kv_unified            = false
+0.03.819.904 I llama_context: freq_base             = 10000000.0
+0.03.819.905 I llama_context: freq_scale            = 1
+0.03.819.905 I llama_context: n_rs_seq              = 3
+0.03.819.905 I llama_context: n_rs_batch            = 4
+0.03.819.905 I llama_context: n_outputs_max         = 4
+0.03.819.906 I llama_context: n_outputs_max_per_seq = 4
+0.03.819.906 I llama_context: n_ctx_seq (32768) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.03.820.105 I llama_context:  ROCm_Host  output buffer size =     0.95 MiB
+0.03.820.228 I llama_kv_cache:      ROCm0 KV buffer size =   640.00 MiB
+0.03.825.390 I llama_kv_cache: size =  640.00 MiB ( 32768 cells,  10 layers,  1/1 seqs), K (f16):  320.00 MiB, V (f16):  320.00 MiB
+0.03.825.391 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 256
+0.03.825.391 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 256
+0.03.826.134 I llama_memory_recurrent:      ROCm0 RS buffer size =   251.25 MiB
+0.03.826.137 I llama_memory_recurrent: size =  251.25 MiB (     1 cells,  40 layers,  1 seqs  3 rs_seq), R (f32):   11.25 MiB, S (f32):  240.00 MiB, P (f32):    0.00 MiB
+0.03.826.145 I sched_reserve: reserving ...
+0.03.835.101 I resolve_fused_ops: Flash Attention enabled
+0.03.835.103 I resolve_fused_ops: resolving derived kq mask support:
+0.03.835.770 I resolve_fused_ops: derived kq mask flash attention enabled
+0.03.835.771 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.03.836.407 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.03.837.018 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.03.840.472 W SLAB_INIT dev=0 free=28.40 GiB reserve=4.75 GiB headroom=1.25 GiB aux=3.50 GiB size(VA)=27.12 GiB mapped=23.62 GiB boundary=0.62 GiB va_spare=3.50 GiB chunk=64.0 MiB ring_req=2.93 GiB
+0.03.840.476 W ggml_cuda_slab_init_locked: device 0: slab 23.62 GiB (chunk 64.0 MiB): work 0.62 GiB + arena 23.00 GiB (4.75 GiB reserve, 3.50 GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+0.03.840.479 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 600.62 MiB from the slab work region (boundary 640.00 MiB) on device 0
+0.03.847.987 I ggml_gallocr_reserve_n_impl: reallocating ROCm0 buffer from size 600.62 MiB to 674.09 MiB
+0.03.847.995 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1024.00 MiB from the slab work region (boundary 1024.00 MiB) on device 0
+0.03.848.980 I sched_reserve:      ROCm0 compute buffer size =  1024.00 MiB
+0.03.848.981 I sched_reserve:  ROCm_Host compute buffer size =    64.23 MiB
+0.03.848.983 I sched_reserve: graph (pp bs=2048, tg bs=1): nodes = 4089 / 3999, splits = 120 / 42, input objects = 5 / 4, input tensors = 9 / 10
+0.03.848.983 I sched_reserve: reserve took 22.84 ms, sched copies = 1
+0.03.849.025 I cmn          init: llama threadpool init, n_threads = 16
+0.03.849.041 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.03.855.058 I sched_graph_realloc: graph reallocation: nodes = 4499 (changed = 0), splits = 42, n_same = 1, n_diff = 0
+0.03.857.788 I ggml_cuda_async_input_arm_locked: device ring: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=0 disables)
+0.03.857.792 I ggml_cuda_async_input_set: device 0: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)
+0.04.148.227 I ggml_backend_cuda_stage_h2d_gbps: H2D bandwidth calibration: 28.7 GB/s (512 MiB x3 in 56.16 ms, from the slab arena)
+0.04.156.268 I sched_stage_min_tokens: H2D staging calibration: 28.7 GB/s -> min_tokens=64
+0.04.249.429 W alloc_all_locked: MoE expert cache (auto): arena 18662.0 MiB of 18662.0 MiB host experts (100.0% residency).  MOE_EXPERT_CACHE_MIB=0 disables the cache; set a positive value to size it explicitly.
+0.04.257.298 W alloc_table_locked: layer=0 role=blk.0.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.263.939 W alloc_table_locked: layer=0 role=blk.0.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.270.587 W alloc_table_locked: layer=0 role=blk.0.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.278.459 W alloc_table_locked: layer=3 role=blk.3.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.285.105 W alloc_table_locked: layer=3 role=blk.3.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.291.748 W alloc_table_locked: layer=3 role=blk.3.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.299.614 W alloc_table_locked: layer=4 role=blk.4.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.306.262 W alloc_table_locked: layer=4 role=blk.4.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.312.910 W alloc_table_locked: layer=4 role=blk.4.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.320.767 W alloc_table_locked: layer=8 role=blk.8.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.327.418 W alloc_table_locked: layer=8 role=blk.8.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.334.060 W alloc_table_locked: layer=8 role=blk.8.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.341.930 W alloc_table_locked: layer=12 role=blk.12.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.348.567 W alloc_table_locked: layer=12 role=blk.12.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.355.215 W alloc_table_locked: layer=12 role=blk.12.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.363.077 W alloc_table_locked: layer=15 role=blk.15.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.369.716 W alloc_table_locked: layer=15 role=blk.15.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.376.356 W alloc_table_locked: layer=15 role=blk.15.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.384.216 W alloc_table_locked: layer=16 role=blk.16.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.390.855 W alloc_table_locked: layer=16 role=blk.16.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.397.497 W alloc_table_locked: layer=16 role=blk.16.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.405.358 W alloc_table_locked: layer=1 role=blk.1.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.412.010 W alloc_table_locked: layer=1 role=blk.1.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.418.650 W alloc_table_locked: layer=1 role=blk.1.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.426.515 W alloc_table_locked: layer=2 role=blk.2.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.433.157 W alloc_table_locked: layer=2 role=blk.2.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.439.805 W alloc_table_locked: layer=2 role=blk.2.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.447.681 W alloc_table_locked: layer=5 role=blk.5.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.454.321 W alloc_table_locked: layer=5 role=blk.5.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.460.973 W alloc_table_locked: layer=5 role=blk.5.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.468.844 W alloc_table_locked: layer=6 role=blk.6.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.475.492 W alloc_table_locked: layer=6 role=blk.6.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.482.138 W alloc_table_locked: layer=6 role=blk.6.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.490.006 W alloc_table_locked: layer=7 role=blk.7.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.496.652 W alloc_table_locked: layer=7 role=blk.7.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.503.299 W alloc_table_locked: layer=7 role=blk.7.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.511.173 W alloc_table_locked: layer=9 role=blk.9.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.517.805 W alloc_table_locked: layer=9 role=blk.9.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.524.448 W alloc_table_locked: layer=9 role=blk.9.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.532.312 W alloc_table_locked: layer=10 role=blk.10.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.538.948 W alloc_table_locked: layer=10 role=blk.10.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.545.600 W alloc_table_locked: layer=10 role=blk.10.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.553.470 W alloc_table_locked: layer=11 role=blk.11.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.560.113 W alloc_table_locked: layer=11 role=blk.11.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.566.762 W alloc_table_locked: layer=11 role=blk.11.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.574.631 W alloc_table_locked: layer=13 role=blk.13.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.581.273 W alloc_table_locked: layer=13 role=blk.13.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.587.921 W alloc_table_locked: layer=13 role=blk.13.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.595.790 W alloc_table_locked: layer=14 role=blk.14.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.602.435 W alloc_table_locked: layer=14 role=blk.14.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.609.076 W alloc_table_locked: layer=14 role=blk.14.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.616.935 W alloc_table_locked: layer=17 role=blk.17.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.623.573 W alloc_table_locked: layer=17 role=blk.17.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.630.219 W alloc_table_locked: layer=17 role=blk.17.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.638.081 W alloc_table_locked: layer=18 role=blk.18.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.644.725 W alloc_table_locked: layer=18 role=blk.18.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.651.363 W alloc_table_locked: layer=18 role=blk.18.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.659.217 W alloc_table_locked: layer=19 role=blk.19.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.665.849 W alloc_table_locked: layer=19 role=blk.19.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.672.490 W alloc_table_locked: layer=19 role=blk.19.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.680.400 W alloc_table_locked: layer=20 role=blk.20.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.687.039 W alloc_table_locked: layer=20 role=blk.20.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.693.680 W alloc_table_locked: layer=20 role=blk.20.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.701.537 W alloc_table_locked: layer=21 role=blk.21.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.708.172 W alloc_table_locked: layer=21 role=blk.21.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.714.815 W alloc_table_locked: layer=21 role=blk.21.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.722.666 W alloc_table_locked: layer=22 role=blk.22.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.729.300 W alloc_table_locked: layer=22 role=blk.22.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.735.939 W alloc_table_locked: layer=22 role=blk.22.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.743.797 W alloc_table_locked: layer=23 role=blk.23.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.750.429 W alloc_table_locked: layer=23 role=blk.23.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.757.062 W alloc_table_locked: layer=23 role=blk.23.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.764.913 W alloc_table_locked: layer=24 role=blk.24.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.771.545 W alloc_table_locked: layer=24 role=blk.24.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.778.187 W alloc_table_locked: layer=24 role=blk.24.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.786.037 W alloc_table_locked: layer=25 role=blk.25.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.792.674 W alloc_table_locked: layer=25 role=blk.25.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.799.314 W alloc_table_locked: layer=25 role=blk.25.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.807.165 W alloc_table_locked: layer=26 role=blk.26.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.813.796 W alloc_table_locked: layer=26 role=blk.26.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.820.434 W alloc_table_locked: layer=26 role=blk.26.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.828.287 W alloc_table_locked: layer=27 role=blk.27.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.834.916 W alloc_table_locked: layer=27 role=blk.27.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.841.551 W alloc_table_locked: layer=27 role=blk.27.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.849.400 W alloc_table_locked: layer=28 role=blk.28.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.856.028 W alloc_table_locked: layer=28 role=blk.28.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.862.664 W alloc_table_locked: layer=28 role=blk.28.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.870.520 W alloc_table_locked: layer=29 role=blk.29.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.877.151 W alloc_table_locked: layer=29 role=blk.29.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.883.785 W alloc_table_locked: layer=29 role=blk.29.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.891.650 W alloc_table_locked: layer=30 role=blk.30.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.898.277 W alloc_table_locked: layer=30 role=blk.30.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.904.925 W alloc_table_locked: layer=30 role=blk.30.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.912.782 W alloc_table_locked: layer=31 role=blk.31.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.919.412 W alloc_table_locked: layer=31 role=blk.31.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.926.048 W alloc_table_locked: layer=31 role=blk.31.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.933.904 W alloc_table_locked: layer=32 role=blk.32.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.940.540 W alloc_table_locked: layer=32 role=blk.32.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.947.177 W alloc_table_locked: layer=32 role=blk.32.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.955.030 W alloc_table_locked: layer=33 role=blk.33.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.961.668 W alloc_table_locked: layer=33 role=blk.33.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.968.306 W alloc_table_locked: layer=33 role=blk.33.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.977.413 W alloc_table_locked: layer=34 role=blk.34.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.984.042 W alloc_table_locked: layer=34 role=blk.34.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.990.683 W alloc_table_locked: layer=34 role=blk.34.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.04.998.539 W alloc_table_locked: layer=35 role=blk.35.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.005.182 W alloc_table_locked: layer=35 role=blk.35.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.011.825 W alloc_table_locked: layer=35 role=blk.35.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.019.683 W alloc_table_locked: layer=36 role=blk.36.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.026.324 W alloc_table_locked: layer=36 role=blk.36.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.032.961 W alloc_table_locked: layer=36 role=blk.36.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.040.827 W alloc_table_locked: layer=37 role=blk.37.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.047.468 W alloc_table_locked: layer=37 role=blk.37.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.054.105 W alloc_table_locked: layer=37 role=blk.37.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.063.217 W alloc_table_locked: layer=38 role=blk.38.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.069.850 W alloc_table_locked: layer=38 role=blk.38.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.076.488 W alloc_table_locked: layer=38 role=blk.38.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.085.599 W alloc_table_locked: layer=39 role=blk.39.ffn_down_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.092.236 W alloc_table_locked: layer=39 role=blk.39.ffn_gate_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.098.877 W alloc_table_locked: layer=39 role=blk.39.ffn_up_exps.weight is FULLY RESIDENT (256/256 slots): identity fast path ON (the decode band now reads the arena directly; no per-token routing readback)
+0.05.098.886 I alloc_all_locked: device 0: sized 256 slots/table from 120 tables / 72.9 MiB per expert (budget auto MiB/device)
+0.05.098.886 I alloc_all_locked: per-device sizing: 1 device(s), arena total 18662.0 MiB
+0.05.102.109 I common_speculative_init_result: creating MTP draft context against the target model '/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.05.102.122 I llama_context: constructing llama_context
+0.05.102.128 I llama_context: n_seq_max             = 1
+0.05.102.128 I llama_context: n_ctx                 = 32768
+0.05.102.128 I llama_context: n_ctx_seq             = 32768
+0.05.102.128 I llama_context: n_batch               = 2048
+0.05.102.128 I llama_context: n_ubatch              = 512
+0.05.102.129 I llama_context: causal_attn           = 1
+0.05.102.129 I llama_context: flash_attn            = auto
+0.05.102.130 I llama_context: kv_unified            = false
+0.05.102.131 I llama_context: freq_base             = 10000000.0
+0.05.102.131 I llama_context: freq_scale            = 1
+0.05.102.131 I llama_context: n_rs_seq              = 0
+0.05.102.131 I llama_context: n_rs_batch            = 1
+0.05.102.132 I llama_context: n_outputs_max         = 1
+0.05.102.132 I llama_context: n_outputs_max_per_seq = 1
+0.05.102.132 I llama_context: n_ctx_seq (32768) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.05.102.346 I llama_context:  ROCm_Host  output buffer size =     0.95 MiB
+0.05.102.880 I llama_kv_cache:      ROCm0 KV buffer size =    64.00 MiB
+0.05.102.954 I llama_kv_cache: size =   64.00 MiB ( 32768 cells,   1 layers,  1/1 seqs), K (f16):   32.00 MiB, V (f16):   32.00 MiB
+0.05.102.955 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 256
+0.05.102.955 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 256
+0.05.102.958 I sched_reserve: reserving ...
+0.05.104.460 I resolve_fused_ops: Flash Attention enabled
+0.05.104.461 I resolve_fused_ops: resolving derived kq mask support:
+0.05.104.521 I resolve_fused_ops: derived kq mask flash attention enabled
+0.05.104.522 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.05.104.558 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.05.104.591 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.05.105.715 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 512.00 MiB from the slab work region (boundary 1024.00 MiB) on device 0
+0.05.106.733 I sched_reserve:      ROCm0 compute buffer size =   512.00 MiB
+0.05.106.734 I sched_reserve:  ROCm_Host compute buffer size =     8.15 MiB
+0.05.106.736 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 86 / 86, splits = 2 / 2, input objects = 5 / 4, input tensors = 6 / 7
+0.05.106.737 I sched_reserve: reserve took 3.78 ms, sched copies = 1
+0.05.107.246 I cmn  common_conte: the context supports bounded partial sequence removal
+0.05.107.247 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 32768, kv_unified = 'false'
+0.05.107.261 I spec common_specu: adding speculative implementation 'draft-mtp'
+0.05.107.262 I spec common_specu: - n_max=3, n_min=0, p_min=0.00, n_embd=2048, backend_sampling=1
+0.05.107.263 I spec common_specu: - gpu_layers=-1, cache_k=f16, cache_v=f16, ctx_tgt=yes, ctx_dft=yes, devices=[default]
+0.05.107.432 I sched_reserve: reserving ...
+0.05.108.831 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 512.00 MiB from the slab work region (boundary 1024.00 MiB) on device 0
+0.05.109.787 I sched_reserve:      ROCm0 compute buffer size =   512.00 MiB
+0.05.109.788 I sched_reserve:  ROCm_Host compute buffer size =     8.15 MiB
+0.05.109.790 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 92 / 92, splits = 2 / 2, input objects = 6 / 5, input tensors = 6 / 7
+0.05.109.790 I sched_reserve: reserve took 2.36 ms, sched copies = 1
+0.05.115.171 I srv    load_model: speculative decoding context initialized
+0.05.115.174 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 32768
+0.05.115.185 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.05.115.185 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.05.115.187 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.05.115.187 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.05.115.199 I srv          init: idle slots will be saved to prompt cache upon starting a new task
+0.05.117.910 I srv          init: init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+'
+0.05.118.196 I srv          init: init: chat template, thinking = 0
+0.05.118.204 I srv          init: preserve_reasoning kwarg: true
+0.05.118.205 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.05.118.229 I srv  server_run_i: model loaded
+0.05.118.230 I srv  server_on_li: listening on http://127.0.0.1:33773
+0.05.118.277 I srv  update_slots: all slots are idle
+0.05.132.611 I srv  server_strea: conv_id= (empty=1)
+0.05.133.571 I slot get_availabl: id  0 | task -1 |  - skipping, slot is empty
+0.05.133.577 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+0.05.133.577 I srv  get_availabl: updating prompt cache
+0.05.133.580 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.05.133.582 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.05.133.584 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 32768 tokens, 8589934592 est)
+0.05.133.585 I srv  get_availabl: prompt cache update took 0.01 ms
+0.05.133.638 I slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.05.133.644 I slot launch_slot_: id  0 | task -1 | sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.05.133.646 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.05.133.660 I slot   operator(): id  0 | task 0 | new prompt, n_ctx_slot = 32768, n_keep = 0, task.n_tokens = 562
+0.05.133.669 I slot   operator(): id  0 | task 0 | cached n_tokens = 0, memory_seq_rm [0, end)
+0.05.133.827 I sched_reserve: reserving ...
+0.05.148.406 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 768.00 MiB) on device 0
+0.05.158.486 I sched_reserve:      ROCm0 compute buffer size =   768.00 MiB
+0.05.158.488 I sched_reserve:  ROCm_Host compute buffer size =    64.23 MiB
+0.05.158.490 I sched_reserve: graph (pp bs=2048, tg bs=1): nodes = 4088 / 3998, splits = 122 / 42, input objects = 5 / 4, input tensors = 9 / 10
+0.05.158.491 I sched_reserve: reserve took 24.66 ms, sched copies = 1
+0.05.165.966 I sched_graph_realloc: graph reallocation: nodes = 4502 (changed = 0), splits = 122, n_same = 2, n_diff = 0
+0.05.166.644 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 4544.00 MiB) on device 0
+0.05.178.342 I ggml_cuda_op_gated_delta_net_impl: chunked GDN prefill n=558 K=4 n_seqs=1 (chunked 542 + sequential tail 16, snapshots written; GGML_CUDA_GDN_TAIL=0 restores whole-batch chunking)
+0.05.585.445 I sched_graph_realloc: graph reallocation: nodes = 113 (changed = 0), splits = 2, n_same = 1, n_diff = 0
+0.05.591.132 I slot   operator(): id  0 | task 0 | cached n_tokens = 558, memory_seq_rm [558, end)
+0.05.591.191 I slot init_sampler: id  0 | task 0 | init sampler, took 0.05 ms, tokens: text = 562, total = 562
+0.05.609.579 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 557, pos_max = 557, n_tokens = 558, size = 62.813 MiB)
+0.05.612.714 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 768.00 MiB) on device 0
+0.05.612.824 W ggml_cuda_slab_set_narrow_floor: device 0: narrow floor raise to 1024.0 MiB ignored (ring in use: 3008.0 MiB of 3008.0 MiB, floor 768.0 MiB); the band is learned from the next idle-ring narrow view instead
+0.05.612.826 W ggml_cuda_slab_set_narrow_floor: device 0: narrow floor raise to 1024.0 MiB ignored (ring in use: 3008.0 MiB of 3008.0 MiB, floor 768.0 MiB); the band is learned from the next idle-ring narrow view instead
+0.05.613.554 I sched_graph_realloc: graph reallocation: nodes = 4498 (changed = 0), splits = 42, n_same = 3, n_diff = 0
+0.05.629.361 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 2, n_diff = 0
+0.05.637.751 I sched_graph_realloc: graph reallocation: nodes = 4498 (changed = 0), splits = 42, n_same = 4, n_diff = 0
+0.05.652.609 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 3, n_diff = 0
+0.05.653.025 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 4, n_diff = 0
+0.05.669.077 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 5, n_diff = 0
+0.05.669.323 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 6, n_diff = 0
+0.05.684.769 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 7, n_diff = 0
+0.05.684.999 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 8, n_diff = 0
+0.05.700.421 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 9, n_diff = 0
+0.05.700.644 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 10, n_diff = 0
+0.05.716.470 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 11, n_diff = 0
+0.05.716.687 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 12, n_diff = 0
+0.05.732.788 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 13, n_diff = 0
+0.05.733.022 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 14, n_diff = 0
+0.05.748.716 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 15, n_diff = 0
+0.05.748.921 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 16, n_diff = 0
+0.05.764.591 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 17, n_diff = 0
+0.05.764.803 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 18, n_diff = 0
+0.05.780.502 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 19, n_diff = 0
+0.05.780.728 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 20, n_diff = 0
+0.05.796.502 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 21, n_diff = 0
+0.05.796.730 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 22, n_diff = 0
+0.05.812.330 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 23, n_diff = 0
+0.05.812.549 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 24, n_diff = 0
+0.05.828.028 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 25, n_diff = 0
+0.05.828.251 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 26, n_diff = 0
+0.05.843.836 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 27, n_diff = 0
+0.05.844.051 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 28, n_diff = 0
+0.05.860.121 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 29, n_diff = 0
+0.05.860.436 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 30, n_diff = 0
+0.05.876.014 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 31, n_diff = 0
+0.05.876.245 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 32, n_diff = 0
+0.05.892.007 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 33, n_diff = 0
+0.05.892.218 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 34, n_diff = 0
+0.05.908.170 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 35, n_diff = 0
+0.05.908.378 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 36, n_diff = 0
+0.05.924.254 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 37, n_diff = 0
+0.05.924.456 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 38, n_diff = 0
+0.05.940.022 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 39, n_diff = 0
+0.05.940.228 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 40, n_diff = 0
+0.05.955.917 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 41, n_diff = 0
+0.05.956.118 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 42, n_diff = 0
+0.05.971.747 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 43, n_diff = 0
+0.05.971.946 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 44, n_diff = 0
+0.05.987.495 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 45, n_diff = 0
+0.05.987.698 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 46, n_diff = 0
+0.06.003.348 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 47, n_diff = 0
+0.06.003.553 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 48, n_diff = 0
+0.06.019.239 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 49, n_diff = 0
+0.06.019.442 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 50, n_diff = 0
+0.06.035.522 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 51, n_diff = 0
+0.06.035.723 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 52, n_diff = 0
+0.06.051.511 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 53, n_diff = 0
+0.06.051.707 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 54, n_diff = 0
+0.06.067.458 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 55, n_diff = 0
+0.06.067.654 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 56, n_diff = 0
+0.06.083.328 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 57, n_diff = 0
+0.06.083.535 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 58, n_diff = 0
+0.06.099.093 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 59, n_diff = 0
+0.06.099.294 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 60, n_diff = 0
+0.06.114.706 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 61, n_diff = 0
+0.06.114.907 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 62, n_diff = 0
+0.06.130.498 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 63, n_diff = 0
+0.06.130.700 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 64, n_diff = 0
+0.06.146.494 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 65, n_diff = 0
+0.06.146.696 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 66, n_diff = 0
+0.06.162.387 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 67, n_diff = 0
+0.06.162.590 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 68, n_diff = 0
+0.06.177.949 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 69, n_diff = 0
+0.06.178.157 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 70, n_diff = 0
+0.06.193.559 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 71, n_diff = 0
+0.06.193.768 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 72, n_diff = 0
+0.06.209.536 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 73, n_diff = 0
+0.06.209.740 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 74, n_diff = 0
+0.06.225.468 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 75, n_diff = 0
+0.06.225.671 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 76, n_diff = 0
+0.06.241.298 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 77, n_diff = 0
+0.06.241.493 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 78, n_diff = 0
+0.06.257.029 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 79, n_diff = 0
+0.06.257.242 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 80, n_diff = 0
+0.06.272.853 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 81, n_diff = 0
+0.06.273.052 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 82, n_diff = 0
+0.06.288.616 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 83, n_diff = 0
+0.06.288.812 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 84, n_diff = 0
+0.06.304.375 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 85, n_diff = 0
+0.06.304.574 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 86, n_diff = 0
+0.06.320.062 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 87, n_diff = 0
+0.06.320.269 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 88, n_diff = 0
+0.06.336.193 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 89, n_diff = 0
+0.06.336.399 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 90, n_diff = 0
+0.06.352.087 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 91, n_diff = 0
+0.06.352.295 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 92, n_diff = 0
+0.06.368.054 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 93, n_diff = 0
+0.06.368.256 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 94, n_diff = 0
+0.06.383.559 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 95, n_diff = 0
+0.06.383.758 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 96, n_diff = 0
+0.06.399.568 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 97, n_diff = 0
+0.06.399.775 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 98, n_diff = 0
+0.06.415.511 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 99, n_diff = 0
+0.06.415.716 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 100, n_diff = 0
+0.06.431.426 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 101, n_diff = 0
+0.06.431.627 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 102, n_diff = 0
+0.06.447.695 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 103, n_diff = 0
+0.06.447.891 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 104, n_diff = 0
+0.06.463.611 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 105, n_diff = 0
+0.06.463.818 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 106, n_diff = 0
+0.06.465.162 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 107, n_diff = 0
+0.06.468.966 I sched_graph_realloc: graph reallocation: nodes = 4498 (changed = 0), splits = 42, n_same = 5, n_diff = 0
+0.06.469.632 I ggml_gallocr_reserve_n_impl: reallocating ROCm_Host buffer from size 0.13 MiB to 0.13 MiB
+0.06.482.383 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 108, n_diff = 0
+0.06.482.676 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 109, n_diff = 0
+0.06.498.977 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 110, n_diff = 0
+0.06.499.464 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 111, n_diff = 0
+0.06.515.324 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 112, n_diff = 0
+0.06.515.541 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 113, n_diff = 0
+0.06.531.439 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 114, n_diff = 0
+0.06.531.647 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 115, n_diff = 0
+0.06.547.539 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 116, n_diff = 0
+0.06.547.745 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 117, n_diff = 0
+0.06.563.566 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 118, n_diff = 0
+0.06.563.767 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 119, n_diff = 0
+0.06.579.447 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 120, n_diff = 0
+0.06.579.647 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 121, n_diff = 0
+0.06.595.424 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 122, n_diff = 0
+0.06.595.624 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 123, n_diff = 0
+0.06.611.548 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 124, n_diff = 0
+0.06.611.753 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 125, n_diff = 0
+0.06.627.212 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 126, n_diff = 0
+0.06.627.424 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 127, n_diff = 0
+0.06.643.079 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 128, n_diff = 0
+0.06.643.283 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 129, n_diff = 0
+0.06.659.079 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 130, n_diff = 0
+0.06.659.286 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 131, n_diff = 0
+0.06.675.103 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 132, n_diff = 0
+0.06.675.307 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 133, n_diff = 0
+0.06.691.018 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 134, n_diff = 0
+0.06.691.218 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 135, n_diff = 0
+0.06.707.088 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 136, n_diff = 0
+0.06.707.298 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 137, n_diff = 0
+0.06.722.899 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 138, n_diff = 0
+0.06.723.105 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 139, n_diff = 0
+0.06.738.691 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 140, n_diff = 0
+0.06.738.890 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 141, n_diff = 0
+0.06.754.502 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 142, n_diff = 0
+0.06.754.700 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 143, n_diff = 0
+0.06.770.464 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 144, n_diff = 0
+0.06.770.667 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 145, n_diff = 0
+0.06.786.213 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 146, n_diff = 0
+0.06.786.416 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 147, n_diff = 0
+0.06.802.152 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 148, n_diff = 0
+0.06.802.360 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 149, n_diff = 0
+0.06.818.142 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 150, n_diff = 0
+0.06.818.342 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 151, n_diff = 0
+0.06.834.284 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 152, n_diff = 0
+0.06.834.487 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 153, n_diff = 0
+0.06.850.484 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 154, n_diff = 0
+0.06.850.682 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 155, n_diff = 0
+0.06.866.528 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 156, n_diff = 0
+0.06.866.727 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 157, n_diff = 0
+0.06.882.499 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 158, n_diff = 0
+0.06.882.702 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 159, n_diff = 0
+0.06.898.301 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 160, n_diff = 0
+0.06.898.504 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 161, n_diff = 0
+0.06.914.143 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 162, n_diff = 0
+0.06.914.357 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 163, n_diff = 0
+0.06.929.923 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 164, n_diff = 0
+0.06.930.127 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 165, n_diff = 0
+0.06.946.183 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 166, n_diff = 0
+0.06.946.391 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 167, n_diff = 0
+0.06.962.142 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 168, n_diff = 0
+0.06.962.350 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 169, n_diff = 0
+0.06.978.357 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 170, n_diff = 0
+0.06.978.559 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 171, n_diff = 0
+0.06.994.385 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 172, n_diff = 0
+0.06.994.580 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 173, n_diff = 0
+0.07.010.227 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 174, n_diff = 0
+0.07.010.433 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 175, n_diff = 0
+0.07.026.054 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 176, n_diff = 0
+0.07.026.255 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 177, n_diff = 0
+0.07.041.850 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 178, n_diff = 0
+0.07.042.065 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 179, n_diff = 0
+0.07.057.794 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 180, n_diff = 0
+0.07.057.993 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 181, n_diff = 0
+0.07.073.948 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 182, n_diff = 0
+0.07.074.146 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 183, n_diff = 0
+0.07.090.143 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 184, n_diff = 0
+0.07.090.349 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 185, n_diff = 0
+0.07.106.201 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 186, n_diff = 0
+0.07.106.406 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 187, n_diff = 0
+0.07.122.401 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 188, n_diff = 0
+0.07.122.598 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 189, n_diff = 0
+0.07.138.234 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 190, n_diff = 0
+0.07.138.438 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 191, n_diff = 0
+0.07.154.144 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 192, n_diff = 0
+0.07.154.348 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 193, n_diff = 0
+0.07.170.379 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 194, n_diff = 0
+0.07.170.579 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 195, n_diff = 0
+0.07.186.660 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 196, n_diff = 0
+0.07.186.860 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 197, n_diff = 0
+0.07.202.857 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 198, n_diff = 0
+0.07.203.058 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 199, n_diff = 0
+0.07.218.794 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 200, n_diff = 0
+0.07.218.990 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 201, n_diff = 0
+0.07.234.649 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 202, n_diff = 0
+0.07.234.851 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 203, n_diff = 0
+0.07.250.795 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 204, n_diff = 0
+0.07.250.995 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 205, n_diff = 0
+0.07.267.019 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 206, n_diff = 0
+0.07.267.219 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 207, n_diff = 0
+0.07.283.106 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 208, n_diff = 0
+0.07.283.309 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 209, n_diff = 0
+0.07.299.185 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 210, n_diff = 0
+0.07.299.390 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 211, n_diff = 0
+0.07.315.083 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 212, n_diff = 0
+0.07.315.289 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 213, n_diff = 0
+0.07.331.056 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 214, n_diff = 0
+0.07.331.260 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 215, n_diff = 0
+0.07.346.968 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 216, n_diff = 0
+0.07.347.171 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 217, n_diff = 0
+0.07.363.008 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 218, n_diff = 0
+0.07.363.209 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 219, n_diff = 0
+0.07.379.144 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 220, n_diff = 0
+0.07.379.352 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 221, n_diff = 0
+0.07.395.212 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 222, n_diff = 0
+0.07.395.409 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 223, n_diff = 0
+0.07.411.344 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 224, n_diff = 0
+0.07.411.538 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 225, n_diff = 0
+0.07.427.307 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 226, n_diff = 0
+0.07.427.509 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 227, n_diff = 0
+0.07.443.339 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 228, n_diff = 0
+0.07.443.542 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 229, n_diff = 0
+0.07.459.192 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 230, n_diff = 0
+0.07.459.395 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 231, n_diff = 0
+0.07.475.324 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 232, n_diff = 0
+0.07.475.528 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 233, n_diff = 0
+0.07.491.438 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 234, n_diff = 0
+0.07.491.646 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 235, n_diff = 0
+0.07.492.963 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 236, n_diff = 0
+0.07.496.229 I sched_graph_realloc: graph reallocation: nodes = 4498 (changed = 0), splits = 42, n_same = 6, n_diff = 0
+0.07.496.844 I ggml_gallocr_reserve_n_impl: reallocating ROCm_Host buffer from size 0.13 MiB to 0.14 MiB
+0.07.509.512 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 237, n_diff = 0
+0.07.509.798 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 238, n_diff = 0
+0.07.525.783 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 239, n_diff = 0
+0.07.526.256 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 240, n_diff = 0
+0.07.542.082 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 241, n_diff = 0
+0.07.542.307 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 242, n_diff = 0
+0.07.557.952 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 243, n_diff = 0
+0.07.558.161 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 244, n_diff = 0
+0.07.573.896 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 245, n_diff = 0
+0.07.574.095 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 246, n_diff = 0
+0.07.589.880 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 247, n_diff = 0
+0.07.590.079 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 248, n_diff = 0
+0.07.605.972 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 249, n_diff = 0
+0.07.606.180 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 250, n_diff = 0
+0.07.621.967 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 251, n_diff = 0
+0.07.622.184 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 252, n_diff = 0
+0.07.637.913 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 253, n_diff = 0
+0.07.638.070 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 254, n_diff = 0
+0.07.653.703 I sched_graph_realloc: graph reallocation: nodes = 109 (changed = 0), splits = 2, n_same = 255, n_diff = 0
+0.07.653.822 I slot print_timing: id  0 | task 0 | prompt eval time =     495.62 ms /   562 tokens (    0.88 ms per token,  1133.93 tokens per second)
+0.07.653.823 I slot print_timing: id  0 | task 0 |        eval time =    2024.54 ms /   498 tokens (    4.07 ms per token,   245.49 tokens per second)
+0.07.653.824 I slot print_timing: id  0 | task 0 |       total time =    2520.16 ms /  1060 tokens
+0.07.653.825 I slot print_timing: id  0 | task 0 |    graphs reused =        123
+0.07.653.826 I slot print_timing: id  0 | task 0 |   graph reallocs =          6    /     0        (same size) / (changed size)
+0.07.653.828 I slot print_timing: id  0 | task 0 | draft acceptance = 0.98148 (  371 accepted /   378 generated), mean len =  3.94
+0.07.653.828 I slot print_timing: id  0 | task 0 |      acc per pos = (0.992, 0.976, 0.976)
+0.07.653.840 I spec common_specu: statistics        draft-mtp: #calls(b,g,a) =    1    126    126, #gen drafts =    126, #acc drafts =   125, #gen tokens =    378, #acc tokens =   371, #mean acc len = 3.94, #acc rate/pos = (0.992, 0.976, 0.976), dur(b,g,a) = 0.015, 457.959, 0.029 ms
+0.07.653.869 I slot      release: id  0 | task 0 | stop processing: n_tokens = 1059, truncated = 0
+0.07.653.874 I srv  update_slots: all slots are idle
+0.07.654.023 I srv    operator(): operator(): cleaning up before exit...
+0.07.654.407 I common_memory_breakdown_print: | memory breakdown [MiB]             | total   free     self   model   context   compute    unaccounted |
+0.07.654.408 I common_memory_breakdown_print: |   - ROCm0 (AI PRO R9700 (gfx1201)) | 32624 = 4254 + ( 7092 =  2425 +     891 +    3776) +       21277 |
+0.07.654.408 I common_memory_breakdown_print: |   - Host                           |                 19177 = 19177 +       0 +       0                |
+0.07.655.925 W ~llama_context:  ROCm_Host compute buffer size of   0.1350 MiB, does not match expectation of   0.1311 MiB
+0.07.670.638 W moe_cache_forget_all: model teardown: dropped 120 expert-cache table(s) (18662.0 MiB of arena) on device 0 and un-sized the cache, so the next model sizes on its own first band pass
+0.08.462.338 I moe_cache_report: MoE expert cache: h=0.0000 (0/0 reaches), fills=30720 evictions=0, tables=120, slots=30720, arena=18662.0 MiB total (budget auto MiB/device)
+0.08.462.342 I moe_cache_report: takeover=0 decline_all=0 get_ok=690 cold=uva cold_reaches=0
+0.08.462.342 I moe_cache_report: cold admission=touch, admission-rejected (served cold)=0
+0.08.462.343 I moe_cache_report: device 0: tables=120 slots/table(sum)=30720 arena=18662.0 MiB (budget auto MiB/device)
+0.08.470.303 I heat_map_save_locked: saved 120 heat entries to /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.moe-heatmap
+0.08.470.305 I moe_cache_report: heat (R2): total=0 (persisted prior + this session), nonzero=0/0 experts over 0 tables
+0.08.470.307 I moe_cache_report: prefill cache staging: ok=120 geom_decline=0 unusable=0 nomatch=0; arena=18662.0 MiB host=0.0 MiB (H2D 0.0% of staged); PRS rebuilds=120
+0.08.470.307 I moe_cache_report: VRAM budget: requested=auto MiB/device, free-clamped=1, arena alloc failures=0 (fail-soft)

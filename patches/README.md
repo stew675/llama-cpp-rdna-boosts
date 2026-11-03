@@ -2979,6 +2979,46 @@ a hook is CUDA-only (the non-CUDA entries stay NULL and the feature is simply in
   its default, and `git grep` on the applied branch for its call sites.  A block's "knobs" list here is the
   set its own hunks read/write, not a claim of exclusive ownership.
 
+
+### r207 (2026-11-03) -- the host-pool-speed campaign folded in
+
+`wip/host-pool-speed/` was promoted here rather than as a new block (it is this block's pool code).
+Everything below is `--host-experts pool` only; the default `pinned` mode is byte-for-byte unchanged.  The measured
+record is `wip/host-pool-speed/README.md` §18 and `WORKLOG.md` 261103.009-012.
+
+* **A POOL-backed table is served by the device gather in the prefill band by default.**  Its whole-table staging
+  is the slow path at every width (the source is the pageable model mapping plus the pool's host alias, degrading
+  as coverage rises): 122B-A10B, `-ncmoe 48`, 5258-token prompt, `-ub 2048`, three R9700s — pool FRAC 95 prefill
+  **1507.7-1631.3 t/s** with the gather against `pinned`'s 634-638, and **16.9** with the gather off; decode at
+  parity (67.2-67.7); prefill logits **bit-identical** (KLD -0.000000 / top-p 100.000 %).  A new optional iface
+  query `moe_cache_pool_backed(backend, weight)` (CUDA: "this table's master is the read-only mapping"; forwarded
+  by the Meta backend) plus a **band** gate in `sched_input_gatherable` (`n_tokens > moe_cache_band`) — the decode
+  band keeps the arena's slot-remap read, because the gather there costs 1.2-4.1 t/s.  `GGML_SCHED_DEVGATHER` is
+  three-valued: unset = pool-backed only (shipped), `0` = kill switch, `1`/`force` = the old A/B arm (not the
+  default: it costs a pinned master ~47 % prefill at two devices).  The gather also resolves the arena first and
+  the pool second, which subsumes `MOE_HOST_POOL_COLD` (`COLD=0` 19.57 vs 19.25-19.86 with it, 15.54 without).
+* **`MOE_HOST_POOL_RAM_PCT` scales every table** instead of shaving the registration-order tail to the one-slot
+  floor (`RAM_PCT=70` on the 122B: 10.94 -> **17.44 t/s** at identical pinned bytes, +73 % with `SIZING=1`;
+  `RAM_PCT=85`: 19.52 -> 20.97), and `MOE_HOST_POOL_SIZING=1` fits its concentration plan *to* the ceiling.
+* **`MOE_HOST_POOL_SIZING` / `_COV_PCT`** (opt-in): per-table slots from routing concentration — +7.5 % decode at
+  FRAC 80, +16.4 % at FRAC 60 at identical pinned bytes, for -13/-15 % prefill.
+* **Diagnostics**: `moe_cache_report` reports the run (it used to print an emptied cache in every mode — the
+  artefact behind the "the pool never activated" false alarm), a forced `MOE_HOST_POOL_DIO` logs its mode,
+  `bounce_acquire` owns the pinned bounce ring (2209-3108 MiB on the 122B, uncapped on purpose: a cap costs
+  8-25 % of prefill at FRAC 80), pool fills are timed by source, and the gather reports its calls.
+* **`MOE_HOST_POOL_PREFETCH` removed** (parsed, never read — `TODO` #268 closed).
+* **Held back:** `MOE_HOST_POOL_FRAC=100` as the default (better on one GPU, 9 % worse on a split while the ceiling
+  does not reserve the model's pageable footprint; over-committed a 91 GiB box once).  The default stays 80.
+
+Gates: greedy text byte-identical on 1/2/3 GPUs (5835 `dc178c29fe89`, 6079 `01607c16b483`, 5917 `5421cf18bed5`;
+257 `5531ae33f0f7` on the 64-token oracle); prefill logits KLD -0.000000 / top-p 100 %; MTP four-axis acceptance
+identical to 5 decimals (0.81370 / 0.75408 / 0.89175 / 0.98148) with `none` == `draft-mtp`; `llama-batched-bench
+-npl 4,8` pool 338.5/835.8 vs pinned 81.8/136.0; faults clean.
+
+Open follow-ups (`../TODO.md`): #131 (the pool staging path's own root cause — now kill-switch-only), #132 (the
+pair's remaining -21.7 % decode is one synchronous demand read per token), #133 (a fully-resident table is still
+re-copied out of the arena per prefill ubatch — the *default* mode's own defect, up to ~3x).
+
 ## Block 13 — MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in)
 
 **What.**  The MTP draft head can score a **row subset of the LM head**: with `--spec-draft-mtp-vocab N` the

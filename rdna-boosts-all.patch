@@ -12,7 +12,7 @@ index 8e3c88dac..49fa1b296 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 9706b3ac5..9c613053a 100644
+index 9706b3ac5..9fe9747b1 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -26,7 +26,7 @@ index 9706b3ac5..9c613053a 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -2718,12 +2716,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2718,12 +2716,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LOAD_MODE"));
@@ -35,7 +35,8 @@ index 9706b3ac5..9c613053a 100644
 +        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
 +        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
 +        "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
-+        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default 25% of the host expert bytes).\n"
++        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default MOE_HOST_POOL_FRAC=80% of\n"
++        "        the host expert bytes, capped by MOE_HOST_POOL_RAM_PCT of MemAvailable).\n"
 +        "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
 +        "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
 +        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
@@ -60,7 +61,7 @@ index 9706b3ac5..9c613053a 100644
          [](common_params & params, const std::string & value) {
              /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
              else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
-@@ -2777,11 +2794,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2777,11 +2795,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_env("LLAMA_ARG_CPU_MOE"));
      add_opt(common_arg(
          {"-ncmoe", "--n-cpu-moe"}, "N",
@@ -75,7 +76,7 @@ index 9706b3ac5..9c613053a 100644
              llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
          }
      ).set_env("LLAMA_ARG_N_CPU_MOE"));
-@@ -2826,12 +2845,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2826,12 +2846,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -94,7 +95,7 @@ index 9706b3ac5..9c613053a 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -2841,6 +2864,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2841,6 +2865,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -103,7 +104,7 @@ index 9706b3ac5..9c613053a 100644
              } else {
                  throw std::invalid_argument("invalid value");
              }
-@@ -4140,12 +4165,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4140,12 +4166,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for K for the draft model\n"
              "allowed values: %s\n"
@@ -121,7 +122,7 @@ index 9706b3ac5..9c613053a 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
      add_opt(common_arg(
-@@ -4153,12 +4179,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4153,12 +4180,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for V for the draft model\n"
              "allowed values: %s\n"
@@ -139,7 +140,7 @@ index 9706b3ac5..9c613053a 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
      add_opt(common_arg(
-@@ -4176,25 +4203,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4176,25 +4204,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
      add_opt(common_arg(
          {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
@@ -184,7 +185,7 @@ index 9706b3ac5..9c613053a 100644
      add_opt(common_arg(
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
-@@ -4212,6 +4256,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4212,6 +4257,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -4870,7 +4871,7 @@ index b0c067b49..89b85fbce 100644
          struct ggml_tensor * node = graph->nodes[i];
          struct node_alloc * node_alloc = &galloc->node_allocs[i];
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..49f691776 100644
+index dc7367dec..c664b6802 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -30,6 +30,26 @@ extern "C" {
@@ -4948,7 +4949,7 @@ index dc7367dec..49f691776 100644
      };
  
      struct ggml_backend_i {
-@@ -152,8 +206,92 @@ extern "C" {
+@@ -152,8 +206,100 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -5038,10 +5039,18 @@ index dc7367dec..49f691776 100644
 +        // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
 +        // backends' positional initializers stay valid (NULL).
 +        bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
++        // wip/host-pool-speed (#131): is this routed expert table served by the bounded pinned host POOL
++        // (`--host-experts pool`) rather than by a pinned master?  A pool-backed table's whole-table
++        // STAGING is the slow path at every width (its source is the pageable model mapping plus the pool
++        // alias), while the device gather resolves it from the two pinned tiers on the device, so the
++        // scheduler sends a pool-backed table to the gather unconditionally.  A pinned master keeps the
++        // staging path (the gather costs it ~47 % prefill at two devices, `wip/host-pool-speed` §18.2).
++        // Answers per (table, device); NULL = unknown/false.
++        bool (*moe_cache_pool_backed)(ggml_backend_t backend, const struct ggml_tensor * weight);
      };
  
      struct ggml_backend {
-@@ -216,6 +354,126 @@ extern "C" {
+@@ -216,6 +362,126 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -5169,7 +5178,7 @@ index dc7367dec..49f691776 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fb35be352..84926f87f 100644
+index fb35be352..1f8717c1d 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -7981,7 +7990,7 @@ index fb35be352..84926f87f 100644
          if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
              bool backend_allreduce_success = false;
              if (backend_ctx->comm_ctx) {
-@@ -2500,6 +4229,243 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2500,6 +4229,257 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -8157,6 +8166,20 @@ index fb35be352..84926f87f 100644
 +    return n_backends > 0 ? band : 8;
 +}
 +
++// wip/host-pool-speed (#131): forward the pool-backed query to the simple devices.  A tensor split gives
++// every simple device the SAME host master, so the answer is uniform; report true if any device says so.
++static bool ggml_backend_meta_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    const size_t n_backends = ggml_backend_meta_n_backends(backend);
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        if (simple_backend != nullptr && simple_backend->iface.moe_cache_pool_backed != nullptr &&
++            simple_backend->iface.moe_cache_pool_backed(simple_backend, weight)) {
++            return true;
++        }
++    }
++    return false;
++}
++
 +static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
 +        const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
 +        size_t slice_off, int split_axis) {
@@ -8225,7 +8248,7 @@ index fb35be352..84926f87f 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2514,9 +4480,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2514,9 +4494,22 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_plan_update       = */ nullptr,
      /* .graph_plan_compute      = */ nullptr,
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
@@ -8247,11 +8270,12 @@ index fb35be352..84926f87f 100644
 +    /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
 +    /* .moe_cache_remap         = */ nullptr,   // not forwarded: -sm tensor keeps the eager path
++    /* .moe_cache_pool_backed   = */ ggml_backend_meta_moe_cache_pool_backed,
  };
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 22e5fd9c7..879c52dd3 100644
+index 22e5fd9c7..d9bc8fd13 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,21 @@
@@ -8554,7 +8578,7 @@ index 22e5fd9c7..879c52dd3 100644
 +    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
 +    // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
 +    // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
-+    bool devgather_enabled;
++    int  devgather_mode;   // 0 = off, 1 = pool-backed tables only (default), 2 = force (A/B)
 +    struct {
 +        struct ggml_tensor * dst;
 +        size_t size;
@@ -9019,7 +9043,7 @@ index 22e5fd9c7..879c52dd3 100644
          }
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -1814,19 +2411,382 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1814,19 +2411,400 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -9194,21 +9218,39 @@ index 22e5fd9c7..879c52dd3 100644
 +static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
 +
 +static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
-+                                   const struct ggml_tensor * input_cpy) {
-+    if (!sched->devgather_enabled) {
++                                   const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
++    if (sched->devgather_mode == 0) {
 +        return false;
 +    }
-+    if (sched->backends[split->backend_id]->iface.moe_cache_gather == NULL) {
++    ggml_backend_t split_backend = sched->backends[split->backend_id];
++    if (split_backend->iface.moe_cache_gather == NULL) {
 +        return false;
 +    }
-+    // The gather serves the below-gate band, where `sched_stage_issue` skips whole-shard staging
-+    // entirely.  At or above the staging width gate, staging (the ring for `-sm layer`, the meta
-+    // `stage_input` for `-sm tensor`) is the faster path (Q4_K_M ub8192: staging 5283 vs gather 4035;
-+    // `-sm layer` ncmoe 40 4511 vs 2625), EXCEPT for a large expert table (see above).
++    // wip/host-pool-speed (#131): a POOL-BACKED table (`--host-experts pool`) gathers at EVERY width.
++    // Its whole-table staging is the slow path at every width because the source is the pageable model
++    // mapping plus the pool's host alias, and it degrades as coverage rises -- measured on the 122B-A10B
++    // across three RDNA4 GPUs, 5258-token prompt: staging 134.3 t/s at FRAC 80 and 12.9 at FRAC 95,
++    // versus **969.3 / 1623.5** with the gather, against `pinned`'s 555.1 (`README.md` §18.2).  A PINNED
++    // master keeps the staging path: the gather costs it ~47 % prefill at two devices.
++    const bool pool_backed = split_backend->iface.moe_cache_pool_backed != NULL &&
++                             split_backend->iface.moe_cache_pool_backed(split_backend, input);
++    if (sched->devgather_mode == 1) {
++        if (!pool_backed) {
++            return false;
++        }
++        // PREFILL BAND ONLY.  At or below the cache's decode/verify band the routed op is served from the
++        // ARENA (the slot-remap read), and taking it over with the gather costs an order of magnitude:
++        // measured on the 3-GPU pool arm, decode fell to 1.2-4.1 t/s against 22-47 with staging.  Above the
++        // band the op is streamed (prefill) and staging is the slow path -- the case this rule exists for.
++        const int64_t band = sched_moe_cache_band(split_backend);
++        return band > 0 && sched_stage_batch_tokens(split) > band;
++    }
++    // mode 2 (`GGML_SCHED_DEVGATHER=1|force`): the historical A/B arm -- gather below the staging width
++    // gate and for a large table, in either host-expert mode.
 +    const bool below_gate = sched_stage_min_tokens(sched) > 0 &&
 +                            sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched);
 +    const bool big_table  = ggml_nbytes(input_cpy) >= SCHED_GATHER_TABLE_MIN_BYTES;
-+    if (!below_gate && !big_table) {
++    if (!below_gate && !big_table && !pool_backed) {
 +        return false;
 +    }
 +    for (int ni = 0; ni < split->graph.n_nodes; ni++) {
@@ -9243,7 +9285,7 @@ index 22e5fd9c7..879c52dd3 100644
 +            continue;
 +        }
 +        struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
-+        if (sched_input_gatherable(sched, split, in_cpy)) {
++        if (sched_input_gatherable(sched, split, split->inputs[i], in_cpy)) {
 +            return;
 +        }
 +    }
@@ -9262,7 +9304,7 @@ index 22e5fd9c7..879c52dd3 100644
 +        }
 +        // A routed expert table is deferred to the gather (see sched_input_gatherable).
 +        struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
-+        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, split->inputs[i], input_cpy)) {
 +            continue;
 +        }
 +        n_host_inputs++;
@@ -9295,7 +9337,7 @@ index 22e5fd9c7..879c52dd3 100644
 +            continue;
 +        }
 +        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
-+        if (sched_input_gatherable(sched, split, input_cpy)) {
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
 +            continue;
 +        }
 +        const size_t size = ggml_nbytes(input);
@@ -9404,7 +9446,7 @@ index 22e5fd9c7..879c52dd3 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -1834,31 +2794,327 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -1834,31 +2812,327 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -9597,7 +9639,7 @@ index 22e5fd9c7..879c52dd3 100644
 +            // experts from the host master into `input_cpy`, reading the routing on the device,
 +            // so the host ids readback and its full device synchronize are skipped.  A backend
 +            // that cannot serve the layout (or the gate off) falls through to the host path.
-+            if (sched_input_gatherable(sched, split, input_cpy) &&
++            if (sched_input_gatherable(sched, split, input, input_cpy) &&
 +                ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
 +                split_backend->iface.moe_cache_gather != NULL) {
 +                // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
@@ -9752,7 +9794,7 @@ index 22e5fd9c7..879c52dd3 100644
      }
  }
  
-@@ -1867,12 +3123,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1867,12 +3141,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      struct ggml_backend_sched_split * splits = sched->splits;
  
      int prev_backend_id = -1;
@@ -9768,7 +9810,7 @@ index 22e5fd9c7..879c52dd3 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1887,12 +3146,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1887,12 +3164,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -9783,7 +9825,7 @@ index 22e5fd9c7..879c52dd3 100644
              }
          }
  
-@@ -1940,6 +3199,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1940,6 +3217,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -9798,7 +9840,7 @@ index 22e5fd9c7..879c52dd3 100644
          prev_backend_id = split_backend_id;
      }
  
-@@ -1959,14 +3226,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1959,14 +3244,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -9815,7 +9857,7 @@ index 22e5fd9c7..879c52dd3 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2003,7 +3270,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2003,7 +3288,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -9831,7 +9873,7 @@ index 22e5fd9c7..879c52dd3 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2012,6 +3286,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2012,6 +3304,76 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -9874,8 +9916,19 @@ index 22e5fd9c7..879c52dd3 100644
 +        // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
 +        // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
 +        // persistent/never-reused).
++        // wip/host-pool-speed (#131): three-valued.  UNSET = "pool-backed tables gather" (the default: a
++        // pool table's staging is the slow path at every width, measured 7x-126x behind the gather on a
++        // 3-GPU split, `README.md` §18.2).  `0` is the kill switch.  `1`/`force` is the historical A/B arm
++        // (gather below the staging width gate and for large tables, in either host-expert mode) -- it is
++        // NOT the default because it costs a pinned master ~47 % prefill at two devices.
 +        const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
-+        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
++        if (devgather_env == NULL || devgather_env[0] == '\0') {
++            sched->devgather_mode = 1;
++        } else if (atoi(devgather_env) == 0 && strcmp(devgather_env, "force") != 0) {
++            sched->devgather_mode = 0;
++        } else {
++            sched->devgather_mode = 2;
++        }
 +        if (sched->stage_enabled) {
 +            bool stage_capable = false;
 +            for (int b = 0; b < sched->n_backends; b++) {
@@ -9897,7 +9950,7 @@ index 22e5fd9c7..879c52dd3 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2026,6 +3359,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2026,6 +3388,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -9908,7 +9961,7 @@ index 22e5fd9c7..879c52dd3 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2090,6 +3427,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2090,6 +3456,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -9926,7 +9979,7 @@ index 22e5fd9c7..879c52dd3 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2127,6 +3475,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2127,6 +3504,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -9935,7 +9988,7 @@ index 22e5fd9c7..879c52dd3 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2221,6 +3571,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2221,6 +3600,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -9944,7 +9997,7 @@ index 22e5fd9c7..879c52dd3 100644
          case GGML_OP_MUL_MAT:
          case GGML_OP_MUL_MAT_ID:
          case GGML_OP_CUMSUM:
-@@ -2592,6 +3944,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2592,6 +3973,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -9954,7 +10007,7 @@ index 22e5fd9c7..879c52dd3 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2617,6 +3972,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2617,6 +4001,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -34299,7 +34352,7 @@ index 000000000..7570a3b06
 +void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
 +size_t ggml_cuda_slab_seed_floor(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a9a..fad68b433 100644
+index aff687a9a..cc39dffa3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -42614,6 +42667,13 @@ index aff687a9a..fad68b433 100644
 -
 -        // closure check: the trailing add must read the same x as the leading mul
 -        const ggml_tensor * x_in_add = (add->src[0] == mul1) ? add->src[1] : add->src[0];
+-
+-        // Kernel iterates over total = T * C, so x and add must be 2D and
+-        // a / inv_b must collapse to [1, C, 1, 1]. Higher dims are not handled.
+-        const bool dim_ok   = (x->ne[2]   == 1 && x->ne[3]   == 1) &&
+-                              (add->ne[2] == 1 && add->ne[3] == 1) &&
+-                              (a->ne[2]   == 1 && a->ne[3]   == 1);
+-        const bool shape_ok = ggml_are_same_shape(a, inv_b) && a->ne[0] == 1 && a->ne[1] == x->ne[1];
 +    // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
 +    // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
 +    // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
@@ -42622,13 +42682,6 @@ index aff687a9a..fad68b433 100644
 +    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && "unsupported buffer type");
 +    ggml_cuda_async_input_drain(cuda_ctx->device);
  
--        // Kernel iterates over total = T * C, so x and add must be 2D and
--        // a / inv_b must collapse to [1, C, 1, 1]. Higher dims are not handled.
--        const bool dim_ok   = (x->ne[2]   == 1 && x->ne[3]   == 1) &&
--                              (add->ne[2] == 1 && add->ne[3] == 1) &&
--                              (a->ne[2]   == 1 && a->ne[3]   == 1);
--        const bool shape_ok = ggml_are_same_shape(a, inv_b) && a->ne[0] == 1 && a->ne[1] == x->ne[1];
--
 -        // x is in the supported whitelist and every chain intermediate shares
 -        // x's type. launch_snake reads a and inv_b as const float *, so they
 -        // stay F32.
@@ -42800,13 +42853,13 @@ index aff687a9a..fad68b433 100644
 +            }
 +        } else {
 +            memcpy(s.buf, data, full);
-+        }
+         }
 +        if (stride_tensor == size) {
 +            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, s.buf, compact, cudaMemcpyHostToDevice, h2d_stream));
 +        } else {
 +            CUDA_CHECK(cudaMemcpy2DAsync(
 +                (char *) tensor->data + offset, stride_tensor, s.buf, stride_data, size, n_copies, cudaMemcpyHostToDevice, h2d_stream));
-         }
++        }
 +        CUDA_CHECK(hipEventRecord(s.ev, h2d_stream));
 +        // order the consumer (the split's compute, on the main stream) after the queued H2D
 +        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), s.ev, 0));
@@ -43913,9 +43966,9 @@ index aff687a9a..fad68b433 100644
 +    CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
  }
 +#endif // USE_CUDA_GRAPH
-+
  
 -static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++
 +static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, ggml_cuda_graph * graph) {
 +    int64_t t_ev = g_cgc_on ? ggml_time_us() : 0;
      bool graph_evaluated_or_captured = false;
@@ -44282,7 +44335,7 @@ index aff687a9a..fad68b433 100644
 +                cuda_graph_update_required = false;
 +                graph->warmup_complete = false;
 +                graph->capture_deferred = true;
-+            }
+             }
 +            if (band_armed && !use_cuda_graph) {
 +                // Belt-and-braces: ANY direct run in an armed stretch served this graph's pool temporaries
 +                // from the band, so the next capture must be preceded by a disarmed direct run.  This also
@@ -44290,13 +44343,12 @@ index aff687a9a..fad68b433 100644
 +                // warmup was already complete) and the very next run would otherwise capture immediately.
 +                graph->warmup_complete = false;
 +                graph->capture_deferred = true;
-             }
++            }
 +            } // else: not prefill
          }
      }
--#endif // USE_CUDA_GRAPH
-+#endif // USE_CUDA_GRAPH
-+
+ #endif // USE_CUDA_GRAPH
+ 
 +    ggml_cuda_graph_stats_arm();
 +    if (!use_cuda_graph) {
 +        g_gc_n_direct++;
@@ -44305,7 +44357,7 @@ index aff687a9a..fad68b433 100644
 +    } else {
 +        g_gc_n_replay++;
 +    }
- 
++
      if (use_cuda_graph && cuda_graph_update_required) {
          // Start CUDA graph capture
 +        if (ggml_cuda_graph_trace()) {
@@ -44924,15 +44976,17 @@ index aff687a9a..fad68b433 100644
      ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
      stream_context.reset();
  
-@@ -5367,6 +8562,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5367,6 +8562,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
 +
++static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
++
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -5383,7 +8579,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5383,7 +8581,20 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -44949,10 +45003,11 @@ index aff687a9a..fad68b433 100644
 +    /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
 +    /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
++    /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -5409,6 +8617,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -5409,6 +8620,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -44967,7 +45022,7 @@ index aff687a9a..fad68b433 100644
      return description;
  }
  
-@@ -5653,8 +8869,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5653,8 +8872,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -44978,7 +45033,7 @@ index aff687a9a..fad68b433 100644
  }
  
  // TODO: move these functions here
-@@ -5814,6 +9030,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5814,6 +9033,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                          return true;
                      case GGML_TYPE_IQ4_NL:
@@ -44988,7 +45043,7 @@ index aff687a9a..fad68b433 100644
                      case GGML_TYPE_MXFP4:
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
-@@ -5903,6 +9122,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5903,6 +9125,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -44997,7 +45052,7 @@ index aff687a9a..fad68b433 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -6109,8 +9330,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6109,8 +9333,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -45039,7 +45094,7 @@ index aff687a9a..fad68b433 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
-@@ -6134,7 +9388,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6134,7 +9391,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -45049,7 +45104,7 @@ index aff687a9a..fad68b433 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -6155,6 +9410,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -6155,6 +9413,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -45066,7 +45121,7 @@ index aff687a9a..fad68b433 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -6189,6 +9454,218 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -6189,6 +9457,224 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -45133,6 +45188,12 @@ index aff687a9a..fad68b433 100644
 +static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
 +    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
 +    return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
++}
++
++static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    // wip/host-pool-speed (#131): see the iface comment.  `backend->context` is the CUDA backend context.
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    return moe_cache_table_is_pool(weight, ctx->device);
 +}
 +
 +static void ggml_backend_cuda_device_moe_cache_forget(ggml_backend_dev_t dev) {
@@ -45285,7 +45346,7 @@ index aff687a9a..fad68b433 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -6205,6 +9682,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -6205,6 +9691,27 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -45313,7 +45374,7 @@ index aff687a9a..fad68b433 100644
  };
  
  // backend reg
-@@ -6286,8 +9784,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -6286,8 +9793,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -45387,7 +45448,7 @@ index aff687a9a..fad68b433 100644
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
          return (void *)ggml_backend_cuda_comm_init;
      }
-@@ -6384,6 +9947,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6384,6 +9956,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -60812,10 +60873,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..334931ecd
+index 000000000..1b80b37b1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7185 @@
+@@ -0,0 +1,7694 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -60878,6 +60939,7 @@ index 000000000..334931ecd
 +    char *      host = nullptr;
 +    cudaEvent_t ev   = nullptr;
 +    bool        busy = false;
++    uint64_t    seq  = 0;   // acquisition order (the bounded ring waits on the oldest entry)
 +};
 +
 +struct table_t {
@@ -60977,6 +61039,19 @@ index 000000000..334931ecd
 +    void *      prs_arena   = nullptr;  // arena base the snapshot was built against
 +    int         prs_slots   = 0;        // slot count the snapshot was built against
 +    std::vector<int32_t> prs_host;      // persistent staging (the async H2D must not race its source)
++
++    // Gather residency snapshot (wip/host-pool-speed, mechanism (b)): the same two-tier encoding as `prs`
++    // (`>= 0` arena slot, `<= -2` pool slot `-v-2`, `-1` neither), but refreshed on the COMPUTE stream so
++    // the device gather can resolve an expert from the arena or the pool instead of only a device-readable
++    // master.  Deliberately separate from `prs_*`: staging rebuilds that one on the copy stream, and one
++    // buffer written from two streams is a race.  `gprs_last` is what the device copy currently holds, so
++    // an unchanged map costs no H2D at all.
++    int32_t *            gprs_dev  = nullptr;
++    int64_t              gprs_n    = 0;
++    void *               gprs_arena = nullptr;
++    int                  gprs_slots = 0;
++    std::vector<int32_t> gprs_host;
++    std::vector<int32_t> gprs_last;
 +
 +    // Provisional slots (MOE_EXPERT_CACHE_PROVISIONAL=1): a pre-filled/loaded expert is "provisional"
 +    // until it is hit.  While it is, the touch doorkeeper is bypassed for it, so the entry is evictable
@@ -61117,6 +61192,12 @@ index 000000000..334931ecd
 +                                     //   stays clear of swap (see ENVIRONMENT.md).
 +int64_t g_pool_ram_cap     = -1;     // bytes; -1 = not computed yet
 +int64_t g_pool_ram_used    = 0;      // bytes pinned by the pools built so far
++// wip/host-pool-speed W3: the ceiling's DISTRIBUTION.  The clamp used to shave the REGISTRATION-ORDER TAIL
++// down to the one-slot floor, which starved the last ~14 tables of a 144-table model at RAM_PCT 70 and cost
++// 40 % of decode for 10 % fewer slots (README §14.6).  Instead the planned total is compared with the
++// ceiling ONCE and every table's slot count is scaled by the same factor, so a tightened ceiling now costs
++// coverage everywhere instead of killing a few tables.  -1 = the scale has not been decided yet.
++double  g_pool_ram_scale   = -1.0;
 +int64_t g_preflight_host_bytes = 0;  // Σ host expert bytes over host-expert devices (the AUTO basis)
 +bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
 +// TODO #87 (1): `MOE_HOST_POOL_DIO` is AUTO by default -- decided once, at the first pool build, from
@@ -61130,9 +61211,22 @@ index 000000000..334931ecd
 +bool    g_pool_dio_decided = false;
 +bool    g_pool_stage_batch = true;   // MOE_HOST_POOL_STAGE_BATCH=0: one cudaMemcpyAsync per expert for the
 +                                     //   pool-backed prefill staging (the pre-r114 arm; A/B only)
-+bool    g_pool_prefetch   = false; // MOE_HOST_POOL_PREFETCH=1: speculatively warm the pool from the routing
-+                                   //   (a net loss unless the pool nears full residency -- long-prompt sweep)
 +int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all registered host tensors)
++// wip/host-pool-speed: per-table pool SIZING.  `MOE_HOST_POOL_FRAC` gives every host table the same slot count
++// (`n_experts * FRAC/100`), so the pinned bytes go to a table with a long cold tail exactly as to one with a flat
++// hot set.  What differs between tables is not their routed mass (a top-k router hands every table `n_used`
++// experts per token, so the total is a constant) but its CONCENTRATION: `cov` sizing asks for the slots a table
++// needs to hold `MOE_HOST_POOL_COV_PCT` of its own prior mass, fitted to the same total byte budget.  Offline on
++// the 122B-A10B trace at FRAC 80 that takes the disk tier from 48.7 to 28.5 MiB per decode token with `h`
++// unchanged (`wip/host-pool-speed/tools/pool-sizing-sim.py`, HANDOVER §4/F6).  0 = uniform (default until gated).
++int     g_pool_sizing      = 0;      // MOE_HOST_POOL_SIZING: 0 = uniform, 1 = cov
++int     g_pool_cov_pct     = 90;     // MOE_HOST_POOL_COV_PCT: the mass fraction `cov` sizing targets
++bool    g_pool_cov_fit     = false;  // the one-shot fit has run
++std::map<const void *, int> g_pool_cov_slots;   // host tensor -> pool slots (the fit's result)
++// wip/host-pool-speed W3: the byte total the fit actually planned.  The RAM ceiling is applied as a
++// proportional scale over the SIZING's own plan, so it needs that plan's total as its denominator --
++// using the uniform FRAC total instead would scale a ceiling-fitted cov plan a second time.
++int64_t g_pool_cov_bytes = 0;
 +
 +// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
 +// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
@@ -61165,6 +61259,23 @@ index 000000000..334931ecd
 +bool                                g_enabled    = false;
 +bool                                g_init_done  = false;
 +bool                                g_report     = true;
++// Teardown snapshot of the report's STRUCTURAL aggregates (tables/slots/arena, hits/misses/fills/evictions and
++// the host pool's tensors/slots/pinned bytes).  `moe_cache_report` is an `atexit` hook and the model teardown
++// (`moe_cache_forget_all`) un-sizes the cache first, so without this every run ends with
++// "tables=0, slots=0, arena=0.0 MiB" and "host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned" -- in BOTH modes,
++// which reads as "the pool never activated" (it cost one full investigation, 2026-11-02).  The snapshot is taken
++// at the first forget, when every device's tables are still registered, and the report prefers it when present.
++struct moe_report_snapshot {
++    bool    have      = false;
++    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
++    int     n_tables = 0, n_slots = 0;
++    int64_t dev_slots [GGML_CUDA_MAX_DEVICES] = {0};
++    int64_t dev_arena [GGML_CUDA_MAX_DEVICES] = {0};
++    int     dev_tables[GGML_CUDA_MAX_DEVICES] = {0};
++    int64_t arena_bytes = 0;
++    int64_t n_pools = 0, p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
++};
++static moe_report_snapshot g_report_snap;
 +bool                                g_fill       = false;   // opt-in: copy the master into the slot
 +int                                 g_device     = -1;
 +int64_t                             g_period     = 32;   // LFRU decay period, decode steps
@@ -61224,6 +61335,23 @@ index 000000000..334931ecd
 +bool                                g_stage_cache     = true;
 +// Prefill staging accounting (per call = per table per ubatch).
 +int64_t                             g_stage_ok        = 0;
++// Gather accounting (wip/host-pool-speed mechanism (b)): `calls` = gather invocations that returned true,
++// `pool` = of those, the ones served from a POOL-backed table (the new third source), `miss_fills` = routed
++// experts that were in neither tier and were copied into the destination before the kernel.
++int64_t                             g_uploadp_calls   = 0;   // moe_cache_upload_pageable serviced ranges
++int64_t                             g_uploadp_bytes   = 0;   // ... and the bytes that took the bounce path
++int64_t                             g_bounce_bytes    = 0;   // pinned ring bytes ever allocated (freed at teardown)
++// Demand-fill cost accounting (README §16): wall time spent INSIDE the synchronous fill, split by source, and
++// the bytes it moved.  Read against the run's token count to size the overlap/coalesce candidate.
++int64_t                             g_fill_read_calls   = 0;   // fills that hit storage (O_DIRECT / pread)
++int64_t                             g_fill_read_us      = 0;
++int64_t                             g_fill_memcpy_calls = 0;   // fills served by a memcpy out of the mapping
++int64_t                             g_fill_memcpy_us    = 0;
++int64_t                             g_fill_total_bytes  = 0;   // (bytes; `g_fill_bytes` is the pre-existing traffic counter)
++static uint64_t                     g_bounce_seq      = 0;
++int64_t                             g_gather_calls    = 0;
++int64_t                             g_gather_pool     = 0;
++int64_t                             g_gather_fills    = 0;
 +int64_t                             g_stage_arena_bytes = 0;
 +int64_t                             g_stage_host_bytes  = 0;
 +int64_t                             g_stage_decline_geom = 0;
@@ -61478,6 +61606,7 @@ index 000000000..334931ecd
 +// process-wide and holds whole experts; the cold encoding is `n_res + pool slot` with the pool's base).
 +static bool g_pool_cold = true;
 +static host_pool_t * table_pool_locked(table_t & t);
++static int64_t pool_ram_cap_locked();   // wip/host-pool-speed W3: the RAM_PCT ceiling, measured once
 +static int pool_cold_slot_locked(table_t & t, int32_t expert) {
 +    if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.n_slices > 0 || t.src_off != 0 ||
 +            ggml_cuda_info().device_count != 1) {
@@ -61566,6 +61695,16 @@ index 000000000..334931ecd
 +    // cache is not a second copy competing for RAM.
 +    g_pool_enabled     = moe_host_pool_on();
 +    g_pool_auto        = g_pool_enabled && (moe_host_pool_mib() < 0);
++    // DEFAULT = 80 % of each host expert tensor, still subject to the `MOE_HOST_POOL_RAM_PCT` ceiling below.
++    // `MOE_HOST_POOL_FRAC` is a percentage of the model's HOST EXPERT SET, not of RAM, and coverage is the
++    // pool's decode lever: at `-ncmoe 48` on the 122B-A10B (1 x R9700, 96 GiB, 67.1 GiB of host experts)
++    // decode was 17.76 t/s at 80 %, 20.59 at 100 % against 22.34 `pinned` (2026-11-02, wip/host-pool-speed).
++    // Full coverage is nevertheless NOT the shipped default: (a) the ceiling below does not reserve the
++    // model's own pageable footprint, so on a multi-device split 100 % pins enough to starve the page cache
++    // and measured 9 % SLOWER than 95 % (4 GiB less pinned, 42 GiB less disk per run, 2026-11-03); (b) a
++    // FRAC 100 pool over-committed a 91 GiB box once, stalling the prepopulate; (c) the 1-GPU srv cell
++    // measured 100 % worse than 80 % (624.5 vs 646.8 prefill).  Raise it when the ceiling learns to reserve
++    // the model, and measure per split then.
 +    g_pool_frac        = env_int("MOE_HOST_POOL_FRAC", 80);
 +    if (g_pool_frac < 1) {
 +        g_pool_frac = 1;
@@ -61573,6 +61712,10 @@ index 000000000..334931ecd
 +    if (g_pool_frac > 100) {
 +        g_pool_frac = 100;
 +    }
++    g_pool_sizing      = env_int("MOE_HOST_POOL_SIZING", 0);
++    g_pool_cov_pct     = env_int("MOE_HOST_POOL_COV_PCT", 90);
++    if (g_pool_cov_pct < 1)   { g_pool_cov_pct = 1;  }
++    if (g_pool_cov_pct > 100) { g_pool_cov_pct = 100; }
 +    g_pool_ram_pct     = env_int("MOE_HOST_POOL_RAM_PCT", 85);
 +    if (g_pool_ram_pct < 0) {
 +        g_pool_ram_pct = 0;
@@ -61588,19 +61731,25 @@ index 000000000..334931ecd
 +        g_pool_dio_req = -1;
 +    }
 +    if (g_pool_dio_req >= 0) {
-+        g_pool_dio         = g_pool_dio_req != 0;
-+        g_pool_dio_decided = true;
++        // Apply the forced mode NOW (no fill may use the other one) but leave `g_pool_dio_decided` clear:
++        // `pool_decide_dio_locked` reports the effective mode once, at the first pool build.  Pre-setting the
++        // flag here is what made that report unreachable (a forced A/B arm logged no fill mode at all).
++        g_pool_dio = g_pool_dio_req != 0;
 +    }
-+    g_pool_prefetch    = env_int("MOE_HOST_POOL_PREFETCH", 0) != 0;
 +    g_pool_stage_batch = env_int("MOE_HOST_POOL_STAGE_BATCH", 1) != 0;
 +    g_pool_total_bytes = (g_pool_enabled && !g_pool_auto) ? moe_host_pool_mib() * 1024 * 1024 : 0;
 +    if (g_pool_enabled) {
++        // Report the effective fill mode here as well as at the first pool build (`pool_decide_dio_locked`):
++        // this line also serves the `MOE_HOST_POOL_MIB` shape, which never goes through `--host-experts pool`.
++        const char * fill_mode = g_pool_dio_req < 0 ? "AUTO (MOE_HOST_POOL_DIO=0|1 forces it)"
++                               : (g_pool_dio ? "O_DIRECT (forced by MOE_HOST_POOL_DIO=1)"
++                                             : "buffered (forced by MOE_HOST_POOL_DIO=0)");
 +        if (g_pool_auto) {
 +            GGML_LOG_INFO("%s: MoE host expert pool: AUTO = %d%% of the MoE host expert bytes, pinned; fill "
-+                          "mode AUTO (MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, g_pool_frac);
++                          "mode %s\n", __func__, g_pool_frac, fill_mode);
 +        } else {
-+            GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned; fill mode AUTO "
-+                          "(MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, (long long) moe_host_pool_mib());
++            GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned; fill mode %s\n",
++                          __func__, (long long) moe_host_pool_mib(), fill_mode);
 +        }
 +    }
 +    g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
@@ -61934,6 +62083,149 @@ index 000000000..334931ecd
 +#endif
 +}
 +
++// wip/host-pool-speed: the slots `t` needs to hold `cov_pct` of its own prior mass, or -1 when there is no
++// prior to rank by (the caller then falls back to the uniform ask).  `t.heat` is the persisted long-horizon
++// prior applied at registration (`heat_apply_loaded_locked`) -- the same ranking the pool's content uses, so a
++// table that has never been seen falls back rather than being sized from noise.  Caller holds `g_mutex`.
++static int table_cov_slots_locked(const table_t & t, int cov_pct) {
++    if (t.n_experts <= 0) {
++        return 1;
++    }
++    if ((int) t.heat.size() != t.n_experts) {
++        return -1;
++    }
++    std::vector<uint32_t> h(t.heat.begin(), t.heat.end());
++    std::sort(h.begin(), h.end(), std::greater<uint32_t>());
++    uint64_t tot = 0;
++    for (uint32_t v : h) {
++        tot += v;
++    }
++    if (tot == 0) {
++        return -1;   // a prior with no mass at all: nothing to concentrate on
++    }
++    uint64_t cum = 0;
++    for (int i = 0; i < t.n_experts; i++) {
++        cum += h[(size_t) i];
++        if (cum * 100 >= tot * (uint64_t) cov_pct) {
++            return i + 1;
++        }
++    }
++    return t.n_experts;
++}
++
++// One-shot fit of the per-table pool slots by concentration, to the SAME total byte budget the uniform rule
++// would spend (`MOE_HOST_POOL_FRAC` of the host expert set).  Runs at the first pool build, when every host
++// tensor is registered, so it is order-independent (which is what the per-tensor FRAC rule exists to guarantee).
++// `MOE_HOST_POOL_MIB` (an explicit process-wide byte budget) keeps the uniform split.  Caller holds `g_mutex`.
++static void pool_fit_cov_locked() {
++    if (g_pool_cov_fit) {
++        return;
++    }
++    g_pool_cov_fit = true;
++    struct plan_t { const void * host; int k; int n_exp; size_t bytes; };
++    std::vector<plan_t> plan;
++    std::set<const void *> seen;
++    int64_t budget = 0;
++    int64_t uniform_slots = 0;
++    for (const table_t & t : g_tables) {
++        if (!t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
++            continue;
++        }
++        if (!seen.insert(t.host).second) {
++            continue;   // one plan per host TENSOR (the pool is shared across a split's per-device tables)
++        }
++        const int uni = std::max(1, std::min(t.n_experts, (int) ((int64_t) t.n_experts * g_pool_frac / 100)));
++        int k = table_cov_slots_locked(t, g_pool_cov_pct);
++        if (k < 0) {
++            k = uni;    // no prior: ask for what the uniform rule asks for
++        }
++        k = std::max(1, std::min(k, t.n_experts));
++        budget         += (int64_t) uni * (int64_t) t.host_bytes;
++        uniform_slots += uni;
++        plan.push_back({ t.host, k, t.n_experts, t.host_bytes });
++    }
++    if (plan.empty() || budget <= 0) {
++        return;
++    }
++    // wip/host-pool-speed W3: the concentration fit is a REDISTRIBUTION at a fixed byte total, so the ceiling
++    // has to be applied to the TOTAL it fits to, not afterwards.  Scaling a fitted plan uniformly preserves
++    // only the average and collapses the concentration straight back to the uniform rule (measured: FRAC 100
++    // + `RAM_PCT=70` gave 144 x 208 slots with and without `MOE_HOST_POOL_SIZING=1`).
++    {
++        const int64_t cap = pool_ram_cap_locked();
++        if (cap > 0 && budget > cap) {
++            budget = cap;
++        }
++    }
++    // slots_i = clamp(round(alpha * k_i), 1, n_exp_i); find the largest alpha whose byte total fits.
++    auto alloc = [&](double alpha, std::vector<int> * out) {
++        int64_t bytes = 0;
++        if (out != nullptr) {
++            out->assign(plan.size(), 0);
++        }
++        for (size_t i = 0; i < plan.size(); i++) {
++            const plan_t & c = plan[i];
++            int sl = (int) std::llround(alpha * (double) c.k);
++            sl = std::max(1, std::min(c.n_exp, sl));
++            bytes += (int64_t) sl * (int64_t) c.bytes;
++            if (out != nullptr) {
++                (*out)[i] = sl;
++            }
++        }
++        return bytes;
++    };
++    double lo = 0.0, hi = 1.0;
++    while (alloc(hi, nullptr) <= budget && hi < 1e9) {
++        hi *= 2.0;
++    }
++    for (int it = 0; it < 80; it++) {
++        const double mid = 0.5 * (lo + hi);
++        if (alloc(mid, nullptr) <= budget) {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    std::vector<int> slots;
++    int64_t used = alloc(lo, &slots);
++    // Hand the rounding leftovers to the tables that want the most slots (largest k first) while they fit, then
++    // (if a floor overshot) take slots back from the smallest-k tables until the budget is respected.
++    std::vector<size_t> order(plan.size());
++    for (size_t i = 0; i < order.size(); i++) {
++        order[i] = i;
++    }
++    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return plan[a].k > plan[b].k; });
++    for (size_t i : order) {
++        while (slots[i] < plan[i].n_exp && used + (int64_t) plan[i].bytes <= budget) {
++            slots[i]++;
++            used += (int64_t) plan[i].bytes;
++        }
++    }
++    for (auto it = order.rbegin(); it != order.rend() && used > budget; ++it) {
++        const size_t i = *it;
++        while (slots[i] > 1 && used > budget) {
++            slots[i]--;
++            used -= (int64_t) plan[i].bytes;
++        }
++    }
++    int64_t kept = 0;
++    int64_t kept_bytes = 0;
++    for (size_t i = 0; i < plan.size(); i++) {
++        g_pool_cov_slots[plan[i].host] = slots[i];
++        kept += slots[i];
++        kept_bytes += (int64_t) slots[i] * (int64_t) plan[i].bytes;
++    }
++    g_pool_cov_bytes = kept_bytes;
++    GGML_LOG_INFO("%s: host pool SIZING = cov%d (concentration, %s): %zu host tensors, budget %.1f MiB, "
++                  "alpha=%.3f, %lld slots vs %lld uniform (%.1f %%) -- per-table slots now follow each table's "
++                  "own routing concentration instead of a flat FRAC (MOE_HOST_POOL_SIZING=0 restores it)\n",
++                  __func__, g_pool_cov_pct,
++                  "MOE_HOST_POOL_COV_PCT of each table's prior mass",
++                  plan.size(), (double) budget / (1024.0 * 1024.0), lo,
++                  (long long) kept, (long long) uniform_slots,
++                  uniform_slots > 0 ? 100.0 * (double) kept / (double) uniform_slots : 0.0);
++}
++
 +// TODO #87 (1): decide whether the pool fills from the page cache or with O_DIRECT.  Called ONCE, from the
 +// first pool build, so every pool and every bounce path in the process agrees.
 +//
@@ -61955,6 +62247,8 @@ index 000000000..334931ecd
 +    }
 +    g_pool_dio_decided = true;
 +    if (g_pool_dio_req >= 0) {
++        // Forced (`MOE_HOST_POOL_DIO=0|1`): `parse_env` already applied it; this is the one place that reports
++        // it, because it runs once, at the first pool build, at a log level the operator can see.
 +        g_pool_dio = g_pool_dio_req != 0;
 +        GGML_LOG_INFO("%s: host pool fill mode: %s (forced by MOE_HOST_POOL_DIO=%d)\n", __func__,
 +                      g_pool_dio ? "O_DIRECT (page cache bypassed)" : "buffered (page cache as L3)",
@@ -61984,11 +62278,22 @@ index 000000000..334931ecd
 +                  g_pool_dio ? "the set does not fit beside the pool" : "the set fits beside the pool");
 +}
 +
-+// Cap `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.  Caller holds
-+// `g_mutex` (it updates the process-wide running total).
-+static int pool_clamp_slots_to_ram(int slots, size_t host_bytes, const table_t & t) {
-+    if (g_pool_ram_pct <= 0 || slots <= 0 || host_bytes == 0) {
-+        return slots;   // ceiling disabled
++// Cap this table's `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.
++// Caller holds `g_mutex` (it updates the process-wide running total).
++//
++// wip/host-pool-speed W3: the ceiling is applied as ONE proportional scale over every table, not as a shave
++// of whichever tables happen to register last.  The old form gave the registration-order tail ONE slot each
++// once the running total reached the cap -- measured on the 122B at `RAM_PCT=70`: 14 of 144 tables at 1 slot
++// and **-40 % decode** for 10 % fewer slots (README §14.6), and on the 3-GPU pair at `FRAC=100` the same
++// effect alone dropped the pool's hit rate from 0.91 to 0.78.  A proportional shave costs every table a
++// little coverage instead, which is what a memory ceiling should do.
++//
++// `planned_total` is the pre-ceiling pinned size the caller was aiming for (FRAC / MIB / cov plan), i.e. the
++// denominator the ceiling is compared against.  It is a process-wide number, so the scale is too.
++// The `MOE_HOST_POOL_RAM_PCT` ceiling in bytes, measured once (0 = no ceiling: disabled, or no MemAvailable).
++static int64_t pool_ram_cap_locked() {
++    if (g_pool_ram_pct <= 0) {
++        return 0;
 +    }
 +    if (g_pool_ram_cap < 0) {
 +        const int64_t avail = pool_available_ram_bytes();
@@ -61998,39 +62303,61 @@ index 000000000..334931ecd
 +                          __func__, g_pool_ram_pct, (double) g_pool_ram_cap / (1024.0 * 1024.0));
 +        }
 +    }
-+    if (g_pool_ram_cap <= 0) {
++    return g_pool_ram_cap;
++}
++
++static int pool_clamp_slots_to_ram(int slots, size_t host_bytes, int64_t planned_total, const table_t & t) {
++    if (g_pool_ram_pct <= 0 || slots <= 0 || host_bytes == 0) {
++        return slots;   // ceiling disabled
++    }
++    if (pool_ram_cap_locked() <= 0) {
 +        return slots;   // no MemAvailable (non-Linux, or unreadable): keep the configured size
 +    }
++    // Decide the proportional scale once, from the process-wide plan vs the process-wide ceiling.
++    if (g_pool_ram_scale < 0.0) {
++        if (planned_total > 0 && planned_total > g_pool_ram_cap) {
++            g_pool_ram_scale = (double) g_pool_ram_cap / (double) planned_total;
++            if (g_pool_ram_scale > 1.0) {
++                g_pool_ram_scale = 1.0;
++            }
++            GGML_LOG_INFO("%s: the host pool does not fit the RAM ceiling: planned %.1f MiB against %.1f MiB "
++                          "(%d%% of MemAvailable), so EVERY table's slots are scaled by %.3f instead of "
++                          "starving the tables that register last (MOE_HOST_POOL_FRAC is a percentage of the "
++                          "model's HOST EXPERT SET, not of RAM; lower it, or raise MOE_HOST_POOL_RAM_PCT, to "
++                          "size this deliberately)\n",
++                          __func__, (double) planned_total / (1024.0 * 1024.0),
++                          (double) g_pool_ram_cap / (1024.0 * 1024.0), g_pool_ram_pct, g_pool_ram_scale);
++        } else {
++            g_pool_ram_scale = 1.0;
++        }
++    }
++    int out = slots;
 +    const int64_t spare = g_pool_ram_cap - g_pool_ram_used;
-+    if (spare <= 0) {
-+        static bool warned_full = false;
-+        if (!warned_full) {
-+            warned_full = true;
-+            GGML_LOG_WARN("%s: the host pool is at its RAM ceiling (%.1f MiB pinned, %d%% of MemAvailable); "
-+                          "layer=%d role=%s gets ONE slot and the rest of its reads take the bounce path.  "
-+                          "Lower MOE_HOST_POOL_FRAC (or raise MOE_HOST_POOL_RAM_PCT) if that is not what you "
-+                          "want.\n", __func__, (double) g_pool_ram_used / (1024.0 * 1024.0), g_pool_ram_pct,
-+                          t.layer, t.role.c_str());
++    if (g_pool_ram_scale < 1.0) {
++        out = (int) ((double) slots * g_pool_ram_scale);
++        if (out < 1) {
++            out = 1;    // the floor is kept only where the ceiling cannot cover even one slot
 +        }
-+        return 1;
 +    }
-+    const int fit = (int) (spare / (int64_t) host_bytes);
-+    if (fit < slots) {
-+        static bool warned_trim = false;
-+        if (!warned_trim) {
-+            warned_trim = true;
-+            GGML_LOG_WARN("%s: trimming the host pool to the RAM ceiling: layer=%d role=%s would take %d "
-+                          "slots (%.1f MiB) but only %.1f MiB of the %d%% MemAvailable ceiling is left; using "
-+                          "%d.  MOE_HOST_POOL_FRAC=%d is a percentage of the model's HOST EXPERT SET, not of "
-+                          "RAM -- lower it (or raise MOE_HOST_POOL_RAM_PCT) to size this deliberately.\n",
-+                          __func__, t.layer, t.role.c_str(), slots,
-+                          (double) slots * (double) host_bytes / (1024.0 * 1024.0),
-+                          (double) spare / (1024.0 * 1024.0), g_pool_ram_pct, fit, g_pool_frac);
++    // Backstop: the proportional target can still overshoot (the one-slot floor, and slot rounding across
++    // 144+ tables).  If this table would cross the ceiling, shave it to what actually fits; only a table that
++    // cannot fit at all falls to the floor.
++    if (spare <= 0 || (int64_t) out * (int64_t) host_bytes > spare) {
++        const int fit = spare > 0 ? (int) (spare / (int64_t) host_bytes) : 0;
++        if (fit < out) {
++            static bool warned_trim = false;
++            if (!warned_trim) {
++                warned_trim = true;
++                GGML_LOG_INFO("%s: the RAM ceiling still binds after the proportional scale (layer=%d "
++                              "role=%s: %d slots wanted, %d fit in the %.1f MiB left); one-slot floor applies "
++                              "to the remainder\n",
++                              __func__, t.layer, t.role.c_str(), out, fit, (double) spare / (1024.0 * 1024.0));
++            }
++            out = fit < 1 ? 1 : fit;
 +        }
-+        slots = fit < 1 ? 1 : fit;
 +    }
-+    g_pool_ram_used += (int64_t) slots * (int64_t) host_bytes;
-+    return slots;
++    g_pool_ram_used += (int64_t) out * (int64_t) host_bytes;
++    return out;
 +}
 +
 +// The pool for `t`'s host tensor, created lazily and shared by every per-device table of that tensor.
@@ -62075,9 +62402,10 @@ index 000000000..334931ecd
 +        }
 +    }
 +    int slots = 0;
++    int64_t planned_pool = g_pool_total_bytes > 0 ? g_pool_total_bytes
++                                                 : (host_total * g_pool_frac) / 100;
 +    // TODO #87 (1): decide the fill mode before ANY read happens, from the process-wide numbers.
-+    pool_decide_dio_locked(host_total, g_pool_total_bytes > 0 ? g_pool_total_bytes
-+                                                             : (host_total * g_pool_frac) / 100);
++    pool_decide_dio_locked(host_total, planned_pool);
 +    if (g_pool_total_bytes > 0) {
 +        // explicit process-wide budget, split proportionally to each tensor's share of the host set
 +        if (host_total > 0) {
@@ -62085,8 +62413,18 @@ index 000000000..334931ecd
 +        } else {
 +            slots = (int) (((int64_t) g_pool_total_bytes / (int64_t) n_hosts) / (int64_t) t.host_bytes);
 +        }
++    } else if (g_pool_sizing == 1) {
++        // wip/host-pool-speed: per-table sizing from routing concentration, same total byte budget.
++        pool_fit_cov_locked();
++        const auto cs = g_pool_cov_slots.find(key);
++        slots = cs != g_pool_cov_slots.end() ? cs->second : (int) ((int64_t) t.n_experts * g_pool_frac / 100);
 +    } else {
 +        slots = (int) ((int64_t) t.n_experts * g_pool_frac / 100);
++    }
++    if (g_pool_total_bytes <= 0 && g_pool_sizing == 1 && g_pool_cov_bytes > 0) {
++        // The fit is the plan that ran: the ceiling's denominator must be what it actually planned, or a
++        // ceiling-fitted `cov` plan is scaled a second time here.
++        planned_pool = g_pool_cov_bytes;
 +    }
 +    if (slots < 1) {
 +        slots = 1;   // a pool that cannot hold one expert cannot replace the master
@@ -62094,7 +62432,7 @@ index 000000000..334931ecd
 +    if (slots > t.n_experts) {
 +        slots = t.n_experts;
 +    }
-+    slots = pool_clamp_slots_to_ram(slots, t.host_bytes, t);
++    slots = pool_clamp_slots_to_ram(slots, t.host_bytes, planned_pool, t);
 +    GGML_LOG_INFO("%s: host pool (%s): %zu host tensors, %lld MiB host expert bytes; layer=%d role=%s -> "
 +                  "%d/%d slots of %zu B (%.1f MiB)\n",
 +                  __func__,
@@ -62184,9 +62522,16 @@ index 000000000..334931ecd
 +// them under pressure and re-faults from the GGUF -- the disk tier).  `MOE_HOST_POOL_DIO=1` keeps the file
 +// read with O_DIRECT, which is the only mode that bypasses the page cache.  Caller holds `g_mutex`.
 +static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
++    // wip/host-pool-speed: the fill's WALL TIME, by source.  A demand fill is synchronous (the host thread
++    // blocks on it), so this is the number that decides whether an overlapped/coalesced fill is worth
++    // building at all (README §16).  Two clock reads per fill: fills are ~1 per miss, so this is free.
++    const int64_t t0 = ggml_time_us();
 +    const size_t rel = (size_t) expert * p.host_bytes;
 +    if (!g_pool_dio && p.src_host != nullptr) {
 +        memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
++        g_fill_memcpy_calls++;
++        g_fill_memcpy_us += ggml_time_us() - t0;
++        g_fill_total_bytes += (int64_t) p.host_bytes;
 +        return true;
 +    }
 +    if (p.fd < 0) {
@@ -62199,6 +62544,9 @@ index 000000000..334931ecd
 +    const size_t off = p.file_offs + rel;
 +    const bool ok = g_pool_dio ? pool_dio_read(p.fd, dst, p.host_bytes, off, p.align)
 +                               : (pool_pread(p.fd, dst, p.host_bytes, off) == (pool_ssize_t) p.host_bytes);
++    g_fill_read_calls++;
++    g_fill_read_us += ggml_time_us() - t0;
++    g_fill_total_bytes += (int64_t) p.host_bytes;
 +    // Diagnostic (`MOE_HOST_POOL_VERIFY=1`): the slot must hold exactly the expert's bytes as they appear in
 +    // the file mapping.  A mismatch means the pool read landed on the wrong offset/length -- the classic
 +    // O_DIRECT alignment bug -- and would otherwise surface as corrupt generated text much later.
@@ -62612,6 +62960,14 @@ index 000000000..334931ecd
 +        }
 +        return i;
 +    }
++    // wip/host-pool-speed: MEASURED, and deliberately NOT capped.  The grow-on-demand ring was suspected of
++    // unbounded growth (charter §4.4 / PR #267's 0010), and it does hold 2.2-3.0 GiB of pinned bounce on the
++    // 122B -- but the memory is the PREFILL MISS path's (one entry per expert in flight while a whole table's
++    // miss set is read), and capping it costs 8-25 % of prefill at FRAC 80 (cap 8: prefill 573-644 vs 759-763;
++    // cap 4: 870-891; cap 2: 846-839, all against 918-921 at FRAC 100 where nothing binds).  The scheduler-copy
++    // path never exceeds ~5 entries, so a cap there is inert.  The fix for the memory is fewer, LARGER fills
++    // (coalesce a run of consecutive missing experts into one pinned read), not a smaller ring -- see
++    // wip/host-pool-speed README §16.
 +    device_guard dg(t.device);
 +    void *      mem = nullptr;
 +    cudaEvent_t ev  = nullptr;
@@ -62630,7 +62986,9 @@ index 000000000..334931ecd
 +    b.host = (char *) mem;
 +    b.ev   = ev;
 +    b.busy = false;
++    b.seq  = ++g_bounce_seq;
 +    t.bounce.push_back(b);
++    g_bounce_bytes += (int64_t) t.host_bytes;
 +    return (int) t.bounce.size() - 1;
 +}
 +
@@ -62678,11 +63036,19 @@ index 000000000..334931ecd
 +        return true;
 +    }
 +    if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
++        // wip/host-pool-speed: the copy KIND out of the pool.  Default keeps the historical D2D from the
++        // mapped UVA alias (`base_dev`), which is required when the copying device is not the one that
++        // allocated the pool (the portable+mapped alias is the only cross-device source that does not fall
++        // back to a pageable staging memmove).  On a single-GPU arm the same pinned memory is a valid H2D
++        // source, and `cudaMemcpyHostToDevice` is the DMA path the pinned master takes -- so this switch
++        // measures how much of pool mode's decode deficit is the D2D-from-alias copy itself.
++        static const bool pool_h2d = getenv("MOE_HOST_POOL_H2D") != nullptr;
 +        int    s = -1;
 +        char * p = pool_peek_locked(*pool, expert, &s);
 +        if (p != nullptr && s >= 0) {
-+            out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
-+            out->kind      = cudaMemcpyDeviceToDevice;
++            out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                      : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++            out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
 +            out->pool_slot = s;
 +            out->pool_hit  = true;
 +            return true;
@@ -62690,8 +63056,9 @@ index 000000000..334931ecd
 +        if (allow_empty_fill) {
 +            p = pool_fill_empty_locked(*pool, expert, &s);
 +            if (p != nullptr && s >= 0) {
-+                out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
-+                out->kind      = cudaMemcpyDeviceToDevice;
++                out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                          : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++                out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
 +                out->pool_slot = s;
 +                out->pool_hit  = false;
 +                return true;
@@ -63667,11 +64034,20 @@ index 000000000..334931ecd
 +// parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
 +// thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
 +// thread and dominated the kernel.
++// wip/host-pool-speed (mechanism (b)): the gather resolves a routed expert from THREE sources, all of
++// them safe to read in a kernel on a no-XNACK device: the arena slot (`prs[e] >= 0`), a POOL slot
++// (`prs[e] <= -2`, a `cudaHostAlloc`'d pinned mapping, so no hold is needed), and -- only when the table
++// has no pool, i.e. the legacy pinned-master gather -- the device-readable master.  An expert in NEITHER
++// tier (`prs[e] == -1`) is copied into `dst` by the caller before this kernel runs (`skip_miss`), so the
++// kernel never reads the pageable master: that read is what `INVARIANTS.md` (device-visible host memory
++// must be RESIDENT) forbids.
 +static __global__ void moe_cache_gather_kernel(
 +        char * __restrict__ dst_base, const char * __restrict__ src_base,
 +        const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
 +        int n_used, int n_tok, int n_experts, int n_split,
-+        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis) {
++        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis,
++        const char * __restrict__ arena, const int32_t * __restrict__ prs, int slots,
++        const char * __restrict__ pool_dev, int64_t pool_stride, int skip_miss) {
 +    const int e = blockIdx.x % n_experts;
 +    const int s = blockIdx.x / n_experts;
 +
@@ -63696,7 +64072,22 @@ index 000000000..334931ecd
 +    const int nt  = blockDim.x;
 +    char *       dst = dst_base + (int64_t) e * expert_bytes;
 +    const char * src = src_base + (int64_t) e * host_bytes + src_off;
-+    if (split_axis != 0 || host_pitch == 0) {
++    // A slot source is already in the DESTINATION's layout (the arena slot and the pool slot both hold one
++    // device expert, contiguous `expert_bytes`), so it is always a flat copy.  `src_off`/`host_pitch` only
++    // describe the host master's slice geometry.
++    bool flat = (split_axis != 0 || host_pitch == 0);
++    if (prs != nullptr) {
++        const int r = prs[e];
++        if (r >= 0 && r < slots && arena != nullptr) {
++            src  = arena + (int64_t) r * expert_bytes;
++            flat = true;
++        } else if (r <= -2 && pool_dev != nullptr) {
++            src = pool_dev + (int64_t) (-r - 2) * pool_stride + src_off;
++        } else if (skip_miss) {
++            return;   // the caller already copied this expert into `dst` (it is in neither tier)
++        }
++    }
++    if (flat) {
 +        const int64_t chunk = (expert_bytes + n_split - 1) / n_split;
 +        const int64_t off   = (int64_t) s * chunk;
 +        const int64_t len   = expert_bytes - off;
@@ -63881,6 +64272,9 @@ index 000000000..334931ecd
 +    devremap_free_locked(t);
 +    if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
 +    t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
++    if (t.gprs_dev != nullptr) { (void) cudaFree(t.gprs_dev); t.gprs_dev = nullptr; }
++    t.gprs_n = 0; t.gprs_arena = nullptr; t.gprs_slots = 0;
++    std::fill(t.gprs_last.begin(), t.gprs_last.end(), -1);
 +    free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
 +    (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
 +
@@ -65231,11 +65625,48 @@ index 000000000..334931ecd
 +//     auto floor) and un-size the cache: the arena was sized -- and possibly seated in the movable-boundary
 +//     slab -- for the model that just went away, so the next model sizes on its own first band pass instead
 +//     of silently running uncached.
++// Capture the report's structural aggregates before the tables (and their host pools) are dropped.  Taken once,
++// at the first forget: a per-device teardown still sees every device's table, so the first snapshot is the whole
++// run.  Caller holds `g_mutex`.
++static void report_snapshot_locked() {
++    if (g_report_snap.have) {
++        return;
++    }
++    g_report_snap.have = true;
++    for (const table_t & t : g_tables) {
++        g_report_snap.hits += t.hits;
++        g_report_snap.misses += t.misses;
++        g_report_snap.fills += t.fills;
++        g_report_snap.evictions += t.evictions;
++        if (t.slots > 0) {
++            g_report_snap.n_tables++;
++            g_report_snap.n_slots += t.slots;
++            if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES) {
++                g_report_snap.dev_slots [t.device] += t.slots;
++                g_report_snap.dev_arena [t.device] += (int64_t) t.slots * (int64_t) t.expert_bytes;
++                g_report_snap.dev_tables[t.device]++;
++            }
++        }
++    }
++    g_report_snap.arena_bytes = g_arena_bytes;
++    g_report_snap.n_pools     = (int64_t) g_host_pools.size();
++    for (const auto & kv : g_host_pools) {
++        const host_pool_t & p = kv.second;
++        g_report_snap.p_slots  += p.slots;
++        g_report_snap.p_hits   += p.hits;
++        g_report_snap.p_misses += p.misses;
++        g_report_snap.p_fills  += p.fills;
++        g_report_snap.p_evict  += p.evictions;
++        g_report_snap.p_bytes  += (int64_t) p.slots * (int64_t) p.host_bytes;
++    }
++}
++
 +void moe_cache_forget_all(int device) {
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    if (g_tables.empty()) {
 +        return;
 +    }
++    report_snapshot_locked();   // before anything is un-sized: the exit-time report describes the RUN
 +    std::vector<char> dropped(g_tables.size(), 0);
 +    std::vector<int>  drop;
 +    for (int i = 0; i < (int) g_tables.size(); i++) {
@@ -65837,6 +66268,23 @@ index 000000000..334931ecd
 +// is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
 +// can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
 +// run has to stay byte-identical to the cache-less one.  Returns false before sizing.
++bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
++    // wip/host-pool-speed (#131): a routed expert table whose master is the read-only model MAPPING
++    // (`--host-experts pool`) is a "pool" table; one with a pinned, device-readable master is not.  Called
++    // from the scheduler's split, once per routed expert op, so keep it cheap: a linear scan over the
++    // registered tables (a few hundred) guarded by the same lock the registration uses.
++    if (weight == nullptr || device < 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    for (const table_t & t : g_tables) {
++        if (t.device == device && t.host == (const void *) weight->data) {
++            return !t.host_pinned && t.src_known;
++        }
++    }
++    return false;
++}
++
 +bool moe_cache_has_tables() {
 +    if (!g_enabled) {
 +        return false;
@@ -66348,44 +66796,17 @@ index 000000000..334931ecd
 +        // pinned master has no bytes there either, so the stale destination is the same either way, and a
 +        // pageable copy of that range would read past the mapping.
 +        const size_t n_total = std::min(size, span - off);
++        g_uploadp_calls++;
++        g_uploadp_bytes += (int64_t) n_total;
 +        size_t done = 0;
 +        while (done < n_total) {
 +            const size_t n = std::min(n_total - done, t.host_bytes);
-+            // Acquire a pinned bounce entry, fill it from the mapping, and issue a pinned H2D.
-+            int idx = -1;
-+            for (int i = 0; i < (int) t.bounce.size(); i++) {
-+                if (t.bounce[(size_t) i].busy) {
-+#if defined(GGML_USE_HIP)
-+                    const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
-+#else
-+                    const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
-+#endif
-+                    (void) cudaGetLastError();
-+                    if (!ready) {
-+                        continue;
-+                    }
-+                    t.bounce[(size_t) i].busy = false;
-+                }
-+                idx = i;
-+                break;
-+            }
++            // Acquire a pinned bounce entry, fill it from the mapping, and issue a pinned H2D.  ONE place owns
++            // the ring (`bounce_acquire`: reuse, BOUNDED growth, wait at the cap), so this path and the pool's
++            // fill path cannot disagree about the depth or the pin budget.
++            const int idx = bounce_acquire(t);
 +            if (idx < 0) {
-+                device_guard dg(t.device);
-+                void *      mem = nullptr;
-+                cudaEvent_t ev  = nullptr;
-+                if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
-+                    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-+                    (void) cudaGetLastError();
-+                    if (mem != nullptr) { (void) cudaFreeHost(mem); }
-+                    if (ev  != nullptr) { (void) cudaEventDestroy(ev); }
-+                    return false;
-+                }
-+                bounce_t b;
-+                b.host = (char *) mem;
-+                b.ev   = ev;
-+                b.busy = false;
-+                t.bounce.push_back(b);
-+                idx = (int) t.bounce.size() - 1;
++                return false;
 +            }
 +            char * buf = t.bounce[(size_t) idx].host;
 +            memcpy(buf, s + done, n);
@@ -66475,6 +66896,13 @@ index 000000000..334931ecd
 +    // missing from that set - the arena then covers only the tables some other path happened to
 +    // register (observed: the last layer alone), and the decode band falls below the uncached path.
 +    // Registration is a cheap map insert and does not allocate (the deferred path leaves slots at 0).
++    // wip/host-pool-speed (mechanism (b)): which sources this table has.  A pinned master is device-readable
++    // (the legacy gather).  A POOL-backed table has no device-readable master at all -- its mapping is
++    // pageable -- but it DOES have the pinned pool, whose slots are `cudaHostAlloc`'d and therefore sound to
++    // read from a kernel, plus the arena.  Resolve arena -> pool -> (caller-filled dst), and never the
++    // master.  The pool is looked up under the same lock as the snapshot below.
++    bool          master_readable = false;
++    host_pool_t * gpool           = nullptr;
 +    {
 +        const int layer = name_layer(weight);
 +        if (layer >= 0) {
@@ -66484,12 +66912,19 @@ index 000000000..334931ecd
 +            // safe when the master has a device mapping; for a pageable model mapping the kernel read
 +            // is a fatal page-not-present fault (issue #116).  Decline and let the scheduler's host
 +            // path stage the experts through its pinned scratch instead.
-+            bool accessible = false;
 +            if (table >= 0) {
 +                std::lock_guard<std::mutex> lock(g_mutex);
-+                accessible = g_tables[table].host_dev != nullptr;
++                table_t & t = g_tables[table];
++                master_readable = t.host_dev != nullptr;
++                if (!master_readable) {
++                    host_pool_t * p = table_pool_locked(t);
++                    if (p != nullptr && !p->failed && p->base_dev != nullptr &&
++                        t.src_off + t.expert_bytes <= t.host_bytes) {
++                        gpool = p;
++                    }
++                }
 +            }
-+            if (!accessible) {
++            if (!master_readable && gpool == nullptr) {
 +                return false;
 +            }
 +        }
@@ -66536,14 +66971,133 @@ index 000000000..334931ecd
 +                (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
 +        }
 +    }
++    // wip/host-pool-speed (mechanism (b)): build this call's two-tier residency map for the gather and, for
++    // every routed expert in NEITHER tier, copy it into `dst` from a pinned source (`expert_host_src`:
++    // a pool slot or the per-table bounce) BEFORE the kernel runs.  The kernel then skips those entries, so
++    // no kernel ever reads the pageable mapping.  The snapshot is rebuilt on every call -- it depends on the
++    // pool's slot map, which the demand path changes without bumping `g_write_seq` -- but the H2D is skipped
++    // when the map is unchanged, so a steady ubatch pays one memcmp of `n_experts` int32s.
++    int32_t *      gprs_dev    = nullptr;
++    int            gprs_slots  = 0;
++    const char *   garena      = nullptr;
++    const char *   gpool_dev   = nullptr;
++    int64_t        gpool_stride = 0;
++    int            skip_miss   = 0;
++    if (gpool != nullptr) {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        // The table is identified by its MASTER POINTER (which is also the pool's key), not by geometry:
++        // two tables of one layer share a geometry, and `table_pool_locked()` allocates on a miss, so it
++        // must never be called on a candidate.
++        table_t * tp = nullptr;
++        for (table_t & t : g_tables) {
++            if (t.host == weight->data && t.device == device && t.n_experts == n_experts &&
++                t.host_bytes == host_bytes && (size_t) t.expert_bytes == expert_bytes &&
++                t.src_off == slice_off && t.host_pitch == host_pitch && t.split_axis == split_axis &&
++                t.host_dev == nullptr) {
++                tp = &t;
++                break;
++            }
++        }
++        if (tp == nullptr) {
++            return false;
++        }
++        table_t & t = *tp;
++        if (t.gprs_dev == nullptr || t.gprs_n != (int64_t) n_experts) {
++            if (t.gprs_dev != nullptr) {
++                (void) cudaFree(t.gprs_dev);
++                t.gprs_dev = nullptr;
++            }
++            if (cudaMalloc((void **) &t.gprs_dev, (size_t) n_experts * sizeof(int32_t)) != cudaSuccess) {
++                (void) cudaGetLastError();
++                t.gprs_dev = nullptr;
++                return false;
++            }
++            t.gprs_n     = n_experts;
++            t.gprs_arena = nullptr;
++            t.gprs_slots = 0;
++            t.gprs_last.assign((size_t) n_experts, INT32_MIN);   // force the first upload
++        }
++        if ((int) t.gprs_host.size() != n_experts) {
++            t.gprs_host.assign((size_t) n_experts, -1);
++        } else {
++            std::fill(t.gprs_host.begin(), t.gprs_host.end(), -1);
++        }
++        for (const auto & kv : t.expert_slot) {
++            const int e = kv.first;
++            if (e >= 0 && e < n_experts && kv.second >= 0 && kv.second < t.slots) {
++                t.gprs_host[(size_t) e] = kv.second;
++            }
++        }
++        for (const auto & kv : gpool->expert_slot) {
++            const int e = kv.first;
++            const int s = kv.second;
++            if (e < 0 || e >= n_experts || s < 0 || s >= gpool->slots ||
++                (size_t) s >= gpool->slot_state.size() || gpool->slot_state[(size_t) s] != 1) {
++                continue;
++            }
++            if (t.gprs_host[(size_t) e] < 0) {
++                t.gprs_host[(size_t) e] = -(s + 2);
++            }
++        }
++        if (t.gprs_arena != (void *) t.arena || t.gprs_slots != t.slots ||
++            t.gprs_last.size() != t.gprs_host.size() ||
++            !std::equal(t.gprs_last.begin(), t.gprs_last.end(), t.gprs_host.begin())) {
++            if (cudaMemcpyAsync(t.gprs_dev, t.gprs_host.data(), (size_t) n_experts * sizeof(int32_t),
++                                cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++            t.gprs_last    = t.gprs_host;
++            t.gprs_arena   = (void *) t.arena;
++            t.gprs_slots   = t.slots;
++        }
++        // The experts in neither tier: a pinned bounce / a fresh pool slot, copied straight into the
++        // destination.  Ordered before the kernel by the stream, so the kernel may skip them.
++        cudaError_t err = cudaSuccess;
++        for (int e = 0; e < n_experts && err == cudaSuccess; e++) {
++            if (t.gprs_host[(size_t) e] != -1) {
++                continue;
++            }
++            char * d = (char *) weight_cpy->data + (size_t) e * expert_bytes;
++            expert_src_t hsrc;
++            if (!expert_host_src(t, e, gpool, /*allow_empty_fill*/ true, &hsrc)) {
++                return false;
++            }
++            if (t.split_axis == 0 && t.host_pitch != 0) {
++                const int64_t rows      = (int64_t) (t.host_bytes / t.host_pitch);
++                const int64_t row_bytes = rows > 0 ? (int64_t) (t.expert_bytes / (size_t) rows) : 0;
++                err = cudaMemcpy2DAsync(d, (size_t) row_bytes, hsrc.base + t.src_off, t.host_pitch,
++                                        (size_t) row_bytes, (size_t) rows, hsrc.kind, (cudaStream_t) stream);
++            } else {
++                err = cudaMemcpyAsync(d, hsrc.base + t.src_off, expert_bytes, hsrc.kind, (cudaStream_t) stream);
++            }
++            if (err == cudaSuccess) {
++                expert_src_done(t, gpool, hsrc, stream, /*retire*/ false);
++                g_gather_fills++;
++            }
++        }
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        g_gather_pool++;
++        gprs_dev     = t.gprs_dev;
++        gprs_slots   = t.slots;
++        garena       = (const char *) t.arena;
++        gpool_dev    = (const char *) gpool->base_dev;
++        gpool_stride = (int64_t) gpool->host_bytes;
++        skip_miss    = 1;
++    }
 +    moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 +        (char *) weight_cpy->data, (const char *) weight->data,
 +        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
-+        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis);
++        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis,
++        garena, gprs_dev, gprs_slots, gpool_dev, gpool_stride, skip_miss);
 +    if (cudaGetLastError() != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        return false;
 +    }
++    g_gather_calls++;
 +    return true;
 +}
 +
@@ -67733,44 +68287,60 @@ index 000000000..334931ecd
 +        return;
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    int64_t hits = 0, misses = 0, fills = 0, evictions = 0;
-+    int n_tables = 0, n_slots = 0;
-+    int64_t dev_slots[GGML_CUDA_MAX_DEVICES]  = {0};
-+    int64_t dev_arena[GGML_CUDA_MAX_DEVICES]  = {0};
-+    int     dev_tables[GGML_CUDA_MAX_DEVICES] = {0};
-+    for (const table_t & t : g_tables) {
-+        hits += t.hits; misses += t.misses; fills += t.fills; evictions += t.evictions;
-+        if (t.slots > 0) {
-+            n_tables++; n_slots += t.slots;
-+            if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES) {
-+                dev_slots [t.device] += t.slots;
-+                dev_arena [t.device] += (int64_t) t.slots * (int64_t) t.expert_bytes;
-+                dev_tables[t.device]++;
-+            }
-+        }
++    if (!g_report_snap.have) {
++        report_snapshot_locked();   // no teardown yet (`--help`, a crash handler, a server shutdown)
 +    }
++    const int64_t hits      = g_report_snap.hits;
++    const int64_t misses    = g_report_snap.misses;
++    const int64_t fills     = g_report_snap.fills;
++    const int64_t evictions = g_report_snap.evictions;
++    const int     n_tables  = g_report_snap.n_tables;
++    const int     n_slots   = g_report_snap.n_slots;
++    const int64_t arena_b   = g_report_snap.arena_bytes;
++    const int64_t * dev_slots  = g_report_snap.dev_slots;
++    const int64_t * dev_arena  = g_report_snap.dev_arena;
++    const int     * dev_tables = g_report_snap.dev_tables;
 +    const int64_t total = hits + misses;
 +    const double h = total > 0 ? (double) hits / (double) total : 0.0;
 +    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
 +                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
-+                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
++                  n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
 +    if (g_devremap_calls > 0) {
 +        GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
 +    }
++    if (g_fill_read_calls + g_fill_memcpy_calls > 0) {
++        const double tb = (double) g_fill_total_bytes / (1024.0 * 1024.0 * 1024.0);
++        GGML_LOG_INFO("%s: pool fills: %lld storage reads %.0f ms, %lld mapping memcpys %.0f ms, %.2f GiB total "
++                      "(%.1f MiB/fill, %.0f MiB/s effective)\n",
++                      __func__, (long long) g_fill_read_calls, g_fill_read_us / 1000.0,
++                      (long long) g_fill_memcpy_calls, g_fill_memcpy_us / 1000.0, tb,
++                      tb * 1024.0 / (double) (g_fill_read_calls + g_fill_memcpy_calls),
++                      tb * 1024.0 / (double) std::max<int64_t>((g_fill_read_us + g_fill_memcpy_us) / 1000000, 1));
++    }
++    if (g_uploadp_calls > 0) {
++        GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
++                      "bounce; pinned bounce ring total %.1f MiB\n",
++                      __func__, (long long) g_uploadp_calls, (double) g_uploadp_bytes / (1024 * 1024),
++                      (double) g_bounce_bytes / (1024 * 1024));
++    }
++    if (g_gather_calls > 0) {
++        GGML_LOG_INFO("%s: device gather: %lld calls (%lld pool-backed), %lld routed experts copied into the "
++                      "destination from the bounce/pool-fill path (neither tier)\n",
++                      __func__, (long long) g_gather_calls, (long long) g_gather_pool, (long long) g_gather_fills);
++    }
 +    if (g_pool_enabled) {
-+        int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
-+        for (const auto & kv : g_host_pools) {
-+            const host_pool_t & p = kv.second;
-+            p_slots += p.slots; p_hits += p.hits; p_misses += p.misses;
-+            p_fills += p.fills; p_evict += p.evictions;
-+            p_bytes += (int64_t) p.slots * (int64_t) p.host_bytes;
-+        }
++        const int64_t p_slots  = g_report_snap.p_slots;
++        const int64_t p_hits   = g_report_snap.p_hits;
++        const int64_t p_misses = g_report_snap.p_misses;
++        const int64_t p_fills  = g_report_snap.p_fills;
++        const int64_t p_evict  = g_report_snap.p_evict;
++        const int64_t p_bytes  = g_report_snap.p_bytes;
 +        const int64_t ptot = p_hits + p_misses;
 +        // WARN, not INFO: llama-cli's default threshold filters INFO, so the pool summary was invisible on a
 +        // plain run (it needs `-lv 4`/`-v`).  The pool is a tuning surface, so its summary must be visible.
 +        GGML_LOG_WARN("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
 +                      "fills=%lld evictions=%lld\n",
-+                      __func__, g_host_pools.size(), (long long) p_slots, (double) p_bytes / (1024 * 1024),
++                      __func__, (size_t) g_report_snap.n_pools, (long long) p_slots, (double) p_bytes / (1024 * 1024),
 +                      ptot > 0 ? (double) p_hits / (double) ptot : 0.0, (long long) p_hits, (long long) ptot,
 +                      (long long) p_fills, (long long) p_evict);
 +    }
@@ -68003,10 +68573,10 @@ index 000000000..334931ecd
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..86e3f6c53
+index 000000000..ee357ecbb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,361 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -68183,6 +68753,12 @@ index 000000000..86e3f6c53
 +// host-resident expert weights and can participate in this run).  When false, the cache can never take
 +// an input over, so its fusions must behave exactly as if it were disabled.
 +bool moe_cache_has_tables();
++
++// wip/host-pool-speed (#131): true when the routed expert table backing `weight` on `device` is served by
++// the bounded pinned host POOL (`--host-experts pool`) instead of a pinned master.  The scheduler uses this
++// to send a pool-backed table to the device gather unconditionally: its whole-table staging is the slow
++// path at every width, while the gather reads the two pinned tiers on the device.
++bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device);
 +
 +// True only when EVERY table has a usable arena.  The cache-band fusion guard is global (one answer
 +// for the whole graph) and the gate+up fused kernel indexes the gate lane with the up table's remap, so
@@ -89153,10 +89729,10 @@ index 6c6393d57..8cce74993 100644
  
      void seek(size_t offset, int whence) const;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index a963f2480..c3eb1948d 100644
+index a963f2480..65bdc27fb 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -10,15 +10,62 @@
+@@ -10,15 +10,63 @@
  #include <array>
  #include <cinttypes>
  #include <cstdint>
@@ -89192,8 +89768,9 @@ index a963f2480..c3eb1948d 100644
 +        }
 +        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
 +                       "mapping and every GPU read is served through a bounded pinned pool "
-+                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes, "
-+                       "O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n", func);
++                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes capped "
++                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
++                       func);
 +    }
 +}
 +
@@ -89219,7 +89796,7 @@ index a963f2480..c3eb1948d 100644
  const char * llama_file_version_name(llama_fver version) {
      switch (version) {
          case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
-@@ -97,8 +144,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
+@@ -97,8 +145,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
          throw std::runtime_error(format("invalid split file: %s", path.c_str()));
      }
  
@@ -89230,7 +89807,7 @@ index a963f2480..c3eb1948d 100644
          paths.push_back(std::string(buf.data(), ret));
      }
  
-@@ -540,9 +587,12 @@ llama_model_loader::llama_model_loader(
+@@ -540,9 +588,12 @@ llama_model_loader::llama_model_loader(
          std::vector<std::string> & splits,
          FILE * file,
          llama_load_mode load_mode,
@@ -89243,7 +89820,7 @@ index a963f2480..c3eb1948d 100644
          const llama_model_kv_override * param_overrides_p,
          const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
          : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
-@@ -558,10 +608,26 @@ llama_model_loader::llama_model_loader(
+@@ -558,10 +609,26 @@ llama_model_loader::llama_model_loader(
      }
  
      tensor_buft_overrides = param_tensor_buft_overrides_p;
@@ -89270,7 +89847,7 @@ index a963f2480..c3eb1948d 100644
      if (!fname.empty()) {
          // Load the main GGUF
          struct ggml_context * ctx = NULL;
-@@ -1123,14 +1189,98 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1123,14 +1190,98 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -89371,7 +89948,7 @@ index a963f2480..c3eb1948d 100644
  
          auto it = ctx_map.find(key);
          if (it == ctx_map.end()) {
-@@ -1185,9 +1335,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1185,9 +1336,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -89385,7 +89962,7 @@ index a963f2480..c3eb1948d 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1226,7 +1378,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1226,7 +1379,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          const buft_list_t * buft_list;
          switch (info.layer) {
              case LLM_TENSOR_LAYER_INPUT:
@@ -89397,7 +89974,7 @@ index a963f2480..c3eb1948d 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
-@@ -1241,15 +1396,102 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1241,15 +1397,102 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
          ggml_backend_buffer_type_t buft = nullptr;
  
@@ -89504,7 +90081,7 @@ index a963f2480..c3eb1948d 100644
                          if (use_mmap) {
                              static std::once_flag once;
                              std::call_once(once, [] {
-@@ -1277,8 +1519,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1277,8 +1520,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // avoid using a host buffer when using mmap
@@ -89520,7 +90097,7 @@ index a963f2480..c3eb1948d 100644
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -1336,7 +1584,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1336,7 +1585,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -89534,7 +90111,7 @@ index a963f2480..c3eb1948d 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1349,9 +1602,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1349,9 +1603,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -89559,7 +90136,7 @@ index a963f2480..c3eb1948d 100644
      }
  
      ggml_tensor t_meta = *cur;
-@@ -1374,6 +1640,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1374,6 +1641,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      if (buft == nullptr) {
          return nullptr;
      }
@@ -89569,7 +90146,7 @@ index a963f2480..c3eb1948d 100644
  
      ggml_context * ctx = ctx_for_buft(buft);
  
-@@ -1417,6 +1686,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -1417,6 +1687,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
      }
  }
  
@@ -89585,7 +90162,7 @@ index a963f2480..c3eb1948d 100644
  void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
      // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
      if (use_mmap || lazy.any()) {
-@@ -1436,11 +1714,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1436,11 +1715,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                  }
              }
  
@@ -89602,7 +90179,7 @@ index a963f2480..c3eb1948d 100644
              if (mlock_mmaps) {
                  std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                  mlock_mmap->init(mapping->addr());
-@@ -1456,6 +1737,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1456,6 +1738,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
      }
  }
  
@@ -89616,7 +90193,7 @@ index a963f2480..c3eb1948d 100644
  using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
  
  // merge a list of [first, last) ranges into a sorted, non-overlapping list
-@@ -1573,10 +1861,12 @@ bool llama_model_loader::load_all_data(
+@@ -1573,10 +1862,12 @@ bool llama_model_loader::load_all_data(
      }
      GGML_ASSERT(size_data != 0 && "call init_mappings() first");
  
@@ -89631,7 +90208,7 @@ index a963f2480..c3eb1948d 100644
      constexpr size_t n_buffers = 4;
  
      size_t alignment = 1;
-@@ -1584,8 +1874,17 @@ bool llama_model_loader::load_all_data(
+@@ -1584,8 +1875,17 @@ bool llama_model_loader::load_all_data(
          alignment = std::max(file->read_alignment(), alignment);
      }
  
@@ -89651,7 +90228,7 @@ index a963f2480..c3eb1948d 100644
  
      std::vector<ggml_backend_buffer_t> host_buffers;
      std::vector<ggml_backend_event_t> events;
-@@ -1611,6 +1910,15 @@ bool llama_model_loader::load_all_data(
+@@ -1611,6 +1911,15 @@ bool llama_model_loader::load_all_data(
              return nullptr;
          }
  
@@ -89667,7 +90244,7 @@ index a963f2480..c3eb1948d 100644
          if (buft != ggml_backend_dev_buffer_type(dev)) {
              LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                  ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-@@ -1626,6 +1934,21 @@ bool llama_model_loader::load_all_data(
+@@ -1626,6 +1935,21 @@ bool llama_model_loader::load_all_data(
          }
  
          auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -89689,7 +90266,7 @@ index a963f2480..c3eb1948d 100644
          if (!host_buft) {
              LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                  ggml_backend_dev_name(dev));
-@@ -1634,16 +1957,16 @@ bool llama_model_loader::load_all_data(
+@@ -1634,16 +1958,16 @@ bool llama_model_loader::load_all_data(
  
          // If the backend is supported, create pinned memory buffers and events for synchronisation.
          for (size_t idx = 0; idx < n_buffers; ++idx) {
@@ -89710,7 +90287,7 @@ index a963f2480..c3eb1948d 100644
  
              auto * event = ggml_backend_event_new(dev);
              if (!event) {
-@@ -1705,7 +2028,7 @@ bool llama_model_loader::load_all_data(
+@@ -1705,7 +2029,7 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -89719,7 +90296,7 @@ index a963f2480..c3eb1948d 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -1737,11 +2060,31 @@ bool llama_model_loader::load_all_data(
+@@ -1737,11 +2061,31 @@ bool llama_model_loader::load_all_data(
                      lmlock->grow_to(weight->offs + n_size);
                  }
  
@@ -89754,7 +90331,7 @@ index a963f2480..c3eb1948d 100644
              }
          } else {
              const auto & file = files.at(weight->idx);
-@@ -1821,6 +2164,17 @@ bool llama_model_loader::load_all_data(
+@@ -1821,6 +2165,17 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -89772,7 +90349,7 @@ index a963f2480..c3eb1948d 100644
          size_done += n_size;
      }
  
-@@ -1852,11 +2206,20 @@ bool llama_model_loader::load_all_data(
+@@ -1852,11 +2207,20 @@ bool llama_model_loader::load_all_data(
          // unmap offloaded tensors and metadata
          if (use_mmap) {
              for (uint32_t idx = 0; idx < mappings.size(); idx++) {

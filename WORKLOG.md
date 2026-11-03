@@ -1,3 +1,64 @@
+## 261103.012 (r207) -- DELIVERY: block 12 amended with host-pool-speed (the pool gather default, the RAM-ceiling distribution, the diagnostics)
+
+**Delivery change.**  `wip/host-pool-speed/` is promoted **into block 12** (the pool's block -- no new block: it is
+this block's code, and the campaign's own promotion checklist pointed at the block-12 note).  The set stays
+**16 patches (0000-0015)**; `release.json` is `v16-6050b467c-r207`, tip `3333f387a`, tree
+`3bbd3613abb202de32bb65863a98b42f1ebd6f0f` (unchanged by the fold -- only block 12's commit content moved).  `pinned` (the default `--host-experts` mode) is byte-for-byte
+unchanged; everything here is `--host-experts pool`.  Per-block reference: `patches/README.md` block 12 (`r207` note); the
+measured record is `wip/host-pool-speed/README.md` §18 (four sessions, 1/2/3 x R9700, 122B-A10B).
+
+**What it does.**  (1) A POOL-backed table is served by the device **gather in the prefill band** by default --
+its whole-table staging is the slow path at every width: 3-GPU `pool` FRAC 95 prefill **1507.7-1631.3 t/s** with
+the gather, **16.9** without, against `pinned` 634-638, with decode at parity (67.2-67.7) and **bit-identical
+prefill logits** (KLD -0.000000 / same-top-p 100.000 %).  `GGML_SCHED_DEVGATHER` becomes three-valued (unset =
+pool-backed only, `0` = kill switch, `1`/`force` = the old A/B arm, which costs `pinned` ~47 % prefill at two
+devices, so it is not the default).  (2) `MOE_HOST_POOL_RAM_PCT` now **scales every table** instead of starving the
+registration-order tail (`RAM_PCT=70`: **10.94 -> 17.44 t/s**, +73 % with `SIZING=1` at identical pinned bytes;
+`85`: 19.52 -> 20.97).  (3) `MOE_HOST_POOL_SIZING`/`_COV_PCT` (opt-in): per-table slots from routing
+concentration, +7.5 %/+16.4 % decode at FRAC 80/60 for -13/-15 % prefill.  (4) The pool's diagnostics report the
+RUN (the `atexit` report used to print an emptied cache in every mode), a forced `DIO` logs its mode,
+`bounce_acquire` owns the pinned bounce ring (2209-3108 MiB on the 122B, uncapped on purpose: a cap costs 8-25 %
+prefill at FRAC 80), pool fills are timed by source, and the gather reports its calls.  (5) The dead
+`MOE_HOST_POOL_PREFETCH` is removed (`TODO` #268 closed).
+
+**Block, not a new block (the maintainer's call).**  `261103.011` recommended promoting this as a *new* block 16
+for mechanical simplicity; the maintainer's instruction was to fold it into an existing block, and **block 12** is
+the right home (it owns the pool; the campaign's own promotion checklist named "the block-12 note").  The fold was
+done by moving the candidate commit next to block 12 in the chain and squashing it there: **the resulting tree is
+identical** (`3bbd3613...`), only block 12's commit content and message changed.  Precedent: the same shape was
+resolved the same way at r190, when Goal B's block 16 was folded into block 15.
+
+**Held back deliberately:** `MOE_HOST_POOL_FRAC=100` as the default.  It is +16 % decode over 80 on ONE GPU, but
+the RAM ceiling does not yet reserve the model's own pageable footprint, and on a split 100 % measured **9 %
+slower** than 95 % (4 GiB more pinned, 42 GiB more disk per run), over-committed a 91 GiB box once, and lost to
+80 % on the 1-GPU srv cell.  The default stays 80 and the reasoning is in the code comment + `ENVIRONMENT.md`.
+
+**Measured on a clean box** (after the restart that cleared a tmpfs `/tmp` + a 70 GiB orphan, see 261103.011's
+session note; two runs per arm, `swap 0`, `MemAvailable >= 83.7 GiB`): 3 GPUs `pinned` 67.7/67.3 decode and
+638.2/634.1 prefill vs `pool` FRAC 95 67.7/67.2 and 1631.3/1507.7; pair `pinned` 49.2/49.2 and 1651.4/1642.3 vs
+`pool` 38.5/38.5 and 1446.2/1461.3 (-21.7 % decode, the campaign's open item `TODO` #132); 1 GPU `pinned`
+25.4/25.4 and 724.6/723.2 vs `pool` FRAC 100 23.4/23.4 and 718.3/718.1 (-7.9 %).
+
+**Gates:** greedy text byte-identical across modes on 1/2/3 GPUs (5835 chars `dc178c29fe89`, 6079
+`01607c16b483`, 5917 `5421cf18bed5`; 257 `5531ae33f0f7` on the 64-token oracle) and again on the final tree;
+prefill-logit **KLD -0.000000 / top-p 100.000 %**; MTP four-axis acceptance **identical to 5 decimals** on all
+four axes (0.81370 / 0.75408 / 0.89175 / 0.98148) with `none` == `draft-mtp` text; `llama-batched-bench
+-npl 4,8` pool **338.5/835.8** vs pinned 81.8/136.0 pp t/s (`npl=1` is a tool artefact, see below);
+`check-gpu-faults.sh` clean; `scripts/validate-set.sh` green (17 blocks, applied tree = `release.json.tree` in a
+fresh tarball).
+
+**Two measurement traps recorded** (both cost time this session): (a) `/tmp` on `soar` is **tmpfs** -- run
+artefacts there consume RAM, and with the 122B that pushed the box into swap and produced impossible numbers;
+the campaign now uses `tools/arm-run-261103.sh`, which refuses to record an arm unless the box is clean and logs
+to disk.  (b) `llama-batched-bench` at `-npl 1 -npp 64` reports pool prefill **~1 t/s** (1.00 with the gather,
+0.96 without, i.e. not a path question) while `llama-cli` at the same 64-token width gives 71.2 vs pinned's 33.8
+and `pinned` is itself 3.5x depressed in that tool; at `npl` 4/8 the tool is sane.  Read that gate at `npl >= 4`.
+
+**Open** (`TODO`): #131 (the pool staging path's own root cause; now reachable only via the kill switch -- fix or
+delete), #132 (the pair's synchronous demand read, ~25-30 % overlap ceiling there), #133 (a fully-resident table
+is still re-copied out of the arena per prefill ubatch -- the DEFAULT mode's own prefill defect, up to ~3x, found
+while measuring this block).
+
 ## 261103.011 (wip) -- promotion assessment: the re-base is 207 upstream commits, so promotion and re-base split
 
 No delivery change.  Continues `261103.002`.  Requested work: rebase, gates, promote.

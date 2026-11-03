@@ -262,22 +262,9 @@ call.
   draft matmul wider, so it is a non-goal, not a parked idea.  Record:
   `archive/work/spec-draft-mtp-vocab/VALIDATION-2026-10-22.md` §5.
 
-## 268. `MOE_HOST_POOL_PREFETCH` is a dead knob — re-wire it deliberately or remove it
-
-**Status: open, decision needed (2026-11-02, `wip/host-pool-speed` §15).**  `g_pool_prefetch` is parsed
-(`moe-expert-cache.cu`, `env_int("MOE_HOST_POOL_PREFETCH", 0)`) and **never read**: grep finds only the
-declaration and the parse.  `ENVIRONMENT.md` documents it as a live opt-in ("routing-driven speculative pool
-prefill; off because a long-prompt sweep showed it hurts until the pool nears full residency"), and
-`wip/host-pool-speed/README.md` §4.3 says to re-measure it — which would measure nothing.  Two honest options:
-(a) remove the variable and correct `ENVIRONMENT.md` + the campaign note, or (b) re-wire it in the shape the
-measurement actually supports (a *known-sequence* coalesced readahead ahead of the pool staging sweep, not
-routing speculation — the routing-driven form measured as a net loss when sub-full,
-`archive/work/host-expert-dio-cache/PHASE2B-FINDINGS.md`).  Do not leave a documented no-op in place: a knob
-that silently does nothing is worse than a missing one (`AGENTS.md`, environment-variable policy).
-
 ## 131. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
 
-**Status: the PREFILL REGRESSION IS FIXED in the campaign set (`patches/0006`, 2026-11-03) — `--host-experts pool`
+**Status: FIXED AND SHIPPED in block 12 (amended, r207, 2026-11-03) — `--host-experts pool`
 now gathers a pool-backed table in the prefill band by default, measured 1502.6-1569.2 t/s prefill against
 `pinned`'s 471.8 at three devices with decode at -0.7 %, and 16.9 t/s with the gather switched off
 (`GGML_SCHED_DEVGATHER=0`).  What remains OPEN is the *root cause inside the staging path*: it is still
@@ -289,8 +276,7 @@ device vs a 28.6 GB/s calibration).  Two caveats worth carrying: `GGML_MOE_GATHE
 Hole-B corruption at this width/quant (the control is vacuous — do not cite it), and an earlier `pinned` 75.2 t/s reading **did not reproduce** (three reruns: 394.1 / 425.7 / 425.2 t/s), so the
 arm is stable; any "N x faster than pinned" prefill claim still needs a pinned control from the same group.  The
 `llama-bench pp1024` disagreement (pool 130 ± 73 vs pinned 271 ± 2.5) is open and needs a `-r 3` repeat at
-`-ub 1024`.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
-three-valued `GGML_SCHED_DEVGATHER`) is the maintainer's call.**  Original finding text follows.
+`-ub 1024`.  The `ENVIRONMENT.md` row for the three-valued `GGML_SCHED_DEVGATHER` shipped with it.**  Original finding text follows.
 
 **Found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4), a defect in the DELIVERY's block 12
 code, not in a campaign patch.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
@@ -341,7 +327,7 @@ semantic review, not just a textual merge: **`f5222f25c` "cuda: fuse MoE (MUL_MA
 (the campaign's gather / mapped-host-memory area); also `8fc037672` (Q8_1 correction sum) and `1b6935b22`
 (flash_attn_ext_rows, block 05's area).  Re-base plan: re-cut every block at the new base, per-block build ladder,
 re-record the prefill-logit base on the new base, re-measure the headline arms (a re-base is a decode *and* prefill
-change — `AGENTS.md`), then re-apply the promoted block 16 on top.
+change — `AGENTS.md`), then re-apply block 12's r207 amendment on top.
 
 ## 133. A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch
 

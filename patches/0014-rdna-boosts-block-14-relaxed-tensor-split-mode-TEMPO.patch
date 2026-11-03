@@ -1,4 +1,4 @@
-From 1e26e432cdd173a77e378bd0b347d648849f2ff8 Mon Sep 17 00:00:00 2001
+From f453fc3626d024e3e244d1b4f146e0e6d3be917d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: relaxed-tensor split mode
@@ -68,10 +68,10 @@ mellum/mistral4 at all (enabled by the same change, unvalidated -- no model).
  11 files changed, 130 insertions(+), 16 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 5a3a44ff5..9c613053a 100644
+index 7a9910282..9fe9747b1 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2845,12 +2845,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2846,12 +2846,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -90,7 +90,7 @@ index 5a3a44ff5..9c613053a 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -2860,6 +2864,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2861,6 +2865,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -136,7 +136,7 @@ index db30957cd..4b2783ec4 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index ca66455a2..d929ed5db 100644
+index 070d4952c..562d0a386 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -54,6 +54,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis

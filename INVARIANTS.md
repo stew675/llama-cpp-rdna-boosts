@@ -1486,3 +1486,30 @@ change), and let `WORKLOG.md` carry the narrative.
   The claim is NOT refuted for ROCm **7.14** (the delivery ships both lines) or for the **async-input ring**
   (a shared *destination*, a different failure); `wip/host-expert-eager-push/` P1 settles it in the real path
   before any default flips.
+- **A pool-backed expert table must be served by the device gather in the prefill band; its whole-table staging
+  is the slow path at every width (r207, block 12).**  For `--host-experts pool` the master is the read-only
+  model mapping, so staging a table for a wide ubatch reads the pageable mapping plus the pool's host alias and
+  degrades as coverage rises: on the 122B-A10B across three RDNA4 GPUs (`-ncmoe 48`, 5258-token prompt,
+  `-ub 2048`, 2000-token greedy decode) pool FRAC 80 staged at 134.3 t/s and FRAC 95 at 12.9, against
+  **1507.7-1631.3** with the gather and `pinned`'s 634-638; the same arm with `GGML_SCHED_DEVGATHER=0` collapses
+  to 16.9.  Its prefill logits are **bit-identical** to the staging path (KLD -0.000000 / same-top-p 100.000 %),
+  so this is a transport fact, not a numerics one.  The gate is a **band** one: `n_tokens > moe_cache_band`, because
+  taking the decode band over with the gather costs an order of magnitude (1.2-4.1 t/s) — the decode band is
+  served from the arena by the slot-remap read.  Do not widen the gather to the decode band, and do not make
+  `GGML_SCHED_DEVGATHER=1` (force) the default: it costs a pinned master ~47 % prefill at two devices.
+- **A memory ceiling on a cache must be applied to the DISTRIBUTION, not to whatever registers last (r207, block
+  16).**  `MOE_HOST_POOL_RAM_PCT` shaved the registration-order tail to the one-slot floor: on the 122B at
+  `RAM_PCT=70` that was 26 of 144 tables at one slot and **10.94 t/s**, while 10 % more ceiling decoded 19.52.
+  Scaling every table's slot count by one process-wide factor gave **17.44** at the same pinned bytes (+73 % with
+  `MOE_HOST_POOL_SIZING=1`: 18.92), and `RAM_PCT=85` went 19.52 -> 20.97.  A per-table floor is only defensible
+  where the ceiling cannot cover one slot.  Same rule for a concentration fit: it must be fitted *to* the ceiling,
+  because a uniform rescale of a fitted plan collapses it back to uniform.
+- **At `-ncmoe 48` on a three-device split the expert set is fully VRAM-resident, and the DEFAULT mode still
+  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133).**  The arena sizes to
+  `67110.0 MiB of 67110.0` (256/256 slots/table, identity), yet the prefill stages **61 GiB for a 3049-token
+  prompt** with `arena=61031.5 MiB host=510.5 MiB` — 99.2 % of it read back out of VRAM into the op's per-split
+  weight buffer, once per table per ubatch, serialised against the compute (copy table -> compute -> copy next) at
+  ~8 GB/s aggregate.  Consequences: `pinned` prefill at 3 GPUs (394-426 t/s) is *slower* than at 1 GPU (755.5)
+  despite 3x the VRAM and 3x the compute, and `-sm layer` at 3 GPUs prefills at 944.3 for the same redundant bytes
+  because it issues one staging call per table instead of one per table *per device*.  Host residency is
+  irrelevant to this cost; a fully resident table should serve the prefill op in place.
