@@ -1199,6 +1199,12 @@ first attempt routed *all* pool-table gathers with no band gate and decode fell 
 is served from the arena by the slot-remap read, and the gather must not take it over (`sched_input_gatherable`
 now requires `n_tokens > moe_cache_band`).
 
+**The pair, with the fix (2026-11-03, 2000-token greedy, 5258-token prompt, `-sm tensor`):** `pinned` 1643.9
+prefill / **49.0** decode; `pool` FRAC 80 948.2 / **29.6**; `pool` FRAC 95 1506.2 / **38.5** — text identical across
+all three (`6079 chars sha=01607c16b483`).  So the fix lifts the pair's pool prefill 1024 -> 1506 t/s (+47 %) but
+**the acceptance criterion is met only on the three-device shape** (-0.7 % decode there) and **not on the pair
+(-21 % at FRAC 95)**, where the residual is the synchronous demand read (`TODO` #132), not the gather.
+
 **Is the prefill number real, or is it corruption?**  The code's own history says a gather that looks faster
 than the link can carry is skipping work (`SCHED_GATHER_TABLE_MIN_BYTES`'s comment: the 2026-10-04 numbers were
 "from a *corrupted* gather pass"), so it was attacked with the delivery's prefill oracle rather than with
