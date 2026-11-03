@@ -314,9 +314,11 @@ Text oracle: 150 chars `sha=4ac3a523160f` (Q4_K_M, `pool`, in-mode via `archive/
    over-commits on the pair (and is worse even on the 1-GPU srv cell).  Keep 80 for multi-device, or make the
    default depend on `dev_count`?  *Measured: 3-GPU `FRAC 100` clamps itself to 63832 MiB (the RAM ceiling now
    scales it proportionally, `patches/0005`) and decodes 45.44 against FRAC 80's 49.99 and FRAC 95's 51.03 —
-   i.e. on a big-arena split MORE coverage is better on decode; the ceiling, not a flat FRAC, is the right
-   limiter.  Recommendation: keep one default (`100`) and let the RAM ceiling scale it, rather than branching on
-   `dev_count`.*
+   i.e. on a big-arena split MORE coverage is better on decode, up to where the pinned pool evicts the model's
+   own page cache.  On the pair (W3 build): FRAC 80 26.08 < FRAC 100 29.08 < **FRAC 95 32.02**, and the F100 ->
+   F95 step is 4 GiB less pinned for 42 GiB less disk traffic.  Recommendation: **one default (no `dev_count`
+   branch), but the RAM ceiling must reserve the model's own pageable footprint** before `100` is a good
+   multi-device default (`README.md` §3.2/§18.2 finding D); until then 95 is the better split arm on this box.*
 2. **The gather's promotion shape**: pool-only default (needs the capability predicate), or keep
    `GGML_SCHED_DEVGATHER` opt-in forever?  *Measured: mandatory for `pool` at 3 devices (+66x prefill),
    neutral for `pool` at 2, and **-47 %** for `pinned` at 2.  Recommendation: pool-only default, with the
