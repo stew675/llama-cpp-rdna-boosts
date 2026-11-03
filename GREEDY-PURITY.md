@@ -2265,8 +2265,17 @@ FINDINGS-2026-10-17-coverage-vs-defrag.md` row 3 dissects Strata's `STRATA_ROUTE
 *neither copied nor computed*, its contribution dropped **without renormalisation**, and because it is not a
 lookup it is not counted as a miss either.  It is worth **6.5 points** of that engine's reported hit rate, and in
 the maintainer's own run it silently skipped **201 978 experts in one request** — the same run is 98.4 % as
-reported and **91.9 %** on an apples-to-apples "was the expert resident" basis.  That is the exact measurement
-this rule exists to make unnecessary: the "win" is a metric definition, not a speed-up.
+reported and **91.9 %** on an apples-to-apples "was the expert resident" basis, against **90.6 %** for this
+delivery's own cache at 38.3 % of pairs held, i.e. *within 1-2 points on comparable accounting*.
+
+**Two inflations, and they are not the same thing.**  *The hit rate* is inflated **definitionally**: the skip
+happens before the accounting, so it removes both the fetch and the miss — one cannot miss on an expert one has
+decided not to fetch.  The rest of that engine's "astronomical" figure is not even the skip: it is routing
+concentration (holding 63.7 % of the pairs serves 98 % of the lookups, because the routing distribution is
+extremely peaked).  *The tokens/s* is inflated by **work not done**: the model computing less, not the engine
+computing faster.  So a hit rate from such an engine is not a residency metric at all, and its throughput is not
+comparable to an exact engine's — which is why both strictures in the rule above exist, and why the only fair
+comparison is its switch **off** with both sides on the same accounting.
 
 **Record.**  This entry.  Source analyses: `archive/work/moe-cache-coverage/FINDINGS-2026-10-17-coverage-vs-defrag.md`
 (row 3, the numbers above — do not re-derive them) and `wip/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
