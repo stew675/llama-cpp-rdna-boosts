@@ -80,6 +80,18 @@ decode)
     run_arm pool-cold0-1    MOE_HOST_POOL_FRAC=80 MOE_HOST_POOL_COLD=0 ::: --host-experts pool
     run_arm pinned-2        :::
     ;;
+# Step 0 of the decode-gap decomposition: how much of the pool FRAC 100 deficit is the missing
+# GGML_MOE_DEVREMAP (r203 measured +8.1 % on soar), and how much is the copy kind / pool path overhead?
+# Needs the working tree carrying patches/h2d-experiment.patch (MOE_HOST_POOL_H2D).
+step0)
+    run_arm pinned            :::
+    run_arm pinned-noremap    GGML_MOE_DEVREMAP=0 :::
+    run_arm pool-fr100        MOE_HOST_POOL_FRAC=100 ::: --host-experts pool
+    run_arm pool-fr100-h2d    MOE_HOST_POOL_FRAC=100,MOE_HOST_POOL_H2D=1 ::: --host-experts pool
+    run_arm pinned-noremap-2  GGML_MOE_DEVREMAP=0 :::
+    run_arm pool-fr100-2      MOE_HOST_POOL_FRAC=100 ::: --host-experts pool
+    run_arm pool-fr100-h2d-2  MOE_HOST_POOL_FRAC=100,MOE_HOST_POOL_H2D=1 ::: --host-experts pool
+    ;;
 # one pool arm, for the mechanism (a) exposure counters (the pageable-master fallback path).
 pool)
     run_arm pool-frac80     MOE_HOST_POOL_FRAC=80  ::: --host-experts pool

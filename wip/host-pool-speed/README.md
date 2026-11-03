@@ -823,3 +823,70 @@ is still **-11 %** (srv cell, FRAC 80) to **-22 %** (122B, FRAC 100) behind `pin
 What changed is that the *prefill* half of the acceptance argument is settled and the gather removed a `#266`
 dependency (`MOE_HOST_POOL_COLD`).  The remaining decode gap is the pool's own demand path, i.e. P0-a
 (`GGML_MOE_DEVREMAP` over pool slots), which this session did not start.
+
+## 15. Step 0 — where the decode gap actually is (measured 2026-11-02, later the same session)
+
+The plan was "close the ~8 % `GGML_MOE_DEVREMAP` gap on pool tables (P0-a) and then re-measure".  **Step 0 says
+that is the wrong order**: the remap is worth a third of what the campaign assumed on this host, and ~18 % of the
+pool's decode deficit is not any of the explanations on the table.  All arms below are the 122B reference arm
+(`-ncmoe 48`, 5258-token prompt, 1862-token greedy decode), alternating, same binary (`6e2b58c83`'s tree, plus
+`patches/h2d-experiment.patch` applied to the working tree for the H2D arm and reverted after).
+
+| arm | decode t/s | prefill t/s | disk/run | arena hit |
+|---|---|---|---|---|
+| `pinned` (remap on, the delivery default) | **32.77** | 1024.0 | 70.1 GiB | 0.7544 |
+| `pinned`, `GGML_MOE_DEVREMAP=0` ×2 | **31.73 / 31.63** | 1026.2 / 1007.1 | 72.7 / 64.5 | 0.7537 |
+| `pool` FRAC 100 ×2 | **26.12 / 25.73** | 918.1 / 920.7 | 101.2 / 101.0 | 0.9131 / 0.9136 |
+| `pool` FRAC 100 + `MOE_HOST_POOL_H2D=1` ×2 | 25.90 / 25.85 | 915.6 / 914.8 | 95.1 / 95.1 | 0.9132 / 0.9139 |
+
+1. **The remap is worth ~+3.3 % here, not +8.1 %** (32.77 vs 31.68 mean).  P0-a's whole ceiling on this arm is
+   ~1.1 t/s.  It stays worth doing for `#266`'s sake, but it is **demoted from the campaign's top item** — the
+   r203 +8.1 % was measured on a different box, a different model and the 35B-A3B cell.
+2. **The copy kind is nil** (25.90/25.85 vs 26.12/25.73), confirming session 2's H2D A/B — the D2D-from-alias
+   hypothesis is dead a second time, now at full coverage.
+3. **~18 % remains unexplained** (25.9 against 31.7 with the remap excluded).  And it is *not* traffic: identical
+   arena (22517.6 MiB), identical reaches (2 150 688/turn), the pool arm has **more** arena hits, moves **fewer**
+   bytes (943.8 GiB vs 962.2 GiB of expert traffic) and reads **fewer** bytes from disk.  So it is not coverage,
+   not copies, not the page cache.
+
+### 15.1 The first instrument that localises it: a per-kernel trace
+
+`perf` on the host thread is uninformative (the process is mostly idle: 64 % of its CPU cycles are ROCr's
+`AsyncEventsLoop`, 22 % `__memmove`, i.e. no host bottleneck to remove).  `rocprofv3 --kernel-trace` on a
+**pure-decode** workload (`-c 4096`, `-n 128`, short prompt) does localise it — same graph, same dispatch
+counts, per-kernel durations compared:
+
+| kernel | pool s | pinned s | n (both) | per-dispatch pool / pinned |
+|---|---|---|---|---|
+| `mul_mat_vec_q_moe<q4_K,2>` | 0.492 | 0.435 | 6 296 | 78.1 / 69.1 µs |
+| `mul_mat_vec_q_ksplit<Q8_0,…>` | 0.434 | 0.413 | 5 295 | 81.9 / 78.0 µs |
+| **`__amd_rocclr_fillBufferUnAligned`** | **0.162** | **0.035** | 441 | **367.2 / 78.5 µs (4.7x)** |
+| `__amd_rocclr_copyBuffer` | 0.065 | 0.029 | 20 691 / 13 281 | 3.1 / 2.2 µs |
+| `mul_mat_q<q8_0,16>` | 0.029 | 0.013 | 297 | 97.0 / 42.8 µs |
+| total GPU kernel time | **1.932** | **1.629** | 104 116 / 96 706 | (+18.6 %, matching the wall gap) |
+
+Read it as: **the wall gap is GPU work, and 42 % of the delta is one runtime kernel** (`fillBufferUnAligned`,
++0.127 s of the +0.303 s) **whose dispatch count does not change at all** — plus **58 extra `copyBuffer` calls
+per decode step** (161 vs 103; the pool's fetch path is per-expert) and a 5-16 % per-dispatch slowdown on the two
+routed matvec kernels.  `fillBufferUnAligned` at 367 µs is far too big to be a guard pad; identifying what fills
+~MBs per step in the pool arm and why the same 441 dispatches cost 4.7x is **the next concrete action**, ahead of
+P0-a.
+
+### 15.2 What this means for the plan
+
+- **P0-a is demoted** (~1.1 t/s ceiling here).  It is still the piece `#266`'s removal needs, so it is worth doing
+  eventually — but it is no longer the thing that moves the acceptance criterion.
+- **The new P0 is the residual 18 %**, starting with `fillBufferUnAligned`.
+- The measurement also retires one more campaign assumption: `MOE_EXPERT_CACHE_COLD=uva` is default-on and
+  **20.5 % of reaches are served cold** (441 399 cold reaches/turn, 801 GiB of the 944 GiB of expert traffic) in
+  *both* modes — so the cold path, not the fill path, is where the bytes are.  Anything that changes cold-read
+  behaviour is a decode-band change and needs the same gates.
+
+The trace CSVs are 40-75 MB each and are **not** committed; regenerate a pair and summarise them with
+`tools/rocprof-summarise.py k-pool_kernel_trace.csv k-pinned_kernel_trace.csv`, which reproduces the table above
+(use a short prompt and `-n 128`, or a prefill floods the trace with `moe_cache_stage_kernel`).
+
+**Instrument note (for the next session):** `perf record` works here without `--call-graph` (`perf_event_paranoid`
+is 2, so `-g` is refused — do not raise it silently); `rocprofv3 --kernel-trace -f csv` works and the per-kernel
+durations are comparable **only** as durations (the tracer distorts the achieved rate badly: 13.3 vs 27.2 t/s on
+the same two arms, so never quote a t/s from a traced run).

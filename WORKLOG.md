@@ -1,3 +1,48 @@
+## 261102.017 (wip) -- Step 0: the remap is worth +3.3 % on this host (not +8.1), the copy kind is nil, and ~18 % of the pool's decode gap is GPU work in one runtime kernel
+
+No delivery change.  Continues `261102.016`.  Record: `wip/host-pool-speed/README.md` §15, data
+`data/20261102-session3-step0`, `data/20261102-session3-profile`.
+
+**Why it was run.** The plan going in was "close the ~8 % `GGML_MOE_DEVREMAP` gap on pool tables (P0-a), then
+re-measure".  One 15-minute measurement re-ordered the campaign instead.  122B reference arm (`-ncmoe 48`,
+5258-token prompt, 1862-token greedy decode), alternating, one binary:
+
+| arm | decode t/s | prefill t/s |
+|---|---|---|
+| `pinned` (remap on) | 32.77 | 1024.0 |
+| `pinned`, `GGML_MOE_DEVREMAP=0` x2 | 31.73 / 31.63 | 1026.2 / 1007.1 |
+| `pool` FRAC 100 x2 | 26.12 / 25.73 | 918.1 / 920.7 |
+| `pool` FRAC 100 + `MOE_HOST_POOL_H2D=1` x2 | 25.90 / 25.85 | 915.6 / 914.8 |
+
+**The remap is worth +3.3 % here, not +8.1 %** (32.77 vs 31.68), so P0-a's ceiling on this arm is ~1.1 t/s: it is
+demoted from the campaign's top item (the r203 figure came off a different box, model and cell).  The copy kind is
+**nil** a second time (H2D 25.90/25.85 vs D2D 26.12/25.73), now at full coverage.  And **~18 % is unexplained** --
+and not by traffic: identical arena (22517.6 MiB), identical reaches (2 150 688/turn), *more* arena hits, **fewer**
+expert bytes moved (943.8 vs 962.2 GiB) and fewer disk bytes than the pinned arm.
+
+**Localised with the right instrument.** `perf` on the host thread is a dead end (the process is mostly idle: 64 %
+of its CPU cycles are ROCr `AsyncEventsLoop`, 22 % `__memmove`).  `rocprofv3 --kernel-trace` on a pure-decode
+workload compares per-kernel durations with identical dispatch counts:
+
+* **`__amd_rocclr_fillBufferUnAligned`: 367.2 vs 78.5 us per dispatch, 441 dispatches in BOTH arms** -- +0.127 s of
+  the +0.303 s GPU-time delta, i.e. **42 % of the residual**, with no change in how often it runs;
+* **58 extra `__amd_rocclr_copyBuffer` calls per decode step** (161 vs 103) -- the pool's per-expert fetch path;
+* the two routed matvec kernels 5-16 % slower per dispatch (78.1 vs 69.1 us, 81.9 vs 78.0 us).
+
+So the new P0 is the residual 18 %, starting with "what fills ~MBs per decode step in the pool arm, and why do the
+same 441 fills cost 4.7x".  P0-a still has to happen for `#266`'s removal (pool slots are pinned, so the in-place
+read is sound) -- it just is not what moves the acceptance criterion.
+
+**Also retired:** `MOE_EXPERT_CACHE_COLD=uva` is default-on and **20.5 % of reaches are served cold** in both modes
+(441 399 cold reaches/turn, 801 GiB of the 944 GiB of expert traffic) -- the cold path, not the fill path, is where
+the bytes are.  **And found:** `MOE_HOST_POOL_PREFETCH` is a **dead parse** (set at init, never read) while
+`ENVIRONMENT.md` documents it as a live opt-in -- recorded as `TODO.md` #268 (re-wire deliberately or remove; do not
+leave a documented no-op).
+
+**Instrument notes for the next session:** `perf record` works here but `-g` is refused (`perf_event_paranoid`=2 --
+do not raise it silently); `rocprofv3 --kernel-trace -f csv` works and its durations are comparable, but its
+achieved rate is not (13.3 vs 27.2 t/s on the same two arms), so never quote a t/s from a traced run.
+
 ## 261102.016 (wip + one delivery script) -- `gate-prefill-logits.sh --extra` committed; an external pipelined-staging proposal reviewed and recorded
 
 **Delivery script change (committed with the maintainer's go-ahead):** `scripts/gate-prefill-logits.sh` gains

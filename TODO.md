@@ -251,6 +251,19 @@ call.
   draft matmul wider, so it is a non-goal, not a parked idea.  Record:
   `archive/work/spec-draft-mtp-vocab/VALIDATION-2026-10-22.md` §5.
 
+## 268. `MOE_HOST_POOL_PREFETCH` is a dead knob — re-wire it deliberately or remove it
+
+**Status: open, decision needed (2026-11-02, `wip/host-pool-speed` §15).**  `g_pool_prefetch` is parsed
+(`moe-expert-cache.cu`, `env_int("MOE_HOST_POOL_PREFETCH", 0)`) and **never read**: grep finds only the
+declaration and the parse.  `ENVIRONMENT.md` documents it as a live opt-in ("routing-driven speculative pool
+prefill; off because a long-prompt sweep showed it hurts until the pool nears full residency"), and
+`wip/host-pool-speed/README.md` §4.3 says to re-measure it — which would measure nothing.  Two honest options:
+(a) remove the variable and correct `ENVIRONMENT.md` + the campaign note, or (b) re-wire it in the shape the
+measurement actually supports (a *known-sequence* coalesced readahead ahead of the pool staging sweep, not
+routing speculation — the routing-driven form measured as a net loss when sub-full,
+`archive/work/host-expert-dio-cache/PHASE2B-FINDINGS.md`).  Do not leave a documented no-op in place: a knob
+that silently does nothing is worse than a missing one (`AGENTS.md`, environment-variable policy).
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship
