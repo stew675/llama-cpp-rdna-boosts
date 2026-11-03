@@ -36,6 +36,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **131** | `--host-experts pool` prefill collapsed under a >=3-device `-sm tensor` split (block 12's staging path; root cause still unidentified) | performance (delivery defect) | **FIXED BY DEFAULT in `patches/0006`** (pool tables gather in the prefill band: 1502-1569 vs `pinned` 471.8 prefill, decode -0.7 %; the kill switch reproduces 16.9 t/s).  **Open:** the staging path's own cost, and the promotion.  See §131 |
 | **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
 | **133** | A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch — 3-GPU `pinned` prefill is *slower* than 1-GPU (471-607 vs 755.5 t/s) at 100 % arena residency | performance (delivery defect, default mode) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §133 |
+| **134** | Re-base the delivery onto upstream `6b9c0cfcb` (207 commits; block 00 conflicts; two overlapping upstream commits to review) | provenance / maintenance | **OPEN — its own release** (2026-11-03, `WORKLOG` 261103.003).  See §134 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -328,6 +329,19 @@ is now a bigger prize than the tensor-split remap (`#269`, +3.3 %).  Protocol: r
 `scripts/moe-trace-replay.py` first (`wip/host-pool-speed` §9.6 — an overlap does not change placement, so the
 model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
 gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
+
+## 134. Re-base the delivery onto upstream `6b9c0cfcb` — 207 commits, block 00 conflicts immediately
+
+**Status: open, assessed 2026-11-03 (`WORKLOG.md` 261103.003).  Deferred out of the promotion session by design: it
+is its own release.**  `6050b467c..upstream/master` = **207 commits**; `git am -3` of the delivery onto the new tip
+fails at **block 00** (`ggml/src/ggml-cuda/mmq.cu`, `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`,
+`src/llama-model.cpp`, `src/llama-vocab.cpp`).  Two upstream commits overlap this campaign's mechanisms and need a
+semantic review, not just a textual merge: **`f5222f25c` "cuda: fuse MoE (MUL_MAT_ID) gate/up and GLU in MMQ"**
+(the delivery's MoE/MUL_MAT_ID area) and **`740251a92` "cuda: gather batched tensor reads into mapped host memory"**
+(the campaign's gather / mapped-host-memory area); also `8fc037672` (Q8_1 correction sum) and `1b6935b22`
+(flash_attn_ext_rows, block 05's area).  Re-base plan: re-cut every block at the new base, per-block build ladder,
+re-record the prefill-logit base on the new base, re-measure the headline arms (a re-base is a decode *and* prefill
+change — `AGENTS.md`), then re-apply the promoted block 16 on top.
 
 ## 133. A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch
 
