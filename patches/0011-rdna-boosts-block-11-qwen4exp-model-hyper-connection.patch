@@ -1,4 +1,4 @@
-From a7f1858fe7eb8ffd878cab932b261f1e79bb3f61 Mon Sep 17 00:00:00 2001
+From 13bc89642ba102430e733eb0e2c714d162f00be3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -107,12 +107,12 @@ nothing.
  src/llama-model.h                        |    1 +
  src/llama.cpp                            |   18 +-
  src/models/models.h                      |   62 +-
- src/models/qwen4exp.cpp                  | 2335 ++++++++++++++++++----
+ src/models/qwen4exp.cpp                  | 2338 ++++++++++++++++++----
  tests/CMakeLists.txt                     |    3 +
  tests/test-backend-ops.cpp               |  467 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   12 +-
- 46 files changed, 12088 insertions(+), 433 deletions(-)
+ 46 files changed, 12091 insertions(+), 433 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -10517,7 +10517,7 @@ index 59a4e5703..9bbd1f4c4 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 1f3b1cdef..2189c11bb 100644
+index 1f3b1cdef..fc4f4979b 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,330 @@
@@ -13111,7 +13111,7 @@ index 1f3b1cdef..2189c11bb 100644
      const int64_t n_prev   = n_gram - 1;
  
      std::vector<int32_t> idx(n_heads * n_tokens);
-@@ -1363,29 +2912,79 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1363,29 +2912,82 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
          }
  
          for (int64_t n = 2; n <= n_gram; ++n) {
@@ -13181,6 +13181,9 @@ index 1f3b1cdef..2189c11bb 100644
 +                }
 +            }
 +        }
++#elif defined(_WIN32)
++        // same batch on Windows: one PrefetchVirtualMemory call over the merged rows
++        llama_prefetch_rows(tab, idx.data(), idx.size());
 +#endif
 +
 +        emb_scratch.resize(idx.size() * (size_t) dim);
@@ -13202,7 +13205,7 @@ index 1f3b1cdef..2189c11bb 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1438,7 +3037,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1438,7 +3040,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                  conv_states_all->nb[1],
                  (slot * mem_size + kv_head) * row_size);
  
@@ -13214,7 +13217,7 @@ index 1f3b1cdef..2189c11bb 100644
      }
  
      return conv_input;
-@@ -1449,7 +3051,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1449,7 +3054,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      const int64_t n_heads = hparams.ple_n_heads;
  
      // the attention cells see every ubatch regardless of the layer types

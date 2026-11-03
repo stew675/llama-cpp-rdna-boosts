@@ -1,3 +1,60 @@
+## 261103.014 (r209) -- DELIVERY: Windows host memory folded into blocks 09/11/12/15 (PR #269)
+
+**Delivery change.**  PR #269 (`@overdoingism`, `wip/windows-host-memory/`) is **folded into the blocks that own
+each concern**, not merged as a fourth source area: the set stays **16 patches (0000-0015)** and `release.json` is
+`v16-6050b467c-r209`, tip `27271aa91`, tree `8c6c992db70cb2316bf1ef66b0702f124454b336`.  Placement: **block 09**
+the WDDM free-VRAM figure (`vendors/hip.h` + the new `ggml-cuda/wddm-mem.cu`) and the Windows working-set release
+in `llama-mmap.cpp`; **block 11** the qwen4exp PLE prefetch; **block 12** the host pool's available-RAM figure;
+**block 15** the KV spill ceiling's.  Per-block reference: `patches/README.md` (r209 notes in 09/11/12/15);
+variables: `ENVIRONMENT.md` (`GGML_CUDA_WDDM_FREE`, plus Windows notes on `LLAMA_LOAD_RELEASE_MMAP`,
+`MOE_HOST_POOL_DIO`/`_RAM_PCT`, `LLAMA_KV_SPILL_RAM_PCT`); facts: `INVARIANTS.md` (four r209 entries).
+
+**What it does (all Windows-only, `_WIN32`-gated).**  (1) `cudaMemGetInfo` returns the smaller of HIP's free
+figure and the adapter's WDDM figure (`D3DKMTQueryStatistics` over the non-aperture segments,
+`CommitLimit - BytesResident`, adapter by LUID, entry point resolved from `gdi32.dll` at run time), so the slab,
+the expert-cache sizing, `--fit` and `GGML_CUDA_MIN_FREE_MIB` stop believing another process's memory is free
+(issue #216); `GGML_CUDA_WDDM_FREE=0` keeps HIP's.  It makes the figure honest and **does not** make an
+overcommit fail, so `TODO` #216's accepted limitation is unchanged.  (2) the host pool and the KV spill ceiling
+read `GlobalMemoryStatusEx().ullAvailPhys` instead of `-1`; before this the pool always resolved
+`MOE_HOST_POOL_DIO` to `O_DIRECT` and neither RAM ceiling applied.  (3) `llama_mmap::unmap_fragment` drops the
+range from the working set (`VirtualUnlock`) instead of being a no-op, so the r49 per-tensor release and the
+end-of-load release actually free the pages of an uploaded tensor.  (4) the qwen4exp host-resident PLE gather
+prefetches its ubatch through `llama_prefetch_rows`, the helper gemma4 and deepseek41 already use.
+
+**Why folding it is safe on Linux: measured, not argued.**  Every changed translation unit was preprocessed with
+the delivery's own compile commands (`build-rocm/compile_commands.json`, `-E -P`) on the r208 tree and on the
+folded tree: `ggml-cuda.cu`, `moe-expert-cache.cu`, `src/llama-mmap.cpp` and `src/models/qwen4exp.cpp` are
+**identical token streams apart from `__FILE__`/`__LINE__` strings**, the only header edit (`vendors/hip.h`) is
+inside `#if defined(_WIN32)` so it cannot affect a non-Windows preprocess, and the new `wddm-mem.cu` compiles as
+an empty TU off Windows (it does need a cmake re-run: the CUDA list is `file(GLOB "*.cu")` without
+`CONFIGURE_DEPENDS`).  The `.cu` also passes `check-windows-portability.sh`, which now scans it as an added file.
+
+**Gates** (gfx1201, ROCm 10.1, `~/llama.cpp` on the folded chain, build `17a28ac6d`):
+* **Coherence**: 4B Q8_0, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`: 1 GPU **897 chars
+  `a77fa8c1107a`** and 3 GPU `-sm tensor` **964 `eab86065e67e`** -- byte-identical to r208 on both arms.
+* **Prefill logits**: `gate-prefill-logits.sh` **KLD 0.000000 / same-top-p 100.000 %** (bit-identical prefill).
+* **Per-block build**: `gate-per-block-build.sh --changed-from f12c2b0d6` (targets `all`, fresh build dir per
+  commit) **4/4 built, 0 failed** in 1073 s; every other block's delta is unchanged by construction.
+* **GPU faults**: `check-gpu-faults.sh --since "3 hours ago"` over the journal and the two coherence logs --
+  clean.
+* **Delivery contract**: `validate-set.sh` green -- 16/16 strict `git am` on the fresh tarball, applied tree
+  `8c6c992db`, every artifact sha256, the conflict-marker scan and the Windows portability lint (287 added
+  files).  `.tip` re-cut twice from `patches/` in two fresh clones and both printed `27271aa91`, i.e. the
+  deterministic re-cut still holds.
+
+**Not run, and why.**  The MTP four-axis protocol and the seven per-block arms: no Linux-visible code changed
+(the four preprocessed TUs are token-identical and prefill logits are bit-identical), so every arm would
+measure the r208 build.  No Windows gate exists on this box (no toolchain, `TODO` #95): the Windows numbers in
+the block notes are the reporter's and are labelled as such.  Their own record also says the exact four-commit
+combination was never built (their measured tree carried a dropped fifth commit), commits 3 and 4 were measured
+together, and commit 1 measured ~2 t/s decode *slower* on their headless card -- all preserved in the archived
+campaign so a Windows regression report starts from the truth.
+
+**Campaign.**  `wip/windows-host-memory/` is promoted and its record moved to
+[`archive/work/windows-host-memory/`](archive/work/windows-host-memory/README.md) with a `RESOLUTION.md` (what
+shipped, what stayed the submitter's, and the Windows re-entry conditions); no stub is left in `wip/`, and
+`wip/CAMPAIGNS.md` records the promotion.
+
 ## 261103.013 (r208) -- DELIVERY: block 05 amended with the RDNA2 (gfx1030) FA prefill/tail work (PR #270/#271)
 
 **Delivery change.**  PR #270 and PR #271 (`@slavap`, RDNA2 `fattn-tile.cuh`) are **folded into block 05**, not cut

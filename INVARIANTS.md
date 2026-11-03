@@ -1533,3 +1533,34 @@ change), and let `WORKLOG.md` carry the narrative.
   symbol address/size, plus the amdhsa resource usage (`.vgpr_count`, `.vgpr_spill_count`,
   `.group_segment_fixed_size`).  That comparison is what proved r208's RDNA2-gated changes leave gfx1201
   bit-identical (88/88 and 106/106 kernels).
+- **On Windows `hipMemGetInfo` is not a free-VRAM figure (r209, block 09).**  It counts only this process's
+  allocations, so with any other process holding memory on the card it over-reports free VRAM; and WDDM does
+  not refuse an allocation past that point, it pages the excess to system RAM and the GPU reads it over PCIe
+  (issue #216).  The adapter's own figure is `D3DKMTQueryStatistics` over the non-aperture segments,
+  `CommitLimit - BytesResident`, which counts every process; `cudaMemGetInfo` now returns the smaller of the
+  two (`GGML_CUDA_WDDM_FREE=0` keeps HIP's).  Two consequences to keep straight: the reading is honest, but
+  **an overcommit still does not fail**, so `TODO` #216's accepted limitation stands; and the two figures are
+  not interchangeable — HIP's is this process's remaining budget, WDDM's is the adapter's remaining commit
+  room, and the WDDM one *includes* memory other processes will keep.
+- **Windows `llama_mmap::unmap_fragment` used to be a no-op, so every loader release freed nothing (r209,
+  block 09).**  A view cannot be unmapped in part, so the Windows implementation now drops the range from the
+  working set with `VirtualUnlock` on unlocked pages (it reports `ERROR_NOT_LOCKED` and the clean file pages
+  move to the standby list; it still unlocks a locked page in the range, as `munmap` would).  The mapping and
+  the data pointer stay valid, so unlike POSIX this is safe even for a range something still reads — do not
+  "restore symmetry" by making the POSIX side a trim, because there the release is what bounds peak RSS.
+  Measured on the reporter's box (Flash-Next, `--fit`): working set after load 67.4 -> 21.2 GiB.
+- **Windows has no `MemAvailable`, and before r209 the delivery's two RAM ceilings and the pool's fill-mode
+  decision therefore did not exist there (r209, blocks 12 and 15).**  `pool_available_ram_bytes()` returned
+  `-1`, so `MOE_HOST_POOL_DIO=auto` always resolved to `O_DIRECT` ("no MemAvailable") and neither
+  `MOE_HOST_POOL_RAM_PCT` nor `LLAMA_KV_SPILL_RAM_PCT` applied.  `GlobalMemoryStatusEx().ullAvailPhys` (free
+  plus standby) is the counterpart and is what they now read; it is a *different* quantity from the WDDM
+  device figure above, and one may not substitute for the other.
+- **A Windows-only change can be folded into the delivery when it is provably inert on Linux, and the proof
+  is preprocessing, not inspection (r209).**  Compile each changed translation unit with the delivery's own
+  compile command (`build-rocm/compile_commands.json`) as `-E -P` on both trees and diff the token streams:
+  identical apart from `__FILE__`/`__LINE__` strings is the statement "the Linux build compiles the same
+  code"; object or `.so` hashes are not (see the r208 entry).  A header change is inert by construction when
+  its only delta is inside `#if defined(_WIN32)`.  What this method cannot do is validate the Windows arms —
+  those stay the reporter's numbers, and no gate on this box reaches them (there is no Windows toolchain,
+  `TODO` #95).  Also: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` **without** `CONFIGURE_DEPENDS`, so a
+  newly added CUDA source needs a cmake re-run, not just a rebuild.

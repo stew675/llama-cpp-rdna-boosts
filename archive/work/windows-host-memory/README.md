@@ -1,6 +1,10 @@
-# wip/windows-host-memory — Windows: WDDM free VRAM, available RAM, mapped pages after upload, PLE prefetch
+# windows-host-memory — Windows: WDDM free VRAM, available RAM, mapped pages after upload, PLE prefetch
 
-Written by Claude (AI).  One `git am` file with four commits, made on `v16-6050b467c-r195`; it also applies on r206 (`git am -3`, not built there).  Each commit can be taken on its own.  It touches `ggml/src/ggml-cuda/ggml-cuda.cu`, `ggml/src/ggml-cuda/moe-expert-cache.cu`, `ggml/src/ggml-cuda/vendors/hip.h`, a new `ggml/src/ggml-cuda/wddm-mem.cu`, `src/llama-mmap.cpp` and `src/models/qwen4exp.cpp` (+194 / -2).
+> **Folded into the delivery in r209** (blocks 09/11/12/15, `v16-6050b467c-r209`).  What shipped, what stayed
+> the submitter's, and the Windows re-entry conditions are in [`RESOLUTION.md`](RESOLUTION.md).  This file is
+> the submitter's original record, kept verbatim except for the two lines marked `[r208 review]`.
+
+Written by Claude (AI).  One `git am` file with four commits, made on `v16-6050b467c-r195`; it also applies on r206 and on **r208** (`git am -3`, not built there).  **[r208 review]** commit 2 stacks on commit 1 -- it edits the `wddm-mem.cu` commit 1 creates and calls its new function -- so 1+2 travel together; commits 3 and 4 do stand alone.  It touches `ggml/src/ggml-cuda/ggml-cuda.cu`, `ggml/src/ggml-cuda/moe-expert-cache.cu`, `ggml/src/ggml-cuda/vendors/hip.h`, a new `ggml/src/ggml-cuda/wddm-mem.cu`, `src/llama-mmap.cpp` and `src/models/qwen4exp.cpp` (+194 / -2).
 `windows-host-memory.patch` sha256 `ceff3bb87c5448c07750488d82726c5d4b7597b0ff172cfa721f0ff40229f312`.
 
 Everything is behind `_WIN32` (commits 1 and 2 also behind `GGML_USE_HIP`); Linux and macOS compile the same code as before.

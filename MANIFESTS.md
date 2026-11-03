@@ -358,6 +358,21 @@ in CI.  The model-level gates are manual:
    pool, `is_streaming()`, the sparse decode arm, block 15's `--fit` interaction or `memory_breakdown()`'s KV
    accounting; every release that touches block 15.  ~15 s (`--window-only`), ~5 min (`--pool-only`).
 
+18. **A Windows-only change (r209, PR #269)** — there is no Windows toolchain on the primary box (`TODO` #95),
+   so the gate is **inertness on Linux**, and it is proved rather than inspected: compile each changed
+   translation unit with the delivery's own command (`build-rocm/compile_commands.json`) as `-E -P` on the
+   previous and the folded tree and diff the token streams — identical apart from `__FILE__`/`__LINE__`
+   strings is the claim "the Linux build compiles the same code".  A header delta wholly inside
+   `#if defined(_WIN32)` is inert by construction; a new `.cu` must be checked to compile to an empty TU off
+   Windows (and it needs a cmake re-run: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` without
+   `CONFIGURE_DEPENDS`).  Then the ordinary tip gates as evidence rather than as a search: coherence on 1 GPU
+   and a 3-GPU `-sm tensor` arm (byte-identical to the previous release), `gate-prefill-logits.sh`,
+   `gate-per-block-build.sh --changed-from <prev tip>` (the blocks the fold touched), `check-gpu-faults.sh`,
+   and `validate-set.sh`, whose portability lint scans the added file (tier 1).  **The Windows arms are the
+   reporter's numbers and say so in the block notes** — this gate cannot validate them, and a release that
+   claims otherwise is wrong.  r209: 4 TUs token-identical, coherence `897 a77fa8c1107a` / `964 eab86065e67e`
+   (== r208), KLD 0.000000 / 100.000 %, per-block 4/4, no faults.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

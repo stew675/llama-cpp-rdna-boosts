@@ -145,7 +145,12 @@ call.
 
 
 - **A Windows VRAM overcommit is not catchable: it surfaces as a device loss, not an allocation failure
-  (issue #216, accepted; nothing in the delivery can change it).**  On WDDM an allocation set larger than
+  (issue #216, accepted; nothing in the delivery can change it).**  **r209 note:** block 09 now ships the
+  honest *figure* on Windows (`cudaMemGetInfo` returns the smaller of HIP's and the adapter's WDDM figure,
+  `GGML_CUDA_WDDM_FREE=0` opt-out), so the slab, the cache sizing, `--fit` and `GGML_CUDA_MIN_FREE_MIB` no
+  longer count another process's memory as free.  That does **not** make an overcommit fail, so this item
+  stands as written; making the WDDM figure refuse through `GGML_CUDA_MIN_FREE_MIB` was never tried and is
+  the open question (re-entry conditions: `archive/work/windows-host-memory/RESOLUTION.md`).  On WDDM an allocation set larger than
   the card does not fail, it pages into system memory; the first big prefill (a full `-ub` compute buffer
   plus the FA staging) then loses the device, and the process's *next* rocBLAS touch aborts with
   `rocBLAS error: Could not initialize Tensile host: No devices found` (rocBLAS's `TensileHost` prints
@@ -174,6 +179,10 @@ call.
   rewritten because a non-AMD/Windows claim cannot be validated on this box (scope policy: non-AMD backends
   are out of validation scope); if a Windows build log names one of them, apply the same two-line helper
   fix there and bump the release.  Do not re-report as a new defect without a Windows build log.
+  **r209 adds a case in point:** the Windows host-memory fold (blocks 09/11/12/15, PR #269) was proven inert
+  on Linux by preprocessing the changed TUs, and it has **never been compiled by us** — no Windows toolchain
+  here — so its own build is the reporter's.  A build log naming any of the ~10 `int64_t` TUs, or one of the
+  four folded hunks, is the only thing that closes this.
 
 - **The Meta split-state lookup-count headroom (TODO #80) — retired 2026-10-24, accepted.**  The measured
   defect (issue #184: the pre-warm walk allocating one heap node per visited tensor on every graph
