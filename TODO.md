@@ -33,7 +33,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
-| **131** | `--host-experts pool` prefill collapses (16.85 t/s vs `pinned` 564.65) under a ≥3-device `-sm tensor` split — block 12, not a campaign patch; scales with pool size; `STAGE_BATCH=0` / `DIO=0` / `FRAC` do not fix it; the gather does | correctness / performance (delivery defect) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §270 |
+| **131** | `--host-experts pool` prefill collapsed under a >=3-device `-sm tensor` split (block 12's staging path; root cause still unidentified) | performance (delivery defect) | **FIXED BY DEFAULT in `patches/0006`** (pool tables gather in the prefill band: 1502-1569 vs `pinned` 471.8 prefill, decode -0.7 %; the kill switch reproduces 16.9 t/s).  **Open:** the staging path's own cost, and the promotion.  See §131 |
 | **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
@@ -275,9 +275,16 @@ that silently does nothing is worse than a missing one (`AGENTS.md`, environment
 
 ## 131. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
 
-**Status: open, found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4).  It is a defect in
-the DELIVERY's block 12 code, not in a campaign patch, and it needs a decision: fix it in block 12, or document the
-gather as a requirement.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
+**Status: the PREFILL REGRESSION IS FIXED in the campaign set (`patches/0006`, 2026-11-03) — `--host-experts pool`
+now gathers a pool-backed table in the prefill band by default, measured 1502.6-1569.2 t/s prefill against
+`pinned`'s 471.8 at three devices with decode at -0.7 %, and 16.9 t/s with the gather switched off
+(`GGML_SCHED_DEVGATHER=0`).  What remains OPEN is the *root cause inside the staging path*: it is still
+pathologically slow for a pool-backed table at >= 3 devices and is now reachable only through the kill switch, so
+either fix it or delete that branch for pool tables.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
+three-valued `GGML_SCHED_DEVGATHER`) is the maintainer's call.**  Original finding text follows.
+
+**Found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4), a defect in the DELIVERY's block 12
+code, not in a campaign patch.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
 pinned to 3 R9700s: `--host-experts pool` prefills at **16.85 t/s** against `pinned`'s **564.65** (and 1126.8 with
 `GGML_SCHED_DEVGATHER=1`); the same arms at 2 devices are 1024.1 (pool) vs 1603.8 (pinned), i.e. healthy.  The
 defect is in the pool branch of `moe_cache_stage_table` (`!t.host_pinned`): the `pinned` arm stages the same volume

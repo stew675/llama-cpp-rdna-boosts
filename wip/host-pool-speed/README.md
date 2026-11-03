@@ -1160,11 +1160,10 @@ devices, 512-token prompt, `-ub 2048`:
 * **Turning the arena off recovers 4.3x** (`MIB=0` → 50.4) while turning only the staging path off does not
   (16.1), so the cost lives in the cache's **per-(table, device) prefill work around** the staging copy.
 
-Next measurement (queued, blocked on the box): time the per-table `cudaMalloc(t.prs_dev)`/`cudaFree` pair in the
-staging path (instrumented, ~432 of them = 144 tensors × 3 devices, each a 1 KiB map allocated *inside* the
-prefill) and the per-split scheduler time.  If the allocation is the cost, the fix is to allocate that map once
-per table at registration (or use a per-device scratch) — small and safe.  If it is the scheduler, the fix is the
-ring/optional-allocation path the AGENTS notes describe (`GGML_CUDA_SLAB_RING_MIB` floor).
+That "next measurement" was superseded: the per-table `cudaMalloc(t.prs_dev)` cost 0.00 s in total (423 calls,
+max 64 us) and the staging copy 1.6 s, so neither is the cost.  With the gather as the default the *prefill* is
+fixed (see the resolution below); the staging path's own cost is still unexplained and is only reachable through
+`GGML_SCHED_DEVGATHER=0` now — `TODO` #131 keeps that half open rather than closing it as "worked around".
 
 **Finding C — the pool is at pinned parity on decode exactly where its tiers are large enough.**  The 3-GPU
 `-sm tensor` shape gives the arena everything (`arena 67110 MiB = 100 % of the host expert set`, `h≈0.986`) and
@@ -1179,6 +1178,34 @@ FRAC 95 pins 63.7 GiB and reads 143.7 GiB from disk per run, FRAC 100 pins 67.1 
 4 GiB more pinned costs 42 GiB more disk and 9 % of decode.  That is §3.2's "the ceiling does not reserve the
 model's own page cache" showing up as a decode effect on a multi-device split, and it also means the *pre-W3*
 `FRAC 100` arm understated the pool by 9.4 % because the old tail shave had taken 920 slots off the last tables.
+
+**Finding B, RESOLVED (2026-11-03, `patches/0006`) — a pool-backed table now gathers in the prefill band, by
+default.**  The staging path is the defect (above); the device gather is the remedy, and it is now routed
+automatically for `--host-experts pool` tables in the prefill band.  Same box, same 122B, 5258-token prompt,
+`-ub 2048`, **2000-token greedy decode** (`data/20261103-multigpu/w1-fix/`):
+
+| arm (3 × R9700, `-sm tensor`, `-ncmoe 48`) | prefill t/s | decode t/s |
+|---|---|---|
+| `pinned` | 471.8 | **67.6** |
+| `pool` FRAC 80 (gather, new default) | **1502.6** | 67.1 |
+| `pool` FRAC 95 (gather, new default) | **1569.2** | 67.1 |
+| `pool` FRAC 95, `GGML_SCHED_DEVGATHER=0` (kill switch) | **16.9** | 27.3 |
+
+so on the box's own three-device shape the pool is now **-0.7 % decode and 3.2x `pinned`'s prefill** — inside
+(and past) PR #267's own published envelope (§1: `pinned` 74.7/1189 vs `mmap` 72.4/1278).  The change is
+neutral elsewhere: pair `pinned` 1671.6 prefill (unchanged, it never gathers), pair `pool` 948.6 (staging was
+1024.1, i.e. -7 % of a path that was never broken there), 1-GPU `pool` FRAC 100 734.2 vs `pinned` 755.5.  The
+first attempt routed *all* pool-table gathers with no band gate and decode fell to 1.2-4.1 t/s — the decode band
+is served from the arena by the slot-remap read, and the gather must not take it over (`sched_input_gatherable`
+now requires `n_tokens > moe_cache_band`).
+
+**Correctness of the new default:** `257 chars sha=5531ae33f0f7` on all eight mode/device arms (pair and 3-GPU,
+gather default and forced: `data/20261103-text-purity-b-{pair,g3}`), and **`5835 chars sha=dc178c29fe89` across
+`pinned` / `pool` F80 / `pool` F95 at 3 GPUs with a 2000-token decode behind a 5258-token multi-ubatch
+gather-served prefill** — i.e. the gather's prefill is text-exact at exactly the multi-ubatch width the code's
+`SCHED_GATHER_TABLE_MIN_BYTES` comment warns the old "one-time expert-head zero" bug lived in.
+`check-gpu-faults.sh` clean.  Note the *staging path itself* is still unidentified (TODO #131 keeps that item:
+it is now only reachable via the kill switch, and it should either be fixed or deleted for pool tables).
 
 ### 18.3 W3 — the `RAM_PCT` ceiling now scales every table (implemented, measured, `patches/0005`)
 
@@ -1262,10 +1289,10 @@ the pair the residual is the demand fill (§18.4) plus the page-cache starvation
 4. **P1-a's overlap half is re-opened for the multi-device case** (§18.4): the demand fill is 29 % of a pair
    decode step, so the worker's ceiling is ~25-30 %, not ~6 %.  Re-screen with the replayer before building
    (`§9.6`), then measure.
-5. **The gather's promotion shape is now clearer but not decided** (§7 open decision 2): it is mandatory for
-   `pool` at 3 devices and harmful for `pinned` at 2.  A pool-only default still needs the truthful per-device
-   capability predicate; until then `GGML_SCHED_DEVGATHER` stays opt-in and `--host-experts pool` on 3+ devices
-   should be documented as "needs the gather on".
+5. **The gather's promotion shape is now implemented and measured** (§7 open decision 2): a **pool-only**
+   default, gated by the truthful per-device query `moe_cache_pool_backed()` and band-limited to the prefill
+   (`patches/0006`).  `pinned` never gathers, so the 2-device −47 % regression is gone; the kill switch is
+   `GGML_SCHED_DEVGATHER=0`.  What remains for the maintainer is promotion only (the `ENVIRONMENT.md` row).
 6. **W2 (the tensor-split-aware remap) is unchanged and still last**: its ceiling on the pair is ≈ +3.3 % of
    decode, against the fill's ~25-30 % and the staging defect's prefill collapse.  It is not blocked by anything
    here; it is simply no longer the biggest item, and it still needs the maintainer's `§7` decisions before it
