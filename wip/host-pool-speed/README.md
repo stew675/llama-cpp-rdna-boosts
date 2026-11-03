@@ -1083,7 +1083,9 @@ Pair (`HIP_VISIBLE_DEVICES=0,2`, in-process `0,1`), `-sm tensor`:
 | `pool` FRAC 80, staging | 26.08 | **1024.1** | 0.9544 | 212.8 GiB |
 | `pool` FRAC 80 + gather | 26.11 | 991.5 (-3 %) | 0.9544 | 214.2 GiB |
 | `pool` FRAC 80, `SIZING=1` (cov90) | **28.02 (+7.4 %)** | 698.7 (-32 %) | 0.9544 | 202.1 GiB |
-| `pool` FRAC 100 (RAM ceiling clamped it to 35944/36864 slots) | 26.58 | 1333.9 | 0.9544 | 203.2 GiB |
+| `pool` FRAC 100 (RAM ceiling clamped it to 35944/36864 slots — **pre-W3 build**) | 26.58 | 1333.9 | 0.9544 | 203.2 GiB |
+| `pool` FRAC 100 (same arm, **W3 build**, ceiling needs no shave: 36864 slots) | **29.08 (+9.4 %)** | 1316.9 | 0.9547 | 185.5 GiB |
+| `pool` FRAC 95 (W3 build, 34992 slots / 63702 MiB) | **32.02** | **1397.1** | 0.9547 | 143.7 GiB |
 
 3 GPUs (`HIP_VISIBLE_DEVICES=0,1,2`), `-sm tensor`:
 
@@ -1143,6 +1145,14 @@ be documented as needing it until #270 is fixed.
 the pool arm then decodes **49.48-49.99 vs `pinned` 51.97-52.04 (-4.5 %)**, i.e. inside PR #267's own
 `mmap`-vs-`pinned` envelope (72.4 vs 74.7 = -3.1 %).  On the pair the arena is 49.8 GiB for 67.1 GiB of experts
 (`h=0.95`), the pool carries the rest, and the deficit is **-34 %** — see §18.4.
+
+**Finding D — coverage is still the pair's decode lever, but the ceiling must leave the model a page cache.**
+On the W3 build the pair's `pool` arms are FRAC 80 **26.08** < FRAC 100 **29.08** < FRAC 95 **32.02** (against
+`pinned` 39.85): more coverage helps until the pinned pool starts evicting the model's own pageable set —
+FRAC 95 pins 63.7 GiB and reads 143.7 GiB from disk per run, FRAC 100 pins 67.1 GiB and reads 185.5 GiB, i.e.
+4 GiB more pinned costs 42 GiB more disk and 9 % of decode.  That is §3.2's "the ceiling does not reserve the
+model's own page cache" showing up as a decode effect on a multi-device split, and it also means the *pre-W3*
+`FRAC 100` arm understated the pool by 9.4 % because the old tail shave had taken 920 slots off the last tables.
 
 ### 18.3 W3 — the `RAM_PCT` ceiling now scales every table (implemented, measured, `patches/0005`)
 
@@ -1204,6 +1214,10 @@ there, ~0 at full coverage), and it is a strictly better first target than W2's 
 
 ### 18.6 What this session changes in the plan
 
+0. **The pair is at −19.7 % and the 3-GPU shape at −1.8 %** with the campaign set on the W3 build (pair:
+`pool` FRAC 95 32.02 vs `pinned` 39.85; 3 GPUs: `pool` FRAC 95 51.03 vs `pinned` 51.97, gather on).  The
+acceptance criterion (§1) is therefore **met on the box's own three-device shape and not on the pair**, and on
+the pair the residual is the demand fill (§18.4) plus the page-cache starvation in finding D.
 1. **F7 is closed** (§18.1) — the handover's inherited blocker was an environment mistake, and the multi-device
    arms mean something now.
 2. **W3 is done** (§18.3, `patches/0005`): `RAM_PCT` scales proportionally, `+59…73 %` decode at `RAM_PCT=70`,
