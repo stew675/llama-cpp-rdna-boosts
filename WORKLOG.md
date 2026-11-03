@@ -1,3 +1,20 @@
+## 261103.008 (wip) -- eager-push pushed for the 3-GPU gate test
+
+No delivery change.  Continues `261103.007`.
+
+**Published.**  The delivery repo is pushed (`origin/main` @ `6cc1eb67`).  The two experiment branches are on
+the **personal fork** (`origin` = `git@github.com:stew675/llama.cpp.git`) so the multi-GPU box can check out the
+state instead of re-applying patches: `p1-push-src` @ `be83da8f0` (transport switch) and
+`p2-pinned-working-set` @ `f131cef2f` (all four patches).  **`rdna-boosts` is untouched** (`efaa60db0`); no
+release branch was pushed, and per the pushing policy nothing went to upstream.
+
+**New instrument** [`wip/host-expert-eager-push/p2-gate-3gpu.sh`](wip/host-expert-eager-push/p2-gate-3gpu.sh):
+the device-set gate test.  It runs the rotate arm and the rotation-off control on a tensor split, prints
+`released`/`release_denied`, the text hash and t/s for each, and runs `check-gpu-faults.sh` on both.  PASS =
+`release_denied` materially > the 1 measured on one GPU with identical text and no faults; FAIL = `released > 0`
+with `release_denied == 0` (the device set is wrong and the gate is decorative) or a fault (a release happened
+early).  Recorded in `PUSH-MLOCK-TIER.md` §8b with the checkout + build commands.
+
 ## 261103.007 (wip) -- eager-push P2 increment 3: the device-set eviction gate + rotation, additive and free
 
 No delivery change.  Continues `261103.006`.

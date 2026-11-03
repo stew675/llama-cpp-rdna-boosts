@@ -222,6 +222,27 @@ evidence that the gate *denies* under contention, though — the real test is a 
 device set is > 1 and an in-flight read on device 1 must block a release decided against device 0.  That is the
 next measurement.
 
+## 8b. Published for the multi-GPU gate test (2026-11-03)
+
+The experiment branches are on the **personal fork** (`origin` = `git@github.com:stew675/llama.cpp.git`), so a
+multi-GPU box can check out the state directly instead of re-applying patches.  **`rdna-boosts` is untouched**
+(still `efaa60db0`); these are experiment branches only:
+
+| branch | content |
+|---|---|
+`p1-push-src` @ `be83da8f0` | `0001` — the push transport switch |
+`p2-pinned-working-set` @ `f131cef2f` | `0001`-`0004` — + working set, heat seed, device-set gate + rotation |
+
+```bash
+git fetch origin && git checkout p2-pinned-working-set
+~/bin/build-llama-rocm            # ~/bin/build-llama-rocm-714 for the older ROCm line
+cd <delivery>/wip/host-expert-eager-push
+SUDO=1 ./p2-gate-3gpu.sh 0,1,2 500     # the gate test; see the script header for PASS/FAIL
+```
+
+The script runs the rotate arm and the rotation-off control, prints the pinned-set report (`released`,
+`release_denied`), the text hash and t/s for each, and runs `check-gpu-faults.sh` on both logs.
+
 ## 9. Additive by construction (the pool path is not touched)
 
 The whole diff against the release tip is **189 insertions, 0 deletions**, and every line is behind an
