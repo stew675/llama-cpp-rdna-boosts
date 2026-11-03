@@ -1,4 +1,13 @@
-# P3 RESULTS — the multi-GPU assessment: the transport is a loss on a split, and the gate has no hook there (2026-11-03)
+# P3 RESULTS — the multi-GPU assessment: `-sm tensor` is an OPEN defect, not a closed question (2026-11-03)
+
+> **OPEN.  This file is the measurement record; the live investigation is
+> [`HANDOVER.md`](HANDOVER.md).**  Nothing here closes the campaign: the direct page-cache push is at parity on
+> one device and on a 3-device `-sm layer` split, and **50 % short on a 2-device `-sm tensor` split**.  The
+> cause is *partially* attributed (§3a) and the remaining gap is unexplained — the ranked experiment list, the
+> exact commands and the trap list for the next session are in `HANDOVER.md`.  Do not read "the driver's staging
+> is slow" as "this cannot be fixed": what has been ruled out is listed in `HANDOVER.md` §4, and the prime
+> untested candidate (the copy DESTINATION: plain `hipMalloc` in the probes vs an arena/VMM slot in the path) is
+> `HANDOVER.md` experiment 1.
 
 **Verdict: correctness GREEN on 1, 2 and 3 devices.  The TRANSPORT — a direct CE source on the pageable
 mapping, not the host-push principle — WORKS: parity on 1 device (55.1 vs 53.6 t/s) and parity on a 3-device
@@ -273,7 +282,8 @@ that cost — it prevents *reclaim* (the disk read), not the copy, because the b
 So the RAM question and the transport question are separable, and the answer to each is:
 
 - **Transport: the bounded bounce ring, not the direct CE.**  41.9-42.7 t/s against 28.4, and the direct path
-  wedges the driver when parallelised (§3a).
+  is neutral once each device has its own issuing thread (§3a) — so this is NOT closed by that lever, and it is
+  not closed at all: see `HANDOVER.md`.
 - **Residency: `mlock` over the mapping** — the same pages, locked, with **no duplicate**.  That is what
   replaces the 4.7 GiB pool's *guarantee* at a fraction of its RAM, and it is the piece
   `PUSH-MLOCK-TIER.md` designed.

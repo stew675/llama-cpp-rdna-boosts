@@ -1,6 +1,8 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (OPEN)
 
-> **P3 STATUS (2026-11-03): the multi-GPU assessment — the transport WORKS, except under `-sm tensor`.**
+> **P3 STATUS (2026-11-03): the transport WORKS, except under `-sm tensor` — an OPEN defect, not a verdict.
+> The record is [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md); the live investigation, the ranked
+> experiment list and the trap list are in [`HANDOVER.md`](HANDOVER.md).**
 > [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md).  Rebased onto **r209** as branch
 > `p2-eager-push-r209` (4/4, no conflicts; 389 insertions, one file).  **Correctness GREEN** on 1, 2 and 3
 > devices: `mapping` and the pool produce **byte-identical** greedy text over a forced 500-token generation
