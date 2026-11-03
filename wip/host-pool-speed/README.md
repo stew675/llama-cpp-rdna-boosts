@@ -1235,6 +1235,32 @@ gather-served prefill** — i.e. the gather's prefill is text-exact at exactly t
 `check-gpu-faults.sh` clean.  Note the *staging path itself* is still unidentified (TODO #131 keeps that item:
 it is now only reachable via the kill switch, and it should either be fixed or deleted for pool tables).
 
+**Why `pinned` prefill is so slow when every weight is host-resident (measured 2026-11-03).**  Because at this arm
+the experts are **also 100 % VRAM-resident**, and the prefill copies them out of VRAM per ubatch anyway:
+
+| | 1 GPU | 3 GPUs |
+|---|---|---|
+| arena (`alloc_all_locked: MoE expert cache (auto)`) | 22544.8 MiB of 67110.0 = **33.6 %** | 67110.0 MiB of 67110.0 = **100 %** |
+| slots/table | 85 | **256 (identity)** |
+| `pinned` prefill, 5258-token prompt | **755.5 t/s** | 471.8-606.9 t/s |
+
+Three devices with three times the VRAM and three times the compute prefill **slower than one** — so prefill is not
+compute-bound and not host-residency-bound.  The cache's own counter says where it goes: on the 3049-token prompt
+the 3-GPU `pinned` arm logs `prefill cache staging: ok=396 ... arena=61031.5 MiB host=510.5 MiB (H2D 0.8 % of
+staged)` — i.e. **61 GiB is copied out of the ARENA (VRAM) into the op's per-split weight buffer, once per table
+per ubatch**, and only 0.8 % comes from host RAM.  That copy is ~8 GB/s aggregate (2.6 GB/s per device) over a 7.7 s
+prefill: far below local D2D speed, because it is a 256-block kernel copy per table issued 396 times and
+*serialised against the compute* (copy table → compute table → copy next), so it scales with the number of tables
+per device and never overlaps.  For a fully resident table the copy buys nothing — the op could read the arena in
+place, which is exactly what the gather does in the pool arm (and why that arm scales normally: 1 GPU 734 → 3 GPUs
+1300-1600 t/s).  Forcing the gather on `pinned` does **not** help (587.8 vs 564.7 t/s) because a pinned table's
+gather source is the *pinned host master* over PCIe, not the arena.
+
+That makes the pool arm's "3x prefill win" really "**no-copy prefill vs re-copy-into-the-op's-buffer prefill**", and
+it means the same defect is still present in the **default (pinned) mode** at a large-arena configuration — see
+`TODO` #133: let an identity (fully resident) table serve the prefill op in place, the aliasing
+`moe_cache_get_table()` already does in the decode band.
+
 ### 18.3 W3 — the `RAM_PCT` ceiling now scales every table (implemented, measured, `patches/0005`)
 
 `pool_clamp_slots_to_ram()` shaved the **registration-order tail** to the one-slot floor.  Measured on `soar`,
