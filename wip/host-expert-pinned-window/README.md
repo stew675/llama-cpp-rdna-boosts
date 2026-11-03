@@ -157,10 +157,24 @@ is an SLO, not a call: a demoted range may be reclaimed at any moment, so a re-p
 *cached if we are lucky* -- the fill path has to absorb a fault-speed refill (~13 ms/8 MiB) without stalling the
 token more than the pool path would.
 
-**5.3 Budget caveat (deployment, not a blocker).**  `mlock` is capped by **`RLIMIT_MEMLOCK` = 8 MiB soft/hard on
-this box**, so a multi-GiB window needs `LimitMEMLOCK=infinity` (systemd) or `CAP_IPC_LOCK`.  Without `mlock`
-the window is "cached but reclaimable": correct, but a reclaim under pressure turns a fill into a fault-speed
-refill (~13 ms/8 MiB measured, vs the pool's 17 ms/8 MiB for the same cold range — still the better arm).
+**5.3 The hold is a SOUNDNESS REQUIREMENT, not a budget caveat — CORRECTED 2026-11-02.**  `mlock` is capped by
+**`RLIMIT_MEMLOCK` = 8 MiB soft/hard on this box**, so a multi-GiB window needs `LimitMEMLOCK=infinity`
+(systemd) or `CAP_IPC_LOCK` — and the earlier text here called that a "deployment, not a blocker" caveat and
+asserted the un-`mlock`ed window was *"cached but reclaimable: **correct**, just slower on a refill"*.  **That is
+wrong.**  There is no host-side refill to be slow: on a no-XNACK GPU a kernel read of a page that is not present
+is a fatal fault (issue #116), which on a model larger than RAM aborts the run (`Page not present`,
+`WORKLOG.md` 261102.012) and, when the range is only partly lockable, hangs it (261102.013).  The promote
+policy of §5.2 — `mlock` + register on promote, `munlock` + unregister on demote — is therefore the design, not
+an option; the code now takes the hold or **declines the registration** (`bind_host_dev_locked`) and gates every
+in-place kernel read on it.
+
+> **Cross-reference (2026-11-02).**  This requirement was already written down, in the parallel campaign:
+> `wip/host-pool-speed/README.md` §7 — *"the intermediary **guarantees** the requisite pages are pinned **and**
+> resident before it hands the go-ahead back to the GPU ... a residency check before the read is released, and
+> **no** fallback that copies from pageable memory."*  The two campaigns ran at the same time on different hosts
+> and were never cross-referenced; that is how this document came to argue the opposite of the maintainer's
+> brief.  The authoritative statement is that §7 plus `INVARIANTS.md` (device-visible host memory must be
+> resident).
 
 **5.4 Internal mechanism: unresolved, and it does not change the decision.**  `rocprofv3 --memory-copy-trace`
 (`trace-copy-path.sh`, `runs/copy-path_memory_copy_trace.csv`) shows one H2D copy per source and **no kernel at

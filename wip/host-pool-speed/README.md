@@ -288,6 +288,15 @@ Sketch (design note only, no work scheduled):
   So: only with a **hard per-table pin budget** (the pool's `RAM_PCT` shape), a **residency check** before the
   read is released, and **no** fallback that copies from pageable memory.
 
+> **Cross-reference (2026-11-02, added from the 1-GPU host).**  §7's rule was violated by the parallel
+> `wip/host-expert-pinned-window/` campaign, which let SM kernels read the mmap'd master in place: on a model
+> larger than RAM that is a fatal GPU page fault (`Page not present`, no XNACK, `WORKLOG.md` 261102.012) and with
+> `mlock` it stops being a RAM saving at all (261102.013).  Two of its pieces are **sound under §7 as written**
+> and worth taking here: CE (copy-engine) copies out of a *registered* mapping instead of the per-table bounce
+> `memcpy` -- measured there as prefill 375.9 -> 532.6 t/s and -6.7 GB RSS, and independently priced by Avalon at
+> fills 115 -> 61 us -- and an arena-aware gather **gated on a hold** (for pool mode: gathering from the pinned
+> pool slots, a D2D).  Neither involves a kernel reading pageable memory.
+
 ## 8. PR #267 — the architecture-level assessment (recorded, not adopted)
 
 `--host-experts mmap` (0001) + sparse file-alias registration (0002) + arena-across-prefill (0003) + a per-table
