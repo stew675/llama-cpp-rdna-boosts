@@ -104,6 +104,11 @@
 #                                    to this gate unless the arm is `--sm tensor` on >= 2 devices.
 #   --timeout N       TIMEOUT        per-run seconds (default 1800)
 #   --keep            KEEP=1         keep the per-run logs
+#   --extra "ARGS"    PPL_EXTRA      extra llama-perplexity arguments, word-split (default: none).
+#                                    Needed to gate a configuration that is not the all-GPU default --
+#                                    e.g. a host-expert arm: --extra "-ncmoe 40 --host-experts pool".
+#                                    Folded into the base file name, because a base recorded on one
+#                                    configuration is not a reference for another.
 #   --allow-base-mismatch            skip the base-meta compatibility check
 #   --record, --ab SPEC
 #
@@ -136,6 +141,7 @@ CAND_ENV="${CAND_ENV:-}"
 ALLOW_CONTROL_PASS="${ALLOW_CONTROL_PASS:-0}"
 DEVICE="${DEVICE:-0}"
 SM="${SM:-}"
+PPL_EXTRA="${PPL_EXTRA:-}"
 TIMEOUT="${TIMEOUT:-1800}"
 KEEP="${KEEP:-0}"
 ALLOW_BASE_MISMATCH=0
@@ -174,6 +180,7 @@ while [ $# -gt 0 ]; do
         --timeout)              TIMEOUT="$2"; shift 2 ;;
         --keep)                 KEEP=1; shift ;;
         --allow-base-mismatch)  ALLOW_BASE_MISMATCH=1; shift ;;
+        --extra)                PPL_EXTRA="$2"; shift 2 ;;
         --record)               RECORD=1; RECORD_ENV=""; shift ;;
         --ab)                   RECORD=1; RECORD_ENV="${2:-}"; shift 2 ;;
         -h|--help)              usage 0 ;;
@@ -246,7 +253,12 @@ if [ -z "$BASE" ]; then
     # arena, the native tile read), so it is a different point and gets its own base file.
     kv_tag=""
     [ "$KV" != "f16" ] && kv_tag="-kv${KV}"
-    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${UB:+-ub${UB}}.kld"
+    # A non-default configuration (a host-expert arm, a split mode) is its own point.
+    xt_tag=""
+    if [ -n "$PPL_EXTRA" ]; then
+        xt_tag="-x$(printf '%s' "$PPL_EXTRA" | tr -cs 'A-Za-z0-9.' '-' | sed 's/^-*//;s/-*$//')"
+    fi
+    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${UB:+-ub${UB}}.kld"
 fi
 META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
@@ -269,7 +281,7 @@ echo "==> prefill-logit KLD gate (issue #113)"
 echo "    ppl=$LLAMA_PPL"
 echo "    model=$MODEL"
 echo "    corpus=$CORPUS  (sha256=${CORPUS_SHA:0:16}...)"
-echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS"
+echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS${PPL_EXTRA:+  extra='$PPL_EXTRA'}"
 echo "    base=$BASE$( [ -f "$META" ] && { r="$(sed -n 's/^rocm=//p' "$META" | head -1)"; [ -n "$r" ] && printf '  (recorded with ROCm %s)' "$r"; } )"
 echo "    thresholds: mean KLD <= $MAX_KLD, same-top-p >= ${MIN_TOPP}%"
 [ "$FAMILY_SWITCH" -eq 1 ] && echo "    mode=family-switch (control ubatch=$CONTROL_UB, max point PPL=$FAMILY_MAX_PPL)"
@@ -287,10 +299,13 @@ run_ppl() {
     local sm_args=()
     [ -n "$SM" ] && sm_args=(-sm "$SM")
     # shellcheck disable=SC2086  # $extra is an intended word-split K=V list
+    local xt_args=()
+    # shellcheck disable=SC2206  # an intended word-split argument list
+    [ -n "$PPL_EXTRA" ] && xt_args=($PPL_EXTRA)
     timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEVICE" ${extra:-} \
         "$LLAMA_PPL" -m "$MODEL" -f "$CORPUS" \
         -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -ctk "$KV" -ctv "$KV" -t "$THREADS" "${ub_args[@]}" "${sm_args[@]}" \
-        "$@" >"$out" 2>&1
+        "${xt_args[@]}" "$@" >"$out" 2>&1
 }
 
 mean_kld()  { sed -n 's/^Mean[[:space:]]*KLD:[[:space:]]*\([-0-9.][0-9.]*\).*/\1/p' "$1" | head -1; }

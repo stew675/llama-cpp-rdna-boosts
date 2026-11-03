@@ -191,6 +191,13 @@ is the observed "streamed from disk over and over".  Candidates, cheapest first:
    the pool admitting only what survives) — only if (1) and (2) are insufficient; it reintroduces a churning
    structure that r113 deliberately removed, so it needs the offline model's numbers first.
 
+**An external "pipelined asynchronous staging" proposal (pinned ring + `O_DIRECT` + a background fill thread)
+was reviewed 2026-11-02: see [`PROPOSAL-pipelined-staging.md`](PROPOSAL-pipelined-staging.md)** — the ring, the
+`O_DIRECT`-into-pinned-memory fill and the overlap are already shipped (r111/r114) and the CPU-copy half is
+measured at <=0.3 % of wall clock, so only the *demand-fill* worker is open, with a ~19 % decode ceiling that
+exists only on a sub-full pool and two measured negative precedents (r113's worker, `MOE_HOST_POOL_PREFETCH`).
+Screen it with the replayer first, per §9.6.
+
 Measure with `/proc/diskstats` (bytes read per decode token) and `MOE_HOST_POOL_VERIFY=1`, not throughput alone.
 The reference model's full pass is **166 GB of shard bytes** (§9.1), so "a repeated cold expert re-reads from
 disk" is not a rounding error — at ~1.8 GB/s it is ~92 s of a pass.

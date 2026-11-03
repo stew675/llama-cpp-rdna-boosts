@@ -1,3 +1,35 @@
+## 261102.016 (wip + one delivery script) -- `gate-prefill-logits.sh --extra` committed; an external pipelined-staging proposal reviewed and recorded
+
+**Delivery script change (committed with the maintainer's go-ahead):** `scripts/gate-prefill-logits.sh` gains
+`--extra "ARGS"` (`PPL_EXTRA`), extra `llama-perplexity` arguments — word-split, folded into the base-file name so
+a base recorded on one configuration is never reused for another.  **Why it was needed:** the gate could not
+judge *any* non-default configuration, so the host-expert arm this campaign has to gate
+(`-ncmoe 40 --host-experts pool`) was unmeasurable through it — the alternative was a hand-rolled
+`llama-perplexity` invocation with no base-meta check.  Additive; no existing arm changes.  Used for
+`261102.015`'s KLD result (mean `-0.000000` / same-top-p `100.000 %`).  No change to `patches/`,
+`release.json` or `rdna-boosts-all.patch`.
+
+**External proposal recorded, not scheduled** (`wip/host-pool-speed/PROPOSAL-pipelined-staging.md`): a
+"pipelined asynchronous staging" idea — a multi-buffered pinned ring, `O_DIRECT` reads straight into pinned host
+memory, and a background thread filling the next buffer while the GPU runs the current one, offered as the way
+to hide the bounce/CPU-copy cost.  Three quarters of it **is the shipped design**: the staging ring
+(`GGML_SCHED_STAGE_SLOTS`, default 8, copy stream + per-slot events), the tier-resident fill as one kernel
+launch (`MOE_HOST_POOL_STAGE_BATCH=1`, 1564 -> 2103 t/s prefill), and `O_DIRECT` landing directly in the pinned
+pool slot (`MOE_HOST_POOL_DIO`, `pool_dio_read` into `cudaHostAlloc` memory — no bounce, no CPU copy).  Its two
+framings do not apply here: the delivery never used managed memory (the *faulting* design was `window`, closed
+as fatal on no-XNACK hardware), and the remaining bounce cost is measured at 56.4 MiB (srv cell) to 3664 MiB
+(122B) per run, <=0.3 % of wall clock.
+
+What is genuinely open is a **demand-fill worker** (overlap the host-side `pread` of the current ubatch's misses
+with the previous ubatch's compute).  Sized before anything is built: 122B FRAC 80 reads 160-165 GiB/run, of
+which ~73 GiB is the model load and ~53.7 GiB the one-shot prepopulate, leaving **~18 MiB/token of demand reads
+= ~10 ms of a 51.8 ms step (~19 % ceiling)** — and **zero at FRAC 100** (hit rate 0.91), i.e. it buys nothing on
+the "pool big enough for the whole set" case the acceptance criterion is about.  Two measured precedents are
+negative (`MOE_HOST_POOL_PREFETCH` default 0 because it hurt until near-full residency; r113's background
+worker cost 2x decode for 0 MiB of L3), so the recorded order is: replayer screen (§9.6) -> a `pread` wall-time
+histogram over a 2000-token decode -> only then a single-worker demand fill **into pool slots** (never a second
+bounce ring, never eviction-side), with `io_uring` explicitly not the first step.
+
 ## 261102.016 (wip) -- "use hipHostMalloc(Mapped) + hipHostGetDevicePointer" -- already the delivery's default; measured, and it costs exactly what we knew
 
 No delivery change.  Answering a suggestion (from an external assistant) that this pair is the way to handle a
