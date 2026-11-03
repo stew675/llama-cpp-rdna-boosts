@@ -1,4 +1,6 @@
-// probe-pageable-threads — is the driver's pageable-copy staging PER PROCESS or PER THREAD?
+// probe-pageable-threads — is the pageable staging PER THREAD, and is SHARING A STREAM between two
+// enqueueing threads safe?  (P3: the real path wedged twice; the probe never did.  The one thing the real
+// path does that this probe did not is let TWO threads enqueue on the SAME stream.)
 //
 // WHY (wip/host-expert-eager-push, P3): pushing straight from the pageable model mapping is at parity on ONE
 // device (55.1 vs 53.6 t/s) and on a 3-device `-sm layer` split (55.6 vs 53.7), but a 2-device `-sm tensor`
@@ -24,6 +26,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #define HIPCK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
@@ -40,18 +46,36 @@ int main(int argc, char ** argv) {
     const int    per_dev = argc > 3 ? atoi(argv[3]) : 64;
     const int    rounds  = argc > 4 ? atoi(argv[4]) : 150;
     const bool   threads = getenv("THREADS") != nullptr && atoi(getenv("THREADS")) != 0;
+    // SHARED=1: the worker threads enqueue on the MAIN thread's stream for that device (two enqueueing
+    // threads per stream, which is what the in-tree queue did) instead of one stream per thread.
+    const bool   shared  = getenv("SHARED") != nullptr && atoi(getenv("SHARED")) != 0;
 
     std::vector<hipStream_t> stream((size_t) ndev);
     std::vector<void *>      dst((size_t) ndev);
     const size_t page_bytes = chunk * (size_t) per_dev;
     void * page = nullptr;
-    if (posix_memalign(&page, 4096, page_bytes) != 0) {
-        return 1;
+    // MMAPF=<file>: source the copies from a FILE-BACKED read-only mapping (the model's situation) instead of
+    // anonymouse memory -- a pageable copy that has to fault file pages in is a different driver path, and it
+    // is the one difference between the in-tree queue (which wedged) and this probe (which does not).
+    const char * mmapf = getenv("MMAPF");
+    if (mmapf != nullptr) {
+        const int fd = open(mmapf, O_RDONLY);
+        if (fd < 0) { perror("open"); return 1; }
+        page = mmap(nullptr, page_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (page == MAP_FAILED) { perror("mmap"); return 1; }
+        printf("  source: %s (file-backed, first %zu MiB, NOT pre-faulted)\n", mmapf, page_bytes >> 20);
+    } else {
+        if (posix_memalign(&page, 4096, page_bytes) != 0) {
+            return 1;
+        }
+        memset(page, 1, page_bytes);
+        printf("  source: anonymous memory\n");
     }
-    memset(page, 1, page_bytes);
+    std::vector<hipStream_t> wstream((size_t) ndev);
     for (int d = 0; d < ndev; d++) {
         HIPCK(hipSetDevice(d));
         HIPCK(hipStreamCreate(&stream[(size_t) d]));
+        HIPCK(hipStreamCreate(&wstream[(size_t) d]));
         HIPCK(hipMalloc(&dst[(size_t) d], page_bytes));
         HIPCK(hipDeviceSynchronize());
     }
@@ -59,14 +83,17 @@ int main(int argc, char ** argv) {
     // one round = every device issues its run of fills (the pattern of one MoE op)
     const auto round_issue = [&](int d) {
         HIPCK(hipSetDevice(d));
+        // the stream the push lands on: shared with the main thread under SHARED=1, else private to this thread
+        hipStream_t s = shared ? stream[(size_t) d] : wstream[(size_t) d];
         for (int c = 0; c < per_dev; c++) {
             HIPCK(hipMemcpyAsync((char *) dst[(size_t) d] + (size_t) c * chunk, (const char *) page + (size_t) c * chunk,
-                                 chunk, hipMemcpyHostToDevice, stream[(size_t) d]));
+                                 chunk, hipMemcpyHostToDevice, s));
         }
     };
     const auto round_sync = [&](int d) {
         HIPCK(hipSetDevice(d));
         HIPCK(hipStreamSynchronize(stream[(size_t) d]));
+        if (!shared) { HIPCK(hipStreamSynchronize(wstream[(size_t) d])); }
     };
 
     // warm-up
@@ -88,8 +115,9 @@ int main(int argc, char ** argv) {
     }
     const double ms = now_ms() - t0;
     const double bytes = (double) page_bytes * (double) ndev * (double) rounds;
-    printf("  %d device(s), %s: %8.2f ms  %7.2f GB/s  %6.1f us/fill\n", ndev,
-           threads ? "one thread PER DEVICE" : "ONE thread for all devices", ms, bytes / 1e9 / (ms / 1000.0),
+    printf("  %d device(s), %s%s: %8.2f ms  %7.2f GB/s  %6.1f us/fill\n", ndev,
+           threads ? "one thread PER DEVICE" : "ONE thread for all devices",
+           shared ? " (SHARED stream)" : " (private stream)", ms, bytes / 1e9 / (ms / 1000.0),
            1000.0 * ms / ((double) per_dev * (double) ndev * (double) rounds));
     return 0;
 }

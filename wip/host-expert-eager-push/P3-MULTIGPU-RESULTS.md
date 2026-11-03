@@ -191,7 +191,7 @@ it means the direct pageable push needs **no pinned host duplicate at all** — 
 RAM property that is the campaign's actual goal (delete the pool's 4.7-9.3 GiB, `PUSH-MLOCK-TIER.md`), with
 the residency guarantee coming from the mlock tier rather than from pool slots.
 
-**REFUTED on first implementation: the worker-thread handshake deadlocked in the real path.**  A
+**FIRST attempt: a teardown deadlock in my code, not a driver wedge (see the correction below).**  A
 per-device upload thread with "caller waits until the copy has been ISSUED" wedged on its first run: the
 process sat with GPUs and CPU idle, 6 threads — main in `futex_do_wait`, two in `kfd_wait_on_events`, and the
 two per-device workers parked on their condvars with no job in flight — i.e. the copy was never issued and
@@ -201,7 +201,29 @@ is the surrounding state — the waiting thread holds the cache mutex, and the d
 rather than a private buffer.  **Not diagnosed**; do not re-attempt this shape without (i) a timeout-guarded
 handshake that falls back to the caller's-thread copy and logs it, and (ii) a stack trace of the wedge.
 
-**Second attempt, and the wedge is in the DRIVER, not the handshake.**  Re-implemented with a **bounded**
+**Second attempt wedged again — and the cause turned out to be MINE, not the driver's (RETRACTION, see
+below).**
+
+**CORRECTION (same day, after a gdb trace): the "wedge" was a TEARDOWN deadlock in my own code.**  The traces
+showed the main thread inside \`exit()\` -> \`_dl_fini\` -> \`__do_fini\` -> \`__cxx_global_array_dtor\` ->
+\`std::condition_variable::~condition_variable\` -> \`pthread_cond_destroy\`, blocked, with the two workers parked
+in \`uq_worker\`'s \`cv.wait()\`: destroying a condvar that still has waiters is undefined and blocks.  The two
+"stuck GPU work" threads I had read as \`kfd_wait_on_events\` are ROCm's own \`AsyncEventsLoop\` threads in their
+normal idle state, not evidence of anything.  **So nothing was ever wedged in the driver: the generation had
+completed and the process hung on the way out.**  Fix: allocate the per-device queue on the heap and never
+destroy it.  With that, **the queue runs cleanly: 115 808 fills issued by the per-device threads, 0 caller
+fallbacks, 0 stalled devices** — and it is **performance-neutral: 27.5 t/s against 28.2 without it** (pool
+56.0).  So the per-thread-de-contention hypothesis is **not** the explanation in the real path, and the
+remaining gap between the probe's 21-30 us/fill and the path's ~107 us/fill is unexplained by the thread, the
+stream, or the source (the probe reproduces none of it with a file-backed source, a shared stream, or
+per-device threads).
+
+**The one difference left is the DESTINATION**: the probe copies into a plain \`hipMalloc\` buffer, the real
+path into an expert-cache ARENA slot (the delivery's arena/VMM machinery).  That is the next test: the same
+probe with a VMM-mapped destination.
+
+**Superseded (kept for the record): the second attempt and the reasoning that led to it.**  Re-implemented with
+a **bounded**
 wait (1.5 s, falling back to the caller's-thread copy) so the arm could not hang on my code.  It froze again
 after ~25 s, and the process state rules the handshake out: **the two workers were parked on their condvars
 (no job in flight) while two other threads sat in `kfd_wait_on_events`** — i.e. the copies WERE issued and
