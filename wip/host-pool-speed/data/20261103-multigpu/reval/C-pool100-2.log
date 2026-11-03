@@ -1,0 +1,133 @@
+
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11909-e23754b5d
+model      : /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> # llama-cpp-rdna-boosts A patch collection that brings **AMD RDNA-specific performance work** to [llama.cpp](https://github.com/ggml-org/llama.cpp): MTP decode, chunked gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next) support, and an attention-memory campaign that frees several GiB of VRAM. It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point **`790cf5 ... (truncated)
+Based on the detailed documentation you provided, here is a structured summary and analysis of the **llama-cpp-rdna-boosts** patch collection. This appears to be a highly specialized, performance-tuned fork of `llama.cpp` specifically optimized for **AMD RDNA3, RDNA3.5, and RDNA4** architectures.
+
+### 🚀 Project Overview
+**llama-cpp-rdna-boosts** is a collection of **16 self-contained patches** designed to bring significant performance improvements, memory optimizations, and new feature support to `llama.cpp` on AMD GPUs.
+
+*   **Target Base:** `llama.cpp` at commit `790cf51aa` (re-based as of **2026-09-13**).
+*   **Target Hardware:**
+    *   **RDNA 3:** `gfx1100` (e.g., RX 7900 XTX/XT, 7800 XT)
+    *   **RDNA 3.5:** `gfx1150`/`gfx1151` (Strix Point/Halo APUs)
+    *   **RDNA 4:** `gfx1200`/`gfx1201` (RX 9060/9070 series) — *Primary beneficiary of new kernels.*
+*   **Installation Method:** Strict `git am` workflow via `scripts/apply-all.sh`. **Do not** use `git apply` on concatenated files.
+
+---
+
+### 🔑 Key Features & Capabilities
+
+#### 1. Performance Accelerations
+*   **WMMA Flash-Attention:** Native BF16 Flash-Attention using Wave Matrix Multiply Accumulate (WMMA) instructions.
+    *   *RDNA4:* Full support.
+    *   *RDNA3/3.5:* Backported with tuned head limits (576 heads for RDNA3, 320 for RDNA3.5).
+*   **Chunked Gated-Delta-Net (GDN):** A fused prefill kernel optimized for BF16/WMMA, segregated by architecture (separate kernels for `gfx11` and `gfx12`).
+*   **Fused MoE (Mixture of Experts):**
+    *   Fused `Gate + Up + GLU` MMQ kernels.
+    *   Supports RDNA4, RDNA3.5, and RDNA3.0.
+    *   Includes `mmvq` short-K item-split for decode optimization.
+*   **K-Quant Boosts:** Optimized VDR (Vectorized Dot Product) paths for Q4_K, Q5_K, Q6_K, and Q8_0, including a dedicated parameter table for RDNA3.5.
+*   **Hybrid All-Reduce (Block 12):** Custom internal all-reduce for small-tensor decode paths on RDNA4, falling back to RCCL for other architectures.
+
+#### 2. Memory Optimization (Block 15)
+A major "Attention-Memory Campaign" that frees significant VRAM:
+*   **Savings:** ~3.4 GiB/GPU on Qwen4exp models; ~800 MiB/GPU on dense models.
+*   **Techniques:**
+    *   Derived KQ masks (`LLAMA_KQ_MASK_DERIVED`).
+    *   Native Q8_0 and BF16 K/V in Flash-Attention kernels.
+    *   QSA (Sparse Attention) score-chain memory optimization.
+    *   Unused view release in `ggml-alloc`.
+
+#### 3. New Model Support
+*   **Qwen4exp / Qwen3.8-Flash-Next:** Full support including:
+    *   QSA (Sparse Attention) with default QSA sparse FA.
+    *   Fused indexer top-k.
+    *   MTP (Multi-Token Prediction) draft heads.
+    *   WS4 hyperconn prefill fusions.
+
+#### 4. Stability & Correctness
+*   **Greedy Purity:** Ensures plain decode matches `draft-mtp` verify for specific configurations.
+*   **Bit-Identical Results:** CPU and GPU decode/verify batches are bit-identical (with specific caveats for Block 10 and 13).
+*   **Runtime Arch Selection:** No compile-time gating; the binary detects `cc`/`gcnArchName` at runtime to select the correct kernel path.
+
+---
+
+### 📦 The 16-Patch Breakdown
+
+| Block | Focus Area | Key Details |
+| :--- | :--- | :--- |
+| **00** | **Structural Fixes** | FA small-batch KV-split, Vulkan masked-V fixes. **Base for all others.** |
+| **01** | MTP Draft | Adaptive MTP draft depth (`--draft-mtp-adaptive`). |
+| **02** | Prefill Kernel | Fused chunked gated-delta-net (BF16/WMMA). |
+| **03** | KV Cache | BF16 KV cache + native BF16 flash-attn. |
+| **04** | Flash-Attn | RDNA4 WMMA flash-attn + Q6_K mmq prefill. |
+| **05** | CPU/GPU Sync | CPU bit-identical decode/verify batches. |
+| **06** | Memory | Host-buffer revert for discrete GPUs. |
+| **07** | Device Wrapper | Meta device-wrapper skip. |
+| **08** | Prefill Fusion | Fused-core prefill kernels + GPU bit-identical results. |
+| **09** | Buffering | Meta-buffer compute-container headroom. |
+| **10** | Quant Boosts | K-quant boosts (Q4-Q8) + RDNA3.5 mmvq table. **Note:** Changes decode numerics (reordering). |
+| **11** | Graphs | Skip CUDA graphs for multi-token prefill. |
+| **12** | All-Reduce | Hybrid HIP all-reduce (RDNA4 only, fallback to RCCL). |
+| **13** | MoE Fusion | Fused MoE gate+up+GLU + mmvq short-K split. |
+| **14** | Qwen4exp | Full Qwen3.8-Flash-Next support (QSA, MTP, etc.). |
+| **15** | **Memory Wins** | Attention-memory campaign (saves ~3.4 GiB/GPU). |
+
+---
+
+### ⚠️ Critical Notes & Caveats
+
+1.  **Greedy Purity Warning (Block 10 & 13):**
+    *   **Block 10:** Changes decode numerics on K-split paths due to FP32 reduction reordering. Outputs are deterministic *within* a build but may differ from stock builds.
+    *   **Block 13:** Rewrites small-batch mmvq decode kernels.
+    *   *Action:* If 100% bit-identical reproducibility with stock `llama.cpp` is required, **do not apply Block 10**.
+
+2.  **Installation Strictness:**
+    *   Must use `git am` or `scripts/apply-all.sh`.
+    *   `git apply` on concatenated patches will silently drop hunks and break the build.
+
+3.  **RDNA4 Specifics:**
+    *   Block 12 (All-Reduce) is **RDNA4-only**.
+    *   Block 15 memory optimizations are most effective on RDNA4 but apply generally.
+
+4.  **Upstream Status:**
+    *   Some blocks (e.g., Block 12) are gated pending community verification.
+    *   The project tracks upstream drift and requires regeneration via `scripts/make-patches.sh` when the base commit changes.
+
+### 📚 Documentation References
+*   **Apply Instructions:** `patches/README.md`
+*   **Change Log:** `WORKLOG.md` (Dated records, newest first)
+*   **Verification:** `MANIFESTS.md` (Apply order + contract)
+*   **Purity Details:** `GREEDY-PURITY.md` (Crucial for Block 10/13 users)
+*   **Baseline:** `BASELINE.md` (Fork point policy)
+
+This patch set represents a cutting-edge effort to maximize AMD GPU utilization for LLM inference, particularly for the upcoming RDNA4 architecture and large MoE models like Qwen4exp.
+
+[ Prompt: 718.1 t/s | Generation: 23.4 t/s ]
+
+
+Exiting...

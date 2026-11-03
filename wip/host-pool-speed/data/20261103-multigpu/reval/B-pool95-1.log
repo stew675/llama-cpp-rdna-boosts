@@ -1,0 +1,116 @@
+
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11909-e23754b5d
+model      : /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> # llama-cpp-rdna-boosts A patch collection that brings **AMD RDNA-specific performance work** to [llama.cpp](https://github.com/ggml-org/llama.cpp): MTP decode, chunked gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next) support, and an attention-memory campaign that frees several GiB of VRAM. It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point **`790cf5 ... (truncated)
+Based on the detailed README and changelog you provided, here is a structured summary of the **llama-cpp-rdna-boosts** patch collection. This project is a specialized optimization suite for **llama.cpp** targeting **AMD RDNA** GPUs (specifically RDNA3, 3.5, and 4), delivering significant performance gains, memory savings, and new model support.
+
+### 🚀 Core Value Proposition
+This is a **16-patch collection** (Block 00 + Blocks 01–15) designed to be applied on top of the `llama.cpp` fork point **`790cf51aa`**. It introduces:
+*   **Performance:** RDNA-specific kernels (WMMA Flash Attention, Gated-Delta-Net), fused MoE operations, and k-quant decode paths.
+*   **Memory Efficiency:** An "attention-memory campaign" (Block 15) freeing ~3.4 GiB VRAM on large models (e.g., Qwen4exp) and ~800 MiB on dense models.
+*   **New Features:** Support for **Qwen4exp (Qwen3.8-Flash-Next)**, MTP (Multi-Token Prediction) decode, and hybrid all-reduce for multi-GPU setups.
+*   **Architecture Support:** Optimized for **RDNA4** (`gfx120x`) with back-ported optimizations for **RDNA3** (`gfx1100`) and **RDNA3.5** (`gfx115x`).
+
+---
+
+### 📦 The 16 Blocks (Summary)
+
+| Block | Key Feature | Details |
+| :--- | :--- | :--- |
+| **00** | **Structural Fixes** | Fixes FA small-batch KV-split width invariance and Vulkan masked-V/freed-cell issues. The foundation for all other blocks. |
+| **01** | **Adaptive MTP** | Adaptive draft depth (`--draft-mtp-adaptive`) for Multi-Token Prediction. |
+| **02** | **Chunked GDN Prefill** | Fused chunked gated-delta-net prefill kernel (BF16/WMMA). Separate kernels for RDNA4 and RDNA3. |
+| **03** | **BF16 KV Cache** | Native BF16 KV cache and Flash Attention. Includes HIP masked-V fixes. |
+| **04** | **WMMA Flash-Attn** | RDNA4 WMMA Flash Attention. Also runs on RDNA3/3.5 with tuned head limits (576 for RDNA3, 320 for 3.5). |
+| **05** | **CPU Bit-Identical** | Ensures CPU decode/verify batches are bit-identical. |
+| **06** | **Host Buffer Revert** | Reverts host-buffer logic for discrete GPUs. |
+| **07** | **Meta Device Skip** | Skips meta device wrappers. |
+| **08** | **Fused Core Prefill** | Fused-core prefill kernels with GPU bit-identical results. Includes fixes for quantized KV types (`q4_1`, `q5_0`, etc.). |
+| **09** | **Meta Buffer Headroom** | Adds compute-container headroom for meta buffers. |
+| **10** | **k-Quant Boosts** | VDR boosts for Q4/Q5/Q6/Q8_0. Adds dedicated RDNA3.5 mmvq table. **Note:** Changes decode numerics (reordering reduction). |
+| **11** | **CUDA Graph Skip** | Skips CUDA graphs for multi-token prefill (keeps them for decode). |
+| **12** | **Hybrid All-Reduce** | Custom internal all-reduce for small tensors on **RDNA4 only**. Falls back to RCCL elsewhere. |
+| **13** | **Fused MoE** | Fused MoE gate+up+GLU MMQ + mmvq short-K item-split. Validated on RDNA4, 3.5, and 3.0. |
+| **14** | **Qwen4exp Support** | Full support for Qwen3.8-Flash-Next (QSA sparse FA, fused indexer, MTP draft-head, WS4 hyperconn). |
+| **15** | **Memory Wins** | **Major Memory Savings:** Derived KQ masks, native Q8_0/BF16 K/V in FA kernels, QSA score-chain memory optimizations. |
+
+---
+
+### ⚙️ Architecture & Compatibility
+
+*   **Target Families:**
+    *   **RDNA 4 (`gfx1200`/`gfx1201`):** Maximum benefit (WMMA Flash-Attn, Chunked-GDN, k-quant VDR, Block 12 All-Reduce).
+    *   **RDNA 3.5 (`gfx1150`/`gfx1151`):** Strix Point/Halo APUs. Back-ported kernels with tuned limits.
+    *   **RDNA 3 (`gfx1100`):** RX 7900/7800 series. Back-ported kernels.
+*   **Runtime Selection:** The binary is multi-arch. It detects the device `cc`/`gcnArchName` at runtime to select the correct kernel path.
+    *   *Build Example:* `GPU_TARGETS="gfx1100;gfx1151;gfx1201"`
+*   **Exceptions:**
+    *   **Block 12:** Internal all-reduce is **RDNA4-only**.
+    *   **Block 10:** Changes decode numerics (reordering). Not bit-identical to stock builds (deterministic within build, but differs across configs).
+
+---
+
+### 🛠️ Installation & Workflow
+
+**⚠️ Critical:** Do **not** use `git apply` on the concatenated series. It silently drops hunks.
+
+1.  **Prerequisites:** A clean `llama.cpp` checkout at commit `790cf51aa`.
+2.  **Apply Method:**
+    *   **Recommended:** Use the provided script: `scripts/apply-all.sh` (Strict 16/16 `git am`).
+    *   **Manual:** Apply patches `patches/0000-…` through `patches/0015-…` individually using `git am`.
+3.  **Upstream Drift:** If upstream `llama.cpp` moves, regenerate patches using `scripts/make-patches.sh` from the forked repository.
+
+---
+
+### 📉 Recent Updates (as of 2026-09-13)
+
+*   **Re-base:** Updated to upstream master `790cf51aa` (70 commits ahead of previous base).
+*   **Conflict Resolution:** Resolved 4 upstream clashes regarding FA tuning, `GGML_FA_QUANTS`, MoE MMQ, and indexer V cache.
+*   **Validation:**
+    *   `test-backend-ops`: 18061/18061 passed.
+    *   **Greedy Purity:** Plain decode matches `draft-mtp` verify for `--spec-draft-n-max <= 7`.
+    *   **Memory:** Block 15 confirmed to save ~3.4 GiB/GPU on Qwen4exp.
+*   **Block 13 Fixes:** Added RDNA3.5/3.0 fused-MoE-MMQ gate relaxations and fixed decode/verify band-uniformity issues.
+
+### ⚠️ Important Caveats
+
+1.  **Greedy Purity (Block 10):** If you require 100% bit-identical outputs across different builds/configs, **do not apply Block 10**. It reorders FP32 reductions in VDR kernels.
+2.  **Block 13 Caveat:** Rewrites small-batch mmvq decode kernels. Specific fixes were applied in Sept 2026 to ensure bit-identical results for `W=1..8` on MoE projections.
+3.  **Block 12 Gate:** The custom all-reduce is strictly gated to RDNA4. Multi-GPU setups on RDNA3 will fall back to RCCL.
+
+### 📚 Documentation Links
+*   **Patch Details:** `patches/README.md`
+*   **Worklog:** `WORKLOG.md` (Dated record of changes)
+*   **Purity Policy:** `GREEDY-PURITY.md`
+*   **Manifests:** `MANIFESTS.md` (Apply order & verification)
+*   **Baseline:** `BASELINE.md` (Fork point & drift policy)
+
+This patch set represents a highly mature, community-driven effort to unlock the full potential of AMD's latest GPU architectures for LLM inference.
+
+[ Prompt: 1446.2 t/s | Generation: 38.5 t/s ]
+
+
+Exiting...

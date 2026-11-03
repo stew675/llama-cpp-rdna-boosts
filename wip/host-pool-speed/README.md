@@ -1287,6 +1287,41 @@ it means the same defect is still present in the **default (pinned) mode** at a 
 `TODO` #133: let an identity (fully resident) table serve the prefill op in place, the aliasing
 `moe_cache_get_table()` already does in the decode band.
 
+### 18.2b REVALIDATED after the box restart (2026-11-03, clean box) — every headline number holds
+
+**Why it had to be redone:** `/tmp` on `soar` is **tmpfs**.  This session had put ~6.6 GB of run artefacts in it
+(rocprof CSVs, a 2.9 GB prefill-logit base, a llama.cpp worktree), an aborted run left a `llama-cli` holding
+**70 GiB RSS**, and the box was running with 12 GiB of swap in use — after which the numbers were erratic (a 75.2
+t/s `pinned` prefill, `llama-bench` core-dumping, a run aborted mid-flight).  The box was restarted; everything
+below was measured on it with `swap 0`, `MemAvailable ≥ 83.7 GiB`, no stray processes, logs on **disk** (the repo's
+`data/`, never `/tmp`), and each arm verified clean before and after (`tools/arm-run-261103.sh` refuses to record an
+arm on a dirty box).  Data: `data/20261103-multigpu/reval/` (`summary.tsv` has the per-arm memory/swap/disk state).
+
+| group | arm | decode t/s | prefill t/s | text |
+|---|---|---|---|---|
+| 3 GPUs, `-sm tensor` | `pinned` ×2 | **67.7 / 67.3** | **638.2 / 634.1** | `dc178c29fe89` |
+| | `pool` FRAC 95 (gather) ×2 | **67.7 / 67.2** | **1631.3 / 1507.7** | `dc178c29fe89` |
+| | `pool` FRAC 80 | 66.6 | 1343.8 | `dc178c29fe89` |
+| pair, `-sm tensor` | `pinned` ×2 | **49.2 / 49.2** | **1651.4 / 1642.3** | `01607c16b483` |
+| | `pool` FRAC 95 (gather) ×2 | **38.5 / 38.5** | 1446.2 / 1461.3 | `01607c16b483` |
+| 1 GPU, `-sm layer` | `pinned` ×2 | **25.4 / 25.4** | 724.6 / 723.2 | `5421cf18bed5` |
+| | `pool` FRAC 100 ×2 | **23.4 / 23.4** | 718.3 / 718.1 | `5421cf18bed5` |
+
+So, on a clean box and with two runs per arm: **3 GPUs the pool is at decode parity (-0.6 %) and 2.4-2.6x
+`pinned`'s prefill; the pair is -21.7 %; one GPU is -7.9 %** (exactly the campaign's long-standing "pool raw
+overhead" figure).  Every group's text is byte-identical across modes.  The prefill-logit gate was re-run here too:
+**mean KLD -0.000000 / same-top-p 100.000 %** (base PPL 3.5537).
+
+**One anomaly survives the clean box, and it is `llama-batched-bench`-specific**, so the gate must be read with
+care: at `-npp 64 -ntg 64 -npl 1` the pool arm reports **~1 t/s** prefill (63-66 s for 64 tokens) against
+`pinned`'s 9.74 — and it is **1.00 with the gather on and 0.96 with it off**, i.e. not a path question; the same
+pool arm at the same 64-token width in `llama-cli` gives **71.2 t/s** against `pinned`'s 33.8 (and `pinned` itself
+is 3.5x depressed in the tool at `npl=1`).  At `npl` 4 and 8 the tool behaves sanely and the pool leads by 4-6x
+(**338.5 vs 81.8**, **835.8 vs 136.0**).  Treat the `npl=1` cell as a tool artefact to be explained, not as a
+host-expert measurement; the earlier report that this "1.02 t/s" was caused by the memory contamination is
+**withdrawn** — it reproduces on the clean box, so it is a separate, still-open question (recorded under `TODO`
+#131, not a regression from `patches/0006`).
+
 ### 18.3 W3 — the `RAM_PCT` ceiling now scales every table (implemented, measured, `patches/0005`)
 
 `pool_clamp_slots_to_ram()` shaved the **registration-order tail** to the one-slot floor.  Measured on `soar`,
