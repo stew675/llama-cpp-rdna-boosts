@@ -79,7 +79,9 @@ def price(events, arm, c, cold_pagecache=0.5):
                 cold_disk * (c["pool_memcpy_cold"] + c["ce_h2d"]) +
                 read_hot * c["ce_h2d"])
         device = consumes * c["ce_h2d"] + consumes * c["sm_read"]
-        link_mib = consumes * 2          # the pool writes a slot and then copies it to VRAM
+        # The pool's `memcpy` is host RAM -> host RAM (not link traffic); only the slot -> VRAM CE copy
+        # crosses the link.  Corrected 2026-11-03: the earlier `* 2` mislabelled the host memcpy as link.
+        link_mib = consumes
     else:
         host = (fills_hot * c["grant_hot"] +
                 cold_cache * c["grant_hot"] +
@@ -189,7 +191,7 @@ def main(argv=None):
             row["grants_per_tok"], row["cold_grants_per_tok"]))
     print()
     print("host µs/decode-token is HOST CPU time on the token's critical path; the device/link column is")
-    print("what a grant costs the link (both arms move the same bytes once, the pool writes them twice).")
+    print("the one CE transfer either arm pays (the pool's memcpy is host RAM -> host RAM, not link).")
     print("A negative delta means the window is cheaper.  `l3 MiB/tok` is the disk tier both modes share.")
     if args.json:
         with open(args.json, "w") as f:
