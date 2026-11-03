@@ -201,6 +201,16 @@ is the surrounding state — the waiting thread holds the cache mutex, and the d
 rather than a private buffer.  **Not diagnosed**; do not re-attempt this shape without (i) a timeout-guarded
 handshake that falls back to the caller's-thread copy and logs it, and (ii) a stack trace of the wedge.
 
+**Second attempt, and the wedge is in the DRIVER, not the handshake.**  Re-implemented with a **bounded**
+wait (1.5 s, falling back to the caller's-thread copy) so the arm could not hang on my code.  It froze again
+after ~25 s, and the process state rules the handshake out: **the two workers were parked on their condvars
+(no job in flight) while two other threads sat in `kfd_wait_on_events`** — i.e. the copies WERE issued and
+returned, and their GPU completion never arrives.  A timeout on the host cannot reach that.  Two wedges, two
+distinct signatures (the first had nothing in flight; the second leaves work that never completes), both
+reproducible, neither tunable from here: **a pageable `cudaMemcpyAsync` issued from a foreign thread is not
+safe on this stack.**  The copies must be issued from the thread that owns the device/stream — the same
+conclusion DESIGN §6 records for device-initiated requests ("adds a sync"), arriving from the other direction.
+
 **Coalescing is the cheaper lever, and it was already named in this codebase.**  `bounce_acquire` carries a
 measured note: the grow-on-demand bounce ring is **deliberately UNCAPPED** and holds **2.2-3.0 GiB of pinned
 bounce on the 122B prefill miss path**, and "the fix for the memory is fewer, LARGER fills (coalesce a run of
@@ -216,6 +226,41 @@ that will enqueue the consumer waits for the worker to have *issued* (not comple
 unchanged because both the fill and the op land on the same device stream.  The fallback, if that proves
 awkward, is a **per-device pinned ring of tens of MiB** (our own memcpy, which measures 1-2 µs per call) —
 bounded far below the "under 2 GiB" the maintainer would accept, and 2 orders of magnitude below the pool.
+
+## 3b. What the RAM is actually buying: the pool-size / transport curve at 2 devices (0,2)
+
+The maintainer's constraint is **RAM** (delete the pinned pool if at all possible; a staging buffer under
+2 GiB would be tolerated).  So the pool — which IS a pinned staging buffer — was swept by size, on the clean
+upstream-x8 pair (`HIP_VISIBLE_DEVICES=0,2`), `--ignore-eos -n 500`, 35B-A3B, `-ncmoe 40`:
+
+| arm | pinned pool | decode t/s | vs pool |
+|---|---|---|---|
+| A pool FRAC 50 | 4 712 MiB | **55.9** | 100 % |
+| B bounce only (`MOE_HOST_POOL_MIB=1`, `PUSH_SRC=pinned`) | ~0 | 41.9 | 75 % |
+| C pool 512 MiB | 512 MiB | 42.2 | 75 % |
+| D pool 1024 MiB | 1 024 MiB | 42.7 | 76 % |
+| E direct page-cache push (`PUSH_SRC=mapping`) | 0 | 28.4 | 51 % |
+
+**Read this carefully, because it is not a transport story.**  C and D are indistinguishable from B: a pool
+that does not hold the *hot* set is the same as no pool.  The pool's benefit is all-or-nothing — residency of
+the working set — and no transport can substitute for it.  The 25 % gap between A and B/C/D is **the per-fill
+host memcpy that a page-cache source always pays**: with 4.7 GiB resident, ~75 % of fills hit a pinned slot and
+cost nothing; without it, every fill copies page-cache bytes into the ring first.  `mlock` does **not** remove
+that cost — it prevents *reclaim* (the disk read), not the copy, because the bytes stay pageable.
+
+So the RAM question and the transport question are separable, and the answer to each is:
+
+- **Transport: the bounded bounce ring, not the direct CE.**  41.9-42.7 t/s against 28.4, and the direct path
+  wedges the driver when parallelised (§3a).
+- **Residency: `mlock` over the mapping** — the same pages, locked, with **no duplicate**.  That is what
+  replaces the 4.7 GiB pool's *guarantee* at a fraction of its RAM, and it is the piece
+  `PUSH-MLOCK-TIER.md` designed.
+
+**Under the 4 % parity bar, none of the low-RAM options pass on this band** (75 % and 51 %).  Two things soften
+that and must be measured before any decision: (i) this is the **fit-in-RAM** band, where the mode is not meant
+to be used — on the not-fitting band every miss is a disk read anyway and the transport difference should
+shrink, which is exactly the maintainer's own argument; (ii) the 25 % is *one* number for one config — the
+fraction of fills that hit the pool is what sets it, so it depends on FRAC, arena budget and model.
 
 ## 4. `GGML_SCHED_DEVGATHER` — irrelevant to decode, decisive for prefill
 
