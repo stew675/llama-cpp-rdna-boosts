@@ -86,6 +86,8 @@ echo "  Block 16 is opt-in (LLAMA_PREFILL_LANES=2, default 1): with the env"
 echo "  unset every run takes the pre-existing single-lane path."
 echo "  Block 17 is always on where it applies (RDNA2 tile FA prefill/decode);"
 echo "  other targets stay byte-identical (compile-time / device-CC gated)."
+echo "  Block 18 is always on where it applies (RDNA2 tile FA tail load);"
+echo "  other targets stay byte-identical (compile-time RDNA2 macro gated)."
 echo
 echo "Gates (mixed-arch, e.g. RX 7900 XTX + Radeon Pro V620, 2-GPU -sm layer):"
 echo "  LLAMA_PREFILL_LANES=2 llama-cli -m <model> -sm layer -ts 1,1 ... -v"

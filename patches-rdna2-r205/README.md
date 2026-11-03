@@ -1,13 +1,14 @@
-# rdna-boosts r205 add-on set (blocks 16-17)
+# rdna-boosts r205 add-on set (blocks 16-18)
 
 ## Block 16 -- two-lane prefill (LLAMA_PREFILL_LANES)
 
-**2 patches** that apply on top of the 16-block rdna-boosts delivery set
+**3 patches** that apply on top of the 16-block rdna-boosts delivery set
 (`release.json`, `v16-6050b467c-r205`, applied tree `d6e71901`). Strict
-`git am` on the recorded base reproduces the recorded tree `c680d4f6`
+`git am` on the recorded base reproduces the recorded tree `3b00f589`
 byte-for-byte (0016: d6e71901 -> 3249229a; 0017: 3249229a -> c680d4f6;
-validated on a fresh worktree at base `6050b467c`: 16/16 base blocks
-strict, tree assert, add-on strict, tree assert).
+0018: c680d4f6 -> 3b00f589; validated on a fresh worktree at base
+`6050b467c`: 16/16 base blocks strict, tree assert, add-on strict,
+tree assert; 0018 also strict standalone on the 16-block base).
 
 ## What it adds
 
@@ -111,3 +112,46 @@ identical config, the body is the whole gap (not host, not occupancy).
 - residual vs stock at 32k (1106.5 vs 1231.7): the r205 4×8 body's
   register pressure (256 VGPR + 488B scratch vs stock 212/0) — a
   body-trimming follow-up, not a launch hazard
+
+## Block 18 -- RDNA2 (gfx1030) FA tile tail: the clamped in-bounds read
+
+**1 file** (`ggml/src/ggml-cuda/fattn-tile.cuh`, +24/−12): on gfx1030 the
+FA tile kernel's checked tail loads out-of-range rows through a per-row
+`if (!oob_check || i < i_sup)` branch plus a local zero array. The branch
+form is forced by the flat-scratch hazard (a pointer-select between the
+global KV pointer and a local zero array can fault at a near-null
+address for unaligned KV lengths), and it is also the cost: it pushes
+the checked-tail instantiation past the 256-VGPR cap, spilling 488 B of
+scratch through global memory in the D=256 4x8/16x2 prefill kernels
+(HSACO: 256 sat / 167 spills / 488 B vs stock 212 / 0 / 0).
+
+The tail values never reach the result (the k_VKQ_sup guards discard
+them before the softmax), so on RDNA2 the out-of-range rows are clamped
+to the last in-bounds row (`i_c = i_sup - 1`): a single in-bounds global
+load, no branch, no zero array. Every read stays inside the KV cache
+(an unchecked read past k_VKQ_max faults at a full 131k context). All
+three sites (half2 loader, native dequant loader head/tail) are in
+`#if defined(RDNA2)` (gfx103x-only compile-time macro); every other
+target keeps the existing pointer-select, codegen unchanged.
+
+### Validation (slavap-pd-7900, V620 gfx1030 = Rocm2, -lm dio -b 8192 -ub 2048 -fa 1)
+
+| test | build14 (block 17) | with block 18 | delta |
+|---|---|---|---|
+| pp2048 @ d0 | 2347.1 | **2375.39** | ~0 |
+| pp2048 @ d32768 | 1106.5 | **1259.83** | +13.8% (stock: 1231.7) |
+| pp2048 @ d131072 | 411.7 | **474.70** | +15.3% |
+| tg256 @ d32768 | 82.46 | **85.49** | +3.7% |
+| tg256 @ d131072 | 58.9 | **62.40** | +5.9% |
+| q8_0 pp2048 @ d32768 | 1098.47 | **1196.41** | +8.9% (no abort) |
+
+- HSACO (dkq256-dv256, gfx1030): 4x8 229 VGPR / 0 spills / 0 B, 16x2
+  236 / 0 / 0, q8_0 4x8 224 / 0 / 0
+- greedy tokens: two -fa 1 runs (-s 42 -n 30) byte-identical to each
+  other and to the block-17 build
+- gfx1100 (Rocm0) pp/tg vs the pre-fix build: +0.6% (r=1 noise); the
+  RDNA2 macro is gfx103x-only, so non-RDNA2 codegen is structurally
+  unchanged
+- 131k caveat: this box intermittently faults at d131k (HSA memory
+  aperture) independent of this block -- the block-17 build faults
+  identically; it clears and reappears with the V620 power profile

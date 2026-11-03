@@ -1,0 +1,130 @@
+From 0af328774371ec43c42a663dcc4be4ecf15d4894 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 03 Nov 2026 22:00:00 -0800
+Subject: [PATCH 18/18] rdna-boosts: block 18: RDNA2 (gfx1030) FA tile tail -- clamped in-bounds read instead of checked branch + zero fill
+
+The residual at 32k behind block 17 (1106.5 vs stock 1231.7 t/s pp2048
+@ d32768) is register pressure in r205's own 4x8 D=256 FA tile body:
+the gfx1030 HSACO shows 256 VGPR (saturated) + 488 B of per-thread
+scratch spilling through global memory, vs 212 VGPR / 0 B for the
+stock body (16x2: 256 sat + 520 B; the q8_0 4x8 spills as well).
+
+The cost is the RDNA2 checked tail. On gfx1030 the tail rows load
+through a per-row `if (!oob_check || i < i_sup)` branch with a local
+16-byte-aligned zero array for out-of-range rows (the branch form is
+forced by a flat-scratch hazard: a pointer-select between the global
+KV pointer and a local zero array can form a flat pointer into
+private memory and fault at a near-null address for unaligned KV
+lengths -- Qwen3.8's 2051-cell gathered decode, test-backend-ops
+kv=113). The branch plus zero array is what pushes the checked-tail
+instantiation past the 256-VGPR cap.
+
+The tail values never reach the result: the k_VKQ_sup guards discard
+them before the softmax. So on RDNA2 the out-of-range rows are
+clamped to the last in-bounds row (i_c = i_sup - 1) instead of
+zero-filled: a single in-bounds global load, no branch, no zero
+array. Every read stays inside the KV cache (an unchecked read past
+k_VKQ_max faults at a full 131k context) and the duplicated tail
+values are still discarded by the same guards. All three sites sit in
+#if defined(RDNA2) (gfx103x-only compile-time macro): the half2
+loader (K head + V tiles) and the native dequant loader (head/tail);
+every other target keeps the existing pointer-select, codegen
+unchanged.
+
+HSACO (dkq256-dv256 TU, gfx1030): 4x8 229 VGPR / 0 spills / 0 B (was
+256 sat / 167 / 488 B), 16x2 236 / 0 / 0 (was 256 sat / 175 / 520 B),
+q8_0 4x8 224 / 0 / 0.
+
+Measured (slavap-pd-7900, V620 gfx1030 = Rocm2, -lm dio -b 8192 -ub
+2048 -fa 1, Qwen3.6-35B-A3B-UD-IQ4_XS):
+
+  test                 build14 (block 17)   block 18    delta
+  pp2048 @ d0          2347.1               2375.39     ~0
+  pp2048 @ d32768      1106.5               1259.83     +13.8% (stock: 1231.7)
+  pp2048 @ d131072     411.7                474.70      +15.3%
+  tg256 @ d32768       82.46                85.49       +3.7%
+  tg256 @ d131072      58.9                 62.40       +5.9%
+  q8_0 pp2048 @ d32k   1098.47              1196.41     +8.9% (no abort)
+
+- greedy tokens: two -fa 1 runs (-s 42 -n 30) byte-identical to each
+  other and to the block-17 build
+- gfx1100 (Rocm0) pp/tg vs the pre-fix build: +0.6% (r=1 noise); the
+  RDNA2 macro is gfx103x-only, so non-RDNA2 codegen is structurally
+  unchanged
+- 131k caveat: this box intermittently faults at d131k (HSA memory
+  aperture) independent of this block -- the block-17 build faults
+  identically; it clears and reappears with the V620 power profile
+---
+ggml/src/ggml-cuda/fattn-tile.cuh |   36 ++++++++++++++++++++++++------------
+ 1 file changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 58de1b867..cce32b30e 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -445,19 +445,19 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
+ 
+-                    // RDNA2 (gfx1030) has no architected flat scratch: selecting between a global
+-                    // pointer and a pointer to a local zero array can form a flat pointer into
+-                    // private memory and fault at a near-null address for unaligned KV lengths
+-                    // (Qwen3.8's 2051-cell gathered decode, test-backend-ops kv=113). Branch on the
+-                    // bounds there. Same values; every other target keeps the pointer-select so its
+-                    // codegen is unchanged.
++                    // RDNA2 (gfx1030) out-of-range rows are clamped to the last in-bounds row
++                    // instead of zero-filled: the tail values are discarded by the k_VKQ_sup guards
++                    // before the softmax, so the duplicated values never reach the result while
++                    // every read stays inside the KV cache (an unchecked read past k_VKQ_max faults
++                    // at a full 131k context). The single global pointer also avoids the
++                    // flat-scratch hazard a pointer-select between global data and a local zero
++                    // array causes (Qwen3.8's 2051-cell gathered decode, test-backend-ops kv=113),
++                    // and the per-row branch plus zero array is what pushed the checked-tail
++                    // instantiation past the 256-VGPR cap, spilling 488 B of scratch through global
++                    // memory in the D=256 4x8/16x2 prefill kernels.
+ #if defined(RDNA2)
+-                    if (!oob_check || i < i_sup) {
+-                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, KV + i*stride_KV + j);
+-                    } else {
+-                        const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
+-                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, zero);
+-                    }
++                    const int i_c = (!oob_check || i < i_sup) ? i : i_sup - 1;
++                    ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, KV + i_c*stride_KV + j);
+ #else
+                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
+                     ggml_cuda_memcpy_1<cpy_nb>(
+@@ -525,8 +525,16 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_native(
+                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
+ 
+                     __align__(16) half2 tmp[cpy_ne];
++#if defined(RDNA2)
++                    {
++                        // Clamp out-of-range rows to the last in-bounds row, see the half2 loader
++                        // above; the dequantized tail values are discarded by the k_VKQ_sup guards.
++                        const int i_c = (!oob_check || i < i_sup) ? i : i_sup - 1;
++                        const char * const __restrict__ row = KV + (size_t) i_c*stride_KV;
++#else
+                     if (!oob_check || i < i_sup) {
+                         const char * const __restrict__ row = KV + (size_t) i*stride_KV;
++#endif // defined(RDNA2)
+                         const int el = el_off + 2*j;
+                         if constexpr (type_KV == GGML_TYPE_Q8_0) {
+                             ggml_cuda_fattn_dequantize_q8_0_chunk(row, el, tmp);
+@@ -541,12 +549,16 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_native(
+                         } else {
+                             ggml_cuda_fattn_dequantize_iq4_nl_chunk(row, el, tmp);
+                         }
++#if defined(RDNA2)
++                    }
++#else
+                     } else {
+ #pragma unroll
+                         for (int l = 0; l < cpy_ne; ++l) {
+                             tmp[l] = make_half2(0.0f, 0.0f);
+                         }
+                     }
++#endif // defined(RDNA2)
+                     ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, tmp);
+                 }
+             }
