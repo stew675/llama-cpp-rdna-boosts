@@ -18,7 +18,15 @@
 > through 67 GiB of pressure; `MADV_PAGEOUT` is refused while locked and succeeds after `munlock`, dropping the
 > window to 0/262144; 48.7 µs/MiB in, 0.81 µs/MiB out).  So the pool's **RAM duplicate** disappears while its
 > *guarantee* is kept, and `push` becomes a real extension of the arena.  See
-> [`PUSH-MLOCK-TIER.md`](PUSH-MLOCK-TIER.md) — and note it needs `LimitMEMLOCK`/`CAP_IPC_LOCK`.
+> [`PUSH-MLOCK-TIER.md`](PUSH-MLOCK-TIER.md).
+>
+> **P2 increment 1 is implemented and measured** (`patches/0002`, `MOE_HOST_PUSH_MLOCK_MIB=N`): first-use
+> pinning over the mapping with a one-byte per-expert mask and a process-wide budget; **refusal is not fatal**
+> (one message naming `LimitMEMLOCK=`/`CAP_IPC_LOCK` and the actual limit, keep what was pinned, carry on from
+> the page cache).  Measured: 7 MiB / 11 experts unprivileged with one refusal message and a correct run;
+> **4095 MiB / 6 744 experts as root, zero refusals**; text byte-identical with and without pinning
+> (`sha=0cf4a62aa63f`); no GPU faults.  **Rotation is not implemented** — it pins monotonically on first use,
+> and rotation needs `munlock` on eviction gated on a *device set* under `-sm tensor`.
 
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in `patches/`
 or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a separate

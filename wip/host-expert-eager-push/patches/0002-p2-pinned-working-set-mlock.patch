@@ -1,0 +1,136 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index c3c2a90b7..873260641 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -17,6 +17,8 @@
+ #if !defined(_WIN32)
+ #include <dirent.h>
+ #include <fcntl.h>
++#include <sys/mman.h>          // wip/host-expert-eager-push P2: mlock/munlock of the pinned working set
++#include <sys/resource.h>      //                             RLIMIT_MEMLOCK (the graceful-degradation message)
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #endif
+@@ -72,6 +74,9 @@ struct table_t {
+     size_t      host_pitch  = 0;    // host row pitch (nb[1]) for a strided axis-0 slice; 0 => contiguous 1-D fill
+     int         split_axis  = -1;   // -1 = whole expert; 0/1 = the master axis this slice was split on
+     bool        cold_safe   = true; // false: the host geometry is not representable by a single UVA read
++    // wip/host-expert-eager-push P2: one byte per expert -- its mapping bytes are in the pinned working set
++    // (`mlock`).  Empty until the first pin; never allocated when MOE_HOST_PUSH_MLOCK_MIB is unset.
++    std::vector<uint8_t> push_locked;
+     // wip/fix-gemma-4 (TODO #77/C): a FUSED table under `-sm tensor` (gemma4 `ffn_gate_up_exps`, whose
+     // device slot is `[gate_slice | up_slice]`).  The slot is assembled by concatenating these host
+     // ranges in order; `n_slices == 0` means the historical single slice (`src_off`/`host_pitch`).
+@@ -1860,11 +1865,92 @@ static bool g_push_src_mapping = false;
+ static bool g_push_src_parsed  = false;
+ static long g_push_src_copies  = 0;   // diagnostic: how many fills took the mapping source
+ 
++// wip/host-expert-eager-push P2: the PINNED WORKING SET.  `mlock` the bytes of the model mapping the policy is
++// warming, so the hot set cannot be reclaimed and a push does not become a disk read.  This is NOT a transport
++// (the driver is not told, and the copy is still pageable): it is how the host tiers' residency policy is
++// enforced on a mapping we do not own.
++//
++//   MOE_HOST_PUSH_MLOCK_MIB=N    pin up to N MiB of the host expert set (0/unset = off)
++//
++// REFUSAL IS NOT FATAL.  The budget may exceed RLIMIT_MEMLOCK (8 MiB by default on this box), so the kernel
++// simply refuses at the limit: log ONCE with what the user can do, keep what was pinned, and carry on with the
++// unpinned remainder served from the page cache exactly as before.  A partly-pinned working set is the normal
++// state on a box without CAP_IPC_LOCK, not an error.
++static size_t  g_push_mlock_budget = 0;   // bytes; 0 = disabled
++static size_t  g_push_mlock_bytes  = 0;   // bytes actually pinned
++static bool    g_push_mlock_stop   = false;   // the kernel refused: stop trying (once-message)
++static long    g_push_mlock_experts = 0;
++static long    g_push_mlock_fail    = 0;
++static bool    g_push_mlock_parsed  = false;
++
++static void push_mlock_parse() {
++    if (g_push_mlock_parsed) {
++        return;
++    }
++    g_push_mlock_parsed = true;
++    const char * e = getenv("MOE_HOST_PUSH_MLOCK_MIB");
++    if (e == nullptr) {
++        return;
++    }
++    g_push_mlock_budget = (size_t) atoll(e) << 20;
++    fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_MLOCK_MIB=%zu -- pinning up to %zu MiB of the host expert set\n",
++            (size_t) atoll(e), g_push_mlock_budget >> 20);
++}
++
++static long vmlck_limit_kb() {
++    struct rlimit rl;
++    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
++        return -1;
++    }
++    return (rl.rlim_cur == RLIM_INFINITY) ? -1 : (long) (rl.rlim_cur / 1024);
++}
++
++// Pin one expert's bytes in the mapping.  Called from the fill path, once per (table, expert).
++static void push_mlock_expert(table_t & t, int32_t expert) {
++    if (g_push_mlock_budget == 0 || g_push_mlock_stop || expert < 0 || expert >= t.n_experts) {
++        return;
++    }
++    if (t.push_locked.empty()) {
++        t.push_locked.assign((size_t) t.n_experts, 0);
++    }
++    if (t.push_locked[(size_t) expert]) {
++        return;
++    }
++    if (g_push_mlock_bytes + t.expert_bytes > g_push_mlock_budget) {
++        g_push_mlock_stop = true;
++        fprintf(stderr, "P1-PUSH: pinned working set full: %zu MiB pinned in %ld experts (budget %zu MiB); "
++                        "the remainder stays reclaimable page cache\n",
++                g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20);
++        return;
++    }
++    void * addr = (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off);
++    if (mlock(addr, t.expert_bytes) != 0) {
++        g_push_mlock_fail++;
++        g_push_mlock_stop = true;
++        const int err = errno;
++        // ONE message, with the remedy.  Everything already pinned stays pinned, and the rest is served from
++        // the page cache exactly as it would be without this feature.
++        fprintf(stderr,
++                "P1-PUSH: mlock refused (%s) after %zu MiB pinned in %ld experts (requested %zu MiB).  "
++                "The pinned working set stops here and the remainder stays reclaimable page cache -- correct, "
++                "just less warm.  To pin more, raise the limit for this process: "
++                "`LimitMEMLOCK=<MiB>` in the unit, or grant CAP_IPC_LOCK (RLIMIT_MEMLOCK is %ld KiB here).  "
++                "See wip/host-expert-eager-push/PUSH-MLOCK-TIER.md\n",
++                strerror(err), g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20,
++                (long) vmlck_limit_kb());
++        return;
++    }
++    t.push_locked[(size_t) expert] = 1;
++    g_push_mlock_bytes  += t.expert_bytes;
++    g_push_mlock_experts++;
++}
++
+ static void push_src_parse() {
+     if (g_push_src_parsed) {
+         return;
+     }
+     g_push_src_parsed = true;
++    push_mlock_parse();
+     const char * e = getenv("MOE_HOST_PUSH_SRC");
+     g_push_src_mapping = e != nullptr && strcmp(e, "mapping") == 0;
+     if (g_push_src_mapping) {
+@@ -1897,6 +1983,7 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         out->base = (const char *) t.host + (size_t) expert * t.host_bytes;
+         out->kind = cudaMemcpyHostToDevice;
+         g_push_src_copies++;
++        push_mlock_expert(t, expert);   // P2: enforce the pinned working set on first use
+         return true;
+     }
+     if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
+@@ -7126,6 +7213,11 @@ void moe_cache_report() {
+         GGML_LOG_INFO("%s: P1 push-src: MOE_HOST_PUSH_SRC=mapping, %lld fills DMA'd straight from the mapping\n",
+                       __func__, g_push_src_copies);
+     }
++    if (g_push_mlock_budget > 0) {
++        GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
++                      "refusals=%lld); the remainder is reclaimable page cache\n", __func__,
++                      g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20, g_push_mlock_fail);
++    }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
+         const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;

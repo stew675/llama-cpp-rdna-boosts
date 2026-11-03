@@ -93,3 +93,48 @@ L4  the GGUF on disk                 the cold source
    actually get reclaimed (and re-read), or does the pinned set push the streaming path into OOM?
 4. **`-sm tensor`**: one pinned budget per host tensor (not per device), and the eviction/release gate fanned
    out to every device that reads it — the campaign's P6 rule applied to the mlock path.
+
+## 6. P2 increment 1 — implemented and measured (2026-11-03)
+
+`patches/0002` (136 lines, `moe-expert-cache.cu`; branch `p2-pinned-working-set` @ `7699a492e`, on top of the
+P1 push switch):
+
+```
+MOE_HOST_PUSH_MLOCK_MIB=N     pin up to N MiB of the host expert set (0/unset = off)
+```
+
+- **Policy enforcement, not transport.**  `mlock` over the mapping's own pages on **first use** of an expert
+  (the fill path is the routing), tracked per table with a one-byte mask, counted in a process-wide budget.
+  The driver is not told, so the transport is unchanged — this only makes the warm set unreclaimable.
+- **Graceful degradation, exactly as specified.**  When the kernel refuses (the normal case on a box without
+  `CAP_IPC_LOCK`), the mode logs **one** message naming the remedy and the actual limit, keeps what was
+  already pinned, and carries on with the remainder served from the page cache — correct, just less warm:
+
+  ```
+  P1-PUSH: mlock refused (Cannot allocate memory) after 7 MiB pinned in 11 experts (requested 64 MiB).
+  The pinned working set stops here and the remainder stays reclaimable page cache -- correct, just less
+  warm.  To pin more, raise the limit for this process: `LimitMEMLOCK=<MiB>` in the unit, or grant
+  CAP_IPC_LOCK (RLIMIT_MEMLOCK is 8192 KiB here).
+  ```
+- **Measured**, 35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses (`MOE_EXPERT_CACHE_MIB=2048`,
+  `FRAC=50`), `MOE_HOST_PUSH_SRC=mapping`:
+
+  | arm | pinned | refusals | text | result |
+  |---|---|---|---|---|
+  unprivileged, request 64 MiB | **7 MiB / 11 experts** | 1 (one message) | — | run correct, 17 421 mapping fills continue |
+  root, request 4096 MiB | **4095 MiB / 6 744 experts** | 0 | — | run correct |
+  request 0 (off) | 0 | 0 | `sha=0cf4a62aa63f` | control |
+  request 64 MiB | 7 MiB | 1 | `sha=0cf4a62aa63f` | **byte-identical to the control** |
+
+  `check-gpu-faults.sh --since 12 min` clean.  (No throughput claim from these runs: single-shot, and the
+  first arm of a pair pays the cold page cache.)
+- **Periodic, not continual** — honoured in the sense that pinning happens only on a first-use fill (a
+  boundary event); there is no per-token re-pin, no polling, and no `munlock` in this increment.
+
+**Not yet implemented, and it is the next increment:** rotation.  This pins **monotonically on first use** and
+stops at the budget, so a session that starts cold keeps a suboptimal set; rotation needs
+(i) a demotion trigger at the cache policy's boundary (its decay period already exists), (ii) `munlock` on
+eviction, and (iii) — the reason it is not a five-line change — the **device-set event gate**: a locked range
+must not be released while any device's copy is still reading it, which under `-sm tensor` is a set of devices,
+not one stream (the campaign's P6 rule, and the same hazard the closed window campaign measured: unregistering
+a range a queued copy still reads returns success and is not safe).

@@ -1,3 +1,30 @@
+## 261103.005 (wip) -- eager-push P2 increment 1: the pinned working set, with graceful degradation
+
+No delivery change.  Continues `261103.004`.
+
+**Implemented** (`patches/0002`, 136 lines, fork branch `p2-pinned-working-set` @ `7699a492e`):
+`MOE_HOST_PUSH_MLOCK_MIB=N` pins up to N MiB of the host expert set in place — `mlock` over the mapping on
+**first use** (the fill path is the routing), one byte per expert of state, one process-wide budget.  It is
+**policy enforcement, not transport**: the driver is not told, the copy stays pageable, and what it buys is
+residency, so a push of a warm expert is not a disk read.
+
+**Refusal is not fatal, by design** (the maintainer's call): `RLIMIT_MEMLOCK` is 8 MiB on this box and often
+far below the budget, so the kernel refuses at the limit — one message names the remedy (`LimitMEMLOCK=` in
+the unit, or `CAP_IPC_LOCK`) and the actual limit, everything already pinned stays pinned, and the remainder is
+served from the page cache exactly as before.  A partly-pinned working set is the normal state, not an error.
+
+**Measured** (35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses, `MOE_HOST_PUSH_SRC=mapping`):
+unprivileged with a 64 MiB request → **7 MiB pinned in 11 experts, one refusal message, run correct**
+(17 421 mapping fills continue); root with 4096 MiB → **4095 MiB pinned in 6 744 experts, zero refusals**; text
+**byte-identical** with and without pinning (`sha=0cf4a62aa63f`); `check-gpu-faults.sh --since 12 min` clean.
+No throughput claim from these runs (single-shot, and the first arm pays the cold page cache).
+
+**Not yet: rotation.**  This pins monotonically on first use and stops at the budget; rotation needs a demotion
+at the cache policy's boundary, `munlock` on eviction, and — the hard part — a **device-set** event gate, since
+a locked range must not be released while any device's copy still reads it (`-sm tensor`).  That is the next
+increment, and it is where the campaign can still fail.  `patches/`, `release.json` and
+`rdna-boosts-all.patch` untouched.
+
 ## 261103.004 (wip) -- eager-push: the pool splits into transport (drop) and residency (keep as an mlock'd working set)
 
 No delivery change.  Continues `261103.003`; the maintainer's refinement, measured the same day.
