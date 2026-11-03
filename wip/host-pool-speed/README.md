@@ -667,7 +667,7 @@ the r206 tip (`0005` = W3, the `RAM_PCT` proportional ceiling), applied tree
 environment artefact** (the "`pinned` gets no cache under `-sm tensor`" claim was `MOE_EXPERT_CACHE_MIB=0`); W3 is
 **done** (`RAM_PCT=70`: +59 %/+73 % decode at identical pinned bytes); W1's gather assertion **fails** on the pair
 (`pinned` −47 % prefill) and the gather is **mandatory** for `pool` at 3 devices (prefill 16.85 → 1126.8 t/s,
-`TODO` #270); and the pair's remaining −34 % decode is **86 % synchronous demand reads** (`TODO` #271, ~25-30 %
+`TODO` #131); and the pair's remaining −34 % decode is **86 % synchronous demand reads** (`TODO` #132, ~25-30 %
 overlap ceiling).  Nothing is promoted: `patches/` (delivery) and `release.json` are untouched.  The 1-GPU
 session-3 record below is unchanged and remains the reference for the single-GPU regime.
 
@@ -1129,16 +1129,42 @@ answer is "it is not any of them" — all at 3 devices, FRAC 80 unless stated (`
 | `pool` + gather | **1126.80** | the whole path: the gather does not use it |
 
 So the cost is monotone in the **pinned pool size** (19.9 GiB → 206 t/s, 53.5 GiB → 16.85, 63.7 GiB → 15.03) and
-it is confined to the first ubatches (310 s for the first 3210 of 5258 prompt tokens, 1.8 s for the rest).  Two
-live hypotheses, and the record does not yet separate them: the box is **over-committed** (73 GiB model mapping
-+ a 54-64 GiB pinned pool on 91 GiB of RAM) so the staging's pageable reads may be re-reading from disk; and the
-pool alias (`pool->base_dev`) is read by *peer* devices' kernels, which grows with the pool's covered fraction.
-The pair has the same over-commit and is fast, which argues for the second; a per-stage wall-clock breakdown
-(and a per-stream busy-union, `README` §16.1's instrument) is the measurement that would settle it.
-**Either way this is a delivery defect in block 12's pool mode under a ≥3-device tensor split**, not a
-campaign-patch regression (the arm is the pre-existing staging path).  Tracked as `TODO` #270; the gather
-(`patches/0003`, `GGML_SCHED_DEVGATHER=1`) is the working remedy, and `--host-experts pool` on 3+ devices should
-be documented as needing it until #270 is fixed.
+it is confined to the first ubatches (310 s for the first 3210 of 5258 prompt tokens, 1.8 s for the rest).  **This
+is a delivery defect in block 12's pool mode under a ≥3-device tensor split**, not a campaign-patch regression
+(the arm is the pre-existing staging path).  Tracked as `TODO` #131; the gather (`patches/0003`,
+`GGML_SCHED_DEVGATHER=1`) is the working remedy, and `--host-experts pool` on 3+ devices should be documented as
+needing it until #131 is fixed.
+
+**Finding B, diagnosis (2026-11-03, later — and it is NOT the staging copy).**  Instrumented the staging entry
+point per call (device, pool-backed or not, bytes, host wall split into map-build / miss-loop / kernel, and an
+optional forced `cudaStreamSynchronize` on the copy stream), and cross-checked with a per-kernel trace.  Same 3
+devices, 512-token prompt, `-ub 2048`:
+
+| arm | prefill t/s |
+|---|---|
+| `pinned`, cache on | **140.1** |
+| `pool` FRAC 80, cache on | **11.8** |
+| `pool` FRAC 80, `GGML_MOE_CACHE_STAGE=0` (staging path off) | 16.1 |
+| `pool` FRAC 80, `MOE_EXPERT_CACHE_MIB=0` (no arena, no cache) | **50.4** |
+
+* **The staging function is not the cost.**  423 staging calls cost **1.04 s of host time in total** (miss loop
+  0.76 s); with `GGML_INSTR_STAGE_SYNC=1` the staged copies themselves add **0.66 s**.  Of a 273-419 s prefill
+  that is noise.
+* **The GPU kernel time is the same in both modes**: `rocprofv3 --kernel-trace`, same prompt, total kernel time
+  **5.04 s (pool) vs 4.08 s (pinned)** over 70 283 / 66 842 dispatches, with matching dispatch counts per kernel
+  (only `__amd_rocclr_fillBufferUnAligned` differs: 3574 vs 1846 — ROCclr's buffer *fill*, i.e. ~1700 extra
+  allocation/fill operations in the pool arm, ≈4 per staging call).
+* **The host burns 2.3x the CPU** for the same work: `perf stat` task-clock **83.2 s (pool) vs 35.8 s (pinned)`,
+  with major faults 44 138 vs 870 (that half is a *load-time* artefact: in pool mode the experts stay in the
+  page-cache mapping, in `pinned` they are pread'd into the pinned master).
+* **Turning the arena off recovers 4.3x** (`MIB=0` → 50.4) while turning only the staging path off does not
+  (16.1), so the cost lives in the cache's **per-(table, device) prefill work around** the staging copy.
+
+Next measurement (queued, blocked on the box): time the per-table `cudaMalloc(t.prs_dev)`/`cudaFree` pair in the
+staging path (instrumented, ~432 of them = 144 tensors × 3 devices, each a 1 KiB map allocated *inside* the
+prefill) and the per-split scheduler time.  If the allocation is the cost, the fix is to allocate that map once
+per table at registration (or use a per-device scratch) — small and safe.  If it is the scheduler, the fix is the
+ring/optional-allocation path the AGENTS notes describe (`GGML_CUDA_SLAB_RING_MIB` floor).
 
 **Finding C — the pool is at pinned parity on decode exactly where its tiers are large enough.**  The 3-GPU
 `-sm tensor` shape gives the arena everything (`arena 67110 MiB = 100 % of the host expert set`, `h≈0.986`) and
@@ -1196,7 +1222,15 @@ split multiplies the miss set (each device's table misses its own slice) while t
 **So the "overlap worker" that §16.3 declined is worth re-opening for the multi-device case** (ceiling ≈ 25-30 %
 there, ~0 at full coverage), and it is a strictly better first target than W2's remap (+3.3 %).
 
-### 18.5 Gates run this session
+### 18.5 The box was wedged at the end of the session (my mistake, recorded so it is not repeated)
+
+A `pkill -f "seq 1 90"` intended for a sampler matched its own shell, killed the running `llama-cli`, and left a
+**stale KFD entry holding ~99 GB of VRAM** across the three R9700s (`rocm-smi --showpids` shows a dead pid as
+`UNKNOWN`; every subsequent load fails with `unable to allocate ROCm0 buffer`).  It needs
+`sudo rocm-smi --gpureset -d 0,1,2` or a reboot to clear — it cannot be reclaimed from user space.  The handover's
+own trap list says to kill by pid, never by pattern; this is that trap, self-inflicted.
+
+### 18.6 Gates run this session
 
 * **Greedy text**, `-n 64`, no `-lv`: `257 chars sha=5531ae33f0f7` on **all eight** arms — pair and 3-GPU,
   `pinned` / `pool` FRAC 80 / `pinned`+gather / `pool`+gather (`data/20261103-text-purity`).  Identical *across*
@@ -1212,7 +1246,7 @@ there, ~0 at full coverage), and it is a strictly better first target than W2's 
   the MTP four-axis protocol (no MTP arm was run: `--spec-type none` throughout), `llama-batched-bench` (no
   server path changed).
 
-### 18.6 What this session changes in the plan
+### 18.7 What this session changes in the plan
 
 0. **The pair is at −19.7 % and the 3-GPU shape at −1.8 %** with the campaign set on the W3 build (pair:
 `pool` FRAC 95 32.02 vs `pinned` 39.85; 3 GPUs: `pool` FRAC 95 51.03 vs `pinned` 51.97, gather on).  The
@@ -1222,7 +1256,7 @@ the pair the residual is the demand fill (§18.4) plus the page-cache starvation
    arms mean something now.
 2. **W3 is done** (§18.3, `patches/0005`): `RAM_PCT` scales proportionally, `+59…73 %` decode at `RAM_PCT=70`,
    `+7 %` at 85 %, at identical pinned bytes.
-3. **New P0: the pool's staging path under a ≥3-device tensor split** (§18.2 finding B, `TODO` #270) — prefill
+3. **New P0: the pool's staging path under a ≥3-device tensor split** (§18.2 finding B, `TODO` #131) — prefill
    16.85 t/s against `pinned` 564.65, fixed in-place by the gather (1126.8).  A delivery defect, not a campaign
    one.
 4. **P1-a's overlap half is re-opened for the multi-device case** (§18.4): the demand fill is 29 % of a pair
