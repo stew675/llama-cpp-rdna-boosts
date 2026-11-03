@@ -1235,7 +1235,27 @@ gather-served prefill** — i.e. the gather's prefill is text-exact at exactly t
 `check-gpu-faults.sh` clean.  Note the *staging path itself* is still unidentified (TODO #131 keeps that item:
 it is now only reachable via the kill switch, and it should either be fixed or deleted for pool tables).
 
-**Why `pinned` prefill is so slow when every weight is host-resident (measured 2026-11-03).**  Because at this arm
+**Split-mode dependence (measured 2026-11-03, same box, same prompt 3049 tokens, `-n 4`, `-ncmoe 48`, 3 GPUs).**
+Every number quoted above is **`-sm tensor`** (the campaign's Phase-1 shape).  The `-sm layer` counterpart, same
+arms and same redundant staging volume:
+
+| 3 GPUs | `-sm tensor` | `-sm layer` |
+|---|---|---|
+| arena (`alloc_all_locked`) | 67110.0 of 67110.0 = 100 % | 67110.0 of 67110.0 = 100 % |
+| `pinned` prefill | **394.1 / 425.7 / 425.2** | **944.3** |
+| `pool` prefill (gather default) | 1129.6 / 1300.4 / 1387.8 | **1000.7 (+6 % over pinned)** |
+| `pinned` / `pool` decode | 46-67 / 67 | 16.7 / 24.9 (the known `-sm layer` decode penalty) |
+| staging calls per prefill | 396-846 (`-sm tensor`: one per table **per device**) | 244 (one per table: each device owns its own layers) |
+
+Three consequences, and they narrow the finding: (a) the 100 % arena residency and the redundant re-copy of
+resident tables happen in **both** splits — it is not a tensor-split artefact; (b) its *cost* is dominated by the
+**number of staging calls**, which tensor split triples (a slice of every table on every device) while layer split
+issues one per table, so `-sm tensor` pinned prefill is 2.3x slower than `-sm layer` (394-426 vs 944.3) for the
+same bytes; (c) therefore the **pool's prefill advantage is a `-sm tensor` phenomenon** — under `-sm layer` the
+two modes are within 6 % (1000.7 vs 944.3), because the staging is already cheap there.  Layer split remains
+unusable for decode in either mode (16.7 / 24.9 t/s), as the delivery already documents.
+
+**Why `pinned` prefill is so slow when every weight is host-resident (`-sm tensor`, measured 2026-11-03).**  Because at this arm
 the experts are **also 100 % VRAM-resident**, and the prefill copies them out of VRAM per ubatch anyway:
 
 | | 1 GPU | 3 GPUs |

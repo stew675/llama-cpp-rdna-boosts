@@ -343,6 +343,13 @@ compute; the no-copy path (the pool gather, which resolves from the arena) scale
 Forcing the gather on `pinned` does not help (587.8 vs 564.7) because a pinned table's gather source is the pinned
 *host* master over PCIe.
 
+**Split-mode dependence (measured 2026-11-03):** the redundant re-copy happens under **both** `-sm tensor` and
+`-sm layer` (both size the arena to 100 % of the set here), but its cost tracks the **number of staging calls**:
+tensor split issues one per table *per device* (396-846 per prefill) and prefills at 394.1-425.7 t/s, layer split
+issues one per table (244) and prefills at **944.3** — same bytes, 2.3x apart.  So the item is worst under
+`-sm tensor`, and the pool's prefill advantage over `pinned` (2.7-3.7x there) shrinks to +6 % under `-sm layer`
+(1000.7 vs 944.3).
+
 **Candidate fix:** let an identity (fully resident) table serve the prefill op **in place** — the take-over /
 aliasing path `moe_cache_get_table()` already implements for the decode band, which the scheduler does not use
 above the band (`offload_op` is band-gated).  Needs: the take-over decision above the band for identity tables
