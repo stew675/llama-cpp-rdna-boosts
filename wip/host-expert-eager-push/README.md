@@ -27,6 +27,12 @@
 > **4095 MiB / 6 744 experts as root, zero refusals**; text byte-identical with and without pinning
 > (`sha=0cf4a62aa63f`); no GPU faults.  **Rotation is not implemented** — it pins monotonically on first use,
 > and rotation needs `munlock` on eviction gated on a *device set* under `-sm tensor`.
+>
+> **P2 increment 2** (`patches/0003`): the pinned set is **seeded from the heat prior** at sizing, in the same
+> ranked order the arena seeds itself (`MOE_HOST_PUSH_MLOCK_SEED=0` disables it) — measured `seeded=6013
+> first_use=756` of 6 769 pinned experts on 35B-A3B, text byte-identical with and without seeding
+> (`sha=0cf4a62aa63f`), no faults.  Both host tiers now agree on the hot set, which is what makes `push` an
+> extension of the arena rather than a second cache.
 
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in `patches/`
 or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a separate

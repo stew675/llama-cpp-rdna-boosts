@@ -138,3 +138,40 @@ eviction, and (iii) — the reason it is not a five-line change — the **device
 must not be released while any device's copy is still reading it, which under `-sm tensor` is a set of devices,
 not one stream (the campaign's P6 rule, and the same hazard the closed window campaign measured: unregistering
 a range a queued copy still reads returns success and is not safe).
+
+## 7. P2 increment 2 — the pinned set is seeded from the heat prior (2026-11-03)
+
+`patches/0003` (98 lines, same branch, on top of `0002`):
+
+```
+MOE_HOST_PUSH_MLOCK_SEED=0     disable seeding (first-use only) -- kill switch / A/B arm
+```
+
+At sizing, immediately after the arena's own `apply_heat_seed_locked()`, `push_mlock_seed_locked()` pins the
+mapping's top-ranked experts **in the same order the arena seeds itself** (`heat_rank_vec`, the decode-band
+ranking), until the budget is exhausted.  So:
+
+- **both host tiers agree on the ranking** — the arena's slots and the pinned set are the same hot set, which
+  is what makes `push` an extension of the arena rather than a separate cache;
+- the set is **right from token 1** instead of being whatever the router touched first (the monotonic
+  first-use ordering that increment 1 shipped);
+- **no prior → no seeding**, and first-use admission fills the set exactly as before (a first run, or
+  `MOE_EXPERT_HEATMAP=0`);
+- the graceful refusal path is shared: seeding stops at `RLIMIT_MEMLOCK` with the same single message, and a
+  partly-seeded set is a normal state.
+
+**Measured** (35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses, budget 4096 MiB, as root, with a
+prior from earlier runs on the box):
+
+```
+pinned working set 4095 MiB in 6769 experts (budget 4096 MiB, seeded=6013 first_use=756, refusals=0)
+```
+
+`seeded=6013` from the prior, `first_use=756` for tables that had no usable prior entry — the designed
+mixture.  And the invariant that matters: **the pinned set is a performance artifact and never a result** —
+text is byte-identical with seeding on and off (`sha=0cf4a62aa63f`), `check-gpu-faults` clean, and t/s is equal
+(48.6 vs 48.7) on this box, where the whole set is page-cache hot anyway.  The seed's value is on a
+cold / not-fitting arm, which is the next measurement.
+
+**Still owed:** rotation by decay (demote + `munlock`, gated on a device set), then the 122B cold arm, then the
+7.14 correctness gate, then the A/B with the pool actually built.

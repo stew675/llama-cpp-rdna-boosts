@@ -1,3 +1,26 @@
+## 261103.006 (wip) -- eager-push P2 increment 2: the pinned set is seeded from the heat prior
+
+No delivery change.  Continues `261103.005`, per the maintainer's call ("seed from the heat map if present").
+
+**Implemented** (`patches/0003`, 98 lines, fork branch `p2-pinned-working-set`): `push_mlock_seed_locked()`
+runs at sizing immediately after the arena's own `apply_heat_seed_locked()` and pins the mapping's top-ranked
+experts **in the same order the arena seeds itself** (`heat_rank_vec`, the decode-band ranking) until the budget
+is exhausted.  `MOE_HOST_PUSH_MLOCK_SEED=0` disables it (first-use only, the A/B arm).  No prior → no seeding,
+and first-use admission fills the set as before; the graceful refusal path is shared (seeding stops at
+`RLIMIT_MEMLOCK` with the same single message).
+
+**Measured** (35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses, budget 4096 MiB, root, with a
+prior from earlier runs): `pinned working set 4095 MiB in 6769 experts (seeded=6013 first_use=756,
+refusals=0)` — the 756 are tables with no usable prior entry, i.e. the designed mixture.  **The pinned set is a
+performance artifact and never a result**: text byte-identical with seeding on and off (`sha=0cf4a62aa63f`),
+`check-gpu-faults` clean, t/s equal (48.6 vs 48.7) on this box where the whole set is page-cache hot.  The
+seed's value is on a cold/not-fitting arm, which is the next measurement.
+
+**Both host tiers now agree on the hot set** (arena slots and the pinned mapping are ranked by the same prior),
+which is what makes `push` an extension of the arena rather than a second cache.  Still owed: rotation by decay
+(demote + `munlock`, gated on a device set), the 122B cold arm, the 7.14 gate, and the A/B with the pool
+actually built.  `patches/`, `release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261103.005 (wip) -- eager-push P2 increment 1: the pinned working set, with graceful degradation
 
 No delivery change.  Continues `261103.004`.

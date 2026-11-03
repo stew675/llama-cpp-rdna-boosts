@@ -1,0 +1,98 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 873260641..310010a9a 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1880,8 +1880,10 @@ static size_t  g_push_mlock_budget = 0;   // bytes; 0 = disabled
+ static size_t  g_push_mlock_bytes  = 0;   // bytes actually pinned
+ static bool    g_push_mlock_stop   = false;   // the kernel refused: stop trying (once-message)
+ static long    g_push_mlock_experts = 0;
++static long    g_push_mlock_seeded  = 0;   // of the above, how many came from the HEAT PRIOR (not first use)
+ static long    g_push_mlock_fail    = 0;
+ static bool    g_push_mlock_parsed  = false;
++static bool    g_push_mlock_seed    = true;   // MOE_HOST_PUSH_MLOCK_SEED=0: no heat seeding, first use only
+ 
+ static void push_mlock_parse() {
+     if (g_push_mlock_parsed) {
+@@ -1893,6 +1895,12 @@ static void push_mlock_parse() {
+         return;
+     }
+     g_push_mlock_budget = (size_t) atoll(e) << 20;
++    const char * sd = getenv("MOE_HOST_PUSH_MLOCK_SEED");
++    if (sd != nullptr && strcmp(sd, "0") == 0) {
++        g_push_mlock_seed = false;
++        fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_MLOCK_SEED=0 -- the pinned working set is filled by FIRST USE "
++                        "only (no heat prior)\n");
++    }
+     fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_MLOCK_MIB=%zu -- pinning up to %zu MiB of the host expert set\n",
+             (size_t) atoll(e), g_push_mlock_budget >> 20);
+ }
+@@ -1905,6 +1913,46 @@ static long vmlck_limit_kb() {
+     return (rl.rlim_cur == RLIM_INFINITY) ? -1 : (long) (rl.rlim_cur / 1024);
+ }
+ 
++// Pin one expert's bytes in the mapping (the primitive both the seed and first-use admission use).
++static void push_mlock_expert(table_t & t, int32_t expert);
++
++// P2 increment 2: SEED the pinned set from the persisted heat map, at sizing, in the same ranked order the
++// arena's own heat seed uses -- so a cold start pins the set the previous run learned instead of whatever the
++// router happens to touch first.  No prior (a first run, or MOE_EXPERT_HEATMAP=0) => nothing happens here and
++// first-use admission fills the set as before.  Caller holds `g_mutex`.
++void push_mlock_seed_locked(table_t & t) {
++    if (g_push_mlock_budget == 0 || !g_push_mlock_seed || g_push_mlock_stop || t.host == nullptr ||
++        t.n_experts <= 0 || t.expert_bytes == 0) {
++        return;
++    }
++    if ((int) t.heat.size() != t.n_experts) {
++        return;   // no prior for this table
++    }
++    const std::vector<uint32_t> & rank_by = heat_rank_vec(t);
++    uint64_t total = 0;
++    for (uint32_t v : t.heat) {
++        total += v;
++    }
++    if (total == 0) {
++        return;
++    }
++    std::vector<int32_t> rank((size_t) t.n_experts);
++    for (int e = 0; e < t.n_experts; e++) {
++        rank[(size_t) e] = e;
++    }
++    std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
++        if (rank_by[(size_t) a] != rank_by[(size_t) b]) {
++            return rank_by[(size_t) a] > rank_by[(size_t) b];
++        }
++        return a < b;
++    });
++    const long before = g_push_mlock_experts;
++    for (int i = 0; i < t.n_experts && !g_push_mlock_stop; i++) {
++        push_mlock_expert(t, rank[(size_t) i]);
++    }
++    g_push_mlock_seeded += g_push_mlock_experts - before;
++}
++
+ // Pin one expert's bytes in the mapping.  Called from the fill path, once per (table, expert).
+ static void push_mlock_expert(table_t & t, int32_t expert) {
+     if (g_push_mlock_budget == 0 || g_push_mlock_stop || expert < 0 || expert >= t.n_experts) {
+@@ -3380,6 +3428,10 @@ void alloc_table_locked(table_t & t, int slots) {
+     // the arena begins with the hot set the previous run learned (and the in-run prefill seed, which is
+     // inert under staging, only fills what is left).
+     apply_heat_seed_locked(t);
++    // wip/host-expert-eager-push P2: the same prior, enforced as RESIDENCY on the mapping (no copy).  Runs
++    // after the arena's seed so both tiers agree on the ranking, and before the first fill so the pinned set
++    // is right from token 1.
++    push_mlock_seed_locked(t);
+     // TODO #64.2: pre-allocate the device routing-tally mirror here, at sizing (outside any captured
+     // graph), so the sampled decode-band tally on an identity table only ever *launches* its kernel.
+     if (g_heat_on) {
+@@ -7215,8 +7267,9 @@ void moe_cache_report() {
+     }
+     if (g_push_mlock_budget > 0) {
+         GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
+-                      "refusals=%lld); the remainder is reclaimable page cache\n", __func__,
+-                      g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20, g_push_mlock_fail);
++                      "seeded=%lld first_use=%lld, refusals=%lld); the remainder is reclaimable page cache\n",
++                      __func__, g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20,
++                      g_push_mlock_seeded, g_push_mlock_experts - g_push_mlock_seeded, g_push_mlock_fail);
+     }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
