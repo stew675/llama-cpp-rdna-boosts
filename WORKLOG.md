@@ -1,3 +1,42 @@
+## 261102.015 (wip) -- new campaign: `wip/moe-static-hot-tier/` -- fill the static VRAM tier by HEAT and freeze it outside the movable boundary
+
+No delivery change; no code.  Seeded at the maintainer's call after the `-ncmoe` discussion on the 1-GPU host.
+Indexed in `wip/CAMPAIGNS.md`.
+
+**The arithmetic that motivates it.**  `-ncmoe N` is tail placement here, so `-ncmoe 44` on 48 layers keeps four
+layers device-resident: that is **1/12 of the expert bytes for exactly 1/12 of the routed mass**, because every
+token routes `k` experts through every layer (measured: each table is 1/144 of the mass on Flash-Next).  The
+measured coverage curve says the same bytes spent on the hottest pairs buy **~40-45 %** of the mass (10 % of pairs
+= 48.5 %).  So the static tier is not wrong, its *fill policy* is.
+
+**Why the tier must stay** (the maintainer's correction, recorded so it is not "simplified" away later):
+`-ncmoe 0` is fully VRAM resident -- no host experts, no cache -- and pinning some experts as residents gives the
+GPU **work to hide the ring's streaming prefill I/O behind** (a real small-ubatch win that amortises at large
+ubatch), while being **immune to the ubatch VRAM pressure that evicts arena tables wholesale** (observed here:
+`evicted 5132.0 MiB of arena tables from the taken slab chunks`, `re-armed 30 stood-down expert-cache tables after
+a compute-buffer drop`).
+
+**What exists / what is missing.**  The `MHT2` heat prior and `apply_heat_seed_locked`'s top-`slots` seeding
+already exist -- but those slots are ordinary evictable arena slots.  There is **no freeze partition** in the
+cache (`g_heat_frozen` is about the *map file*, not residency; the staging snapshot's "no freeze partition" is
+literal), and per-table slot counts are allocated **uniformly**, not by concentration.  The four steps are
+written out in the campaign README, and the load-bearing one is allocating frozen slots **outside the
+movable-boundary slab** -- a frozen slot inside a lendable chunk is not frozen, and if that cannot be solved
+without gutting the slab's lending the honest outcome is "not viable".
+
+**Dimensioning constraint recorded up front.**  r74 measured a conversation-local F-LRU + heat seed beating a
+static cross-run top-`f` set by **+1.8 pts** at equal residency, so freezing the whole budget costs coverage; the
+shape to build is "freeze the robust core (top ~5-10 % of pairs, ~35-49 % of the mass), let the arena own the
+rest".
+
+**Protocol, so the first step is not code.**  Simulate with `scripts/moe-trace-replay.py --churn on --seed
+sidecar:<map>` sized to the layer tier's expert bytes, against the adaptive default; score `h`, L3/disk bytes per
+token and distinct ranges touched.  If the simulation does not separate them, stop.  If it does, measure the
+ubatch matrix (prefill `-ub 512/2048/4096` x {no tier, layer tier, heat-frozen equal bytes}; decode >= 2000
+tokens) and judge on the **eviction/re-arm fingerprint** as well as the numbers -- the prefill-logit gate is blind
+to residency defects.  The campaign also records that routing sidecars are MHT2 and the old `heatmap-audit.py` is
+MHT1-only.
+
 ## 261102.014 (wip) -- window CLOSED and archived; beta 0016 WITHDRAWN; the pool campaign takes the two sound mechanisms
 
 No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched).  Continues `261102.013`.
