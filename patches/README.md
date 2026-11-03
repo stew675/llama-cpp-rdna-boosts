@@ -41,7 +41,7 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +630 / −214 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242; + r172: the derived mask covers batches of several sequences — 1.03 GiB device + 0.94 GiB host back on a 2-slot unified server, PR #247) | +5545 / −624 | 295 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242; + r172: the derived mask covers batches of several sequences — 1.03 GiB device + 0.94 GiB host back on a 2-slot unified server, PR #247; + r208: RDNA2 (gfx1030) prefill — the `q_global` threshold 16 → 64 and the D=256 `ncols2` cap lift, and the clamped in-bounds tail — PR #270/#271) | +5565 / −624 | 295 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary) | +2903 / −3 | 7 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
@@ -505,6 +505,35 @@ almost all of them `template-instances/*.cu`.
   of the unchecked `ncols2 > 1` branch takes the already-compiled `oob_check = true` form, so an exact-size
   operand (test-backend-ops) cannot read into the neighbouring allocation; every other target compiles the
   branch unchanged.  The 511-row guard tail stays with its derivation documented.
+* **RDNA2 (gfx1030) prefill: the `q_global` threshold and the D=256 `ncols2` cap (r208, PR #270/#271)**: the tile
+  kernel was ~15-19 % below the stock kernel at depth on gfx1030 (issue #214's report), and the gap was the
+  launch config plus the checked tail's register pressure, not the host side.  Three RDNA2-only changes:
+  the global-half2 Q path (`GGML_CUDA_FATTN_TILE_Q_GLOBAL`) now needs **64** columns instead of 16, so at the
+  prefill shape (32 columns) Q comes back from LDS; `rdna_cap_ncols2` is **lifted for `DKQ == 256`** (D=128
+  keeps it), which lets D=256 take the GQA fold the cap was blocking; and the checked tail **clamps its
+  out-of-range rows to the last in-bounds row** instead of branching to a local zero array.  The tail values
+  are discarded by the `k_VKQ_sup` guards before the softmax, every read stays inside the KV cache, and the
+  pointer-select the branch existed to avoid (the kv=113 flat-scratch fault of r76/r88) goes with it.  All
+  seven launcher `q_h2` arguments move with the kernel condition (one that lags is the r88 null-`Q_h2`
+  fault), and `i_sup - 1` is allowed to be `-1` on purpose: a V chunk wholly past the KV end reads the last
+  valid row, and "fixing" that to `max(i_sup - 1, 0)` would read one row past the cache.
+
+  **Why the cap was stale, and what makes it safe to lift:** it dated from r76, when HIP's RDNA2 occupancy
+  query (which assumes a quarter of the WGP register file) returned 0 blocks for the wide D=256 variants and
+  the launch asserted.  `launch_fattn` computes RDNA2 occupancy itself now, so the guard is `blocks >= 1`
+  from `4*waves_per_simd/waves_per_block` (LDS-capped at `128K/lds`) instead.  Measured on the patched gfx1030
+  HSACO: every D=256 shape the launcher can now pick reports **>= 2 blocks** (4x8: 235 VGPR, 29 696 B LDS,
+  4 blocks), so the assert is unreachable, and the family's largest static LDS stays 63 488 B of gfx1030's
+  65 536 B.  The checked tail's scratch goes **480/500 B -> 0** on D=256 4x8/16x2 (the submitter's 488/520
+  on their toolchain).
+
+  **Blast radius is RDNA2 only, and that is checked, not argued:** both changes are `#if defined(RDNA2)` or
+  `GGML_CUDA_CC_IS_RDNA2`, so for gfx1201 every tile kernel's machine code and resource usage are
+  bit-identical before and after (88/88 and 106/106 kernels compared per kernel on the build objects;
+  two compiles of the *same* source differ in symbol-table order, so object hashes are not the oracle).
+  RDNA3_0/RDNA3_5/NVIDIA/MUSA/SYCL are unchanged by the same preprocessor structure.  Timings are the
+  submitter's (pp2048 @ d32768 1041.0 -> 1259.8 t/s, tg256 @ d131072 50.9 -> 62.4, V620 gfx1030); RDNA2 is
+  best-effort per `CONTAINERS.md` and carries no gate in this repo.  `WORKLOG.md` 261103.013.
 * **RDNA3_0 head-512 WMMA rows (r102, PR #199)**: the RDNA head-512 rows of
   `ggml_cuda_fattn_mma_get_config_rdna` were tuned on gfx1201 and keep Q in registers, so on gfx1100 every
   head-512 kernel sat at the 256-VGPR limit and spilled ~1.0-1.4k VGPRs per lane — which is why head 512 was

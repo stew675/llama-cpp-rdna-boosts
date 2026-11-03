@@ -1513,3 +1513,23 @@ change), and let `WORKLOG.md` carry the narrative.
   despite 3x the VRAM and 3x the compute, and `-sm layer` at 3 GPUs prefills at 944.3 for the same redundant bytes
   because it issues one staging call per table instead of one per table *per device*.  Host residency is
   irrelevant to this cost; a fully resident table should serve the prefill op in place.
+- **A launch cap whose justification is an occupancy QUERY has to be re-checked when the query is replaced
+  (r208, block 05).**  `rdna_cap_ncols2` capped the D=256 tile variants at `ncols2 <= 2` because HIP's RDNA2
+  occupancy calculator (it assumes a quarter of the WGP register file) returned 0 blocks and the launcher
+  asserted.  r76 replaced that query with a manual WGP computation, and the cap then guarded nothing: every
+  D=256 shape the launcher can pick measures **>= 2 blocks** on the patched gfx1030 HSACO (4x8 = 235 VGPR,
+  29 696 B LDS, 4 blocks), so the assert is unreachable.  A stale cap is not free: it was also withholding the
+  GQA fold from D=256, which is most of the RDNA2 prefill deficit of issue #214.  When a "this aborts" cap and
+  the mechanism it blamed are in different layers, prove the mechanism still exists before keeping the cap.
+- **`i_sup - 1` in the RDNA2 tile tail is deliberately allowed to be -1 (r208, block 05).**  A V chunk that
+  lies wholly past the KV end (the tail length is an exact multiple of `nbatch_V`) loads with `i_sup == 0`, so
+  the clamped row index is `-1` and row `-1` of that chunk is `k_VKQ_max - 1`, the last VALID row; every weight
+  in the chunk is zero, so the values are unused.  Do not "fix" it to `max(i_sup - 1, 0)`: row 0 of such a
+  chunk IS `k_VKQ_max`, one row past the cache.  The comment in the loader says so for the same reason.
+- **Two compiles of the same source do not produce byte-identical objects, so object or `.so` hashes are not
+  a codegen oracle (r208).**  Comparing a release's `libggml-hip.so` before and after a change reports a
+  difference even when nothing changed (the symbol/string-table order varies run to run).  What *is* stable is
+  the code object: extract `.hip_fatbin`, unbundle it per arch, and compare each kernel's `.text` slice by
+  symbol address/size, plus the amdhsa resource usage (`.vgpr_count`, `.vgpr_spill_count`,
+  `.group_segment_fixed_size`).  That comparison is what proved r208's RDNA2-gated changes leave gfx1201
+  bit-identical (88/88 and 106/106 kernels).

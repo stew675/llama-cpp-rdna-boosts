@@ -1,3 +1,86 @@
+## 261103.013 (r208) -- DELIVERY: block 05 amended with the RDNA2 (gfx1030) FA prefill/tail work (PR #270/#271)
+
+**Delivery change.**  PR #270 and PR #271 (`@slavap`, RDNA2 `fattn-tile.cuh`) are **folded into block 05**, not cut
+as new blocks 17/18: it is block 05's kernel, the same call as r76/r88 for this author's RDNA2 work.  The set stays
+**16 patches (0000-0015)**; `release.json` is `v16-6050b467c-r208`, tip `f12c2b0d6`, tree
+`f79a2f4aeda1f726731c4fca08f06a45e53c9a20`.  Block 05's own delta is `+5565 / -624` over 295 files.  Per-block
+reference: `patches/README.md` block 05 (r208 bullet); RDNA2 reader-facing note: `CONTAINERS.md`.
+
+**What it does.**  Three RDNA2-only changes to the tile kernel: (1) the global-half2 Q path
+(`GGML_CUDA_FATTN_TILE_Q_GLOBAL`) now requires **64** columns instead of 16, so at the prefill shape (16x2 = 32
+columns) Q comes back out of LDS and the checked tail stops spilling ~180 VGPRs; the two kernel-side conditions,
+the `Q_tmp_count` stub and all **seven** launcher `q_h2` arguments move together (one that lags is the r88
+null-`Q_h2` fault); (2) `rdna_cap_ncols2` is **lifted for `DKQ == 256`** (D=128 keeps it), which lets D=256 take
+the GQA fold; (3) the checked tail **clamps out-of-range rows to the last in-bounds row** instead of branching to
+a local zero array -- the values are discarded by the `k_VKQ_sup` guards, every read stays inside the KV cache,
+and the pointer-select the branch existed to avoid (the kv=113 flat-scratch fault) goes with it.
+
+**This is issue #214's RDNA2 deficit.**  The reporter's RX 6700 XT (gfx1031 as gfx1030) and @slavap's V620 both
+measured the delivery 14-19 % *slower* than stock at 120k.  The gap was the launch config plus the checked tail,
+not the host side.  The submitter's numbers (V620, Qwen3.6-35B-A3B IQ4_XS, `-b 8192 -ub 2048 -fa 1`): pp2048 @
+d32768 **1041.0 -> 1259.8** t/s (stock 1231.7), pp2048 @ d131072 **368.2 -> 474.7**, tg256 @ d131072 **50.9 ->
+62.4**, tg256 @ d32768 82.5 -> 85.5, and pp2048 @ d0 unmoved (2330 -> 2375).  Those numbers stay the submitter's:
+RDNA2 is best-effort ("no performance claims and no purity gates for it", `CONTAINERS.md`), and we cannot run it.
+
+**Why the cap lift is safe (the one behavioural reversal in the PRs).**  The cap dated from r76 and its comment
+said the wide D=256 variants overflow the register file and the occupancy query returns 0, i.e. an abort.  r76
+itself replaced that query with a manual WGP computation, so the cap has guarded nothing since.  Applied the
+tree's own formula (`4*waves_per_simd/waves_per_block`, LDS-capped at `128K/lds`) to the patched gfx1030 HSACO:
+**every** D=256 shape the launcher can now pick reports `>= 2` blocks (4x8: 235 VGPR, 29 696 B LDS, 4 blocks;
+16x2: 242 VGPR, 2 blocks), so `GGML_ASSERT(max_blocks_per_sm > 0)` is unreachable, and the family's largest
+static LDS stays 63 488 B of gfx1030's 65 536 B.  Also verified on that HSACO: the D=256 4x8/16x2 checked-tail
+scratch goes **480/500 B -> 0** (the submitter's 488/520 on their toolchain), and 16x1 keeps 76 B (so "0 spills"
+is true where it is claimed, not universally -- 16x1 and `dkq64` keep a little).
+
+**Blast radius is RDNA2 only, and it is measured rather than argued.**  Both levers are `#if defined(RDNA2)` or
+`GGML_CUDA_CC_IS_RDNA2`, so for **gfx1201** every tile kernel's machine code is bit-identical before and after:
+extracted `.hip_fatbin` from the *build objects* of `fattn-tile-instance-dkq256-dv256-f16` and
+`-dkq128-dv128-f16`, unbundled per arch, and compared each kernel's `.text` slice plus amdhsa resource usage
+(88/88 and 106/106 kernels identical, host `.text` identical).  Two compiles of the *same* source differ in
+symbol-table order, so `.o`/`.so` hashes are NOT a codegen oracle -- recorded in `INVARIANTS.md` with the method.
+RDNA3_0/RDNA3_5/NVIDIA/MUSA/SYCL are unchanged by the same preprocessor structure.  Both levers also compile
+clean for **gfx1030** on ROCm 10.1 (all 12 `template-instances` tile TUs, no warnings) -- which the r88 note said
+was impossible on the old toolchain; ROCm 10.1 has `oclc_isa_version_1030.bc`, so gfx1030 codegen is available
+here and is worth using for RDNA2 review in future.
+
+**Gates** (gfx1201, ROCm 10.1, `~/llama.cpp` at the release tree):
+* **Coherence, and it is an A/B this time**: rebuilt r207 (`3333f387a`) and r208 in the same path and ran both
+  arms on both builds -- 4B Q8_0, `prompts/prose-rdna-boosts.txt`, `-n 200 --seed 42 --temp 0`: 1 GPU **897 chars
+  `a77fa8c1107a`** and 3 GPU `-sm tensor` **964 `eab86065e67e`** on *both* builds, byte-identical.
+* **Prefill logits**: `gate-prefill-logits.sh` (gfx1201, 27B Q8_0, 40 chunks, f16 KV) **KLD 0.000000 /
+  same-top-p 100.000 %** -- bit-identical prefill, as the machine-code comparison predicts.
+* **MTP**: prose axis (`-n 3000`, 27B UD-Q4_K_XL, `--spec-draft-n-max 7`) `draft-mtp` **74.7 t/s** vs `none`
+  **30.1**, acceptance **0.58448** (pos 1 0.901) -- rules 1-2 green.  **The other three axes were not re-run**
+  and that is deliberate: the R (reasoning-on), C (code) and K (recall) arms compare against the same r207
+  numbers (0.81370 / 0.75408 / 0.89175 / 0.98148, 261103.012) on a build whose gfx1201 device code is
+  bit-identical, so they cannot move; re-running them would cost wall-clock and prove nothing.
+* **Per-block build**: `gate-per-block-build.sh --changed-from 3333f387a` -- 2/2 built (block 05 with the fold,
+  `414s`; the tip, `4s`); every other block's delta is unchanged by construction.
+* **GPU faults**: `check-gpu-faults.sh --since "90 min ago"` over the journal and all four coherence logs --
+  clean.
+* **`validate-set.sh`**: green on a fresh tarball, applied tree = `release.json.tree`, plus the new
+  delivery-repo marker scan (see below).
+
+**Not taken from the PRs.**  Their `patches-rdna2-r205/` + `release-rdna2-r205.json` +
+`scripts/apply-rdna2-r205.sh` re-packaging (the same call as r88: `release.json` and `patches/` stay the single
+source of truth), and the **block 16 two-lane prefill** (`LLAMA_PREFILL_LANES`) that both branches were stacked
+on -- that is PR #268, a separate candidate, and it is not in this tree.  Reported to the submitter on both PRs,
+which are closed by this release.  Their "the current release is r206" is stale (r207 was current, `fattn-tile.cuh`
+is unchanged r205 -> r208, so the patches applied cleanly regardless).
+
+**One repo defect found and fixed on the way (no delivery change, commit `314b883e`).**  `wip/CAMPAIGNS.md` shipped
+in 7112063b with two leftover `<<<<<<< HEAD` lines and a pasted commit line, because `validate-set.sh`'s
+conflict-marker scan only ever looked at the *applied block trees* and never at this repo's own tracked files.
+Markers removed, and the same three patterns now run against the delivery repo in `validate-set.sh` (CI catches
+the class on the next push).
+
+**Published (2026-11-03).**  Tag `v16-6050b467c-r208` (annotated) on the delivery repo; the fork's `rdna-boosts`
+branch force-pushed to `f12c2b0d6` (the deterministic re-cut, tree checked against `release.json`).  The ROCm
+images are built and pushed off-host by the worker watcher (`scripts/container-watch.sh` on `radiance`), which
+picks the tag up within ~10 minutes; nothing else is needed here.
+
+---
+
 ## 261103.012 (r207) -- DELIVERY: block 12 amended with host-pool-speed (the pool gather default, the RAM-ceiling distribution, the diagnostics)
 
 **Delivery change.**  `wip/host-pool-speed/` is promoted **into block 12** (the pool's block -- no new block: it is

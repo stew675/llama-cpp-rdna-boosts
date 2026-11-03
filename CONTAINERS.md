@@ -157,6 +157,15 @@ What applies / what does not:
   fixed), but it remains unvalidated by the maintainer; slavap's V620 run of
   `test-backend-ops -o FLASH_ATTN_EXT` is a full pass on the add-on tree.  If a
   long-context prompt still aborts, run `-fa off` and report it on issue #158.
+* **The RDNA2 long-context prefill deficit is closed behind r208.**  Issue #214 reported the delivery
+  14-19 % *slower* than stock at 120k on gfx1030 / gfx1031 (the reporter's RX 6700 XT), and @slavap's
+  V620 reproduced it.  It was not the host side: the tile kernel's launch config and the checked tail's
+  register pressure.  r208 folds three RDNA2-only changes into block 05 (the `q_global` threshold 16 -> 64,
+  the D=256 `ncols2` cap lift, and a clamped in-bounds tail) which lift pp2048 @ d32768 from 1041.0 to
+  1259.8 t/s (stock 1231.7) and tg256 @ d131072 from 50.9 to 62.4.  The mechanism, why the cap was stale
+  and what keeps this RDNA2-only are in `patches/README.md` block 05 (r208) and `WORKLOG.md` 261103.013.
+  **Still the submitter's numbers**: they were measured on a Radeon Pro V620 (`gfx1030`, Navi 21),
+  not by the maintainer, and RDNA2 stays a best-effort target with no gate in this repo.
 
 Validation path: build from source with `gfx1030` in the target list, or pull
 this image, and report back on issue #158.  The tester checklist is
