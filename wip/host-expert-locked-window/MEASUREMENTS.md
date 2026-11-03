@@ -234,3 +234,50 @@ under a back-to-back fill stress, `check-gpu-faults.sh`), because the failure mo
 the upside is 1.5-2.7x on the fill path.  If it cannot be made safe without a per-device staging buffer, then
 that buffer *is* the pool and the copy is load-bearing — which is the current design, for the reason now
 measured rather than assumed.
+
+## 6. Does the "tearing" claim hold? (it does not reproduce for a 1-D push)
+
+§5 was going to leave the pool's copy standing on a correctness claim: "a pageable `cudaMemcpyAsync` … tears
+under back-to-back use (measured: nondeterministic greedy text)" (`ggml-cuda.cu:6255`, and the prior
+campaign's `PROTOTYPE.md:47`).  So the claim was tested directly.  `arm tear` / `arm tear2d`: N copies issued
+back-to-back with **one** sync at the end (the overlap an async fill actually has), from one host thread over
+S streams, every copy verified against its own source, and the wrong bytes identified when they arrive.
+
+| source | copies x blob | in flight | streams | iterations | result |
+|---|---|---|---|---|---|
+pageable | 8 x 1.66 MiB | 13 MiB | 2 | 100 | **0 torn** |
+pageable | 64 x 1.66 MiB | 106 MiB | 2 | 20 | **0 torn** |
+pageable | 16 x 8 MiB | 128 MiB | 4 | 12 | **0 torn** |
+`mlock`ed, unregistered | 4 x 1.66 MiB | 6.6 MiB | 2 | 100 | **0 torn** |
+`hipHostRegister`ed | 16 x 8 MiB | 128 MiB | 4 | 12 | **0 torn** |
+`cudaMallocHost` (the pool's own source) | 8 x 1.66 MiB | 13 MiB | 2 | 100 | **0 torn** |
+
+2-D pageable (`hipMemcpy2DAsync`, 425 x 4096, the path the warning names): 8 copies x 1.66 MiB, 2 streams →
+**0 torn, no fault**, but **376 µs per 1.66 MiB (4.6 GB/s)** vs 66-93 µs for the same bytes 1-D, i.e. ~4-5x
+slower — the "pathologically slow" half of the warning confirms, the "can fault"/"tears" half does not.
+
+**What the three hypotheses in the question turn out to be, answered:**
+
+- **"does locking first stop it"** — no difference, but the question is moot: the plain pageable case did not
+  tear either, so there is nothing for the lock to fix.  (And the driver is not told about `mlock`; only
+  `hipHostRegister` changes its path.)
+- **"what if each push is one-shot"** — one-shotness is not the variable; *concurrency* is, and 106-128 MiB in
+  flight over 2-4 streams is clean.  These loops also re-read the same source regions 20-100 times, so
+  re-reading is not a factor either.
+- **"re-read requires another request"** — not needed: repeated pushes from the same page-cache region verify
+  clean, every iteration.
+
+**So the claim needs re-sourcing before it is used to justify the copy.**  It has no dated record in the
+delivery (no ROCm line, no reproduction), it does not reproduce here for the 1-D CE push on ROCm 10.1, and
+the code's own warning is attached to the **2-D** loader path — where the failure it describes ("crashed the
+`-sm tensor` host-expert load", `ggml-cuda.cu:2152`) is a different symptom (a fault) from the one a fill
+would hit.  Two candidate origins remain, and a microbench cannot separate them: (a) ROCm **7.14** (the
+delivery ships both lines), and (b) the **async-input ring** (`GGML_CUDA_ASYNC_INPUT`), whose hazard is a
+shared *destination* ring, not a source bounce.
+
+**This is now the most promising direction the campaign has produced**: if the tearing claim is 7.14-only or
+ring-only, then the pool's `memcpy` is removable for 1-D fills on 10.1 — 1.5-2x hot and 2.7x cold on the fill
+path, with no pinning, no registration, no window and no release problem.  That is "the pool without the
+bounce", reached by deleting the copy rather than the mapping.  It wants its own campaign, and its first
+deliverable is reproduce-or-refute in the REAL path (the loader/scheduler, not a microbench), on both ROCm
+lines, with a same-seed greedy gate and `scripts/check-gpu-faults.sh`.

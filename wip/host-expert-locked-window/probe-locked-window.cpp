@@ -845,6 +845,152 @@ static int arm_remapram(const char * path, double expert_mib, double win_mib) {
     return 0;
 }
 
+// Does the documented "tears under back-to-back use" reproduce for a 1-D expert fill, and does any host-side
+// preparation stop it?  The hypotheses are separable:
+//   pageable    plain page-cache pages                     (the delivery's suspect)
+//   locked      mlock'ed first (resident, but NOT registered -- the driver does not know)
+//   registered  hipHostRegister'd (the driver DOES know)
+//   pinned      cudaMallocHost (the pool's source: the control that must never tear)
+// and for each, N copies issued back-to-back over S streams with ONE sync at the end -- the overlap the
+// delivery's async fill actually has.  Every copy is verified against its own source; when it is wrong we
+// also report WHICH source's bytes arrived, because a shared bounce gives you copy j's bytes in copy i's
+// destination, which is the signature to look for.
+// LW_TEAR=pageable|locked|registered|pinned  LW_TEAR_N=8  LW_TEAR_STREAMS=2  LW_TEAR_ITERS=200
+static int arm_tear(const char * path, double expert_mib) {
+    const char * mode = getenv("LW_TEAR") ? getenv("LW_TEAR") : "pageable";
+    const int ncopy  = getenv("LW_TEAR_N") ? atoi(getenv("LW_TEAR_N")) : 8;
+    const int nstr   = getenv("LW_TEAR_STREAMS") ? atoi(getenv("LW_TEAR_STREAMS")) : 2;
+    const int iters  = getenv("LW_TEAR_ITERS") ? atoi(getenv("LW_TEAR_ITERS")) : 200;
+
+    region r = map_and_register(path, expert_mib);
+    const size_t n = r.expert;
+    const size_t need = (size_t) ncopy * n;
+    if (need > r.bytes / 2) { printf("region too small for %d copies\n", ncopy); return 3; }
+
+    const unsigned char * src = r.base;
+    unsigned char * pinned = nullptr;
+    if (strcmp(mode, "pinned") == 0) {
+        HIP_CHECK(hipHostMalloc((void **) &pinned, need, hipHostMallocDefault));
+        memcpy(pinned, r.base, need);
+        src = pinned;
+    } else if (strcmp(mode, "registered") == 0) {
+        HIP_CHECK(hipHostRegister(r.base, need, hipHostRegisterDefault));
+        r.registered = true;
+    } else if (strcmp(mode, "locked") == 0) {
+        const int rc = mlock((void *) r.base, need);
+        if (rc != 0) { printf("mlock(%zu): %s -- cannot test this arm\n", need, strerror(errno)); return 3; }
+        printf("mlock'ed %s (VmLck %ld KiB); the driver has NOT been told\n", mib((double) need).c_str(), vmlck_kb());
+    } else if (strcmp(mode, "pageable") != 0) {
+        printf("unknown LW_TEAR mode '%s'\n", mode); return 64;
+    }
+
+    std::vector<hipStream_t> st(nstr);
+    for (int i = 0; i < nstr; i++) HIP_CHECK(hipStreamCreate(&st[i]));
+    std::vector<unsigned char *> d(ncopy);
+    for (int i = 0; i < ncopy; i++) HIP_CHECK(hipMalloc(&d[i], n));
+    std::vector<std::vector<unsigned char>> back(ncopy, std::vector<unsigned char>(n));
+
+    printf("mode=%s  copies=%d  streams=%d  iterations=%d  blob=%s  in flight=%s\n", mode, ncopy, nstr, iters,
+           mib((double) n).c_str(), mib((double) need).c_str());
+    fflush(stdout);
+
+    int torn = 0, clean = 0;
+    std::vector<std::pair<int,int>> sig;   // (copy i got j's bytes)
+    for (int it = 0; it < iters; it++) {
+        for (int i = 0; i < ncopy; i++) {
+            HIP_CHECK(hipMemcpyAsync(d[i], src + (size_t) i * n, n, hipMemcpyHostToDevice, st[i % nstr]));
+        }
+        for (int i = 0; i < nstr; i++) HIP_CHECK(hipStreamSynchronize(st[i]));
+        bool bad = false;
+        for (int i = 0; i < ncopy; i++) {
+            HIP_CHECK(hipMemcpy(back[i].data(), d[i], n, hipMemcpyDeviceToHost));
+            if (memcmp(back[i].data(), src + (size_t) i * n, n) == 0) continue;
+            bad = true;
+            for (int j = 0; j < ncopy; j++) {
+                if (j != i && memcmp(back[i].data(), src + (size_t) j * n, n) == 0) { sig.push_back({i, j}); break; }
+            }
+        }
+        if (bad) torn++; else clean++;
+        if (bad && torn <= 3) {
+            printf("  iteration %d: TORN", it);
+            for (auto & pr : sig) {
+                if (pr.first >= 0) { printf("  (copy %d carries copy %d's bytes)", pr.first, pr.second); pr.first = -1; }
+            }
+            printf("\n");
+        }
+    }
+    printf("result: %d/%d iterations clean, %d torn\n", clean, iters, torn);
+    if (!sig.empty()) printf("       shared-bounce signature seen %zu times (copy i carrying copy j's bytes)\n", sig.size());
+    printf("%s\n", torn == 0
+        ? "  -> no tearing in this configuration: this source is safe for an overlapped 1-D fill"
+        : "  -> TEARING REPRODUCED: this source cannot feed overlapped copies");
+
+    for (int i = 0; i < ncopy; i++) (void) hipFree(d[i]);
+    for (int i = 0; i < nstr; i++) (void) hipStreamDestroy(st[i]);
+    if (pinned) (void) hipHostFree(pinned);
+    if (strcmp(mode, "locked") == 0) munlock((void *) r.base, need);
+    if (strcmp(mode, "registered") == 0) HIP_CHECK(hipHostUnregister(r.base));
+    release_region(r);
+    return torn ? 1 : 0;
+}
+
+// The delivery's warning names the 2-D path explicitly ("a pageable-source hipMemcpy2DAsync is
+// pathologically slow AND can fault").  A 1-D expert fill does not use it, but the LOADER does -- and that is
+// where the -sm tensor host-expert crash came from.  Measure it: fault, tear, or just slow?
+// LW_TEAR2D=pageable|locked|registered  LW_TEAR_N=8  LW_TEAR_STREAMS=2  LW_TEAR_ITERS=20  LW_TEAR_W=4096
+static int arm_tear2d(const char * path, double expert_mib) {
+    const char * mode = getenv("LW_TEAR2D") ? getenv("LW_TEAR2D") : "pageable";
+    const int ncopy = getenv("LW_TEAR_N") ? atoi(getenv("LW_TEAR_N")) : 8;
+    const int nstr  = getenv("LW_TEAR_STREAMS") ? atoi(getenv("LW_TEAR_STREAMS")) : 2;
+    const int iters = getenv("LW_TEAR_ITERS") ? atoi(getenv("LW_TEAR_ITERS")) : 20;
+    const size_t w  = getenv("LW_TEAR_W") ? (size_t) atol(getenv("LW_TEAR_W")) : 4096;
+
+    region r = map_and_register(path, expert_mib);
+    const size_t n = r.expert - (r.expert % w);
+    const size_t rows = n / w;
+    if ((size_t) ncopy * n > r.bytes / 2) { printf("region too small\n"); return 3; }
+    if (strcmp(mode, "registered") == 0) { HIP_CHECK(hipHostRegister(r.base, (size_t) ncopy * n, hipHostRegisterDefault)); r.registered = true; }
+    else if (strcmp(mode, "locked") == 0) {
+        if (mlock((void *) r.base, (size_t) ncopy * n) != 0) { printf("mlock: %s\n", strerror(errno)); return 3; }
+    }
+    const unsigned char * src = r.base;
+
+    std::vector<hipStream_t> st(nstr);
+    for (int i = 0; i < nstr; i++) HIP_CHECK(hipStreamCreate(&st[i]));
+    std::vector<unsigned char *> d(ncopy);
+    for (int i = 0; i < ncopy; i++) HIP_CHECK(hipMalloc(&d[i], n));
+    std::vector<std::vector<unsigned char>> back(ncopy, std::vector<unsigned char>(n));
+
+    printf("2-D copy: mode=%s copies=%d streams=%d %zux%zu (pitch %zu) iters=%d\n", mode, ncopy, nstr, rows, w,
+           w, iters);
+    fflush(stdout);
+    int torn = 0;
+    double t_first = 0;
+    for (int it = 0; it < iters; it++) {
+        const double a = now_us();
+        for (int i = 0; i < ncopy; i++) {
+            HIP_CHECK(hipMemcpy2DAsync(d[i], w, src + (size_t) i * n, w, w, rows, hipMemcpyHostToDevice, st[i % nstr]));
+        }
+        for (int i = 0; i < nstr; i++) HIP_CHECK(hipStreamSynchronize(st[i]));
+        const double b = now_us();
+        if (it == 0) t_first = b - a;
+        bool bad = false;
+        for (int i = 0; i < ncopy; i++) {
+            HIP_CHECK(hipMemcpy(back[i].data(), d[i], n, hipMemcpyDeviceToHost));
+            if (memcmp(back[i].data(), src + (size_t) i * n, n) != 0) bad = true;
+        }
+        if (bad) torn++;
+    }
+    printf("first iteration: %.1f us for %d copies (%s)  -> %.1f GB/s per copy\n", t_first, ncopy,
+           mib((double) ((size_t) ncopy * n)).c_str(), n / ((t_first / ncopy) * 1e-6) / 1e9);
+    printf("result: %d/%d iterations torn\n", torn, iters);
+    printf("%s\n", torn ? "  -> the 2-D pageable path tears" : "  -> no tearing, but compare the rate above");
+    for (int i = 0; i < ncopy; i++) (void) hipFree(d[i]);
+    for (int i = 0; i < nstr; i++) (void) hipStreamDestroy(st[i]);
+    release_region(r);
+    return torn ? 1 : 0;
+}
+
 // Can the HOST push an expert straight out of the pageable mapping -- no pinned slot, no registration?
 // That is the "host pushes" direction without the pool's `memcpy`.  ROCm stages a pageable H2D through an
 // internal bounce, so the answer is an empirical one; measure it against the pool's memcpy+CE and against a
@@ -1254,12 +1400,14 @@ int main(int argc, char ** argv) {
     if (strcmp(arm, "remap") == 0)       return arm_remap(path, emib, big_mib > 0 ? big_mib : 256.0);
     if (strcmp(arm, "remapram") == 0)    return arm_remapram(path, emib, big_mib > 0 ? big_mib : 512.0);
     if (strcmp(arm, "dmapage") == 0)     return arm_dmapage(path, emib);
+    if (strcmp(arm, "tear") == 0)        return arm_tear(path, emib);
+    if (strcmp(arm, "tear2d") == 0)      return arm_tear2d(path, emib);
     if (strcmp(arm, "scratch") == 0)     return arm_scratch(path, emib, big_mib > 0 ? big_mib : 1024.0);
     if (strcmp(arm, "big") == 0)         return arm_big(path, emib, big_mib);
     if (strcmp(arm, "pageable") == 0)    return arm_pageable(path, emib);
     if (strcmp(arm, "absent") == 0)      return arm_absent(path, emib);
     if (strcmp(arm, "unheld") == 0)      return arm_unheld(path, emib);
 
-    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|dmapage|big|unheld)\n", arm);
+    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|dmapage|tear|tear2d|big|unheld)\n", arm);
     return 64;
 }
