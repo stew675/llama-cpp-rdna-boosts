@@ -438,6 +438,17 @@ campaign's Phase-1 pair arm (`HIP_VISIBLE_DEVICES=0,2`, `-sm tensor`, `-ncmoe 48
 * Both pair pool runs *did* get an arena (`MoE arena = 0.8323`) where `pinned` did not, which is why pool mode
   looks faster than `pinned` on this shape (17.69 vs 14.46, **8-token runs — not a policy number**).
 
+> **F7 CORRECTED 2026-11-03 (multi-GPU box, `soar`): the whole of F7 was an ENVIRONMENT ARTEFACT and there is no
+> `-sm tensor` registration gap.**  Those arms ran with **`MOE_EXPERT_CACHE_MIB=0`**, which disables the cache; with
+> the cache off, `offload_op` falls back to the batch-size test and a 1-token decode leaves the routed `MUL_MAT_ID`
+> on the CPU — so 98 decode splits instead of 50, no slab, no `alloc_all_locked`, no arena, and a "14.46 t/s
+> no-cache rate".  Reproduced exactly (14.40 t/s, prefill 887.2, splits 145/98).  With the shipped default
+> (AUTO), on the same pair and the same arm: `alloc_all_locked: device 0/1 sized 190 slots/table`, arena
+> **49808.2 MiB**, `h=0.9477`, 39.72-39.87 t/s decode / 1604-1648 prefill.  The split accounting is healthy and
+> instrumented: `moe_host_expert_dev_count=2`, 33555 MiB per device, `layer_dev=Meta() meta=1` distributed to
+> ROCm0/ROCm1.  **The two bullet points above remain valid as descriptions of what the `MIB=0` arm looked like;
+> they are not a defect in the split.**  Full record: [`README.md`](README.md) §18.1/§18.2.
+
 **Consequence for the new default:** `MOE_HOST_POOL_FRAC=100` is measured on **one** host-expert device (§3.3) and
 should stay the default there; on a multi-device tensor split it over-commits (pool 67.1 GiB + a 73 GiB model on
 96 GiB) and needs the page-cache budget, not a bigger FRAC.  The 2-GPU arms must be re-run with 2000-token

@@ -1,3 +1,49 @@
+## 261103.009 (wip) -- host-pool-speed on the multi-GPU box: F7 was an env artefact, the gather's real shape, W3 shipped
+
+No delivery change (nothing promoted; `patches/` and `release.json` untouched).  Continues `261102.020`.  Measured
+record: [`wip/host-pool-speed/README.md`](wip/host-pool-speed/README.md) §18; the campaign set is now **five**
+patches (`0005` = W3), applied tree `5fb99c1c9e45a485fc8780898fecfcb77b0544af` on the r206 tip `efaa60db0`
+(fresh-worktree `git am` verified).
+
+**1. F7 is closed, and it was an environment mistake.**  The handover's inherited blocker ("under `-sm tensor`
+`pinned` never sizes the expert cache, so its 14.46 t/s was the no-cache rate") reproduces exactly with
+**`MOE_EXPERT_CACHE_MIB=0`** in that arm's environment: cache off -> `offload_op` falls back to the batch-size
+test -> a 1-token decode leaves the routed `MUL_MAT_ID` on the CPU (98 decode splits vs 50, no slab, no
+`alloc_all_locked`, 14.40 t/s / prefill 887.2).  With the shipped default the pair sizes **49808.2 MiB of
+per-device arena, 190 slots/table on each device, h=0.9477** and decodes ~30 t/s at `-n 8` / 39.7 at
+`-n 2000`.  Instrumented to be sure: `moe_host_expert_dev_count=2` (33555 MiB per device) and
+`layer_dev=Meta() meta=1` distributed to ROCm0/ROCm1 — the split accounting is healthy.
+
+**2. W1: the multi-device arms, measured (122B-A10B, `-ncmoe 48`, 2000-token decodes, `-lv 4`).**  Pair
+(`HIP_VISIBLE_DEVICES=0,2`): `pinned` **39.72-39.87** decode / 1604-1648 prefill; `pinned`+gather 39.81 /
+**832.5 (-47 %)**; `pool` F80 staging 26.08 / 1024.1; `pool` F80+`SIZING=1` **28.02** / 698.7.  3 GPUs
+(`0,1,2`): `pinned` **51.97-52.04** / 565-606; `pinned`+gather 51.71 / 587.8 (+4 %); `pool` F80 staging 49.99 /
+**16.85**; `pool` F80+gather **49.48 / 1126.8 (+66x)**; `pool` F95 staging **51.03** / 15.03; `pool` F30 staging
+47.25 / 206.3.  So (a) W1's "gather >= staging per split mode" assertion **fails** on the pair — the gather is a
+large-table / pool-staging-rescue mechanism, not a general prefill win — and (b) **`--host-experts pool` prefill
+collapses at three devices** (16.85 vs 564.65; the `pinned` arm stages the same bytes through the same kernel at
+full speed) while the gather restores it.  That is a **delivery defect in block 12**, tracked as `TODO` #270 with
+the probes that did not move it (`STAGE_BATCH=0` 31.99, `DIO=0` 8.12, `FRAC 95` 15.03, `FRAC 30` 206.3 — it scales
+with the pinned pool size).  Greedy text `257 chars sha=5531ae33f0f7` on all eight arms; `check-gpu-faults.sh`
+clean from 04:10 (a 03:58:53 burst predates the session).
+
+**3. W3 shipped as `patches/0005`** — the `MOE_HOST_POOL_RAM_PCT` ceiling was shaving the registration-order tail
+to the one-slot floor (26 of 144 tables at 1 slot on the 122B at `RAM_PCT=70`, 10.94 t/s; 2 tables at 85 %, from
+layer 18 on).  It now scales **every** table's slot count by one process-wide factor and lets `SIZING=1` fit its
+concentration plan to the ceiling.  Measured (1 GPU, `-sm layer`, FRAC 100, 2000-token): `RAM_PCT 70`
+**10.94 -> 17.44 t/s (+59 %)**, **+73 %** with cov90 (18.92), prefill 343 -> 598, at identical pinned bytes;
+`RAM_PCT 85` **19.52 -> 20.97 (+7 %)**; `pinned` control 22.36.
+
+**4. The pair's decode deficit is the synchronous demand read** (`TODO` #271): 20.7 demand fills/token at ~0.55 ms
+= **11.3 ms of a 38.3 ms step (29 %)**, against 5.1 fills = 5.2 ms of 56 ms (9 %) on one GPU — i.e. **86 %** of the
+pair's 13.2 ms/token gap to `pinned` is one `O_DIRECT` read per uncovered expert per token, and the overlap
+candidate the 1-GPU ~6 % ceiling declined has a **~25-30 %** ceiling on a split.  On the 3-GPU shape, where the
+arena holds the whole set, the pool is at **-1.8 %** decode (51.03 vs 51.97) — inside PR #267's own envelope.
+
+**Not done / owed:** `HEAD-TO-HEAD.md` (needs a legitimate 3-GPU pool prefill arm = `#270`, plus the 1-GPU control
+and an MTP arm), `gate-prefill-logits.sh` on this box (no base recorded here), and W2 (`TODO` #269, tensor-split
+remap) — measured as no longer the biggest item, and still waiting on the maintainer's `§7` decisions.
+
 ## 261103.008 (wip) -- eager-push pushed for the 3-GPU gate test
 
 No delivery change.  Continues `261103.007`.

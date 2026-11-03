@@ -7,9 +7,27 @@
 Nothing here is in `patches/`; nothing is applied to the fork (`AGENTS.md`, WIP rules).  The 1-GPU host's work is
 finished as far as it can go: what remains needs two or three devices.
 
+> **Update 2026-11-03 (session 4, on `soar`): W1 and W3 are DONE; see [`README.md`](README.md) §18 for the
+> measured record and §0 below for the revised order.**  Headlines: F7 was an **environment mistake**
+> (`MOE_EXPERT_CACHE_MIB=0` in that arm), so `pinned` on a split has a full 49.8 GiB arena and a cached
+> baseline; the gather **fails** W1's assertion on the pair (`pinned` −47 % prefill) and is **mandatory** for
+> `pool` at three devices (prefill 16.85 → 1126.8 t/s); W3 shipped as `patches/0005` (+59…73 % decode at
+> `RAM_PCT=70`); and the pair's decode deficit is **86 % one synchronous demand read per token** (29 % of the
+> step), which re-opens the overlap candidate for the multi-device case.  W2 (the tensor-split-aware remap) is
+> unchanged and still last.
+
 ---
 
 ## 0. Status in one paragraph, and what to do first
+
+**2026-11-03 (current):** W1 and W3 are closed (§3 below); the pool is at **-1.8 %** decode against a *cached*
+`pinned` on the 3-GPU `-sm tensor` shape (51.03 at `FRAC 95` vs 51.97) and **-34 %** on the pair, where the gap is
+86 % synchronous demand reads.  The next two items, in order: **(1)** the pool's staging path under a ≥3-device
+split (`TODO` #270 — prefill 16.85 vs `pinned` 564.65; the gather works around it), then **(2)** the demand-fill
+overlap for the multi-device case (ceiling ~25-30 % there; re-screen first, `README.md` §9.6).  W2 (the remap,
++3.3 %) follows and still needs the `§7` decisions.
+
+**2026-11-02 (the original brief, kept for the reasoning):**
 
 The pool arm's **prefill** problem is solved (the pool-aware device gather, `patches/0003`: srv-cell prefill
 641-647 → 833-878 t/s, ahead of `pinned`'s 739) and the campaign's P1 items are **closed on evidence** (§3.6:
@@ -38,11 +56,14 @@ Two things are explicitly **not** in scope: a direct GPU read of pageable memory
 
 ## 2. State of the tree, and the one blocker you inherit
 
-* **Campaign set = four patches** in [`patches/`](patches/README.md): `0001` diagnostics (teardown report + forced
+* **Campaign set = five patches** in [`patches/`](patches/README.md): `0001` diagnostics (teardown report + forced
   `DIO` logging), `0002` full-coverage default + `cov90` per-table sizing, `0003` **the pool-aware device gather**,
-  `0004` bounce-ring accounting + single owner.  Applied on the delivery tip `efaa60db0` they give tree
-  **`ac580a8e3a6f12ccb5f673dace82b16ec4f1f275`**; per-patch build 4/4 clean; greedy text 150 chars
-  `sha=4ac3a523160f` in `pool` and `pool`+gather.
+  `0004` bounce-ring accounting + single owner, `0005` (**new 2026-11-03, W3**) the `RAM_PCT` ceiling scales every
+  table proportionally and the concentration fit spends the ceiling.  Applied on the delivery tip `efaa60db0` the
+  first four give tree `ac580a8e3`; **all five give tree `5fb99c1c9e45a485fc8780898fecfcb77b0544af`**, verified
+  2026-11-03 by `git am` of `000[12345]-*.patch` on a fresh `efaa60db0` worktree (the *tree* is the contract: an
+  ad-hoc `git am` stamps its own commit ids; only `apply-all.sh` is deterministic).  Per-patch build clean; greedy text `sha=4ac3a523160f` on 1 GPU (1-GPU host) and `sha=5531ae33f0f7` on both `soar`
+  device counts (§18.5).
 * Apply to whatever checkout you use (`~/llama.cpp` on soar is fine — do **not** push it; the delivery branch is
   refreshed only by `scripts/fork-refresh.sh` at release time):
   ```bash
@@ -53,7 +74,16 @@ Two things are explicitly **not** in scope: a direct GPU read of pageable memory
 * **`HANDOVER.md` is the 1-GPU host's session-2 record** and its §3 baseline numbers are `soar`'s own (22.33
   `pinned` / 17.76 `pool` on the 122B).  **This host's 1-GPU numbers are ~1.5x higher on `pinned`** (32.8-34.2)
   at the same `h=0.754`, so when you compare against §14-§17 use **ratios, never absolute t/s**.
-* **The blocker you inherit (F7, 2026-11-02, preliminary — short decodes):** on `HIP_VISIBLE_DEVICES=0,2 -sm
+* ~~**The blocker you inherit (F7, 2026-11-02, preliminary — short decodes):**~~ **F7 IS CLOSED (2026-11-03).**  It
+  was an **environment artefact**: that arm ran with `MOE_EXPERT_CACHE_MIB=0`, which disables the cache, and with
+  the cache off a 1-token decode leaves the routed `MUL_MAT_ID` on the CPU (98 decode splits instead of 50, no
+  slab, no arena, no `alloc_all_locked`) — reproduced exactly (14.40 t/s, prefill 887.2).  With the shipped
+  default the pair sizes a **49808.2 MiB per-device arena, 190 slots/table on each device, h=0.9477** and decodes
+  at ~40 t/s (§18.1/§18.2).  The instrumentation also confirmed the split accounting is healthy
+  (`moe_host_expert_dev_count=2`, 33555 MiB per device, `layer_dev=Meta()` → distributed to ROCm0/ROCm1).  The
+  original note is kept below for the record.  **Trap for the future: to A/B "cache off" use `-ncmoe 0`, never
+  `MOE_EXPERT_CACHE_MIB=0`, on a multi-device split.**
+* **The original note (F7, 2026-11-02, preliminary — short decodes):** on `HIP_VISIBLE_DEVICES=0,2 -sm
   tensor -ncmoe 48` with the 122B, **`pinned` never sizes the expert cache** (no `alloc_all_locked` line, no
   `moe_cache_report`, `Meta() 65248 = 51424 free` — ~51 of 65 GiB of device memory untouched), so its 14.46 t/s was
   the *no-cache* rate; and **`pool` at `FRAC 100` stalled once** in the prepopulate under page-cache pressure
@@ -131,6 +161,34 @@ multi-device arm; neither exists while `pinned` has no cache and a full pool can
 **Pass:** gather ≥ staging per split mode at `-p 2048+`, text identical, faults clean, and a `pinned` baseline
 that actually has a cache.
 
+**DONE 2026-11-03 — result: the assertion FAILS, and that is the finding** (`README.md` §18.1/§18.2):
+
+| arm | pair (`-sm tensor`) | 3 GPUs (`-sm tensor`) |
+|---|---|---|
+| `pinned` (cached baseline) | 39.72-39.87 decode / **1604-1648** prefill | 51.97-52.04 / **565-606** |
+| `pinned` + gather | 39.81 / **832.5 (-47 %)** | 51.71 / 587.8 (+4 %) |
+| `pool` FRAC 80, staging | 26.08 / 1024.1 | 49.99 / **16.85 (!)** |
+| `pool` FRAC 80 + gather | 26.11 / 991.5 (-3 %) | **49.48 / 1126.8 (+66x)** |
+| `pool` FRAC 80 + cov90 | **28.02** / 698.7 | 48.97 / 24.01 (staging) |
+| `pool` FRAC 95, staging | — | **51.03** / 15.03 |
+| `pool` FRAC 30, staging | — | 47.25 / 206.3 |
+
+1. F7 closed (above) — the pair's `pinned` baseline has an arena (`49808.2 MiB`, `h=0.9477`).
+2. **The gather is not a general prefill win**: it costs `pinned` **-47 %** on the pair (the 180 MB tables are
+   under the 224 MiB always-gather gate, exactly the mechanism `README.md` §14.4 describes at -11 % on one GPU).
+   Do not make it default-on for pinned tables.
+3. **The gather is the ONLY workable pool prefill at three devices**: the pool's staging path collapses there
+   (16.85 t/s against `pinned`'s 564.65) and the gather restores 1126.8 t/s (+100 % over `pinned`).  This is a
+   **delivery defect in block 12's pool mode under a ≥3-device tensor split** (`TODO` #270), not a campaign
+   patch's: it is the pre-existing staging path.  Measured everywhere: `FRAC` 30/80/95, `STAGE_BATCH=0` (31.99),
+   `DIO=0`, 2000-token and 64-token runs, so it is not coverage, not the batch arm and not the fill mode; the
+   `pinned` arm stages the *same* bytes through the *same* kernel at full speed.
+4. Text identity and faults: `257 chars sha=5531ae33f0f7` on all eight arms (pair and 3-GPU, both gather states);
+   `check-gpu-faults.sh --since 04:10` clean.
+5. **Promotion shape**: keep `GGML_SCHED_DEVGATHER` opt-in, and document that `--host-experts pool` on 3+
+   devices needs it on until #270 is fixed.  A pool-only default still needs the truthful per-device capability
+   predicate — the decision is still the maintainer's (this file §7, item 2).
+
 ### W2 — P0-a: the device remap over pool slots, tensor-split aware (`TODO` #269)
 
 Read `TODO.md` #269 first; it carries the maintainer's decision and the condition.  The mechanism is nearly
@@ -156,7 +214,15 @@ same-top-p ≥ 98 %, `check-gpu-faults.sh` clean, and the r203 invariant list **
 **Ceiling:** +3.3 % decode on this host's 122B arm (+8.1 % was r203's own cell on 35B-A3B).  Judge it against a
 same-session `pinned` control, and expect it to be *worth doing for `#266`'s sake* rather than for the number.
 
-### W3 — the `RAM_PCT` clamp-distribution defect (small, independent, real)
+### W3 — the `RAM_PCT` clamp-distribution defect (small, independent, real) — **DONE 2026-11-03** (`patches/0005`)
+
+**Result** (`README.md` §18.3): 1 GPU, `-sm layer`, `FRAC 100`, 2000-token decode — `RAM_PCT=70`
+**10.94 -> 17.44 t/s (+59 %)** and `+73 %` with `SIZING=1` (18.92), at identical pinned bytes (54.5 GiB), where the
+old clamp had starved **26 of 144 tables to one slot**; `RAM_PCT=85` **19.52 -> 20.97 (+7 %)**, where the shave bit
+from layer 18 on.  `pinned` control 22.36.  The fix lives in `patches/0005` (proportional scale + the cov fit
+spends the ceiling), so `RAM_PCT` is a usable knob again.  The text below is the original brief, kept for the
+reasoning.
+
 
 `pool_clamp_slots_to_ram()` shaves the **registration-order tail** down to the one-slot floor instead of shaving
 every table proportionally: at `RAM_PCT=70` that is 14 tables at 1 slot out of 144 and **−40 % decode** for 10 %
@@ -166,9 +232,17 @@ feature, so it can be done on any box: gate it on the 122B at `RAM_PCT` 70/80/85
 and `pswpout`, and require text + MTP acceptance unchanged.  It is also the honest answer to the maintainer's
 "85 % looks too high" report: the level is fine, the distribution is not.
 
-### W4 — the campaign's Phase-1 numbers on the multi-GPU box
+### W4 — the campaign's Phase-1 numbers on the multi-GPU box — **the arm table is measured; `HEAD-TO-HEAD.md` is not yet written**
 
-Re-measure the baseline so the head-to-head is writable: `pinned` / `pool` FRAC 80 / FRAC 100 / `pool`+gather,
+The pair and 3-GPU arm tables are in `README.md` §18.2 (2000-token decodes, alternating, `-lv 4`, pool before
+pinned in each group).  What is *missing* for the head-to-head: the 1-GPU control on this box (only the W3 arms
+ran there: `pinned` 22.36 / 20.97 pool `FRAC 100` `RAM_PCT 85`), a `pool` arm **at decode parity** with the
+gather on and `FRAC 95` (the closest so far is 51.03 vs 51.97 = -1.8 %, which needs the §18.2 prefill fix to be a
+legitimate arm), and the MTP arm (`--spec-type draft-mtp`: every arm this session ran `--spec-type none`).  Write
+`HEAD-TO-HEAD.md` only after §18.2's prefill defect has a decision — otherwise the 3-GPU prefill column compares
+a broken pool arm with #267's numbers.
+
+The protocol to follow: `pinned` / `pool` FRAC 80 / FRAC 100 / `pool`+gather,
 1 GPU (a control, so the box is comparable to §14), the x8 pair, and 3 GPUs, at `-ncmoe 48`, ≥ 2000-token decodes,
 `-lv 4`, arms alternating, `pool` measured **before** any `pinned` arm in a group (its 40-67 GiB pin evicts the
 page cache pool reads from).  Then write `HEAD-TO-HEAD.md` against PR #267's published envelope (§1).
@@ -233,11 +307,21 @@ Text oracle: 150 chars `sha=4ac3a523160f` (Q4_K_M, `pool`, in-mode via `archive/
 
 ## 7. Open decisions the maintainer owes (ask before W2 lands)
 
+> **Status 2026-11-03:** the measurements that these decisions were waiting on now exist (`README.md` §18), so
+> all four can be answered; none has been decided by this session.  A recommendation follows each.
+
 1. **The `FRAC` default on a multi-device split**: `100` is the single-GPU default (`patches/0002`) but it
    over-commits on the pair (and is worse even on the 1-GPU srv cell).  Keep 80 for multi-device, or make the
-   default depend on `dev_count`?
+   default depend on `dev_count`?  *Measured: 3-GPU `FRAC 100` clamps itself to 63832 MiB (the RAM ceiling now
+   scales it proportionally, `patches/0005`) and decodes 45.44 against FRAC 80's 49.99 and FRAC 95's 51.03 —
+   i.e. on a big-arena split MORE coverage is better on decode; the ceiling, not a flat FRAC, is the right
+   limiter.  Recommendation: keep one default (`100`) and let the RAM ceiling scale it, rather than branching on
+   `dev_count`.*
 2. **The gather's promotion shape**: pool-only default (needs the capability predicate), or keep
-   `GGML_SCHED_DEVGATHER` opt-in forever?
+   `GGML_SCHED_DEVGATHER` opt-in forever?  *Measured: mandatory for `pool` at 3 devices (+66x prefill),
+   neutral for `pool` at 2, and **-47 %** for `pinned` at 2.  Recommendation: pool-only default, with the
+   predicate answering per (table, device) at the point where the gather would serve ("is this table
+   pool-backed?"); `pinned` keeps the staging path.  Do not flip the default before that predicate exists.*
 3. **`#267`'s reply**: hold it until the head-to-head is written (still the plan), or answer now that the prefill
    half is settled and only decode is open?
 4. **`MOE_HOST_POOL_PREFETCH`** (`TODO` #268): remove it and correct `ENVIRONMENT.md`, or re-wire it as a
@@ -248,7 +332,10 @@ Text oracle: 150 chars `sha=4ac3a523160f` (Q4_K_M, `pool`, in-mode via `archive/
 ## 8. Files, and what not to touch
 
 * **Measured records:** `README.md` §14 (re-base + srv-cell baseline + the gather), §15 (Step 0: remap/copy-kind/
-  residual + the per-kernel trace), §16 (the bounce ring + the synchronous fill), §17 (coalescing, refuted).
+  residual + the per-kernel trace), §16 (the bounce ring + the synchronous fill), §17 (coalescing, refuted),
+  **§18 (session 4 on `soar`: F7 resolved, the W1 multi-device arms, W3, the pair's demand-fill accounting)**.
+  Data: `README.md` §18's header names every directory; runners `tools/run-arms-multigpu-261103.sh` and
+  `tools/run-text-purity-multigpu-261103.sh` (both take `VIS`/`SM`/`NCMOE` from the environment).
   `HANDOVER.md` is the 1-GPU session-2 record (it also holds `soar`'s own 1-GPU baseline numbers).
   `HANDOVER-2026-11-02.md` is the window campaign's hand-over, with its corrections in §6a.
 * **Data:** `data/20261102-session3-{srv,122b,step0,fillcost,ring,coalesce,profile,openb,four-axis,batched}`.

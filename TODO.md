@@ -27,6 +27,9 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
 
+| **270** | `--host-experts pool` prefill collapses (16.85 t/s vs `pinned` 564.65) under a ≥3-device `-sm tensor` split — block 12, not a campaign patch; scales with pool size; `STAGE_BATCH=0` / `DIO=0` / `FRAC` do not fix it; the gather does | correctness / performance (delivery defect) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §270 |
+| **271** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
+
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
@@ -264,9 +267,46 @@ routing speculation — the routing-driven form measured as a net loss when sub-
 `archive/work/host-expert-dio-cache/PHASE2B-FINDINGS.md`).  Do not leave a documented no-op in place: a knob
 that silently does nothing is worse than a missing one (`AGENTS.md`, environment-variable policy).
 
+## 270. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
+
+**Status: open, found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4).  It is a defect in
+the DELIVERY's block 12 code, not in a campaign patch, and it needs a decision: fix it in block 12, or document the
+gather as a requirement.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
+pinned to 3 R9700s: `--host-experts pool` prefills at **16.85 t/s** against `pinned`'s **564.65** (and 1126.8 with
+`GGML_SCHED_DEVGATHER=1`); the same arms at 2 devices are 1024.1 (pool) vs 1603.8 (pinned), i.e. healthy.  The
+defect is in the pool branch of `moe_cache_stage_table` (`!t.host_pinned`): the `pinned` arm stages the same volume
+through the same kernel at full speed.  Probes that did NOT move it (all at 3 devices): `MOE_HOST_POOL_STAGE_BATCH=0`
+(31.99), `MOE_HOST_POOL_DIO=0` buffered (**8.12**), `FRAC 95` (15.03, so it is not the uncovered-expert loop),
+`FRAC 30` (206.30 — i.e. it scales with the PINNED POOL SIZE, 19.9 → 53.5 → 63.7 GiB gives 206 → 16.85 → 15.03).
+Two live candidates: the box is over-committed (73 GiB mapping + 54-64 GiB pinned on 91 GiB RAM) so the staging's
+pageable reads re-read from disk; or the peer-device reads of the pool alias (`pool->base_dev`) are slow and grow
+with the pool's coverage.  **Next measurement:** a per-stage wall-clock breakdown plus the per-stream busy-union
+instrument `README` §16.1 describes; do not re-measure the prefill total, it is already bracketed.  Workaround until
+then: `GGML_SCHED_DEVGATHER=1` (pool-only use; on `pinned` the gather costs -47 % prefill at 2 devices).  Gates for
+a fix: same-seed greedy text on 2 and 3 devices, `check-gpu-faults.sh`, and the prefill at ≥ `pinned`.
+
+## 271. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
+
+**Status: open, measured 2026-11-03 (`wip/host-pool-speed` README §18.4).**  On the 2-GPU x8 pair at `FRAC 80` the
+pool decodes 26.08 against `pinned`'s 39.72 (-34 %), and the fill accounting says **86 % of that gap is one
+synchronous `O_DIRECT` read per uncovered expert per decode step**: 20.7 demand fills/token at ~0.55 ms = ~11.3 ms
+of a 38.3 ms step (29 %), against 5.1 fills/token = ~5.2 ms of a 56 ms step (9 %) on one GPU — which is why §16.3
+correctly declined an overlap worker at a ~6 % ceiling there.  On a multi-device split the miss set is per device
+and the fill stays on one host thread, so the ceiling is ~25-30 % (and ~0 at full coverage / the 3-GPU shape where
+the arena holds the whole set: 49.48-51.03 vs 51.97-52.04, i.e. **-1.8 %**, inside PR #267's own envelope).  This
+is now a bigger prize than the tensor-split remap (`#269`, +3.3 %).  Protocol: re-screen with
+`scripts/moe-trace-replay.py` first (`wip/host-pool-speed` §9.6 — an overlap does not change placement, so the
+model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
+gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
+
 ## 269. PR #266's disposition: keep the device remap, drop the rest — and the remap must be tensor-split aware
 
-**Status: decided 2026-11-02 (maintainer).  Forward-looking: it constrains how `GGML_MOE_DEVREMAP` is
+**Status: decided 2026-11-02 (maintainer); 2026-11-03 update — still open, still gated, and now DEMOTED behind
+`#270` (the pool prefill collapse at ≥3 devices) and `#271` (the ~25-30 % demand-fill overlap ceiling on a split).
+Nothing in the 2026-11-03 multi-GPU session blocks it or changes its condition; the multi-device arm it needs now
+exists and is healthy (F7 was an environment artefact: `MOE_EXPERT_CACHE_MIB=0`, not a `-sm tensor` registration
+gap — `wip/host-pool-speed` §18.1), so the pair/3-GPU `-sm tensor` gates it names are runnable.**  Forward-looking:
+it constrains how `GGML_MOE_DEVREMAP` is
 re-implemented over pool slots, and it is the acceptance condition for that work.**  The maintainer's call:
 PR #266's **`GGML_MOE_DEVREMAP` survives** the #266 reversion and stays a capability going forward, because it is
 the one piece of #266 whose removal costs real throughput (the sync-free decode map; r203 measured +8.1 % on its

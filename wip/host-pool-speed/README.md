@@ -537,6 +537,8 @@ oracle does not separate is not implemented.
 - [`HANDOVER-MULTIGPU.md`](HANDOVER-MULTIGPU.md) — the cold-start handover for the multi-GPU box (state, W1-W4,
   traps, gates, promotion checklist); [`HANDOVER.md`](HANDOVER.md) is the 1-GPU session-2 record.
 - `scripts/moe-trace-replay.py` — the offline two-tier model (band-split heat, `--pool-frac`).
+- `tools/run-arms-multigpu-261103.sh` / `tools/run-text-purity-multigpu-261103.sh` — the session-4 multi-device
+  arm and text-oracle runners (`VIS=0,2|0,1,2`, `SM=tensor|layer`, `NCMOE`, `NGEN`, `LV`).
 - `archive/work/moe-expert-cache/item3-findings-session20.md` — the 122B-A10B `-ncmoe 99 -sm tensor` numbers,
   the 166 GB/pass shard-byte figure, and the staging-vs-gather architecture rule (§9.1).
 - PR #267 files (on the submitter's branch, not in this repo): `wip/mmap-host-experts-r204/0001..0010`,
@@ -659,7 +661,17 @@ state, the ordered work list (W1 multi-device arms → W2 the tensor-split-aware
 W4 the head-to-head), the traps, the gates and the promotion checklist.  The 1-GPU host's work is finished as far
 as it can go.
 
-**Current state (2026-11-02, session 3 — the 1-GPU host; see §14 for the measured record):** the campaign set is
+**Current state (2026-11-03, session 4 — the MULTI-GPU box; see §18):** the campaign set is **five** patches on
+the r206 tip (`0005` = W3, the `RAM_PCT` proportional ceiling), applied tree
+`5fb99c1c9e45a485fc8780898fecfcb77b0544af`; F7 is **resolved as an
+environment artefact** (the "`pinned` gets no cache under `-sm tensor`" claim was `MOE_EXPERT_CACHE_MIB=0`); W3 is
+**done** (`RAM_PCT=70`: +59 %/+73 % decode at identical pinned bytes); W1's gather assertion **fails** on the pair
+(`pinned` −47 % prefill) and the gather is **mandatory** for `pool` at 3 devices (prefill 16.85 → 1126.8 t/s,
+`TODO` #270); and the pair's remaining −34 % decode is **86 % synchronous demand reads** (`TODO` #271, ~25-30 %
+overlap ceiling).  Nothing is promoted: `patches/` (delivery) and `release.json` are untouched.  The 1-GPU
+session-3 record below is unchanged and remains the reference for the single-GPU regime.
+
+**Session 3 state (2026-11-02 — the 1-GPU host; see §14 for the measured record):** the campaign set is
 now **four** patches on the r206 tip (applied tree `ac580a8e3`): the teardown-report / forced-`DIO` diagnostics,
 the full-coverage default (`FRAC 100`) + `cov90` per-table sizing, and — new this session — **mechanism (b), the
 pool-aware device gather** (`patches/0003`), which takes the srv cell's prefill from 641-647 to **832-878 t/s**
@@ -1015,3 +1027,198 @@ bandwidth left to recover by making individual reads bigger.
 worker (~6 % ceiling at FRAC 80, ~0 at FRAC 100, two measured negative precedents — §16.3) is worth building.
 The remaining decode work is P0-a (`GGML_MOE_DEVREMAP` over pool slots, `TODO` #269, ceiling +3.3 % here, and it
 must be **tensor-split aware**), the `soar` multi-device `-sm tensor` arm, and the §5 knob collapse.
+
+## 18. Measured — session 4, 2026-11-03, the MULTI-GPU box (`soar`): W1 and W3 done, W2 still open
+
+Box: `soar`, 3 × R9700 gfx1201 (32.6 GiB each) + the Granite Ridge iGPU (never pinned in), 91 GiB RAM,
+ROCm 10.1.0, `/llm` on NVMe (`nvme2n1`).  Tree: the delivery tip `efaa60db0` + the campaign set (now **five**
+patches, `0005` = W3 added this session; per-patch build clean, applied tree
+`5fb99c1c9e45a485fc8780898fecfcb77b0544af`).  Protocol: the
+campaign's reference 122B-A10B UD-Q4_K_XL, `-ncmoe 48 -ngl 99 -c 8192 -ctk/-ctv q8_0 -fa auto -b/-ub 2048`,
+5258-token prose prompt, **2000-token greedy decode** (`-n 2000`, the model stops at ~1860-1793), `-lv 4`,
+`--spec-type none --seed 42 --temp 0`, arms alternating in one sequence, `pool` arms before `pinned` arms in
+each group (page-cache order), never two benchmarks at once.  Data:
+`data/20261103-multigpu/{w1-pair,w1-3gpu,w3-before,w3-after,w3-after2}` and `data/20261103-text-purity` (both
+device counts in one directory — the text runner takes the output directory as a positional argument); runner
+`tools/run-arms-multigpu-261103.sh` (`VIS`/`SM` select the device set and split), text oracle
+`tools/run-text-purity-multigpu-261103.sh`.
+
+### 18.1 F7 is RESOLVED — it was an env artefact, there is no `-sm tensor` registration gap
+
+F7 (`HANDOVER.md` §4) said that under `-sm tensor` on the pair `pinned` never sizes the expert cache, so its
+14.46 t/s was a no-cache rate.  Reproduced exactly, and the cause is **`MOE_EXPERT_CACHE_MIB=0` in that arm's
+environment**, not a device/Meta registration defect:
+
+| arm (pair, `-sm tensor`, `-ncmoe 48`, 5258-token prompt, `-n 8`) | prefill | decode | decode-graph splits | arena | slots/table |
+|---|---|---|---|---|---|
+| `pinned`, `MOE_EXPERT_CACHE_MIB=0` (what F7 measured) | 887.2 | **14.40** | 98 | **none** | — |
+| `pinned`, shipped default (AUTO) | 1614.5 | **30.06** | 50 | **49808.2 MiB** | **190** (×2 devices) |
+
+`MOE_EXPERT_CACHE_MIB=0` disables the cache, and with the cache off `offload_op` falls back to
+`get_op_batch_size(op) >= op_offload_min_batch_size`, i.e. a 1-token decode leaves the routed `MUL_MAT_ID` on the
+CPU (98 splits instead of 50, no slab, no arena, no `alloc_all_locked`).  With the shipped default the whole
+multi-device path is healthy — instrumented on this tree:
+
+```
+TEMPINSTR preflight: moe_host_expert_dev_count=2      (ROCm0 33555.0 MiB, ROCm1 33555.0 MiB)
+TEMPINSTR account blk.2.ffn_down_exps.weight: buft=ROCm_Host buft_dev=ROCm0 layer_dev=Meta() meta=1 n_experts=256
+alloc_all_locked: device 0/1: sized 190 slots/table from 144 tables / 131.1 MiB per expert
+alloc_all_locked: per-device sizing: 2 device(s), arena total 49808.2 MiB
+```
+
+So the split accounting, the preflight and the per-device arena all work; `-sm tensor` + host experts is **not**
+a no-cache shape.  Two consequences: (a) the pair's `pinned` baseline in §18.2 is a *cached* baseline, which is
+what W1 needed; (b) **`MOE_EXPERT_CACHE_MIB=0` on a multi-device tensor split is a trap worth documenting** — it
+silently moves every routed expert to the CPU and halves decode, and the only visible symptom is the split count
+and the missing arena.  (`TORCH`-style "disable the cache to isolate it" A/Bs must use `-ncmoe 0`, not `MIB=0`.)
+
+### 18.2 W1 — the multi-device arms, and the gather's real shape
+
+Pair (`HIP_VISIBLE_DEVICES=0,2`, in-process `0,1`), `-sm tensor`:
+
+| arm | decode t/s | prefill t/s | arena `h` | disk / run |
+|---|---|---|---|---|
+| `pinned` × 4 | **39.72 / 39.72 / 39.85 / 39.87** | 1603.8 / 1568.0 / 1574.0 / 1647.8 | 0.9477 | 71-73 GiB |
+| `pinned` + gather | 39.81 | **832.5 (-47 %)** | 0.9476 | 74.2 GiB |
+| `pool` FRAC 80, staging | 26.08 | **1024.1** | 0.9544 | 212.8 GiB |
+| `pool` FRAC 80 + gather | 26.11 | 991.5 (-3 %) | 0.9544 | 214.2 GiB |
+| `pool` FRAC 80, `SIZING=1` (cov90) | **28.02 (+7.4 %)** | 698.7 (-32 %) | 0.9544 | 202.1 GiB |
+| `pool` FRAC 100 (RAM ceiling clamped it to 35944/36864 slots) | 26.58 | 1333.9 | 0.9544 | 203.2 GiB |
+
+3 GPUs (`HIP_VISIBLE_DEVICES=0,1,2`), `-sm tensor`:
+
+| arm | decode t/s | prefill t/s | arena `h` | disk / run |
+|---|---|---|---|---|
+| `pinned` × 2 | **51.97 / 52.04** | 564.7 / 606.1 | 0.9863 | 75-76 GiB |
+| `pinned` + gather | 51.71 | 587.8 (+4 %) | 0.9865 | 73.6 GiB |
+| `pool` FRAC 80, staging | 49.99 | **16.85 (!!)** | 0.9859 | 330.9 GiB |
+| `pool` FRAC 80 + gather | **49.48** | **1126.8 (+66×)** | 0.9855 | 226.8 GiB |
+| `pool` FRAC 80 + cov90, staging | 48.97 | 24.01 | 0.9839 | 301.4 GiB |
+| `pool` FRAC 95, staging | **51.03** | 15.03 | 0.9835 | 317.5 GiB |
+| `pool` FRAC 80, `STAGE_BATCH=0` | 49.25 | 31.99 | 0.9854 | 291.3 GiB |
+| `pool` FRAC 80, `DIO=0` (buffered) | 50.75 | 8.12 | 0.9833 | 227.8 GiB |
+| `pool` FRAC 30, staging | 47.25 | 206.30 | 0.9853 | 294.3 GiB |
+| `pool` FRAC 100 (clamped to 63832 MiB), staging | 45.44 | 11.20 | 0.9868 | 357.6 GiB |
+
+**Finding A — W1's assertion fails on the pair, for the documented reason.**  `gather ≥ staging per split mode`
+does **not** hold at 2 devices: on `pinned` the gather costs **-47 % prefill** (832 vs 1604), and on the pool it
+is neutral (-3 %).  This is the same mechanism the 1-GPU 122B showed at -11 % (§14.4): a 256-expert 180 MB table
+is under `SCHED_GATHER_TABLE_MIN_BYTES` (224 MiB), so only sub-gate ubatches gather, and the gather then moves
+the same bytes through kernel copies instead of the DMA engine.  **The gather is therefore not a general prefill
+win — it is a *large-table* win and a *pool-staging rescue*.**  On the pair it must stay opt-in.
+
+**Finding B — the pool staging path collapses at THREE devices, and the gather is the fix (new P0).**  At 2
+devices the pool's prefill is 1024 t/s (fine); at 3 devices the same code path stages the *same* volume (846
+stage ops, 122 GiB "arena" + 9.4 GiB "host") in **312 s instead of 5 s** — 16.85 t/s against `pinned`'s 564.65.
+The `pinned` arm at 3 devices stages the identical 122 GiB through the same staging kernel at full speed (790 ops,
+0.8 GiB from the host), so the defect is in the **pool branch of `moe_cache_stage_table`** (`!t.host_pinned`), not
+in the staging kernel, the split, or the arena.  Turning the gather on takes the same arm to **1126.8 t/s**
+(+66x, +100 % over `pinned`).  It was then probed with every knob that could plausibly be the cause, and the
+answer is "it is not any of them" — all at 3 devices, FRAC 80 unless stated (`data/20261103-multigpu/w1-3gpu`):
+
+| probe | prefill t/s | what it rules out |
+|---|---|---|
+| `pool`, staging (baseline) | **16.85** | — |
+| `pool`, `STAGE_BATCH=0` (no staging kernel; per-expert copies) | 31.99 | the single-launch kernel / the pool-alias read *inside* it |
+| `pool`, `MOE_HOST_POOL_DIO=0` (buffered) | **8.12** | `O_DIRECT`; buffered is *worse* (page-cache thrash) |
+| `pool`, `FRAC 95` (5 % uncovered) | 15.03 | the per-uncovered-expert miss loop (nearly everything is covered) |
+| `pool`, `FRAC 30` (19.9 GiB pool) | **206.30** | — but see below: it scales with the POOL SIZE |
+| `pinned` (same 3 devices) | 564.65 | the split, the all-reduce, the staging kernel itself |
+| `pool` + gather | **1126.80** | the whole path: the gather does not use it |
+
+So the cost is monotone in the **pinned pool size** (19.9 GiB → 206 t/s, 53.5 GiB → 16.85, 63.7 GiB → 15.03) and
+it is confined to the first ubatches (310 s for the first 3210 of 5258 prompt tokens, 1.8 s for the rest).  Two
+live hypotheses, and the record does not yet separate them: the box is **over-committed** (73 GiB model mapping
++ a 54-64 GiB pinned pool on 91 GiB of RAM) so the staging's pageable reads may be re-reading from disk; and the
+pool alias (`pool->base_dev`) is read by *peer* devices' kernels, which grows with the pool's covered fraction.
+The pair has the same over-commit and is fast, which argues for the second; a per-stage wall-clock breakdown
+(and a per-stream busy-union, `README` §16.1's instrument) is the measurement that would settle it.
+**Either way this is a delivery defect in block 12's pool mode under a ≥3-device tensor split**, not a
+campaign-patch regression (the arm is the pre-existing staging path).  Tracked as `TODO` #270; the gather
+(`patches/0003`, `GGML_SCHED_DEVGATHER=1`) is the working remedy, and `--host-experts pool` on 3+ devices should
+be documented as needing it until #270 is fixed.
+
+**Finding C — the pool is at pinned parity on decode exactly where its tiers are large enough.**  The 3-GPU
+`-sm tensor` shape gives the arena everything (`arena 67110 MiB = 100 % of the host expert set`, `h≈0.986`) and
+the pool arm then decodes **49.48-49.99 vs `pinned` 51.97-52.04 (-4.5 %)**, i.e. inside PR #267's own
+`mmap`-vs-`pinned` envelope (72.4 vs 74.7 = -3.1 %).  On the pair the arena is 49.8 GiB for 67.1 GiB of experts
+(`h=0.95`), the pool carries the rest, and the deficit is **-34 %** — see §18.4.
+
+### 18.3 W3 — the `RAM_PCT` ceiling now scales every table (implemented, measured, `patches/0005`)
+
+`pool_clamp_slots_to_ram()` shaved the **registration-order tail** to the one-slot floor.  Measured on `soar`,
+1 GPU, `-sm layer`, `FRAC 100`, 2000-token decode (`data/20261103-multigpu/w3-*`):
+
+| arm | decode t/s | prefill t/s | pinned | pool slots/table |
+|---|---|---|---|---|
+| **before**, `RAM_PCT=70` | **10.94** | 343.5 | 54.7 GiB | 117×256, 1×34, **26×1** |
+| **after**, `RAM_PCT=70` | **17.44 (+59 %)** | 597.8 | 54.5 GiB | 144×208 |
+| **after**, `RAM_PCT=70`, `SIZING=1` (ceiling-fitted) | **18.92 (+73 %)** | 612.1 | 54.4 GiB | cov inside the ceiling |
+| **before**, `RAM_PCT=85` | 19.52 | 617.5 | 66.1 GiB | 141×256, 1×181, **2×1** |
+| **after**, `RAM_PCT=85` | **20.85 / 20.97 (+7 %)** | 607-671 | 65.8-66.3 GiB | 144×253 |
+| `pinned` (1-GPU control, same session) | 22.36 | 671.7 | — | — |
+
+So the level was never the problem (the 1-GPU session's OPEN B finding, §14.6) — the *distribution* was, and it
+is worse than measured before: at `RAM_PCT=85` the shave already bites **from layer 18 on** (2 tables at 1 slot),
+and at 70 it takes out **26 of 144 tables**.  The fix (patch `0005`): compare the process-wide plan with the
+ceiling **once** and scale *every* table's slot count by that factor, keeping the one-slot floor only where the
+ceiling cannot cover a slot, with the old shave as a rounding backstop; and let the concentration fit spend the
+ceiling as its budget (a uniform rescale of a fitted plan collapses it back to uniform — measured identical
+144×208 before that second half).  `RAM_PCT` is now a usable knob: 70 % + cov90 (18.92) sits 15 % behind the 85 %
+arm instead of 44 % behind it.
+
+### 18.4 The decode gap on the pair is the SYNCHRONOUS DEMAND READ — 2.2x the 1-GPU cost
+
+§16.3 sized the demand-fill overlap candidate at a ~6 % ceiling on one GPU and correctly declined it.  On the
+pair that ceiling is much larger, and the fill accounting (`patches/0004`) says why:
+
+| arm | pool fills | read wall | bytes | demand fills (minus prepopulate) | demand read / decode token |
+|---|---|---|---|---|---|
+| 1 GPU, FRAC 80 (§16.3) | 38 844 | 29.3 s | 69.1 GiB | 9 468 / 1 862 = **5.1** | **~5.2 ms of a 56 ms step (9 %)** |
+| pair, FRAC 80 | 69 777 | 35.1 s | 124.0 GiB | 40 401 / 1 950 = **20.7** | **~11.3 ms of a 38 ms step (29 %)** |
+| pair, FRAC 100 (clamped) | 47 446 | 25.0 s | 84.3 GiB | ~10 600 / 1 950 = 5.4 | ~6 ms |
+| pair, FRAC 80 + cov90 | 59 321 | 30.4 s | 105.5 GiB | 29 900 / 1 950 = 15.3 | ~8 ms |
+
+At `FRAC 80` the pair's whole deficit is 25.1 ms/token (pinned) vs 38.3 (pool) = 13.2 ms, of which the demand
+fill is ~11.3 ms — **86 % of the gap is one synchronous O_DIRECT read per uncovered expert per decode step**,
+not copies and not traffic (identical arena, identical reaches, the pool moves fewer bytes).  A multi-device
+split multiplies the miss set (each device's table misses its own slice) while the fill stays on one host thread.
+**So the "overlap worker" that §16.3 declined is worth re-opening for the multi-device case** (ceiling ≈ 25-30 %
+there, ~0 at full coverage), and it is a strictly better first target than W2's remap (+3.3 %).
+
+### 18.5 Gates run this session
+
+* **Greedy text**, `-n 64`, no `-lv`: `257 chars sha=5531ae33f0f7` on **all eight** arms — pair and 3-GPU,
+  `pinned` / `pool` FRAC 80 / `pinned`+gather / `pool`+gather (`data/20261103-text-purity`).  Identical *across*
+  device counts as well as within them, which is stronger than the per-device-count reference the campaign
+  assumes.
+* `scripts/check-gpu-faults.sh --since "04:10"` → **clean** (the only kernel faults in the window's journal are a
+  burst at 03:58:53, i.e. before this session's first run; `--since "5 hours ago"` fails on them, so the window
+  matters).
+* W3 changes were measured with the *same* binary pair (before = the five-patch-minus-0005 build, after = the
+  six-commit build), arms alternating, identical protocol.
+* Not run this session (and why): `gate-prefill-logits.sh` (needs a base recorded on this box; the gather and W3
+  are layout/diagnostic changes whose *text* identity is measured above — but a promotion needs it, see §6),
+  the MTP four-axis protocol (no MTP arm was run: `--spec-type none` throughout), `llama-batched-bench` (no
+  server path changed).
+
+### 18.6 What this session changes in the plan
+
+1. **F7 is closed** (§18.1) — the handover's inherited blocker was an environment mistake, and the multi-device
+   arms mean something now.
+2. **W3 is done** (§18.3, `patches/0005`): `RAM_PCT` scales proportionally, `+59…73 %` decode at `RAM_PCT=70`,
+   `+7 %` at 85 %, at identical pinned bytes.
+3. **New P0: the pool's staging path under a ≥3-device tensor split** (§18.2 finding B, `TODO` #270) — prefill
+   16.85 t/s against `pinned` 564.65, fixed in-place by the gather (1126.8).  A delivery defect, not a campaign
+   one.
+4. **P1-a's overlap half is re-opened for the multi-device case** (§18.4): the demand fill is 29 % of a pair
+   decode step, so the worker's ceiling is ~25-30 %, not ~6 %.  Re-screen with the replayer before building
+   (`§9.6`), then measure.
+5. **The gather's promotion shape is now clearer but not decided** (§7 open decision 2): it is mandatory for
+   `pool` at 3 devices and harmful for `pinned` at 2.  A pool-only default still needs the truthful per-device
+   capability predicate; until then `GGML_SCHED_DEVGATHER` stays opt-in and `--host-experts pool` on 3+ devices
+   should be documented as "needs the gather on".
+6. **W2 (the tensor-split-aware remap) is unchanged and still last**: its ceiling on the pair is ≈ +3.3 % of
+   decode, against the fill's ~25-30 % and the staging defect's prefill collapse.  It is not blocked by anything
+   here; it is simply no longer the biggest item, and it still needs the maintainer's `§7` decisions before it
+   lands.
