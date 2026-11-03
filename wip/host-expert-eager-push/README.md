@@ -1,5 +1,16 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (OPEN)
 
+> **P1 STATUS (2026-11-03): correctness GREEN on ROCm 10.1, performance leg confounded — see
+> [`P1-RESULTS.md`](P1-RESULTS.md).**  `patches/0001` adds `MOE_HOST_PUSH_SRC=mapping` (default off): on
+> 35B-A3B with forced misses, the mapping arm made **33 393 direct pageable DMA fills** with **byte-identical
+> text** (`sha=0cf4a62aa63f`), an identical access census, and **no GPU faults** — the 1-D tearing claim is
+> refuted in the real path.  Performance found two things instead: where the page cache is hot the `memcpy`
+> is **already hidden behind the DMA** (102.9 vs 102.6 t/s warm/warm), and on the 122B arm the mapping source
+> **silently bypasses the pool's `O_DIRECT` decision**, so that 5.7x is a page-cache-vs-DIO comparison, not a
+> copy win.  **`push` is therefore not a replacement for `pool` but the missing middle rung** of a memory
+> ladder: `pinned` (locked) → **`push` (reclaimable page cache)** → `pool` (streams from disk).  P2 must first
+> make the mapping source honour the DIO decision, and the 7.14 correctness gate is still owed.
+
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in `patches/`
 or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a separate
 decision).

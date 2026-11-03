@@ -1,0 +1,69 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 334931ecd..c3c2a90b7 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1845,6 +1845,38 @@ struct expert_src_t {
+     int            bounce    = -1;
+ };
+ 
++// wip/host-expert-eager-push P1: `MOE_HOST_PUSH_SRC=mapping` makes a POOL-BACKED master (the read-only model
++// mapping) the copy engine's source directly, instead of memcpy'ing the expert into a pinned pool slot / bounce
++// ring first.  That deletes the per-miss host memcpy, which is the entire cost gap (measured: a 1-D CE push
++// from the mapping is 66-93 us hot / 1.32 ms cold per 1.66 MiB against the pool's 137 us / ~3.5 ms).
++//
++// It is an ENV SWITCH, not a mode: `pinned` (the default) is the delivered, measured-safe path, and this
++// campaign's P1 is a reproduce-or-refute of the claim that a pageable source tears under back-to-back use
++// (the comment above `expert_host_src`).  1-D only: a strided/sliced table (or a 2-D copy) keeps the pool,
++// because the 2-D pageable path is documented to fault as well as to be 4-5x slower.
++//   MOE_HOST_PUSH_SRC=mapping    direct pageable H2D from the mapping (the candidate)
++//   MOE_HOST_PUSH_SRC=pinned     the delivered path (default, and the control arm)
++static bool g_push_src_mapping = false;
++static bool g_push_src_parsed  = false;
++static long g_push_src_copies  = 0;   // diagnostic: how many fills took the mapping source
++
++static void push_src_parse() {
++    if (g_push_src_parsed) {
++        return;
++    }
++    g_push_src_parsed = true;
++    const char * e = getenv("MOE_HOST_PUSH_SRC");
++    g_push_src_mapping = e != nullptr && strcmp(e, "mapping") == 0;
++    if (g_push_src_mapping) {
++        // stderr as well: ggml's INFO/WARN can be filtered below llama.cpp's default threshold, and an
++        // engagement check that cannot be seen is worthless.
++        fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_SRC=mapping -- host-expert fills DMA straight from the model "
++                        "mapping (no pinned staging)\n");
++        GGML_LOG_WARN("%s: MOE_HOST_PUSH_SRC=mapping -- host-expert fills DMA straight from the model "
++                      "mapping (no pinned staging).  EXPERIMENTAL (wip/host-expert-eager-push P1)\n", __func__);
++    }
++}
++
+ // TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
+ // the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
+ // Caller holds `g_mutex`.
+@@ -1859,6 +1891,14 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         out->kind = cudaMemcpyHostToDevice;
+         return true;
+     }
++    push_src_parse();
++    if (g_push_src_mapping && t.host_pitch == 0 && t.n_slices == 0 && t.src_off + t.expert_bytes <= t.host_bytes) {
++        // The candidate: the mapping itself is the CE source.  No pool slot, no bounce, no host memcpy.
++        out->base = (const char *) t.host + (size_t) expert * t.host_bytes;
++        out->kind = cudaMemcpyHostToDevice;
++        g_push_src_copies++;
++        return true;
++    }
+     if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
+         int    s = -1;
+         char * p = pool_peek_locked(*pool, expert, &s);
+@@ -7082,6 +7122,10 @@ void moe_cache_report() {
+                       total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0,
+                       (long long) g_prs_rebuilds);
+     }
++    if (g_push_src_mapping) {
++        GGML_LOG_INFO("%s: P1 push-src: MOE_HOST_PUSH_SRC=mapping, %lld fills DMA'd straight from the mapping\n",
++                      __func__, g_push_src_copies);
++    }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
+         const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;

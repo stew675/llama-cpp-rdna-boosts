@@ -1,3 +1,29 @@
+## 261103.003 (wip) -- eager-push P1: the bypass switch is green on 10.1 for correctness, and reframes the mode ladder
+
+No delivery change.  Continues `261103.002`.
+
+**[`wip/host-expert-eager-push/P1-RESULTS.md`](wip/host-expert-eager-push/P1-RESULTS.md)** — the P1 switch
+(`patches/0001`, `MOE_HOST_PUSH_SRC=mapping`, default off; loose patch on the fork branch `p1-push-src`,
+`be83da8f0`) makes a pool-backed master the copy engine's source directly, deleting the per-miss `memcpy`.
+
+**Correctness GREEN on ROCm 10.1.**  35B-A3B, 1 GPU, `-ncmoe 40 --host-experts pool`, forced misses
+(`MOE_EXPERT_CACHE_MIB=2048`, `FRAC=50`): **33 393 direct pageable DMA fills** (47 427 on the 122B arm), text
+**byte-identical** to `pinned` (`sha=0cf4a62aa63f`), identical access census (`hits=64947 fills=30033
+colds=39420`, `h=48.32 %`), `check-gpu-faults.sh --since 16 min` **clean** — the "tears under back-to-back
+use" claim is refuted in the real path (10.1 only; 7.14 still owed).
+
+**Performance produced two findings instead of the A/B.**  (a) Where the page cache is hot the pool's `memcpy`
+is already **hidden behind the DMA**: warm/warm 102.9 (`pinned`) vs 102.6 (`mapping`) t/s, i.e. the archived
+campaign's serialized 137 vs 66-93 us does not translate to a pipeline win.  (b) A direct mapping push
+**bypasses the pool's `O_DIRECT` decision**, so the 122B arm's 18-19 vs 3.2-3.3 t/s is page-cache-vs-DIO, not a
+copy win; with `MOE_HOST_POOL_DIO=0` forced on both arms it is inconclusive at 64 tokens.
+
+**Consequence: the modes are a memory ladder, not alternatives** — `pinned` (whole set non-reclaimable) →
+**`push` (reclaimable page cache, the missing middle rung)** → `pool`/DIO (streams from disk when the set does
+not fit).  `push` is not a `pool` replacement.  Next: make the mapping source honour DIO per table, run a
+warm-up + interleaved + >= 500-token A/B, then the 7.14 correctness gate; then P2 eagerness.  `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261103.002 (wip) -- new campaign: `host-expert-eager-push` (never device-pull; the host pushes)
 
 No delivery change.  Seeded at the maintainer's call, the same day its predecessor closed.
