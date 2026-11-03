@@ -1,3 +1,33 @@
+## 261103.007 (wip) -- eager-push P2 increment 3: the device-set eviction gate + rotation, additive and free
+
+No delivery change.  Continues `261103.006`.
+
+**Implemented** (`patches/0004`, 293 lines, fork branch `p2-pinned-working-set` @ `f131cef2f`): the **device-set
+eviction gate** — a pinned range is `munlock`ed only when no device can still be reading it (one boundary event
+per device per op recorded on that device's stream, a per-expert read epoch, a 4-deep ring, conservative on a
+stale slot; the device set is cached per table) — and **rotation**: release only what the policy says is cold
+(not arena-resident AND decayed count 0), at most 8 experts per sweep, on a wall-clock cadence
+(`MOE_HOST_PUSH_MLOCK_PERIOD_MS`, default 2000).
+
+**Three measured traps, now encoded.**  (1) The staleness signal must be the *policy's*: using "was it filled
+lately" released hot-but-arena-resident experts, collapsed the pinned set to 33 experts and dropped generation
+to **1.0 t/s**.  (2) The cadence must not be derived from an op/table count: the table set grows lazily, so
+"every g_period boundaries" fired every 1-2 tables and cost **156 ms/token** (5.7 then 9.2 t/s); wall clock
+fixed it.  (3) `mlock`/`munlock` on populated page-cache pages is ~ms/MiB (far above the 48.7 us/MiB measured on
+a sparse scratch file), so the pinned set must be near-static — 4 232 releases over 500 tokens was
+unaffordable, 16 is free.
+
+**Measured after the fixes** (35B-A3B, 1 GPU, `-ncmoe 40`, forced misses, budget 512 MiB, 500 tokens, root):
+**47.9 t/s with rotation vs 47.9-48.9 without**, pinned set stable at 511 MiB / 837 experts,
+`seeded=725 first_use=128 released=16 release_denied=1` over 17 037 boundaries.
+
+**Additive by construction** (the maintainer's constraint, with `wip/host-pool-speed/` owning the pool path):
+the entire diff against the release tip is **189 insertions, 0 deletions**, every line behind a default-off
+`MOE_HOST_PUSH_*` variable, and a default-arm run logs **zero** `P1-PUSH` lines.  Nothing here changes a
+default and the pool/bounce path is untouched.  Next: the **multi-device gate test** (2-GPU `-sm tensor`, where
+`release_denied` must be non-trivial — the only real proof the gate denies), then the 122B cold arm, then the
+7.14 gate.  `patches/`, `release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261103.006 (wip) -- eager-push P2 increment 2: the pinned set is seeded from the heat prior
 
 No delivery change.  Continues `261103.005`, per the maintainer's call ("seed from the heat map if present").

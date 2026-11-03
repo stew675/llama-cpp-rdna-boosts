@@ -1,0 +1,293 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 310010a9a..ef64a8eda 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -76,7 +76,9 @@ struct table_t {
+     bool        cold_safe   = true; // false: the host geometry is not representable by a single UVA read
+     // wip/host-expert-eager-push P2: one byte per expert -- its mapping bytes are in the pinned working set
+     // (`mlock`).  Empty until the first pin; never allocated when MOE_HOST_PUSH_MLOCK_MIB is unset.
+-    std::vector<uint8_t> push_locked;
++    std::vector<int>      push_devices;      // the device SET that can read this host base (a split reads slices)
++    std::vector<uint8_t>  push_locked;
++    std::vector<uint32_t> push_read_epoch;   // the host boundary at which this expert's bytes were last read
+     // wip/fix-gemma-4 (TODO #77/C): a FUSED table under `-sm tensor` (gemma4 `ffn_gate_up_exps`, whose
+     // device slot is `[gate_slice | up_slice]`).  The slot is assembled by concatenating these host
+     // ranges in order; `n_slices == 0` means the historical single slice (`src_off`/`host_pitch`).
+@@ -706,6 +708,7 @@ static const char * budget_desc() {
+ // `moe_cache_init()`, so the env parse must not depend on that ordering (issue #136).  Caller holds
+ // `g_mutex` (or is single-threaded during startup).
+ void parse_env();
++static void push_src_parse();   // wip/host-expert-eager-push: parsed in parse_env() so the seeder can rely on it
+ static void ensure_env() {
+     static bool done = false;
+     if (done) {
+@@ -790,6 +793,7 @@ void parse_env() {
+                           "(MOE_HOST_POOL_DIO=0|1 forces it)\n", __func__, (long long) moe_host_pool_mib());
+         }
+     }
++    push_src_parse();   // wip/host-expert-eager-push: P1/P2, all default-off (see the block above expert_host_src)
+     g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
+     g_period      = env_int("MOE_EXPERT_CACHE_PERIOD",  32);
+     g_fill        = env_int("MOE_EXPERT_CACHE_FILL",     1) != 0;
+@@ -1880,10 +1884,181 @@ static size_t  g_push_mlock_budget = 0;   // bytes; 0 = disabled
+ static size_t  g_push_mlock_bytes  = 0;   // bytes actually pinned
+ static bool    g_push_mlock_stop   = false;   // the kernel refused: stop trying (once-message)
+ static long    g_push_mlock_experts = 0;
+-static long    g_push_mlock_seeded  = 0;   // of the above, how many came from the HEAT PRIOR (not first use)
++static long    g_push_mlock_seeded  = 0;   // CUMULATIVE pins that came from the HEAT PRIOR (not first use)
++static long    g_push_mlock_first   = 0;   // CUMULATIVE pins that came from first use
+ static long    g_push_mlock_fail    = 0;
+ static bool    g_push_mlock_parsed  = false;
+ static bool    g_push_mlock_seed    = true;   // MOE_HOST_PUSH_MLOCK_SEED=0: no heat seeding, first use only
++static bool    g_push_in_seed       = false;  // inside push_mlock_seed_locked (counts a pin as seeded)
++static bool    g_push_mlock_rotate  = true;   // MOE_HOST_PUSH_MLOCK_ROTATE=0: never release (pin monotonically)
++static long    g_push_rotate_max    = 8;      // experts released per sweep: pin/unpin is ~ms/MiB on a real
++                                              // mapping, so the set must be near-static (measured: a sweep that
++                                              // released everything stale cost 156 ms/token)
++
++// ---- the eviction gate (P2 increment 3) ----------------------------------------------------------
++//
++// A pinned range may be `munlock`ed only when NO device can still be reading it.  Under `-sm tensor` the
++// same host pages are read by several devices (each table_t is a device's slice of one host tensor), so
++// "finished" is a SET of streams, not one.  The gate is the campaign's epoch scheme: one boundary event per
++// device per op (recorded on that device's stream at the host hook), a per-expert epoch of its last read, and
++// a release allowed only when the read is at least one full boundary behind and the events for it (and every
++// later one in the ring) have completed -- stream ordering then makes the answer exact.
++//
++// The ring is 4 deep and a slot may be reused by a newer epoch: that is SAFE, because a newer event on the
++// same stream completing implies the older read on that stream completed too.  What must never happen is a
++// release on a *stale* "not ready" or on an epoch whose event has not been recorded at all -- hence the
++// `epoch <= recorded` check below.
++static constexpr int PUSH_EV_RING = 4;
++static uint64_t     g_push_epoch     = 0;    // completed host boundaries (ops)
++static uint64_t     g_push_ev_epoch[GGML_CUDA_MAX_DEVICES][PUSH_EV_RING] = {};
++static cudaEvent_t  g_push_ev[GGML_CUDA_MAX_DEVICES][PUSH_EV_RING] = {};
++static bool         g_push_ev_used[GGML_CUDA_MAX_DEVICES] = {};
++static long         g_push_released = 0;
++static long         g_push_release_denied = 0;
++
++static bool push_mlock_on() {
++    return g_push_mlock_budget > 0;
++}
++
++// The gate, the rotation and the boundary hook.  Called from `moe_cache_update_host` (once per op), so every
++// read the fills of that op issue is bracketed by an event on that device's stream.
++static bool push_gate_safe_locked(const table_t & t, int32_t e) {
++    if (!g_push_mlock_rotate) {
++        return false;
++    }
++    if (e < 0 || e >= t.n_experts || (int) t.push_read_epoch.size() != t.n_experts) {
++        return false;
++    }
++    const uint32_t read_at = t.push_read_epoch[(size_t) e];
++    // One full boundary of lag: the event for `read_at` is still in the ring and not yet superseded by a
++    // *later* boundary on the same device.
++    if ((uint64_t) read_at + 1 >= g_push_epoch) {
++        return false;
++    }
++    // The device SET: every table that shares this host base can read these pages (a tensor split gives each
++    // device its own slice of the same expert).  Cached once per table -- the sweep must not rescan g_tables
++    // per expert (that is 144 tables x 144 experts per boundary).
++    table_t & tt = const_cast<table_t &>(t);
++    if (tt.push_devices.empty()) {
++        for (const table_t & o : g_tables) {
++            if (o.host == t.host && o.device >= 0 && o.device < GGML_CUDA_MAX_DEVICES) {
++                tt.push_devices.push_back(o.device);
++            }
++        }
++        if (tt.push_devices.empty() && t.device >= 0) {
++            tt.push_devices.push_back(t.device);
++        }
++    }
++    for (const int dev : tt.push_devices) {
++        if (!g_push_ev_used[dev]) {
++            continue;   // this device has never recorded a boundary: nothing of its can be in flight
++        }
++        const int      slot = (int) ((uint64_t) read_at % PUSH_EV_RING);
++        cudaEvent_t    ev   = g_push_ev[dev][slot];
++        if (ev == nullptr || g_push_ev_epoch[dev][slot] < (uint64_t) read_at) {
++            return false;   // the ring no longer holds an event at least as new as the read: be conservative
++        }
++#if defined(GGML_USE_HIP)
++        if (hipEventQuery((hipEvent_t) ev) == hipErrorNotReady) {
++#else
++        if (cudaEventQuery(ev) == cudaErrorNotReady) {
++#endif
++            (void) cudaGetLastError();
++            return false;
++        }
++        (void) cudaGetLastError();
++    }
++    return true;
++}
++
++// Release the pinned experts that nothing has read since the previous sweep.  Runs at the policy's own decay
++// cadence, never per token, and only ever releases what the gate proves safe.
++static void push_rotate_locked() {
++    if (!push_mlock_on() || !g_push_mlock_rotate) {
++        return;
++    }
++    long released_now = 0;
++    for (table_t & t : g_tables) {
++        if (t.push_locked.empty() || t.host == nullptr || released_now >= g_push_rotate_max) {
++            continue;
++        }
++        for (int e = 0; e < t.n_experts; e++) {
++            if (released_now >= g_push_rotate_max) {
++                break;
++            }
++            if (!t.push_locked[(size_t) e]) {
++                continue;
++            }
++            // The staleness signal is the POLICY's, not the fill count: the arena absorbs most reads, so an
++            // expert that is merely arena-resident has not been "filled lately" and must NOT be released.
++            if (t.expert_slot.find(e) != t.expert_slot.end()) {
++                continue;   // resident in the arena: keep its host pages warm
++            }
++            const auto cit = (int) t.count.size() == t.n_experts ? t.count[(size_t) e] : 0;
++            if (cit > 0) {
++                continue;   // still being routed: keep it pinned
++            }
++            if (!push_gate_safe_locked(t, e)) {
++                g_push_release_denied++;
++                continue;
++            }
++            void * addr = (void *) ((const char *) t.host + (size_t) e * t.host_bytes + t.src_off);
++            if (munlock(addr, t.expert_bytes) != 0) {
++                continue;
++            }
++            t.push_locked[(size_t) e] = 0;
++            t.push_read_epoch[(size_t) e] = 0;
++            g_push_mlock_bytes -= t.expert_bytes;
++            g_push_mlock_experts--;
++            g_push_released++;
++            released_now++;
++        }
++    }
++    if (g_push_released > 0 && g_push_mlock_stop) {
++        const bool room = g_push_mlock_bytes + (1u << 20) <= g_push_mlock_budget;
++        if (room) {
++            g_push_mlock_stop = false;   // the budget has room again: first-use admission may resume
++        }
++    }
++}
++
++static void push_gate_boundary_locked(int device, void * stream) {
++    if (!push_mlock_on() || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    const uint64_t ep   = g_push_epoch;
++    const int      slot = (int) (ep % PUSH_EV_RING);
++    if (g_push_ev[device][slot] == nullptr) {
++        if (cudaEventCreateWithFlags(&g_push_ev[device][slot], cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return;
++        }
++    }
++    if (cudaEventRecord(g_push_ev[device][slot], (cudaStream_t) stream) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return;
++    }
++    g_push_ev_epoch[device][slot] = ep;
++    g_push_ev_used[device]        = true;
++    g_push_epoch++;
++    // The rotation cadence is WALL CLOCK, not an op count.  This hook runs once per TABLE per op and the table
++    // set grows lazily, so any "every N boundaries" rule is wrong near startup (it fired every 1-2 tables and
++    // turned a periodic sweep into a continual one: measured 9.2 t/s vs ~40).  `mlock`/`munlock` on populated
++    // page-cache pages is also ~ms/MiB, so the pinned set has to be near-static anyway.
++    static auto last_sweep = std::chrono::steady_clock::time_point{};
++    static long sweep_ms   = -1;
++    if (sweep_ms < 0) {
++        const char * e = getenv("MOE_HOST_PUSH_MLOCK_PERIOD_MS");
++        sweep_ms = e != nullptr ? atol(e) : 2000;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (last_sweep.time_since_epoch().count() == 0 ||
++            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sweep).count() >= sweep_ms) {
++        last_sweep = now;
++        push_rotate_locked();
++    }
++}
++
+ 
+ static void push_mlock_parse() {
+     if (g_push_mlock_parsed) {
+@@ -1895,6 +2070,15 @@ static void push_mlock_parse() {
+         return;
+     }
+     g_push_mlock_budget = (size_t) atoll(e) << 20;
++    const char * mx = getenv("MOE_HOST_PUSH_MLOCK_ROTATE_MAX");
++    if (mx != nullptr) {
++        g_push_rotate_max = atol(mx);
++    }
++    const char * rt = getenv("MOE_HOST_PUSH_MLOCK_ROTATE");
++    if (rt != nullptr && strcmp(rt, "0") == 0) {
++        g_push_mlock_rotate = false;
++        fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_MLOCK_ROTATE=0 -- the pinned working set is never released\n");
++    }
+     const char * sd = getenv("MOE_HOST_PUSH_MLOCK_SEED");
+     if (sd != nullptr && strcmp(sd, "0") == 0) {
+         g_push_mlock_seed = false;
+@@ -1946,11 +2130,11 @@ void push_mlock_seed_locked(table_t & t) {
+         }
+         return a < b;
+     });
+-    const long before = g_push_mlock_experts;
++    g_push_in_seed = true;
+     for (int i = 0; i < t.n_experts && !g_push_mlock_stop; i++) {
+         push_mlock_expert(t, rank[(size_t) i]);
+     }
+-    g_push_mlock_seeded += g_push_mlock_experts - before;
++    g_push_in_seed = false;
+ }
+ 
+ // Pin one expert's bytes in the mapping.  Called from the fill path, once per (table, expert).
+@@ -1960,6 +2144,12 @@ static void push_mlock_expert(table_t & t, int32_t expert) {
+     }
+     if (t.push_locked.empty()) {
+         t.push_locked.assign((size_t) t.n_experts, 0);
++        t.push_read_epoch.assign((size_t) t.n_experts, 0);
++    }
++    // EVERY read refreshes the epoch, pinned or not: an expert that stays hot must never look stale to the
++    // rotation (and the epoch is what the gate uses to decide when the bytes may be released).
++    if ((int) t.push_read_epoch.size() == t.n_experts) {
++        t.push_read_epoch[(size_t) expert] = (uint32_t) (g_push_epoch > 0 ? g_push_epoch - 1 : 0);
+     }
+     if (t.push_locked[(size_t) expert]) {
+         return;
+@@ -1991,6 +2181,11 @@ static void push_mlock_expert(table_t & t, int32_t expert) {
+     t.push_locked[(size_t) expert] = 1;
+     g_push_mlock_bytes  += t.expert_bytes;
+     g_push_mlock_experts++;
++    if (g_push_in_seed) {
++        g_push_mlock_seeded++;
++    } else {
++        g_push_mlock_first++;
++    }
+ }
+ 
+ static void push_src_parse() {
+@@ -6176,6 +6371,9 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+                            int device, size_t slice_off, int split_axis,
+                            const struct ggml_backend_moe_slice * slices, int n_slices) {
+     g_write_seq++;
++    if (push_mlock_on()) {
++        push_gate_boundary_locked(device, stream);
++    }
+     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
+         return false;
+     }
+@@ -7267,9 +7465,11 @@ void moe_cache_report() {
+     }
+     if (g_push_mlock_budget > 0) {
+         GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
+-                      "seeded=%lld first_use=%lld, refusals=%lld); the remainder is reclaimable page cache\n",
++                      "seeded=%lld first_use=%lld cumulative, refusals=%lld; released=%lld release_denied=%lld over %llu "
++                      "boundaries); the remainder is reclaimable page cache\n",
+                       __func__, g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20,
+-                      g_push_mlock_seeded, g_push_mlock_experts - g_push_mlock_seeded, g_push_mlock_fail);
++                      g_push_mlock_seeded, g_push_mlock_first, g_push_mlock_fail,
++                      g_push_released, g_push_release_denied, (unsigned long long) g_push_epoch);
+     }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {

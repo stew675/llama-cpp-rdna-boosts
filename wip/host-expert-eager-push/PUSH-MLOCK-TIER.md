@@ -175,3 +175,65 @@ cold / not-fitting arm, which is the next measurement.
 
 **Still owed:** rotation by decay (demote + `munlock`, gated on a device set), then the 122B cold arm, then the
 7.14 correctness gate, then the A/B with the pool actually built.
+
+## 8. P2 increment 3 — the device-set eviction gate, and rotation (2026-11-03)
+
+`patches/0004` (293 lines, same branch, on top of `0003`):
+
+```
+MOE_HOST_PUSH_MLOCK_ROTATE=0        never release (pin monotonically)
+MOE_HOST_PUSH_MLOCK_ROTATE_MAX=8    experts released per sweep
+MOE_HOST_PUSH_MLOCK_PERIOD_MS=2000  the sweep cadence
+```
+
+**The gate.**  A pinned range may be `munlock`ed only when **no device can still be reading it**.  Under
+`-sm tensor` the same host pages are read by several devices (each `table_t` is a device's slice of one host
+tensor), so "finished" is a **set of streams**.  Implementation: one boundary event per device per op, recorded
+on that device's stream at the host hook; a per-expert epoch of its last read; release only when the read is at
+least one full boundary behind *and* every recorded event for it (and later ones in the 4-deep ring) has
+completed.  Ring reuse is safe in the direction that matters (a newer event on the same stream completing
+implies the older read did), and a missing/stale slot is treated conservatively.  The device set is cached per
+table (the sweep must not rescan `g_tables` per expert).
+
+**Rotation.**  Releases only what the **policy** says is cold — not arena-resident *and* its decayed count is
+0 — at most `ROTATE_MAX` experts per sweep, on a wall-clock cadence.
+
+### Three lessons, all measured, all now encoded
+
+1. **The staleness signal must be the policy's, not "was it filled lately."**  The arena absorbs most reads, so
+   a hot-but-arena-resident expert looks unfilled; the first cut released those and the pinned set **collapsed
+   to 33 experts, generation 1.0 t/s** (30 419 releases over 500 tokens).
+2. **The cadence must not be derived from an op/table count.**  The table set grows lazily, so "every
+   `g_period` boundaries" fired every 1-2 tables and turned a periodic sweep into a continual one: **5.7 then
+   9.2 t/s** (156 ms/token).  Wall clock fixed it.
+3. **`mlock`/`munlock` on populated page-cache pages is ~ms/MiB**, far above the 48.7 µs/MiB measured on a
+   sparse scratch file — so the pinned set must be **near-static**: 4 232 releases over 500 tokens was
+   unaffordable, 16 is free.
+
+**Measured after the fixes** (35B-A3B, 1 GPU, `-ncmoe 40`, forced misses, budget 512 MiB, 500 tokens, root):
+
+| | generation | pinned set | churn |
+|---|---|---|---|
+rotation off | 47.9-48.9 t/s | 511 MiB / 838 experts | — |
+**rotation on (2 s, max 8)** | **47.9 t/s** | **511 MiB / 837 experts** | `seeded=725 first_use=128 released=16 release_denied=1` over 17 037 boundaries |
+
+So the gate and the rotation are free at this cadence, and the set stays stable.  `release_denied=1` is weak
+evidence that the gate *denies* under contention, though — the real test is a **multi-device** arm, where the
+device set is > 1 and an in-flight read on device 1 must block a release decided against device 0.  That is the
+next measurement.
+
+## 9. Additive by construction (the pool path is not touched)
+
+The whole diff against the release tip is **189 insertions, 0 deletions**, and every line is behind an
+`MOE_HOST_PUSH_*` variable that defaults **off**:
+
+| hook | guard |
+|---|---|
+`expert_host_src`'s mapping branch | `MOE_HOST_PUSH_SRC=mapping` (unset → the pool/bounce path exactly as before) |
+`push_mlock_expert` | only reachable from that branch |
+`push_gate_boundary_locked` in `moe_cache_update_host` | `push_mlock_on()` (budget > 0) |
+`push_mlock_seed_locked` at sizing | budget > 0 (early return otherwise) |
+every log line | budget > 0 / mapping mode |
+
+Verified at runtime: a default-arm run with the pool configured logs **zero** `P1-PUSH` lines.  The parallel
+`wip/host-pool-speed/` campaign therefore owns the pool path untouched, and nothing here changes a default.

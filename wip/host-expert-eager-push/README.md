@@ -33,6 +33,18 @@
 > first_use=756` of 6 769 pinned experts on 35B-A3B, text byte-identical with and without seeding
 > (`sha=0cf4a62aa63f`), no faults.  Both host tiers now agree on the hot set, which is what makes `push` an
 > extension of the arena rather than a second cache.
+>
+> **P2 increment 3** (`patches/0004`): the **device-set eviction gate** (a pinned range is released only when no
+> device can still be reading it — one boundary event per device per op, a per-expert read epoch, a 4-deep ring)
+> and **rotation** (policy-cold experts only, ≤ 8 per sweep, wall-clock cadence).  Measured free after three
+> fixes: **47.9 t/s with rotation vs 47.9-48.9 without**, pinned set stable at 511 MiB / 837 experts,
+> `released=16 release_denied=1`.  Two traps encoded in the design now: the staleness signal must be the
+> *policy's* (not the fill count — that collapsed the set to 33 experts at 1.0 t/s), and the cadence must be
+> wall-clock (an op/table-derived one made the sweep continual: 156 ms/token).
+>
+> **Additive by construction**: the entire diff against the release tip is 189 insertions, 0 deletions, all
+> behind default-off `MOE_HOST_PUSH_*` variables; a default-arm run logs zero `P1-PUSH` lines and the
+> pool/bounce path that `wip/host-pool-speed/` owns is untouched.
 
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in `patches/`
 or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a separate
