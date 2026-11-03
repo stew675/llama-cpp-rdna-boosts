@@ -1,3 +1,32 @@
+## 261102.019 (wip) -- PR #266's disposition decided (remap stays, tensor-split aware); coalesced multi-expert fills built, measured and REFUTED
+
+No delivery change.  Continues `261102.018`.
+
+**Decision recorded (`TODO` #269, campaign README §3.1):** PR #266's **`GGML_MOE_DEVREMAP` survives** the #266
+reversion as a delivery capability — it is the one piece whose removal costs real throughput (+3.3 % measured on
+this host's 122B arm, r203's own cell said +8.1 %) — and everything else in #266 is dropped, including
+`MOE_HOST_POOL_COLD`, which the pool-aware gather now subsumes (15.54 -> 19.57 t/s at `COLD=0`).  **The condition
+is that the remap be tensor-split aware:** a per-device map whose cold-id encoding is per-device-slice aware (each
+device's arena slots differ; the pool slot does not) with the freshness invariant held per device, gated on 1 GPU
+*and* the multi-device `-sm tensor` arm.  A single-device-only implementation is not acceptable.
+
+**Coalesced multi-expert fills: implemented, measured, reverted.**  The staging miss loop walks experts in
+ascending order, so a run of consecutive misses was read with ONE aligned pread of up to 16 MiB into a shared
+4-slot pinned scratch and issued as ONE H2D (`MOE_HOST_POOL_COALESCE=0` as the kill switch, 1:1 geometry only).
+Result: FRAC 80 prefill **590.1 vs 629.8** and decode **16.24 vs 17.65** (-6 % / -8 %), FRAC 100 inert
+(896.2/912.9, 25.48/25.25).  The reason is structural: **the pool's residency is heat-ranked, not expert-ordered**,
+so "the experts this table does not hold" is a scattered file subset — the run finder produced runs of ~1.2 experts
+(3503 runs covering 7.7 of 69 GiB), and the prepopulate (29 376-36 864 of the fills) fills slots in *rank* order,
+so it cannot coalesce either.  The read path is also already at device speed: in situ 2.4-2.6 GB/s, *above* the
+`O_DIRECT` dd ceiling on the real shard (587 MB/s at 1792 KiB, 1.5-1.7 GB/s at >= 4 MiB), because thousands of
+back-to-back preads already present a deep sequential stream.
+
+So P1-a/§4.1 is **closed on evidence**: neither coalescing (refuted) nor an overlap worker (~6 % ceiling at
+FRAC 80, ~0 at FRAC 100, two measured negatives) is worth building.  What is left for the campaign is P0-a
+(`TODO` #269), the `soar` multi-device `-sm tensor` arm, and the §5 knob collapse.
+
+Verified after the revert: greedy text `sha=4ac3a523160f` (`pool`), tree clean.
+
 ## 261102.018 (wip) -- the pool's pinned bounce ring and the synchronous fill, measured: 3-4 ms/token of serialised read, 2.2-3.1 GiB of bounce, and the "4.7x fill" is not ours
 
 No delivery change.  Continues `261102.017`.  Record: `wip/host-pool-speed/README.md` §16, `patches/0004`, data

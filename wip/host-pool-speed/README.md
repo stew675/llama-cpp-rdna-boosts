@@ -120,6 +120,13 @@ tuning.
 
 ## 3. P0 — the work that decides the campaign
 
+> **Disposition decided 2026-11-02 (maintainer):** the remap survives the `#266` reversion and stays a delivery
+> capability; the rest of `#266` (including `MOE_HOST_POOL_COLD`, subsumed by the gather) is dropped.  **The
+> condition is that the remap is tensor-split aware** — a per-device map whose cold-id encoding is per-device-slice
+> aware and whose freshness invariant holds per device.  Tracked as `TODO` #269.  Its measured ceiling on this
+> host is **+3.3 %** (§15), not the +8.1 % the r203 cell reported, so it is scheduled *behind* the coalesced fill
+> (§16.3/§17) and gated on the multi-device arm.
+
 ### 3.1 P0-a: `GGML_MOE_DEVREMAP` on a pool-backed table (the decode gap, ≈ +8 %)
 
 The mechanism is nearly there — `pool_cold_slot_locked()` + `moe_cache_get_cold()`'s pool branch already
@@ -954,7 +961,7 @@ subtracting the pool's one-shot prepopulate (29 376 / 36 864 of the fills), not 
 
 **What this decides for the two candidates:**
 
-* **Coalescing (deterministic, known-sequence readahead): worth screening, not obviously free.**  O_DIRECT on the
+* **Coalescing (deterministic, known-sequence readahead): SCREENED AND REFUTED — see §17.**  O_DIRECT on the
   real shard (`00002-of-00003`, 46 GiB, 256 MiB spans) reads **587 MB/s at our 1792 KiB fill size** and
   **1.5-1.7 GB/s at >= 4 MiB** — so per-read size does matter at the device level, even though the in-situ
   sequential stream already achieves 2.6 GB/s (queue depth / locality).  The instrument is now in place
@@ -965,3 +972,39 @@ subtracting the pool's one-shot prepopulate (29 376 / 36 864 of the fills), not 
   is full and the residual fills are the tier's own churn), against two measured negative precedents (r113's
   worker; `MOE_HOST_POOL_PREFETCH`, now known to be a dead parse — `TODO.md` #268).  Not worth a thread on this
   evidence; revisit only if the coalesced arm shows the fill still dominating after the read time halves.
+
+## 17. Coalesced multi-expert fills — built, measured, REFUTED (2026-11-02, session 3)
+
+§16.3 said "worth screening, not obviously free".  It was screened, and it loses.  Record so nobody builds it
+again: `data/20261102-session3-coalesce`.
+
+**What was built** (and then reverted — nothing of it remains in the tree): the staging path's miss loop walks
+experts in ascending order, so a *run* of consecutive misses was read with ONE aligned pread of up to 16 MiB into
+a shared 4-slot pinned scratch (64 MiB process-wide, bounded, event-tracked) and issued as ONE H2D, instead of
+one pread + one per-expert bounce entry each.  Kill switch `MOE_HOST_POOL_COALESCE=0`; the 1:1 geometry only.
+
+**Why it fails: the miss set is not contiguous.**  The pool's residency is **heat-ranked**, not expert-ordered, so
+"the experts this table does not hold" is a *scattered* subset of the file — and the run finder therefore produced
+runs of ~1.2 experts:
+
+| arm | prefill | decode | coalesced coverage | read time (all fills) | ring |
+|---|---|---|---|---|---|
+| FRAC 80, coalesce **on** | **590.1** | **16.24** | 3 503 runs, 7.7 GiB of 69 GiB | 41 229 ms | 2761 MiB |
+| FRAC 80, `=0` | **629.8** | **17.65** | — | 29 415 ms | 2946 MiB |
+| FRAC 100, on | 896.2 | 25.48 | 385 runs, 0.7 GiB of 80 GiB | 40 191 ms | 2202 MiB |
+| FRAC 100, `=0` | 912.9 | 25.25 | — | 40 628 ms | 2255 MiB |
+
+So at FRAC 80 it costs **-6 % prefill and -8 % decode** (the scratch churn plus a mostly-single-expert fallback),
+and at FRAC 100 it is inert (0.7 GiB of 80 GiB coalescable).  And the second half of the idea — the *prepopulate*,
+which is 29 376-36 864 of the fills — cannot coalesce either: it fills slots in **rank** order, so its sources are
+scattered by construction.
+
+**And the read path is already at device speed.**  In situ the fills run at **2.4-2.6 GB/s**, which is *above* the
+`dd iflagn=direct` ceiling measured on the real 46 GiB shard (587 MB/s at our 1792 KiB size, 1.5-1.7 GB/s at
+>= 4 MiB): thousands of back-to-back preads already present the device with a deep sequential stream.  There is no
+bandwidth left to recover by making individual reads bigger.
+
+**Consequences.**  §4.1's P1-a is closed on the evidence: neither coalescing (refuted above) nor an overlap
+worker (~6 % ceiling at FRAC 80, ~0 at FRAC 100, two measured negative precedents — §16.3) is worth building.
+The remaining decode work is P0-a (`GGML_MOE_DEVREMAP` over pool slots, `TODO` #269, ceiling +3.3 % here, and it
+must be **tensor-split aware**), the `soar` multi-device `-sm tensor` arm, and the §5 knob collapse.

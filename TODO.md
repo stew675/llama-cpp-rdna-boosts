@@ -264,6 +264,25 @@ routing speculation — the routing-driven form measured as a net loss when sub-
 `archive/work/host-expert-dio-cache/PHASE2B-FINDINGS.md`).  Do not leave a documented no-op in place: a knob
 that silently does nothing is worse than a missing one (`AGENTS.md`, environment-variable policy).
 
+## 269. PR #266's disposition: keep the device remap, drop the rest — and the remap must be tensor-split aware
+
+**Status: decided 2026-11-02 (maintainer).  Forward-looking: it constrains how `GGML_MOE_DEVREMAP` is
+re-implemented over pool slots, and it is the acceptance condition for that work.**  The maintainer's call:
+PR #266's **`GGML_MOE_DEVREMAP` survives** the #266 reversion and stays a capability going forward, because it is
+the one piece of #266 whose removal costs real throughput (the sync-free decode map; r203 measured +8.1 % on its
+own cell, +3.3 % on this host's 122B arm — `wip/host-pool-speed/README.md` §15).  Everything else in #266 is
+dropped, including `MOE_HOST_POOL_COLD`, which the pool-aware device gather now subsumes (measured: `COLD=0`
+15.54 -> 19.57 t/s with the gather, `README.md` §14.4).
+
+**The condition:** the remap must be **tensor-split aware**.  Today `devremap_ok_locked()` needs a pinned master
+(`table_cold_ok()` -> `t.host_dev != nullptr`) and a `MOE_HOST_POOL_COLD` pool read declines whenever
+`device_count != 1`, so a `-sm tensor` split gets no map at all.  An implementation that only works on one device
+is not acceptable: the map is per (table, device) — a pool slot is process-wide and its device alias is valid on
+every device — so the cold id encoding must be per-device-slice aware (each device's arena slots differ; the pool
+slot does not) and the freshness invariant (a re-rank invalidates a lagging map: see `wip/host-pool-speed`
+§3.1's layout epoch / freeze) must hold per device.  Gates: same-seed greedy text and MTP acceptance on 1 GPU
+**and** on the multi-device `-sm tensor` arm (`soar`), with `check-gpu-faults.sh` clean.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship
