@@ -284,9 +284,10 @@ either fix it or delete that branch for pool tables.  **Verification of the fix 
 KLD gate (`--ab "GGML_SCHED_DEVGATHER=0"`) reads **−0.000000 / 100.000 %** (bit-identical prefill), text is
 byte-identical (5835 chars `dc178c29fe89`), and the rate is physically bounded (in-place pinned reads, 19 GB/s per
 device vs a 28.6 GB/s calibration).  Two caveats worth carrying: `GGML_MOE_GATHER_ONCE=1` no longer produces the
-Hole-B corruption at this width/quant (the control is vacuous — do not cite it), and **`pinned`'s own prefill is
-unstable in this box state (75.2-606.9 t/s)** while the pool arm repeats tightly, so any "N x faster than pinned"
-prefill claim needs a pinned control measured in the same group.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
+Hole-B corruption at this width/quant (the control is vacuous — do not cite it), and an earlier `pinned` 75.2 t/s reading **did not reproduce** (three reruns: 394.1 / 425.7 / 425.2 t/s), so the
+arm is stable; any "N x faster than pinned" prefill claim still needs a pinned control from the same group.  The
+`llama-bench pp1024` disagreement (pool 130 ± 73 vs pinned 271 ± 2.5) is open and needs a `-r 3` repeat at
+`-ub 1024`.  Promotion of `0006` (and the `ENVIRONMENT.md` row for the
 three-valued `GGML_SCHED_DEVGATHER`) is the maintainer's call.**  Original finding text follows.
 
 **Found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4), a defect in the DELIVERY's block 12
