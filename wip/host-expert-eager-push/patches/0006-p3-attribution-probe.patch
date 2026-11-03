@@ -1,0 +1,109 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 89b851064..da0894903 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2196,6 +2196,21 @@ static long    g_push_mlock_fail    = 0;
+ // "full" message on every re-fill (measured: two lines interleaved into a generation on the -sm layer arm,
+ // which made a byte-identical arm hash differently -- wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md 1b).
+ static bool    g_push_full_msg    = false;
++
++// P3 attribution probe (MOE_HOST_PUSH_PROBE=1, default OFF): is the multi-device loss spent INSIDE the
++// driver's copy call, or waiting on the device?  Times every fill copy on the host and records whether the
++// copying backend's device was current at the call -- the two candidate causes in
++// wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md §3.  Host microseconds only: a pageable copy returns
++// after QUEUING, so a small host figure means the cost is device-side waiting (staging/serialisation), not
++// a slow call.
++static bool     g_pi_on         = false;
++static bool     g_pi_setdev     = false;   // make t.device current before the copy (A/B for the 46 % mismatch)
++static long     g_pi_calls      = 0;
++static long     g_pi_h2d        = 0;   // pageable/pinned HOST -> device (the mapping push and the bounce)
++static long     g_pi_d2d        = 0;   // the pool's D2D from the mapped UVA alias
++static long     g_pi_mismatch   = 0;   // cudaGetDevice() != the backend's device at the call
++static uint64_t g_pi_us         = 0;
++static uint64_t g_pi_us_h2d     = 0;
+ static bool    g_push_fail_msg    = false;
+ static bool    g_push_mlock_parsed  = false;
+ static bool    g_push_mlock_seed    = true;   // MOE_HOST_PUSH_MLOCK_SEED=0: no heat seeding, first use only
+@@ -2514,6 +2529,17 @@ static void push_src_parse() {
+     push_mlock_parse();
+     const char * e = getenv("MOE_HOST_PUSH_SRC");
+     g_push_src_mapping = e != nullptr && strcmp(e, "mapping") == 0;
++    const char * pi = getenv("MOE_HOST_PUSH_PROBE");
++    g_pi_on = pi != nullptr && strcmp(pi, "0") != 0;
++    const char * sd2 = getenv("MOE_HOST_PUSH_SETDEV");
++    g_pi_setdev = sd2 != nullptr && strcmp(sd2, "0") != 0;
++    if (g_pi_setdev) {
++        fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_SETDEV -- set the copying backend's device before every fill copy\n");
++    }
++    if (g_pi_on) {
++        fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_PROBE -- timing every fill copy on the host "
++                        "(attribution only)\n");
++    }
+     if (g_push_src_mapping) {
+         // stderr as well: ggml's INFO/WARN can be filtered below llama.cpp's default threshold, and an
+         // engagement check that cannot be seen is worthless.
+@@ -2648,8 +2674,8 @@ static void expert_src_done(table_t & t, host_pool_t * pool, const expert_src_t
+ // contiguous slice (1-D copy).
+ // wip/host-expert-master-drop (TODO #55): the bytes come from `expert_host_src` (pinned master / pinned
+ // pool slot / pinned bounce), never from the pageable mapping.
+-static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const expert_src_t & src,
+-                                      cudaStream_t stream) {
++static cudaError_t copy_slot_from_src_impl(const table_t & t, void * dst, const expert_src_t & src,
++                                           cudaStream_t stream) {
+     if (t.n_slices > 0) {
+         size_t dst_o = 0;
+         for (int k = 0; k < t.n_slices; k++) {
+@@ -2674,6 +2700,39 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
+     return cudaMemcpyAsync(dst, s, t.expert_bytes, src.kind, stream);
+ }
+ 
++// P3 attribution probe: host microseconds inside the copy call, and the current device at the call.  Default
++// off, so a normal run is byte-for-byte unaffected (one branch per fill).
++static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const expert_src_t & src,
++                                      cudaStream_t stream) {
++    if (!g_pi_on && !g_pi_setdev) {
++        return copy_slot_from_src_impl(t, dst, src, stream);
++    }
++    int dev = -1;
++    (void) cudaGetDevice(&dev);
++    if (dev != t.device) {
++        g_pi_mismatch++;
++        if (g_pi_setdev) {
++            (void) cudaSetDevice(t.device);
++        }
++    }
++    if (!g_pi_on) {
++        return copy_slot_from_src_impl(t, dst, src, stream);
++    }
++    const auto t0  = std::chrono::steady_clock::now();
++    const cudaError_t err = copy_slot_from_src_impl(t, dst, src, stream);
++    const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - t0).count();
++    g_pi_calls++;
++    g_pi_us += us;
++    if (src.kind == cudaMemcpyHostToDevice) {
++        g_pi_h2d++;
++        g_pi_us_h2d += us;
++    } else {
++        g_pi_d2d++;
++    }
++    return err;
++}
++
+ // The SIZING-time bulk fill (identity table, prefill/heat seed): acquire, copy the whole table in, and
+ // retire the pool copy -- a seeded expert is wholly resident, so its pool slot is dead weight and is freed
+ // for a later `pool_fill_empty_locked` (the one-shot seeds are the only eviction this helper may cause).
+@@ -7993,6 +8052,13 @@ void moe_cache_report() {
+         GGML_LOG_INFO("%s: P1 push-src: MOE_HOST_PUSH_SRC=mapping, %lld fills DMA'd straight from the mapping\n",
+                       __func__, g_push_src_copies);
+     }
++    if (g_pi_on || g_pi_setdev) {
++        GGML_LOG_INFO("%s: P1 probe: %ld fill copies, %llu us host total (%.1f us/fill); H2D %ld in %llu us "
++                      "(%.1f us/copy), D2D %ld; device-mismatch at the call %ld\n", __func__, g_pi_calls,
++                      (unsigned long long) g_pi_us, g_pi_calls > 0 ? (double) g_pi_us / (double) g_pi_calls : 0.0,
++                      g_pi_h2d, (unsigned long long) g_pi_us_h2d,
++                      g_pi_h2d > 0 ? (double) g_pi_us_h2d / (double) g_pi_h2d : 0.0, g_pi_d2d, g_pi_mismatch);
++    }
+     if (g_push_mlock_budget > 0) {
+         GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
+                       "seeded=%lld first_use=%lld cumulative, refusals=%lld; released=%lld release_denied=%lld over %llu "

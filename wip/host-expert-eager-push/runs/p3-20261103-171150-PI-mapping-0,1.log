@@ -1,0 +1,1133 @@
+
+
+Loading model... |0.00.016.382 I cmn  common_param: common_params_print_info: build 11908 (29bc6de67) with Clang 24.0.0 for Linux x86_64
+0.00.016.384 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.016.385 I cmn  common_param: device_info:
+0.00.016.409 I cmn  common_param:   - ROCm0   : AMD Radeon AI PRO R9700 (gfx1201) (32624 MiB, 32554 MiB free)
+0.00.016.416 I cmn  common_param:   - ROCm1   : AMD Radeon AI PRO R9700 (gfx1201) (32624 MiB, 32554 MiB free)
+0.00.016.423 I cmn  common_param:   - CPU     : AMD Ryzen 9 9950X3D2 16-Core Processor (93642 MiB, 93642 MiB free)
+0.00.016.481 I cmn  common_param: system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | FA_QUANTS = q4_0-q4_0,q4_1-q4_1,q5_0-q5_0,q5_1-q5_1,q8_0-q8_0,bf16-bf16,f16-f16,iq4_nl-iq4_nl | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.016.522 I srv  init_listene: running without SSL
+0.00.016.700 I srv          init: using 31 threads for HTTP server
+0.00.016.737 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.018.457 I srv    load_model: loading model '/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.00.018.458 I srv    load_model: local path '/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.00.018.471 I cmn  common_init_: fitting params to device memory ...
+0.00.018.472 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.018.488 I common_params_fit_impl: getting device memory data for initial parameters:
+-P1-PUSH: MOE_HOST_PUSH_PROBE -- timing every fill copy on the host (attribution only)
+P1-PUSH: MOE_HOST_PUSH_SRC=mapping -- host-expert fills DMA straight from the model mapping (no pinned staging)
+\|/0.00.483.576 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.00.483.578 I common_memory_breakdown_print: |   - Meta() (Meta())    | 65248 = 64492 + ( 2654 =  1921 +     222 +     510) +       -1898 |
+0.00.483.578 I common_memory_breakdown_print: |   - Host               |                  19193 = 19177 +       0 +      16                |
+-\|/-0.00.965.749 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.00.965.757 I common_fit_params: fitting params to free memory took 0.95 seconds
+0.00.965.764 I llama_model_loader: host_experts_mode=POOL: NO pinned master; the host experts stay in the model mapping and every GPU read is served through a bounded pinned pool (MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80% of the host expert bytes capped by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)
+0.00.990.443 I llama_model_loader: loaded meta data with 55 key-value pairs and 753 tensors from /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (version GGUF V3 (latest))
+0.00.990.456 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.990.459 I llama_model_loader: - kv   0:                       general.architecture str              = qwen35moe
+0.00.990.460 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.990.461 I llama_model_loader: - kv   2:                     general.sampling.top_k i32              = 20
+0.00.990.462 I llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 0.950000
+0.00.990.463 I llama_model_loader: - kv   4:                      general.sampling.temp f32              = 1.000000
+0.00.990.463 I llama_model_loader: - kv   5:                               general.name str              = Qwen3.6-35B-A3B
+0.00.990.463 I llama_model_loader: - kv   6:                           general.basename str              = Qwen3.6-35B-A3B
+0.00.990.463 I llama_model_loader: - kv   7:                       general.quantized_by str              = Unsloth
+0.00.990.463 I llama_model_loader: - kv   8:                         general.size_label str              = 35B-A3B
+0.00.990.464 I llama_model_loader: - kv   9:                            general.license str              = apache-2.0
+0.00.990.464 I llama_model_loader: - kv  10:                       general.license.link str              = https://huggingface.co/Qwen/Qwen3.6-3...
+0.00.990.465 I llama_model_loader: - kv  11:                           general.repo_url str              = https://huggingface.co/unsloth
+0.00.990.465 I llama_model_loader: - kv  12:                   general.base_model.count u32              = 1
+0.00.990.465 I llama_model_loader: - kv  13:                  general.base_model.0.name str              = Qwen3.6 35B A3B
+0.00.990.466 I llama_model_loader: - kv  14:          general.base_model.0.organization str              = Qwen
+0.00.990.466 I llama_model_loader: - kv  15:              general.base_model.0.repo_url str              = https://huggingface.co/Qwen/Qwen3.6-3...
+0.00.990.468 I llama_model_loader: - kv  16:                               general.tags arr[str,3]       = ["qwen3_5_moe", "qwen", "image-text-t...
+0.00.990.468 I llama_model_loader: - kv  17:                      qwen35moe.block_count u32              = 41
+0.00.990.469 I llama_model_loader: - kv  18:                   qwen35moe.context_length u32              = 262144
+0.00.990.469 I llama_model_loader: - kv  19:                 qwen35moe.embedding_length u32              = 2048
+0.00.990.469 I llama_model_loader: - kv  20:             qwen35moe.attention.head_count u32              = 16
+0.00.990.469 I llama_model_loader: - kv  21:          qwen35moe.attention.head_count_kv u32              = 2
+0.00.990.470 I llama_model_loader: - kv  22:          qwen35moe.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+0.00.990.471 I llama_model_loader: - kv  23:                   qwen35moe.rope.freq_base f32              = 10000000.000000
+0.00.990.472 I llama_model_loader: - kv  24: qwen35moe.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.00.990.472 I llama_model_loader: - kv  25:                     qwen35moe.expert_count u32              = 256
+0.00.990.472 I llama_model_loader: - kv  26:                qwen35moe.expert_used_count u32              = 8
+0.00.990.472 I llama_model_loader: - kv  27:             qwen35moe.attention.key_length u32              = 256
+0.00.990.472 I llama_model_loader: - kv  28:           qwen35moe.attention.value_length u32              = 256
+0.00.990.472 I llama_model_loader: - kv  29:       qwen35moe.expert_feed_forward_length u32              = 512
+0.00.990.473 I llama_model_loader: - kv  30: qwen35moe.expert_shared_feed_forward_length u32              = 512
+0.00.990.473 I llama_model_loader: - kv  31:                  qwen35moe.ssm.conv_kernel u32              = 4
+0.00.990.473 I llama_model_loader: - kv  32:                   qwen35moe.ssm.state_size u32              = 128
+0.00.990.473 I llama_model_loader: - kv  33:                  qwen35moe.ssm.group_count u32              = 16
+0.00.990.473 I llama_model_loader: - kv  34:               qwen35moe.ssm.time_step_rank u32              = 32
+0.00.990.473 I llama_model_loader: - kv  35:                   qwen35moe.ssm.inner_size u32              = 4096
+0.00.990.474 I llama_model_loader: - kv  36:          qwen35moe.full_attention_interval u32              = 4
+0.00.990.474 I llama_model_loader: - kv  37:             qwen35moe.rope.dimension_count u32              = 64
+0.00.990.474 I llama_model_loader: - kv  38:             qwen35moe.nextn_predict_layers u32              = 1
+0.00.990.474 I llama_model_loader: - kv  39:                       tokenizer.ggml.model str              = gpt2
+0.00.990.474 I llama_model_loader: - kv  40:                         tokenizer.ggml.pre str              = qwen35
+0.00.990.475 I llama_model_loader: - kv  41:                      tokenizer.ggml.tokens arr[str,248320]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+0.00.990.476 I llama_model_loader: - kv  42:                  tokenizer.ggml.token_type arr[i32,248320]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.00.990.477 I llama_model_loader: - kv  43:                      tokenizer.ggml.merges arr[str,247587]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+0.00.990.477 I llama_model_loader: - kv  44:                tokenizer.ggml.eos_token_id u32              = 248046
+0.00.990.477 I llama_model_loader: - kv  45:            tokenizer.ggml.padding_token_id u32              = 248055
+0.00.990.477 I llama_model_loader: - kv  46:                tokenizer.ggml.bos_token_id u32              = 248044
+0.00.990.478 I llama_model_loader: - kv  47:               tokenizer.ggml.add_bos_token bool             = false
+0.00.990.478 I llama_model_loader: - kv  48:                    tokenizer.chat_template str              = {%- set image_count = namespace(value...
+0.00.990.478 I llama_model_loader: - kv  49:               general.quantization_version u32              = 2
+0.00.990.479 I llama_model_loader: - kv  50:                          general.file_type u32              = 15
+0.00.990.479 I llama_model_loader: - kv  51:                      quantize.imatrix.file str              = Qwen3.6-35B-A3B-GGUF/imatrix_unsloth....
+0.00.990.479 I llama_model_loader: - kv  52:                   quantize.imatrix.dataset str              = unsloth_calibration_Qwen3.6-35B-A3B.txt
+0.00.990.479 I llama_model_loader: - kv  53:             quantize.imatrix.entries_count u32              = 510
+0.00.990.480 I llama_model_loader: - kv  54:              quantize.imatrix.chunks_count u32              = 77
+0.00.990.480 I llama_model_loader: - type  f32:  368 tensors
+0.00.990.480 I llama_model_loader: - type q8_0:  259 tensors
+0.00.990.481 I llama_model_loader: - type q4_K:   82 tensors
+0.00.990.481 I llama_model_loader: - type q5_K:   38 tensors
+0.00.990.481 I llama_model_loader: - type q6_K:    4 tensors
+0.00.990.481 I llama_model_loader: - type bf16:    2 tensors
+0.00.990.483 I print_info: file format = GGUF V3 (latest)
+0.00.990.483 I print_info: file type   = Q4_K - Medium
+0.00.990.484 I print_info: file size   = 21.10 GiB (5.10 BPW) 
+0.00.990.490 I llama_prepare_model_devices: skipping CPU (AMD Ryzen 9 9950X3D2 16-Core Processor) for tensor parallelism
+0.00.990.490 I llama_prepare_model_devices: creating a Meta device for tensor parallelism from 2 devices:
+0.00.990.491 I llama_prepare_model_devices: - device 0: ROCm0 (AMD Radeon AI PRO R9700 (gfx1201))
+0.00.990.491 I llama_prepare_model_devices: - device 1: ROCm1 (AMD Radeon AI PRO R9700 (gfx1201))
+0.00.990.500 I llama_prepare_model_devices: using device Meta() (Meta()) (unknown id) - 64568 MiB free
+\0.01.028.416 I load: 0 unused tokens
+0.01.040.750 I load: printing all EOG tokens:
+0.01.040.751 I load:   - 248044 ('<|endoftext|>')
+0.01.040.751 I load:   - 248046 ('<|im_end|>')
+0.01.040.751 I load:   - 248063 ('<|fim_pad|>')
+0.01.040.751 I load:   - 248064 ('<|repo_name|>')
+0.01.040.751 I load:   - 248065 ('<|file_sep|>')
+0.01.040.830 I load: special tokens cache size = 33
+0.01.055.187 I load: token to piece cache size = 1.7581 MB
+0.01.055.193 I print_info: arch                  = qwen35moe
+0.01.055.193 I print_info: vocab_only            = 0
+0.01.055.193 I print_info: no_alloc              = 0
+0.01.055.194 I print_info: n_ctx_train           = 262144
+0.01.055.194 I print_info: n_embd_inp            = 2048
+0.01.055.194 I print_info: n_embd                = 2048
+0.01.055.195 I print_info: n_embd_out            = 2048
+0.01.055.195 I print_info: n_layer               = 40
+0.01.055.195 I print_info: n_layer_all           = 41
+0.01.055.201 I print_info: n_head                = 16
+0.01.055.202 I print_info: n_head_kv             = 2
+0.01.055.202 I print_info: n_rot                 = 64
+0.01.055.202 I print_info: n_swa                 = 0
+0.01.055.203 I print_info: is_swa_any            = 0
+0.01.055.203 I print_info: non_causal_type       = 0
+0.01.055.203 I print_info: n_embd_head_k         = 256
+0.01.055.203 I print_info: n_embd_head_v         = 256
+0.01.055.204 I print_info: n_gqa                 = 8
+0.01.055.204 I print_info: n_embd_k_gqa          = 512
+0.01.055.205 I print_info: n_embd_v_gqa          = 512
+0.01.055.205 I print_info: f_norm_eps            = 0.0e+00
+0.01.055.206 I print_info: f_norm_rms_eps        = 1.0e-06
+0.01.055.206 I print_info: f_clamp_kqv           = 0.0e+00
+0.01.055.206 I print_info: f_max_alibi_bias      = 0.0e+00
+0.01.055.206 I print_info: f_logit_scale         = 0.0e+00
+0.01.055.206 I print_info: f_attn_scale          = 0.0e+00
+0.01.055.206 I print_info: f_attn_value_scale    = 0.0000
+0.01.055.207 I print_info: n_ff                  = 0
+0.01.055.207 I print_info: n_expert              = 256
+0.01.055.208 I print_info: n_expert_used         = 8
+0.01.055.208 I print_info: n_expert_groups       = 0
+0.01.055.208 I print_info: n_group_used          = 0
+0.01.055.208 I print_info: causal attn           = 1
+0.01.055.208 I print_info: pooling type          = -1
+0.01.055.209 I print_info: rope type             = 40
+0.01.055.209 I print_info: rope scaling          = linear
+0.01.055.209 I print_info: freq_base_train       = 10000000.0
+0.01.055.210 I print_info: freq_scale_train      = 1
+0.01.055.210 I print_info: n_ctx_orig_yarn       = 262144
+0.01.055.210 I print_info: rope_yarn_log_mul     = 0.0000
+0.01.055.210 I print_info: rope_finetuned        = unknown
+0.01.055.211 I print_info: mrope sections        = [11, 11, 10, 0]
+0.01.055.211 I print_info: ssm_d_conv            = 4
+0.01.055.211 I print_info: ssm_d_inner           = 4096
+0.01.055.211 I print_info: ssm_d_state           = 128
+0.01.055.211 I print_info: ssm_dt_rank           = 32
+0.01.055.212 I print_info: ssm_n_group           = 16
+0.01.055.212 I print_info: ssm_dt_b_c_rms        = 0
+0.01.055.212 I print_info: model type            = 35B.A3B
+0.01.055.212 I print_info: model params          = 35.51 B
+0.01.055.213 I print_info: general.name          = Qwen3.6-35B-A3B
+0.01.055.213 I print_info: vocab type            = BPE
+0.01.055.213 I print_info: n_vocab               = 248320
+0.01.055.214 I print_info: n_merges              = 247587
+0.01.055.214 I print_info: BOS token             = 248044 '<|endoftext|>'
+0.01.055.214 I print_info: EOS token             = 248046 '<|im_end|>'
+0.01.055.214 I print_info: EOT token             = 248046 '<|im_end|>'
+0.01.055.214 I print_info: PAD token             = 248055 '<|vision_pad|>'
+0.01.055.214 I print_info: LF token              = 198 'Ċ'
+0.01.055.215 I print_info: FIM PRE token         = 248060 '<|fim_prefix|>'
+0.01.055.215 I print_info: FIM SUF token         = 248062 '<|fim_suffix|>'
+0.01.055.215 I print_info: FIM MID token         = 248061 '<|fim_middle|>'
+0.01.055.215 I print_info: FIM PAD token         = 248063 '<|fim_pad|>'
+0.01.055.215 I print_info: FIM REP token         = 248064 '<|repo_name|>'
+0.01.055.215 I print_info: FIM SEP token         = 248065 '<|file_sep|>'
+0.01.055.216 I print_info: EOG token             = 248044 '<|endoftext|>'
+0.01.055.216 I print_info: EOG token             = 248046 '<|im_end|>'
+0.01.055.216 I print_info: EOG token             = 248063 '<|fim_pad|>'
+0.01.055.216 I print_info: EOG token             = 248064 '<|repo_name|>'
+0.01.055.216 I print_info: EOG token             = 248065 '<|file_sep|>'
+0.01.055.216 I print_info: max token length      = 256
+0.01.055.224 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.01.056.227 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.01.094.601 W model has unused tensor blk.40.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.01.094.603 W model has unused tensor blk.40.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.01.094.607 W model has unused tensor blk.40.attn_q.weight (size = 17825792 bytes) -- ignoring
+0.01.094.608 W model has unused tensor blk.40.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.01.094.609 W model has unused tensor blk.40.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.01.094.614 W model has unused tensor blk.40.attn_output.weight (size = 8912896 bytes) -- ignoring
+0.01.094.615 W model has unused tensor blk.40.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.01.094.616 W model has unused tensor blk.40.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.01.094.618 W model has unused tensor blk.40.ffn_gate_inp.weight (size = 1048576 bytes) -- ignoring
+0.01.094.619 W model has unused tensor blk.40.ffn_down_exps.weight (size = 184549376 bytes) -- ignoring
+0.01.094.622 W model has unused tensor blk.40.ffn_gate_exps.weight (size = 150994944 bytes) -- ignoring
+0.01.094.623 W model has unused tensor blk.40.ffn_up_exps.weight (size = 150994944 bytes) -- ignoring
+0.01.094.625 W model has unused tensor blk.40.ffn_gate_inp_shexp.weight (size = 4096 bytes) -- ignoring
+0.01.094.626 W model has unused tensor blk.40.ffn_gate_shexp.weight (size = 1114112 bytes) -- ignoring
+0.01.094.628 W model has unused tensor blk.40.ffn_up_shexp.weight (size = 1114112 bytes) -- ignoring
+0.01.094.629 W model has unused tensor blk.40.ffn_down_shexp.weight (size = 1114112 bytes) -- ignoring
+0.01.094.631 W model has unused tensor blk.40.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.01.094.633 W model has unused tensor blk.40.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.01.094.635 W model has unused tensor blk.40.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.01.094.639 W model has unused tensor blk.40.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+0.01.099.107 I load_tensors: offloading output layer to GPU
+0.01.099.108 I load_tensors: offloading 40 repeating layers to GPU
+0.01.099.109 I load_tensors: offloaded 42/42 layers to GPU
+0.01.099.111 I load_tensors:   CPU_Mapped model buffer size =   515.31 MiB
+0.01.099.111 I load_tensors:       Meta() model buffer size =  1064.91 MiB
+0.01.099.111 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.112 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.113 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.113 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.113 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.113 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.113 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.114 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.115 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.115 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.115 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.115 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.115 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.116 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.117 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.118 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.119 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.120 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.120 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.120 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.120 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.120 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.121 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.121 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.121 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.121 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.122 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.123 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.124 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.125 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.126 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.127 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   210.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.128 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   176.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   210.00 MiB
+0.01.099.129 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.130 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.130 I load_tensors: ROCm_HostMap model buffer size =   210.00 MiB
+0.01.099.130 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+0.01.099.130 I load_tensors: ROCm_HostMap model buffer size =   144.00 MiB
+|/-\0.01.445.448 I heat_map_load_locked: loaded 120 heat entries from /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.moe-heatmap
+0.01.448.598 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.01.448.599 I cmn  common_init_: added <|im_end|> logit bias = -inf
+0.01.448.600 I cmn  common_init_: added <|fim_pad|> logit bias = -inf
+0.01.448.600 I cmn  common_init_: added <|repo_name|> logit bias = -inf
+0.01.448.600 I cmn  common_init_: added <|file_sep|> logit bias = -inf
+0.01.448.637 I llama_init_from_model: enabling flash_attn since it is required for SPLIT_MODE_TENSOR
+0.01.448.648 I llama_context: constructing llama_context
+0.01.448.654 I llama_context: n_seq_max             = 1
+0.01.448.655 I llama_context: n_ctx                 = 8192
+0.01.448.656 I llama_context: n_ctx_seq             = 8192
+0.01.448.656 I llama_context: n_batch               = 2048
+0.01.448.656 I llama_context: n_ubatch              = 512
+0.01.448.656 I llama_context: causal_attn           = 1
+0.01.448.657 I llama_context: flash_attn            = enabled
+0.01.448.657 I llama_context: kv_unified            = false
+0.01.448.659 I llama_context: freq_base             = 10000000.0
+0.01.448.660 I llama_context: freq_scale            = 1
+0.01.448.660 I llama_context: n_rs_seq              = 0
+0.01.448.660 I llama_context: n_rs_batch            = 1
+0.01.448.661 I llama_context: n_outputs_max         = 1
+0.01.448.661 I llama_context: n_outputs_max_per_seq = 1
+0.01.448.661 I llama_context: n_ctx_seq (8192) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.01.465.563 I ggml_cuda_ar_pipeline_init: initialized HIP AllReduce pipeline: 2 GPUs, 1024 KB chunked kernel staging + 32 MB copy-engine staging per GPU
+|0.01.574.618 I llama_context:  ROCm_Host  output buffer size =     0.95 MiB
+0.01.579.264 I ggml_cuda_vmm_region_available: device 0: VMM region available (map unit 2 MiB, driver granularity 2 MiB)
+0.01.579.639 I ggml_cuda_vmm_region_available: device 1: VMM region available (map unit 2 MiB, driver granularity 2 MiB)
+0.01.580.055 I llama_kv_cache:     Meta() KV buffer size =    80.00 MiB
+0.01.581.293 I llama_kv_cache: size =  160.00 MiB (  8192 cells,  10 layers,  1/1 seqs), K (f16):   80.00 MiB, V (f16):   80.00 MiB
+0.01.581.295 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 256
+0.01.581.295 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 256
+0.01.582.895 I llama_memory_recurrent:     Meta() RS buffer size =    31.41 MiB
+0.01.582.899 I llama_memory_recurrent: size =   62.81 MiB (     1 cells,  40 layers,  1 seqs  0 rs_seq), R (f32):    2.81 MiB, S (f32):   60.00 MiB, P (f32):    0.00 MiB
+0.01.583.818 I sched_reserve: reserving ...
+0.01.585.857 I resolve_fused_ops: resolving derived kq mask support:
+0.01.586.841 I resolve_fused_ops: derived kq mask flash attention enabled
+0.01.586.842 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.01.587.617 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.01.588.356 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.01.589.082 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.01.603.944 W SLAB_INIT dev=0 free=30.34 GiB reserve=1.38 GiB headroom=1.38 GiB aux=0.00 GiB size(VA)=28.94 GiB mapped=28.94 GiB boundary=0.56 GiB va_spare=0.00 GiB chunk=64.0 MiB ring_req=0.95 GiB
+0.01.603.947 W ggml_cuda_slab_init_locked: device 0: slab 28.94 GiB (chunk 64.0 MiB): work 0.56 GiB + arena 28.38 GiB (1.38 GiB reserve, 0.00 GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+0.01.603.950 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 561.00 MiB from the slab work region (boundary 576.00 MiB) on device 0
+0.01.616.309 W SLAB_INIT dev=1 free=30.34 GiB reserve=1.38 GiB headroom=1.38 GiB aux=0.00 GiB size(VA)=28.94 GiB mapped=28.94 GiB boundary=0.56 GiB va_spare=0.00 GiB chunk=64.0 MiB ring_req=0.95 GiB
+0.01.616.312 W ggml_cuda_slab_init_locked: device 1: slab 28.94 GiB (chunk 64.0 MiB): work 0.56 GiB + arena 28.38 GiB (1.38 GiB reserve, 0.00 GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+0.01.616.314 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 561.00 MiB from the slab work region (boundary 576.00 MiB) on device 1
+/0.01.617.842 I ggml_gallocr_reserve_n_impl: reallocating Meta() buffer from size 561.00 MiB to 674.04 MiB
+0.01.617.904 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1024.00 MiB from the slab work region (boundary 1024.00 MiB) on device 0
+0.01.617.907 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1024.00 MiB from the slab work region (boundary 1024.00 MiB) on device 1
+0.01.619.114 I sched_reserve:     Meta() compute buffer size =  1024.00 MiB
+0.01.619.116 I sched_reserve:        CPU compute buffer size =    16.06 MiB
+0.01.619.118 I sched_reserve: graph (pp bs=512, tg bs=1): nodes = 3819 / 3819, splits = 120 / 42, input objects = 5 / 4, input tensors = 9 / 10
+0.01.619.119 I sched_reserve: reserve took 35.30 ms, sched copies = 1
+0.01.619.186 I cmn          init: llama threadpool init, n_threads = 16
+0.01.619.205 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.01.622.508 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 1, n_diff = 0
+0.01.643.670 I ggml_cuda_async_input_arm_locked: device ring: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=0 disables)
+0.01.643.676 I ggml_cuda_async_input_set: device 0: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)
+0.01.645.773 I ggml_cuda_async_input_arm_locked: device ring: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=0 disables)
+0.01.645.776 I ggml_cuda_async_input_set: device 1: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)
+-\|/0.02.098.288 I ggml_backend_cuda_stage_h2d_gbps: H2D bandwidth calibration: 28.7 GB/s (512 MiB x3 in 56.20 ms, from the slab arena)
+-\|0.02.323.368 I ggml_backend_cuda_stage_h2d_gbps: H2D bandwidth calibration: 14.5 GB/s (512 MiB x3 in 111.45 ms, from the slab arena)
+0.02.332.036 I sched_stage_min_tokens: H2D staging calibration: 14.5 GB/s -> min_tokens=1542
+0.02.332.295 I bind_host_dev_locked: the host expert master is pageable (pool-backed `--host-experts pool`); the in-place cold read is disabled and misses are served from the pinned host pool
+/-0.02.519.643 I pool_decide_dio_locked: host pool fill mode: buffered (page cache as L3) -- MemAvailable 81530.3 MiB, planned pool 9331.0 MiB, host expert set 18662.0 MiB (the set fits beside the pool; MOE_HOST_POOL_DIO=0|1 forces either arm)
+0.02.519.651 I pool_ram_cap_locked: host pool RAM ceiling: 85% of MemAvailable = 69300.8 MiB (MOE_HOST_POOL_RAM_PCT)
+0.02.519.653 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=0 role=blk.0.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.02.536.152 I pool_prepopulate_locked: prewarmed host pool layer=0 role=blk.0.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.538.076 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.540.247 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=0 role=blk.0.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.543.463 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.543.651 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=0 role=blk.0.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.559.103 I pool_prepopulate_locked: prewarmed host pool layer=0 role=blk.0.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.562.575 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.564.356 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=0 role=blk.0.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.595.338 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.595.467 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=0 role=blk.0.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.609.465 I pool_prepopulate_locked: prewarmed host pool layer=0 role=blk.0.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.612.940 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.614.703 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=0 role=blk.0.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+\0.02.645.428 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.645.565 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=3 role=blk.3.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.02.663.023 I pool_prepopulate_locked: prewarmed host pool layer=3 role=blk.3.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.664.934 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.667.098 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=3 role=blk.3.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.670.713 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.670.912 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=3 role=blk.3.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.685.413 I pool_prepopulate_locked: prewarmed host pool layer=3 role=blk.3.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.688.940 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.690.836 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=3 role=blk.3.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+|0.02.722.395 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.722.553 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=3 role=blk.3.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.736.994 I pool_prepopulate_locked: prewarmed host pool layer=3 role=blk.3.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.740.538 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.742.411 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=3 role=blk.3.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.773.821 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.773.960 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=4 role=blk.4.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.02.792.960 I pool_prepopulate_locked: prewarmed host pool layer=4 role=blk.4.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.794.881 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.797.226 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=4 role=blk.4.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.800.615 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.800.820 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=4 role=blk.4.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.816.727 I pool_prepopulate_locked: prewarmed host pool layer=4 role=blk.4.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+/0.02.820.164 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.822.292 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=4 role=blk.4.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.854.439 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.854.576 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=4 role=blk.4.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.869.930 I pool_prepopulate_locked: prewarmed host pool layer=4 role=blk.4.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.873.342 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.875.269 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=4 role=blk.4.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.907.620 I apply_heat_seed_locked: layer=4 role=blk.4.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.907.785 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=8 role=blk.8.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+-0.02.926.947 I pool_prepopulate_locked: prewarmed host pool layer=8 role=blk.8.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.928.856 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.931.119 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=8 role=blk.8.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.934.513 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.934.733 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=8 role=blk.8.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.02.950.849 I pool_prepopulate_locked: prewarmed host pool layer=8 role=blk.8.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.02.954.610 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.956.542 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=8 role=blk.8.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.02.989.280 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.02.989.431 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=8 role=blk.8.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.005.768 I pool_prepopulate_locked: prewarmed host pool layer=8 role=blk.8.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.009.184 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.010.959 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=8 role=blk.8.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+\0.03.042.740 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.042.890 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=12 role=blk.12.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.061.319 I pool_prepopulate_locked: prewarmed host pool layer=12 role=blk.12.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.063.216 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.065.519 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=12 role=blk.12.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.068.943 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.069.179 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=12 role=blk.12.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.083.729 I pool_prepopulate_locked: prewarmed host pool layer=12 role=blk.12.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.087.120 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.088.973 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=12 role=blk.12.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+|0.03.121.301 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.121.439 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=12 role=blk.12.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.136.331 I pool_prepopulate_locked: prewarmed host pool layer=12 role=blk.12.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.139.727 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.141.582 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=12 role=blk.12.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.174.601 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.174.769 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=15 role=blk.15.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.193.657 I pool_prepopulate_locked: prewarmed host pool layer=15 role=blk.15.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.195.569 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.197.941 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=15 role=blk.15.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.201.658 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.201.880 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=15 role=blk.15.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+/0.03.218.154 I pool_prepopulate_locked: prewarmed host pool layer=15 role=blk.15.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.221.594 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.223.572 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=15 role=blk.15.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.255.894 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.256.017 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=15 role=blk.15.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.271.578 I pool_prepopulate_locked: prewarmed host pool layer=15 role=blk.15.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.275.002 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.277.216 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=15 role=blk.15.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.309.939 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.310.110 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=16 role=blk.16.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+-0.03.328.313 I pool_prepopulate_locked: prewarmed host pool layer=16 role=blk.16.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.330.223 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.332.705 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=16 role=blk.16.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.336.301 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.336.492 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=16 role=blk.16.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.352.602 I pool_prepopulate_locked: prewarmed host pool layer=16 role=blk.16.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.356.149 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.358.390 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=16 role=blk.16.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.389.093 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.389.206 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=16 role=blk.16.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.405.419 I pool_prepopulate_locked: prewarmed host pool layer=16 role=blk.16.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.408.886 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.410.911 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=16 role=blk.16.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+\0.03.441.634 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.441.767 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=1 role=blk.1.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.458.558 I pool_prepopulate_locked: prewarmed host pool layer=1 role=blk.1.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.460.459 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.462.805 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=1 role=blk.1.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.466.067 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.466.241 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=1 role=blk.1.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.481.363 I pool_prepopulate_locked: prewarmed host pool layer=1 role=blk.1.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.484.758 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.486.665 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=1 role=blk.1.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+|0.03.518.309 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.518.431 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=1 role=blk.1.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.534.645 I pool_prepopulate_locked: prewarmed host pool layer=1 role=blk.1.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.538.057 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.539.952 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=1 role=blk.1.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.571.676 I apply_heat_seed_locked: layer=1 role=blk.1.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.571.809 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=2 role=blk.2.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.588.747 I pool_prepopulate_locked: prewarmed host pool layer=2 role=blk.2.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.590.648 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.592.911 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=2 role=blk.2.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.596.200 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.596.376 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=2 role=blk.2.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.612.184 I pool_prepopulate_locked: prewarmed host pool layer=2 role=blk.2.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.615.609 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.617.546 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=2 role=blk.2.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+/0.03.650.974 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.651.090 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=2 role=blk.2.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.666.067 I pool_prepopulate_locked: prewarmed host pool layer=2 role=blk.2.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.669.488 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.671.431 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=2 role=blk.2.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.704.837 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.704.981 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=5 role=blk.5.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+-0.03.721.505 I pool_prepopulate_locked: prewarmed host pool layer=5 role=blk.5.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.723.403 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.725.786 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=5 role=blk.5.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.729.085 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.729.253 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=5 role=blk.5.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.743.539 I pool_prepopulate_locked: prewarmed host pool layer=5 role=blk.5.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.746.985 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.748.944 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=5 role=blk.5.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.780.696 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.780.809 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=5 role=blk.5.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.795.046 I pool_prepopulate_locked: prewarmed host pool layer=5 role=blk.5.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.798.469 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.800.385 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=5 role=blk.5.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+\0.03.832.058 I apply_heat_seed_locked: layer=5 role=blk.5.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.832.195 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=6 role=blk.6.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.849.594 I pool_prepopulate_locked: prewarmed host pool layer=6 role=blk.6.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.851.500 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.853.890 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=6 role=blk.6.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.857.125 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.857.296 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=6 role=blk.6.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.871.359 I pool_prepopulate_locked: prewarmed host pool layer=6 role=blk.6.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.874.743 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.876.658 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=6 role=blk.6.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.907.691 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.907.807 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=6 role=blk.6.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+|0.03.920.665 I pool_prepopulate_locked: prewarmed host pool layer=6 role=blk.6.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.924.050 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.925.940 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=6 role=blk.6.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.956.743 I apply_heat_seed_locked: layer=6 role=blk.6.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.956.893 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=7 role=blk.7.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.03.972.234 I pool_prepopulate_locked: prewarmed host pool layer=7 role=blk.7.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.974.133 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.976.468 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=7 role=blk.7.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.03.979.710 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.979.873 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=7 role=blk.7.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.03.993.703 I pool_prepopulate_locked: prewarmed host pool layer=7 role=blk.7.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.03.997.122 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.03.999.091 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=7 role=blk.7.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+/0.04.029.985 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.030.095 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=7 role=blk.7.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.043.913 I pool_prepopulate_locked: prewarmed host pool layer=7 role=blk.7.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.047.316 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.049.255 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=7 role=blk.7.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.080.047 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.080.186 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=9 role=blk.9.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.097.596 I pool_prepopulate_locked: prewarmed host pool layer=9 role=blk.9.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.099.495 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.101.875 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=9 role=blk.9.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.105.123 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.105.291 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=9 role=blk.9.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+-0.04.119.469 I pool_prepopulate_locked: prewarmed host pool layer=9 role=blk.9.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.122.894 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.124.875 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=9 role=blk.9.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.156.189 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.156.301 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=9 role=blk.9.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.169.139 I pool_prepopulate_locked: prewarmed host pool layer=9 role=blk.9.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.172.545 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.174.468 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=9 role=blk.9.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.205.683 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.205.823 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=10 role=blk.10.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+\0.04.221.262 I pool_prepopulate_locked: prewarmed host pool layer=10 role=blk.10.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.223.165 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.225.615 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=10 role=blk.10.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.228.864 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.229.045 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=10 role=blk.10.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.242.846 I pool_prepopulate_locked: prewarmed host pool layer=10 role=blk.10.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.246.255 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.248.260 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=10 role=blk.10.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.281.517 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.281.634 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=10 role=blk.10.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.295.568 I pool_prepopulate_locked: prewarmed host pool layer=10 role=blk.10.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.298.938 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.300.949 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=10 role=blk.10.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+|0.04.334.191 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.334.329 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=11 role=blk.11.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.350.645 I pool_prepopulate_locked: prewarmed host pool layer=11 role=blk.11.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.352.544 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.354.929 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=11 role=blk.11.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.358.160 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.358.330 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=11 role=blk.11.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.372.062 I pool_prepopulate_locked: prewarmed host pool layer=11 role=blk.11.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.375.470 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.377.419 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=11 role=blk.11.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.408.187 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.408.300 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=11 role=blk.11.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+/0.04.422.458 I pool_prepopulate_locked: prewarmed host pool layer=11 role=blk.11.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.425.868 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.427.808 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=11 role=blk.11.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.458.665 I apply_heat_seed_locked: layer=11 role=blk.11.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.458.799 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=13 role=blk.13.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.475.878 I pool_prepopulate_locked: prewarmed host pool layer=13 role=blk.13.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.477.786 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.480.158 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=13 role=blk.13.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.483.417 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.483.590 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=13 role=blk.13.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.497.927 I pool_prepopulate_locked: prewarmed host pool layer=13 role=blk.13.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.501.359 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.503.990 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=13 role=blk.13.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+-0.04.536.490 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.536.635 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=13 role=blk.13.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.551.113 I pool_prepopulate_locked: prewarmed host pool layer=13 role=blk.13.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.554.556 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.556.468 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=13 role=blk.13.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.588.662 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.588.807 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=14 role=blk.14.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.606.060 I pool_prepopulate_locked: prewarmed host pool layer=14 role=blk.14.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.607.960 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.610.262 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=14 role=blk.14.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.613.521 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.613.694 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=14 role=blk.14.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+\0.04.627.141 I pool_prepopulate_locked: prewarmed host pool layer=14 role=blk.14.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.630.555 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.632.529 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=14 role=blk.14.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.664.631 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.664.743 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=14 role=blk.14.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.678.972 I pool_prepopulate_locked: prewarmed host pool layer=14 role=blk.14.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.682.345 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.684.257 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=14 role=blk.14.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.716.226 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.716.371 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=17 role=blk.17.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+|0.04.733.852 I pool_prepopulate_locked: prewarmed host pool layer=17 role=blk.17.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.735.750 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.738.219 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=17 role=blk.17.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.741.732 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.741.904 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=17 role=blk.17.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.755.367 I pool_prepopulate_locked: prewarmed host pool layer=17 role=blk.17.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.758.787 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.760.816 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=17 role=blk.17.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.793.310 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.793.422 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=17 role=blk.17.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.807.378 I pool_prepopulate_locked: prewarmed host pool layer=17 role=blk.17.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.810.786 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.812.790 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=17 role=blk.17.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+/0.04.845.244 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.845.377 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=18 role=blk.18.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.862.617 I pool_prepopulate_locked: prewarmed host pool layer=18 role=blk.18.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.864.516 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.866.970 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=18 role=blk.18.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.870.144 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.870.311 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=18 role=blk.18.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.884.641 I pool_prepopulate_locked: prewarmed host pool layer=18 role=blk.18.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.888.085 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.890.012 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=18 role=blk.18.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+-0.04.924.491 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.924.607 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=18 role=blk.18.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.04.938.964 I pool_prepopulate_locked: prewarmed host pool layer=18 role=blk.18.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.942.392 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.944.426 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=18 role=blk.18.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.04.978.990 I apply_heat_seed_locked: layer=18 role=blk.18.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.04.979.132 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=19 role=blk.19.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.04.996.894 I pool_prepopulate_locked: prewarmed host pool layer=19 role=blk.19.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.04.998.794 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.001.226 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=19 role=blk.19.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.004.802 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.004.970 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=19 role=blk.19.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+\0.05.019.098 I pool_prepopulate_locked: prewarmed host pool layer=19 role=blk.19.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.022.516 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.024.467 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=19 role=blk.19.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.053.251 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.053.363 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=19 role=blk.19.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.067.824 I pool_prepopulate_locked: prewarmed host pool layer=19 role=blk.19.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.071.327 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.073.359 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=19 role=blk.19.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.102.114 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.102.275 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=20 role=blk.20.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+|0.05.119.037 I pool_prepopulate_locked: prewarmed host pool layer=20 role=blk.20.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.120.943 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.123.098 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=20 role=blk.20.ffn_down_exps.weight: 54 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.126.237 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.126.446 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=20 role=blk.20.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.139.241 I pool_prepopulate_locked: prewarmed host pool layer=20 role=blk.20.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.142.648 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.144.685 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=20 role=blk.20.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.175.795 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.175.932 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=20 role=blk.20.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.189.134 I pool_prepopulate_locked: prewarmed host pool layer=20 role=blk.20.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.192.570 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.194.454 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=20 role=blk.20.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+/0.05.225.615 I apply_heat_seed_locked: layer=20 role=blk.20.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.225.778 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=21 role=blk.21.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.242.252 I pool_prepopulate_locked: prewarmed host pool layer=21 role=blk.21.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.244.168 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.246.674 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=21 role=blk.21.ffn_down_exps.weight: 56 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.249.962 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.250.172 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=21 role=blk.21.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.263.099 I pool_prepopulate_locked: prewarmed host pool layer=21 role=blk.21.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.266.490 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.268.414 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=21 role=blk.21.ffn_gate_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.299.116 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.299.254 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=21 role=blk.21.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.312.524 I pool_prepopulate_locked: prewarmed host pool layer=21 role=blk.21.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.315.948 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.317.894 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=21 role=blk.21.ffn_up_exps.weight: 56 filled, 56 freed, 200 wanted non-resident, ranked by the heat prior
+-0.05.348.540 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.348.696 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=22 role=blk.22.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.364.036 I pool_prepopulate_locked: prewarmed host pool layer=22 role=blk.22.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.365.950 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.367.906 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=22 role=blk.22.ffn_down_exps.weight: 49 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.371.070 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.371.288 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=22 role=blk.22.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.384.033 I pool_prepopulate_locked: prewarmed host pool layer=22 role=blk.22.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.387.433 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.389.193 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=22 role=blk.22.ffn_gate_exps.weight: 49 filled, 49 freed, 200 wanted non-resident, ranked by the heat prior
+\0.05.422.249 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.422.391 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=22 role=blk.22.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.435.511 I pool_prepopulate_locked: prewarmed host pool layer=22 role=blk.22.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.438.989 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.440.620 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=22 role=blk.22.ffn_up_exps.weight: 48 filled, 48 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.473.507 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.473.652 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=23 role=blk.23.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.489.796 I pool_prepopulate_locked: prewarmed host pool layer=23 role=blk.23.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.491.703 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.493.745 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=23 role=blk.23.ffn_down_exps.weight: 50 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.496.953 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.497.123 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=23 role=blk.23.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.509.561 I pool_prepopulate_locked: prewarmed host pool layer=23 role=blk.23.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.512.981 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.514.764 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=23 role=blk.23.ffn_gate_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+|0.05.545.156 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.545.278 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=23 role=blk.23.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.558.856 I pool_prepopulate_locked: prewarmed host pool layer=23 role=blk.23.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.562.291 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.563.929 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=23 role=blk.23.ffn_up_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.594.260 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.594.403 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=24 role=blk.24.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.610.466 I pool_prepopulate_locked: prewarmed host pool layer=24 role=blk.24.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.612.377 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.614.333 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=24 role=blk.24.ffn_down_exps.weight: 49 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.617.853 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.618.030 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=24 role=blk.24.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+/0.05.631.307 I pool_prepopulate_locked: prewarmed host pool layer=24 role=blk.24.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.634.736 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.636.528 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=24 role=blk.24.ffn_gate_exps.weight: 49 filled, 49 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.668.572 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.668.686 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=24 role=blk.24.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.682.001 I pool_prepopulate_locked: prewarmed host pool layer=24 role=blk.24.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.685.411 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.687.101 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=24 role=blk.24.ffn_up_exps.weight: 49 filled, 49 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.719.157 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.05.719.297 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=25 role=blk.25.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.735.828 I pool_prepopulate_locked: prewarmed host pool layer=25 role=blk.25.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.737.742 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.740.005 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=25 role=blk.25.ffn_down_exps.weight: 52 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.743.184 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.743.357 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=25 role=blk.25.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.756.487 I pool_prepopulate_locked: prewarmed host pool layer=25 role=blk.25.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.759.854 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.761.709 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=25 role=blk.25.ffn_gate_exps.weight: 53 filled, 53 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.794.108 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.794.221 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=25 role=blk.25.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.807.582 I pool_prepopulate_locked: prewarmed host pool layer=25 role=blk.25.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.810.958 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.812.860 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=25 role=blk.25.ffn_up_exps.weight: 54 filled, 54 freed, 200 wanted non-resident, ranked by the heat prior
+\0.05.845.308 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.845.445 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=26 role=blk.26.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.860.574 I pool_prepopulate_locked: prewarmed host pool layer=26 role=blk.26.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.862.494 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.864.546 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=26 role=blk.26.ffn_down_exps.weight: 51 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.867.713 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.867.894 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=26 role=blk.26.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.880.885 I pool_prepopulate_locked: prewarmed host pool layer=26 role=blk.26.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.884.265 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.886.084 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=26 role=blk.26.ffn_gate_exps.weight: 52 filled, 52 freed, 200 wanted non-resident, ranked by the heat prior
+|0.05.920.947 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.921.060 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=26 role=blk.26.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.05.934.207 I pool_prepopulate_locked: prewarmed host pool layer=26 role=blk.26.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.937.593 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.939.269 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=26 role=blk.26.ffn_up_exps.weight: 51 filled, 51 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.974.292 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.974.439 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=27 role=blk.27.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.05.990.756 I pool_prepopulate_locked: prewarmed host pool layer=27 role=blk.27.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.05.992.668 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.994.593 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=27 role=blk.27.ffn_down_exps.weight: 47 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.05.997.802 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.05.997.974 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=27 role=blk.27.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.011.120 I pool_prepopulate_locked: prewarmed host pool layer=27 role=blk.27.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.014.548 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.016.099 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=27 role=blk.27.ffn_gate_exps.weight: 47 filled, 47 freed, 200 wanted non-resident, ranked by the heat prior
+/0.06.048.664 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.048.781 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=27 role=blk.27.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.062.120 I pool_prepopulate_locked: prewarmed host pool layer=27 role=blk.27.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.065.519 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.067.045 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=27 role=blk.27.ffn_up_exps.weight: 46 filled, 46 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.099.532 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.099.667 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=28 role=blk.28.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.115.989 I pool_prepopulate_locked: prewarmed host pool layer=28 role=blk.28.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.117.906 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.06.119.737 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=28 role=blk.28.ffn_down_exps.weight: 45 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.122.901 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.123.076 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=28 role=blk.28.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.136.308 I pool_prepopulate_locked: prewarmed host pool layer=28 role=blk.28.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.139.749 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.141.279 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=28 role=blk.28.ffn_gate_exps.weight: 45 filled, 45 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.173.590 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.173.737 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=28 role=blk.28.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.187.192 I pool_prepopulate_locked: prewarmed host pool layer=28 role=blk.28.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.190.608 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.191.995 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=28 role=blk.28.ffn_up_exps.weight: 44 filled, 44 freed, 200 wanted non-resident, ranked by the heat prior
+\0.06.223.855 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.224.014 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=29 role=blk.29.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.239.629 I pool_prepopulate_locked: prewarmed host pool layer=29 role=blk.29.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.241.533 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.243.356 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=29 role=blk.29.ffn_down_exps.weight: 46 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.246.829 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.247.001 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=29 role=blk.29.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.259.821 I pool_prepopulate_locked: prewarmed host pool layer=29 role=blk.29.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.263.217 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.264.785 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=29 role=blk.29.ffn_gate_exps.weight: 46 filled, 46 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.296.631 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.296.764 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=29 role=blk.29.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.308.844 I pool_prepopulate_locked: prewarmed host pool layer=29 role=blk.29.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.312.251 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.313.744 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=29 role=blk.29.ffn_up_exps.weight: 45 filled, 45 freed, 200 wanted non-resident, ranked by the heat prior
+|0.06.345.673 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.345.829 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=30 role=blk.30.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.360.720 I pool_prepopulate_locked: prewarmed host pool layer=30 role=blk.30.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.362.622 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.364.393 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=30 role=blk.30.ffn_down_exps.weight: 46 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.367.795 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.367.965 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=30 role=blk.30.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.380.335 I pool_prepopulate_locked: prewarmed host pool layer=30 role=blk.30.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.383.724 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.385.262 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=30 role=blk.30.ffn_gate_exps.weight: 46 filled, 46 freed, 200 wanted non-resident, ranked by the heat prior
+/0.06.420.224 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.420.352 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=30 role=blk.30.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.432.469 I pool_prepopulate_locked: prewarmed host pool layer=30 role=blk.30.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.435.844 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.437.360 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=30 role=blk.30.ffn_up_exps.weight: 46 filled, 46 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.472.370 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.472.521 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=31 role=blk.31.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.487.449 I pool_prepopulate_locked: prewarmed host pool layer=31 role=blk.31.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.489.352 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.491.583 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=31 role=blk.31.ffn_down_exps.weight: 53 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.494.798 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.495.012 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=31 role=blk.31.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.507.763 I pool_prepopulate_locked: prewarmed host pool layer=31 role=blk.31.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.511.171 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.513.090 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=31 role=blk.31.ffn_gate_exps.weight: 53 filled, 53 freed, 200 wanted non-resident, ranked by the heat prior
+-0.06.543.112 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.543.255 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=31 role=blk.31.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.556.341 I pool_prepopulate_locked: prewarmed host pool layer=31 role=blk.31.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.559.729 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.561.807 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=31 role=blk.31.ffn_up_exps.weight: 53 filled, 53 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.591.480 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.591.627 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=32 role=blk.32.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.606.782 I pool_prepopulate_locked: prewarmed host pool layer=32 role=blk.32.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.608.705 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.610.466 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=32 role=blk.32.ffn_down_exps.weight: 45 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.613.906 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.614.077 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=32 role=blk.32.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+\0.06.626.519 I pool_prepopulate_locked: prewarmed host pool layer=32 role=blk.32.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.629.901 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.631.481 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=32 role=blk.32.ffn_gate_exps.weight: 45 filled, 45 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.664.187 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.664.310 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=32 role=blk.32.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.676.780 I pool_prepopulate_locked: prewarmed host pool layer=32 role=blk.32.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.680.200 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.681.744 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=32 role=blk.32.ffn_up_exps.weight: 45 filled, 45 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.714.289 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.714.434 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=33 role=blk.33.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+|0.06.729.487 I pool_prepopulate_locked: prewarmed host pool layer=33 role=blk.33.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.731.399 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.733.350 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=33 role=blk.33.ffn_down_exps.weight: 50 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.736.822 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.736.995 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=33 role=blk.33.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.749.371 I pool_prepopulate_locked: prewarmed host pool layer=33 role=blk.33.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.752.781 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.754.510 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=33 role=blk.33.ffn_gate_exps.weight: 51 filled, 51 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.786.822 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.786.944 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=33 role=blk.33.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.799.124 I pool_prepopulate_locked: prewarmed host pool layer=33 role=blk.33.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.802.520 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.804.158 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=33 role=blk.33.ffn_up_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+/0.06.836.468 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.836.624 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=34 role=blk.34.ffn_down_exps.weight -> 128/256 slots of 860160 B (105.0 MiB)
+0.06.855.144 I pool_prepopulate_locked: prewarmed host pool layer=34 role=blk.34.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.857.938 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.860.860 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=34 role=blk.34.ffn_down_exps.weight: 53 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.865.394 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.865.588 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=34 role=blk.34.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.877.309 I pool_prepopulate_locked: prewarmed host pool layer=34 role=blk.34.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.880.711 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.882.566 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=34 role=blk.34.ffn_gate_exps.weight: 53 filled, 53 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.912.818 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.912.938 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=34 role=blk.34.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+-0.06.925.158 I pool_prepopulate_locked: prewarmed host pool layer=34 role=blk.34.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.928.606 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.930.451 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=34 role=blk.34.ffn_up_exps.weight: 53 filled, 53 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.960.800 I apply_heat_seed_locked: layer=34 role=blk.34.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.961.085 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=35 role=blk.35.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.06.976.325 I pool_prepopulate_locked: prewarmed host pool layer=35 role=blk.35.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.06.978.236 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.980.680 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=35 role=blk.35.ffn_down_exps.weight: 52 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.06.984.266 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.06.984.456 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=35 role=blk.35.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.06.996.630 I pool_prepopulate_locked: prewarmed host pool layer=35 role=blk.35.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.000.318 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.002.327 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=35 role=blk.35.ffn_gate_exps.weight: 52 filled, 52 freed, 200 wanted non-resident, ranked by the heat prior
+\0.07.032.728 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.032.886 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=35 role=blk.35.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.045.373 I pool_prepopulate_locked: prewarmed host pool layer=35 role=blk.35.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.048.767 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.050.728 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=35 role=blk.35.ffn_up_exps.weight: 52 filled, 52 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.081.015 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.081.158 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=36 role=blk.36.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.07.095.623 I pool_prepopulate_locked: prewarmed host pool layer=36 role=blk.36.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.097.530 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.099.612 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=36 role=blk.36.ffn_down_exps.weight: 50 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.103.066 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.103.271 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=36 role=blk.36.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.115.096 I pool_prepopulate_locked: prewarmed host pool layer=36 role=blk.36.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.118.624 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.07.120.496 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=36 role=blk.36.ffn_gate_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.152.583 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.152.702 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=36 role=blk.36.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.164.683 I pool_prepopulate_locked: prewarmed host pool layer=36 role=blk.36.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.168.237 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.170.055 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=36 role=blk.36.ffn_up_exps.weight: 51 filled, 51 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.202.238 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.202.383 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=37 role=blk.37.ffn_down_exps.weight -> 128/256 slots of 720896 B (88.0 MiB)
+0.07.217.260 I pool_prepopulate_locked: prewarmed host pool layer=37 role=blk.37.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.219.187 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.07.221.525 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=37 role=blk.37.ffn_down_exps.weight: 51 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.224.989 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.225.172 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=37 role=blk.37.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.237.081 I pool_prepopulate_locked: prewarmed host pool layer=37 role=blk.37.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.240.683 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.242.607 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=37 role=blk.37.ffn_gate_exps.weight: 51 filled, 51 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.275.515 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.275.641 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=37 role=blk.37.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.287.866 I pool_prepopulate_locked: prewarmed host pool layer=37 role=blk.37.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.291.366 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.293.288 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=37 role=blk.37.ffn_up_exps.weight: 52 filled, 52 freed, 200 wanted non-resident, ranked by the heat prior
+-0.07.325.749 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.325.907 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=38 role=blk.38.ffn_down_exps.weight -> 128/256 slots of 860160 B (105.0 MiB)
+0.07.343.012 I pool_prepopulate_locked: prewarmed host pool layer=38 role=blk.38.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.345.783 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.348.305 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=38 role=blk.38.ffn_down_exps.weight: 52 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.352.830 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.353.034 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=38 role=blk.38.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.364.661 I pool_prepopulate_locked: prewarmed host pool layer=38 role=blk.38.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.368.079 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.369.782 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=38 role=blk.38.ffn_gate_exps.weight: 51 filled, 51 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.402.572 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.402.696 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=38 role=blk.38.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.414.302 I pool_prepopulate_locked: prewarmed host pool layer=38 role=blk.38.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.417.742 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.419.460 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=38 role=blk.38.ffn_up_exps.weight: 52 filled, 52 freed, 200 wanted non-resident, ranked by the heat prior
+\0.07.452.176 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.452.512 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=39 role=blk.39.ffn_down_exps.weight -> 128/256 slots of 860160 B (105.0 MiB)
+0.07.469.653 I pool_prepopulate_locked: prewarmed host pool layer=39 role=blk.39.ffn_down_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.472.408 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.474.842 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=39 role=blk.39.ffn_down_exps.weight: 50 filled, 0 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.479.552 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.479.861 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=39 role=blk.39.ffn_gate_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.491.275 I pool_prepopulate_locked: prewarmed host pool layer=39 role=blk.39.ffn_gate_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.494.654 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.496.345 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=39 role=blk.39.ffn_gate_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+|0.07.527.895 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.528.035 I table_pool_locked: host pool (MOE_HOST_POOL_FRAC of the host expert bytes): 120 host tensors, 18662 MiB host expert bytes; layer=39 role=blk.39.ffn_up_exps.weight -> 128/256 slots of 589824 B (72.0 MiB)
+0.07.540.064 I pool_prepopulate_locked: prewarmed host pool layer=39 role=blk.39.ffn_up_exps.weight: 128/128 slots (ranked by the persisted heat prior)
+0.07.543.456 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.545.069 I pool_rerank_from_heat_locked: host pool laid out as the arena's complement layer=39 role=blk.39.ffn_up_exps.weight: 50 filled, 50 freed, 200 wanted non-resident, ranked by the heat prior
+0.07.576.520 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.07.576.559 I alloc_all_locked: device 0: sized 56 slots/table from 120 tables / 36.4 MiB per expert (budget 2048 MiB/device)
+0.07.576.561 I alloc_all_locked: device 1: sized 56 slots/table from 120 tables / 36.4 MiB per expert (budget 2048 MiB/device)
+0.07.576.562 I alloc_all_locked: per-device sizing: 2 device(s), arena total 4082.3 MiB
+0.07.586.271 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 768.00 MiB) on device 0
+0.07.586.274 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 768.00 MiB) on device 1
+0.07.587.063 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 2, n_diff = 0
+0.07.587.820 I ggml_gallocr_reserve_n_impl: reallocating CPU buffer from size 0.03 MiB to 0.06 MiB
+/-\|/-\|0.08.327.006 I cmn  common_conte: the context does not support partial sequence removal
+0.08.331.732 I srv    load_model: speculative decoding will use checkpoints
+0.08.331.734 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 8192, kv_unified = 'false'
+0.08.331.743 I spec common_specu: no implementations specified for speculative decoding
+0.08.331.746 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 8192
+0.08.331.760 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.08.331.761 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.08.331.761 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.08.331.762 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.08.331.775 I srv          init: idle slots will be saved to prompt cache upon starting a new task
+0.08.334.463 I srv          init: init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+<think>
+'
+0.08.334.742 I srv          init: init: chat template, thinking = 1
+0.08.334.751 I srv          init: preserve_reasoning kwarg: true
+0.08.334.752 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.08.334.775 I srv  server_run_i: model loaded
+0.08.334.776 I srv  server_on_li: listening on http://127.0.0.1:60279
+0.08.334.810 I srv  update_slots: all slots are idle
+/ 0.08.441.040 I srv  server_strea: conv_id= (empty=1)
+0.08.441.218 I slot get_availabl: id  0 | task -1 |  - skipping, slot is empty
+0.08.441.228 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+0.08.441.229 I srv  get_availabl: updating prompt cache
+0.08.441.234 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.08.441.237 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.08.441.240 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 8192 tokens, 8589934592 est)
+0.08.441.241 I srv  get_availabl: prompt cache update took 0.01 ms
+0.08.441.309 I slot launch_slot_: id  0 | task -1 | sampler chain: logits -> logit-bias -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.08.441.316 I slot launch_slot_: id  0 | task -1 | sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.08.441.317 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.08.441.328 I slot   operator(): id  0 | task 0 | new prompt, n_ctx_slot = 8192, n_keep = 0, task.n_tokens = 15
+0.08.441.338 I slot   operator(): id  0 | task 0 | cached n_tokens = 0, memory_seq_rm [0, end)
+0.08.443.211 I ggml_gallocr_reserve_n_impl: reallocating CPU buffer from size 0.06 MiB to 0.35 MiB
+0.08.736.689 I slot   operator(): id  0 | task 0 | cached n_tokens = 11, memory_seq_rm [11, end)
+0.08.736.713 I slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 15, total = 15
+0.08.754.984 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 10, pos_max = 10, n_tokens = 11, size = 62.813 MiB)
+0.08.759.559 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 1024.00 MiB) on device 0
+0.08.759.564 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 768.00 MiB from the slab work region (boundary 1024.00 MiB) on device 1
+0.08.760.405 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 3, n_diff = 0
+0.08.761.165 I ggml_gallocr_reserve_n_impl: reallocating CPU buffer from size 0.03 MiB to 0.13 MiB
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11908-29bc6de67
+model      : /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> The capital of France is
+
+[Start thinking]
+
+Here0.09.400.400 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 4, n_diff = 0
+'s a thinking process:
+
+1.  **Analyze User Input:** The user asks "The capital of France is" - this is a straightforward factual question.
+2.  **Identify Key Entity:** France (country)
+3.  **Retrieve Knowledge:** What is the capital of France? Paris.
+4.  **Formulate Response:** Keep it direct and accurate. "Paris." or "The capital of France is Paris."
+5.  **Check Accuracy0.17.328.038 I slot print_timing: id  0 | task 0 | n_gen =    100, tg =  12.49 t/s, tg_3s =  12.61 t/s
+:** Confirmed. Paris has been the capital of France for centuries.
+6.  **Output Generation:** Provide the answer clearly.✅
+[End thinking]
+
+The capital of France is **Paris**. 🇫🇷✨ Let me know if you'd like any fun facts0.20.362.058 I slot print_timing: id  0 | task 0 | n_gen =    156, tg =  14.14 t/s, tg_3s =  18.46 t/s
+ about it! 😊🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨0.23.141.530 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 5, n_diff = 0
+📚🌟🇫0.23.381.223 I slot print_timing: id  0 | task 0 | n_gen =    250, tg =  17.81 t/s, tg_3s =  31.13 t/s
+🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐0.26.382.232 I slot print_timing: id  0 | task 0 | n_gen =    391, tg =  22.96 t/s, tg_3s =  46.98 t/s
+🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫🇷✨🌍🏛️🗼🥐🍷🎨📚🌟🇫0.28.526.185 I sched_graph_realloc: graph reallocation: nodes = 4229 (changed = 0), splits = 42, n_same = 6, n_diff = 0
+0.28.602.209 I slot print_timing: id  0 | task 0 | prompt eval time =     958.07 ms /    15 tokens (   63.87 ms per token,    15.66 tokens per second)
+0.28.602.211 I slot print_timing: id  0 | task 0 |        eval time =   19202.80 ms /   500 tokens (   38.48 ms per token,    25.99 tokens per second)
+0.28.602.212 I slot print_timing: id  0 | task 0 |       total time =   20160.87 ms /   515 tokens
+0.28.602.213 I slot print_timing: id  0 | task 0 |    graphs reused =        496
+0.28.602.214 I slot print_timing: id  0 | task 0 |   graph reallocs =          6    /     0        (same size) / (changed size)
+0.28.602.223 I slot print_timing: id  0 | task 0 |   MoE arena = 0.8347 (809140 hit / 969408 reaches this turn), arena 4082.3 MiB
+0.28.602.240 I slot      release: id  0 | task 0 | stop processing: n_tokens = 514, truncated = 0
+0.28.602.247 I srv  update_slots: all slots are idle
+🇷
+0.28.603.696 I srv    operator(): operator(): cleaning up before exit...
+0.28.604.138 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+0.28.604.139 I common_memory_breakdown_print: |   - Meta() (Meta())    | 65248 = 1657 + ( 1944 =  1064 +     111 +     768) +       61646 |
+0.28.604.139 I common_memory_breakdown_print: |   - Host               |                 19177 = 19177 +       0 +       0                |
+0.28.604.234 W ~llama_context:        CPU compute buffer size of   0.1272 MiB, does not match expectation of   0.0320 MiB
+0.29.551.999 W moe_cache_forget_all: model teardown: dropped 120 expert-cache table(s) (2041.2 MiB of arena) on device 0 and un-sized the cache, so the next model sizes on its own first band pass
+0.29.653.023 W moe_cache_forget_all: model teardown: dropped 120 expert-cache table(s) (2041.2 MiB of arena) on device 1 and un-sized the cache, so the next model sizes on its own first band pass
+0.34.304.730 I moe_cache_report: MoE expert cache: h=0.8347 (809140/969408 reaches), fills=173708 evictions=160268, tables=240, slots=13440, arena=4082.3 MiB total (budget 2048 MiB/device)
+0.34.304.735 I moe_cache_report: pool fills: 0 storage reads 0 ms, 21829 mapping memcpys 856 ms, 12.96 GiB total (0.6 MiB/fill, 13269 MiB/s effective)
+0.34.304.736 W moe_cache_report: host pool (L2): 120 tensors, 15360 slots, 9331.0 MiB pinned; h=0.5657 (32695/57800), fills=21829 evictions=0
+0.34.304.737 I moe_cache_report: takeover=120240 decline_all=234 get_ok=1920 cold=uva cold_reaches=0
+0.34.304.737 I moe_cache_report: cold admission=touch, admission-rejected (served cold)=0
+0.34.304.738 I moe_cache_report: device 0: tables=120 slots/table(sum)=6720 arena=2041.2 MiB (budget 2048 MiB/device)
+0.34.304.738 I moe_cache_report: device 1: tables=120 slots/table(sum)=6720 arena=2041.2 MiB (budget 2048 MiB/device)
+0.34.312.765 I heat_map_save_locked: saved 120 heat entries to /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.moe-heatmap
+0.34.312.768 I moe_cache_report: heat (R2): total=0 (persisted prior + this session), nonzero=0/0 experts over 0 tables
+0.34.312.769 I moe_cache_report: P1 push-src: MOE_HOST_PUSH_SRC=mapping, 115808 fills DMA'd straight from the mapping
+0.34.312.773 I moe_cache_report: P1 probe: 173708 fill copies, 15150708 us host total (87.2 us/fill); H2D 140913 in 15121260 us (107.3 us/copy), D2D 32795; device-mismatch at the call 80134
+0.34.312.774 I moe_cache_report: VRAM budget: requested=2048 MiB/device, free-clamped=0, arena alloc failures=0 (fail-soft)
+0.34.312.775 I moe_cache_report: expert access: hits=809140 fills=160268 colds=0 (hit=83.47% fill=16.53% cold=0.00%)
+0.34.312.777 I moe_cache_report: expert H2D traffic: fills=48637.6 MiB cold-reads=0.0 MiB total=48637.6 MiB over ~6 tokens = 8106.27 MiB/token
+0.34.312.778 I moe_cache_report: expert traffic per token: 8106.3 MiB/token = 8300825 KiB/token (fills 8300825, cold 0)
+
+[ Prompt: 15.7 t/s | Generation: 26.0 t/s ]
+
+
+Exiting...

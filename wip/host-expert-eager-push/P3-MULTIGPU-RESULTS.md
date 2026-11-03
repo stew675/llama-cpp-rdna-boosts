@@ -151,6 +151,53 @@ the op**, from one host thread, back to back.  Candidate causes, cheapest test f
 | b | **per-call device context**: `ggml_backend_meta_moe_cache_update` loops over the child backends with no `ggml_cuda_set_device` between them | free at 1 device, invisible under `-sm layer` (one device per op), paid 2 of 3 calls on a 3-device op — the observed pattern | log `hipGetDevice()` at the copy, then add the guard |
 | c | driver staging contention across the devices of one op | the probe bounds it at ~1.54x | already bounded; at most a part |
 
+## 3a. ATTRIBUTED: the pageable copy call itself, and the staging resource is PER THREAD
+
+`MOE_HOST_PUSH_PROBE=1` (`patches/0006`) times every fill copy on the host and records whether the copying
+backend's device was current.  Same arms as §2, `--ignore-eos -n 500`, `-lv 4`:
+
+| devices | ctrl arm: host time in the copy | mapping arm: host time in the copy | per H2D copy (mapping) |
+|---|---|---|---|
+| 1 | 52 437 µs (53 495 copies, **1.0 µs/fill**) | 2 353 275 µs | **44 µs** |
+| 2 | 243 258 µs (173 708 copies, **1.4 µs/fill**) | **15 150 708 µs** | **107 µs** |
+| 3 | 100 246 µs (68 078 copies, **1.5 µs/fill**) | **11 066 908 µs** | **191 µs** |
+
+At 2 devices **15.2 s of a 34.3 s run is spent blocked inside `cudaMemcpyAsync`** — that is the whole 52.4 ->
+26.0 t/s.  A pinned/D2D copy from the same thread costs 1.4 µs, so the driver's pageable staging is ~75x
+slower per call and **degrades** with concurrent devices: 44 / 107 / 191 µs is ~12 / 5.6 / 3.1 GB/s aggregate.
+
+**Not the bytes.**  The census is identical between the arms at every device count (48 637.6 MiB at 2
+devices, 19 934.1 MiB at 3), so the switch moves the same bytes.  What changes is the number of **copies**: a
+split gives each device its own slice, so per-copy size halves (0.57 MiB at 1 device -> 0.28 MiB at 2) and the
+call count doubles — and each of those smaller copies costs *more*.
+
+**Eliminated: the device-context candidate.**  46 % of all fill calls run with the wrong current device
+(80 134 / 173 708 at 2 devices) — but equally in **both** arms, and `MOE_HOST_PUSH_SETDEV=1` (make
+`t.device` current before the copy) changes nothing: **26.1 -> 26.0 t/s**.  So the per-call device switch is
+a real wart but not this cost.
+
+**The staging resource is per THREAD, and that is the fix.**  `probe-pageable-threads.cpp` issues the same
+fills from one thread versus one thread per device:
+
+| devices | one issuing thread | one thread per device |
+|---|---|---|
+| 1 | 15.0 GB/s (41 µs/fill) | 15.1 GB/s (41 µs) |
+| 2 | 11.8 GB/s (52 µs) | **20.6 GB/s (30 µs)** |
+| 3 | 12.8 GB/s (48 µs) | **29.4 GB/s (21 µs)** |
+
+A single host thread serialises every device's pageable copies through its own bounce; one thread per device
+removes the serialisation entirely.  **This is the design's own P6 rule ("one push queue per device")**, and
+it means the direct pageable push needs **no pinned host duplicate at all** — so the transport can keep the
+RAM property that is the campaign's actual goal (delete the pool's 4.7-9.3 GiB, `PUSH-MLOCK-TIER.md`), with
+the residency guarantee coming from the mlock tier rather than from pool slots.
+
+**Implementation shape (next):** a per-device upload queue — the fill hands (dst, src, len, stream) to that
+device's worker, the worker issues the copy on the device's stream and records an event, and the host thread
+that will enqueue the consumer waits for the worker to have *issued* (not completed) it.  Ordering is
+unchanged because both the fill and the op land on the same device stream.  The fallback, if that proves
+awkward, is a **per-device pinned ring of tens of MiB** (our own memcpy, which measures 1-2 µs per call) —
+bounded far below the "under 2 GiB" the maintainer would accept, and 2 orders of magnitude below the pool.
+
 ## 4. `GGML_SCHED_DEVGATHER` — irrelevant to decode, decisive for prefill
 
 The gather returns from the scheduler **before** the fill path, so an A/B of anything in the fill path is only
