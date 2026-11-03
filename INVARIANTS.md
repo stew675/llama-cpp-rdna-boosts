@@ -1447,3 +1447,12 @@ change), and let `WORKLOG.md` carry the narrative.
   host on each ubatch — an accidental prefetch that re-faulted every page immediately before the device read it.
   A reclaim-safety test must actually evict the range it reads; the gather (which removed that prefetch) is what
   finally exposed this.
+  **And `Mlocked` is not a pinning probe**: a `hipHostMalloc`'d buffer is pinned by the driver yet reports
+  `Mlocked: 0 kB` — measured 2026-11-02 with two 256 MiB buffers that stayed data-identical through 61.7 GiB of
+  real anonymous pressure (`archive/work/host-expert-pinned-window/probe-host-malloc-mapped.cpp`).  So "`Mlocked`
+  stayed 0" is not, on its own, evidence that pages can be reclaimed (nor that they cannot); `hipHostAlloc`/
+  `hipHostMalloc` pin without mlocking, and `hipHostRegister` maps without pinning.  The same probe confirms the
+  pinned path itself: a kernel (SM) read of a `hipHostMalloc`'d buffer is data-identical at **51.8 GiB/s** with
+  `hipHostMallocDefault` and with `hipHostMallocMapped` alike, and `hipHostGetDevicePointer` returns the identity
+  pointer on this platform (`unifiedAddressing` reports NO but `canMapHostMemory` yes), so the `Mapped` flag is
+  not what buys anything here — the pinning is.

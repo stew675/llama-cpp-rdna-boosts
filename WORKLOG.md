@@ -1,3 +1,31 @@
+## 261102.016 (wip) -- "use hipHostMalloc(Mapped) + hipHostGetDevicePointer" -- already the delivery's default; measured, and it costs exactly what we knew
+
+No delivery change.  Answering a suggestion (from an external assistant) that this pair is the way to handle a
+missing XNACK.  It is -- and it is `--host-experts pinned`, the delivery's default: `bind_host_dev_locked()`
+tries `cudaHostGetDevicePointer` FIRST and, on success, sets `host_pinned`, which is the flag that permits every
+in-place kernel read (cold read, staging kernel, gather).  Probe added:
+`archive/work/host-expert-pinned-window/probe-host-malloc-mapped.cpp` (with a positive control, so "identical"
+means something).
+
+| arm (256 MiB, 1x R9700) | kernel read | data | under 61.7 GiB of real anon pressure |
+|---|---|---|---|
+| `hipHostMallocDefault` | 51.8 GiB/s SM / 51.7 CE | IDENTICAL | IDENTICAL |
+| `hipHostMallocMapped` | 51.8 SM / 52.1 CE | IDENTICAL | IDENTICAL |
+
+**Why it works is the point**: it does not make the no-XNACK fault survivable, it makes it impossible -- pinned
+pages cannot be evicted, so there is nothing to fault on.  And that is the whole cost: the host expert set stops
+being swappable (68.6 GB RSS on the srv cell, ~59 GB on the IQ4_NL cell), which is precisely what `window` tried
+to avoid and could not without XNACK.  The bounded middle ground -- pinned but only `RAM_PCT` of the set -- is
+`--host-experts pool`, i.e. the live campaign.
+
+**Two facts recorded in `INVARIANTS.md`.**  (a) On this platform `Mapped` buys nothing: `unifiedAddressing`
+reports NO yet `hipHostGetDevicePointer` returns the IDENTITY pointer for both flags, at identical bandwidth --
+what matters is that `hipHostMalloc` pins (the code calls `GetDevicePointer` rather than assuming identity, which
+is what keeps it correct where the alias does differ).  (b) **`Mlocked: 0` is not a pinning probe**: both pinned
+buffers reported `Mlocked: 0 kB` / `Unevictable: 162 MB` while surviving 61.7 GiB of pressure.  The closed
+campaign leaned on "`Mlocked` stayed 0, so the registration is a mapping not a lock" -- right conclusion for the
+registration (no GUP), unsafe inference from `Mlocked` alone.
+
 ## 261102.015 (wip) -- host-pool-speed Phase 1 on the 1-GPU host: the re-base is a no-op, the pool's 285.3 reference is withdrawn, and the pool-aware gather lands prefill ahead of `pinned`
 
 No delivery change (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched; one **gate-script**
