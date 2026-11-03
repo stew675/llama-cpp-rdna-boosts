@@ -28,6 +28,12 @@ done by moving the candidate commit next to block 12 in the chain and squashing 
 identical** (`3bbd3613...`), only block 12's commit content and message changed.  Precedent: the same shape was
 resolved the same way at r190, when Goal B's block 16 was folded into block 15.
 
+**Published (2026-11-03).**  Tag `v16-6050b467c-r207` (annotated) pushed to the delivery repo's `origin`; the fork's
+`rdna-boosts` branch force-pushed to `3333f387a` with the same tree, so a consumer can clone the fork and check the
+branch out instead of applying the patches.  `release.yml` builds the release assets from the tag; the ROCm container
+images are built and pushed **off-host** by the worker watcher on `radiance` (`scripts/container-watch.sh`, which
+polls for the new tag -- `CONTAINERS.md`), not in CI and not on this box.
+
 **Held back deliberately:** `MOE_HOST_POOL_FRAC=100` as the default.  It is +16 % decode over 80 on ONE GPU, but
 the RAM ceiling does not yet reserve the model's own pageable footprint, and on a split 100 % measured **9 %
 slower** than 95 % (4 GiB more pinned, 42 GiB more disk per run), over-committed a 91 GiB box once, and lost to
