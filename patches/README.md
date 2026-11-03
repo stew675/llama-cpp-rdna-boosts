@@ -2199,7 +2199,7 @@ prefill-logit **0.000000 / 100.000 %** on qwen4exp q8_0 and **-0.000000 / 100.00
 -ncmoe 48`) loads and generates; no GPU faults.  One trap: a fresh-process text run without
 `ROCBLAS_USE_HIPBLASLT=0` read a different hash — the per-start hipBLASLt pick of issue #67 (§44), not a change.
 Numbers: `benchmarks/2026-10-31-cpy-2d-vec16.md`; record `archive/work/cpy-2d-vec16/README.md` (the promoted
-`beta/0016`, from the KV campaign's `f8e47e392`).
+`archive/work/host-experts-window-beta` (beta 0016, withdrawn 2026-11-02), from the KV campaign's `f8e47e392`).
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 

@@ -289,7 +289,7 @@ Sketch (design note only, no work scheduled):
   read is released, and **no** fallback that copies from pageable memory.
 
 > **Cross-reference (2026-11-02, added from the 1-GPU host).**  §7's rule was violated by the parallel
-> `wip/host-expert-pinned-window/` campaign, which let SM kernels read the mmap'd master in place: on a model
+> `archive/work/host-expert-pinned-window/` campaign (closed 2026-11-02), which let SM kernels read the mmap'd master in place: on a model
 > larger than RAM that is a fatal GPU page fault (`Page not present`, no XNACK, `WORKLOG.md` 261102.012) and with
 > `mlock` it stops being a RAM saving at all (261102.013).  Two of its pieces are **sound under §7 as written**
 > and worth taking here: CE (copy-engine) copies out of a *registered* mapping instead of the per-table bounce

@@ -1431,7 +1431,7 @@ change), and let `WORKLOG.md` carry the narrative.
   is still taken verbatim (no per-GPU addition), so the old value stays one env var away.
 
 - **Device-visible host memory must be `RESIDENT`, not merely addressable — `hipHostRegister` does not provide
-  residency, and without XNACK there is no fault-and-retry (wip, `beta/0016` / `wip/host-expert-pinned-window`,
+  residency, and without XNACK there is no fault-and-retry (closed 2026-11-02: `archive/work/host-experts-window-beta` / `archive/work/host-expert-pinned-window`,
   2026-11-02).**  A registered range installs page tables (UVA alias) but leaves the pages ordinary reclaimable
   page-cache pages (`Mlocked` stays 0 — that is exactly the property the window campaign advertised).  On a
   no-XNACK GPU a device read of a page that is **not present** is a fatal `Page not present` fault, so a
