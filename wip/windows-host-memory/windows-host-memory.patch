@@ -1,0 +1,366 @@
+From 141b20a21209ebd23cee15b5fe9a511a6833e314 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:20:20 +0800
+Subject: [PATCH 1/4] HIP/Windows: free device memory by WDDM's statistics as
+ well as hipMemGetInfo
+
+On Windows hipMemGetInfo counts only this process's allocations, so with other processes on the card it reports more
+free memory than WDDM can give, and WDDM does not refuse an allocation past that point: it moves memory to system RAM
+("shared GPU memory"), read by the GPU over PCIe, and a large prefill can then lose the device (issue #216).
+cudaMemGetInfo now maps to ggml_hip_mem_get_info on Windows: hipMemGetInfo, then the adapter's local-segment commit
+limit minus resident bytes for every process (D3DKMTQueryStatistics, resolved from gdi32 at run time; the adapter is
+found by the device's LUID), and the smaller free figure is returned.  Every free-memory reader (the slab, the MoE
+expert cache sizing, --fit, GGML_CUDA_MIN_FREE_MIB) goes through it.  GGML_CUDA_WDDM_FREE=0 keeps hipMemGetInfo's
+figures.  Linux is unchanged.  The approach follows the WDDM free-memory query of Avalon (github.com/freriadoc/Avalon,
+MIT).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/vendors/hip.h |   6 ++
+ ggml/src/ggml-cuda/wddm-mem.cu   | 143 +++++++++++++++++++++++++++++++
+ 2 files changed, 149 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/wddm-mem.cu
+
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index b3b113388..fecab644b 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -106,7 +106,13 @@
+ #define cudaMemcpyKind hipMemcpyKind
+ #define cudaMemset hipMemset
+ #define cudaMemsetAsync hipMemsetAsync
++#if defined(_WIN32)
++// hipMemGetInfo does not count other processes' memory on Windows; this one also asks WDDM (wddm-mem.cu)
++hipError_t ggml_hip_mem_get_info(size_t * free, size_t * total);
++#define cudaMemGetInfo ggml_hip_mem_get_info
++#else
+ #define cudaMemGetInfo hipMemGetInfo
++#endif
+ #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
+ #define cudaSetDevice hipSetDevice
+ #define cuDeviceGet hipDeviceGet
+diff --git a/ggml/src/ggml-cuda/wddm-mem.cu b/ggml/src/ggml-cuda/wddm-mem.cu
+new file mode 100644
+index 000000000..be3ff7f1a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/wddm-mem.cu
+@@ -0,0 +1,143 @@
++// Free device memory on Windows (WDDM).
++//
++// hipMemGetInfo counts only this process's allocations, so when other processes hold memory on the card it reports more
++// free memory than WDDM can give.  WDDM does not refuse an allocation past that point: it moves memory to system RAM
++// ("shared GPU memory"), which the GPU then reads over PCIe -- slow, and on a large prefill it can end in a device loss
++// (issue #216).  The adapter's own statistics count every process: the local (non-aperture) segments' commit limit minus
++// their resident bytes.  cudaMemGetInfo (vendors/hip.h) returns the smaller of the two free figures; the total is HIP's.
++// GGML_CUDA_WDDM_FREE=0 returns hipMemGetInfo's figures unchanged.
++//
++// The adapter is found by the LUID HIP reports; D3DKMTQueryStatistics is resolved from gdi32 at run time, so nothing new
++// is linked.  The approach follows the WDDM free-memory query of Avalon (github.com/freriadoc/Avalon, MIT).
++
++#include "common.cuh"
++
++#if defined(GGML_USE_HIP) && defined(_WIN32)
++
++#define WIN32_LEAN_AND_MEAN
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <winternl.h>   // NTSTATUS, for d3dkmthk.h
++#include <d3dkmthk.h>
++
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace {
++
++using wddm_query_fn = NTSTATUS (APIENTRY *)(const D3DKMT_QUERYSTATISTICS *);
++
++constexpr int WDDM_MAX_DEVICES = 64;
++
++wddm_query_fn wddm_query() {
++    static const wddm_query_fn fn = [] {
++        HMODULE gdi = LoadLibraryA("gdi32.dll");
++        return gdi ? (wddm_query_fn) GetProcAddress(gdi, "D3DKMTQueryStatistics") : nullptr;
++    }();
++    return fn;
++}
++
++bool wddm_enabled() {
++    static const bool on = [] {
++        const char * v = getenv("GGML_CUDA_WDDM_FREE");
++        return v == nullptr || atoi(v) != 0;
++    }();
++    return on;
++}
++
++// the adapter LUID of each HIP device, read once (hipGetDeviceProperties is slow)
++struct wddm_device {
++    std::once_flag luid_once;
++    bool           luid_ok = false;
++    LUID           luid    = {};
++    std::once_flag log_once;
++};
++
++wddm_device g_wddm_device[WDDM_MAX_DEVICES];
++
++bool wddm_luid(int device, LUID & out) {
++    wddm_device & d = g_wddm_device[device];
++    std::call_once(d.luid_once, [&] {
++        hipDeviceProp_t prop;
++        if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
++            (void) hipGetLastError();
++            return;
++        }
++        static_assert(sizeof(d.luid) == sizeof(prop.luid), "LUID size");
++        memcpy(&d.luid, prop.luid, sizeof(d.luid));
++        d.luid_ok = d.luid.LowPart != 0 || d.luid.HighPart != 0;
++    });
++    out = d.luid;
++    return d.luid_ok;
++}
++
++// every process's free memory in the adapter's local segments
++bool wddm_free(int device, size_t & free_out) {
++    const wddm_query_fn query = wddm_query();
++    LUID luid;
++    if (query == nullptr || !wddm_luid(device, luid)) {
++        return false;
++    }
++    D3DKMT_QUERYSTATISTICS q = {};
++    q.Type        = D3DKMT_QUERYSTATISTICS_ADAPTER;
++    q.AdapterLuid = luid;
++    if (query(&q) != 0) {
++        return false;
++    }
++    unsigned long long limit    = 0;
++    unsigned long long resident = 0;
++    for (ULONG i = 0; i < q.QueryResult.AdapterInformation.NbSegments; ++i) {
++        D3DKMT_QUERYSTATISTICS s = {};
++        s.Type                   = D3DKMT_QUERYSTATISTICS_SEGMENT;
++        s.AdapterLuid            = luid;
++        s.QuerySegment.SegmentId = i;
++        if (query(&s) != 0) {
++            return false;
++        }
++        const D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION & seg = s.QueryResult.SegmentInformation;
++        if (seg.Aperture) {
++            continue;   // system memory seen through the GPU's aperture
++        }
++        limit    += seg.CommitLimit;
++        resident += seg.BytesResident;
++    }
++    if (limit == 0) {
++        return false;
++    }
++    free_out = resident < limit ? (size_t) (limit - resident) : 0;
++    return true;
++}
++
++} // namespace
++
++hipError_t ggml_hip_mem_get_info(size_t * free, size_t * total) {
++    const hipError_t err = hipMemGetInfo(free, total);
++    if (err != hipSuccess || !wddm_enabled()) {
++        return err;
++    }
++    int device = 0;
++    if (hipGetDevice(&device) != hipSuccess) {
++        (void) hipGetLastError();
++        return err;
++    }
++    if (device < 0 || device >= WDDM_MAX_DEVICES) {
++        return err;
++    }
++    size_t free_wddm = 0;
++    if (!wddm_free(device, free_wddm)) {
++        return err;
++    }
++    std::call_once(g_wddm_device[device].log_once, [&] {
++        GGML_LOG_INFO("%s: device %d: free memory %zu MiB by WDDM, %zu MiB by HIP (the smaller is used; "
++                      "GGML_CUDA_WDDM_FREE=0 keeps HIP's)\n", __func__, device, free_wddm >> 20, *free >> 20);
++    });
++    if (free_wddm < *free) {
++        *free = free_wddm;
++    }
++    return err;
++}
++
++#endif // defined(GGML_USE_HIP) && defined(_WIN32)
+-- 
+2.43.0
+
+
+From c068e9bcb49e52c047b884196f0ca4b6a61fd188 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:49:29 +0800
+Subject: [PATCH 2/4] HIP/Windows: available system RAM by GlobalMemoryStatusEx
+
+The host expert pool reads MemAvailable from /proc/meminfo to choose its fill mode (buffered when the planned pool
+plus the host expert set fit, O_DIRECT otherwise) and to cap its pinned size (MOE_HOST_POOL_RAM_PCT); the windowed KV
+spill ceiling reads it too.  Off Linux both returned -1, so on Windows the pool always took the box for memory-tight
+(O_DIRECT fills, "no MemAvailable") and neither RAM ceiling applied.  On Windows both now take ullAvailPhys from
+GlobalMemoryStatusEx (free plus standby pages, the counterpart of MemAvailable), so the existing policy decides from
+the real figure.  MOE_HOST_POOL_DIO=0|1 still forces either fill mode.  Linux is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  5 +++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu |  6 ++++++
+ ggml/src/ggml-cuda/wddm-mem.cu         | 13 +++++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 873beff41..a6609b685 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2584,6 +2584,11 @@ static int64_t ggml_cuda_kv_available_ram_bytes() {
+     fclose(f);
+     return kb > 0 ? kb * 1024 : -1;
+ }
++#elif defined(GGML_USE_HIP) && defined(_WIN32)
++int64_t ggml_hip_win_available_ram_bytes();   // GlobalMemoryStatusEx (wddm-mem.cu)
++static int64_t ggml_cuda_kv_available_ram_bytes() {
++    return ggml_hip_win_available_ram_bytes();
++}
+ #else
+ static int64_t ggml_cuda_kv_available_ram_bytes() {
+     return -1;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index cc928b2a9..c99f7b911 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -51,6 +51,10 @@ static inline int64_t moe_cache_max_i64(int64_t a, int64_t b) { return a > b ? a
+ // `moe_cache_get_stats`/`moe_cache_report`), but called from inside it too.
+ static void heat_pull_locked();
+ 
++#if defined(GGML_USE_HIP) && defined(_WIN32)
++int64_t ggml_hip_win_available_ram_bytes();   // GlobalMemoryStatusEx (wddm-mem.cu)
++#endif
++
+ namespace {
+ 
+ // wip/host-expert-master-drop (TODO #55): one pinned, one-host-expert staging entry for a PAGEABLE master
+@@ -1046,6 +1050,8 @@ static int64_t pool_available_ram_bytes() {
+     }
+     fclose(f);
+     return kb > 0 ? kb * 1024 : -1;
++#elif defined(GGML_USE_HIP) && defined(_WIN32)
++    return ggml_hip_win_available_ram_bytes();
+ #else
+     return -1;
+ #endif
+diff --git a/ggml/src/ggml-cuda/wddm-mem.cu b/ggml/src/ggml-cuda/wddm-mem.cu
+index be3ff7f1a..306bd2533 100644
+--- a/ggml/src/ggml-cuda/wddm-mem.cu
++++ b/ggml/src/ggml-cuda/wddm-mem.cu
+@@ -140,4 +140,17 @@ hipError_t ggml_hip_mem_get_info(size_t * free, size_t * total) {
+     return err;
+ }
+ 
++// Available system RAM on Windows: the counterpart of Linux's MemAvailable (free plus standby pages), which the
++// host expert pool (its fill mode and its RAM ceiling) and the windowed KV spill ceiling read from /proc/meminfo.
++// Without it they took Windows for a memory-tight box: the pool chose O_DIRECT fills (no MemAvailable) and read
++// every miss from disk.  -1 when the call fails, as on a platform without the figure.
++int64_t ggml_hip_win_available_ram_bytes() {
++    MEMORYSTATUSEX st = {};
++    st.dwLength = sizeof(st);
++    if (!GlobalMemoryStatusEx(&st) || st.ullAvailPhys == 0) {
++        return -1;
++    }
++    return (int64_t) st.ullAvailPhys;
++}
++
+ #endif // defined(GGML_USE_HIP) && defined(_WIN32)
+-- 
+2.43.0
+
+
+From d4b00c3b5235595e6f85a3c3e97eda2157e536f6 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:35:39 +0800
+Subject: [PATCH 3/4] llama/Windows: drop the pages of uploaded tensors from
+ the working set
+
+The loader releases a tensor's mapping range as soon as the tensor has been copied to a device or a non-mapping host
+buffer (LLAMA_LOAD_RELEASE_MMAP), and releases the ranges no CPU tensor uses at the end of the load.  On Windows
+unmap_fragment was a no-op, so every copied range stayed resident in the process next to its copy.  With
+Qwen3.8-Flash-Next on a 92 GB box (26 GB of weights in VRAM, 21 GB of host experts in pinned memory, 27 GB of PLE left
+mapped) that is ~47 GB of dead file pages: RAM filled up and the PLE pages were paged out and read back from disk on
+every ubatch.  A view cannot be unmapped in part, so unmap_fragment now drops the range from the working set
+(VirtualUnlock on unlocked pages); the clean pages go to the standby list.  POSIX is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-mmap.cpp | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index b2f3698a2..6b61c870c 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -641,8 +641,24 @@ struct llama_mmap::impl {
+     }
+ 
+     void unmap_fragment(size_t first, size_t last) {
+-        GGML_UNUSED(first);
+-        GGML_UNUSED(last);
++        // A view cannot be unmapped in part, so drop the range's pages from the working set
++        // instead: the range has been copied to a device (or a non-mapping host buffer), and
++        // its clean file pages otherwise stay resident next to that copy for as long as the
++        // process lives.  VirtualUnlock on pages that are not locked does exactly that (and
++        // reports ERROR_NOT_LOCKED); the pages move to the standby list.
++        static const size_t page_size = [] {
++            SYSTEM_INFO info;
++            GetSystemInfo(&info);
++            return (size_t) info.dwPageSize;
++        }();
++        first = (first + page_size - 1) / page_size * page_size;
++        last  = std::min(last, size) / page_size * page_size;
++        if (last <= first) {
++            return;
++        }
++        if (!VirtualUnlock((char *) addr + first, last - first) && GetLastError() != ERROR_NOT_LOCKED) {
++            LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(GetLastError()).c_str());
++        }
+     }
+ 
+     ~impl() {
+-- 
+2.43.0
+
+
+From 2fe8a7d2c06c8b08ddb8a4977c8ef474512652e9 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 02:35:39 +0800
+Subject: [PATCH 4/4] qwen4exp/Windows: prefetch a ubatch's PLE rows in one
+ call
+
+The host-resident PLE gather queues every distinct page of the ubatch with MADV_WILLNEED before reading the rows, so
+the faults are served concurrently; that block was Linux/macOS only, and on Windows the rows faulted in one after
+another from disk.  On Windows the same rows now go through llama_prefetch_rows (one PrefetchVirtualMemory call over
+the merged ranges), as gemma4 and deepseek41 already do.  Linux and macOS are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/qwen4exp.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 230efe5b1..41631ef72 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -3023,6 +3023,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+                 }
+             }
+         }
++#elif defined(_WIN32)
++        // same batch on Windows: one PrefetchVirtualMemory call over the merged rows
++        llama_prefetch_rows(tab, idx.data(), idx.size());
+ #endif
+ 
+         emb_scratch.resize(idx.size() * (size_t) dim);
+-- 
+2.43.0
+
