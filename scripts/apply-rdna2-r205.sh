@@ -82,8 +82,10 @@ echo "Build (dual-arch example: RDNA2 + RDNA3):"
 echo "  cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGGML_HIP_GRAPHS=ON -DGPU_TARGETS=gfx1030;gfx1100 -DCMAKE_BUILD_TYPE=Release"
 echo "  cmake --build build -j"
 echo
-echo "  The add-on is opt-in (LLAMA_PREFILL_LANES=2, default 1): with the env"
+echo "  Block 16 is opt-in (LLAMA_PREFILL_LANES=2, default 1): with the env"
 echo "  unset every run takes the pre-existing single-lane path."
+echo "  Block 17 is always on where it applies (RDNA2 tile FA prefill/decode);"
+echo "  other targets stay byte-identical (compile-time / device-CC gated)."
 echo
 echo "Gates (mixed-arch, e.g. RX 7900 XTX + Radeon Pro V620, 2-GPU -sm layer):"
 echo "  LLAMA_PREFILL_LANES=2 llama-cli -m <model> -sm layer -ts 1,1 ... -v"

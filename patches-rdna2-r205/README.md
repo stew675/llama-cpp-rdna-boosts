@@ -1,10 +1,13 @@
-# rdna-boosts two-lane prefill (block 16): LLAMA_PREFILL_LANES
+# rdna-boosts r205 add-on set (blocks 16-17)
 
-**1 patch** that applies on top of the 16-block rdna-boosts delivery set
+## Block 16 -- two-lane prefill (LLAMA_PREFILL_LANES)
+
+**2 patches** that apply on top of the 16-block rdna-boosts delivery set
 (`release.json`, `v16-6050b467c-r205`, applied tree `d6e71901`). Strict
-`git am` on the recorded base reproduces the recorded tree `3249229a`
-byte-for-byte (validated on a fresh worktree at base `6050b467c`: 16/16
-base blocks strict, tree assert, add-on strict, tree assert).
+`git am` on the recorded base reproduces the recorded tree `c680d4f6`
+byte-for-byte (0016: d6e71901 -> 3249229a; 0017: 3249229a -> c680d4f6;
+validated on a fresh worktree at base `6050b467c`: 16/16 base blocks
+strict, tree assert, add-on strict, tree assert).
 
 ## What it adds
 
@@ -60,3 +63,51 @@ gfx1030;gfx1100 dual build, llama-cli prompt-eval, p8192, ABBA 3 rounds)
   the target engages; draft acceptance unaffected, no aborts
 - decode: the 2-lane arm runs the stream-ordered input copies on the main
   scheduler (halo parity) — tg128 70.96 → 81.87, no regression
+
+## Block 17 -- RDNA2 (gfx1030) FA prefill: the q_global threshold and the D=256 ncols2 cap lift
+
+**1 file** (`ggml/src/ggml-cuda/fattn-tile.cuh`, +16/−14), two RDNA2-only
+levers for the TILE flash-attention kernel:
+
+1. **q_global threshold 16 → 64** (11 sites: the two kernel-side
+   conditions, the `Q_tmp_count` stub condition, 7 launcher `q_h2` args,
+   1 comment). The global-half2 Q path only pays off at ≥ 64 columns; at
+   the prefill config (16×2 = 32 cols) it makes the kernel re-read Q
+   from global per K-tile pass and the kernel spills 140–145 VGPRs.
+   Below 64 cols Q goes back to LDS: 0 spills.
+2. **`rdna_cap_ncols2` lifted for `DKQ == 256`** (D=128 keeps the cap).
+   The cap's comment claims the D=256 ncols2≥4 variants "overflow the
+   register file (occupancy query returns 0 → abort)"; measured 4×8
+   D=256 launches run fine, including native q8_0 KV (no abort) — the
+   manual WGP occupancy fallback keeps ≥ 1 block resident even when the
+   kernel spills scratch. Lifting the cap lets BOTH prefill and decode
+   take the GQA-8 fold: KV read once per block instead of 4×.
+
+### Why (root cause)
+
+On gfx1030 the block-05 TILE kernel is ~15–16% slower than the stock
+kernel at long context (pp2048 @ d32768: 1041.0 vs 1231.7 t/s on
+Qwen3.6-35B-A3B, head-256 GQA-8). A/B on the r205 tree: a verbatim
+stock-kernel transplant measures 1376.0 t/s, and r205's own body forced
+to the stock 4×8 config gives 375 vs the stock kernel's 463 at d131072 —
+identical config, the body is the whole gap (not host, not occupancy).
+
+### Validation (slavap-pd-7900, V620 gfx1030 = Rocm2, -lm dio -b 8192 -ub 2048 -fa 1)
+
+| test | r205 release | with block 17 | delta |
+|---|---|---|---|
+| pp2048 @ d0 | 2330.2 | 2347.1 | ~0 |
+| pp2048 @ d32768 | 1041.0 | **1106.5** | +6.3% |
+| pp2048 @ d131072 | 368.2 | **411.7** | +11.8% |
+| tg256 @ d131072 | 50.9 | **58.9** | +16.0% |
+
+- greedy tokens: two `-fa 1` runs (-s 42 -n 30) byte-identical to each
+  other and to `-fa 0`
+- gfx1100 (Rocm0) pp/tg within 0.4% of the pre-fix build (both levers
+  are compile-time / device-CC gated; other targets byte-identical)
+- r206: `fattn-tile.cuh` is byte-identical between r205 and r206
+  (reconstructed from the r206 patch set: 0004/0005/0010 touch it, net
+  zero drift), so 0017 applies to the current r206 release as well
+- residual vs stock at 32k (1106.5 vs 1231.7): the r205 4×8 body's
+  register pressure (256 VGPR + 488B scratch vs stock 212/0) — a
+  body-trimming follow-up, not a launch hazard

@@ -1,0 +1,175 @@
+From c5aac2237cd5d1334071e31d02016f77c7305930 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 02 Nov 2026 20:00:00 -0700
+Subject: [PATCH 17/17] rdna-boosts: block 17: RDNA2 (gfx1030) FA prefill -- the q_global threshold and the D=256 ncols2 cap lift
+
+On gfx1030 (RDNA2) the flash-attention TILE kernel is ~15-16% slower than
+the stock kernel at long context (pp2048 @ d32768: 1041.0 vs 1231.7 t/s on
+Qwen3.6-35B-A3B, head-256 GQA-8, -lm dio -b 8192 -ub 2048 -fa 1).  The
+regression is in the block-05 kernel body + its launch config, not the
+host side: a verbatim stock-kernel transplant on this tree measures
+1376.0 t/s @ d32768, and forcing r205's own body to the stock 4x8 config
+gives only 375 vs the stock kernel's 463 at d131072 -- identical config,
+the body is the whole gap.
+
+Two independent levers in fattn-tile.cuh, both RDNA2-only (compile-time
+RDNA2 macro for the first, GGML_CUDA_CC_IS_RDNA2 for the second):
+
+1. q_global threshold 16 -> 64 (11 sites: the two kernel-side conditions,
+   the Q_tmp_count stub condition, 7 launcher q_h2 args, 1 comment).
+   The global-half2 Q path is only worth it at >= 64 columns; at the
+   prefill config (16x2 = 32 cols) it makes the kernel re-read Q from
+   global per K-tile pass and the kernel spills 140-145 VGPRs.  Below
+   64 cols Q goes back to LDS: 0 spills.
+
+2. rdna_cap_ncols2: lifted for DKQ == 256 (D=128 keeps the cap).  The
+   cap's comment claims the D=256 ncols2>=4 variants "overflow the
+   register file (occupancy query returns 0 -> abort)"; measured 4x8
+   D=256 launches run fine on this box/toolchain, including native q8_0
+   KV (no abort) -- the manual WGP occupancy fallback keeps >= 1 block
+   resident even when the kernel spills scratch.  Lifting the cap lets
+   BOTH prefill and decode take the GQA-8 fold: KV read once per block
+   instead of 4x.
+
+Validation (slavap-pd-7900, Radeon Pro V620 gfx1030 = Rocm2, Qwen3.6-35B-
+A3B-UD-IQ4_XS, -lm dio -b 8192 -ub 2048 -fa 1 -r 1):
+
+  test              r205 release   this block   delta
+  pp2048 @ d0        2330.2         2347.1        ~0
+  pp2048 @ d32768    1041.0         1106.5       +6.3%
+  pp2048 @ d131072    368.2          411.7      +11.8%
+  tg256 @ d131072     50.9           58.9       +16.0%
+
+- greedy token sanity: two -fa 1 runs (-s 42 -n 30) byte-identical to
+  each other and to -fa 0
+- RDNA3 (gfx1100, Rocm0) pp/tg vs the pre-fix build: within 0.4% on all
+  four rows
+- stock-kernel A/B (not shipped): the verbatim stock 4x8 body on this
+  tree measures 1376.0 t/s @ d32768 but aborts at d131072 (HSA memory
+  aperture; the stock body predates this tree's launcher contract).
+  The residual of THIS block vs stock at 32k (1106.5 vs 1231.7) is the
+  r205 4x8 body's register pressure (256 VGPR + 488B scratch vs stock's
+  212 VGPR / 0B) -- a separate body-trimming follow-up, not a launch
+  hazard.
+
+---
+ ggml/src/ggml-cuda/fattn-tile.cuh |   30 ++++++++++++++++--------------
+ 1 file changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index f8b0de4..58de1b8 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -813,7 +813,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+     // through the LDS, which the K reads already saturate (RDNA2: removing them measured +30% on the
+     // 512-column kernel). Narrow kernels keep the original loop over Q_tmp: they are bound by
+     // streaming K/V and the extra cached reads cost them more than the LDS reads did.
+-    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols1*ncols2 >= 16;
++    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols1*ncols2 >= 64;
+     if constexpr (q_global) {
+         constexpr int nsteps = (nbatch_K/2) / cpy_ne;
+         constexpr int nrows  = nbatch_fa/(np*warp_size);
+@@ -1403,7 +1403,7 @@ static __global__ void flash_attn_tile(
+     constexpr bool use_bf16 = ggml_cuda_fattn_tile_use_bf16<T_KV>();
+     // Wide kernels with Q from global (q_global) leave Q_tmp unused: keep a 2-element stub so the
+     // LDS that K/V/KQ need is not taken by Q (RDNA2 has 64 KB LDS per WGP).
+-    constexpr int Q_tmp_count   = (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16) ? 2 : ncols*DKQ/2;
++    constexpr int Q_tmp_count   = (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64) ? 2 : ncols*DKQ/2;
+     constexpr int KV_tmp_stride = nbatch_K/2 + cpy_ne;
+     constexpr int KV_tmp_count  = nbatch_fa*KV_tmp_stride + DVp-DV;
+     constexpr int KQ_count      = ncols*nbatch_fa;
+@@ -1443,7 +1443,7 @@ static __global__ void flash_attn_tile(
+     // Q comes pre-converted from Q_h2 (see launch_fattn) for the wide kernels, where the reads amortize
+     // over many columns and the LDS traffic they replace is the limiter. The narrow decode kernels are
+     // bound by streaming K/V and the extra cached reads cost them more than the LDS reads did.
+-    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16;
++    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64;
+ #else
+     constexpr bool q_global = false;
+ #endif // FAST_FP16_AVAILABLE
+@@ -1792,13 +1792,13 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
+         // The q_h2 argument must mirror the kernel-side q_global condition
+-        // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16): the wide RDNA2 kernels
++        // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64): the wide RDNA2 kernels
+         // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
+         // false) passed a null pointer to the kernel -> illegal memory access (decode band).
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+             need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-            /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++            /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+         return;
+     }
+ 
+@@ -1827,7 +1827,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+             return;
+         }
+     }
+@@ -1845,7 +1845,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+             return;
+         }
+     }
+@@ -1859,7 +1859,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+             return;
+         }
+     }
+@@ -1873,7 +1873,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+             return;
+         }
+     }
+@@ -1887,7 +1887,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+             return;
+         }
+     }
+@@ -1900,7 +1900,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+-                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
++                /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+         return;
+     }
+ 
+@@ -1927,10 +1927,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+     const bool use_gqa_opt = (mask != nullptr || KQV->src[5] != nullptr) && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+-    // RDNA2 (gfx1030): the D=128/256 ncols2>=4 variants carry 4+ DV accumulators per thread and
+-    // overflow the register file (occupancy query returns 0 -> abort), so cap ncols2<=2.
++    // RDNA2 (gfx1030): cap ncols2<=2 for D=128. D=256 was capped on the belief that the wider
++    // variants overflow the register file (occupancy 0 -> abort), but measured 4x8 D=256 launches
++    // run fine -- the manual occupancy fallback keeps >=1 block resident even when the kernel
++    // spills some scratch -- and they beat the 16x2 shape, so the cap is lifted for DKQ == 256.
+     // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
+-    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && (DKQ == 256 || DKQ == 128);
++    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && DKQ == 128;
+ 
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
