@@ -4,6 +4,24 @@
 findings that matter more than the A/B it was meant to run.**  P1 is not finished: the DIO confound below
 must be fixed before any throughput number means anything.
 
+## What the two arms ACTUALLY were (read this before quoting any number below)
+
+The switch lives inside `--host-experts pool`, and **the pool was never built in either arm** — both logs
+report `host pool (L2): 0 tensors, 0 slots, 0.0 MiB pinned`.  So `MOE_HOST_POOL_FRAC=50` did nothing, and the
+control arm was not the pool at all:
+
+| env value | what the fill actually did | is that "the pool"? |
+|---|---|---|
+`MOE_HOST_PUSH_SRC=pinned` | `expert_host_src()`'s **per-table pinned bounce** branch: `memcpy` the expert out of the page cache into a pinned ring slot (or `pread` it with O_DIRECT), then H2D | **no** |
+`MOE_HOST_PUSH_SRC=mapping` | **direct pageable `cudaMemcpyAsync` from the model mapping** (33 393 fills on the 35B arm, 47 427 on the 122B arm), no staging at all | no |
+
+So this was **push vs a staged copy through a pinned bounce ring**, which is a valid transport comparison —
+and it is *not* "push vs pool".  `MOE_HOST_POOL_DIO` governs **both** the pool fill and the bounce staging
+(shared `g_pool_dio`), which is why flipping it changed the control arm's source, not the push arm's.
+
+**Consequently: the push TRANSPORT was tested; a push MODE was not.**  There is no `--host-experts push`, no
+pool-free configuration, no page-cache-residency policy and no eagerness in what ran.
+
 ## What was built
 
 `patches/0001-p1-moe-host-push-src-mapping.patch` (69 lines, `ggml/src/ggml-cuda/moe-expert-cache.cu`):
@@ -49,9 +67,9 @@ under pipelining it does not translate.)
 **2. ⚠ A direct mapping push silently bypasses the pool's DIO decision, so it is not an apples-to-apples
 arm.**  122B-A10B `-ncmoe 48`, pool FRAC 50, arena 4 GiB, interleaved (M/P/P/M, 64 tokens, all warm):
 `mapping` **18.0 / 19.0 t/s** vs `pinned` **3.3 / 3.2 t/s**.  That 5.7x is **not** a copy win: with the set
-larger than the page cache the pool decides `MOE_HOST_POOL_DIO=auto → O_DIRECT`, i.e. the delivered arm
-streams from disk on purpose, while the mapping arm reads through the page cache and never touches the pool's
-DIO path at all.  Forced buffered (`MOE_HOST_POOL_DIO=0`, both arms): `pinned` 4.9 / 4.9 vs `mapping`
+larger than the page cache the staging path decides `MOE_HOST_POOL_DIO=auto → O_DIRECT`, i.e. the staged arm
+reads from disk on purpose, while the mapping arm reads through the page cache and never enters that branch at
+all.  The difference is the SOURCE (disk vs page cache), not the transport.  Forced buffered (`MOE_HOST_POOL_DIO=0`, both arms): `pinned` 4.9 / 4.9 vs `mapping`
 4.4 / 11.3 — **inconclusive** (variance is large at 64 tokens; a warm-up protocol is needed).
 
 ## What this means for the design (the useful part)
@@ -78,8 +96,12 @@ confounded.
 
 ## Next
 
+0. **Fix the test before fixing the code.**  The pool must actually be built for the A/B that matters
+   (`MOE_HOST_POOL_MIB` explicit, and the teardown report must show tensors/slots/MiB — `0 tensors` means the
+   arm is the bounce path, not the pool).  Then the two comparisons are: **push vs pool** and **push vs
+   pinned**, each with the same source policy.
 1. Fix the DIO interaction (per-table availability of the mapping source; the arm must not exist where the
-   pool would stream), then re-run the 122B A/B with a warm-up + interleave + ≥500 tokens.
+   staging path would stream), then re-run the 122B A/B with a warm-up + interleave + ≥500 tokens.
 2. 7.14 build of the same patch: the same correctness gate (the refutation is 10.1-only so far).
 3. Then P2 (eagerness): the switch currently pushes at *demand* time; the win, if any, is in issuing the
    next op's fills early.
