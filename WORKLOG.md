@@ -1,3 +1,29 @@
+## 261103.004 (wip) -- eager-push: the pool splits into transport (drop) and residency (keep as an mlock'd working set)
+
+No delivery change.  Continues `261103.003`; the maintainer's refinement, measured the same day.
+
+**The proposal** (maintainer): do away with the pool's bounce buffer — its true cost is RAM, not speed — and
+enforce the FRAC policy by `mlock`ing portions of the weights so the hot set is not reclaimed while the
+remainder cycles.  Then `push` is a true extension of the arena rather than a streamer.
+
+**The property it needs, measured** (`archive/work/host-expert-locked-window/probe-locked-window.cpp`, new arm
+`mlockram`; residency through a *fresh* mapping, pressure **held** while measuring): `mlock` holds through
+67 GiB of anonymous pressure (4 MiB and 1024 MiB windows, 262144/262144 resident), `MADV_PAGEOUT` is refused
+while locked (`EINVAL`) and **succeeds after `munlock`, dropping the window to 0/262144**; `mlock` eager
+48.7 us/MiB in, 0.81 us/MiB out (4.6x cheaper per MiB than `mlock2(ONFAULT)`+populate).  So `mlock` is a
+**releasable** residency knob — precisely the property `hipHostRegister` does not have, which is why the closed
+window campaign's wall does not apply here.
+
+**Recorded** in [`wip/host-expert-eager-push/PUSH-MLOCK-TIER.md`](wip/host-expert-eager-push/PUSH-MLOCK-TIER.md):
+L1 arena, **L2 pinned working set over the mapping (no second copy)**, L3 reclaimable page cache, L4 disk; the
+FRAC budget now counts bytes *locked*; rotation incremental at the policy's decay period (a whole 8 GiB
+re-mlock would cost ~400 ms).  Caveats carried: `LimitMEMLOCK`/`CAP_IPC_LOCK` becomes a deployment
+requirement; an over-large pinned set is an OOM hazard exactly as the pool is (but it is the only pinned
+tier); `mlock` does not change the transport (still a pageable H2D), so the 1-D tearing evidence and the 7.14
+gate stand unchanged.  Next: pinned set over a real mapping, rotation cost under load, the L3 reclaim
+interaction, and `-sm tensor` (one budget per host tensor, release gated on a device set).  `patches/`,
+`release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261103.003 (wip) -- eager-push P1: the bypass switch is green on 10.1 for correctness, and reframes the mode ladder
 
 No delivery change.  Continues `261103.002`.

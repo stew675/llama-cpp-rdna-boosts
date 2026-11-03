@@ -1133,6 +1133,88 @@ static int arm_scratch(const char * path, double expert_mib, double win_mib) {
     return released ? 0 : 1;
 }
 
+// P0.6 (for `wip/host-expert-eager-push/`): the mirror of `arm scratch`, with **mlock instead of
+// registration**.  The push design wants a bounded PINNED WORKING SET over the mapping, with the remainder
+// reclaimable -- which is only possible if mlock is releasable.  Measure: does an mlocked window stay resident
+// under real pressure, and does `munlock` give the pages back (cgroup `file` must drop)?
+//   LW_SCRATCH=<path>   scratch file (default /home/stew675/lw-scratch.bin)
+static int arm_mlockram(const char * path, double expert_mib, double win_mib) {
+    (void) path; (void) expert_mib;
+    const char * sp = getenv("LW_SCRATCH");
+    const std::string file = sp ? sp : "/home/stew675/lw-scratch.bin";
+    const size_t W = (size_t) (win_mib * 1048576.0);
+    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+    auto mib_of = [&](const char * k) { return cg_kb(k) / 1048576.0; };
+
+    const int fd = open(file.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { printf("open %s: %s\n", file.c_str(), strerror(errno)); return 3; }
+    if (ftruncate(fd, (off_t) W) != 0) { printf("ftruncate: %s\n", strerror(errno)); return 3; }
+    auto report = [&](const char * what) {
+        const size_t npg = W / pg;
+        printf("  %-28s WINDOW %6zu/%zu resident (fresh map)  VmLck %8.1f MiB  MemAvailable %6ld MiB\n", what,
+               fresh_resident(fd, 0, W), npg, vmlck_kb() / 1024.0, meminfo_kb("MemAvailable") / 1024);
+    };
+    unsigned char * w = (unsigned char *) mmap(nullptr, W, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (w == MAP_FAILED) { printf("mmap: %s\n", strerror(errno)); return 3; }
+
+    report("baseline (empty scratch)");
+    const double f0 = mib_of("file");
+    const double t0 = now_us();
+    const int rc = mlock(w, W);
+    const double t1 = now_us();
+    printf("  mlock(%s) -> %s  (%.1f us, %.2f us/MiB)\n", mib((double) W).c_str(),
+           rc == 0 ? "ok" : strerror(errno), t1 - t0, (t1 - t0) / (W / 1048576.0));
+    if (rc != 0) { printf("  cannot test mlock at this size (RLIMIT_MEMLOCK/VmLck)\n"); return 3; }
+    (void) madvise(w, W, MADV_POPULATE_READ);
+    report("mlocked + populated");
+    const double f1 = mib_of("file");
+
+    // Pressure must be HELD while the residency is measured: an allocate-then-free loop leaves the page
+    // cache no reason to reclaim, which is the trap that made an earlier version of this arm say
+    // "not released" for both mlock and registration.
+    const long avail = meminfo_kb("MemAvailable") / 1024;
+    const size_t press = (size_t) (avail > 4096 ? (long) (avail * 3 / 4) : 1024) << 20;
+    unsigned char * m = (unsigned char *) mmap(nullptr, press, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t touched = 0;
+    if (m != MAP_FAILED) {
+        for (size_t i = 0; i < press; i += pg) { m[i] = 0x3C; touched += pg; }
+    }
+    printf("  pressure held: %.0f MiB anonymous\n", (double) touched / 1048576.0);
+    report("mlocked, under pressure");
+    const size_t held = fresh_resident(fd, 0, W);
+
+    // The deterministic release proof: MADV_PAGEOUT is REFUSED over a VM_LOCKED VMA and must succeed after
+    // munlock.  (Real pressure alone cannot prove it: the anon pages are already touched, so the kernel has
+    // no new demand to reclaim for.)
+    printf("  MADV_PAGEOUT while mlocked -> %s\n",
+           madvise(w, W, MADV_PAGEOUT) == 0 ? "accepted (unexpected)" : strerror(errno));
+    report("PAGEOUT attempted while mlocked");
+
+    const double t2 = now_us();
+    const int urc = munlock(w, W);
+    const double t3 = now_us();
+    printf("  munlock(%s) -> %s  (%.1f us, %.2f us/MiB)\n", mib((double) W).c_str(),
+           urc == 0 ? "ok" : strerror(errno), t3 - t2, (t3 - t2) / (W / 1048576.0));
+    printf("  MADV_PAGEOUT after munlock -> %s\n",
+           madvise(w, W, MADV_PAGEOUT) == 0 ? "accepted" : strerror(errno));
+    report("PAGEOUT after munlock");
+    const size_t rel = fresh_resident(fd, 0, W);
+    printf("  window residency: mlocked %zu/%zu -> after munlock %zu/%zu (pressure held)\n", held, W / pg, rel,
+           W / pg);
+    const bool released = rel * 2 < (W / pg);
+    printf("  %s\n", (held == W / pg && released)
+          ? "RELEASED: mlock holds under pressure AND munlock gives the pages back -> a bounded pinned "
+            "working set over the mapping is viable"
+          : (held != W / pg ? "mlock did not hold under pressure"
+                            : "munlock did not release while pressure was held"));
+    if (m != MAP_FAILED) munmap(m, press);
+    munmap(w, W);
+    close(fd);
+    unlink(file.c_str());
+    return released ? 0 : 1;
+}
+
 // ---- P0.5 #3: where do a registered range's bytes live? ----
 static int arm_ram(const char * path, double expert_mib, double ram_mib) {
     region r = map_and_register(path, expert_mib);
@@ -1402,12 +1484,13 @@ int main(int argc, char ** argv) {
     if (strcmp(arm, "dmapage") == 0)     return arm_dmapage(path, emib);
     if (strcmp(arm, "tear") == 0)        return arm_tear(path, emib);
     if (strcmp(arm, "tear2d") == 0)      return arm_tear2d(path, emib);
+    if (strcmp(arm, "mlockram") == 0)    return arm_mlockram(path, emib, big_mib > 0 ? big_mib : 1024.0);
     if (strcmp(arm, "scratch") == 0)     return arm_scratch(path, emib, big_mib > 0 ? big_mib : 1024.0);
     if (strcmp(arm, "big") == 0)         return arm_big(path, emib, big_mib);
     if (strcmp(arm, "pageable") == 0)    return arm_pageable(path, emib);
     if (strcmp(arm, "absent") == 0)      return arm_absent(path, emib);
     if (strcmp(arm, "unheld") == 0)      return arm_unheld(path, emib);
 
-    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|dmapage|tear|tear2d|big|unheld)\n", arm);
+    fprintf(stderr, "unknown arm '%s' (base|hold-hot|hold-cold|survive|granularity|pin|evicted|pageable|absent|regcost|release|release-held|reuse|ram|remap|remapram|scratch|mlockram|dmapage|tear|tear2d|big|unheld)\n", arm);
     return 64;
 }

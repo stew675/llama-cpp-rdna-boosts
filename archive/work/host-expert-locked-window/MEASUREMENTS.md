@@ -281,3 +281,26 @@ path, with no pinning, no registration, no window and no release problem.  That 
 bounce", reached by deleting the copy rather than the mapping.  It wants its own campaign, and its first
 deliverable is reproduce-or-refute in the REAL path (the loader/scheduler, not a microbench), on both ROCm
 lines, with a same-seed greedy gate and `scripts/check-gpu-faults.sh`.
+
+## 7. P0.6 — the `mlock` mirror (added for `wip/host-expert-eager-push/`, 2026-11-03)
+
+The successor's design replaces the pool's pinned duplicate with a **pinned working set `mlock`'d over the
+mapping**, so the one property it needs is the opposite of the registration's: a hold that can be *released*.
+`arm mlockram` (new) measures it on a scratch file, with residency read through a **fresh** mapping and the
+pressure **held** while measuring (an allocate-then-free loop leaves the kernel no reason to reclaim — that
+trap produced a false "not released" on the first cut of this arm, and on the earlier `arm scratch` reading).
+
+| step | 4 MiB window (unprivileged) | 1024 MiB window (root) |
+|---|---|---|
+`mlock` + populate | 1024/1024 | 262144/262144 |
+67 GiB anonymous pressure, held | **1024/1024** | **262144/262144** |
+`MADV_PAGEOUT` while locked | refused (`EINVAL`) | refused (`EINVAL`) |
+`munlock` | 12.4 µs (3.09 µs/MiB) | 831 µs (0.81 µs/MiB) |
+after `munlock`, pressure still held | **0/1024** | **0/262144** |
+
+`mlock` eager: **48.7 µs/MiB** (~50 ms/GiB) — ~4.6x cheaper per MiB than the `mlock2(ONFAULT)`+populate pair
+measured in §1.3 (225 µs/MiB), so eager is the primitive to use.
+
+**Verdict: `mlock` is a releasable, enforceable residency knob — the property `hipHostRegister` does not
+have.**  The design that uses it is `wip/host-expert-eager-push/PUSH-MLOCK-TIER.md`.  Deployment requirement:
+`RLIMIT_MEMLOCK` (8 MiB here, unraisable as uid 1000) → `LimitMEMLOCK=` / `CAP_IPC_LOCK`.

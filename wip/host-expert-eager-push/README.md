@@ -11,6 +11,15 @@
 > ladder: `pinned` (locked) → **`push` (reclaimable page cache)** → `pool` (streams from disk).  P2 must first
 > make the mapping source honour the DIO decision, and the 7.14 correctness gate is still owed.
 
+> **THE DESIGN SHAPE (2026-11-03, after P1 and the `mlock` test): the pool splits into transport and residency,
+> and only residency is worth keeping.**  Transport = the direct pageable push (`patches/0001`, measured equal
+> to memcpy+pinned H2D when warm).  Residency = a **pinned working set `mlock`'d over the mapping itself**,
+> bounded by the FRAC budget and rotated by the arena's own policy — measured **releasable** (`mlock` holds
+> through 67 GiB of pressure; `MADV_PAGEOUT` is refused while locked and succeeds after `munlock`, dropping the
+> window to 0/262144; 48.7 µs/MiB in, 0.81 µs/MiB out).  So the pool's **RAM duplicate** disappears while its
+> *guarantee* is kept, and `push` becomes a real extension of the arena.  See
+> [`PUSH-MLOCK-TIER.md`](PUSH-MLOCK-TIER.md) — and note it needs `LimitMEMLOCK`/`CAP_IPC_LOCK`.
+
 **Seeded 2026-11-03 at the maintainer's call.  Nothing here is implemented, and nothing here is in `patches/`
 or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a separate
 decision).
