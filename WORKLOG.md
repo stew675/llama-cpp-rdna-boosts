@@ -1,3 +1,47 @@
+## 261102.018 (wip) -- the pool's pinned bounce ring and the synchronous fill, measured: 3-4 ms/token of serialised read, 2.2-3.1 GiB of bounce, and the "4.7x fill" is not ours
+
+No delivery change.  Continues `261102.017`.  Record: `wip/host-pool-speed/README.md` §16, `patches/0004`, data
+`data/20261102-session3-fillcost`, `data/20261102-session3-ring`, `data/20261102-session3-profile/kt*`.
+
+**The item-1 chase ended in a negative result, and that is the useful part.**  The `fillBufferUnAligned` kernel
+that carried 42 % of §15.1's "residual" is **ROCclr internal, not ggml**: env-gated instrumentation of *both*
+memset entry points logs 8 calls in an 8-token run and zero `memset_tensor` calls while the tracer counts 441
+fills on the same arm, with **identical dispatch counts in both arms** (144 grid-8192 + 288 grid-256), on stream 0,
+with **no overlap** and a GPU concurrency factor of 1.00.  So §15.1's per-stream duration sum overstated the
+residual: the pool arm issues **58 more `copyBuffer` calls per decode step** (161 vs 103) and its timelines are
+longer, but there is no fill-kernel regression to fix.  `tools/rocprof-summarise.py` now flags that row shape.
+
+**The pinned bounce ring was under-reported and is 2.2-3.1 GiB.**  `moe_cache_upload_pageable` kept its own copy
+of the acquire/grow loop, so the old counter never saw `bounce_acquire` (which `expert_host_src` also uses).
+Honest totals on the 122B reference arm: **2209.7 MiB at FRAC 100, 3107.7 MiB at FRAC 80**, from 732
+`cudaHostAlloc` calls in an *8-token* run at ~274 us median.  `bounce_acquire` is now the ring's only owner
+(`patches/0004`).
+
+**Capping it -- the charter's §4.4 / PR #267's 0010 -- was implemented, swept and REVERTED.**  Cap 8 is neutral at
+FRAC 100 (prefill 887/916, decode 25.99/26.07 vs 918/921 and 26.12/25.73 uncapped) but costs **8-25 % of prefill
+at FRAC 80** (573-644 vs 759-763); cap 4 gives 870/891, cap 2 846/839.  The memory is the **prefill miss path**
+legitimately holding one entry per expert in flight while a whole table's miss set is read, and the scheduler-copy
+path never exceeds ~5 entries (capping *it* is inert, waits = 0).  A control build of the parent commit measures
+FRAC 80 at 720.1 prefill / 18.52 decode against this tree's 721.5 / 18.56, so the surviving change is neutral and
+the 759-763-to-721 drift is box state.
+
+**The synchronous fill is now sized, and it is smaller than the crude estimate.**  `pool_fill_slot_locked` times
+its two sources: FRAC 80 = 38 836 storage reads, 69.1 GiB, **27.3 s** (2.6 GB/s); FRAC 100 = 44 980 reads, 80.0 GiB,
+**34.5 s** (2.4 GB/s); zero mapping memcpys.  One expert per read (1.8 MiB), 100 % serialised with compute, so
+**~3-4 ms of a 52 ms decode step (~6 %)** after subtracting the one-shot prepopulate -- not the ~19 % an earlier
+`/proc/diskstats` estimate implied (it counted the model load and the prepopulate).  Consequences: the **overlap**
+candidate has a hard ~6 % ceiling at FRAC 80 and ~0 at FRAC 100 (hit 0.91) against two measured negatives, so it
+stays unbuilt; **coalescing** is worth screening because O_DIRECT on the real 46 GiB shard reads **587 MB/s at our
+1792 KiB size vs 1.5-1.7 GB/s at >= 4 MiB**, and it is also the only *bounded* fix for the ring.
+
+**Item 3 (P0-a, `GGML_MOE_DEVREMAP` over pool slots) is recommended for deferral, with its ceiling measured:**
++3.3 % on this arm (§15), i.e. ~1.1 t/s, versus a layout-epoch/freeze design.  The promotion blocker remains the
+`soar` multi-device `-sm tensor` arm, not the remap.
+
+**Delivery state:** campaign set is now **four** patches, applied tree `ac580a8e3a6f12ccb5f673dace82b16ec4f1f275`,
+per-patch build 4/4 clean, greedy text `sha=4ac3a523160f` in `pool` and `pool`+gather.  `patches/` (delivery),
+`release.json` and `rdna-boosts-all.patch` untouched.
+
 ## 261102.017 (wip) -- Step 0: the remap is worth +3.3 % on this host (not +8.1), the copy kind is nil, and ~18 % of the pool's decode gap is GPU work in one runtime kernel
 
 No delivery change.  Continues `261102.016`.  Record: `wip/host-pool-speed/README.md` §15, data

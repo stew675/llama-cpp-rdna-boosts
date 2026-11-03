@@ -646,7 +646,7 @@ What session 2 changed in the campaign's plan:
 ## 13. Session state
 
 **Current state (2026-11-02, session 3 — the 1-GPU host; see §14 for the measured record):** the campaign set is
-now **three** patches on the r206 tip (applied tree `6e2b58c83`): the teardown-report / forced-`DIO` diagnostics,
+now **four** patches on the r206 tip (applied tree `ac580a8e3`): the teardown-report / forced-`DIO` diagnostics,
 the full-coverage default (`FRAC 100`) + `cov90` per-table sizing, and — new this session — **mechanism (b), the
 pool-aware device gather** (`patches/0003`), which takes the srv cell's prefill from 641-647 to **832-878 t/s**
 (pool ahead of `pinned`'s 739) and removes the `MOE_HOST_POOL_COLD` dependency.  Mechanism (a) was **measured and
@@ -683,8 +683,8 @@ to `efaa60db0` with no fuzz, no 3-way and **no conflict** (the window campaign n
 lives only in the archived reference diff).  Verified: fresh worktree at `efaa60db0` + `git am` = tree
 `0b8cc5a8b` exactly.
 
-The set now has three patches (README in [`patches/`](patches/README.md)); applying all three to a fresh
-`efaa60db0` gives **applied tree `6e2b58c83e4f550f6a0d537216c05ac01754e083`**.  Per-patch build: 3/3 clean
+The set now has four patches (README in [`patches/`](patches/README.md)); applying all four to a fresh
+`efaa60db0` gives **applied tree `ac580a8e3a6f12ccb5f673dace82b16ec4f1f275`** (four patches after §16).  Per-patch build: 4/4 clean
 (`llama-cli`, `llama-server`, `llama-batched-bench`, `llama-perplexity` at each level).  Greedy text on the
 re-based build: 150 chars `sha=4ac3a523160f` (the campaign reference).
 
@@ -829,7 +829,7 @@ dependency (`MOE_HOST_POOL_COLD`).  The remaining decode gap is the pool's own d
 The plan was "close the ~8 % `GGML_MOE_DEVREMAP` gap on pool tables (P0-a) and then re-measure".  **Step 0 says
 that is the wrong order**: the remap is worth a third of what the campaign assumed on this host, and ~18 % of the
 pool's decode deficit is not any of the explanations on the table.  All arms below are the 122B reference arm
-(`-ncmoe 48`, 5258-token prompt, 1862-token greedy decode), alternating, same binary (`6e2b58c83`'s tree, plus
+(`-ncmoe 48`, 5258-token prompt, 1862-token greedy decode), alternating, same binary (the three-patch tree, plus
 `patches/h2d-experiment.patch` applied to the working tree for the H2D arm and reverted after).
 
 | arm | decode t/s | prefill t/s | disk/run | arena hit |
@@ -890,3 +890,78 @@ The trace CSVs are 40-75 MB each and are **not** committed; regenerate a pair an
 is 2, so `-g` is refused — do not raise it silently); `rocprofv3 --kernel-trace -f csv` works and the per-kernel
 durations are comparable **only** as durations (the tracer distorts the achieved rate badly: 13.3 vs 27.2 t/s on
 the same two arms, so never quote a t/s from a traced run).
+
+## 16. The bounce ring and the synchronous fill — measured, and what they decide (2026-11-02, session 3)
+
+Chasing the §15 residual (a fill kernel 4.7x slower in the pool arm) produced two measurements that matter and
+one negative result.  Data: `data/20261102-session3-fillcost`, `data/20261102-session3-ring`, `kt*` traces.
+
+### 16.1 The 4.7x fill is not ours — it is ROCclr internal, and it is a timeline artifact
+
+`rocprofv3 --kernel-trace` reports 441 `__amd_rocclr_fillBufferUnAligned` dispatches in **both** arms (144 with
+grid 8192 ~ 2 MiB, 288 with grid 256 ~ 64 KiB, 8 on a worker stream), in **identical counts**, in pairs, spread
+over the whole run, on stream 0 (`cudaStreamPerThread`), with **no overlap** against compute (0/50 sampled) and a
+GPU concurrency factor of 1.00.  Only the *durations* differ (2.4 vs 1.4 us; median 367 vs 231 us; pool has a
+heavy tail to 3.5 ms).
+
+It is **not** a ggml memset: env-gated instrumentation of both `ggml_backend_cuda_buffer_memset_tensor` and
+`..._buffer_clear` logs **8 calls in an 8-token run and zero `memset_tensor` calls**, while the tracer counts 441
+fills on the same arm.  So the fills are inside the ROCr runtime (the same family as `__amd_rocclr_copyBuffer`,
+which the pool arm calls **58 more times per decode step**: 161 vs 103).  **Conclusion: §15.1's "42 % of the
+residual is one runtime kernel" is a per-stream duration sum, and the honest reading is "the pool arm issues more
+copy work and its timelines are longer", not "a fill kernel regressed".** Do not chase it further without a
+per-stream busy-union analysis; `tools/rocprof-summarise.py` flags the "same count, different duration" rows.
+
+### 16.2 The pinned bounce ring: 2.2-3.1 GiB, from the prefill miss path, and capping it is a loss
+
+`moe_cache_upload_pageable` had its own acquire/grow loop, so the reported ring total was under-counted (it never
+saw `bounce_acquire`, which `expert_host_src` also uses).  Instrumented honestly:
+
+| arm | ring total | notes |
+|---|---|---|
+| FRAC 100 | 2209.7 MiB | 732 `cudaHostAlloc`s in an **8-token** run, ~274 us median |
+| FRAC 80 | 3107.7 MiB | |
+
+`bounce_acquire` is now the ring's only owner (`patches/0004`), so the number is true.  **A cap was implemented,
+swept and reverted** — it is the charter's §4.4 / PR #267's 0010 idea, and the measurement says no:
+
+| cap | decode (FRAC 100) | prefill (FRAC 100) | prefill (FRAC 80) | ring |
+|---|---|---|---|---|
+| none | 26.12 / 25.73 | 918 / 921 | **759-763** | 2209-3108 MiB |
+| 8 | 25.99 / 26.07 | 887 / 916 | **573-644** | 1719 MiB |
+| 4 | 25.51 / 25.66 | 870 / 891 | — | 1009 MiB |
+| 2 | 25.64 / 25.63 | 846 / 839 | — | 524 MiB |
+
+The ring's memory is the **prefill miss path** legitimately holding one entry per expert in flight while a
+whole table's miss set is read; the scheduler-copy path never exceeds ~5 entries, so capping *it* is inert
+(waits = 0).  A control build of the parent commit measures FRAC 80 at 720.1 prefill / 18.52 decode against this
+tree's 721.5 / 18.56, i.e. the surviving change is neutral.  (The 759-763 baseline was taken hours earlier; the
+~5 % drift between them is box state, not code — hence the control.)
+
+### 16.3 The synchronous fill: 3-4 ms per decode token, ~6 % of the step, fully serialised
+
+`pool_fill_slot_locked` now times its two sources (`patches/0004`), which finally sizes §4.1/C's candidates:
+
+| arm | storage reads | read wall time | bytes | effective | mapping memcpys |
+|---|---|---|---|---|---|
+| FRAC 80 | 38 836 | **27.3 s** | 69.1 GiB | 2.6 GB/s | 0 |
+| FRAC 100 | 44 980 | **34.5 s** | 80.0 GiB | 2.4 GB/s | 0 |
+
+Every fill is one expert (1.8 MiB on this model), the reads are 100 % serialised with compute (the host thread
+blocks inside the fill), and per decode token that is **~3-4 ms of a 52 ms step (~6 % at FRAC 80)** — after
+subtracting the pool's one-shot prepopulate (29 376 / 36 864 of the fills), not the ~19 % an earlier
+`/proc/diskstats` estimate suggested (that estimate wrongly counted the model load and the prepopulate).
+
+**What this decides for the two candidates:**
+
+* **Coalescing (deterministic, known-sequence readahead): worth screening, not obviously free.**  O_DIRECT on the
+  real shard (`00002-of-00003`, 46 GiB, 256 MiB spans) reads **587 MB/s at our 1792 KiB fill size** and
+  **1.5-1.7 GB/s at >= 4 MiB** — so per-read size does matter at the device level, even though the in-situ
+  sequential stream already achieves 2.6 GB/s (queue depth / locality).  The instrument is now in place
+  (`pool fills:` line): a coalesced arm must beat 27.3 s, and it also shrinks the ring by the same factor, which
+  is the only *bounded* way to fix §16.2.  This is the same shape as the external "pipelined staging" proposal
+  ([`PROPOSAL-pipelined-staging.md`](PROPOSAL-pipelined-staging.md)) and it is the part of it that survives.
+* **Overlap (a demand-fill worker): a hard ~6 % ceiling at FRAC 80 and ~0 at FRAC 100** (hit rate 0.91, the pool
+  is full and the residual fills are the tier's own churn), against two measured negative precedents (r113's
+  worker; `MOE_HOST_POOL_PREFETCH`, now known to be a dead parse — `TODO.md` #268).  Not worth a thread on this
+  evidence; revisit only if the coalesced arm shows the fill still dominating after the read time halves.

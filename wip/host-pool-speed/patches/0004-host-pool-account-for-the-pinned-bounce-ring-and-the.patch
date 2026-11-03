@@ -1,0 +1,217 @@
+From f2bb17b791a760579e26a3be29ee85071b20b1a4 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 2 Nov 2026 21:30:56 -0600
+Subject: [PATCH] host pool: account for the pinned bounce ring and the
+ synchronous fill, and give the ring one owner
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two diagnostics and one dedup.  No behaviour change, no new knob, no perf claim.
+
+The ring: `moe_cache_upload_pageable` had its own copy of the acquire/grow loop, so nothing could say how
+much pinned bounce a run actually held -- the old counter saw only that path and missed `bounce_acquire`,
+which `expert_host_src` also uses.  Measured with an env-gated count: 732 `cudaHostAlloc` calls in an
+8-token run at ~274 us median, and an honest ring total of 2209-3108 MiB on the 122B arm (FRAC 100-80).
+The duplicated loop is gone: `bounce_acquire` is the ring's only owner.
+
+The fills: `pool_fill_slot_locked` now time-boxes its two sources (a storage read, or a memcpy out of the
+mapping) and the report prints calls/ms/GiB/effective rate.  This is the instrument that sizes the
+overlap/coalesce candidate (see wip/host-pool-speed README §16): FRAC 80 does 38836 storage reads of 1.8 MiB
+= 69 GiB in 27.3 s (2.6 GB/s); FRAC 100 44980 reads = 80 GiB in 34.5 s (2.4 GB/s) -- i.e. 3-4 ms per decode
+token of SYNCHRONOUS read, ~6 % of the step, fully serialised with compute.
+
+Deliberately NOT capped: capping the ring was implemented, swept and reverted.  Cap 8 is neutral at FRAC 100
+(prefill 887/916, decode 25.99/26.07 vs 918/921 and 26.12/25.73 uncapped) but costs 8-25 % of prefill at
+FRAC 80 (573-644 vs 759-763), cap 4 gives 870/891, cap 2 gives 846/839 -- because the ring's memory is the
+PREFILL MISS path legitimately holding one entry per expert in flight while a whole table's miss set is
+read.  A control build of the parent commit measures FRAC 80 at 720.1 prefill / 18.52 decode against this
+one's 721.5 / 18.56, so the change itself is neutral there too.
+
+Text 150 chars sha=4ac3a523160f.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 97 +++++++++++++++-----------
+ 1 file changed, 57 insertions(+), 40 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index eef320ac3..c2102900b 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -60,6 +60,7 @@ struct bounce_t {
+     char *      host = nullptr;
+     cudaEvent_t ev   = nullptr;
+     bool        busy = false;
++    uint64_t    seq  = 0;   // acquisition order (the bounded ring waits on the oldest entry)
+ };
+ 
+ struct table_t {
+@@ -452,7 +453,15 @@ int64_t                             g_stage_ok        = 0;
+ // experts that were in neither tier and were copied into the destination before the kernel.
+ int64_t                             g_uploadp_calls   = 0;   // moe_cache_upload_pageable serviced ranges
+ int64_t                             g_uploadp_bytes   = 0;   // ... and the bytes that took the bounce path
+-int64_t                             g_bounce_bytes    = 0;   // pinned ring bytes ever allocated (peak-ish: never freed)
++int64_t                             g_bounce_bytes    = 0;   // pinned ring bytes ever allocated (freed at teardown)
++// Demand-fill cost accounting (README §16): wall time spent INSIDE the synchronous fill, split by source, and
++// the bytes it moved.  Read against the run's token count to size the overlap/coalesce candidate.
++int64_t                             g_fill_read_calls   = 0;   // fills that hit storage (O_DIRECT / pread)
++int64_t                             g_fill_read_us      = 0;
++int64_t                             g_fill_memcpy_calls = 0;   // fills served by a memcpy out of the mapping
++int64_t                             g_fill_memcpy_us    = 0;
++int64_t                             g_fill_total_bytes  = 0;   // (bytes; `g_fill_bytes` is the pre-existing traffic counter)
++static uint64_t                     g_bounce_seq      = 0;
+ int64_t                             g_gather_calls    = 0;
+ int64_t                             g_gather_pool     = 0;
+ int64_t                             g_gather_fills    = 0;
+@@ -1571,9 +1580,16 @@ static void pool_reap_locked(host_pool_t & p) {
+ // them under pressure and re-faults from the GGUF -- the disk tier).  `MOE_HOST_POOL_DIO=1` keeps the file
+ // read with O_DIRECT, which is the only mode that bypasses the page cache.  Caller holds `g_mutex`.
+ static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
++    // wip/host-pool-speed: the fill's WALL TIME, by source.  A demand fill is synchronous (the host thread
++    // blocks on it), so this is the number that decides whether an overlapped/coalesced fill is worth
++    // building at all (README §16).  Two clock reads per fill: fills are ~1 per miss, so this is free.
++    const int64_t t0 = ggml_time_us();
+     const size_t rel = (size_t) expert * p.host_bytes;
+     if (!g_pool_dio && p.src_host != nullptr) {
+         memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
++        g_fill_memcpy_calls++;
++        g_fill_memcpy_us += ggml_time_us() - t0;
++        g_fill_total_bytes += (int64_t) p.host_bytes;
+         return true;
+     }
+     if (p.fd < 0) {
+@@ -1586,6 +1602,9 @@ static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
+     const size_t off = p.file_offs + rel;
+     const bool ok = g_pool_dio ? pool_dio_read(p.fd, dst, p.host_bytes, off, p.align)
+                                : (pool_pread(p.fd, dst, p.host_bytes, off) == (pool_ssize_t) p.host_bytes);
++    g_fill_read_calls++;
++    g_fill_read_us += ggml_time_us() - t0;
++    g_fill_total_bytes += (int64_t) p.host_bytes;
+     // Diagnostic (`MOE_HOST_POOL_VERIFY=1`): the slot must hold exactly the expert's bytes as they appear in
+     // the file mapping.  A mismatch means the pool read landed on the wrong offset/length -- the classic
+     // O_DIRECT alignment bug -- and would otherwise surface as corrupt generated text much later.
+@@ -1999,6 +2018,14 @@ static int bounce_acquire(table_t & t) {
+         }
+         return i;
+     }
++    // wip/host-pool-speed: MEASURED, and deliberately NOT capped.  The grow-on-demand ring was suspected of
++    // unbounded growth (charter §4.4 / PR #267's 0010), and it does hold 2.2-3.0 GiB of pinned bounce on the
++    // 122B -- but the memory is the PREFILL MISS path's (one entry per expert in flight while a whole table's
++    // miss set is read), and capping it costs 8-25 % of prefill at FRAC 80 (cap 8: prefill 573-644 vs 759-763;
++    // cap 4: 870-891; cap 2: 846-839, all against 918-921 at FRAC 100 where nothing binds).  The scheduler-copy
++    // path never exceeds ~5 entries, so a cap there is inert.  The fix for the memory is fewer, LARGER fills
++    // (coalesce a run of consecutive missing experts into one pinned read), not a smaller ring -- see
++    // wip/host-pool-speed README §16.
+     device_guard dg(t.device);
+     void *      mem = nullptr;
+     cudaEvent_t ev  = nullptr;
+@@ -2017,7 +2044,9 @@ static int bounce_acquire(table_t & t) {
+     b.host = (char *) mem;
+     b.ev   = ev;
+     b.busy = false;
++    b.seq  = ++g_bounce_seq;
+     t.bounce.push_back(b);
++    g_bounce_bytes += (int64_t) t.host_bytes;
+     return (int) t.bounce.size() - 1;
+ }
+ 
+@@ -2065,11 +2094,19 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         return true;
+     }
+     if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
++        // wip/host-pool-speed: the copy KIND out of the pool.  Default keeps the historical D2D from the
++        // mapped UVA alias (`base_dev`), which is required when the copying device is not the one that
++        // allocated the pool (the portable+mapped alias is the only cross-device source that does not fall
++        // back to a pageable staging memmove).  On a single-GPU arm the same pinned memory is a valid H2D
++        // source, and `cudaMemcpyHostToDevice` is the DMA path the pinned master takes -- so this switch
++        // measures how much of pool mode's decode deficit is the D2D-from-alias copy itself.
++        static const bool pool_h2d = getenv("MOE_HOST_POOL_H2D") != nullptr;
+         int    s = -1;
+         char * p = pool_peek_locked(*pool, expert, &s);
+         if (p != nullptr && s >= 0) {
+-            out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+-            out->kind      = cudaMemcpyDeviceToDevice;
++            out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                      : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++            out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+             out->pool_slot = s;
+             out->pool_hit  = true;
+             return true;
+@@ -2077,8 +2114,9 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         if (allow_empty_fill) {
+             p = pool_fill_empty_locked(*pool, expert, &s);
+             if (p != nullptr && s >= 0) {
+-                out->base      = (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+-                out->kind      = cudaMemcpyDeviceToDevice;
++                out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
++                                          : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
++                out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+                 out->pool_slot = s;
+                 out->pool_hit  = false;
+                 return true;
+@@ -5804,42 +5842,12 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
+         size_t done = 0;
+         while (done < n_total) {
+             const size_t n = std::min(n_total - done, t.host_bytes);
+-            // Acquire a pinned bounce entry, fill it from the mapping, and issue a pinned H2D.
+-            int idx = -1;
+-            for (int i = 0; i < (int) t.bounce.size(); i++) {
+-                if (t.bounce[(size_t) i].busy) {
+-#if defined(GGML_USE_HIP)
+-                    const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
+-#else
+-                    const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
+-#endif
+-                    (void) cudaGetLastError();
+-                    if (!ready) {
+-                        continue;
+-                    }
+-                    t.bounce[(size_t) i].busy = false;
+-                }
+-                idx = i;
+-                break;
+-            }
++            // Acquire a pinned bounce entry, fill it from the mapping, and issue a pinned H2D.  ONE place owns
++            // the ring (`bounce_acquire`: reuse, BOUNDED growth, wait at the cap), so this path and the pool's
++            // fill path cannot disagree about the depth or the pin budget.
++            const int idx = bounce_acquire(t);
+             if (idx < 0) {
+-                device_guard dg(t.device);
+-                void *      mem = nullptr;
+-                cudaEvent_t ev  = nullptr;
+-                if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+-                    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+-                    (void) cudaGetLastError();
+-                    if (mem != nullptr) { (void) cudaFreeHost(mem); }
+-                    if (ev  != nullptr) { (void) cudaEventDestroy(ev); }
+-                    return false;
+-                }
+-                bounce_t b;
+-                b.host = (char *) mem;
+-                b.ev   = ev;
+-                b.busy = false;
+-                t.bounce.push_back(b);
+-                g_bounce_bytes += (int64_t) t.host_bytes;
+-                idx = (int) t.bounce.size() - 1;
++                return false;
+             }
+             char * buf = t.bounce[(size_t) idx].host;
+             memcpy(buf, s + done, n);
+@@ -7341,6 +7349,15 @@ void moe_cache_report() {
+     if (g_devremap_calls > 0) {
+         GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
+     }
++    if (g_fill_read_calls + g_fill_memcpy_calls > 0) {
++        const double tb = (double) g_fill_total_bytes / (1024.0 * 1024.0 * 1024.0);
++        GGML_LOG_INFO("%s: pool fills: %lld storage reads %.0f ms, %lld mapping memcpys %.0f ms, %.2f GiB total "
++                      "(%.1f MiB/fill, %.0f MiB/s effective)\n",
++                      __func__, (long long) g_fill_read_calls, g_fill_read_us / 1000.0,
++                      (long long) g_fill_memcpy_calls, g_fill_memcpy_us / 1000.0, tb,
++                      tb * 1024.0 / (double) (g_fill_read_calls + g_fill_memcpy_calls),
++                      tb * 1024.0 / (double) std::max<int64_t>((g_fill_read_us + g_fill_memcpy_us) / 1000000, 1));
++    }
+     if (g_uploadp_calls > 0) {
+         GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
+                       "bounce; pinned bounce ring total %.1f MiB\n",
+-- 
+2.56.0
+
