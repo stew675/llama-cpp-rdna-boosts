@@ -1,0 +1,248 @@
+From a33f31ee44c4f054dc44453e273cf7342770a6d9 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 3 Nov 2026 05:56:40 -0600
+Subject: [PATCH] host pool: the RAM ceiling scales every table proportionally,
+ and the concentration fit spends the ceiling
+
+MOE_HOST_POOL_RAM_PCT shaved the REGISTRATION-ORDER TAIL down to the one-slot floor: on the 122B-A10B
+(-ncmoe 48, FRAC 100, RAM_PCT 70) 26 of 144 tables got ONE slot and the run decoded 10.94 t/s for a
+54.7 GiB pool, while 10 % more ceiling (RAM_PCT 85) decoded 19.52.  The ceiling is a memory budget, not a
+license to kill a few tables.
+
+- The clamp now compares the process-wide plan with the ceiling ONCE and scales EVERY table's slot count by
+  that factor (one-slot floor retained only where the ceiling cannot cover a slot), with the old shave as a
+  backstop for the rounding overshoot.  Measured (1 x R9700, 122B-A10B, -ncmoe 48, 2000-token decode):
+  RAM_PCT 70 10.94 -> 17.44 t/s at the same pinned bytes (117x256/1x34/26x1 -> 144x208 slots), prefill
+  343 -> 598 t/s; RAM_PCT 85 19.52 -> 20.97 (141x256/1x181/2x1 -> 144x253).
+- MOE_HOST_POOL_SIZING=1 now fits its concentration plan TO the ceiling (the fit is a redistribution at a
+  fixed byte total, so a uniform rescale afterwards collapsed it back to the uniform rule -- measured:
+  RAM_PCT 70 + cov90 gave the identical 144x208).  With the fit spending the ceiling: 18.92 t/s at
+  54.4 GiB pinned, i.e. +8.5 % over the proportional-uniform arm in the same ceiling.
+- The clamp's denominator is whatever the sizing actually planned (FRAC / MOE_HOST_POOL_MIB / the cov
+  plan's byte total), so a ceiling-fitted plan is never scaled twice.
+
+Nothing here changes the shipped size on a box where the ceiling does not bind (FRAC 100 with enough
+MemAvailable is byte-for-byte the same pool).  See wip/host-pool-speed/README.md SS19.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 131 ++++++++++++++++++-------
+ 1 file changed, 97 insertions(+), 34 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index c2102900b..ff37dcfe9 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -313,6 +313,12 @@ int     g_pool_ram_pct     = 85;     // MOE_HOST_POOL_RAM_PCT: ceiling on the WH
+                                      //   stays clear of swap (see ENVIRONMENT.md).
+ int64_t g_pool_ram_cap     = -1;     // bytes; -1 = not computed yet
+ int64_t g_pool_ram_used    = 0;      // bytes pinned by the pools built so far
++// wip/host-pool-speed W3: the ceiling's DISTRIBUTION.  The clamp used to shave the REGISTRATION-ORDER TAIL
++// down to the one-slot floor, which starved the last ~14 tables of a 144-table model at RAM_PCT 70 and cost
++// 40 % of decode for 10 % fewer slots (README §14.6).  Instead the planned total is compared with the
++// ceiling ONCE and every table's slot count is scaled by the same factor, so a tightened ceiling now costs
++// coverage everywhere instead of killing a few tables.  -1 = the scale has not been decided yet.
++double  g_pool_ram_scale   = -1.0;
+ int64_t g_preflight_host_bytes = 0;  // Σ host expert bytes over host-expert devices (the AUTO basis)
+ bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
+ // TODO #87 (1): `MOE_HOST_POOL_DIO` is AUTO by default -- decided once, at the first pool build, from
+@@ -340,6 +346,10 @@ int     g_pool_sizing      = 0;      // MOE_HOST_POOL_SIZING: 0 = uniform, 1 = c
+ int     g_pool_cov_pct     = 90;     // MOE_HOST_POOL_COV_PCT: the mass fraction `cov` sizing targets
+ bool    g_pool_cov_fit     = false;  // the one-shot fit has run
+ std::map<const void *, int> g_pool_cov_slots;   // host tensor -> pool slots (the fit's result)
++// wip/host-pool-speed W3: the byte total the fit actually planned.  The RAM ceiling is applied as a
++// proportional scale over the SIZING's own plan, so it needs that plan's total as its denominator --
++// using the uniform FRAC total instead would scale a ceiling-fitted cov plan a second time.
++int64_t g_pool_cov_bytes = 0;
+ 
+ // An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
+ // several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
+@@ -719,6 +729,7 @@ static inline bool table_cold_ok(const table_t & t) {
+ // process-wide and holds whole experts; the cold encoding is `n_res + pool slot` with the pool's base).
+ static bool g_pool_cold = true;
+ static host_pool_t * table_pool_locked(table_t & t);
++static int64_t pool_ram_cap_locked();   // wip/host-pool-speed W3: the RAM_PCT ceiling, measured once
+ static int pool_cold_slot_locked(table_t & t, int32_t expert) {
+     if (!g_cold_uva || !g_pool_cold || !t.cold_safe || t.host_dev != nullptr || t.n_slices > 0 || t.src_off != 0 ||
+             ggml_cuda_info().device_count != 1) {
+@@ -1257,6 +1268,16 @@ static void pool_fit_cov_locked() {
+     if (plan.empty() || budget <= 0) {
+         return;
+     }
++    // wip/host-pool-speed W3: the concentration fit is a REDISTRIBUTION at a fixed byte total, so the ceiling
++    // has to be applied to the TOTAL it fits to, not afterwards.  Scaling a fitted plan uniformly preserves
++    // only the average and collapses the concentration straight back to the uniform rule (measured: FRAC 100
++    // + `RAM_PCT=70` gave 144 x 208 slots with and without `MOE_HOST_POOL_SIZING=1`).
++    {
++        const int64_t cap = pool_ram_cap_locked();
++        if (cap > 0 && budget > cap) {
++            budget = cap;
++        }
++    }
+     // slots_i = clamp(round(alpha * k_i), 1, n_exp_i); find the largest alpha whose byte total fits.
+     auto alloc = [&](double alpha, std::vector<int> * out) {
+         int64_t bytes = 0;
+@@ -1309,10 +1330,13 @@ static void pool_fit_cov_locked() {
+         }
+     }
+     int64_t kept = 0;
++    int64_t kept_bytes = 0;
+     for (size_t i = 0; i < plan.size(); i++) {
+         g_pool_cov_slots[plan[i].host] = slots[i];
+         kept += slots[i];
++        kept_bytes += (int64_t) slots[i] * (int64_t) plan[i].bytes;
+     }
++    g_pool_cov_bytes = kept_bytes;
+     GGML_LOG_INFO("%s: host pool SIZING = cov%d (concentration, %s): %zu host tensors, budget %.1f MiB, "
+                   "alpha=%.3f, %lld slots vs %lld uniform (%.1f %%) -- per-table slots now follow each table's "
+                   "own routing concentration instead of a flat FRAC (MOE_HOST_POOL_SIZING=0 restores it)\n",
+@@ -1375,11 +1399,22 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
+                   g_pool_dio ? "the set does not fit beside the pool" : "the set fits beside the pool");
+ }
+ 
+-// Cap `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.  Caller holds
+-// `g_mutex` (it updates the process-wide running total).
+-static int pool_clamp_slots_to_ram(int slots, size_t host_bytes, const table_t & t) {
+-    if (g_pool_ram_pct <= 0 || slots <= 0 || host_bytes == 0) {
+-        return slots;   // ceiling disabled
++// Cap this table's `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.
++// Caller holds `g_mutex` (it updates the process-wide running total).
++//
++// wip/host-pool-speed W3: the ceiling is applied as ONE proportional scale over every table, not as a shave
++// of whichever tables happen to register last.  The old form gave the registration-order tail ONE slot each
++// once the running total reached the cap -- measured on the 122B at `RAM_PCT=70`: 14 of 144 tables at 1 slot
++// and **-40 % decode** for 10 % fewer slots (README §14.6), and on the 3-GPU pair at `FRAC=100` the same
++// effect alone dropped the pool's hit rate from 0.91 to 0.78.  A proportional shave costs every table a
++// little coverage instead, which is what a memory ceiling should do.
++//
++// `planned_total` is the pre-ceiling pinned size the caller was aiming for (FRAC / MIB / cov plan), i.e. the
++// denominator the ceiling is compared against.  It is a process-wide number, so the scale is too.
++// The `MOE_HOST_POOL_RAM_PCT` ceiling in bytes, measured once (0 = no ceiling: disabled, or no MemAvailable).
++static int64_t pool_ram_cap_locked() {
++    if (g_pool_ram_pct <= 0) {
++        return 0;
+     }
+     if (g_pool_ram_cap < 0) {
+         const int64_t avail = pool_available_ram_bytes();
+@@ -1389,39 +1424,61 @@ static int pool_clamp_slots_to_ram(int slots, size_t host_bytes, const table_t &
+                           __func__, g_pool_ram_pct, (double) g_pool_ram_cap / (1024.0 * 1024.0));
+         }
+     }
+-    if (g_pool_ram_cap <= 0) {
++    return g_pool_ram_cap;
++}
++
++static int pool_clamp_slots_to_ram(int slots, size_t host_bytes, int64_t planned_total, const table_t & t) {
++    if (g_pool_ram_pct <= 0 || slots <= 0 || host_bytes == 0) {
++        return slots;   // ceiling disabled
++    }
++    if (pool_ram_cap_locked() <= 0) {
+         return slots;   // no MemAvailable (non-Linux, or unreadable): keep the configured size
+     }
++    // Decide the proportional scale once, from the process-wide plan vs the process-wide ceiling.
++    if (g_pool_ram_scale < 0.0) {
++        if (planned_total > 0 && planned_total > g_pool_ram_cap) {
++            g_pool_ram_scale = (double) g_pool_ram_cap / (double) planned_total;
++            if (g_pool_ram_scale > 1.0) {
++                g_pool_ram_scale = 1.0;
++            }
++            GGML_LOG_INFO("%s: the host pool does not fit the RAM ceiling: planned %.1f MiB against %.1f MiB "
++                          "(%d%% of MemAvailable), so EVERY table's slots are scaled by %.3f instead of "
++                          "starving the tables that register last (MOE_HOST_POOL_FRAC is a percentage of the "
++                          "model's HOST EXPERT SET, not of RAM; lower it, or raise MOE_HOST_POOL_RAM_PCT, to "
++                          "size this deliberately)\n",
++                          __func__, (double) planned_total / (1024.0 * 1024.0),
++                          (double) g_pool_ram_cap / (1024.0 * 1024.0), g_pool_ram_pct, g_pool_ram_scale);
++        } else {
++            g_pool_ram_scale = 1.0;
++        }
++    }
++    int out = slots;
+     const int64_t spare = g_pool_ram_cap - g_pool_ram_used;
+-    if (spare <= 0) {
+-        static bool warned_full = false;
+-        if (!warned_full) {
+-            warned_full = true;
+-            GGML_LOG_WARN("%s: the host pool is at its RAM ceiling (%.1f MiB pinned, %d%% of MemAvailable); "
+-                          "layer=%d role=%s gets ONE slot and the rest of its reads take the bounce path.  "
+-                          "Lower MOE_HOST_POOL_FRAC (or raise MOE_HOST_POOL_RAM_PCT) if that is not what you "
+-                          "want.\n", __func__, (double) g_pool_ram_used / (1024.0 * 1024.0), g_pool_ram_pct,
+-                          t.layer, t.role.c_str());
++    if (g_pool_ram_scale < 1.0) {
++        out = (int) ((double) slots * g_pool_ram_scale);
++        if (out < 1) {
++            out = 1;    // the floor is kept only where the ceiling cannot cover even one slot
+         }
+-        return 1;
+     }
+-    const int fit = (int) (spare / (int64_t) host_bytes);
+-    if (fit < slots) {
+-        static bool warned_trim = false;
+-        if (!warned_trim) {
+-            warned_trim = true;
+-            GGML_LOG_WARN("%s: trimming the host pool to the RAM ceiling: layer=%d role=%s would take %d "
+-                          "slots (%.1f MiB) but only %.1f MiB of the %d%% MemAvailable ceiling is left; using "
+-                          "%d.  MOE_HOST_POOL_FRAC=%d is a percentage of the model's HOST EXPERT SET, not of "
+-                          "RAM -- lower it (or raise MOE_HOST_POOL_RAM_PCT) to size this deliberately.\n",
+-                          __func__, t.layer, t.role.c_str(), slots,
+-                          (double) slots * (double) host_bytes / (1024.0 * 1024.0),
+-                          (double) spare / (1024.0 * 1024.0), g_pool_ram_pct, fit, g_pool_frac);
++    // Backstop: the proportional target can still overshoot (the one-slot floor, and slot rounding across
++    // 144+ tables).  If this table would cross the ceiling, shave it to what actually fits; only a table that
++    // cannot fit at all falls to the floor.
++    if (spare <= 0 || (int64_t) out * (int64_t) host_bytes > spare) {
++        const int fit = spare > 0 ? (int) (spare / (int64_t) host_bytes) : 0;
++        if (fit < out) {
++            static bool warned_trim = false;
++            if (!warned_trim) {
++                warned_trim = true;
++                GGML_LOG_INFO("%s: the RAM ceiling still binds after the proportional scale (layer=%d "
++                              "role=%s: %d slots wanted, %d fit in the %.1f MiB left); one-slot floor applies "
++                              "to the remainder\n",
++                              __func__, t.layer, t.role.c_str(), out, fit, (double) spare / (1024.0 * 1024.0));
++            }
++            out = fit < 1 ? 1 : fit;
+         }
+-        slots = fit < 1 ? 1 : fit;
+     }
+-    g_pool_ram_used += (int64_t) slots * (int64_t) host_bytes;
+-    return slots;
++    g_pool_ram_used += (int64_t) out * (int64_t) host_bytes;
++    return out;
+ }
+ 
+ // The pool for `t`'s host tensor, created lazily and shared by every per-device table of that tensor.
+@@ -1466,9 +1523,10 @@ static host_pool_t * table_pool_locked(table_t & t) {
+         }
+     }
+     int slots = 0;
++    int64_t planned_pool = g_pool_total_bytes > 0 ? g_pool_total_bytes
++                                                 : (host_total * g_pool_frac) / 100;
+     // TODO #87 (1): decide the fill mode before ANY read happens, from the process-wide numbers.
+-    pool_decide_dio_locked(host_total, g_pool_total_bytes > 0 ? g_pool_total_bytes
+-                                                             : (host_total * g_pool_frac) / 100);
++    pool_decide_dio_locked(host_total, planned_pool);
+     if (g_pool_total_bytes > 0) {
+         // explicit process-wide budget, split proportionally to each tensor's share of the host set
+         if (host_total > 0) {
+@@ -1484,13 +1542,18 @@ static host_pool_t * table_pool_locked(table_t & t) {
+     } else {
+         slots = (int) ((int64_t) t.n_experts * g_pool_frac / 100);
+     }
++    if (g_pool_total_bytes <= 0 && g_pool_sizing == 1 && g_pool_cov_bytes > 0) {
++        // The fit is the plan that ran: the ceiling's denominator must be what it actually planned, or a
++        // ceiling-fitted `cov` plan is scaled a second time here.
++        planned_pool = g_pool_cov_bytes;
++    }
+     if (slots < 1) {
+         slots = 1;   // a pool that cannot hold one expert cannot replace the master
+     }
+     if (slots > t.n_experts) {
+         slots = t.n_experts;
+     }
+-    slots = pool_clamp_slots_to_ram(slots, t.host_bytes, t);
++    slots = pool_clamp_slots_to_ram(slots, t.host_bytes, planned_pool, t);
+     GGML_LOG_INFO("%s: host pool (%s): %zu host tensors, %lld MiB host expert bytes; layer=%d role=%s -> "
+                   "%d/%d slots of %zu B (%.1f MiB)\n",
+                   __func__,
+-- 
+2.56.0
+
