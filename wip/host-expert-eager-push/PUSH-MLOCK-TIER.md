@@ -224,6 +224,15 @@ next measurement.
 
 ## 8b. Published for the multi-GPU gate test (2026-11-03)
 
+**Update (P3, 2026-11-03): the branches above are on the r208 chain.**  `rdna-boosts` is now **r209**
+(`27271aa91`, not `efaa60db0`), so re-cut the four commits with
+`git rebase --onto 27271aa91 efaa60db0 origin/p2-pinned-working-set` — 4/4, **no conflicts** (389
+insertions, one file) — which is branch **`p2-eager-push-r209`** on the fork.  The gate below is reachable
+**only on `-sm layer` or 1 GPU** (a tensor split never reaches the hook: `P3-MULTIGPU-RESULTS.md` §5), and
+the "one message" diagnostics are now once **per process** — before that, rotation re-opened the budget and
+re-printed them *inside* the generated text on a `2>&1` capture, which made a byte-identical arm hash
+differently (`P3-MULTIGPU-RESULTS.md` §1b).
+
 The experiment branches are on the **personal fork** (`origin` = `git@github.com:stew675/llama.cpp.git`), so a
 multi-GPU box can check out the state directly instead of re-applying patches.  **`rdna-boosts` is untouched**
 (still `efaa60db0`); these are experiment branches only:
@@ -266,6 +275,23 @@ campaign's case for it: **4.7 GiB of pinned pool to delete, against a 512 MiB pi
 
 The script now warns when the resolved binary is really `llama-server` and when the run decoded fewer than
 `GATE_MIN_TOKENS` (default 100) tokens, so a vacuous arm cannot be mistaken for a result again.
+
+**Two corrections to the reading above, from the same-day P3 runs on the primary box** (real `llama-cli`,
+`--ignore-eos -n 500`, both arms) — recorded here rather than by editing the paragraph:
+
+1. **`over ~N tokens` is not the decode length, and `srv` log lines do not mean llama-server.**  `over ~N
+   tokens` is the cache's traffic-accounting counter on the `expert H2D traffic` line and it reads `~6` (or
+   `~3`) on a full 500-token decode; and in this tree `llama-cli` is built on the server implementation, so it
+   emits `srv`/`slot print_timing` lines of its own — the "ran as llama-server" reading came from those two
+   strings, and both are normal here.  The harness now decides from the **binary** (basename must be
+   `llama-cli`) and from `slot print_timing ... eval time = ... / N tokens` (500 on these arms), and fails the
+   arm below `GATE_MIN_TOKENS`.
+2. **A real 500-token run under `-sm tensor` still reports `over 3 boundaries`**, so a short request was not
+   the (only) reason the counter did not advance.  The cause is structural: on a tensor split the whole graph
+   is one Meta split, the routing ids are computed inside it, and the issue-#129 guard stands the
+   host-readback branch down — `moe_cache_update_host`, where increment 3 records its per-device boundary,
+   never runs (P3-MULTIGPU-RESULTS.md §5).  The counterexample is the same build on `-sm layer`:
+   **60 357** boundaries, `released=40 release_denied=528`.
 
 ## 9. Additive by construction (the pool path is not touched)
 

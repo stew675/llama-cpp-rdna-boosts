@@ -1564,3 +1564,32 @@ change), and let `WORKLOG.md` carry the narrative.
   those stay the reporter's numbers, and no gate on this box reaches them (there is no Windows toolchain,
   `TODO` #95).  Also: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` **without** `CONFIGURE_DEPENDS`, so a
   newly added CUDA source needs a cmake re-run, not just a rebuild.
+- **A pageable push costs nothing where a fill batch goes to ONE device, and that is the whole present
+  constraint (r209, `wip/host-expert-eager-push` P3).**  Making the copy engine's source the read-only model
+  mapping (no memcpy into a pinned slot) measured **55.1 -> 53.6 t/s** on 1 GPU and **55.6 -> 53.7 t/s** on a
+  3-device `-sm layer` split — parity, byte-identical text — but **52.5 -> 26.1** on a 2-device and
+  **20.6 -> 16.3** on a 3-device `-sm tensor` split, the configuration that issues the fills of *several
+  devices inside one op*.  The marginal per-fill cost over the pool's memcpy+pinned+CE shape is 28 us / 205 us /
+  302 us / 41 us for 1 dev / 2 dev tensor / 3 dev tensor / 3 dev layer, against a host that already spends
+  ~1 core-second of CPU per token on the tensor-split host-expert path.  The driver's pageable staging
+  ("staged through a shared internal bounce", `ggml-cuda.cu:6255`) is real and widens with device count
+  (1.06x -> 1.54x of the pool's per-fill cost) but is ~20x too small to explain the tensor-split loss, so do
+  not attribute it to the driver alone.  Record and candidate causes: `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §2-§3.
+- **The 1-D pageable tearing claim stays refuted, now multi-device (r209).**  Up to 65 260 consecutive direct
+  pageable fills produced byte-identical greedy text on 1, 2 and 3 devices with no GPU fault, so the
+  "nondeterministic greedy text" half of the `ggml-cuda.cu:6255` comment has no recorded reproduction here —
+  the cost half does (previous entry).  Both ROCm lines still owe their own record; this one is 10.1 only.
+- **A `-sm tensor` split never reaches `moe_cache_update_host`, so no per-op host boundary exists there
+  (r209).**  With tensor split the whole graph is one Meta split, so a routed expert op's ids are computed
+  inside that split and the issue-#129 guard stands the scheduler's host-readback branch down
+  (`ggml-backend.cpp`, `host_expert_input && node_n_consumers == 1 && !ids_computed_here`); measured 3
+  boundary events (the sizing calls, one per device) at 2 and 3 devices against 60 357 on `-sm layer`.  The
+  expert arena is still driven (take-over + demand fills), so a policy hook placed there silently does nothing
+  on a split — and a split is the only configuration where one host tensor has a device set > 1, so a
+  cross-device release gate is currently unreachable in *any* configuration.
+- **A diagnostic written to stderr from the fill path can corrupt a text-purity comparison (r209).**  Callers
+  capture `2>&1`, so an unthrottled `fprintf(stderr, ...)` lands in the middle of llama-cli's streamed
+  generation and an otherwise byte-identical arm hashes differently — measured twice: a `-lv 4` log (stats
+  interleaved, which `scripts/extract-generated.py` documents) and a per-event `P1-PUSH` message re-fired
+  after a budget reset.  Keep capture streams separate (`>out 2>err`: the text is stdout, every log line is
+  stderr) and make such messages once-per-process.

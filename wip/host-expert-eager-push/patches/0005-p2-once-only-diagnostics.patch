@@ -1,0 +1,50 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index fb4960eff..89b851064 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2190,6 +2190,13 @@ static long    g_push_mlock_experts = 0;
+ static long    g_push_mlock_seeded  = 0;   // CUMULATIVE pins that came from the HEAT PRIOR (not first use)
+ static long    g_push_mlock_first   = 0;   // CUMULATIVE pins that came from first use
+ static long    g_push_mlock_fail    = 0;
++// The diagnostics below are stderr writes issued from the FILL path, so they land wherever the process's
++// stderr goes -- including, for a caller that redirects 2>&1, INSIDE the generated text.  They are therefore
++// ONE per process, never per event: the budget can free up again (rotation), which used to re-print the
++// "full" message on every re-fill (measured: two lines interleaved into a generation on the -sm layer arm,
++// which made a byte-identical arm hash differently -- wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md 1b).
++static bool    g_push_full_msg    = false;
++static bool    g_push_fail_msg    = false;
+ static bool    g_push_mlock_parsed  = false;
+ static bool    g_push_mlock_seed    = true;   // MOE_HOST_PUSH_MLOCK_SEED=0: no heat seeding, first use only
+ static bool    g_push_in_seed       = false;  // inside push_mlock_seed_locked (counts a pin as seeded)
+@@ -2459,9 +2466,12 @@ static void push_mlock_expert(table_t & t, int32_t expert) {
+     }
+     if (g_push_mlock_bytes + t.expert_bytes > g_push_mlock_budget) {
+         g_push_mlock_stop = true;
+-        fprintf(stderr, "P1-PUSH: pinned working set full: %zu MiB pinned in %ld experts (budget %zu MiB); "
+-                        "the remainder stays reclaimable page cache\n",
+-                g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20);
++        if (!g_push_full_msg) {
++            g_push_full_msg = true;
++            fprintf(stderr, "P1-PUSH: pinned working set full: %zu MiB pinned in %ld experts (budget %zu MiB); "
++                            "the remainder stays reclaimable page cache\n",
++                    g_push_mlock_bytes >> 20, g_push_mlock_experts, g_push_mlock_budget >> 20);
++        }
+         return;
+     }
+     void * addr = (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off);
+@@ -2469,8 +2479,13 @@ static void push_mlock_expert(table_t & t, int32_t expert) {
+         g_push_mlock_fail++;
+         g_push_mlock_stop = true;
+         const int err = errno;
+-        // ONE message, with the remedy.  Everything already pinned stays pinned, and the rest is served from
+-        // the page cache exactly as it would be without this feature.
++        // ONE message PER PROCESS, with the remedy (rotation can re-open the budget, and re-trying would
++        // otherwise re-print this on every sweep).  Everything already pinned stays pinned, and the rest is
++        // served from the page cache exactly as it would be without this feature.
++        if (g_push_fail_msg) {
++            return;
++        }
++        g_push_fail_msg = true;
+         fprintf(stderr,
+                 "P1-PUSH: mlock refused (%s) after %zu MiB pinned in %ld experts (requested %zu MiB).  "
+                 "The pinned working set stops here and the remainder stays reclaimable page cache -- correct, "

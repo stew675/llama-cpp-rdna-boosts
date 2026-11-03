@@ -1,5 +1,27 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (OPEN)
 
+> **P3 STATUS (2026-11-03): the multi-GPU assessment — the transport WORKS, except under `-sm tensor`.**
+> [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md).  Rebased onto **r209** as branch
+> `p2-eager-push-r209` (4/4, no conflicts; 389 insertions, one file).  **Correctness GREEN** on 1, 2 and 3
+> devices: `mapping` and the pool produce **byte-identical** greedy text over a forced 500-token generation
+> (up to **65 260** direct pageable fills), identical access census, `check-gpu-faults` clean — the 1-D
+> tearing claim is refuted a third time, now multi-device (ROCm 10.1; 7.14 still owed).  **Decode is at
+> parity** on 1 device (**55.1 vs 53.6 t/s**) and on a 3-device **`-sm layer`** split (**55.6 vs 53.7**):
+> pushing straight from the reclaimable page cache costs nothing where fills are issued one device at a time.
+> It **degrades only under `-sm tensor`** — the config that issues several devices' fills inside one op —
+> 2 devices **52.5 -> 26.1**, 3 devices **20.6 -> 16.3**.  The marginal per-fill cost over a pool fill goes
+> **28 µs (1 dev) -> 205 (2 dev) -> 302 (3 dev tensor) -> 41 (3 dev layer)** while the host burns ~1
+> core-second of CPU per token, so the GPUs are starved throughout.  The driver's pageable staging is real
+> but **~20x too small** to explain it (`probe-pageable-multi.cpp`); the candidate causes and the test for
+> each are the results doc §3, and **making the tensor split behave like the layer split is the campaign's
+> next engineering task, not a verdict on the mechanism**.  Two tooling defects found and fixed: the gate
+> hashed a `-lv 4` log and the campaign's own stderr diagnostics could land *inside* the generation, so
+> `p2-gate-3gpu.sh` now separates stdout/stderr and the "one message" diagnostics are once per process.
+> With that the gate **PASSES on `-sm layer`** (`released=40 release_denied=528` over 60 357 boundaries)
+> and **FAILS as inert on a tensor split** (3 boundaries): under `-sm tensor` the whole graph is one Meta
+> split, so the routing ids are computed inside it and `moe_cache_update_host` — where P2 puts its per-device
+> boundary — never runs.  P2's eagerness therefore needs a boundary source that exists there.
+
 > **P1 STATUS (2026-11-03): correctness GREEN on ROCm 10.1, performance leg confounded — see
 > [`P1-RESULTS.md`](P1-RESULTS.md).**  `patches/0001` adds `MOE_HOST_PUSH_SRC=mapping` (default off): on
 > 35B-A3B with forced misses, the mapping arm made **33 393 direct pageable DMA fills** with **byte-identical
