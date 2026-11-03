@@ -191,7 +191,26 @@ it means the direct pageable push needs **no pinned host duplicate at all** — 
 RAM property that is the campaign's actual goal (delete the pool's 4.7-9.3 GiB, `PUSH-MLOCK-TIER.md`), with
 the residency guarantee coming from the mlock tier rather than from pool slots.
 
-**Implementation shape (next):** a per-device upload queue — the fill hands (dst, src, len, stream) to that
+**REFUTED on first implementation: the worker-thread handshake deadlocked in the real path.**  A
+per-device upload thread with "caller waits until the copy has been ISSUED" wedged on its first run: the
+process sat with GPUs and CPU idle, 6 threads — main in `futex_do_wait`, two in `kfd_wait_on_events`, and the
+two per-device workers parked on their condvars with no job in flight — i.e. the copy was never issued and
+nothing was pending (killed after ~2 min; the tree was reverted, nothing was committed).  The standalone
+pattern does **not** hang (`probe-pageable-threads.cpp` runs it for 1-3 devices repeatedly), so the difference
+is the surrounding state — the waiting thread holds the cache mutex, and the destination is a live arena slot
+rather than a private buffer.  **Not diagnosed**; do not re-attempt this shape without (i) a timeout-guarded
+handshake that falls back to the caller's-thread copy and logs it, and (ii) a stack trace of the wedge.
+
+**Coalescing is the cheaper lever, and it was already named in this codebase.**  `bounce_acquire` carries a
+measured note: the grow-on-demand bounce ring is **deliberately UNCAPPED** and holds **2.2-3.0 GiB of pinned
+bounce on the 122B prefill miss path**, and "the fix for the memory is fewer, LARGER fills (coalesce a run of
+consecutive missing experts into one pinned read), not a smaller ring" (`wip/host-pool-speed` §16).  That
+matters twice over here: it is the same fix as (a) the pageable path's per-call cost (one staging copy per RUN
+of consecutive experts instead of one per expert) *and* (b) the maintainer's RAM constraint — a `push` mode
+using the bounce as its transport must bound that ring, and the maintainer's bar is **under 2 GiB at parity**.
+Coalescing needs no threads, so it carries none of the ordering risk above.
+
+**Implementation shape (original plan, paused):** a per-device upload queue — the fill hands (dst, src, len, stream) to that
 device's worker, the worker issues the copy on the device's stream and records an event, and the host thread
 that will enqueue the consumer waits for the worker to have *issued* (not completed) it.  Ordering is
 unchanged because both the fill and the op land on the same device stream.  The fallback, if that proves
