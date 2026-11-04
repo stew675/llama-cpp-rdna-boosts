@@ -68,7 +68,7 @@ perfect identity rather than "within tolerance":
 
 | arm | r213 (`9a793f724`) | r214 (`e76491d89`) |
 |---|---|---|
-| **Flash-Next 2 dev `-c 204800`, pool on (the repro)** | **fault** | **clean**, 869-990 t/s pp, `3ba9d426b43bc6b7` |
+| **Flash-Next 2 dev `-c 204800`, pool on (the repro)** | **fault** | **clean**, 830-990 t/s pp, `3ba9d426b43bc6b7` |
 | Flash-Next 2 dev `-c 204800`, pool off | fault | clean, `3ba9d426b43bc6b7` |
 | Flash-Next 2 dev `-c 131072` / 1 dev `-c 204800` | clean | clean, `3ba9d426b43bc6b7` |
 | Flash-Next 2 dev `-c 262144` | (straddles) | clean, `3ba9d426b43bc6b7` |
