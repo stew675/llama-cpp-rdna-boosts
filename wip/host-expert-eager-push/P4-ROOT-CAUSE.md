@@ -850,6 +850,39 @@ from the registration experiment goes into the delivery.
 Both go through `fprintf(stderr, ...)` **not** `GGML_LOG_WARN`, because ggml's WARN is filtered at
 llama-cli's default level -- the same trap that hid the campaign's own P1-PUSH messages in P3.
 
+### Landed (fork commit `a644115a0`, patch `0009`): ONE knob for the tier
+
+The mechanism is uniform, so the interface is now uniform too -- the maintainer's design:
+
+```
+-lme, --limit-host-experts auto|N        (auto is the default once -ncmoe/-cpu-moe is given)
+    auto : pin the whole host expert set when it fits in RAM, else a bounded pinned pool at
+           MOE_HOST_POOL_FRAC (80%)
+    N    : pin a pool of N GiB, clamped to the size of the host expert set; N above 90% of
+           MemAvailable is REFUSED, because that memory cannot be swapped out
+--host-experts pinned|pool               DEPRECATED shorthands (warn): pinned = pin the whole
+                                         set, pool = auto
+```
+
+Verified end to end on this box:
+
+| invocation | result |
+|---|---|
+| `-lme 200` | refused: *"more than 90% of the available memory (82 GiB): that memory is non-swappable"* |
+| `-lme 8` | `host pool (L2): 13440 slots, 8164.6 MiB pinned` |
+| `-lme 64` (host set is 18.2 GiB) | clamped: `30720 slots, 18662.0 MiB pinned` -- the whole set |
+| `--host-experts pool` | deprecation warning, then `limit-host-experts: auto -- pin the whole host expert set ...` |
+
+**Honest gap, and it is the one remaining design piece**: `auto` resolves to *pinned* today.  The pool fallback
+for a set that does not fit needs the host-expert byte total **before** buffer assignment, which the loader does
+not currently compute.  Two options, in preference order:
+
+1. **a metadata pre-pass** in the loader (sum the nbytes of the tensors the `-ncmoe` selection will host, before
+   `host_expert_buft` assigns any of them) -- exact, and it makes `auto` a pure decision;
+2. **switch on failure**: keep pinned, and let the (now loud) `PINNED HOST ALLOCATION FAILED` warning trigger a
+   retry in pool mode.  Cheaper, but a half-loaded model has to be torn down first, and the user pays the failed
+   allocation.
+
 ### Left to do (in order), with the acceptance bar for each
 
 | # | change | acceptance |

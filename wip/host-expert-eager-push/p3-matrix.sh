@@ -20,6 +20,7 @@ SM=${SM:-tensor}   # tensor = the Meta backend; layer = one device per layer (no
 N=${N:-300}
 CTX=${CTX:-8192}
 NCMOE=${NCMOE:-40}
+LME=${LME:-}         # --limit-host-experts value: auto | N (GiB)
 LAZY=${LAZY:-}       # e.g. LAZY=off -> --lazy-mode off (prevents lazy PLE weight loading confounding a run)
 CACHE_MIB=${CACHE_MIB:-2048}
 POOL_FRAC=${POOL_FRAC:-50}
@@ -38,6 +39,8 @@ PROMPT_ARGS=(-p "The capital of France is")
 [ -n "$PROMPT_FILE" ] && PROMPT_ARGS=(-f "$PROMPT_FILE")
 LV_ARGS=()
 [ "$LV" -gt 0 ] && LV_ARGS=(-lv "$LV")
+LME_ARGS=()
+[ -n "$LME" ] && LME_ARGS=(--limit-host-experts "$LME")
 LAZY_ARGS=()
 [ -n "$LAZY" ] && LAZY_ARGS=(--lazy-mode "$LAZY")
 # EOS=1 keeps generating past EOS (--ignore-eos): a 150-token greedy answer that stops at EOS makes a poor
@@ -55,7 +58,7 @@ env HIP_VISIBLE_DEVICES="$GPU" LD_LIBRARY_PATH="$ROCM/lib${LD_LIBRARY_PATH:+:$LD
     "$BIN/llama-cli" -m "$MODEL" -ngl 99 -sm "$SM" -mg 0 \
         -ncmoe "$NCMOE" --host-experts "$HOSTMODE" -c "$CTX" -n "$N" \
         "${PROMPT_ARGS[@]}" --seed 42 --temp 0 \
-        --no-display-prompt --single-turn "${EOS_ARGS[@]}" "${LV_ARGS[@]}" "${LAZY_ARGS[@]}" >"$LOG" 2>&1
+        --no-display-prompt --single-turn "${EOS_ARGS[@]}" "${LV_ARGS[@]}" "${LME_ARGS[@]}" "${LAZY_ARGS[@]}" >"$LOG" 2>&1
 rc=$?
 echo "=== $TAG  (rc=$rc, gpus=$GPU, sm=$SM, n=$N, bin=$BIN)"
 echo "    env: $*  (host-experts=$HOSTMODE)"

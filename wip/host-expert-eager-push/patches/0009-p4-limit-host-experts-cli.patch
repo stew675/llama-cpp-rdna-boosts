@@ -1,0 +1,147 @@
+From a644115a08832852f5fadbcba61cf28fdef61eb8 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 3 Nov 2026 21:51:38 -0600
+Subject: [PATCH] cli: --limit-host-experts [auto|N] (-lme) -- one knob for the
+ non-swappable host-expert tier
+
+The mechanism is uniform now (every host-expert tier is hipHostMalloc'd), so the CLI can
+be too:
+
+  -lme, --limit-host-experts auto|N
+    auto : pin the whole host expert set when it fits in RAM, else a bounded pinned pool
+           sized MOE_HOST_POOL_FRAC (default 80%) of the host expert bytes.  Implied when
+           -ncmoe/-cpu-moe is given and nothing else is.
+    N    : pin a pool of N GiB (clamped to the host expert set).  N > 90% of MemAvailable
+           is refused with an explanation, because that memory cannot be swapped out.
+
+  --host-experts pinned|pool  -> DEPRECATED shorthands (warn), both expressed through the
+                                 one knob: 'pinned' = pin the whole set, 'pool' = auto.
+
+Verified: -lme 200 refused ('more than 90% of the available memory (82 GiB)');
+-lme 8 -> 'host pool (L2): 13440 slots, 8164.6 MiB pinned'; -lme 64 -> clamped to the whole
+18662.0 MiB set; --host-experts pool warns and resolves to auto.
+
+Still open (documented, not done): 'auto' resolves to PINNED today -- the pool fallback for
+a set that does not fit needs the host-expert byte total before buffer assignment (a
+metadata pre-pass in the loader, or switch-on-failure using the new loud pinned-allocation
+warning).
+---
+ common/arg.cpp    | 55 ++++++++++++++++++++++++++++++++++++++++++++---
+ common/common.cpp | 13 +++++++++++
+ common/common.h   |  6 ++++++
+ 3 files changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 9fe9747b1..8225f868a 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2727,13 +2727,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
+         "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+         [](common_params & params, const std::string & value) {
+-            /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+-            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+-            else if (value == "pool")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_POOL;   }
++            fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "
++                            "(-lme) instead\n");
++            // The mechanism is uniform now (every host-expert tier is hipHostMalloc'd), so the old spelling
++            // has one meaning each: 'pinned' = pin the whole set (= 'auto' when it fits), 'pool' = auto.
++            /**/ if (value == "auto")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
++            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
++            else if (value == "pool")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+             else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
+             else { throw std::invalid_argument("invalid value"); }
+         }
+     ));
++    add_opt(common_arg(
++        {"-lme", "--limit-host-experts"}, "auto|N",
++        "cap the NON-SWAPPABLE memory used by host-resident MoE experts (--n-cpu-moe/-ncmoe) (default: auto)\n"
++        "- auto: choose automatically -- pin the whole host expert set when it fits in RAM, otherwise a bounded\n"
++        "        pinned pool sized MOE_HOST_POOL_FRAC (default 80%) of the host expert bytes.  Implied when\n"
++        "        -ncmoe/-cpu-moe is given and nothing else is.\n"
++        "- N:    pin a pool of N GiB (clamped to the size of the host expert set).  N above 90% of the\n"
++        "        available memory is refused, because that memory cannot be swapped out.\n"
++        "The mechanism is uniform: every host expert tier is hipHostMalloc'd, so the tier is exactly the\n"
++        "budget and can be released.  (--host-experts pinned|pool are deprecated shorthands.)",
++        [](common_params & params, const std::string & value) {
++            if (value == "auto") {
++                params.host_experts_limit_gib = 0;
++                params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
++                return;
++            }
++            char * end = nullptr;
++            const long long n = strtoll(value.c_str(), &end, 10);
++            if (end == value.c_str() || *end != '\0' || n < 0) {
++                throw std::invalid_argument("expected 'auto' or a number of GiB");
++            }
++            params.host_experts_limit_gib = (int64_t) n;
++            params.host_experts_mode      = n == 0 ? LLAMA_HOST_EXPERTS_MODE_AUTO : LLAMA_HOST_EXPERTS_MODE_POOL;
++            if (n > 0) {
++                // Refuse a budget that would make most of RAM non-swappable.  Checked here, where the user
++                // gets the error before a 20-70 GiB model load; the exact figure is re-checked when the pool
++                // is sized (the loader knows the host expert bytes then).
++                FILE * mi = fopen("/proc/meminfo", "r");
++                long long avail_mib = -1;
++                if (mi != nullptr) {
++                    char line[256];
++                    while (fgets(line, sizeof(line), mi) != nullptr) {
++                        if (strncmp(line, "MemAvailable:", 13) == 0) { avail_mib = atoll(line + 13) / 1024; break; }
++                    }
++                    fclose(mi);
++                }
++                if (avail_mib > 0 && (long long) n * 1024 > avail_mib * 90 / 100) {
++                    throw std::invalid_argument(
++                        "--limit-host-experts " + value + " (GiB) is more than 90% of the available memory (" +
++                        std::to_string(avail_mib / 1024) + " GiB): that memory is non-swappable, so it is refused. "
++                        "Use 'auto', a smaller N, or free memory first.");
++                }
++            }
++        }
++    ));
+     add_opt(common_arg(
+         {"-lzm", "--lazy-mode"}, "MODE",
+         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index e16e1cb5e..665f73d1b 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2025,6 +2025,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.load_mode       = params.load_mode;
+     mparams.lazy_mode = params.lazy_mode;
+     mparams.host_experts_mode = params.host_experts_mode;
++    // --limit-host-experts N: the ONE knob for the non-swappable host-expert tier.  The mechanism is uniform
++    // (every tier is hipHostMalloc'd), so N is expressed as the pool budget and clamped to the host expert
++    // set where it is sized.  The resolved choice is logged once, so the user can see what they got.
++    if (params.host_experts_limit_gib > 0) {
++        char buf[32];
++        snprintf(buf, sizeof(buf), "%lld", (long long) params.host_experts_limit_gib * 1024);
++        setenv("MOE_HOST_POOL_MIB", buf, 1);   // explicit MiB wins over FRAC/RAM_PCT inside the pool sizing
++        fprintf(stderr, "limit-host-experts: %lld GiB pinned pool for host-resident experts "
++                        "(clamped to the host expert set; the tier is hipHostMalloc'd and releasable)\n",
++                (long long) params.host_experts_limit_gib);
++    } else if (params.host_experts_limit_gib == 0 && params.host_experts_mode == LLAMA_HOST_EXPERTS_MODE_AUTO) {
++        fprintf(stderr, "limit-host-experts: auto -- pin the whole host expert set when it fits in RAM\n");
++    }
+     // `-ncmoe N` hosts the LAST N trunk layers (the tail placement, the default).
+     // `LLAMA_HOST_EXPERTS_FROM_END=0` is the kill switch that restores the historical first-N placement.
+     {
+diff --git a/common/common.h b/common/common.h
+index ec1dd017b..7ba61eadf 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -539,6 +539,12 @@ struct common_params {
+ 
+     // how host-resident expert weights (`-ncmoe`/`-cmoe`) are backed when the model is mmap'd
+     enum llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
++    // --limit-host-experts: the ONE knob that sizes the non-swappable host-expert tier.
++    //   host_experts_limit_gib == -1 && host_experts_mode given  -> legacy --host-experts
++    //   host_experts_limit_gib == -1 && mode AUTO                -> "auto": pin the whole set
++    //   host_experts_limit_gib ==  0                             -> "auto" (same as above)
++    //   host_experts_limit_gib ==  N (>0)                        -> a pinned POOL of N GiB
++    int64_t host_experts_limit_gib = -1;   // -1 = unset, 0 = auto, >0 = GiB for the pool
+ 
+     // `-ncmoe N` count, kept so `common_model_params_to_llama` can set
+     // `llama_model_params.n_cpu_moe_from_end` and the loader can host the LAST N trunk layers
+-- 
+2.56.0
+
