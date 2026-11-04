@@ -3380,9 +3380,10 @@ block, including its OOM.
    that rewrites cells in place without going through the writers (the K-shift, a state restore), which calls
    `kv_pool_invalidate()`.
 5. **Eligibility is narrow on purpose** — one stream, non-MLA, K and V both present, `!v_trans`, a uniform
-   `compress_ratio` and cell geometry, **no window active**, a device-offloaded cache, and only the **trunk**
-   context of a qwen4exp model (the MTP draft's cache is read densely: pooling it would only make its reads
-   leave VRAM).  Anything else declines with one message and the KV is unchanged.
+   `compress_ratio` and cell geometry, **no window active**, a device-offloaded cache, a mirror buffer type from
+   **every** device the cache's layers are on (a `-sm layer` split qualifies since r213, a tensor split does not),
+   and only the **trunk** context of a qwen4exp model (the MTP draft's cache is read densely: pooling it would
+   only make its reads leave VRAM).  Anything else declines with one message and the KV is unchanged.
 
 **Knobs.**  `LLAMA_KV_REGION_POOL=<cells>` (unset/`0` = off), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
 selected page compared byte-for-byte with the mirror at read time, 0 mismatches expected),
@@ -3422,11 +3423,30 @@ It is worth it only where the resident KV does not fit — then the 204 MiB pool
 at `-c 262144 -ncmoe 16` aborts with `cudaMalloc failed: out of memory` / `failed to allocate buffer for kv
 cache` with the knob unset and **runs** with it), and the arena it frees is worth +1.44 GiB.
 
+**Multi-device (r213).**  The pool is **per layer and per device**: on a `-sm layer` split with N devices the cache
+gets one pinned host mirror **buffer type per device**, one device pool and page table per layer, and **one counter
+block per device** (`kvpool_ctr_<device>`); a layer's resolve node therefore has every source on its own device.
+Two defects had to be fixed for that to hold, and both are "do not do that again": (1) the mirror buft's **name must
+be device-unique** — `llama_kv_cache` keys its buft -> context map by name (`strcmp`), so a device-invariant name
+collapsed the per-device mirrors into device 0's (the windowed KV's region buft is unique for the same reason);
+(2) the counter block must not be shared — created once in the first pool layer's device it put device-0 memory in
+every other device's resolve node.  Either defect alone makes the `KV_POOL` node unclaimable (the CUDA backend
+rejects an op whose sources live on another device, the CPU backend has no `KV_POOL`) and the scheduler aborts with
+`GGML_ASSERT(*cur_backend_id != -1)` at load.  `LLAMA_KV_POOL_STATS` **sums** the per-device counters and prints the
+block count.  A **tensor split** still declines (its Meta device has no per-device mirror), one message, KV unchanged.
+
 **Not in this block:** the pool declines a tensor split (one page table per device would need a per-device pool
 and a split-aware resolve — block 15's window has the same limitation), the *mirror* grows on demand (r196) and
 is bounded by the pinned-RAM ceiling `LLAMA_KV_SPILL_RAM_PCT`, which declines the pool loudly rather than being
 OOM-killed, and k-quant indexer keys stay on the chain (block 11's loader needs a 32-element block that
 divides `idx_dim`).
+
+**Gates (r213).**  `gate-kv-residency.sh` PASS on tree `2125cfab7`, now including a **multi-device section**
+(`pmref`/`pmres`/`pmfloor` on `MULTI_DEVICES=0,1`, `-sm layer`): text `f260d1824ab3` identical across the three 2-device
+arms (`pmres == pmfloor == pmref`), the enable line reporting the 2-device span, **2 counter blocks summed**, `bad 0`,
+and on the same 252 resolves `pmfloor` claiming 267.2 vs 118.0 per resolve with a lower hit rate (89.19 % vs 91.22 %).
+Single-device arms unchanged (`pres` 145.3 / 90.83 %, `pfloor` 222.7 / 89.67 %); same-seed text byte-identical to r212 on
+the 4B coherence arm (`1c5d32ac537d`) and on the 1-GPU pool arm (`f260d1824ab3`); `validate-set.sh` GREEN.
 
 **Gates (r190, on the final base).**  Greedy text pool == the resident sparse arm at 5.3k
 (`332 dd1981213373`), 51 475 depth (`854 43b30de151b9`) and 180k (`861 263c7f2be4d9`), with the dense arm

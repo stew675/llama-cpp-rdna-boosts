@@ -1,3 +1,68 @@
+## 261104.004 (r213) -- block 15 amended: the attendance pool works on a multi-device `-sm layer` split
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 15 AMENDED), release `v16-6050b467c-r213`, tip `9a793f724`,
+tree `2125cfab7`.**  Found while answering a user question about a `llama-server` that would not start from a
+Flash-Next `runme` (`LLAMA_KV_REGION_POOL=16384`, `-c 204800`, `HIP_VISIBLE_DEVICES=0,2`).
+
+**The finding.**  The pool aborted the process at model load on any **two-device** `-sm layer` arm -- before a token:
+
+```
+ggml/src/ggml-backend.cpp:1933: GGML_ASSERT(*cur_backend_id != -1) failed
+  ggml_backend_sched_split_graph <- llama_context::graph_reserve <- resolve_fused_ops <- sched_reserve
+```
+
+A node no backend claims.  Instrumenting the split (all of it reverted) showed `op=KV_POOL` for a layer on device 1 with
+its sources on **two** devices: `kvpool_ctr` on `ROCm0`, `cache_k/v_l27` in `ROCm_KV_Pool_Mirror` of **device 0**, the pool
+and page table on `ROCm1`.  `ggml_backend_cuda_device_supports_op` rejects an op with a CUDA buffer on another device
+(`ggml-cuda.cu`, the "all the sources are allocated on this device" pre-check), the CPU backend has no `GGML_OP_KV_POOL`,
+so every backend declines and the assert fires.  Two independent defects fed that graph, both fixed here:
+
+1. **The mirror buffer type had no device in its NAME.**  `ggml_backend_cuda_kv_pool_mirror_buffer_type_name()` returned
+   `ROCm_KV_Pool_Mirror` for every device, and `llama_kv_cache`'s buft -> context map is ordered by **name** (`strcmp`,
+   `src/llama-kv-cache.cpp`): the two per-device mirror bufts compared EQUAL, so only device 0's context survived and every
+   layer on device 1 got its mirror tensors allocated in **device 0's** buffer type.  (The windowed KV's region buft avoids
+   this by reusing the plain CUDA getter, which is device-unique -- it was the pool mirror that broke the rule.)  The buft
+   now carries a `ggml_backend_cuda_buffer_type_context` whose name is `ROCm_KV_Pool_Mirror<device>`.
+2. **ONE counter block served every device.**  `kvpool_ctr` (epoch, claim cursor, miss list) was created once, in the FIRST
+   pool layer's device context, and passed to every layer's resolve node -- so a device-1 node read device-0 memory even
+   with the mirror buft fixed.  There is now **one counter block per device**, created in that device's own context and
+   named `kvpool_ctr_<device>`; `kv_pool_layer` carries the pointer its layer's node needs.
+
+Supporting changes: the eligibility check asks **every** device the cache's layers are on (and still declines a tensor
+split, whose Meta device has no per-device mirror); `memory_breakdown()` recognises a mirror buffer by membership in the
+set of mirror bufts instead of pointer equality with device 0's; `kv_pool_bytes()` sums the counter blocks; the teardown
+`LLAMA_KV_POOL_STATS` line **sums every device's counters** and prints the block count (`... 12 layers, 2 counter blocks,
+claims ...`), so a 2-device arm that reports 1 is instantly visible.  The enable line reports the device span.
+
+**Single-device runs are unchanged** (one device = one mirror buft = one counter block, same order): the same-seed greedy
+text is **byte-identical** before/after on the 4B coherence arm (`sha=1c5d32ac537d`) and on the pool arm
+(`sha=f260d1824ab3`, 1 GPU, `-c 32768`, 25 763-token prefix), with the counters inside their run-to-run spread
+(claims 42 461 -> 42 576, hits 90.45 -> 90.42 %, resolves 252 either way).
+
+**Gates.**  `gate-kv-residency.sh` **PASS** on the final build, including a **new multi-device section** (`pmref`/`pmres`/
+`pmfloor` on `MULTI_DEVICES=0,1`, `-sm layer`) added because nothing in the gate reached the fixed code: text
+`f260d1824ab3` on all three multi arms (**pmres == pmfloor == pmref**), `ATTENDANCE POOL ENABLED` once, the enable line
+reporting the 2-device span, **2 counter blocks summed**, `bad 0`, and on the same 252 resolves `pmfloor` claiming more per
+resolve (267.2 vs 118.0) with a lower hit rate (89.19 % vs 91.22 %) -- the forced-miss arm is real on a split too.  The
+one-device pool arms are unchanged (`pres` 145.3 claims/resolve 90.83 %, `pfloor` 222.7 / 89.67 %).  `validate-set.sh`
+GREEN (16 blocks, fresh-tarball strict `git am`, tree `2125cfab7`); a canonical re-cut is a fixed point (`apply-all.sh`
+prints `Applied tip: 9a793f724` twice, from two independent clones).
+
+**Also found, NOT fixed here (pre-existing, not block 15):** on that same user arm at `-c 204800` **two devices**, prefill
+faults the GPU -- `HSA_STATUS_ERROR_MEMORY_FAULT` in `rms_norm_f32` on GPU 1, `gfxhub page fault` in the journal, right
+after `moe_cache_evict_slab_range` throws away 5.4-5.8 GiB of arena tables.  It reproduces with **`LLAMA_KV_REGION_POOL=0`**
+(same signature), so it is not this change and not the pool; `-c 131072` on 2 devices and `-c 204800` on 1 device are both
+clean (`sha=3ba9d426b43bc6b7` / no faults).  Tracked as `TODO` #143.
+
+**Files.**  `ggml/src/ggml-cuda/ggml-cuda.cu` (mirror buft name + context), `src/llama-kv-cache.{h,cpp}` (per-device
+counter blocks, mirror buft set, eligibility, stats/accounting), `scripts/gate-kv-residency.sh` (the multi-device arms,
+`RUN_DEVS`, `MULTI_DEVICES`, `--multi-only`), `ENVIRONMENT.md`, `MANIFESTS.md`, `patches/README.md`, `INVARIANTS.md`,
+`TODO.md`, `release.json`.
+
+**Artifact churn, no content change.**  The set was re-exported from a canonical re-cut rather than from a working
+chain, so `patches/0009`-`0014` differ only in their `From <sha>` line (196 -> canonical ids) and every `index` line of
+`rdna-boosts-all.patch` moved with block 15's blobs; only `patches/0015` changes content.
+
 ## 261104.003 (r212) -- the host pool's fill mode mirrors `--load-mode` (a mmap is a request for the page cache, not a RAM guess)
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 12 AMENDED), release `v16-6050b467c-r212`, tip `5f3e6ffee`,

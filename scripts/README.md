@@ -26,7 +26,7 @@ scripts/gate-spec-align.sh                            # speculative verify-batch
 scripts/gate-spec-width-band.sh                       # speculative verify-WIDTH band gate, band-0 3 GPU, 1/2/4 slots (r185)
 scripts/gate-spec-draft-window.sh                      # MTP draft KV window gate, 2 slots over a unified cache (issue #264)
 scripts/gate-kv-window-split.sh                         # the windowed KV across a -sm tensor split, 3/2/1-device + MTP + fit arms (TODO #124)
-scripts/gate-kv-residency.sh                             # KV residency gate: the window and the pool, resident arm vs forced-miss arm (campaign P0)
+scripts/gate-kv-residency.sh                             # KV residency gate: the window and the pool, resident arm vs forced-miss arm (campaign P0), incl. a 2-device -sm layer pool section
 ```
 
 **Release work (assessing PRs, A/B arms, the folded tree): ONE checkout, never one worktree per arm**

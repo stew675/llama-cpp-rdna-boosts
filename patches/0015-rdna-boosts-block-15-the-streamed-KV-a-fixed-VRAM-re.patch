@@ -1,4 +1,4 @@
-From 2cf5ce8bbf68c1a7eca51fbb99b8bde4ddaf8a76 Mon Sep 17 00:00:00 2001
+From 9a793f724cf757ec24b10cd16db71a75412ecae9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -377,7 +377,7 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1221 ++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1408 ++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1413 ++++++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 +++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
  ggml/src/ggml-cuda/moe-expert-cache.cu     |   32 +-
@@ -386,8 +386,8 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
  src/llama-ext.h                            |   68 +
- src/llama-kv-cache.cpp                     |  931 +++++++++++-
- src/llama-kv-cache.h                       |   94 +-
+ src/llama-kv-cache.cpp                     |  988 ++++++++++++-
+ src/llama-kv-cache.h                       |   99 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
  src/llama-memory-hybrid-idx.h              |    4 +-
  src/llama-memory-hybrid.cpp                |   12 +-
@@ -397,7 +397,7 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  src/llama-model.cpp                        |  144 +-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   58 +-
- 33 files changed, 6049 insertions(+), 800 deletions(-)
+ 33 files changed, 6116 insertions(+), 800 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -2887,7 +2887,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 50c65928a..fb6fa066e 100644
+index 50c65928a..cdf843d37 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -3731,7 +3731,7 @@ index 50c65928a..fb6fa066e 100644
  // Communication context for multi-GPU AllReduce during tensor parallelism.
  //
  // Created once per meta backend instance.  Resources for the selected mode
-@@ -3500,6 +4297,390 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -3500,6 +4297,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -3778,9 +3778,13 @@ index 50c65928a..fb6fa066e 100644
 +};
 +
 +static const char * ggml_backend_cuda_kv_pool_mirror_buffer_type_name(ggml_backend_buffer_type_t buft) {
-+    return GGML_CUDA_NAME "_KV_Pool_Mirror";
-+
-+    GGML_UNUSED(buft);
++    // MUST be unique per device: `llama_kv_cache` keys its buft -> context map by NAME (`strcmp`), so two
++    // device bufts that answer the same string collapse into the FIRST one's context -- every layer on the
++    // other devices then gets its mirror tensors in device 0's buffer type, and its resolve node (mirror on
++    // one device, pool on the other) is claimed by no backend at all: `GGML_ASSERT(*cur_backend_id != -1)`
++    // in the scheduler's split.  Same discipline as the windowed KV's region buffer type, which reuses the
++    // plain CUDA getter for exactly this reason.
++    return ((ggml_backend_cuda_buffer_type_context *) buft->context)->name.c_str();
 +}
 +
 +static bool ggml_backend_buft_is_cuda_kv_pool_mirror(ggml_backend_buffer_type_t buft) {
@@ -4101,7 +4105,8 @@ index 50c65928a..fb6fa066e 100644
 +                /* .is_host             = */ NULL,
 +            },
 +            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
-+            /* .context  = */ nullptr,
++            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device,
++                    std::string(GGML_CUDA_NAME) + "_KV_Pool_Mirror" + std::to_string(device), 0},
 +        };
 +        init[device] = true;
 +    }
@@ -4122,7 +4127,7 @@ index 50c65928a..fb6fa066e 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -4932,6 +6113,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -4932,6 +6118,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
              break;
@@ -4132,7 +4137,7 @@ index 50c65928a..fb6fa066e 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -5026,11 +6210,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+@@ -5026,11 +6215,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -4182,7 +4187,7 @@ index 50c65928a..fb6fa066e 100644
  
      // A pinned-source cudaMemcpyAsync is read by the copy engine when the stream reaches it, not when it is
      // issued, so the caller must not modify `data` until the copy has completed -- and this path's caller
-@@ -5076,7 +6297,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -5076,7 +6302,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4214,7 +4219,7 @@ index 50c65928a..fb6fa066e 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-@@ -5087,7 +6331,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -5087,7 +6336,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4253,7 +4258,7 @@ index 50c65928a..fb6fa066e 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -5181,11 +6455,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -5181,11 +6460,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4312,7 +4317,7 @@ index 50c65928a..fb6fa066e 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -8058,6 +9376,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8058,6 +9381,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4327,7 +4332,7 @@ index 50c65928a..fb6fa066e 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8087,7 +9413,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8087,7 +9418,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -4337,7 +4342,7 @@ index 50c65928a..fb6fa066e 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8516,8 +9843,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8516,8 +9848,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4398,7 +4403,7 @@ index 50c65928a..fb6fa066e 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8629,6 +10008,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8629,6 +10013,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -5140,7 +5145,7 @@ index 0079595f5..194325816 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..81ccf1e4d 100644
+index b3f3a9c87..55a4df604 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,287 @@ static bool ggml_is_power_of_2(int n) {
@@ -5441,7 +5446,7 @@ index b3f3a9c87..81ccf1e4d 100644
      model(model), hparams(hparams), v_trans(v_trans),
      n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
      n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_type(swa_type),
-@@ -187,6 +469,275 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +469,297 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -5651,18 +5656,34 @@ index b3f3a9c87..81ccf1e4d 100644
 +            } else if (!uniform_cell) {
 +                why = "the K/V cell geometry is not uniform across its layers";
 +            }
-+            ggml_backend_buffer_type_t buft_mirror = why == nullptr ? llama_kv_pool_mirror_buft(model.dev_layer(0)) : nullptr;
-+            if (why == nullptr && buft_mirror == nullptr) {
-+                why = "the backend does not provide the pool's pinned host mirror buffer type (single device with "
-+                      "the CUDA backend only)";
++            // The mirror must be answerable on EVERY device that will hold a pool layer: with `-sm layer` a
++            // multi-device cache gets one mirror buffer (and one device pool, page table and counter block)
++            // per device, and a device that does not answer would have to fall back to the plain device KV
++            // for its layers only -- which the resolve node (one per layer, all sources local) cannot express.
++            // A tensor split still declines: its Meta device has no reg, so no per-device mirror exists.
++            std::vector<ggml_backend_buffer_type_t> mirror_bufts;
++            if (why == nullptr) {
++                for (uint32_t il = 0; il < n_layer; ++il) {
++                    if (!hparams.has_kv(il) || (filter && !filter(il))) {
++                        continue;
++                    }
++                    ggml_backend_buffer_type_t b = llama_kv_pool_mirror_buft(model.dev_layer(il));
++                    if (b == nullptr) {
++                        why = "the backend does not provide the pool's pinned host mirror buffer type for every "
++                              "device the cache's layers are on (the CUDA backend, one device per layer: a "
++                              "tensor split has no per-device mirror)";
++                        break;
++                    }
++                    if (std::find(mirror_bufts.begin(), mirror_bufts.end(), b) == mirror_bufts.end()) {
++                        mirror_bufts.push_back(b);
++                    }
++                }
 +            }
 +            // the pinned mirror is bounded by the same ceiling as the windowed KV's spill: it is NON-SWAPPABLE RAM
 +            size_t mirror_worst = (size_t) kv_size * cell * n_tens;
 +            if (why == nullptr) {
 +                const size_t budget = llama_kv_region_spill_budget(model.dev_layer(0));
 +                if (budget != SIZE_MAX && mirror_worst > budget) {
-+                    ggml_backend_buffer_type_t unused = buft_mirror;
-+                    GGML_UNUSED(unused);
 +                    LLAMA_LOG_ERROR("%s: LLAMA_KV_REGION_POOL needs a %.2f MiB pinned host mirror at full context, "
 +                                    "but only %.2f MiB is available (the LLAMA_KV_SPILL_RAM_PCT ceiling on pinned, "
 +                                    "non-swappable RAM).  The pool is disabled and the KV stays as it is.\n",
@@ -5697,19 +5718,25 @@ index b3f3a9c87..81ccf1e4d 100644
 +                kv_pool_n_pages    = n_pages;
 +                kv_pool_n_blocks   = n_blocks;
 +                kv_pool_blocks_row = blocks_row;
-+                kv_pool_mirror     = buft_mirror;
++                pool_mirror_bufts  = mirror_bufts;
 +
++                const std::string dev_note = mirror_bufts.size() > 1
++                        ? "  The cache's layers span " + std::to_string(mirror_bufts.size()) +
++                          " devices: each keeps its own mirror, pool and counter block, and a layer's resolve "
++                          "node runs entirely on its own device."
++                        : "";
 +                LLAMA_LOG_WARN("%s: ATTENDANCE POOL ENABLED for the attention KV: a %.1f MiB device pool of %u pages "
 +                               "x %u cells per layer (LLAMA_KV_REGION_POOL=%u%s), with the authoritative copy in a "
 +                               "pinned host mirror (up to %.2f MiB at full context).  A decode step resolves its "
 +                               "top-k selection through the page table and fills the pages it missed from the "
 +                               "mirror (~%.2f MiB/token at a 90%% hit rate); prefill reads the mirror over the "
-+                               "PCIe link.  Unset LLAMA_KV_REGION_POOL to keep the KV fully in VRAM.\n",
++                               "PCIe link.%s  Unset LLAMA_KV_REGION_POOL to keep the KV fully in VRAM.\n",
 +                               __func__,
 +                               (double) n_pages*page*cell*n_tens / 1048576.0, n_pages, page, req,
 +                               n_pages*page != req ? ", floored to one decode band" : "",
 +                               (double) mirror_worst / 1048576.0,
-+                               (double) (width*cell*n_tens*0.10) / 1048576.0);
++                               (double) (width*cell*n_tens*0.10) / 1048576.0,
++                               dev_note.c_str());
 +            }
 +        }
 +    }
@@ -5717,7 +5744,7 @@ index b3f3a9c87..81ccf1e4d 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +794,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +816,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -5758,7 +5785,7 @@ index b3f3a9c87..81ccf1e4d 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -252,11 +837,24 @@ llama_kv_cache::llama_kv_cache(
+@@ -252,11 +859,31 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -5766,12 +5793,19 @@ index b3f3a9c87..81ccf1e4d 100644
 +        // MIRROR -- every existing path (the writers, the state I/O, the shift, `get_k`/`get_v`) then works on
 +        // it unchanged, which is exactly the point of making the mirror authoritative.  The pool is a separate
 +        // device allocation in the ordinary device buffer.
++        ggml_backend_dev_t dev_layer = model.dev_layer(il);
++
 +        ggml_context * ctx_kv = ctx;
 +        if (kv_pool_page != 0) {
-+            ggml_backend_buffer_type_t buft_mirror = llama_kv_pool_mirror_buft(model.dev_layer(il));
++            ggml_backend_buffer_type_t buft_mirror = llama_kv_pool_mirror_buft(dev_layer);
 +            ctx_kv = buft_mirror != nullptr ? ctx_for_buft(buft_mirror) : nullptr;
 +            if (!ctx_kv) {
 +                throw std::runtime_error("failed to create ggml context for the KV pool mirror");
++            }
++            // the eligibility check above walked the same layer set, so this only re-states it (and keeps
++            // `memory_breakdown()`'s host bucket honest if the two ever disagree)
++            if (std::find(pool_mirror_bufts.begin(), pool_mirror_bufts.end(), buft_mirror) == pool_mirror_bufts.end()) {
++                pool_mirror_bufts.push_back(buft_mirror);
 +            }
 +        }
 +
@@ -5785,7 +5819,7 @@ index b3f3a9c87..81ccf1e4d 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -265,13 +863,38 @@ llama_kv_cache::llama_kv_cache(
+@@ -265,13 +892,50 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -5816,17 +5850,29 @@ index b3f3a9c87..81ccf1e4d 100644
 +            ggml_format_name(pl.tbl,    "kvpool_%stbl_l%d", name_tag, il);
 +            ggml_format_name(pl.inv,    "kvpool_%sinv_l%d", name_tag, il);
 +            ggml_format_name(pl.use,    "kvpool_%suse_l%d", name_tag, il);
-+            if (pool_ctr == nullptr) {
-+                // 12 counters, then the miss list (one entry per claimed block + one per written page)
-+                pool_ctr = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 12 + (int64_t) kv_pool_n_pages + 256);
-+                ggml_format_name(pool_ctr, "kvpool_%sctr", name_tag);
++            // one counter block per DEVICE, in that device's own context: 12 counters, then the miss list
++            // (one entry per claimed block + one per written page)
++            {
++                ggml_tensor * ctr_d = nullptr;
++                for (const auto & pc : pool_ctrs) {
++                    if (pc.first == dev_layer) {
++                        ctr_d = pc.second;
++                        break;
++                    }
++                }
++                if (ctr_d == nullptr) {
++                    ctr_d = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 12 + (int64_t) kv_pool_n_pages + 256);
++                    ggml_format_name(ctr_d, "kvpool_%sctr_%s", name_tag, ggml_backend_dev_name(dev_layer));
++                    pool_ctrs.emplace_back(dev_layer, ctr_d);
++                }
++                pl.ctr = ctr_d;
 +            }
 +        }
 +        pool_layers.push_back(pl);
      }
  
      if (reuse) {
-@@ -319,6 +942,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -319,6 +983,29 @@ llama_kv_cache::llama_kv_cache(
          ctxs_bufs.emplace_back(std::move(ctx), buf);
      }
  
@@ -5844,8 +5890,8 @@ index b3f3a9c87..81ccf1e4d 100644
 +            ggml_backend_tensor_memset(pl.use, 0xFF, 0, ggml_nbytes(pl.use));
 +            pool_bytes += ggml_nbytes(pl.pool_k) + ggml_nbytes(pl.pool_v);
 +        }
-+        if (pool_ctr != nullptr) {
-+            ggml_backend_tensor_memset(pool_ctr, 0, 0, ggml_nbytes(pool_ctr));
++        for (const auto & pc : pool_ctrs) {
++            ggml_backend_tensor_memset(pc.second, 0, 0, ggml_nbytes(pc.second));
 +        }
 +        mirror_bytes = size_k_bytes() + size_v_bytes();
 +        LLAMA_LOG_INFO("%s: attendance pool: %.2f MiB of device pool, %.2f MiB of pinned host mirror, "
@@ -5856,7 +5902,7 @@ index b3f3a9c87..81ccf1e4d 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -425,6 +1071,9 @@ void llama_kv_cache::clear(bool data) {
+@@ -425,6 +1112,9 @@ void llama_kv_cache::clear(bool data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
@@ -5866,7 +5912,7 @@ index b3f3a9c87..81ccf1e4d 100644
      }
  }
  
-@@ -743,6 +1392,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -743,6 +1433,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -5877,7 +5923,7 @@ index b3f3a9c87..81ccf1e4d 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -798,6 +1451,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -798,6 +1492,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -5916,7 +5962,7 @@ index b3f3a9c87..81ccf1e4d 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1023,9 +1708,32 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1023,9 +1749,33 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      for (const auto & [ctx, buf] : ctxs_bufs) {
          ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
  
@@ -5925,7 +5971,8 @@ index b3f3a9c87..81ccf1e4d 100644
 +        // Charge the mirror to the host bucket, the same treatment the windowed KV's spill gets above, so
 +        // `--fit` sizes a context around the pool instead of reserving the mirror (1.6-2.4 GiB at 103k-180k)
 +        // as if it were device memory; that reservation was giving back the very arena the pool frees.
-+        const bool is_pool_mirror = kv_pool_page != 0 && buft == kv_pool_mirror;
++        const bool is_pool_mirror = kv_pool_page != 0 &&
++                std::find(pool_mirror_bufts.begin(), pool_mirror_bufts.end(), buft) != pool_mirror_bufts.end();
 +
          if (hparams.no_alloc) {
              GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
@@ -5950,7 +5997,7 @@ index b3f3a9c87..81ccf1e4d 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1035,6 +1743,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1035,6 +1785,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -5968,8 +6015,10 @@ index b3f3a9c87..81ccf1e4d 100644
 +            }
 +        }
 +    }
-+    if (pool_ctr != nullptr) {
-+        vram += ggml_nbytes(pool_ctr);
++    for (const auto & pc : pool_ctrs) {
++        if (pc.second != nullptr) {
++            vram += ggml_nbytes(pc.second);
++        }
 +    }
 +    // the cell-indexed tensors ARE the mirror in this mode: the authoritative copy of the whole context
 +    for (const auto & l : layers) {
@@ -5985,7 +6034,7 @@ index b3f3a9c87..81ccf1e4d 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1551,6 +2287,151 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1551,6 +2331,164 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -6010,7 +6059,8 @@ index b3f3a9c87..81ccf1e4d 100644
 +    // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
 +    // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
 +    // counters back synchronises the device).
-+    if (kv_pool_page == 0 || pool_ctr == nullptr || pool_ctr->data == nullptr) {
++    if (kv_pool_page == 0 || pool_ctrs.empty() || pool_ctrs.front().second == nullptr ||
++            pool_ctrs.front().second->data == nullptr) {
 +        return;
 +    }
 +    // the path, not a flag: a line on stderr sits between the generated text and llama-cli's perf line, and
@@ -6023,13 +6073,25 @@ index b3f3a9c87..81ccf1e4d 100644
 +    if (f == nullptr) {
 +        return;
 +    }
-+    int32_t c[12] = {};
-+    ggml_backend_tensor_get(pool_ctr, c, 0, sizeof(c));
++    // one counter block per device: every field is additive across them (the epoch/cursor/miss list are
++    // per-device state, so summing reports the same physical events the single block used to count)
++    int64_t c[12] = {};
++    for (const auto & pc : pool_ctrs) {
++        if (pc.second == nullptr || pc.second->data == nullptr) {
++            continue;
++        }
++        int32_t cd[12] = {};
++        ggml_backend_tensor_get(pc.second, cd, 0, sizeof(cd));
++        for (int i = 0; i < 12; ++i) {
++            c[i] += cd[i];
++        }
++    }
 +    const double ids = (double) c[3];
-+    fprintf(f, "%s: KV pool: %u pages x %u cells/layer, %u layers, claims %d, misses %d, ids %d, "
++    fprintf(f, "%s: KV pool: %u pages x %u cells/layer, %u layers, %u counter blocks, claims %d, misses %d, ids %d, "
 +            "hits %d (%.2f %%), dirty re-fills %d, resolves %d, bad %d\n",
-+            __func__, kv_pool_n_pages, kv_pool_page, (uint32_t) layers.size(),
-+            c[0], c[2], c[3], c[4], ids > 0 ? 100.0*(double) c[4]/ids : 0.0, c[5], c[6], c[7]);
++            __func__, kv_pool_n_pages, kv_pool_page, (uint32_t) layers.size(), (uint32_t) pool_ctrs.size(),
++            (int) c[0], (int) c[2], (int) c[3], (int) c[4], ids > 0 ? 100.0*(double) c[4]/ids : 0.0,
++            (int) c[5], (int) c[6], (int) c[7]);
 +    fclose(f);
 +}
 +
@@ -6105,7 +6167,7 @@ index b3f3a9c87..81ccf1e4d 100644
 +
 +    const kv_pool_layer & pl = pool_layers[ikv];
 +
-+    ggml_tensor * res = ggml_kv_pool(ctx, ids, pl.tbl, pl.inv, pool_ctr,
++    ggml_tensor * res = ggml_kv_pool(ctx, ids, pl.tbl, pl.inv, pl.ctr,
 +            /* mirror_k */ layers[ikv].k, /* mirror_v */ layers[ikv].v,
 +            pl.pool_k, pl.pool_v, wids, pl.use);
 +
@@ -6137,7 +6199,7 @@ index b3f3a9c87..81ccf1e4d 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1612,6 +2493,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1612,6 +2550,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -6171,7 +6233,7 @@ index b3f3a9c87..81ccf1e4d 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -1890,6 +2798,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1890,6 +2855,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -6181,7 +6243,7 @@ index b3f3a9c87..81ccf1e4d 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3314,6 +4225,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3314,6 +4282,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -6191,7 +6253,7 @@ index b3f3a9c87..81ccf1e4d 100644
      return true;
  }
  
-@@ -3487,6 +4401,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3487,6 +4458,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  
@@ -6204,7 +6266,7 @@ index b3f3a9c87..81ccf1e4d 100644
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 6bf874cb5..39e27f6b1 100644
+index 6bf874cb5..74c0b18d5 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -118,9 +118,13 @@ public:
@@ -6282,7 +6344,7 @@ index 6bf874cb5..39e27f6b1 100644
      bool get_has_shift() const;
  
      ggml_type type_k() const;
-@@ -335,6 +377,40 @@ private:
+@@ -335,6 +377,45 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
  
@@ -6304,16 +6366,21 @@ index 6bf874cb5..39e27f6b1 100644
 +        ggml_tensor * tbl    = nullptr;   // I32 [n_blocks]  block -> slot | -1
 +        ggml_tensor * inv    = nullptr;   // I32 [n_pages]   slot -> block | -1
 +        ggml_tensor * use    = nullptr;   // I32 [n_pages]   the epoch that last marked the slot in use
++        ggml_tensor * ctr    = nullptr;   // I32 [12 + n_pages + 256] this layer's DEVICE counter block
 +    };
 +    std::vector<kv_pool_layer> pool_layers;
-+    ggml_tensor * pool_ctr = nullptr;      // I32 [8] device counters (claim cursor, miss list, ...)
++    // ONE counter block per DEVICE (claim cursor, epoch, miss list, ...): a resolve node runs on the device
++    // its layer is on, so its sources must all be there -- a single block for the whole cache would put every
++    // other device's node in a cross-device graph that no backend claims (r213).
++    std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> pool_ctrs;
 +    uint32_t kv_pool_page       = 0;       // page size in cells (0 = pool off)
 +    uint32_t kv_pool_n_pages    = 0;
 +    uint32_t kv_pool_n_blocks   = 0;
 +    uint32_t kv_pool_blocks_row = 0;       // blocks one selection can span
-+    // the pinned host MIRROR's buffer type: `memory_breakdown()` charges its bytes to the host bucket (only
-+    // the compact device pool above is VRAM), which is what `--fit` needs to size a context around the pool
-+    ggml_backend_buffer_type_t kv_pool_mirror = nullptr;
++    // the pinned host MIRROR's buffer types, ONE PER DEVICE the cache's layers are on: `memory_breakdown()`
++    // charges their bytes to the host bucket (only the compact device pool above is VRAM), which is what
++    // `--fit` needs to size a context around the pool
++    std::vector<ggml_backend_buffer_type_t> pool_mirror_bufts;
 +
 +    // drop every residency claim (the pages stay valid copies, they just stop being authoritative for
 +    // their block).  Needed by any path that rewrites cells in place WITHOUT going through the writers:
@@ -6323,7 +6390,7 @@ index 6bf874cb5..39e27f6b1 100644
      // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
-@@ -453,6 +529,20 @@ public:
+@@ -453,6 +534,20 @@ public:
  
      uint32_t get_n_kv() const;
  

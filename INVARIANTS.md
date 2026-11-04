@@ -1690,3 +1690,29 @@ cost a session to learn; do not re-derive them.
 4. **A mapping-backed pool's master is the read-only model mapping, so `--load-mode dio`/`none` cannot have a pool** — the plan
    reports "NOT APPLIED: a pool needs a mapped load" and the whole-tensor pinned master is used instead.  Do not read that as the
    pool being disabled by a bug.
+
+## r213 -- the attendance pool on a multi-device `-sm layer` split (per-device buffer types and counters)
+
+1. **A per-device buffer type's NAME must be device-unique.**  `llama_kv_cache` keys its `buft -> ggml_context` map by
+   `strcmp` on `ggml_backend_buft_name()` (deliberately, so the order is well defined), so two bufts that answer the same
+   string are ONE entry and every tensor created for the second device lands in the first device's context and buffer.
+   The pool's mirror buft returned a constant `ROCm_KV_Pool_Mirror` and did exactly that; the windowed KV's region buft
+   reuses the plain CUDA getter (`ROCm<N>`) for this reason.  Any new per-device buft in this tree: make the name carry
+   the device (and check `allocation` of a >1-device cache), or the collapse is silent until something reads the wrong
+   device's memory.
+2. **One counter block per DEVICE, never one per cache.**  A resolve node runs on its layer's device, so everything it
+   reads/writes must be there: `kvpool_ctr` (epoch, claim cursor, miss list) was created once in the first pool layer's
+   context, which put device-0 memory in every other device's `GGML_OP_KV_POOL` node.  `ggml_backend_cuda_device_supports_op`
+   refuses an op whose CUDA-buffer source is on another device and the CPU backend has no `KV_POOL`, so *no* backend
+   claims the node and the scheduler aborts at load -- `GGML_ASSERT(*cur_backend_id != -1)` in `ggml_backend_sched_split_graph`,
+   inside the `--fit` probe's graph.  A cross-device src is a load-time assert, not a wrong answer.
+3. **A per-device placement is invisible unless the report says so.**  The pool stats line now prints the number of
+   counter blocks it summed; a 2-device arm reporting 1 means the blocks (or the bufts) collapsed, which is the defect
+   above surfacing in a number instead of an abort.  `gate-kv-residency.sh` asserts it, and the enable line reports the
+   device span.
+4. **The pool is not the cause of every 2-device large-context fault.**  On the reported arm (`-c 204800`, 2 devices,
+   `-ncmoe 48`, mmap) prefill faults `rms_norm_f32` on GPU 1 (`HSA_STATUS_ERROR_MEMORY_FAULT` + `gfxhub page fault`)
+   right after `moe_cache_evict_slab_range` discards 5.4-5.8 GiB of arena tables, and it **reproduces with
+   `LLAMA_KV_REGION_POOL=0`**; `-c 131072` (2 devices) and `-c 204800` (1 device) are clean.  Before blaming block 15 for a
+   multi-device fault, run the same arm with the pool off (`TODO` #143).
+

@@ -31,6 +31,18 @@
 #                   the smallest pool the backend will build, against a 6 441-page working set -- the forced
 #                   misses, and `LLAMA_KV_POOL_VERIFY=1` on this arm (the churn arm is where a wrong-page
 #                   resolve would show)
+#   Pool, MULTI-DEVICE (`-sm layer`, the same model/prompt/knobs on `MULTI_DEVICES`, default `0,1`): the pool
+#   is per layer AND per device (one mirror buffer type, device pool, page table and counter block per
+#   device), so a multi-device arm is a distinct placement, not a rerun: r213 shipped a fix for exactly the
+#   "no backend claims the resolve node" abort on a 2-device `-sm layer` arm, and nothing else in the gate
+#   reaches it.  Text is judged WITHIN the device count (`INVARIANTS.md`: greedy text is a per-device-count
+#   reference), so the reference is the 2-device no-pool sparse arm, not `pref`:
+#     pmref         no pool, 2 devices, the sparse decode arm -- the 2-device reference
+#     pmres         2 devices, `LLAMA_KV_REGION_POOL=$POOL_RES`
+#     pmfloor       2 devices, `LLAMA_KV_REGION_POOL=$POOL_FLOOR` (+ `LLAMA_KV_POOL_VERIFY=1`)
+#   Plus the two witnesses only a multi-device arm can give: the enable line must report the layer span, and
+#   the teardown counters must report ONE counter block PER DEVICE (a single-device report on a 2-device arm
+#   means the blocks are not really per device -- the r213 defect).
 #
 #   The counters also move a little RUN TO RUN (the claim cursor is an atomicAdd, so which slots the
 #   launches of one step hand out is not fixed): the same two arms read 144.3/218.4 claims per resolve in one
@@ -53,7 +65,7 @@
 #   (`context` MiB in this log), which the gate prints for the arm it matters on.
 #
 # Usage:
-#   ./scripts/gate-kv-residency.sh [--keep] [--window-only|--pool-only]
+#   ./scripts/gate-kv-residency.sh [--keep] [--window-only|--pool-only|--multi-only]
 #
 # Environment:
 #   LLAMA_CLI    binary (default: ~/llama.cpp/build-rocm/bin/llama-cli)
@@ -65,6 +77,9 @@
 #   NGEN         generated tokens per arm (default 64; the counter arms need enough steps to separate)
 #   CTX_WIN / CTX_POOL / POOL_RES / POOL_FLOOR   the arm's `-c` and pool sizes (defaults 16384 / 32768 /
 #                32768 / 512 -- POOL_FLOOR is meant to be floored, see the arm table)
+#   MULTI_DEVICES  the devices the multi-device pool arms use (default `0,1`; needs two real GPUs and the
+#                `-sm layer` split, which is the default -- a tensor split declines the pool by design and
+#                would make those arms vacuous).  `MULTI_DEVICES=0` disables the section (1 GPU box).
 #   KEEPOUT      log dir (default: mktemp -d)
 #   REUSE        1 = do not run anything; RE-GRADE the logs already in KEEPOUT (the pool arms cost ~5 min, so
 #                a threshold or message change should not need a re-run).  The arms must all be present.
@@ -86,17 +101,20 @@ CTX_WIN="${CTX_WIN:-16384}"
 CTX_POOL="${CTX_POOL:-32768}"
 POOL_RES="${POOL_RES:-32768}"
 POOL_FLOOR="${POOL_FLOOR:-512}"
+MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 REUSE="${REUSE:-0}"
 KEEP=0
 DO_WINDOW=1
 DO_POOL=1
+DO_MULTI=1
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
-        --window-only) DO_POOL=0 ;;
+        --window-only) DO_POOL=0; DO_MULTI=0 ;;
         --pool-only) DO_WINDOW=0 ;;
-        -h|--help) sed -n '2,86p' "$0"; exit 0 ;;
+        --multi-only) DO_WINDOW=0; DO_POOL=0 ;;
+        -h|--help) sed -n '2,89p' "$0"; exit 0 ;;
         *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -105,7 +123,7 @@ mkdir -p "$KEEPOUT"
 [ -x "$LLAMA_CLI" ]      || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL_WIN" ]      || { echo "error: no model at $MODEL_WIN" >&2; exit 2; }
 [ -f "$PROMPT_WIN" ]     || { echo "error: no prompt at $PROMPT_WIN" >&2; exit 2; }
-if [ "$DO_POOL" = 1 ]; then
+if [ "$DO_POOL" = 1 ] || [ "$DO_MULTI" = 1 ]; then
     [ -f "$MODEL_POOL" ]  || { echo "error: no model at $MODEL_POOL" >&2; exit 2; }
     [ -f "$DRAFT_POOL" ]  || { echo "error: no draft at $DRAFT_POOL" >&2; exit 2; }
     [ -f "$PROMPT_POOL" ] || { echo "error: no prompt at $PROMPT_POOL" >&2; exit 2; }
@@ -136,7 +154,7 @@ run_arm() {
         [ -s "$err" ] || { fail "$arm: no log to re-grade at $err"; return 1; }
         return 0
     fi
-    if ! HIP_VISIBLE_DEVICES=0 ROCBLAS_USE_HIPBLASLT=0 "${launcher[@]}" timeout 2400 "$LLAMA_CLI" \
+    if ! HIP_VISIBLE_DEVICES="${RUN_DEVS:-0}" ROCBLAS_USE_HIPBLASLT=0 "${launcher[@]}" timeout 2400 "$LLAMA_CLI" \
             -m "$model" -ngl 99 -fit off -f "$prompt" -n "$NGEN" \
             --seed 42 --temp 0 --no-display-prompt --single-turn -v "$@" \
             >"$out" 2>"$err"; then
@@ -170,6 +188,11 @@ pool_pages() {
 pool_hit() {
     sed -nE 's/.*hits [0-9]+ \(([0-9.]+) %\).*/\1/p' "$KEEPOUT/$1.stats" 2>/dev/null | tail -1
 }
+# one counter block PER DEVICE: a 2-device arm that reports 1 is the r213 defect (the blocks are shared, and
+# the resolve node then has a source on the other device)
+pool_blocks() {
+    sed -nE 's/.*([0-9]+) counter blocks.*/\1/p' "$KEEPOUT/$1.stats" 2>/dev/null | tail -1
+}
 # claims per resolve, one decimal (integer-safe: never compared as a float by the shell)
 claims_per_resolve() {
     local c r
@@ -188,6 +211,7 @@ echo "==> gate: KV residency (block 15: the window and the attendance pool; wip/
 info "llama-cli    : $LLAMA_CLI"
 info "window arm   : $MODEL_WIN, -c $CTX_WIN"
 [ "$DO_POOL" = 1 ] && info "pool arm     : $MODEL_POOL (+ $(basename "$DRAFT_POOL")), -c $CTX_POOL"
+[ "$DO_MULTI" = 1 ] && info "multi arm    : the same pool arms on HIP_VISIBLE_DEVICES=$MULTI_DEVICES (-sm layer), when that names 2+ devices"
 info "logs         : $KEEPOUT"
 
 # ===== the window ========================================================================================
@@ -231,16 +255,19 @@ if [ "$DO_WINDOW" = 1 ]; then
 fi
 
 # ===== the pool ==========================================================================================
+# Both pool sections (one device, and the multi-device split) run these same arms; only the device set differs.
+pool_arm() {   # pool_arm <arm> [VAR=VAL ...]
+    local arm=$1
+    shift
+    run_arm "$arm" "$MODEL_POOL" "$PROMPT_POOL" \
+        LLAMA_KV_POOL_STATS="$KEEPOUT/$arm.stats" "$@" -- \
+        -md "$DRAFT_POOL" -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off \
+        -c "$CTX_POOL" -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 4
+}
+
+# ===== the pool (one device) =============================================================================
 if [ "$DO_POOL" = 1 ]; then
     echo "-- pool arms (Flash-Next + MTP, -c $CTX_POOL q8_0 KV, -ncmoe 48, a 25 763-token prefix)"
-    pool_arm() {   # pool_arm <arm> [VAR=VAL ...]
-        local arm=$1
-        shift
-        run_arm "$arm" "$MODEL_POOL" "$PROMPT_POOL" \
-            LLAMA_KV_POOL_STATS="$KEEPOUT/$arm.stats" "$@" -- \
-            -md "$DRAFT_POOL" -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off \
-            -c "$CTX_POOL" -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 4
-    }
     pool_arm pref   LLAMA_QSA_DENSE_DECODE_UNTIL=0                        || exit 1
     pool_arm pres   LLAMA_KV_REGION_POOL="$POOL_RES"                      || exit 1
     pool_arm pfloor LLAMA_KV_REGION_POOL="$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1 || exit 1
@@ -306,6 +333,70 @@ resident pool"
     awk -v a="$H_FLR" -v b="$H_RES" 'BEGIN { exit !(a+0 < b+0) }' \
         && pass "pfloor's hit rate is lower ($H_FLR % vs $H_RES %)" \
         || fail "the two pool arms report the same hit rate ($H_FLR % vs $H_RES %)"
+
+fi
+
+# ===== the pool across a multi-device `-sm layer` split (r213) ===========================================
+# One mirror buffer type, device pool, page table and counter block PER DEVICE.  The defect this section
+# exists for was not a wrong number but an abort: a resolve node whose sources spanned two devices was
+# claimed by no backend at all.  Text is judged within the device count (the reference is `pmref`, the
+# 2-device sparse arm, never `pref`).
+if [ "$DO_MULTI" = 1 ]; then
+    NDEVS=$(awk -F, '{ print NF }' <<< "$MULTI_DEVICES")
+    if [ "$NDEVS" -lt 2 ]; then
+        info "multi-device pool arms SKIPPED (MULTI_DEVICES='$MULTI_DEVICES' names fewer than 2 devices)"
+    else
+        echo "-- multi-device pool arms ($NDEVS devices '$MULTI_DEVICES', -sm layer, same model/prompt/knobs)"
+        # the same arms, on the multi-device set: `RUN_DEVS` is read by run_arm, and a prefixed assignment
+        # on a shell function is visible inside that call only
+        pool_arm_md() {   # pool_arm_md <arm> [VAR=VAL ...]
+            local arm=$1
+            shift
+            RUN_DEVS="$MULTI_DEVICES" pool_arm "$arm" "$@"
+        }
+        pool_arm_md pmref   LLAMA_QSA_DENSE_DECODE_UNTIL=0                        || exit 1
+        pool_arm_md pmres   LLAMA_KV_REGION_POOL="$POOL_RES"                      || exit 1
+        pool_arm_md pmfloor LLAMA_KV_REGION_POOL="$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1 || exit 1
+
+        HPMREF=$(hash_of pmref); HPMRES=$(hash_of pmres); HPMFLR=$(hash_of pmfloor)
+        info "pmref text: $HPMREF    pmres: $HPMRES    pmfloor: $HPMFLR"
+        [ -n "$HPMREF" ] && [ "$HPMREF" = "$HPMRES" ] \
+            && pass "pmres == pmref (a per-device pool is byte-identical to the 2-device sparse arm)" \
+            || fail "pmres != pmref: '$HPMRES' vs '$HPMREF'"
+        [ -n "$HPMREF" ] && [ "$HPMREF" = "$HPMFLR" ] \
+            && pass "pmfloor == pmref (forced misses across a device split change no token)" \
+            || fail "pmfloor != pmref: '$HPMFLR' vs '$HPMREF'"
+
+        for a in pmres pmfloor; do
+            [ "$(count $a 'ATTENDANCE POOL ENABLED')" = 1 ] && pass "$a placed the attendance pool (once)" \
+                || fail "$a 'ATTENDANCE POOL ENABLED' count = $(count $a 'ATTENDANCE POOL ENABLED') (want 1)"
+            [ "$(count $a "devices: each keeps its own mirror")" = 1 ] \
+                && pass "$a reports one mirror/pool/counter block per device (the placement is really split)" \
+                || fail "$a did not report a per-device placement (one device only? see the enable line)"
+            NBLK=$(pool_blocks $a); MRES=$(pool_field $a resolves)
+            [ "$NBLK" = "$NDEVS" ] \
+                && pass "$a summed $NDEVS device counter blocks ($MRES resolves, $(pool_field $a claims) claims)" \
+                || fail "$a reports '$NBLK' counter block(s), want $NDEVS -- the counters are not per device, which is the r213 defect"
+            [ "$(pool_field $a bad)" = 0 ] && pass "$a: bad 0 (no out-of-range id, no verify mismatch)" \
+                || fail "$a: bad = '$(pool_field $a bad)' (want 0)"
+            [ "${MRES:-0}" -gt 0 ] 2>/dev/null \
+                && pass "$a ran $MRES pool resolves" \
+                || fail "$a ran no pool resolve at all"
+        done
+        # the residency numbers must move here too, or the two multi arms are the same placement
+        M_RES=$(claims_per_resolve pmres); M_FLR=$(claims_per_resolve pmfloor)
+        [ "$(claims_x100 pmfloor)" -gt "$(claims_x100 pmres)" ] 2>/dev/null \
+            && pass "pmfloor claims more per resolve ($M_FLR vs $M_RES)" \
+            || fail "the two multi-device arms claim the same per resolve ($M_FLR vs $M_RES)"
+        MH_RES=$(pool_hit pmres); MH_FLR=$(pool_hit pmfloor)
+        awk -v a="$MH_FLR" -v b="$MH_RES" 'BEGIN { exit !(a+0 < b+0) }' \
+            && pass "pmfloor's hit rate is lower ($MH_FLR % vs $MH_RES %)" \
+            || fail "the two multi-device arms report the same hit rate ($MH_FLR % vs $MH_RES %)"
+        PAGES_MRES=$(pool_pages pmres); PAGES_MFLR=$(pool_pages pmfloor)
+        [ "${PAGES_MRES:-0}" -gt "${PAGES_MFLR:-0}" ] 2>/dev/null \
+            && pass "pmres holds the whole cache ($PAGES_MRES pages) and pmfloor does not ($PAGES_MFLR)" \
+            || fail "the two multi-device arms hold the same number of pages ($PAGES_MRES vs $PAGES_MFLR)"
+    fi
 fi
 
 # ===== the KV accounting (from the logs, never from the knobs) ===========================================
@@ -322,7 +413,8 @@ if [ "$DO_WINDOW" = 1 ]; then
     done
 fi
 if [ "$DO_POOL" = 1 ]; then
-    for a in pref pres pfloor; do
+    for a in pref pres pfloor pmref pmres pmfloor; do
+        [ -s "$KEEPOUT/$a.err" ] || continue
         line=$(grep -m1 -E 'llama_kv_cache: size = ' "$KEEPOUT/$a.err" | sed -E 's/^.*size = +//')
         pool=$(grep -m1 -oE 'attendance pool: [0-9.]+ MiB of device pool, [0-9.]+ MiB of pinned host mirror, [0-9]+ pages of [0-9]+ cells' \
             "$KEEPOUT/$a.err")
