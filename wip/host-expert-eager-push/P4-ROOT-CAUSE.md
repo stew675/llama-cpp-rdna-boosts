@@ -798,6 +798,42 @@ tensor per device):
 about 3.5x throughput and 2x the bytes.  That deserves a one-line WARN at sizing, next to the loud-fallback
 requirement.
 
+## 5h. The 3-GPU weakness is MODEL-SPECIFIC (proven on a second model), not a mechanism failure
+
+The maintainer's question: does a larger model that fits 2 *and* 3 GPUs behave differently?  Measured on
+**Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (arch `qwen4exp`, 48 layers, 512 experts / 10 used, n_embd 2560,
+n_head 24, 70.6 GiB on disk of which **~21 GiB is PLE weights that stay on the HOST** -- which is why it fits
+two 32 GiB cards at all).  Every arm ran with **`--lazy-mode off`** (added as a harness knob) so lazy PLE
+loading does not confound the numbers.
+
+| Flash-Next IQ3_XXS | 2 GPUs (0,2) | 3 GPUs (0,1,2) |
+|---|---|---|
+| experts in VRAM, prefill | 1 191.5 | 1 195.5 |
+| experts in VRAM, decode | 84.4 | 86.9 |
+| **all 48 expert layers pinned on host**, prefill | **297.6** | 196.7 |
+| **all 48 expert layers pinned on host**, decode | 47.9 | 45.9 |
+
+**And the split geometry is HEALTHY at 3 devices** -- unlike 35B-A3B, there is no mirrored table:
+
+```
+Flash-Next IQ3_XXS, layer 0, 3 devices (host_bytes = 473 600 for gate/up, 921 600 for down):
+  dev=0  eb=94720  (1 granularity unit)   dev=1  eb=189440  (2 units)   dev=2  eb=189440  (2 units)
+  dev=0  eb=184320 (1 unit)              dev=1  eb=368640  (2 units)   dev=2  eb=368640  (2 units)
+```
+i.e. the expert tensors carry **five** block-aligned units (against 35B-A3B's **two**), so a 3-way partition
+exists -- it is just uneven (a 1/2/2 -> 20/40/40 compute split), and `eb != hb` on every device, so nothing is
+mirrored.
+
+So the 35B-A3B 3-GPU collapse is a **model-specific defect of the split fallback** (a two-unit axis cannot be
+divided three ways, and the zero-extent device is given a mirrored whole copy instead of being skipped), not a
+property of `-sm tensor`, the host-expert path, or any transport.  That is exactly the maintainer's framing:
+**document 35B-A3B as the model that does not scale to 3 tensor-split devices, and fix the fallback so it uses
+fewer devices instead of mirroring.**
+
+The 2-vs-3 comparison here is still not a clean scaling claim: the 3-device set contains the **x4** card
+(device 1) while the 2-device set is both x8, and the 1/2/2 partition is unbalanced.  What the measurement does
+establish is that the *split is well-formed* for this model and *malformed* for 35B-A3B.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45

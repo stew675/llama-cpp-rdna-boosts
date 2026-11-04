@@ -20,6 +20,7 @@ SM=${SM:-tensor}   # tensor = the Meta backend; layer = one device per layer (no
 N=${N:-300}
 CTX=${CTX:-8192}
 NCMOE=${NCMOE:-40}
+LAZY=${LAZY:-}       # e.g. LAZY=off -> --lazy-mode off (prevents lazy PLE weight loading confounding a run)
 CACHE_MIB=${CACHE_MIB:-2048}
 POOL_FRAC=${POOL_FRAC:-50}
 HOSTMODE=${HOSTMODE:-pool}   # --host-experts <mode>: pool | pinned.  MUST be set on the SCRIPT invocation line (HOSTMODE=pinned ./p3-matrix.sh ...), not after the tag -- an env assignment in "$@" reaches `env` but NOT this shell variable, which silently made every earlier "pinned" run a pool run.
@@ -37,6 +38,8 @@ PROMPT_ARGS=(-p "The capital of France is")
 [ -n "$PROMPT_FILE" ] && PROMPT_ARGS=(-f "$PROMPT_FILE")
 LV_ARGS=()
 [ "$LV" -gt 0 ] && LV_ARGS=(-lv "$LV")
+LAZY_ARGS=()
+[ -n "$LAZY" ] && LAZY_ARGS=(--lazy-mode "$LAZY")
 # EOS=1 keeps generating past EOS (--ignore-eos): a 150-token greedy answer that stops at EOS makes a poor
 # throughput sample (it averages in the cold first tokens) and a weak corruption test (fewer fills).
 EOS_ARGS=()
@@ -52,7 +55,7 @@ env HIP_VISIBLE_DEVICES="$GPU" LD_LIBRARY_PATH="$ROCM/lib${LD_LIBRARY_PATH:+:$LD
     "$BIN/llama-cli" -m "$MODEL" -ngl 99 -sm "$SM" -mg 0 \
         -ncmoe "$NCMOE" --host-experts "$HOSTMODE" -c "$CTX" -n "$N" \
         "${PROMPT_ARGS[@]}" --seed 42 --temp 0 \
-        --no-display-prompt --single-turn "${EOS_ARGS[@]}" "${LV_ARGS[@]}" >"$LOG" 2>&1
+        --no-display-prompt --single-turn "${EOS_ARGS[@]}" "${LV_ARGS[@]}" "${LAZY_ARGS[@]}" >"$LOG" 2>&1
 rc=$?
 echo "=== $TAG  (rc=$rc, gpus=$GPU, sm=$SM, n=$N, bin=$BIN)"
 echo "    env: $*  (host-experts=$HOSTMODE)"
