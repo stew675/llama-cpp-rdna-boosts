@@ -123,6 +123,16 @@ measure the same tiny pool (444 pp / 50 tg, `decline_all=30720`).  Use `-lme 64`
 **Campaign**: `wip/host-expert-eager-push/` is **promoted and archived** to
 `archive/work/host-expert-eager-push/` (P5/P6 + this session's matrix and logs); `wip/CAMPAIGNS.md` updated.
 
+**Release mechanics**: delivery `main` -> `a1f78c85` (+ a follow-up commit renaming six archived run-log paths that
+contained `:`, which `scripts/check-windows-paths.sh` rejects and which failed the `Validate delivery set` job on
+every push since r210's log commit -- `archive/work/host-expert-eager-push/runs/`, renamed, content unchanged),
+tag **`v16-6050b467c-r211`** (the GitHub Release job attached the assets), and the personal fork's `rdna-boosts`
+force-pushed from `27271aa91` to **`3e9b35c50`** (tree `e2089b13`) by `scripts/fork-refresh.sh --build --gates
+--push`, which re-checked the coherence + prefill-logit gates on the branch (`mean KLD 0.000000 / 100.000 %`).
+The ROCm images are built off-host by the `radiance` watcher; it had **stopped logging at 07:50** (no process, no
+cron output since) and had to be started by hand before it saw the tag -- it is now running
+`build-containers.sh --rocm "7.14.1 10.1" --push --prune --force` for r211.  Nothing was built on the primary box.
+
 ## 261104.001 (r210) -- block 09 amended: the host-expert tier becomes ONE pinned per-expert pool that mirrors the arena when the budget allows
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED -- no new block), release
