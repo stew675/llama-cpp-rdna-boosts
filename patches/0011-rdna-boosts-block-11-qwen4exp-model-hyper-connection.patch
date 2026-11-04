@@ -1,4 +1,4 @@
-From 9fded63342c2e26df1fefb463d5afc21f139ba60 Mon Sep 17 00:00:00 2001
+From 94cdcaa3e2fb7900c9fe25c003c5b0c50ff0c80c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -101,7 +101,7 @@ nothing.
  src/llama-memory-hybrid-idx.cpp          |  791 +++++++-
  src/llama-memory-hybrid-idx.h            |  100 +
  src/llama-memory-recurrent.cpp           |   13 +-
- src/llama-model-loader.cpp               |   68 +-
+ src/llama-model-loader.cpp               |   76 +-
  src/llama-model-loader.h                 |   13 +
  src/llama-model.cpp                      |   46 +-
  src/llama-model.h                        |    1 +
@@ -112,7 +112,7 @@ nothing.
  tests/test-backend-ops.cpp               |  467 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   12 +-
- 46 files changed, 12088 insertions(+), 422 deletions(-)
+ 46 files changed, 12077 insertions(+), 441 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -2878,7 +2878,7 @@ index 3f4a80512..5887851d6 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 315e22baf..3a8cc275c 100644
+index 1bd0de281..8bffa48f1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -27,6 +27,9 @@
@@ -10076,7 +10076,7 @@ index 97e4e8a81..a5f4f99ad 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 50a9f3050..ea7cbaf38 100644
+index 4b867612d..086c9ed8d 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -16,17 +16,35 @@
@@ -10121,7 +10121,34 @@ index 50a9f3050..ea7cbaf38 100644
  const char * llama_file_version_name(llama_fver version) {
      switch (version) {
          case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
-@@ -1163,6 +1181,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
+@@ -540,26 +558,6 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
+ 
+ 
+-// `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+-static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
+-    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
+-        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
+-                       "by a no-XNACK GPU, issue #116); using pinned instead\n", func);
+-    }
+-    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
+-        // issue #130: route through the device API (the pool is global in ggml-cuda, so any device serves;
+-        // a backend without the callback is a no-op).
+-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+-            ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+-        }
+-        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+-                       "mapping and every GPU read is served through a bounded pinned pool "
+-                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes capped "
+-                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
+-                       func);
+-    }
+-}
+-
+ ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
+     if (dev == nullptr) {
+         return nullptr;
+@@ -1540,6 +1538,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
              __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
  }
  
@@ -10136,30 +10163,7 @@ index 50a9f3050..ea7cbaf38 100644
  // wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
  // fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
  // layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
-@@ -1178,11 +1204,21 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
- // model has no device to reserve a staging ring or expert-cache arena on, and inserting a null key
- // made `llama_context` abort in `ggml_backend_dev_memory`.
- static void moe_host_expert_account(std::map<ggml_backend_dev_t, size_t> & acc,
--        const std::string & name, size_t bytes, ggml_backend_buffer_type_t buft,
-+        const std::string & name, size_t bytes, int64_t n_experts, ggml_backend_buffer_type_t buft,
-         const buft_list_t * buft_list_layer) {
-     if (buft == nullptr || !ggml_backend_buft_is_host(buft) || name.find("exps") == std::string::npos) {
-         return;
-     }
-+    // Only a routed EXPERT BANK is accounted.  The name filter above also matches the per-expert
-+    // side tensors some arches carry -- gemma4's `ffn_down_exps.scale` is 128 x F32 = 512 B per layer,
-+    // i.e. 30 x 512 B = 15360 B of a 23.1 GiB host-expert set.  The expert cache only ever registers a
-+    // `MUL_MAT_ID` bank (`weight->ne[2] >= 2`), so such a tensor made the cache's completeness check
-+    // unsatisfiable by exactly that residue: no arena was ever sized and gemma4 paid a full per-op
-+    // expert upload with zero residency (TODO #77).  A bank has an expert axis; a scale/bias vector has
-+    // `ne[2] == 1`.
-+    if (n_experts < 2) {
-+        return;
-+    }
-     ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
-     ggml_backend_dev_t layer_dev = (buft_list_layer != nullptr && !buft_list_layer->empty())
-                                  ? buft_list_layer->front().first : buft_dev;
-@@ -1280,9 +1316,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1667,9 +1673,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -10173,7 +10177,7 @@ index 50a9f3050..ea7cbaf38 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1546,10 +1584,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1933,10 +1941,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -10187,7 +10191,7 @@ index 50a9f3050..ea7cbaf38 100644
          const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
          is_lazy = lazy.add(tn.str(), cur, w);
  
-@@ -2117,8 +2155,10 @@ bool llama_model_loader::load_all_data(
+@@ -2504,8 +2512,10 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {

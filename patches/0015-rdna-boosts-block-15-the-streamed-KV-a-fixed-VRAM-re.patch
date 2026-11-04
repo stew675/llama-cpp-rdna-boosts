@@ -1,4 +1,4 @@
-From 489c2b4bcf6f848599ebb8e65d5b17f0e5f513f3 Mon Sep 17 00:00:00 2001
+From 65d1e72ad231cb98fbb217e4d1faccf0ca8910cb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -375,29 +375,29 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
  ggml/src/ggml-cuda/fattn-qsa.cu            |   40 +-
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1221 +++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1221 ++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1408 +++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1408 ++++++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 +++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
- ggml/src/ggml-cuda/moe-expert-cache.cu     |   45 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu     |   32 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   83 +-
  src/llama-context.cpp                      |   17 +
  src/llama-context.h                        |    3 +
  src/llama-ext.h                            |   68 +
- src/llama-kv-cache.cpp                     |  931 ++++++++++++-
+ src/llama-kv-cache.cpp                     |  931 +++++++++++-
  src/llama-kv-cache.h                       |   94 +-
  src/llama-memory-hybrid-idx.cpp            |    5 +-
  src/llama-memory-hybrid-idx.h              |    4 +-
  src/llama-memory-hybrid.cpp                |   12 +-
  src/llama-memory-hybrid.h                  |    7 +-
  src/llama-memory.h                         |   15 +
- src/llama-model-loader.cpp                 |  345 ++++-
+ src/llama-model-loader.cpp                 | 1476 ++++++++++----------
  src/llama-model.cpp                        |  144 +-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   58 +-
- 33 files changed, 5655 insertions(+), 76 deletions(-)
+ 33 files changed, 6049 insertions(+), 800 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -4793,7 +4793,7 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 5731fb435..aff63e80e 100644
+index d2bbabc43..31db9fac1 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -54,10 +54,6 @@ static void heat_pull_locked();
@@ -4807,27 +4807,7 @@ index 5731fb435..aff63e80e 100644
  namespace {
  
  // wip/host-expert-tier: the loader opens the persisted prior BEFORE it places any host-expert tensor (see
-@@ -2080,19 +2076,6 @@ static void pool_rerank_from_heat_locked(table_t & t) {
-     //    is the hottest entry just placed -- measured as a pool hit rate that got WORSE than expert order.
-     std::unordered_set<int32_t> keep(want.begin(), want.begin() + n);
-     int freed = 0;
--    for (int sl = 0; sl < pool->slots; sl++) {
--        const int32_t e = pool->slot_expert[(size_t) sl];
--        if (e < 0 || pool->slot_state[(size_t) sl] != 1 || keep.count(e) != 0) {
--            continue;
--        }
--        rank.push_back(e);
--    }
--    const int n = std::min((int) want.size(), pool->slots);
--    // 1. Free every slot whose expert is NOT wanted.  Freeing is bookkeeping only (no copy), and it MUST
--    //    precede the fills: `pool_slot_locked`'s eviction picks the LRU, which while filling in rank order
--    //    is the hottest entry just placed -- measured as a pool hit rate that got WORSE than expert order.
--    std::unordered_set<int32_t> keep(want.begin(), want.begin() + n);
--    int freed = 0;
-     for (int sl = 0; sl < pool->slots; sl++) {
-         const int32_t e = pool->slot_expert[(size_t) sl];
-         if (e < 0 || pool->slot_state[(size_t) sl] != 1 || keep.count(e) != 0) {
-@@ -2402,7 +2385,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+@@ -2422,7 +2418,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return cudaErrorInvalidDeviceFunction;
      }
      const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -4853,7 +4833,7 @@ index 5731fb435..aff63e80e 100644
      return err;
  }
  
-@@ -4487,9 +4487,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -4507,9 +4520,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -6496,20 +6476,70 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 5a8849ebc..3386d2be9 100644
+index 538f7f6e9..3386d2be9 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -53,12 +53,19 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
+@@ -53,874 +53,872 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
  // read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
  // becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
  // not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
--ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev) const {
+-const char * llama_file_version_name(llama_fver version) {
+-    switch (version) {
+-        case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
+-        case GGUF_FILE_VERSION_V2: return "GGUF V2";
+-        case GGUF_FILE_VERSION_V3: return "GGUF V3 (latest)";
 +ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
-     if (dev == nullptr) {
-         return nullptr;
++    if (dev == nullptr) {
++        return nullptr;
      }
-     static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
--    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL && use_mmap && !pin_master) {
+-
+-    return "unknown";
+-}
+-
+-#define LLAMA_FTYPE_PREFIX "(guessed) "
+-
+-const char * llama_ftype_name(llama_ftype ftype) {
+-    static constexpr size_t guessed_prefix_len = sizeof(LLAMA_FTYPE_PREFIX) - 1;
+-    const char * name;
+-    switch ((enum llama_ftype) (ftype & ~LLAMA_FTYPE_GUESSED)) {
+-        case LLAMA_FTYPE_ALL_F32:          name = LLAMA_FTYPE_PREFIX "all F32"; break;
+-        case LLAMA_FTYPE_MOSTLY_F16:       name = LLAMA_FTYPE_PREFIX "F16"; break;
+-        case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
+-        case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
+-        case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q3_K_M:    name = LLAMA_FTYPE_PREFIX "Q3_K - Medium"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q3_K_L:    name = LLAMA_FTYPE_PREFIX "Q3_K - Large"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q4_K_S:    name = LLAMA_FTYPE_PREFIX "Q4_K - Small"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q4_K_M:    name = LLAMA_FTYPE_PREFIX "Q4_K - Medium"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q5_K_S:    name = LLAMA_FTYPE_PREFIX "Q5_K - Small"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q5_K_M:    name = LLAMA_FTYPE_PREFIX "Q5_K - Medium"; break;
+-        case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
+-        case LLAMA_FTYPE_MOSTLY_TQ1_0:     name = LLAMA_FTYPE_PREFIX "TQ1_0 - 1.69 bpw ternary"; break;
+-        case LLAMA_FTYPE_MOSTLY_TQ2_0:     name = LLAMA_FTYPE_PREFIX "TQ2_0 - 2.06 bpw ternary"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ2_M:     name = LLAMA_FTYPE_PREFIX "IQ2_M - 2.7 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ3_XS:    name = LLAMA_FTYPE_PREFIX "IQ3_XS - 3.3 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ3_XXS:   name = LLAMA_FTYPE_PREFIX "IQ3_XXS - 3.0625 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ1_S:     name = LLAMA_FTYPE_PREFIX "IQ1_S - 1.5625 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
+-        case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
+-        default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
++    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
 +    // wip/host-expert-tier: with a `-lme` plan the decision is per TENSOR.  A hole keeps the read-only model
 +    // mapping (pageable, served through the bounded pool or the per-table bounce ring); everything else gets
 +    // the pinned master, which for a table IS the region: expert `e` lives at `base + e * host_bytes`, so a
@@ -6518,13 +6548,23 @@ index 5a8849ebc..3386d2be9 100644
 +    const bool want_mapping = host_experts_plan_done ? host_expert_is_hole(name)
 +                                                     : host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL;
 +    if (want_mapping && use_mmap && !pin_master) {
-         ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(dev);
-         if (master != nullptr) {
-             return master;
-@@ -67,6 +74,340 @@ ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev
-     return ggml_backend_dev_host_buffer_type(dev);
++        ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(dev);
++        if (master != nullptr) {
++            return master;
++        }
+     }
+-    return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
++    return ggml_backend_dev_host_buffer_type(dev);
  }
  
+-#undef LLAMA_FTYPE_PREFIX
+-
+-// return a list of splits for a given path
+-// for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
+-static std::vector<std::string> llama_get_list_splits(const std::string & path, const int idx, const int n_split) {
+-    std::vector<std::string> paths;
+-    std::string split_prefix;
+-    std::vector<char> buf(llama_path_max(), 0);
 +// ---------------------------------------------------------------------------------------------
 +// wip/host-expert-tier: the `-lme, --limit-host-experts` budget, spent on WHOLE host-expert tensors
 +// in descending hotness order.  See `plan_host_expert_placement` in the header for the policy.
@@ -6535,7 +6575,11 @@ index 5a8849ebc..3386d2be9 100644
 +// is byte-for-byte today's `pinned` master and its table keeps the single-launch staging branch and the
 +// in-place cold read.  Per-expert residency inside a table remains the pool's job (the fallback below).
 +// ---------------------------------------------------------------------------------------------
-+
+ 
+-    {
+-        int ret = llama_split_prefix(buf.data(), buf.size(), path.c_str(), idx, n_split);
+-        if (!ret) {
+-            throw std::runtime_error(format("invalid split file name: %s", path.c_str()));
 +// MemAvailable, not MemFree: the pinned tier is allowed to sit on reclaimable page cache, and the kernel
 +// hands page cache over on demand.  Falls back to the CPU device's free memory on a platform without
 +// /proc/meminfo.  Returns 0 when nothing can be measured (the caller then refuses to guess).
@@ -6551,9 +6595,13 @@ index 5a8849ebc..3386d2be9 100644
 +                out = (size_t) kib * 1024;
 +                break;
 +            }
-+        }
+         }
+-        split_prefix = std::string(buf.data(), ret);
 +        fclose(f);
-+    }
+     }
+-
+-    if (split_prefix.empty()) {
+-        throw std::runtime_error(format("invalid split file: %s", path.c_str()));
 +#endif
 +    if (out == 0) {
 +        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -6561,19 +6609,31 @@ index 5a8849ebc..3386d2be9 100644
 +        if (cpu != nullptr) {
 +            ggml_backend_dev_memory(cpu, &out, &total);
 +        }
-+    }
+     }
 +    return out;
 +}
-+
+ 
+-    for (int i = 0; i < n_split; ++i) {
+-        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
+-        paths.push_back(std::string(buf.data(), ret));
 +// `blk.12.ffn_gate_exps.weight` -> 12, or -1.
 +static int host_expert_layer_of(const std::string & name) {
 +    int layer = -1;
 +    if (sscanf(name.c_str(), "blk.%d.", &layer) != 1) {
 +        return -1;
-+    }
+     }
+-
+-    return paths;
 +    return layer;
-+}
-+
+ }
+ 
+-namespace GGUFMeta {
+-    template <typename T, gguf_type gt_, T (*gfun)(const gguf_context *, const int64_t)>
+-    struct GKV_Base_Type {
+-        static constexpr gguf_type gt = gt_;
+-
+-        static T getter(const gguf_context * ctx, const int kid) {
+-            return gfun(ctx, kid);
 +// The placement the loader will actually make for `name` on layer `layer`: the `-ncmoe` tail rule, or an
 +// explicit caller pattern (`--cpu-moe`, `--override-tensor exps=CPU`, `-ncmoe` in the forward placement).
 +// Mirrors the `create_tensor` override logic, minus the exclusions that can only make it MORE conservative
@@ -6592,21 +6652,60 @@ index 5a8849ebc..3386d2be9 100644
 +    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
 +        if (o->buft != ggml_backend_cpu_buffer_type()) {
 +            continue;
-+        }
+         }
+-    };
+-
+-    template<typename T> struct GKV_Base;
+-
+-    template<> struct GKV_Base<bool        >: GKV_Base_Type<bool,         GGUF_TYPE_BOOL,    gguf_get_val_bool> {};
+-    template<> struct GKV_Base<uint8_t     >: GKV_Base_Type<uint8_t,      GGUF_TYPE_UINT8,   gguf_get_val_u8  > {};
+-    template<> struct GKV_Base<uint16_t    >: GKV_Base_Type<uint16_t,     GGUF_TYPE_UINT16,  gguf_get_val_u16 > {};
+-    template<> struct GKV_Base<uint32_t    >: GKV_Base_Type<uint32_t,     GGUF_TYPE_UINT32,  gguf_get_val_u32 > {};
+-    template<> struct GKV_Base<uint64_t    >: GKV_Base_Type<uint64_t,     GGUF_TYPE_UINT64,  gguf_get_val_u64 > {};
+-    template<> struct GKV_Base<int8_t      >: GKV_Base_Type<int8_t,       GGUF_TYPE_INT8,    gguf_get_val_i8  > {};
+-    template<> struct GKV_Base<int16_t     >: GKV_Base_Type<int16_t,      GGUF_TYPE_INT16,   gguf_get_val_i16 > {};
+-    template<> struct GKV_Base<int32_t     >: GKV_Base_Type<int32_t,      GGUF_TYPE_INT32,   gguf_get_val_i32 > {};
+-    template<> struct GKV_Base<int64_t     >: GKV_Base_Type<int64_t,      GGUF_TYPE_INT64,   gguf_get_val_i64 > {};
+-    template<> struct GKV_Base<float       >: GKV_Base_Type<float,        GGUF_TYPE_FLOAT32, gguf_get_val_f32 > {};
+-    template<> struct GKV_Base<double      >: GKV_Base_Type<double,       GGUF_TYPE_FLOAT64, gguf_get_val_f64 > {};
+-    template<> struct GKV_Base<const char *>: GKV_Base_Type<const char *, GGUF_TYPE_STRING,  gguf_get_val_str > {};
+-
+-    template<> struct GKV_Base<std::string> {
+-        static constexpr gguf_type gt = GGUF_TYPE_STRING;
+-
+-        static std::string getter(const gguf_context * ctx, const int kid) {
+-            return gguf_get_val_str(ctx, kid);
 +        std::regex pattern(o->pattern);
 +        if (std::regex_search(tensor_name, pattern)) {
 +            return true;
-+        }
+         }
+-    };
 +    }
 +    return false;
 +}
-+
+ 
+-    struct ArrayInfo {
+-        const gguf_type gt;
+-        const size_t length;
+-        const void * data;
+-    };
 +void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
 +    if (host_experts_plan_done) {
 +        return;
 +    }
 +    host_experts_plan_done = true;
-+
+ 
+-    template<> struct GKV_Base<ArrayInfo> {
+-        public:
+-        static constexpr gguf_type gt = GGUF_TYPE_ARRAY;
+-        static ArrayInfo getter(const gguf_context *ctx, const int k) {
+-            const enum gguf_type arr_type = gguf_get_arr_type(ctx, k);
+-            return ArrayInfo {
+-                arr_type,
+-                gguf_get_arr_n(ctx, k),
+-                arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx, k),
+-            };
+-        }
 +    // --- 1. the candidate set and its byte total ------------------------------------------------
 +    // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
 +    // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
@@ -6618,22 +6717,95 @@ index 5a8849ebc..3386d2be9 100644
 +        size_t      host_bytes = 0;
 +        size_t      nbytes = 0;
 +        int64_t     score = 0;
-+    };
+     };
+-
+-    template<typename T>
+-    class GKV : public GKV_Base<T> {
+-        GKV() = delete;
+-
+-        public:
+-        static T get_kv(const gguf_context * ctx, const int k) {
+-            const enum gguf_type kt = gguf_get_kv_type(ctx, k);
+-
+-            if (kt != GKV::gt) {
+-                throw std::runtime_error(format("key %s has wrong type %s but expected type %s",
+-                    gguf_get_key(ctx, k), gguf_type_name(kt), gguf_type_name(GKV::gt)));
+-            }
+-            return GKV::getter(ctx, k);
+-        }
+-
+-        static const char * override_type_to_str(const llama_model_kv_override_type ty) {
+-            switch (ty) {
+-                case LLAMA_KV_OVERRIDE_TYPE_BOOL:  return "bool";
+-                case LLAMA_KV_OVERRIDE_TYPE_INT:   return "int";
+-                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: return "float";
+-                case LLAMA_KV_OVERRIDE_TYPE_STR:   return "str";
+-            }
+-            return "unknown";
+-        }
+-
+-        static bool validate_override(const llama_model_kv_override_type expected_type, const struct llama_model_kv_override * ovrd) {
+-            if (!ovrd) { return false; }
+-            if (ovrd->tag == expected_type) {
+-                LLAMA_LOG_INFO("%s: Using metadata override (%5s) '%s' = ",
+-                    __func__, override_type_to_str(ovrd->tag), ovrd->key);
+-                switch (ovrd->tag) {
+-                    case LLAMA_KV_OVERRIDE_TYPE_BOOL:  {
+-                        LLAMA_LOG_INFO("%s\n", ovrd->val_bool ? "true" : "false");
+-                    } break;
+-                    case LLAMA_KV_OVERRIDE_TYPE_INT:   {
+-                        LLAMA_LOG_INFO("%" PRId64 "\n", ovrd->val_i64);
+-                    } break;
+-                    case LLAMA_KV_OVERRIDE_TYPE_FLOAT: {
+-                        LLAMA_LOG_INFO("%.6f\n", ovrd->val_f64);
+-                    } break;
+-                    case LLAMA_KV_OVERRIDE_TYPE_STR: {
+-                        LLAMA_LOG_INFO("%s\n", ovrd->val_str);
+-                    } break;
+-                    default:
+-                        // Shouldn't be possible to end up here, but just in case...
+-                        throw std::runtime_error(
+-                            format("Unsupported attempt to override %s type for metadata key %s\n",
+-                                override_type_to_str(ovrd->tag), ovrd->key));
+-                }
+-                return true;
+-            }
+-            LLAMA_LOG_WARN("%s: Warning: Bad metadata override type for key '%s', expected %s but got %s\n",
+-                __func__, ovrd->key, override_type_to_str(expected_type), override_type_to_str(ovrd->tag));
+-            return false;
 +    std::vector<cand_t> cands;
 +    size_t total = 0;
 +    for (const auto & kv : weights_map) {
 +        const std::string & name = kv.first;
 +        if (name.find("exps") == std::string::npos) {
 +            continue;
-+        }
+         }
+-
+-        template<typename OT>
+-        static typename std::enable_if<std::is_same<OT, bool>::value, bool>::type
+-        try_override(OT & target, const struct llama_model_kv_override * ovrd) {
+-            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_BOOL, ovrd)) {
+-                target = ovrd->val_bool;
+-                return true;
+-            }
+-            return false;
 +        const ggml_tensor * t = kv.second.tensor;
 +        if (t == nullptr || t->ne[2] < 2) {
 +            continue;   // an expert bank only: a `scale`/`bias` side vector has ne[2] == 1
-+        }
+         }
+-
+-        template<typename OT>
+-        static typename std::enable_if<!std::is_same<OT, bool>::value && std::is_integral<OT>::value, bool>::type
+-        try_override(OT & target, const struct llama_model_kv_override * ovrd) {
+-            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_INT, ovrd)) {
+-                target = ovrd->val_i64;
+-                return true;
+-            }
+-            return false;
 +        const int layer = host_expert_layer_of(name);
 +        if (!host_expert_selected(name, layer, n_layer_trunk)) {
 +            continue;
-+        }
+         }
 +        cand_t c;
 +        c.name       = name;
 +        c.layer      = layer;
@@ -6651,7 +6823,15 @@ index 5a8849ebc..3386d2be9 100644
 +        host_experts_policy    = "no host expert tensors to place";
 +        return;
 +    }
-+
+ 
+-        template<typename OT>
+-        static typename std::enable_if<std::is_floating_point<OT>::value, bool>::type
+-        try_override(T & target, const struct llama_model_kv_override * ovrd) {
+-            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_FLOAT, ovrd)) {
+-                target = ovrd->val_f64;
+-                return true;
+-            }
+-            return false;
 +    // --- 2. the budget --------------------------------------------------------------------------
 +    const size_t avail = host_experts_available_bytes();
 +    // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
@@ -6662,7 +6842,16 @@ index 5a8849ebc..3386d2be9 100644
 +        const int v = atoi(e);
 +        if (v > 0 && v <= 100) {
 +            frac = v;
-+        }
+         }
+-
+-        template<typename OT>
+-        static typename std::enable_if<std::is_same<OT, std::string>::value, bool>::type
+-        try_override(T & target, const struct llama_model_kv_override * ovrd) {
+-            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_STR, ovrd)) {
+-                target = ovrd->val_str;
+-                return true;
+-            }
+-            return false;
 +    }
 +    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
 +    size_t cap = 0;
@@ -6693,7 +6882,11 @@ index 5a8849ebc..3386d2be9 100644
 +    if (!pinned_masters) {
 +        for (const auto & c : cands) {
 +            host_experts_holes.insert(c.name);
-+        }
+         }
+-
+-        static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+-            if (try_override<T>(target, ovrd)) {
+-                return true;
 +        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
 +        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
 +        const size_t budget = host_experts_limit_gib > 0
@@ -6707,8 +6900,18 @@ index 5a8849ebc..3386d2be9 100644
 +                ggml_backend_dev_t d = ggml_backend_dev_get(i);
 +                ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget);
 +                ggml_backend_dev_moe_cache_set_host_pool(d, true);
-+            }
-+        }
+             }
+-            if (k < 0) { return false; }
+-            target = get_kv(ctx, k);
+-            return true;
+         }
+-
+-        static bool set(const gguf_context * ctx, const char * key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+-            return set(ctx, gguf_find_key(ctx, key), target, ovrd);
+-        }
+-
+-        static bool set(const gguf_context * ctx, const std::string & key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+-            return set(ctx, key.c_str(), target, ovrd);
 +        const char * how = budget >= total ? "the whole host expert set (a MIRROR)"
 +                                           : "the arena's complement, plus mirrored residents while capacity lasts";
 +        if (host_experts_limit_gib > 0) {
@@ -6720,7 +6923,14 @@ index 5a8849ebc..3386d2be9 100644
 +            snprintf(policy, sizeof(policy),
 +                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
 +                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
-+        }
+         }
+-    };
+-}
+-
+-    template<typename T>
+-    typename std::enable_if<std::is_integral<T>::value, bool>::type
+-    llama_model_loader::get_arr_n(const std::string & key, T & result, bool required) {
+-        const int kid = gguf_find_key(metadata, key.c_str());
 +        host_experts_policy = policy;
 +        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
 +        return;
@@ -6751,7 +6961,10 @@ index 5a8849ebc..3386d2be9 100644
 +                 put(total), frac, put(auto_cap));
 +    }
 +    host_experts_policy = policy;
-+
+ 
+-        if (kid < 0) {
+-            if (required) {
+-                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
 +    if (cap == 0) {
 +        // The not-fitting band: today's pool-backed master (pageable), which is the mode the pool exists for.
 +        // EVERY candidate is a hole -- without this the per-tensor decision would fall through to the pinned
@@ -6763,12 +6976,24 @@ index 5a8849ebc..3386d2be9 100644
 +            host_experts_pool_holes = true;
 +            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
 +                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
-+            }
-+        }
+             }
+-            return false;
+         }
+-
+-        struct GGUFMeta::ArrayInfo arr_info =
+-            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
+-
+-
+-        result = arr_info.length;
+-        return true;
 +        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
 +        return;
-+    }
-+
+     }
+ 
+-    template<typename T>
+-    typename std::enable_if<std::is_integral<T>::value, bool>::type
+-    llama_model_loader::get_arr_n(enum llm_kv kid, T & result, bool required) {
+-        return get_arr_n(llm_kv(kid), result, required);
 +    // --- 3. rank by the persisted heat prior, then take what fits --------------------------------
 +    ggml_backend_dev_t heat_dev = nullptr;
 +    if (!files.empty()) {
@@ -6781,35 +7006,72 @@ index 5a8849ebc..3386d2be9 100644
 +                }
 +            }
 +        }
-+    }
+     }
+-
+-    template bool llama_model_loader::get_arr_n(enum llm_kv kid, uint32_t & result, bool required);
+-    template std::enable_if<std::is_integral<uint32_t>::value, bool>::type
+-    llama_model_loader::get_arr_n<uint32_t>(const std::string & key, uint32_t & result, bool required);
+-
+-    template<typename T>
+-    bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & result, bool required) {
+-        const gguf_context * ctx = metadata;
+-        const int kid = gguf_find_key(ctx, key.c_str());
+-
+-        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+-            if (required) {
+-                throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
 +    if (heat_dev != nullptr) {
 +        for (auto & c : cands) {
 +            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts, c.host_bytes);
 +            if (s >= 0) {
 +                c.score = s;
 +                host_experts_heat_seen = true;
-+            }
-+        }
+             }
+-            return false;
+         }
 +    }
 +    if (host_experts_heat_seen) {
 +        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
 +            return a.score > b.score;
 +        });
 +    }
-+
+ 
+-        struct GGUFMeta::ArrayInfo arr_info =
+-            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
+-
+-        bool type_ok = false;
+-        switch (arr_info.gt) {
+-            case GGUF_TYPE_UINT32:
+-            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+-                                              (std::is_same<T,    uint32_t>::value); break;
+-            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+-            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+-            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
+-            default:
+-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+-        }
+-        if (!type_ok) {
+-            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
 +    size_t planned = 0;
 +    size_t n_pinned = 0;
 +    for (const auto & c : cands) {
 +        if (planned + c.nbytes > cap) {
 +            host_experts_holes.insert(c.name);   // stays in the model mapping; a smaller one below may still fit
 +            continue;
-+        }
+         }
 +        host_experts_pinned.insert(c.name);
 +        planned += c.nbytes;
 +        ++n_pinned;
 +    }
 +    host_experts_cap_bytes = cap;
-+
+ 
+-        if constexpr (std::is_same<T, std::string>::value) {
+-            const size_t n_items = gguf_get_arr_n(ctx, kid);
+-            result.clear();
+-
+-            for (size_t i = 0; i < n_items; i++) {
+-                const T value = gguf_get_arr_str(ctx, kid, i);
+-                result.emplace_back(value);
 +    // Holes keep the read-only model mapping and are served either by the bounded pinned pool or, when the
 +    // budget is spent, by the per-table bounce ring (the page cache as the source).  The pool is only given
 +    // what the budget has left, so `-lme` stays a cap on the whole non-swappable tier rather than a floor.
@@ -6826,10 +7088,19 @@ index 5a8849ebc..3386d2be9 100644
 +        if (host_experts_pool_holes) {
 +            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
 +                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
-+            }
-+        }
-+    }
-+
+             }
+-        } else {
+-            result.resize(arr_info.length);
+-            result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+         }
+-
+-        return true;
+     }
+ 
+-    template<typename T, size_t N_MAX>
+-    bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, bool required) {
+-        const gguf_context * ctx = metadata;
+-        const int kid = gguf_find_key(ctx, key.c_str());
 +    snprintf(policy, sizeof(policy),
 +             "%.1f of %.1f MiB pinned (%zu of %zu tensors, %s); %.1f MiB pageable%s",
 +             put(planned), put(total), n_pinned, cands.size(),
@@ -6840,7 +7111,13 @@ index 5a8849ebc..3386d2be9 100644
 +    host_experts_policy += policy;
 +    LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
 +}
-+
+ 
+-        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+-            if (required) {
+-                throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
+-            }
+-            return false;
+-        }
 +void llama_model_loader::report_host_expert_placement() {
 +    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
 +        return;
@@ -6858,10 +7135,962 @@ index 5a8849ebc..3386d2be9 100644
 +                   (double) host_experts_holes_bytes / mib,
 +                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
 +}
+ 
+-        struct GGUFMeta::ArrayInfo arr_info =
+-            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
++const char * llama_file_version_name(llama_fver version) {
++    switch (version) {
++        case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
++        case GGUF_FILE_VERSION_V2: return "GGUF V2";
++        case GGUF_FILE_VERSION_V3: return "GGUF V3 (latest)";
++    }
+ 
+-        bool type_ok = false;
+-        switch (arr_info.gt) {
+-            case GGUF_TYPE_BOOL:
+-            case GGUF_TYPE_UINT32:
+-            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+-                                              (std::is_same<T,    uint32_t>::value); break;
+-            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+-            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+-            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
+-            default:
+-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+-        }
+-        if (!type_ok) {
+-            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
+-        }
++    return "unknown";
++}
+ 
+-        if (arr_info.length > N_MAX) {
+-            throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, key.c_str(), (uint32_t) N_MAX));
+-        }
++#define LLAMA_FTYPE_PREFIX "(guessed) "
+ 
+-        if constexpr (std::is_same<T, std::string>::value) {
+-            const size_t n_items = gguf_get_arr_n(ctx, kid);
++const char * llama_ftype_name(llama_ftype ftype) {
++    static constexpr size_t guessed_prefix_len = sizeof(LLAMA_FTYPE_PREFIX) - 1;
++    const char * name;
++    switch ((enum llama_ftype) (ftype & ~LLAMA_FTYPE_GUESSED)) {
++        case LLAMA_FTYPE_ALL_F32:          name = LLAMA_FTYPE_PREFIX "all F32"; break;
++        case LLAMA_FTYPE_MOSTLY_F16:       name = LLAMA_FTYPE_PREFIX "F16"; break;
++        case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
++        case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
++        case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
++        case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
++        case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
++        case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
++        case LLAMA_FTYPE_MOSTLY_Q5_1:      name = LLAMA_FTYPE_PREFIX "Q5_1"; break;
++        case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
++        case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
++        case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
++        case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
++        case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
++        case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
++        case LLAMA_FTYPE_MOSTLY_Q3_K_M:    name = LLAMA_FTYPE_PREFIX "Q3_K - Medium"; break;
++        case LLAMA_FTYPE_MOSTLY_Q3_K_L:    name = LLAMA_FTYPE_PREFIX "Q3_K - Large"; break;
++        case LLAMA_FTYPE_MOSTLY_Q4_K_S:    name = LLAMA_FTYPE_PREFIX "Q4_K - Small"; break;
++        case LLAMA_FTYPE_MOSTLY_Q4_K_M:    name = LLAMA_FTYPE_PREFIX "Q4_K - Medium"; break;
++        case LLAMA_FTYPE_MOSTLY_Q5_K_S:    name = LLAMA_FTYPE_PREFIX "Q5_K - Small"; break;
++        case LLAMA_FTYPE_MOSTLY_Q5_K_M:    name = LLAMA_FTYPE_PREFIX "Q5_K - Medium"; break;
++        case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
++        case LLAMA_FTYPE_MOSTLY_TQ1_0:     name = LLAMA_FTYPE_PREFIX "TQ1_0 - 1.69 bpw ternary"; break;
++        case LLAMA_FTYPE_MOSTLY_TQ2_0:     name = LLAMA_FTYPE_PREFIX "TQ2_0 - 2.06 bpw ternary"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ2_M:     name = LLAMA_FTYPE_PREFIX "IQ2_M - 2.7 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ3_XS:    name = LLAMA_FTYPE_PREFIX "IQ3_XS - 3.3 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ3_XXS:   name = LLAMA_FTYPE_PREFIX "IQ3_XXS - 3.0625 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ1_S:     name = LLAMA_FTYPE_PREFIX "IQ1_S - 1.5625 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
++        case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
++        default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
++    }
++    return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
++}
+ 
+-            for (size_t i = 0; i < n_items; i++) {
+-                const T value = gguf_get_arr_str(ctx, kid, i);
+-                result[i] = value;
+-            }
+-        } else {
+-            if (arr_info.gt == GGUF_TYPE_BOOL) {
+-                const int8_t * values = (const int8_t *) arr_info.data;
+-                std::transform(values, values + arr_info.length, result.begin(), [](int8_t x) {
+-                    return static_cast<T>(x != 0);
+-                });
+-            } else {
+-                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
+-            }
+-        }
++#undef LLAMA_FTYPE_PREFIX
 +
- const char * llama_file_version_name(llama_fver version) {
-     switch (version) {
-         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
++// return a list of splits for a given path
++// for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
++static std::vector<std::string> llama_get_list_splits(const std::string & path, const int idx, const int n_split) {
++    std::vector<std::string> paths;
++    std::string split_prefix;
++    std::vector<char> buf(llama_path_max(), 0);
+ 
+-        return true;
++    {
++        int ret = llama_split_prefix(buf.data(), buf.size(), path.c_str(), idx, n_split);
++        if (!ret) {
++            throw std::runtime_error(format("invalid split file name: %s", path.c_str()));
++        }
++        split_prefix = std::string(buf.data(), ret);
+     }
+ 
+-    template<typename T>
+-    bool llama_model_loader::get_arr(enum llm_kv kid, T & result, bool required) {
+-        return get_arr(llm_kv(kid), result, required);
++    if (split_prefix.empty()) {
++        throw std::runtime_error(format("invalid split file: %s", path.c_str()));
+     }
+ 
+-    template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+-    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
+-
+-    template<typename T>
+-    bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
+-        auto it = kv_overrides.find(key);
++    for (int i = 0; i < n_split; ++i) {
++        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
++        paths.push_back(std::string(buf.data(), ret));
++    }
+ 
+-        const struct llama_model_kv_override * override =
+-            it != kv_overrides.end() ? &it->second : nullptr;
++    return paths;
++}
+ 
+-        const bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
++namespace GGUFMeta {
++    template <typename T, gguf_type gt_, T (*gfun)(const gguf_context *, const int64_t)>
++    struct GKV_Base_Type {
++        static constexpr gguf_type gt = gt_;
+ 
+-        if (required && !found) {
+-            throw std::runtime_error(format("key not found in model: %s", key.c_str()));
++        static T getter(const gguf_context * ctx, const int kid) {
++            return gfun(ctx, kid);
+         }
++    };
+ 
+-        return found;
+-    }
++    template<typename T> struct GKV_Base;
+ 
+-    template<typename T>
+-    bool llama_model_loader::get_key(enum llm_kv kid, T & result, bool required) {
+-        return get_key(llm_kv(kid), result, required);
+-    }
++    template<> struct GKV_Base<bool        >: GKV_Base_Type<bool,         GGUF_TYPE_BOOL,    gguf_get_val_bool> {};
++    template<> struct GKV_Base<uint8_t     >: GKV_Base_Type<uint8_t,      GGUF_TYPE_UINT8,   gguf_get_val_u8  > {};
++    template<> struct GKV_Base<uint16_t    >: GKV_Base_Type<uint16_t,     GGUF_TYPE_UINT16,  gguf_get_val_u16 > {};
++    template<> struct GKV_Base<uint32_t    >: GKV_Base_Type<uint32_t,     GGUF_TYPE_UINT32,  gguf_get_val_u32 > {};
++    template<> struct GKV_Base<uint64_t    >: GKV_Base_Type<uint64_t,     GGUF_TYPE_UINT64,  gguf_get_val_u64 > {};
++    template<> struct GKV_Base<int8_t      >: GKV_Base_Type<int8_t,       GGUF_TYPE_INT8,    gguf_get_val_i8  > {};
++    template<> struct GKV_Base<int16_t     >: GKV_Base_Type<int16_t,      GGUF_TYPE_INT16,   gguf_get_val_i16 > {};
++    template<> struct GKV_Base<int32_t     >: GKV_Base_Type<int32_t,      GGUF_TYPE_INT32,   gguf_get_val_i32 > {};
++    template<> struct GKV_Base<int64_t     >: GKV_Base_Type<int64_t,      GGUF_TYPE_INT64,   gguf_get_val_i64 > {};
++    template<> struct GKV_Base<float       >: GKV_Base_Type<float,        GGUF_TYPE_FLOAT32, gguf_get_val_f32 > {};
++    template<> struct GKV_Base<double      >: GKV_Base_Type<double,       GGUF_TYPE_FLOAT64, gguf_get_val_f64 > {};
++    template<> struct GKV_Base<const char *>: GKV_Base_Type<const char *, GGUF_TYPE_STRING,  gguf_get_val_str > {};
+ 
+-    template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
+-    template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
+-    template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
+-    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
+-    template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
++    template<> struct GKV_Base<std::string> {
++        static constexpr gguf_type gt = GGUF_TYPE_STRING;
+ 
+-    template<>
+-    bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
+-        uint32_t tmp;
+-        const bool found = get_key(kid, tmp, required);
+-        if (found) {
+-            result = (enum llama_pooling_type) tmp;
+-        } else {
+-            result = LLAMA_POOLING_TYPE_UNSPECIFIED;
++        static std::string getter(const gguf_context * ctx, const int kid) {
++            return gguf_get_val_str(ctx, kid);
+         }
+-        return found;
+-    }
++    };
+ 
+-    // get array of n <= N_MAX elements, or a single element repeated n times
+-    template<typename T, size_t N_MAX>
+-    bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
+-        const int kid = gguf_find_key(metadata, key.c_str());
++    struct ArrayInfo {
++        const gguf_type gt;
++        const size_t length;
++        const void * data;
++    };
+ 
+-        if (kid < 0) {
+-            if (required) {
+-                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+-            }
+-            return false;
++    template<> struct GKV_Base<ArrayInfo> {
++        public:
++        static constexpr gguf_type gt = GGUF_TYPE_ARRAY;
++        static ArrayInfo getter(const gguf_context *ctx, const int k) {
++            const enum gguf_type arr_type = gguf_get_arr_type(ctx, k);
++            return ArrayInfo {
++                arr_type,
++                gguf_get_arr_n(ctx, k),
++                arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx, k),
++            };
+         }
++    };
+ 
+-        if (n > N_MAX) {
+-            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n, (uint32_t) N_MAX, key.c_str()));
+-        }
++    template<typename T>
++    class GKV : public GKV_Base<T> {
++        GKV() = delete;
+ 
+-        if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
+-            struct GGUFMeta::ArrayInfo arr_info =
+-                GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
++        public:
++        static T get_kv(const gguf_context * ctx, const int k) {
++            const enum gguf_type kt = gguf_get_kv_type(ctx, k);
+ 
+-            if (n != arr_info.length) {
+-                throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
++            if (kt != GKV::gt) {
++                throw std::runtime_error(format("key %s has wrong type %s but expected type %s",
++                    gguf_get_key(ctx, k), gguf_type_name(kt), gguf_type_name(GKV::gt)));
+             }
+-
+-            return get_arr(key, result, required);
++            return GKV::getter(ctx, k);
+         }
+ 
+-        T value;
++        static const char * override_type_to_str(const llama_model_kv_override_type ty) {
++            switch (ty) {
++                case LLAMA_KV_OVERRIDE_TYPE_BOOL:  return "bool";
++                case LLAMA_KV_OVERRIDE_TYPE_INT:   return "int";
++                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: return "float";
++                case LLAMA_KV_OVERRIDE_TYPE_STR:   return "str";
++            }
++            return "unknown";
++        }
+ 
+-        bool ok = get_key(key, value, required);
+-        if (!ok) {
++        static bool validate_override(const llama_model_kv_override_type expected_type, const struct llama_model_kv_override * ovrd) {
++            if (!ovrd) { return false; }
++            if (ovrd->tag == expected_type) {
++                LLAMA_LOG_INFO("%s: Using metadata override (%5s) '%s' = ",
++                    __func__, override_type_to_str(ovrd->tag), ovrd->key);
++                switch (ovrd->tag) {
++                    case LLAMA_KV_OVERRIDE_TYPE_BOOL:  {
++                        LLAMA_LOG_INFO("%s\n", ovrd->val_bool ? "true" : "false");
++                    } break;
++                    case LLAMA_KV_OVERRIDE_TYPE_INT:   {
++                        LLAMA_LOG_INFO("%" PRId64 "\n", ovrd->val_i64);
++                    } break;
++                    case LLAMA_KV_OVERRIDE_TYPE_FLOAT: {
++                        LLAMA_LOG_INFO("%.6f\n", ovrd->val_f64);
++                    } break;
++                    case LLAMA_KV_OVERRIDE_TYPE_STR: {
++                        LLAMA_LOG_INFO("%s\n", ovrd->val_str);
++                    } break;
++                    default:
++                        // Shouldn't be possible to end up here, but just in case...
++                        throw std::runtime_error(
++                            format("Unsupported attempt to override %s type for metadata key %s\n",
++                                override_type_to_str(ovrd->tag), ovrd->key));
++                }
++                return true;
++            }
++            LLAMA_LOG_WARN("%s: Warning: Bad metadata override type for key '%s', expected %s but got %s\n",
++                __func__, ovrd->key, override_type_to_str(expected_type), override_type_to_str(ovrd->tag));
+             return false;
+         }
+ 
+-        for (uint32_t i = 0; i < n; i++) {
+-            result[i] = value;
++        template<typename OT>
++        static typename std::enable_if<std::is_same<OT, bool>::value, bool>::type
++        try_override(OT & target, const struct llama_model_kv_override * ovrd) {
++            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_BOOL, ovrd)) {
++                target = ovrd->val_bool;
++                return true;
++            }
++            return false;
+         }
+ 
+-        return true;
+-    }
+-
+-    template<typename T>
+-    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required) {
+-        return get_key_or_arr(llm_kv(kid), result, n, required);
+-    }
+-
+-    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
+-        const std::string key = llm_kv(kid);
+-
+-        const int id = gguf_find_key(metadata, key.c_str());
+-
+-        if (id < 0) {
+-            if (required) {
+-                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
++        template<typename OT>
++        static typename std::enable_if<!std::is_same<OT, bool>::value && std::is_integral<OT>::value, bool>::type
++        try_override(OT & target, const struct llama_model_kv_override * ovrd) {
++            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_INT, ovrd)) {
++                target = ovrd->val_i64;
++                return true;
+             }
+             return false;
+         }
+ 
+-        // throw and error if type is an array
+-        if (gguf_get_kv_type(metadata, id) == GGUF_TYPE_ARRAY) {
+-            if (required) {
+-                throw std::runtime_error(format("expected scalar, found array for key: %s", key.c_str()));
++        template<typename OT>
++        static typename std::enable_if<std::is_floating_point<OT>::value, bool>::type
++        try_override(T & target, const struct llama_model_kv_override * ovrd) {
++            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_FLOAT, ovrd)) {
++                target = ovrd->val_f64;
++                return true;
+             }
+             return false;
+         }
+ 
+-        return get_key(key, result, required);
+-    }
++        template<typename OT>
++        static typename std::enable_if<std::is_same<OT, std::string>::value, bool>::type
++        try_override(T & target, const struct llama_model_kv_override * ovrd) {
++            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_STR, ovrd)) {
++                target = ovrd->val_str;
++                return true;
++            }
++            return false;
++        }
+ 
+-    // TODO: this is not very clever - figure out something better
+-    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required);
+-    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
+-    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
++        static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
++            if (try_override<T>(target, ovrd)) {
++                return true;
++            }
++            if (k < 0) { return false; }
++            target = get_kv(ctx, k);
++            return true;
++        }
+ 
++        static bool set(const gguf_context * ctx, const char * key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
++            return set(ctx, gguf_find_key(ctx, key), target, ovrd);
++        }
+ 
+-ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
+-    if (dev == nullptr) {
+-        return nullptr;
+-    }
+-    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
+-    // wip/host-expert-tier: with a `-lme` plan the decision is per TENSOR.  A hole keeps the read-only model
+-    // mapping (pageable, served through the bounded pool or the per-table bounce ring); everything else gets
+-    // the pinned master, which for a table IS the region: expert `e` lives at `base + e * host_bytes`, so a
+-    // fully pinned tensor is byte-for-byte today's `pinned` master and keeps the single-launch staging
+-    // branch, the in-place cold read and the UVA alias.
+-    const bool want_mapping = host_experts_plan_done ? host_expert_is_hole(name)
+-                                                     : host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL;
+-    // The MAPPED (pageable) master a hole is served from is a backend buffer type the device iface grows
+-    // later in this series; until it exists the pinned host buft is the one answer, so a hole is placed
+-    // exactly like a pinned tensor here.  From the block that introduces it, a hole keeps the model
+-    // mapping instead -- which is what makes the pool's pageable master the default for a budget below
+-    // the host expert set.
+-    (void) want_mapping;
+-    (void) pin_master;
+-    return ggml_backend_dev_host_buffer_type(dev);
++        static bool set(const gguf_context * ctx, const std::string & key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
++            return set(ctx, key.c_str(), target, ovrd);
++        }
++    };
+ }
+ 
+-// ---------------------------------------------------------------------------------------------
+-// wip/host-expert-tier: the `-lme, --limit-host-experts` budget, spent on WHOLE host-expert tensors
+-// in descending hotness order.  See `plan_host_expert_placement` in the header for the policy.
+-//
+-// Why per tensor and not per expert: a pinned master is addressed by expert index (stride `nb[2]`), so a
+-// partial one would need holes inside the region and a changed cold-read encoding (the `id - n_res_slots`
+-// -> slot encoding is shared with the KV/arena paths).  Whole tensors keep the geometry, so a pinned tensor
+-// is byte-for-byte today's `pinned` master and its table keeps the single-launch staging branch and the
+-// in-place cold read.  Per-expert residency inside a table remains the pool's job (the fallback below).
+-// ---------------------------------------------------------------------------------------------
++    template<typename T>
++    typename std::enable_if<std::is_integral<T>::value, bool>::type
++    llama_model_loader::get_arr_n(const std::string & key, T & result, bool required) {
++        const int kid = gguf_find_key(metadata, key.c_str());
+ 
+-// MemAvailable, not MemFree: the pinned tier is allowed to sit on reclaimable page cache, and the kernel
+-// hands page cache over on demand.  Falls back to the CPU device's free memory on a platform without
+-// /proc/meminfo.  Returns 0 when nothing can be measured (the caller then refuses to guess).
+-static size_t host_experts_available_bytes() {
+-    size_t out = 0;
+-#if !defined(_WIN32)
+-    FILE * f = fopen("/proc/meminfo", "r");
+-    if (f != nullptr) {
+-        char line[256];
+-        while (fgets(line, sizeof(line), f) != nullptr) {
+-            long long kib = -1;
+-            if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1 && kib > 0) {
+-                out = (size_t) kib * 1024;
+-                break;
++        if (kid < 0) {
++            if (required) {
++                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+             }
++            return false;
+         }
+-        fclose(f);
+-    }
+-#endif
+-    if (out == 0) {
+-        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-        size_t total = 0;
+-        if (cpu != nullptr) {
+-            ggml_backend_dev_memory(cpu, &out, &total);
+-        }
+-    }
+-    return out;
+-}
+ 
+-// `blk.12.ffn_gate_exps.weight` -> 12, or -1.
+-static int host_expert_layer_of(const std::string & name) {
+-    int layer = -1;
+-    if (sscanf(name.c_str(), "blk.%d.", &layer) != 1) {
+-        return -1;
+-    }
+-    return layer;
+-}
++        struct GGUFMeta::ArrayInfo arr_info =
++            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
+ 
+-// The placement the loader will actually make for `name` on layer `layer`: the `-ncmoe` tail rule, or an
+-// explicit caller pattern (`--cpu-moe`, `--override-tensor exps=CPU`, `-ncmoe` in the forward placement).
+-// Mirrors the `create_tensor` override logic, minus the exclusions that can only make it MORE conservative
+-// (an excluded tensor that this says is hosted simply keeps the pageable master).
+-bool llama_model_loader::host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const {
+-    if (layer < 0) {
+-        return false;
+-    }
+-    if (n_cpu_moe_from_end > 0) {
+-        return layer >= n_layer_trunk - n_cpu_moe_from_end && layer < n_layer_trunk;
++
++        result = arr_info.length;
++        return true;
+     }
+-    if (tensor_buft_overrides == nullptr) {
+-        return false;
++
++    template<typename T>
++    typename std::enable_if<std::is_integral<T>::value, bool>::type
++    llama_model_loader::get_arr_n(enum llm_kv kid, T & result, bool required) {
++        return get_arr_n(llm_kv(kid), result, required);
+     }
+-    std::string tensor_name = name;
+-    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
+-        if (o->buft != ggml_backend_cpu_buffer_type()) {
+-            continue;
+-        }
+-        std::regex pattern(o->pattern);
+-        if (std::regex_search(tensor_name, pattern)) {
+-            return true;
++
++    template bool llama_model_loader::get_arr_n(enum llm_kv kid, uint32_t & result, bool required);
++    template std::enable_if<std::is_integral<uint32_t>::value, bool>::type
++    llama_model_loader::get_arr_n<uint32_t>(const std::string & key, uint32_t & result, bool required);
++
++    template<typename T>
++    bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & result, bool required) {
++        const gguf_context * ctx = metadata;
++        const int kid = gguf_find_key(ctx, key.c_str());
++
++        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
++            if (required) {
++                throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
++            }
++            return false;
+         }
+-    }
+-    return false;
+-}
+ 
+-void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+-    if (host_experts_plan_done) {
+-        return;
+-    }
+-    host_experts_plan_done = true;
++        struct GGUFMeta::ArrayInfo arr_info =
++            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
+ 
+-    // --- 1. the candidate set and its byte total ------------------------------------------------
+-    // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
+-    // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
+-    // the order the arch happens to visit them in.
+-    struct cand_t {
+-        std::string name;
+-        int         layer = -1;
+-        int         n_experts = 0;
+-        size_t      host_bytes = 0;
+-        size_t      nbytes = 0;
+-        int64_t     score = 0;
+-    };
+-    std::vector<cand_t> cands;
+-    size_t total = 0;
+-    for (const auto & kv : weights_map) {
+-        const std::string & name = kv.first;
+-        if (name.find("exps") == std::string::npos) {
+-            continue;
++        bool type_ok = false;
++        switch (arr_info.gt) {
++            case GGUF_TYPE_UINT32:
++            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
++                                              (std::is_same<T,    uint32_t>::value); break;
++            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
++            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
++            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
++            default:
++                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+         }
+-        const ggml_tensor * t = kv.second.tensor;
+-        if (t == nullptr || t->ne[2] < 2) {
+-            continue;   // an expert bank only: a `scale`/`bias` side vector has ne[2] == 1
++        if (!type_ok) {
++            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
+         }
+-        const int layer = host_expert_layer_of(name);
+-        if (!host_expert_selected(name, layer, n_layer_trunk)) {
+-            continue;
++
++        if constexpr (std::is_same<T, std::string>::value) {
++            const size_t n_items = gguf_get_arr_n(ctx, kid);
++            result.clear();
++
++            for (size_t i = 0; i < n_items; i++) {
++                const T value = gguf_get_arr_str(ctx, kid, i);
++                result.emplace_back(value);
++            }
++        } else {
++            result.resize(arr_info.length);
++            result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+         }
+-        cand_t c;
+-        c.name       = name;
+-        c.layer      = layer;
+-        c.n_experts  = (int) t->ne[2];
+-        c.host_bytes = (size_t) t->nb[2];
+-        c.nbytes     = ggml_nbytes(t);
+-        total += c.nbytes;
+-        cands.push_back(std::move(c));
+-    }
+-    host_experts_total_bytes = total;
+-    if (cands.empty()) {
+-        // Nothing is hosted (`-ncmoe 0`), or the placement is not one this pre-pass can see: keep the
+-        // historical, mode-keyed decision tensor by tensor.
+-        host_experts_plan_done = false;
+-        host_experts_policy    = "no host expert tensors to place";
+-        return;
++
++        return true;
+     }
+ 
+-    // --- 2. the budget --------------------------------------------------------------------------
+-    const size_t avail = host_experts_available_bytes();
+-    // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
+-    // separate knob from MOE_HOST_POOL_FRAC, which is a percentage of the host EXPERT BYTES (the pool's
+-    // size); the two answer different questions and must not share a variable.
+-    int frac = 80;
+-    if (const char * e = getenv("MOE_HOST_LIMIT_FRAC")) {
+-        const int v = atoi(e);
+-        if (v > 0 && v <= 100) {
+-            frac = v;
++    template<typename T, size_t N_MAX>
++    bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, bool required) {
++        const gguf_context * ctx = metadata;
++        const int kid = gguf_find_key(ctx, key.c_str());
++
++        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
++            if (required) {
++                throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
++            }
++            return false;
+         }
+-    }
+-    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
+-    size_t cap = 0;
+-    // `-lme N` with N below the host expert set spends the budget PER EXPERT (the pool), not per tensor: a
+-    // whole-tensor pinned master is the wrong shape for a partial budget, because MoE routing is spread across
+-    // every layer, so no single tensor is hot (measured: 8 064 MiB of pinned whole tensors = 505 prefill / 50
+-    // decode against 713 / 57 for a 9 331 MiB pool at 2 devices, and the pool reads its residents in place
+-    // since MOE_HOST_POOL_COLD_MULTIDEV).  At or above the set it is the fit case, where a pinned master wins
+-    // decode outright (1105 / 72).
+-    auto put = [](size_t b) { return (double) b / (1024.0 * 1024.0); };
+-    char policy[512];
+-    // The tier for a partial budget.  Default: per EXPERT (the pool) below 90 % of the host expert set, whole
+-    // TENSORS at or above it.  Measured anchors (2 devices, 35B-A3B, see `wip/host-expert-eager-push/
+-    // P5-RESULTS.md` §7): at 86 % of the bytes the two shapes tie on decode (65.6 pool against 65.7 tensors)
+-    // while the pool is far better prefill; at 100 % the whole-tensor tier wins decode outright (71.9 against
+-    // 63.9), because only a pinned *master* gets the single-launch staging branch and the native fill.  The
+-    // exact crossover was not swept -- `MOE_HOST_TIER=pool|tensor` forces either shape, which is the A/B arm.
+-    // wip/host-expert-pool-surplus: the POOL is the mechanism at every budget.  Its per-tensor slot count comes
+-    // from the budget, and the pool lays itself out as "the complement of the arena first, then the hottest
+-    // arena-resident experts while capacity remains" -- so a budget that only covers the complement stays a
+-    // bounded complement, and a budget that covers the whole set turns it into a mirror (i.e. `pinned`'s memory
+-    // and transport, measured 19 % better prefill than a pinned master and within 0.4-3 % on decode).  The
+-    // whole-tensor pinned-master tier is therefore only the explicit `--host-experts pinned` / MOE_HOST_TIER=tensor
+-    // escape hatch.
+-    const char * tier_env = getenv("MOE_HOST_TIER");
+-    const bool force_tensor = tier_env != nullptr && strcmp(tier_env, "tensor") == 0;
+-    const bool pinned_masters = force_tensor || host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED;
+-    if (!pinned_masters) {
+-        for (const auto & c : cands) {
+-            host_experts_holes.insert(c.name);
++
++        struct GGUFMeta::ArrayInfo arr_info =
++            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
++
++        bool type_ok = false;
++        switch (arr_info.gt) {
++            case GGUF_TYPE_BOOL:
++            case GGUF_TYPE_UINT32:
++            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
++                                              (std::is_same<T,    uint32_t>::value); break;
++            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
++            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
++            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
++            default:
++                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+         }
+-        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
+-        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
+-        const size_t budget = host_experts_limit_gib > 0
+-                            ? (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull
+-                            : (total <= auto_cap ? total
+-                                                 : (auto_cap > 0 ? auto_cap : total));
+-        host_experts_cap_bytes = budget;
+-        if (use_mmap) {
+-            host_experts_pool_holes = true;
+-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+-                ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget);
+-                ggml_backend_dev_moe_cache_set_host_pool(d, true);
+-            }
++        if (!type_ok) {
++            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
++        }
++
++        if (arr_info.length > N_MAX) {
++            throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, key.c_str(), (uint32_t) N_MAX));
+         }
+-        const char * how = budget >= total ? "the whole host expert set (a MIRROR)"
+-                                           : "the arena's complement, plus mirrored residents while capacity lasts";
+-        if (host_experts_limit_gib > 0) {
+-            snprintf(policy, sizeof(policy),
+-                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
+-                     "prior (the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
+-                     put(budget), put(total), how, use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
++
++        if constexpr (std::is_same<T, std::string>::value) {
++            const size_t n_items = gguf_get_arr_n(ctx, kid);
++
++            for (size_t i = 0; i < n_items; i++) {
++                const T value = gguf_get_arr_str(ctx, kid, i);
++                result[i] = value;
++            }
+         } else {
+-            snprintf(policy, sizeof(policy),
+-                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
+-                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
++            if (arr_info.gt == GGUF_TYPE_BOOL) {
++                const int8_t * values = (const int8_t *) arr_info.data;
++                std::transform(values, values + arr_info.length, result.begin(), [](int8_t x) {
++                    return static_cast<T>(x != 0);
++                });
++            } else {
++                std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
++            }
+         }
+-        host_experts_policy = policy;
+-        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+-        return;
++
++        return true;
+     }
+-    if (host_experts_limit_gib > 0) {
+-        cap = (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull;
+-        snprintf(policy, sizeof(policy),
+-                 "-lme %lld -> budget %.1f MiB covers the whole host expert set, so it is spent on whole tensors "
+-                 "in descending hotness (the fit case: a pinned master is the fastest decode transport)",
+-                 (long long) host_experts_limit_gib, put(cap));
+-    } else if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED) {
+-        cap = SIZE_MAX;
+-        snprintf(policy, sizeof(policy), "host_experts_mode=PINNED -> the whole host expert set");
+-    } else if (avail == 0) {
+-        cap = SIZE_MAX;
+-        snprintf(policy, sizeof(policy), "auto: MemAvailable unknown -> the whole host expert set");
+-    } else if (total <= auto_cap) {
+-        cap = total;
+-        snprintf(policy, sizeof(policy),
+-                 "auto: the host expert set (%.1f MiB) fits %d%% of MemAvailable (%.1f MiB) -> pin all of it",
+-                 put(total), frac, put(auto_cap));
+-    } else {
+-        cap = 0;
+-        snprintf(policy, sizeof(policy),
+-                 "auto: the host expert set (%.1f MiB) does NOT fit %d%% of MemAvailable (%.1f MiB) -> no pinned "
+-                 "master; every host expert stays in the model mapping and the bounded pinned pool serves the "
+-                 "reads (size it with MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC)",
+-                 put(total), frac, put(auto_cap));
++
++    template<typename T>
++    bool llama_model_loader::get_arr(enum llm_kv kid, T & result, bool required) {
++        return get_arr(llm_kv(kid), result, required);
+     }
+-    host_experts_policy = policy;
+ 
+-    if (cap == 0) {
+-        // The not-fitting band: today's pool-backed master (pageable), which is the mode the pool exists for.
+-        // EVERY candidate is a hole -- without this the per-tensor decision would fall through to the pinned
+-        // default and pin the whole set, which is exactly what this branch exists to avoid.
+-        for (const auto & c : cands) {
+-            host_experts_holes.insert(c.name);
++    template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
++    template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
++    template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
++    template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
++    template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
++    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
++    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
++    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
++
++    template<typename T>
++    bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
++        auto it = kv_overrides.find(key);
++
++        const struct llama_model_kv_override * override =
++            it != kv_overrides.end() ? &it->second : nullptr;
++
++        const bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
++
++        if (required && !found) {
++            throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+         }
+-        if (use_mmap) {
+-            host_experts_pool_holes = true;
+-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+-            }
++
++        return found;
++    }
++
++    template<typename T>
++    bool llama_model_loader::get_key(enum llm_kv kid, T & result, bool required) {
++        return get_key(llm_kv(kid), result, required);
++    }
++
++    template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
++    template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
++    template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
++    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
++    template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
++
++    template<>
++    bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
++        uint32_t tmp;
++        const bool found = get_key(kid, tmp, required);
++        if (found) {
++            result = (enum llama_pooling_type) tmp;
++        } else {
++            result = LLAMA_POOLING_TYPE_UNSPECIFIED;
+         }
+-        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+-        return;
++        return found;
+     }
+ 
+-    // --- 3. rank by the persisted heat prior, then take what fits --------------------------------
+-    ggml_backend_dev_t heat_dev = nullptr;
+-    if (!files.empty()) {
+-        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+-            if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+-                ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
+-                if (heat_dev == nullptr) {
+-                    heat_dev = d;
+-                }
++    // get array of n <= N_MAX elements, or a single element repeated n times
++    template<typename T, size_t N_MAX>
++    bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
++        const int kid = gguf_find_key(metadata, key.c_str());
++
++        if (kid < 0) {
++            if (required) {
++                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+             }
++            return false;
+         }
+-    }
+-    if (heat_dev != nullptr) {
+-        for (auto & c : cands) {
+-            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts, c.host_bytes);
+-            if (s >= 0) {
+-                c.score = s;
+-                host_experts_heat_seen = true;
++
++        if (n > N_MAX) {
++            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n, (uint32_t) N_MAX, key.c_str()));
++        }
++
++        if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
++            struct GGUFMeta::ArrayInfo arr_info =
++                GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
++
++            if (n != arr_info.length) {
++                throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
+             }
++
++            return get_arr(key, result, required);
+         }
+-    }
+-    if (host_experts_heat_seen) {
+-        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
+-            return a.score > b.score;
+-        });
+-    }
+ 
+-    size_t planned = 0;
+-    size_t n_pinned = 0;
+-    for (const auto & c : cands) {
+-        if (planned + c.nbytes > cap) {
+-            host_experts_holes.insert(c.name);   // stays in the model mapping; a smaller one below may still fit
+-            continue;
++        T value;
++
++        bool ok = get_key(key, value, required);
++        if (!ok) {
++            return false;
+         }
+-        host_experts_pinned.insert(c.name);
+-        planned += c.nbytes;
+-        ++n_pinned;
++
++        for (uint32_t i = 0; i < n; i++) {
++            result[i] = value;
++        }
++
++        return true;
+     }
+-    host_experts_cap_bytes = cap;
+ 
+-    // Holes keep the read-only model mapping and are served either by the bounded pinned pool or, when the
+-    // budget is spent, by the per-table bounce ring (the page cache as the source).  The pool is only given
+-    // what the budget has left, so `-lme` stays a cap on the whole non-swappable tier rather than a floor.
+-    // An explicit `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still forces it on -- that is the A/B arm for
+-    // "the same budget spent per EXPERT (the pool) instead of per TENSOR (a pinned master)".
+-    if (!host_experts_holes.empty() && use_mmap) {
+-        // The spare is normally smaller than one host expert tensor (a whole tensor is 90-176 MiB, and the
+-        // budget buys whole tensors), so it cannot fund a useful pool -- and a pool that fits a small fraction
+-        // of the holes buys nothing (measured: a 512 MiB or 1 GiB pool is indistinguishable from none).  The
+-        // holes therefore read the page cache directly through the per-table bounce ring.  An explicit
+-        // `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still turns the pool on, which is the A/B arm for "the
+-        // same RAM spent per EXPERT (a pool) instead of per TENSOR (a pinned master)".
+-        host_experts_pool_holes = getenv("MOE_HOST_POOL") != nullptr || getenv("MOE_HOST_POOL_MIB") != nullptr;
+-        if (host_experts_pool_holes) {
+-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
++    template<typename T>
++    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required) {
++        return get_key_or_arr(llm_kv(kid), result, n, required);
++    }
++
++    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
++        const std::string key = llm_kv(kid);
++
++        const int id = gguf_find_key(metadata, key.c_str());
++
++        if (id < 0) {
++            if (required) {
++                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+             }
++            return false;
+         }
+-    }
+ 
+-    snprintf(policy, sizeof(policy),
+-             "%.1f of %.1f MiB pinned (%zu of %zu tensors, %s); %.1f MiB pageable%s",
+-             put(planned), put(total), n_pinned, cands.size(),
+-             host_experts_heat_seen ? "descending hotness" : "model tensor order (no heat prior)",
+-             put(total - planned),
+-             host_experts_pool_holes ? " via the bounded pinned pool" : " (per-table bounce ring)");
+-    host_experts_policy += ": ";
+-    host_experts_policy += policy;
+-    LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+-}
++        // throw and error if type is an array
++        if (gguf_get_kv_type(metadata, id) == GGUF_TYPE_ARRAY) {
++            if (required) {
++                throw std::runtime_error(format("expected scalar, found array for key: %s", key.c_str()));
++            }
++            return false;
++        }
+ 
+-void llama_model_loader::report_host_expert_placement() {
+-    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
+-        return;
++        return get_key(key, result, required);
+     }
+-    // Always at INFO: a user must be able to see which tier they got.  The pageable fallback costs about
+-    // half the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires
+-    // when a pinned allocation is refused, not when the policy chose not to pin.
+-    const double mib = 1024.0 * 1024.0;
+-    LLAMA_LOG_INFO("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB; %s\n", __func__,
+-                   (double) host_experts_pinned_bytes / mib,
+-                   (double) host_experts_total_bytes / mib,
+-                   host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
+-                       : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
+-                                                      : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
+-                   (double) host_experts_holes_bytes / mib,
+-                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
+-}
++
++    // TODO: this is not very clever - figure out something better
++    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required);
++    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
++    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
+ 
+ 
+ llama_model_loader::llama_model_loader(
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 2eb492f58..1d6dd315c 100644
 --- a/src/llama-model.cpp

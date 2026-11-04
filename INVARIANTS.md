@@ -1632,3 +1632,42 @@ cost a session to learn; do not re-derive them.
    thread; a host-only worker plus main-thread event polling is the shape that works.
 8. **The `-ncmoe` tail bound is `hparams.n_layer()`, not `n_layer_all`** (the latter also counts the nextn/MTP
    head, which is never hosted) — an off-by-one there plans a pinned MTP head and misses trunk layer 0.
+
+## r211 — the take-over guard is about REPRESENTABILITY; a covering pool is a complete cold source, and every block tree must build
+
+1. **The eager take-over's completeness guard must not bound a covering pool by the arena.**
+   `if (!table_cold_ok(t) && t.slots < n_used * n_tok) decline` is a statement about *representability* ("can
+   every routed expert be expressed as a remap id"), not about arena capacity.  `table_cold_ok()` requires
+   `host_dev != nullptr`, which is **null for every pool-backed (pageable-master) table**, so the guard silently
+   bounded the *shipped default* tier by arena slots: at `-llama-batched-bench -npl 8` that is 8x8 = 64 ids
+   against 56 slots, and EVERY routed op declined (`decline_all=1920`, `takeover=0`) and the run read the
+   pageable mapping -- **tg 49.2 against 270.5** at `-npl 8` while `-npl 4` (32 <= 56) was untouched.  A pool
+   whose capacity covers the tensor has the pinned master's own property (every expert is pool-resident, so
+   `id = n_res_slots + slot` is a valid cold id for all of them), so `pool_covers_table()` -- the shared
+   `pool_cold_geometry_ok()` **and** `slots >= n_experts`, plus an O(1) residency re-check -- exempts it.  Measured
+   with the exemption: `-npl 8` **270.3 tg / 1829.5 pp** (best of every arm; pinned 276.5 / 1262.8, `-lme 64`
+   full-coverage pool 271.4 / 1820.1).  A budget that does NOT cover the tensor keeps the bound (r211
+   `-lme 8` still declines at `-npl 8`: 50.4 tg), because with `slots < n_experts` the resident set moves per
+   token and a static per-shape bound cannot guarantee a complete remap.
+2. **Do not reach for a `region`/`region_dev` rebind to express this, and never rebind `t.host`.**  The pool's
+   cold encoding is already "a slot index into one pinned base", so the whole fix is one predicate; `t.host` is
+   the key into `g_host_pools`/`g_host_src` and is shared by every per-device table of one tensor.
+3. **A structural change to the host-expert tier is a decode-band change even when it looks like a prefill one.**
+   The r210 handover attributed the `-npl 8` collapse to `moe_cache_stage_table`'s two-tier staging.  Measured
+   false: for a covering table every expert is non-(-1) in that map, so staging is ONE kernel launch (the same
+   shape as a pinned master's) and the pool's npl-8 prefill is **44 % faster** than pinned's; `GGML_SCHED_DEVGATHER`
+   on/off changes nothing about the collapse (568 vs 635 pp, identical tg).  What looks like a 3x prefill collapse
+   in that table is the **cold first-pass** shape (the arena is sized on the first decode-band pass, so the first
+   prompt batch has none) -- the pre-r210 tree shows the same 128 vs 588 pp at `-npl 1`.
+4. **A block tree that uses a later block's machinery is a broken delivery, and only gate 4 sees it.**  The r210
+   fold left blocks 09/10/11 unbuildable: a spliced function body, `t.n_slices` read before block 10 grows it,
+   `heat_prior_t` used before block 12 defines it, an iface entry pointing at a block-12 function, and a loader
+   calling `plan_host_expert_placement`/`llama_host_experts_mode_apply` before they exist -- plus an out-of-line
+   1-arg `host_expert_buft` that the header's inline forwarder already defines.  Rule: hoist the **definition**
+   to the block that needs it (or restore the pre-fold body), and prefer the tip's content where the hoist would
+   need a later block's *backend API* (an iface member shifts every backend's positional initializer).  The tip
+   tree must be byte-identical afterwards -- check `git rev-parse HEAD^{tree}` at every step, not at the end.
+5. **`MOE_HOST_LIMIT_FRAC=1` no longer means "force the pool".**  The `-lme` budget in the not-fitting band IS
+   `auto_cap` = `MOE_HOST_LIMIT_FRAC` % of `MemAvailable` and it **overrides `MOE_HOST_POOL_MIB`**, so `=1` sizes
+   an 812.9 MiB pool (11 slots/table) and every arm measured with it is a tiny-pool arm.  Use `-lme 64` (the whole
+   set as a pool) and `-lme 8` (a genuine sub-complement budget) for those A/Bs.

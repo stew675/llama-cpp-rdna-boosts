@@ -1,3 +1,17 @@
+> **PROMOTED AND ARCHIVED (2026-11-04, `v16-6050b467c-r211`).**  The host-expert tier this campaign built is
+> **in the delivery** — folded into **block 09** (blocks 10-15 re-cut on top), repaired so every block tree
+> builds, and released as r211 (r210 was never tagged).  What shipped: `-lme auto|N` as the budget over ONE
+> pinned per-expert pool, laid out as the arena's **complement first** and then the arena-resident experts in
+> heat order while capacity lasts; a pool-resident expert read **in place** by any device
+> (`MOE_HOST_POOL_COLD_MULTIDEV`); and, in r211, `pool_covers_table()` — a **covering** pool is exempt from the
+> eager take-over's arena bound, which is what fixes `llama-batched-bench -npl 8` (49.2 -> 270.3 tg).
+> **Dropped, all measured**: the direct pageable push and its `mlock` working set, in-place `hipHostRegister`,
+> the tier/attribution probes, and the eager read-ahead back-fill.
+> Read in this order: [`P5-RESULTS.md`](P5-RESULTS.md) (the tier and its numbers) ->
+> [`P6-POOL-REGION.md`](P6-POOL-REGION.md) (§8 complement vs mirror, §9 the dropped read-ahead, §10 the surplus
+> rule) -> `WORKLOG.md` 261104.001 (r210: the fold) and 261104.002 (r211: the guard fix, the fold repair, every
+> gate).  `INVARIANTS.md` r210/r211 is the "do not re-derive" list.  Open follow-ons: `TODO` #141, #142.
+
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
 > **P8 STATUS (2026-11-04): the pool is the ONE mechanism, and it spends spare capacity mirroring the arena** —

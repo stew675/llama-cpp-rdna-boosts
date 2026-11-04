@@ -1,6 +1,6 @@
 # The delivery patches — what each block is and what it does
 
-**16 blocks** (block 00 + blocks 01-15; block 09 amended in r210) against `release.json.base` (**`6050b467c`**; the base is the
+**16 blocks** (block 00 + blocks 01-15; block 09 amended in r210, repaired in r211) against `release.json.base` (**`6050b467c`**; the base is the
 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
@@ -857,6 +857,26 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 > master's 1105 (+19 %), decode 69.8 vs 71.9 (n=300) and 82.5 vs 82.9 (n=2000) for the same 18 662 MiB pinned.
 > Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.001, `INVARIANTS.md` r210,
 > `wip/host-expert-eager-push/{P5-RESULTS,P6-POOL-REGION}.md`.
+>
+> **r211 repair + amendment: a covering pool is a complete cold source, and this block's tree builds on its
+> own.**  Two things.  (1) The eager take-over's completeness guard bounded a pool-backed table by the
+> **arena** (`t.slots < n_used * n_tok`), because `table_cold_ok()` is false for a pageable master — so at
+> `llama-batched-bench -npl 8` (8x8 = 64 routed ids against 56 slots) **every routed op declined** and the run
+> read the pageable mapping: tg **49.2 against 270.5** for a pinned master.  `pool_covers_table()` now exempts a
+> pool that covers the tensor (every expert is pool-resident, so `id = n_res_slots + slot` is valid for all of
+> them — the pinned master's own property) and the guard is
+> `!table_cold_ok(t) && !pool_covers_table(t) && t.slots < n_used * n_tok`.  Measured at 2 devices: `-npl 8`
+> **1829.5 pp / 270.3 tg** (pinned 1262.8 / 276.5; the pre-r210 tree 1266.4 / 273.0), `-npl 4` 1759.0 / 193.6,
+> and the whole-coverage pool arm (`-lme 64`) 1820.1 / 271.4.  A **sub-complement** budget keeps the bound
+> (`-lme 8` at `-npl 8`: 50.4 tg — `TODO` #141).  (2) The r210 fold had put this block's r210 **uses** ahead of
+> the definitions blocks 10/12/15 own, so **blocks 09, 10 and 11 did not build** (a spliced
+> `pool_rerank_from_tally_locked` body, `t.n_slices`, `heat_prior_t`, a block-12 iface entry, and the loader's
+> `plan_host_expert_placement`/`llama_host_experts_mode_apply`/1-arg `host_expert_buft`).  Each early tree now
+> carries the pre-fold body or a **hoisted definition**, and where the hoist would need a block-12-only backend
+> API (`ggml_backend_dev_moe_host_master_buft`) the pinned host buft is the one answer until that API lands —
+> honest for an intermediate tree, and the **tip tree is byte-identical** (`e2089b13`) before and after.
+> `gate-per-block-build.sh --changed-from 27271aa91`: 5/5.  Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.002,
+> `INVARIANTS.md` r211, `archive/work/host-expert-eager-push/`.
 
 **What it is.**  Everything that makes `-ncmoe`/`-cmoe` (and `--host-experts`) fast and safe without
 fitting the whole model on the device: a pinned host master, a per-op H2D staging ring, a scheduler that

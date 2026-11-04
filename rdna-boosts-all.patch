@@ -61083,10 +61083,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..aff63e80e
+index 000000000..31db9fac1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7899 @@
+@@ -0,0 +1,7939 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61876,6 +61876,39 @@ index 000000000..aff63e80e
 +    }
 +    const int ps = it->second;
 +    return ps >= 0 && ps < p->slots && p->slot_state[(size_t) ps] == 1 ? ps : -1;
++}
++
++// wip/host-expert-eager-push (r210): can this table express EVERY expert as a remap id, i.e. is a
++// miss always representable?  The eager take-over's completeness guard (`moe_cache_update_host`) needs
++// that answer to be STATIC per shape, because a decision that flips per token cannot be baked into one
++// captured graph.
++//
++// * A pinned master (`table_cold_ok`): yes -- the cold region is the master itself (`id = n_res_slots
++//   + e`), so no arena bound applies at all.
++// * A pool-backed table: `table_cold_ok` is FALSE (the master is the pageable model mapping, so
++//   `host_dev` is null), which is why the guard bounded it by the arena -- and then a wide decode band
++//   (`slots < n_used * n_tok`, measured: 56 slots against 8x8 at `-llama-batched-bench -npl 8`)
++//   declined EVERY routed op and served the whole run from the pageable mapping (tg 49.2 against 270.5
++//   for a pinned master).  But a pool whose capacity COVERS the tensor has the pinned master's
++//   property: every expert is pool-resident, so the cold id `n_res_slots + slot` is valid for all of
++//   them and the arena bound is irrelevant.  What makes that STABLE is the pool's layout policy: when
++//   its capacity covers the tensor it never un-loads an expert merely because VRAM also holds it, so
++//   coverage is a property of the budget (`slots`), not of the run.
++//
++// `p->slots` is fixed at the first pool build and `expert_slot` can never hold more than `n_experts`
++// entries, so this is a static property; the residency half is re-checked in O(1) here rather than
++// trusted, and a pool with a genuine sub-complement budget (any `-lme N` below the set, any
++// `MOE_HOST_POOL_FRAC` below 100) fails the first test and keeps the historical arena bound.  Caller
++// holds `g_mutex`.
++static bool pool_covers_table(table_t & t) {
++    if (t.host_dev != nullptr) {
++        return false;   // a pinned master serves its own cold ids; the pool is for a pageable master
++    }
++    host_pool_t * p = table_pool_locked(t);
++    if (!pool_cold_geometry_ok(t, p) || p->slots < t.n_experts) {
++        return false;
++    }
++    return (int) p->expert_slot.size() >= t.n_experts;   // every expert is a resident cold source
 +}
 +
 +// wip/host-expert-master-drop (TODO #55): the master is not pinned, so it lives in the read-only model
@@ -68106,7 +68139,14 @@ index 000000000..aff63e80e
 +    // DETERMINISTICALLY (this bound is a constant per shape) so a shape never captures the arena and then
 +    // declines it on a later replay.  With UVA cold reads the overflow is representable (id = slots+e),
 +    // so a small arena is fine and the decline is not needed.
-+    if (!table_cold_ok(t) && t.slots < (int) (n_used * n_tok)) {
++    //
++    // r210: a table whose pinned pool COVERS the tensor has the same property as a pinned master (every
++    // expert is a cold source), so it must be exempt from the arena bound for the same reason -- the
++    // bound is about REPRESENTABILITY, not about the arena.  Bounding a covering pool by the arena is
++    // what made `llama-batched-bench -npl 8` collapse (8 x 8 routed experts against 56 slots: every op
++    // declined and the run read the pageable mapping; tg 49.2 against 270.5 pinned, and 362.7 once the
++    // arena was merely large enough to dodge the bound).  See `pool_covers_table`.
++    if (!table_cold_ok(t) && !pool_covers_table(t) && t.slots < (int) (n_used * n_tok)) {
 +        g_decline_all++;
 +        return false;
 +    }

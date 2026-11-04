@@ -1,3 +1,128 @@
+## 261104.002 (r211) -- the pool tier is a complete cold source at wide decode (`-npl 8` 49 -> 270 tg), and the r210 fold is repaired so every block builds
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED, 09/10/11/12 REPAIRED), release
+`v16-6050b467c-r211`, tip `3e9b35c50`, tree `e2089b13`.**  Fork base unchanged (`6050b467c`).  Tagged `r211`
+rather than `r210` because the CONTENT changed: the tree moved `d2298e6d` -> `e2089b13` and the previous r210
+record's numbers were taken on `d2298e6d`.
+
+### 1. The blocker: the eager take-over declined every routed op on a covering pool
+
+`llama-batched-bench -npp 512 -ntg 128 -npl 8` on 2 devices gave the pool tier **49.2 tg** against 270.5 for a
+pinned master.  The cause is **not** the prefill staging path the r210 handover hypothesised (that hypothesis is
+refuted below) but the eager take-over's completeness guard in `moe_cache_update_host`:
+
+```c
+if (!table_cold_ok(t) && t.slots < (int) (n_used * n_tok)) { g_decline_all++; return false; }
+```
+
+`table_cold_ok()` is `g_cold_uva && t.cold_safe && t.host_dev != nullptr`, and `host_dev` is **null for every
+pool-backed table** (a pageable master).  So the guard bounded the pool tier by the **arena**: 8 tokens x 8
+routed experts = 64 ids against **56** arena slots at `-npl 8` -> every routed op declined (`decline_all=1920`,
+`takeover=0` in the census) and the whole run read the pageable mapping.  `-npl 4` is 32 <= 56, which is exactly
+why the 4-slot row never moved (193.5 vs 191.9).  r209 shipped the pinned tier, so block 09's numbers never met
+this; r210 made the covering pool the default and inherited it.
+
+The guard is about **representability** ("can every expert be expressed as a remap id"), not about the arena, and
+a pool whose capacity COVERS the tensor has the pinned master's own property: every expert is pool-resident, so
+`id = n_res_slots + slot` is a valid cold id for all of them.  **Fix: `pool_covers_table()`** (same translation
+unit, next to `pool_cold_geometry_ok`), `pool_cold_geometry_ok() && pool->slots >= n_experts` plus an O(1)
+re-check that every expert is resident, and the guard becomes
+`!table_cold_ok(t) && !pool_covers_table(t) && t.slots < n_used * n_tok`.  Nothing else changes: no
+`region`/`region_dev` field and no rebind of `t.host` (it keys `g_host_pools`/`g_host_src` and is shared by every
+per-device table of one tensor) -- the cold encoding already IS "a slot index into one pinned base", which is P6
+§1's whole point.  It is static per shape (the pool's slot count is fixed at the first build and the surplus
+layout never un-loads an expert when `slots >= n_experts`), so a CUDA-graph replay cannot see it flip.
+
+Measured, 2 devices, 35B-A3B Q4_K_M `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048`, serial, frozen heat prior:
+
+| `-npl 1,4,8` | pp 1 | tg 1 | pp 4 | tg 4 | pp 8 | tg 8 |
+|---|---|---|---|---|---|---|
+| pre-r210 tree `27271aa91` | 587.8 | 73.5 | 1254.7 | 199.3 | 1266.4 | 273.0 |
+| r210 `-lme auto` (the bug) | 128.4 | 74.1 | 1762.4 | 193.5 | 637.2 | **49.2** |
+| **r211 `-lme auto`** | 128.1 | 72.8 | 1759.0 | 193.6 | **1829.5** | **270.3** |
+| r211 `MOE_HOST_TIER=tensor` (pinned) | 592.8 | 75.6 | 1251.1 | 191.9 | 1262.8 | 276.5 |
+| r211 `-lme 64` (full-coverage pool, pageable master) | 45.7 | 72.1 | 1826.6 | 194.5 | 1820.1 | 271.4 |
+| r211 `-lme 8` (43 %, a genuine sub-complement budget) | 148.2 | 52.3 | 693.6 | 104.7 | 728.9 | **50.4** |
+| r211 `MOE_EXPERT_CACHE_MIB=0` (cache off) | 327.9 | 44.6 | 1224.8 | 91.2 | 1240.3 | 129.2 |
+
+So the shipped default now beats the pre-r210 tree on **both** axes at 4 and 8 slots (+40-44 % prefill, tg at
+parity) and the whole-coverage pool arm (`-lme 64`) recovers too.  A second `-npl 8` run reproduced 1854.4 /
+272.7.  In the **warm** shape (`-npl 1,8`, the arena sized by the 1-slot arm -- what a server sees after its
+first decode) the default gives **1792.6 / 268.2** against pinned 1253.5 / 268.5.
+
+**Refuted from the r210 handover** (`HANDOVER-R210.md` §3.1a/§3.2, now archived with the campaign): (a) the
+pool's prefill staging is *not* the cause -- for a covering table every expert is non-(-1) in the two-tier map,
+so it is ONE kernel launch, the same shape as a pinned master's, and the pool's npl-8 prefill is 44 % FASTER
+than pinned's; (b) `GGML_SCHED_DEVGATHER=0/1` makes no difference to the collapse (568 vs 635 pp, tg identical);
+(c) the leftover the handover saw as `pp 356-637` is the **cold first-pass** shape (the arena is sized only on
+the first decode-band pass, so the very first prompt batch has no arena) -- the same artifact the pre-r210 tree
+shows at `-npl 1` (pp 588 pinned vs 128 pool).  That first-prompt cost is pre-existing, unchanged by this
+change, and now recorded as `TODO` #142.
+
+### 2. The r210 fold was broken: blocks 09/10/11 did not build (found by gate 4, repaired here)
+
+The r210 fold put r210 **uses** into block 09's tree without the **definitions** the blocks that own them
+introduce, so `scripts/gate-per-block-build.sh` (owed at r210, never run) failed block 09 immediately:
+`decline`-era splices in `pool_rerank_from_tally_locked` (its body spliced with the block-12 surplus/heat body,
+calling the block-12 `pool_rank_experts_locked` that does not exist there and redefining `n`), `t.n_slices` read
+against a `table_t` that only block 10 grows, `it->second.all` on the block-12 `heat_prior_t` that only block 12
+introduces, an iface entry pointing at the block-12 `moe_cache_device_moe_cache_forget`, and
+`src/llama-model-loader.cpp` calling `llama_host_experts_mode_apply` / `plan_host_expert_placement` /
+`report_host_expert_placement` / `moe_host_expert_account(…, n_experts, …)` and defining a 1-arg
+`host_expert_buft` that the r210 header's inline forwarder already defines.
+
+Repair (mechanically re-derivable, `/tmp/repair-tree.py` during this session): each early tree is restored to
+the **pre-fold body** where the code belongs to a later block, or has the **definition hoisted from the block
+that owns it** (`table_t::n_slices` + `GGML_BACKEND_MOE_MAX_SLICES`/`ggml_backend_moe_slice` from block 10; the
+`-lme` plan/report/`host_expert_buft`/`moe_host_expert_account` signature from block 15's loader).  Where the
+hoist would need a block-12-only backend API (`ggml_backend_dev_moe_host_master_buft`, an iface member that
+would shift every backend's positional initializer), block 09 keeps the **pinned host buft in both branches** --
+i.e. a hole is placed like a pinned tensor until the mapped-master API arrives, which is honest for an
+intermediate tree and leaves the tip byte-identical.  **The tip tree is unchanged: `e2089b13` both before and
+after the repair** (verified by `git rev-parse HEAD^{tree}` on the composed chain and by
+`scripts/validate-set.sh`), so every number above is measured on the delivery tree itself.
+
+`scripts/gate-per-block-build.sh --changed-from 27271aa91`: **5/5 built, 0 failed** (blocks 09, 10, 11, 12, 15;
+78 s total, `all` target, wiped build dir per commit).
+
+### 3. Acceptance and the rest of the release gates (all on tree `e2089b13`)
+
+| gate | result |
+|---|---|
+| coherence, 2 devices `-lme auto` | decode **70.8** `-n 300` (bar >= 69), prefill **1314.6-1318.7** (bar >= 1300), `sha=231512fc77e5`; `-n 2000` **82.3** `sha=6ede7c724f4e`; 1 device **52.5** `sha=4ae33f7bd65c` |
+| the host-expert hook's kill-switch arms | `GGML_MOE_DEVREMAP=0` / `MOE_HOST_POOL_COLD=0` / `--host-experts pool` / `MOE_EXPERT_CACHE_VALIDATE=1`: all `sha=231512fc77e5`, no `NONUNIFORM-LAYER`, no `inconsistent` |
+| sequentially driven 2-slot server (`--parallel 2 --kv-unified`, slot0 x3 + slot1 + slot0) | byte-identical text on every request (never a concurrent two-slot diff as the oracle) |
+| MTP four-axis, `-n 3000`, 35B-A3B `-ncmoe 40` 2 devices | R **102.7** vs plain 65.2 (acc 0.710, pos1 0.853) / P **106.7** vs 65.5 (0.736, 0.873) / C **107.3** vs 63.5 (0.843, 0.935) / K **126.2** vs 66.2 (0.989, 1.000) -- acceptance healthy and MTP ahead on every axis |
+| prefill logits (dense 27B Q8_0, the recorded base) | mean KLD **0.000000**, same-top-p **100.000 %** |
+| prefill logits, host-expert A/B (`--ab MOE_HOST_TIER=tensor`, 35B-A3B `-ncmoe 40`) | mean KLD **-0.000000**, same-top-p **100.000 %** -- the pool tier is numerically identical to a pinned master's prefill |
+| per-block build, `--changed-from 27271aa91` | **5/5** (see §2) |
+| `scripts/validate-set.sh` | GREEN: 16 patches, checksums, fresh-tarball strict `git am`, tree `e2089b13`, no conflict markers, Windows portability clean |
+| `scripts/check-gpu-faults.sh` | clean on every arm above |
+
+### 4. Two limits this change does NOT remove (recorded, `TODO` #141/#142)
+
+* **A genuine sub-complement budget still declines at wide decode** (`-lme 8` = 43 % of the set: 50.4 tg at
+  `-npl 8`, worse than the cache being off, 129.2).  With `slots < n_experts` the pool cannot express every
+  expert, and the arena's resident set moves per token, so a *static* per-shape bound cannot guarantee a
+  complete remap -- the honest answer there is a bigger arena or the pinned tier.  Unchanged from r210; it is
+  what `TODO` #141 is for.
+* **The pool tier's first prefill pays ~3 s** (`-npl 1` pp 128 against pinned 588, i.e. 3.97 s vs 0.87 s for a
+  512-token prompt): the pool is built and prepopulated lazily and the arena is not sized until the first
+  decode-band pass, so the first prompt batch runs the pre-sizing staging path.  `MOE_HOST_POOL_PREWARM=0` does
+  not move it (122 vs 130), so it is the build/first-touch, not the prewarm.  Pre-existing r210 behaviour, not
+  a regression of this change (`TODO` #142).
+
+### 5. Also recorded: `MOE_HOST_LIMIT_FRAC` no longer isolates the not-fitting band
+
+The r210 handover's arms C and D used `MOE_HOST_LIMIT_FRAC=1` to mean "force the pool".  Since the r210 plan, the
+`-lme` budget in that band IS `auto_cap` = `MOE_HOST_LIMIT_FRAC` % of `MemAvailable`, and it overrides
+`MOE_HOST_POOL_MIB`, so `=1` sizes a **812.9 MiB** pool (11 slots/table) rather than the set: both arms then
+measure the same tiny pool (444 pp / 50 tg, `decline_all=30720`).  Use `-lme 64` (the whole set as a pool) and
+`-lme 8` (a genuine sub-complement budget) for those two arms.  Documented in `ENVIRONMENT.md`.
+
+**Campaign**: `wip/host-expert-eager-push/` is **promoted and archived** to
+`archive/work/host-expert-eager-push/` (P5/P6 + this session's matrix and logs); `wip/CAMPAIGNS.md` updated.
+
 ## 261104.001 (r210) -- block 09 amended: the host-expert tier becomes ONE pinned per-expert pool that mirrors the arena when the budget allows
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED -- no new block), release
