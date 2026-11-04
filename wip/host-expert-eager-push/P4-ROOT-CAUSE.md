@@ -594,6 +594,50 @@ the copies measure 0.5 us each and 15 GB/s in both arms; the cost only appears p
 live op, with the cache on (§5d).  A startup probe would therefore confidently pick the wrong arm on one
 device, and a probe big enough to see the difference is a prefill the user pays for on every start.
 
+## 5f. `hipHostFree` gives the pages back -- PROVEN (so `hipHostMalloc` can be the one mechanism)
+
+The plan is one allocation mechanism everywhere -- `hipHostMalloc` for both `pinned` (the whole set) and
+`pool` (a bounded, rotated set) -- so the load-bearing question is whether a freed region really returns its
+pages, or leaks them the way `hipHostUnregister` does (§5a).  `probe-hostfree.cpp` answers it two ways.
+
+**Test 1 -- does the page count come back?**  102 chunks of 184 MiB (18.33 GiB, exactly the expert set of
+35B-A3B), touched (the pin materialised), then `hipHostFree`d, twice:
+
+| cycle | held | MemFree returned on free | vs baseline | swap |
+|---|---|---|---|---|
+| 0 | 18.33 GiB | **18 329 MiB** | -365 MiB | 1 831 MiB (flat) |
+| 1 | 18.33 GiB | **18 376 MiB** | -323 MiB | 1 831 MiB (flat) |
+| (earlier, 20.00 GiB x 3 cycles) | 20.00 GiB | 19 688 / 20 340 / 20 067 MiB | -893 / -811 / -902 MiB | flat |
+
+No accumulation across cycles, and swap never moves -- the ~0.3-0.9 GiB residue is page-cache noise, not a
+leak.
+
+**Test 2 -- can the kernel actually REUSE them?**  Immediately after the last free, an 18.33 GiB file was read
+through the page cache: it pulled **18.33 GiB from disk** at 2.02 GB/s and `MemFree` fell by ~18.3 GiB
+(61 095 -> 42 425 MiB).  The freed bytes were genuinely available to become page cache again.
+
+So `hipHostFree` is a real release -- the opposite of `hipHostUnregister`, which returns success and keeps the
+pin (§5a).  That decides the design:
+
+| mechanism | fastest transport | release |
+|---|---|---|
+| **`hipHostMalloc`** | **yes** (prefill 645.9 / 1 105.4 t/s, decode 53.5 / 72.0 -- the best at every device count) | **`hipHostFree` returns the pages (proven above)** |
+| `hipHostRegister` (SVM) | 26 % / 14 % behind on prefill, decode at parity | **not releasable while the mapping lives** (§5a) |
+| pageable + pool/bounce (today's `pool`) | 616.6 / 707.1 prefill, 49.0 / 51.3 decode | n/a |
+
+**Therefore: use `hipHostMalloc` in both modes.**  `pinned` = the whole set in pinned chunks (the loader
+already allocates per tensor, 144-176 MiB, and chunked allocation was verified at 18 584 MiB / 101 chunks /
+101 aliased); `pool` = the *same tier* with a budget -- pin what the budget allows, rotate the contents, and
+`hipHostFree` when shrinking.  That is exactly the maintainer's framing: **`pool` is `pinned` with a pin
+limit and a policy**.  The registration experiment (patch 0007) is not needed for it and should stay out of
+the delivery.
+
+One RAM note worth recording, because it changes the campaign's own premise: the pinned bytes are a *copy*
+(not a registration of the mapping), so the pinned tier costs its budget in new pinned RAM.  It does not
+cost double, though: the mapping's pages for the pinned experts are never read again, so under pressure the
+kernel reclaims them -- the steady-state cost of the tier is its budget, and the reclaimable tier is what
+remains in the page cache.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
