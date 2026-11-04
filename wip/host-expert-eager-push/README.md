@@ -19,7 +19,17 @@
 > `unregister + munmap` does, and a sliding registered window over a **private** mapping of the model file
 > reclaimed **40/40 cycles** (`MemAvailable` flat, no accumulation) while a long-lived model mapping over the
 > same pages stayed fully reclaimable with identical data — so the rule is **never register the model's own
-> mapping; register a private window and release it by `munmap`**.  Also recorded: the destination (plain `hipMalloc` vs a
+> mapping; register a private window and release it by `munmap`**.  **Over-commitment tested at scale**
+> (`probe-overcommit.cpp`, 100 GiB file vs 91 GiB RAM, 20 GiB registered windows, 3 loops, 300 GiB read, in
+> one process): every window released and **verified droppable**, registration 31-33 ms per 20 GiB, DMA 28.8
+> GB/s, `MemAvailable` and swap **flat** — no leak, no thrash, no lockup, in both read modes (`mmap` and
+> `O_DIRECT`).  Releasing a pin does **not** discard the page cache: a resident 8 GiB window re-reads in
+> 13-21 ms and re-registers in ~13 ms (72 GiB in 3.3 s over 3 loops), and with a **50 GiB region pinned
+> permanently** a 5 GiB cycling set still climbs from 40 % to 87 % cache-served over five loops (the no-pin
+> control behaves the same — the convergence is the host's cache policy, not the pin).  Two host caveats
+> recorded: `hipHostRegister` of a single 50 GiB range works and faults the pages in itself (register
+> **first**, not after a read), and on this box `/proc/meminfo` `Cached`/`MemAvailable` do not account these
+> pages usefully — judge residency by `read_bytes` and a second pass.  Also recorded: the destination (plain `hipMalloc` vs a
 > VMM/slab slot) is **irrelevant** (HANDOVER experiment 1 closed negative), and on this stack a pageable
 > **1-D** copy is 2-3x *slower* than a pageable 2-D copy of the same bytes (the opposite of the earlier
 > single-GPU observation; the transferable conclusion is "stop it being pageable", not "reshape the copy").
