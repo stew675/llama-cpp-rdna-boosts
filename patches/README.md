@@ -2510,6 +2510,16 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r212 amendment: the host pool's fill mode mirrors `--load-mode`.**  `MOE_HOST_POOL_DIO=auto` no longer guesses from
+> `MemAvailable` ("the set does not fit beside the pool -> O_DIRECT"), which on a tight box always said O_DIRECT and silently
+> overrode the operator's `--load-mode mmap`.  A mapped load is a request for the page cache, so the pool fills through it; an
+> O_DIRECT fill is an explicit `MOE_HOST_POOL_DIO=1`.  A pool only exists on a mapped load (its master *is* the model mapping), so
+> in practice auto = buffered.  Measured on a 113 GB Flash-Next, 2 devices, `-ncmoe 48 -lme 60`: the population drops from **95.20
+> GiB of storage reads at 2 785 MiB/s (35.8 s)** to **95.20 GiB of mapping memcpys at 4 062 MiB/s (24.8 s)** with zero drive traffic.
+> New iface entry `moe_cache_set_host_fill_mode`, APPENDED at the end of `ggml_backend_device_i` (it is initialized positionally);
+> the loader reports its resolved `use_direct_io` once, from its constructor.  Value-identical: the buffered-vs-O_DIRECT
+> prefill-logit A/B measures KLD -0.000000 / 100.000 %.  Records: `WORKLOG.md` 261104.003, `INVARIANTS.md` r212.
+
 **What it is.**  The tail of the campaigns: CPU wins, the backend-iface fills that every non-CUDA backend
 needs for the new hooks, DFlash, the FA instance build grouping, and the small allocator/model fixes that
 had no other home.

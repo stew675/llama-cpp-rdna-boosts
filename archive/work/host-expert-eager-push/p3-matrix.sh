@@ -10,7 +10,7 @@
 # NEVER run two arms at once (AGENTS.md: benchmarks are serial; a parallel arm poisons both).
 set -uo pipefail
 cd "$(dirname "$0")"
-REPO=$(cd ../.. && pwd)
+REPO=$(cd ../../.. && pwd)
 FORK=${FORK:-$HOME/llama.cpp}
 BIN=${BIN:-$FORK/build-rocm/bin}
 ROCM=${ROCM:-/opt/rocm-10.1.0-gfx120X}

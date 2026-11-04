@@ -1,4 +1,4 @@
-From 65d1e72ad231cb98fbb217e4d1faccf0ca8910cb Mon Sep 17 00:00:00 2001
+From 2cf5ce8bbf68c1a7eca51fbb99b8bde4ddaf8a76 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -1090,10 +1090,10 @@ index 29d9dbbd0..5463bccc3 100644
                      int64_t sum_used_target = sum_free;
                      if (nd == 0) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 705cc5002..dd6961a45 100644
+index 3b054946e..bff990c7f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -589,6 +589,26 @@ extern "C" {
+@@ -591,6 +591,26 @@ extern "C" {
          const struct ggml_tensor * tensor, const struct ggml_backend_meta_split_state * split_state,
          size_t n_devs, size_t dev);
  
@@ -2887,7 +2887,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 853709b00..25a44c152 100644
+index 50c65928a..fb6fa066e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -4337,7 +4337,7 @@ index 853709b00..25a44c152 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8510,8 +9837,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8516,8 +9843,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4398,7 +4398,7 @@ index 853709b00..25a44c152 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8623,6 +10002,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8629,6 +10008,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -4793,7 +4793,7 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index d2bbabc43..31db9fac1 100644
+index 64d0663b4..a5f397132 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -54,10 +54,6 @@ static void heat_pull_locked();
@@ -4807,7 +4807,7 @@ index d2bbabc43..31db9fac1 100644
  namespace {
  
  // wip/host-expert-tier: the loader opens the persisted prior BEFORE it places any host-expert tensor (see
-@@ -2422,7 +2418,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+@@ -2456,7 +2452,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return cudaErrorInvalidDeviceFunction;
      }
      const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -4833,7 +4833,7 @@ index d2bbabc43..31db9fac1 100644
      return err;
  }
  
-@@ -4507,9 +4520,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -4541,9 +4554,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -6476,7 +6476,7 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 538f7f6e9..3386d2be9 100644
+index 70162ac76..8de02d167 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,874 +53,872 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m

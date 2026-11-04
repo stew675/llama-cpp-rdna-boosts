@@ -1671,3 +1671,22 @@ cost a session to learn; do not re-derive them.
    `auto_cap` = `MOE_HOST_LIMIT_FRAC` % of `MemAvailable` and it **overrides `MOE_HOST_POOL_MIB`**, so `=1` sizes
    an 812.9 MiB pool (11 slots/table) and every arm measured with it is a tiny-pool arm.  Use `-lme 64` (the whole
    set as a pool) and `-lme 8` (a genuine sub-complement budget) for those A/Bs.
+
+## r212 — the host pool's fill mode mirrors `--load-mode` (the operator's caching decision), not a RAM guess
+
+1. **`MOE_HOST_POOL_DIO=auto` mirrors `--load-mode`.**  A mapped load is a request for the page cache, so the pool fills through it
+   (a `memcpy` out of the model mapping); O_DIRECT fills are an explicit `MOE_HOST_POOL_DIO=1`.  The pool only exists on a mapped
+   load (its master *is* the mapping), so in practice auto = buffered.  The old rule ("the set does not fit beside the pool ->
+   O_DIRECT") is preserved as a **note** on the decision line, not as the decision.
+2. **The measured cost of getting this wrong is the POPULATION, not the steady state.**  On a 113 GB Flash-Next, 2 devices,
+   `-ncmoe 48 -lme 60` (host expert set 71.7 GiB, pool 60 GiB, `per_layer_token_embd` 26.8 GiB host-resident): O_DIRECT fills read
+   **97 692 × 1.0 MiB = 95.20 GiB at 2 785 MiB/s in 35.8 s** of drive time, all of it inside the load/first-prefill window
+   (`TODO` #142), which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
+   24.8 s**, and the pages stay reusable.  Nothing is evicted either way (`evictions=0`, `h=0.9073`).
+3. **`-lme N` is a byte budget, so N below the host expert set is a SUB-COVER pool, and the model's expert count decides the
+   coverage.**  On a 512-expert/layer model, `-lme 60` against a 71.7 GiB set is 428 slots of 512 = **84 %**, not "it fits"; the
+   plan line prints both numbers, so read it before believing a pool is complete.  A pool *is* complete only when `slots >=
+   n_experts` per table (`pool_covers_table()`, r211).
+4. **A mapping-backed pool's master is the read-only model mapping, so `--load-mode dio`/`none` cannot have a pool** — the plan
+   reports "NOT APPLIED: a pool needs a mapped load" and the whole-tensor pinned master is used instead.  Do not read that as the
+   pool being disabled by a bug.

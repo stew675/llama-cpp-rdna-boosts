@@ -1,3 +1,44 @@
+## 261104.003 (r212) -- the host pool's fill mode mirrors `--load-mode` (a mmap is a request for the page cache, not a RAM guess)
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 12 AMENDED), release `v16-6050b467c-r212`, tip `5f3e6ffee`,
+tree `0c76a1eb`.**  Found while answering a user question about `llama-server` maxing the disk during prefill on a 113 GB
+Flash-Next (`-ncmoe 48 -lme 60`, 2 devices).
+
+**The finding.**  `MOE_HOST_POOL_DIO=auto` decided the pool's fill mode from `planned_pool + host_total > MemAvailable`, which
+on a tight box is always O_DIRECT -- so the operator's `--load-mode mmap` (an explicit request for the page cache) was being
+silently overridden, and the pool's POPULATION -- the one read that cannot be avoided -- went to the drive.  Measured on that
+config (host expert set **71.7 GiB**, pool 60 GiB = 428 of 512 slots/table = 84 %, `per_layer_token_embd` 26.8 GiB
+host-resident, arena 66.3 %):
+
+| pool fill mode | fills | fill time | effective | drive traffic |
+|---|---|---|---|---|
+| O_DIRECT (the old auto) | 97 692 storage reads | **35.8 s** | 2 785 MiB/s | 95.20 GiB off the drive |
+| buffered (the new auto, mirroring `--load-mode mmap`) | 97 692 mapping memcpys | **24.8 s** | 4 062 MiB/s | none |
+| `MOE_HOST_POOL_DIO=1` on a mapped load (the override still works) | 97 692 storage reads | 36.1 s | 2 708 MiB/s | 95.20 GiB |
+
+**Policy (the maintainer's call):** the fill mode **mirrors `--load-mode`**, because the load mode IS the operator's caching
+decision.  A pool only exists on a *mapped* load (its master is the model mapping; `--load-mode dio`/`none` log "NOT APPLIED: a
+pool needs a mapped load" and use the whole-tensor pinned master instead), so in practice auto = buffered and O_DIRECT fills are
+an explicit request.  The MemAvailable numbers are still computed and printed *as a note* on the decision line when they cannot
+hold the pool AND the set, naming `MOE_HOST_POOL_DIO=1` as the memory-tight arm (the regime r112 tuned it for).  The old
+heuristic survives only for a consumer that never reports a load mode.
+
+**Implementation.**  One new device-iface entry, `moe_cache_set_host_fill_mode(dev, direct)`, **APPENDED at the end of
+`ggml_backend_device_i`** (the documented positional-initializer rule -- inserting in the middle would alias every other
+backend's entries, which is exactly what bit the block-09 repair in r211); the loader reports `use_direct_io` from its own
+resolved `--load-mode`, once, in `llama_model_loader`'s constructor; the cache stores it and `pool_decide_dio_locked` applies
+env-force → mirror → heuristic in that order.  Every backend other than CUDA leaves the entry zero-initialized.
+
+**Gates** (all on tree `0c76a1eb`): `validate-set.sh` GREEN (16 blocks, fresh-tarball strict `git am`); per-block build
+`--changed-from 3e9b35c50` **2/2** (block 12 and the tip); coherence unchanged **70.8 decode / 1318.1 prefill**, `sha=231512fc77e5`
+@n=300 and `sha=6ede7c724f4e` @n=2000 (byte-identical to r211); prefill logits **KLD 0.000000 / 100.000 %** on the dense 27B and
+**-0.000000 / 100.000 %** as the buffered-vs-O_DIRECT A/B on the host-expert arm (`--ab "MOE_HOST_POOL_DIO=1"`), which is the
+proof this changes the source of the bytes and not the bytes; MTP four-axis P 106.8/K 126.4/C 107.6/R 102.8 vs plain
+65.6/66.3/63.6/65.0 with acceptance **bit-identical to r211** (0.73569 / 0.98933 / 0.84308 / 0.70957); `llama-batched-bench
+-npl 1,4,8` 126.0 / 1754.5 / 1809.9 pp and 73.6 / 194.3 / **267.0** tg; `check-gpu-faults.sh` clean on every arm.
+
+**Also fixed in passing**: the archived campaign's `p3-matrix.sh` computed the repo root as `../..`, which broke after the move
+to `archive/work/` (the fault check and the text hash silently stopped running) -- now `../../..`.
 ## 261104.002 (r211) -- the pool tier is a complete cold source at wide decode (`-npl 8` 49 -> 270 tg), and the r210 fold is repaired so every block builds
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED, 09/10/11/12 REPAIRED), release
