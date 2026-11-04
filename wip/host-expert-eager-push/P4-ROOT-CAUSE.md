@@ -656,6 +656,57 @@ reclaimable.
 The one-time 1.9 s is also optimisable if it ever matters: it is a double copy today (page cache -> user
 buffer -> pinned), and a direct `read()`/`O_DIRECT` into the pinned buffer would halve it.
 
+## 5g. Why 3-GPU host experts are 20 t/s for EVERY transport: the split mirrors an expert set on dev 0
+
+A quick 3-GPU check (the maintainer asked for one) reproduces `TODO` #135 -- and shows it is **not a transport
+problem at all**, because all three transports land in the same place:
+
+| 3 GPUs (0,1,2), `-sm tensor` | decode (`-n 300`) | prefill (prose) |
+|---|---|---|
+| `pool` | 19.5 | 281.2 |
+| `pinned` (real) | 20.1 | 443.5 |
+| registered in place | 20.4 | 422.4 |
+
+20 t/s is *worse than one GPU* (53.5), while all-VRAM on the same 3 cards is 138.  The geometry explains it --
+with `GGML_CUDA_CACHE_GEOM_DEBUG` now printing the device id:
+
+```
+layer 0, 3 devices:
+  dev=0  ffn_gate_exps  eb=589824 (WHOLE tensor)     ffn_down_exps eb=720896 (WHOLE)
+  dev=1  ffn_gate_exps  eb=294912 (half, src_off 0)  ffn_down_exps eb=360448
+  dev=2  ffn_gate_exps  eb=294912 (half, src_off 294912)  ffn_down_exps eb=360448 (src_off 176)
+```
+
+**Device 0 is MIRRORED (the whole expert) while dev 1 and dev 2 hold the two halves** -- 2x the expert bytes
+and the whole expert's compute on dev 0 (so the critical path is one device, with extra traffic on top).
+Every transport measures the same because the transport is not the bottleneck.
+
+Why: it is **not** `-sm relaxed-tensor` (we never selected it).  `src/llama-impl.h:46-50` says *"TENSOR and
+RELAXED_TENSOR place the weights identically ... they differ only in the replication contract"*, so the
+placement code is shared, and `GGML_META_SPLIT_COPY` (default **1**: every scheduler weight copy inherits its
+weight's split) is what makes the per-split copies follow the weight's state.  The split state itself is what
+hands dev 0 a MIRRORED expert: the split is *"granularity-rounded, so it need not be even"*
+(`ggml_backend_meta_split_dev_bytes`), and this model's expert rows are 512 wide against a 256-element quant
+granularity, i.e. **exactly two valid chunks** -- so a 3-way split cannot be expressed and the leftover device
+falls back to MIRRORED (the default arm of the split-state switch, `llama-model.cpp:680`).  That is why 2
+devices is the last clean tensor split for this family, and why the campaign's own record says the 3-device
+tensor split is not a scaling point.
+
+**Practical consequence for the refactor:** do not chase the 3-GPU tensor number -- it is `TODO` #135/#104
+territory (`relaxed-tensor` is a TEMPORARY block).  The usable 3-GPU configuration is `-sm layer` (a whole
+tensor per device):
+
+| 3 GPUs, `-sm layer` | decode | prefill |
+|---|---|---|
+| `pool` | 50.3 | 671.4 |
+| `pinned` (real) | **54.4** | **622.3** |
+| registered in place | 54.3 | 440.9 |
+
+**One diagnostic worth adding to the delivery**: a table arriving with `split_axis` such that one device holds
+`expert_bytes == host_bytes` while another holds a slice means the split is mirroring -- it silently costs
+about 3.5x throughput and 2x the bytes.  That deserves a one-line WARN at sizing, next to the loud-fallback
+requirement.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
