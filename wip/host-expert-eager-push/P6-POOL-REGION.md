@@ -124,6 +124,74 @@ That is a real change with a narrow payoff (decode parity with `pinned` at 100 %
 per-tensor tier); it is recorded rather than attempted, because the fit case already hits the `pinned` numbers
 through P5's tier and the *interesting* band (a budget below the set) is now the pool's and measured better.
 
+## 7. Why a fully resident pool still decodes slower at `-n 300` — it is warm-up, not the pool
+
+Asked after the first round: *if the pool can hold every weight, why is anything still cold, and does the pool
+need to be armed better at start-up?*  Short answer: nothing is missing from the pool, "cold" is the **VRAM
+arena**, not the host tier, and the decode gap is a **warm-up transient that both arms share** — at `-n 2000` it
+is 2.5 %, and the *marginal* rate differs by 0.5 %.
+
+### 7a. The pool is fully loaded, and it never churns
+
+`MOE_HOST_POOL_MIB` = the whole set (full coverage), 2 devices, `-n 300`:
+
+```
+host pool (L2): 120 tensors, 30720 slots, 18662.0 MiB pinned; h=0.6303, fills=30720, evictions=0
+```
+
+30 720 slots for 30 720 experts, each filled exactly once (the prepopulate), **zero evictions, zero storage
+reads** — the duplicate-free guarantee is intact and nothing is re-read from disk.
+
+### 7b. "Cold" is the arena, and its mix is the same in both arms
+
+| access outcome | pinned master | full-coverage pool |
+|---|---|---|
+| **hit** — the expert is in the **VRAM arena** | 74.06 % | 75.01 % |
+| **cold** — not in VRAM; read **in place** over PCIe (no copy) | 20.69 % (38 075 MiB) | 17.99 % (31 990 MiB) |
+| **fill** — not in VRAM; copied into an arena slot | 5.26 % (9 680 MiB) | 7.00 % (12 448 MiB) |
+| total H2D | 47 755 MiB | **44 438 MiB** |
+
+The arena is `MOE_EXPERT_CACHE_MIB` (2 041 MiB/device here) against an 8.8 GiB/device expert set, i.e. **56 of
+256 experts per table**, and the `touch` doorkeeper deliberately serves a one-shot expert in place instead of
+evicting a hot resident (`GREEDY-PURITY`): "cold" is a *policy choice about VRAM*, present in both arms.  The
+pinned arm is **not** less cold — it does *more* in-place reads and moves *more* bytes.
+
+### 7c. The gap is the first few hundred tokens
+
+decode t/s, 2 devices, identical text at every n:
+
+| `-n` | pinned master | full-coverage pool | gap | wall difference |
+|---|---|---|---|---|
+| 50 | 66.5 | 51.7 | −22 % | +0.22 s |
+| 100 | 68.1 | 55.9 | −18 % | +0.32 s |
+| 300 | 71.9 | 63.9 | −11 % | +0.52 s |
+| 500 | 75.5 | 69.7 | −7.7 % | +0.55 s |
+| 600 | 76.9 | 71.8 | −6.6 % | +0.56 s |
+| 1000 | 80.1 | 76.4 | −4.6 % | +0.61 s |
+| 2000 | 82.9 | 80.8 | **−2.5 %** | +0.63 s |
+
+**Both arms warm up** (pinned 66.5 → 82.9; pool 51.7 → 80.8) as the arena's LFU/heat placement converges, so the
+interesting quantity is the *difference*: ~0.13 s fixed (the n=50 point) plus ~0.5 %/token (300 → 2000 gives
+**85.2 t/s pinned against 84.8 t/s pool** on the marginal 1 700 tokens).  So yes: the gap nearly closes at
+`-n 2000`, and what is left is not a pool-residency problem.
+
+### 7d. Candidates tested and ELIMINATED (all measured, 2 devices, `-n 300`)
+
+| candidate | test | result |
+|---|---|---|
+| the fill copy kind (D2D from the pool alias vs H2D from pinned) | `MOE_HOST_POOL_H2D=1` | 63.7 vs 63.9 — no |
+| the sync-free device remap (only a pinned master qualifies for it) | it never engages in *either* arm (no `device remap: N calls` line); `GGML_MOE_DEVREMAP=0` | 63.7 — no |
+| the cold-read availability (fewer in-place reads in the pool arm) | `MOE_HOST_POOL_COLD=0` | 58.2 → cold reads are worth **+5.7 t/s**, i.e. a win, not the cost |
+| per-access host work: `table_pool_locked()` was a `std::map` (tree) lookup on the per-ACCESS path | cached the pointer on the table + `std::unordered_map` (implemented, measured, then **reverted**: no measurable effect) | 63.8 / 81.1 against 63.9 / 80.8 — no |
+| the pool's 18.22 GiB population (1 033 ms) landing inside the measured window | `MOE_HOST_POOL_PREWARM=0` | +3.0 t/s at n=300, **+0.3 at n=2000** → it is ~0.09 s of the window, not the gap |
+| traffic | the census above | the pool arm moves **less** H2D |
+
+So the pool does not need "better arming": its contents are complete and static, and moving the population to
+the preflight (the only remaining arming step) is worth ~0.09 s of a short run.  The residual ~0.5 %/token is
+**unattributed**; the two structural differences left are that a pool-backed table keeps the pool-backed
+*prefill* staging branch (irrelevant to decode) and that its arena fills read the pool alias rather than a pinned
+master (tested above, a wash).  Recorded so nobody re-derives these six negatives.
+
 ## 6. Reproduce
 
 ```bash
