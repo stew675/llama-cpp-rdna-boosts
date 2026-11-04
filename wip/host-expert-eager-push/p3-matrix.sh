@@ -22,6 +22,7 @@ CTX=${CTX:-8192}
 NCMOE=${NCMOE:-40}
 CACHE_MIB=${CACHE_MIB:-2048}
 POOL_FRAC=${POOL_FRAC:-50}
+HOSTMODE=${HOSTMODE:-pool}   # --host-experts <mode>: pool | pinned (pinned = the FULL pinned master, duplicated)
 PROMPT_FILE=${PROMPT_FILE:-}
 # LV=4 prints the moe_cache_report census (ggml INFO is filtered at llama-cli's default level), but a verbose
 # log INTERLEAVES stats lines into the generated text, so extract-generated.py's hash is INVALID on such a run
@@ -49,12 +50,12 @@ env HIP_VISIBLE_DEVICES="$GPU" LD_LIBRARY_PATH="$ROCM/lib${LD_LIBRARY_PATH:+:$LD
     MOE_EXPERT_CACHE_MIB="$CACHE_MIB" MOE_HOST_POOL_FRAC="$POOL_FRAC" \
     "$@" \
     "$BIN/llama-cli" -m "$MODEL" -ngl 99 -sm "$SM" -mg 0 \
-        -ncmoe "$NCMOE" --host-experts pool -c "$CTX" -n "$N" \
+        -ncmoe "$NCMOE" --host-experts "$HOSTMODE" -c "$CTX" -n "$N" \
         "${PROMPT_ARGS[@]}" --seed 42 --temp 0 \
         --no-display-prompt --single-turn "${EOS_ARGS[@]}" "${LV_ARGS[@]}" >"$LOG" 2>&1
 rc=$?
 echo "=== $TAG  (rc=$rc, gpus=$GPU, sm=$SM, n=$N, bin=$BIN)"
-echo "    env: $*"
+echo "    env: $*  (host-experts=$HOSTMODE)"
 echo "    prompt: ${PROMPT_FILE:-the 15-token 'The capital of France is'}  devgather=${GGML_SCHED_DEVGATHER:-unset}  ignore-eos=${EOS:-0}"
 grep -oE "\[ Prompt: [0-9.]+ t/s \| Generation: [0-9.]+ t/s \]" "$LOG" | tail -1
 if [ "$LV" -gt 0 ] || [ -n "$PROMPT_FILE" ]; then

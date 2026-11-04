@@ -290,6 +290,55 @@ progress, which restores ~2 GB/s cold and >50 GB/s when resident.
 | 50 GiB registration with **no host read first** (`PIN_READ=0`) | **OK** -- registration faults the pages in itself, so the host does **not** have to read them first |
 | register **after** `MADV_WILLNEED`-driven readahead, same process | one **`hipErrorInvalidValue`** observed; the retry succeeds.  **Register-first is the robust order** |
 
+## 5c. What `--host-experts pinned` actually is (and why the registered path replaces it)
+
+The question the next design phase turns on: is `pinned` the same mechanism, just unlimited?  **No.**  From the
+tree:
+
+- `llama_model_loader::host_expert_buft()` returns `ggml_backend_dev_host_buffer_type(dev)` for
+  `LLAMA_HOST_EXPERTS_MODE_PINNED` (`src/llama-model-loader.cpp:56-68`), i.e. the `ROCm_Host` buffer type, whose
+  allocation is `cudaMallocHost` = **`hipHostMalloc`** (`ggml-cuda.cu:4203-4235`) -- a **second, complete copy**
+  of the host expert set, into new pinned pages, loaded from the GGUF.
+- There is **no size limit**: `get_max_size` is **4 GiB per buffer**, so the loader splits the set into
+  several pinned buffers, and the only bound is available RAM.
+- It is **not** `hipHostRegister`.  The tree *has* the in-place call --
+  `ggml_backend_cuda_register_host_buffer()` -> `cudaHostRegister(buffer, size, Portable|ReadOnly)`
+  (`ggml-cuda.cu:8660`) -- and it is exposed through `get_proc_address`, but **nothing in the tree calls it**.
+- Failure is **silent and expensive**: if `cudaMallocHost` fails, the allocation falls back to
+  `ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size)` -- **pageable** memory.  A pageable
+  master has no device alias, so the in-place cold read stands down and every miss becomes a fill.  Measured
+  by forcing it (`GGML_CUDA_NO_PINNED=1`, 2 devices, `-n 300`):
+
+| `--host-experts pinned` | decode | cold read | fills | H2D traffic |
+|---|---|---|---|---|
+| allocator AVAILABLE | **71.6-72.1 t/s** | `cold=uva`, 125 286 in-place reaches (20.7 %) | 31 874 | 9 680 MiB fills + 38 075 MiB cold |
+| allocator DISABLED (pageable fallback) | **36.0 t/s** | `cold=uva`, **0 reaches** | 124 350 | 37 781 MiB fills |
+
+  So "no limit" is exactly the problem: on a box that cannot supply the whole duplicate, the mode degrades by
+  half **without an error**, and nothing tells the user which of the two states they are in.
+
+**Performance parity, RAM not parity** -- all 2 devices, `-n 300`, clean runs, byte-identical text
+(`sha=231512fc77e5`) across every arm:
+
+| arm | decode | what the host expert set costs in RAM |
+|---|---|---|
+| `--host-experts pinned` (fully pinned) | 71.6 / 72.1 | **the whole set duplicated in pinned pages: 18 662 MiB, never released** |
+| `--host-experts pool` (bounded pool) | 50.7 / 51.4 | 9 331 MiB pinned duplicate + page cache |
+| `--host-experts pool` + `MOE_HOST_PUSH_REGISTER_MIB` (registered in place) | **71.5 / 71.7 / 71.9** | the page-cache pages, registered in place -- **no new RAM** |
+| registered in place + `MOE_EXPERT_CACHE_COLD_UVA=0` (no device-pull) | 71.6 | as above |
+
+**So `pinned` is "the right transport at the wrong RAM cost", and the registered mapping is the same
+performance with no duplicate at all.**  That is the design statement: the campaign is not asking for a new
+transport, it is asking `pinned` to stop copying the weights.  Registration also keeps the charter's
+"never device-pull" available at no cost (71.6 with the cold read off, against 71.6 with it on).
+
+Two side notes for whoever implements it:
+
+- Registration needs the model mapping to exist (`use_mmap`); a non-mmap load has no page-cache master to
+  register, so `pinned`'s allocation stays the fallback there.
+- A pageable fallback must be **loud** (the existing `GGML_LOG_DEBUG` in `ggml_cuda_host_malloc` is invisible
+  at the default log level), otherwise a user can silently lose half the throughput.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
