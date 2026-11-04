@@ -632,11 +632,29 @@ already allocates per tensor, 144-176 MiB, and chunked allocation was verified a
 limit and a policy**.  The registration experiment (patch 0007) is not needed for it and should stay out of
 the delivery.
 
-One RAM note worth recording, because it changes the campaign's own premise: the pinned bytes are a *copy*
-(not a registration of the mapping), so the pinned tier costs its budget in new pinned RAM.  It does not
-cost double, though: the mapping's pages for the pinned experts are never read again, so under pressure the
-kernel reclaims them -- the steady-state cost of the tier is its budget, and the reclaimable tier is what
-remains in the page cache.
+**The load phase is a real copy, and the tier costs its budget (both measured).**  `hipHostMalloc` returns
+driver-owned pinned pages, so the loader must move the bytes into them -- it is not a page remap, and it is
+measurable:
+
+| arm | load phase (`loading model tensors` -> next line) | physical memory consumed |
+|---|---|---|
+| `pinned` | **1.9 s** (~9.8 GB/s for 18.6 GiB) | **19 651 / 18 476 / 18 583 MiB** over three consecutive runs |
+| `pool` | 0.04 s (the bytes never leave the mmap) | ~10.1 GiB (the 9.3 GiB pool) |
+
+`pool`'s 0.04 s is what a page remap would look like -- which is why the 1.9 s in `pinned` is proof of a copy
+(it also *cannot* be a remap: hipHostMalloc's pages are pinned and handed to the GPU as stable physical
+memory, so mapping reclaimable file pages into that VA would defeat the pin).
+
+**RAM accounting, and it is the good answer: the tier costs its budget, NOT double.**  Three consecutive
+`pinned` runs consumed 18 651 / 18 476 / 18 583 MiB for an 18 662 MiB tier -- no accumulation, and the
+page-cache copy of the same bytes is not added on top (it gives way as the tier is populated, then stays
+unread).  The measurement is **order-independent**: running `pool` first then `pinned` gives the same
+per-mode figures (19.3 GiB / 10.1 GiB) as the reverse order.  The only ordering-sensitive quantity is what
+each run leaves in the page cache when it exits (~11 GiB after `pinned`, ~1.3 GiB after `pool`), and that is
+reclaimable.
+
+The one-time 1.9 s is also optimisable if it ever matters: it is a double copy today (page cache -> user
+buffer -> pinned), and a direct `read()`/`O_DIRECT` into the pinned buffer would halve it.
 
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
