@@ -1,3 +1,96 @@
+## 261104.007 (r214) -- `TODO` #143 FIXED: the slab's narrow-2 (MTP draft compute) region is MAPPED for its whole extent, and the draft reserve stops guessing the compute term
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED and block 12 AMENDED), release
+`v16-6050b467c-r214`, tip `e76491d89`, tree `5de3ff716`.**  The r213 report (`WORKLOG.md` 261104.004) left one
+pre-existing defect open: a 2-device `-sm layer` Flash-Next at `-c 204800` faults the GPU during the first prefill.
+It was not block 15 (it reproduced with `LLAMA_KV_REGION_POOL=0`), not the PLE host read, and not a use-after-evict.
+
+### 1. The defect: a slab region handed to a graph with no physical behind its top
+
+`ggml_cuda_slab_narrow2_pin_locked()` pins the MTP draft's compute region (narrow-2) at the **top** of the slab's
+reserved VA: `off = size - nf2`.  `ggml_cuda_slab_narrow2_commit_locked()` had two branches:
+
+| condition | what it did |
+|---|---|
+| `off >= mapped` (the region fits the unmapped spare) | maps `nf2` physical at `off` |
+| `off < mapped` ("taken from the arena") | evicts the tables in `[off, mapped)`, caps the arena -- **maps nothing** |
+
+When the region **straddles** `mapped` (`off < mapped < off + nf2`) -- the documented shortfall case, the one r106
+added the arena-yield branch *for* -- nothing above `mapped` is ever mapped, yet the draft's compute buffer occupies
+the whole region.  On a no-XNACK part the first access past `mapped` is an unrecoverable fault.  Every arm's slab
+accounting separates the classes exactly (from the `SLAB_INIT` / `narrow-2` lines):
+
+| arm | slab `size` / `mapped` | narrow-2 `off` | branch | mapped part of the region | |
+|---|---|---|---|---|---|
+| 1 dev, `-c 204800` | 23.19 / 21.88 | 21.94 | spare | 1.25 GiB (all) | clean |
+| 2 dev, `-c 131072` | 25.75 / 24.62, 27.81 / 26.69 | 24.75, 26.81 | spare | 1.00 GiB (all) | clean |
+| 2 dev, `-c 204800` | 25.62 / 24.25, 27.69 / 26.38 | **24.12, 26.19** | **arena** | **0.13 / 0.19 GiB**, 1.37 / 1.31 GiB **absent** | **fault** |
+
+Attribution (temporary `norm.cu` instrumentation, reverted): the faulting launch is `rms_norm_f32<1024,1,...>` over
+`ROCm1#mtp_h_state-48#0` = `reshape_3d(inp->h, n_embd, hc, n_tokens)` (`src/models/qwen4exp.cpp:1223`), `src0`/`dst`
+both in the 1536 MiB `ROCm1` compute buffer = **exactly** the narrow-2 region (`slab_base + 24.12 GiB`).  The fault
+address lands `0x21E000` past `dst`, i.e. just above the mapped boundary, which `/proc/<pid>/maps` confirms: the
+`---s /dev/dri` mapping of the slab ends there and a 1408 MiB `---p` (the slab's `va_spare`) begins.  So the crash is
+inside the *draft's* compute buffer, not the residual stream and not host memory (both `buft=ROCm1, host=0`).
+
+**Fix (block 12, 12 lines of logic):** `narrow2_commit` maps **whichever part of `[off, off+nf2)` has no physical
+behind it** -- the whole region when it is above `mapped`, or just the tail when it straddles -- then sets
+`s.mapped = off + nf2`; the arena-yield and the `arena_free` drop for `[off, mapped)` are unchanged.  Addresses are
+untouched (the region was already handed to the graph allocator), so this moves no tensor.  The comment above
+`ggml_cuda_slab_arena_limit()` is corrected: the `min(mapped, ceiling)` clamp is **load-bearing**, not defensive,
+because `mapped` now ends up *above* `narrow2_off` in the straddle case.
+
+### 2. Why it only showed at a deep context, and the reserve's compute term (block 09)
+
+The region is `size - off` large and the spare is `size - mapped`.  The spare is the draft-context estimate the slab
+holds back **before** the draft exists, and its `compute` term was a 512/768 MiB tier measured at `-c 16384`.  The
+draft's compute buffer is **not** a constant: it is read back measured (`sched_reserve`'s per-backend size, the number
+`slab_narrow2_floor` is given) and it grows with the draft's **context** in 256 MiB lumps.  Measured here (gfx1201,
+Flash-Next GSQ-RCO IQ3_S + its shared `mtp-...-Q4_K_M`, `-ub 4096`, q8_0 KV, per device):
+
+| `-c` | 32768 | 65536 | 98304 | 131072 | 163840 | 196608 | 204800 | 229376 | 262144 |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 GPUs | .75 | .75 | 1.00 | 1.00 | 1.25 | 1.25 | 1.50 | 1.50 | 1.75 GiB |
+| 1 GPU | | | | | | | 1.25 | | |
+
+So the estimate was 2-3.5x short at any context this config is run at -- which is precisely what puts the region across
+`mapped`.  The term is now the **measured minimum** (768 MiB, +256 above a 4096 ubatch) and *stays a floor*: a shortfall
+is harmless now (the commit maps it), while an over-estimate is not free either (on a box with no VRAM left
+`slab_extend` cannot reclaim it, so it stays unmapped).  Correcting it converts the repro arm from the arena-yield
+branch to the clean spare branch, and it is a strict VRAM improvement: 32.82 / 33.11 GB used against 32.89 / 33.24 GB
+with the straddle, 1.50 GiB pinned either way.
+
+### 3. Gates (all on tree `5de3ff716`, tip `e76491d89`)
+
+Same-seed greedy text, `check-gpu-faults.sh` clean on every arm.  **No kernel or op source changed** (the delta is
+`ggml/src/ggml-cuda/ggml-cuda-slab.cu` + `common/draft-reserve.cpp`), which is why the prefill-logit gate reads
+perfect identity rather than "within tolerance":
+
+| arm | r213 (`9a793f724`) | r214 (`e76491d89`) |
+|---|---|---|
+| **Flash-Next 2 dev `-c 204800`, pool on (the repro)** | **fault** | **clean**, 869-990 t/s pp, `3ba9d426b43bc6b7` |
+| Flash-Next 2 dev `-c 204800`, pool off | fault | clean, `3ba9d426b43bc6b7` |
+| Flash-Next 2 dev `-c 131072` / 1 dev `-c 204800` | clean | clean, `3ba9d426b43bc6b7` |
+| Flash-Next 2 dev `-c 262144` | (straddles) | clean, `3ba9d426b43bc6b7` |
+| Flash-Next 2 dev + MTP, `llama-cli` `-c 204800` | `f9f1f58c296e` | `f9f1f58c296e` |
+| dense 4B 3 GPU `-sm tensor` | `b065f37593b3` | `b065f37593b3` |
+| 35B-A3B Q8_0 2 GPU `-sm layer -ncmoe 20` | `4ac3a523160f` | `4ac3a523160f` |
+| **35B-A3B Q8_0 + DFlash2 2 GPU `-sm tensor -ncmoe 20` (the r106 narrow-2 arm)** | `25678ef8d1fc4cfa`, 153.8 t/s | `25678ef8d1fc4cfa`, 155.0 t/s |
+
+`gate-prefill-logits.sh` **PASS, mean KLD 0.000000 / same-top-p 100.000 %** (27B Q8_0, gfx1201, the recorded r213
+base).  `gate-per-block-build.sh --changed-from 9a793f724 --fast` **3/3** (blocks 09, 12, 15, 23 s).  `validate-set.sh`
+**GREEN** (16 blocks, fresh-tarball strict `git am`, tree `5de3ff716`, 287 added files through the Windows lints).  A
+canonical re-cut is a fixed point: `apply-all.sh` printed `Applied tip: e76491d89` from two independent clones (the
+working chain's `048d8abaf` has the same tree and is **not** recorded, per the `.tip` rule).
+
+### 4. Files
+
+`ggml/src/ggml-cuda/ggml-cuda-slab.cu` (block 12), `common/draft-reserve.cpp` (block 09), `patches/0009`/`0012`
+(+ `From`-line churn in 0010/0011/0013-0015), `release.json`, `TODO.md` (#143 closed), `INVARIANTS.md` (r214),
+`patches/README.md`, `MANIFESTS.md`, `ENVIRONMENT.md`, `WORKLOG.md`.  The maintainer's
+`/llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S/runme` comment was corrected (their file, at their request): the arm it
+advertises now works, and so does `-c 262144`.
+
 ## 261104.006 (docs) -- `TODO` #135 re-scoped: an even-split guard at load, not a host-expert perf hunt
 
 **No delivery change** (`patches/`, `release.json` and the fork are untouched; the release stays

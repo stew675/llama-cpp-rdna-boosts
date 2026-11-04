@@ -1714,5 +1714,38 @@ cost a session to learn; do not re-derive them.
    `-ncmoe 48`, mmap) prefill faults `rms_norm_f32` on GPU 1 (`HSA_STATUS_ERROR_MEMORY_FAULT` + `gfxhub page fault`)
    right after `moe_cache_evict_slab_range` discards 5.4-5.8 GiB of arena tables, and it **reproduces with
    `LLAMA_KV_REGION_POOL=0`**; `-c 131072` (2 devices) and `-c 204800` (1 device) are clean.  Before blaming block 15 for a
-   multi-device fault, run the same arm with the pool off (`TODO` #143).
+   multi-device fault, run the same arm with the pool off.  (**Fixed in r214**, `TODO` #143: the fault was the
+   slab's narrow-2 draft-compute region being handed out with its top unmapped -- see the r214 section below.)
 
+
+## r214 -- the slab's narrow-2 region is MAPPED for its whole extent; the draft compute term is a measured floor
+
+1. **A slab region handed to a graph must have physical behind EVERY byte of it.**  Reserved VA is not presence: the
+   slab reserves `size` but maps `mapped`, and the gap (`va_spare`, deliberately left for `slab_extend`) is unmapped VA.
+   `ggml_cuda_slab_narrow2_commit_locked()` mapped the narrow-2 (MTP draft compute) region **only when it lay entirely
+   above `mapped`**; in the documented shortfall case, where the region straddles `mapped`
+   (`narrow2_off < mapped < narrow2_off + nf2`), it took the "arena gave it up" branch and mapped **nothing**, so the
+   top of the draft's compute buffer was absent VA and the first device access past `mapped` was an unrecoverable
+   `HSA_STATUS_ERROR_MEMORY_FAULT` (no XNACK on RDNA4).  The commit now maps whichever part of
+   `[off, off + nf2)` has no physical behind it and advances `s.mapped`.  The `min(mapped, ceiling)` clamp in
+   `ggml_cuda_slab_arena_top()` is therefore **load-bearing**, not defensive (`mapped` ends up above `narrow2_off`).
+2. **A page fault inside `rms_norm_f32` is not evidence of a host read.**  On the #143 arm the kernel is
+   `rms_norm_f32<1024,1,false,false,false,false>` -- the plain instantiation, no fused `mul`/`add` -- over the MTP
+   head's `mtp_h_state` `reshape_3d(inp->h, n_embd, hc, n_tokens)`, with **both** `src0` and `dst` in `ROCm1`
+   (`host=0`).  The `per_layer_token_embd` host override (H1) and the block-12 arena evictions logged immediately
+   before it (H2) were both innocent: the clean `-c 131072` arm evicts *more* (9.4 vs 5.7 GiB), and the fault address
+   was inside the *draft's* compute region, `/proc/<pid>/maps` showing the slab's `---s /dev/dri` mapping ending
+   exactly at the mapped boundary.  Attribute a fault by address-to-buffer (`-lv`/maps/slab line), never by the
+   kernel name.
+3. **The draft context's compute buffer grows with the draft's CONTEXT, in 256 MiB lumps -- a flat tier is wrong.**
+   Measured per device (gfx1201, Flash-Next GSQ-RCO IQ3_S + shared `mtp-...-Q4_K_M`, `-ub 4096`, q8_0 KV):
+   0.75 GiB at `-c 32768`/65536, 1.00 at 98304/131072, 1.25 at 163840/196608 (and 1.25 at 204800 on ONE device),
+   1.50 at 204800/229376, 1.75 at 262144.  The old 512/768 MiB `compute` tier in `common_draft_reserve_estimate` was
+   measured at `-c 16384`, i.e. 2-3.5x short at any real context, which is what pushed narrow-2 across `mapped`.
+   The term is now the measured **floor** and stays a floor on purpose: over-estimating is not free either -- on a box
+   with no VRAM left `slab_extend` cannot reclaim the surplus, so it stays unmapped, while a shortfall costs only a
+   bounded, one-time arena yield that the pin now maps correctly.
+4. **A shortfall is cheaper than a surplus on a full box.**  With the estimate corrected, the repro arm moved from
+   the arena-yield branch to the clean spare branch and used *less* VRAM (32.82/33.11 vs 32.89/33.24 GB, 1.50 GiB
+   pinned either way), because the yield path had mapped the region's tail on top of what the arena already held.
+   Do not "safety-margin" this reserve upward without measuring: the margin comes straight out of the MoE arena.

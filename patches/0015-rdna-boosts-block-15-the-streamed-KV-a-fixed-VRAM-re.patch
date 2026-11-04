@@ -1,4 +1,4 @@
-From 9a793f724cf757ec24b10cd16db71a75412ecae9 Mon Sep 17 00:00:00 2001
+From e76491d89c5057d9bcfa0b8b17849c4071f4da12 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -445,7 +445,7 @@ index c4571a7ca..dcec8cff1 100644
          }
      }
 diff --git a/common/draft-reserve.cpp b/common/draft-reserve.cpp
-index c16a68e69..c95ac0d64 100644
+index 843fd345b..dc3f21270 100644
 --- a/common/draft-reserve.cpp
 +++ b/common/draft-reserve.cpp
 @@ -4,6 +4,8 @@
@@ -457,7 +457,7 @@ index c16a68e69..c95ac0d64 100644
  #include <algorithm>
  #include <cstring>
  #include <vector>
-@@ -100,7 +102,10 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -104,7 +106,10 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                     uint32_t n_ctx,
                                                     uint32_t n_ubatch,
                                                     ggml_type type_k,
@@ -469,7 +469,7 @@ index c16a68e69..c95ac0d64 100644
      common_draft_reserve r;
  
      if (path.empty()) {
-@@ -130,7 +135,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -134,7 +139,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      for (int64_t i = 0; i < n_tensors; ++i) {
          weights += gguf_get_tensor_size(g, i);
      }
@@ -480,7 +480,7 @@ index c16a68e69..c95ac0d64 100644
  
      // `n_ctx == 0` means "from the model": estimating the KV with 0 would UNDER-estimate the reserve (the
      // dangerous direction), so fall back to the context the draft itself declares as its trained maximum.
-@@ -145,6 +152,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -149,6 +156,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      uint32_t block_count = 0;
      uint32_t n_nextn      = 0;
      (void) read_u32_max(g, arch + ".nextn_predict_layers", n_nextn);   // absent for a standalone draft
@@ -499,7 +499,7 @@ index c16a68e69..c95ac0d64 100644
      if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
          r.note = "draft GGUF has no usable block_count";
          gguf_free(g);
-@@ -197,7 +216,32 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+@@ -201,7 +220,32 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                                : 0.0;
      // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
@@ -531,9 +531,9 @@ index c16a68e69..c95ac0d64 100644
 +                                : (size_t) n_ctx;
 +    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
  
-     // --- compute + slack: measured tiers -------------------------------------------------------
-     // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
-@@ -211,13 +255,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
+     // --- compute + slack: measured, not assumed ------------------------------------------------
+     // A measured tier here was wrong in both directions: the draft context's compute buffer is read back
+@@ -224,13 +268,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
      r.ok    = r.total > 0;
  
      LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"

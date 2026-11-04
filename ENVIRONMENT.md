@@ -345,6 +345,18 @@ raises it one-for-one (8192 -> ~4.3 GiB free) at the cost of an equal amount of 
 > the default to 1280 MiB on one GPU** for this reason (the shape no longer needs the env var), without
 > reproducing the order-dependent cliff itself -- see the row above.
 
+> **The MTP draft's compute region is committed VRAM, not a reservation (r214, `TODO` #143).**  The slab pins the draft
+> context's compute buffer in its **narrow-2** region at the top of its reserved VA, and since r214 that region is
+> **mapped for its whole extent** -- 0.75 GiB per device at `-c 32768` up to 1.75 GiB at `-c 262144` on a Flash-Next
+> `-c 204800`-class config (the measured ladder is in `INVARIANTS.md` r214).  Before r214 the region's top could be
+> left as reserved-but-absent VA; the run then *faulted* instead of reporting a budget problem, so any comparison of
+> "VRAM used" across r213 and r214 will show **more** used for the same arena -- up to ~1.4 GiB per device.  That is the
+> draft's own buffer becoming present, not a new cost: the reserve already accounted for it, and the total is no larger
+> than the straddle path's (measured 32.82 / 33.11 GB used against 32.89 / 33.24 GB).  What it does mean is that the
+> per-device margin at a deep context is real -- on this box ~1.0 GiB free on the tighter card at `-c 204800` -- so
+> `GGML_CUDA_SLAB_HEADROOM_MIB` and the arena budget both still apply, and a config that used to "fit" only because
+> the draft's buffer was unmapped now needs the headroom it was always supposed to have.
+
 > **Do not disable hipBLASLt to buy headroom.**  The ROCm BLAS stack allocates its own Tensile code objects
 > and workspace behind the application's back, and that class of allocation CANNOT be routed into the slab.
 > Measured with `ROCBLAS_USE_HIPBLASLT=0` at `GGML_CUDA_SLAB_HEADROOM_MIB=2048`: the output was CORRUPT

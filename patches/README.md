@@ -846,6 +846,17 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r214 amendment: the draft reserve's `compute` term is a measured FLOOR, not a flat tier.**
+> `common_draft_reserve_estimate()` charges `weights + kv + compute + slack` to the slab's `aux` reserve, and its
+> `compute` term was a 512/768 MiB tier measured at `-c 16384`.  The draft context's compute buffer is not a constant:
+> it is read back MEASURED (`sched_reserve`'s per-backend size) and grows with the draft's **context** in 256 MiB lumps
+> — 0.75 GiB at `<= -c 65536` up to 1.75 GiB at `-c 262144` on the field config (1.25 on one device at 204800) — so
+> the estimate was 2-3.5x short at any context that config is run at, which is what put the slab's narrow-2 region
+> across its mapped extent (`TODO` #143).  It is now the measured minimum (768 MiB, +256 above a 4096 ubatch) and
+> deliberately stays a floor: an over-estimate cannot be reclaimed by `slab_extend` on a full box, and a shortfall now
+> costs only a bounded arena yield that block 12's pin maps.  Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.007,
+> `INVARIANTS.md` r214.
+>
 > **r210 amendment: the tier is one pinned per-expert pool, laid out as the arena's complement and then
 > mirrored residents.**  `-lme auto|N` is the budget (`--host-experts pinned|pool` are deprecated shorthands):
 > `auto` spends the whole host expert set on the pool when it fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable`
@@ -2510,6 +2521,20 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r214 amendment: the slab's narrow-2 region is MAPPED for its whole extent.**
+> `ggml_cuda_slab_narrow2_commit_locked()` pinned the MTP draft's compute region at the top of the slab's reserved VA
+> and mapped it **only when the whole region lay above `mapped`**.  In the shortfall case -- the region **straddles**
+> `mapped`, which is what the r106 arena-yield branch exists for -- it mapped *nothing*, so the top of the draft's
+> compute buffer was reserved-but-absent VA: on a no-XNACK part the first device access past `mapped` is an
+> unrecoverable `HSA_STATUS_ERROR_MEMORY_FAULT`.  Measured on a 2-device `-sm layer` Flash-Next at `-c 204800`
+> (`-ncmoe 48`, q8_0 KV): 1.37 / 1.31 GiB of the draft's 1.50 GiB compute region unmapped, the fault in
+> `rms_norm_f32` over the MTP head's `mtp_h_state`, while `-c 131072` (2 devices) and `-c 204800` (1 device) fit the
+> spare and stayed clean.  The commit now maps whichever part of `[off, off+nf2)` has no physical behind it and
+> advances `s.mapped`, so `ggml_cuda_slab_arena_top()`'s `min(mapped, ceiling)` clamp is load-bearing.  Every arm is
+> byte-identical in text to r213 (`3ba9d426b43bc6b7` Flash-Next, `25678ef8d1fc4cfa` the 35B-A3B + DFlash2 narrow-2
+> arm, `f9f1f58c296e`/`b065f37593b3`/`4ac3a523160f` the coherence arms); prefill-logit KLD 0.000000 / 100.000 %.
+> Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.007, `INVARIANTS.md` r214.
+>
 > **r212 amendment: the host pool's fill mode mirrors `--load-mode`.**  `MOE_HOST_POOL_DIO=auto` no longer guesses from
 > `MemAvailable` ("the set does not fit beside the pool -> O_DIRECT"), which on a tight box always said O_DIRECT and silently
 > overrode the operator's `--load-mode mmap`.  A mapped load is a request for the page cache, so the pool fills through it; an

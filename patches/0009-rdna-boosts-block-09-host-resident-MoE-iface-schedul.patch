@@ -1,4 +1,4 @@
-From 7115457debd88e58db6dd9943867456678f0a68c Mon Sep 17 00:00:00 2001
+From 00b88a2d462baa875fe6ecf884dd3b381396299f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -346,7 +346,7 @@ single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 mis
  common/arg.cpp                                |   75 +-
  common/common.cpp                             |  233 +-
  common/common.h                               |   65 +-
- common/draft-reserve.cpp                      |  223 +
+ common/draft-reserve.cpp                      |  236 +
  common/draft-reserve.h                        |   44 +
  common/fit.cpp                                |  499 +-
  common/fit.h                                  |    7 +
@@ -409,7 +409,7 @@ single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 mis
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 67 files changed, 17030 insertions(+), 540 deletions(-)
+ 67 files changed, 17043 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -1013,10 +1013,10 @@ index 38998e2dd..a2528131a 100644
          overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
 diff --git a/common/draft-reserve.cpp b/common/draft-reserve.cpp
 new file mode 100644
-index 000000000..c16a68e69
+index 000000000..843fd345b
 --- /dev/null
 +++ b/common/draft-reserve.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,236 @@
 +#include "draft-reserve.h"
 +
 +#include "log.h"
@@ -1045,15 +1045,19 @@ index 000000000..c16a68e69
 +//             any declared indexer key cache at f32 (the QSA/indexer caches are not covered by `-ctk`).
 +//             KV layers = `nextn_predict_layers` when the GGUF declares an MTP head (the head only ever
 +//             holds its own layer's KV), else `block_count` for a standalone draft model.
-+//   compute : the draft context's compute buffer.  NOT derivable without building a graph; measured at
-+//             512 MiB (`-ub 4096`) and 768 MiB (`-ub 6144`), so the estimate uses a 1 024 MiB tier.
++//   compute : the draft context's compute buffer.  NOT derivable without building a graph; it is read back
++//             MEASURED from the context's `sched_reserve`, and it grows with the draft's CONTEXT in 256 MiB
++//             lumps -- 0.75 GiB at <= 65536 cells up to 1.75 GiB at 262144 on the field config
++//             (2026-11-04, gfx1201, Flash-Next GSQ-RCO IQ3_S + its shared MTP head, `-ub 4096`, q8_0 KV,
++//             per device) -- so the estimate uses the measured 768 MiB FLOOR, not a flat tier.
 +//   slack   : the draft's own load/steady transients, measured at ~135 MiB -> 192 MiB.
 +//
 +// Calibration (2026-10-17, gfx1201, `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, qwen4exp MTP head,
 +// q8_0 KV): weights 2 647 (GGUF) + kv 300/459 (this function, `-c 131072`/`-c 204800`) + compute 1 024 +
 +// slack 192 = 4 163 / 4 322 MiB against a MEASURED 3 584 / 4 000.  It over-estimates by ~550 / ~320 MiB:
-+// the 1 024 MiB compute tier is the biggest single reason (the real buffer is 512-768), and over-estimating
-+// is the intended bias -- `slab_extend` reclaims a surplus once the draft is resident.
++// the compute term is the biggest single reason (the real buffer is 512-768 MiB at the `-c 16384` that
++// calibration used, which is why the floor below is the measured MINIMUM and not the field value), and
++// over-estimating is the intended bias -- `slab_extend` reclaims a surplus once the draft is resident.
 +// ---------------------------------------------------------------------------------------------
 +
 +namespace {
@@ -1218,12 +1222,21 @@ index 000000000..c16a68e69
 +    // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
 +    r.kv = (size_t) ((double) n_ctx * (attn_per_tok + idx_per_tok) * 1.10);
 +
-+    // --- compute + slack: measured tiers -------------------------------------------------------
-+    // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
-+    // out of the OUTSIDE pool) measured 512 MiB at the target's `-ub 4096` and 768 MiB at `-ub 6144`.  That
-+    // is the one term that genuinely scales with the target's ubatch, so it is keyed on it (the wide tier is
-+    // used above 4096); it is a measured tier, not a derivation.
-+    r.compute = (n_ubatch > 4096 ? (size_t) 768 : (size_t) 512) << 20;
++    // --- compute + slack: measured, not assumed ------------------------------------------------
++    // A measured tier here was wrong in both directions: the draft context's compute buffer is read back
++    // MEASURED (`sched_reserve`'s per-backend size) and it grows with the draft's CONTEXT, so the old flat
++    // 512 MiB (`-ub 4096`) / 768 MiB (`-ub 6144`) pair -- both measured at `-c 16384` -- is 2-3.5x short at
++    // any context this config is actually run at.  Measured per device, same config as the header:
++    //
++    //     -c      : 32768 65536 98304 131072 163840 196608 204800 229376 262144
++    //     2 GPUs  :  .75   .75   1.00  1.00   1.25   1.25   1.50   1.50   1.75  GiB
++    //     1 GPU   :                         1.25 (at 204800)                     GiB
++    //
++    // It stays a FLOOR, because over-estimating is not free either: on a box with no VRAM left,
++    // `slab_extend` cannot reclaim a surplus and it stays unmapped.  Reserve the measured minimum plus the
++    // one term that does key on the target's ubatch (a wide ubatch measured +256 MiB at `-c 16384`); where
++    // the real buffer is larger the surplus is a placement question, not a reserve one.
++    r.compute = ((n_ubatch > 4096 ? (size_t) 1024 : (size_t) 768)) << 20;
 +    r.slack   = (size_t) 192 << 20;   // measured ~135
 +
 +    r.total = r.weights + r.kv + r.compute + r.slack;
