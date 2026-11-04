@@ -1,7 +1,7 @@
 # P5 — the `-lme` budget is now a per-TENSOR pinned-master tier, filled in descending hotness
 
 **Status: IMPLEMENTED and MEASURED (2026-11-04), waiting on the maintainer's go/no-go before it is promoted
-into the delivery.**  Branch `p5-host-expert-tier` in `~/llama.cpp` (commit `86584239c`, parent
+into the delivery.**  Branch `p5-host-expert-tier` in `~/llama.cpp` (commit `c1478f911`, parent
 `a644115a0`), exported as [`patches/0010-p5-host-expert-tier.patch`](patches/0010-p5-host-expert-tier.patch).
 Nothing in this file is part of the delivery set yet.
 
