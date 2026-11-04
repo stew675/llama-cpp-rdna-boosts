@@ -41,7 +41,7 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement | performance (delivery defect, default-on) | **OPEN** (2026-11-03, `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §4).  Needs a wider sweep (model x FRAC x ubatch) before touching the default — and note the same switch must be `0` for any prefill A/B of the expert fill path, because the gather serves the routed table itself |
 | **137** | Make the pageable push work under `-sm tensor` (parity at 1 device and on `-sm layer`, 2.0x loss at 2 devices) — the cost is in the fill path, not the driver | performance (campaign, `wip/host-expert-eager-push`) | **OPEN** (2026-11-03, `P3-MULTIGPU-RESULTS.md` §3a).  **Attributed**: the loss is host time *inside* the copy call — 44/107/191 µs per H2D fill at 1/2/3 devices against 1.4 µs to queue a pinned one (15.2 s of a 34.3 s 2-device run is blocked in `cudaMemcpyAsync`); the staging is a synchronous host memcpy and its resource is **per thread** (`probe-pageable-threads.cpp`: 2 devices 11.8 GB/s one thread vs 20.6 one thread per device).  **Eliminated**: the device-context candidate (`MOE_HOST_PUSH_SETDEV=1` changes nothing, 26.1 -> 26.0).  **Settled**: per-device upload threads **work** (115 808 fills, 0 stalls) and are **performance-neutral** (27.5 vs 28.2 t/s) -- the earlier "deadlock" was MY teardown bug (a static array of condvars destroyed while the workers waited on them; heap-allocate and never destroy).  So the thread/staging-contention theory is out; the remaining gap to the probe (21-30 us/fill vs ~107) is unexplained by thread, stream or source, and the one difference left is the **destination** (plain `hipMalloc` in the probe vs an arena/VMM slot in the path) -- test that next.  **NEXT SESSION: work `wip/host-expert-eager-push/HANDOVER.md`** — it has the measured state, what is ruled out, the ranked experiment list with commands, and the trap list.  Prime untested candidate: the copy **DESTINATION** (plain hipMalloc in the probes vs an arena/VMM slot in the path).  Then the copy-size sweep, then coalescing, then the not-fitting band |
 | **138** | Bound the per-table **bounce ring** so it can be a `push` transport: it is deliberately uncapped today and holds **2.2-3.0 GiB** of pinned bounce on the 122B prefill miss path; the maintainer's bar for `push` is **under 2 GiB at parity** | performance / memory (delivery, shared with `wip/host-pool-speed` §16) | **OPEN** (2026-11-03, `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §3a).  Capping alone costs 8-25 % of prefill at FRAC 80 (measured in that campaign), so the cap has to come **with coalescing** (fewer, larger fills).  Needed only if `push` reuses the bounce as its transport; the direct pageable transport needs no pinned bytes at all but is not yet at parity under a tensor split (see #137) |
-| **139** | A partial `-lme` host-expert budget is spent on whole pinned TENSORS, and at equal RAM a per-EXPERT tier (the pool) is better: 8 064 MiB of pinned whole tensors measures 505.1 prefill / 50.1 decode against 713.7 / 51.8 for a 9 331 MiB pool (decode a tie, prefill -29 %) | performance / memory (campaign, `wip/host-expert-eager-push`) | **OPEN — step b2, deferred** (2026-11-04, `P5-RESULTS.md` §3).  The fit case is settled and shipped-ready: `-lme auto` pins the whole set and reproduces `pinned` exactly (1105.4/71.9 at 2 devices, 645.2/53.4 at 1, byte-identical text).  The blocker for the mid-band is the cold-read encoding (`id - n_res_slots -> slot`, shared with the KV/arena paths), which an expert-indexed region with a presence bitmap would have to change.  See §139 |
+| **139** | A partial `-lme` host-expert budget was spent on whole pinned TENSORS, where at equal RAM a per-EXPERT tier is better (8 064 MiB of pinned whole tensors = 505.1 prefill / 50.1 decode against 713.7 / 51.8 for a 9 331 MiB pool) | performance / memory (campaign, `wip/host-expert-eager-push`) | **RESOLVED in the campaign — promotion pending** (2026-11-04, `P6-POOL-REGION.md`).  The expert-indexed region the design asks for IS the bounded pool (slots + `slot_state` + `base_dev`, heat-ranked); it only needed the right to be a cold-read source on a multi-device split, now enabled (`MOE_HOST_POOL_COLD_MULTIDEV`, +11.5 % decode at `-lme 8`, +10 % for the not-fitting pool, byte-identically; a fully resident pool now prefills FASTER than a pinned master, 1166.4 against 1105.4).  `-lme N` spends the budget per expert below 90 % of the host expert set and keeps the whole-tensor pinned-master tier at or above it (the fit case).  The cold-read encoding needed no change.  See §139 |
 
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
@@ -396,39 +396,32 @@ slot does not) and the freshness invariant (a re-rank invalidates a lagging map:
 §3.1's layout epoch / freeze) must hold per device.  Gates: same-seed greedy text and MTP acceptance on 1 GPU
 **and** on the multi-device `-sm tensor` arm (`soar`), with `check-gpu-faults.sh` clean.
 
-## 139. A partial host-expert budget wants a per-EXPERT region, not whole-tensor pinned masters (step b2)
+## 139. A partial host-expert budget wants a per-EXPERT region — which IS the pool, and it now reads in place on any device
 
-**Status: open, actively deferred (2026-11-04, `wip/host-expert-eager-push/P5-RESULTS.md` §3).**  The `-lme`
-budget now buys WHOLE pinned host-expert tensors in descending hotness (`wip/host-expert-eager-push/patches/
-0010`), which is exactly right for the two unambiguous cases — the whole set (where a pinned tensor IS the
-region, because the master is expert-indexed by stride, and the result is bit-for-bit today's `pinned`:
-1 105.4 prefill / 71.9 decode at 2 devices, 645.2 / 53.4 at 1, byte-identical text) and a coarse cap.  It is
-the WRONG shape for the mid-band, and the measurement is unambiguous:
+**Status: RESOLVED in the campaign (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`); promotion into
+`patches/` is pending, with `P5`.**  The question was what a partial `-lme` budget should buy.  Measured at equal
+RAM (2 devices, 35B-A3B, `-n 300`): 8 064 MiB of pinned whole TENSORS = 505.1 prefill / 50.1 decode against
+713.7 / 51.8 for a 9 331 MiB per-EXPERT pool — the pool wins on both phases, because MoE routing is spread across
+every layer so no whole tensor is hot.  The reason the pool then lost to `pinned` (71.9) was narrower than the
+design assumed: **the pool already is the expert-indexed region with a presence bitmap** (a pinned per-host-tensor
+allocation addressed by expert -> slot, `slot_state` for presence, `base_dev` for the device alias, heat-ranked
+contents, and a 1.3 us native D2D fill); it merely was not allowed to be a **cold-read source away from one
+GPU** — `pool_cold_slot_locked()` and `moe_cache_get_cold()` both required `device_count == 1 && src_off == 0`,
+and both are geometry accidents (the alias is already the cross-device fill source; a slice offset is already
+folded into the cold base for a pinned master).  Enabling it changes no encoding: `id - n_res_slots` is a slot
+index into one pinned base, and the pool's base with its slot stride is such a base.  The two sides now share ONE
+predicate (`pool_cold_geometry_ok`) because a disagreement would be a silently wrong matmul, not a crash.
 
-| 2 devices, ~equal non-swappable budget | prefill | decode |
-|---|---|---|
-| 8 064 MiB as pinned whole TENSORS (`-lme 8`) | 505.1 | 50.1 |
-| 9 331 MiB as a per-EXPERT pool (`MOE_HOST_POOL_FRAC=50`, pageable master) | **713.7** | **51.8** |
+Result: **+11.5 % decode at `-lme 8` (48.9 -> 54.5)** and **+10 % for the shipped not-fitting pool (51.8 ->
+57.0)**, byte-identically (`sha=231512fc77e5`), fault-free on 1/2/3 devices; a **fully resident pool now prefills
+faster than a pinned master (1166.4 against 1105.4)** — though its decode still trails (63.9 against 71.9),
+because a resident pool is not a pinned *master* (that is the residual, recorded in P6 §5 and not needed for the
+fit case).  `-lme N` therefore spends the budget per EXPERT below 90 % of the host expert set and keeps the
+whole-tensor pinned-master tier at or above it (`MOE_HOST_TIER=pool|tensor` forces either shape).
 
-Decode ties, prefill is 29 % worse for the per-tensor tier, and the reason is structural: MoE routing is spread
-across every layer, so no whole tensor is hot — pinning one pins 256 experts of which a few are read often,
-while the pool pins the experts that are actually read.  Decode also interpolates exactly linearly on the pinned
-fraction (0 % 37.4, 21 % 42.4, 43 % 50.1, 86 % 65.7, 100 % 71.9), so nothing else is going on.
-
-**What is therefore implemented:** `-lme auto` is a BINARY decision — pin the whole set when it fits
-`MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable`, otherwise no pinned master at all and the bounded pool serves
-the reads (the not-fitting band, unchanged: 713.7 / 51.8).  The mid-band stays the pool's, sized with
-`MOE_HOST_POOL_MIB`.
-
-**What is deferred, and its blocker:** an expert-indexed pinned region with a presence bitmap — the plan's step
-b2 (`IMPLEMENTATION-PLAN.md` §3 step c `[STOP]`).  It gives a resident expert the native transport (no per-fill
-host memcpy) AND stays inside the budget, i.e. it should beat both arms above.  It needs the cold-read encoding
-(`id - n_res_slots -> slot`) changed, and that encoding is shared with the KV/arena paths, so it is a
-deliberately separate change.  Gates for it: the `-lme 8` arm at 1 and 2 devices must beat the 51.8 pool figure
-on both phases, same-seed greedy text byte-identical, `scripts/check-gpu-faults.sh` clean, and the fit case must
-not regress.  Note the two traps `P5-RESULTS.md` §4 records (the `-ncmoe` tail bound is `hparams.n_layer()`, and
-the pool enable must re-resolve `g_pool_enabled` after `parse_env`) — both are silent and both produced a wrong
-measurement first.
+**Still open elsewhere**: `#132` (the pool's synchronous demand read for NON-resident experts — untouched), and
+the 100 %-covered pool becoming the master (P6 §5: fill slots in expert order, rebind a `region`/`region_dev`
+field — never `t.host`, which keys the pool map and is shared across the per-device tables of one tensor).
 
 ## Where the current lists live
 

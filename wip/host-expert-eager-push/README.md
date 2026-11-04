@@ -1,5 +1,24 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
+> **P6 STATUS (2026-11-04): the expert-indexed region IS the pool, and it now works on a multi-device split —
+> [`P6-POOL-REGION.md`](P6-POOL-REGION.md)** (branch commit `72bc81b88`, patch `patches/0011`).  `TODO` #139 is
+> closed in the campaign: the pool is a pinned per-host-tensor region addressed by (expert -> slot) with
+> `slot_state` as the presence bitmap, so the design of record was already built — what it lacked was the right
+> to be a **cold-read source away from one GPU** (`device_count == 1 && src_off == 0` in both
+> `pool_cold_slot_locked` and `moe_cache_get_cold`).  Both restrictions are geometry accidents (the alias is
+> already the cross-device fill source; a slice offset is already folded into the cold base for a pinned master),
+> and they now live in ONE predicate both sides use — if they disagreed the host would emit a cold id the kernel
+> resolves from the wrong base, a silently wrong matmul.  `MOE_HOST_POOL_COLD_MULTIDEV=0` is the kill switch.
+> **Measured +11.5 % decode at `-lme 8` (48.9 -> 54.5) and +10 % for the shipped not-fitting pool (51.8 -> 57.0),
+> byte-identically**, and a **fully resident pool now prefills FASTER than a pinned master (1166.4 against
+> 1105.4)** — a first for the campaign — though its decode still trails (63.9 against 71.9).  With that measured,
+> `-lme N` spends the budget per EXPERT below 90 % of the host expert set (the pool, heat-ranked) and keeps P5's
+> whole-tensor pinned-master tier at or above it (the fit case, where only a pinned *master* gets the
+> single-launch staging branch): 8 GiB 54.5/50.1, 12 GiB 61.6/56.8, 16 GiB 65.6/65.7, 17 GiB 67.0/68.2,
+> 100 % 63.9/71.9 — pool/tensors.  `MOE_HOST_TIER=pool|tensor` forces either shape for an A/B.  Validated on 1,
+> 2 and 3 devices (`-sm layer` and the `#135` degenerate `-sm tensor`), n=500 forced generation, and a second
+> arch (Flash-Next), all byte-identical where the arms must match and all fault-free.
+>
 > **P5 STATUS (2026-11-04): the unified host-expert tier is IMPLEMENTED and MEASURED, awaiting the
 > maintainer's go/no-go before promotion — the record is [`P5-RESULTS.md`](P5-RESULTS.md)** (branch
 > `p5-host-expert-tier`, patch `patches/0010`, 26 arms in `runs/p3-*-p5-*`).  `-lme` is now the **budget for

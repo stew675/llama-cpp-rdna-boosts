@@ -1,7 +1,7 @@
 # IMPLEMENTATION PLAN — the unified host-expert tier (execute without waiting for the maintainer)
 
 > **EXECUTED 2026-11-04 — see [`P5-RESULTS.md`](P5-RESULTS.md).**  Steps **a, b, c, d, e** are implemented
-> on `~/llama.cpp` branch `p5-host-expert-tier` (`c1478f911`, parent `a644115a0`), patch
+> on `~/llama.cpp` branch `p5-host-expert-tier` (`72bc81b88`, on top of `c1478f911`, parent `a644115a0`), patch
 > [`patches/0010-p5-host-expert-tier.patch`](patches/0010-p5-host-expert-tier.patch), and the §3/§4
 > acceptance bars are met: the fit case reproduces `pinned` (1105.4 / 71.9 at 2 devices, 645.2 / 53.4 at 1)
 > with byte-identical text and no GPU faults, and the not-fitting band is unchanged (713.7 / 51.8).  Two
@@ -10,10 +10,14 @@
 > * **Step a's per-expert region is not needed for a whole-tensor budget.**  The master is expert-indexed by
 >   stride, so a wholly pinned tensor already IS the region; `host_pinned` becomes a per-table truth and no
 >   presence bitmap / hole encoding is involved.  The bitmap belongs to a per-EXPERT region, i.e. step b2.
-> * **Step b2 is deferred, and the measurements say why**: at equal RAM a partial budget is better spent
->   per-EXPERT (the pool) than per-tensor — 8 064 MiB pinned as whole tensors is 505.1 prefill / 50.1 decode
->   against 713.7 / 51.8 for 9 331 MiB of pool.  So `auto` is a BINARY decision (pin the whole set when it
->   fits, else the pool) and the mid-band stays the pool's; see `TODO` #139.  Step c's PARTIAL state
+> * **Step b2 is DONE, as the pool** ([`P6-POOL-REGION.md`](P6-POOL-REGION.md)): at equal RAM a partial budget is
+>   better spent per-EXPERT (the pool) than per-tensor — 8 064 MiB pinned as whole tensors is 505.1 prefill /
+>   50.1 decode against 713.7 / 51.8 for 9 331 MiB of pool.  The expert-indexed region the plan asks for already
+>   exists (it is the pool: slots + `slot_state` + `base_dev`, heat-ranked); it only needed the right to be a
+>   cold-read source on a multi-device split, which is now enabled (`MOE_HOST_POOL_COLD_MULTIDEV`, +11.5 %
+>   decode at `-lme 8`, byte-identical).  The cold-read encoding needed **no** change.  `-lme N` therefore
+>   spends the budget per expert below 90 % of the host expert set and keeps the whole-tensor pinned-master tier
+>   at or above it (the fit case, where a pinned *master* wins decode outright).  Step c's PARTIAL state
 >   collapsed with it (a table is ALL_RESIDENT or has holes, which is already per table).
 >
 > Two traps found while executing, both silent (P5 §4): the `-ncmoe` tail bound must be

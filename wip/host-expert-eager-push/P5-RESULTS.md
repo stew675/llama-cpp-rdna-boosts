@@ -68,7 +68,7 @@ prefill = `prompts/prose-rdna-boosts.txt` (5 246 tok, sha256 `fabdec65…`) with
 | `-lme auto` (the set fits) | **1105.4** | **71.9** | 18 662 / 0 | `sha=231512fc77e5` |
 | `-lme 64` (clamped to the set) | 1106.0 | 71.7 | 18 662 / 0 | `sha=231512fc77e5` |
 | `-lme 16` | — | 65.7 | ~16 100 / ~2 500 | `sha=231512fc77e5` |
-| `-lme 8` | 505.1 | 50.1 | 8 064 / 10 598 | `sha=231512fc77e5` |
+| `-lme 8` (whole-tensor tier; **now routed to the pool**, see P6) | 505.1 | 50.1 | 8 064 / 10 598 | `sha=231512fc77e5` |
 | `-lme 4` | — | 42.4 | ~4 000 / ~14 600 | `sha=231512fc77e5` |
 | `auto` **not** fitting (`MOE_HOST_LIMIT_FRAC=1`) | 713.7 | 51.8 | 0 / 18 662 + pool 9 331 | `sha=231512fc77e5` |
 | `--host-experts pinned` (shorthand) | — | 71.8 | 18 662 / 0 | `sha=231512fc77e5` |
@@ -125,12 +125,15 @@ plan set and which the tier now hits exactly) and a user asking for a coarse, te
 mid-band is the pool's, sized with `MOE_HOST_POOL_MIB`, and `-lme 8`'s job is to *bound* the non-swappable
 footprint at 8 GiB, not to spend it optimally.
 
-**What that leaves open** (and it is `IMPLEMENTATION-PLAN.md` step b2, deliberately not attempted here): an
-expert-indexed pinned region with a presence bitmap, i.e. per-expert residency addressed as a MASTER rather
-than as a permutation of slots.  That is what would make a partial budget both fast (native transport for a
-resident expert, no per-fill host memcpy) and bounded — and the plan's `[STOP]` applies: it needs the
-cold-read encoding (`id - n_res_slots -> slot`) changed, which is shared with the KV/arena paths.  That is a
-separate, larger change and it is not needed to ship the fit case.  It is recorded in `TODO.md` #139.
+**What that left open** was `IMPLEMENTATION-PLAN.md` step b2 — an expert-indexed pinned region with a presence
+bitmap.  **That is now done, and it turned out to be the pool itself**: see [`P6-POOL-REGION.md`](P6-POOL-REGION.md).
+The pool already *is* a pinned per-host-tensor region addressed by (expert -> slot) with a presence bitmap; what
+it lacked was the right to be a cold-read source away from one GPU (`device_count == 1 && src_off == 0`, both
+geometry accidents).  With that enabled the cold-read encoding needs **no** change at all — `id - n_res_slots`
+is a slot index into one pinned base, and the pool's base with its slot stride is such a base.  Measured:
++11.5 % decode at `-lme 8` (48.9 -> 54.5) and +10 % for the not-fitting pool (51.8 -> 57.0), byte-identically.
+So `-lme N` now spends the budget per EXPERT below 90 % of the host expert set and keeps the whole-tensor
+pinned-master tier at or above it (the fit case, where a pinned *master* still wins decode outright).
 
 ## 4. Finding 2 — two traps, both silent, both cost a wrong measurement
 
