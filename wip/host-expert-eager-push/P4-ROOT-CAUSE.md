@@ -729,6 +729,33 @@ So a 3-way split is *not expressible* for this model, and the correct fallback i
 split with the third device idle (or a batch-parallel split of the tokens).  Replicating the whole tensor into
 the zero-extent device is the bug.
 
+### Why Qwen3.8-27B scales on 3 GPUs and the 35B-A3B experts do not
+
+Measured, all VRAM, `-sm tensor` (the maintainer's example):
+
+| Qwen3.8-27B Q8_0 | 1 GPU | 2 GPUs (0,2) | 3 GPUs (0,1,2) |
+|---|---|---|---|
+| prefill (5 246 tok) | 1 396.9 | **1 964.4** | 1 900.3 (-3 % vs 2) |
+| decode (`-n 300`) | 20.4 | 35.7 | **45.5** (+27 % vs 2) |
+
+So it does scale -- monotonically on decode, and prefill peaks at 2 GPUs (the 3-GPU arm carries the x4 card,
+worth ~9 % prefill, so it is roughly flat there).  **The difference from the 35B-A3B experts is the quant
+granularity, not "an even divisor":**
+
+| model | splittable width | quant block | slices expressible | 3-way? |
+|---|---|---|---|---|
+| Qwen3.8-27B (attention/FFN) | 5 120 / 17 408, n_head 24 (= 3 x 8) | **32** (Q8_0) | 5 120 = 160 blocks, 17 408 = 544 blocks | **yes**, rounded to 1 664/1 664/1 792 and 5 792/5 792/5 824 |
+| 35B-A3B experts | **512** | **256** (q4_K/q5_K super-block) | 512 = exactly **2** blocks | **no** |
+
+So the rule is `splittable_width / quant_block_size >= n_devices` (plus the head count divisible for the
+attention split), **not** exact divisibility: the 27B's 5 120 does not divide by 3 either, but its blocks are
+32 elements wide so three real slices exist.  A finer quant (Q8_0/Q4_0, 32) splits well; a K-quant
+(q4_K/q5_K, 256) needs a much wider axis to reach three devices -- which is why a MoE model's per-expert FFN
+(512 wide) is stuck at two, and why the fallback must be "use fewer devices", never "mirror one".
+
+Scale matters too: the dense 4B Q8_0 has the same fine granularity and still does not scale
+(prefill 7 405 / 7 977 / 6 862), because the per-device work is too small against the all-reduce.
+
 ### Correction: the mirror explains the HOST path, not the VRAM numbers
 
 I over-attributed earlier.  Measured, all-VRAM `-sm tensor`:
