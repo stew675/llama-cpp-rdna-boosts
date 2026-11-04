@@ -217,6 +217,79 @@ i.e. as much as a fill).  What it needs from the delivery is the machinery the c
 reading it, plus the loader's `path`/`offs` plumbing (`moe_cache_set_host_source`, the same data the DIO tier
 uses) to know which file range a table lives in.
 
+## 5b. The over-commitment test (a 100 GiB file against 91 GiB of RAM), and what the page cache does
+
+The > RAM band is where a pin that cannot be dropped would be fatal, so `probe-overcommit.cpp` runs the
+production shape at scale: a **100 GiB file**, read in windows that are **registered, DMA'd from, and
+released**, cycled several times in **one process**, with a memory watchdog.  Two read modes, because they are
+two bands of the delivery: `READ=mmap` (read through the page cache, register a private mapping of the same
+pages) and `READ=dio` (`O_DIRECT` into an anonymous window buffer -- the page cache bypassed entirely).
+
+**Read mode `mmap`, 20 GiB windows, 3 loops = 300 GiB read:**
+
+| loop | read from disk | per-window register | DMA | verified droppable | MemAvailable | swap |
+|---|---|---|---|---|---|---|
+| 0 / 1 / 2 | 101 674 MiB each (1 % from cache) | 31-33 ms per 20 GiB | 746 ms (28.8 GB/s) | **15 / 15 windows** | 84 073-84 174 MiB (flat) | 447-449 MiB (**flat**) |
+
+**Read mode `dio`, 8 GiB windows, 3 loops:** every read from disk by design (0 % cache), 138-197 ms to
+register 8 GiB, 299 ms DMA at 28.7 GB/s, buffers released every window (`MemAvailable` 83 840-85 637, flat),
+9/9 windows verified.
+
+So: **a 100 GiB working set on a 91 GiB box cycles three times with the pin released every window, no swap
+growth, no OOM, no lockup, and every released window verified re-readable from disk.**  That is the safety
+property the mode needs, and it holds in both read modes.
+
+### The page cache DOES serve the reads again (and it converges, it does not snap)
+
+The same harness with a working set the cache can hold shows the warm behaviour directly -- 3 x 8 GiB, full
+cycle (register -> 8 GiB DMA -> unregister -> munmap) x 3 loops:
+
+| loop | read from disk | per-window read | per-window register | DMA |
+|---|---|---|---|---|
+| 0 (cold) / 1 / 2 | 0 MiB (the regions were already resident) | **13-21 ms per 8 GiB** (vs ~4.3 s cold) | **12.8-14.2 ms per 8 GiB** | 299-303 ms (28.75 GB/s) |
+
+**72 GiB read in 3.3 s**, 9/9 windows released and verified droppable, `MemAvailable` flat.  Releasing the
+pin does not discard the page cache: reading and re-registering resident pages is ~600 GB/s.
+
+**With a 50 GiB region permanently pinned** (`PIN_MIB`, registered once and never released) and a 15 GiB
+cycling set (3 x 5 GiB) on top, 5 loops:
+
+| loop | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| from the page cache | 40 % | 52 % | 67 % | 83 % | **87 %** |
+
+per-window reads fall from >1.1 s to 225-654 ms, every window still released and verified droppable, and
+`MemAvailable`/swap stay flat -- so a large permanent pin does **not** stop the cache from serving ordinary
+reads, it just leaves less room.  The same test **without** the pin at the same starting state is the same
+shape (36-67 % early, converging), i.e. **this is the host's cache behaviour, not the pin.**
+
+Two host facts worth writing down, because they make this box look broken and are neither rare nor HIP's:
+
+- **`/proc/meminfo` does not account these pages usefully here.**  `Cached` sits at ~32-45 GiB and
+  `MemAvailable` stays ~85 GiB while 24 GiB of mapped file pages are demonstrably resident (second pass at
+  463 GB/s) and a 50 GiB registration is live.  Do not judge residency from `Cached`/`MemAvailable` on this
+  box -- use `read_bytes` and the timing of a second pass.
+- **The cache converges over minutes, not instantly** (btop shows the same slow growth), and the practical
+  ceiling for a file working set is ~24-45 GiB even with ~50 GiB free.  6 x 4 GiB is 100 % warm on the second
+  pass; 6 x 8 GiB (48 GiB) is 100 % cold; the same 15 GiB set climbs 40 -> 87 % over five loops.
+  `lru_gen/enabled = 0x0007` with **`min_ttl_ms = 0`** is the most likely tunable here (upstream default
+  1000 ms); it needs root to test.
+
+**One harness defect worth recording, because it cost 12 minutes of wall clock and looked like a kernel
+problem:** walking a file mapping with one load per *page* depends on readahead (the kernel maps ~64 KiB per
+fault).  Under memory pressure the readahead allocations fail and the walk degenerates to one 4 KiB read per
+fault -- **~25 MB/s measured**.  `read_mapping()` now issues `MADV_WILLNEED` per 256 MiB chunk and reports
+progress, which restores ~2 GB/s cold and >50 GB/s when resident.
+
+### Registering a 50 GiB range: works, and it is what makes the pages resident
+
+| test | result |
+|---|---|
+| `hipHostRegister` of 1 / 4 / 8 / 16 / 20 / 24 / 32 / 40 / **50 GiB** in ONE call | **OK** at every size (fresh process) |
+| 50 GiB registration, pages already in page cache | **0.84 s** (~60 GB/s) |
+| 50 GiB registration with **no host read first** (`PIN_READ=0`) | **OK** -- registration faults the pages in itself, so the host does **not** have to read them first |
+| register **after** `MADV_WILLNEED`-driven readahead, same process | one **`hipErrorInvalidValue`** observed; the retry succeeds.  **Register-first is the robust order** |
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
