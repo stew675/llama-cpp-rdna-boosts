@@ -1,0 +1,133 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index d5be5d62f..c5effa8eb 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -2058,20 +2058,30 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+     if (pool == nullptr || pool->failed || pool->slots <= 0) {
+         return;
+     }
++    pool_reap_locked(*pool);   // a drained retirement becomes a free slot (and drops its index)
+     std::vector<int32_t> rank;
+     pool_rank_experts_locked(t, rank);
+-    // The complement, in rank order: an expert already in the arena needs no pool slot -- UNLESS the budget
+-    // covers the whole tensor, in which case the pool is a MIRROR of it (see `fill_slot_from_host`, which
+-    // applies the same rule).  Freeing an arena-resident expert's slot here UN-LOADS it, and its next miss
+-    // then has to re-read it from the model mapping (a synchronous 288 KiB `memcpy` per expert) instead of
+-    // taking a 0.66 us D2D from the pool.  Measured on a full-coverage run at 2 devices: the re-rank freed
+-    // 56 of 256 slots per table (13 440 of 30 720 in the pool) the moment the experts entered VRAM, and that
+-    // is the *second* half of the start-up gap against a pinned master (the first half was the sizing seed).
+-    const bool mirror = pool->slots >= t.n_experts;
++    // Priority order, and it is ONE rule for every budget (wip/host-expert-pool-surplus):
++    //   1. the COMPLEMENT -- every expert the arena does not hold -- in rank order, always first;
++    //   2. then, while capacity remains, the arena-resident experts in the same rank order: the pool expands to
++    //      mirror them, which is what "the budget is big enough" means once the complement is covered.
++    // So `slots < |complement|` is a bounded complement (the historical layout), `slots == |complement|` is
++    // exactly the complement, and `slots > |complement|` also keeps the hottest arena residents -- a full mirror
++    // when the budget covers the tensor.  Un-loading an expert the arena holds forces its next re-admission to be
++    // re-staged from the page cache (a synchronous 288 KiB memcpy), so it is only done when the complement needs
++    // the capacity.
+     std::vector<int32_t> want;
+     want.reserve(rank.size());
+     for (int32_t e : rank) {
+-        if (mirror || t.expert_slot.find(e) == t.expert_slot.end()) {
++        if (t.expert_slot.find(e) == t.expert_slot.end()) {
++            want.push_back(e);
++        }
++    }
++    for (int32_t e : rank) {
++        if (want.size() >= (size_t) pool->slots) {
++            break;
++        }
++        if (t.expert_slot.find(e) != t.expert_slot.end()) {
+             want.push_back(e);
+         }
+     }
+@@ -2107,7 +2117,8 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+     if (freed > 0 || filled > 0) {
+         GGML_LOG_INFO("%s: host pool laid out as the arena's %s layer=%d role=%s: "
+                       "%d filled, %d freed, %zu wanted non-resident, ranked by the heat prior\n",
+-                      __func__, mirror ? "MIRROR (the budget covers the whole tensor)" : "complement",
++                      __func__, (int) want.size() > t.n_experts - (int) t.expert_slot.size()
++                                ? "complement + mirrored residents" : "complement",
+                       t.layer, t.role.c_str(), filled, freed, want.size());
+     }
+ }
+@@ -2888,8 +2899,15 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+     // (5.5 GiB of host memcpy at ~7 GB/s = ~0.5 s), which is what made the pool's STARTING state worse than a
+     // pinned master's and converged away as the arena settled.  A pinned master never has this: it holds every
+     // expert for the whole run, so every fill is a direct H2D from pinned memory.
+-    const bool bounded = pool == nullptr || pool->slots < pool->n_experts;
+-    expert_src_done(t, pool, src, stream, /*retire*/ bounded);
++    // wip/host-expert-pool-surplus: keep the pool's copy whenever its capacity exceeds the COMPLEMENT (the
++    // experts the arena does NOT hold).  The surplus is spent mirroring the arena-resident weights, so a budget
++    // that is merely "big enough for the complement" already stops the un-load/re-read cycle, and a budget that
++    // covers the whole tensor mirrors it completely (measured: retiring those copies cost 20 116 synchronous
++    // page-cache memcpys in the first 300 decode tokens at full coverage).  A pool too small for the complement
++    // retires it, so the space can hold a complement expert -- the historical bounded layout.
++    const int  n_arena  = (int) t.expert_slot.size();
++    const bool keep_all = pool != nullptr && pool->slots > t.n_experts - n_arena;
++    expert_src_done(t, pool, src, stream, /*retire*/ !keep_all);
+     return err;
+ }
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 77890e0a9..3386d2be9 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -229,20 +229,26 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+     // while the pool is far better prefill; at 100 % the whole-tensor tier wins decode outright (71.9 against
+     // 63.9), because only a pinned *master* gets the single-launch staging branch and the native fill.  The
+     // exact crossover was not swept -- `MOE_HOST_TIER=pool|tensor` forces either shape, which is the A/B arm.
++    // wip/host-expert-pool-surplus: the POOL is the mechanism at every budget.  Its per-tensor slot count comes
++    // from the budget, and the pool lays itself out as "the complement of the arena first, then the hottest
++    // arena-resident experts while capacity remains" -- so a budget that only covers the complement stays a
++    // bounded complement, and a budget that covers the whole set turns it into a mirror (i.e. `pinned`'s memory
++    // and transport, measured 19 % better prefill than a pinned master and within 0.4-3 % on decode).  The
++    // whole-tensor pinned-master tier is therefore only the explicit `--host-experts pinned` / MOE_HOST_TIER=tensor
++    // escape hatch.
+     const char * tier_env = getenv("MOE_HOST_TIER");
+-    const bool force_pool   = tier_env != nullptr && strcmp(tier_env, "pool")   == 0;
+     const bool force_tensor = tier_env != nullptr && strcmp(tier_env, "tensor") == 0;
+-    const bool pool_band =
+-        force_pool ||
+-        (!force_tensor && host_experts_limit_gib > 0 &&
+-         (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull < total * 9 / 10);
+-    if (pool_band) {
++    const bool pinned_masters = force_tensor || host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED;
++    if (!pinned_masters) {
+         for (const auto & c : cands) {
+             host_experts_holes.insert(c.name);
+         }
++        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
++        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
+         const size_t budget = host_experts_limit_gib > 0
+                             ? (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull
+-                            : (auto_cap > 0 ? auto_cap : total);   // MOE_HOST_TIER=pool with no `-lme N`
++                            : (total <= auto_cap ? total
++                                                 : (auto_cap > 0 ? auto_cap : total));
+         host_experts_cap_bytes = budget;
+         if (use_mmap) {
+             host_experts_pool_holes = true;
+@@ -252,15 +258,17 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+                 ggml_backend_dev_moe_cache_set_host_pool(d, true);
+             }
+         }
++        const char * how = budget >= total ? "the whole host expert set (a MIRROR)"
++                                           : "the arena's complement, plus mirrored residents while capacity lasts";
+         if (host_experts_limit_gib > 0) {
+             snprintf(policy, sizeof(policy),
+-                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB (ranked by the heat prior; "
+-                     "the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
+-                     put(budget), put(total), use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
++                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
++                     "prior (the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
++                     put(budget), put(total), how, use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+         } else {
+             snprintf(policy, sizeof(policy),
+-                     "MOE_HOST_TIER=pool -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB%s",
+-                     put(budget), put(total), use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
++                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
++                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+         }
+         host_experts_policy = policy;
+         LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());

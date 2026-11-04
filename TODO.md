@@ -434,8 +434,11 @@ field — never `t.host`, which keys the pool map and is shared across the per-d
 
 ## 140. The pool is the arena's complement — a bounded pool could SPILL instead of dropping (candidate)
 
-**Status: BUILT AND MEASURED — a LOSS in both bands, opt-in only (patch `0013`, `MOE_HOST_POOL_READAHEAD=0` by
-default).**  See the last bullet for the numbers and why.  (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`
+**Status: CLOSED — built, measured as a LOSS in both bands, and DROPPED at the maintainer's request** (the code is
+not in the patch chain; it is retrievable at fork commit `a7dfe8871`, and the numbers are in
+`wip/host-expert-eager-push/P6-POOL-REGION.md` §9).  The band it targeted is instead served by the **surplus rule**
+(§10): the pool's spare capacity now mirrors the arena-resident experts, so a budget that covers the complement
+stops the un-load/re-read cycle without any worker at all.  (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`
 §8/§9).**  The pool's contract (TODO #87) is *the arena's complement*: `fill_slot_from_host` retires an expert's
 pool slot when it is seeded into VRAM, and `pool_rerank_from_heat_locked` frees every arena-resident expert's slot
 ("an expert already in the arena needs no pool slot").  So an expert that enters VRAM loses its pool copy, and when

@@ -272,6 +272,46 @@ What *would* be needed: a predicate that predicts re-admission.  The campaign al
 `scripts/moe-trace-replay.py` scores placement/fill policies against a real routing trace offline — so score
 `heat-top-k`, recency and LRU-x predicates there before building another variant.
 
+## 10. The surplus rule: one layout policy for every budget (and the pool is now the one mechanism)
+
+The maintainer's generalisation, implemented as patch `0013` — it **subsumes** the mirror of §8:
+
+> lay the pool out as **the complement first, then the arena-resident experts while capacity remains**.
+
+| pool capacity | layout |
+|---|---|
+| `slots <  |complement|` | a bounded complement (the historical layout, unchanged) |
+| `slots == |complement|` | exactly the complement |
+| `slots >  |complement|` | the complement **plus** the hottest arena residents — a full mirror when the budget covers the tensor, i.e. "basically pinned" |
+
+Two places used to un-load an expert merely because VRAM held it; both now apply the rule: the arena-seed retire
+decision (`keep_all = slots > n_experts - n_arena`) and the heat re-rank's wanted set.  And with the pool carrying
+every case, the loader no longer routes `-lme N >= 90 %` to the whole-tensor pinned-master tier: `auto` (fit) spends
+the **whole set** on the pool, `-lme N` spends N GiB, both land in the same rule, and `--host-experts pinned` /
+`MOE_HOST_TIER=tensor` remain the explicit pinned-master escape hatch.
+
+Measured, 2 devices (0,2), 35B-A3B Q4_K_M, `-ncmoe 40`, decode n=300 / prose-5246 prefill, text byte-identical
+(`231512fc77e5` @n=300, `6ede7c724f4e` @n=2000), `check-gpu-faults` clean:
+
+| arm | prefill | decode n=300 | pool hit rate | pinned / pageable (MiB) |
+|---|---|---|---|---|
+| **`-lme auto` (fit → MIRROR)** | **1317.6** | 70.4 | **1.0000** | 18 662 / 0 |
+| `--host-experts pinned` (escape hatch) | 1105.4 | **71.9** | — | 18 662 / 0 |
+| `-lme 16` (86 %) | — | **66.5** (was 65.6) | 0.8368 | 16 329 / 2 333 |
+| `-lme 12` (64 %) | — | 61.7 (was 61.6) | 0.5658 | 12 247 / 6 415 |
+| `-lme 8` (43 %) | — | 54.1 (was 54.5) | 0.3631 | 8 165 / 10 497 |
+
+**So the default is one mechanism** that beats a pinned master by **19 % on prefill**, is within 0.5-2 % on decode
+(n=2000: 82.5 against 82.9), costs the same pinned RAM, and reports **`h=1.0000` with zero evictions and no
+page-cache re-read at all** (30 960 pool fills = the one-time prepopulate).  The intermediate band gains where the
+surplus appears (`-lme 16`: +0.9 t/s); a genuine sub-complement budget is untouched, as designed.
+
+### Dropped: the read-ahead back-fill (§9), at the maintainer's request
+
+It was built, measured as a loss in both bands, and removed — it raises complexity and adds a synchronisation
+surface for no measured gain.  The code remains retrievable in the fork's history (`a7dfe8871`) and the measurement
+is in §9 + `TODO` #140; nothing of it is in the patch chain.
+
 ## 6. Reproduce
 
 ```bash

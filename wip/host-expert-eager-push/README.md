@@ -1,5 +1,19 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
+> **P8 STATUS (2026-11-04): the pool is the ONE mechanism, and it spends spare capacity mirroring the arena** —
+> `P6-POOL-REGION.md` §10, patch `patches/0013`, branch commit `d87713e36`.  The layout rule is now *one* rule for
+> every budget: the **complement first** (every expert the arena does not hold, in heat rank order), **then the
+> arena-resident experts while capacity remains**.  `slots < |complement|` is the historical bounded complement;
+> `slots > |complement|` keeps the hottest arena residents too — a full mirror when the budget covers the tensor,
+> i.e. "basically pinned".  The loader therefore no longer routes `-lme N >= 90 %` to the whole-tensor tier:
+> `-lme auto` (fit) spends the whole set on the pool, `-lme N` spends N GiB, and `--host-experts pinned` /
+> `MOE_HOST_TIER=tensor` are the explicit escape hatch.  Measured 2 devices, byte-identical text, faults clean:
+> **`auto` = 1317.6 prefill / 70.4 decode (n=300) / 82.5 (n=2000), pool hit rate 1.0000, 18 662 MiB pinned, zero
+> evictions** against a pinned master's 1105.4 / 71.9 / 82.9 — so **+19 % prefill for −0.5…−2 % decode at the same
+> pinned RAM**; the intermediate band gains where the surplus appears (`-lme 16`: 65.6 → 66.5) and a genuine
+> sub-complement budget is unchanged (`-lme 8`: 54.1).  The read-ahead back-fill was **dropped** (measured a loss in
+> both bands, and a needless synchronisation surface; §9 keeps the numbers, commit `a7dfe8871` the code).
+>
 > **P6b STATUS (2026-11-04): a full-coverage pool is a MIRROR, not the arena's complement — and it now BEATS a
 > pinned master at prefill** (patch `patches/0012`, branch commit `2f8947bbd`, record `P6-POOL-REGION.md` §8).
 > The pool IS fully populated before the prompt, but two paths then *un-load* experts from it purely because they
