@@ -434,7 +434,8 @@ field — never `t.host`, which keys the pool map and is shared across the per-d
 
 ## 140. The pool is the arena's complement — a bounded pool could SPILL instead of dropping (candidate)
 
-**Status: open, analysis + numbers recorded, not attempted (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`
+**Status: BUILT AND MEASURED — a LOSS in both bands, opt-in only (patch `0013`, `MOE_HOST_POOL_READAHEAD=0` by
+default).**  See the last bullet for the numbers and why.  (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`
 §8/§9).**  The pool's contract (TODO #87) is *the arena's complement*: `fill_slot_from_host` retires an expert's
 pool slot when it is seeded into VRAM, and `pool_rerank_from_heat_locked` frees every arena-resident expert's slot
 ("an expert already in the arena needs no pool slot").  So an expert that enters VRAM loses its pool copy, and when
@@ -480,10 +481,24 @@ should occupy.  Instead of a D2H spill (PCIe) or a lazy bounce at B's next re-ad
   *disk* read sitting on the critical path; read-ahead converts that into a background fill issued while the GPU
   works.  That is the band the mode exists for, and where this should be judged (P4 §5b's `memory.max` emulation)
   as well as at FRAC 50 / `-lme 8`;
-* TODO #87 measured a **2x decode loss** for the eager *hand-over* on the IQ4_NL field config — a D2H variant in a
-  different regime, before the async slot machinery — so it neither proves nor disproves this.  Re-measure behind a
-  switch (`MOE_HOST_POOL_READAHEAD=1`), with the worker joined at teardown (this campaign deadlocked once on a
-  detached worker + static condvars, HANDOVER trap 3).
+* **BUILT AND MEASURED (patch `0013`) — it LOSES in both bands**, text byte-identical and faults clean:
+
+  | band | read-ahead off | on | jobs | host memcpy moved |
+  |---|---|---|---|---|
+  | page cache, FRAC 50, n=300 | **56.4** | 52.8 | 12 252 | 640 ms |
+  | `O_DIRECT` disk, FRAC 50, n=100 | **15.9** (prefill 24.1) | 15.1 (prefill **16.3**) | 7 984 | 2 534 ms |
+
+  Why, and it is the campaign's own L3 lesson again: **(1)** the victim is by construction the arena's LEAST-demanded
+  resident (`access_locked` evicts min decaying `count`), so an eager copy is a bet against the signal that chose it
+  — and the demand-side `ghost` counter cannot be the predicate, because it is reset to 0 on admission and is
+  therefore 0 for every resident (requiring `ghost >= 1` rejected 100 % of victims, measured); **(2)** the copy
+  competes with the demand path for the same resource — on disk the eager reads fight the demand reads for the NVMe
+  queue and prefill collapses 24.1 → 16.3 t/s; **(3)** only ~26 % of the bounded band's fills can come from the pool
+  at all (the rest are coverage misses no policy can help), so the ceiling is low even with a perfect prediction.
+  The mechanism is kept, default OFF, as an experiment; the worker does **host-only** work (ROCm aborts the process
+  if its runtime threads are first touched from a foreign thread: `std::system_error: Operation not permitted`), so
+  the main thread polls the drain events and hands jobs over.  **A predicate that predicts re-admission is what
+  would be needed** — score candidates offline with `scripts/moe-trace-replay.py` before building another variant.
 
 ## Where the current lists live
 

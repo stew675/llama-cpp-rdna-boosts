@@ -1,0 +1,397 @@
+From a7dfe8871fb1fb2c5fe499e926edc52d156c4106 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Wed, 4 Nov 2026 06:41:57 -0600
+Subject: [PATCH] wip/host-expert-pool-readahead: host-side back-fill worker
+ for the arena's victim (MEASURED: a loss, opt-in)
+
+TODO #140, the maintainer's "eagerly back-fill the evicted weight from the page cache/disk
+
+after the VRAM picks up the promoted weight" idea, built as specified: when the arena promotes
+expert A from the pool and evicts victim B, the slot A vacates is handed to a WORKER THREAD that
+fills it with B's bytes from the page cache (or O_DIRECT in the disk band), so the union
+{VRAM u pool} stays closed and B's next re-admission is a 0.66 us D2D instead of a synchronous
+288 KiB memcpy on the critical path.
+
+Mechanism: the slot is reserved in a new state 3 (`pool_free_slot_locked` now requires state 0),
+the worker is OWNED and joined before any pool is freed, and -- the important part -- the worker
+does HOST-ONLY work: ROCm lazily spins up its runtime threads and doing that from a foreign thread
+aborts the process (`std::system_error: Operation not permitted`), so the main thread polls each
+job's drain event (bounded `cudaEventQuery` per access) and only then hands the job over for the
+memcpy.  Publication is deferred to the main thread, which is why the worker never takes g_mutex
+and a teardown can join it while holding that lock.
+
+MEASURED A LOSS IN BOTH BANDS (text byte-identical, faults clean):
+
+  band                                  off      on     jobs   host memcpy moved
+  page cache, FRAC 50, n=300           56.4    52.8    12252   640 ms
+  O_DIRECT disk, FRAC 50, n=100        15.9    15.1     7984  2534 ms   (prefill 24.1 -> 16.3)
+
+Why: (1) the victim is by construction the arena's LEAST-demanded resident -- `access_locked`
+evicts min decaying `count` -- so an eager copy is a bet against the signal that chose it, and the
+demand-side `ghost` counter cannot be the predicate (it is reset to 0 on admission, so it is 0 for
+every resident: requiring ghost >= 1 rejected 100% of victims); (2) the copy competes with the
+demand path for the same resource -- on disk the eager reads fight the demand reads for the NVMe
+queue and prefill collapses 24.1 -> 16.3 t/s; (3) only ~26% of the bounded band's fills can come
+from the pool at all, the rest are coverage misses no policy can help.
+
+So the default is OFF (`MOE_HOST_POOL_READAHEAD=0`) and this is an opt-in experiment, not a
+default-on feature.  A predicate that predicts re-admission is what would be needed, and the
+campaign already has the offline tool for it (`scripts/moe-trace-replay.py`) -- score
+back-fill predicates there before building another variant.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 285 ++++++++++++++++++++++++-
+ 1 file changed, 282 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index d5be5d62f..50a353def 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -8,6 +8,10 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <cerrno>
+ #include <chrono>
+ #include <cstdio>
+@@ -762,6 +766,10 @@ static inline bool table_cold_ok(const table_t & t) {
+ // restriction holds, which is the A/B arm.
+ static bool g_pool_cold = true;
+ static bool g_pool_cold_multidev = true;
++// wip/host-expert-pool-readahead (TODO #140): the back-fill worker (machinery below); parsed here so `parse_env`
++// and the reporting path can see it.  `MOE_HOST_POOL_READAHEAD=0` is the kill switch.
++static bool g_ra_on = true;
++static int  g_ra_min_ghost = 1;   // back-fill only a victim with demonstrated re-demand (MOE_HOST_POOL_READAHEAD_GHOST)
+ static host_pool_t * table_pool_locked(table_t & t);
+ static int64_t pool_ram_cap_locked();   // wip/host-pool-speed W3: the RAM_PCT ceiling, measured once
+ // The ONE predicate both the host-side cold decision (`pool_cold_slot_locked`) and the kernel-side cold
+@@ -941,6 +949,11 @@ void parse_env() {
+     g_cold_uva = env_int("MOE_EXPERT_CACHE_COLD_UVA", 1) != 0;
+     g_pool_cold = env_int("MOE_HOST_POOL_COLD", 1) != 0;
+     g_pool_cold_multidev = env_int("MOE_HOST_POOL_COLD_MULTIDEV", 1) != 0;
++    // MEASURED A LOSS in both bands (page-cache FRAC 50: 52.9 vs 56.5 t/s; O_DIRECT-disk: 15.1 vs 15.9,
++    // prefill 16.3 vs 24.1) -- see TODO #140.  Kept as an OPT-IN experiment with the mechanism intact; it is not a
++    // default-on feature, and `=0` is the shipped state.
++    g_ra_on              = env_int("MOE_HOST_POOL_READAHEAD", 0) != 0;
++    g_ra_min_ghost       = env_int("MOE_HOST_POOL_READAHEAD_GHOST", 1);
+     g_stage_cache = env_int("GGML_MOE_CACHE_STAGE", 1) != 0;
+     // Admission: `touch` (measured best at every arena size): a first-touch expert is served cold and
+     // only a re-touch is admitted, so one-shot experts stop churning the arena - which raises `h` as
+@@ -1835,11 +1848,233 @@ static void pool_free_locked(host_pool_t & p) {
+     p.failed = true;
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// wip/host-expert-pool-readahead (TODO #140): keep the pool's coverage CURRENT without a PCIe cost.
++//
++// The pool is the arena's COMPLEMENT (TODO #87): an expert that enters VRAM gives up its pool slot, and when the
++// arena later evicts it, its next re-admission has to re-stage the bytes from the model mapping -- a synchronous
++// 288 KiB `memcpy` on the critical path (measured: 46 871 of them at FRAC 50, ~1.3 s of host CPU in a 4.4 s run,
++// which is the partial band's whole deficit against a pinned master).
++//
++// The fix is a HOST-SIDE READ-AHEAD, not a spill: when the arena promotes expert A from the pool and evicts victim
++// B, the slot A vacates is exactly the slot B should occupy -- so back-fill it with B's bytes from the page cache
++// (or the file, in the disk band) on a WORKER THREAD, so the main thread stays free to service the next GPU
++// promotion.  No PCIe is added (host-to-host copy), and B's next re-admission becomes a 0.66 us D2D from the pool.
++//
++// The slot is handed to the worker in state 3 (reserved): `pool_free_slot_locked` will not hand it out and
++// `pool_peek_locked` will not serve it until the main thread PUBLISHES it (state 1) after the copy has landed.
++// Publication is deferred to the main thread deliberately: the worker then never touches `g_mutex`, so a teardown
++// can join it while holding that lock without a cycle (this campaign deadlocked once on a detached worker + static
++// condvars -- HANDOVER trap 3 -- so the worker is owned, joined, and its condvar is a real object).
++static void pool_slot_assign_locked(host_pool_t & p, int slot, int32_t expert);
++
++struct ra_job_t {
++    host_pool_t * pool   = nullptr;
++    int           slot   = -1;
++    int32_t       expert = -1;
++    size_t        bytes  = 0;
++    const char *  src    = nullptr;   // the page-cache source (the model mapping), or null for the file tier
++    int           fd     = -1;        // the file tier (MOE_HOST_POOL_DIO): read the expert's own range
++    size_t        off    = 0;
++    size_t        align  = 4096;
++    int           dev    = -1;
++    cudaEvent_t   ev     = nullptr;   // the promoted expert's copy out of the slot must have drained
++};
++// The worker does HOST-ONLY work.  Every HIP call stays on the main thread: the ROCm runtime lazily spins up its
++// own runtime threads, and doing that from a foreign thread aborts the process (`std::system_error: Operation not
++// permitted` from its `AsyncEventsLoop` startup, measured) -- so the main thread polls each job's drain event
++// (non-blocking `cudaEventQuery`, a few per access) and only then hands the job to the worker for the memcpy.
++std::mutex              g_ra_mutex;
++std::condition_variable g_ra_cv;
++std::deque<ra_job_t>    g_ra_pending;    // waiting for the promoted expert's copy to drain (main thread polls)
++std::deque<ra_job_t>    g_ra_copyq;      // drained: the worker may overwrite the slot
++std::vector<ra_job_t>   g_ra_ready;      // copied: awaiting publication (main thread)
++std::atomic<int64_t>    g_ra_ready_n{0};
++std::atomic<int64_t>    g_ra_pending_n{0};
++std::thread             g_ra_thread;
++bool   g_ra_run        = false;
++bool   g_ra_stop       = false;
++size_t g_ra_max_queue  = 4096;    // bounded: a full queue simply drops the job (lazy behaviour, never a stall)
++int   g_ra_poll_per_call = 8;     // drain-event polls per access (bounded so the hot path stays cheap)
++int64_t g_ra_enqueued = 0, g_ra_done = 0, g_ra_published = 0, g_ra_dropped = 0, g_ra_us = 0;
++
++static void ra_worker_main() {
++  try {
++    std::unique_lock<std::mutex> lk(g_ra_mutex);
++    for (;;) {
++        g_ra_cv.wait(lk, [] { return g_ra_stop || !g_ra_copyq.empty(); });
++        if (g_ra_copyq.empty()) {
++            if (g_ra_stop) {
++                return;
++            }
++            continue;
++        }
++        ra_job_t j = g_ra_copyq.front();
++        g_ra_copyq.pop_front();
++        lk.unlock();
++        char * dst = (char *) j.pool->base + (size_t) j.slot * j.pool->host_bytes;
++        const int64_t t0 = ggml_time_us();
++        bool ok = false;
++        if (j.src != nullptr) {
++            memcpy(dst, j.src, j.bytes);
++            ok = true;
++        } else if (j.fd >= 0) {
++            ok = pool_dio_read(j.fd, dst, j.bytes, j.off, j.align) ||
++                 pool_pread(j.fd, dst, j.bytes, j.off) == (pool_ssize_t) j.bytes;
++        }
++        const int64_t dt = ggml_time_us() - t0;
++        lk.lock();
++        if (ok) {
++            g_ra_us += dt;
++            g_ra_done++;
++            g_ra_ready.push_back(j);
++            g_ra_ready_n.store((int64_t) g_ra_ready.size(), std::memory_order_relaxed);
++        } else {
++            g_ra_dropped++;
++            j.pool->slot_expert[(size_t) j.slot] = -1;   // hand the slot back to the lazy path
++            j.pool->slot_state[(size_t) j.slot]  = 0;
++        }
++        // NB: the lock stays HELD here -- `cv.wait(lk, ...)` at the top of the loop requires ownership
++        // (libstdc++ throws `operation not permitted` otherwise, which is what a stray unlock here produced).
++    }
++  } catch (const std::exception & e) {
++    // Never let an exception escape a raw thread (that is an immediate std::terminate): a kill-switchable
++    // optimisation must degrade to the lazy behaviour instead.
++    GGML_LOG_ERROR("%s: pool read-ahead worker stopped: %s; falling back to the lazy pool path\n", __func__, e.what());
++    std::lock_guard<std::mutex> lk(g_ra_mutex);
++    g_ra_on = false;
++  }
++}
++
++// Caller holds `g_mutex`.  Starts the worker lazily and queues one back-fill.
++static void pool_readahead_enqueue_locked(host_pool_t & p, int slot, int32_t expert, int dev, const char * src,
++                                          int fd, size_t off, size_t align) {
++    if (!g_ra_on || p.base == nullptr || slot < 0 || slot >= p.slots || expert < 0) {
++        return;
++    }
++    cudaEvent_t ev = pool_slot_event(p, slot, dev);
++    if (ev == nullptr) {
++        g_ra_dropped++;
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lk(g_ra_mutex);
++        if (g_ra_pending.size() + g_ra_copyq.size() >= g_ra_max_queue) {
++            g_ra_dropped++;
++            return;
++        }
++        if (!g_ra_run) {
++            g_ra_stop = false;
++            try {
++                g_ra_thread = std::thread(ra_worker_main);
++                g_ra_run = true;
++            } catch (const std::system_error & e) {
++                // A kill-switchable optimisation must never take the run down: without a worker the pool falls back
++                // to exactly the lazy behaviour it had before this feature.
++                g_ra_on = false;
++                GGML_LOG_WARN("%s: pool read-ahead DISABLED: could not start the back-fill worker (%s).  The pool "
++                              "keeps its lazy behaviour (a re-admission re-stages from the page cache).\n",
++                              __func__, e.what());
++                g_ra_dropped++;
++                return;
++            }
++        }
++        ra_job_t j;
++        j.pool = &p; j.slot = slot; j.expert = expert; j.bytes = p.host_bytes;
++        j.src = src; j.fd = fd; j.off = off; j.align = align; j.dev = dev; j.ev = ev;
++        g_ra_pending.push_back(j);
++        g_ra_pending_n.store((int64_t) g_ra_pending.size(), std::memory_order_relaxed);
++        g_ra_enqueued++;
++    }
++}
++
++// Caller holds `g_mutex`.  Polls the pending jobs' drain events (bounded, non-blocking, main thread) and publishes
++// every back-fill the worker has completed.  One relaxed atomic load when there is nothing to do.
++static void pool_readahead_drain_locked() {
++    if (g_ra_pending_n.load(std::memory_order_relaxed) > 0) {
++        std::deque<ra_job_t> moved;
++        {
++            std::lock_guard<std::mutex> lk(g_ra_mutex);
++            for (int k = 0; k < g_ra_poll_per_call && !g_ra_pending.empty(); ) {
++                ra_job_t j = g_ra_pending.front();
++                bool drained = true;
++                if (j.ev != nullptr) {
++                    device_guard dg(j.dev);
++#if defined(GGML_USE_HIP)
++                    drained = hipEventQuery((hipEvent_t) j.ev) != hipErrorNotReady;
++#else
++                    drained = cudaEventQuery(j.ev) != cudaErrorNotReady;
++#endif
++                    (void) cudaGetLastError();
++                }
++                if (!drained) {
++                    // not yet: rotate it to the back so the poll does not starve the queue head
++                    g_ra_pending.pop_front();
++                    g_ra_pending.push_back(j);
++                    ++k;
++                    continue;
++                }
++                g_ra_pending.pop_front();
++                g_ra_copyq.push_back(j);
++                moved.push_back(j);   // (only to size the notify below)
++                ++k;
++            }
++            g_ra_pending_n.store((int64_t) g_ra_pending.size(), std::memory_order_relaxed);
++        }
++        if (!moved.empty()) {
++            g_ra_cv.notify_all();
++        }
++    }
++    if (g_ra_ready_n.load(std::memory_order_relaxed) == 0) {
++        return;
++    }
++    std::vector<ra_job_t> jobs;
++    {
++        std::lock_guard<std::mutex> lk(g_ra_mutex);
++        jobs.swap(g_ra_ready);
++        g_ra_ready_n.store(0, std::memory_order_relaxed);
++    }
++    for (const ra_job_t & j : jobs) {
++        if (j.pool == nullptr || j.slot < 0 || j.slot >= j.pool->slots ||
++                j.pool->slot_state[(size_t) j.slot] != 3) {
++            g_ra_dropped++;
++            continue;
++        }
++        pool_slot_assign_locked(*j.pool, j.slot, j.expert);
++        g_ra_published++;
++    }
++}
++
++// Stop and JOIN the worker.  Caller must NOT hold `g_mutex`'s worker-side resources; the worker never takes
++// `g_mutex`, so joining while the caller holds it is safe (that is why publication is deferred to the main thread).
++static void pool_readahead_stop() {
++    {
++        std::lock_guard<std::mutex> lk(g_ra_mutex);
++        if (!g_ra_run) {
++            return;
++        }
++        g_ra_stop = true;
++        g_ra_pending.clear();
++        g_ra_copyq.clear();
++        g_ra_ready.clear();
++        g_ra_pending_n.store(0, std::memory_order_relaxed);
++        g_ra_ready_n.store(0, std::memory_order_relaxed);
++    }
++    g_ra_cv.notify_all();
++    if (g_ra_thread.joinable()) {
++        g_ra_thread.join();
++    }
++    std::lock_guard<std::mutex> lk(g_ra_mutex);
++    g_ra_run = false;
++}
++
+ // The first slot that holds no expert and is not being retired/reserved (-1 when the pool is full).
+ static int pool_free_slot_locked(host_pool_t & p) {
+     pool_reap_locked(p);
+     for (int s = 0; s < p.slots; s++) {
+-        if (p.slot_expert[(size_t) s] < 0) {
++        // `slot_state` 0 is the ONLY free state: 1 = holding a valid expert, 2 = retiring (draining), 3 =
++        // reserved by the read-ahead worker (wip/host-expert-pool-readahead), which must not be handed out.
++        if (p.slot_expert[(size_t) s] < 0 && p.slot_state[(size_t) s] == 0) {
+             return s;
+         }
+     }
+@@ -2898,6 +3133,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                               bool * out_cold = nullptr) {
+     // The cold read indexes the host master with the table's own host geometry (`moe_cache_get_cold`
+     // returns the per-expert and per-row strides), so a Phase 3 slice is servable in place too.
++    pool_readahead_drain_locked();
+     const bool cold_ok = table_cold_ok(t) || pool_cold_slot_locked(t, expert) >= 0;
+     const auto is_protected = [&](int32_t e) {
+         for (int i = 0; i < n_protect; i++) {
+@@ -3037,9 +3273,41 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             err = copy_slot_from_src(t, dst, hsrc, (cudaStream_t) stream);
+         }
+         if (err == cudaSuccess) {
+-            // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
+-            // being in VRAM now does not mean the pool should forget where to find it next time.
++            // wip/host-expert-pool-readahead (TODO #140): the demand path keeps a pool-resident source resident
++            // (`retire=false`) -- but when the pool is a BOUNDED complement and the promoted expert's slot is no
++            // longer needed, hand that slot to the read-ahead worker to be back-filled with the expert the arena
++            // just evicted.  The union {VRAM u pool} then stays closed, so the victim's next re-admission is a
++            // 0.66 us D2D instead of a synchronous 288 KiB page-cache memcpy on the critical path.
++            // Predicate the back-fill on DEMONSTRATED demand for the victim: an eager copy of an expert nobody
++            // asked for twice is pure work (measured: 12 252 unconditional back-fills were neutral-to-worse at
++            // FRAC 50, because the arena's victim is by construction its least valuable resident).  `ghost` is the
++            // decaying demand counter the `touch` doorkeeper already uses, so this is the same evidence the
++            // adoption policy uses, and a re-admitted expert is exactly the one that pays a bounce today.
++            const int64_t ra_ghost = (victim >= 0 && victim < (int32_t) t.ghost.size()) ? t.ghost[victim] : 0;
++            const bool ra_take = g_ra_on && pool != nullptr && pool->slots < pool->n_experts &&
++                                 hsrc.pool_slot >= 0 && victim >= 0 && !t.identity && t.host != nullptr &&
++                                 ra_ghost >= g_ra_min_ghost;
++            // The demand path NEVER retires its source (TODO #87: the pool is a layout, not a churning cache); only
++            // the read-ahead branch below takes the slot over, into state 3.
+             expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
++            if (ra_take) {
++                // the slot now belongs to the read-ahead until it is published: drop the promoted expert's index
++                const int32_t old_e = pool->slot_expert[(size_t) hsrc.pool_slot];
++                if (old_e >= 0) {
++                    const auto it = pool->expert_slot.find(old_e);
++                    if (it != pool->expert_slot.end() && it->second == hsrc.pool_slot) {
++                        pool->expert_slot.erase(it);
++                    }
++                }
++                pool->slot_expert[(size_t) hsrc.pool_slot] = -1;
++                pool->slot_state [(size_t) hsrc.pool_slot] = 3;   // reserved by the read-ahead
++                const size_t off = t.src_offs + (size_t) victim * t.host_bytes;
++                const bool from_map = !g_pool_dio;
++                pool_readahead_enqueue_locked(*pool, hsrc.pool_slot, victim, t.device >= 0 ? t.device : 0,
++                                              from_map ? (const char *) t.host + (size_t) victim * t.host_bytes
++                                                       : nullptr,
++                                              from_map ? -1 : t.src_fd, off, t.src_align);
++            }
+         }
+         if (err != cudaSuccess) {
+             GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
+@@ -5421,6 +5689,11 @@ void moe_cache_forget_all(int device) {
+             t.src_fd = -1;
+         }
+     }
++    // wip/host-expert-pool-readahead: the worker copies into pool slots and reads the model mapping, so it must be
++    // stopped and joined BEFORE a pool is freed or a mapping dropped.  It never takes `g_mutex`, so joining here
++    // (with that lock held) is safe by construction.
++    pool_readahead_stop();
++
+     // The host pool is keyed by the master and holds PINNED memory: it must not outlive the model either.
+     for (const void * h : dead_hosts) {
+         const auto it = g_host_pools.find(h);
+@@ -8226,6 +8499,12 @@ void moe_cache_report() {
+     GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
+                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
+                   n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
++    if (g_ra_enqueued > 0 || g_ra_dropped > 0) {
++        GGML_LOG_INFO("%s: pool read-ahead: %lld queued, %lld copied (%.1f ms of host memcpy off the critical "
++                      "path), %lld published, %lld dropped%s\n", __func__, (long long) g_ra_enqueued,
++                      (long long) g_ra_done, (double) g_ra_us / 1000.0, (long long) g_ra_published,
++                      (long long) g_ra_dropped, g_ra_on ? "" : " (MOE_HOST_POOL_READAHEAD=0)");
++    }
+     if (g_devremap_calls > 0) {
+         GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
+     }
+-- 
+2.56.0
+

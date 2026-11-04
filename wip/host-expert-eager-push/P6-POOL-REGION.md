@@ -238,6 +238,40 @@ master** (1315.9 against 1105.4) and decodes within 0.4-3 % of it (n=2000 82.6 a
 mirror) instead of the whole-tensor pinned-master tier — the trade is +19 % prefill for ~-2 % decode at
 n≤500.  Not changed here: it is the maintainer's call, and it would remove P5's per-tensor tier entirely.
 
+## 9. The read-ahead back-fill was built and it LOSES (patch `0013`, opt-in)
+
+The maintainer's refinement of the spill — *eagerly back-fill the evicted expert into the slot the promoted expert
+vacates, from the page cache/disk, on a worker thread, so the union `{VRAM ∪ pool}` stays closed without any PCIe* —
+was implemented exactly as described and **measured a loss in both bands** (text byte-identical, faults clean):
+
+| band | read-ahead off | on | jobs | host memcpy moved off the critical path |
+|---|---|---|---|---|
+| page cache, FRAC 50, n=300 | **56.4** | 52.8 | 12 252 | 640 ms |
+| `O_DIRECT` disk, FRAC 50, n=100 | **15.9** (prefill 24.1) | 15.1 (prefill **16.3**) | 7 984 | 2 534 ms |
+
+The three reasons, all measured rather than argued:
+
+1. **The victim is the arena's least-demanded resident by construction.**  `access_locked` evicts the smallest
+   decaying `count` (tie: oldest use), so an eager copy of it is a bet against the very signal that chose it.  The
+   obvious predicate — the demand-side `ghost` counter — cannot be used: it is reset to 0 on admission, so it is 0
+   for *every* resident, and requiring `ghost >= 1` rejected 100 % of victims (measured: zero jobs, baseline rate).
+2. **The copy competes with the demand path for the same resource.**  In the page-cache band the host is already
+   running 46 871 bounce memcpys for the coverage misses, so 12 252 more do not shorten the critical path; in the
+   disk band the eager reads fight the demand reads for the NVMe queue and **prefill collapses 24.1 → 16.3 t/s**.
+3. **The ceiling is low**: only ~26 % of the bounded band's fills can come from the pool at all (the rest are
+   coverage misses that no policy can help), so even a perfect prediction could not pay for the extra reads.
+
+It is the campaign's own L3 lesson in a fourth guise: *the pool's CONTENT matters far more than the hand-over
+policy*.  The mechanism is kept, **default OFF** (`MOE_HOST_POOL_READAHEAD=0`), as an experiment — and one hard-won
+implementation fact is recorded with it: **the worker must do host-only work**.  ROCm lazily spins up its runtime
+threads, and doing that from a foreign thread aborts the process (`std::system_error: Operation not permitted`), so
+the main thread polls each job's drain event (a bounded `cudaEventQuery` per access) and only then hands the job to
+the worker; that also keeps the worker off `g_mutex` entirely, so a teardown can join it while holding the lock.
+
+What *would* be needed: a predicate that predicts re-admission.  The campaign already owns the tool for that —
+`scripts/moe-trace-replay.py` scores placement/fill policies against a real routing trace offline — so score
+`heat-top-k`, recency and LRU-x predicates there before building another variant.
+
 ## 6. Reproduce
 
 ```bash
