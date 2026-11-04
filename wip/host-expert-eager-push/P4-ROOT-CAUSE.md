@@ -425,6 +425,42 @@ are synchronous".
 | the model load / placement | slab and buffer lines byte-identical between the arms |
 | the expert cache entirely | `MOE_EXPERT_CACHE_MIB=0` -> **all three arms 673.7-674.0 t/s** |
 
+### The mechanism: the ROCm SVM path for `hipHostRegister` (and why it is not a bug to fix)
+
+A web search turned up two documented mechanisms and one of them is the answer:
+
+- **`hipHostRegister` has been an *SVM* operation since ROCm 5.6** (`HSA_USE_SVM` enabled silently):
+  [ROCm/ROCm issue #2433](https://github.com/ROCm/ROCm/issues/2433) documents the switch and shows its most
+  visible symptom (registration taking 0.7 s -> 14-54 s for the same range, fixed only by `HSA_USE_SVM=0`).
+- **AMD's own docs do not promise `hipHostRegister` == `hipHostMalloc`.**  The HIP runtime reference says of
+  registration *"on some systems, registered memory may not actually be pinned but uses OS or hardware
+  facilities to allow the GPU to access it"*, and the ROCm/AMD lab-notes say registered memory is *"
+  treated as `hipHostMallocCoherent`"* -- the **coherent** (not L2-cached) pinned flavour, explicitly
+  different from the non-coherent allocation `hipHostMalloc` hands out.
+
+**Measured here, and the result is an ASYMMETRY, not a bug:**
+
+| `HSA_USE_SVM` | 1 device prefill | 1 device decode | 2 devices prefill | 2 devices decode | registration |
+|---|---|---|---|---|---|
+| default (SVM on, ROCm 5.6+) | **477** | **53.4** (+9 % vs pool) | **949** (+34 %) | **71.8** (+39 %) | 18 662 MiB in 0.46 s |
+| `HSA_USE_SVM=0` (legacy path) | 615.7 | -- | 707.2 | 51.2 | **REFUSED**: `registered 0 MiB ... refusals=1`, master stays pageable |
+
+So `HSA_USE_SVM=0` is **not a workaround**: with SVM off the runtime refuses to register the range at all and
+the arm silently degenerates to the pool path (that is why it "matches `pinned`" -- it *is* the pool path; the
+census shows `host pool h=0.03` and 20 289 pool fills).  **Registration on this stack *is* the SVM path**, and
+the same property that makes it a big win on a tensor split (949/71.8) costs 22 % prefill on one device (477).
+
+`pinned` at 2 devices is bimodal in the record (71.6-72.1 twice, 51.2 once): that is the silent per-buffer
+pageable fallback documented in §5c (4 GiB buffers; a failed `cudaMallocHost` falls back to pageable CPU
+memory with only a DEBUG log).  Treat `pinned`'s 2-device number as "72 when every buffer pinned, 51 when it
+fell back".
+
+**So the design answer is a policy, not a fix**: use the registered master where it wins -- **2+ devices,
+where it is +34 % prefill / +39 % decode against the pool and no duplicate RAM** -- and keep today's pinned
+master (or accept +9 % decode / -22 % prefill) at **1 device**.  Nothing in the public record describes this
+particular symptom (a registered source under an expert cache costing a fixed per-token prefill cost on one
+device); the *mechanism* is documented, the behaviour is not.
+
 **The shape of what is left**: the penalty is ~0.47 ms **per prefill token** (0.10 s at 533 tokens, 2.47 s at
 5 246), it needs the expert cache to be ON, and it needs the master range to be registered.  Whole-process
 CPU: user +3.6 s, sys -1.6 s, minor faults +2.5 M, maxrss -7.5 GiB.  It is not the fill *count* (arena sweep),
