@@ -840,6 +840,62 @@ The design is settled (maintainer, 2026-11-04): **`hipHostMalloc` everywhere**, 
 `pool` = the same tier with a budget and a policy, `auto` = pinned when it fits else a bounded pool.  Nothing
 from the registration experiment goes into the delivery.
 
+### DESIGN OF RECORD: one expert-indexed pinned host region (NOT yet implemented)
+
+The transport is uniform (pinned host memory -> GPU, same CE path).  What is *not* uniform today is
+`t.host_pinned`, the flag the prefill staging branch keys on, which is derived from **where the master lives**
+rather than from **whether the bytes are pinned**:
+
+```
+bind_host_dev_locked():  host_pinned = (cudaHostGetDevicePointer(t.host) succeeded)
+  pinned mode : master = the per-tensor ROCm_Host buffer  -> host_pinned = true  -> single-launch staging,
+                                                                                   cold read available
+  pool   mode : master = the pageable model mapping       -> host_pinned = false -> pool-backed staging
+                                                                                   (two-tier snapshot rebuilt
+                                                                                   per op + per-expert copies),
+                                                                                   cold read unavailable
+```
+
+Measured consequence, with the SAME full 18.6 GiB pool (30 720 slots) in both arms at 2 devices:
+
+| | prefill | decode |
+|---|---|---|
+| pinned master, pool present (`LLAMA_HOST_MASTER_PINNED=1`) | **1 105.3** | **71.9** |
+| pageable master + full pool (`-lme 64`) | 532.9 | 22.6 |
+| full pool + pinned master (`-lme 64` + `LLAMA_HOST_MASTER_PINNED=1`) | 1 009.4 | 71.9 |
+
+So a fully-pinned *slot set* does not behave like a pinned *master*: the mode-keyed switch, not the transport,
+is the 3x.  A pool **beside** a pinned master also costs ~9 % prefill for nothing (1 009.4 vs 1 105.4).
+
+**Target shape** -- the maintainer's design, and what the refactor must produce:
+
+1. **One pinned host region, addressed by expert index, with a presence bitmap** (`present[e]`).  Today's pool
+   stores a *permutation* of whole experts in slots, so it cannot serve as a master (the fill indexes weights
+   as `expert * host_bytes`, slot != expert) -- that is precisely why `host_pinned` stays false and the slow
+   branch is taken.  An expert-indexed region makes a full set identical to today's `pinned`, and a partial set
+   a pinned master **with holes**.
+2. **Filled greedily at load in descending hotness**, after VRAM has been filled with the hottest weights up to
+   the first wide prefill boundary: put each host expert in the region while it fits, else leave it in the
+   pageable model mapping.
+3. **Sized by `-lme`**: `auto` = `MOE_HOST_POOL_FRAC` (80 %) of `MemAvailable` at load; `N` = N GiB (clamped to
+   the host expert set; refused above 90 % of available memory).  Same mechanics for both -- only the cap
+   differs.
+4. **Releasable**: `hipHostFree` returns the pages (proven, §5f).
+5. **The pageable mapping is the per-expert fallback through the holes**, so `host_pinned` becomes a per-table
+   truth about *the weights* and the two staging branches collapse into one hole-aware path.  The cost of a
+   non-resident expert is quantified: ~532 prefill / 22.6 decode at 2 devices, which is what the hotness
+   ordering exists to minimise.
+
+**Implementation steps** (none of this is written yet):
+
+| step | where | acceptance |
+|---|---|---|
+| a | expert-indexed region + presence bitmap replacing the slot permutation | a full region reproduces the `pinned` numbers (1 105.4 / 72.0 at 2 devices) |
+| b | greedy load-time placement in hotness order, capped by `-lme` | reporting shows `pinned X of Y GiB`; a set that fits reports `X == Y` and matches step a |
+| c | hole-aware staging branch: one path, `host_pinned` per table | a partial set keeps the pinned numbers for resident experts; non-resident ones take the pageable path |
+| d | retire the mode distinction (`--host-experts` stays a deprecated shorthand) | one mode in the code; `-lme` is the only knob |
+| e | census: `pinned X GiB (cap C), pageable Y GiB`; keep the degenerate-split and pinned-fallback warnings | the tier split is visible in one line |
+
 ### Landed (fork commit `e30ba75b0`, patch `0008`): the two silent failures, made loud
 
 | diagnostic | why | verified |
