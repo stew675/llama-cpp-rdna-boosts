@@ -1,3 +1,20 @@
+## 261104.006 (docs) -- `TODO` #135 re-scoped: an even-split guard at load, not a host-expert perf hunt
+
+**No delivery change** (`patches/`, `release.json` and the fork are untouched; the release stays
+`v16-6050b467c-r213`).  Follow-up to the audit in 261104.005, at the maintainer's correction of what #135 actually is.
+
+**The finding is a limit, not a defect to tune.**  35B-A3B has **no even `-sm tensor` split above 2 GPUs**, so a 3-device
+arm is degenerate (r209: ~20 t/s against ~55 on 1 GPU and ~52 on 2, while all-VRAM on the same three devices gives
+138 t/s), and the ~20 t/s figure is the *symptom of a zero/uneven per-device share* — not something a host-expert path
+can recover.  It is the same class as the accepted limitation already recorded for `gemma-4-E4B-it` at 3 devices (2 KV
+heads < 3 devices, the split-state ratio-consistency assert).
+
+**So the item is re-scoped to the guard it implies:** a **load-time check** that decides whether the requested device
+count can split *this model's* tensors evenly and, when it cannot, **refuses to offload that far** with a message naming
+the constraint and the supported counts — the vLLM TP-validation behaviour.  It must be derived from the model's own
+geometry (head / expert counts), never a hard-coded model list.  The r209 measurement is kept only as the evidence that
+the degenerate configuration is silent today; the row no longer asks for an attribution of the number.
+
 ## 261104.005 (docs) -- TODO/`wip/` audit: two campaigns retired, four items closed, and the entries that outlived their campaigns repointed
 
 **No delivery change** (`patches/`, `release.json` and the fork are untouched; the release stays
