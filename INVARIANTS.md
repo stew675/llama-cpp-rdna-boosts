@@ -1593,3 +1593,42 @@ change), and let `WORKLOG.md` carry the narrative.
   interleaved, which `scripts/extract-generated.py` documents) and a per-event `P1-PUSH` message re-fired
   after a budget reset.  Keep capture streams separate (`>out 2>err`: the text is stdout, every log line is
   stderr) and make such messages once-per-process.
+
+## r210 — the host-expert tier is one pinned per-expert pool, and the pool mirrors the arena when the budget allows
+
+Established 2026-11-04 (`wip/host-expert-eager-push/P5-RESULTS.md`, `P6-POOL-REGION.md`).  Each entry is a fact that
+cost a session to learn; do not re-derive them.
+
+1. **The pool IS the "pinned region addressed by expert index with a presence bitmap"** the design asked for: a
+   pinned per-host-tensor allocation addressed by `expert -> slot`, with `slot_state` as the presence bitmap,
+   `base_dev` as the UVA alias, heat-ranked contents and a native fill (a resident is a 1.3 µs D2D).  Nothing else
+   had to be built to make it a tier — only permissions.
+2. **A pool-resident expert can be cold-read in place at any device count.**  The historical restriction
+   (`device_count == 1 && src_off == 0`) was a geometry accident: `base_dev` is already the cross-device D2D fill
+   source, and a slice offset is folded into the cold base for a pinned master anyway.  Worth **+11.5 %** decode at
+   `-lme 8` and **+10 %** for the not-fitting band (2 devices, byte-identical).  The host-side admission decision
+   and the kernel-side cold description MUST share one predicate — if they disagree the host emits a cold id the
+   kernel resolves from a different base, i.e. a silently wrong matmul, not a crash.
+3. **"The pool is the arena's complement" is what forced page-cache re-staging.**  Two paths un-loaded an expert
+   from the pool the moment VRAM also held it (the arena-seed retire, and the heat re-rank's wanted set).  At full
+   coverage that emptied 44 % of the pool at start-up, and the first arena evictions of those experts then had to
+   re-read from the model mapping: **20 116 synchronous 288 KiB `memcpy`s in the first 300 decode tokens**, i.e.
+   11 % of decode — and invisible to the fill probe, which times only the `cudaMemcpyAsync` (1.2-1.4 µs), not the
+   host memcpy that precedes it.
+4. **The right layout rule is one rule: the complement first, then mirrored residents while capacity lasts.**  A
+   budget that merely covers the complement already stops the re-read cycle; a budget that covers the set makes the
+   pool a full mirror (`h=1.0000`, zero evictions, **no page-cache re-read at all**).  Measured at 2 devices:
+   prefill **1318** vs a pinned master's 1105 (**+19 %**) and decode within 0.5-2 % (n=2000: 82.5 vs 82.9) **for the
+   same 18 662 MiB of pinned RAM**.
+5. **At equal RAM, a partial budget belongs to the pool, not to per-tensor pinning** — decoding interpolates
+   linearly on the pinned fraction (0 % 37.4, 21 % 42.4, 43 % 50.1, 86 % 65.7, 100 % 71.9 t/s) while 8 064 MiB of
+   pinned whole tensors measures 505 prefill / 50.1 decode against 713 / 57 for a 9 331 MiB per-expert pool.
+6. **An eager back-fill of the arena's evicted victim does NOT pay** (built, measured, dropped): the victim is by
+   construction the least-demanded resident, `ghost` cannot predicate it (reset to 0 on admission), and the copy
+   competes with the demand path — page cache 52.8 vs 56.4, `O_DIRECT` disk 15.1 vs 15.9 with prefill collapsing
+   24.1 → 16.3.  Same lesson as the L3 model: the pool's CONTENT matters far more than any hand-over policy.
+7. **A worker thread must not be the first to touch the ROCm runtime** from a foreign thread: its lazily created
+   `AsyncEventsLoop` aborts the process (`std::system_error: Operation not permitted`).  Keep HIP calls on the main
+   thread; a host-only worker plus main-thread event polling is the shape that works.
+8. **The `-ncmoe` tail bound is `hparams.n_layer()`, not `n_layer_all`** (the latter also counts the nextn/MTP
+   head, which is never hosted) — an off-by-one there plans a pinned MTP head and misses trunk layer 0.

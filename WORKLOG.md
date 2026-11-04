@@ -1,3 +1,47 @@
+## 261104.001 (r210) -- block 16: the host-expert tier becomes ONE pinned per-expert pool that mirrors the arena when the budget allows
+
+**Delivery change: `patches/0000`-`0016` (17 blocks), release `v17-6050b467c-r210`, tip `2a94d4a72`, tree
+`d2298e6d`.**  New block: `patches/0016-rdna-boosts-block-16-the-host-expert-tier-one-pinned.patch`.  Fork base is
+unchanged (`6050b467c`); the block was cut on a canonical fork rebuilt with `scripts/apply-all.sh` and verified with
+`scripts/validate-set.sh` (17 blocks, checksums, fresh-tarball strict apply, applied tree `d2298e6d`, Windows
+portability clean).
+
+What changed, in one sentence: the host-resident MoE expert tier is no longer a mode (`--host-experts pinned|pool`)
+but **a budget** (`-lme auto|N`) over **one** mechanism — the pinned per-expert pool — whose contents are laid out as
+the arena's **complement first**, then the arena-resident experts in heat order **while capacity lasts**.
+
+| arm (2 devices, 35B-A3B `-ncmoe 40`) | prefill | decode n=300 | decode n=2000 | pinned RAM |
+|---|---|---|---|---|
+| block 16 `-lme auto` (fit → MIRROR) | **1318** | 69.8 | 82.5 | 18 662 MiB |
+| block 15 `--host-experts pinned` | 1105.4 | **71.9** | 82.9 | 18 662 MiB |
+| `-lme 16` (86 % of the set) | — | 66.5 | — | 16 329 MiB |
+| `-lme 8` (43 % of the set, bounded) | — | 54.1 | — | 8 165 MiB |
+
+Text byte-identical in every arm (`231512fc77e5` @n=300, `4ae33f7bd65c` @1 device, `6ede7c724f4e` @n=2000),
+`scripts/check-gpu-faults.sh` clean.  So the default gains **+19 % prefill for -0.5…-2 % decode at the same pinned
+RAM**, and reports `h=1.0000`, zero evictions and **no page-cache re-read at all** at full coverage.
+
+Carried in from the campaign (`wip/host-expert-eager-push`, `P5-RESULTS.md` / `P6-POOL-REGION.md`): `-lme` as the one
+knob; the pool's **cold read at any device count** (+11.5 % decode at `-lme 8`, +10 % for the not-fitting band, with
+one shared predicate so the host decision and the kernel description cannot disagree); the **surplus/mirror layout**
+rule; and the two loud diagnostics (a pinned host allocation that falls back to pageable, and a DEGENERATE/mirrored
+tensor split), on stderr and once per process because ggml's `WARN` is filtered at llama-cli's default level.
+**Dropped from the campaign**: all of `0001`-`0007` (pageable push, `mlock` residency, rotation/epoch gate, the
+attribution probe, in-place `hipHostRegister`) and the read-ahead back-fill — each measured, none of it in the
+delivery.  Their records stay in `wip/`, and their "do not re-derive" facts are now `INVARIANTS.md` r210.
+
+**Docs**: `ENVIRONMENT.md` gains `MOE_HOST_LIMIT_FRAC` (the `auto` ceiling as % of `MemAvailable`, distinct from
+`MOE_HOST_POOL_FRAC`'s % of the host expert bytes), `MOE_HOST_TIER` (the A/B tier override) and
+`MOE_HOST_POOL_COLD_MULTIDEV` (the cold-read kill switch); the `-lme`/`--host-experts` CLI reference is in
+`common/arg.cpp`.  `INVARIANTS.md` gains the eight r210 entries.  `patches/README.md` gains the block-16 entry.
+
+**Owed before the tag** (`MANIFESTS.md` -> Release gates): the **MTP four-axis protocol**
+(`benchmarks/mtp-adaptive-methodology.md`) on the new default, `llama-batched-bench -npl 1,4,8`, the per-block build
+ladder (`scripts/gate-per-block-build.sh --changed-from 27271aa91`), and then `scripts/fork-refresh.sh --build
+--gates --push` so the personal fork's `rdna-boosts` branch carries the 17-block tip, plus the off-host container
+watcher.  The coherence gate (same-seed greedy text at 1 and 2 devices) and the key numbers above were re-run on the
+**promotion tree itself**, not only on the campaign branch.
+
 ## 261103.015 (wip) -- eager-push: the first 3-GPU log (control arm) — push/seed confirmed, the gate not yet exercised
 
 No delivery change.  Continues `261103.008`.

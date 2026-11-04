@@ -846,6 +846,18 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r210 amendment (staged): the tier is one pinned per-expert pool, laid out as the arena's complement and then
+> mirrored residents.**  `-lme auto|N` is the budget (`--host-experts pinned|pool` are deprecated shorthands):
+> `auto` spends the whole host expert set on the pool when it fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable`
+> — the pool is then a **mirror** of it and the tier behaves as `pinned` while prefilling faster — and keeps the
+> historical `MOE_HOST_POOL_FRAC` layout otherwise (the not-fitting band: page cache / `O_DIRECT`, nothing hard
+> pinned).  `-lme N` spends N GiB on the pool: complement first, then the arena-resident experts in heat order
+> while capacity lasts.  A pool-resident expert is read in place by any device's kernel
+> (`MOE_HOST_POOL_COLD_MULTIDEV`).  Measured at 2 devices, byte-identical text: prefill **1318** against a pinned
+> master's 1105 (+19 %), decode 69.8 vs 71.9 (n=300) and 82.5 vs 82.9 (n=2000) for the same 18 662 MiB pinned.
+> Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.001, `INVARIANTS.md` r210,
+> `wip/host-expert-eager-push/{P5-RESULTS,P6-POOL-REGION}.md`.
+
 **What it is.**  Everything that makes `-ncmoe`/`-cmoe` (and `--host-experts`) fast and safe without
 fitting the whole model on the device: a pinned host master, a per-op H2D staging ring, a scheduler that
 can hand an op to a host-resident table, and the MoE expert cache that keeps the hottest experts in
