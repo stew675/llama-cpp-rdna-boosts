@@ -1,4 +1,10 @@
-# HANDOVER — the direct page-cache expert push: ROOT CAUSE FOUND (see `P4-ROOT-CAUSE.md`)
+# HANDOVER — superseded for the refactor by `IMPLEMENTATION-PLAN.md`
+
+**If you are here to implement the unified host-expert tier, read [`IMPLEMENTATION-PLAN.md`](IMPLEMENTATION-PLAN.md)
+instead (or first): it is the executable plan, with the decisions marked, the acceptance numbers, the tests and
+the trap list, and it is designed to be carried out without waiting for the maintainer.  This file remains the
+record of the investigation that led to it, and [`P4-ROOT-CAUSE.md`](P4-ROOT-CAUSE.md) is the evidence.**
+
 
 **Status: the `-sm tensor` defect is DIAGNOSED and a fix is MEASURED.**  `P4-ROOT-CAUSE.md` is the record:
 the loss is the driver's **pageable staging, a per-CALL cost** that a tensor split pays twice as often per
