@@ -1,10 +1,16 @@
-## 261104.001 (r210) -- block 16: the host-expert tier becomes ONE pinned per-expert pool that mirrors the arena when the budget allows
+## 261104.001 (r210) -- block 09 amended: the host-expert tier becomes ONE pinned per-expert pool that mirrors the arena when the budget allows
 
-**Delivery change: `patches/0000`-`0016` (17 blocks), release `v17-6050b467c-r210`, tip `2a94d4a72`, tree
-`d2298e6d`.**  New block: `patches/0016-rdna-boosts-block-16-the-host-expert-tier-one-pinned.patch`.  Fork base is
-unchanged (`6050b467c`); the block was cut on a canonical fork rebuilt with `scripts/apply-all.sh` and verified with
-`scripts/validate-set.sh` (17 blocks, checksums, fresh-tarball strict apply, applied tree `d2298e6d`, Windows
-portability clean).
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED -- no new block), release
+`v16-6050b467c-r210`, tip `489c2b4bc`, tree `d2298e6d`.**  Fork base unchanged (`6050b467c`).  The change was folded
+into **block 09** ("host-resident MoE: iface, scheduler, expert cache, staging rings") because that block owns the
+expert cache and the host-expert iface; blocks 10-15 were then re-cut on top.  The fold is content-preserving by
+construction and proved so: the 16-block tip tree is still `d2298e6d`, and `scripts/validate-set.sh` is green
+(checksums, fresh-tarball strict apply, tree match, no conflict markers, Windows portability clean).
+
+The fold is a real merge: the change overlaps block 12 ("campaign remainder -- backend iface fills") and block 14
+(relaxed-tensor split) in 6 files / 16 hunks, because those blocks touch the same host-expert and loader regions.
+Block 12's own machinery (the `expert_host_src` implementation and the loader's host-expert block) was deliberately
+kept OUT of block 09 so attribution stays correct.
 
 What changed, in one sentence: the host-resident MoE expert tier is no longer a mode (`--host-experts pinned|pool`)
 but **a budget** (`-lme auto|N`) over **one** mechanism — the pinned per-expert pool — whose contents are laid out as
@@ -12,8 +18,8 @@ the arena's **complement first**, then the arena-resident experts in heat order 
 
 | arm (2 devices, 35B-A3B `-ncmoe 40`) | prefill | decode n=300 | decode n=2000 | pinned RAM |
 |---|---|---|---|---|
-| block 16 `-lme auto` (fit → MIRROR) | **1318** | 69.8 | 82.5 | 18 662 MiB |
-| block 15 `--host-experts pinned` | 1105.4 | **71.9** | 82.9 | 18 662 MiB |
+| block 09 (amended) `-lme auto` (fit → MIRROR) | **1318** | 69.8 | 82.5 | 18 662 MiB |
+| previous `--host-experts pinned` | 1105.4 | **71.9** | 82.9 | 18 662 MiB |
 | `-lme 16` (86 % of the set) | — | 66.5 | — | 16 329 MiB |
 | `-lme 8` (43 % of the set, bounded) | — | 54.1 | — | 8 165 MiB |
 

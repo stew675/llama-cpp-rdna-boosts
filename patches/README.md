@@ -1,6 +1,6 @@
 # The delivery patches — what each block is and what it does
 
-**16 blocks** (block 00 + blocks 01-15) against `release.json.base` (**`6050b467c`**; the base is the
+**16 blocks** (block 00 + blocks 01-15; block 09 amended in r210) against `release.json.base` (**`6050b467c`**; the base is the
 2026-10-25 re-base), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
@@ -846,7 +846,7 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
-> **r210 amendment (staged): the tier is one pinned per-expert pool, laid out as the arena's complement and then
+> **r210 amendment: the tier is one pinned per-expert pool, laid out as the arena's complement and then
 > mirrored residents.**  `-lme auto|N` is the budget (`--host-experts pinned|pool` are deprecated shorthands):
 > `auto` spends the whole host expert set on the pool when it fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable`
 > — the pool is then a **mirror** of it and the tier behaves as `pinned` while prefilling faster — and keeps the
