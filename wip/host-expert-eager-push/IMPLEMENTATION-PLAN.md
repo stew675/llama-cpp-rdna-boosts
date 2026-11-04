@@ -24,6 +24,27 @@ the repo root for the delivery's policy (gates, docs, pushing).  Do **not** re-d
 **[STOP]** if `~/llama.cpp` HEAD is not `a644115a0` or the tree is dirty: the nine campaign patches replay in
 order onto a clean `27271aa91` (`git am`), so rebuild the branch first rather than building on unknown state.
 
+### 0.1 First 15 minutes: confirm the box is in the same state
+
+Do this before touching code; if any line does not match, stop and report rather than working from a different
+baseline.
+
+```bash
+cd ~/llama.cpp && git rev-parse --short HEAD          # expect a644115a0 on p2-eager-push-r209
+CMAKE_BUILD_PARALLEL_LEVEL=16 cmake --build build-rocm --target llama-cli -j 16   # ~40 s, must be clean
+cd ~/llama-cpp-rdna-boosts/wip/host-expert-eager-push
+P=~/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt
+
+# the two reference arms (serial!), 2 devices, both PCIe x8:
+GPU=0,2 SM=tensor EOS=1 N=300 ./p3-matrix.sh ref-pinned              # expect ~72.0 t/s decode
+GPU=0,2 SM=tensor N=1 PROMPT_FILE=$P ./p3-matrix.sh ref-pinned-pre   # expect ~1105 t/s prefill
+GPU=0,2 SM=tensor EOS=1 N=300 ./p3-matrix.sh ref-pool                # expect ~51 t/s decode
+```
+(As of `a644115a0`, `p3-matrix.sh` still passes `--host-experts pool` itself, so it prints a deprecation
+warning — expected, and step (d) fixes it.  It also still needs `LME=`/`LAZY=` for the new knobs.)
+
+`pinned` ≈ 72 / 1105 and `pool` ≈ 51 decode ⇒ the box matches the record and you can start at step (a).
+
 ---
 
 ## 1. The decision being implemented **[DECIDED]**
