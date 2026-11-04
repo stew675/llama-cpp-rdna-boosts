@@ -388,7 +388,57 @@ census is identical between the arms: `fills=18596`, `arena fills=5156`, `H2D 15
    master uses the two-tier snapshot plus per-expert copies.  In these runs its counters stayed 0 -- the
    prefill went through the demand fills, not the staging path -- so it is not the explanation here.
 
-### Why 1 device loses: the registered copies are SYNCHRONOUS
+### Why 1 device loses: REGISTRATION ITSELF, not the memory's provenance (and it is not the copy calls)
+
+The discriminator that settles it -- the SAME master, with and without `hipHostRegister` over it (1 device,
+prefill, `-n 1`, cached-on):
+
+| arm | prefill |
+|---|---|
+| `pinned` (a `hipHostMalloc` master, as today) | **616.5** |
+| the same master, **also registered** | **476.9** |
+| `pool` + a registered file mapping | 475.9 |
+
+So the trigger is **the range being registered**, not where it came from -- which also answers "why should
+`hipHostMalloc` be faster than `hipHostRegister`": they are different *driver objects*.  `hipHostMalloc` hands
+the driver its own allocation, which it keeps mapped for device access and registered with the copy engines;
+`hipHostRegister` pins *user* pages and the driver has to treat that range as a user pointer.  The
+microbenchmarks say the *copy call* is async in both cases (1.2 us from a registered mapping against 3.4 us
+from the same bytes via `hipHostMalloc`, and 15.0 vs 15.2 GB/s sustained), so this is not "registered copies
+are synchronous".
+
+**Everything that has been excluded as the cause** (1 device, prefill, `-sm tensor`, 35B-A3B):
+
+| excluded | measurement |
+|---|---|
+| the fill copies' host cost | `MOE_HOST_PUSH_PROBE`: **4 994 copies in 2 378 us** (0.5 us/copy, 2-D 0) -- the fills are free |
+| the copy API / route | `MOE_HOST_PUSH_SRC_COPY=alias` (D2D from the UVA alias, confirmed engaged by a one-time log) = 477.4 vs 478.7 H2D |
+| the destination | `probe-memcpy2d` at 1 device: `DST=vmm` (slab-style) == `DST=hipMalloc` for both sources (15.0-15.3 GB/s) |
+| the copy geometry | 1-D 100 % of the fills at 1 device |
+| the registration flags | all of `0,1,2,3,4,5,6,7` -> 476-480 (Mapped makes no difference) |
+| the scheduler gather | `GGML_SCHED_DEVGATHER=1/force` -> 477.5 (and it *is* worth +24 % to the pool arm) |
+| the cold in-place read | `MOE_EXPERT_CACHE_COLD_UVA=0` -> 474.4 |
+| the pool's presence / waste | `MOE_HOST_POOL_FRAC=0` -> 475.3 |
+| the arena size | 2048/4096/6144 MiB: both arms improve, the GAP stays 2.46 / 2.73 / 2.92 s -> **not per fill** |
+| the slab / VMM arena | `GGML_CUDA_SLAB=0` -> 478.1 (unchanged) |
+| warm-up / page cache | 3 consecutive reps: 477.7 / 478.6 / 479.3 against 615.9 / 615.9 / 616.2 |
+| the model load / placement | slab and buffer lines byte-identical between the arms |
+| the expert cache entirely | `MOE_EXPERT_CACHE_MIB=0` -> **all three arms 673.7-674.0 t/s** |
+
+**The shape of what is left**: the penalty is ~0.47 ms **per prefill token** (0.10 s at 533 tokens, 2.47 s at
+5 246), it needs the expert cache to be ON, and it needs the master range to be registered.  Whole-process
+CPU: user +3.6 s, sys -1.6 s, minor faults +2.5 M, maxrss -7.5 GiB.  It is not the fill *count* (arena sweep),
+so the next measurement must localise the per-token cost **inside the op**: per-phase in-situ timers
+(`access_locked` vs the remap/map upload vs the hook total) in the prefill band, which is a small patch and
+the only remaining hypothesis with a cheap test.
+
+**Design consequence, and it is a good one**: `pinned` -> registered is the right refactor, but it must be
+gated on **device count** until this is solved -- or the 1-device path must keep the `hipHostMalloc` master
+(i.e. register only where it wins: 2+ devices, where the same arm measures +34 % prefill and +39 % decode
+against the pool and parity against `pinned`).  At 1 device the registered path is a 22 % prefill regression
+*with no decode benefit* (53.5 vs 49.0 measured earlier at 1 device is decode, so: gate on phase or count).
+
+### (superseded) Why 1 device was thought to lose: the registered copies are SYNCHRONOUS
 
 `perf record` of the same 1-device prefill, self time in the main thread:
 
