@@ -1,5 +1,25 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
+> **P5 STATUS (2026-11-04): the unified host-expert tier is IMPLEMENTED and MEASURED, awaiting the
+> maintainer's go/no-go before promotion — the record is [`P5-RESULTS.md`](P5-RESULTS.md)** (branch
+> `p5-host-expert-tier`, patch `patches/0010`, 26 arms in `runs/p3-*-p5-*`).  `-lme` is now the **budget for
+> the pinned host-master tier**, resolved at model load before any tensor is placed: `auto` = pin the whole
+> set when it fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable`, else no pinned master (the mapping + the
+> bounded pool, i.e. today's `pool`); `pinned` = the whole set; `-lme N` = N GiB of **whole tensors in
+> descending hotness** (the persisted heat prior ranks them).  A wholly pinned tensor IS the region (the
+> master is expert-indexed by stride), so the fit case is bit-for-bit today's `pinned`: **1105.4 prefill /
+> 71.9 decode at 2 devices, 645.2 / 53.4 at 1**, byte-identical text (`sha=231512fc77e5` / `4ae33f7bd65c`),
+> no GPU faults, and the not-fitting band unchanged (713.7 / 51.8).  Two findings change the plan's shape:
+> **(1) at equal RAM a partial budget belongs to the POOL, not to per-tensor pinning** — 8 064 MiB of pinned
+> whole tensors measures 505.1 prefill / 50.1 decode against 9 331 MiB of per-EXPERT pool at 713.7 / 51.8
+> (decode a tie, prefill 29 % worse), because routing is spread across every layer, so no whole tensor is
+> hot; `auto` is therefore a BINARY decision and a per-expert *region* (the plan's step b2) is deferred to
+> `TODO` #139.  **(2) two silent traps**: the `-ncmoe` tail bound is `hparams.n_layer()` (not
+> `n_layer_all`, which would plan the MTP head and miss trunk layer 0), and `moe_cache_set_host_pool()` must
+> re-resolve `g_pool_enabled` because the loader decides after `parse_env()` (without it the not-fitting band
+> silently lost the pool: 37.4 vs 51.8 t/s).  `--host-experts pool` is now a deprecated shorthand for
+> `auto`; nothing is promoted into `patches/` yet.
+
 > **P4 STATUS (2026-11-04): the `-sm tensor` defect is DIAGNOSED and a fix is MEASURED — the record is
 > [`P4-ROOT-CAUSE.md`](P4-ROOT-CAUSE.md).**  The loss is the driver's **pageable staging, a per-CALL cost**:
 > in situ at 2 devices the mapping arm spends **12.82 s of a 27.7 s run** inside **90 636 1-D pageable fill
