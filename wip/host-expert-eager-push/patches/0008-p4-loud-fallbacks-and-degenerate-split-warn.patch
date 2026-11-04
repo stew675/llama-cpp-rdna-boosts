@@ -1,0 +1,113 @@
+From e30ba75b053cab3673196def48b2174a9cf58fc5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 3 Nov 2026 21:28:01 -0600
+Subject: [PATCH] diagnostics: make the pinned-host fallback LOUD and warn on a
+ DEGENERATE (mirrored) tensor split
+
+Two silent-failure diagnostics, both of which cost this campaign real time by being
+invisible at the default log level:
+
+1. ggml_backend_cuda_host_buffer_type_alloc_buffer: when the pinned host allocation fails
+   it silently falls back to pageable memory, which is NOT device-readable.  Every
+   consumer that assumes a pinned host master (notably --host-experts pinned) then
+   degrades to the pageable/pool/bounce path -- measured: the pool serves the fills and a
+   multi-GiB bounce ring grows, at the pool's throughput.  One stderr line, once per
+   process (was a GGML_LOG_DEBUG line, i.e. nothing).
+
+2. moe_cache_table: a MIRRORED expert table means the meta split could not be expressed
+   (equal division only, rounded to the quant block), so the zero-extent device is handed
+   the WHOLE tensor instead of being skipped.  Measured on 35B-A3B at 3 devices: ~20 t/s
+   against 72 at 2, for EVERY transport, because it doubles the host bytes on those layers
+   and serialises the whole expert's compute on one device.  Detected at table creation
+   (the report runs after teardown) and reported once, with the reason and the remedy.
+
+Both use fprintf(stderr) because ggml INFO/WARN is filtered at llama-cli's default level.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 17 ++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 36 ++++++++++++++++++++++++--
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ebe1b1ddd..6ed2b59dd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4227,6 +4227,23 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
+ 
+     if (ptr == nullptr) {
+         // fallback to cpu buffer
++        //
++        // LOUD, once per process: a pageable host buffer is not device-readable, so every consumer that
++        // assumed a pinned host master (the host-expert tiers above all) silently degrades to the
++        // pageable/pool/bounce path -- measured at a large expert set: `--host-experts pinned` stops being
++        // pinned at all, the pool serves the fills instead, a multi-GiB bounce ring grows, and throughput
++        // lands at the pool's rather than the pinned master's.  Before this warning the only trace was a
++        // GGML_LOG_DEBUG line, i.e. nothing at the default log level.
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            fprintf(stderr, "PINNED HOST ALLOCATION FAILED for %.1f MiB: falling back to PAGEABLE memory.  "
++                          "This buffer is not device-readable, so anything that expects a pinned host master "
++                          "(notably --host-experts pinned) degrades to the pageable/pool/bounce path -- "
++                          "expect the pool path's throughput, not the pinned master's.  Free RAM, lower the "
++                          "expert-cache/pool budget, or use --host-experts pool deliberately.\n",
++                          (double) size / 1024.0 / 1024.0);
++        }
+         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index eca9ca30c..976d4bbc9 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -6142,14 +6142,46 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+     // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
+     // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
+     if (ggml_cuda_cache_geom_debug()) {
+-        GGML_LOG_WARN("CACHE_GEOM layer=%d role=%s n_experts=%d expert_bytes=%zu host_bytes=%zu src_off=%zu host_pitch=%zu split_axis=%d cold_safe=%d\n",
+-                      layer, t.role.c_str(), n_experts, expert_bytes, host_bytes, src_off, host_pitch, split_axis, (int) cold_safe);
++        GGML_LOG_WARN("CACHE_GEOM layer=%d dev=%d role=%s n_experts=%d expert_bytes=%zu host_bytes=%zu src_off=%zu host_pitch=%zu split_axis=%d cold_safe=%d n_slices=%d\n",
++                      layer, device, t.role.c_str(), n_experts, expert_bytes, host_bytes, src_off, host_pitch, split_axis, (int) cold_safe, t.n_slices);
+     }
+     t.host         = host;
+     t.device       = device;
+     attach_host_src_locked(t, host);
+     heat_apply_loaded_locked(t);   // wip/moe-heatmap-persistence: adopt the persisted prior, if any
+ 
++    // A MIRRORED expert table means the tensor split could not be expressed: the meta split is equal-division
++    // only, rounded DOWN to the quant block, so an axis with fewer block-aligned chunks than devices leaves
++    // one device with a zero extent -- and that device is handed the WHOLE tensor (MIRRORED) instead of being
++    // skipped.  It is silent and expensive: measured on 35B-A3B at 3 devices, ~20 t/s against 72 at 2, for
++    // EVERY transport (2x the host bytes on those layers plus the whole expert's compute on one device), which
++    // is what made a transport investigation chase its own tail.  Detect it when the tables are alive.
++    {
++        static bool warned = false;
++        const bool whole = t.host_bytes > 0 && t.expert_bytes == t.host_bytes;
++        if (!warned) {
++            for (const table_t & o : g_tables) {
++                if (o.layer != t.layer || o.role != t.role || o.host_bytes == 0) {
++                    continue;
++                }
++                if (whole != (o.expert_bytes == o.host_bytes)) {
++                    warned = true;
++                    // fprintf(stderr, ...) and not GGML_LOG_WARN: ggml's WARN is FILTERED at llama-cli's
++                    // default log level, so a GGML_LOG_WARN here is invisible to the user -- which is how a
++                    // 3.5x throughput cliff stayed undiagnosed.  Same rule the campaign's P1-PUSH messages use.
++                    fprintf(stderr, "DEGENERATE TENSOR SPLIT: layer=%d role=%s has expert_bytes=%zu of "
++                                  "host_bytes=%zu on device %d while the same tensor on device %d has "
++                                  "expert_bytes=%zu -- one device holds the WHOLE expert (MIRRORED) and another "
++                                  "a slice.  The split is equal-division only and rounded to the quant block, so "
++                                  "this axis has fewer block-aligned chunks than devices.  Expect ~2x the host "
++                                  "bytes on those layers and NO scaling, for every transport: use fewer devices "
++                                  "(-sm layer) or a finer-block quant.\n", t.layer, t.role.c_str(),
++                                  t.expert_bytes, t.host_bytes, t.device, o.device, o.expert_bytes);
++                    break;
++                }
++            }
++        }
++    }
+     const int id = (int) g_tables.size();
+     g_tables.push_back(std::move(t));
+     g_key_to_id.emplace(key, id);
+-- 
+2.56.0
+

@@ -834,6 +834,37 @@ The 2-vs-3 comparison here is still not a clean scaling claim: the 3-device set 
 (device 1) while the 2-device set is both x8, and the 1/2/2 partition is unbalanced.  What the measurement does
 establish is that the *split is well-formed* for this model and *malformed* for 35B-A3B.
 
+## 5i. The refactor: what is landed, what is left, and the numbers that justify each step
+
+The design is settled (maintainer, 2026-11-04): **`hipHostMalloc` everywhere**, `pinned` = the whole set,
+`pool` = the same tier with a budget and a policy, `auto` = pinned when it fits else a bounded pool.  Nothing
+from the registration experiment goes into the delivery.
+
+### Landed (fork commit `e30ba75b0`, patch `0008`): the two silent failures, made loud
+
+| diagnostic | why | verified |
+|---|---|---|
+| `PINNED HOST ALLOCATION FAILED ... falling back to PAGEABLE memory` (stderr, once) | the fallback is **not device-readable**, so `--host-experts pinned` stops being pinned, the pool serves the fills, a multi-GiB bounce ring grows, and throughput lands at the pool's -- this is what hid the whole thing, since the only trace was a `GGML_LOG_DEBUG` line | forced with `GGML_CUDA_NO_PINNED=1`: fires; normal run: silent |
+| `DEGENERATE TENSOR SPLIT: ... one device holds the WHOLE expert (MIRRORED) and another a slice` (stderr, once) | a split that cannot be expressed hands the zero-extent device the whole tensor; measured ~20 t/s against 72 at 3 devices for every transport | 35B-A3B at 3 devices: fires (naming layer/role/devices).  At 2 devices, and on Flash-Next at 3 devices: silent, as it should be |
+
+Both go through `fprintf(stderr, ...)` **not** `GGML_LOG_WARN`, because ggml's WARN is filtered at
+llama-cli's default level -- the same trap that hid the campaign's own P1-PUSH messages in P3.
+
+### Left to do (in order), with the acceptance bar for each
+
+| # | change | acceptance |
+|---|---|---|
+| 1 | `pinned`: keep the per-tensor `ROCm_Host` (`hipHostMalloc`) master; report the tier's pinned MiB in the census | 1/2 devices: `pinned` >= today's numbers (prefill 645.9 / 1 105.4, decode 53.5 / 72.0) and zero fallback warnings |
+| 2 | `pool` becomes *pinned with a budget*: the pinned tier is the pool (already `hipHostMalloc`), the overflow stays pageable from the model mapping, shrink/free via `hipHostFree` | budget and pinned bytes both reported; freeing returns the pages (proven, §5f); no change to the not-fitting band's behaviour |
+| 3 | `auto`: pinned when the host set fits `MemAvailable` (with headroom), else the bounded pool | the mode choice logged once with its reason |
+| 4 | retire the registration path from the deliverable (patches `0001`-`0007` stay experimental in `wip/`) | `scripts/validate-set.sh` green after regenerating the block set |
+| 5 | docs: `ENVIRONMENT.md` entries (default + class per variable), the 3-GPU tensor-split rule (`width / quant_block >= n_devices`, with 35B-A3B named as the case that does not divide and `-sm layer` as its answer), `TODO` for the mirroring-fallback fix | a reader can predict 3-GPU behaviour from the docs alone |
+| 6 | gates: coherence (same-seed greedy, byte-identical) + 2 reps of decode and prefill at 1/2 devices for `pool`/`pinned` + `check-gpu-faults.sh` | as `MANIFESTS.md` requires before any tag |
+
+**Deliberately out of scope**: the registered-window tier (parked in `wip/`, releasable but 26 %/14 % behind on
+prefill), fixing the splitter's mirroring (documented + warned, not fixed here), and any autotuning probe (the
+1-device signature is invisible to a copy benchmark, §5e).
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
