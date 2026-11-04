@@ -1,4 +1,4 @@
-From 86584239cad1ef3ddbfa8a28c44a3568296c1f09 Mon Sep 17 00:00:00 2001
+From c1478f911326859fccf7182fdcf99495eaf58b81 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 22:39:47 -0600
 Subject: [PATCH] wip/host-expert-tier: -lme is a per-TENSOR pinned-master
@@ -54,6 +54,23 @@ Measured on Qwen3.6-35B-A3B Q4_K_M, -ncmoe 40, 2 devices (0,2), -n 300, prose 52
 
 1 device: auto 645.2/53.4 (sh=4ae33f7bd65c), -lme 8 447.1/48.4 (same text).
 Byte-identical text in every pair; check-gpu-faults clean on every arm.
+---
+ common/arg.cpp                         |  27 ++-
+ common/common.cpp                      |  18 +-
+ common/common.h                        |  13 +-
+ ggml/include/ggml-backend.h            |   7 +
+ ggml/src/ggml-backend-impl.h           |  10 +
+ ggml/src/ggml-backend.cpp              |  16 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  15 ++
+ ggml/src/ggml-cuda/moe-expert-cache.cu |  70 +++++-
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  13 +-
+ include/llama.h                        |   9 +
+ src/llama-model-loader.cpp             | 298 ++++++++++++++++++++++++-
+ src/llama-model-loader.h               |  75 ++++++-
+ src/llama-model.cpp                    |  13 ++
+ src/llama-quant.cpp                    |   2 +-
+ src/llama.cpp                          |   2 +-
+ 15 files changed, 544 insertions(+), 44 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 8225f868a..7cf64a7ac 100644
@@ -262,7 +279,7 @@ index 6ed2b59dd..3a8719ddf 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 976d4bbc9..c6d1404eb 100644
+index 976d4bbc9..d41d488a9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -52,13 +52,19 @@ static inline int64_t moe_cache_max_i64(int64_t a, int64_t b) { return a > b ? a
@@ -303,8 +320,8 @@ index 976d4bbc9..c6d1404eb 100644
 +    // already resolved the pool from the environment, so re-resolve it here.  Without this the pool stayed
 +    // off (parse_env had run with no request) and every hole fell back to the per-table bounce ring --
 +    // measured 37.4 t/s decode at 2 devices against the pool's 51.5.
++    ensure_env();   // outside the lock, exactly as `moe_cache_set_host_source` does
      std::lock_guard<std::mutex> lock(g_mutex);
-+    ensure_env();
 +    if (g_pool_requested == on && g_pool_enabled == (moe_host_pool_on())) {
 +        return;
 +    }

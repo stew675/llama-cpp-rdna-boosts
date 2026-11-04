@@ -1,7 +1,7 @@
 # IMPLEMENTATION PLAN — the unified host-expert tier (execute without waiting for the maintainer)
 
 > **EXECUTED 2026-11-04 — see [`P5-RESULTS.md`](P5-RESULTS.md).**  Steps **a, b, c, d, e** are implemented
-> on `~/llama.cpp` branch `p5-host-expert-tier` (`86584239c`, parent `a644115a0`), patch
+> on `~/llama.cpp` branch `p5-host-expert-tier` (`c1478f911`, parent `a644115a0`), patch
 > [`patches/0010-p5-host-expert-tier.patch`](patches/0010-p5-host-expert-tier.patch), and the §3/§4
 > acceptance bars are met: the fit case reproduces `pinned` (1105.4 / 71.9 at 2 devices, 645.2 / 53.4 at 1)
 > with byte-identical text and no GPU faults, and the not-fitting band is unchanged (713.7 / 51.8).  Two
