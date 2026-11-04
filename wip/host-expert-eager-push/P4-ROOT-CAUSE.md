@@ -495,6 +495,40 @@ is serialised with the DMA.  Recovering the 1-device number therefore needs one 
 Both are small, testable changes.  Whichever is done, the decision to move `pinned` onto registration should
 be taken **with the 1-device prefill number in hand**, because 1 GPU is a supported configuration.
 
+## 5e. Can the master policy be automated at runtime?  Mostly yes -- and the residue is a *preference*.
+
+The decision is "which master does the expert cache fill from", and every input it needs is already known at
+sizing, before any fill happens:
+
+| input | where it comes from | what it decides |
+|---|---|---|
+| device count | the tables' device set (already used by `pool_cold_slot_locked`) | 1 device -> registered costs prefill; 2+ -> registered wins both phases |
+| `use_mmap` | the loader (a page-cache master must exist to register) | no mmap -> registration impossible, pinned allocation is the only master |
+| host expert bytes vs `MemAvailable` | the preflight already computes `g_preflight_host_bytes` for AUTO | fit -> a duplicate is affordable; not fit -> it is not, so it must be the window form |
+| registration *capability* | `hipHostRegister` + `cudaHostGetDevicePointer` at sizing | already handled: refusal leaves `host_pinned=false` and the pool path serves (`g_push_reg_stop`, `refusals`) |
+
+So the policy table is derivable, with no benchmarking and no guessing:
+
+| band | 1 device | 2+ devices |
+|---|---|---|
+| **fits in RAM** | **pinned master** (the duplicate is affordable here, and it has the best prefill: 615 vs 477) | **registered in place** (no duplicate, and it is strictly better: prefill 950 vs 709, decode 71.8 vs 51.2-72.1) |
+| **does not fit** | registered **window** (a duplicate cannot fit; window = releasable, §5a) | registered **window** (same) |
+
+What is **not** automatable is the 1-device fit-band row: registered is +9 % decode and -22 % prefill there.
+That is a workload preference (long prompts vs long generations), not something the runtime can infer, so it
+belongs behind a knob with a documented default, not behind a guess:
+
+- `MOE_HOST_MASTER=auto|registered|pinned` (default `auto` = the table above), and the choice and its reason
+  logged once at sizing, so a user can see which master they got and override it.
+- The delivery has precedent for both halves: an H2D bandwidth calibration already runs at startup, and the
+  prefill/decode *band* machinery (the gather's band gate, `g_period`) already exists if we later want the
+  fill source to differ per band rather than per run.
+
+**What I would NOT automate is an autotune probe.**  The 1-device penalty is invisible to a copy benchmark --
+the copies measure 0.5 us each and 15 GB/s in both arms; the cost only appears per prefill *token*, under a
+live op, with the cache on (§5d).  A startup probe would therefore confidently pick the wrong arm on one
+device, and a probe big enough to see the difference is a prefill the user pays for on every start.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
