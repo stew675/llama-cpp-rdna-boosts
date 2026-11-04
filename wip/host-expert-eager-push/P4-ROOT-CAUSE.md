@@ -692,6 +692,26 @@ falls back to MIRRORED (the default arm of the split-state switch, `llama-model.
 devices is the last clean tensor split for this family, and why the campaign's own record says the 3-device
 tensor split is not a scaling point.
 
+**`-sm relaxed-tensor` changes nothing** -- measured, because the placement code is shared: same geometry
+(dev 0 whole, dev 1/2 halves) and the same speed (decode 20.1 vs 20.0, prefill 442.4 vs 438.2).  The mode only
+changes the replication contract, as `llama-impl.h` says.
+
+**Root cause, now visible per layer.**  The split is *equal-division only, rounded DOWN to the quant
+granularity* (`llama-model.cpp`, the extent loop: `high = ne_s*(j+1)/n_devices`, then
+`high -= high % granularity`; the last device takes the remainder).  For this model's experts (axis width 512,
+granularity 256 for q4_K/q5_K) and 3 devices that gives `high = 170 -> 0`, `341 -> 256`, remainder `256`, i.e.
+extents **0 / 256 / 256**: one device is *given a zero extent*.  What happens to that device depends on the
+layer's rotation (`rotation = il_eff % n_devices`), and the two outcomes are not equivalent:
+
+| layers | extents observed | verdict |
+|---|---|---|
+| 1, 2, 5 | `dev0=294912, dev2=294912` (no table on the zero device) | a clean 2-way split, total = 1x |
+| 0, 3, 4 | `dev0=589824 (WHOLE), dev1=294912, dev2=294912` | **mirrored: total = 2x bytes, whole-expert compute on one device** |
+
+So two thirds of the layers replicate the expert and one third do not -- that is the 20 t/s, and it is why every
+transport measures the same.  It is a **split-path defect** (block 14 territory / `TODO` #135): a zero-extent
+device should be skipped consistently, never left holding a mirrored copy of the whole tensor.
+
 **Practical consequence for the refactor:** do not chase the 3-GPU tensor number -- it is `TODO` #135/#104
 territory (`relaxed-tensor` is a TEMPORARY block).  The usable 3-GPU configuration is `-sm layer` (a whole
 tensor per device):
