@@ -182,6 +182,36 @@ Which splits the design cleanly in two:
 `mlock` tier was transport-neutral (measured in P3 §3b) — the campaign's residency idea was right, it just
 needed the runtime told as well.
 
+### 5a. PROOF that the pages can be dropped (the requirement for the > RAM band)
+
+The mode exists for configs whose weights do **not** fit in RAM, so "the pin is releasable" is a hard
+requirement, not a nicety: a pin that cannot be dropped turns the page cache into unswappable resident memory
+and the host starts swapping, which is worse than any transport win.  `probe-window.cpp` establishes it on
+the **real model file**, in one measurement per arm (fresh process each: driver state is sticky):
+
+| measurement (real GGUF, 64-256 MiB ranges) | result |
+|---|---|
+| `hipHostUnregister`, **all four flag sets** (`Default`, `Portable`, `ReadOnly`, `ReadOnly|Portable`), mapping live, then `MADV_PAGEOUT` | **STILL PINNED** — 2-10 MiB of 64-256 MiB re-read.  Not a flags problem |
+| `hipFreeHost` instead of unregister | `hipErrorInvalidValue` — only accepts `hipHostMalloc` pointers |
+| `hipHostUnregister` **+ `munmap`**, then drop and re-read | **RELEASED** — 256.0 / 256 MiB re-read from disk |
+| **40 cycles** of a sliding registered window (mmap -> register -> 8 H2D fills -> unregister -> munmap -> drop -> verify) | **40/40 reclaimed**, 2 560 MiB re-read in total, `MemAvailable` flat (83 219 -> 83 076 MiB; the *unregistered* control drifts the same way) — **no accumulation** |
+| the delivered shape: a **long-lived model mapping A** + a registered **second mapping B** of the same pages, B released | A's pages **RECLAIMABLE** (256/256 MiB re-read through A) and A's data **identical** by checksum |
+| cost of a window | register **0.6 ms / 64 MiB** (~104 GiB/s on resident pages), unregister ~0.0 ms, plus `munmap`+drop; i.e. a 2 GiB window re-registers in ~20 ms |
+
+So the pin's lifetime is **exactly the VMA's**, and that is the design rule:
+
+> **Never register the model's own mapping.  Register a private, separately-`mmap`'d window over the same
+> file range, and release it with `hipHostUnregister` + `munmap`.**
+
+That shape is releasable, keeps the page cache reclaimable (proven end-to-end through a second, long-lived
+mapping of the same pages), needs no duplicate, and keeps the native-transfer speed — the copy source is just
+another VA range over the same page-cache pages.  Window granularity should be **coarse** (file ranges of
+256 MiB-2 GiB covering many experts/tables, not per expert: a 704 KiB window costs ~6-10 us of registration,
+i.e. as much as a fill).  What it needs from the delivery is the machinery the campaign already designed for
+`mlock` rotation: the P2 per-device epoch gate, so a window is only unmapped once no device can still be
+reading it, plus the loader's `path`/`offs` plumbing (`moe_cache_set_host_source`, the same data the DIO tier
+uses) to know which file range a table lives in.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
@@ -221,11 +251,14 @@ FILE=/var/tmp/pin-test.bin /tmp/probe-pin-free 256   # hipFreeHost is invalid fo
 
 ## 8. Open questions for the maintainer
 
-1. **Is the permanent pin acceptable for the fit-in-RAM band?**  `MOE_HOST_PUSH_REGISTER_MIB` as implemented
-   pins in place for the process lifetime and is the only no-duplicate transport measured at parity — and
-   with the pool off it is **71.7-71.9 t/s against the pool's 51.5 with 9.2 GiB less pinned RAM** (§3a).  It
-   is strictly better than the pool on RAM (same pages, no duplicate) but it is not releasable, so it is an
-   all-or-nothing mode: right for the fit band, unusable where the set does not fit.
+1. **Two shapes, now both measured — which do we build?**
+   (a) *in-place registration* (`MOE_HOST_PUSH_REGISTER_MIB`, as it stands): the only no-duplicate transport
+   measured at parity, and with the pool off **71.7-71.9 t/s against the pool's 51.5 with 9.2 GiB less pinned
+   RAM** (§3a) — but the pin is permanent, so it is an **all-or-nothing fit-in-RAM mode** and must be
+   default-off / refused where the set does not fit.
+   (b) *the registered window* (§5a): releasable, proven droppable over 40 cycles and through a long-lived
+   second mapping, same speed, no duplicate — **the only shape that can serve the > RAM band**, and the one
+   the campaign's charter was written for.
 2. **Or go straight to the registered window** (§5) — the releasable shape, which needs the epoch gate wired
    to `unregister + munmap`, a rotation cadence, and a guard gap.  That is the campaign's charter answer, and
    it is now a bounded engineering task rather than an unexplained gap.

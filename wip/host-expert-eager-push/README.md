@@ -14,7 +14,12 @@
 > is **not releasable** — `hipHostUnregister` leaves the pages pinned while the mapping lives (`hipFreeHost`
 > rejects a registered range; `unregister + munmap` *does* release), so the in-place form is a **permanent**
 > pin usable as an all-or-nothing fit-in-RAM mode, and the **releasable** tier is a private registered
-> **window** over the same page-cache pages.  Also recorded: the destination (plain `hipMalloc` vs a
+> window** over the same page-cache pages.  **Reclaimability is now PROVEN, not assumed** (`probe-window.cpp`,
+> the requirement for the > RAM band): `hipHostUnregister` alone does not release the pin on ANY flag set, but
+> `unregister + munmap` does, and a sliding registered window over a **private** mapping of the model file
+> reclaimed **40/40 cycles** (`MemAvailable` flat, no accumulation) while a long-lived model mapping over the
+> same pages stayed fully reclaimable with identical data — so the rule is **never register the model's own
+> mapping; register a private window and release it by `munmap`**.  Also recorded: the destination (plain `hipMalloc` vs a
 > VMM/slab slot) is **irrelevant** (HANDOVER experiment 1 closed negative), and on this stack a pageable
 > **1-D** copy is 2-3x *slower* than a pageable 2-D copy of the same bytes (the opposite of the earlier
 > single-GPU observation; the transferable conclusion is "stop it being pageable", not "reshape the copy").
