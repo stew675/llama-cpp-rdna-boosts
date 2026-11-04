@@ -712,6 +712,50 @@ So two thirds of the layers replicate the expert and one third do not -- that is
 transport measures the same.  It is a **split-path defect** (block 14 territory / `TODO` #135): a zero-extent
 device should be skipped consistently, never left holding a mirrored copy of the whole tensor.
 
+### Why the split cannot simply be uneven (170/170/172 or 128/128/256)
+
+Because a device's slice must contain **whole quantization blocks**.  These expert tensors are q4_K/q5_K, whose
+super-block is **256 elements**, and the dequant/matmul kernels index blocks from the slice's own base -- so
+every slice boundary has to be a multiple of 256.  The split axes here are 512 wide (host_bytes 589 824 /
+element size = 2048x512 per expert), and 512 admits exactly **two** block-aligned chunks:
+
+| candidate | valid? | why |
+|---|---|---|
+| 256 / 256 / 0 | **yes** | each slice is one whole super-block |
+| 170 / 170 / 172 | no | no slice contains a whole block |
+| 128 / 128 / 256 | no | 128 < one block |
+
+So a 3-way split is *not expressible* for this model, and the correct fallback is the 256/256/0 one -- a 2-way
+split with the third device idle (or a batch-parallel split of the tokens).  Replicating the whole tensor into
+the zero-extent device is the bug.
+
+### Correction: the mirror explains the HOST path, not the VRAM numbers
+
+I over-attributed earlier.  Measured, all-VRAM `-sm tensor`:
+
+| all experts in VRAM | prefill | decode |
+|---|---|---|
+| 1 GPU | 4 641.9 | 114.6 |
+| 2 GPUs (0,2) | 4 778.6 | 136.0 |
+| 3 GPUs (0,1,2) | **4 036.5** | **138.3** |
+
+So 3 GPUs is +1.7 % over 2 at decode and *16 % slower* at prefill -- the third device buys essentially nothing
+in VRAM, but that is **not** the mirror.  Two controls settle it:
+
+- a **dense 4B** model (no expert split at all) shows the same shape: prefill 7 405 / 7 977 / 6 862 and decode
+  103.8 / 137.3 / 153.8 for 1 / 2 / 3 GPUs;
+- the x4 card is worth only ~9 % prefill / ~4 % decode in a clean pair A/B (dense 4B, all VRAM: 0,2 = 8 068 /
+  137.2 against 0,1 = 7 327 / 131.8).
+
+So the 3-GPU **prefill** regression is the **all-reduce over three PCIe peers** (the activations per layer grow
+with the batch), not the split geometry -- it is a property of `-sm tensor` on this box and applies to dense
+models too.
+
+What the mirror *does* explain is the **host-expert** case: 2x the PCIe bytes on two thirds of the layers, plus
+the whole expert's compute serialised on one device, on top of the x4 link -- that is the 3.6x collapse from
+72 t/s (2 devices, both x8) to 20 t/s.  Separating the mirror from the x4 link cleanly would need three x8
+cards, which this box does not have (0 and 2 are x8, device 1 is x4).
+
 **Practical consequence for the refactor:** do not chase the 3-GPU tensor number -- it is `TODO` #135/#104
 territory (`relaxed-tensor` is a TEMPORARY block).  The usable 3-GPU configuration is `-sm layer` (a whole
 tensor per device):
