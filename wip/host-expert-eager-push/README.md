@@ -29,7 +29,12 @@
 > control behaves the same — the convergence is the host's cache policy, not the pin).  Two host caveats
 > recorded: `hipHostRegister` of a single 50 GiB range works and faults the pages in itself (register
 > **first**, not after a read), and on this box `/proc/meminfo` `Cached`/`MemAvailable` do not account these
-> pages usefully — judge residency by `read_bytes` and a second pass.  Also recorded: the destination (plain `hipMalloc` vs a
+> pages usefully — judge residency by `read_bytes` and a second pass.  **And `--host-experts pinned` is NOT this
+> mechanism**: it is `cudaMallocHost` of a *second full copy* of the host expert set (≤4 GiB per buffer, no
+> limit but RAM, silent pageable fallback on failure), i.e. the same transport at the wrong RAM cost — measured
+> 71.6-72.1 t/s with the duplicate against **71.5-71.9 t/s for the registered mapping with no duplicate**, and
+> 36.0 t/s when the pinned allocation falls back to pageable.  The in-place `hipHostRegister` call exists in
+> the tree (`ggml_backend_cuda_register_host_buffer`) but nothing calls it.  See `P4-ROOT-CAUSE.md` §5c.  Also recorded: the destination (plain `hipMalloc` vs a
 > VMM/slab slot) is **irrelevant** (HANDOVER experiment 1 closed negative), and on this stack a pageable
 > **1-D** copy is 2-3x *slower* than a pageable 2-D copy of the same bytes (the opposite of the earlier
 > single-GPU observation; the transferable conclusion is "stop it being pageable", not "reshape the copy").
