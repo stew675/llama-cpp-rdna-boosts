@@ -1,5 +1,21 @@
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
+> **P6b STATUS (2026-11-04): a full-coverage pool is a MIRROR, not the arena's complement — and it now BEATS a
+> pinned master at prefill** (patch `patches/0012`, branch commit `2f8947bbd`, record `P6-POOL-REGION.md` §8).
+> The pool IS fully populated before the prompt, but two paths then *un-load* experts from it purely because they
+> also exist in VRAM (`fill_slot_from_host` retires the pool slot; `pool_rerank_from_heat_locked` frees it —
+> "an expert already in the arena needs no pool slot"), 13 440 of 30 720 slots at full coverage.  When the arena
+> evicts one of those experts the pool peek misses, `pool_fill_empty_locked` has no free slot, and the fill falls
+> through to the **bounce ring: a synchronous 288 KiB `memcpy` from the model mapping** plus an H2D — 20 116 of
+> them in the first 300 decode tokens, invisible to the fill probe (which times only the `cudaMemcpyAsync`).
+> With the mirror rule the bounce goes to **zero** and, at 2 devices, decode goes 51.7 → **64.5** (n=50),
+> 63.9 → **70.4** (n=300), 69.7 → **73.6** (n=500), 80.8 → **82.6** (n=2000) against a pinned master's
+> 66.6 / 71.9 / 75.5 / 82.9, while prefill goes 1166.4 → **1315.9 against the pinned 1105.4 (+19 %)** for the same
+> 18 662 MiB of pinned RAM.  Text byte-identical everywhere, faults clean, bounded pools unchanged by
+> construction (FRAC 50 56.5, `-lme 8` 54.0), 1 device 52.1, 3 devices `-sm layer` 48.1.  **Open policy call:**
+> the fit case could therefore be the pool-as-mirror instead of P5's whole-tensor tier (+19 % prefill, ~-2 %
+> decode at n≤500) — one mechanism, and the per-tensor tier disappears.
+>
 > **P6 STATUS (2026-11-04): the expert-indexed region IS the pool, and it now works on a multi-device split —
 > [`P6-POOL-REGION.md`](P6-POOL-REGION.md)** (branch commit `72bc81b88`, patch `patches/0011`).  `TODO` #139 is
 > closed in the campaign: the pool is a pinned per-host-tensor region addressed by (expert -> slot) with

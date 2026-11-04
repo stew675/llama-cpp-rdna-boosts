@@ -1,0 +1,141 @@
+From 2f8947bbdbf6ffeae94ba0c92fa6d12f1a9420ff Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Wed, 4 Nov 2026 06:19:00 -0600
+Subject: [PATCH] wip/host-expert-pool-mirror: a full-coverage pool is a
+ MIRROR, not the arena's complement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Explains and removes the last of the full-coverage pool's decode deficit.  The pool is fully
+populated by `pool_prepopulate_locked` before any prompt is processed, but two paths then
+deliberately UN-LOAD experts from it the moment they also exist in VRAM, because the pool's
+design contract (TODO #87) is "the arena's COMPLEMENT" -- pinned RAM is the scarce resource:
+
+  * `fill_slot_from_host` (the arena sizing/seed) copies an expert into a VRAM slot and calls
+    `expert_src_done(..., retire=true)`, which marks that expert's pool slot `slot_state = 2`;
+  * `pool_rerank_from_heat_locked` (the heat re-rank at the first decode-band hook) keeps only
+    the wanted NON-resident experts -- "an expert already in the arena needs no pool slot" --
+    and frees the rest (logged: `0 filled, 56 freed, 200 wanted non-resident` per table).
+
+At full coverage that empties 13 440 of the pool's 30 720 slots (44 %) at start-up.  When the
+arena's `touch` policy later evicts one of those experts, `expert_host_src` peeks the pool
+(miss) and `pool_fill_empty_locked` needs a FREE slot, which a pool full of other residents
+does not have -- so the fill falls through to the BOUNCE RING: a synchronous 288 KiB `memcpy`
+out of the model mapping plus an H2D.  Measured 20 116 such bounce fills in the first 300
+decode tokens (~5.5 GiB of host memcpy, ~0.5 s).  The fill probe times only the cudaMemcpyAsync
+(1.2-1.4 us), so the ~25 us host memcpy per fill was invisible in every copy-timing A/B -- the
+reason this survived six earlier attributions.  A pinned master never has the problem: its
+master holds every expert for the whole run, so every fill is a direct 0.3 us H2D.
+
+Fix: when the budget covers the whole tensor (`slots >= n_experts`) the pool is a MIRROR, so
+neither path may un-load an expert because VRAM also has it.  A bounded pool (slots <
+n_experts) keeps the complement policy byte-for-byte, so the not-fitting band and `-lme N`
+are unchanged by construction.
+
+Measured, 2 devices (0,2), 35B-A3B Q4_K_M -ncmoe 40, text identical in every pair
+(231512fc77e5 @n=300, c6e6d709a6db @n=500, 4ae33f7bd65c @1 dev, d589ad909b67 @3 dev),
+check-gpu-faults clean:
+
+  full-coverage pool (18 662 MiB)    n=50   n=300  n=500  n=2000   prefill
+    before                              51.7   63.9   69.7    80.8    1166.4
+    retire fix only                     56.9   67.2   71.1    81.6       --
+    retire + rerank fix (MIRROR)        64.5   70.4   73.6    82.6    1315.9
+    pinned whole-tensor master          66.6   71.9   75.5    82.9    1105.4
+
+So the full-coverage pool now prefills 19 % FASTER than a pinned master and decodes within
+0.4-3 % of it, for the same 18 662 MiB of pinned RAM.  Bounded pools (FRAC 50 / -lme 8) are
+unchanged: 56.5 / 54.0.  1 device 52.1, 3 devices -sm layer 48.1 (n=100).  All the §8 numbers
+were taken with the persisted heat prior FROZEN (read-only sidecar) so both arms seed from the
+same prior.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 48 ++++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 5960af6cd..d5be5d62f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1629,7 +1629,25 @@ static host_pool_t * table_pool_locked(table_t & t) {
+         // allocated the pool copies out of it.  Plain `cudaMallocHost` is tied to the allocating ROCm
+         // context; a cross-device H2D from it falls back to a pageable staging memmove that crashes on a
+         // 2-D strided copy.  The mapped UVA alias is copied from with cudaMemcpyDeviceToDevice instead.
+-        if (cudaHostAlloc(&mem, (size_t) slots * t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess) {
++        //
++        // wip/host-expert-pool-region: `MOE_HOST_POOL_ALLOC` is the A/B for the pool's MEMORY TYPE, because
++        // the pinned master a pool must match is a plain `cudaMallocHost` (ggml_cuda_host_malloc) while the
++        // pool is `cudaHostAlloc(Portable|Mapped)`.  On ROCm those are different driver objects and can be
++        // mapped with different caching for the device, which would show up as per-byte cost on the in-place
++        // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
++        // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
++        // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
++        static const char * pool_alloc = getenv("MOE_HOST_POOL_ALLOC") != nullptr ? getenv("MOE_HOST_POOL_ALLOC") : "portable";
++        const size_t pool_bytes = (size_t) slots * t.host_bytes;
++        cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
++        /**/ if (strcmp(pool_alloc, "plain") == 0) {
++            alloc_err = cudaMallocHost(&mem, pool_bytes);
++        } else if (strcmp(pool_alloc, "mapped") == 0) {
++            alloc_err = cudaHostAlloc(&mem, pool_bytes, cudaHostAllocMapped);
++        } else {
++            alloc_err = cudaHostAlloc(&mem, pool_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
++        }
++        if (alloc_err == cudaSuccess) {
+             p.base        = (char *) mem;
+             void * dev    = nullptr;
+             if (cudaHostGetDevicePointer(&dev, mem, 0) != cudaSuccess) {
+@@ -2042,11 +2060,18 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+     }
+     std::vector<int32_t> rank;
+     pool_rank_experts_locked(t, rank);
+-    // The complement, in rank order: an expert already in the arena needs no pool slot.
++    // The complement, in rank order: an expert already in the arena needs no pool slot -- UNLESS the budget
++    // covers the whole tensor, in which case the pool is a MIRROR of it (see `fill_slot_from_host`, which
++    // applies the same rule).  Freeing an arena-resident expert's slot here UN-LOADS it, and its next miss
++    // then has to re-read it from the model mapping (a synchronous 288 KiB `memcpy` per expert) instead of
++    // taking a 0.66 us D2D from the pool.  Measured on a full-coverage run at 2 devices: the re-rank freed
++    // 56 of 256 slots per table (13 440 of 30 720 in the pool) the moment the experts entered VRAM, and that
++    // is the *second* half of the start-up gap against a pinned master (the first half was the sizing seed).
++    const bool mirror = pool->slots >= t.n_experts;
+     std::vector<int32_t> want;
+     want.reserve(rank.size());
+     for (int32_t e : rank) {
+-        if (t.expert_slot.find(e) == t.expert_slot.end()) {
++        if (mirror || t.expert_slot.find(e) == t.expert_slot.end()) {
+             want.push_back(e);
+         }
+     }
+@@ -2080,9 +2105,10 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+         filled++;
+     }
+     if (freed > 0 || filled > 0) {
+-        GGML_LOG_INFO("%s: host pool laid out as the arena's complement layer=%d role=%s: "
++        GGML_LOG_INFO("%s: host pool laid out as the arena's %s layer=%d role=%s: "
+                       "%d filled, %d freed, %zu wanted non-resident, ranked by the heat prior\n",
+-                      __func__, t.layer, t.role.c_str(), filled, freed, want.size());
++                      __func__, mirror ? "MIRROR (the budget covers the whole tensor)" : "complement",
++                      t.layer, t.role.c_str(), filled, freed, want.size());
+     }
+ }
+ 
+@@ -2853,7 +2879,17 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+         return cudaErrorInvalidDeviceFunction;
+     }
+     const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
+-    expert_src_done(t, pool, src, stream, /*retire*/ true);
++    // wip/host-expert-pool-region: retire the source slot ONLY when the pool is a BOUNDED complement of the
++    // arena (`slots < n_experts`), which is the case TODO #87's hand-over design was written for.  When the
++    // budget covers the whole tensor the pool is a MIRROR of it, and retiring the slot here UN-LOADS an expert
++    // that is already resident: the first arena eviction of that expert then has to re-read it from the page
++    // cache through the bounce ring (a synchronous 288 KiB `memcpy` + an H2D) instead of a D2D from the pool.
++    // Measured on a full-coverage run at 2 devices: 20 116 such bounce fills in the first 300 decode tokens
++    // (5.5 GiB of host memcpy at ~7 GB/s = ~0.5 s), which is what made the pool's STARTING state worse than a
++    // pinned master's and converged away as the arena settled.  A pinned master never has this: it holds every
++    // expert for the whole run, so every fill is a direct H2D from pinned memory.
++    const bool bounded = pool == nullptr || pool->slots < pool->n_experts;
++    expert_src_done(t, pool, src, stream, /*retire*/ bounded);
+     return err;
+ }
+ 
+-- 
+2.56.0
+

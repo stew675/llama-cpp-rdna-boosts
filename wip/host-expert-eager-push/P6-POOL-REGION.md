@@ -192,6 +192,52 @@ the preflight (the only remaining arming step) is worth ~0.09 s of a short run. 
 *prefill* staging branch (irrelevant to decode) and that its arena fills read the pool alias rather than a pinned
 master (tested above, a wash).  Recorded so nobody re-derives these six negatives.
 
+## 8. Why the pool bounced while "fully resident": it is the arena's COMPLEMENT by design (and the fix)
+
+**This supersedes §7c/§7d's "unattributed ~0.5 %/token".**  Asked: *if the pool holds every weight, why is anything
+bouncing?*  Because **"fully resident" is a claim about the pool's contents right after prepopulation, and the pool
+then deliberately un-loads experts** — its design contract (TODO #87) is *the arena's COMPLEMENT*, because pinned
+RAM is the scarce resource.  Two code paths enforce it, both after the prompt:
+
+| where | what it does at full coverage |
+|---|---|
+| `fill_slot_from_host` (the arena sizing/seed) | copies an expert into VRAM, then `expert_src_done(..., retire=true)` marks its **pool slot retiring** (`slot_state = 2`) — the expert is dropped from the pool *because* it is now in VRAM. 13 440 of 30 720 slots |
+| `pool_rerank_from_heat_locked` (heat re-rank, first decode-band hook) | keeps only the wanted NON-resident experts — *"an expert already in the arena needs no pool slot"* — and frees the rest.  Logged per table: `0 filled, 56 freed, 200 wanted non-resident` |
+
+So from the first decode step the pool is the *complement* of the arena: it holds the 200 of 256 experts that are
+not in VRAM and has **no copy of the 56 that are**.  When the arena's `touch` policy later evicts one of those 56
+and its bytes are needed again, `expert_host_src` peeks the pool (miss), `pool_fill_empty_locked` needs a *free*
+slot (a pool full of other residents has none), and the fill falls through to the **bounce ring**: a synchronous
+**288 KiB `memcpy` out of the model mapping** plus an H2D.  Measured **20 116 such bounce fills in the first 300
+decode tokens** (~5.5 GiB of host memcpy at ~7 GB/s ≈ 0.5 s).
+
+Why every earlier attribution missed it: the fill probe (`MOE_HOST_PUSH_PROBE`) times the `cudaMemcpyAsync` only
+(1.2-1.4 µs for a bounce fill) — the ~25 µs host memcpy that precedes it is in `expert_host_src`, invisible to
+every copy-timing A/B.  A pinned master never bounces: `table_master_pageable()` is false, so `expert_host_src`
+returns `master + e*stride` (0.3 µs H2D) for every expert, always — it never forgets.
+
+**Fix (patch `0012`): when the budget covers the whole tensor (`slots >= n_experts`) the pool is a MIRROR.**
+Neither path may un-load an expert because VRAM also has it.  A bounded pool (`slots < n_experts`) keeps the
+complement policy byte-for-byte, so the not-fitting band and `-lme N` are unchanged *by construction*.
+
+| 2 devices | n=50 | n=300 | n=500 | n=2000 | prefill |
+|---|---|---|---|---|---|
+| full pool, before | 51.7 | 63.9 | 69.7 | 80.8 | 1166.4 |
+| + retire fix | 56.9 | 67.2 | 71.1 | 81.6 | — |
+| **+ rerank fix (MIRROR)** | **64.5** | **70.4** | **73.6** | **82.6** | **1315.9** |
+| pinned whole-tensor master | 66.6 | 71.9 | 75.5 | 82.9 | 1105.4 |
+
+Byte-identical text in every pair (`231512fc77e5` @n=300, `c6e6d709a6db` @n=500, `4ae33f7bd65c` @1 device,
+`d589ad909b67` @3 devices), `check-gpu-faults` clean, bounded pools unchanged (FRAC 50 56.5, `-lme 8` 54.0),
+1 device 52.1, 3 devices `-sm layer` 48.1 at n=100.  All §8 numbers were taken with the persisted heat prior
+**frozen** (read-only sidecar) so both arms seed from the same prior.
+
+**Consequence, and it is a policy question**: a full-coverage pool now prefills **19 % faster than a pinned
+master** (1315.9 against 1105.4) and decodes within 0.4-3 % of it (n=2000 82.6 against 82.9; n=300 70.4 against
+71.9) **for the same 18 662 MiB of pinned RAM**.  So `-lme auto`'s fit case could be one mechanism (the pool as a
+mirror) instead of the whole-tensor pinned-master tier — the trade is +19 % prefill for ~-2 % decode at
+n≤500.  Not changed here: it is the maintainer's call, and it would remove P5's per-tensor tier entirely.
+
 ## 6. Reproduce
 
 ```bash

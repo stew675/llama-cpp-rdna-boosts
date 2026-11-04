@@ -419,6 +419,14 @@ because a resident pool is not a pinned *master* (that is the residual, recorded
 fit case).  `-lme N` therefore spends the budget per EXPERT below 90 % of the host expert set and keeps the
 whole-tensor pinned-master tier at or above it (`MOE_HOST_TIER=pool|tensor` forces either shape).
 
+**Update (same day, `P6-POOL-REGION.md` §8, patch `0012`)**: the full-coverage pool was also bouncing because it is
+the arena's **complement** by design — two paths un-load an expert from the pool the moment it enters VRAM, so the
+arena's first evictions had to re-read from the model mapping through the bounce ring (20 116 synchronous 288 KiB
+memcpys in the first 300 decode tokens).  A full-coverage pool is now a **MIRROR**: decode 63.9 → 70.4 (n=300) and
+80.8 → 82.6 (n=2000) against a pinned master's 71.9/82.9, and prefill **1315.9 against 1105.4 (+19 %)** for the
+same pinned RAM.  So the fit case could be the pool alone (one mechanism, no whole-tensor tier) — a policy call
+left open, with the trade being +19 % prefill for ~-2 % decode at n<=500.
+
 **Still open elsewhere**: `#132` (the pool's synchronous demand read for NON-resident experts — untouched), and
 the 100 %-covered pool becoming the master (P6 §5: fill slots in expert order, rebind a `region`/`region_dev`
 field — never `t.host`, which keys the pool map and is shared across the per-device tables of one tensor).
