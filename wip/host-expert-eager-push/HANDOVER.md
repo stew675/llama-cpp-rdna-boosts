@@ -1,9 +1,19 @@
-# HANDOVER — the direct page-cache expert push is not yet at parity under `-sm tensor` (OPEN, unresolved)
+# HANDOVER — the direct page-cache expert push: ROOT CAUSE FOUND (see `P4-ROOT-CAUSE.md`)
 
-**Status: OPEN.  This is an unresolved performance defect, not a closed investigation and not a refutation of
-the mechanism.**  The mechanism itself is measured-good where it can be exercised cleanly; the multi-device
-tensor-split case is *partially* attributed and the remaining gap is unexplained.  Your job, if you pick this
-up, is to find the rest of the cause — **not** to re-litigate whether the idea is viable.
+**Status: the `-sm tensor` defect is DIAGNOSED and a fix is MEASURED.**  `P4-ROOT-CAUSE.md` is the record:
+the loss is the driver's **pageable staging, a per-CALL cost** that a tensor split pays twice as often per
+byte (in situ: 90 636 1-D pageable fills at **141 µs/copy = 12.82 s of a 27.7 s run**, against **1.3 µs/copy**
+for the same arm's pinned-ring 2-D fills); registering the host mapping **in place**
+(`MOE_HOST_PUSH_REGISTER_MIB`, patch `0007`) makes it **0.3-0.5 µs/copy**, and 2 devices go from 21.5 to
+**71.6 t/s** against the pool's 51.5, byte-identical text.  One measured caveat decides the shape of the
+fix: `hipHostUnregister` does **not** release the pin while the mapping lives (`hipFreeHost` rejects a
+registered range; `unregister + munmap` does release), so the in-place form is a **permanent** pin and the
+**releasable** form is a private registered **window** over the same file pages.
+
+**Read `P4-ROOT-CAUSE.md` first; the sections below are the pre-diagnosis state of the investigation and are
+kept because the ruling-out list (§4) and the trap list (§7) are still valid.**
+
+---
 
 Read this whole file before touching anything.  Sections 1-2 are the problem and the goal; 3 is every number
 measured so far; 4 is what is ruled out and **what that rules out for you**; 5 is the ranked experiment list

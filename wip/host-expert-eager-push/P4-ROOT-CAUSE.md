@@ -1,0 +1,238 @@
+# P4 — ROOT CAUSE FOUND: the `-sm tensor` loss is the PAGEABLE STAGING per fill copy (2026-11-04)
+
+> **This closes the open question in [`HANDOVER.md`](HANDOVER.md) §5.**  The mechanism was never in doubt:
+> the multi-device loss is **host time inside the copy call** (the record already placed it there), and what
+> was missing is *why* the copy call costs 107-191 µs.  It is not the bytes, not the geometry, not the
+> destination, not the device context, not the queue: **the driver stages every pageable upload, and the
+> staging is a per-CALL cost, so a tensor split (which halves the copy size and doubles the call count) pays
+> it twice as often per byte.**  Measured in situ, at the real geometry, in one run:
+>
+> | arm (2 devices, 0,2, n=300) | 1-D pageable fills | 2-D/sliced fills (pinned ring) | host time in copies | decode |
+> |---|---|---|---|---|
+> | `MOE_HOST_PUSH_SRC=mapping` | 90 636 × **141.0 µs** | 18 995 × 1.3 µs | **12.82 s** of 27.7 s | 21.5 t/s |
+> | `MOE_HOST_PUSH_REGISTER_MIB=20000` | 90 636 × **0.3 µs** | 45 314 × 0.5 µs | **0.052 s** | **71.6 t/s** |
+>
+> The fix is `hipHostRegister` over the **read-only model mapping, in place**: no copy, no duplicate, and the
+> fill becomes a native transfer.  Cost of the pin: measured, below (§5) — **`hipHostUnregister` does not
+> release it while the mapping lives**, so the in-place form is a permanent pin and the *releasable* shape is
+> a private registered **window** (`unregister + munmap` does release; §5).
+
+Measured on gfx1201 x2 (R9700, `HIP_VISIBLE_DEVICES=0,2`, both upstream x8), ROCm 10.1.0,
+`~/bin/build-llama-rocm` (`build-rocm`), `Qwen3.6-35B-A3B-UD-Q4_K_M`, `-ncmoe 40 --host-experts pool`,
+`MOE_EXPERT_CACHE_MIB=2048`, `MOE_HOST_POOL_FRAC=50`, `--seed 42 --temp 0 --ignore-eos -n 300`, serial runs.
+Tree: `p2-eager-push-r209` + campaign patches `0001`-`0007` (`0007` is new: the registered source + the
+geometry split in the attribution probe).
+
+---
+
+## 1. What a tensor split actually does to the fill (the missing fact)
+
+`GGML_CUDA_CACHE_GEOM_DEBUG=1` prints one line per table.  At 2 devices the 240 tables come in exactly three
+shapes (counts from a full run):
+
+| tables | `expert_bytes` | `host_bytes` | `src_off` | `host_pitch` | `split_axis` | per-fill copy |
+|---|---|---|---|---|---|---|
+| 80 | 294 912 | 589 824 | 0 | **0** | 1 | **1-D**, 288 KiB |
+| 80 | 294 912 | 589 824 | 294 912 | **0** | 1 | **1-D**, 288 KiB |
+| 37 | 360 448 | 720 896 | 0 | **352** | 0 | **2-D**: 2048 rows × **176 B** |
+| 37 | 360 448 | 720 896 | 176 | **352** | 0 | **2-D**: 2048 rows × 176 B |
+| 3 | 430 080 | 860 160 | 0 / 210 | 420 | 0 | 2-D: 2048 rows × 210 B |
+
+So a tensor split gives `ffn_gate_exps`/`ffn_up_exps` a **contiguous 1-D slice** (`split_axis=1`, packed) and
+`ffn_down_exps` a **strided 2-D slice** (axis 0 split: 2048 segments of 176 B at pitch 352).  One device and
+`-sm layer` are 1-D everywhere — which is exactly why they were at parity and `-sm tensor` was not: not
+because of the split *per se*, but because the split changes the copy the fill issues.
+
+**And the 2-D table is not the expensive one.**  The old push gate required `host_pitch == 0 && n_slices == 0`,
+so the 2-D down fills fell through to the pinned bounce ring — and they cost **1.3 µs/copy**.  The whole loss
+was in the 1-D gate/up fills.  That inverted the campaign's working assumption (and is the opposite of what
+the same code's own comment predicted, and of the earlier single-GPU observation that 2-D was the slow case —
+see §6).
+
+## 2. The cost is the pageable STAGING, and it is per CALL, not per byte
+
+In situ, `MOE_HOST_PUSH_PROBE=1` (patched in `0007` to split the H2D time by copy geometry):
+
+```
+mapping (pageable)  P1 probe: 135950 fill copies, 12819977 us host total (94.3 us/fill); H2D 109631 in 12804960 us
+                    P1 probe geometry: 1-D 90636 copies in 12779519 us (141.0 us/copy, 99.8% of the H2D time);
+                                       2-D/sliced 18995 copies in 25441 us (1.3 us/copy, 0.2%)
+registered          P1 probe: 135950 fill copies, 51511 us host total (0.4 us/fill);   H2D 135950 in 51511 us
+                    P1 probe geometry: 1-D 90636 copies in 30857 us (0.3 us/copy, 59.9%);
+                                       2-D/sliced 45314 copies in 20654 us (0.5 us/copy, 40.1%)
+```
+
+Same bytes (census identical between arms: `37221.8 MiB` H2D, `h=0.7907`, `fills=122510`), same destination
+(the slab/VMM arena), same stream, same thread, same call count — the **only** difference is whether the
+source range is registered.  141 µs → 0.3 µs.
+
+**Why it scales with the device count rather than the bytes.**  The staging cost is dominated by a fixed
+per-call component, so what matters is the *number* of calls for a given amount of data.  A tensor split gives
+each device its own slice, so for the same expert bytes there are N times as many copies of 1/N the size —
+the cost per byte rises with N.  This also explains the two other facts already in the record without any new
+mechanism: that 1 device is at parity (one call per expert, and the fixed cost is small next to the 0.57 MiB
+transfer), and that a *smaller* pool does not help (the pool's benefit is residency, not the transport).
+
+## 3. The fix: register the mapping in place (`MOE_HOST_PUSH_REGISTER_MIB`)
+
+`hipHostRegister(base, len, hipHostRegisterReadOnly|Portable)` over the table's host master, once at sizing,
+page-aligned outwards, shared by every device's table for the same tensor, bounded by a MiB budget
+(`patches/0007`).  Nothing is copied or moved: the page cache keeps the only copy of the bytes, and the driver
+is simply told they are pinned, so the fill becomes a native transfer, for **every** geometry (1-D, strided
+2-D, fused multi-slice) — the old 1-D-only restriction is lifted for a registered master because the staging
+is what made the other geometries unsafe/slow.
+
+All arms below are the same build, `--ignore-eos -n 300`, `--seed 42 --temp 0`, serial, control = `pool`:
+
+| config | ctrl (`pool`) | registered in-place push | delta | text |
+|---|---|---|---|---|
+| 1 GPU, `-sm tensor` | 49.0 | **53.5** | +9 % | identical `4ae33f7bd65c` |
+| **2 GPU (0,2), `-sm tensor`** | **51.5** (two reps: 51.5/51.5) | **71.6** (two reps: 71.6/71.8) | **+39 %** | identical `231512fc77e5` |
+| 3 GPU, `-sm tensor` | 19.4 | 20.5 | +6 % | identical `4ae33f7bd65c` |
+| 3 GPU, `-sm layer` | 50.5 | 54.3 | +8 % | identical `4ae33f7bd65c` |
+
+- **Correctness: byte-identical greedy text in every pair** (680/681 chars; the 2-device answer differs from
+  the 1/3-device answer, which is the documented per-device-count reference rule, not a campaign difference).
+- `scripts/check-gpu-faults.sh`: clean on every run.
+- Prefill also improves where it is measured (2 devices 36.6 -> 72.0 t/s prompt processing).
+- The 3-device tensor arm remains the degraded configuration of `TODO` #135 (20 t/s with the pool too, 138
+  with all experts in VRAM); the campaign's relative result there is +6 %, not a scaling point.
+- Registration cost at sizing: **977 ms for 18 662 MiB** (~19 GB/s of registration; the whole host expert set,
+  240 tables, 0 refusals).  One-time, logged.
+
+### 3a. The campaign's actual goal: **no pool at all** (`MOE_HOST_POOL_FRAC=0`)
+
+The arms above still build the pool (FRAC 50 = 9 331 MiB of *duplicate* pinned RAM), so they do not answer
+the RAM question.  With the pool switched off entirely — no duplicate, no bounce ring, the page cache is the
+only copy — the registered push does not just hold up, it is the same speed:
+
+| 2 devices (0,2), `-n 300` | pool (FRAC 50) | **registered push, NO pool** |
+|---|---|---|
+| decode | 51.5 / 51.5 | **71.9 / 71.7** |
+| `host pool (L2)` in the log | 9 331.0 MiB pinned | **145.8 MiB** (the minimum, 240 slots) |
+| text | `sha=231512fc77e5` | `sha=231512fc77e5` (identical) |
+| GPU faults | clean | clean |
+
+So **9.2 GiB of the duplicate disappears and throughput goes up 40 %**, byte-identically.  What replaces it is
+the 18 662 MiB of page-cache pages made non-evictable (§5) — the same bytes, once, which is exactly the
+campaign's charter ("the bytes should live once, in the page cache"), with the residency guarantee carried by
+registration instead of by `mlock` + a copy.  For comparison, the same arm with no pool and no registration
+(bounce ring only) is **36.8 t/s**.
+
+## 4. Why the earlier probes missed it (so the next session does not repeat it)
+
+`probe-pageable-multi.cpp` / `probe-pageable-threads.cpp` issued 600 KiB 1-D copies from a *single repeatedly
+re-read* window into a `hipMalloc` destination and reported aggregate GB/s.  Two things hid the cost:
+
+1. **They report throughput, not host time in the call.**  Overlapping copies make the aggregate look like
+   12-20 GB/s even when each call blocks for ~90 µs on the host; the in-situ number is the one that matters.
+2. **The window repeats**, so the pages the driver stages are the same 600 KiB every round.  The real path
+   reads a different 704 KiB of a 19 GiB mapping every fill.
+
+`probe-memcpy2d.cpp` (new) fixes both and reproduces it (360 KiB, 2 devices, one issuing thread):
+
+| source | 1-D copy, idle stream | 1-D, 256 MiB D2D queued ahead | 2-D copy, idle | 2-D, queue ahead |
+|---|---|---|---|---|
+| file mapping, **pageable** | **91.4 µs** host/call | **146.2 µs** | 44.6 µs | 41.5 µs |
+| file mapping, **registered** | 22.8 µs | **16.8 µs** | 19.3 µs | 23.8 µs |
+| `hipHostMalloc` (pinned) | 18.3 µs | — | 19.7 µs | 25.4 µs |
+
+Three facts fall out of it, all of record for later:
+
+- **A pageable 1-D copy is the expensive one** (91-146 µs), and it is *worse* under a live queue.  A pageable
+  2-D copy of the same bytes is 2-3x *cheaper* on this stack (44 µs) — see §6.
+- **Registration removes the cost entirely and removes the queue sensitivity** (17-23 µs regardless of load).
+- **The destination is irrelevant**: `DST=vmm` (page-reserve + create + map, as the slab arena is) equals
+  `DST=hipMalloc` to within noise in every arm.  HANDOVER experiment 1 is therefore **closed negative**.
+
+## 5. The RAM question — the maintainer's `hipHostUnregister` finding REPRODUCES, and the answer is `munmap`
+
+A residency tier that cannot be released is worse than the pool in the band the mode exists for (the set does
+not fit).  `probe-pin.cpp` / `probe-pin-free.cpp` measure the pin's lifetime with the only honest signal on
+this stack (`VmLck` does not see HIP pins; `mincore` reports page-cache residency): touch the range, ask the
+kernel to reclaim it, re-touch, and count `/proc/self/io read_bytes`.
+
+| arm (256 MiB window of a 1.4 GiB file on disk) | re-read after `FADV_DONTNEED`+`MADV_PAGEOUT` | verdict |
+|---|---|---|
+| control, never registered | 256.0 / 256 MiB | evicted (the method works) |
+| registered, **`hipHostUnregister`**, mapping live | **2.0 / 256 MiB** | **still pinned — the pin LEAKED** |
+| registered, `hipHostUnregister` + 0.5 s, mapping live | 2.0 / 256 MiB | still pinned (not deferred) |
+| registered, **`hipFreeHost`** | `hipErrorInvalidValue` | not applicable — it only takes `hipHostMalloc` pointers |
+| registered, `hipHostUnregister` + **`munmap`** | 256.0 / 256 MiB | **released** |
+| registered, nothing (control) | 2.0 / 256 MiB | pinned, as designed |
+| `hipHostMalloc` -> `hipHostFree` | VMA gone | the documented pair behaves |
+
+So, on this stack:
+
+- **`hipHostUnregister` returns `hipErrorSuccess` and does NOT give the pages back** while the mapping lives —
+  exactly the maintainer's finding on the other system.  It only makes the *runtime* forget the registration
+  (a copy from the range reverts to the slow pageable path).
+- **`hipFreeHost` is not a workaround**: it rejects a registered range.
+- **The pin is tied to the VMA.**  `unregister + munmap` releases it completely, and register/unregister
+  cycles on the same range work repeatedly (3 cycles measured).
+
+Which splits the design cleanly in two:
+
+| shape | RAM | release | verdict |
+|---|---|---|---|
+| register the **model mapping in place** (`MOE_HOST_PUSH_REGISTER_MIB`, as measured in §3) | the page-cache pages, pinned, **no duplicate** | **none** — permanent for the process | usable as an **all-or-nothing** fit-in-RAM mode; 18.6 GiB pinned against the pool's 9.3 GiB *duplicate* on the same run, and +39 % throughput.  Not usable where the set does not fit |
+| a **private, separately-mapped registered WINDOW** over the model file (`mmap` the range again, register it, DMA from it, then `unregister + munmap` to release) | the same page-cache pages, pinned while the window is open | **`unregister + munmap`** | **this is the releasable tier the campaign wanted** — no duplicate, native speed, bounded and rotatable.  Needs (i) the existing P2 epoch gate for safe release while fills are in flight, (ii) a rotation cadence that respects the ~19 GB/s registration cost (256 MiB ≈ 14 ms), (iii) a guard gap between windows (adjacent registrations returned `part or all of the requested memory range is already mapped`) |
+
+`mlock` is **not** a substitute: it keeps the pages but does not make them a DMA source, which is why the P2
+`mlock` tier was transport-neutral (measured in P3 §3b) — the campaign's residency idea was right, it just
+needed the runtime told as well.
+
+## 6. Dated facts that contradict older ones (recorded, not reconciled)
+
+- **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
+  µs/call, §4).  The maintainer's observation from the single-GPU system was the opposite.  Both can be true
+  across ROCm lines/geometries; what is *not* geometry-dependent is the conclusion: **a pageable source is a
+  staging cost per call, and the fix is not to reshape the copy but to stop it being pageable.**
+- The code comment above `expert_host_src` (`a 2-D pageable H2D is the pathological ROCm case`) is **not**
+  what this box measures — the pathological case here is the 1-D pageable upload.  Left in place (it is a
+  wip patch's comment); do not cite it as current.
+
+## 7. Reproduce
+
+```bash
+cd wip/host-expert-eager-push
+
+# the attribution (per-copy geometry split + the reporting line)
+GPU=0,2 SM=tensor EOS=1 N=300 LV=4 ./p3-matrix.sh map  MOE_HOST_PUSH_SRC=mapping MOE_HOST_PUSH_PROBE=1
+GPU=0,2 SM=tensor EOS=1 N=300 LV=4 ./p3-matrix.sh reg  MOE_HOST_PUSH_REGISTER_MIB=20000 \
+                                                         MOE_HOST_PUSH_PROBE=1 MOE_EXPERT_CACHE_COLD_UVA=0
+
+# the headline pairs (clean runs: text hash valid, no -lv)
+GPU=0,2 SM=tensor EOS=1 N=300 ./p3-matrix.sh ctrl
+GPU=0,2 SM=tensor EOS=1 N=300 ./p3-matrix.sh reg MOE_HOST_PUSH_REGISTER_MIB=20000
+
+# the geometry a tensor split produces
+GPU=0,2 SM=tensor EOS=1 N=4 LV=4 GGML_CUDA_CACHE_GEOM_DEBUG=1 ./p3-matrix.sh geom   # grep CACHE_GEOM
+
+# the standalone reproduction + the pin's lifetime
+/opt/rocm-10.1.0-gfx120X/bin/hipcc --offload-arch=gfx1201 -O2 -o /tmp/probe-memcpy2d probe-memcpy2d.cpp
+HIP_VISIBLE_DEVICES=0,2 MODE=1d SRC=file    /tmp/probe-memcpy2d 2 10 16   # 91 us/copy
+HIP_VISIBLE_DEVICES=0,2 MODE=1d SRC=reg     /tmp/probe-memcpy2d 2 10 16   # 23 us/copy
+HIP_VISIBLE_DEVICES=0,2 MODE=1d SRC=file BUSYMB=256 /tmp/probe-memcpy2d 2 10 16   # 146 us/copy
+/opt/rocm-10.1.0-gfx120X/bin/hipcc --offload-arch=gfx1201 -O2 -o /tmp/probe-pin probe-pin.cpp
+FILE=/var/tmp/pin-test.bin /tmp/probe-pin 256        # pin survives unregister, dies with the mapping
+FILE=/var/tmp/pin-test.bin /tmp/probe-pin-free 256   # hipFreeHost is invalid for a registered range
+```
+
+## 8. Open questions for the maintainer
+
+1. **Is the permanent pin acceptable for the fit-in-RAM band?**  `MOE_HOST_PUSH_REGISTER_MIB` as implemented
+   pins in place for the process lifetime and is the only no-duplicate transport measured at parity — and
+   with the pool off it is **71.7-71.9 t/s against the pool's 51.5 with 9.2 GiB less pinned RAM** (§3a).  It
+   is strictly better than the pool on RAM (same pages, no duplicate) but it is not releasable, so it is an
+   all-or-nothing mode: right for the fit band, unusable where the set does not fit.
+2. **Or go straight to the registered window** (§5) — the releasable shape, which needs the epoch gate wired
+   to `unregister + munmap`, a rotation cadence, and a guard gap.  That is the campaign's charter answer, and
+   it is now a bounded engineering task rather than an unexplained gap.
+3. **The registered master makes the delivery's cold in-place read (UVA) legal** (`cudaHostGetDevicePointer`
+   succeeds), i.e. a *device-pull* path becomes reachable where the charter says "never device-pull".  With
+   `MOE_EXPERT_CACHE_COLD_UVA=0` the arms above measure the pure push and are unchanged (71.6 vs 71.7), so
+   this is a policy choice, not a performance one — but it must be an explicit one.
+4. `MOE_HOST_PUSH_SRC=mapping` (pageable) should probably be retired as a candidate: it is strictly worse than
+   the bounce ring it was meant to replace (§2 shows 141 µs against 1.3 µs), and the campaign's answer is
+   registration, not the pageable push.

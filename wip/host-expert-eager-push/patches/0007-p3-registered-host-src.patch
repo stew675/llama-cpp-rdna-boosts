@@ -1,0 +1,244 @@
+From 3d81ca9fca3aea234dcd0a360d2c6b41b189b89b Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 3 Nov 2026 18:16:28 -0600
+Subject: [PATCH] wip/p3-registered-host-src: register the host expert mapping
+ in place (no duplicate, no per-call staging)
+
+The -sm tensor loss is the PAGEABLE STAGING, not the bytes, the geometry, the
+destination or the device context.  In situ (2 devices, n=300): the mapping arm
+spends 12.82 s of a 27.7 s run inside 90636 1-D pageable fill copies
+(141.0 us/copy, 99.8 % of the H2D time), while the 18995 2-D/sliced copies it
+serves from the pinned bounce ring are 1.3 us/copy.  A tensor split halves the
+per-copy size and doubles the call count, and the staging cost is per CALL, so
+the cost per byte rises with the device count.
+
+MOE_HOST_PUSH_REGISTER_MIB=N calls hipHostRegister over the read-only model
+mapping IN PLACE: no copy, no duplicate, and the fill becomes a native transfer.
+Same run, registered: 0.3-0.5 us/copy, 71.6 t/s against the pool's 51.5 and the
+pageable push's 21.5, byte-identical text (sha=231512fc77e5).
+
+Also splits the attribution probe by copy geometry (1-D vs 2-D/sliced).
+
+CAVEAT measured here (probe-pin.cpp / probe-pin-free.cpp): hipHostUnregister does
+NOT release the pin while the mapping is live (MADV_PAGEOUT re-reads 2 of 256 MiB;
+the control re-reads 256 of 256), hipFreeHost rejects a registered range, and the
+pin is tied to the VMA (unregister + munmap does release).  So registering the
+model mapping is a permanent pin; a releasable tier needs a private window.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 146 ++++++++++++++++++++++++-
+ 1 file changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index da0894903..6aec7ab4d 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -89,6 +89,12 @@ struct table_t {
+     // ranges in order; `n_slices == 0` means the historical single slice (`src_off`/`host_pitch`).
+     int         n_slices    = 0;
+     struct { size_t src_off; size_t len; } slice[GGML_BACKEND_MOE_MAX_SLICES];
++    // wip/host-expert-eager-push P3: the page-aligned span of THIS table's host master that was registered
++    // in place with `hipHostRegister` (null = still pageable).  Registration does not move or copy a byte:
++    // it tells the driver the pages are pinned, which makes `host` a legal DMA source with NO per-call
++    // staging.  See `push_register_locked`.
++    void *      host_reg    = nullptr;
++    size_t      host_reg_len = 0;
+     // wip/host-expert-dio-cache Phase 1: the on-disk source of this table's host master, registered by
+     // the loader (`moe_cache_set_host_source`).  Empty unless `MOE_HOST_POOL_MIB > 0`.
+     std::string src_path;
+@@ -2172,6 +2178,30 @@ static bool g_push_src_mapping = false;
+ static bool g_push_src_parsed  = false;
+ static long g_push_src_copies  = 0;   // diagnostic: how many fills took the mapping source
+ 
++// wip/host-expert-eager-push P3: `MOE_HOST_PUSH_SRC=mapping` is measured to be at parity where the fill is a
++// 1-D copy and 2-3x short where the split makes it a 2-D or a sliced copy, and the whole loss is host time
++// inside the copy call -- because the driver STAGES every pageable upload: it acquires a pinned bounce, and
++// (measured on this stack) allocates/maps/unmaps/frees GPU-visible staging per call, ~60-70 us of fixed cost
++// that a fill burst pays ONCE PER EXPERT PER DEVICE.  Halving the per-copy size therefore makes it worse, not
++// better, which is exactly the `-sm tensor` signature.
++//
++// `MOE_HOST_PUSH_REGISTER_MIB=N` registers up to N MiB of the host expert mapping IN PLACE with
++// `hipHostRegister`, so the very same bytes become a DMA source: no copy is made, no duplicate is allocated,
++// and no per-call staging happens.  That is the residency guarantee the campaign wanted from `mlock` (which
++// keeps the pages but does NOT let the driver DMA from them) without the pool's RAM duplicate.
++//   MOE_HOST_PUSH_REGISTER_MIB=N   pin up to N MiB of the host master in place (0/unset = off)
++static size_t  g_push_reg_budget = 0;      // bytes; 0 = disabled
++static size_t  g_push_reg_bytes  = 0;      // bytes actually registered
++static long    g_push_reg_tables = 0;      // tables whose master is registered
++static long    g_push_reg_refusals = 0;    // tables left pageable (budget exhausted / runtime refused)
++static bool    g_push_reg_stop   = false;  // the runtime refused once: stop trying
++static bool    g_push_reg_msg    = false;
++static double  g_push_reg_ms     = 0.0;    // wall time spent registering (one-time, at sizing)
++// Ranges already registered.  The same host tensor is registered once and then SHARED by every device's
++// table (`moe_cache_table` is called per (tensor, device)), so a second request inside a known range must
++// reuse it rather than register the same pages twice.
++static std::vector<std::pair<char *, char *>> g_push_reg_ranges;
++
+ // wip/host-expert-eager-push P2: the PINNED WORKING SET.  `mlock` the bytes of the model mapping the policy is
+ // warming, so the hot set cannot be reclaimed and a push does not become a disk read.  This is NOT a transport
+ // (the driver is not told, and the copy is still pageable): it is how the host tiers' residency policy is
+@@ -2207,6 +2237,10 @@ static bool     g_pi_on         = false;
+ static bool     g_pi_setdev     = false;   // make t.device current before the copy (A/B for the 46 % mismatch)
+ static long     g_pi_calls      = 0;
+ static long     g_pi_h2d        = 0;   // pageable/pinned HOST -> device (the mapping push and the bounce)
++static long     g_pi_1d         = 0;   // ... of which a single flat copy (split_axis != 0, or no slice)
++static long     g_pi_2d         = 0;   // ... of which a 2-D / multi-slice copy (the tensor-split geometry)
++static uint64_t g_pi_us_1d      = 0;
++static uint64_t g_pi_us_2d      = 0;
+ static long     g_pi_d2d        = 0;   // the pool's D2D from the mapped UVA alias
+ static long     g_pi_mismatch   = 0;   // cudaGetDevice() != the backend's device at the call
+ static uint64_t g_pi_us         = 0;
+@@ -2533,6 +2567,15 @@ static void push_src_parse() {
+     g_pi_on = pi != nullptr && strcmp(pi, "0") != 0;
+     const char * sd2 = getenv("MOE_HOST_PUSH_SETDEV");
+     g_pi_setdev = sd2 != nullptr && strcmp(sd2, "0") != 0;
++    const char * rg = getenv("MOE_HOST_PUSH_REGISTER_MIB");
++    if (rg != nullptr) {
++        const long mib = atol(rg);
++        g_push_reg_budget = mib > 0 ? (size_t) mib << 20 : 0;
++        if (g_push_reg_budget > 0) {
++            fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_REGISTER_MIB=%ld -- register the host expert mapping in "
++                            "place (no duplicate, no per-call staging)\n", mib);
++        }
++    }
+     if (g_pi_setdev) {
+         fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_SETDEV -- set the copying backend's device before every fill copy\n");
+     }
+@@ -2565,7 +2608,13 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         return true;
+     }
+     push_src_parse();
+-    if (g_push_src_mapping && t.host_pitch == 0 && t.n_slices == 0 && t.src_off + t.expert_bytes <= t.host_bytes) {
++    // P3: a REGISTERED master is a legal DMA source for EVERY geometry -- 1-D, strided 2-D (a tensor split's
++    // axis-0 slice) and fused multi-slice -- because the driver no longer has to stage it.  An UNREGISTERED
++    // (pageable) master stays 1-D only: that is where the campaign measured parity, and a pageable 2-D upload
++    // is the pathological case the comment above warns about.
++    const bool direct = g_push_src_mapping && t.src_off + t.expert_bytes <= t.host_bytes &&
++                        (t.host_reg != nullptr || (t.host_pitch == 0 && t.n_slices == 0));
++    if (direct) {
+         // The candidate: the mapping itself is the CE source.  No pool slot, no bounce, no host memcpy.
+         out->base = (const char *) t.host + (size_t) expert * t.host_bytes;
+         out->kind = cudaMemcpyHostToDevice;
+@@ -2724,9 +2773,19 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
+             std::chrono::steady_clock::now() - t0).count();
+     g_pi_calls++;
+     g_pi_us += us;
++    // The GEOMETRY split matters as much as the kind: a tensor split gives a 2-D (axis-0 strided) or a fused
++    // multi-slice copy, and those are different driver paths from a flat 1-D upload (probe-memcpy2d.cpp).
++    const bool geo2d = t.n_slices > 0 || (t.split_axis == 0 && t.host_pitch > 0);
+     if (src.kind == cudaMemcpyHostToDevice) {
+         g_pi_h2d++;
+         g_pi_us_h2d += us;
++        if (geo2d) {
++            g_pi_2d++;
++            g_pi_us_2d += us;
++        } else {
++            g_pi_1d++;
++            g_pi_us_1d += us;
++        }
+     } else {
+         g_pi_d2d++;
+     }
+@@ -5868,8 +5927,77 @@ bool moe_cache_has_tables() {
+     return !g_tables.empty();
+ }
+ 
++// wip/host-expert-eager-push P3: register the table's host master with the runtime, IN PLACE.
++//
++// WHY: with a pageable source the driver must stage every upload through a pinned bounce it owns, so each
++// copy is (measured) 60-70 us of fixed cost plus the transfer -- and `hipMemcpy2DAsync`/sliced copies pay it
++// per call as well.  A tensor split splits the expert across devices, so the same bytes need 2 (or 3) calls
++// of half (or a third) the size: the staging cost per byte therefore RISES with the device count, which is
++// exactly the P3 defect (`-sm tensor` 2 devices 52.5 -> 26.1 t/s while 1 device and `-sm layer` are parity).
++//
++// `hipHostRegister` over the read-only model mapping tells the runtime those pages are pinned.  It does NOT
++// copy or move them -- the page cache keeps the only copy, so the RAM the campaign wants back really is
++// freed -- it just makes the range a legal DMA source.  Measured on this stack (probe-memcpy2d.cpp):
++// a 360 KiB pageable 1-D fill is 91 us (146 us with the stream busy); the same fill from the SAME bytes,
++// registered, is 17-23 us and does not degrade under load.
++//
++// The range is page-aligned outwards because registration is a page operation: `t.host` is a tensor inside
++// the model mapping and is not guaranteed to start on a page.  Registration is per (tensor, device) table in
++// the caller, but the RANGE is process-wide: a second device's table for the same tensor finds it here and
++// reuses it.  Caller holds `g_mutex`.
++static bool push_register_locked(table_t & t) {
++    if (t.host_reg != nullptr) {
++        return true;
++    }
++    push_src_parse();   // the budget comes from the environment; parsed lazily and once
++    if (g_push_reg_budget == 0 || g_push_reg_stop || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
++        return false;
++    }
++    const size_t page = 4096;
++    char * base = (char *) ((uintptr_t) t.host & ~(uintptr_t) (page - 1));
++    char * end  = (char *) t.host + (size_t) t.n_experts * t.host_bytes;
++    end = (char *) (((uintptr_t) end + page - 1) & ~(uintptr_t) (page - 1));
++    const size_t len = (size_t) (end - base);
++    for (const auto & r : g_push_reg_ranges) {
++        if (base >= r.first && end <= r.second) {
++            t.host_reg     = base;      // already registered by another device's table for this tensor
++            t.host_reg_len = len;
++            g_push_reg_tables++;
++            return true;
++        }
++    }
++    if (g_push_reg_bytes + len > g_push_reg_budget) {
++        g_push_reg_refusals++;
++        return false;
++    }
++    {
++        device_guard dg(t.device);
++        const auto t0 = std::chrono::steady_clock::now();
++        const cudaError_t err = cudaHostRegister(base, len, cudaHostRegisterReadOnly | cudaHostRegisterPortable);
++        g_push_reg_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
++                std::chrono::steady_clock::now() - t0).count();
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_push_reg_stop = true;   // the runtime refused the mapping: stay pageable, once-message
++            g_push_reg_refusals++;
++            return false;
++        }
++    }
++    t.host_reg     = base;
++    t.host_reg_len = len;
++    g_push_reg_bytes += len;
++    g_push_reg_tables++;
++    g_push_reg_ranges.emplace_back(base, end);
++    return true;
++}
++
+ // Attach the loader-registered on-disk source (if any) to `t`.  Caller holds `g_mutex`.
+ static void attach_host_src_locked(table_t & t, const void * host) {
++    if (host != nullptr) {
++        // P3: register the master in place (no-op unless MOE_HOST_PUSH_REGISTER_MIB is set).  Done here
++        // because this is where the host pointer is first known, i.e. sizing, once per table.
++        (void) push_register_locked(t);
++    }
+     if (host == nullptr || !t.src_path.empty()) {
+         return;
+     }
+@@ -8058,6 +8186,22 @@ void moe_cache_report() {
+                       (unsigned long long) g_pi_us, g_pi_calls > 0 ? (double) g_pi_us / (double) g_pi_calls : 0.0,
+                       g_pi_h2d, (unsigned long long) g_pi_us_h2d,
+                       g_pi_h2d > 0 ? (double) g_pi_us_h2d / (double) g_pi_h2d : 0.0, g_pi_d2d, g_pi_mismatch);
++        GGML_LOG_INFO("%s: P1 probe geometry: 1-D %ld copies in %llu us (%.1f us/copy, %.1f%% of the H2D time); "
++                      "2-D/sliced %ld copies in %llu us (%.1f us/copy, %.1f%%)\n", __func__,
++                      g_pi_1d, (unsigned long long) g_pi_us_1d,
++                      g_pi_1d > 0 ? (double) g_pi_us_1d / (double) g_pi_1d : 0.0,
++                      g_pi_us_h2d > 0 ? 100.0 * (double) g_pi_us_1d / (double) g_pi_us_h2d : 0.0,
++                      g_pi_2d, (unsigned long long) g_pi_us_2d,
++                      g_pi_2d > 0 ? (double) g_pi_us_2d / (double) g_pi_2d : 0.0,
++                      g_pi_us_h2d > 0 ? 100.0 * (double) g_pi_us_2d / (double) g_pi_us_h2d : 0.0);
++    }
++    if (g_push_reg_budget > 0) {
++        GGML_LOG_INFO("%s: P1 push-src: registered %zu MiB of the host master IN PLACE in %lld tables "
++                      "(budget %zu MiB, refusals=%lld, %.0f ms at sizing); %s\n",
++                      __func__, g_push_reg_bytes >> 20, g_push_reg_tables, g_push_reg_budget >> 20,
++                      g_push_reg_refusals, g_push_reg_ms,
++                      g_push_reg_stop ? "the RUNTIME REFUSED a range -- stay pageable"
++                                      : "no duplicate, no per-call staging");
+     }
+     if (g_push_mlock_budget > 0) {
+         GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
+-- 
+2.56.0
+

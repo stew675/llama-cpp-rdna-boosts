@@ -1,28 +1,34 @@
-# wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (OPEN)
+# wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 
-> **P3 STATUS (2026-11-03): the transport WORKS, except under `-sm tensor` — an OPEN defect, not a verdict.
-> The record is [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md); the live investigation, the ranked
-> experiment list and the trap list are in [`HANDOVER.md`](HANDOVER.md).**
-> [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md).  Rebased onto **r209** as branch
-> `p2-eager-push-r209` (4/4, no conflicts; 389 insertions, one file).  **Correctness GREEN** on 1, 2 and 3
-> devices: `mapping` and the pool produce **byte-identical** greedy text over a forced 500-token generation
-> (up to **65 260** direct pageable fills), identical access census, `check-gpu-faults` clean — the 1-D
-> tearing claim is refuted a third time, now multi-device (ROCm 10.1; 7.14 still owed).  **Decode is at
-> parity** on 1 device (**55.1 vs 53.6 t/s**) and on a 3-device **`-sm layer`** split (**55.6 vs 53.7**):
-> pushing straight from the reclaimable page cache costs nothing where fills are issued one device at a time.
-> It **degrades only under `-sm tensor`** — the config that issues several devices' fills inside one op —
-> 2 devices **52.5 -> 26.1**, 3 devices **20.6 -> 16.3**.  The marginal per-fill cost over a pool fill goes
-> **28 µs (1 dev) -> 205 (2 dev) -> 302 (3 dev tensor) -> 41 (3 dev layer)** while the host burns ~1
-> core-second of CPU per token, so the GPUs are starved throughout.  The driver's pageable staging is real
-> but **~20x too small** to explain it (`probe-pageable-multi.cpp`); the candidate causes and the test for
-> each are the results doc §3, and **making the tensor split behave like the layer split is the campaign's
-> next engineering task, not a verdict on the mechanism**.  Two tooling defects found and fixed: the gate
-> hashed a `-lv 4` log and the campaign's own stderr diagnostics could land *inside* the generation, so
-> `p2-gate-3gpu.sh` now separates stdout/stderr and the "one message" diagnostics are once per process.
-> With that the gate **PASSES on `-sm layer`** (`released=40 release_denied=528` over 60 357 boundaries)
-> and **FAILS as inert on a tensor split** (3 boundaries): under `-sm tensor` the whole graph is one Meta
-> split, so the routing ids are computed inside it and `moe_cache_update_host` — where P2 puts its per-device
-> boundary — never runs.  P2's eagerness therefore needs a boundary source that exists there.
+> **P4 STATUS (2026-11-04): the `-sm tensor` defect is DIAGNOSED and a fix is MEASURED — the record is
+> [`P4-ROOT-CAUSE.md`](P4-ROOT-CAUSE.md).**  The loss is the driver's **pageable staging, a per-CALL cost**:
+> in situ at 2 devices the mapping arm spends **12.82 s of a 27.7 s run** inside **90 636 1-D pageable fill
+> copies at 141 µs/copy (99.8 % of the H2D time)**, while the same arm's 2-D/sliced fills — served from the
+> pinned bounce ring — are **1.3 µs/copy**.  A tensor split halves the per-copy size and doubles the call
+> count, so the fixed staging cost is paid twice per byte; that is the whole defect, and it is why 1 device
+> and `-sm layer` were at parity.  **The fix is `hipHostRegister` over the read-only model mapping, in
+> place** (`patches/0007`, `MOE_HOST_PUSH_REGISTER_MIB=N`): no copy, no duplicate, native transfer for every
+> geometry — **0.3-0.5 µs/copy**, and 2 devices go from **21.5 to 71.6 t/s** against the pool's **51.5**
+> (byte-identical text `sha=231512fc77e5`); 1 GPU 53.5 vs 49.0, 3 GPU `-sm layer` 54.3 vs 50.5, 3 GPU tensor
+> 20.5 vs 19.4 (that arm is `TODO` #135's degraded config).  Two measured caveats decide the shape: the pin
+> is **not releasable** — `hipHostUnregister` leaves the pages pinned while the mapping lives (`hipFreeHost`
+> rejects a registered range; `unregister + munmap` *does* release), so the in-place form is a **permanent**
+> pin usable as an all-or-nothing fit-in-RAM mode, and the **releasable** tier is a private registered
+> **window** over the same page-cache pages.  Also recorded: the destination (plain `hipMalloc` vs a
+> VMM/slab slot) is **irrelevant** (HANDOVER experiment 1 closed negative), and on this stack a pageable
+> **1-D** copy is 2-3x *slower* than a pageable 2-D copy of the same bytes (the opposite of the earlier
+> single-GPU observation; the transferable conclusion is "stop it being pageable", not "reshape the copy").
+
+> **P3 STATUS (2026-11-03): the transport WORKS, except under `-sm tensor` — now diagnosed in P4.**  The
+> pre-diagnosis record is [`P3-MULTIGPU-RESULTS.md`](P3-MULTIGPU-RESULTS.md); the ruling-out list and the
+> trap list are in [`HANDOVER.md`](HANDOVER.md).  Summary: **correctness GREEN** on 1, 2 and 3 devices
+> (`mapping` and the pool produce byte-identical greedy text over a forced 500-token generation, up to
+> **65 260** direct pageable fills, identical access census, `check-gpu-faults` clean — the 1-D tearing
+> claim refuted a third time, now multi-device; 7.14 still owed); decode at **parity** on 1 device
+> (55.1 vs 53.6 t/s) and on a 3-device **`-sm layer`** split (55.6 vs 53.7), and the 2-device tensor split
+> **52.5 -> 26.1** — which P4 attributes to the pageable staging per call, not to the split.  Also from P3,
+> still true: the **device-set gate is INERT on a tensor split** (3 boundaries vs 60 357 on `-sm layer`),
+> so P2's eagerness needs a boundary source that exists there.
 
 > **P1 STATUS (2026-11-03): correctness GREEN on ROCm 10.1, performance leg confounded — see
 > [`P1-RESULTS.md`](P1-RESULTS.md).**  `patches/0001` adds `MOE_HOST_PUSH_SRC=mapping` (default off): on
