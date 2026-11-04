@@ -176,7 +176,12 @@ Which splits the design cleanly in two:
 | shape | RAM | release | verdict |
 |---|---|---|---|
 | register the **model mapping in place** (`MOE_HOST_PUSH_REGISTER_MIB`, as measured in §3) | the page-cache pages, pinned, **no duplicate** | **none** — permanent for the process | usable as an **all-or-nothing** fit-in-RAM mode; 18.6 GiB pinned against the pool's 9.3 GiB *duplicate* on the same run, and +39 % throughput.  Not usable where the set does not fit |
-| a **private, separately-mapped registered WINDOW** over the model file (`mmap` the range again, register it, DMA from it, then `unregister + munmap` to release) | the same page-cache pages, pinned while the window is open | **`unregister + munmap`** | **this is the releasable tier the campaign wanted** — no duplicate, native speed, bounded and rotatable.  Needs (i) the existing P2 epoch gate for safe release while fills are in flight, (ii) a rotation cadence that respects the ~19 GB/s registration cost (256 MiB ≈ 14 ms), (iii) a guard gap between windows (adjacent registrations returned `part or all of the requested memory range is already mapped`) |
+| a **private, separately-mapped registered WINDOW** over the model file (`mmap` the range again, register it, DMA from it, then `unregister + munmap` to release) | the same page-cache pages, pinned while the window is open | **`unregister + munmap`** — proven droppable, 40/40 cycles, §5a | **this is the releasable tier the campaign wanted** — no duplicate, native speed, bounded and rotatable.  Needs (i) the existing P2 epoch gate for safe release while fills are in flight, (ii) **coarse** windows (register is 0.6 ms/64 MiB ≈ 104 GiB/s, so a 256 MiB-2 GiB file range that covers many tables, rotated infrequently — a per-expert window would cost about as much as the fill it serves), (iii) a guard gap between windows (adjacent registrations returned `part or all of the requested memory range is already mapped`) |
+
+**Guard in the tree** (`patches/0007`): because the in-place mode cannot release, it refuses to register past
+**half of `MemAvailable`** measured at the first registration, and says so once on stderr and in the census
+line.  Verified: a 20 GiB budget registers the full 18 662 MiB and keeps 71.7 t/s with `sha=231512fc77e5`, and
+a deliberately oversized budget (60 GiB) stops at the cap instead of pinning the box into swap.
 
 `mlock` is **not** a substitute: it keeps the pages but does not make them a DMA source, which is why the P2
 `mlock` tier was transport-neutral (measured in P3 §3b) — the campaign's residency idea was right, it just

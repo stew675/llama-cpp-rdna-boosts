@@ -1,4 +1,4 @@
-From 3d81ca9fca3aea234dcd0a360d2c6b41b189b89b Mon Sep 17 00:00:00 2001
+From 599ff619352f168f38b8e098bc735879a1a1b30d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 18:16:28 -0600
 Subject: [PATCH] wip/p3-registered-host-src: register the host expert mapping
@@ -25,11 +25,11 @@ the control re-reads 256 of 256), hipFreeHost rejects a registered range, and th
 pin is tied to the VMA (unregister + munmap does release).  So registering the
 model mapping is a permanent pin; a releasable tier needs a private window.
 ---
- ggml/src/ggml-cuda/moe-expert-cache.cu | 146 ++++++++++++++++++++++++-
- 1 file changed, 145 insertions(+), 1 deletion(-)
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 181 ++++++++++++++++++++++++-
+ 1 file changed, 180 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index da0894903..6aec7ab4d 100644
+index da0894903..eca9ca30c 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -89,6 +89,12 @@ struct table_t {
@@ -45,7 +45,7 @@ index da0894903..6aec7ab4d 100644
      // wip/host-expert-dio-cache Phase 1: the on-disk source of this table's host master, registered by
      // the loader (`moe_cache_set_host_source`).  Empty unless `MOE_HOST_POOL_MIB > 0`.
      std::string src_path;
-@@ -2172,6 +2178,30 @@ static bool g_push_src_mapping = false;
+@@ -2172,6 +2178,31 @@ static bool g_push_src_mapping = false;
  static bool g_push_src_parsed  = false;
  static long g_push_src_copies  = 0;   // diagnostic: how many fills took the mapping source
  
@@ -62,6 +62,7 @@ index da0894903..6aec7ab4d 100644
 +// keeps the pages but does NOT let the driver DMA from them) without the pool's RAM duplicate.
 +//   MOE_HOST_PUSH_REGISTER_MIB=N   pin up to N MiB of the host master in place (0/unset = off)
 +static size_t  g_push_reg_budget = 0;      // bytes; 0 = disabled
++static size_t  g_push_reg_avail  = 0;      // MemAvailable at the first registration (the fit-in-RAM bound)
 +static size_t  g_push_reg_bytes  = 0;      // bytes actually registered
 +static long    g_push_reg_tables = 0;      // tables whose master is registered
 +static long    g_push_reg_refusals = 0;    // tables left pageable (budget exhausted / runtime refused)
@@ -76,7 +77,7 @@ index da0894903..6aec7ab4d 100644
  // wip/host-expert-eager-push P2: the PINNED WORKING SET.  `mlock` the bytes of the model mapping the policy is
  // warming, so the hot set cannot be reclaimed and a push does not become a disk read.  This is NOT a transport
  // (the driver is not told, and the copy is still pageable): it is how the host tiers' residency policy is
-@@ -2207,6 +2237,10 @@ static bool     g_pi_on         = false;
+@@ -2207,6 +2238,10 @@ static bool     g_pi_on         = false;
  static bool     g_pi_setdev     = false;   // make t.device current before the copy (A/B for the 46 % mismatch)
  static long     g_pi_calls      = 0;
  static long     g_pi_h2d        = 0;   // pageable/pinned HOST -> device (the mapping push and the bounce)
@@ -87,7 +88,7 @@ index da0894903..6aec7ab4d 100644
  static long     g_pi_d2d        = 0;   // the pool's D2D from the mapped UVA alias
  static long     g_pi_mismatch   = 0;   // cudaGetDevice() != the backend's device at the call
  static uint64_t g_pi_us         = 0;
-@@ -2533,6 +2567,15 @@ static void push_src_parse() {
+@@ -2533,6 +2568,16 @@ static void push_src_parse() {
      g_pi_on = pi != nullptr && strcmp(pi, "0") != 0;
      const char * sd2 = getenv("MOE_HOST_PUSH_SETDEV");
      g_pi_setdev = sd2 != nullptr && strcmp(sd2, "0") != 0;
@@ -97,13 +98,14 @@ index da0894903..6aec7ab4d 100644
 +        g_push_reg_budget = mib > 0 ? (size_t) mib << 20 : 0;
 +        if (g_push_reg_budget > 0) {
 +            fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_REGISTER_MIB=%ld -- register the host expert mapping in "
-+                            "place (no duplicate, no per-call staging)\n", mib);
++                            "place (no duplicate, no per-call staging).  FIT-IN-RAM ONLY: the pin is NOT "
++                            "releasable while the mapping lives (P4-ROOT-CAUSE.md 5a)\n", mib);
 +        }
 +    }
      if (g_pi_setdev) {
          fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_SETDEV -- set the copying backend's device before every fill copy\n");
      }
-@@ -2565,7 +2608,13 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+@@ -2565,7 +2610,13 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
          return true;
      }
      push_src_parse();
@@ -118,7 +120,7 @@ index da0894903..6aec7ab4d 100644
          // The candidate: the mapping itself is the CE source.  No pool slot, no bounce, no host memcpy.
          out->base = (const char *) t.host + (size_t) expert * t.host_bytes;
          out->kind = cudaMemcpyHostToDevice;
-@@ -2724,9 +2773,19 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
+@@ -2724,9 +2775,19 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
              std::chrono::steady_clock::now() - t0).count();
      g_pi_calls++;
      g_pi_us += us;
@@ -138,7 +140,7 @@ index da0894903..6aec7ab4d 100644
      } else {
          g_pi_d2d++;
      }
-@@ -5868,8 +5927,77 @@ bool moe_cache_has_tables() {
+@@ -5868,8 +5929,109 @@ bool moe_cache_has_tables() {
      return !g_tables.empty();
  }
  
@@ -185,6 +187,38 @@ index da0894903..6aec7ab4d 100644
 +        g_push_reg_refusals++;
 +        return false;
 +    }
++    // SAFETY (P4-ROOT-CAUSE.md 5a): a registered range CANNOT be released while the mapping lives --
++    // `hipHostUnregister` returns success and the pages stay pinned, `hipFreeHost` rejects a registered
++    // range.  Only `unregister + munmap` gives them back, which an in-place registration of the model
++    // mapping can never do.  So this mode is FIT-IN-RAM ONLY, and it refuses to pin past a hard fraction of
++    // what the box actually has, so a set that does not fit cannot turn the page cache into swapped-out
++    // memory.  (The releasable shape is a private registered WINDOW, see the same section.)
++    if (g_push_reg_avail == 0) {
++        FILE * mi = fopen("/proc/meminfo", "r");
++        if (mi != nullptr) {
++            char line[256];
++            while (fgets(line, sizeof(line), mi) != nullptr) {
++                if (strncmp(line, "MemAvailable:", 13) == 0) {
++                    g_push_reg_avail = (size_t) atoll(line + 13) << 10;
++                    break;
++                }
++            }
++            fclose(mi);
++        }
++    }
++    const size_t cap = g_push_reg_avail / 2;
++    if (cap > 0 && g_push_reg_bytes + len > cap) {
++        if (!g_push_reg_msg) {
++            g_push_reg_msg = true;
++            fprintf(stderr, "P1-PUSH: MOE_HOST_PUSH_REGISTER_MIB stops at %zu MiB: a registered range cannot be "
++                            "released while its mapping lives (P4-ROOT-CAUSE.md 5a), so the in-place mode refuses "
++                            "to pin more than half of MemAvailable (%zu MiB).  Fit-in-RAM only -- for a set that "
++                            "does not fit, the releasable shape is a private registered WINDOW.\n",
++                    g_push_reg_bytes >> 20, g_push_reg_avail >> 20);
++        }
++        g_push_reg_refusals++;
++        return false;
++    }
 +    {
 +        device_guard dg(t.device);
 +        const auto t0 = std::chrono::steady_clock::now();
@@ -216,7 +250,7 @@ index da0894903..6aec7ab4d 100644
      if (host == nullptr || !t.src_path.empty()) {
          return;
      }
-@@ -8058,6 +8186,22 @@ void moe_cache_report() {
+@@ -8058,6 +8220,23 @@ void moe_cache_report() {
                        (unsigned long long) g_pi_us, g_pi_calls > 0 ? (double) g_pi_us / (double) g_pi_calls : 0.0,
                        g_pi_h2d, (unsigned long long) g_pi_us_h2d,
                        g_pi_h2d > 0 ? (double) g_pi_us_h2d / (double) g_pi_h2d : 0.0, g_pi_d2d, g_pi_mismatch);
@@ -235,7 +269,8 @@ index da0894903..6aec7ab4d 100644
 +                      __func__, g_push_reg_bytes >> 20, g_push_reg_tables, g_push_reg_budget >> 20,
 +                      g_push_reg_refusals, g_push_reg_ms,
 +                      g_push_reg_stop ? "the RUNTIME REFUSED a range -- stay pageable"
-+                                      : "no duplicate, no per-call staging");
++                                      : "no duplicate, no per-call staging; FIT-IN-RAM ONLY (the pin is not "
++                                        "releasable while the mapping lives)");
      }
      if (g_push_mlock_budget > 0) {
          GGML_LOG_INFO("%s: P1 push-src: pinned working set %zu MiB in %lld experts (budget %zu MiB, "
