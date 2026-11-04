@@ -11,6 +11,12 @@
 > [`P6-POOL-REGION.md`](P6-POOL-REGION.md) (§8 complement vs mirror, §9 the dropped read-ahead, §10 the surplus
 > rule) -> `WORKLOG.md` 261104.001 (r210: the fold) and 261104.002 (r211: the guard fix, the fold repair, every
 > gate).  `INVARIANTS.md` r210/r211 is the "do not re-derive" list.  Open follow-ons: `TODO` #141, #142.
+> **This campaign subsumed and obsoleted two `wip/` campaigns, both retired on 2026-11-04:**
+> [`archive/work/host-pool-speed/`](../host-pool-speed/RESOLUTION.md) (the `--host-experts pool` mode's own
+> speed campaign, whose remaining tier question `-lme` answers, and whose `push` transport is the one dropped
+> here — so its `TODO` #137/#138 were retired with it) and
+> [`archive/work/no-xnack-and-avalon/`](../no-xnack-and-avalon/RESOLUTION.md) (the no-XNACK analysis, whose
+> answer this tier embodies).
 
 # wip/host-expert-eager-push — never device-pull: the host pushes, eagerly (ROOT CAUSE FOUND)
 

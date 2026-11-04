@@ -1,4 +1,9 @@
-# wip/host-pool-speed — make `--host-experts pool` faster, simpler and automatic (OPEN)
+# host-pool-speed — make `--host-experts pool` faster, simpler and automatic
+
+> **RETIRED AND ARCHIVED (2026-11-04).**  Promoted in r207 and then superseded by
+> [`archive/work/host-expert-eager-push/`](../host-expert-eager-push/README.md), which replaced the host-expert
+> tier policy this campaign was tuning.  Read [`RESOLUTION.md`](RESOLUTION.md) first: it says what shipped,
+> what was obsoleted (the `push` transports and the `TODO` items that existed for them) and what stayed open.
 
 **Seeded 2026-11-02 at the maintainer's call.  Nothing here is implemented, and nothing here is in
 `patches/` or gets applied to the fork** (`AGENTS.md`, WIP rules: a campaign is a handover, and promotion is a

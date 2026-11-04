@@ -2278,6 +2278,6 @@ comparable to an exact engine's — which is why both strictures in the rule abo
 comparison is its switch **off** with both sides on the same accounting.
 
 **Record.**  This entry.  Source analyses: `archive/work/moe-cache-coverage/FINDINGS-2026-10-17-coverage-vs-defrag.md`
-(row 3, the numbers above — do not re-derive them) and `wip/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
+(row 3, the numbers above — do not re-derive them) and `archive/work/no-xnack-and-avalon/README.md` (`~/Avalon`, commits to
 `c24c03d84`); the no-XNACK constraint that makes such engines reach for it is `INVARIANTS.md`
 (device-visible host memory must be resident).

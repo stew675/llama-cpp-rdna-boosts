@@ -1,5 +1,9 @@
 # The no-XNACK constraint, and what Avalon does instead
 
+> **RETIRED AND ARCHIVED (2026-11-04).**  An analysis note (no code, no campaign).  Its question is answered,
+> its recommended techniques are shipped or superseded by the r210/r211 host-expert tier, and the mode it was
+> written against never shipped.  Read [`RESOLUTION.md`](RESOLUTION.md) first.
+
 **Status (2026-11-02): analysis note, no code, no campaign.**  Opened after the `--host-experts window` prefill
 campaign hit a fatal GPU page fault on a model larger than RAM (`WORKLOG.md` 261102.012/.013), to answer one
 question against a working implementation: *can host-expert reads be done at speed on a GPU with no XNACK?*

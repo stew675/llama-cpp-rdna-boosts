@@ -40,7 +40,7 @@ GPU (a kernel read of a reclaimable registered page is a fatal fault, and holdin
 disappears).  It is archived with a resolution at
 [`../archive/work/host-experts-window-beta/`](../archive/work/host-experts-window-beta/README.md) and
 [`../archive/work/host-expert-pinned-window/RESOLUTION.md`](../archive/work/host-expert-pinned-window/RESOLUTION.md);
-the two mechanisms worth keeping moved to [`../wip/host-pool-speed/`](../wip/host-pool-speed/HANDOVER-2026-11-02.md).
+the two mechanisms worth keeping moved to [`../archive/work/host-pool-speed/`](../archive/work/host-pool-speed/HANDOVER-2026-11-02.md) (the campaign has since retired there).
 
 (Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 

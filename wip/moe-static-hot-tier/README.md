@@ -76,7 +76,7 @@ workload — top ~5-10 % of pairs, ~35-49 % of the mass) and let the arena own t
 | frozen flag per slot, excluded from victim selection and from LRU | `access_locked` (victim choice), `pool`/`arena` slot state, `moe_cache_rearm` |
 | allocate frozen slots outside the movable boundary | `alloc_table_locked` / the movable-boundary slab (`ggml_cuda_slab_*`, `moe_cache_evict_slab_range`) |
 | seed the frozen set from the prior, once | `apply_heat_seed_locked` (already ranks by the sidecar) |
-| per-table `K` by concentration | the cov90 sizing helper being built by `wip/host-pool-speed` (§P1) |
+| per-table `K` by concentration | the cov90 sizing helper that `archive/work/host-pool-speed/` built (§P1, promoted in r207) |
 | keep the identity/cold encoding honest | `prs` (staging) and the DEVREMAP cold band — a frozen set that is *contiguous from id 0* is what would let a partially resident table approach the `identity` band |
 
 ## 5. Measurement protocol (this is the campaign's real deliverable)
@@ -132,7 +132,7 @@ evidence for this feature.
 
 ## 8. Relationship to the other work
 
-* **`wip/host-pool-speed/`** owns the *host* tier (bounded pinned pool) and the cov90 sizing this campaign
+* **`archive/work/host-pool-speed/`** (retired) owns the *host* tier (bounded pinned pool) and the cov90 sizing this campaign
   would consume.  The two are orthogonal: this one decides what lives in VRAM, that one decides what lives in
   RAM and how it gets there.
 * **`archive/work/host-expert-pinned-window/`** (closed) contributes two things that are irrelevant *here* except

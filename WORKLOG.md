@@ -1,3 +1,51 @@
+## 261104.005 (docs) -- TODO/`wip/` audit: two campaigns retired, four items closed, and the entries that outlived their campaigns repointed
+
+**No delivery change** (`patches/`, `release.json` and the fork are untouched; the release stays
+`v16-6050b467c-r213`).  Housekeeping on the forward-looking docs, prompted by `TODO.md` carrying items whose campaigns
+had already finished.
+
+**Retired campaigns (both moved out of `wip/`, no stub left).**
+[`archive/work/host-pool-speed/`](archive/work/host-pool-speed/RESOLUTION.md) — its results shipped in r207 (block 12)
+and its remaining tier question was answered by its own successor, so
+[`archive/work/host-expert-eager-push/`](archive/work/host-expert-eager-push/README.md) (r210/r211) **subsumed and
+obsoleted** it; the tier is now a budget (`-lme`) over one mechanism, which is exactly what that campaign was still
+tuning.  [`archive/work/no-xnack-and-avalon/`](archive/work/no-xnack-and-avalon/RESOLUTION.md) — an analysis note, never
+in the `wip/` index: its question ("can host-expert reads be done at speed with no XNACK?") is answered, its
+recommended techniques are shipped (registered-mapping alias fill), already had (slab lend) or refuted (host-side
+read-ahead, built and measured as a loss — `TODO` #140), and the mode it was written against (`--host-experts window`)
+never shipped.  Both archived directories now carry a `RESOLUTION.md` and a RETIRED banner; `wip/CAMPAIGNS.md` lost
+their rows and gained the dated narrative.
+
+**`TODO` items retired with them (the handle stays permanent, the row does not).**  **#137** (make the pageable push
+work under `-sm tensor`) and **#138** (bound the bounce ring so it can be a `push` transport) — the `push` transport is
+**not in the delivery**; it was measured and dropped from the shipped design, so both describe code that does not exist.
+**#139** (a partial `-lme` budget wants a per-expert region) — closed by r211: the expert-indexed region *is* the
+bounded pool and it reads in place on a multi-device split.  **#140** (a bounded pool could spill / read-ahead instead
+of dropping) — built and measured as a **loss in both bands** (page cache FRAC 50: 56.4 -> 52.8 t/s; `O_DIRECT` FRAC
+50: 15.9 -> 15.1, prefill 24.1 -> 16.3), so its two sections left `TODO.md`.
+
+**Kept, with their records repointed at the archive** (they describe the **shipped** modes — `--host-experts pool` /
+`pinned` / `GGML_SCHED_DEVGATHER` all still ship, so they are not defunct): **#131** (re-stated: the ≥3-device pool
+prefill collapse is **fixed in r207**; the open half is the staging path's unidentified root cause, now reachable only
+through `GGML_SCHED_DEVGATHER=0`), **#132** (the pool's synchronous demand read on a split), **#133** (an identity
+table is re-copied out of the arena per prefill ubatch in the default mode — a delivery perf defect with no campaign
+dependency), **#136** (`GGML_SCHED_DEVGATHER`'s prefill-band default).  **#135** is kept but honestly re-stated: it was
+measured on r209 and the tier it measured was replaced by r210/r211, and the attribution plan it named died with
+`push`, so its status is now "unverified on the current tree, re-open with one 1-vs-2-vs-3-device arm".
+
+**Also fixed in the audit.**  `TODO` **#269** was an orphan section with no table row (the file's one item you could
+not see in the index) — it now has its row, and its stray bold run is repaired.  The header's handle note claimed the
+sequence ran to `#130` and that new items continue from `#131`; it now records that `#131`-`#143` are allocated and new
+items continue from **`#144`**, and the "current state" line named r206 (now r213).  One accepted-limitations bullet
+cited `TODO` **#131** for a **different** finding (`MOE_HOST_POOL_COLD`'s single-visible-device limit, r203) — the same
+id was reused; the bullet now says it has no id, since `#131` is the pool-prefill collapse.
+
+**Deliberately not touched.**  The accepted-limitations list stays whole (its job is to stop re-investigation, so a
+"closed, accepted" bullet belongs there); `WORKLOG.md`/`benchmarks/` keep the `wip/` paths that were correct when they
+were written (`AGENTS.md`: a `wip/` path in a dated record is a historical location); and the two `wip/` campaigns that
+are genuinely open or parked (`kv-residency-cleanup/`, `moe-static-hot-tier/`, `fp8-support/`, `vram-resident-slots/`)
+plus the deliberately-retained `moe-cpu-overlap/` are unchanged.
+
 ## 261104.004 (r213) -- block 15 amended: the attendance pool works on a multi-device `-sm layer` split
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 15 AMENDED), release `v16-6050b467c-r213`, tip `9a793f724`,

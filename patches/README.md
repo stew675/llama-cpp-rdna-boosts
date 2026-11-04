@@ -3093,9 +3093,9 @@ a hook is CUDA-only (the non-CUDA entries stay NULL and the feature is simply in
 
 ### r207 (2026-11-03) -- the host-pool-speed campaign folded in
 
-`wip/host-pool-speed/` was promoted here rather than as a new block (it is this block's pool code).
+`archive/work/host-pool-speed/` was promoted here rather than as a new block (it is this block's pool code), and the campaign then retired there once its successor obsoleted the rest.
 Everything below is `--host-experts pool` only; the default `pinned` mode is byte-for-byte unchanged.  The measured
-record is `wip/host-pool-speed/README.md` §18 and `WORKLOG.md` 261103.009-012.
+record is `archive/work/host-pool-speed/README.md` §18 and `WORKLOG.md` 261103.009-012.
 
 * **A POOL-backed table is served by the device gather in the prefill band by default.**  Its whole-table staging
   is the slow path at every width (the source is the pageable model mapping plus the pool's host alias, degrading

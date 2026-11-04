@@ -17,14 +17,15 @@ were never used.  They are **`#120`-`#126`** now (plus `#127` for the `cpy_2d_ve
 is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old handles; they mean these rows.
 The old numbers are **retired** — do not reuse them.
 
-> **Handle numbering (corrected 2026-11-03):** the real sequence runs to **#130** (closed, issue #263), so this
-> file's `#268`/`#269` — allocated by the 2026-11-02 session — are themselves out of sequence, the same failure the
-> 2026-10-31 renumbering note below describes.  New items continue from **#131**.  Renumbering `#268`/`#269` would
-> also touch `WORKLOG.md` 261102.* and the campaign records that cite them, so it is left as a decision for the
-> maintainer rather than done here.
+> **Handle numbering (corrected 2026-11-03, sequence re-checked 2026-11-04):** the real sequence runs to **#130**
+> (closed, issue #263), so this file's `#268`/`#269` — allocated by the 2026-11-02 session — are themselves out of
+> sequence, the same failure the 2026-10-31 renumbering note below describes.  **#131`-`#143 are allocated** (the
+> 2026-11-03/04 items), so **new items continue from `#144`**.  Renumbering `#268`/`#269` would also touch
+> `WORKLOG.md` 261102.* and the campaign records that cite them, so it is left as a decision for the maintainer
+> rather than done here.
 
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v16-6050b467c-r206`** (read `.release` in `release.json` -- it is the
+(the 2026-10-25 re-base), release **`v16-6050b467c-r213`** (read `.release` in `release.json` -- it is the
 source of truth, not this line).  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
@@ -33,19 +34,15 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 |---|---|---|---|
 | **143** | A 2-device `-sm layer` Flash-Next at `-c 204800` faults the GPU during prefill (`HSA_STATUS_ERROR_MEMORY_FAULT` in `rms_norm_f32` on the second device, `gfxhub page fault` in the journal), right after `moe_cache_evict_slab_range` discards 5.4-5.8 GiB of arena tables; `-c 131072` on 2 devices and `-c 204800` on 1 device are clean, and it **reproduces with `LLAMA_KV_REGION_POOL=0`** so the attendance pool is not the cause | correctness / VRAM (delivery, pre-existing) | **OPEN** (2026-11-04, found while fixing the pool's multi-device arm, `WORKLOG.md` 261104.004, `INVARIANTS.md` r213 §4; gfx1201 x3, Flash-Next GSQ-IQ3_S `-ncmoe 48`, q8_0 KV, `--load-mode mmap`, `GGML_CUDA_SLAB_HEADROOM_MIB=1536`, 4k-token prompt).  The reported user arm is `HIP_VISIBLE_DEVICES=0,2`; the arena-table eviction (block 12's `moe_cache_evict_slab_range`) is the last thing logged before the fault, and the faulting kernel is a normalization over the residual stream -- so the first question is whether an evicted-but-still-referenced arena chunk (or the host-resident `per_layer_token_embd` read on the second device) is the source.  Needs the same arm with the arena pinned larger (`GGML_CUDA_SLAB_HEADROOM_MIB`, `-ncmoe` sweep) to separate pressure from a use-after-evict; `check-gpu-faults.sh --log` is the oracle |
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM (campaign `wip/fp8-support/`) | performance / new type | **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116 |
-| **131** | `--host-experts pool` prefill collapsed under a >=3-device `-sm tensor` split (block 12's staging path; root cause still unidentified) | performance (delivery defect) | **FIXED BY DEFAULT in `patches/0006`** (pool tables gather in the prefill band: 1502-1569 vs `pinned` 471.8 prefill, decode -0.7 %; the kill switch reproduces 16.9 t/s).  **Open:** the staging path's own cost, and the promotion.  See §131 |
-| **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`wip/host-pool-speed` §16.3) | performance | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.4).  See §271 |
-| **133** | A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch — 3-GPU `pinned` prefill is *slower* than 1-GPU (471-607 vs 755.5 t/s) at 100 % arena residency | performance (delivery defect, default mode) | **OPEN** (2026-11-03, `wip/host-pool-speed` §18.2).  See §133 |
+| **131** | `--host-experts pool` prefill collapsed under a >=3-device `-sm tensor` split (block 12's staging path; root cause still unidentified) | performance (delivery defect) | **FIXED in r207** (pool tables gather in the prefill band, block 12: 1502-1569 vs `pinned` 471.8 prefill at 3 devices, decode -0.7 %; `GGML_SCHED_DEVGATHER=0` reproduces 16.9 t/s).  **Still OPEN:** the staging path's own cost, and the promotion.  See §131 |
+| **132** | The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`archive/work/host-pool-speed/README.md` §16.3) | performance | **OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.4).  See §132 |
+| **133** | A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch — 3-GPU `pinned` prefill is *slower* than 1-GPU (471-607 vs 755.5 t/s) at 100 % arena residency | performance (delivery defect, default mode) | **OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.2).  See §133 |
 | **134** | Re-base the delivery onto upstream `6b9c0cfcb` (207 commits; block 00 conflicts; two overlapping upstream commits to review) | provenance / maintenance | **OPEN — its own release** (2026-11-03, `WORKLOG` 261103.003).  See §134 |
-| **135** | A 3-device `-sm tensor` split with host-resident experts (`-ncmoe`) runs at ~20 t/s while 1 GPU gives ~55 and 2 GPUs ~52 — the third device *halves* throughput, identically for `--host-experts pool` and `pinned`, while all-VRAM on the same 3 devices gives 138 t/s | performance (delivery, pre-existing) | **OPEN** (2026-11-03, `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §7; measured on r209, gfx1201 x3, 35B-A3B Q4_K_M `-ncmoe 40`).  Consequence: the 3-device tensor arm is **not** a scaling point for host-resident experts and it caps every host-expert campaign's "more devices" arm.  Needs the same attribution as #137 (host CPU per token is ~2.7x the `-sm layer` figure) |
-| **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement | performance (delivery defect, default-on) | **OPEN** (2026-11-03, `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §4).  Needs a wider sweep (model x FRAC x ubatch) before touching the default — and note the same switch must be `0` for any prefill A/B of the expert fill path, because the gather serves the routed table itself |
-| **137** | Make the pageable push work under `-sm tensor` (parity at 1 device and on `-sm layer`, 2.0x loss at 2 devices) — the cost is in the fill path, not the driver | performance (campaign, `wip/host-expert-eager-push`) | **OPEN** (2026-11-03, `P3-MULTIGPU-RESULTS.md` §3a).  **Attributed**: the loss is host time *inside* the copy call — 44/107/191 µs per H2D fill at 1/2/3 devices against 1.4 µs to queue a pinned one (15.2 s of a 34.3 s 2-device run is blocked in `cudaMemcpyAsync`); the staging is a synchronous host memcpy and its resource is **per thread** (`probe-pageable-threads.cpp`: 2 devices 11.8 GB/s one thread vs 20.6 one thread per device).  **Eliminated**: the device-context candidate (`MOE_HOST_PUSH_SETDEV=1` changes nothing, 26.1 -> 26.0).  **Settled**: per-device upload threads **work** (115 808 fills, 0 stalls) and are **performance-neutral** (27.5 vs 28.2 t/s) -- the earlier "deadlock" was MY teardown bug (a static array of condvars destroyed while the workers waited on them; heap-allocate and never destroy).  So the thread/staging-contention theory is out; the remaining gap to the probe (21-30 us/fill vs ~107) is unexplained by thread, stream or source, and the one difference left is the **destination** (plain `hipMalloc` in the probe vs an arena/VMM slot in the path) -- test that next.  **NEXT SESSION: work `wip/host-expert-eager-push/HANDOVER.md`** — it has the measured state, what is ruled out, the ranked experiment list with commands, and the trap list.  Prime untested candidate: the copy **DESTINATION** (plain hipMalloc in the probes vs an arena/VMM slot in the path).  Then the copy-size sweep, then coalescing, then the not-fitting band |
-| **138** | Bound the per-table **bounce ring** so it can be a `push` transport: it is deliberately uncapped today and holds **2.2-3.0 GiB** of pinned bounce on the 122B prefill miss path; the maintainer's bar for `push` is **under 2 GiB at parity** | performance / memory (delivery, shared with `wip/host-pool-speed` §16) | **OPEN** (2026-11-03, `wip/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §3a).  Capping alone costs 8-25 % of prefill at FRAC 80 (measured in that campaign), so the cap has to come **with coalescing** (fewer, larger fills).  Needed only if `push` reuses the bounce as its transport; the direct pageable transport needs no pinned bytes at all but is not yet at parity under a tensor split (see #137) |
-| **140** | The pool is the arena's *complement*, so an expert that enters VRAM loses its pool copy; every later re-admission of it re-stages from the page cache (`memcpy`) or, if no slot is free, through the bounce ring. Full-coverage pools are now a MIRROR (patch `0012`); a **bounded** pool could instead **spill the arena victim into a free pool slot** (2 copies per eviction, async D2H) and keep `{VRAM ∪ pool}` closed | performance / memory (campaign, `wip/host-expert-eager-push`) | **OPEN — candidate, not attempted** (2026-11-04, `P6-POOL-REGION.md` §9).  Bounce fills measured at 2 devices, `-n 300`: full coverage 20 116 of 54 410 (now 0 after the mirror), FRAC 50 46 871 of 74 112 (63 %), `-lme 8` 39 096 of 68 554 (57 %) -- mostly *coverage* misses a spill cannot help (the pool holds 43-50 % of the experts), partly complement drops.  **Preferred variant (maintainer, 2026-11-04): READ-AHEAD, not a spill** — back-fill the evicted expert into the pool slot the promoted expert just vacated, from the page cache (or `O_DIRECT` in the disk band), *host-side*: no PCIe doubling, the same host bytes as today's lazy bounce but moved earlier, and the re-admission then becomes a 0.66 us D2D instead of `memcpy` + H2D.  At FRAC 50 the bounce memcpy is **~1.3 s of host CPU in a 4.4 s run** (46 871 x ~29 us), which IS the bounded band's 25 % deficit against `pinned` (53.9 vs 71.9 t/s), so the win is the OVERLAP (the host is idle while the GPU computes) + hiding the disk read in the not-fitting band.  Needs a worker or async I/O (a `memcpy` is synchronous), and this campaign deadlocked once on a detached worker + static condvars (HANDOVER trap 3) — heap-allocate and join.  TODO #87's 2x figure is a different regime; re-measure in the right band.  See §140 |
+| **135** | A 3-device `-sm tensor` split with host-resident experts (`-ncmoe`) runs at ~20 t/s while 1 GPU gives ~55 and 2 GPUs ~52 — the third device *halves* throughput, identically for `--host-experts pool` and `pinned`, while all-VRAM on the same 3 devices gives 138 t/s | performance (delivery, pre-existing) | **OPEN — measured on r209, NOT re-measured since** (2026-11-03, `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §7; gfx1201 x3, 35B-A3B Q4_K_M `-ncmoe 40`).  Consequence: the 3-device tensor arm is **not** a scaling point for host-resident experts.  The tier it was measured on was replaced by r210/r211 (`-lme`, the pinned per-expert pool) and the attribution plan it named went with `push` (retired #137), so the honest state is **unverified on the current tree**: one `llama-batched-bench`/`tg` arm at 1 vs 2 vs 3 devices on r213 decides whether the finding still holds |
+| **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement | performance (delivery defect, default-on) | **OPEN** (2026-11-03, `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §4).  Needs a wider sweep (model x FRAC x ubatch) before touching the default — and note the same switch must be `0` for any prefill A/B of the expert fill path, because the gather serves the routed table itself |
 | **141** | A **genuine sub-complement** host-expert budget (`-lme 8` = 43 % of the set, or any `MOE_HOST_POOL_FRAC` below 100) declines the eager take-over at wide decode: `llama-batched-bench -npl 8` gives **50.4 tg**, i.e. worse than the cache being off (129.2), because `slots + pool coverage < n_used * n_tok` cannot guarantee a complete remap and the run falls back to the pageable mapping | performance (block 09, the pool tier) | **OPEN -- measured limit** (2026-11-04, `WORKLOG.md` 261104.002 §4).  The bound is static per shape on purpose (a per-token decision cannot be baked into a captured graph), so the honest answers are a bigger arena, the pinned tier, or the retired `MOE_HOST_POOL_SIZING`/coverage work.  Candidates worth scoring offline with `scripts/moe-trace-replay.py` before any code: (a) require the arena to hold `n_used * band` slots for a pool-backed table (size it, do not decline it), (b) serve a neither-tier expert from the bounce ring *inside* the take-over instead of declining the table (needs the ring to be a legal cold source for one token), (c) accept the variance and let the graph re-capture.  Nothing is in flight; the r211 fix covers only the covering case |
-| **142** | The pool tier's **first** prefill pays ~3 s: `llama-batched-bench -npp 512 -npl 1` measures **pp 128** for the pool against **588** for a pinned master (3.97 s vs 0.87 s), and the same 3 s is amortised invisibly inside a 5246-token prompt (prefill 1318 t/s, fine).  The pool is built and prepopulated lazily and the arena is sized only on the first DECODE-band pass, so the first prompt batch runs the pre-sizing staging path with no arena at all | performance (block 09/12, `moe-expert-cache`) | **OPEN -- pre-existing (r210), not a r211 regression** (2026-11-04, `WORKLOG.md` 261104.002 §4).  `MOE_HOST_POOL_PREWARM=0` does not move it (122 vs 130), so it is the build/first-touch, not the prewarm order.  The lead from `P6-POOL-REGION.md` §7d is to move the population into the preflight (before the first timed batch) -- it was scoped as worth only ~0.09 s at `-n 300`, but this row is the arm where it is worth 3 s |
-| **139** | A partial `-lme` host-expert budget was spent on whole pinned TENSORS, where at equal RAM a per-EXPERT tier is better (8 064 MiB of pinned whole tensors = 505.1 prefill / 50.1 decode against 713.7 / 51.8 for a 9 331 MiB pool) | performance / memory (campaign, `wip/host-expert-eager-push`) | **CLOSED -- shipped in r211** (promoted with the rest of the campaign into block 09, then repaired and re-cut: see `WORKLOG.md` 261104.002).  The expert-indexed region the design asks for IS the bounded pool (slots + `slot_state` + `base_dev`, heat-ranked), it reads in place on a multi-device split (`MOE_HOST_POOL_COLD_MULTIDEV`, +11.5 % decode at `-lme 8`), and `-lme N` spends the budget per expert below the host expert set.  The cold-read encoding needed no change.  Detail: §139 |
-
+| **142** | The pool tier's **first** prefill pays ~3 s: `llama-batched-bench -npp 512 -npl 1` measures **pp 128** for the pool against **588** for a pinned master (3.97 s vs 0.87 s), and the same 3 s is amortised invisibly inside a 5246-token prompt (prefill 1318 t/s, fine).  The pool is built and prepopulated lazily and the arena is sized only on the first DECODE-band pass, so the first prompt batch runs the pre-sizing staging path with no arena at all | performance (block 09/12, `moe-expert-cache`) | **OPEN -- pre-existing (r210), not a r211 regression** (2026-11-04, `WORKLOG.md` 261104.002 §4).  `MOE_HOST_POOL_PREWARM=0` does not move it (122 vs 130), so it is the build/first-touch, not the prewarm order.  The lead from `archive/work/host-expert-eager-push/P6-POOL-REGION.md` §7d is to move the population into the preflight (before the first timed batch) -- it was scoped as worth only ~0.09 s at `-n 300`, but this row is the arm where it is worth 3 s |
+| **269** | PR #266's disposition: keep `GGML_MOE_DEVREMAP` (the sync-free decode remap, +3.3 % on this host's 122B arm), drop the rest — and the remap must become **tensor-split aware** before it is re-implemented over pool slots | capability / acceptance condition | **DECIDED 2026-11-02 (maintainer); OPEN, demoted** behind #131/#132 (2026-11-03).  Today `devremap_ok_locked()` needs a pinned master and `MOE_HOST_POOL_COLD` declines whenever `device_count != 1`, so a `-sm tensor` split gets no map at all; the map is per (table, device) while a pool slot is process-wide, so the cold-id encoding must be per-device-slice aware and the freshness invariant must hold per device.  Gates: same-seed greedy text and MTP acceptance on 1 GPU **and** the multi-device `-sm tensor` arm, `check-gpu-faults.sh` clean.  Detail: §269 |
 Accepted limitations that are deliberately **not** fixed are listed at the end — do not re-report them.
 
 ---
@@ -105,7 +102,7 @@ call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
-* **`MOE_HOST_POOL_COLD` needs a single VISIBLE device** (r203, `TODO` **#131**).  The in-place pool read keys on
+* **`MOE_HOST_POOL_COLD` needs a single VISIBLE device** (r203; **no `TODO` id** — the `#131` this bullet used to cite is the pool-prefill collapse below, a different finding).  The in-place pool read keys on
   `ggml_cuda_info().device_count == 1`, which is process-wide: on a multi-GPU box running a one-GPU arm (three
   R9700s plus the iGPU are four HIP devices here) it is **silently off**, costing that arm the +4.8 % TG the
   same config gets with `HIP_VISIBLE_DEVICES` pinned to one device.  The restriction is deliberate — the pinned
@@ -295,7 +292,7 @@ arm is stable; any "N x faster than pinned" prefill claim still needs a pinned c
 `llama-bench pp1024` disagreement (pool 130 ± 73 vs pinned 271 ± 2.5) is open and needs a `-r 3` repeat at
 `-ub 1024`.  The `ENVIRONMENT.md` row for the three-valued `GGML_SCHED_DEVGATHER` shipped with it.**  Original finding text follows.
 
-**Found 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2, session 4), a defect in the DELIVERY's block 12
+**Found 2026-11-03 on `soar` (`archive/work/host-pool-speed/` README §18.2, session 4), a defect in the DELIVERY's block 12
 code, not in a campaign patch.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
 pinned to 3 R9700s: `--host-experts pool` prefills at **16.85 t/s** against `pinned`'s **564.65** (and 1126.8 with
 `GGML_SCHED_DEVGATHER=1`); the same arms at 2 devices are 1024.1 (pool) vs 1603.8 (pinned), i.e. healthy.  The
@@ -321,7 +318,7 @@ a fix: same-seed greedy text on 2 and 3 devices, `check-gpu-faults.sh`, and the 
 
 ## 132. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
 
-**Status: open, measured 2026-11-03 (`wip/host-pool-speed` README §18.4).**  On the 2-GPU x8 pair at `FRAC 80` the
+**Status: open, measured 2026-11-03 (`archive/work/host-pool-speed/` README §18.4).**  On the 2-GPU x8 pair at `FRAC 80` the
 pool decodes 26.08 against `pinned`'s 39.72 (-34 %), and the fill accounting says **86 % of that gap is one
 synchronous `O_DIRECT` read per uncovered expert per decode step**: 20.7 demand fills/token at ~0.55 ms = ~11.3 ms
 of a 38.3 ms step (29 %), against 5.1 fills/token = ~5.2 ms of a 56 ms step (9 %) on one GPU — which is why §16.3
@@ -329,7 +326,7 @@ correctly declined an overlap worker at a ~6 % ceiling there.  On a multi-device
 and the fill stays on one host thread, so the ceiling is ~25-30 % (and ~0 at full coverage / the 3-GPU shape where
 the arena holds the whole set: 49.48-51.03 vs 51.97-52.04, i.e. **-1.8 %**, inside PR #267's own envelope).  This
 is now a bigger prize than the tensor-split remap (`#269`, +3.3 %).  Protocol: re-screen with
-`scripts/moe-trace-replay.py` first (`wip/host-pool-speed` §9.6 — an overlap does not change placement, so the
+`scripts/moe-trace-replay.py` first (`archive/work/host-pool-speed/README.md` §9.6 — an overlap does not change placement, so the
 model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
 gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
 
@@ -348,7 +345,7 @@ change — `AGENTS.md`), then re-apply block 12's r207 amendment on top.
 
 ## 133. A fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch
 
-**Status: open, measured 2026-11-03 on `soar` (`wip/host-pool-speed` README §18.2).  Delivery performance defect in
+**Status: open, measured 2026-11-03 on `soar` (`archive/work/host-pool-speed/` README §18.2).  Delivery performance defect in
 the DEFAULT (`pinned`) mode at a large-arena configuration — not a pool issue.**  At `-ncmoe 48` on three RDNA4
 GPUs the arena is `67110.0 MiB of 67110.0` (256/256 slots/table, i.e. the whole host expert set is *also* fully
 VRAM-resident), and the prefill nevertheless stages **61 GiB for a 3049-token prompt — `arena=61031.5 MiB
@@ -381,12 +378,12 @@ default mode's prefill, which is also the baseline every pool claim is divided b
 `#131` (the pool prefill collapse at ≥3 devices) and `#132` (the ~25-30 % demand-fill overlap ceiling on a split).
 Nothing in the 2026-11-03 multi-GPU session blocks it or changes its condition; the multi-device arm it needs now
 exists and is healthy (F7 was an environment artefact: `MOE_EXPERT_CACHE_MIB=0`, not a `-sm tensor` registration
-gap — `wip/host-pool-speed` §18.1), so the pair/3-GPU `-sm tensor` gates it names are runnable.**  Forward-looking:
-it constrains how `GGML_MOE_DEVREMAP` is
-re-implemented over pool slots, and it is the acceptance condition for that work.**  The maintainer's call:
+gap — `archive/work/host-pool-speed/README.md` §18.1), so the pair/3-GPU `-sm tensor` gates it names are runnable.**
+Forward-looking: it constrains how `GGML_MOE_DEVREMAP` is re-implemented over pool slots, and it is the acceptance
+condition for that work.  The maintainer's call:
 PR #266's **`GGML_MOE_DEVREMAP` survives** the #266 reversion and stays a capability going forward, because it is
 the one piece of #266 whose removal costs real throughput (the sync-free decode map; r203 measured +8.1 % on its
-own cell, +3.3 % on this host's 122B arm — `wip/host-pool-speed/README.md` §15).  Everything else in #266 is
+own cell, +3.3 % on this host's 122B arm — `archive/work/host-pool-speed/README.md` §15).  Everything else in #266 is
 dropped, including `MOE_HOST_POOL_COLD`, which the pool-aware device gather now subsumes (measured: `COLD=0`
 15.54 -> 19.57 t/s with the gather, `README.md` §14.4).
 
@@ -395,115 +392,9 @@ dropped, including `MOE_HOST_POOL_COLD`, which the pool-aware device gather now 
 `device_count != 1`, so a `-sm tensor` split gets no map at all.  An implementation that only works on one device
 is not acceptable: the map is per (table, device) — a pool slot is process-wide and its device alias is valid on
 every device — so the cold id encoding must be per-device-slice aware (each device's arena slots differ; the pool
-slot does not) and the freshness invariant (a re-rank invalidates a lagging map: see `wip/host-pool-speed`
+slot does not) and the freshness invariant (a re-rank invalidates a lagging map: see `archive/work/host-pool-speed/`
 §3.1's layout epoch / freeze) must hold per device.  Gates: same-seed greedy text and MTP acceptance on 1 GPU
 **and** on the multi-device `-sm tensor` arm (`soar`), with `check-gpu-faults.sh` clean.
-
-## 139. A partial host-expert budget wants a per-EXPERT region — which IS the pool, and it now reads in place on any device
-
-**Status: RESOLVED in the campaign (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`); promotion into
-`patches/` is pending, with `P5`.**  The question was what a partial `-lme` budget should buy.  Measured at equal
-RAM (2 devices, 35B-A3B, `-n 300`): 8 064 MiB of pinned whole TENSORS = 505.1 prefill / 50.1 decode against
-713.7 / 51.8 for a 9 331 MiB per-EXPERT pool — the pool wins on both phases, because MoE routing is spread across
-every layer so no whole tensor is hot.  The reason the pool then lost to `pinned` (71.9) was narrower than the
-design assumed: **the pool already is the expert-indexed region with a presence bitmap** (a pinned per-host-tensor
-allocation addressed by expert -> slot, `slot_state` for presence, `base_dev` for the device alias, heat-ranked
-contents, and a 1.3 us native D2D fill); it merely was not allowed to be a **cold-read source away from one
-GPU** — `pool_cold_slot_locked()` and `moe_cache_get_cold()` both required `device_count == 1 && src_off == 0`,
-and both are geometry accidents (the alias is already the cross-device fill source; a slice offset is already
-folded into the cold base for a pinned master).  Enabling it changes no encoding: `id - n_res_slots` is a slot
-index into one pinned base, and the pool's base with its slot stride is such a base.  The two sides now share ONE
-predicate (`pool_cold_geometry_ok`) because a disagreement would be a silently wrong matmul, not a crash.
-
-Result: **+11.5 % decode at `-lme 8` (48.9 -> 54.5)** and **+10 % for the shipped not-fitting pool (51.8 ->
-57.0)**, byte-identically (`sha=231512fc77e5`), fault-free on 1/2/3 devices; a **fully resident pool now prefills
-faster than a pinned master (1166.4 against 1105.4)** — though its decode still trails (63.9 against 71.9),
-because a resident pool is not a pinned *master* (that is the residual, recorded in P6 §5 and not needed for the
-fit case).  `-lme N` therefore spends the budget per EXPERT below 90 % of the host expert set and keeps the
-whole-tensor pinned-master tier at or above it (`MOE_HOST_TIER=pool|tensor` forces either shape).
-
-**Update (same day, `P6-POOL-REGION.md` §8, patch `0012`)**: the full-coverage pool was also bouncing because it is
-the arena's **complement** by design — two paths un-load an expert from the pool the moment it enters VRAM, so the
-arena's first evictions had to re-read from the model mapping through the bounce ring (20 116 synchronous 288 KiB
-memcpys in the first 300 decode tokens).  A full-coverage pool is now a **MIRROR**: decode 63.9 → 70.4 (n=300) and
-80.8 → 82.6 (n=2000) against a pinned master's 71.9/82.9, and prefill **1315.9 against 1105.4 (+19 %)** for the
-same pinned RAM.  So the fit case could be the pool alone (one mechanism, no whole-tensor tier) — a policy call
-left open, with the trade being +19 % prefill for ~-2 % decode at n<=500.
-
-**Still open elsewhere**: `#132` (the pool's synchronous demand read for NON-resident experts — untouched), and
-the 100 %-covered pool becoming the master (P6 §5: fill slots in expert order, rebind a `region`/`region_dev`
-field — never `t.host`, which keys the pool map and is shared across the per-device tables of one tensor).
-
-## 140. The pool is the arena's complement — a bounded pool could SPILL instead of dropping (candidate)
-
-**Status: CLOSED — built, measured as a LOSS in both bands, and DROPPED at the maintainer's request** (the code is
-not in the patch chain; it is retrievable at fork commit `a7dfe8871`, and the numbers are in
-`wip/host-expert-eager-push/P6-POOL-REGION.md` §9).  The band it targeted is instead served by the **surplus rule**
-(§10): the pool's spare capacity now mirrors the arena-resident experts, so a budget that covers the complement
-stops the un-load/re-read cycle without any worker at all.  (2026-11-04, `wip/host-expert-eager-push/P6-POOL-REGION.md`
-§8/§9).**  The pool's contract (TODO #87) is *the arena's complement*: `fill_slot_from_host` retires an expert's
-pool slot when it is seeded into VRAM, and `pool_rerank_from_heat_locked` frees every arena-resident expert's slot
-("an expert already in the arena needs no pool slot").  So an expert that enters VRAM loses its pool copy, and when
-the arena's `touch` policy later evicts it, the next re-admission must re-stage its bytes from the model mapping:
-`pool_peek` misses, `pool_fill_empty_locked` may find no free slot, and the fill falls through to the **bounce ring**
-— a synchronous 288 KiB `memcpy` out of the page cache plus an H2D (the fill probe times only the `cudaMemcpyAsync`,
-which is why this hid for so long).
-
-* **Full-coverage pools are FIXED**: they are now a MIRROR (patch `0012`) — no copies, bounce 20 116 → 0, decode
-  63.9 → 70.4 (n=300) / 80.8 → 82.6 (n=2000), prefill 1166.4 → **1315.9** against a pinned master's 1105.4.
-* **A bounded pool (FRAC < 100, `-lme N`) still drops**, and there bounce fills are the majority of the fill path
-  (FRAC 50: 46 871 of 74 112 = 63 %; `-lme 8`: 39 096 of 68 554 = 57 %).  Most of those are *coverage* misses (the
-  pool holds 43-50 % of the experts, so a spill cannot help), but the complement drop is a real part of it.
-* **The candidate**: at FRAC < 100 a free pool slot exists, so the arena's victim can be **spilled** into it
-  (`D2H`, async, published only when the copy drains — `slot_state = 2` + the per-slot events already exist) while
-  the incoming expert is filled from its own slot (`D2D`).  That keeps `{VRAM ∪ pool}` closed: no re-staging, no
-  page-cache dependency.  Cost: +1 async D2H per eviction (~+50 % of the fill-path PCIe traffic); benefit: one
-  synchronous host `memcpy` saved per re-admission — and in the **not-fitting band** the avoided re-staging can be a
-  **disk** read, which is the band the mode exists for.
-* ~~The candidate~~ **Superseded by the READ-AHEAD variant below** (maintainer, 2026-11-04): the D2H spill doubles
-  the fill path's PCIe traffic, and the same "closed union" can be had without any PCIe at all.
-
-### The preferred shape: HOST-SIDE READ-AHEAD into the vacated slot
-
-When the arena promotes expert A from the pool and evicts victim B, the slot A leaves behind is exactly the slot B
-should occupy.  Instead of a D2H spill (PCIe) or a lazy bounce at B's next re-admission (a *synchronous* host
-`memcpy` on the critical path), back-fill that slot **from the page cache / disk, host-side, ahead of use**:
-
-* no extra PCIe — the copy is host-to-host (mapping → pinned pool); the PCIe path at re-admission becomes a 0.66 us
-  `D2D` from the pool instead of `memcpy` + `H2D`;
-* the union `{VRAM ∪ pool}` stays closed, so an expert in the pool's coverage is **never** dropped back to the page
-  cache — the complement policy is preserved (it maximises the union) *and* the re-read is removed;
-* the same host bytes as today are moved, but **earlier**, where they can overlap the GPU: this is the whole point.
-  In decode the host is otherwise idle while the GPU crunches, but a `memcpy` is synchronous, so the read-ahead
-  needs a **worker thread** (or async I/O in the disk band) — and the slot must only be published when its copy has
-  drained, which the existing `slot_state = 2` + per-slot event machinery already expresses.  If a re-admission
-  arrives before the copy lands, fall back to today's path so correctness never depends on the timing;
-* **the size of the prize**: at FRAC 50 the bounce path moves 46 871 x 288 KiB = 12.9 GiB of host memcpy in a 4.4 s
-  run at ~29 us each = **~1.3 s of host CPU**, and the arm measures 53.9 t/s against `pinned`'s 71.9 (a 25 %
-  deficit) — i.e. the bounce memcpy *is* the bounded band's deficit.  Removing it from the critical path is the last
-  big lever in the partial band;
-* **the band it matters most in is the not-fitting one**: there a re-admission of an uncovered expert is a ~1.32 ms
-  *disk* read sitting on the critical path; read-ahead converts that into a background fill issued while the GPU
-  works.  That is the band the mode exists for, and where this should be judged (P4 §5b's `memory.max` emulation)
-  as well as at FRAC 50 / `-lme 8`;
-* **BUILT AND MEASURED (patch `0013`) — it LOSES in both bands**, text byte-identical and faults clean:
-
-  | band | read-ahead off | on | jobs | host memcpy moved |
-  |---|---|---|---|---|
-  | page cache, FRAC 50, n=300 | **56.4** | 52.8 | 12 252 | 640 ms |
-  | `O_DIRECT` disk, FRAC 50, n=100 | **15.9** (prefill 24.1) | 15.1 (prefill **16.3**) | 7 984 | 2 534 ms |
-
-  Why, and it is the campaign's own L3 lesson again: **(1)** the victim is by construction the arena's LEAST-demanded
-  resident (`access_locked` evicts min decaying `count`), so an eager copy is a bet against the signal that chose it
-  — and the demand-side `ghost` counter cannot be the predicate, because it is reset to 0 on admission and is
-  therefore 0 for every resident (requiring `ghost >= 1` rejected 100 % of victims, measured); **(2)** the copy
-  competes with the demand path for the same resource — on disk the eager reads fight the demand reads for the NVMe
-  queue and prefill collapses 24.1 → 16.3 t/s; **(3)** only ~26 % of the bounded band's fills can come from the pool
-  at all (the rest are coverage misses no policy can help), so the ceiling is low even with a perfect prediction.
-  The mechanism is kept, default OFF, as an experiment; the worker does **host-only** work (ROCm aborts the process
-  if its runtime threads are first touched from a foreign thread: `std::system_error: Operation not permitted`), so
-  the main thread polls the drain events and hands jobs over.  **A predicate that predicts re-admission is what
-  would be needed** — score candidates offline with `scripts/moe-trace-replay.py` before building another variant.
 
 ## Where the current lists live
 
