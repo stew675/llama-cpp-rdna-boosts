@@ -495,7 +495,36 @@ is serialised with the DMA.  Recovering the 1-device number therefore needs one 
 Both are small, testable changes.  Whichever is done, the decision to move `pinned` onto registration should
 be taken **with the 1-device prefill number in hand**, because 1 GPU is a supported configuration.
 
-## 5d-bis. CORRECTION: `--host-experts pinned` does not pin a large expert set at all on this box
+## 5d-ter. THE MEASURED MATRIX, with a *real* pinned master (a harness bug had hidden it)
+
+**The harness bug:** `HOSTMODE=pinned` was being passed *after* the script name, so it reached `env` but not
+`p3-matrix.sh`'s own `--host-experts "$HOSTMODE"` -- **every earlier "pinned" run in this record was
+`--host-experts pool`**.  That is why `pool` and `pinned` measured identically everywhere, and why `pinned`'s
+2-device number was bimodal.  Fixed (the variable must be set on the script invocation line; the script now
+documents it), and re-measured.  A genuine `hipHostMalloc` master works at this size because the loader
+allocates **per tensor** (144-176 MiB), and chunked allocation was verified independently: 18 584 MiB in 101
+chunks of 184 MiB, 1.86 s, **101/101 with a device alias**.
+
+| arm | prefill 1 dev | decode 1 dev | prefill 2 dev | decode 2 dev | host RAM |
+|---|---|---|---|---|---|
+| `pool` | 616.6 | 49.0 | 707.1 | 51.3 | 9.3 GiB pool + bounce ring |
+| **`pinned` (real `cudaMallocHost`)** | **645.9** | **53.5** | **1105.4** | **72.0** | the whole set duplicated, never released |
+| registered in place | 478.7 | 53.4 | 951.6 | 71.8 | none (the page-cache pages) |
+| cache off: pool / pinned / registered | 673.4 / 686.1 / 672.9 | | 949.4 / 1043.6 / 948.9 | | |
+
+Three things follow, and they change the picture:
+
+1. **Registered == pinned on DECODE at both device counts** (53.4 vs 53.5, 71.8 vs 72.0).  Decode is settled:
+   one mechanism, no duplicate.
+2. **A real pinned master is the FASTEST prefill transport** (645.9 / 1105.4), so `pinned` is no longer just
+   "the duplicate we want to delete" -- it is the performance bar.  Registered trails it by 26 % (1 dev) and
+   14 % (2 dev).
+3. **That prefill gap is NOT the transfer**: the staging census is identical between the two arms at 2 devices
+   (`ok=2574`, `arena=43707.1 MiB`, `host=156096.9 MiB`, `H2D 78.1 %`, `PRS rebuilds=2574`, same fills), and
+   sustained bulk H2D is identical from both sources (27.93/28.68/28.76 vs 27.94/28.69/28.77 GB/s at 4/32/128
+   MiB blocks).  So it is the prefill *staging path*, not the copy -- the one remaining open item.
+
+## 5d-bis. (superseded in part by 5d-ter) `--host-experts pinned` on a *pageable* master
 
 The 1-device comparison in §5d ("registered 477 vs pinned 615") rests on a **false premise**.  With
 `--host-experts pinned` at 1 device, the delivery itself says:

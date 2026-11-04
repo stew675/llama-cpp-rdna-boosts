@@ -22,7 +22,7 @@ CTX=${CTX:-8192}
 NCMOE=${NCMOE:-40}
 CACHE_MIB=${CACHE_MIB:-2048}
 POOL_FRAC=${POOL_FRAC:-50}
-HOSTMODE=${HOSTMODE:-pool}   # --host-experts <mode>: pool | pinned (pinned = the FULL pinned master, duplicated)
+HOSTMODE=${HOSTMODE:-pool}   # --host-experts <mode>: pool | pinned.  MUST be set on the SCRIPT invocation line (HOSTMODE=pinned ./p3-matrix.sh ...), not after the tag -- an env assignment in "$@" reaches `env` but NOT this shell variable, which silently made every earlier "pinned" run a pool run.
 PROMPT_FILE=${PROMPT_FILE:-}
 # LV=4 prints the moe_cache_report census (ggml INFO is filtered at llama-cli's default level), but a verbose
 # log INTERLEAVES stats lines into the generated text, so extract-generated.py's hash is INVALID on such a run
