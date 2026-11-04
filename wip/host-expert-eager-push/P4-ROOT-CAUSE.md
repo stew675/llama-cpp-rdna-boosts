@@ -339,6 +339,76 @@ Two side notes for whoever implements it:
 - A pageable fallback must be **loud** (the existing `GGML_LOG_DEBUG` in `ggml_cuda_host_malloc` is invisible
   at the default log level), otherwise a user can silently lose half the throughput.
 
+## 5d. Prefill: registered wins at 2 devices (+34 %), loses at 1 device (-22 %) -- and why
+
+Prefill is a different animal from decode here, so it is measured separately: `prose-rdna-boosts.txt`
+(5 246 tokens), `-n 1`, `-sm tensor`, 2 reps each (`prompts/README.md` has the prompt's sha256).
+
+| 2 devices (0,2) | prefill | vs pool | decode (`-n 300`) |
+|---|---|---|---|
+| `pool` (ctrl) | 708.5 / 708.4 | -- | 50.7-51.4 |
+| `pinned` (`hipHostMalloc` duplicate) | 708.8 / 708.2 | 0 % | 71.6-72.1 |
+| **`pool` + registered in place** | **951.0 / 950.0** | **+34 %** | **71.5-71.9** |
+| registered + `MOE_EXPERT_CACHE_COLD_UVA=0` | 951.9 / 950.0 | +34 % | 71.6 |
+| registered + `GGML_SCHED_DEVGATHER=0` | 950.8 / 950.5 | +34 % | -- |
+| registered, **pool off** (`MOE_HOST_POOL_FRAC=0`) | **953.0 / 958.9** | **+35 %** | 71.7-71.9 |
+
+| 1 device (GPU 0) | prefill |
+|---|---|
+| `pool` | 615.6 (with `GGML_SCHED_DEVGATHER=0`: 495.7) |
+| `pinned` | 614.7 |
+| **registered in place** | **477.7** (-22 %) |
+
+So the answer to "what are prefill speeds like with registered" is **much better at 2 devices and worse at 1
+device**, and the two cases are explained by *which device-pull path is available*, not by the copy bytes (the
+census is identical between the arms: `fills=18596`, `arena fills=5156`, `H2D 1563.3 MiB`, `cold=0`).
+
+### The mechanisms, and the gates that differ on a tensor split
+
+1. **The scheduler's device gather** (`GGML_SCHED_DEVGATHER`, `ggml-backend.cpp:3351`).  Three-valued:
+   default `1` = *"pool-backed tables gather"*; `0` = kill switch; `1`/`force` = mode 2, the historical A/B
+   arm that also gathers for a **pinned** master -- and the comment there records that mode 2 *"costs a pinned
+   master ~47 % prefill at two devices"*, which is exactly what the numbers above show from the other side
+   (a pool master 708 vs the registered/pinned path 950 at 2 devices).
+   At **1 device the gather is worth +24 % to the pool arm** (495.7 -> 615.6) and a registered/pinned master
+   cannot use it: `force` measured 477.5, i.e. no recovery.  That is the bulk of the 1-device gap.
+2. **The cold in-place read** (`MOE_EXPERT_CACHE_COLD_UVA`), i.e. the GPU reading host memory in place
+   through the UVA alias.  Its two gates are **not** the same:
+   - the *arena overflow* cold read (`table_cold_ok`) works per device slice (`cold_safe` for a 2-D strided
+     slice; not for a fused table);
+   - the *pool* cold read (`pool_cold_slot_locked`) is **single-device only** -- it returns -1 when
+     `ggml_cuda_info().device_count != 1`, by construction (the pool is process-wide and holds whole experts).
+   Measured: at 2 devices the registered arm served **125 286 reaches cold (20.7 %)**; at 1 device the prefill
+   runs served **0** cold reaches.  Turning it off (`COLD_UVA=0`) changes nothing at either device count, so
+   it is not what makes the difference -- but it *is* the thing that only exists on a split.
+3. **The per-op host boundary** (`moe_cache_update_host`) runs on 1 device and on `-sm layer`, and **never** on
+   a tensor split (3 boundaries vs 60 357 -- P3 §5): the whole graph is one Meta split, so the pool's per-op
+   accounting, the gather decision cadence and the campaign's epoch machinery are all inert there.
+4. **Prefill staging** (`moe_cache_stage_table`): a pinned master stages with ONE kernel launch; a pool-backed
+   master uses the two-tier snapshot plus per-expert copies.  In these runs its counters stayed 0 -- the
+   prefill went through the demand fills, not the staging path -- so it is not the explanation here.
+
+### Why 1 device loses: the registered copies are SYNCHRONOUS
+
+`perf record` of the same 1-device prefill, self time in the main thread:
+
+| arm | host `__memmove_avx512` | `BusyWaitSignal::WaitRelaxed` | `AsyncEventsLoop` |
+|---|---|---|---|
+| `pool` (616 t/s) | **71.3 %** | 0.8 % | 3.6 % |
+| registered (477 t/s) | 27.7 % | **15.6 %** | 23.0 % |
+
+The pool arm burns the host *copying* (its fills are host memcpys, and they are useful).  The registered arm
+instead **spin-waits inside the runtime** for each copy -- the transfer is issued synchronously, so the host
+is serialised with the DMA.  Recovering the 1-device number therefore needs one of:
+
+- **asynchronous fill issue**: one copy stream (and issuing thread) per device, with the compute stream
+  ordered by an event -- the campaign's own P6 rule.  It was measured *performance-neutral* in the pageable
+  world (where the loss was the staging, not the wait), which is exactly why it is the right lever now;
+- **or** a device gather that works for a registered master at 1 device (mode 2 does not, measured).
+
+Both are small, testable changes.  Whichever is done, the decision to move `pinned` onto registration should
+be taken **with the 1-device prefill number in hand**, because 1 GPU is a supported configuration.
+
 ## 6. Dated facts that contradict older ones (recorded, not reconciled)
 
 - **On this stack a pageable 1-D copy is slower than a pageable 2-D copy** of the same bytes (91-146 vs 41-45
