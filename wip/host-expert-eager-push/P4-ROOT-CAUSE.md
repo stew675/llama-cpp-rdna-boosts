@@ -495,6 +495,42 @@ is serialised with the DMA.  Recovering the 1-device number therefore needs one 
 Both are small, testable changes.  Whichever is done, the decision to move `pinned` onto registration should
 be taken **with the 1-device prefill number in hand**, because 1 GPU is a supported configuration.
 
+## 5d-bis. CORRECTION: `--host-experts pinned` does not pin a large expert set at all on this box
+
+The 1-device comparison in §5d ("registered 477 vs pinned 615") rests on a **false premise**.  With
+`--host-experts pinned` at 1 device, the delivery itself says:
+
+```
+bind_host_dev_locked: the host expert master is pageable (pool-backed `--host-experts pool`);
+    the in-place cold read is disabled and misses are served from the pinned host pool
+moe_cache_report: scheduler pageable-master fallback: 228 ranges, 288.8 MiB served through the per-table
+    bounce; pinned bounce ring total 7489.6 MiB
+moe_cache_report: host pool (L2): 120 tensors, 15360 slots, 9331.0 MiB pinned; h=0.0300 (4342/144664),
+    fills=20293
+```
+
+`cudaMallocHost(18 662 MiB)` **fails**, `ggml_backend_cuda_host_buffer_type_alloc_buffer` silently falls back
+to a *pageable* CPU buffer, and the expert pool then serves every fill.  That is why `pool` and `pinned`
+measure **identically** (615.6 vs 615.6 t/s, same census).  Consequences:
+
+1. **`--host-experts pinned` is not a pinned master for a large expert set.**  At 18.6 GiB it is a pageable
+   master + a 9.3 GiB pool + up to a **7.5 GiB bounce ring** -- i.e. it uses *more* RAM than `pool` mode and
+   performs the same.  This also explains the bimodal 2-device `pinned` numbers in §5d (71.6-72.1 vs 51.2):
+   they track whether the pinned allocation (partly) succeeded.  The fallback must be **loud** (TODO: it is
+   one `GGML_LOG_INFO`/`DEBUG` line today).
+2. **Registration (the SVM path) is the only way to obtain a genuinely device-accessible host master of this
+   size** on this stack -- which is exactly the argument for the maintainer's plan ("register everywhere").
+3. **The 1-device comparison is therefore registered-in-place vs the POOL**, not vs a pinned master:
+
+| 1 device | prefill | decode | host RAM |
+|---|---|---|---|
+| registered in place (SVM) | 477 | **53.4** | the page-cache pages, no duplicate |
+| `pool` / nominal `pinned` | **615** | 48.8 | 9.3 GiB pool + 7.5 GiB bounce ring |
+
+So the 1-device trade is: **-22 % prefill, +9 % decode, and ~17 GiB less RAM**.  The maintainer's instinct
+("`HSA_USE_SVM` makes registration uniform everywhere") is the better reading of the data -- the alternative
+at 1 device is not a pinned master, it is the pool with its duplicate + bounce ring.
+
 ## 5e. Can the master policy be automated at runtime?  Mostly yes -- and the residue is a *preference*.
 
 The decision is "which master does the expert cache fill from", and every input it needs is already known at
@@ -511,7 +547,7 @@ So the policy table is derivable, with no benchmarking and no guessing:
 
 | band | 1 device | 2+ devices |
 |---|---|---|
-| **fits in RAM** | **pinned master** (the duplicate is affordable here, and it has the best prefill: 615 vs 477) | **registered in place** (no duplicate, and it is strictly better: prefill 950 vs 709, decode 71.8 vs 51.2-72.1) |
+| **fits in RAM** | **registered in place** (the only real pinned master at this size, §5d-bis: 477 prefill / 53.4 decode against the pool's 615 / 48.8 *with* 9.3 GiB pool + 7.5 GiB bounce ring) | **registered in place** (no duplicate, and strictly better: prefill 950 vs 709, decode 71.8 vs 51.2-72.1) |
 | **does not fit** | registered **window** (a duplicate cannot fit; window = releasable, §5a) | registered **window** (same) |
 
 What is **not** automatable is the 1-device fit-band row: registered is +9 % decode and -22 % prefill there.
