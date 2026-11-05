@@ -145,9 +145,55 @@ and no speed.  The pool's VRAM is inside the KV buffer's size, while its mirror 
 **Question.**  At the runme's `-c 262144` (a 200k+ working set) is a fixed count still right, or should it
 scale with `-c` / the indexer's top-k?  Nobody has asked; do not change the default without the arm.
 
+**Cross-arm, 2026-11-05 (`wip/bench-56gb/`, 1 x R9700, host experts on a mirror pool so the host tiers are
+not a variable, `-c 204800`, `-ub 6144`, `-lv 4`).**  New data point, and it does NOT sit on the A17 curve:
+
+* the default `LLAMA_KV_REGION_POOL=16384` (4 104 pages, 204.4 MiB of device pool, **12** full-attention
+  layers on this model) reports `hits 8408 (4.27 %)` of 196 896 ids at a 179.5k prompt, with
+  `misses 29041 / claims 29041`, i.e. every claim missed and only 4.3 % of the ids were served from a
+  resident page.  A17's 86.0 % was at 102 800.  Half the context, a 20x difference in hit rate: reconcile
+  this BEFORE changing any default (the candidates are the prompt cache, `--parallel`, `-ub`, and the
+  indexer's `top_k=2048` against a fixed 16 416 cells; the arms above did not control for them).
+* measured cost of the pool at that context, everything else identical: **+2.3 GiB host anon** (the pinned
+  mirror, up to 2 550 MiB at full context), **+2.3 GiB of arena VRAM** (the KV is in VRAM when the pool is
+  off, so the expert arena shrinks by the same amount), decode neutral within noise, and prefill **0 to -17 %**:
+  0 % at `-ub 6144` with `-cache-ram 1024`, -7 % at `-ub 2048` with the same, and -17 % when the pool runs
+  beside a 6 GiB prompt cache (`-cache-ram 6144`), which is page-cache competition, not the resolve path.  A
+  65536-cell pool is worse
+  than 16384 on both bands.
+* so on this box the pool is currently a RAM-for-VRAM trade that pays a PCIe cost for a 4 % hit rate.  That
+  does not make it wrong (it is opt-in, and the contract is that it is inert when unset); it makes the sizing
+  question the whole question.
+
+**The work, in the order I would take it** (each step is cheap and can end the campaign):
+
+1. **Reconcile the two hit rates** on one rig, one build, one config, at 32k / 64k / 102 800 / 204800: same
+   `--parallel`, same `-ub`, same `--cache-ram`, page cache dropped before each start.  *Accept:* a curve, not a
+   point, and a stated reason for the 86 % versus 4.3 % gap.  If the gap is a config artefact in A17's favour,
+   the default is probably fine; if it is real, the pool is a large-context tool that stops working exactly
+   where it is needed and that must be said in `ENVIRONMENT.md`.
+2. **`auto` sizing from the working set**, not from a constant: `top_k (2048) x full-attention layers x the
+   decode band`, plus the sink/recent tail, clamped by the VRAM budget (`kv_pool_bytes()` already reports the
+   VRAM/RAM pair).  Keep the explicit cell count for A/B.  *Accept:* at every context, `auto` is within 3 % of
+   the best hand-picked value on both bands, and no row is worse than pool-off.
+3. **Report the property, not the counters.**  Predicted coverage of the attended working set at the target
+   context (startup, visible without `-lv 4`) plus the measured hit rate at shutdown from
+   `LLAMA_KV_POOL_STATS`.  "4.27 % hits" is only meaningful beside "of a working set 24x the pool".
+4. **Decline when it cannot pay.**  Below a coverage threshold (start at 60 %), do not build the pool and say
+   why: a low-coverage pool is pure cost (+2.3 GiB host, +2.3 GiB of arena, per-token PCIe refills).
+5. **Prefill bypass**, decided by A/B: the prefill loss appears at `-ub 2048` with `-cache-ram 6144` and
+   disappears at `-ub 6144` with `-cache-ram 1024`, so it may be page-cache competition rather than the resolve
+   path.  Measure before changing anything.
+6. **Document the decision table by context length** (16k-64k plain VRAM KV; 128k-200k a working-set-sized pool
+   if it fits; above that the window or accept the streamed cache) wherever the knob is documented.
+
 **Gates.**  The A11/A14 three-depth shape (interleaved arms, `-n 512`, MTP-4), hit rate from
-`LLAMA_KV_POOL_STATS`, `LLAMA_KV_POOL_VERIFY=1`, text identity.  Size: S-M (needs a 200k+ arm; the prefill
-is minutes, not hours).
+`LLAMA_KV_POOL_STATS`, `LLAMA_KV_POOL_VERIFY=1`, text identity, and §4 below as written.  Size: S-M (needs a
+200k+ arm; the prefill is minutes, not hours).
+
+**Records for the cross-arm:** [`bench-56gb/RESULTS.md`](../bench-56gb/RESULTS.md) (rows A-E, K) and
+[`bench-56gb/README.md`](../bench-56gb/README.md) (the rig; it is the only way to reproduce a 200k context on a
+small box without a small box).
 
 ### 2.5 Close-outs — decide and record, no code
 
