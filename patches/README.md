@@ -620,6 +620,10 @@ a `k_idxs`/`s_copy`/`k_rot` tensor is always consumed by the node that needed it
 
 ## Block 06 — MMB and mmf32: the quantized and the F32 prefill GEMM
 
+> **r217 amendment (issue #273 item 4, `getenv` audit):** `mmf32.cu`'s `GGML_CUDA_MMF32_LOG` latch read its
+> variable twice (`getenv("X") ? atoi(getenv("X")) : 0`); it now reads it once into the stored pointer.  No
+> behaviour change, no default moved.
+
 **What it is.**  The prefill-GEMM block: `mmb.cu` (~2.4k lines) dequantizes quantized weights into bf16
 WMMA fragments on the fly (dense, routed/compact MoE, GLU, F32-split, tall/narrow, tiny-M, IQ3_XXS, HC16,
 plus a shadow cache; adapted from `pwilkin`'s `strix-halo` fork), and `mmf32.cu` (**r104**) serves the F32
@@ -1481,6 +1485,23 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r217 amendment (issue #273 items 1 and 4): the FA stream-K fixup grid and the GDN q/k l2-norm-pair grid go
+> off the gfx1201 dispatch stall, and this block's `getenv` reads are latched.**  `launch_fattn`'s
+> `flash_attn_stream_k_fixup_uniform` launch (one block per output tile) and
+> `ggml_cuda_op_rms_norm_scale_pair_fused`'s `2*nrows*nchannels` launch now ask
+> `ggml_cuda_grid_stall_pad()` and add one returning block, with a guard at the top of each kernel
+> (`tile_idx * blocks_per_tile >= nblocks_stream_k`, `blockIdx.x >= 2*nrows`).  Arithmetic unchanged, i.e.
+> bit-identical; `GGML_CUDA_GRID_STALL_PAD=0` still turns the whole pad off.  Worth it where the grid is short
+> (the reporter's model launches these at 256 blocks: 15.48 -> 10.08 us and 15.8 -> 2.4 us per launch);
+> neutral on a 16384-block grid, where the stall's fixed ~10 us is hidden by the kernel's own runtime
+> (`INVARIANTS.md` r217 fact 1, `benchmarks/2026-11-05-issue-273.md`).  The same change latches every
+> `getenv` in this block's files (`common.cuh`, `mmb.cu`, `mmvq.cu`, `norm.cu`, `fattn*.cu/.cuh`, `mmvf.cu`,
+> `gdn-conv.cu`, `gated_delta_net.cu`, `ple-conv.cu`, `topk-moe.cu`, `unary.cu`, `norm-gated.cu`,
+> `moe-weighted-reduction.cu`, `mmq.cu`, `concat.cu`, `cpy-batch.cu`): one read per variable, stored.  Two
+> per-op reads this block owned are gone: `GGML_CUDA_MMB_TYPES` (per matmul, up to 22 913 calls per run) and
+> `GGML_CUDA_FA_STAGE_CHUNK_DEBUG` (per FA launch, up to 431).  Greedy text identical on every gate arm;
+> prefill-logit KLD 0.000000 / 100.000 %.
+
 **What it is.**  The infrastructure half of the pre-r109 block 10: it owns the translation units split out
 of `ggml-cuda.cu` (the movable-boundary **slab**, its arena, and the `ggml_cuda_try_fuse` dispatcher), the
 async graph-input ring, and the GDN/MMB/rope decode fusions.  The **qwen4exp architecture it used to carry
@@ -2327,6 +2348,12 @@ Numbers: `benchmarks/2026-10-31-cpy-2d-vec16.md`; record `archive/work/cpy-2d-ve
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 
+> **r217 amendment (issue #273 item 4, `getenv` audit):** this block's switches (`ggml-cuda-try-fuse.cu`,
+> `hc-mix.cu`, `indexer-score.cu`) and the recurrent rollback debug flag in `llama-memory-recurrent.cpp` are
+> read once per process (the reporter's item 4: `LLAMA_RS_ROLLBACK_DEBUG` was a `getenv()` on every
+> speculative rollback and on every recurrent `prepare()`).  No behaviour change: every value is a constant
+> for the life of the process either way, and the arms are bit-identical.
+
 **What it is.**  The qwen4exp (Qwen3.8-Flash-Next) architecture support, split out of block 10 in r109 so
 the model graph, the sparse-attention op and the hyper-connections no longer share a commit with the slab,
 the fusion dispatcher and the async input ring.  QSA moves with the model by the maintainer's decision
@@ -2550,6 +2577,21 @@ ms/token**; wall A/B `-n 512`, interleaved, **40.48/40.48 -> 42.11/42.11 t/s (+4
 form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_NOBLOCK=1` is the isolation arm).
 
 ## Block 12 — campaign remainder
+
+> **r217 amendment (issue #273 items 2, 3 and 4): `seq_rm` stops at the parked bound, the drafter's prompt is
+> no longer copied per step, and this block's `getenv` reads are latched.**  (a) `llama_kv_cache::seq_rm()`
+> scanned to `used_max_p1()`, which with `--kv-unified --parallel 2` is the whole cache because the parked idle
+> slot sits at the top; a sequence that is not parked now stops at `used_max_p1_below(park_bound())` (a parked
+> sequence holds only cells at or above the bound, and no other sequence has a cell there).  Measured on a
+> 131 072-cell unified cache with a 64-cell parked sequence: **42.127 -> 1.358 us per removal** (31x), the
+> parked cells and a full removal of the live sequence unchanged; `scripts/gate-park-idle-slots.sh` green.
+> (b) `server-context.cpp` only fills `slot.spec_prompt` when `prompt.tokens.has_mtmd` -- without media the
+> slot's own vector IS the prompt the drafters read inside `common_speculative_draft()` -- removing a
+> **28.8 us/step** copy at 110K tokens.  (c) `ggml-cuda-slab.cu`, `ggml-cuda-moe-cache-hooks.cu` and this
+> block's `getenv` lines are latched (the `GGML_CUDA_SLAB_STATS` 7 681-15 552 per-op reads are gone;
+> `ggml_cuda_slab_stats_on()` is the shared accessor).  Same-seed text identical on all four parking-gate
+> requests and on the reporter's server shape.  Records: `INVARIANTS.md` r217 facts 2 and 4,
+> `benchmarks/2026-11-05-issue-273.md`.
 
 > **r214 amendment: the slab's narrow-2 region is MAPPED for its whole extent.**
 > `ggml_cuda_slab_narrow2_commit_locked()` pinned the MTP draft's compute region at the top of the slab's reserved VA
@@ -3187,6 +3229,9 @@ re-copied out of the arena per prefill ubatch — the *default* mode's own defec
 
 ## Block 13 — MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in)
 
+> **r217 amendment (issue #273 item 4, `getenv` audit):** `llama-graph.cpp`'s `LLAMA_GRAPH_RESULT_DEBUG` was
+> read on every graph result (9 per run in the audit trace); it is latched now.  No behaviour change.
+
 **What.**  The MTP draft head can score a **row subset of the LM head**: with `--spec-draft-mtp-vocab N` the
 draft context copies the LM-head rows for token ids `< N` plus every control/user-defined id into its own
 head (a **verbatim copy in the LM head's own quant type**), scores the draft matmul over that subset, and
@@ -3313,6 +3358,14 @@ byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op witho
 Purity notes: `GREEDY-PURITY.md` §58.
 
 ## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`), the attendance POOL (`LLAMA_KV_REGION_POOL`) and the MTP draft WINDOW (`LLAMA_SPEC_DRAFT_WINDOW`, **default on**)
+
+> **r217 amendment (issue #273 item 4, `getenv` audit):** the region path's diagnostics
+> (`LLAMA_KV_REGION_TRACE`, `_DEBUG`, `_CANARY`) were read inside `vmm_map` / `vmm_unmap` / `vmm_remap`, i.e.
+> once per mapping when a KV window is active; they are latched behind `vmm_trace_on()` / `vmm_debug_on()` /
+> `vmm_canary_on()` now.  This block's other files (`ggml-cuda.cu`, `ggml-backend-meta.cpp`,
+> `moe-expert-cache.cu`, `llama-context.cpp`, `llama-model-loader.cpp`, `llama-memory-hybrid-idx.cpp`,
+> `models/qwen4exp.cpp`) are latched as well -- including `GGML_STAGE_TRACE`, which the loader read **per
+> tensor** (144-240 calls per run).  No behaviour change; the windowed/pooled arms are unchanged.
 
 This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: **two** opt-in placements of the same cache, plus the third variant that is **default on** because it measures non-negative (the MTP draft window, r193).  The **window** (Goal A of `TODO` #118, r178) keeps the newest `W` cells in VRAM and spills the tail to pinned system RAM in the same VA reservation.  The **pool** (Goal B, r190) keeps the authoritative copy of the *whole* context in a pinned host mirror and only the pages a decode step attends to in VRAM, resolved through a page table.  They answer the same question from opposite ends (newest cells vs attended cells), they are mutually exclusive by construction (the pool declines while a window is active), and each is byte-identical to a build without it when its knob is unset.  Both report `is_streaming()`, so a streamed cache takes the sparse QSA decode arm (also this block: B2).
 

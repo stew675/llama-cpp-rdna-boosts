@@ -1,4 +1,4 @@
-From 6bcbd22306f16c23d01ef277b6bf0ba2654198d5 Mon Sep 17 00:00:00 2001
+From 1c09a4334ecd5d0d0f803feec3896d721cb8e4dc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: MMB quantized prefill GEMM
@@ -2646,7 +2646,7 @@ index 000000000..fd8085897
 +void ggml_cuda_mmb_release_all();
 diff --git a/ggml/src/ggml-cuda/mmf32.cu b/ggml/src/ggml-cuda/mmf32.cu
 new file mode 100644
-index 000000000..2257a267e
+index 000000000..110a844d0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmf32.cu
 @@ -0,0 +1,201 @@
@@ -2833,7 +2833,7 @@ index 000000000..2257a267e
 +    }
 +    // Diagnostics: the first few resolved plans on stderr, gated on the env var (the same convention as
 +    // GGML_CUDA_MMB_LOG).  It reports what was actually used; it never changes what is computed.
-+    static const int log_n = getenv("GGML_CUDA_MMF32_LOG") ? atoi(getenv("GGML_CUDA_MMF32_LOG")) : 0;
++    static const int log_n = [] { const char * e = getenv("GGML_CUDA_MMF32_LOG"); return e ? atoi(e) : 0; }();
 +    if (log_n != 0) {
 +        static std::atomic<int> printed{0};
 +        if (printed.fetch_add(1) < 16) {

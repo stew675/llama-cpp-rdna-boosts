@@ -1,4 +1,4 @@
-From 1a5b30cc34409d3d515a0060acd9c629a0a9211f Mon Sep 17 00:00:00 2001
+From a4ce65582af2821b8e035c476766bc7148c48432 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 13:54:26 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -331,8 +331,8 @@ byte-identical across modes on 1/2/3 GPUs (5835 chars dc178c29fe89 / 6079 01607c
  ggml/src/ggml-cpu/ggml-cpu.c                  |    6 +
  ggml/src/ggml-cpu/ggml-cpu.cpp                |    2 +-
  ggml/src/ggml-cpu/repack.cpp                  |    3 +
- .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   31 +-
- ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  247 +-
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   35 +-
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  251 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  136 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 2602 +++++++++++++----
  ggml/src/ggml-cuda/moe-expert-cache.h         |   31 +
@@ -348,7 +348,7 @@ byte-identical across modes on 1/2/3 GPUs (5835 chars dc178c29fe89 / 6079 01607c
  src/llama-ext.h                               |   17 +
  src/llama-graph.cpp                           |   77 +-
  src/llama-graph.h                             |   27 +
- src/llama-kv-cache.cpp                        |  319 +-
+ src/llama-kv-cache.cpp                        |  332 ++-
  src/llama-kv-cache.h                          |   30 +
  src/llama-kv-cells.h                          |   33 +
  src/llama-memory-hybrid-idx.cpp               |   71 +
@@ -388,11 +388,11 @@ byte-identical across modes on 1/2/3 GPUs (5835 chars dc178c29fe89 / 6079 01607c
  src/models/qwen3next.cpp                      |    2 +-
  src/models/qwen4exp.cpp                       |    2 +-
  src/models/sensenova-u1.cpp                   |    2 +-
- tools/server/server-context.cpp               |  315 +-
+ tools/server/server-context.cpp               |  326 ++-
  tools/server/server-task.cpp                  |  104 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 79 files changed, 5975 insertions(+), 995 deletions(-)
+ 79 files changed, 5997 insertions(+), 1005 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index d07aac4c3..1840d87d3 100644
@@ -1938,13 +1938,15 @@ index 9282ca299..cc8978d50 100644
          /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ new ggml::cpu::repack::extra_buffer_type(),
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 21fb976bd..accf66f03 100644
+index 21fb976bd..7623cb2d3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -52,10 +52,29 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
+@@ -51,11 +51,30 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
+     // Deferred unless the scheduler's redirect mode (GGML_SCHED_STAGE_MODE=1) points the input at the slot: every
      // other caller (the scheduler's ring in its default mode, the meta backend's mirrored upload) copies the slot
      // into the input with stage_d2d, where the deferral is resolved.
-     static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
+-    static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
++    static const bool redirect = [] { const char * e = getenv("GGML_SCHED_STAGE_MODE"); return e != nullptr && atoi(e) != 0; }();
 +    // wip/host-expert-master-drop (TODO #55): `stage_from_cache` also serves a POOL-BACKED (pageable) master,
 +    // filling the slot from the arena + the pinned host pool -- so a pooled table is staged without a
 +    // pageable transfer.  The plain fallback below (a 1-D pageable H2D) stays for a table the cache does
@@ -1985,6 +1987,15 @@ index 21fb976bd..accf66f03 100644
      const size_t total = width * n_copies;                 // the device's compacted slice
      void * dst = cuda_ctx->h2d_stage_buffer(slot, total);
      if (dst == nullptr) {
+@@ -85,7 +111,7 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
+     // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
+     // was the pathological ROCm case (the campaign's `hipMemcpy2DAsync` fault); this is the pinned
+     // form the source-pinning fix made possible.  `GGML_STAGE_GATHER_SCRATCH=1` forces the old path.
+-    static const bool force_scratch = getenv("GGML_STAGE_GATHER_SCRATCH") != nullptr && atoi(getenv("GGML_STAGE_GATHER_SCRATCH")) != 0;
++    static const bool force_scratch = [] { const char * e = getenv("GGML_STAGE_GATHER_SCRATCH"); return e != nullptr && atoi(e) != 0; }();
+     if (src_pinned && !force_scratch) {
+         CUDA_CHECK(cudaMemcpy2DAsync(dst, width, (const char *) src + offset, stride_src, width, n_copies, cudaMemcpyHostToDevice, s));
+         CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 @@ -94,7 +120,10 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
      // A host gather when the per-block compaction is cheap (few copies), else stage the whole
      // contiguous range and pick this device's `width`-byte block out of every `stride_src` on the copy
@@ -1998,7 +2009,7 @@ index 21fb976bd..accf66f03 100644
          void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
          if (pin == nullptr) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index bab71d893..cb836a271 100644
+index bab71d893..d6ed08aeb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 @@ -573,8 +573,9 @@ static size_t ggml_cuda_slab_up(size_t x, size_t a) {
@@ -2302,6 +2313,24 @@ index bab71d893..cb836a271 100644
          }
          // Establish the fixed narrow floor: the first reserve smaller than the boundary (the
          // prefill -> decode drop re-reserves the decode/verify layout there).  Its ring region then sits
+@@ -1547,7 +1684,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
+             }
+         };
+         if (!s.inited || !s.ring_armed) {
+-            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
++            if (ggml_cuda_slab_stats_on()) {
+                 if (s.wide_aux_denied_n == 0) {
+                     GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
+                                   device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
+@@ -1569,7 +1706,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
+         // Never grow past the MAPPED region (the arena's top): the slab's VA may carry spare unmapped
+         // space above `mapped`, and a kernel writing there would fault.
+         const size_t aux_limit = std::min(ggml_cuda_slab_arena_limit(s), s.mapped);
+-        if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
++        if (ggml_cuda_slab_stats_on()) {
+             GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB want=%.1f MiB off=%.1f MiB aux=%.1f MiB "
+                           "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
+                           device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 8bffa48f1..50c65928a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -8269,7 +8298,7 @@ index 6cf67faa9..4ebe6f298 100644
      // we will use this to determine whether the graph can be reused by comparing them with the new parameters
      // note: these are updated after constructing the new graph
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 9800a4f14..b3f3a9c87 100644
+index 9800a4f14..b93ddc27c 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -419,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
@@ -8281,7 +8310,23 @@ index 9800a4f14..b3f3a9c87 100644
      if (data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
-@@ -467,6 +469,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -449,8 +451,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         uint32_t new_head = cells.size();
+ 
+-        // only the used range can match: an empty cell's pos is -1 (bounds taken before the loop changes them)
+-        const uint32_t i_end = cells.used_max_p1();
++        // only the used range can match: an empty cell's pos is -1 (bounds taken before the loop changes them).
++        // Parked sequences (seq_park) hold the cells from park_bound() up and no other sequence has a cell there, so a
++        // sequence that is not parked stops below the bound -- the range get_n_kv() decodes over.  Without that a parked
++        // idle slot at the top of the cache made every removal scan the whole cache (issue #273: 245760 cells scanned
++        // per speculative step while the live sequence held 10.5K).
++        const bool below_park = !parked.empty() && parked.count(seq_id) == 0;
++        const uint32_t i_end = below_park ? cells.used_max_p1_below(park_bound()) : cells.used_max_p1();
+         for (uint32_t i = cells.used_min(); i < i_end; ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+@@ -467,6 +474,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
          if (new_head != cells.size() && new_head < head) {
              head = new_head;
          }
@@ -8292,7 +8337,7 @@ index 9800a4f14..b3f3a9c87 100644
      } else {
          // match any sequence
          for (uint32_t s = 0; s < n_stream; ++s) {
-@@ -493,6 +499,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -493,6 +504,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                  head = new_head;
              }
          }
@@ -8303,7 +8348,7 @@ index 9800a4f14..b3f3a9c87 100644
      }
  
      return true;
-@@ -507,6 +517,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+@@ -507,6 +522,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
      GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
      GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
  
@@ -8314,7 +8359,7 @@ index 9800a4f14..b3f3a9c87 100644
      const auto s0 = seq_to_stream[seq_id_src];
      const auto s1 = seq_to_stream[seq_id_dst];
  
-@@ -611,12 +625,284 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+@@ -611,12 +630,284 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
          }
      }
  
@@ -8330,7 +8375,7 @@ index 9800a4f14..b3f3a9c87 100644
  
 +// LLAMA_KV_PARK_DEBUG=1: log every park, unpark and compaction move, and why a park or an unpark is refused
 +static bool llama_kv_park_debug() {
-+    static const bool v = getenv("LLAMA_KV_PARK_DEBUG") != nullptr && atoi(getenv("LLAMA_KV_PARK_DEBUG")) != 0;
++    static const bool v = [] { const char * e = getenv("LLAMA_KV_PARK_DEBUG"); return e != nullptr && atoi(e) != 0; }();
 +    return v;
 +}
 +
@@ -8599,7 +8644,7 @@ index 9800a4f14..b3f3a9c87 100644
  void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
-@@ -799,6 +1085,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+@@ -799,6 +1090,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
  llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
      llama_kv_cache::slot_info_vec_t res;
  
@@ -8619,7 +8664,7 @@ index 9800a4f14..b3f3a9c87 100644
      struct state_t {
          slot_info sinfo; // slot info for the ubatch
  
-@@ -1051,14 +1350,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1051,14 +1355,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
  
          uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
  
@@ -8642,7 +8687,7 @@ index 9800a4f14..b3f3a9c87 100644
              return { };
          }
  
-@@ -1069,8 +1373,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1069,8 +1378,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
          const uint32_t n_test = cont ? n_tokens : 1;
  
          while (true) {
@@ -8653,7 +8698,7 @@ index 9800a4f14..b3f3a9c87 100644
                  head_cur = 0;
                  continue;
              }
-@@ -1128,7 +1432,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1128,7 +1437,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                  res.idxs[s].clear();
              }
  
@@ -8662,7 +8707,24 @@ index 9800a4f14..b3f3a9c87 100644
                  //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                  return { };
              }
-@@ -1331,7 +1635,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+@@ -1315,7 +1624,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+     // LLAMA_KV_N_PAD_MIN raises the 256-cell floor: n_kv - and with it the graph layout - then stays constant for longer,
+     // so fewer captured graphs are invalidated as the context grows (-sm tensor splits each token into ~100 graphs)
+-    static const uint32_t n_pad_min = getenv("LLAMA_KV_N_PAD_MIN") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_MIN")) : 256u;
++    static const uint32_t n_pad_min = [] { const char * e = getenv("LLAMA_KV_N_PAD_MIN"); return e ? (uint32_t) atoi(e) : 256u; }();
+     // LLAMA_KV_N_PAD_PREFILL: a coarser pad for prompt-sized ubatches (> 64 tokens) once the cache is past
+     // LLAMA_KV_N_PAD_PREFILL_FROM cells (default 4096; compared with the decode-padded occupancy).  Every prompt ubatch grows the cache by its own size, so with the
+     // decode pad n_kv - and the graph - changes at every ubatch and the whole graph is rebuilt (split state, allocation);
+@@ -1324,14 +1633,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
+     // Decode and verify batches keep the decode pad (a coarse pad there slows every step and changes its numerics).
+     // Default: 8192 on a multi-device split, 0 (off) on a single device; the value is rounded up to a power of two.
+     // Not for training (its graphs assert n_kv == n_tokens).
+-    static const uint32_t n_pad_prefill_from = getenv("LLAMA_KV_N_PAD_PREFILL_FROM") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_PREFILL_FROM")) : 4096u;
++    static const uint32_t n_pad_prefill_from = [] { const char * e = getenv("LLAMA_KV_N_PAD_PREFILL_FROM"); return e ? (uint32_t) atoi(e) : 4096u; }();
+     const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
+     const bool     prefill   = n_tokens > 64 && n_pad_prefill > n_pad_cur;
+ 
      for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
          const auto & cells = v_cells[sinfo.strm[s]];
  
@@ -9749,7 +9811,7 @@ index c42c604e8..93d31f7c0 100644
          ggml_tensor * inpSA = inpL;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 6790efe2f..d6aa3c909 100644
+index 6790efe2f..6e54a785f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -298,6 +298,14 @@ struct server_slot {
@@ -10151,7 +10213,32 @@ index 6790efe2f..d6aa3c909 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3859,7 +4156,7 @@ private:
+@@ -3799,7 +4096,14 @@ private:
+                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                         }
+ 
+-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
++                        // the drafters read the prompt only inside common_speculative_draft() below, before the batch
++                        // changes it: without media the slot's own token vector IS that prompt, so it is not copied every
++                        // step (issue #273: a 110K-token prompt cost ~0.1 ms per step to copy).
++                        if (slot.prompt.tokens.has_mtmd) {
++                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
++                        }
++                        const llama_tokens * spec_prompt =
++                                slot.prompt.tokens.has_mtmd ? &slot.spec_prompt : &slot.prompt.tokens.get_tokens();
+ 
+                         const bool spec_reject = slot.use_spec_rejection();
+ 
+@@ -3808,7 +4112,7 @@ private:
+                             /* .n_max    = */ n_draft_max,
+                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
+                             /* .id_last  = */ slot.sampled,
+-                            /* .prompt   = */ &slot.spec_prompt,
++                            /* .prompt   = */ spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
+                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                             /* .temp     = */ slot.task->params.sampling.temp,
+@@ -3859,7 +4163,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -10160,7 +10247,7 @@ index 6790efe2f..d6aa3c909 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -3930,6 +4227,8 @@ private:
+@@ -3930,6 +4234,8 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -10169,7 +10256,7 @@ index 6790efe2f..d6aa3c909 100644
                          if (spec) {
                              common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
                          }
-@@ -4183,6 +4482,8 @@ private:
+@@ -4183,6 +4489,8 @@ private:
  
                                      bool do_reset = it == slot.prompt.checkpoints.rend();
  
@@ -10178,7 +10265,7 @@ index 6790efe2f..d6aa3c909 100644
                                      if (!do_reset) {
                                          // restore the context checkpoint
                                          if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-@@ -4202,6 +4503,7 @@ private:
+@@ -4202,6 +4510,7 @@ private:
  
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -10186,7 +10273,7 @@ index 6790efe2f..d6aa3c909 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                      }
  
-@@ -4220,6 +4522,7 @@ private:
+@@ -4220,6 +4529,7 @@ private:
                                      const auto & cur = *it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -10194,7 +10281,7 @@ index 6790efe2f..d6aa3c909 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -4898,7 +5201,7 @@ private:
+@@ -4898,7 +5208,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  

@@ -1,3 +1,80 @@
+## 261105.003 (r217) -- issue #273: two more grids off the gfx1201 stall, `seq_rm` stops at the parked bound, the per-step prompt copy is gone, and every `getenv` is read once
+
+**Released as `v16-6050b467c-r217` (16 blocks; blocks 06, 10, 11, 12, 13 and 15 amended).**  Fork point
+unchanged (`6050b467c`), canonical tip **`541a94a32`**, tree **`c9217f0f`**.  Reported by **@overdoingism**
+([issue #273](https://github.com/stew675/llama-cpp-rdna-boosts/issues/273)), four independent items, each
+claimed bit-identical; every number below is in
+[`benchmarks/2026-11-05-issue-273.md`](benchmarks/2026-11-05-issue-273.md).
+
+### 1. The two grids (block 10: `fattn-common.cuh`, `norm.cu`)
+
+`flash_attn_stream_k_fixup_uniform`'s tile grid and `rms_norm_scale_pair_f32`'s `2*nrows*nchannels` grid
+now go through `ggml_cuda_grid_stall_pad` and add the returning block, exactly as mmvq/mmvf/MoE do:
+a guard in each kernel and one extra block at each launch.  **The stall reproduces on this box**
+(`archive/work/rdna4-grid-stall-pad/graphgap.hip` extended to large grids): 256 blocks 12.63 us against
+257 blocks 2.34, 512 13.63 against 513 2.71, 1024 11.62 against 1025 3.32.  **But it is a fixed ~10 us and
+only dominates a short kernel**: from ~2048 blocks on (16384 against 16385 = 24.41 against 24.49) there is
+nothing to recover.  A rocprofv3 trace of the reporter's model shape shows both grids *do* hit the
+condition but at 16384 / 32768-393216 blocks on this model's row and channel counts, so here the pad is
+neutral and the gain is theirs (256-block grids: 15.48 -> 10.08 us and 15.8 -> 2.4 us per launch).
+
+### 2. `seq_rm` with an idle slot parked (block 12: `llama-kv-cache.cpp`)
+
+`llama_kv_cache::seq_rm()` scanned `[used_min(), used_max_p1())`; with `--kv-unified --parallel 2` the
+parked idle slot sits at the top of the cache, so `used_max_p1()` is the cache size and every speculative
+step scanned all 245 760 cells.  A parked sequence holds only cells at or above `park_bound()`, so a
+sequence that is **not** parked now stops the scan there (`used_max_p1_below(park_bound())`).  Measured
+with a public-API harness on a 131 072-cell unified cache, 4096 live cells, a 64-cell parked sequence:
+**42.127 -> 1.358 us per call** (31x), and the parked sequence's cells, a full removal of the live sequence
+and the unpark are all unchanged.  `scripts/gate-park-idle-slots.sh` is green (6 park moves, 2 unpark,
+park == lazyoff on all four requests, parkoff still differs).
+
+### 3. The drafter's prompt is no longer copied every step (block 12: `server-context.cpp`)
+
+Without media the slot's own token vector *is* the prompt the drafters read inside
+`common_speculative_draft()`, so `slot.spec_prompt` is only filled when `has_mtmd`.  The removed work is
+2.8 us/step at 10.5K tokens and **28.8 us/step at 110K** (isolated measurement of the same copy).
+
+### 4. The `getenv` audit -- issue #273 item 4, widened to the whole delivery (blocks 06/10/11/12/13/15)
+
+The reporter's item 4 (`LLAMA_RS_ROLLBACK_DEBUG` read on every recurrent rollback) was one case of a class.
+An `LD_PRELOAD` interposer counted every `getenv` per name across four real runs; four reads were genuinely
+per-op, not per-process:
+
+| repeated read | 27B server | 35B-A3B `-ncmoe 24` | Flash-Next `-ncmoe 40` |
+|---|---|---|---|
+| `GGML_CUDA_MMB_TYPES` (`mmb_wtype_mask`, per matmul) | 7 657 | 10 103 | 22 913 |
+| `GGML_CUDA_SLAB_STATS` (`slab_log_stats`, per op) | -- | 7 681 | 15 552 |
+| `GGML_STAGE_TRACE` (model-loader, **per tensor**) | -- | 144 | 240 |
+| `GGML_CUDA_FA_STAGE_CHUNK_DEBUG` (per FA launch) | 265 | 268 | 125 |
+
+All four are latched now, plus `LLAMA_GRAPH_RESULT_DEBUG` (per graph), `GGML_STAGE_META_REDIRECT` (per
+staged chunk), `LLAMA_QSA_SCORE_STRIP_DEBUG`, and the region path's `LLAMA_KV_REGION_TRACE`/`_DEBUG`/
+`_CANARY` (per `vmm_map`/`vmm_remap` when a KV window is active).  **Every doubled read in the tree is
+gone: 129 lines called `getenv()` twice for one name (`getenv("X") ? atoi(getenv("X")) : D`), zero do
+now**, and each is a single read into a latched value (`[] { const char * e = getenv("X"); ... }()`, the
+idiom `ENVIRONMENT.md` already documents).  425 call sites over 371 variables remain; the only multi-reads
+left are one per **template instantiation** (`GGML_CUDA_DISABLE_MMQ_ROUTED` 25x in `mmq.cuh`,
+`GGML_CUDA_GRID_STALL_PAD` 5-6x in `common.cuh`), which a function-local static cannot share, and one-shot
+init/argument reads.  One call costs 21.74 ns here (0.18 ns latched) and far more on Windows, so
+`MMB_TYPES` alone was 0.5 ms of a Flash-Next run.
+
+### End to end and gates
+
+The reporter's own shape (Qwen3.8-27B UD-Q4_K_XL + DFlash2-Q4_K_M, `-c 245760 --parallel 2 --kv-unified
+-ub 2048 -fa on`, q8_0 KV, `--spec-draft-n-max 5`, greedy 512 tokens, arms alternated): **10.5K 12.917 ->
+12.925 ms/token (+0.06 %, noise), 110K 16.5515 -> 16.4965 (-0.33 %)**, text identical
+(`3a9db54dc13c76c4`).  This box is 2.5x faster per step than the reporter's while the host work is only
+~2x cheaper, so items 2-4 land at the noise floor here and at 0.25 % on theirs -- the per-piece numbers
+are the statement of record.
+
+Same-seed greedy text identical on 1 GPU, 3 GPU `-sm tensor`, Flash-Next on 2 GPU `-sm layer -ncmoe 40` and
+both server prompts; **prefill-logit KLD 0.000000 / 100.000 %** (exact); MTP Protocol A flat on the P/K/R
+axes with `plain == draft-mtp` text (`draft-mtp n3` 56.2 -> 56.4, K 84.4 -> 84.4, R 70.7 -> 70.7);
+`llama-batched-bench -npl 1,4,8` B=1 flat, B=4 flat, **B=8 1.690 -> 1.6775 s**; park gate green;
+`validate-set.sh` green; `gate-per-block-build.sh --changed-from 790686b53` green on the six amended
+blocks + tip.
+
 ## 261105.002 (r217) -- the KV residency gate now asserts the pool's PROMPT rate: a placement may not be correct and slow
 
 **Tooling only: `scripts/gate-kv-residency.sh` + its two index entries.  `patches/` is unchanged and the release
@@ -43,6 +120,7 @@ default **and** this entry together -- never widen it silently to get green.
 
 **Follow-up worth doing:** the pool section is the only place this class of regression is visible, so gate 17's
 row in `MANIFESTS.md` is now the one that has to be run for any block-15 change; nothing else catches it.
+
 
 ## 261105.001 (r216) -- the attendance pool costs ~50 % of PROMPT throughput on a config whose KV already fits; the `runme` returns to a resident KV
 

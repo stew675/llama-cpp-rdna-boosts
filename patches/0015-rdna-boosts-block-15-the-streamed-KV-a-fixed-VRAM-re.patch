@@ -1,4 +1,4 @@
-From c4f8497755e9332fdd735bd70bfe390a3521aa31 Mon Sep 17 00:00:00 2001
+From 894b3ce6761be7df7cf02034d6f34cfcd5f9ce61 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -371,33 +371,33 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  ggml/include/ggml-backend.h                |   20 +
  ggml/include/ggml-rpc.h                    |    4 +-
  ggml/include/ggml.h                        |   42 +
- ggml/src/ggml-backend-meta.cpp             |  138 ++
+ ggml/src/ggml-backend-meta.cpp             |  143 +-
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
  ggml/src/ggml-cuda/fattn-qsa.cu            |   40 +-
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1221 ++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1238 ++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1413 ++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1449 ++++++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 +++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
- ggml/src/ggml-cuda/moe-expert-cache.cu     |   32 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu     |   38 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   83 +-
- src/llama-context.cpp                      |   17 +
+ src/llama-context.cpp                      |   19 +-
  src/llama-context.h                        |    3 +
  src/llama-ext.h                            |   68 +
  src/llama-kv-cache.cpp                     |  988 ++++++++++++-
  src/llama-kv-cache.h                       |   99 +-
- src/llama-memory-hybrid-idx.cpp            |    5 +-
+ src/llama-memory-hybrid-idx.cpp            |    9 +-
  src/llama-memory-hybrid-idx.h              |    4 +-
  src/llama-memory-hybrid.cpp                |   12 +-
  src/llama-memory-hybrid.h                  |    7 +-
  src/llama-memory.h                         |   15 +
- src/llama-model-loader.cpp                 | 1476 ++++++++++----------
+ src/llama-model-loader.cpp                 | 1486 ++++++++++----------
  src/llama-model.cpp                        |  144 +-
  src/llama-model.h                          |    7 +
- src/models/qwen4exp.cpp                    |   58 +-
- 33 files changed, 6116 insertions(+), 800 deletions(-)
+ src/models/qwen4exp.cpp                    |   66 +-
+ 33 files changed, 6173 insertions(+), 831 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -1198,7 +1198,7 @@ index bde0e01ae..db46f0180 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 562d0a386..1f8717c1d 100644
+index 562d0a386..9e08103b3 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -1360,6 +1360,18 @@ index 562d0a386..1f8717c1d 100644
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
  
  // [TAG_META_UNALLOC_ALIAS]
+@@ -3470,8 +3608,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
+                 // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
+                 // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
+-                // correct configuration.
+-                if (getenv("GGML_STAGE_META_REDIRECT") == nullptr && chunk.backend->iface.stage_d2d != NULL) {
++                // correct configuration.  Latched: this is the per-chunk upload path (issue #273 audit).
++                static const bool meta_redirect = getenv("GGML_STAGE_META_REDIRECT") != nullptr;
++                if (!meta_redirect && chunk.backend->iface.stage_d2d != NULL) {
+                     chunk.backend->iface.stage_d2d(chunk.backend, chunk.orig, chunk.slot,
+                                                    ggml_nbytes(simple_tensor));
+                 } else {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
 index 6caf0c619..30898273c 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
@@ -1533,10 +1545,10 @@ index e17d4bf60..93fc0641f 100644
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
 new file mode 100644
-index 000000000..d76979d32
+index 000000000..d31f94bf0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
-@@ -0,0 +1,1221 @@
+@@ -0,0 +1,1238 @@
 +// wip/kv-residency (TODO #117): the grow-only VMM region -- the O1 "fixed KV region" primitive.
 +// Contract, driver facts and the two traps: ggml-cuda-vmm-region.h.
 +//
@@ -1705,6 +1717,23 @@ index 000000000..d76979d32
 +    }
 +};
 +
++// Diagnostic switches for the region path: they are read ONCE per process (issue #273's getenv audit) --
++// vmm_map/vmm_unmap/vmm_remap run per batch when a KV window is active.
++static bool vmm_trace_on() {
++    static const bool on = getenv("LLAMA_KV_REGION_TRACE") != nullptr;
++    return on;
++}
++
++static bool vmm_debug_on() {
++    static const bool on = getenv("LLAMA_KV_REGION_DEBUG") != nullptr;
++    return on;
++}
++
++static bool vmm_canary_on() {
++    static const bool on = getenv("LLAMA_KV_REGION_CANARY") != nullptr;
++    return on;
++}
++
 +bool vmm_quarantine_enabled() {
 +    static const bool on = [] {
 +        const char * e = getenv("LLAMA_KV_REGION_QUARANTINE");
@@ -1776,7 +1805,7 @@ index 000000000..d76979d32
 +        }
 +    }
 +    (void) cuMemRelease(handle);   // the mapping keeps the physical alive
-+    if (getenv("LLAMA_KV_REGION_TRACE") != nullptr) {
++    if (vmm_trace_on()) {
 +        fprintf(stderr, "MMAP   addr=%8.3f MiB bytes=%7.3f host=%d\n", addr_off / 1048576.0, bytes / 1048576.0, (int) host);
 +        fflush(stderr);
 +    }
@@ -1788,7 +1817,7 @@ index 000000000..d76979d32
 +        return;
 +    }
 +    const CUdeviceptr addr = (CUdeviceptr) ((uintptr_t) r->base + addr_off);
-+    if (getenv("LLAMA_KV_REGION_TRACE") != nullptr) {
++    if (vmm_trace_on()) {
 +        fprintf(stderr, "MUNMAP addr=%8.3f MiB bytes=%7.3f\n", addr_off / 1048576.0, bytes / 1048576.0);
 +        fflush(stderr);
 +    }
@@ -1946,7 +1975,7 @@ index 000000000..d76979d32
 +            return false;             // leave what did map: those bytes are valid and cleared
 +        }
 +        vmm_insert(r, a, n, host);
-+        if (getenv("LLAMA_KV_REGION_TRACE") != nullptr) {
++        if (vmm_trace_on()) {
 +            fprintf(stderr, "MSETsp addr=%8.3f MiB bytes=%7.3f host=%d\n", a / 1048576.0, n / 1048576.0, (int) host);
 +            fflush(stderr);
 +        }
@@ -2049,7 +2078,7 @@ index 000000000..d76979d32
 +        return false;
 +    }
 +    vmm_insert(r, off, bytes, host);   // re-insert
-+    if (getenv("LLAMA_KV_REGION_DEBUG") != nullptr) {
++    if (vmm_debug_on()) {
 +        // verify the restore landed (a debug-only readback: an H2D into a freshly mapped VA was measured to
 +        // land only partially in an earlier revision of this code)
 +        std::vector<char> chk(bytes);
@@ -2099,7 +2128,7 @@ index 000000000..d76979d32
 +    // Cross-check: does the COPY ENGINE see the same bytes as a device kernel?  A disagreement would mean the
 +    // instrument (not the mapping) is wrong, which is exactly the trap that made the sliding-window debug
 +    // verify blind before.
-+    if (getenv("LLAMA_KV_REGION_DEBUG") != nullptr) {
++    if (vmm_debug_on()) {
 +        std::vector<unsigned char> ce(bytes);
 +        if (cudaMemcpy(ce.data(), (const char *) r->base + off, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
 +            const unsigned char * k = (const unsigned char *) r->probe_host;
@@ -2131,7 +2160,7 @@ index 000000000..d76979d32
 +// DIAGNOSTIC (block §3.7.6): is every host mapping still what the flip left there?  Called from the write
 +// paths and from the growth points, one line per divergence (which mapping, when, how many bytes changed).
 +void ggml_cuda_vmm_region_verify_host(ggml_cuda_vmm_region * r, const char * where) {
-+    if (r == nullptr || getenv("LLAMA_KV_REGION_DEBUG") == nullptr) {
++    if (r == nullptr || !vmm_debug_on()) {
 +        return;
 +    }
 +    for (const vmm_mapping & m : r->maps) {
@@ -2163,7 +2192,7 @@ index 000000000..d76979d32
 +// `vmm_map` takes the hold that keeps it safe, so nothing here has to.
 +bool vmm_remap(ggml_cuda_vmm_region * r, const vmm_mapping & m, bool host) {
 +    const vmm_mapping saved = m;
-+    const bool dbg = getenv("LLAMA_KV_REGION_DEBUG") != nullptr;
++    const bool dbg = vmm_debug_on();
 +    if (dbg) {
 +        GGML_LOG_INFO("%s: FLIP device %d off=%.3f bytes=%.3f -> %s\n", __func__, r->device,
 +                saved.off / 1048576.0, saved.bytes / 1048576.0, host ? "host" : "vram");
@@ -2210,7 +2239,7 @@ index 000000000..d76979d32
 +        // CANARY (§3.7.6): overwrite the just-flipped mapping with a known non-zero pattern, so a later change
 +        // to it is proof that SOMETHING WROTE there, as opposed to a read returning stale bytes.  This is what
 +        // separated "the spill was written over" from "the reader saw stale bytes" in the hazard hunt.
-+        if (getenv("LLAMA_KV_REGION_CANARY") != nullptr) {
++        if (vmm_canary_on()) {
 +            if (vmm_ensure_dev_stage(r, saved.bytes)) {
 +                std::vector<unsigned char> ab(saved.bytes, 0xAB);
 +                if (cudaMemcpy(r->dev_stage, ab.data(), saved.bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
@@ -2233,7 +2262,7 @@ index 000000000..d76979d32
 +    if (r == nullptr) {
 +        return false;
 +    }
-+    if (getenv("LLAMA_KV_REGION_TRACE") != nullptr) {
++    if (vmm_trace_on()) {
 +        fprintf(stderr, "ENSURE off=%8.3f MiB bytes=%7.3f host=%d\n", off / 1048576.0, bytes / 1048576.0, (int) host);
 +        fflush(stderr);
 +    }
@@ -2294,7 +2323,7 @@ index 000000000..d76979d32
 +            return false;
 +        }
 +        vmm_insert(r, a, n, host);
-+        if (getenv("LLAMA_KV_REGION_TRACE") != nullptr) {
++        if (vmm_trace_on()) {
 +            fprintf(stderr, "MSETmap addr=%8.3f MiB bytes=%7.3f host=%d\n", a / 1048576.0, n / 1048576.0, (int) host);
 +            fflush(stderr);
 +        }
@@ -2887,7 +2916,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 50c65928a..cdf843d37 100644
+index 50c65928a..f40e3f9cc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -2949,6 +2978,15 @@ index 50c65928a..cdf843d37 100644
          if (slab_view) {
              ggml_cuda_slab_work_release(device, slab_off, slab_need);   // the slab owns the region; the slack may go to the arena
              return;
+@@ -1877,7 +1906,7 @@ struct ggml_cuda_async_input_done_guard {
+         }
+         // default on only with GGML_CUDA_ASYNC_INPUT_BATCH=1 (i.e. the default): with per-copy uploads alone it measured
+         // ~1 % slower on one GPU
+-        static const bool lazy = getenv("GGML_CUDA_ASYNC_INPUT_LAZY_DONE") ? atoi(getenv("GGML_CUDA_ASYNC_INPUT_LAZY_DONE")) != 0 : g_async_input_batch;
++        static const bool lazy = [] { const char * e = getenv("GGML_CUDA_ASYNC_INPUT_LAZY_DONE"); return e ? atoi(e) != 0 : g_async_input_batch; }();
+         if (lazy) {
+             o.done_pending = true;
+             o.done_stream  = stream;
 @@ -2259,6 +2288,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
  struct ggml_backend_cuda_buffer_type_context {
      int device;
@@ -4127,6 +4165,15 @@ index 50c65928a..cdf843d37 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
+@@ -3666,7 +4852,7 @@ static bool    g_cgc_reg = false;
+ static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
+ static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+ static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
+-static const int  g_mmb_mark_log = getenv("GGML_CUDA_MMB_MARK_LOG") ? atoi(getenv("GGML_CUDA_MMB_MARK_LOG")) : 0;
++static const int  g_mmb_mark_log = [] { const char * e = getenv("GGML_CUDA_MMB_MARK_LOG"); return e ? atoi(e) : 0; }();
+ // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
+ // under -sm tensor), so it is resolved once instead of per call.
+ static const bool g_cuda_splice_env_on = [] {
 @@ -4932,6 +6118,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
@@ -4317,7 +4364,110 @@ index 50c65928a..cdf843d37 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -8058,6 +9381,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5894,13 +7217,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             }
+ 
+             if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
+-            static const bool fuse_gdn_state_gather =
+-                (getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER")) != 0) &&
+-                (getenv("GGML_CUDA_DISABLE_FUSION") == nullptr || atoi(getenv("GGML_CUDA_DISABLE_FUSION")) == 0);
++            static const bool fuse_gdn_state_gather = [] {
++                const char * fuse = getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER");
++                const char * dis  = getenv("GGML_CUDA_DISABLE_FUSION");
++                return (fuse == nullptr || atoi(fuse) != 0) && (dis == nullptr || atoi(dis) == 0);
++            }();
+             // GGML_CUDA_GDN_GATHER_INDEX=0: per-gather walk instead of the per-graph index (A/B);
+             // =2: both, abort on a different answer
+-            static const int gdn_gather_index_mode =
+-                getenv("GGML_CUDA_GDN_GATHER_INDEX") ? atoi(getenv("GGML_CUDA_GDN_GATHER_INDEX")) : 1;
++            static const int gdn_gather_index_mode = [] {
++                const char * e = getenv("GGML_CUDA_GDN_GATHER_INDEX");
++                return e ? atoi(e) : 1;
++            }();
+             ggml_cuda_gdn_gather_index gdn_gather_index;
+             cuda_ctx->gdn_deferred_gathers.clear();
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+@@ -6272,7 +7599,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     use_cuda_graph = true;
+                     // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
+                     // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
+-                    static const bool mem_gen_check = !getenv("GGML_CUDA_GRAPH_MEM_GEN") || atoi(getenv("GGML_CUDA_GRAPH_MEM_GEN")) != 0;
++                    static const bool mem_gen_check = [] { const char * e = getenv("GGML_CUDA_GRAPH_MEM_GEN"); return !e || atoi(e) != 0; }();
+                     cuda_graph_update_required = graph->instances.empty() ||
+                         (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
+                 }
+@@ -6416,7 +7743,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
+     // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
+     {
+-        static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 1;
++        static const int hc16 = [] { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : 1; }();
+         if (hc16 >= 1 && ggml_cuda_mmb_active() &&
+                 GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
+@@ -6447,7 +7774,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 }
+                 if (ok && nread > 0 && elide_f32) {
+                     ggml_cuda_mmb_mark_bf16_only(gr);
+-                    static const int lg = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
++                    static const int lg = [] { const char * e = getenv("GGML_CUDA_MMB_LOG"); return e ? atoi(e) : 0; }();
+                     if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
+                             gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
+                 }
+@@ -6462,7 +7789,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
+     // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
+     {
+-        static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 1;
++        static const int hc16 = [] { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : 1; }();
+         if (hc16 >= 1 && ggml_cuda_mmb_active() &&
+                 GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+             auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
+@@ -6576,7 +7903,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             ggml_cuda_hc_combine_norm_args ca;
+             if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
+         }
+-        static const int blk_dbg = getenv("GGML_CUDA_HC_BLK16_DEBUG") ? atoi(getenv("GGML_CUDA_HC_BLK16_DEBUG")) : 0;
++        static const int blk_dbg = [] { const char * e = getenv("GGML_CUDA_HC_BLK16_DEBUG"); return e ? atoi(e) : 0; }();
+         if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
+         if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
+             std::vector<const ggml_tensor *> blks;
+@@ -6682,7 +8009,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     }
+ 
+-    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
++    static const bool disable_fusion = [] { const char * e = getenv("GGML_CUDA_DISABLE_FUSION"); return e != nullptr && std::atoi(e); }();
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
+ 
+@@ -6704,14 +8031,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
+         // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
+         // size.  GGML_CUDA_QK_ROTATE=0: off.
+-        static const bool qk_rotate = getenv("GGML_CUDA_QK_ROTATE") == nullptr || atoi(getenv("GGML_CUDA_QK_ROTATE")) != 0;
++        static const bool qk_rotate = [] { const char * e = getenv("GGML_CUDA_QK_ROTATE"); return e == nullptr || atoi(e) != 0; }();
+         // Quantized KV cache: build_attn rotates Q, K and V (RESHAPE, Hadamard MUL_MAT, RESHAPE after each).  The Q
+         // chain then ends with its rotation, and V's rotation sits between the V and K projections, which stops the
+         // row concat.  Take Q's rotation along with the Q chain and move V's rotation (the Hadamard MUL_MATs between the
+         // chains, the views they read and everything downstream of them) behind the Q chain.  Same nodes, one stream:
+         // bit-identical.  1-token graphs only (the row concat is a 1-token fusion; prefill keeps the stock order).
+         // GGML_CUDA_QK_ROTATE_HADAMARD=0: off (the Q chain then ends at its ROPE, as before).
+-        static const bool qk_rotate_had = getenv("GGML_CUDA_QK_ROTATE_HADAMARD") == nullptr || atoi(getenv("GGML_CUDA_QK_ROTATE_HADAMARD")) != 0;
++        static const bool qk_rotate_had = [] { const char * e = getenv("GGML_CUDA_QK_ROTATE_HADAMARD"); return e == nullptr || atoi(e) != 0; }();
+         const auto is_had = [](const ggml_tensor * t) {
+             return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+         };
+@@ -6831,7 +8158,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
+         // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
+         // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
+-        static const bool cat_reorder = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER") == nullptr || atoi(getenv("GGML_CUDA_MMVQ_CONCAT_REORDER")) != 0;
++        static const bool cat_reorder = [] { const char * e = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER"); return e == nullptr || atoi(e) != 0; }();
+         const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
+         if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
+             ggml_tensor ** n = cgraph->nodes;
+@@ -8058,6 +9385,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4332,7 +4482,7 @@ index 50c65928a..cdf843d37 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8087,7 +9418,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8087,7 +9422,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -4342,7 +4492,7 @@ index 50c65928a..cdf843d37 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8516,8 +9848,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8516,8 +9852,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4403,7 +4553,7 @@ index 50c65928a..cdf843d37 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8629,6 +10013,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8629,6 +10017,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -4798,7 +4948,7 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 2fb331980..9027b83ba 100644
+index 2fb331980..de110d58a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -56,10 +56,6 @@ static void heat_pull_locked();
@@ -4812,6 +4962,24 @@ index 2fb331980..9027b83ba 100644
  namespace {
  
  // wip/host-expert-tier: the loader opens the persisted prior BEFORE it places any host-expert tensor (see
+@@ -1775,7 +1771,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
+         // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
+         // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
+         // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
+-        static const char * pool_alloc = getenv("MOE_HOST_POOL_ALLOC") != nullptr ? getenv("MOE_HOST_POOL_ALLOC") : "thp";
++        static const char * pool_alloc = [] { const char * e = getenv("MOE_HOST_POOL_ALLOC"); return e != nullptr ? e : "thp"; }();
+         const size_t pool_bytes = (size_t) slots * t.host_bytes;
+         cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
+         /**/ if (strcmp(pool_alloc, "thp") == 0) {
+@@ -2250,7 +2246,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
+ }
+ 
+ static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
+-    static const bool bulk = getenv("MOE_HOST_POOL_BULK") == nullptr || atoi(getenv("MOE_HOST_POOL_BULK")) != 0;
++    static const bool bulk = [] { const char * e = getenv("MOE_HOST_POOL_BULK"); return e == nullptr || atoi(e) != 0; }();
+     if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
+         return;
+     }
 @@ -2632,7 +2628,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return cudaErrorInvalidDeviceFunction;
      }
@@ -4854,6 +5022,15 @@ index 2fb331980..9027b83ba 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
+@@ -6518,7 +6534,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
+     // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
+     if (head_pad > 0 && weight_cpy->data != nullptr) {
+-        static const bool once = getenv("GGML_MOE_GATHER_ONCE") != nullptr && atoi(getenv("GGML_MOE_GATHER_ONCE")) != 0;
++        static const bool once = [] { const char * e = getenv("GGML_MOE_GATHER_ONCE"); return e != nullptr && atoi(e) != 0; }();
+         bool run = true;
+         if (once) {
+             std::lock_guard<std::mutex> lock(g_mutex);
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
 index 631c106cd..a5eb90a03 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
@@ -5013,7 +5190,7 @@ index b945670c4..3815dd1bc 100644
  
  struct ggml_tensor * ggml_indexer_top_k(
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ffe6a0557..56f2a3366 100644
+index ffe6a0557..25b303b58 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -746,6 +746,7 @@ llama_context::llama_context(
@@ -5024,6 +5201,15 @@ index ffe6a0557..56f2a3366 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
+@@ -3312,7 +3313,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         // outputs (a prompt chunk that does not end its prompt), so they need the same wait there: the next ubatch's input
+         // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
+         // to overwrite a layer input before its copy had read it.
+-        static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
++        static const bool readback_sync = [] { const char * e = getenv("GGML_READBACK_SYNC"); return e == nullptr || atoi(e) != 0; }();
+         // F1 (issue #240): with the in-graph stores there is no layer-input readback to order (the copy that needed
+         // it no longer exists, and syncing the device once per ubatch would serialize a multi-ubatch prefill) -
+         // except for an embedding ubatch, which fills the host rows the draft reads.
 @@ -6912,6 +6913,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
@@ -5145,7 +5331,7 @@ index 0079595f5..194325816 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index b3f3a9c87..55a4df604 100644
+index b93ddc27c..57e6b4a62 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,287 @@ static bool ggml_is_power_of_2(int n) {
@@ -5912,7 +6098,7 @@ index b3f3a9c87..55a4df604 100644
      }
  }
  
-@@ -743,6 +1433,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -748,6 +1438,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -5923,7 +6109,7 @@ index b3f3a9c87..55a4df604 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -798,6 +1492,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -803,6 +1497,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -5962,7 +6148,7 @@ index b3f3a9c87..55a4df604 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1023,9 +1749,33 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1028,9 +1754,33 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      for (const auto & [ctx, buf] : ctxs_bufs) {
          ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
  
@@ -5997,7 +6183,7 @@ index b3f3a9c87..55a4df604 100644
          } else {
              // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
              ret[buft] += ggml_backend_buffer_get_size(buf.get());
-@@ -1035,6 +1785,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1040,6 +1790,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -6034,7 +6220,7 @@ index b3f3a9c87..55a4df604 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1551,6 +2331,164 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1556,6 +2336,164 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -6199,7 +6385,7 @@ index b3f3a9c87..55a4df604 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1612,6 +2550,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1617,6 +2555,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -6233,7 +6419,7 @@ index b3f3a9c87..55a4df604 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -1890,6 +2855,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1895,6 +2860,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -6243,7 +6429,7 @@ index b3f3a9c87..55a4df604 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3314,6 +4282,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3319,6 +4287,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -6253,7 +6439,7 @@ index b3f3a9c87..55a4df604 100644
      return true;
  }
  
-@@ -3487,6 +4458,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3492,6 +4463,11 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
  
@@ -6412,7 +6598,7 @@ index 6bf874cb5..74c0b18d5 100644
      ggml_type type_v() const;
  
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index bee794a97..76ef5d842 100644
+index bee794a97..1cc8a5304 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
 @@ -70,13 +70,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
@@ -6432,6 +6618,17 @@ index bee794a97..76ef5d842 100644
      hparams_idx(model.hparams),
      mem_idx(filter_idx == nullptr ? nullptr : [&] {
          // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+@@ -1789,7 +1790,9 @@ std::vector<int64_t> llama_memory_hybrid_idx_context::qsa_score_key_limits(
+         limits.push_back(std::min(n_blocks, std::max(budget, (maximum + 1)/ratio) + 1));
+     }
+ 
+-    if (getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr) {
++    // a per-decide read: latch it (issue #273's getenv audit)
++    static const bool strip_debug = getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr;
++    if (strip_debug) {
+         fprintf(stderr, "QSA score bounds: n_tokens=%lld n_blocks=%lld strip=%lld ratio=%u budget=%lld limits=[%lld, %lld]\n",
+                 (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
+                 (long long) limits.front(), (long long) limits.back());
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
 index 932953ecf..9d17f1649 100644
 --- a/src/llama-memory-hybrid-idx.h
@@ -6543,7 +6740,7 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 70162ac76..8de02d167 100644
+index 70162ac76..dbca4592d 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,874 +53,872 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -8158,6 +8355,37 @@ index 70162ac76..8de02d167 100644
  
  
  llama_model_loader::llama_model_loader(
+@@ -942,8 +940,8 @@ llama_model_loader::llama_model_loader(
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+     int trace = 0;
+-    if (getenv("LLAMA_TRACE")) {
+-        trace = atoi(getenv("LLAMA_TRACE"));
++    if (const char * e = getenv("LLAMA_TRACE")) {
++        trace = atoi(e);
+     }
+ 
+     if (param_overrides_p != nullptr) {
+@@ -1763,7 +1761,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
+                 tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
+                 tn.bid <  (int) hparams.n_layer()) {
+-            if (getenv("GGML_STAGE_TRACE")) {
++            // a per-TENSOR read: latch it (issue #273's getenv audit)
++            static const bool stage_trace = getenv("GGML_STAGE_TRACE") != nullptr;
++            if (stage_trace) {
+                 fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
+                 fflush(stderr);
+             }
+@@ -2050,7 +2050,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+ // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
+ // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
+ static bool llama_load_release_mmap() {
+-    static const bool enabled = getenv("LLAMA_LOAD_RELEASE_MMAP") == nullptr || atoi(getenv("LLAMA_LOAD_RELEASE_MMAP")) != 0;
++    static const bool enabled = [] { const char * e = getenv("LLAMA_LOAD_RELEASE_MMAP"); return e == nullptr || atoi(e) != 0; }();
+     return enabled;
+ }
+ 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 2eb492f58..1d6dd315c 100644
 --- a/src/llama-model.cpp
@@ -8362,7 +8590,7 @@ index 78f231057..74f90509c 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 4e6acca4c..c5e0697a7 100644
+index 4e6acca4c..59f342c09 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -166,6 +166,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
@@ -8400,6 +8628,33 @@ index 4e6acca4c..c5e0697a7 100644
  // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
  // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
  // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
+@@ -755,7 +783,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     // tail of the collapse launch) or Q8_0 (mmvq rows on the down grid).
+     // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
+     // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
+-    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
++    static const bool hc_mix_bf16 = [] { const char * e = getenv("LLAMA_HC_MIX_BF16"); return !e || atoi(e) != 0; }();
+     // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
+     const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
+                             (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
+@@ -772,7 +800,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         const int64_t out_n = n_embd + (w_inject ? hc : 0);
+         // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
+         // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
+-        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
++        static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();
+         const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
+         if (planar) {
+             ggml_hc_mix_set_planar(dst_t);
+@@ -918,7 +946,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
+     // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
+     // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
+-    static const bool pin_block_out = getenv("LLAMA_HC_PIN_BLOCK_OUT") != nullptr && atoi(getenv("LLAMA_HC_PIN_BLOCK_OUT")) != 0;
++    static const bool pin_block_out = [] { const char * e = getenv("LLAMA_HC_PIN_BLOCK_OUT"); return e != nullptr && atoi(e) != 0; }();
+     if (pin_block_out) {
+         ggml_set_output(block_out);
+     }
 @@ -2371,9 +2399,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
      }
@@ -8455,6 +8710,15 @@ index 4e6acca4c..c5e0697a7 100644
              build_qsa_store_k(mctx_hyb, cur, il);
          } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                     n_kv < qsa_dense_prefill_until) {
+@@ -3057,7 +3109,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+ 
+         // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
+         // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B
+-        static const bool tail_cont = getenv("LLAMA_CONV_TAIL_CONT") != nullptr && atoi(getenv("LLAMA_CONV_TAIL_CONT")) != 0;
++        static const bool tail_cont = [] { const char * e = getenv("LLAMA_CONV_TAIL_CONT"); return e != nullptr && atoi(e) != 0; }();
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail_cont ? ggml_cont(ctx0, tail) : tail, dst));
+     }
+ 
 -- 
 2.56.0
 

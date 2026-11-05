@@ -1817,3 +1817,38 @@ cost a session to learn; do not re-derive them.
    tokens flipped one token between pool-on and pool-off (stable across two prompts).  The shipped default is the
    plain device KV -- block 15 unset, the arm `patches/README.md` calls byte-identical to a build without the block
    -- and `scripts/gate-kv-residency.sh` is the arbiter for the pool arm, not a sampled text hash.
+
+## r217 -- the gfx1201 stall is a FIXED cost (it only pays on short grids); a parked slot bounds `seq_rm`; every `getenv` is read once
+
+**Measured facts behind issue #273.  Do not re-derive; do not "optimise" the arms that are neutral.**
+
+1. **The gfx1201 grid-size stall is a fixed ~10 us added to a short kernel, so padding it only pays below ~2048
+   blocks.**  `archive/work/rdna4-grid-stall-pad/graphgap.hip` (2000 dependent trivial kernels in a captured HIP
+   graph, 256 threads/block), extended to large grids: 256 blocks **12.63 us** against 257 **2.34**, 512 **13.63** /
+   513 **2.71**, 1024 **11.62** / 1025 **3.32**, 1536 **6.42** / 1537 **4.21** -- then 2048 5.08 / 2049 4.83, 4096
+   7.54 / 4097 7.52, 8192 12.71 / 8193 12.76, 16384 24.41 / 16385 24.49, 32768 46.06 / 32769 45.86.  Above ~2048
+   blocks the kernel's own runtime hides the fixed cost and the pad changes nothing (it stays harmless and
+   bit-identical).  A block-value multiple of 256 or a work-item multiple of 65536 both trigger it; a launch can
+   hit the condition and be **neutral** -- check the grid size before claiming a gain (issue #273: the reporter's
+   256-block grids pay, a 27B model's 16384-block grid does not).
+2. **A parked idle slot sits at the TOP of a unified cache, so `used_max_p1()` is the cache size.**  `seq_rm()`
+   must therefore scan to `used_max_p1_below(park_bound())` for a sequence that is **not** parked (a parked
+   sequence holds only cells at or above the bound, and no other sequence has a cell there).  Measured on a
+   131 072-cell unified cache with 4096 live cells and a 64-cell parked sequence: **42.127 us -> 1.358 us** per
+   removal (31x); the parked cells, a full removal of the live sequence and the unpark are unchanged
+   (`scripts/gate-park-idle-slots.sh` is the end-to-end arbiter).  The negative `seq_id` (any-sequence) branch
+   must keep scanning the whole used range -- it has to remove parked cells too.
+3. **A per-op `getenv()` is a measurable cost AND a correctness hazard, so every read is latched once.**  One call
+   is **21.74 ns** here (a latched `static` 0.18 ns) and much worse on Windows (the CRT lock), but the harder
+   reason is that the ROCm 7.14 `rocprofiler-register` calls `setenv()` during early init and can reallocate the
+   process environment under a concurrent `getenv()` (ROCm issue #10196), which once made an env gate read as
+   unset -- see the comment at the top of `src/models/qwen4exp.cpp`.  Audit with an `LD_PRELOAD` interposer that
+   counts `getenv` per name on a real run: before r217 `GGML_CUDA_MMB_TYPES` (per matmul) was read 7 657-22 913
+   times per run, `GGML_CUDA_SLAB_STATS` 7 681-15 552, `GGML_STAGE_TRACE` 144-240, `GGML_CUDA_FA_STAGE_CHUNK_DEBUG`
+   125-431.  `getenv("X") ? atoi(getenv("X")) : D` (the doubled read) is gone from the tree; a read is
+   `[] { const char * e = getenv("X"); return ...; }()` into a `static`, or a file-local accessor when several
+   functions need it.  A `static` inside a **template** function is one copy per instantiation (that is the only
+   multi-read left, e.g. `GGML_CUDA_DISABLE_MMQ_ROUTED` in `mmq.cuh`).
+4. **Without media, the server slot's own token vector IS the prompt the drafters read**, so `slot.spec_prompt`
+   must only be copied when `tokens.has_mtmd`; the copy is 2.8 us/step at 10.5K tokens and **28.8 us/step at
+   110K**.  The drafters read it inside `common_speculative_draft()`, before the batch changes the prompt.

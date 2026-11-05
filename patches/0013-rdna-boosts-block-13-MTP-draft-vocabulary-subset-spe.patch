@@ -1,4 +1,4 @@
-From 969e421f69cb9c5fb2be1df915321be45486ed6b Mon Sep 17 00:00:00 2001
+From f1fa0363c4a0759d9a929c6ac4919c01686eb8f1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -50,7 +50,7 @@ Co-authored-by: Martino B <martino2k6@users.noreply.github.com>
  src/llama-context.cpp           |  18 +++
  src/llama-context.h             |   3 +
  src/llama-cparams.h             |   2 +
- src/llama-graph.cpp             |   1 +
+ src/llama-graph.cpp             |   9 +-
  src/llama-graph.h               |   7 +
  src/llama-model.cpp             | 149 ++++++++++++++++++++
  src/llama-model.h               |  21 +++
@@ -60,7 +60,7 @@ Co-authored-by: Martino B <martino2k6@users.noreply.github.com>
  src/models/qwen4exp.cpp         |  17 ++-
  tests/CMakeLists.txt            |   1 +
  tests/test-mtp-draft-vocab.cpp  | 243 ++++++++++++++++++++++++++++++++
- 19 files changed, 569 insertions(+), 6 deletions(-)
+ 19 files changed, 575 insertions(+), 8 deletions(-)
  create mode 100644 tests/test-mtp-draft-vocab.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
@@ -271,10 +271,25 @@ index 4c6f67705..1f472330f 100644
      float rope_freq_scale;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5b0e61353..f34511a3c 100644
+index 5b0e61353..f7dd72528 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1785,6 +1785,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+@@ -1518,8 +1518,12 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
+ llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
+     reset();
+ 
+-    const char * LLAMA_GRAPH_RESULT_DEBUG = getenv("LLAMA_GRAPH_RESULT_DEBUG");
+-    debug = LLAMA_GRAPH_RESULT_DEBUG ? atoi(LLAMA_GRAPH_RESULT_DEBUG) : 0;
++    // a per-graph read: latch it (issue #273's getenv audit)
++    static const int result_debug = [] {
++        const char * e = getenv("LLAMA_GRAPH_RESULT_DEBUG");
++        return e ? atoi(e) : 0;
++    }();
++    debug = result_debug;
+ }
+ 
+ int64_t llm_graph_result::get_max_nodes() const {
+@@ -1785,6 +1789,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
      prec_policy      (params.prec_policy),
      hdmd             (params.hdmd),
      samplers         (params.samplers),

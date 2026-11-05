@@ -30,6 +30,23 @@ device allocation, per graph input, per batch) would otherwise read it thousands
 avoids caching a `const char *` returned by `getenv()` across calls, which is unsafe on Windows because
 the MSVC CRT reuses its buffer for the next `getenv()`.
 
+**Since r217 this is enforced, not aspirational (issue #273 item 4).**  A run-time `getenv` counter
+(an `LD_PRELOAD` interposer) found four reads that were genuinely per-op rather than per-process:
+`GGML_CUDA_MMB_TYPES` (per matmul, 7 657-22 913 calls per run), `GGML_CUDA_SLAB_STATS` (7 681-15 552),
+`GGML_STAGE_TRACE` (per tensor, 144-240) and `GGML_CUDA_FA_STAGE_CHUNK_DEBUG` (per FA launch, 125-431).
+All are latched now, and **no line in the delivery reads the same name twice** (129 did, in the
+`getenv("X") ? atoi(getenv("X")) : D` idiom).  A new variable is read like this:
+
+```cpp
+static const bool on = [] { const char * e = getenv("GGML_CUDA_X"); return e == nullptr || atoi(e) != 0; }();
+```
+
+(or a file-local accessor when several functions need the same switch).  The audit found a second reason
+to latch rather than re-read: the ROCm 7.14 `rocprofiler-register` calls `setenv()` during early init and
+can reallocate the environment under a concurrent `getenv()` (ROCm issue #10196), which is why
+`src/models/qwen4exp.cpp` gate-compiles qsa3 instead of gating it on an env variable.  A `static` inside a
+**template** function is one copy per instantiation, which is the only multi-read that remains.
+
 ## The short answer: what you actually need
 
 **Nothing.** Every feature the delivery ships is default-on, and this is deliberate policy (see

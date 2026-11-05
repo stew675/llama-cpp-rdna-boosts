@@ -1,4 +1,4 @@
-From 2fd3ed9d9ddca002a613f18fa93dd22cf65a70a9 Mon Sep 17 00:00:00 2001
+From 2b718cba804b0ebc3eade9e16b0d0a18008d5508 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -78,7 +78,7 @@ nothing.
  ggml/src/ggml-cuda/fattn-qsa.cu          |  756 +++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh         |   28 +
  ggml/src/ggml-cuda/fattn-qsa3.cu         |  774 +++++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   48 +
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   88 +-
  ggml/src/ggml-cuda/ggml-cuda.cu          |  163 ++
  ggml/src/ggml-cuda/hc-mix.cu             | 1409 +++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
@@ -100,7 +100,7 @@ nothing.
  src/llama-lazy-reader.h                  |   91 +
  src/llama-memory-hybrid-idx.cpp          |  791 +++++++-
  src/llama-memory-hybrid-idx.h            |  100 +
- src/llama-memory-recurrent.cpp           |   13 +-
+ src/llama-memory-recurrent.cpp           |   24 +-
  src/llama-model-loader.cpp               |   76 +-
  src/llama-model-loader.h                 |   13 +
  src/llama-model.cpp                      |   46 +-
@@ -112,7 +112,7 @@ nothing.
  tests/test-backend-ops.cpp               |  467 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   12 +-
- 46 files changed, 12077 insertions(+), 441 deletions(-)
+ 46 files changed, 12107 insertions(+), 462 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -2777,7 +2777,7 @@ index 000000000..e17d4bf60
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 3f4a80512..5887851d6 100644
+index 3f4a80512..917e3c6e2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -30,6 +30,9 @@
@@ -2807,7 +2807,86 @@ index 3f4a80512..5887851d6 100644
  #include "ggml-cuda/ggml-cuda-try-fuse.cuh"
  #include "ggml.h"
  #include <algorithm>
-@@ -1749,6 +1755,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -541,7 +547,7 @@ static const struct {
+ // tokens), when the CONCAT is the gather's only reader and nothing but the folded snapshot CPYs writes the cache before
+ // the conv.  GGML_CUDA_FUSE_GDN_CONV_GATHER=0: off.
+ bool ggml_cuda_gdn_conv_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx) {
+-    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_CONV_GATHER") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_GATHER")) != 0;
++    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_CONV_GATHER"); return e == nullptr || atoi(e) != 0; }();
+     const ggml_tensor * gr = cgraph->nodes[node_idx];
+     const auto g = idx.gathers.find(gr);
+     if (!fuse || g == idx.gathers.end() || g->second.n_gdn != 0 || g->second.n_concat != 1 || g->second.other_reader ||
+@@ -576,8 +582,10 @@ static bool ggml_cuda_topk_moe_fusion_disabled() {
+     // A/B kill-switch for the fused MoE router.  The fused kernel is bit-identical to the generic
+     // softmax -> argsort -> get_rows -> norm chain (both the softmax reduction/normalization and
+     // the argsort tie-break are matched), so this only exists to compare the two execution paths.
+-    static const bool disabled = getenv("GGML_CUDA_DISABLE_TOPK_MOE_FUSION") != nullptr &&
+-                                 std::atoi(getenv("GGML_CUDA_DISABLE_TOPK_MOE_FUSION")) != 0;
++    static const bool disabled = [] {
++        const char * e = getenv("GGML_CUDA_DISABLE_TOPK_MOE_FUSION");
++        return e != nullptr && std::atoi(e) != 0;
++    }();
+     return disabled;
+ }
+ 
+@@ -1071,16 +1079,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
+ // primary device): the q4_0 / q5_0 / iq4_nl group quantizers ballot and shuffle over one 32-lane wave, so a wave64
+ // device keeps its separate launches.  q8_0's shuffle width is wave-size agnostic.
+ static bool ggml_cuda_kv_fold_type_ok(const ggml_type t, const int warp_size) {
+-    static const bool q4 = getenv("GGML_CUDA_KV_FOLD_Q4_0")   == nullptr || atoi(getenv("GGML_CUDA_KV_FOLD_Q4_0"))   != 0;
+-    static const bool q5 = getenv("GGML_CUDA_KV_FOLD_Q5_0")   == nullptr || atoi(getenv("GGML_CUDA_KV_FOLD_Q5_0"))   != 0;
+-    static const bool nl = getenv("GGML_CUDA_KV_FOLD_IQ4_NL") == nullptr || atoi(getenv("GGML_CUDA_KV_FOLD_IQ4_NL")) != 0;
++    static const bool q4 = [] { const char * e = getenv("GGML_CUDA_KV_FOLD_Q4_0"); return e   == nullptr || atoi(e)   != 0; }();
++    static const bool q5 = [] { const char * e = getenv("GGML_CUDA_KV_FOLD_Q5_0"); return e   == nullptr || atoi(e)   != 0; }();
++    static const bool nl = [] { const char * e = getenv("GGML_CUDA_KV_FOLD_IQ4_NL"); return e == nullptr || atoi(e) != 0; }();
+     const bool wave32 = warp_size == 32;
+     return t == GGML_TYPE_Q8_0 ||
+            (wave32 && ((q4 && t == GGML_TYPE_Q4_0) || (q5 && t == GGML_TYPE_Q5_0) || (nl && t == GGML_TYPE_IQ4_NL)));
+ }
+ 
+ static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, const bool allow_v, const int warp_size) {
+-    static const bool on = getenv("GGML_CUDA_FUSE_ROPE_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_ROPE_FWHT")) != 0;
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSE_ROPE_FWHT"); return e == nullptr || atoi(e) != 0; }();
+     if (!on || i + 3 > cgraph->n_nodes) {
+         return 0;
+     }
+@@ -1182,7 +1190,7 @@ static int ggml_cuda_rope_fwht_count(const ggml_cgraph * cgraph, const int i, co
+ // cache row the K chain writes) may write over them or over the Q output, and nothing in between may read the Q chain.
+ // GGML_CUDA_ROPE_QK_PAIR=0: off.
+ static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const bool allow) {
+-    static const bool on = getenv("GGML_CUDA_ROPE_QK_PAIR") == nullptr || atoi(getenv("GGML_CUDA_ROPE_QK_PAIR")) != 0;
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_ROPE_QK_PAIR"); return e == nullptr || atoi(e) != 0; }();
+     if (!on || !allow) {
+         return 0;
+     }
+@@ -1248,7 +1256,7 @@ static int ggml_cuda_qk_pair_k_at(const ggml_cgraph * cgraph, const int i, const
+ // VIEW and SET_ROWS into a cache of the same type with the same row length: the fused kernel's per-head blocks also write
+ // the V row (k_set_rows' cast), so the V set_rows launch goes away.  GGML_CUDA_ROPE_SET_ROWS_V=0: off.
+ static bool ggml_cuda_rope_set_rows_v_ok(const ggml_cgraph * cgraph, const int i) {
+-    static const bool on = getenv("GGML_CUDA_ROPE_SET_ROWS_V") == nullptr || atoi(getenv("GGML_CUDA_ROPE_SET_ROWS_V")) != 0;
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_ROPE_SET_ROWS_V"); return e == nullptr || atoi(e) != 0; }();
+     if (!on || i + 7 > cgraph->n_nodes) {
+         return false;
+     }
+@@ -1415,7 +1423,7 @@ static int ggml_cuda_fwht_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const g
+ // not run (one parallel block), the FWHT runs as usual.  Returns the index offset of the last node done, or 0 (FA not
+ // run).  1-token graphs.  GGML_CUDA_FA_COMBINE_FWHT=0: off.
+ static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+-    static const bool on = getenv("GGML_CUDA_FA_COMBINE_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FA_COMBINE_FWHT")) != 0;
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FA_COMBINE_FWHT"); return e == nullptr || atoi(e) != 0; }();
+     ggml_tensor * fa = cgraph->nodes[i];
+     if (!on || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[1] != 1 || fa->type != GGML_TYPE_F32 ||
+             ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) {
+@@ -1458,7 +1466,7 @@ static int ggml_cuda_fa_had_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+ // whose V VIEW reads that RESHAPE (the QK rotate's order with a quantized KV cache): the fused K kernel can rotate the
+ // V row itself.  GGML_CUDA_FUSE_V_FWHT=0: off.
+ static bool ggml_cuda_v_fwht_fold_at(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+-    static const bool v_fwht_on = getenv("GGML_CUDA_FUSE_V_FWHT") == nullptr || atoi(getenv("GGML_CUDA_FUSE_V_FWHT")) != 0;
++    static const bool v_fwht_on = [] { const char * e = getenv("GGML_CUDA_FUSE_V_FWHT"); return e == nullptr || atoi(e) != 0; }();
+     if (!v_fwht_on || i < 0 || i + 12 > cgraph->n_nodes) {
+         return false;
+     }
+@@ -1749,6 +1757,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -2825,7 +2904,32 @@ index 3f4a80512..5887851d6 100644
  // wip/moe-expert-cache (H1): while the cache is active, only the fusions that read a routed
  // expert table in the cache band stand down; every other backend fusion (router/topk, GDN, QSA,
  // rope, norms, and the *prefill* MoE fusions) stays on.  The decode/verify MoE must run through
-@@ -2135,6 +2152,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -1862,7 +1881,7 @@ static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor *
+ // the gate -> Q8_1 kernel reads the row-strided view itself, so the CONT launches nothing.  The CONT is an exact
+ // copy, so the result is bit-identical.  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0: off.  Returns the extra nodes consumed.
+ static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+-    static const bool fuse = getenv("GGML_CUDA_FUSE_CONT_GATE_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_CONT_GATE_Q8_1")) != 0;
++    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_CONT_GATE_Q8_1"); return e == nullptr || atoi(e) != 0; }();
+     const ggml_tensor * c = cgraph->nodes[i];
+     if (!fuse || c->op != GGML_OP_CONT || c->type != GGML_TYPE_F32 || i + 2 >= cgraph->n_nodes) {
+         return 0;
+@@ -1894,7 +1913,7 @@ static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ct
+ // GDN output: RMS_NORM(xn) -> MUL(w) at r, r+1, and later UNARY(sigmoid)(z) -> MUL(norm, .) -> decode matmul at s, s+1.
+ // Returns r when the gate -> Q8_1 kernel at s can compute the norm itself (same decision at both nodes), -1 otherwise.
+ static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s) {
+-    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_NORM_GATE")) != 0;
++    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE"); return e == nullptr || atoi(e) != 0; }();
+     if (!fuse || s < 2 || s + 1 >= cgraph->n_nodes) {
+         return -1;
+     }
+@@ -2129,12 +2148,16 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+-    static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
++    static bool disable_moe_mmq = [] { const char * e = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"); return e != nullptr && std::atoi(e); }();
+ 
+     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -2836,7 +2940,7 @@ index 3f4a80512..5887851d6 100644
  
      // GDN snapshot CPYs already written by the direct conv kernel (GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off)
      if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, i)) {
-@@ -2157,6 +2178,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2157,6 +2180,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
          return n_shared_expert;
      }
  
@@ -2847,7 +2951,52 @@ index 3f4a80512..5887851d6 100644
  
      // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
      // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
-@@ -3223,6 +3248,29 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+@@ -2257,7 +2284,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     //RoPE + view + set-rows
+-    static const bool disable_rope_setrows = getenv("GGML_CUDA_DISABLE_ROPE_SETROWS") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_SETROWS"));
++    static const bool disable_rope_setrows = [] { const char * e = getenv("GGML_CUDA_DISABLE_ROPE_SETROWS"); return e != nullptr && std::atoi(e); }();
+     if (!disable_rope_setrows && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_tensor * rope     = cgraph->nodes[i];
+         ggml_tensor * set_rows = cgraph->nodes[i + 2];
+@@ -2268,7 +2295,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+ 
+     // Snake activation: y = x + sin(a*x)^2 * inv_b
+     // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
+-    static const bool disable_snake = getenv("GGML_CUDA_DISABLE_SNAKE") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SNAKE"));
++    static const bool disable_snake = [] { const char * e = getenv("GGML_CUDA_DISABLE_SNAKE"); return e != nullptr && std::atoi(e); }();
+     if (!disable_snake && ggml_can_fuse_subgraph(cgraph, i,
+             { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
+             { i + 4 })) {
+@@ -2315,7 +2342,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     }
+ 
+     // multi-(add or mul)
+-    static const bool disable_fused_addmul = getenv("GGML_CUDA_DISABLE_FUSED_ADDMUL") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSED_ADDMUL"));
++    static const bool disable_fused_addmul = [] { const char * e = getenv("GGML_CUDA_DISABLE_FUSED_ADDMUL"); return e != nullptr && std::atoi(e); }();
+     if (!disable_fused_addmul && (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL)) {
+         int     n_fuse = 0;
+         ggml_op ops[8];
+@@ -3070,7 +3097,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         // Defer Q to j and run both in one launch (rms_norm_mul_rope_f32_qk_pair<.., fwht_n, true>): each block runs the
+         // single launch's body, so the results are the same.  Nothing runs in between; the pair kernel's writes (Q's
+         // rotation, the K / V cache rows) must not touch what the other half reads.  GGML_CUDA_QK_PAIR_FWHT=0: off.
+-        static const bool pair_fwht_on = getenv("GGML_CUDA_QK_PAIR_FWHT") == nullptr || atoi(getenv("GGML_CUDA_QK_PAIR_FWHT")) != 0;
++        static const bool pair_fwht_on = [] { const char * e = getenv("GGML_CUDA_QK_PAIR_FWHT"); return e == nullptr || atoi(e) != 0; }();
+         const int j = i + 7;
+         if (pair_fwht_on && kv_allow_v && cuda_ctx->qk_pend_graph == nullptr && j + 12 <= cgraph->n_nodes &&
+                 ggml_cuda_is_view_or_noop(cgraph->nodes[i + 5]) && ggml_cuda_is_view_or_noop(cgraph->nodes[i + 6]) &&
+@@ -3173,7 +3200,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+         // a second RMS_NORM + SCALE over a view of the same tensor with the same shape, strides, eps and scale (the GDN
+         // q / k l2 norm), separated only by no-op nodes: both in one launch.  GGML_CUDA_DISABLE_NORM_PAIR=1: off.
+-        static const bool norm_pair_off = getenv("GGML_CUDA_DISABLE_NORM_PAIR") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_NORM_PAIR")) != 0;
++        static const bool norm_pair_off = [] { const char * e = getenv("GGML_CUDA_DISABLE_NORM_PAIR"); return e != nullptr && atoi(e) != 0; }();
+         const ggml_tensor * x0 = node->src[0];
+         int j = i + 2;
+         while (!norm_pair_off && j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
+@@ -3223,6 +3250,29 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
      // then read inject's data as block_out. It now reads the live REPEAT output (mul operand).
      // Opt-outs: GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_MIX=1 / GGML_CUDA_DISABLE_HC_COMB=1.
  
@@ -3096,7 +3245,7 @@ index 1bd0de281..8bffa48f1 100644
          case GGML_OP_OPT_STEP_ADAMW:
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
 new file mode 100644
-index 000000000..9a0168792
+index 000000000..4a615ee7c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
 @@ -0,0 +1,1409 @@
@@ -4096,11 +4245,11 @@ index 000000000..9a0168792
 +    }
 +    // Q8_1 of the mixed output straight into the quantize cache, for the mmvq matmuls over it (see the up kernel).
 +    // GGML_HC_MIX_Q8=0 leaves it to their quantize_q8_1 (A/B).
-+    static const bool up_q8 = !getenv("GGML_HC_MIX_Q8") || atoi(getenv("GGML_HC_MIX_Q8")) != 0;
++    static const bool up_q8 = [] { const char * e = getenv("GGML_HC_MIX_Q8"); return !e || atoi(e) != 0; }();
 +    block_q8_1 * q8 = nullptr;
 +    int * q8_cnt = nullptr;
 +    const int64_t q8_stride_t = n_embd / QK8_1;
-+    static const bool up_v2_q8 = !getenv("GGML_HC_UP_V2") || atoi(getenv("GGML_HC_UP_V2")) != 0;
++    static const bool up_v2_q8 = [] { const char * e = getenv("GGML_HC_UP_V2"); return !e || atoi(e) != 0; }();
 +    if (up_q8 && up_v2_q8 && GGML_PAD(n_embd, MATRIX_ROW_PADDING) == n_embd && n_embd / QK8_1 <= GGML_CUDA_HC_Q8_CNT) {
 +        bool found = false;
 +        void * p = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, n_tokens*q8_stride_t*sizeof(block_q8_1),
@@ -4141,7 +4290,7 @@ index 000000000..9a0168792
 +        }
 +        {
 +            // GGML_HC_UP_V2=0: the original row-at-a-time kernel (v2 is bit-identical)
-+            static const bool up_v2 = !getenv("GGML_HC_UP_V2") || atoi(getenv("GGML_HC_UP_V2")) != 0;
++            static const bool up_v2 = [] { const char * e = getenv("GGML_HC_UP_V2"); return !e || atoi(e) != 0; }();
 +            // at most 448 blocks of 4 warps (the gfx1201 grid-size stall, as mul_mat_vec_f_vb); v2: 256 blocks (flat from
 +            // 128 to 320 at n_embd 2560, slower above), at most HC_UP2_MAXR rows per block
 +            const int nblk = up_v2 ? (int) std::max<int64_t>(std::min<int64_t>(n_embd, 256), (n_embd + HC_UP2_MAXR - 1)/HC_UP2_MAXR)
@@ -4288,8 +4437,8 @@ index 000000000..9a0168792
 +    // block's prologue (same arithmetic, bit-identical); GGML_CUDA_HC_MIX_PREQ=0 restores the
 +    // prologue. The band kernel serves all tokens of a >1-token band from one block per RPB rows
 +    // (bit-identical); GGML_CUDA_HC_MIX_BAND=0 restores the one-block-per-token launch.
-+    static const bool preq    = !getenv("GGML_CUDA_HC_MIX_PREQ") || std::atoi(getenv("GGML_CUDA_HC_MIX_PREQ"));
-+    static const bool up_band = !getenv("GGML_CUDA_HC_MIX_BAND") || std::atoi(getenv("GGML_CUDA_HC_MIX_BAND"));
++    static const bool preq = [] { const char * e = getenv("GGML_CUDA_HC_MIX_PREQ"); return !e || std::atoi(e); }();
++    static const bool up_band = [] { const char * e = getenv("GGML_CUDA_HC_MIX_BAND"); return !e || std::atoi(e); }();
 +    const int n_groups_up = 8 * warp_size * vdr / qi;
 +    const int maxi_up     = (rpb_up*blocks_up + n_groups_up - 1) / n_groups_up;
 +    const bool band       = up_band && n_tokens >= 1 && rpb_up == 16 && maxi_up <= 4 && blocks_up == 10;
@@ -4498,7 +4647,7 @@ index 000000000..9a0168792
 +// and the mixer's norm in one kernel.  Returns the number of graph nodes consumed
 +// (the HC_MIX node) when fused, 0 when the pattern does not match.
 +int ggml_cuda_hc_combine_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-+    static const bool fuse_hc_combine_mix = getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX") == nullptr || atoi(getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX")) != 0;
++    static const bool fuse_hc_combine_mix = [] { const char * e = getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX"); return e == nullptr || atoi(e) != 0; }();
 +    if (!fuse_hc_combine_mix || i + 1 >= cgraph->n_nodes) {
 +        return 0;
 +    }
@@ -5809,7 +5958,7 @@ index 000000000..ff0945039
 +int ggml_cuda_hc_gate_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
 new file mode 100644
-index 000000000..e81007a70
+index 000000000..0ea431534
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/indexer-score.cu
 @@ -0,0 +1,751 @@
@@ -6556,7 +6705,7 @@ index 000000000..e81007a70
 +    GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_is_contiguous(s));
 +    GGML_ASSERT(args.dst->type == GGML_TYPE_F32 && ggml_is_contiguous(args.dst));
 +    GGML_ASSERT(args.heads >= 2 && args.rows >= 1);
-+    { static const int lg = getenv("GGML_CUDA_IDX_RELU_SUM_LOG") ? atoi(getenv("GGML_CUDA_IDX_RELU_SUM_LOG")) : 0; static unsigned cnt = 0;
++    { static const int lg = [] { const char * e = getenv("GGML_CUDA_IDX_RELU_SUM_LOG"); return e ? atoi(e) : 0; }(); static unsigned cnt = 0;
 +      if (lg && cnt++ < 4) fprintf(stderr, "IDX_RELU_SUM score=%s nb=%lld heads=%d rows=%lld\n", s->name, (long long) s->ne[0], args.heads, (long long) args.rows); }
 +    const int n_blocks = (int) s->ne[0];
 +    constexpr int threads = 256;
@@ -10045,10 +10194,42 @@ index 516c7d222..d9bf0b884 100644
  private:
      llama_memory_hybrid_idx * mem = nullptr;
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 97e4e8a81..a5f4f99ad 100644
+index 97e4e8a81..e942d8e88 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -636,6 +636,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+@@ -179,6 +179,13 @@ void llama_memory_recurrent::clear(bool data) {
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+ }
+ 
++// LLAMA_RS_ROLLBACK_DEBUG=1: instrumentation for the recurrent rollback boundary (the RSMTP lines below).  Read
++// ONCE: seq_rm() and prepare() run on every speculative step, and getenv() is slow on Windows (issue #273).
++static bool rs_rollback_debug() {
++    static const bool debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
++    return debug;
++}
++
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     uint32_t new_head = size;
+ 
+@@ -239,7 +246,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 const llama_pos last_seq_pos  = ((size_t) seq_id < last_ubatch_pos_last_by_seq.size())
+                         ? last_ubatch_pos_last_by_seq[seq_id] : -1;
+                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+-                    if (getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr) {
++                    if (rs_rollback_debug()) {
+                         LLAMA_LOG_WARN("%s: RSROLL seq=%d rollback=%d p0=%d last_global_nseq=%u last_global_pos=%d "
+                                        "last_seq_nseq=%u last_seq_pos=%d n_rs_seq=%u n_rs_batch=%u\n",
+                                        __func__, (int) seq_id, (int) rollback, (int) p0,
+@@ -581,7 +588,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+         // ubatch, so a server log shows the prepare order that leads into a partial rollback.  Used to
+         // answer open question 1 ("whose prepare is the large one, and does the MTP verify batch go
+         // through this path at all?").
+-        const bool rs_debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
++        const bool rs_debug = rs_rollback_debug();
+         if (rs_debug) {
+             for (size_t u = 0; u < ubatches.size(); ++u) {
+                 const llama_ubatch & ub = ubatches[u];
+@@ -636,6 +643,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
  }
  
  bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
@@ -10066,7 +10247,7 @@ index 97e4e8a81..a5f4f99ad 100644
      const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
      const uint32_t n_seqs       = ubatch.n_seqs;
  
-@@ -789,7 +800,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -789,7 +807,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
          const int32_t cell_id = s + min;
          auto & cell = cells[cell_id];
  
