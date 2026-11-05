@@ -100,6 +100,29 @@ Nothing here changes a default; steps 1 to 3 make today's behaviour honest and v
 * `-lme auto` deciding "mirror" from a *container* figure is a behaviour change on small containers.  That is the
   point, but it must be recorded in `WORKLOG.md` and in `ENVIRONMENT.md`, with the arm that shows it.
 
+## 4b. r221 (2026-11-05) made MIRROR-vs-PARTIAL load-bearing for a default-on feature -- a motivating case for step 3
+
+Nothing in this note changed, and r221 touches none of its three defects (no cgroup figure, no authoritative
+explicit budget, no verdict line).  But it makes the coverage question cost something visible, in two ways:
+
+* **`GGML_MOE_DEVREMAP` (default ON) now declines on a PARTIAL pool and serves a MIRROR one** (`dr_pool_ok`,
+  latched from `pool_covers_table()` at sizing; block 09, r221).  So a tier that lands at 93.6 % instead of
+  100 % no longer just pays a slower first prefill -- it also forfeits **+9.9 % decode** (1 GPU, 35B-A3B Q8_0
+  `-ncmoe 40`, the default `-lme auto` mirror arm: 57.6 -> 63.3 t/s), silently, at default verbosity.  That is
+  defect 3's "the operator cannot see the tier" with a decode number attached instead of a prefill one.
+* **The same default config is a mirror or not depending on `MemAvailable` at load time, which I hit live this
+  session.**  35B-A3B Q8_0 (32.6 GiB set, ~75 GiB available) planned `auto -> ... the whole host expert set (a
+  MIRROR)`; the 122B UD-Q4_K_XL (67.1 GiB set, ~63 GiB cap) planned `auto -> ... the arena's complement` on the
+  same box minutes later.  Neither line says MIRROR/PARTIAL/NONE, and the plan line is INFO on top of that.
+  One precision for step 3: `report_host_expert_placement()` is already **WARN** (visible without `-lv 4`) and
+  prints `pinned X MiB of Y, pageable Z MiB` -- so the work is to put the verdict and the coverage ratio on the
+  line that is already visible, not to raise a level.
+* Consequence for any arm that A/Bs a host-expert change on this box: **check the plan line before believing a
+  decode delta**, because a PARTIAL tier turns a remap arm into a no-op and reads as "the feature did nothing".
+
+`INVARIANTS.md` r221 fact 6 (`device remap: N tables served, M of K offers declined`) is the per-run tell; this
+campaign's step 3 would replace reading it with one operator-facing line.
+
 ## 5. Records
 
 | where | what |

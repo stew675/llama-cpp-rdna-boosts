@@ -97,6 +97,40 @@ i.e. handing the op the pool's own device alias when, and only when, the pool co
   paths, the MoE fusions), not only the routed `MMVQ` band the cold read was built for.  If a kernel assumes
   device memory, the alias must decline for that op rather than fail.
 
+## 4b. r221 (2026-11-05) shipped the shape this note recommends, in the DECODE band -- read this before step 3
+
+`TODO` #269 landed as r221 (`WORKLOG.md` 261105.007, `INVARIANTS.md` r221, block 09).  It does **not** touch the
+prefill staging copy or `MOE_HOST_POOL_ALIAS` -- your steps 1, 2, 4 and 5 are untouched, and the 8 % you are
+chasing is still a prefill question.  What it did do is take **step 3's advice verbatim** ("prefer the per-expert
+remap shape ... over aliasing `src0->data` wholesale") for the routed `MUL_MAT_ID` decode band, and in doing so
+answers four of your §4 worries with measurements:
+
+* **A covering pool is now a legitimate cold source: cold id `slots + pool slot`.**  `pool_covers_table()` gained
+  a second consumer (`dr_pool_ok`, latched once at sizing) and the map builder emits the pool slot instead of the
+  expert index, so the kernel resolves a miss through `base_dev`.  Measured on the default `-lme auto` mirror,
+  1 GPU, 35B-A3B Q8_0 `-ncmoe 40`: 57.6 -> 63.3 t/s decode (**+9.9 %**), byte-identical text.  Nothing was
+  invented twice: `pool_covers_table()` is still the one predicate, it is just stricter (see the next bullet).
+* **The "one slot short" case in your §4 was NOT hypothetical -- it was a live bug.**  `kept_all` in
+  `expert_host_src` retired a slot for a mirror whenever `pool->slots > n_experts - n_arena`, which is FALSE
+  during the seeding pass (the arena is empty), so a mirror could end at 255/256 live residents and stand the
+  remap down.  Fixed in block 15 (`keep_all` never retires a mirror), and `pool_covers_table` now counts LIVE
+  slots (`slot_state == 1`): a retiring slot still has an `expert_slot` index but cannot serve a cold read.
+* **The graph-capture worry is answered for this shape.**  The per-expert remap is safe under capture because
+  the *decision* is latched per shape at sizing and the map is republished each call on the device stream;
+  measured over 300- and 1000-token greedy runs with graphs on, bit-identical text on 1/2/3 devices.  Your
+  rerank-invalidation fear is closed structurally: `pool_rerank_from_heat_locked` now returns before any
+  bookkeeping when the pool covers the table (it was a no-op by coincidence), so a covering pool's
+  `expert -> slot` map is **write-once after sizing**.  That is the invariant to reuse in step 3, whatever the
+  transport.
+* **The -22 % precedent did not reproduce in the decode band.**  For a *covering* pool the in-place read beat
+  the eager fill path (part of the +9.9 %); a **sub-complement** pool cannot be remapped at all (`0 of 3840
+  offers served`, by construction -- the map would have a hole) so it keeps the eager path, which is exactly
+  your "keep the fill path for misses" requirement, enforced structurally rather than by measurement.
+
+Still open for you, and unchanged by r221: the prefill band's kernels (`MMQ`/`MMF`, the MoE fusions) reading an
+alias at all, the staging-share spike, and whether the bytes are better moved as a bulk copy.  The
+`-ub` dependence you recorded is the thing to attack first.
+
 ## 5. Records
 
 | where | what |
