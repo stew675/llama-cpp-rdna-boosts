@@ -10,6 +10,17 @@
 #   releases -- and a residency defect is a WRONG ANSWER, not a crash: the text is the oracle, and it is only
 #   an oracle if the arm provably left the resident placement.
 #
+#   r217: A PLACEMENT CAN ALSO BE CORRECT AND SLOW, and until r217 nothing here could see that.  Block 15's
+#   pool was measured at 427.5 t/s of PROMPT against 829.3 for the plain device KV on the same card (-48 %,
+#   WORKLOG.md 261105.001) while every arm below passed -- it only shows at prompt length because its
+#   page-fill path runs per DECODE step, and a prompt chunk writes every cell of its range and reuses
+#   nothing.  The pool section therefore also asserts the two arms' PROMPT RATES: they share the prompt, the
+#   binary and the device, so the numbers are comparable by construction.  The floor is `PREFILL_MIN_PCT`
+#   (default 40 %), a REGRESSION floor and not a target: the pool's known prompt cost must pass it while a
+#   FURTHER regression must not, so it is set below the ~48 % measured here (see the assertion's comment).
+#   The window arms are REPORTED and not asserted: a window below the depth you run is a documented
+#   trade-off (`ENVIRONMENT.md` 17.0), and asserting it would fight a deliberate design.
+#
 #   So every placement gets two arms -- one that holds everything the run touches, and one that is
 #   DELIBERATELY too small for it -- and the gate fails if the two arms report the same residency (a gate that
 #   cannot leave the resident arm is not a gate), or if their text differs by a single token.
@@ -31,6 +42,8 @@
 #                   the smallest pool the backend will build, against a 6 441-page working set -- the forced
 #                   misses, and `LLAMA_KV_POOL_VERIFY=1` on this arm (the churn arm is where a wrong-page
 #                   resolve would show)
+#     and one assertion beyond residency (r217): `pres` must keep >= `PREFILL_MIN_PCT` (40 %) of `pref`'s
+#     PROMPT rate.  `pfloor` runs with the verify oracle and is not a timing arm.
 #   Pool, MULTI-DEVICE (`-sm layer`, the same model/prompt/knobs on `MULTI_DEVICES`, default `0,1`): the pool
 #   is per layer AND per device (one mirror buffer type, device pool, page table and counter block per
 #   device), so a multi-device arm is a distinct placement, not a rerun: r213 shipped a fix for exactly the
@@ -80,6 +93,11 @@
 #   MULTI_DEVICES  the devices the multi-device pool arms use (default `0,1`; needs two real GPUs and the
 #                `-sm layer` split, which is the default -- a tensor split declines the pool by design and
 #                would make those arms vacuous).  `MULTI_DEVICES=0` disables the section (1 GPU box).
+#   PREFILL_MIN_PCT  the share of `pref`'s PROMPT rate (`pres` must keep), default 40.  A placement may not be
+#                correct and slow: block 15's pool costs ~48 % of the prompt on a KV that fits (r217), so this
+#                is a REGRESSION floor and not a target -- it is set below the measured cost so the known
+#                behaviour passes and a further regression fails.  Read from llama-cli's own perf line on the
+#                two arms that share the prompt, the binary and the device.
 #   KEEPOUT      log dir (default: mktemp -d)
 #   REUSE        1 = do not run anything; RE-GRADE the logs already in KEEPOUT (the pool arms cost ~5 min, so
 #                a threshold or message change should not need a re-run).  The arms must all be present.
@@ -101,6 +119,7 @@ CTX_WIN="${CTX_WIN:-16384}"
 CTX_POOL="${CTX_POOL:-32768}"
 POOL_RES="${POOL_RES:-32768}"
 POOL_FLOOR="${POOL_FLOOR:-512}"
+PREFILL_MIN_PCT="${PREFILL_MIN_PCT:-40}"
 MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 REUSE="${REUSE:-0}"
@@ -114,7 +133,7 @@ for arg in "$@"; do
         --window-only) DO_POOL=0; DO_MULTI=0 ;;
         --pool-only) DO_WINDOW=0 ;;
         --multi-only) DO_WINDOW=0; DO_POOL=0 ;;
-        -h|--help) sed -n '2,89p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,107p' "$0"; exit 0 ;;
         *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -165,6 +184,11 @@ run_arm() {
 }
 
 hash_of() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1.out" 2>/dev/null | sed -E 's/.*sha=//'; }
+# an arm's PROMPT (prefill) rate, tokens/s from llama-cli's own perf line.  The arms of one section run the
+# same prompt on the same binary and device, so their rates are comparable by construction (r217).
+prompt_ts() {
+    sed -nE 's/.*prompt eval time =.*, *([0-9.]+) tokens per second.*/\1/p' "$KEEPOUT/$1.err" 2>/dev/null | tail -1
+}
 count()   { grep -c -- "$2" "$KEEPOUT/$1.err" 2>/dev/null || true; }
 # the largest `of which host N MiB` a windowed arm ever reported (the grow lines carry the spill)
 host_max() {
@@ -252,6 +276,11 @@ if [ "$DO_WINDOW" = 1 ]; then
         || fail "wspill logged $(count wspill 'refusing to flip') 'refusing to flip' refusal(s)"
     [ "$(count wref 'WINDOWED KV ENABLED')" = 0 ] && pass "wref (no knob) built no window" \
         || fail "wref enabled a window without LLAMA_KV_RESIDENT_CELLS"
+
+    # INFO only, no assertion: a window that spills below the depth the run reaches is a DOCUMENTED trade-off
+    # (11-26 %, `ENVIRONMENT.md` 17.0), so its prompt rate is reported for the record and never gated.  The
+    # assertion in the pool section is the one that has no such excuse (r217).
+    info "window prompt rate (info, not asserted): wref $(prompt_ts wref) / wres $(prompt_ts wres) / wspill $(prompt_ts wspill) t/s"
 fi
 
 # ===== the pool ==========================================================================================
@@ -280,6 +309,34 @@ if [ "$DO_POOL" = 1 ]; then
     [ -n "$HPRE" ] && [ "$HPRE" = "$HPFLR" ] \
         && pass "pfloor == pref (a pool claimed out under pressure changes no token)" \
         || fail "pfloor != pref: '$HPRE' vs '$HPFLR'"
+
+    # ... and the PLACEMENT may not cost the PROMPT (r217).  The pool's page-fill path runs per DECODE step;
+    # a prompt chunk writes every cell of its range and reuses nothing, so the fill is work the no-pool arm
+    # does not do.  Measured 427.5 t/s against 829.3 at pp32K on one RX 7900 XTX (-48 %, WORKLOG 261105.001)
+    # while every residency assertion above passed.  These two arms share the prompt, the binary and the
+    # device, so the rates are comparable by construction; pfloor carries the verify oracle and is not a
+    # timing arm, so it is not asserted.  Both rates must be PRESENT: an unparsed rate would make this
+    # vacuous, which is the one failure mode this gate exists to refuse.
+    #
+    # The floor is 40 %, BELOW the measured cost, on purpose.  These canonical arms carry a smaller quant
+    # (IQ3_XXS), a 2x smaller context and therefore a larger arena than the analogue that measured 52 %, so
+    # they are expected to read at or above ~50 %: 40 passes the known behaviour and still fails a further
+    # regression (a pool that puts the prompt on the critical path would read far lower).  If a change
+    # legitimately moves this ratio, say so in WORKLOG.md and move the default in the SAME commit -- do not
+    # widen it silently to get green.
+    T_PRE=$(prompt_ts pref); T_RES=$(prompt_ts pres)
+    info "prompt rate: pref $T_PRE t/s, pres $T_RES t/s (floor $PREFILL_MIN_PCT % of pref)"
+    if [ -z "$T_PRE" ] || [ -z "$T_RES" ]; then
+        fail "no prompt rate in the log (pref '$T_PRE', pres '$T_RES'): the prefill assertion would be vacuous"
+    else
+        pass "both pool arms reported a prompt rate ($T_PRE / $T_RES t/s)"
+        awk -v r="$T_RES" -v p="$T_PRE" -v m="$PREFILL_MIN_PCT" \
+            'BEGIN { exit !(p+0 > 0 && r+0 >= p*(m+0)/100.0) }' \
+            && pass "pres keeps >= $PREFILL_MIN_PCT % of pref's prompt rate ($T_RES vs $T_PRE t/s)" \
+            || fail "the pool costs the PROMPT: pres $T_RES t/s against pref $T_PRE t/s (< $PREFILL_MIN_PCT %)\
+ -- a placement may not be correct and slow (block 15 Goal B is -48 % measured, WORKLOG.md 261105.001);\
+ if this is a deliberate new cost, say so there and lower PREFILL_MIN_PCT"
+    fi
 
     # acceptance is a second, independent witness: the drafter proposes from the same resolved KV
     acc() { grep -oE '"draft_n":[0-9]+,"draft_n_accepted":[0-9]+' "$KEEPOUT/$1.err" 2>/dev/null | tail -1; }

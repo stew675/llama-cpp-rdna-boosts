@@ -1,4 +1,51 @@
+## 261105.002 (r217) -- the KV residency gate now asserts the pool's PROMPT rate: a placement may not be correct and slow
+
+**Tooling only: `scripts/gate-kv-residency.sh` + its two index entries.  `patches/` is unchanged and the release
+set stays `v16-6050b467c-r215`.**
+
+`261105.001` found block 15's attendance pool at -48 % prompt throughput while every gate assertion passed.  The
+gate was not wrong -- it asserts text identity and residency, and that is its job -- but nothing in the release
+flow looked at the *speed* of a placement, so a correct-and-slow placement passed every gate and shipped.  The
+arms already run one 25 763-token prompt each with the same binary on the same device, so the comparison was
+sitting in the logs unread.
+
+**What it asserts now.**  In the one-device pool section, `pres` must keep `PREFILL_MIN_PCT` (default **40 %**)
+of `pref`'s `prompt eval` tokens/s.  Both numbers are parsed from the arms' own llama-cli perf line
+(`prompt_ts()`), so there is no second measurement and no extra runtime; a missing rate is a FAIL rather than a
+skip, because a silently vacuous assertion is the failure mode this gate exists to refuse.  `pfloor` runs with
+`LLAMA_KV_POOL_VERIFY=1` and is explicitly not a timing arm.  The **window** arms' rates are printed and not
+asserted: a window below the depth the run reaches is a documented 11-26 % trade-off (`ENVIRONMENT.md` 17.0),
+and gating it would fight a deliberate design.
+
+**Why the floor is 40 % and not 80 %.**  It is a *regression* floor, not a target: the pool's known cost must
+pass.  The analogue measurement (`261105.001`, IQ3_S, `-c 204800`) read 427.5 against 829.3 t/s = 52 %, and the
+canonical gate arms carry a smaller quant, a 2x smaller context and therefore a larger arena, so they are
+expected at or above ~50 %.  40 % passes the known behaviour and still fails a further regression.  The script
+header and the assertion's comment both say that a change which legitimately moves the ratio must move this
+default **and** this entry together -- never widen it silently to get green.
+
+**Validation.**
+
+* `--window-only` end to end on this box (Qwen3.5-9B in place of the absent 4B default): all 10 residency/text
+  assertions PASS, and the new INFO line reads `wref 3702.05 / wres 3957.52 / wspill 2405.31 t/s` -- the spill
+  cost as an observation, not a failure, which is the intended behaviour of the non-asserted arm.
+* The assertion itself, graded through `REUSE=1` on real perf lines: identical arms PASS; `pres` at 24 % of
+  `pref` FAILs with the message above; a log with the perf line stripped FAILs as vacuous.  One FAIL per cause.
+* The canonical pool arms **cannot run on a 59 GiB host**: `-lm none -lzm off` makes the 26.8 GiB PLE resident
+  beside the ~44 GiB host expert set (~72 GiB).  Attempting it on this box drove `MemAvailable` to 0 and had to
+  be killed; it is now stated in the script header, `MANIFESTS.md` gate 17 and `scripts/README.md`, and the
+  guidance is to point `MODEL_POOL`/`DRAFT_POOL`/`PROMPT_POOL` elsewhere or grade `--window-only`.  The
+  40 % default is therefore set from the IQ3_S analogue, not from the canonical arms -- recorded here so nobody
+  later mistakes it for a measured value of those arms.
+* `-h` now prints the whole header (`2,107p`, it stopped at `2,89p` and silently dropped `KEEPOUT`, `REUSE`
+  and `ROCBLAS_USE_HIPBLASLT` from the usage text -- a pre-existing truncation, fixed here because the new
+  variable is in the same block).
+
+**Follow-up worth doing:** the pool section is the only place this class of regression is visible, so gate 17's
+row in `MANIFESTS.md` is now the one that has to be run for any block-15 change; nothing else catches it.
+
 ## 261105.001 (r216) -- the attendance pool costs ~50 % of PROMPT throughput on a config whose KV already fits; the `runme` returns to a resident KV
+
 
 **Docs only: `patches/` is unchanged and the release set stays `v16-6050b467c-r215` (tip `790686b53`, tree
 `19200174f`).**  No block is amended; this entry records a *config* finding and the measurement behind it.

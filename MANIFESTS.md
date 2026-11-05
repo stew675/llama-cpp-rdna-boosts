@@ -349,6 +349,16 @@ in CI.  The model-level gates are manual:
    holding exactly `-c/4` pages, and on the SAME resolve count `pfloor` claiming more per resolve and hitting
    less.  `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
    log (cells, bytes, the buffer the placement got, host-backed MiB, pool geometry, the counters line).
+   **r217: the pool section also asserts the PROMPT RATE** -- `pres` must keep `PREFILL_MIN_PCT` (default
+   40 %) of `pref`'s `prompt eval` tokens/s, both read from the arms' own logs, so a placement that is
+   *correct and slow* now fails: block 15's pool was measured at 427.5 against 829.3 t/s at pp32K (-48 %,
+   `WORKLOG.md` 261105.001) while every residency assertion passed, because its page-fill path runs per
+   DECODE step and a prompt chunk reuses nothing.  The floor sits BELOW that known cost on purpose (a
+   regression floor, not a target) and `pfloor` is not a timing arm (it carries the verify oracle).  The
+   window arms' prompt rates are printed and **not** asserted: a window below the run depth is a documented
+   11-26 % trade-off (`ENVIRONMENT.md` 17.0).  The canonical pool arms need ~72 GiB of host RAM
+   (`-lm none -lzm off` = a resident PLE + a pinned host expert set), so on a smaller box pass `MODEL_POOL`/
+   `DRAFT_POOL`/`PROMPT_POOL` or grade `--window-only`.
    **The counters that cannot be asserted are in the script header**: `hits %` can never read 100 % (a block
    claimed by the same launch is neither hit nor miss) and a resident pool does not reach ~0 misses (the claim
    cursor is round-robin and the top-k selection moves) -- at `-c 32768`, depth 25 763 and 8 192 pages,
