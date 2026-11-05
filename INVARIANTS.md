@@ -1790,3 +1790,30 @@ cost a session to learn; do not re-derive them.
    `MemAvailable`, measured once, sizes the pool: a run started while the page cache still holds the model sizes a
    smaller pool (45 504 slots / 29.6 GiB against 73 728 / 47.9 GiB) and then takes the loader's pinned-master path
    (a 13.5 s load).  Drop the page cache (`POSIX_FADV_DONTNEED`) before any start-time comparison.
+
+## r216 -- block 15 Goal B is a DECODE placement: its page-fill path is ~50 % of the prompt on a KV that fits
+
+**Measured facts.  Do not re-derive; do not enable the pool on a prompt-heavy server.**
+
+1. **The pool's page-fill path is per DECODE step, so at PROMPT time it is pure overhead.**  `LLAMA_KV_REGION_POOL=16384`
+   against the plain device KV, one RX 7900 XTX, `-c 204800`, Qwen3.8-Flash-Next GSQ-RCO-IQ3_S (`-ncmoe 48`, q8_0
+   KV): **pp32K 427.5 against 829.3 t/s**, pp8K 463 against 769, **pp113K 409.2 against 808.2**.  A prompt chunk
+   writes every cell of its range, so the fill it pays is never reused; a decode step re-reads the same pages.
+2. **The pool's decode gain is exactly the arena it frees, and it is small.**  Same run: +12 % decode (59.4 against
+   52.8 t/s over 192 tokens) for 2.3 GiB of arena (12 084 against 9 742 MiB).  The KV here is ~13 KiB per token
+   (`2.6 GiB` at `-c 204800`), so on a 24 GiB card the pool's fittability case does not arise; Goal A's window
+   (`LLAMA_KV_RESIDENT_CELLS`) buys the same arena with no kernel change, free up to its own depth (530.1 against
+   808.2 at pp113K once it spills past 64K).
+3. **Prefill at this shape is not thread-, ubatch- or host-RAM-bound -- measure before tuning any of them.**
+   `--threads` 7/12/14/16 = 769/771/769/769 t/s at pp8K; `-ub 4096` against 2048 = 771 against 769;
+   `--cache-ram 6144 -> 0` = 768; `GGML_CUDA_SLAB_HEADROOM_MIB 1536 -> 768` = 776 (+1 %) for +843 MiB of arena.
+   The expert arena is a decode feature: `MOE_EXPERT_CACHE_MIB=4096` = 789 pp / 38 tg, `=0` = 890 pp / 10.8 tg.
+4. **A fixed `--limit-host-experts N` makes a config host-RAM-specific and refuses to start below it.**  `N` is
+   refused when the pinned master would exceed 90 % of the memory available at load (`54` on a 59 GiB host:
+   `more than 90 % of the available memory (59 GiB)`), and a later flag on the command line cannot rescue it
+   because the refusal happens while the argument is parsed.  Use `auto` in anything shared.
+5. **Pool on and pool off can differ by a near tie; the DEFAULT is the arm with the strong property.**  Same prompt,
+   temp 0, 128 output tokens: pool / plain / window all produced `00f5b00b804d2ebf`.  A 32K prompt at 48 output
+   tokens flipped one token between pool-on and pool-off (stable across two prompts).  The shipped default is the
+   plain device KV -- block 15 unset, the arm `patches/README.md` calls byte-identical to a build without the block
+   -- and `scripts/gate-kv-residency.sh` is the arbiter for the pool arm, not a sampled text hash.

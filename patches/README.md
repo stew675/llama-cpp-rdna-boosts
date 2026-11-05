@@ -3402,6 +3402,15 @@ context in pinned host RAM and only the pages a decode step actually attends to 
 `0`) the attention KV takes the plain device buffer and the run is byte-identical to a build without this
 block, including its OOM.
 
+**Measured cost when the KV already fits (r216).**  The page-fill path below is per *decode* step, so at
+**prompt** time it is pure overhead: on one RX 7900 XTX at `-c 204800` with Qwen3.8-Flash-Next IQ3_S
+(`-ncmoe 48`, q8_0 KV), `LLAMA_KV_REGION_POOL=16384` read **427.5 t/s at pp32K against 829.3** with the plain
+device KV (-48 %; 409.2 against 808.2 at pp113K), and bought **+12 % decode** (59.4 against 52.8 t/s over 192
+tokens) -- which is exactly the 2.3 GiB of expert arena it frees (12 084 against 9 742 MiB).  The KV of this
+model is ~13 KiB per token (`2.6 GiB` at `-c 204800`), so on a 24 GiB card the pool's fittability case does not
+arise.  **Do not enable it on a prompt-heavy server**; for the arena, prefer Goal A's window, which costs no
+kernel change.  `WORKLOG.md` 261105.001, `INVARIANTS.md` r216.
+
 **What it is.**
 
 * The attention cache's **cell-indexed tensors become the pinned host MIRROR** and stay **authoritative**, so

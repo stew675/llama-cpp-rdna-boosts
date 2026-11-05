@@ -1,3 +1,79 @@
+## 261105.001 (r216) -- the attendance pool costs ~50 % of PROMPT throughput on a config whose KV already fits; the `runme` returns to a resident KV
+
+**Docs only: `patches/` is unchanged and the release set stays `v16-6050b467c-r215` (tip `790686b53`, tree
+`19200174f`).**  No block is amended; this entry records a *config* finding and the measurement behind it.
+
+Reported symptom: the Qwen3.8-Flash-Next GSQ-RCO-IQ3_S `runme` "barely touches 400 t/s" prefill at `-c 204800`
+on one RX 7900 XTX, while the same model and card read ~1 030 t/s at pp8K through `llama-bench` at a small
+context.  Two causes, both configuration:
+
+### 1. The file could not start on a 59 GiB host
+
+`--limit-host-experts 54` (a hard GiB budget) is refused outright when the pinned master would exceed 90 % of
+the memory available at load: `--limit-host-experts 54 (GiB) is more than 90 % of the available memory
+(59 GiB)`.  It was written for a 62-64 GiB host and this one reports 59 GiB `MemAvailable`.  A later flag on
+the command line cannot rescue that -- the refusal happens while the argument is parsed -- so the budget has
+to be `auto`, which pins the whole 46.84 GiB host-expert set here (80 % of `MemAvailable`) and declines to
+the bounded host pool when it does not fit.  **A fixed `--limit-host-experts N` is a landmine in any shared
+config**: the same file starts on one box and refuses on a smaller one, with the reason buried in a usage
+dump.
+
+### 2. The pool's page-fill path is per DECODE step, so at PROMPT time it is pure overhead
+
+`LLAMA_KV_REGION_POOL=16384` keeps the authoritative KV in a pinned host mirror and resolves the pages a
+*decode step* attends to.  A prompt chunk writes every cell of its range, so the page-fill path runs over the
+whole chunk with no reuse to pay it back.  On a config whose KV already fits, that is ~50 % of the prompt.
+
+### The measured shape of the fix
+
+One RX 7900 XTX (gfx1100, 24 GiB, PCIe 4.0 x16), Ryzen 9 7950X (16C, SMT off), 59 GiB `MemAvailable`, ROCm
+10.1.0-gfx1100, llama.cpp `790686b53` (the r215 tree; binaries rebuilt for this measurement), `-c 204800`,
+`-ncmoe 48`, q8_0 KV, the Q4_K_M MTP draft (`--spec-draft-n-max 3`), temp 0, one request per cell, median of
+2 (one at 113K).  Prompt lengths 27 763 / 6 874 / 113 321 tokens:
+
+| arm | pp32K | pp8K | pp113K | tg (192 tok) | MoE arena |
+|---|---|---|---|---|---|
+| `LLAMA_KV_REGION_POOL=16384` (the file before this entry) | 427.5 | 463 | 409.2 | 59.4 | 12 084 MiB (25.2 %) |
+| plain device KV (**new default**) | **829.3** | **769** | **808.2** | 52.8 | 9 742 MiB (20.3 %) |
+| the same `+ LLAMA_KV_RESIDENT_CELLS=65536` | -- | 790.6 | 530.1 | 59.1 | 11 616 MiB (24.2 %) |
+
++94 % prefill at 32K, +66 % at 8K, +97 % at 113K, for -11 % decode.  The decode the pool buys is exactly the
+2.3 GiB of arena it frees (12 084 -> 9 742 MiB): the KV of this model is ~13 KiB per token, i.e. ~2.6 GiB at
+`-c 204800`, which a 24 GiB card can simply hold.  Goal A's **window** is the placement that buys the arena
+back with no kernel change, and it is free up to its own depth -- past 64K its spilled tail costs 34 % prefill
+(530.1 against 808.2 at 113K), so it is offered in the `runme` header, not made the default.
+
+### What did NOT move the number (measured, so nobody re-derives it)
+
+* `--threads` 7 / 12 / 14 / 16: 769 / 771 / 769 / 769 t/s at pp8K.  The CPU is not the critical path at this
+  shape -- do not "fix" prefill with a thread count.
+* `-ub 4096` against 2048: 771 against 769.  `--cache-ram 6144 -> 0`: 768.
+* `GGML_CUDA_SLAB_HEADROOM_MIB 1536 -> 768`: 776 (+1 %) for +843 MiB of arena; not worth the OOM margin it
+  exists to buy.
+* `MOE_EXPERT_CACHE_MIB=4096`: 789 pp / 38 tg; `=0`: 890 pp / 10.8 tg.  The expert arena is a DECODE feature:
+  with it off the prompt is the best measured (890) and decode collapses.  4 GiB is the prompt-leaning
+  compromise if a batch-only workload ever needs one.
+
+### Text
+
+Same prompt, temp 0, 128 output tokens: `LLAMA_KV_REGION_POOL=16384`, the plain device KV and
+`LLAMA_KV_RESIDENT_CELLS=65536` all produced `00f5b00b804d2ebf`.  On a 32K prompt at 48 output tokens the pool
+arm produced a different prefix from the plain arm (one near-tie flip, stable across two prompts), which is
+what a placement change is allowed to do and what `scripts/gate-kv-residency.sh` is the arbiter for.  The
+shipped default is the plain device KV, i.e. block 15 unset -- the arm `patches/README.md` calls byte-identical
+to a build without the block.
+
+### The `runme` change (outside this repo, at the maintainer's request)
+
+`LLAMA_KV_REGION_POOL` 16384 -> **0** (kill switch kept: `LLAMA_KV_REGION_POOL=16384 ./runme` tests the pool);
+`--limit-host-experts 54` -> `${LME:-auto}`; `LD_LIBRARY_PATH` falls back on `/opt/rocm-10.1.0-gfx1100/lib`
+before the gfx120X tree; the header rewritten around the table above.  Not a delivery change: the `runme` is
+a host-side consumer config, and the shipped number that moved is the file's own.
+
+**Conclusion for block 15 Goal B:** it is a *fittability* feature for a KV that does not fit, and a decode
+feature on one that does.  It is not a prompt-path optimisation, and it must not be enabled on a prompt-heavy
+server -- `ENVIRONMENT.md` 17.1 now says so.
+
 ## 261104.008 (r215) -- `--load-mode mmap` reaches `listening` 1.6x faster than `--load-mode none`: the host pool's mirror FILL and its pinned BACKING
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED and block 12 AMENDED), release
