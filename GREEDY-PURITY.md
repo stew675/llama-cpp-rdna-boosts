@@ -122,7 +122,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§50** | a draft length is a verify width *and* a memory-tier parameter: with host experts served by the arena, a verify batch wider than the cache band leaves VRAM and streams the routed experts from host on every step | doctrine (r123, TODO #59 closed) |
 | **§51** | a kernel-config row keyed on one tile dimension also configures every query width that reaches that tile: a decode/verify-band row must not be reachable from prefill | doctrine (`TODO` #97/#98, 2026-10-24) |
 | **§52** | an op with no test case has no oracle: `HC_COMBINE` ran 0/0 in `test-backend-ops`, so a wrong fused residual combine was invisible to every gate — the op and the default-on fusion that consumes it are covered since r128 | fix (r128, TODO #100 closed) |
-| **§53** | a draft with a window on every layer never reads the prompt rows before the window, so skipping their ingest is exact -- and on a partially reused prompt the skipped rows must be *dropped* from the draft's cache (r218) | doctrine/fix (r130, issue #272 r218) |
+| **§53** | a draft with a window on every layer never reads the prompt rows before the window, so skipping their ingest is exact -- and on a partially reused prompt the skipped rows must be *dropped* from the draft's cache (r218) | doctrine/fix (r130; r218, issue #272) |
 | **§54** | a fill of an input the graph may not consume is guarded on `buffer`, never on the pointer | fix (r131, PR #222) |
 | **§55** | a quantize cache keyed on a root tensor must match the pointer it fills from, and validate its read range | fix (r132, PR #218) |
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
@@ -1197,7 +1197,7 @@ ingested row, exactly as it does for a first-ever prompt.  Anything else in the 
 AHEAD of the target after a checkpoint restore) is rejected by both rules, so that overlapping tail is trimmed
 unconditionally.  Gate: `scripts/gate-spec-reuse-window.sh` (`INVARIANTS.md` r218).
 
-*Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §53, `WORKLOG.md` 261105.00N (r218).
+*Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §53, `WORKLOG.md` 261105.004 (r218).
 
 
 ## 54. A fill of an input the graph may not consume is guarded on `buffer`, never on the pointer
