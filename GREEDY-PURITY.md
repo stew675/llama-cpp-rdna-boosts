@@ -122,7 +122,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§50** | a draft length is a verify width *and* a memory-tier parameter: with host experts served by the arena, a verify batch wider than the cache band leaves VRAM and streams the routed experts from host on every step | doctrine (r123, TODO #59 closed) |
 | **§51** | a kernel-config row keyed on one tile dimension also configures every query width that reaches that tile: a decode/verify-band row must not be reachable from prefill | doctrine (`TODO` #97/#98, 2026-10-24) |
 | **§52** | an op with no test case has no oracle: `HC_COMBINE` ran 0/0 in `test-backend-ops`, so a wrong fused residual combine was invisible to every gate — the op and the default-on fusion that consumes it are covered since r128 | fix (r128, TODO #100 closed) |
-| **§53** | a draft with a window on every layer never reads the prompt rows before the window; skipping their ingest is exact | doctrine/fix (r130) |
+| **§53** | a draft with a window on every layer never reads the prompt rows before the window, so skipping their ingest is exact -- and on a partially reused prompt the skipped rows must be *dropped* from the draft's cache (r218) | doctrine/fix (r130, issue #272 r218) |
 | **§54** | a fill of an input the graph may not consume is guarded on `buffer`, never on the pointer | fix (r131, PR #222) |
 | **§55** | a quantize cache keyed on a root tensor must match the pointer it fills from, and validate its read range | fix (r132, PR #218) |
 | **§56** | a per-arch dispatch decision keys on the running device, and the pass that consults it selects its own | fix (r132, PR #218) |
@@ -1184,7 +1184,20 @@ when the first generation row is seen so a later position shift (a new prompt on
 checkpoint rewind) can never skip rows.  The skip must happen before the target synchronization, or the
 speed-up it exists for (not waiting on the target for a batch the draft will not consume) is not obtained.
 
-*Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §53.
+**The skipped rows must also be *removed* from the draft's cache on a partially reused prompt (r218, issue
+#272).**  Skipping is only exact while the draft's cache stays contiguous with the rows it does ingest: the
+batch check wants the first ingested position to be the cache's `seq_pos_max + 1`.  A slot keeps a prefix
+from an earlier task, so when a turn adds more than `n_swa` tokens the new window starts past the rows the
+draft kept, and the draft's cache ends below its first ingested row.  A strict (non-M-RoPE) draft is then
+**rejected** (`inconsistent sequence positions`, HTTP 500 on the request); an M-RoPE draft is allowed the
+forward jump and instead ingests a batch that attends to nothing.  The stale prefix cannot be attended by any
+later row (that is the same mask argument, and the batch that would carry those positions is long gone), so
+dropping it is exact: `spec_draft_align_cache()` drops it and the draft starts a fresh window at the first
+ingested row, exactly as it does for a first-ever prompt.  Anything else in the same position (a draft found
+AHEAD of the target after a checkpoint restore) is rejected by both rules, so that overlapping tail is trimmed
+unconditionally.  Gate: `scripts/gate-spec-reuse-window.sh` (`INVARIANTS.md` r218).
+
+*Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §53, `WORKLOG.md` 261105.00N (r218).
 
 
 ## 54. A fill of an input the graph may not consume is guarded on `buffer`, never on the pointer

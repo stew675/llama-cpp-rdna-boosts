@@ -278,6 +278,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the verify-batch alignment / a multi-slot draft width | `scripts/gate-spec-align.sh` / `scripts/gate-spec-width-band.sh` |
 | a qwen4exp hyper-connection op, chain or matcher | `scripts/gate-hc-fusions.sh MODEL.gguf` |
 | the MTP draft KV window (block 15 Goal C) | `scripts/gate-spec-draft-window.sh` |
+| a drafter's own KV cache: the DFlash/MTP prompt-ingest tail, a restored draft checkpoint, or anything that decides which rows a draft ingests | `scripts/gate-spec-reuse-window.sh` |
 | the KV window/region provider, the attendance pool, `is_streaming()` or the sparse decode arm (block 15) | `scripts/gate-kv-residency.sh` |
 | the delivery set itself (any regenerated patch) | `scripts/validate-set.sh` |
 | anything (before a tag) | `scripts/gate-per-block-build.sh --changed-from <prev tip>` + `scripts/check-gpu-faults.sh` |

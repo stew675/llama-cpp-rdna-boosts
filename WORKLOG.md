@@ -1,3 +1,73 @@
+## 261105.004 (r218) -- issue #272: a partially reused prompt invalidated the drafter's KV (blocks 02 and 12)
+
+**Released as `v16-6050b467c-r218` (16 blocks; blocks 02 and 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`f235fdaee`**, tree **`d362b5d67b14afa71755ff8b9f203703bad28891`**.  Reported by **@hermeticvm**
+([issue #272](https://github.com/stew675/llama-cpp-rdna-boosts/issues/272)) on an RX 6700 XT with
+`--spec-type draft-dspark`; every number below is in
+[`benchmarks/2026-11-05-spec-draft-reuse-272.md`](benchmarks/2026-11-05-spec-draft-reuse-272.md).
+
+### What was wrong
+
+The third turn of their replay answered `HTTP 500 decode() failed: failed to process speculative batch` with
+`inconsistent sequence positions ... sequence 0 ... X = 1995 ... starting position of Y = 2242`; n-gram drafting
+alone, `cache_prompt: false` and `-ctxcp 0` were all clean, and their upstream control was clean.  **The cause is
+this delivery's DFlash prompt-ingest tail (r130, block 12) — and it is not RDNA2-specific.**  `process()` ingests
+only the last `n_swa` (2048) rows of the prompt, which is exact (§53) but assumes the draft's cache stays
+contiguous with the rows it does ingest.  A prefix kept from an earlier task breaks that as soon as a turn adds
+more than `n_swa` tokens: the new window starts past the draft's kept rows, so the draft's cache ends at the
+reused prefix while its first ingested row is at `prompt_end - n_swa`.  A **strict** (non-M-RoPE) draft — the
+`NORM`/`NEOX` backbone class that DSpark drafts with no `dflash.rope.dimension_sections` use — has its batch
+**rejected**, and the request 500s.  An **M-RoPE** draft is allowed the forward jump and instead ingests a batch
+whose first rows attend to nothing.  The MTP drafter has the same exposure through `LLAMA_MTP_INGEST_TAIL`
+(block 02, r118).  The reporter's arithmetic fits exactly: 246 rows skipped, `Y = prompt_end - 2048`,
+`X + 1 = 1996` = the "1996 cached tokens" their upstream control reported.
+
+### The fix (78 lines, no new knob, no default change)
+
+`spec_draft_align_cache()` (`common/speculative.cpp`, added by block 02 and reused by block 12's DFlash/DSpark
+drafter) is called by both `process()` implementations before the injection batch is built.  A draft **behind**
+the batch drops its stale prefix for a strict draft — every row of it is older than the window of the prompt's
+end, so no later row can attend to it, and the batch that would have carried it is gone — and starts a fresh
+window at the first ingested row, exactly as it does for a first-ever prompt; an M-RoPE draft keeps the jump it
+already tolerated, so that path is unchanged.  A draft **ahead** of the batch (a checkpoint restore can put it
+past the position the task resumes from) is trimmed in every case, because both batch rules reject that overlap.
+A `gemma4`-style cache shared with the target is never touched.
+
+### Reproduced, then gated
+
+No DSpark drafter exists for a model here, so the reporter's draft *class* was derived: a copy of the 35B-A3B
+DFlash2-Q8_0 draft with `dflash.rope.dimension_sections` zeroed (`n_pos_per_embd` 4 -> 1).  The derived copy is
+measurably the same model — identical text **and** identical acceptance on every turn (14/33, 10/48, 13/37) — so
+only the batch-check rule differs.  Three turns of `prompts/prose-rdna-boosts.txt` (+5246 tokens each, 2 slots,
+unified KV, `-ctxcp 4`, `-c 49152`): **pre-fix turn 2 = HTTP 500** (`X = 5241, Y = 8445`), **post-fix 12/12
+requests answered**, with the tail and no-tail arms byte-identical.  `LLAMA_DFLASH_INGEST_TAIL=0` passes on the
+pre-fix build, which isolates the tail as the trigger.  New gate `scripts/gate-spec-reuse-window.sh` (four arms:
+shipped and derived draft × tail on/off), registered in `MANIFESTS.md` (block 02 and 12 rows), `scripts/README.md`
+and the `AGENTS.md` gate table; it also passes with `GGML_LF_DFLASH_DEV=0` (the host injection path).
+
+### Gates (gfx1201, ROCm 10.1.0, `~/bin/build-llama-rocm`; `build-base` = r217 vs `build-rocm` = r218)
+
+| gate | result |
+|---|---|
+| `gate-spec-reuse-window.sh` | pre-fix **FAIL** (the issue's own message), post-fix **PASS** 12/12 + text identical; PASS again with `GGML_LF_DFLASH_DEV=0` |
+| coherence, same-seed greedy | text **identical 6/6** (dense 4B `1c5d32ac537d`; 27B MTP `d45e2221805a`; 27B DFlash2 `d45e2221805a`; 35B-A3B DFlash2, `-ncmoe 40` and 3 GPU `-sm layer` all `0cf4a62aa63f`) |
+| MTP four-axis (27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42) | text identical 4/4 (R `0ffad0c34953`, P `4f0d1ea854e9`, C `95603a6a89a4`, K `a87c4318b649`); acceptance identical **0.74932 (275/367)**, acc per pos (0.837, 0.756, 0.642); t/s flat (54.5/71.1-71.4/75.1/83.0-82.6) |
+| `gate-spec-draft-window.sh` (MTP drafter touched) | PASS — 1024 cells/seq, 6/6 requests identical to the no-window arm |
+| `gate-ckpt-reuse.sh` (the checkpoint's draft buffer is the other cause) | PASS without a draft and **with a DFlash2 draft** (keep 3, created 5 < 8, text == 4/4) |
+| prefill logits (`gate-prefill-logits.sh`) | **0.000000 / 100.000 %** |
+| per-block build (`--fast --changed-from 541a94a32`) | **3/3** (block 02 78 s, block 12 6 s, the tip); 13 deltas byte-identical to r217 |
+| GPU faults (`check-gpu-faults.sh`, 20 logs) | clean |
+| `validate-set.sh` | green — strict **16/16** on a fresh tarball, tree == `release.json.tree` |
+
+**Docs changed with it:** `patches/README.md` (block 02 and 12 content + the index rows), `MANIFESTS.md` (two
+gate rows), `INVARIANTS.md` (the r218 entry), `GREEDY-PURITY.md` (§53's reuse half + the index row),
+`scripts/README.md` (the gate), `AGENTS.md` (the gate table row), the new gate script and the benchmark record.
+No `ENVIRONMENT.md` change: the fix adds no variable and changes no default.  Nothing was filed in `TODO.md`.
+
+**Not validated:** the MTP half of the realign (every MTP-head model on this box is M-RoPE, so that path is a
+no-op by construction; the four-axis, draft-window and ckpt-reuse gates are its inertness evidence), a real
+DSpark GGUF, and gfx1030 itself (the defect is in `common/`, but it was reproduced on gfx1201 only).
+
 ## 261105.003 (r217) -- issue #273: two more grids off the gfx1201 stall, `seq_rm` stops at the parked bound, the per-step prompt copy is gone, and every `getenv` is read once
 
 **Released as `v16-6050b467c-r217` (16 blocks; blocks 06, 10, 11, 12, 13 and 15 amended).**  Fork point

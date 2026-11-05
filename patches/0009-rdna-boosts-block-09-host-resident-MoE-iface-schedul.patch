@@ -1,4 +1,4 @@
-From 010204613cc2e86607eebe1d7244739a20360bf3 Mon Sep 17 00:00:00 2001
+From c1640a1ba760c2e908539e5ca47295e49736f732 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -1888,10 +1888,10 @@ index 824d386b0..9b171b54b 100644
  
  // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 3dc85b18c..32bc28f58 100644
+index e2a21f5d0..478d0ce40 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -1619,9 +1619,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1661,9 +1661,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          n_hard.assign(n_seq, 0);
          n_last.assign(n_seq, 0);
  
@@ -1905,7 +1905,7 @@ index 3dc85b18c..32bc28f58 100644
  
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
-@@ -3044,15 +3046,32 @@ struct common_speculative_init_result::impl {
+@@ -3103,15 +3105,32 @@ struct common_speculative_init_result::impl {
      llama_context_ptr context;
  };
  
@@ -1939,7 +1939,7 @@ index 3dc85b18c..32bc28f58 100644
      auto cparams = common_context_params_to_llama(params);
  
      if (spec_mtp) {
-@@ -3082,9 +3101,22 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3141,9 +3160,22 @@ common_speculative_init_result::common_speculative_init_result(
      std::string model_path;
      if (has_draft) {
          model_path = params.speculative.draft.mparams.path;
@@ -1964,7 +1964,7 @@ index 3dc85b18c..32bc28f58 100644
          if (model_dft == NULL) {
              LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
              return;
-@@ -3112,6 +3144,15 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3171,6 +3203,15 @@ common_speculative_init_result::common_speculative_init_result(
  
          pimpl->context.reset(ctx_dft);
      }
@@ -1980,7 +1980,7 @@ index 3dc85b18c..32bc28f58 100644
  }
  
  common_speculative_init_result::~common_speculative_init_result() = default;
-@@ -3124,8 +3165,9 @@ llama_context * common_speculative_init_result::context() {
+@@ -3183,8 +3224,9 @@ llama_context * common_speculative_init_result::context() {
      return pimpl->context.get();
  }
  
@@ -1992,7 +1992,7 @@ index 3dc85b18c..32bc28f58 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -3556,3 +3598,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3615,3 +3657,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }

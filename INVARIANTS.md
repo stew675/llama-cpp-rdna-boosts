@@ -1852,3 +1852,43 @@ cost a session to learn; do not re-derive them.
 4. **Without media, the server slot's own token vector IS the prompt the drafters read**, so `slot.spec_prompt`
    must only be copied when `tokens.has_mtmd`; the copy is 2.8 us/step at 10.5K tokens and **28.8 us/step at
    110K**.  The drafters read it inside `common_speculative_draft()`, before the batch changes the prompt.
+
+## r218 -- the drafter's KV must stay contiguous with the rows it ingests (issue #272)
+
+**Measured facts.  Do not re-derive; a rejected draft batch is a HTTP 500 on the user's request, not a slow
+path.**
+
+1. **The ingest tail leaves the draft's cache ending below the first row a PARTIALLY reused prompt ingests.**
+   `LLAMA_DFLASH_INGEST_TAIL` (block 12, r130) and `LLAMA_MTP_INGEST_TAIL` (block 02, r118) ingest only the
+   last `n_swa` rows of the prompt.  A slot keeps a prefix from an earlier task, so when the new turn adds
+   more than `n_swa` tokens the new prompt's window starts *past* the rows the draft kept: the draft's
+   `seq_pos_max` is the reused prefix's end (P-1) while the first row the task injects is at
+   `ingest_from = prompt_end - n_swa > P`.  The batch check requires `seq_pos_min == seq_pos_max + 1`.
+2. **A strict (non-M-RoPE) draft is REJECTED; an M-RoPE draft is allowed to jump.**  `llama_batch_allocr::init()`
+   has two branches: `n_pos_per_embd > 1` (M-RoPE: `X < Y` for tokens, `X <= Y` for embeddings) and the
+   `Y = X + 1` rule otherwise.  A DFlash/DSpark draft carries `dflash.rope.dimension_sections` when it drafts
+   for an M-RoPE target (`LLAMA_ROPE_TYPE_MROPE`, `n_pos_per_embd = 4`) and takes `NORM`/`NEOX`
+   (`n_pos_per_embd = 1`) otherwise, so the same defect is a 500 for one draft class and a silently
+   context-starved batch for the other.
+3. **Reproduced on gfx1201, issue #272 (the reporter's shape).**  35B-A3B UD-Q4_K_M + the 35B-A3B DFlash2-Q8_0
+   draft, `-np 2 --kv-unified -ctxcp 4 -fa on -c 49152`, three turns of `prompts/prose-rdna-boosts.txt`
+   (+5246 tokens per turn, 2048-position window, `prompt_n` 5246/5251/5224, `cache_n` 0/5242/10516): the
+   pre-fix build answers turn 2 with `HTTP 500 decode() failed: failed to process speculative batch` and
+   `inconsistent sequence positions ... sequence 0 ... X = 5241 ... starting position of Y = 8445`.  The
+   reporter's DSpark arm measured the same message at `X = 1995, Y = 2242` (prefix 1996 reused, window start
+   2242).  `LLAMA_DFLASH_INGEST_TAIL=0` passes on the pre-fix build - the tail is the trigger.
+4. **A metadata-only non-M-RoPE copy of an M-RoPE draft is a faithful stand-in, so the two draft classes can be
+   compared on one model pair.**  Zeroing `dflash.rope.dimension_sections` (`[64,0,0,0] -> [0,0,0,0]`) switches
+   only the batch-check rule: the derived draft measures the **same acceptance** as the original
+   (0.42424 = 14 accepted / 33 generated, 0.20833 = 10/48, 0.35135 = 13/37, mean len 2.56/1.77/2.30) and the
+   same text on every turn, i.e. an M-RoPE rotation with one section is numerically what the strict backbone
+   does.  That is what makes `scripts/gate-spec-reuse-window.sh` able to hold one model pair for both rules.
+5. **The stale prefix carries nothing, so dropping it is exact.**  Every row below `ingest_from` is masked for
+   the prompt-end query (`GREEDY-PURITY.md` §53), and the injection batch does not contain them, so they can
+   neither be attended nor re-ingested: the only exact repair is to drop them and start a fresh window at the
+   first ingested row, exactly as the first-ever prompt of a session does.  After the repair the tail and
+   no-tail arms produce byte-identical text on every turn of the reuse replay (6/6 requests across the two
+   draft classes) - the drafter proposes, the target verifies.
+6. **A draft found AHEAD of the target is rejected by BOTH branches**, so the overlapping tail is trimmed
+   unconditionally (`pos_max + 1 > pos_first`): a checkpoint restore can put the draft past the position the
+   task resumes from, and this call re-ingests those positions anyway.
