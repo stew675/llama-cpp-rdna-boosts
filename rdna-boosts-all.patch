@@ -61323,10 +61323,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..de110d58a
+index 000000000..67033c662
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,8155 @@
+@@ -0,0 +1,8326 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61460,6 +61460,15 @@ index 000000000..de110d58a
 +    int64_t     fills       = 0;
 +    int64_t     evictions   = 0;
 +    bool        alloc_failed= false;
++    // issue #274: the once-per-table report of a FAILED fill (a failure used to be silent apart from a
++    // per-occurrence warn, and the slot stayed resident).
++    bool        fill_fail_warned = false;
++    // A table whose fills have FAILED is not servable: the eager take-over and the consumer must decline it
++    // wholesale from then on (the same policy `alloc_failed`/`!moe_cache_has_arena()` already use), because a
++    // take-over that still emitted a remap would skip the scheduler's `input_cpy` copy AND the arena holds
++    // nothing -- measured as corrupt greedy text on the issue-#274 forced-failure arm.  One failed fill is
++    // enough: a source that failed once (no pool, no bounce, no mapping) does not come back.
++    bool        fill_failed  = false;
 +    // Session 7 identity fast path: slots == n_experts, slot == expert, the whole table was copied
 +    // in at sizing time, and the consumer reads the arena with the raw routing ids (no remap, no
 +    // per-token host routing readback).
@@ -61943,6 +61952,9 @@ index 000000000..de110d58a
 +int64_t                             g_acc_colds       = 0;
 +int64_t                             g_fill_bytes      = 0;
 +int64_t                             g_cold_bytes      = 0;
++// issue #274: fills whose source could not be resolved/filled.  A failed fill is rolled back (the slot is
++// NOT resident) and the routed op is declined, so this is counted separately from `g_acc_fills`.
++int64_t                             g_fill_fail       = 0;
 +
 +int env_int(const char * name, int dflt) {
 +    const char * e = getenv(name);
@@ -62477,11 +62489,28 @@ index 000000000..de110d58a
 +
 +// ---- wip/host-expert-dio-cache Phase 2: the bounded pinned host tier (L2) -------------------------
 +
-+// Host-pool file I/O portability (issue #130).  The bounded host pool is a POSIX feature; every
-+// file call goes through these five helpers so the Windows build compiles.  There `pool_open_file`
-+// returns -1, the pool marks itself failed, and a miss is served from the pinned master exactly as
-+// if the pool were disabled.  A real Windows pool (ReadFile with an OVERLAPPED offset,
-+// FILE_FLAG_NO_BUFFERING for the DIO mode, _aligned_malloc) would be the proper fix if wanted.
++// Host-pool file I/O portability (issue #130, issue #274).  The pool's DISK TIER is a POSIX feature; every
++// file call goes through these five helpers so the Windows build compiles, and there `pool_open_file` is a
++// stub that returns -1.  The pool itself does NOT need it: a pool is only created for a table whose master
++// is the read-only model mapping, so `src_host` (the mapping) can always serve a fill and the disk tier only
++// decides whether the PAGE CACHE is populated.  Treating it as required is what broke issue #274: on
++// Windows with `MOE_HOST_POOL_DIO=1` every pool fill failed, every pool marked itself failed, the bounce
++// fallback asked for the same missing tier and failed too -- and the demand path still recorded the slot as
++// RESIDENT, i.e. a garbage expert in the arena rather than a slow one.  A real Windows disk tier (ReadFile
++// with an OVERLAPPED offset, FILE_FLAG_NO_BUFFERING for the DIO mode, _aligned_malloc) would be the proper
++// fix if it is ever wanted; until then the pool fills through the mapping there.
++//
++// `MOE_HOST_POOL_DIO_FAULT=1` (diagnostic) reproduces "this platform has no pool disk tier" on Linux, which
++// is the only way to exercise the Windows arm from a box without a Windows toolchain.
++static bool pool_file_io_available() {
++#if defined(_WIN32)
++    return false;
++#else
++    static const bool faulted = getenv("MOE_HOST_POOL_DIO_FAULT") != nullptr;
++    return !faulted;
++#endif
++}
++
 +#if defined(_WIN32)
 +typedef int pool_ssize_t;
 +static int  pool_open_file(const char * path, bool dio) { (void) path; (void) dio; return -1; }
@@ -62492,6 +62521,9 @@ index 000000000..de110d58a
 +#else
 +typedef ssize_t pool_ssize_t;
 +static int  pool_open_file(const char * path, bool dio) {
++    if (!pool_file_io_available()) {
++        return -1;
++    }
 +    return open(path, O_RDONLY | (dio ? O_DIRECT : 0));
 +}
 +static void pool_fd_align(int fd, size_t * align) {
@@ -62780,6 +62812,26 @@ index 000000000..de110d58a
 +// buffered miss evicts the cache it needs.  The middle band (the set fits, the set + a full pool does not)
 +// is unmeasured -- a forced `MOE_HOST_POOL_DIO=0|1` is the escape hatch there.
 +// Caller holds `g_mutex`.
++static bool pool_dio_effective(bool want) {
++    if (!want || pool_file_io_available()) {
++        return want;
++    }
++    // issue #274: O_DIRECT fills need `pool_open_file`, which does not exist on every platform (Windows is a
++    // compile-time stub returning -1).  Asking for the disk tier there used to fail EVERY pool fill, fail
++    // every pool, and then fail the bounce fallback as well -- while the demand path still recorded the slot
++    // as resident, so the run produced garbage rather than a slow answer.  The tier is an optimisation, not a
++    // requirement (the pool's master is the read-only model mapping), so refuse it and keep the pool.
++    static bool warned = false;
++    if (!warned) {
++        warned = true;
++        GGML_LOG_WARN("%s: O_DIRECT fills are NOT available on this platform (the pool's file I/O is a no-op "
++                      "stub), so the host pool fills through the model mapping / page cache instead.  Nothing "
++                      "is disabled: the pool, its pin, the in-place cold read and the per-table bounce ring "
++                      "are unchanged.\n", __func__);
++    }
++    return false;
++}
++
 +static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
 +    if (g_pool_dio_decided) {
 +        return;
@@ -62788,7 +62840,7 @@ index 000000000..de110d58a
 +    if (g_pool_dio_req >= 0) {
 +        // Forced (`MOE_HOST_POOL_DIO=0|1`): `parse_env` already applied it; this is the one place that reports
 +        // it, because it runs once, at the first pool build, at a log level the operator can see.
-+        g_pool_dio = g_pool_dio_req != 0;
++        g_pool_dio = pool_dio_effective(g_pool_dio_req != 0);
 +        GGML_LOG_INFO("%s: host pool fill mode: %s (forced by MOE_HOST_POOL_DIO=%d)\n", __func__,
 +                      g_pool_dio ? "O_DIRECT (page cache bypassed)" : "buffered (page cache as L3)",
 +                      g_pool_dio_req);
@@ -62801,7 +62853,7 @@ index 000000000..de110d58a
 +    // `-ncmoe 48 -lme 60`: 95.20 GiB of storage reads at 2 785 MiB/s where the mapping was 4x faster and
 +    // stayed reusable.  `MOE_HOST_POOL_DIO=0|1` (handled above) still forces either arm.
 +    if (g_pool_load_mode >= 0) {
-+        g_pool_dio = g_pool_load_mode != 0;
++        g_pool_dio = pool_dio_effective(g_pool_load_mode != 0);
 +        // The mirror is the POLICY, but the trade-off is worth stating at the moment it is taken: when the
 +        // set does not fit beside the pinned pool, a buffered fill's page cache competes with the pool for
 +        // the same RAM (r112 measured O_DIRECT as the right arm there: 18-19 vs 3.2-3.3 t/s on a box whose
@@ -62827,7 +62879,7 @@ index 000000000..de110d58a
 +    }
 +    const int64_t avail = pool_available_ram_bytes();
 +    if (avail <= 0 || host_total <= 0) {
-+        g_pool_dio = true;   // no MemAvailable to reason with: keep the memory-tight default (r112)
++        g_pool_dio = pool_dio_effective(true);   // no MemAvailable to reason with: keep the memory-tight default (r112)
 +        GGML_LOG_INFO("%s: host pool fill mode: O_DIRECT (no MemAvailable, keeping the memory-tight default;"
 +                      " MOE_HOST_POOL_DIO=0 forces buffered)\n", __func__);
 +        return;
@@ -62839,7 +62891,7 @@ index 000000000..de110d58a
 +            pool = cap;
 +        }
 +    }
-+    g_pool_dio = pool + host_total > avail;
++    g_pool_dio = pool_dio_effective(pool + host_total > avail);
 +    GGML_LOG_INFO("%s: host pool fill mode: %s -- MemAvailable %.1f MiB, planned pool %.1f MiB, host expert"
 +                  " set %.1f MiB (%s; MOE_HOST_POOL_DIO=0|1 forces either arm)\n", __func__,
 +                  g_pool_dio ? "O_DIRECT (page cache bypassed)" : "buffered (page cache as L3)",
@@ -63206,14 +63258,18 @@ index 000000000..de110d58a
 +// When the host tensor is backed by the read-only model mapping (the pool-backed master) that is a plain
 +// memcpy out of the page cache: no syscall, no second copy, and the pages stay reclaimable (the kernel drops
 +// them under pressure and re-faults from the GGUF -- the disk tier).  `MOE_HOST_POOL_DIO=1` keeps the file
-+// read with O_DIRECT, which is the only mode that bypasses the page cache.  Caller holds `g_mutex`.
++// read with O_DIRECT, which is the only mode that bypasses the page cache.  The disk tier is an OPTIMISATION:
++// when it is unavailable (a platform whose pool file I/O is a stub, a file that cannot be opened) the fill
++// falls back to the mapping instead of failing, because failing here marks the whole pool dead (issue #274).
++// Caller holds `g_mutex`.
 +static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
 +    // wip/host-pool-speed: the fill's WALL TIME, by source.  A demand fill is synchronous (the host thread
 +    // blocks on it), so this is the number that decides whether an overlapped/coalesced fill is worth
 +    // building at all (README §16).  Two clock reads per fill: fills are ~1 per miss, so this is free.
 +    const int64_t t0 = ggml_time_us();
 +    const size_t rel = (size_t) expert * p.host_bytes;
-+    if (!g_pool_dio && p.src_host != nullptr) {
++    const bool   use_disk = g_pool_dio && pool_file_io_available();
++    if (!use_disk && p.src_host != nullptr) {
 +        memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
 +        g_fill_memcpy_calls++;
 +        g_fill_memcpy_us += ggml_time_us() - t0;
@@ -63223,13 +63279,42 @@ index 000000000..de110d58a
 +    if (p.fd < 0) {
 +        p.fd = pool_open_file(p.path.c_str(), g_pool_dio);
 +        if (p.fd < 0) {
-+            return false;
++            if (p.src_host == nullptr) {
++                return false;   // no source at all: a pool that cannot be filled must stay failed
++            }
++            // The disk tier is gone but the master is mapped: read it directly.  A one-time line, because
++            // this is the arm that used to fail the pool outright (issue #274).
++            static bool warned_fallback = false;
++            if (!warned_fallback) {
++                warned_fallback = true;
++                GGML_LOG_WARN("%s: the host pool's disk tier is unavailable (%s); filling through the model "
++                              "mapping / page cache instead.  The pool contents are identical, only the page "
++                              "cache is populated.\n", __func__, g_pool_dio ? "O_DIRECT requested" : "no file handle");
++            }
++            memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
++            g_fill_memcpy_calls++;
++            g_fill_memcpy_us += ggml_time_us() - t0;
++            g_fill_total_bytes += (int64_t) p.host_bytes;
++            return true;
 +        }
 +        pool_fd_align(p.fd, &p.align);
 +    }
 +    const size_t off = p.file_offs + rel;
-+    const bool ok = g_pool_dio ? pool_dio_read(p.fd, dst, p.host_bytes, off, p.align)
-+                               : (pool_pread(p.fd, dst, p.host_bytes, off) == (pool_ssize_t) p.host_bytes);
++    bool ok = g_pool_dio ? pool_dio_read(p.fd, dst, p.host_bytes, off, p.align)
++                         : (pool_pread(p.fd, dst, p.host_bytes, off) == (pool_ssize_t) p.host_bytes);
++    if (!ok && p.src_host != nullptr) {
++        // A failed disk read (a short pread, an O_DIRECT alignment refusal) is not a reason to fail the fill
++        // OR the pool: the master holds the same bytes.  Retry through the mapping and say so once.
++        static bool warned_read = false;
++        if (!warned_read) {
++            warned_read = true;
++            GGML_LOG_WARN("%s: a host pool disk read failed (dio=%d); falling back to the model mapping for "
++                          "the slot.  The pool stays live.\n", __func__, (int) g_pool_dio);
++        }
++        memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
++        g_fill_memcpy_calls++;
++        ok = true;
++    }
 +    g_fill_read_calls++;
 +    g_fill_read_us += ggml_time_us() - t0;
 +    g_fill_total_bytes += (int64_t) p.host_bytes;
@@ -63797,6 +63882,15 @@ index 000000000..de110d58a
 +    int            bounce    = -1;
 +};
 +
++// Diagnostic (issue #274): emulate "a pageable master has NO resolvable source for this expert", i.e. the
++// bounce ring cannot be allocated.  The point of the arm is the SLOT state, not the fill: a failed fill must
++// roll the admission back and decline the op (correct, slow) instead of leaving a resident slot full of stale
++// bytes (fast, wrong).  Only the pool/bounce path is faulted; a pinned master is untouched.
++static bool pool_fill_fault() {
++    static const bool v = getenv("MOE_HOST_POOL_FILL_FAULT") != nullptr;
++    return v;
++}
++
 +// TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
 +// the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
 +// Caller holds `g_mutex`.
@@ -63810,6 +63904,9 @@ index 000000000..de110d58a
 +        out->base = (const char *) t.host + (size_t) expert * t.host_bytes;
 +        out->kind = cudaMemcpyHostToDevice;
 +        return true;
++    }
++    if (pool_fill_fault()) {
++        return false;
 +    }
 +    if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
 +        // wip/host-pool-speed: the copy KIND out of the pool.  Default keeps the historical D2D from the
@@ -63844,35 +63941,56 @@ index 000000000..de110d58a
 +    }
 +    // Bounce: reuse an entry whose copy has drained, else grow the ring.  Copying the page-cache-backed
 +    // mapping into pinned memory is a plain host memcpy, so the transfer below is a pinned H2D.
++    //
++    // issue #274: the DISK TIER is an optimisation, never a requirement.  When it cannot serve (no file I/O on
++    // this platform, the source was never registered, the file cannot be opened, a short read) the expert is
++    // copied out of the model mapping instead -- the same bytes, only with the page cache populated.  A hard
++    // failure here is a WRONG ANSWER, not a slow one: the demand path cannot serve the expert at all, and it
++    // used to record the slot as resident anyway (`access_locked`).
 +    const int idx = bounce_acquire(t);
 +    if (idx < 0) {
++        static bool warned_ring = false;
++        if (!warned_ring) {
++            warned_ring = true;
++            GGML_LOG_WARN("%s: no pinned bounce entry for layer=%d role=%s (cudaHostAlloc failed); the host "
++                          "pool and the bounce ring are both unavailable for this table\n", __func__, t.layer,
++                          t.role.c_str());
++        }
 +        return false;
 +    }
 +    char * buf = t.bounce[(size_t) idx].host;
-+    if (!g_pool_dio && t.host != nullptr) {
-+        // the mapped master: a plain memcpy out of the page cache
-+        memcpy(buf, (const char *) t.host + (size_t) expert * t.host_bytes, t.host_bytes);
-+    } else {
++    bool   filled = false;
++    if (g_pool_dio && pool_file_io_available() && t.src_known && !t.src_path.empty()) {
 +        // DISK TIER (`MOE_HOST_POOL_DIO=1`): read the expert with O_DIRECT so the page cache is not
 +        // populated -- the whole point of the mode, and it must hold for STAGING too (a whole-table prefill
 +        // staging copy would otherwise fault the entire expert set into the page cache).
-+        if (!t.src_known || t.src_path.empty()) {
-+            return false;
-+        }
 +        device_guard dg(t.device);
 +        if (t.src_fd < 0) {
 +            t.src_fd = pool_open_file(t.src_path.c_str(), g_pool_dio);
-+            if (t.src_fd < 0) {
-+                return false;
++            if (t.src_fd >= 0) {
++                pool_fd_align(t.src_fd, &t.src_align);
 +            }
-+            pool_fd_align(t.src_fd, &t.src_align);
 +        }
-+        const size_t off = t.src_offs + (size_t) expert * t.host_bytes;
-+        const bool ok = g_pool_dio ? pool_dio_read(t.src_fd, buf, t.host_bytes, off, t.src_align)
-+                                   : (pool_pread(t.src_fd, buf, t.host_bytes, off) == (pool_ssize_t) t.host_bytes);
-+        if (!ok) {
-+            return false;
++        if (t.src_fd >= 0) {
++            const size_t off = t.src_offs + (size_t) expert * t.host_bytes;
++            filled = g_pool_dio ? pool_dio_read(t.src_fd, buf, t.host_bytes, off, t.src_align)
++                                : (pool_pread(t.src_fd, buf, t.host_bytes, off) == (pool_ssize_t) t.host_bytes);
 +        }
++    }
++    if (!filled && t.host != nullptr) {
++        // the mapped master: a plain memcpy out of the page cache
++        static bool warned_map = false;
++        if (!warned_map && g_pool_dio) {
++            warned_map = true;
++            GGML_LOG_WARN("%s: the host pool's disk tier cannot serve a fill (layer=%d role=%s); staging "
++                          "expert bytes through the model mapping instead.  The bytes are identical -- only "
++                          "the page cache is populated.\n", __func__, t.layer, t.role.c_str());
++        }
++        memcpy(buf, (const char *) t.host + (size_t) expert * t.host_bytes, t.host_bytes);
++        filled = true;
++    }
++    if (!filled) {
++        return false;
 +    }
 +    out->base    = buf;
 +    out->kind    = cudaMemcpyHostToDevice;
@@ -64127,9 +64245,43 @@ index 000000000..de110d58a
 +            expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
 +        }
 +        if (err != cudaSuccess) {
-+            GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
-+                          __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
++            // issue #274: a fill that failed must NOT leave the expert RESIDENT.  The remap is built from
++            // `t.expert_slot`, so recording a slot whose bytes were never copied does not degrade the answer,
++            // it CORRUPTS it (the reporter's run produced one token and stopped: every fill had failed and
++            // every slot was still marked resident).  Roll the admission back: `moe_cache_update_host`'s pass 2
++            // then finds no slot for this expert, cannot resolve a cold or pool id for it either, and DECLINES
++            // the op, so the scheduler serves it from the host master (slow, correct).
++            t.expert_slot.erase(expert);
++            if (slot >= 0 && slot < t.slots && t.slot_expert[slot] == expert) {
++                t.slot_expert[slot] = -1;
++            }
++            t.slot_dirty = true;
++            t.fill_failed = true;
++            t.count[expert] = 0;   // never used: a later admission must not inherit this attempt's count
++            t.fills--;
++            g_acc_fills--;
++            g_fill_bytes -= (int64_t) t.expert_bytes;
++            g_fill_fail++;
++            const bool first_for_table = !t.fill_fail_warned;
++            t.fill_fail_warned = true;
++            if (first_for_table || (g_fill_fail % 10000) == 0) {
++                // Report the REAL cause: `err` is what `expert_host_src`/`copy_slot_from_src` returned, and
++                // `cudaGetLastError()` is empty for both (`"no error"` is what made this look like a driver
++                // problem in issue #274).
++                GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: %s; the slot is NOT resident "
++                              "(%lld failed fills so far)\n", __func__, t.layer, t.role.c_str(), expert,
++                              cudaGetErrorString(err), (long long) g_fill_fail);
++            }
++            if (cold_ok && out_cold != nullptr) {
++                *out_cold = true;
++                g_acc_colds++;
++                g_cold_bytes += (int64_t) t.expert_bytes;
++            }
++            return { nullptr, false };
 +        }
++        // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
++        // being in VRAM now does not mean the pool should forget where to find it next time.
++        expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
 +    }
 +    return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
 +}
@@ -68355,6 +68507,13 @@ index 000000000..de110d58a
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
 +    t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
++    if (t.fill_failed) {
++        // issue #274: this table's fills have failed, so it has no arena it can serve from.  Decline BEFORE
++        // anything is remapped: a take-over here would skip the scheduler's `input_cpy` copy and the consumer
++        // would read an arena that was never filled.
++        g_decline_all++;
++        return false;
++    }
 +
 +    // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never
 +    // cache-managed (the arena serves the decode band only), but its routing is the strongest available
@@ -69018,6 +69177,9 @@ index 000000000..de110d58a
 +    // slots, and the caller re-checks the remap shape, so a partially-evicted cache still serves its
 +    // residents.
 +    table_t & t = g_tables[id];
++    if (t.fill_failed) {
++        return false;   // issue #274: never hand out the arena of a table whose fills have failed
++    }
 +    // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
 +    // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
 +    // the decode/verify band: prefill keeps the normal path (its MMQ fusions and the MMQ dispatch read
@@ -69382,7 +69544,16 @@ index 000000000..de110d58a
 +                      (long long) g_prs_rebuilds);
 +    }
 +    GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
-+                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
++                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
++    if (g_fill_fail > 0) {
++        // issue #274: a failed fill rolls the admission back and declines the op, so the run is CORRECT but
++        // slow.  Silence here is what let "every fill failed" reach the reporter as broken output instead of
++        // a number: say it in the census, once, at the level the operator sees.
++        GGML_LOG_WARN("%s: FAILED fills: %lld (each one was rolled back -- the slot is not resident and the "
++                      "routed op was declined, so the scheduler served it from the host master)\n",
++                      __func__, (long long) g_fill_fail);
++    }
++    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
 +        const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
 +        const int64_t bytes = g_fill_bytes + g_cold_bytes;
 +        // One census op per (layer, role, device) table per token; integer division loses at most
@@ -90996,10 +91167,10 @@ index 6c6393d57..8cce74993 100644
  
      void seek(size_t offset, int whence) const;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index a963f2480..dbca4592d 100644
+index a963f2480..f0889b471 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -10,15 +10,404 @@
+@@ -10,15 +10,418 @@
  #include <array>
  #include <cinttypes>
  #include <cstdint>
@@ -91387,24 +91558,38 @@ index a963f2480..dbca4592d 100644
 +    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
 +        return;
 +    }
-+    // Always at INFO: a user must be able to see which tier they got.  The pageable fallback costs about
-+    // half the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires
-+    // when a pinned allocation is refused, not when the policy chose not to pin.
++    // Always at WARN: a user must be able to see which tier they got.  The pageable fallback costs about half
++    // the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires when a
++    // pinned allocation is refused, not when the policy chose not to pin.
++    //
++    // issue #274: it used to be INFO, which is INVISIBLE at the default verbosity (common/log.cpp maps
++    // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE against a default threshold of LOG_LEVEL_INFO).  The reporter
++    // could see only the WARN lines -- the failures -- and not one of the decisions that produced them.
 +    const double mib = 1024.0 * 1024.0;
-+    LLAMA_LOG_INFO("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB; %s\n", __func__,
++    std::string src = "";
++    if (host_experts_sourceable > 0) {
++        // The pool is built per host tensor from this registration; a mismatch against the pageable tensor
++        // count is the first thing a "the pool never appears" report needs to know.
++        src = format(", %zu/%zu pool sources registered", host_experts_sources, host_experts_sourceable);
++        if (host_experts_sources < host_experts_sourceable) {
++            src += " -- the unregistered tensors cannot use the pool (their buffer names no device); the "
++                   "per-table bounce ring serves them";
++        }
++    }
++    LLAMA_LOG_WARN("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB%s; %s\n", __func__,
 +                   (double) host_experts_pinned_bytes / mib,
 +                   (double) host_experts_total_bytes / mib,
 +                   host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
 +                       : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
 +                                                      : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
-+                   (double) host_experts_holes_bytes / mib,
++                   (double) host_experts_holes_bytes / mib, src.c_str(),
 +                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
 +}
 +
  const char * llama_file_version_name(llama_fver version) {
      switch (version) {
          case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
-@@ -97,8 +486,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
+@@ -97,8 +500,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
          throw std::runtime_error(format("invalid split file: %s", path.c_str()));
      }
  
@@ -91415,7 +91600,7 @@ index a963f2480..dbca4592d 100644
          paths.push_back(std::string(buf.data(), ret));
      }
  
-@@ -540,15 +929,19 @@ llama_model_loader::llama_model_loader(
+@@ -540,15 +943,19 @@ llama_model_loader::llama_model_loader(
          std::vector<std::string> & splits,
          FILE * file,
          llama_load_mode load_mode,
@@ -91437,7 +91622,7 @@ index a963f2480..dbca4592d 100644
      }
  
      if (param_overrides_p != nullptr) {
-@@ -558,9 +951,37 @@ llama_model_loader::llama_model_loader(
+@@ -558,9 +965,37 @@ llama_model_loader::llama_model_loader(
      }
  
      tensor_buft_overrides = param_tensor_buft_overrides_p;
@@ -91475,7 +91660,7 @@ index a963f2480..dbca4592d 100644
  
      if (!fname.empty()) {
          // Load the main GGUF
-@@ -1123,14 +1544,98 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1123,14 +1558,98 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      return true;
  }
  
@@ -91576,7 +91761,7 @@ index a963f2480..dbca4592d 100644
  
          auto it = ctx_map.find(key);
          if (it == ctx_map.end()) {
-@@ -1185,9 +1690,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1185,9 +1704,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -91590,7 +91775,7 @@ index a963f2480..dbca4592d 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1226,7 +1733,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1226,7 +1747,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          const buft_list_t * buft_list;
          switch (info.layer) {
              case LLM_TENSOR_LAYER_INPUT:
@@ -91602,7 +91787,7 @@ index a963f2480..dbca4592d 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
-@@ -1241,15 +1751,104 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1241,15 +1765,104 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
          ggml_backend_buffer_type_t buft = nullptr;
  
@@ -91711,7 +91896,7 @@ index a963f2480..dbca4592d 100644
                          if (use_mmap) {
                              static std::once_flag once;
                              std::call_once(once, [] {
-@@ -1277,8 +1876,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1277,8 +1890,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // avoid using a host buffer when using mmap
@@ -91727,7 +91912,7 @@ index a963f2480..dbca4592d 100644
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -1336,7 +1941,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1336,7 +1955,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -91742,7 +91927,7 @@ index a963f2480..dbca4592d 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1349,9 +1960,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1349,9 +1974,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -91767,7 +91952,7 @@ index a963f2480..dbca4592d 100644
      }
  
      ggml_tensor t_meta = *cur;
-@@ -1374,6 +1998,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1374,6 +2012,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      if (buft == nullptr) {
          return nullptr;
      }
@@ -91778,7 +91963,7 @@ index a963f2480..dbca4592d 100644
  
      ggml_context * ctx = ctx_for_buft(buft);
  
-@@ -1417,6 +2045,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -1417,6 +2059,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
      }
  }
  
@@ -91794,7 +91979,7 @@ index a963f2480..dbca4592d 100644
  void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
      // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
      if (use_mmap || lazy.any()) {
-@@ -1436,11 +2073,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1436,11 +2087,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                  }
              }
  
@@ -91811,7 +91996,7 @@ index a963f2480..dbca4592d 100644
              if (mlock_mmaps) {
                  std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                  mlock_mmap->init(mapping->addr());
-@@ -1456,6 +2096,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1456,6 +2110,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
      }
  }
  
@@ -91825,7 +92010,7 @@ index a963f2480..dbca4592d 100644
  using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
  
  // merge a list of [first, last) ranges into a sorted, non-overlapping list
-@@ -1573,10 +2220,12 @@ bool llama_model_loader::load_all_data(
+@@ -1573,10 +2234,12 @@ bool llama_model_loader::load_all_data(
      }
      GGML_ASSERT(size_data != 0 && "call init_mappings() first");
  
@@ -91840,7 +92025,7 @@ index a963f2480..dbca4592d 100644
      constexpr size_t n_buffers = 4;
  
      size_t alignment = 1;
-@@ -1584,8 +2233,17 @@ bool llama_model_loader::load_all_data(
+@@ -1584,8 +2247,17 @@ bool llama_model_loader::load_all_data(
          alignment = std::max(file->read_alignment(), alignment);
      }
  
@@ -91860,7 +92045,7 @@ index a963f2480..dbca4592d 100644
  
      std::vector<ggml_backend_buffer_t> host_buffers;
      std::vector<ggml_backend_event_t> events;
-@@ -1611,6 +2269,15 @@ bool llama_model_loader::load_all_data(
+@@ -1611,6 +2283,15 @@ bool llama_model_loader::load_all_data(
              return nullptr;
          }
  
@@ -91876,7 +92061,7 @@ index a963f2480..dbca4592d 100644
          if (buft != ggml_backend_dev_buffer_type(dev)) {
              LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                  ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-@@ -1626,6 +2293,21 @@ bool llama_model_loader::load_all_data(
+@@ -1626,6 +2307,21 @@ bool llama_model_loader::load_all_data(
          }
  
          auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -91898,7 +92083,7 @@ index a963f2480..dbca4592d 100644
          if (!host_buft) {
              LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                  ggml_backend_dev_name(dev));
-@@ -1634,16 +2316,16 @@ bool llama_model_loader::load_all_data(
+@@ -1634,16 +2330,16 @@ bool llama_model_loader::load_all_data(
  
          // If the backend is supported, create pinned memory buffers and events for synchronisation.
          for (size_t idx = 0; idx < n_buffers; ++idx) {
@@ -91919,7 +92104,7 @@ index a963f2480..dbca4592d 100644
  
              auto * event = ggml_backend_event_new(dev);
              if (!event) {
-@@ -1705,7 +2387,7 @@ bool llama_model_loader::load_all_data(
+@@ -1705,7 +2401,7 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -91928,7 +92113,7 @@ index a963f2480..dbca4592d 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -1737,11 +2419,31 @@ bool llama_model_loader::load_all_data(
+@@ -1737,11 +2433,31 @@ bool llama_model_loader::load_all_data(
                      lmlock->grow_to(weight->offs + n_size);
                  }
  
@@ -91963,7 +92148,7 @@ index a963f2480..dbca4592d 100644
              }
          } else {
              const auto & file = files.at(weight->idx);
-@@ -1821,6 +2523,20 @@ bool llama_model_loader::load_all_data(
+@@ -1821,6 +2537,29 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -91975,16 +92160,25 @@ index a963f2480..dbca4592d 100644
 +                ggml_backend_buffer_is_host(cur->buffer) &&
 +                !host_expert_is_pinned(ggml_get_name(cur)) &&
 +                std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
++            // issue #274: the census needs to know whether the registration REACHED the backend.  A host-expert
++            // bank in a pageable buffer whose tensor buffer carries no device (a CPU bdev, or a buffer type the
++            // backend does not own) silently registers nothing, and then the pool is never built for it -- so
++            // count the eligible tensors and the ones whose buffer names a device.
++            host_experts_sourceable++;
++            ggml_backend_dev_t src_dev =
++                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
++            if (src_dev != nullptr) {
++                host_experts_sources++;
++            }
 +            ggml_backend_dev_moe_cache_set_host_source(
-+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer)),
-+                    cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
++                    src_dev, cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
 +                    (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
 +        }
 +
          size_done += n_size;
      }
  
-@@ -1852,11 +2568,20 @@ bool llama_model_loader::load_all_data(
+@@ -1852,11 +2591,20 @@ bool llama_model_loader::load_all_data(
          // unmap offloaded tensors and metadata
          if (use_mmap) {
              for (uint32_t idx = 0; idx < mappings.size(); idx++) {
@@ -92010,7 +92204,7 @@ index a963f2480..dbca4592d 100644
              }
          }
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index ed59079a4..70cbbf73d 100644
+index ed59079a4..4c864f5e8 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -68,6 +68,7 @@ struct llama_model_loader {
@@ -92021,7 +92215,7 @@ index ed59079a4..70cbbf73d 100644
  
      int n_kv      = 0;
      int n_tensors = 0;
-@@ -78,6 +79,88 @@ struct llama_model_loader {
+@@ -78,6 +79,98 @@ struct llama_model_loader {
  
      bool use_mmap = false;
      bool use_direct_io = false;
@@ -92044,6 +92238,13 @@ index ed59079a4..70cbbf73d 100644
 +    bool   host_experts_pool_holes   = false;        // the holes are served by the bounded pinned pool
 +    std::string host_experts_policy;                // the resolved policy, for the census line
 +    bool   host_experts_heat_seen    = false;        // the heat prior answered for at least one tensor
++    // issue #274: how many host-expert tensors actually got an on-disk source registered for the pool
++    // (`moe_cache_set_host_source`), against how many were ELIGIBLE (a pageable, non-pinned expert bank).
++    // Without a source the pool is never built for that tensor and every miss falls back to the per-table
++    // bounce ring, so this pair is the first thing a "the pool never appears" report needs -- and it must be
++    // visible at the default log level, not only under `-v`.
++    size_t host_experts_sources      = 0;
++    size_t host_experts_sourceable   = 0;
 +
 +    // The buffer type a host-resident expert weight (`-ncmoe`/`-cmoe`, a `MUL_MAT_ID` table) should use on
 +    // `dev`: the pinned host buffer by default, or the backend's pool-backed master buffer in POOL mode
@@ -92103,14 +92304,17 @@ index ed59079a4..70cbbf73d 100644
 +    }
 +
 +    // The one-line census of the resolved tier, after the load: `pinned X MiB of Y MiB (cap C MiB),
-+    // pageable Z MiB`, plus which tensors were pinned and why.  Always at INFO (a user must be able to see
-+    // which tier they got: the pageable fallback costs half the throughput, and 0008's warning only fires
-+    // when a PINNED allocation fails).
++    // pageable Z MiB`, plus which tensors were pinned and why, plus the pool-source count.
++    // issue #274: this is WARN, not INFO.  `common_log_get_verbosity()` maps GGML_LOG_LEVEL_INFO to
++    // LOG_LEVEL_TRACE, so an INFO line is INVISIBLE at the default verbosity (`-lv 3`) -- the reporter of
++    // issue #274 could not see the tier census, the pool's "enabled"/fill-mode lines or the pool's per-table
++    // build line at all, which is what made a pool that had FAILED look like a pool that was never requested.
++    // It is a one-off decision line, the same class as `MoE expert cache (auto): arena ...` (also WARN).
 +    void report_host_expert_placement();
      bool check_tensors;
      bool no_alloc;
      bool load_mtp;
-@@ -88,10 +171,30 @@ struct llama_model_loader {
+@@ -88,10 +181,30 @@ struct llama_model_loader {
          // set by the caller before the create_tensor() calls
          enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
  
@@ -92141,7 +92345,7 @@ index ed59079a4..70cbbf73d 100644
          bool any() const {
              return !ranges.empty();
          }
-@@ -100,6 +203,11 @@ struct llama_model_loader {
+@@ -100,6 +213,11 @@ struct llama_model_loader {
              return tensors.count(ggml_get_name(t)) > 0;
          }
  
@@ -92153,7 +92357,7 @@ index ed59079a4..70cbbf73d 100644
          const llama_mmap::ranges & for_file(uint32_t idx) const {
              static const llama_mmap::ranges none;
  
-@@ -111,8 +219,11 @@ struct llama_model_loader {
+@@ -111,8 +229,11 @@ struct llama_model_loader {
          static ggml_backend_buffer_type_t buft();
  
      private:
@@ -92165,7 +92369,7 @@ index ed59079a4..70cbbf73d 100644
      } lazy;
  
      llama_files files;
-@@ -124,6 +235,13 @@ struct llama_model_loader {
+@@ -124,6 +245,13 @@ struct llama_model_loader {
      std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
      std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
      const llama_model_tensor_buft_override * tensor_buft_overrides;
@@ -92179,7 +92383,7 @@ index ed59079a4..70cbbf73d 100644
  
      gguf_context_ptr metadata_ptr;
      struct gguf_context * metadata; // either metadata_ptr.get() or externally set
-@@ -136,7 +254,14 @@ struct llama_model_loader {
+@@ -136,7 +264,14 @@ struct llama_model_loader {
  
      size_t size_done = 0;
      size_t size_data = 0;
@@ -92195,7 +92399,7 @@ index ed59079a4..70cbbf73d 100644
  
      // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
      struct ggml_backend_buft_comparator {
-@@ -145,10 +270,11 @@ struct llama_model_loader {
+@@ -145,10 +280,11 @@ struct llama_model_loader {
          }
      };
  
@@ -92208,7 +92412,7 @@ index ed59079a4..70cbbf73d 100644
      };
  
      struct ctx_key_comparator {
-@@ -156,7 +282,21 @@ struct llama_model_loader {
+@@ -156,7 +292,21 @@ struct llama_model_loader {
              if (lhs.lazy != rhs.lazy) {
                  return lhs.lazy < rhs.lazy;
              }
@@ -92231,7 +92435,7 @@ index ed59079a4..70cbbf73d 100644
          }
      };
  
-@@ -177,9 +317,13 @@ struct llama_model_loader {
+@@ -177,9 +327,13 @@ struct llama_model_loader {
          std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
          FILE * file,
          llama_load_mode load_mode,
@@ -92245,7 +92449,7 @@ index ed59079a4..70cbbf73d 100644
          const llama_model_kv_override * param_overrides_p,
          const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
  
-@@ -251,6 +395,9 @@ struct llama_model_loader {
+@@ -251,6 +405,9 @@ struct llama_model_loader {
      // data that this context never reads (lazy tensors, -cmoe tensors, ...)
      std::vector<mapping_range> get_mapping_ranges(uint32_t idx, ggml_context * ctx) const;
  

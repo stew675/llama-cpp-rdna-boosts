@@ -3159,7 +3159,9 @@ had no other home.
 `LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
 `LLAMA_STATE_TIMING` (r152), `LLAMA_STATE_STAGE_MIB` (r157),
 `GGML_CPU_MOE_OFFLOAD_THREADS`, `GGML_CUDA_SLAB_RING_MIB`, and (r111+, POOL mode) `MOE_HOST_POOL_MIB` /
-`MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`, plus
+`MOE_HOST_POOL_FRAC` / `MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_VERIFY` / `LLAMA_HOST_MASTER_PINNED`
+(r219) `MOE_HOST_POOL_DIO_FAULT` / `MOE_HOST_POOL_FILL_FAULT` (diagnostics: the
+platform-without-a-disk-tier arm and the forced-fill-failure arm of `gate-host-pool.sh`), plus
 (r113) `MOE_HOST_POOL_RAM_PCT` (default **85** since r114), (r114) `MOE_HOST_POOL_STAGE_BATCH` and
 (r130, server) `LLAMA_SERVER_LAZY_IDLE_SLOTS` / `LLAMA_SERVER_CACHE_REUSE`, (r155, server)
 `LLAMA_SERVER_CKPT_REUSE`;
@@ -3169,6 +3171,25 @@ the heat prior's MHT2 sidecar is not a knob (an `MHT1` file is read as `dec = al
 **Notes.**  A backend-iface entry is a compile-time contract: adding one to the struct means adding it to
 **every** backend's initializer, or the build breaks for that backend.  Keep the difference documented when
 a hook is CUDA-only (the non-CUDA entries stay NULL and the feature is simply inactive).
+
+* **The pool's disk tier is best-effort, and a failed fill is rolled back (r219, issue #274).**  Two defects,
+  one report (Windows, `--load-mode mmap -ncmoe 47 --host-experts pool`, a host expert set larger than RAM):
+  (a) `pool_file_io_available()` is a compile-time stub on Windows (`pool_open_file` -> -1), so a requested
+  `MOE_HOST_POOL_DIO=1` failed **every** pool fill, which marked **every pool failed** (`table_pool_locked()`
+  -> null, so the pool "never appeared"), and the bounce fallback asked for the same missing tier and returned
+  false -- the reporter's `no pinned host source ... (pool and bounce both unavailable)`.  Fixed: the disk tier
+  only decides whether the page cache is populated, `pool_fill_slot_locked`/`expert_host_src` fall back to the
+  model mapping, and `pool_dio_effective()` refuses a disk tier the platform does not have with one WARN.
+  (b) `access_locked()` registered the slot as **resident** before the copy, so a fill that failed served stale
+  arena bytes (`async fill failed ...: no error` -- `cudaGetLastError()` is empty for a host-side failure) --
+  20 t/s prefill and a one-token answer.  Fixed: the admission rolls back, `t.fill_failed` stands the table
+  down wholesale (`moe_cache_update_host` / `moe_cache_get_table`, the same policy as `alloc_failed`), and the
+  exit census reports `FAILED fills: N`.  The tier census (`report_host_expert_placement`) is **WARN** and
+  carries the pool-source count: at the default verbosity INFO does not exist, so the reporter saw every
+  failure and none of the decisions.  The whole thing is gated by `scripts/gate-host-pool.sh`, whose
+  `MOE_HOST_POOL_DIO_FAULT` / `MOE_HOST_POOL_FILL_FAULT` arms reproduce the Windows shape and a hard source
+  failure on Linux (the only way to reach them from this box).  Measured: 7281 pre-fix `async fill failed`
+  lines and garbled text against 0 and byte-identical text post-fix.
 
 ---
 

@@ -1,3 +1,94 @@
+## 261105.005 (r219) -- issue #274: on Windows the host pool's fills could not be serviced, and a failed fill was served as resident (block 12)
+
+**Released as `v16-6050b467c-r219` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`2f7761bf5`**, tree **`d9a6468856304e9cf81fbfebcfe5c9366ec10c26`**.  Reported by **@DanoPTT**
+([issue #274](https://github.com/stew675/llama-cpp-rdna-boosts/issues/274)) on **Windows 11 / ROCm 10.0**, one
+R9700, 47.3 GB RAM, Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS with `--n-cpu-moe 47 --host-experts pool --load-mode
+mmap`: a 4996-token prompt prefilled at **20.4 t/s**, `MoE arena = 0.4939`, and greedy generation stopped after
+**one token**.  Every diagnostic below is reproducible with the two new diagnostic knobs, which is the point:
+this box has no Windows toolchain (`TODO` #95), so the platform state and the forced failure are now *arms*.
+
+### What was wrong (two defects, and the reporter's log named both)
+
+1. **The pool's DISK TIER was treated as required.**  A fill has two possible sources: the read-only model
+   mapping (a `memcpy` out of the page cache -- always present, because a pool's master *is* that mapping) and
+   the pool's disk tier (`MOE_HOST_POOL_DIO=1`, `pread`/`O_DIRECT`).  The file I/O is a **compile-time stub on
+   Windows** (`pool_open_file` -> -1, the issue-#130 portability shape), so with the disk tier selected every
+   pool fill failed, `pool_fill_empty_locked` marked the pool `failed`, and `table_pool_locked()` returned null
+   for the rest of the run -- the pool "never appeared".  The per-table bounce fallback then asked for the same
+   missing tier and returned false: `fill_slot_from_host: no pinned host source for layer=37 ... (pool and
+   bounce both unavailable)`.  **The reporter reached the disk tier by default**: r209's `MOE_HOST_POOL_DIO=auto`
+   chose `O_DIRECT` whenever `pool + host set > MemAvailable` (30 GB + 40 GB against 38 GB), which is exactly
+   their box.  r212 has since made `auto` mirror `--load-mode` (a mapped load fills buffered), so the default
+   path into this is gone -- but the mode is one env var away and the failure was silent corruption.
+2. **A fill that failed was recorded as RESIDENT.**  `access_locked()` registered `t.expert_slot[expert]` and
+   returned the arena pointer *before* the copy, so a failed fill left the slot serving stale bytes: the arena
+   "hit rate" (`h`) still looked plausible, the text was garbage, and the only trace was
+   `access_locked: async fill failed table layer=1 role=blk.1.ffn_gate_exps.weight expert=320: no error` --
+   `cudaGetLastError()` is empty for a host-side failure, so the message hid the cause.  The reporter guessed
+   this half of it ("the fill also still returns the slot as resident") and was right.
+3. **The decisions were invisible.**  Every line that would have explained the state (`host experts:` tier
+   census, `host pool enabled`, the per-table `host pool (...)` build line, the fill mode) is `GGML_LOG_INFO`,
+   and `common_log_get_verbosity()` maps INFO to `LOG_LEVEL_TRACE` against a default threshold of
+   `LOG_LEVEL_INFO`: at the default verbosity an operator sees **only** WARN and above, i.e. every failure and
+   none of the decisions.  That is why a pool that had *failed* looked like a pool that was never requested.
+
+### The fix (block 12, no new default, no behaviour change where the disk tier exists)
+
+* The disk tier is **best-effort everywhere**: `pool_fill_slot_locked()` falls back to the mapping when the
+  file cannot be opened or a read fails (it must not fail the pool), `pool_mirror_bulk_fill_locked()`'s failure
+  now falls through to the ranked per-slot path, `expert_host_src()`'s bounce ring falls back to the mapping
+  instead of returning false, and `pool_dio_effective()` **refuses** a requested `O_DIRECT` on a platform with
+  no pool file I/O, with one WARN.  The pool, its pin and the in-place cold read are untouched.
+* A failed fill **rolls the admission back** (no `expert_slot` entry, the fill counters undone), the census
+  reports `FAILED fills: N`, and the message carries the real cause (`cudaGetErrorString(err)`, once per table
+  plus every 10000th).  The table is then marked `fill_failed` and **stands down wholesale**
+  (`moe_cache_update_host`, `moe_cache_get_table`) -- the same policy as `alloc_failed` -- so the scheduler
+  serves the op from the host master instead of the arena.  The stand-down is *part of the fix*, not a
+  belt-and-braces: with the rollback alone, the eager take-over still emitted pool-cold ids for a table whose
+  arena was empty and the arm produced garbage (the first cut measured `b7e2732392540006`, i.e. wrong).
+* `report_host_expert_placement()` is **WARN** (a one-off decision line, the same class as
+  `MoE expert cache (auto): arena ...`) and carries the pool-source count (`141/141 pool sources registered`),
+  which is the first number a "the pool never appeared" report needs.
+
+### Reproduced, then gated -- with the Windows shape as a gate arm
+
+No Windows box here, so the platform state is an env: **`MOE_HOST_POOL_DIO_FAULT=1`** makes the pool's file
+I/O report "not available" (the Windows stub, on Linux) and **`MOE_HOST_POOL_FILL_FAULT=1`** makes
+`expert_host_src()` fail for a pageable master.  Pre-fix, on the instrumented reproduction build (the fault
+injection alone), the `nodisk` arm prints **7281** `async fill failed ... : no error` and
+`no pinned host source ... (pool and bounce both unavailable)` and generates
+`b7e2732392540006` -- garbage after "We need answer".  Post-fix the same arm is byte-identical to the shipped
+arm (`a99ccbd97ecb`).  New gate `scripts/gate-host-pool.sh` (four arms: shipped / `MOE_HOST_POOL_DIO=1` /
+`MOE_HOST_POOL_DIO_FAULT=1` / `MOE_HOST_POOL_FILL_FAULT=1`) is 19/19, registered in `MANIFESTS.md` (the block-12
+row), `scripts/README.md` and the `AGENTS.md` gate table.
+
+### Gates (gfx1201, ROCm 10.1.0, `~/bin/build-llama-rocm`; `build-base` = r217, commit `541a94a32`)
+
+| gate | result |
+|---|---|
+| `gate-host-pool.sh` | **PASS 19/19** -- the three healthy arms byte-identical (182 chars `a99ccbd97ecb`) with a live pool (55272 / 54990 / 54849 slots of 512, 30.6 / 30.5 / 30.4 GiB pinned; fill mode buffered / **O_DIRECT** / buffered) and **no** fill failure; `nodisk` logs the refusal (not vacuous); `fail` is byte-identical too, with **2790** rolled-back fills, `the slot is NOT resident` per table, and no `async fill failed` |
+| pool kill-switch arms (Flash-Next `-ncmoe 47`, 1 GPU) | text identical in all four: shipped, `MOE_HOST_POOL_COLD=0`, `GGML_MOE_DEVREMAP=0`, and a fresh default arm (`abe986e7eeee35d7`) |
+| coherence, same-seed greedy vs `build-base` | text **identical 6/6**: 4B Q8_0 1 GPU `7e6229b260f6` (= 3 GPU `-sm tensor`), 27B UD-Q4_K_XL 1 GPU and `draft-mtp n3` `d45e2221805a`, 35B-A3B `-ncmoe 40` 2 GPU `-sm layer` and 3 GPU `-sm layer` `461ca8cd0e88` (the 2-GPU host arm re-ran 69.7/70.0 vs 70.3/70.1 t/s: flat) |
+| MTP four-axis (27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42) | text identical 4/4 to r217 **and** to r218's recorded hashes (R `0ffad0c34953` 9243, P `4f0d1ea854e9` 5830, C `95603a6a89a4` 8966, K `a87c4318b649` 2174); acceptance **bit-identical** (R 0.52690 = 1224/2323, P 0.81305 = 1383/1701, C 0.86236 = 1441/1671, K 0.99200 = 372/375, mean len 2.58/3.44/3.59/3.98); t/s flat (54.6/71.2/74.9/82.8 vs 54.3/71.1/75.0/82.8) |
+| 2-slot server, **sequentially** driven (35B-A3B `-ncmoe 40`, 2 GPU `-sm layer`, `--parallel 2 --kv-unified`) | slot 0 and slot 1 text identical on both builds (`ffe5048f3f82`, 107 chars) and throughput flat (69.9/71.2 vs 71.0/70.9 t/s) -- never a concurrent diff (`GREEDY-PURITY.md` §38/§82) |
+| `llama-batched-bench -npl 1,4,8` (35B-A3B `-ncmoe 40`, 2 GPU) | tg128 B=1 **69.18 vs 69.30**, B=4 **210.08 vs 210.07**, B=8 **306.59 vs 305.01**, pp512 3045 / 3096 vs 3094 / 3110; both builds report the same mirror pool (120 tensors, 30720 slots, 18662 MiB pinned, h=1.0000) |
+| prefill logits (`gate-prefill-logits.sh`) | **0.000000 / 100.000 %** |
+| per-block build (`--fast --tip 1beee61a6 --changed-from f235fdaee`) | **2/2** (block 12 13 s, the tip 7 s); blocks 13-15 patch-ids unchanged |
+| GPU faults (`check-gpu-faults.sh --since "4 hours ago"`) | clean (the journal's last faults are 2026-11-04, before this session) |
+| `validate-set.sh` | GREEN -- checksums, strict **16/16** on a fresh tarball, tree == `release.json.tree`, Windows portability lint 287 files |
+
+### Notes
+
+* `SLAB_STATS ... pool=%.1f MiB` is the **CUDA async pool**, not the host pool -- the reporter read `pool=4.4
+  MiB` as "the host pool is 4.4 MiB" and that number says nothing about it.  The host pool's own census is
+  `moe_cache_report: host pool (L2): N tensors, N slots, N MiB pinned` (WARN, at exit).
+* Two diagnostics are added (`MOE_HOST_POOL_DIO_FAULT`, `MOE_HOST_POOL_FILL_FAULT`), both in `ENVIRONMENT.md`
+  as `diagnostic` class and both reachable only from `gate-host-pool.sh`.  Nothing is gated off by default and
+  no default changed: a mapped load already fills buffered since r212.
+* `--host-experts pool` is the deprecated spelling of `-lme auto` and still selects the pool (mode `AUTO`,
+  which places every host expert in the mapping and sizes the pool); the reporter's flag was right.
+
 ## 261105.004 (r218) -- issue #272: a partially reused prompt invalidated the drafter's KV (blocks 02 and 12)
 
 **Released as `v16-6050b467c-r218` (16 blocks; blocks 02 and 12 amended).**  Fork point unchanged (`6050b467c`),

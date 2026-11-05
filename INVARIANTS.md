@@ -1892,3 +1892,41 @@ path.**
 6. **A draft found AHEAD of the target is rejected by BOTH branches**, so the overlapping tail is trimmed
    unconditionally (`pos_max + 1 > pos_first`): a checkpoint restore can put the draft past the position the
    task resumes from, and this call re-ingests those positions anyway.
+
+## r219 -- the host pool's disk tier is an OPTIMISATION, and a failed fill is never resident (issue #274)
+
+1. **A pool fill must never depend on a tier the platform may not have (r219, block 12).**  The bounded host
+   pool's master IS the read-only model mapping, so `src_host` (the mapping) can always serve a fill; the pool's
+   DISK TIER (`MOE_HOST_POOL_DIO=1`, `pread`/`O_DIRECT`) only decides whether the page cache is populated.  The
+   file I/O is a compile-time stub on Windows (`pool_open_file` returns -1, issue #130), so treating it as
+   required failed every fill there.  Measured on Windows (reporter, r209, `--load-mode mmap --n-cpu-moe 47`
+   `--host-experts pool`, 38 GB free against a 40 GB host expert set): **7281 x** `access_locked: async fill
+   failed ... : no error` and `fill_slot_from_host: no pinned host source ... (pool and bounce both
+   unavailable)`, a 4996-token prompt at 20.4 t/s and a ONE-token generation.  r212 had already made
+   `MOE_HOST_POOL_DIO=auto` mirror `--load-mode` (a mapped load fills buffered), which removes the default path
+   into this -- but the mode is one env var away, and the failure mode was silent corruption, not a slow run.
+   The fix: the disk tier is best-effort everywhere (`pool_fill_slot_locked`, `expert_host_src`'s bounce ring),
+   a requested O_DIRECT is refused with one WARN on a platform without the file I/O, and a pool whose disk read
+   fails falls back to the mapping instead of marking itself failed.  Reproduced on Linux with the new
+   `MOE_HOST_POOL_DIO_FAULT` diagnostic; the pre-fix build then shows the issue's exact two messages and
+   garbage text (`b7e2732392540006`), the fixed build is byte-identical to the shipped arm (`a99ccbd97ecb`).
+2. **A failed fill must ROLL BACK: a slot is never resident because a copy was attempted.**  `access_locked()`
+   registered `t.expert_slot[expert]` and returned the arena pointer BEFORE the copy, so a fill that could not
+   be serviced left a resident slot holding whatever the arena had there.  That is a wrong answer, not a slow
+   one (the reporter's one token, `h=0.4939`), and its only trace was `cudaGetErrorString(cudaGetLastError())`
+   = `"no error"` -- `cudaGetLastError()` is empty for a host-side failure, which is why the message looked like
+   a driver note.  The admission now rolls back, the table is marked `fill_failed` and stands down wholesale
+   (`moe_cache_update_host`, `moe_cache_get_table`), so the scheduler serves the op from the host master, and
+   the census reports `FAILED fills: N` plus `the slot is NOT resident` per table.  Measured with
+   `MOE_HOST_POOL_FILL_FAULT`: 2790 rolled-back fills and **byte-identical** text to the shipped arm
+   (`a99ccbd97ecb`); the first cut of the rollback alone was NOT enough -- it left the eager take-over emitting
+   pool-cold ids for a table whose arena was empty, and that arm ran garbage (`b7e2732392540006`), which is why
+   the stand-down is part of the fix and `gate-host-pool.sh` gates the text, not just the log.
+3. **A one-off tier decision at INFO is invisible.**  `common_log_get_verbosity()` maps `GGML_LOG_LEVEL_INFO`
+   to `LOG_LEVEL_TRACE` against a default threshold of `LOG_LEVEL_INFO`, so at the default verbosity an operator
+   sees only WARN and above.  The reporter's log therefore contained every FAILURE and none of the decisions
+   that produced them: no `host experts:` tier census, no `host pool enabled`, no per-table `host pool (...)`
+   build line, no fill mode.  `report_host_expert_placement()` is now WARN (it is a one-off decision line, the
+   same class as `MoE expert cache (auto): arena ...`) and it carries the pool-source count
+   (`141/141 pool sources registered`), which is the first number a "the pool never appeared" report needs.
+   Do not "quiet" a decision line back to INFO: at the default level it does not exist.
