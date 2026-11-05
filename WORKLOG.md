@@ -1,3 +1,76 @@
+## 261105.008 (no release) -- `wip/host-expert-mirror` CLOSED: the mirror's prefill transport is the gather (serialised at the link's rate), the r114 single-launch staging kernel is the worst option, and the copy-engine path wins only in a 1-GPU width band
+
+**No delivery change.**  `patches/`, `release.json`, every block and `ENVIRONMENT.md` are untouched; the delivery
+stays `v16-6050b467c-r221` (16 blocks, tip `75059f1c4`, tree `01363a18`).  The campaign record moved to
+[`archive/work/host-expert-mirror/`](archive/work/host-expert-mirror/RESOLUTION.md), the `wip/CAMPAIGNS.md` row is
+deleted (no stub), and the forward-looking residue is `TODO` #271/#272.  The facts are appended to
+[`INVARIANTS.md`](INVARIANTS.md) ("no release, r221 tree").
+
+### What the campaign asked, and what measurement did to it
+
+It was opened to close the last ~8 % of prefill against `briansp2020`'s branch (1802 vs 1949 t/s, `-ub 6144`, one
+R9700, a mirror host tier) by **handing a covering pool's op the pool's device alias** instead of staging a copy
+(`MOE_HOST_POOL_ALIAS`).  Step 1 was a spike, and it refuted the premise rather than the target:
+
+* **the copy is the device GATHER, not the staging engine** -- `device gather: 1410 calls (1410 pool-backed), 0
+  routed experts from the neither-tier path`, the staging census absent, and `GGML_MOE_CACHE_STAGE=0` a no-op
+  (1616.2 vs 1618.8 t/s).  The campaign's "46.84 GiB per ubatch through the staged table" had the right bytes
+  and the wrong mechanism;
+* **it reads the pool's pinned alias in place at 33 GB/s** (329.19 GiB pool + 126.50 GiB arena per 52k pass,
+  250.7 MB per call in 7.52 ms) against this stack's 28.6 GB/s bulk-H2D calibration -- so an alias cannot move
+  the bytes faster, and an in-place prefill can only ever buy **overlap**;
+* **it is serialised** (kernel/wall 0.95) and costs **34.9 %** of the prefill's GPU time at `-ub 6144` (10.91 s
+  of 31.22 s; **55 %** at `-ub 2048`), which is where the money is -- not in the copy function.
+
+### The lead that was worth following, and its mechanism
+
+The contrast that opened it: the pool tier's staging ran 1241-1391 t/s while the *pinned* tier's staging ran
+1708 on the same config.  Traced (three transcripts, `rocprofv3`, durations only) and diffed per kernel at
+identical dispatch counts:
+
+| pool mirror, 1 GPU, `-ub 6144` | wall | total GPU kernel | kernel/wall | transport |
+|---|---|---|---|---|
+| gather (default) | 32.74 s | 31.22 s | 0.95 | gather 10.91 s, serialised |
+| staging, single kernel (`GGML_SCHED_DEVGATHER=0`) | 37.94 s | **43.55 s** | 1.15 | stage kernel 11.22 s, **compute kernels starved 3-41x** |
+| staging, per-expert copy engine (`... MOE_HOST_POOL_STAGE_BATCH=0`) | **29.75 s** | 27.57 s | 0.93 | 182 873 short blits under compute |
+
+The single-launch kernel monopolises the CUs: at identical counts `mm_ids_helper_512_10` goes 0.051 -> 2.081 s
+(41x), `quantize_mmq_q8_1` 0.336 -> 1.657, `mul_mat_q_routed_compact<20>` 1.291 -> 4.438.  **r114's +34 % for
+that kernel was real only against a pageable master that paid a host memcpy into a pinned bounce per copy**; with
+the pool alias readable in place (r215/r219) there is nothing to amortise, so it is now the worst option at every
+width and device count measured.  Interleaved ABAB, 1 GPU, `-ub` 2048 / 5120 / 6144 / 7168 / 8192 / 16384:
+gather 1016-1021 / 1511 / 1627-1629 / 1685 / **1748** / **1945**, kernel 872-875 / - / 1412-1425 / - / 1546 /
+1736, copy-engine 742-907 / **1694** / **1840-1845** / **1889** / 1696 / 1788.  On 3 GPUs `-sm tensor` the order
+reverses (gather **2359** > kernel 2075 > CE 2053) and no #131 collapse reproduced on a 46.84 GiB mirror.
+
+### Why it is not a delivery change
+
+* the only measurable win is a **two-env-var configuration** (`GGML_SCHED_DEVGATHER=0
+  MOE_HOST_POOL_STAGE_BATCH=0`) worth +12-13 % on **one** shape (1 GPU, `-ub` 5120-7168), which loses at `-ub
+  2048`, loses again above ~8k (the CE arm's overlap stalls: kernel/wall 0.80) and reverses on a tensor split.
+  Defaulting it would repeat r114's mistake in the other direction -- one cell, one width, one device count;
+* the alternative explanations were closed by measurement: the pool's alloc shape (`thp` vs `portable`) and the
+  copy kind (`MOE_HOST_POOL_H2D`) move **nothing**, `AnonHugePages` is 0 GiB in both, and the arena (`-c 65536`)
+  is nearly inert (+1.2 %) because only ~28 % of routed offers are served from it;
+* purity measured: same-seed greedy text is **byte-identical across all three transports** (`68704e68...`, 135
+  chars).  The logit gate A/B is *not* run here (no delivery change) and is listed as owed in `TODO` #272.
+
+### Retirement
+
+`wip/host-expert-mirror/` is deleted from the index and moved to `archive/work/host-expert-mirror/`
+(`RESOLUTION.md` = claim / rule / numbers / what would reopen it; `spike-261105/` = the step-1 evidence with its
+scripts, prompts and a `kernel-diff.py`; `LEAD-pool-staging-gap.md` = the three-transport comparison).  Paths in
+the moved documents and in `wip/bench-56gb/README.md` and `wip/host-expert-coverage/README.md` were repointed at
+the new location.  Two forward-looking items carry the residue: **#271** (a pinned master declines staging for 54
+of 144 tables every ubatch -- `ok=783 unusable=477`, served by compute-stream per-tensor copies, with no log line
+naming them) and **#272** (the transport should be chosen by width and device count; name the 8192 stall first).
+
+**Protocol, for the next session on this box:** a block-ordered set of "reps" produced a **16 % monotonic drift** in
+this session (staging kernel 1241 -> 1434, copy engine 1549 -> 1844) while the interleaved gather control stayed
+at 1616-1629; the pinned tier swung 36 % across identical censuses.  Only interleaved ABAB within a cycle is
+trustworthy -- `spike-261105/abba.sh` exists for that reason, and the earlier block-ordered rows in `SPIKE.md` are
+marked superseded.
+
 ## 261105.007 (r221) -- TODO #269: the sync-free decode remap becomes tensor-split and covering-pool aware (block 09, plus one line each in blocks 12 and 15)
 
 **Released as `v16-6050b467c-r221` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip

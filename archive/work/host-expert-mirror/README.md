@@ -1,7 +1,16 @@
-# wip/host-expert-mirror - when the pool covers the set, stop staging a copy
+# host-expert-mirror (archived) - when the pool covers the set, stop staging a copy
 
-**Status: OPEN - scoping note with a measured target (2026-11-05).  Nothing implemented, nothing in `patches/`,
-nothing applied to the fork.**
+> **CLOSED 2026-11-05 (no release, no delivery change) -> [`RESOLUTION.md`](RESOLUTION.md).**  The campaign's
+> premise was refuted by measurement: on a mirror the prefill transport is the **device gather** (not the staging
+> engine), it reads the pinned pool alias **in place at 33 GB/s** (at the link's ceiling), and it is **serialised**
+> on the compute stream — so an in-place alias can only ever buy overlap.  What *was* recoverable is the
+> **engine/stream** choice (`LEAD-pool-staging-gap.md`): per-expert copy-engine staging measures +12-13 % on one
+> GPU at `-ub` 5120-7168, while the r114 single-launch staging kernel is the *worst* transport at every width and
+> device count measured.  Nothing here is in `patches/`.  The text below is the original scoping note, kept for the
+> reasoning (its §2 numbers are superseded by `spike-261105/SPIKE.md` and `LEAD-pool-staging-gap.md`).
+
+**Status when written: scoping note with a measured target (2026-11-05).  Nothing implemented, nothing in
+`patches/`, nothing applied to the fork.**
 
 **What this is.**  A mirror pool holds every expert of every host table in pinned RAM.  The GPU still receives a
 copy of the routed experts every ubatch, because the scheduler's host-weight upload is the only way an op
@@ -26,7 +35,7 @@ i.e. handing the op the pool's own device alias when, and only when, the pool co
   `MOE_HOST_POOL_ALLOC=portable` restores the r214 shape.  The alias exists under both.
 * **A registered source is not automatically a prefill loss** (`INVARIANTS.md`, r215 item 7): the archived -22 %
   1-device prefill regression was a *pageable mapping registered in place*, whose fills became synchronous DMA
-  ([`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md`](../../archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md)
+  ([`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md`](../host-expert-eager-push/P4-ROOT-CAUSE.md)
   §5d).  That precedent is the main risk here, and it is close enough that this campaign must re-measure rather
   than assume, in both directions.
 * **Any new reader of a host expert master must go through `expert_host_src` (pool slot / per-table pinned
@@ -51,6 +60,16 @@ i.e. handing the op the pool's own device alias when, and only when, the pool co
 * an in-place read does not move fewer bytes over PCIe; it moves them as kernel loads instead of as a bulk copy.
   So the win, if any, is "no VRAM write, no double buffer, no copy-engine sync", not "less traffic".  The 8 % is
   the size of that prize, and this campaign's first step is to find out how much of it is reachable at all.
+
+> **2026-11-05: step 1 is DONE and steps 2-3 are RE-SCOPED.**  The spike is
+> [`spike-261105/SPIKE.md`](spike-261105/SPIKE.md) and its follow-up lead is
+> [`LEAD-pool-staging-gap.md`](LEAD-pool-staging-gap.md).  Headline: on a mirror the prefill transport is the
+> **device gather** (not the staging engine), it is **serialised** on the compute stream and costs **34.9 %** of
+> prefill GPU time at `-ub 6144` (55 % at `-ub 2048`) at the link's full 33 GB/s -- so the bytes are not
+> recoverable and the in-place alias below is the wrong lever.  What *is* recoverable is the stream: per-expert
+> copy-engine staging measures **+13 %** over the gather on one GPU at `-ub 6144` (and the r114 single-launch
+> staging kernel is the *worst* of the three, because it starves the compute kernels).  Steps 3-5 below are kept
+> for the reasoning, but the campaign's live work is now the lead, not `MOE_HOST_POOL_ALIAS`.
 
 ## 3. The work, in the order I would take it
 
@@ -135,10 +154,10 @@ alias at all, the staging-share spike, and whether the bytes are better moved as
 
 | where | what |
 |---|---|
-| [`bench-56gb/RESULTS.md`](../bench-56gb/RESULTS.md) | the matrix (mirror rows, ub sweep) |
-| [`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md`](../../archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md) | §5d, the -22 % registered-pageable-mapping precedent |
-| [`archive/work/host-expert-eager-push/P6-POOL-REGION.md`](../../archive/work/host-expert-eager-push/P6-POOL-REGION.md) | the pool-as-expert-indexed-region design that `MOE_HOST_POOL_COLD_MULTIDEV` implements |
-| [`archive/work/host-pool-speed/PROPOSAL-pipelined-staging.md`](../../archive/work/host-pool-speed/PROPOSAL-pipelined-staging.md) | the other way to pay less for the copy (pipelining); read before choosing in-place |
-| [`archive/work/host-pool-speed/HEAD-TO-HEAD.md`](../../archive/work/host-pool-speed/HEAD-TO-HEAD.md) | the earlier head-to-head of the pool against a pinned master |
+| [`wip/bench-56gb/RESULTS.md`](../../../wip/bench-56gb/RESULTS.md) | the matrix (mirror rows, ub sweep) |
+| [`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md`](../host-expert-eager-push/P4-ROOT-CAUSE.md) | §5d, the -22 % registered-pageable-mapping precedent |
+| [`archive/work/host-expert-eager-push/P6-POOL-REGION.md`](../host-expert-eager-push/P6-POOL-REGION.md) | the pool-as-expert-indexed-region design that `MOE_HOST_POOL_COLD_MULTIDEV` implements |
+| [`archive/work/host-pool-speed/PROPOSAL-pipelined-staging.md`](../host-pool-speed/PROPOSAL-pipelined-staging.md) | the other way to pay less for the copy (pipelining); read before choosing in-place |
+| [`archive/work/host-pool-speed/HEAD-TO-HEAD.md`](../host-pool-speed/HEAD-TO-HEAD.md) | the earlier head-to-head of the pool against a pinned master |
 | `INVARIANTS.md` | the r215 item 7 (a registered source is not automatically a loss), the `expert_host_src` rule |
 | `ENVIRONMENT.md` | `MOE_HOST_POOL_COLD`, `MOE_HOST_POOL_COLD_MULTIDEV`, `MOE_HOST_POOL_STAGE_BATCH`, `MOE_HOST_POOL_ALLOC`, `MOE_HOST_POOL_H2D` |

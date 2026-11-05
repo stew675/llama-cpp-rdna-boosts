@@ -41,6 +41,8 @@ Accepted limitations that are deliberately **not** fixed are listed at the end �
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement | performance (delivery defect, default-on) | **OPEN** (2026-11-03, `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §4).  Needs a wider sweep (model x FRAC x ubatch) before touching the default — and note the same switch must be `0` for any prefill A/B of the expert fill path, because the gather serves the routed table itself |
 | **141** | A **genuine sub-complement** host-expert budget (`-lme 8` = 43 % of the set, or any `MOE_HOST_POOL_FRAC` below 100) declines the eager take-over at wide decode: `llama-batched-bench -npl 8` gives **50.4 tg**, i.e. worse than the cache being off (129.2), because `slots + pool coverage < n_used * n_tok` cannot guarantee a complete remap and the run falls back to the pageable mapping | performance (block 09, the pool tier) | **OPEN -- measured limit** (2026-11-04, `WORKLOG.md` 261104.002 §4).  The bound is static per shape on purpose (a per-token decision cannot be baked into a captured graph), so the honest answers are a bigger arena, the pinned tier, or the retired `MOE_HOST_POOL_SIZING`/coverage work.  Candidates worth scoring offline with `scripts/moe-trace-replay.py` before any code: (a) require the arena to hold `n_used * band` slots for a pool-backed table (size it, do not decline it), (b) serve a neither-tier expert from the bounce ring *inside* the take-over instead of declining the table (needs the ring to be a legal cold source for one token), (c) accept the variance and let the graph re-capture.  Nothing is in flight; the r211 fix covers only the covering case |
 | **142** | The pool tier's **first** prefill pays ~3 s: `llama-batched-bench -npp 512 -npl 1` measures **pp 128** for the pool against **588** for a pinned master (3.97 s vs 0.87 s), and the same 3 s is amortised invisibly inside a 5246-token prompt (prefill 1318 t/s, fine).  The pool is built and prepopulated lazily and the arena is sized only on the first DECODE-band pass, so the first prompt batch runs the pre-sizing staging path with no arena at all | performance (block 09/12, `moe-expert-cache`) | **OPEN -- pre-existing (r210), not a r211 regression** (2026-11-04, `WORKLOG.md` 261104.002 §4).  `MOE_HOST_POOL_PREWARM=0` does not move it (122 vs 130), so it is the build/first-touch, not the prewarm order.  The lead from `archive/work/host-expert-eager-push/P6-POOL-REGION.md` §7d is to move the population into the preflight (before the first timed batch) -- it was scoped as worth only ~0.09 s at `-n 300`, but this row is the arm where it is worth 3 s |
+| **271** | On a **pinned** host-expert master, **54 of 144 expert tables decline the prefill staging path on every ubatch** (`prefill cache staging: ok=783 unusable=477`) and are served by per-tensor copies on the COMPUTE stream instead — a silent prefill cost on a tier `-lme auto` can select, with no log line naming the tables | performance / visibility (delivery — a decision line that does not exist) | **OPEN — measured 2026-11-05** (`archive/work/host-expert-mirror/RESOLUTION.md`, `LEAD-pool-staging-gap.md` §5.2).  The decline predicate is `t.host_pinned && (arena == nullptr \|\| slots <= 0 \|\| host_dev == nullptr \|\| !cold_safe)` and the pool tier reports `unusable=0` on the same config, so the 54 tables have no usable arena/alias.  Evidence: traced `__amd_rocclr_copyBuffer` 3383 calls / 2.20 s in the pinned staging arm against 1629 / 0.09 s in the gather arm; the arm still measures 1700-1827 t/s, i.e. the fallback is not catastrophic, which is why it went unnoticed.  First step is an INFO/WARN line naming the table, layer and reason |
+| **272** | The prefill expert-transport **engine/stream choice** is width- and device-count shaped, and the shipped switch combination is wrong on one shape: per-expert copy-engine staging (`GGML_SCHED_DEVGATHER=0 MOE_HOST_POOL_STAGE_BATCH=0`) measures **+12-13 %** over the default gather on one GPU at `-ub` 5120-7168, loses at `-ub 2048` and by `8192` (its pipeline stalls: kernel/wall 0.80), and the gather wins by **14 %** on a 3-device tensor split; the r114 single-launch `moe_cache_stage_kernel` is **last at every width and device count measured** because it starves the compute kernels (same-count kernels 3-41x slower) | performance (delivery — a default/selection rule) | **OPEN — measured 2026-11-05, no code change** (`archive/work/host-expert-mirror/RESOLUTION.md`).  Before any change: name the 8192 stall (ring depth `GGML_SCHED_STAGE_SLOTS` vs the split count is the suspect), then a sweep over 1/2/3 GPU x {`tensor`,`layer`} x {mirror, sub-complement} x `-ub` {2048,5120,6144,7168,8192,16384}, `gate-prefill-logits.sh --ab`, `gate-host-pool.sh`, `MUL_MAT_ID`, and `-sm layer`.  Greedy text is already byte-identical across all three transports (`68704e68…`); a pure-documentation outcome (`ENVIRONMENT.md` describes neither arm's effect on prefill) is legitimate and is what the campaign recommended |
 
 ---
 
@@ -386,6 +388,49 @@ only, a graph-capture audit (the band gate exists because capture bakes the redi
 delivery requires for a pref/prefill change — `gate-prefill-logits.sh` must read KLD 0.000000 (the arms are the
 same bytes, so anything else is a bug), same-seed greedy text, `check-gpu-faults.sh`.  **Value:** up to ~3x on the
 default mode's prefill, which is also the baseline every pool claim is divided by.
+
+## 271. On a pinned master, 54 of 144 tables never enter the prefill staging path (and nothing says so)
+
+**Status: open, measured 2026-11-05 (`archive/work/host-expert-mirror/`).**  On a real `--host-experts pinned`
+master (47 962.5 MiB `ROCm_Host`, 0 MiB pageable) the prefill staging census reads `ok=783 unusable=477` — 54 of
+144 tables are declined every ubatch — while the same 1-GPU config on the pool tier reads `unusable=0`.  The
+declined tables are served by per-tensor copies on the **compute** stream (traced `__amd_rocclr_copyBuffer` 3383
+calls / 2.20 s against 1629 / 0.09 s in the gather arm), so they are serialised against compute on a tier that is
+otherwise the fastest transport measured (1700-1827 t/s).  The predicate is
+`t.host_pinned && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe)`; which of the
+four fires, for which tables, is not logged at any verbosity.  **Work:** a decision line at the level
+`report_host_expert_placement` already uses (WARN, one-off) naming table/layer/reason once per run, then decide
+per reason (an absent arena is a sizing question, a null alias is a geometry question, `!cold_safe` is a slice
+question).  **Do not** re-measure the pinned total before that line exists — the arm is stable but 15-18 % below
+the pool's best transport on this box, and the fallback is the cheapest candidate explanation.
+
+## 272. The prefill expert transport should be chosen by width and device count, not by one default
+
+**Status: open, measured 2026-11-05 (`archive/work/host-expert-mirror/RESOLUTION.md`).**  Three transports exist
+and their ranking inverts with the shape.  On one GPU with a mirror tier, a 52 512-token prompt, `-n 1`
+(interleaved ABAB, t/s):
+
+| `-ub` | gather (default) | r114 single-launch staging | per-expert copy-engine |
+|---|---|---|---|
+| 2048 | **1016-1021** | 872-875 | 742-907 |
+| 5120 | 1511 | - | **1694** |
+| 6144 | 1627-1629 | 1412-1425 | **1840-1845** |
+| 7168 | 1685 | - | **1889** |
+| 8192 | **1748** | 1546 | 1696 |
+| 16384 | **1945** | 1736 | 1788 |
+| 3 GPU `-sm tensor`, 6144 | **2359** | 2075 | 2053 |
+
+Traced causes: the gather is a **compute-stream** node, serialised (10.91 s of a 32.74 s prefill at `-ub 6144`);
+the single-launch `moe_cache_stage_kernel` **monopolises the CUs** and starves short kernels (identical dispatch
+counts: `mm_ids_helper_512_10` 41x, `quantize_mmq_q8_1` 4.9x, `mul_mat_q_routed_compact<20>` 3.4x slower; 43.55 s
+of GPU time against 31.22 / 27.57); the copy-engine path overlaps under compute but **stalls above ~8k**
+(kernel/wall 0.80 at 8192 against 0.93 at 6144 — 20 % of the wall with no kernel running).  r114's +34 % for the
+single launch was measured against a *pageable* master that paid a host memcpy into a pinned bounce per copy;
+with the pool alias readable in place (r215/r219) there is nothing to amortise.  **Work:** name the 8192 stall
+(ring depth `GGML_SCHED_STAGE_SLOTS` = 8 against the split count is the suspect), then the sweep in the table row
+above.  **A config-only outcome is acceptable and is what the campaign recommended**: `GGML_SCHED_DEVGATHER=0
+MOE_HOST_POOL_STAGE_BATCH=0` is two documented kill switches, so a consumer can have the band today — what is
+missing is one `ENVIRONMENT.md` line saying so (a prefill-transport change, so it owes the logit gate as an A/B).
 
 ## Where the current lists live
 

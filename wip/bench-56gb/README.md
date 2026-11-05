@@ -68,11 +68,11 @@ a warm page cache (13 to 30 s of load plus pool fill, 3 x 8 s decode, 26 s for 5
 
 ## Runs we still owe
 
-* `-sm tensor` rows for the mirror config (`host-expert-mirror/` step 6);
+* `-sm tensor` rows for the mirror config (`archive/work/host-expert-mirror/` step 6, REFUTED -- that campaign closed 2026-11-05);
 * the KV pool high-hit-rate rows at 32k and 64k (`kv-residency-cleanup/` §2.4, and the A17 numbers it already
   has at 5 246 and 102 800 tokens);
 * the split sweep (pool, arena) = (47, auto), (44, auto), (40, 26), (34, 32) (`host-expert-split/` step 3);
-* `MOE_HOST_POOL_H2D=0|1` and `MOE_HOST_POOL_ALLOC=thp|portable` rows (`host-expert-mirror/` step 4);
+* `MOE_HOST_POOL_H2D=0|1` and `MOE_HOST_POOL_ALLOC=thp|portable` rows (`archive/work/host-expert-mirror/` step 4, CLOSED -- the alloc shape does not move any transport);
 * a 93 GiB control row (no cgroup, no ballast) so the effect of the emulation itself is measured once;
 * a cold-page-cache arm for the mirror row, since every row above was warm.
 

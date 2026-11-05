@@ -2026,3 +2026,53 @@ greedy text throughout:
    model against 91 GB of RAM re-reads itself every arm and is not measurable this way), and the
    `device remap:` census read before drawing a conclusion -- "no gain" and "not engaged" look identical
    without it.
+
+## (no release, r221 tree) -- the mirror's prefill transport is the GATHER, it is serialised at the link's rate, and the alternative transports rank by STREAM, not by bytes
+
+Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM, no cgroup), tree
+`75059f1c4` (r221), model `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S`, `-lme 47` + `MOE_HOST_POOL_RAM_PCT=0` (plan line:
+"the whole host expert set (a MIRROR)"), 52 512-token prompt, greedy.  Record:
+[`archive/work/host-expert-mirror/`](archive/work/host-expert-mirror/RESOLUTION.md) (the campaign closed here;
+`WORKLOG.md` 261105.008).  No delivery change.
+
+1. **On a mirror the prefill transport is the DEVICE GATHER, so no staging/miss-path number describes the
+   shipped default.**  `sched_input_gatherable` mode 1 requires `moe_cache_pool_backed()` (the pageable-master
+   `pool` tier) and a width above the cache band, so every pool-backed table above the band is gathered:
+   measured `device gather: 1410 calls (1410 pool-backed), 0 routed experts copied ... (neither tier)` and the
+   staging census **absent**; `GGML_MOE_CACHE_STAGE=0` changes nothing (1616.2 vs 1618.8 t/s).  Read the exit
+   census before attributing any prefill cost to `moe_cache_upload_pageable` or `moe_cache_stage_table`.
+2. **The gather moves the routed expert bytes at the link's ceiling, so it is not a bytes problem.**  Its kernel
+   is **34.9 %** of the prefill's GPU time at `-ub 6144` (10.91 s of 31.22 s; **55.0 %** at `-ub 2048`), and it
+   reads **329.19 GiB from the pool + 126.50 GiB from the arena** per 52k pass: 250.7 MB of pool reads per call
+   in 7.52 ms = **33 GB/s**, against this stack's **28.6 GB/s** bulk-H2D calibration.  An in-place alias moves
+   the same bytes at the same rate; the only thing it could buy is overlap.
+3. **The gather is SERIALISED (kernel/wall 0.95), which is where the recoverable loss is.**  Sum-of-kernels
+   ~= wall means it is a compute-stream node adding its full time to the prefill.  The transports rank by
+   *stream and engine*, and the ranking inverts with the shape: 1 GPU `-ub 6144` gather 1627 / r114 single-launch
+   staging kernel 1418 / per-expert copy-engine 1842; `-ub 2048` gather 1016-1021 / kernel 872-875 / CE 742-907;
+   `-ub 16384` gather 1945 / kernel 1736 / CE 1788; 3 GPU `-sm tensor` gather 2359 / kernel 2075 / CE 2053.  The
+   CE win is a **1-GPU width band (5120-7168)**; by 8192 its overlap stalls (kernel/wall **0.80** -- 20 % of the
+   wall idle with no kernel running).
+4. **A single-launch staging kernel that streams a whole 341 MiB table STARVES the compute kernels.**  At
+   identical dispatch counts the same compute kernels run **3-41x** slower in the arm where
+   `moe_cache_stage_kernel` (144 blocks x 256 threads) is concurrently resident: `mm_ids_helper_512_10` 0.051 ->
+   2.081 s, `quantize_mmq_q8_1` 0.336 -> 1.657 s, `mul_mat_q_routed_compact<20>` 1.291 -> 4.438 s; total GPU time
+   43.55 s vs 31.22 (gather) and 27.57 (many short copy-engine blits).  **r114's +34 % for that kernel was
+   measured against a pageable master that paid a host memcpy into a pinned bounce per copy**; with the pool
+   alias readable in place there is nothing to amortise, so the same kernel is now the *worst* option at every
+   width and device count measured.  Do not re-derive "+34 % for one launch" from the r114 record.
+5. **A pinned master's staging is one kernel launch on the COPY stream and genuinely overlaps** (kernel total
+   33.80 s > wall 31.17 s) -- it is the "already overlapped" control, and the pool mirror's whole gap to it is
+   ~5 % prefill for 46.84 GiB of duplicate RAM.  Its own engine preference is the opposite of the pool tier's
+   (kernel 1820-1825 > per-expert CE 1545-1547, interleaved), confounded by 54 of 144 tables declining staging
+   entirely (`ok=783 unusable=477`, `TODO` #271).
+6. **`-ub` is a bytes-per-token lever on a mirror, and the arena's SIZED residency overstates what it serves.**
+   Every prefill ubatch routes essentially the whole table, so bytes/token ∝ 1/ub while the ubatch count ∝ ub:
+   `-ub 2048 -> 16384` is 1019 -> 1942 t/s (gather), at the cost of the arena (21.5 -> 16.4 GiB).  Enlarging the
+   arena alone is nearly inert (`-c 65536`: pool 329 -> 312 GiB, +1.2 %) because only ~28 % of routed offers are
+   served from it -- the slots fill on demand during the pass (`hits=951 fills=2019`), so size it *and* seed it.
+7. **A block-ordered set of "reps" is not a measurement on this box** (this extends r221 fact 7).  Block-ordered
+   arms drifted monotonically by **16 %** over one session (staging kernel 1241 -> 1434, copy-engine 1549 ->
+   1844) while the interleaved gather control stayed at 1616-1629 (+-0.3 %), and the pinned tier swung 36 %
+   across identical censuses.  Only interleaved ABAB within one cycle is trustworthy; `AnonHugePages` was 0 GiB
+   in both pool alloc shapes and neither `MOE_HOST_POOL_ALLOC` nor `MOE_HOST_POOL_H2D` moved any arm.

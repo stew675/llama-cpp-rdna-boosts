@@ -8,7 +8,7 @@
 `bench-56gb` rig, three separate pieces of code were found to silently stop the host-expert pool from reaching
 100 % coverage, and none of them says so at the default verbosity.  On a 59 GiB box that produces a tier that
 pays the pinned cost without buying the property.  This campaign is about the **policy and the visibility**, not
-about a new transport (`host-expert-mirror/`) and not about the split (`host-expert-split/`).
+about a new transport ([`host-expert-mirror/`](../../archive/work/host-expert-mirror/RESOLUTION.md), now archived) and not about the split (`host-expert-split/`).
 
 ## 1. What you inherit (do not re-derive)
 
