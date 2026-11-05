@@ -390,6 +390,19 @@ in CI.  The model-level gates are manual:
    claims otherwise is wrong.  r209: 4 TUs token-identical, coherence `897 a77fa8c1107a` / `964 eab86065e67e`
    (== r208), KLD 0.000000 / 100.000 %, per-block 4/4, no faults.
 
+19. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274): one pool-backed host-expert config
+   (Flash-Next, `--n-cpu-moe 47`, `--load-mode mmap`, a `MOE_HOST_LIMIT_FRAC` low enough that the set does not
+   fit), four arms and same-seed greedy text: shipped / `MOE_HOST_POOL_DIO=1` / `MOE_HOST_POOL_DIO_FAULT=1` (a
+   platform with NO pool disk tier: the Windows shape) / `MOE_HOST_POOL_FILL_FAULT=1` (no source can be
+   resolved at all).  It **fails** unless the three healthy arms are byte-identical with a real pool
+   (slots > 0, MiB pinned > 0) and no fill failure, the disk-tier arms are not vacuous, and the forced-failure
+   arm is still byte-identical with `FAILED fills: N` and `the slot is NOT resident` per table.  Two rules it
+   exists for: a fill must never require a tier the platform may not have (the mapping is always a source), and
+   a fill that fails must roll the admission back and decline the op rather than serve the slot.  Required for
+   any change to a pool fill/staging path, `expert_host_src()`, the cache's admission, the
+   `-lme`/`--host-experts pool` placement or the loader's host-expert source registration; every release.
+   ~2 min on one GPU (the pool prewarm dominates).
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block
