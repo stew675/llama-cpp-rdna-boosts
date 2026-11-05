@@ -60,14 +60,14 @@ injection alone), the `nodisk` arm prints **7281** `async fill failed ... : no e
 `no pinned host source ... (pool and bounce both unavailable)` and generates
 `b7e2732392540006` -- garbage after "We need answer".  Post-fix the same arm is byte-identical to the shipped
 arm (`a99ccbd97ecb`).  New gate `scripts/gate-host-pool.sh` (four arms: shipped / `MOE_HOST_POOL_DIO=1` /
-`MOE_HOST_POOL_DIO_FAULT=1` / `MOE_HOST_POOL_FILL_FAULT=1`) is 19/19, registered in `MANIFESTS.md` (the block-12
+`MOE_HOST_POOL_DIO_FAULT=1` / `MOE_HOST_POOL_FILL_FAULT=1`) is 18/18, registered in `MANIFESTS.md` (the block-12
 row), `scripts/README.md` and the `AGENTS.md` gate table.
 
 ### Gates (gfx1201, ROCm 10.1.0, `~/bin/build-llama-rocm`; `build-base` = r217, commit `541a94a32`)
 
 | gate | result |
 |---|---|
-| `gate-host-pool.sh` | **PASS 19/19** -- the three healthy arms byte-identical (182 chars `a99ccbd97ecb`) with a live pool (55272 / 54990 / 54849 slots of 512, 30.6 / 30.5 / 30.4 GiB pinned; fill mode buffered / **O_DIRECT** / buffered) and **no** fill failure; `nodisk` logs the refusal (not vacuous); `fail` is byte-identical too, with **2790** rolled-back fills, `the slot is NOT resident` per table, and no `async fill failed` |
+| `gate-host-pool.sh` | **PASS 18/18** -- the three healthy arms byte-identical (182 chars `a99ccbd97ecb`) with a live pool (55272 / 54990 / 54849 slots of 512, 30.6 / 30.5 / 30.4 GiB pinned; fill mode buffered / **O_DIRECT** / buffered) and **no** fill failure; `nodisk` logs the refusal (not vacuous); `fail` is byte-identical too, with **2790** rolled-back fills, `the slot is NOT resident` per table, and no `async fill failed` |
 | pool kill-switch arms (Flash-Next `-ncmoe 47`, 1 GPU) | text identical in all four: shipped, `MOE_HOST_POOL_COLD=0`, `GGML_MOE_DEVREMAP=0`, and a fresh default arm (`abe986e7eeee35d7`) |
 | coherence, same-seed greedy vs `build-base` | text **identical 6/6**: 4B Q8_0 1 GPU `7e6229b260f6` (= 3 GPU `-sm tensor`), 27B UD-Q4_K_XL 1 GPU and `draft-mtp n3` `d45e2221805a`, 35B-A3B `-ncmoe 40` 2 GPU `-sm layer` and 3 GPU `-sm layer` `461ca8cd0e88` (the 2-GPU host arm re-ran 69.7/70.0 vs 70.3/70.1 t/s: flat) |
 | MTP four-axis (27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42) | text identical 4/4 to r217 **and** to r218's recorded hashes (R `0ffad0c34953` 9243, P `4f0d1ea854e9` 5830, C `95603a6a89a4` 8966, K `a87c4318b649` 2174); acceptance **bit-identical** (R 0.52690 = 1224/2323, P 0.81305 = 1383/1701, C 0.86236 = 1441/1671, K 0.99200 = 372/375, mean len 2.58/3.44/3.59/3.98); t/s flat (54.6/71.2/74.9/82.8 vs 54.3/71.1/75.0/82.8) |
@@ -88,6 +88,8 @@ row), `scripts/README.md` and the `AGENTS.md` gate table.
   no default changed: a mapped load already fills buffered since r212.
 * `--host-experts pool` is the deprecated spelling of `-lme auto` and still selects the pool (mode `AUTO`,
   which places every host expert in the mapping and sizes the pool); the reporter's flag was right.
+* The gate was re-run against the re-cut release tree (`2f7761bf5`) after `fork-refresh.sh`: 18/18 again, the
+  same four text hashes.  Its per-arm `Prompt:` figures are warmup noise (a 22-token prompt) and are not gated.
 
 ## 261105.004 (r218) -- issue #272: a partially reused prompt invalidated the drafter's KV (blocks 02 and 12)
 
