@@ -1,4 +1,4 @@
-From 8edf461fee7b1c5c2ce561913cd1fadf10a6dbbc Mon Sep 17 00:00:00 2001
+From 063c417c99961ebe59df7c0ea41546a6112cdc89 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -21539,10 +21539,10 @@ index 35f625eaa..ea7ce5ad9 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 9dfe0618e..b9ed4ef38 100644
+index a70650fa7..58d725d1a 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -1621,6 +1621,40 @@ static void pool_rank_from_prefill_locked() {
+@@ -1786,6 +1786,40 @@ static void pool_rank_from_prefill_locked() {
  // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
  // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
  // to token - and that variability is what broke CUDA graph replay.
@@ -21583,7 +21583,7 @@ index 9dfe0618e..b9ed4ef38 100644
  moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                                const int32_t * protect = nullptr, int n_protect = 0,
                                bool * out_cold = nullptr) {
-@@ -1777,6 +1811,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -1942,6 +1976,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
              const bool pool_sync = (n_protect > pool->slots);
              pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
          }
@@ -21606,7 +21606,7 @@ index 9dfe0618e..b9ed4ef38 100644
          const bool from_pool = pool_expert != nullptr;
          const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
          const char * src = from_pool
-@@ -1826,6 +1876,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -1991,6 +2041,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  
  // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
  // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
@@ -21632,7 +21632,7 @@ index 9dfe0618e..b9ed4ef38 100644
  // `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
  // (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
  // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
-@@ -1834,7 +1903,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -1999,7 +2068,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  void apply_prefill_seed_locked(table_t & t) {
      const bool from_tally = g_prefill_seed;
      if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
@@ -21641,7 +21641,7 @@ index 9dfe0618e..b9ed4ef38 100644
          return;
      }
      if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
-@@ -1923,7 +1992,8 @@ void apply_prefill_seed_locked(table_t & t) {
+@@ -2088,7 +2157,8 @@ void apply_prefill_seed_locked(table_t & t) {
  // MOE_EXPERT_CACHE_PREFILL_SEED.  Call it BEFORE `apply_prefill_seed_locked` so the persisted prior
  // wins the (empty-arena) race for slots 0...
  void apply_heat_seed_locked(table_t & t) {
@@ -21651,7 +21651,7 @@ index 9dfe0618e..b9ed4ef38 100644
          return;
      }
      if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
-@@ -2754,23 +2824,11 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -2919,23 +2989,11 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -21678,7 +21678,7 @@ index 9dfe0618e..b9ed4ef38 100644
              if (err != cudaSuccess) {
                  (void) cudaGetLastError();
                  ok = false;
-@@ -2846,7 +2904,24 @@ static bool moe_cache_tables_complete_locked() {
+@@ -3011,7 +3069,24 @@ static bool moe_cache_tables_complete_locked() {
              expected += g_preflight_device_bytes[d];
          }
      }
@@ -21704,7 +21704,7 @@ index 9dfe0618e..b9ed4ef38 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -4533,7 +4608,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -4698,7 +4773,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -21714,7 +21714,7 @@ index 9dfe0618e..b9ed4ef38 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -4551,6 +4627,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4716,6 +4792,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -21728,7 +21728,7 @@ index 9dfe0618e..b9ed4ef38 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -4580,6 +4663,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4745,6 +4828,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -21740,7 +21740,7 @@ index 9dfe0618e..b9ed4ef38 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -4648,7 +4736,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4813,7 +4901,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -21749,7 +21749,7 @@ index 9dfe0618e..b9ed4ef38 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -4922,6 +5010,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
+@@ -5087,6 +5175,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
      return span <= host_bytes - src_off;
  }
  
@@ -21777,7 +21777,7 @@ index 9dfe0618e..b9ed4ef38 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5169,7 +5278,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5334,7 +5443,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -21787,7 +21787,7 @@ index 9dfe0618e..b9ed4ef38 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -5212,7 +5322,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5377,7 +5487,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -21813,7 +21813,7 @@ index 9dfe0618e..b9ed4ef38 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5229,7 +5356,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5394,7 +5521,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -21823,7 +21823,7 @@ index 9dfe0618e..b9ed4ef38 100644
      if (table < 0) {
          return false;
      }
-@@ -5281,7 +5409,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5446,7 +5574,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -21832,7 +21832,7 @@ index 9dfe0618e..b9ed4ef38 100644
          g_decline_all++;
          return false;
      }
-@@ -5627,7 +5755,7 @@ static bool devremap_alloc_locked(table_t & t) {
+@@ -5792,7 +5920,7 @@ static bool devremap_alloc_locked(table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
@@ -21841,7 +21841,7 @@ index 9dfe0618e..b9ed4ef38 100644
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -5837,7 +5965,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6002,7 +6130,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }

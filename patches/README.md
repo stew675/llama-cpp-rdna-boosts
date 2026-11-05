@@ -846,6 +846,36 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r215 amendment: the host pool's MIRROR fill and its pinned BACKING.**  Two costs in the pinned L2 pool
+> that only a **mapped** load pays, both found by asking why `--load-mode mmap` reaches `listening` 1.6x later than
+> `--load-mode none` on the same model (Flash-Next IQ3_S, `-ncmoe 48`, cold page cache, 1 device: 26.3 s against
+> 16.7 s).  Neither arm does more *work* — both move the same 48 GiB of host-expert weights into RAM.
+> **(1) The fill.**  A pool that covers a whole tensor is a **mirror**: its memory is one contiguous
+> `n_experts * host_bytes` allocation and the GGUF expert layout is expert-major at the same stride, so the whole
+> mirror is **one sequential read of the tensor** (slot `e` == file offset `file_offs + e*host_bytes`) instead of one
+> `host_bytes` `memcpy` per heat-ranked slot out of the demand-faulted model mapping.  48 GiB went **10.8 s -> 7.4 s**
+> (4.5 -> 6.5 GB/s, the rate the direct load gets) and it stops faulting a second 48 GiB into the page cache that
+> cannot be kept beside the pinned mirror.  The order is content-free here (every expert is resident either way); a
+> partial pool keeps the heat-ranked path.  `MOE_HOST_POOL_BULK=0` is the A/B arm.
+> **(2) The backing.**  `cudaHostAlloc(Portable|Mapped)` pins page by page, so pinning the 48 GiB mirror cost **5.4 s**
+> — and pinned a zero page for every 4 KiB page that the fill then overwrote.  The pool is now an anonymous
+> `mmap` + `MADV_HUGEPAGE` region pinned with `cudaHostRegister(Portable|Mapped)` **after** the fill (~1 ms plus a pin
+> folded into the fill's own page allocation), released with `cudaHostUnregister` + `munmap` in block 12's
+> `pool_free_locked`.  `Mapped` is required: `Portable` alone leaves the region unreachable by an in-place cold read
+> (a GPU page fault), which is why the two vendor headers gained the `cudaHostRegisterMapped` mapping.  The
+> release pairing is not optional — `cudaHostUnregister` alone does **not** return the pages on this stack (the pin
+> is tied to the VMA: `archive/work/host-expert-eager-push/` P4 §5), and a pool SLOT is index bookkeeping inside that
+> one allocation, so recycling never pins or unpins (144 register / 144 unregister over a run with 35 559 slot
+> fills; `AnonHugePages` 48.97 GiB -> 0 at teardown).  `MOE_HOST_POOL_ALLOC=portable` restores the r214 shape.
+> **Gates** (r215, `gate-prefill-logits.sh --ab` on the host-expert arm): mean KLD **0.000000**, same-top-p
+> **100.000 %** — the two arms are bit-identical at the logits; same-seed greedy text identical at 1 and 2 devices;
+> `-npl 4/8` batched within noise (B=8 tg 121 vs 118 t/s, no sign of the r210 multi-slot collapse); MTP prose
+> `-n 2000` acceptance **0.64545 (1318/2042) / mean len 2.94** in both arms with prefill 999.7 vs 984.0 t/s (the
+> archived 1-device registered-source prefill regression, P4 §5d, is **not** reproduced); `llama-batched-bench`
+> at `-c 16384` segfaults on this model in both arms (pre-existing, workload/model limit, not this change).
+> Records: [`../WORKLOG.md`](../WORKLOG.md) 261104.008, `INVARIANTS.md` r215, `ENVIRONMENT.md`
+> `MOE_HOST_POOL_ALLOC` / `MOE_HOST_POOL_BULK`.
+>
 > **r214 amendment: the draft reserve's `compute` term is a measured FLOOR, not a flat tier.**
 > `common_draft_reserve_estimate()` charges `weights + kv + compute + slack` to the slab's `aux` reserve, and its
 > `compute` term was a 512/768 MiB tier measured at `-c 16384`.  The draft context's compute buffer is not a constant:

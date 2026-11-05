@@ -1749,3 +1749,44 @@ cost a session to learn; do not re-derive them.
    the arena-yield branch to the clean spare branch and used *less* VRAM (32.82/33.11 vs 32.89/33.24 GB, 1.50 GiB
    pinned either way), because the yield path had mapped the region's tail on top of what the arena already held.
    Do not "safety-margin" this reserve upward without measuring: the margin comes straight out of the MoE arena.
+
+## r215 -- the host pool's fill and backing (block 09/12 amendment)
+
+**Measured facts.  Do not re-derive; do not "simplify" either mechanism back.**
+
+1. **`--load-mode mmap` and `--load-mode none` read the SAME bytes.**  `/proc/PID/io read_bytes` is 54.6 GiB in
+   both arms at 1 and at 2 devices, and the 48 GiB host-expert set lands in RAM in both.  A startup-time
+   difference between them is a *mechanism* difference, never an amount-of-work difference -- measure the bytes
+   before theorising.
+2. **A mirror pool's fill order is content-free, so it must be read sequentially.**  When the budget covers the
+   whole host tensor the pool is a MIRROR (`slots == n_experts`), its memory is one contiguous
+   `n_experts * host_bytes` allocation, and the GGUF expert layout is expert-major at that same stride (slot `e`
+   == file offset `file_offs + e*host_bytes`).  One sequential read of the tensor is 6.5 GB/s against 4.5 GB/s for
+   one `host_bytes` `memcpy` per heat-ranked slot out of the demand-faulted mapping, and it avoids faulting a
+   second copy of the bytes into a page cache that cannot be kept beside the pinned mirror (48 GiB: 10.8 s ->
+   7.4 s).  A *partial* pool is a different thing -- there the prior decides the content, so the ranked path stays.
+3. **`cudaHostAlloc(Portable|Mapped)` pins page by page, and pinning an EMPTY region is the expensive half.**  48 GiB
+   = 5.4 s, and it allocates+pins a zero page for every 4 KiB page the fill then overwrites.  `mmap` +
+   `MADV_HUGEPAGE` (2 MiB pages) + `cudaHostRegister` **after** the fill is ~1 ms plus page allocation the fill
+   needed anyway.  Same UVA device alias, same in-place cold read, same cross-device D2D fill source.
+4. **`cudaHostRegister` needs `Mapped`, not just `Portable`.**  A `Portable`-only registration returns success and
+   then faults the GPU on the first in-place cold read ("Page not present or supervisor privilege") -- found at
+   block 09, invisible in the log.  This stack has no XNACK, so an unregistered/unmapped range is not readable.
+5. **The pin is tied to the VMA: `cudaHostUnregister` alone does NOT release it** (2.0 of 256 MiB re-readable after
+   unregister, and it is not deferred -- `archive/work/host-expert-eager-push/` P4 §5).  The release is
+   `unregister` + `munmap`; verified end to end (`AnonHugePages` 48.97 GiB -> 0 at teardown, `MemAvailable` back to
+   baseline).  Anonymous THP is not a hugetlbfs carve-out, so nothing is retained.
+6. **Slot recycling must never touch the pin, and does not.**  A pool slot is index bookkeeping inside the one
+   per-tensor allocation, so churn pins nothing: with an 8 GiB partial pool and 35 559 slot fills, exactly
+   144 `hostRegister` / 144 `hostUnregister` (one per host tensor).  Any future design that allocates per SLOT
+   re-introduces pin/unpin churn and is wrong.
+7. **A registered source under the expert cache is NOT automatically a prefill loss.**  The archived -22 % 1-device
+   prefill regression (`archive/work/host-expert-eager-push/P4-ROOT-CAUSE.md` §5d) was a *pageable mapping*
+   registered in place, whose fills became synchronous DMA; it does not transfer to a pinned mirror whose transport
+   is unchanged.  Re-measured after this change: prefill 999.7 t/s (registered THP mirror) against 984.0 (the r214
+   `cudaHostAlloc` pair), and the multi-slot band at B=8 is 121 against 118 t/s, not the r210 ~50 collapse.  Test
+   both shapes anyway -- the mechanism is close enough that it must be re-measured, not assumed.
+8. **Startup timing is sensitive to `MemAvailable` at the FIRST pool build.**  `MOE_HOST_POOL_RAM_PCT` (85) of
+   `MemAvailable`, measured once, sizes the pool: a run started while the page cache still holds the model sizes a
+   smaller pool (45 504 slots / 29.6 GiB against 73 728 / 47.9 GiB) and then takes the loader's pinned-master path
+   (a 13.5 s load).  Drop the page cache (`POSIX_FADV_DONTNEED`) before any start-time comparison.

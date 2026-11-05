@@ -20,7 +20,7 @@ The old numbers are **retired** — do not reuse them.
 > **Handle numbering (corrected 2026-11-03, sequence re-checked 2026-11-04):** the real sequence runs to **#130**
 > (closed, issue #263), so this file's `#268`/`#269` — allocated by the 2026-11-02 session — are themselves out of
 > sequence, the same failure the 2026-10-31 renumbering note below describes.  **#131`-`#143 are allocated** (the
-> 2026-11-03/04 items; `#143` closed in r214), so **new items continue from `#144`**.  Renumbering `#268`/`#269` would also touch
+> 2026-11-03/04 items; `#143` closed in r214; `#270` is the r215 finding), so **new items continue from `#271`**.  Renumbering `#268`/`#269` would also touch
 > `WORKLOG.md` 261102.* and the campaign records that cite them, so it is left as a decision for the maintainer
 > rather than done here.
 
@@ -328,6 +328,19 @@ is now a bigger prize than the tensor-split remap (`#269`, +3.3 %).  Protocol: r
 `scripts/moe-trace-replay.py` first (`archive/work/host-pool-speed/README.md` §9.6 — an overlap does not change placement, so the
 model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
 gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
+
+## 270. `llama-batched-bench -c 16384` segfaults on Flash-Next at `-ncmoe 48` (both arms, no output)
+
+**Status: open, found 2026-11-04 (r215).  Pre-existing, not that change — recorded so it is not re-discovered as one.**
+`llama-batched-bench` on Qwen3.8-Flash-Next GSQ-RCO-IQ3_S (`-ngl 999 -ncmoe 48 -sm tensor -fa 1 -ctk/ctv q8_0
+-ot 'per_layer_token_embd.*=CPU' -lm mmap`) exits with SIGSEGV (139) and **prints nothing at all** — not even the
+model-load banner — for `-c 16384` at `-npp 512 -ntg 128 -npl 1` (and `-npl 2/4/8`, and `-npp 64 -ntg 64 -npl 8`).
+`-c 8192` runs those same shapes normally (`-npp 16 -ntg 32 -npl 1,4,8` and `-npp 16 -ntg 32 -npl 8` both produce
+the table).  Reproduced with `MOE_HOST_POOL_ALLOC=portable MOE_HOST_POOL_BULK=0`, i.e. the r214 code path, so it is
+the workload shape / VRAM cliff on this model, not the r215 pool change.  Worth chasing only because a silent
+SIGSEGV with no message is a bad failure mode (the archive's warning that this instrument has been unreliable
+before applies: `archive/work/host-expert-eager-push/HANDOVER-R210.md` §3).  Start from `-c 16384 -npp 16` and
+bisect the context, then check whether it is the compute buffer, the arena or the `-npp 512` prefill shape.
 
 ## 134. Re-base the delivery onto upstream `6b9c0cfcb` — 207 commits, block 00 conflicts immediately
 

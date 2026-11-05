@@ -61156,10 +61156,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a5f397132
+index 000000000..9027b83ba
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7979 @@
+@@ -0,0 +1,8155 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61179,6 +61179,8 @@ index 000000000..a5f397132
 +#if !defined(_WIN32)
 +#include <dirent.h>
 +#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/resource.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
 +#endif
@@ -61453,6 +61455,11 @@ index 000000000..a5f397132
 +    int64_t     fills       = 0;
 +    int64_t     evictions   = 0;
 +    bool        failed      = false;
++    // r215: nonzero = the backing is an `mmap`+`MADV_HUGEPAGE` region pinned with `cudaHostRegister`
++    // (`MOE_HOST_POOL_ALLOC=thp`, the default), released with `cudaHostUnregister`+`munmap` rather than
++    // `cudaFreeHost`.  Zero = the historical one-shot `cudaHostAlloc`/`cudaMallocHost`.
++    size_t      mmap_bytes  = 0;
++    bool        registered  = false;     // the mmap region above has been pinned
 +};
 +// Keyed by the host tensor only: the pool is PROCESS-WIDE (one copy of each whole expert for every
 +// device), and `MOE_HOST_POOL_MIB` is the total non-swappable budget, split equally over the registered
@@ -62759,6 +62766,81 @@ index 000000000..a5f397132
 +// The pool for `t`'s host tensor, created lazily and shared by every per-device table of that tensor.
 +// Caller holds `g_mutex`.  Returns null (and every fill falls back to the full master) when the pool is
 +// off, the source is unknown, or the budget is too small for one expert.
++// r215: the pinned host pool's BACKING.  `cudaHostAlloc(Portable|Mapped)` pins page by page, so the
++// 48 GiB mirror of a `-ncmoe all` model costs ~5.4 s of pure pinning -- and it pins a zero page for every
++// 4 KiB page that the mirror fill then overwrites.  Two changes, both measured (gfx1201,
++// Qwen3.8-Flash-Next IQ3_S, `-ncmoe 48 --load-mode mmap`, cold page cache):
++//
++//   * back the pool with an anonymous `mmap` + `MADV_HUGEPAGE` (2 MiB pages) and pin it with
++//     `cudaHostRegister` AFTER the mirror has been filled, so the pin walks pages that already exist
++//     (~1 ms instead of ~5.4 s: the fill's own page allocation is work that used to be wasted);
++//   * the result still carries a UVA device alias for the in-place cold read and the cross-device D2D
++//     fill source -- exactly the property `cudaHostAlloc(Portable|Mapped)` provided.
++//
++// `MOE_HOST_POOL_ALLOC=thp` selects it (the default); `portable` (the pre-r215 pair), `plain`
++// (`cudaMallocHost`) and `mapped` (`cudaHostAllocMapped`) remain as the A/B arm and the escape hatch.
++// Anonymous THP pages return to the buddy allocator on `munmap` (there is no hugetlbfs reservation to
++// leak), and the pool's SLOTS are index bookkeeping inside this one allocation, so recycling a slot never
++// pins or unpins anything: measured over a run with 35 559 slot fills, one register and one unregister
++// per host tensor.
++static void * pool_mmap_thp_alloc(size_t bytes) {
++#if defined(__linux__)
++    void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (p == MAP_FAILED) {
++        return nullptr;
++    }
++    (void) madvise(p, bytes, MADV_HUGEPAGE);   // best effort: no THP just means the historical pin cost
++    return p;                                   // deliberately NOT pinned yet -- `pool_mmap_thp_pin`
++#endif
++    (void) bytes;
++    return nullptr;
++}
++
++// Pin the (already populated) mirror and resolve its device alias.  Registering an EMPTY anonymous range
++// makes the kernel allocate and pin a zero page per page, all of which the fill overwrites; registering it
++// after the fill only walks pages that already exist.
++static bool pool_mmap_thp_pin(host_pool_t & p) {
++#if defined(__linux__)
++    if (p.base == nullptr || p.mmap_bytes == 0 || p.registered) {
++        return p.registered;
++    }
++    if (cudaHostRegister(p.base, p.mmap_bytes,
++                         cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    p.registered = true;
++    void * dev = nullptr;
++    if (cudaHostGetDevicePointer(&dev, p.base, 0) != cudaSuccess) {
++        // UVA: the host pointer IS the device address (the delivered KV pool mirror relies on the same
++        // property), so an unavailable alias is not a failure.
++        (void) cudaGetLastError();
++        dev = p.base;
++    }
++    p.base_dev = dev;
++    return true;
++#else
++    (void) p;
++    return false;
++#endif
++}
++
++static void pool_mmap_thp_release(host_pool_t & p) {
++#if defined(__linux__)
++    if (p.base == nullptr || p.mmap_bytes == 0) {
++        return;
++    }
++    if (p.registered) {
++        (void) cudaHostUnregister(p.base);
++        p.registered = false;
++    }
++    munmap(p.base, p.mmap_bytes);
++    p.mmap_bytes = 0;
++#else
++    (void) p;
++#endif
++}
++
 +static host_pool_t * table_pool_locked(table_t & t) {
 +    if (!g_pool_enabled || !t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
 +        return nullptr;
@@ -62851,10 +62933,21 @@ index 000000000..a5f397132
 +        // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
 +        // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
 +        // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
-+        static const char * pool_alloc = getenv("MOE_HOST_POOL_ALLOC") != nullptr ? getenv("MOE_HOST_POOL_ALLOC") : "portable";
++        static const char * pool_alloc = getenv("MOE_HOST_POOL_ALLOC") != nullptr ? getenv("MOE_HOST_POOL_ALLOC") : "thp";
 +        const size_t pool_bytes = (size_t) slots * t.host_bytes;
 +        cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
-+        /**/ if (strcmp(pool_alloc, "plain") == 0) {
++        /**/ if (strcmp(pool_alloc, "thp") == 0) {
++            mem = pool_mmap_thp_alloc(pool_bytes);
++            if (mem != nullptr) {
++                p.mmap_bytes = pool_bytes;
++                alloc_err    = cudaSuccess;
++            } else {
++                // No `mmap`/THP (a non-POSIX build, or the reservation was refused): fall back to the
++                // historical shape rather than leaving the host tier off.
++                alloc_err = cudaHostAlloc(&mem, pool_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
++            }
++        }
++        else if (strcmp(pool_alloc, "plain") == 0) {
 +            alloc_err = cudaMallocHost(&mem, pool_bytes);
 +        } else if (strcmp(pool_alloc, "mapped") == 0) {
 +            alloc_err = cudaHostAlloc(&mem, pool_bytes, cudaHostAllocMapped);
@@ -62864,11 +62957,13 @@ index 000000000..a5f397132
 +        if (alloc_err == cudaSuccess) {
 +            p.base        = (char *) mem;
 +            void * dev    = nullptr;
-+            if (cudaHostGetDevicePointer(&dev, mem, 0) != cudaSuccess) {
-+                (void) cudaGetLastError();
-+                dev = mem;
++            if (p.mmap_bytes == 0) {
++                if (cudaHostGetDevicePointer(&dev, mem, 0) != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    dev = mem;
++                }
 +            }
-+            p.base_dev    = dev;
++            p.base_dev    = dev;   // an mmap pool gets its alias from `pool_mmap_thp_pin`, after the fill
 +            p.slots       = slots;
 +            p.host_bytes  = t.host_bytes;
 +            p.n_experts   = t.n_experts;
@@ -62889,6 +62984,16 @@ index 000000000..a5f397132
 +    const auto res = g_host_pools.emplace(key, std::move(p));
 +    if (!res.first->second.failed && g_pool_prewarm) {
 +        pool_prepopulate_locked(res.first->second, t);   // DIO-fill the slots now, ranked by the prefill routing
++    }
++    if (!res.first->second.failed && res.first->second.mmap_bytes > 0 &&
++            !pool_mmap_thp_pin(res.first->second)) {
++        // The pool's device alias is what the in-place cold read and the cross-device fill source need, so
++        // an unpinned pool must not be handed to the scheduler: fall back to the per-table bounce ring.
++        GGML_LOG_WARN("%s: could not pin the mmap-backed host pool of layer=%d role=%s (%.1f MiB); "
++                      "falling back to the per-table bounce ring\n",
++                      __func__, t.layer, t.role.c_str(),
++                      (double) res.first->second.mmap_bytes / (1024.0 * 1024.0));
++        res.first->second.failed = true;
 +    }
 +    return res.first->second.failed ? nullptr : &res.first->second;
 +}
@@ -63036,7 +63141,16 @@ index 000000000..a5f397132
 +    }
 +    p.slot_ev.clear();
 +    if (p.base != nullptr) {
-+        (void) cudaFreeHost(p.base);
++        // r215: an `mmap`+THP pool is released with unregister+munmap.  `cudaHostUnregister` ALONE does not
++        // give the pages back on this stack (measured in `archive/work/host-expert-eager-push/`, P4 §5:
++        // 2.0 of 256 MiB re-readable after unregister, i.e. still pinned; and it is not deferred) -- the pin
++        // is tied to the VMA, so the `munmap` is what releases it.  Verified on teardown: AnonHugePages
++        // 48.97 GiB -> 0 and MemAvailable back to baseline.
++        if (p.mmap_bytes > 0) {
++            pool_mmap_thp_release(p);
++        } else {
++            (void) cudaFreeHost(p.base);
++        }
 +        p.base     = nullptr;
 +        p.base_dev = nullptr;
 +    }
@@ -63195,6 +63309,64 @@ index 000000000..a5f397132
 +// latency to lose.  Experts are ranked by the prefill routing (`t.prefill_count`) when it is available, so
 +// the decode's hot set is resident; otherwise experts are taken in order.  This is the whole point of a
 +// DIO tier: the SSD bandwidth is spent once, up front, not in per-token stalls.  Caller holds `g_mutex`.
++// r215: a FULL-MIRROR pool (every expert of the tensor) is one contiguous allocation of
++// `n_experts * host_bytes`, and the GGUF expert layout is expert-major at exactly that stride -- the slot
++// for expert `e` is `base + e*host_bytes` at file offset `file_offs + e*host_bytes`.  So the whole mirror is
++// ONE sequential pass over the tensor, the same read the `--load-mode none` host-master path issues,
++// instead of one `host_bytes` memcpy per ranked slot out of the page-cache-backed model mapping.
++//
++// Measured (Qwen3.8-Flash-Next IQ3_S, `-ncmoe 48 -lm mmap`, cold page cache): the 48 GiB mirror went from
++// ~10.8 s to ~7.4 s -- 4.5 -> 6.5 GB/s, the rate the direct load gets -- and it stops faulting a second
++// 48 GiB into the page cache that cannot be kept beside the pinned mirror.  The fill ORDER is content-free
++// here (`slots == n_experts`, so every expert is resident either way); the prior still decides the layout
++// whenever the budget is smaller than the tensor, via the ranked path below.  `MOE_HOST_POOL_BULK=0`
++// restores the per-slot fill (the A/B arm).
++static bool pool_mirror_bulk_fill_locked(host_pool_t & p, const table_t & t) {
++    if (p.slots != p.n_experts || p.host_bytes == 0 || p.fd >= 0 || p.base == nullptr || p.path.empty()) {
++        return false;
++    }
++    p.fd = pool_open_file(p.path.c_str(), g_pool_dio);
++    if (p.fd < 0) {
++        return false;
++    }
++    pool_fd_align(p.fd, &p.align);
++    const int64_t t0    = ggml_time_us();
++    const size_t  total = (size_t) p.n_experts * p.host_bytes;
++    const size_t  chunk = 32ull * 1024 * 1024;
++    size_t        done  = 0;
++    while (done < total) {
++        const size_t want = std::min(chunk, total - done);
++        // `pool_dio_read` handles the alignment (and the O_DIRECT bounce) when the disk tier is forced; the
++        // default buffered arm is a plain bulk `pread`.
++        const bool ok = g_pool_dio
++                      ? pool_dio_read(p.fd, p.base + done, want, p.file_offs + done, p.align)
++                      : pool_pread(p.fd, p.base + done, want, p.file_offs + done) == (pool_ssize_t) want;
++        if (!ok) {
++            // A half-filled mirror must never be handed to the scheduler: leave it unpublished and let the
++            // caller fall back to the per-slot fill, which reports its own failures.
++            GGML_LOG_WARN("%s: bulk mirror fill failed layer=%d role=%s at %zu/%zu B\n",
++                          __func__, t.layer, t.role.c_str(), done, total);
++            return false;   // the fd stays open: the per-slot fallback reuses it
++        }
++        done += want;
++    }
++    const int64_t us = ggml_time_us() - t0;
++    for (int e = 0; e < p.n_experts; e++) {
++        // slot == expert: the file layout IS the slot layout
++        p.slot_expert[(size_t) e] = e;
++        p.expert_slot[e]          = e;
++        p.slot_state[(size_t) e]  = 1;
++        p.last[(size_t) e]        = ++p.clock;
++        p.fills++;
++    }
++    GGML_LOG_INFO("%s: host pool mirror layer=%d role=%s: %d experts, %.1f MiB sequential in %.0f ms "
++                  "(%.0f MiB/s)\n", __func__, t.layer, t.role.c_str(), p.n_experts,
++                  (double) total / (1024.0 * 1024.0), us / 1000.0,
++                  (double) total / (1024.0 * 1024.0) / (double) std::max<int64_t>(us / 1000000, 1));
++    return true;
++}
++
++
 +// TODO #87: the ONE ranking that decides the host pool's content -- and therefore how much of the
 +// decode band is served from pinned RAM instead of the mapping/disk.  Order: the persisted long-horizon
 +// heat prior first (it is the only signal that has seen DECODE routing from previous sessions; a prefill
@@ -63236,6 +63408,10 @@ index 000000000..a5f397132
 +}
 +
 +static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
++    static const bool bulk = getenv("MOE_HOST_POOL_BULK") == nullptr || atoi(getenv("MOE_HOST_POOL_BULK")) != 0;
++    if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
++        return;
++    }
 +    // Load-time warm: fill every slot from the ranked order.  It runs BEFORE the arena is sized/seeded,
 +    // so it can only use the persisted prior; `pool_rerank_from_heat_locked` re-derives the pool as the
 +    // arena's complement once the arena content is known.  `pool_slot_locked` is the eviction-capable
@@ -78041,7 +78217,7 @@ index d5ff93b91..b7d3fa221 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index 8e8f5a4ee..b3269e4a5 100644
+index 8e8f5a4ee..a5eb90a03 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
 @@ -25,6 +25,10 @@
@@ -78063,7 +78239,14 @@ index 8e8f5a4ee..b3269e4a5 100644
  #define cudaEvent_t hipEvent_t
  #define cudaEventDestroy hipEventDestroy
  #define cudaFree hipFree
-@@ -85,6 +90,11 @@
+@@ -79,12 +84,18 @@
+ #define cudaHostGetDevicePointer hipHostGetDevicePointer
+ #define cudaHostRegister hipHostRegister
+ #define cudaHostRegisterPortable hipHostRegisterPortable
++#define cudaHostRegisterMapped hipHostRegisterMapped
+ #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
+ #define cudaHostUnregister hipHostUnregister
+ #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
  #define cudaLaunchHostFunc hipLaunchHostFunc
  #define cudaMalloc hipMalloc
  #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
@@ -78075,7 +78258,7 @@ index 8e8f5a4ee..b3269e4a5 100644
  #define cudaMallocManaged hipMallocManaged
  #define cudaMemAdvise hipMemAdvise
  #define cudaMemcpy hipMemcpy
-@@ -97,7 +107,13 @@
+@@ -97,7 +108,13 @@
  #define cudaMemcpyKind hipMemcpyKind
  #define cudaMemset hipMemset
  #define cudaMemsetAsync hipMemsetAsync
@@ -78089,6 +78272,18 @@ index 8e8f5a4ee..b3269e4a5 100644
  #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
  #define cudaSetDevice hipSetDevice
  #define cuDeviceGet hipDeviceGet
+diff --git a/ggml/src/ggml-cuda/vendors/musa.h b/ggml/src/ggml-cuda/vendors/musa.h
+index 22126decf..f012d82b6 100644
+--- a/ggml/src/ggml-cuda/vendors/musa.h
++++ b/ggml/src/ggml-cuda/vendors/musa.h
+@@ -69,6 +69,7 @@
+ #define cudaGetLastError musaGetLastError
+ #define cudaHostRegister musaHostRegister
+ #define cudaHostRegisterPortable musaHostRegisterPortable
++#define cudaHostRegisterMapped musaHostRegisterMapped
+ #define cudaHostRegisterReadOnly musaHostRegisterReadOnly
+ #define cudaHostUnregister musaHostUnregister
+ #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel
 diff --git a/ggml/src/ggml-cuda/wddm-mem.cu b/ggml/src/ggml-cuda/wddm-mem.cu
 new file mode 100644
 index 000000000..306bd2533

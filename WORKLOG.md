@@ -1,3 +1,69 @@
+## 261104.008 (r215) -- `--load-mode mmap` reaches `listening` 1.6x faster than `--load-mode none`: the host pool's mirror FILL and its pinned BACKING
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED and block 12 AMENDED), release
+`v16-6050b467c-r215`, tip `c4f849775`, tree `19200174f`.**  Reported symptom: on Qwen3.8-Flash-Next
+GSQ-RCO-IQ3_S (`-ncmoe 48`, the `runme` config) a `--load-mode mmap` start takes ~1.5x as long to serve as
+`--load-mode none`.  It is not a loader difference and it is not more work: both arms move the same 48 GiB of
+host-expert weights into RAM (`/proc/PID/io read_bytes` 54.6 GiB in both, 1 and 2 devices).  It was two costs
+in the pinned host pool (`ggml/src/ggml-cuda/moe-expert-cache.cu`), both of which only a mapped load pays.
+
+### 1. Cold measurements (page cache dropped with `POSIX_FADV_DONTNEED`, same command line)
+
+| arm | 1 device | 2 devices (`0,2`) |
+|---|---|---|
+| `--load-mode mmap`, r214 | 26.30 s | 30.76 s |
+| `+` the mirror fill (1) | 22.31 s | — |
+| `+` the THP backing (2) = **r215** | **15.19 s** | **19.27 s** |
+| `--load-mode none` | 16.70 s | 19.91 s |
+
+The `runme` itself: **26.3 s -> 15.17 s** to `listening`, attendance pool active, 43 t/s decode.  mmap is now
+*faster* than `none`, because the PLE tensor stays lazy-read.
+
+### 2. The two costs
+
+1. **The mirror fill.**  With the budget covering the whole host expert set (`-lme auto` in the fitting band) each
+   per-tensor pool is a **mirror** (`slots == n_experts`), and the prewarm filled it with one `host_bytes`
+   (256-900 KiB) `memcpy` per heat-ranked slot out of the demand-faulted model mapping: ~4.5 GB/s, and it faulted a
+   *second* 48 GiB into the page cache that cannot be kept beside the 48 GiB pinned mirror.  A mirror holds every
+   expert, so the fill ORDER is content-free and its memory is one contiguous `n_experts * host_bytes` allocation
+   whose layout is exactly the GGUF expert-major stride: the whole mirror is now **one sequential read of the
+   tensor**, the same `pread` mechanism `--load-mode none` uses for its pinned master.  48 GiB 10.8 s -> 7.4 s.
+2. **The backing.**  `cudaHostAlloc(Portable|Mapped)` of 48 GiB cost **5.4 s**: it pins page by page and pins a zero
+   page per 4 KiB page, every one of which the fill immediately overwrites.  An anonymous `mmap` + `MADV_HUGEPAGE`
+   region (2 MiB pages) pinned with `cudaHostRegister` **after** the fill costs ~1 ms of explicit pin plus page
+   allocation the fill had to do anyway.  `Mapped` is required — `Portable` alone leaves it unreachable by the
+   in-place cold read (a GPU page fault at block 09, which is how it was found) — so `vendors/hip.h` and
+   `vendors/musa.h` gained the `cudaHostRegisterMapped` mapping.
+
+### 3. Release and recycling (the maintainer's constraint)
+
+`cudaHostUnregister` alone does **not** return the pages on this stack (the pin is tied to the VMA —
+`archive/work/host-expert-eager-push/` P4 §5), so block 12's `pool_free_locked` does `unregister` + `munmap`.
+Verified: `AnonHugePages` 48.97 GiB while running -> **0** after teardown, `MemAvailable` back to baseline.  A pool
+SLOT is index bookkeeping inside that one allocation, so recycling never pins/unpins: with an 8 GiB partial pool
+and **35 559 slot fills**, **144 `hostRegister` / 144 `hostUnregister`** (exactly one per host tensor).
+
+### 4. Gates (all green; the memory type is what forced the full set)
+
+`gate-prefill-logits.sh --ab "MOE_HOST_POOL_ALLOC=portable MOE_HOST_POOL_BULK=0"` on the host-expert arm:
+**mean KLD 0.000000, same-top-p 100.000 %** — bit-identical logits.  Same-seed greedy text identical at 1 and 2
+devices.  `llama-batched-bench -npp 16 -ntg 32 -npl 4,8` interleaved, cache dropped, 3 passes: B=4 tg
+82.00/82.34/82.00 against 81.68/81.17/82.34 (a single earlier pass read -2.1 %, which inverted — run-to-run
+noise), B=8 tg 121 t/s against 118 (the r210 multi-slot collapse was ~50, not reproduced).  MTP prose `-n 2000`
+(prompt `fabdec65…`): acceptance **0.64545 (1318/2042), mean len 2.94** and identical text in both arms, MTP 62.0
+against plain 35.8 t/s, prefill **999.7 vs 984.0** t/s — the archived 1-device registered-source prefill
+regression (P4 §5d, -22 %) is **not** reproduced.  `MOE_HOST_POOL_VERIFY=1` (all 144x512 experts against the
+mapping) 0 mismatches.  `check-gpu-faults.sh --since "3 hours ago"` clean, `validate-set.sh` green.
+
+### 5. Two findings recorded rather than fixed
+
+* **Startup timing is cache- and RAM-sensitive through the pool budget**: `pool_ram_cap_locked()` is
+  `MOE_HOST_POOL_RAM_PCT` (85) of `MemAvailable` measured at the FIRST pool build, so a run started while the page
+  cache still holds the model sizes a smaller pool (measured 45 504 slots / 29.6 GiB against 73 728 / 47.9 GiB) and
+  then takes the loader's pinned-master path (a 13.5 s load).  Drop the cache before comparing start numbers.
+* **`llama-batched-bench -c 16384` segfaults** on this model at `-ncmoe 48` with no output, in BOTH arms and at
+  every `-npp`/`-npl` (pre-existing; `-c 8192` is fine).  Not investigated here.
+
 ## 261104.007 (r214) -- `TODO` #143 FIXED: the slab's narrow-2 (MTP draft compute) region is MAPPED for its whole extent, and the draft reserve stops guessing the compute term
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED and block 12 AMENDED), release
