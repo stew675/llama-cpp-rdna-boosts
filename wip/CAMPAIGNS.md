@@ -32,7 +32,9 @@ is the signature of a stub, not of a campaign.
 **Opened (2026-11-05, block 15 tip `790686b53`) - three host-expert campaigns and one rig, from reproducing
 `briansp2020`'s 56 GB-container numbers**
 ([PR #267 comment](https://github.com/stew675/llama-cpp-rdna-boosts/pull/267#issuecomment-6644149816); the config
-handed back is `wip/bench-56gb/runme-56gb-mirror.sh`).  The measured base is
+handed back is `wip/bench-56gb/runme-56gb-mirror.sh`; **one of the three has since closed**
+([`archive/work/host-expert-mirror/`](../archive/work/host-expert-mirror/RESOLUTION.md), 2026-11-05 -- the
+transport question was measured and capped, `WORKLOG.md` 261105.008)).  The measured base is
 [`bench-56gb/RESULTS.md`](bench-56gb/RESULTS.md): host expert set 46.84 GiB, so the budget that buys a mirror is
 `-lme 47`; a mirror gives 78.5 t/s decode and 1802 t/s prefill with **0 MiB of drive reads**, against his 82.7 /
 1949, and every partial tier measured is a cliff (97.7 % coverage costs 25 % of the first prefill, 92.4 % costs
