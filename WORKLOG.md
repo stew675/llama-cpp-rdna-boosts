@@ -1,7 +1,7 @@
 ## 261104.008 (r215) -- `--load-mode mmap` reaches `listening` 1.6x faster than `--load-mode none`: the host pool's mirror FILL and its pinned BACKING
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 09 AMENDED and block 12 AMENDED), release
-`v16-6050b467c-r215`, tip `c4f849775`, tree `19200174f`.**  Reported symptom: on Qwen3.8-Flash-Next
+`v16-6050b467c-r215`, tip `790686b53`, tree `19200174f`.**  Reported symptom: on Qwen3.8-Flash-Next
 GSQ-RCO-IQ3_S (`-ncmoe 48`, the `runme` config) a `--load-mode mmap` start takes ~1.5x as long to serve as
 `--load-mode none`.  It is not a loader difference and it is not more work: both arms move the same 48 GiB of
 host-expert weights into RAM (`/proc/PID/io read_bytes` 54.6 GiB in both, 1 and 2 devices).  It was two costs
