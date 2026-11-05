@@ -2017,3 +2017,12 @@ greedy text throughout:
    down with them; `GGML_MOE_DEVREMAP=0` is the remap's own.  The exit report's `device remap: N tables
    served, M of K offers declined` line is what tells "no gain" from "not engaged" -- read it before
    concluding anything about this path.
+7. **A decode A/B on this box needs the ABBA protocol even for a 20-second arm, and a *prefill* rate that
+   halves is the tell that the run is not comparable.**  This session's first pass at the remap read
+   -2.5 % on `llama-cli -n 300` (three reps each, alternating, disk delta 0-29 MiB) and the same command
+   later read +8.9 %; the discriminating symptom was prefill 1214 vs 2716 t/s at an *identical* arena size,
+   i.e. a run in a degraded state that no counter in the decode rate shows.  Protocol that worked: 2+ ABBA
+   cycles per arm pair, `MemAvailable` and used VRAM recorded per run, the model page-cache-resident (a 74 GB
+   model against 91 GB of RAM re-reads itself every arm and is not measurable this way), and the
+   `device remap:` census read before drawing a conclusion -- "no gain" and "not engaged" look identical
+   without it.
