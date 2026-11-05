@@ -1,4 +1,4 @@
-From c49c9c8853adad4918f712bf130cd4a6acda5ac2 Mon Sep 17 00:00:00 2001
+From 62fef26f0f4a3452a0ffbcd94f5945756ebda15d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 13:54:26 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -339,6 +339,20 @@ does not have, and a FAILED fill must not be resident:
 
 Gates: gate-host-pool.sh 19/19 (four arms byte-identical; pre-fix 7281 `async fill failed` lines and
 garbled text); see WORKLOG.md 261105.005.
+
+  * r220, cross-backend copy ordering (from @slavap, PR #268): the general D2D split-input copy used
+    the backend's SHARED per-device `copy_event` -- issue on the source stream, re-record that event,
+    wait the destination stream on it.  A queued HIP stream wait resolves against the LATEST record at
+    execution, so a copy still in flight re-records the event and re-binds the consumers already
+    queued on it; independent copies then serialize against each other.  `cpy_tensor_async`'s body is
+    now `cpy_tensor_async_impl(..., ev_nowait)` and the new optional iface member
+    `cpy_tensor_async_nowait` takes a CALLER-owned event, recorded on the source stream right behind
+    the copy and waited on by the consumer, so no wait is ever re-bound.  The scheduler keeps a ring
+    of those events per source backend (a slot is re-recorded only after its previous record
+    completed) and restarts the rings at every full synchronize.  `GGML_SCHED_COPY_EVENT=shared`
+    restores the old path (kill switch).  Bit-exact and throughput-neutral on this box (same-seed
+    greedy text identical on `-sm tensor` / `-sm layer` / `-sm layer -ncmoe`; pp8192 3-GPU `-sm layer`
+    6311 vs 6317 t/s); the win is on a box where two cross-backend copies overlap.
 ---
  common/arg.cpp                                |    6 +-
  common/common.cpp                             |   11 +
@@ -350,9 +364,9 @@ garbled text); see WORKLOG.md 261105.005.
  ggml/include/ggml-rpc.h                       |    4 +-
  ggml/include/ggml.h                           |   13 +
  ggml/src/ggml-alloc.c                         |   82 +-
- ggml/src/ggml-backend-impl.h                  |   29 +
+ ggml/src/ggml-backend-impl.h                  |   40 +
  ggml/src/ggml-backend-meta.cpp                |  181 +-
- ggml/src/ggml-backend.cpp                     |   98 +-
+ ggml/src/ggml-backend.cpp                     |  172 +-
  ggml/src/ggml-cpu/arch-fallback.h             |    1 +
  ggml/src/ggml-cpu/arch/x86/quants.c           |   90 +-
  ggml/src/ggml-cpu/ggml-cpu.c                  |    6 +
@@ -360,7 +374,7 @@ garbled text); see WORKLOG.md 261105.005.
  ggml/src/ggml-cpu/repack.cpp                  |    3 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   35 +-
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  251 +-
- ggml/src/ggml-cuda/ggml-cuda.cu               |  136 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  172 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 2789 +++++++++++++----
  ggml/src/ggml-cuda/moe-expert-cache.h         |   31 +
  .../template-instances/generate_cu_files.py   |   46 +-
@@ -420,7 +434,7 @@ garbled text); see WORKLOG.md 261105.005.
  tools/server/server-task.cpp                  |  104 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 80 files changed, 6238 insertions(+), 1023 deletions(-)
+ 80 files changed, 6349 insertions(+), 1033 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index d07aac4c3..1840d87d3 100644
@@ -1293,10 +1307,10 @@ index b47a1423e..89b85fbce 100644
 -    galloc->layout_valid = false;
 -}
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ca91b1fb1..8606145fe 100644
+index ca91b1fb1..46313d7f7 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -292,6 +292,14 @@ extern "C" {
+@@ -292,6 +292,25 @@ extern "C" {
          // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
          // backends' positional initializers stay valid (NULL).
          bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
@@ -1308,10 +1322,21 @@ index ca91b1fb1..8606145fe 100644
 +        // staging path (the gather costs it ~47 % prefill at two devices, `wip/host-pool-speed` §18.2).
 +        // Answers per (table, device); NULL = unknown/false.
 +        bool (*moe_cache_pool_backed)(ggml_backend_t backend, const struct ggml_tensor * weight);
++
++        // (optional) r220: `cpy_tensor_async` WITHOUT the internal destination-stream wait.  The copy is issued
++        // on the SOURCE stream and `ev` (a caller-owned event) is recorded there right behind it; the caller
++        // orders the consumer itself with `ggml_backend_event_wait(dst, ev)`.  Why this exists: a queued
++        // `hipStreamWaitEvent` resolves against the LATEST record of its event at execution time, so the
++        // per-device shared `copy_event` that `cpy_tensor_async` re-records rebinds the waits of copies that
++        // are still queued and serializes independent cross-backend copies against each other (measured by
++        // @slavap on a two-lane prefill: ~0 % overlap until each copy got its own event, PR #268).  With one
++        // event per copy no wait is ever re-bound.  APPENDED at the very end, so the other backends' positional
++        // initializers stay valid (NULL); a backend that does not implement it keeps `cpy_tensor_async`.
++        bool (*cpy_tensor_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_event_t ev);
      };
  
      struct ggml_backend {
-@@ -450,6 +458,15 @@ extern "C" {
+@@ -450,6 +469,15 @@ extern "C" {
          // table fits per slot.  Appended like the fields above.
          size_t (*slab_ring_slots)(ggml_backend_dev_t dev);
  
@@ -1327,7 +1352,7 @@ index ca91b1fb1..8606145fe 100644
          // (optional) TODO #59: the MoE expert cache's decode/verify band in tokens (the widest routed
          // `MUL_MAT_ID` batch the arena serves from VRAM), or 0 when the cache is disabled.  `common` clamps
          // the draftless (n-gram) speculators' draft length to `band - 1` so a speculative verify batch never
-@@ -476,6 +493,18 @@ extern "C" {
+@@ -476,6 +504,18 @@ extern "C" {
          void    (*moe_cache_set_host_pool_budget)(ggml_backend_dev_t dev, size_t bytes);
          void    (*moe_heat_open)(ggml_backend_dev_t dev, const char * model_path);
          int64_t (*moe_heat_score)(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
@@ -1648,7 +1673,7 @@ index b976d6c38..9d8f8911d 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f41f89928..15be30a3c 100644
+index f41f89928..169f901a9 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -321,6 +321,13 @@ int64_t ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const
@@ -1706,7 +1731,35 @@ index f41f89928..15be30a3c 100644
  void ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm) {
      // wip/slab-ring-region: arm/disarm the reserved H2D staging-ring hole.  No-op when the backend has no
      // slab or no ring hole (the hook is optional and zero-initialized).
-@@ -1223,7 +1264,7 @@ struct ggml_backend_sched {
+@@ -1142,6 +1183,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
+ #define GGML_SCHED_MAX_COPIES 4
+ #endif
+ 
++// r220: per-copy events for the cross-backend input copies (see `ggml_backend_sched_next_copy_event`).
++// Must exceed the copies queued between two host synchronizations, because a slot is only re-recorded
++// after its previous record has completed.
++#ifndef GGML_SCHED_COPY_EVENTS
++#define GGML_SCHED_COPY_EVENTS 16
++#endif
++
+ struct ggml_backend_sched_split {
+     int backend_id;
+     int i_start;
+@@ -1192,6 +1240,13 @@ struct ggml_backend_sched {
+     int cur_copy;
+     int next_copy;
+     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
++
++    // r220: per-copy events for `cpy_tensor_async_nowait`, keyed by the SOURCE backend (the event is
++    // recorded on the source stream).  One event per queued copy, so no consumer wait is ever re-bound
++    // to a later record; `copy_event_used` guards the ring wrap (see the iface comment).
++    ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
++    int copy_event_next[GGML_SCHED_MAX_BACKENDS];
++    int copy_event_used[GGML_SCHED_MAX_BACKENDS];
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -1223,7 +1278,7 @@ struct ggml_backend_sched {
      bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
      // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
      // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
@@ -1715,7 +1768,7 @@ index f41f89928..15be30a3c 100644
      struct {
          struct ggml_tensor * dst;
          size_t size;
-@@ -2571,21 +2612,39 @@ static void sched_stage_restore(ggml_backend_sched_t sched) {
+@@ -2571,21 +2626,39 @@ static void sched_stage_restore(ggml_backend_sched_t sched) {
  static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
  
  static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
@@ -1763,7 +1816,7 @@ index f41f89928..15be30a3c 100644
          return false;
      }
      for (int ni = 0; ni < split->graph.n_nodes; ni++) {
-@@ -2620,7 +2679,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+@@ -2620,7 +2693,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
              continue;
          }
          struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
@@ -1772,7 +1825,7 @@ index f41f89928..15be30a3c 100644
              return;
          }
      }
-@@ -2639,7 +2698,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+@@ -2639,7 +2712,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
          }
          // A routed expert table is deferred to the gather (see sched_input_gatherable).
          struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
@@ -1781,7 +1834,7 @@ index f41f89928..15be30a3c 100644
              continue;
          }
          n_host_inputs++;
-@@ -2672,7 +2731,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+@@ -2672,7 +2745,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
              continue;
          }
          struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
@@ -1790,7 +1843,52 @@ index f41f89928..15be30a3c 100644
              continue;
          }
          const size_t size = ggml_nbytes(input);
-@@ -2954,7 +3013,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2735,6 +2808,19 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+ // This forces the synchronous copy for these tensors while leaving the host-resident weight uploads
+ // on the async/staged path.  Issue #87; the reporter confirmed the fix.
+ // `GGML_SCHED_SYNC_GRAPH_INPUTS=0` restores the r26 behaviour (A/B / bisect only).
++// r220: `GGML_SCHED_COPY_EVENT=shared` restores the pre-r220 behaviour, where every cross-backend
++// input copy re-records the backend's shared per-device `copy_event` and the destination stream waits on
++// it.  Kept as the kill switch for A/B and bisection: on HIP a queued stream wait resolves against the
++// latest record, so the shared event re-binds consumers of copies still in flight and serializes
++// independent copies (see the iface comment).  Default: one event per copy.
++static bool sched_shared_copy_event(void) {
++    static const bool shared = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_COPY_EVENT");
++        return e != nullptr && strcmp(e, "shared") == 0;
++    }();
++    return shared;
++}
++
+ static bool sched_sync_graph_inputs(void) {
+     static const bool enabled = [] {
+         const char * e = GGML_ENV_STR("GGML_SCHED_SYNC_GRAPH_INPUTS");
+@@ -2763,6 +2849,24 @@ struct ggml_backend_sched_copy_state {
+ // then used-expert pruning); upstream #29943 moved the pruning to llama_context::
+ // sched_copy_experts, but the delivery keeps it here so the scheduler stays cache-aware
+ // and upstream's llama_moe_cache (behind --moe-cache-mib) stays dormant.
++// r220: the next per-copy event for a source backend.  A ring, so a wrap re-records a slot only after its
++// previous record has completed: re-recording one that a consumer still has queued would re-bind that
++// consumer to the new record (the very hazard per-copy events exist to remove).
++static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sched_t sched, int backend_id) {
++    ggml_backend_event_t & ev = sched->copy_events[backend_id][sched->copy_event_next[backend_id]];
++    sched->copy_event_next[backend_id] = (sched->copy_event_next[backend_id] + 1) % GGML_SCHED_COPY_EVENTS;
++    const bool wrapped = ++sched->copy_event_used[backend_id] > GGML_SCHED_COPY_EVENTS;
++    if (ev == NULL) {
++        ev = ggml_backend_event_new(sched->backends[backend_id]->device);
++        if (ev == NULL) {
++            return NULL;
++        }
++    } else if (wrapped) {
++        ggml_backend_event_synchronize(ev);
++    }
++    return ev;
++}
++
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+@@ -2954,7 +3058,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              // experts from the host master into `input_cpy`, reading the routing on the device,
              // so the host ids readback and its full device synchronize are skipped.  A backend
              // that cannot serve the layout (or the gate off) falls through to the host path.
@@ -1799,7 +1897,45 @@ index f41f89928..15be30a3c 100644
                  ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
                  split_backend->iface.moe_cache_gather != NULL) {
                  // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
-@@ -3314,8 +3373,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3091,10 +3195,27 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+                     ggml_backend_synchronize(split_backend);
+                 }
+                 ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input_cpy));
+-            } else
++            } else {
++            // r220: issue the cross-backend copy on the SOURCE stream and order this split on a PER-COPY
++            // event.  The plain `cpy_tensor_async` below records the backend's shared per-device
++            // `copy_event` and makes the destination stream wait on it, and a queued HIP stream wait binds
++            // to the LATEST record at execution: a copy still in flight from another split (or another lane)
++            // re-records the shared event and re-binds this wait to it, so independent copies serialize
++            // against each other.  With an event per copy nothing is ever re-bound.  A backend without
++            // events (CPU, the meta backend) keeps the old path.
++            bool copied = false;
++            const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
++            if (!sched_shared_copy_event() && input_backend_id >= 0 && split_backend->iface.cpy_tensor_async_nowait != NULL &&
++                input_backend->iface.event_record != NULL && split_backend->iface.event_wait != NULL) {
++                ggml_backend_event_t copy_ev = ggml_backend_sched_next_copy_event(sched, input_backend_id);
++                if (copy_ev != NULL && split_backend->iface.cpy_tensor_async_nowait(input_backend, split_backend, input, input_cpy, copy_ev)) {
++                    ggml_backend_event_wait(split_backend, copy_ev);
++                    copied = true;
++                }
++            }
+             // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+             // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+-            if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++            if (!copied && (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy))) {
+                 ggml_backend_synchronize(input_backend);
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+@@ -3103,6 +3224,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+                 }
+                 ggml_backend_tensor_copy(input, input_cpy);
+             }
++            }
+         }
+     }
+ }
+@@ -3314,8 +3436,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
          // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
          // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
          // persistent/never-reused).
@@ -1820,6 +1956,27 @@ index f41f89928..15be30a3c 100644
          if (sched->stage_enabled) {
              bool stage_capable = false;
              for (int b = 0; b < sched->n_backends; b++) {
+@@ -3348,6 +3481,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+         for (int c = 0; c < sched->n_copies; c++) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
++        for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
++            ggml_backend_event_free(sched->copy_events[b][e]);
++        }
+         for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
+             ggml_backend_event_free(sched->stage_done_ev[b][s]);
+             ggml_backend_event_free(sched->stage_free_ev[b][s]);
+@@ -3473,6 +3609,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     for (int i = 0; i < sched->n_backends; i++) {
+         ggml_backend_synchronize(sched->backends[i]);
++        // r220: every queued copy has completed, so no per-copy event can still be waited on.  Restarting
++        // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
++        sched->copy_event_next[i] = 0;
++        sched->copy_event_used[i] = 0;
+     }
+     if (!sched->is_alloc) {
+         // if the graph is not already allocated, always use copy 0 after a synchronization
 diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
 index 4e59d0ae0..486e22c7e 100644
 --- a/ggml/src/ggml-cpu/arch-fallback.h
@@ -2393,7 +2550,7 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8bffa48f1..50c65928a 100644
+index 8bffa48f1..0177e7f46 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3500,6 +3500,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -2510,7 +2667,66 @@ index 8bffa48f1..50c65928a 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -7174,6 +7267,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5173,7 +5266,8 @@ static void ggml_cuda_peer_copy_staged(
+     ggml_cuda_set_device(src_device);
+ }
+ 
+-static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
++static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst,
++        ggml_backend_event_t ev_nowait) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+ 
+@@ -5227,16 +5321,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ #endif // GGML_CUDA_NO_PEER_COPY
+         }
+ 
+-        // record event on src stream after the copy
+-        if (!cuda_ctx_src->copy_event) {
++        if (ev_nowait != NULL) {
++            // r220: the caller owns the ordering.  Record ITS event on the source stream, right behind the
++            // copy, and touch neither the shared `copy_event` nor the destination stream: re-recording the
++            // shared event (or queueing a destination wait on it) is what serializes independent copies on
++            // HIP, where a queued `hipStreamWaitEvent` binds to the latest record at execution time.
+             ggml_cuda_set_device(cuda_ctx_src->device);
+-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+-        }
++            CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev_nowait->context, cuda_ctx_src->stream()));
++        } else {
++            // record event on src stream after the copy
++            if (!cuda_ctx_src->copy_event) {
++                ggml_cuda_set_device(cuda_ctx_src->device);
++                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
++            }
+ 
+-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
++            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+ 
+-        // wait on dst stream for the copy to complete
+-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
++            // wait on dst stream for the copy to complete
++            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
++        }
+     } else {
+         // src and dst are on the same backend
+         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+@@ -5244,6 +5347,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+     return true;
+ }
+ 
++static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
++    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, nullptr);
++}
++
++// r220: the same copy, but the caller passes the event to order the consumer on (`cpy_tensor_async_nowait`)
++static bool ggml_backend_cuda_cpy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, ggml_backend_event_t ev) {
++    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, ev);
++}
++
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+     ggml_cuda_async_input_drain(cuda_ctx->device);
+@@ -7174,6 +7286,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -2519,15 +2735,16 @@ index 8bffa48f1..50c65928a 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7203,6 +7298,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7203,6 +7317,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
 +    /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
++    /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -7733,6 +7829,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7733,6 +7849,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -2536,7 +2753,7 @@ index 8bffa48f1..50c65928a 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -8119,6 +8217,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -8119,6 +8237,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -2559,7 +2776,7 @@ index 8bffa48f1..50c65928a 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -8138,6 +8252,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -8138,6 +8272,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -2571,7 +2788,7 @@ index 8bffa48f1..50c65928a 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -8161,6 +8280,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -8161,6 +8300,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -2591,7 +2808,7 @@ index 8bffa48f1..50c65928a 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -8295,11 +8427,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8295,11 +8447,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,

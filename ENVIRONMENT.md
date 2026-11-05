@@ -412,6 +412,7 @@ configuration.
 | `GGML_STAGE_META_REDIRECT` | off | diagnostic | meta redirection instead of the explicit d2d completion. |
 | `GGML_STAGE_NO_RESTORE` | off | diagnostic | skip the redirect restore (debug only — unsafe). |
 | `GGML_STAGE_GATHER_SCRATCH` | off | diagnostic | force the gather scratch path. |
+| `GGML_SCHED_COPY_EVENT` | `per-copy` | kill-switch (value) | r220, block 12.  The cross-backend split-input copy is ordered on a **per-copy** event from the scheduler's per-source-backend ring, instead of the backend's shared per-device `copy_event`.  Why: a queued HIP stream wait resolves against the **latest** record of its event at execution time, so a copy still in flight re-records the shared event and re-binds the consumers already queued on it — independent copies then serialize against each other (diagnosed by @slavap for PR #268, where it cost a two-lane prefill all of its overlap).  `shared` restores the old single shared event (A/B and bisection only).  Bit-exact and throughput-neutral on this box (pp8192, 3 GPU `-sm layer`: 6311 vs 6317 t/s); the win is on a box where two cross-backend copies overlap. |
 | `GGML_MOE_CACHE_STAGE` | on | kill-switch | r83.  With `-ncmoe`/`-cmoe` host experts, a whole-table staging copy is filled from the expert-cache arena for the experts already resident and from the pinned host master for the rest, so only the non-resident experts cross PCIe.  `0` restores the full whole-table upload.  It declines to the plain upload for a table the slab stood down mid-prefill, an unpinned host master or a geometry mismatch; `moe_cache_report` prints the staged arena/host split and the H2D percentage. |
 
 `GGML_MOE_CACHE_INPLACE` (r36) was removed with the device-remap path at r40 and is not read by this
@@ -1032,6 +1033,20 @@ read above the pinned extent is refused loudly; `LLAMA_KV_SPILL_RAM_PCT` (block 
 Parking on a pooled cache **declines** to the server's save-and-clear fallback: a park packs to the top of the
 cache, so growing the mirror to its destination would pin the whole context again.
 
+
+## 18. Optional artifacts (`optional/`) — **not part of the delivery**
+
+These exist only in a checkout made with `scripts/apply-all.sh --include-optional`; the delivery itself
+never reads them.  They are catalogued here because a consumer who applies an optional artifact is running
+these code paths and needs the same default/class discipline (`optional/README.md`).
+
+`optional/two-lane-prefill` (from PR #268, @slavap):
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `LLAMA_PREFILL_LANES` | `1` | opt-in (value) | `2` enables the two-lane prefill (two consecutive prefill ubatches on two backend schedulers, splits submitted alternately).  Anything else, or a layout the artifact cannot reach, logs one WARN and stays single-lane.  **Read and refused under `-sm tensor` (one backend) and under plain `-sm layer` (pipeline parallelism on)** — the reachability table is in `optional/two-lane-prefill/README.md`. |
+| `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
+| `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
 ## Maintaining this file
 

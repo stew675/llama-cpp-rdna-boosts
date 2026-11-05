@@ -1,0 +1,1523 @@
+From 95c29f0d744856307bb6fbcc237fd4cfb5b700b6 Mon Sep 17 00:00:00 2001
+From: "Slava P." <slavap@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:45:57 +0000
+Subject: [PATCH] rdna-boosts [optional]: two-lane prefill
+ (LLAMA_PREFILL_LANES) -- consecutive-ubatch overlap
+
+From PR #268 by @slavap, rebased onto the current delivery set (r220) and reduced to
+what the delivery does not already carry:
+
+- DROPPED: `cpy_tensor_async_nowait` and its CUDA implementation, and the per-copy
+  event ring.  r220 folded those into the delivery (block 12) from this same PR, so
+  the optional patch now USES `ggml_backend_sched_next_copy_event` /
+  `cpy_tensor_async_nowait` instead of defining them.
+- DROPPED: the second copy of `ggml_backend_sched_next_copy_event`.
+- FIXED: the event code no longer spells `hipEventDefault` / `hipEventElapsedTime`
+  unconditionally (`ggml-cuda.cu` still builds for CUDA via nvcc): the elapsed-time
+  hook uses `cudaEventElapsedTime`, and the backend's events are created with
+  timing ONLY when `GGML_SCHED_PAIR_DEBUG>=3`, the one consumer of elapsed time, so
+  applying this patch costs the default path nothing.
+- FIXED: the documented `-sm layer -ts 1,1` dense layout is refused by the feature's
+  own gate on this tree; the README states which layouts are reachable and why.
+
+LLAMA_PREFILL_LANES=2 builds two consecutive prefill ubatches on a second backend
+scheduler and submits their splits alternately
+(ggml_backend_sched_graph_compute_async_pair), so one device's routed experts overlap
+the other device's attention on a wide prefill.  Opt-in, default 1 (single lane); it
+degrades to the existing path when < 2 non-CPU backends, pipeline parallelism,
+no_alloc, or a draft context (ctx_other) is present, and a ubatch is paired only when
+it is wide, output-free, and no nextn (MTP) or F1 layer-input readback is active.
+
+Reachability on this delivery (measured, 3x R9700 / gfx1201): `-sm tensor` counts ONE
+backend (the Meta device wrapping N GPUs) so the pair never engages; plain `-sm layer`
+enables the scheduler's own pipeline parallelism and the feature declines.  The
+reachable layouts are ones that already disable pipeline parallelism, i.e. with
+`--override-tensor`, which is the layout this patch was measured in.
+
+Measured here with the pair engaged (pair decided: splits a=4 b=4, interleaved=1):
+MoE 35B-A3B Q8_0 pp8192 +0.03 %, dense 27B Q6_K_XL nil -- i.e. throughput-neutral on
+balanced devices.  The submitter's +34 % / +13 % are on a 7900 XTX + V620 pair, where
+the two devices differ ~3x and the overlap hides the imbalance.
+
+Validated here: greedy text byte-identical between lanes (prompts/prose-rdna-boosts.txt,
+-n 64, --temp 0 --seed 42); no abort with MTP; default path unchanged.
+---
+ ggml/include/ggml-backend.h     |  20 ++
+ ggml/include/ggml-cuda.h        |   1 +
+ ggml/src/ggml-backend-impl.h    |   8 +
+ ggml/src/ggml-backend.cpp       | 593 ++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu |  37 +-
+ include/llama.h                 |   2 +
+ src/llama-context.cpp           | 252 ++++++++++++--
+ src/llama-context.h             |  30 +-
+ src/llama-cparams.h             |   1 +
+ 9 files changed, 889 insertions(+), 55 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index bff990c7f..dc98f1e1d 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -228,6 +228,9 @@ extern "C" {
+     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
+     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
+     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
++// elapsed milliseconds between two event records (a first, b second); negative when b was recorded before a.
++// Both events must have completed before the query.  Backend-provided; same backend family required.
++GGML_API bool                 ggml_backend_event_elapsed_time(ggml_backend_event_t a, ggml_backend_event_t b, double * ms);
+ 
+     //
+     // Backend device
+@@ -481,6 +484,23 @@ extern "C" {
+     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
++    // Compute two already-allocated graphs (see ggml_backend_sched_alloc_graph) on two schedulers that share the same
++    // backends, submitting their splits alternately so that work of one graph on one device overlaps work of the
++    // other graph on another device. Neither scheduler may have an eval callback set.
++    // The two lanes may share persistent state (KV / recurrent caches): the submission is admitted only when the
++    // lanes have the same split structure or leave no cache hazards (GGML_SCHED_PAIR_DEBUG=1 logs the decision);
++    // otherwise the graphs run one after the other, still correct, just without overlap.
++    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b);
++    // Copy host-resident graph inputs to their split backend with stream-ordered async copies instead of a host wait
++    // and a synchronous copy. The caller must not modify the input data until the graph has been computed
++    // (ggml_backend_sched_synchronize).
++    GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool enable);
++    // Issue each cross-backend copy right after the split that produces its source, on the producer's queue, and
++    // make the consumer wait on an event instead of copying when it is submitted. Without this a copy is enqueued
++    // on the producer's queue only when the consumer is submitted, i.e. behind whatever else was queued there
++    // meanwhile (the other lane of ggml_backend_sched_graph_compute_async_pair), which serializes the devices.
++    // Same caller contract as async inputs: synchronize before the next graph. Needs backends with events.
++    GGML_API void                 ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable);
+     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+ 
+     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81eeae..978571e49 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -42,6 +42,7 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 46313d7f7..dc2095a25 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -313,6 +313,7 @@ extern "C" {
+         bool (*cpy_tensor_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_event_t ev);
+     };
+ 
++
+     struct ggml_backend {
+         ggml_guid_t guid;
+         struct ggml_backend_i iface;
+@@ -516,8 +517,15 @@ extern "C" {
+         // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
+         // that never answers leaves the pool on its own default).
+         void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
++
++        // (optional) optional/two-lane-prefill: milliseconds between two event records (a first, b second),
++        // only used by GGML_SCHED_PAIR_DEBUG diagnostics.  APPENDED at the very end for the positional-
++        // initializer reason above; zero-initialized for backends that do not answer (the elapsed-time debug
++        // output is then simply skipped).
++        bool    (*event_elapsed_time)(ggml_backend_dev_t dev_a, ggml_backend_dev_t dev_b, ggml_backend_event_t a, ggml_backend_event_t b, double * ms);
+     };
+ 
++
+     struct ggml_backend_device {
+         struct ggml_backend_device_i iface;
+         ggml_backend_reg_t reg;
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 169f901a9..2ca825167 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -36,6 +36,14 @@
+     return set ? v.c_str() : nullptr; \
+ }())
+ 
++// Typed views over GGML_ENV_STR, same read-once convention: an integer is parsed in full, a flag is any
++// non-zero integer (presence with an empty value reads 0, as everywhere else in this file).
++#define GGML_ENV_INT(name, def) ([]() -> int { \
++    static const int v = []() { const char * e = getenv(name); return e != nullptr ? atoi(e) : (def); }(); \
++    return v; \
++}())
++#define GGML_ENV_FLAG(name, def) (GGML_ENV_INT(name, (def) ? 1 : 0) != 0)
++
+ #ifdef __APPLE__
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -978,6 +986,17 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
+     backend->iface.event_wait(backend, event);
+ }
+ 
++// elapsed milliseconds between two event records (a first, b second); negative when b was recorded before
++// a.  Both events must have completed before the query.  Backend-provided (device iface hook); the
++// two events must come from the same backend family.
++bool ggml_backend_event_elapsed_time(ggml_backend_event_t a, ggml_backend_event_t b, double * ms) {
++    if (a == NULL || b == NULL || a->device == NULL || b->device == NULL ||
++        a->device->iface.event_elapsed_time == NULL) {
++        return false;
++    }
++    return a->device->iface.event_elapsed_time(a->device, b->device, a, b, ms);
++}
++
+ static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
+     GGML_ASSERT(backend);
+     if (backend->iface.graph_optimize != NULL) {
+@@ -1197,6 +1216,9 @@ struct ggml_backend_sched_split {
+     struct ggml_tensor ** inputs;
+     int n_inputs;
+     int inputs_capacity;
++    // per input: event recorded on the producer backend after an eager copy of this input (NULL: copy lazily)
++    ggml_backend_event_t * input_events;
++    int input_events_capacity;
+     // graph view of this split
+     struct ggml_cgraph graph;
+ };
+@@ -1219,6 +1241,7 @@ struct ggml_backend_sched {
+     // hash map of the nodes in the graph
+     struct ggml_hash_set  hash_set;
+     int                 * hv_tensor_backend_ids; // [hash_set.size]
++    int                 * hv_tensor_split_ids;   // [hash_set.size] the split that produced the tensor (-1: not a split node)
+     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+ 
+     int * node_backend_ids; // [graph_size]
+@@ -1247,6 +1270,14 @@ struct ggml_backend_sched {
+     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
+     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
+     int copy_event_used[GGML_SCHED_MAX_BACKENDS];
++
++    // optional/two-lane-prefill: copy graph inputs that live in host memory to the split backend with a
++    // stream-ordered async copy instead of a host wait + synchronous copy (ggml_backend_sched_set_async_inputs);
++    // the caller guarantees the host data is not modified before the graph has been computed
++    bool async_inputs;
++    // optional/two-lane-prefill: issue each cross-backend copy right after the split that produces its source
++    // (ggml_backend_sched_set_eager_copies), on the delivery's per-copy ring event above
++    bool eager_copies;
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -1316,8 +1347,17 @@ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split
+         GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(struct ggml_tensor *));
+         GGML_ABORT("failed to grow split inputs container");
+     }
++    const int old_cap = split->inputs_capacity;
+     split->inputs = pnew;
+     split->inputs_capacity = new_cap;
++    auto * enew = (ggml_backend_event_t *) realloc((void *) split->input_events, new_cap * sizeof(ggml_backend_event_t));
++    if (enew == NULL) {
++        GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(ggml_backend_event_t));
++        GGML_ABORT("failed to grow split input events container");
++    }
++    split->input_events = enew;
++    split->input_events_capacity = new_cap;
++    memset(enew + old_cap, 0, (new_cap - old_cap) * sizeof(ggml_backend_event_t));
+ }
+ 
+ static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
+@@ -2151,6 +2191,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         sched->n_splits = i_split + 1;
+     }
+ 
++    // which split produced which tensor: the eager-copy mapping (a consumer input is eager-copied when its
++    // producer split runs) and the pair name guard both key on it
++    for (int i = 0; i < sched->n_splits; i++) {
++        const struct ggml_backend_sched_split & sp = sched->splits[i];
++        for (int j = sp.i_start; j < sp.i_end; j++) {
++            struct ggml_tensor * node = graph->nodes[j];
++            if (ggml_is_view_op(node->op)) {
++                continue;
++            }
++            sched->hv_tensor_split_ids[hash_id(node)] = i;
++        }
++    }
++
+     if (sched->debug) {
+         ggml_backend_sched_print_assignments(sched, graph);
+     }
+@@ -2263,6 +2316,41 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+     int n_dep_nodes_added = 0;
+ 
++    // eager copies (ggml_backend_sched_compute_splits) write a consumer split's input copy right after its producer
++    // split, on the source stream. An input copy allocated at the consumer's position may share memory with tensors
++    // of the destination splits in between, which would then overwrite it (write-after-read against the reusable
++    // buffer). Allocate such copies at the producer's position instead: their live range then spans producer ->
++    // consumer and nothing in between can alias them. eager_producer[c][k] is the producer split of consumer split
++    // c's input k, or -1 when the copy stays at the consumer.
++    std::vector<std::vector<int>> eager_producer;
++    if (sched->eager_copies) {
++        eager_producer.resize(sched->n_splits);
++        for (int c = 0; c < sched->n_splits; c++) {
++            struct ggml_backend_sched_split * cs = &sched->splits[c];
++            eager_producer[c].assign(cs->n_inputs, -1);
++            for (int k = 0; k < cs->n_inputs; k++) {
++                struct ggml_tensor * x = cs->inputs[k];
++                if (ggml_nbytes(x) == 0 || ggml_backend_sched_graph_input(x) != NULL) {
++                    continue;
++                }
++                if (x->buffer != NULL && ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                    continue;
++                }
++                const int ps = sched->hv_tensor_split_ids[hash_id(x)];
++                if (ps < 0 || ps >= c || sched->splits[ps].backend_id == cs->backend_id) {
++                    continue;
++                }
++                // the same capabilities the issue loop below requires (it re-checks per copy)
++                if (sched->backends[sched->splits[ps].backend_id]->iface.cpy_tensor_async == NULL ||
++                        sched->backends[sched->splits[ps].backend_id]->iface.event_record == NULL ||
++                        sched->backends[cs->backend_id]->iface.event_wait == NULL) {
++                    continue;
++                }
++                eager_producer[c][k] = ps;
++            }
++        }
++    }
++
+     for (int i = 0; i < sched->n_splits; i++) {
+         struct ggml_backend_sched_split * split = &sched->splits[i];
+ 
+@@ -2281,8 +2369,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
+ 
+             // add a dependency to the input copy so that it is allocated at the start of the split
+-            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+-            graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
++            // (eager-copied inputs were already placed after their producer split)
++            if (eager_producer.empty() || eager_producer[i][j] < 0) {
++                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
++                graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
++            }
+         }
+ 
+         for (int j = split->i_start; j < split->i_end; j++) {
+@@ -2310,6 +2401,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                 }
+             }
+         }
++
++        // input copies of later splits that this split produces and that will be eager-copied: allocate them here
++        if (!eager_producer.empty()) {
++            for (int c = i + 1; c < sched->n_splits; c++) {
++                struct ggml_backend_sched_split * cs = &sched->splits[c];
++                for (int k = 0; k < cs->n_inputs; k++) {
++                    if (eager_producer[c][k] != i) {
++                        continue;
++                    }
++                    assert(graph_copy->size > graph_copy->n_nodes);
++                    struct ggml_tensor * input_cpy = tensor_id_copy(hash_id(cs->inputs[k]), cs->backend_id, sched->cur_copy);
++                    sched->node_backend_ids[graph_copy->n_nodes] = cs->backend_id;
++                    graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
++                }
++            }
++        }
+     }
+ 
+     // a mismatch means a backend added a dep with an `until` tensor that is not a node of the optimized graph
+@@ -2836,12 +2943,14 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
+-// Per-scheduler state for the copy helper below (the ids readback cache: consecutive
+-// expert inputs of one split, e.g. a merged gate/up pair, share the routing ids).
+-struct ggml_backend_sched_copy_state {
++// Per-scheduler state of the split loop, kept outside the loop so two schedulers can interleave their splits
++// (ggml_backend_sched_graph_compute_async_pair).  The ids readback cache: consecutive expert inputs of one
++// split, e.g. a merged gate/up pair, share the routing ids.
++struct ggml_backend_sched_compute_state {
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
++    int prev_backend_id = -1;
+ };
+ 
+ // Copy one split input to the split backend.  Expert inputs of a host-resident routed
+@@ -2851,7 +2960,8 @@ struct ggml_backend_sched_copy_state {
+ // and upstream's llama_moe_cache (behind --moe-cache-mib) stays dormant.
+ // r220: the next per-copy event for a source backend.  A ring, so a wrap re-records a slot only after its
+ // previous record has completed: re-recording one that a consumer still has queued would re-bind that
+-// consumer to the new record (the very hazard per-copy events exist to remove).
++// consumer to the new record (the very hazard per-copy events exist to remove).  Used by the general
++// cross-backend copy below and by optional/two-lane-prefill's eager copies.
+ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sched_t sched, int backend_id) {
+     ggml_backend_event_t & ev = sched->copy_events[backend_id][sched->copy_event_next[backend_id]];
+     sched->copy_event_next[backend_id] = (sched->copy_event_next[backend_id] + 1) % GGML_SCHED_COPY_EVENTS;
+@@ -2867,9 +2977,18 @@ static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sche
+     return ev;
+ }
+ 
+-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
++static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int input_id, ggml_backend_sched_compute_state & st) {
++    struct ggml_tensor * input = split->inputs[input_id];
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
++
++    // already copied right after its producer (eager copies): only order this backend after that copy, then skip
++    if (split->input_events[input_id] != NULL) {
++        ggml_backend_event_wait(split_backend, split->input_events[input_id]);
++        split->input_events[input_id] = NULL;
++        return;
++    }
++
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
+@@ -2880,13 +2999,24 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+ 
+     if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+         (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
+-        // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++        if (sched->async_inputs && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
++                split_backend->iface.set_tensor_async != NULL && split_backend->iface.event_wait != NULL) {
++            // stream-ordered host input copy: wait for this backend's previous split on-stream, then enqueue the
++            // H2D; the host goes on without blocking. The caller must not modify the input data until the graph has
++            // been computed (ggml_backend_sched_synchronize)
++            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
++            }
++            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input_cpy));
+         } else {
+-            ggml_backend_synchronize(split_backend);
++            // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
++            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++            } else {
++                ggml_backend_synchronize(split_backend);
++            }
++            ggml_backend_tensor_copy(input, input_cpy);
+         }
+-        ggml_backend_tensor_copy(input, input_cpy);
+     } else {
+         // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
+         // real split input, then free the slot.  Both the D2D and the compute are on the main
+@@ -3229,27 +3359,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     }
+ }
+ 
+-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+-    GGML_ASSERT(sched);
+-    struct ggml_backend_sched_split * splits = sched->splits;
+-
+-    int prev_backend_id = -1;
+-    ggml_backend_sched_copy_state st;
++// input events are set by the eager copies at their producer and consumed (reset) by the consumer split; an
++// aborted compute can leave some set, and a reused graph would then wait on a stale event and skip its copy
++// - clear them at every compute entry
++static void ggml_backend_sched_clear_input_events(ggml_backend_sched_t sched) {
++    for (int i = 0; i < sched->n_splits; i++) {
++        struct ggml_backend_sched_split & sp = sched->splits[i];
++        if (sp.input_events) {
++            memset(sp.input_events, 0, sp.inputs_capacity * sizeof(ggml_backend_event_t));
++        }
++    }
++}
+ 
+-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+-        struct ggml_backend_sched_split * split = &splits[split_id];
+-        int split_backend_id = split->backend_id;
+-        ggml_backend_t split_backend = sched->backends[split_backend_id];
++static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id, ggml_backend_sched_compute_state & st) {
++    struct ggml_backend_sched_split * split = &sched->splits[split_id];
++    int split_backend_id = split->backend_id;
++    ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
+-        sched_stage_issue(sched, split);
++    sched_stage_issue(sched, split);
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
++        if (split->n_inputs == 0 && st.prev_backend_id >= 0 && st.prev_backend_id != split_backend_id) {
++            if (sched->events[st.prev_backend_id][sched->cur_copy] != NULL) {
++                ggml_backend_event_synchronize(sched->events[st.prev_backend_id][sched->cur_copy]);
+             } else {
+-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
++                ggml_backend_synchronize(sched->backends[st.prev_backend_id]);
+             }
+         }
+ 
+@@ -3257,12 +3392,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], st);
++                ggml_backend_sched_copy_input(sched, split, input_id, st);
+             }
+         }
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], st);
++                ggml_backend_sched_copy_input(sched, split, input_id, st);
+             }
+         }
+ 
+@@ -3305,6 +3440,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // eager copies: push this split's outputs that later splits on other backends consume, now, on this
++        // backend's queue (right behind their producer), and leave the consumer an event to wait on.
++        // Without this a copy is enqueued on the producer's queue only when the consumer is submitted - in
++        // ggml_backend_sched_graph_compute_async_pair, behind the other lane's split queued meanwhile -
++        // which serializes the devices
++        if (sched->eager_copies && split_backend->iface.cpy_tensor_async != NULL &&
++                split_backend->iface.event_record != NULL) {
++            for (int c = split_id + 1; c < sched->n_splits; c++) {
++                struct ggml_backend_sched_split * cs = &sched->splits[c];
++                if (cs->backend_id == split_backend_id) {
++                    continue;
++                }
++                ggml_backend_t dst_backend = sched->backends[cs->backend_id];
++                if (dst_backend->iface.event_wait == NULL) {
++                    continue;
++                }
++                for (int k = 0; k < cs->n_inputs; k++) {
++                    struct ggml_tensor * x = cs->inputs[k];
++                    if (ggml_nbytes(x) == 0 || cs->input_events[k] != NULL) {
++                        continue;
++                    }
++                    // a graph input (or a view of one) is copied by the host-input path, not cross-backend
++                    if (ggml_backend_sched_graph_input(x) != NULL) {
++                        continue;
++                    }
++                    if (x->buffer != NULL && ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                        continue;
++                    }
++                    // the producer of a view is the viewed tensor's producer
++                    struct ggml_tensor * root = x;
++                    while (root->view_src) {
++                        root = root->view_src;
++                    }
++                    if (sched->hv_tensor_split_ids[hash_id(root)] != split_id) {
++                        continue;
++                    }
++                    ggml_backend_event_t ev = ggml_backend_sched_next_copy_event(sched, split_backend_id);
++                    if (ev == NULL) {
++                        continue;
++                    }
++                    struct ggml_tensor * input_cpy = tensor_copy(x, cs->backend_id, sched->cur_copy);
++                    // nowait: the copy is issued on the source stream and `ev` is recorded there right behind it;
++                    // the consumer split waits on `ev`.  The plain cpy_tensor_async instead re-records the shared
++                    // per-device copy event and waits on it on the dst stream: on HIP a queued wait binds to the
++                    // LATEST record at execution, so the other lane's later copies would rebind this wait to a much
++                    // later record and serialize the pair (block 16, measured: 0% overlap in every layout).
++                    if (split_backend->iface.cpy_tensor_async_nowait != NULL) {
++                        if (!split_backend->iface.cpy_tensor_async_nowait(split_backend, dst_backend, x, input_cpy, ev)) {
++                            continue;
++                        }
++                    } else {
++                        if (!split_backend->iface.cpy_tensor_async(split_backend, dst_backend, x, input_cpy)) {
++                            continue;
++                        }
++                        ggml_backend_event_record(ev, split_backend);
++                    }
++                    cs->input_events[k] = ev;
++                }
++            }
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+@@ -3318,9 +3514,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
+-        prev_backend_id = split_backend_id;
+-    }
++        st.prev_backend_id = split_backend_id;
++
++        return GGML_STATUS_SUCCESS;
++}
+ 
++static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
++    GGML_ASSERT(sched);
++    ggml_backend_sched_clear_input_events(sched);
++    ggml_backend_sched_compute_state st;
++    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
++        enum ggml_status ec = ggml_backend_sched_compute_split(sched, split_id, st);
++        if (ec != GGML_STATUS_SUCCESS) {
++            return ec;
++        }
++    }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -3354,7 +3562,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+     sched->hash_set    = ggml_hash_set_new(graph_size);
+     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
++    sched->hv_tensor_split_ids   = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_split_ids[0]));
+     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
++    memset(sched->hv_tensor_split_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_split_ids[0]));
+ 
+     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
+     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+@@ -3494,10 +3704,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     ggml_hash_set_free(&sched->hash_set);
+     for (int i = 0; i < sched->splits_capacity; i++) {
+         free(sched->splits[i].inputs);
++        free(sched->splits[i].input_events);
+     }
+     free(sched->splits);
+     free(sched->graph_inputs);
+     free(sched->hv_tensor_backend_ids);
++    free(sched->hv_tensor_split_ids);
+     free(sched->hv_tensor_copies);
+     free(sched->node_backend_ids);
+     free(sched->leaf_backend_ids);
+@@ -3515,6 +3727,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+     if (!sched->is_reset) {
+         ggml_hash_set_reset(&sched->hash_set);
+         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
++        memset(sched->hv_tensor_split_ids,   -1, sched->hash_set.size * sizeof(sched->hv_tensor_split_ids[0]));
+         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+         sched->is_reset = true;
+     }
+@@ -3605,6 +3818,324 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+     return ggml_backend_sched_compute_splits(sched);
+ }
+ 
++// halo-hybrid: data hazards on the persistent state two lanes share (KV / recurrent caches: buffers that are
++// neither weights nor compute - compute tensors carry GGML_BACKEND_BUFFER_USAGE_COMPUTE and never match).
++// The alternating submission a0 b0 a1 b1 ... orders a's split j before b's split i only when both run on the
++// same backend stream and j <= i, so every write of a to a cache tensor must reach b's reads and writes of it
++// that way, and every read of a must precede b's writes the same way. Per whole cache tensor (conservative).
++// Returns the number of violations, logging the first n_log. a_shift delays lane a's split indices (self-test:
++// a pair that is hazard-free in lockstep must show hazards when a is delayed one split).
++static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend_sched_t sb, int n_log, int * n_cross, int a_shift) {
++    struct acc { int split; int backend; bool write; };
++    std::unordered_map<const ggml_tensor *, std::vector<acc>> use[2];
++    auto root = [](const ggml_tensor * t) {
++        while (t->view_src) {
++            t = t->view_src;
++        }
++        return t;
++    };
++    auto cache = [](const ggml_tensor * r) {
++        return r->buffer != nullptr && ggml_backend_buffer_get_usage(r->buffer) == GGML_BACKEND_BUFFER_USAGE_ANY;
++    };
++    ggml_backend_sched_t lanes[2] = { sa, sb };
++    for (int l = 0; l < 2; l++) {
++        ggml_backend_sched_t s = lanes[l];
++        for (int i = 0; i < s->n_splits; i++) {
++            const struct ggml_backend_sched_split & sp = s->splits[i];
++            for (int k = 0; k < sp.n_inputs; k++) {   // an input copied in from another backend: read at this split
++                const ggml_tensor * r = root(sp.inputs[k]);
++                if (cache(r)) {
++                    use[l][r].push_back({ i + (l == 0 ? a_shift : 0), sp.backend_id, false });
++                }
++            }
++            for (int n = 0; n < sp.graph.n_nodes; n++) {
++                const ggml_tensor * t = sp.graph.nodes[n];
++                if (ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
++                    continue;
++                }
++                const ggml_tensor * r = root(t);
++                if (cache(r)) {
++                    use[l][r].push_back({ i + (l == 0 ? a_shift : 0), sp.backend_id, true });
++                }
++                for (int j = 0; j < GGML_MAX_SRC; j++) {
++                    if (t->src[j] && cache(root(t->src[j]))) {
++                        use[l][root(t->src[j])].push_back({ i + (l == 0 ? a_shift : 0), sp.backend_id, false });
++                    }
++                }
++            }
++        }
++    }
++    int n_bad = 0;
++    if (n_cross) {
++        *n_cross = 0;
++    }
++    for (const auto & it : use[0]) {
++        const auto jt = use[1].find(it.first);
++        if (jt == use[1].end()) {
++            continue;
++        }
++        for (const acc & x : it.second) {
++            for (const acc & y : jt->second) {
++                if (!x.write && !y.write) {
++                    continue;
++                }
++                if (x.split <= y.split && x.backend == y.backend) {
++                    continue;
++                }
++                if (n_cross && x.backend != y.backend) {
++                    (*n_cross)++;
++                }
++                if (n_bad++ < n_log) {
++                    GGML_LOG_WARN("  pair hazard on %s: a %s at split %d (%s) | b %s at split %d (%s)\n", it.first->name,
++                        x.write ? "writes" : "reads", x.split, ggml_backend_name(sa->backends[x.backend]),
++                        y.write ? "writes" : "reads", y.split, ggml_backend_name(sb->backends[y.backend]));
++                }
++            }
++        }
++    }
++    return n_bad;
++}
++
++enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b) {
++    GGML_ASSERT(sched_a && sched_b && sched_a != sched_b);
++    GGML_ASSERT(sched_a->is_alloc && sched_b->is_alloc);
++    GGML_ASSERT(!sched_a->callback_eval && !sched_b->callback_eval);
++    GGML_ASSERT(sched_a->n_backends == sched_b->n_backends);
++    for (int i = 0; i < sched_a->n_backends; i++) {
++        GGML_ASSERT(sched_a->backends[i] == sched_b->backends[i]);
++    }
++    ggml_backend_sched_clear_input_events(sched_a);
++    ggml_backend_sched_clear_input_events(sched_b);
++
++    // the interleaving below is only safe when both lanes have the same split structure (split i of a and of b
++    // cover the same layers on the same backend, so a's writes to the KV / recurrent state of a layer are queued
++    // before b's reads). Different structures (e.g. a different ubatch width changing placement) fall back to
++    // running a completely, then b - still correct, just without overlap.
++    {
++        // same layers per split = same backend and the same first and last node (by name); node COUNTS may differ
++        // legitimately between the two ubatches
++        auto node_name = [](const struct ggml_backend_sched_split & sp, bool last) -> const char * {
++            return sp.graph.n_nodes > 0 ? sp.graph.nodes[last ? sp.graph.n_nodes - 1 : 0]->name : "";
++        };
++        bool same = sched_a->n_splits == sched_b->n_splits;
++        for (int i = 0; same && i < sched_a->n_splits; i++) {
++            const struct ggml_backend_sched_split & xa = sched_a->splits[i];
++            const struct ggml_backend_sched_split & xb = sched_b->splits[i];
++            same = xa.backend_id == xb.backend_id && strcmp(node_name(xa, false), node_name(xb, false)) == 0 &&
++                   strcmp(node_name(xa, true), node_name(xb, true)) == 0;
++        }
++        // a pair whose split names differ still interleaves when it has no cache hazards (a batch that starts a
++        // sequence: every admitted pair has none). GGML_SCHED_PAIR_HAZARD=0 keeps the name guard alone;
++        // GGML_SCHED_PAIR_DEBUG=1 logs the hazard count of every pair (accepted or not);
++        // GGML_SCHED_PAIR_DEBUG>=2 also runs the self-test (lane a delayed one split must show hazards)
++        static const bool  pair_debug   = GGML_ENV_FLAG("GGML_SCHED_PAIR_DEBUG", false);
++        static const int   pair_dbg_lvl = GGML_ENV_INT("GGML_SCHED_PAIR_DEBUG", 0);
++        static const bool  pair_hazard  = GGML_ENV_FLAG("GGML_SCHED_PAIR_HAZARD", true);
++        static int  n_refused_logged = 0;
++        static int  n_reorder_logged = 0;
++        static int  n_admitted_logged = 0;
++        if (pair_hazard) {
++            int n_cross = 0;
++            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, pair_debug ? 8 : 0, &n_cross, 0);
++            if (pair_dbg_lvl >= 2) {
++                GGML_LOG_WARN("%s: self-test, a delayed one split: %d cache hazards\n", __func__,
++                    ggml_backend_sched_pair_hazards(sched_a, sched_b, 2, nullptr, 1));
++            }
++            if (!same && n_bad == 0) {
++                // admitted by the hazard check, which models the alternating order only
++                same = true;
++            } else if (same && n_cross > 0) {
++                // a names-match pair is refused only for a hazard that crosses backends (a CPU split, or a cache
++                // reader on the other device); a same-backend reorder is what the name guard always admitted
++                same = false;
++                if (n_refused_logged++ < 4) {
++                    GGML_LOG_WARN("%s: the lanes match but leave %d cache hazards (%d across backends): running them one after the other\n",
++                        __func__, n_bad, n_cross);
++                }
++            } else if (same && n_bad > 0 && (pair_debug || n_reorder_logged++ < 4)) {
++                GGML_LOG_WARN("%s: the lanes match with %d same-stream reorders and no cross-backend hazard: interleaving (name guard)\n",
++                    __func__, n_bad);
++            }
++        }
++        if (pair_debug && n_admitted_logged++ < 4) {
++            GGML_LOG_WARN("%s: pair decided: splits a=%d b=%d, interleaved=%d\n", __func__,
++                sched_a->n_splits, sched_b->n_splits, (int) same);
++        }
++        if (!same) {
++            static int n_logged = 0;
++            if (n_logged++ < 4) {
++                GGML_LOG_WARN("%s: the two lanes have different split structures (%d vs %d splits): running them one after the other\n",
++                    __func__, sched_a->n_splits, sched_b->n_splits);
++                const int n = std::max(sched_a->n_splits, sched_b->n_splits);
++                for (int i = 0; i < n; i++) {
++                    const struct ggml_backend_sched_split * xa = i < sched_a->n_splits ? &sched_a->splits[i] : nullptr;
++                    const struct ggml_backend_sched_split * xb = i < sched_b->n_splits ? &sched_b->splits[i] : nullptr;
++                    const bool diff = !xa || !xb || xa->backend_id != xb->backend_id ||
++                        (xa->graph.n_nodes && xb->graph.n_nodes && (strcmp(xa->graph.nodes[0]->name, xb->graph.nodes[0]->name) != 0 ||
++                         strcmp(xa->graph.nodes[xa->graph.n_nodes-1]->name, xb->graph.nodes[xb->graph.n_nodes-1]->name) != 0));
++                    if (diff) {
++                        GGML_LOG_WARN("  split %d: a %s %d nodes (%s .. %s) | b %s %d nodes (%s .. %s)\n", i,
++                            xa ? ggml_backend_name(sched_a->backends[xa->backend_id]) : "-", xa ? xa->i_end - xa->i_start : 0,
++                            xa && xa->graph.n_nodes ? xa->graph.nodes[0]->name : "-", xa && xa->graph.n_nodes ? xa->graph.nodes[xa->graph.n_nodes-1]->name : "-",
++                            xb ? ggml_backend_name(sched_b->backends[xb->backend_id]) : "-", xb ? xb->i_end - xb->i_start : 0,
++                            xb && xb->graph.n_nodes ? xb->graph.nodes[0]->name : "-", xb && xb->graph.n_nodes ? xb->graph.nodes[xb->graph.n_nodes-1]->name : "-");
++                    }
++                }
++            }
++            ggml_backend_sched_compute_state st;
++            for (int split_id = 0; split_id < sched_a->n_splits; split_id++) {
++                enum ggml_status ec = ggml_backend_sched_compute_split(sched_a, split_id, st);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    return ec;
++                }
++            }
++            ggml_backend_sched_compute_state st2;
++            for (int split_id = 0; split_id < sched_b->n_splits; split_id++) {
++                enum ggml_status ec = ggml_backend_sched_compute_split(sched_b, split_id, st2);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    return ec;
++                }
++            }
++            return GGML_STATUS_SUCCESS;
++        }
++    }
++    // splits are submitted alternately: a0 b0 a1 b1 ... Each backend runs its own in-order stream, so while
++    // a1 (say, the experts on the second device) waits for a0, b0 already runs on the first device.
++    // Cross-graph ordering (b reads the KV/recurrent state a writes at the same layer) follows from a's split i
++    // being queued on the shared stream before b's split i.
++    ggml_backend_sched_compute_state st_a, st_b;
++    const int n = std::max(sched_a->n_splits, sched_b->n_splits);
++    // GGML_SCHED_PAIR_DEBUG>=3: per-split host wall times AND per-lane/per-backend GPU start/end events.
++    // If every submit returns in a few ms, the host ran ahead and any serialization is device-side; the
++    // event table (offsets from lane a's first record, after a debug-only full sync at pair end) shows
++    // where the lanes' chunks actually start and finish on each device.
++    static const bool pair_ts = GGML_ENV_INT("GGML_SCHED_PAIR_DEBUG", 0) >= 3;
++    const int64_t t_pair0 = pair_ts ? ggml_time_us() : 0;
++    constexpr int PAIR_TS_MAX_B = 8;
++    ggml_backend_event_t ev_start[2][PAIR_TS_MAX_B] = {};
++    ggml_backend_event_t ev_end[2][PAIR_TS_MAX_B]   = {};
++    int first_sp[2][PAIR_TS_MAX_B] = {};
++    int last_sp[2][PAIR_TS_MAX_B]  = {};
++    if (pair_ts) {
++        for (int l = 0; l < 2; l++) {
++            ggml_backend_sched_t s = l == 0 ? sched_a : sched_b;
++            for (int i = 0; i < s->n_backends; i++) {
++                first_sp[l][i] = -1;
++                last_sp[l][i]  = -1;
++            }
++            for (int sp = 0; sp < s->n_splits; sp++) {
++                const int b = s->splits[sp].backend_id;
++                if (first_sp[l][b] < 0) {
++                    first_sp[l][b] = sp;
++                }
++                last_sp[l][b] = sp;
++            }
++        }
++    }
++    auto submit_ts = [&](const char * lane, ggml_backend_sched_t sched, int split_id,
++                         ggml_backend_sched_compute_state & st) -> enum ggml_status {
++        const int l  = (lane[0] == 'a') ? 0 : 1;
++        const struct ggml_backend_sched_split * sp = &sched->splits[split_id];
++        const int b = sp->backend_id;
++        ggml_backend_t be = sched->backends[b];
++        if (pair_ts && first_sp[l][b] == split_id) {
++            // not every backend has event support (the CPU backend has no event_record)
++            ev_start[l][b] = ggml_backend_event_new(be->device);
++            if (ev_start[l][b] != nullptr && be->iface.event_record != NULL) {
++                ggml_backend_event_record(ev_start[l][b], be);
++            } else {
++                ev_start[l][b] = nullptr;
++            }
++        }
++        const int64_t t0 = ggml_time_us();
++        enum ggml_status ec = ggml_backend_sched_compute_split(sched, split_id, st);
++        if (pair_ts && last_sp[l][b] == split_id) {
++            ev_end[l][b] = ggml_backend_event_new(be->device);
++            if (ev_end[l][b] != nullptr && be->iface.event_record != NULL) {
++                ggml_backend_event_record(ev_end[l][b], be);
++            } else {
++                ev_end[l][b] = nullptr;
++            }
++        }
++        if (pair_ts) {
++            GGML_LOG_WARN("pair-ts lane=%s split=%2d/%d backend=%s inputs=%2d host_us=%8lld cum_ms=%8.1f first=%s last=%s\n",
++                lane, split_id, sched->n_splits, ggml_backend_name(be), sp->n_inputs,
++                (long long) (ggml_time_us() - t0), (ggml_time_us() - t_pair0) / 1000.0,
++                sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "-",
++                sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1]->name : "-");
++        }
++        return ec;
++    };
++    for (int split_id = 0; split_id < n; split_id++) {
++        if (split_id < sched_a->n_splits) {
++            enum ggml_status ec = submit_ts("a", sched_a, split_id, st_a);
++            if (ec != GGML_STATUS_SUCCESS) {
++                return ec;
++            }
++        }
++        if (split_id < sched_b->n_splits) {
++            enum ggml_status ec = submit_ts("b", sched_b, split_id, st_b);
++            if (ec != GGML_STATUS_SUCCESS) {
++                return ec;
++            }
++        }
++    }
++    if (pair_ts) {
++        for (int i = 0; i < sched_a->n_backends; i++) {
++            ggml_backend_synchronize(sched_a->backends[i]);
++        }
++        GGML_LOG_WARN("pair-ts total host_us=%lld\n", (long long) (ggml_time_us() - t_pair0));
++        // offsets in ms from the first recorded lane-a event; -1 = not recorded / not queryable
++        ggml_backend_event_t ref = nullptr;
++        for (int i = 0; i < sched_a->n_backends && ref == nullptr; i++) {
++            ref = ev_start[0][i];
++        }
++        auto off = [&](ggml_backend_event_t e) -> double {
++            if (ref == nullptr || e == nullptr) {
++                return -1.0;
++            }
++            double ms = -1.0;
++            if (ggml_backend_event_elapsed_time(ref, e, &ms)) {
++                return ms;
++            }
++            return -1.0;
++        };
++        const char * names[PAIR_TS_MAX_B] = { "CPU", "GPU0", "GPU1", "GPU2", "GPU3", "GPU4", "GPU5", "GPU6" };
++        for (int i = 0; i < sched_a->n_backends; i++) {
++            names[i] = ggml_backend_name(sched_a->backends[i]);
++        }
++        for (int l = 0; l < 2; l++) {
++            GGML_LOG_WARN("pair-ev lane=%c:", l == 0 ? 'a' : 'b');
++            for (int b = 0; b < sched_a->n_backends; b++) {
++                GGML_LOG_WARN("  %-8s start=%8.1f end=%8.1f", names[b],
++                    off(ev_start[l][b]), off(ev_end[l][b]));
++            }
++            GGML_LOG_WARN("\n");
++        }
++        for (int l = 0; l < 2; l++) {
++            for (int b = 0; b < sched_a->n_backends; b++) {
++                if (ev_start[l][b] != nullptr && ev_end[l][b] != nullptr) {
++                    double ms = 0;
++                    if (ggml_backend_event_elapsed_time(ev_start[l][b], ev_end[l][b], &ms)) {
++                        GGML_LOG_WARN("pair-ev span lane=%c %-8s = %8.1f ms\n", l == 0 ? 'a' : 'b', names[b], ms);
++                    }
++                }
++            }
++        }
++    }
++    return GGML_STATUS_SUCCESS;
++}
++
++void ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool enable) {
++    GGML_ASSERT(sched);
++    sched->async_inputs = enable;
++}
++
++void ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable) {
++    GGML_ASSERT(sched);
++    sched->eager_copies = enable;
++}
++
+ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     for (int i = 0; i < sched->n_backends; i++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 08eea6151..74f262c0c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9487,7 +9487,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+     ggml_cuda_set_device(dev_ctx->device);
+ 
+     cudaEvent_t event;
+-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
++    // optional/two-lane-prefill: only the elapsed-time diagnostic (GGML_SCHED_PAIR_DEBUG>=3) needs a TIMING
++    // event, and a timing event is the more expensive one to record.  Keep every other event non-timing so the
++    // patch costs the default path nothing.  `hipEventDefault`/`cudaEventDefault` and the elapsed-time query
++    // have no hipify alias, so they follow the `#ifdef GGML_USE_HIP` form this file already uses (the per-op
++    // timing block) -- an unguarded `hip*` spelling does not compile for CUDA (nvcc).
++    static const bool timing_events = [] {
++        const char * e = getenv("GGML_SCHED_PAIR_DEBUG");
++        return e != nullptr && atoi(e) >= 3;
++    }();
++#ifdef GGML_USE_HIP
++    CUDA_CHECK(cudaEventCreateWithFlags(&event, timing_events ? hipEventDefault : hipEventDisableTiming));
++#else
++    CUDA_CHECK(cudaEventCreateWithFlags(&event, timing_events ? cudaEventDefault : cudaEventDisableTiming));
++#endif
+ 
+     return new ggml_backend_event {
+         /* .device  = */ dev,
+@@ -9508,6 +9521,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+ }
+ 
++static bool ggml_backend_cuda_device_event_elapsed_time(ggml_backend_dev_t dev_a, ggml_backend_dev_t dev_b,
++        ggml_backend_event_t a, ggml_backend_event_t b, double * ms) {
++    (void) dev_a;
++    (void) dev_b;
++    float f = 0;
++    if (a == NULL || b == NULL) {
++        return false;
++    }
++#ifdef GGML_USE_HIP
++    const bool elapsed_ok = hipEventElapsedTime(&f, (hipEvent_t) a->context, (hipEvent_t) b->context) == hipSuccess;
++#else
++    const bool elapsed_ok = cudaEventElapsedTime(&f, (cudaEvent_t) a->context, (cudaEvent_t) b->context) == cudaSuccess;
++#endif
++    if (!elapsed_ok) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    *ms = f;
++    return true;
++}
++
+ // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
+ // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
+ // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
+@@ -9790,6 +9824,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
+     /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
+     /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
++    /* .event_elapsed_time       = */ ggml_backend_cuda_device_event_elapsed_time,
+ };
+ 
+ // backend reg
+diff --git a/include/llama.h b/include/llama.h
+index 6962f1dd2..55a0ae4c0 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -644,6 +644,8 @@ extern "C" {
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
++    // halo-hybrid: number of prefill lanes the context resolved (1, or 2 with LLAMA_PREFILL_LANES on an eligible layout)
++    LLAMA_API uint32_t llama_n_prefill_lanes(const struct llama_context * ctx);
+ 
+     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
+     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 25b303b58..7b6fe1da3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1516,6 +1516,59 @@ void llama_context::sched_reserve() {
+         }
+     }
+ 
++    // halo-hybrid: two-lane prefill. Consecutive prefill ubatches are built on two schedulers and their splits are
++    // submitted alternately (ggml_backend_sched_graph_compute_async_pair), so one device's experts overlap the
++    // other's attention. Costs a second set of compute buffers. Needs >= 2 non-CPU backends, no pipeline
++    // parallelism, and a target context (the draft's second scheduler would collide with this one).
++    cparams.prefill_lanes = 1;
++    {
++        int64_t lanes_req = 1;
++        const char * e = getenv("LLAMA_PREFILL_LANES");
++        if (e != nullptr) {
++            lanes_req = (int64_t) atoi(e);
++        }
++        int n_gpu = 0;
++        for (auto & backend : backends) {
++            if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                n_gpu++;
++            }
++        }
++        if (lanes_req >= 2 && n_gpu >= 2 && !cparams.pipeline_parallel && !model.hparams.no_alloc &&
++                cparams.ctx_other == nullptr) {
++            cparams.prefill_lanes = 2;
++
++            gf_res_prev_lane.reset(new llm_graph_result(max_nodes));
++            sched_lane.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
++            if (sched_lane) {
++                auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask, false, 1);
++                if (!gf) {
++                    throw std::runtime_error("failed to allocate compute buffers for the second prefill lane");
++                }
++                // graph inputs live in host memory; stream-ordered copies instead of a host wait per split
++                // (prepare_ubatch drains the lane before rewriting its host inputs)
++                ggml_backend_sched_set_async_inputs(sched.get(),      true);
++                ggml_backend_sched_set_async_inputs(sched_lane.get(), true);
++                // and copies issued right behind their producer, otherwise a lane's output copy queues behind the
++                // other lane's split on the producing device and the consumer waits for both
++                ggml_backend_sched_set_eager_copies(sched.get(),      true);
++                ggml_backend_sched_set_eager_copies(sched_lane.get(), true);
++                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++                    const size_t size = ggml_backend_sched_get_buffer_size(sched_lane.get(), backend_ptrs[i]);
++                    if (size > 1) {
++                        LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB (prefill lane 2)\n", __func__,
++                                ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
++                    }
++                }
++                LLAMA_LOG_INFO("%s: two-lane prefill enabled (LLAMA_PREFILL_LANES)\n", __func__);
++            } else {
++                cparams.prefill_lanes = 1;
++            }
++        } else if (lanes_req >= 2) {
++            LLAMA_LOG_WARN("%s: LLAMA_PREFILL_LANES ignored (n_gpu = %d, pipeline_parallel = %d)\n",
++                    __func__, n_gpu, cparams.pipeline_parallel);
++        }
++    }
++
+     // wip/moe-verify-fusions (narrow-2): re-affirm the pinned narrow-2 floor for the MTP draft context
+     // from its measured compute size.  The region is established lazily on the draft's first allocation
+     // (its widest reserve); this keeps the pin at least as large as that layout.  A no-op for the target
+@@ -1635,6 +1688,10 @@ uint32_t llama_context::n_ubatch() const {
+     return cparams.n_ubatch;
+ }
+ 
++uint32_t llama_context::n_prefill_lanes() const {
++    return cparams.prefill_lanes;
++}
++
+ uint32_t llama_context::n_seq_max() const {
+     return cparams.n_seq_max;
+ }
+@@ -2253,7 +2310,7 @@ bool llama_context::set_adapter_cvec(
+     // one), so 512 MiB is comfortably below anything worth reclaiming.
+     static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
+ 
+-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, int lane) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -2511,33 +2568,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
+-    const bool alt = sched_alt_for(ubatch);
++    const bool alt = (lane == 0) ? sched_alt_for(ubatch) : false;
+     sched_alt_select(alt);
+ 
+-    auto * res = get_gf_res_prev(alt);
++    auto * res = (lane == 0) ? get_gf_res_prev(alt) : lane_res(lane);
+     auto * gf  = res->get_gf();
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
++    const auto gparams = graph_params(res, ubatch, mctx, gtype, lane);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    // halo-hybrid: the graph-reuse state is tracked per lane (lane 0 in gf_res_prev_active, lane 1 in its own)
++    llm_graph_result * & act = (lane == 0) ? gf_res_prev_active : gf_res_prev_active_lane;
++    if (!graph_reuse_disable && act == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+         // that the previous compute is still reading.
+         if (cparams.pipeline_parallel) {
+-            ggml_backend_sched_synchronize(sched.get());
++            ggml_backend_sched_synchronize(lane_sched(lane));
+         }
+ 
+         n_reused++;
+     } else {
+-        gf_res_prev_active = nullptr;
++        act = nullptr;
+         res->reset();
+ 
+-        ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        ggml_backend_sched_reset(lane_sched(lane));
++        ggml_backend_sched_set_eval_callback(lane_sched(lane), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -2562,7 +2621,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+                 ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
+             }
+         }
+-        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
++        const bool alloc_ok = ggml_backend_sched_alloc_graph(lane_sched(lane), gf);
+         if (is_draft) {
+             for (const auto & d : model.devices) {
+                 ggml_backend_dev_slab_compute_narrow2(d.dev, false);
+@@ -2575,13 +2634,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
+-        gf_res_prev_active = res;
++        act = res;
+     }
+ 
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+ 
++        // halo-hybrid: two-lane prefill uses stream-ordered host input copies. The previous pair (or single
++        // graph) on the shared backends may still be reading this lane's host inputs, so drain before rewriting
++        // them (ggml_backend_sched_synchronize covers every backend the lane shares).
++        if (sched_lane) {
++            ggml_backend_sched_synchronize(lane_sched(lane));
++        }
++
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+ 
+@@ -2606,6 +2672,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         lf_wait_features_consumed();
+     }
+ 
++    ret = GGML_STATUS_SUCCESS;
++
++    return res;
++}
++
++llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // halo-hybrid: the single-lane path. The two-lane pair path prepares its two consecutive ubatches on the two
++    // lanes (prepare_ubatch) and computes them together with graph_compute_pair.
++    auto * res = prepare_ubatch(ubatch, gtype, mctx, ret, 0);
++    if (!res) {
++        return nullptr;
++    }
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+@@ -3076,6 +3155,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         }
+     };
+ 
++    // remove this ubatch's positions from the memory module and map a failed compute to a return code
++    auto ubatch_fail = [&](const llama_ubatch & ub, ggml_status st) -> int {
++        llama_pos pos_min[LLAMA_MAX_SEQ];
++        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
++            pos_min[s] = std::numeric_limits<llama_pos>::max();
++        }
++        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
++            const auto & seq_id = ub.seq_id[i][0];
++            pos_min[seq_id] = std::min(pos_min[seq_id], ub.pos[i]);
++        }
++        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
++            if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
++                continue;
++            }
++            LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
++            memory->seq_rm(s, pos_min[s], -1);
++        }
++        switch (st) {
++            case GGML_STATUS_ABORTED:      return  2;
++            case GGML_STATUS_ALLOC_FAILED: return -2;
++            case GGML_STATUS_FAILED:       return -3;
++            default:                       return -1;
++        }
++    };
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+@@ -3100,6 +3204,61 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         ggml_status status;
+ 
++        // halo-hybrid: two-lane prefill. A 0-output wide ubatch (a plain prefill chunk) is prepared on lane 0 and,
++        // when the next ubatch is also wide and output-free, on lane 1; the two are computed with interleaved splits
++        // (ggml_backend_sched_graph_compute_async_pair) so the two devices overlap. A 0-output ubatch has nothing to
++        // read back, so no output extraction runs here and the single-lane path below is left untouched.  The nextn
++        // (MTP) and F1 layer-input reads are the exception: they run on 0-output ubatches, so those workloads stay
++        // on the single-lane path.
++        if (cparams.prefill_lanes >= 2 && sched_lane != nullptr && cparams.cb_eval == nullptr &&
++                !cparams.embeddings_nextn && !cparams.lf_layer_inp_dev &&
++                ubatch.n_tokens > 1 && n_outputs == 0) {
++            const auto gtype_lane = ctx_type_to_graph_type(cparams.ctx_type);
++            auto * res_a = prepare_ubatch(ubatch, gtype_lane, mctx.get(), status, 0);
++            if (!res_a) {
++                return ubatch_fail(ubatch, status);
++            }
++            bool paired = false;
++            const bool have_next = mctx->next();
++            if (have_next) {
++                const auto & ubn = mctx->get_ubatch();
++                int32_t n_out_n = (n_outputs_all == n_tokens_all) ? ubn.n_tokens : 0;
++                for (uint32_t i = 0; i < ubn.n_tokens; i++) {
++                    n_out_n += (int32_t) (ubn.output[i] != 0);
++                }
++                if (ubn.n_tokens > 1 && n_out_n == 0) {
++                    const llama_ubatch ubatch_b = ubn;
++                    n_outputs = n_out_n;
++                    auto * res_b = prepare_ubatch(ubatch_b, gtype_lane, mctx.get(), status, 1);
++                    if (!res_b) {
++                        return ubatch_fail(ubatch_b, status);
++                    }
++                    if (graph_compute_pair(true) == GGML_STATUS_SUCCESS) {
++                        n_tokens_prev_l += ubatch.n_tokens;
++                        n_tokens_prev_l += ubatch_b.n_tokens;
++                        n_tokens_prev = std::max(n_tokens_prev, ubatch_b.n_tokens);
++                        paired = true;
++                    }
++                }
++            }
++            if (paired) {
++                if (!mctx->next()) {
++                    break;
++                }
++                continue;
++            }
++            // no partner (last ubatch, or the next one is narrow): this ubatch runs alone on lane 0
++            if (graph_compute(res_a->get_gf(), true) != GGML_STATUS_SUCCESS) {
++                return ubatch_fail(ubatch, status);
++            }
++            n_tokens_prev_l += ubatch.n_tokens;
++            n_tokens_prev = ubatch.n_tokens;
++            if (!have_next) {
++                break;
++            }
++            continue;   // mctx is already at the next (narrow) ubatch; the loop processes it on its own
++        }
++
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
+         if (!res) {
+@@ -4059,6 +4218,18 @@ llm_graph_result * llama_context::get_gf_res_prev(bool alt) {
+     return res.get();
+ }
+ 
++// halo-hybrid: lane 0 is the main scheduler and its graph-reuse state; lane 1 is the second prefill lane
++ggml_backend_sched_t llama_context::lane_sched(int lane) const {
++    return (lane == 0 || !sched_lane) ? sched.get() : sched_lane.get();
++}
++
++llm_graph_result * llama_context::lane_res(int lane) {
++    if (lane == 0 || !gf_res_prev_lane) {
++        return get_gf_res_prev(0);
++    }
++    return gf_res_prev_lane.get();
++}
++
+ // pack sampler outputs into as few sequences as possible before using sequences without samplers
+ static void ubatch_prepare_reserve(
+               llama_ubatch                            & ubatch,
+@@ -4118,7 +4289,7 @@ static void ubatch_prepare_reserve(
+ 
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+-        bool packed_kq_mask, bool reserve_injection) {
++        bool packed_kq_mask, bool reserve_injection, int lane) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+     GGML_ASSERT(n_outputs_l >= 1);
+ 
+@@ -4127,7 +4298,7 @@ ggml_cgraph * llama_context::graph_reserve(
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+     }
+ 
+-    ggml_backend_sched_reset(sched.get());
++    ggml_backend_sched_reset(lane_sched(lane));
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+     for (auto & res : gf_res_prev) {
+@@ -4137,6 +4308,9 @@ ggml_cgraph * llama_context::graph_reserve(
+     }
+     gf_res_prev_active = nullptr;
+     gf_res_prev_active_alt = nullptr;
++    if (lane != 0) {
++        gf_res_prev_active_lane = nullptr;
++    }
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -4151,7 +4325,7 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     auto * res = gf_res_reserve.get();
+ 
+-    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
++    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), lane);
+ 
+     // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
+     // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a
+@@ -4184,9 +4358,9 @@ ggml_cgraph * llama_context::graph_reserve(
+     // initialize scheduler with the specified graph
+     if (split_only) {
+         if (sizes) {
+-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
++            ggml_backend_sched_reserve_size(lane_sched(lane), gf, sizes);
+         } else {
+-            ggml_backend_sched_split_graph(sched.get(), gf);
++            ggml_backend_sched_split_graph(lane_sched(lane), gf);
+         }
+     } else {
+         // wip/moe-verify-fusions (narrow-2): the MTP draft context (identified by `ctx_other`, set for
+@@ -4205,7 +4379,7 @@ ggml_cgraph * llama_context::graph_reserve(
+                 ggml_backend_dev_slab_compute_narrow2(d.dev, true);
+             }
+         }
+-        const bool reserved = ggml_backend_sched_reserve(sched.get(), gf);
++        const bool reserved = ggml_backend_sched_reserve(lane_sched(lane), gf);
+         if (is_draft) {
+             for (const auto & d : model.devices) {
+                 ggml_backend_dev_slab_compute_narrow2(d.dev, false);
+@@ -4225,14 +4399,16 @@ llm_graph_params llama_context::graph_params(
+                         llm_graph_result * res,
+                       const llama_ubatch & ubatch,
+             const llama_memory_context_i * mctx,
+-                          llm_graph_type   gtype) const {
++                          llm_graph_type   gtype,
++                       int          lane) const {
++    sched_build = lane_sched(lane);
+     return {
+         /*.arch        =*/ model.arch,
+         /*.hparams     =*/ model.hparams,
+         /*.cparams     =*/ cparams,
+         /*.ubatch      =*/ ubatch,
+         /*.gtype       =*/ gtype,
+-        /*.sched       =*/ sched.get(),
++        /*.sched       =*/ lane_sched(lane),
+         /*.backend_cpu =*/ backend_cpu,
+         /*.cvec        =*/ cvec.get(),
+         /*.loras       =*/ loras.get(),
+@@ -4287,6 +4463,15 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
++    // halo-hybrid: eager copies and async inputs (two-lane prefill) require the previous graphs to be done before
++    // host inputs are rewritten.  prepare_ubatch drains before its own set_inputs, so this only has to cover a
++    // graph (memory updates) that follows a pair without going through it.
++    if (cparams.prefill_lanes >= 2 && lanes_sync_pending) {
++        ggml_backend_sched_synchronize(sched.get());
++        ggml_backend_sched_synchronize(sched_lane.get());
++        lanes_sync_pending = false;
++    }
++
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -4297,6 +4482,29 @@ ggml_status llama_context::graph_compute(
+     return status;
+ }
+ 
++// halo-hybrid: compute the graphs prepared on both lanes with their splits interleaved (see
++// ggml_backend_sched_graph_compute_async_pair). Neither graph is synchronized here; the next prepare_ubatch drains
++// the shared backends before rewriting its host inputs, and lanes_sync_pending covers a graph that skips it.
++ggml_status llama_context::graph_compute_pair(bool batched) {
++    GGML_ASSERT(sched_lane);
++
++    const int n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
++    for (const auto & set_n_threads_fn : set_n_threads_fns) {
++        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
++    }
++
++    auto status = ggml_backend_sched_graph_compute_async_pair(sched.get(), sched_lane.get());
++    if (status != GGML_STATUS_SUCCESS) {
++        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async_pair failed with error %d\n", __func__, status);
++    } else {
++        // the host inputs of both lanes may still be in flight; a graph that follows this pair without going
++        // through prepare_ubatch must drain first
++        lanes_sync_pending = true;
++    }
++
++    return status;
++}
++
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+     auto * lctx = static_cast<llama_context *>(user_data);
+ 
+@@ -4327,7 +4535,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
+                 for (const auto & backend : backends) {
+                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                         if (ggml_backend_supports_op(backend.get(), cur)) {
+-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                            ggml_backend_sched_set_tensor_backend(sched_build ? sched_build : sched.get(), cur, backend.get());
+                         }
+                     }
+                 }
+@@ -6327,6 +6535,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
+     return ctx->n_ubatch();
+ }
+ 
++uint32_t llama_n_prefill_lanes(const llama_context * ctx) {
++    return ctx->n_prefill_lanes();
++}
++
+ uint32_t llama_n_seq_max(const llama_context * ctx) {
+     return ctx->n_seq_max();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index f80389890..ee874d880 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -75,6 +75,7 @@ struct llama_context {
+     uint32_t n_ctx_seq() const;
+     uint32_t n_batch()   const;
+     uint32_t n_ubatch()  const;
++    uint32_t n_prefill_lanes() const; // halo-hybrid: 1, or 2 with two-lane prefill
+     uint32_t n_seq_max() const;
+ 
+     uint32_t n_threads()       const;
+@@ -152,6 +153,16 @@ struct llama_context {
+             llama_memory_context_i * mctx,
+                        ggml_status & ret);
+ 
++    // halo-hybrid: the first half of process_ubatch (apply memory, build or reuse the graph, allocate it on
++    // the lane's scheduler, set the inputs) without computing it. lane 0 is the main scheduler, lane 1 the
++    // second prefill lane. Compute with graph_compute (lane 0) or graph_compute_pair (both).
++    llm_graph_result * prepare_ubatch(
++                const llama_ubatch & ubatch,
++                    llm_graph_type   gtype,
++            llama_memory_context_i * mctx,
++                       ggml_status & ret,
++                               int   lane);
++
+     int encode(const llama_batch_ext & batch_inp);
+     int decode(const llama_batch_ext & batch_inp);
+ 
+@@ -315,6 +326,11 @@ public:
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+ 
++    // halo-hybrid: compute the graphs prepared on both lanes with their splits interleaved
++    ggml_status graph_compute_pair(bool batched);
++    ggml_backend_sched_t lane_sched(int lane) const;
++    llm_graph_result *   lane_res(int lane);
++
+     // reserve a graph with a dummy ubatch of the specified size
+     // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
+     //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
+@@ -322,7 +338,7 @@ public:
+     //   support probes must NOT set it - they verify the derived form is present in the graph.
+     ggml_cgraph * graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+-        bool packed_kq_mask = false, bool reserve_injection = false);
++        bool packed_kq_mask = false, bool reserve_injection = false, int lane = 0);
+ 
+     // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
+     // compute reserve must be sized for the packed mask - see the definition for the full reasoning
+@@ -346,7 +362,8 @@ private:
+                         llm_graph_result * res,
+                       const llama_ubatch & ubatch,
+             const llama_memory_context_i * mctx,
+-                          llm_graph_type   gtype) const;
++                          llm_graph_type   gtype,
++                      int          lane = 0) const;
+ 
+     llm_graph_cb graph_get_cb() const;
+ 
+@@ -464,9 +481,10 @@ private:
+     std::vector<swap_info> output_swaps;
+ 
+     ggml_backend_sched_ptr sched;
++    ggml_backend_sched_ptr sched_lane; // halo-hybrid: second scheduler (own compute buffers) for two-lane prefill
++    bool                   lanes_sync_pending = false; // halo-hybrid: a lane pair is in flight; drain before a graph that skips prepare_ubatch
+ 
+     // The MTP draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle; with
+-    // one scheduler each switch re-splits and re-allocates the graph.  The graphs with outputs run on a second
+     // scheduler, so both stay allocated and are reused.  It is swapped into `sched` only while a decode or encode
+     // runs (LLAMA_DRAFT_SCHED2=0: off).  A DFlash/DFlash2 draft alternates unlike graphs that BOTH have no
+     // outputs (a KV injection and a noise block whose lattice comes from h_nextn), so there the batch kind picks
+@@ -542,10 +560,16 @@ private:
+ 
+     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
+     std::array<llm_graph_result_ptr, 2> gf_res_prev;
++    llm_graph_result_ptr gf_res_prev_lane;   // halo-hybrid: the reuse state of the second prefill lane
+     llm_graph_result_ptr gf_res_reserve;
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+     llm_graph_result * gf_res_prev_active_alt = nullptr; // the reuse state of the scheduler not in `sched`
++    llm_graph_result * gf_res_prev_active_lane = nullptr; // halo-hybrid: the reuse state of the second prefill lane
++
++    // halo-hybrid: the scheduler of the graph being built (a prefill lane's, or the main one); graph_get_cb pins
++    // tensors into it
++    mutable ggml_backend_sched_t sched_build = nullptr;
+ 
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 1f472330f..cdf32b204 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -68,6 +68,7 @@ struct llama_cparams {
+     ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
+     ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
+     bool pipeline_parallel;
++    int32_t prefill_lanes = 1; // two-lane prefill (LLAMA_PREFILL_LANES): 2 = consecutive prefill ubatches on two schedulers with interleaved splits
+     bool training;           // set by llama_opt_init()
+ 
+     size_t moe_cache_size;
+-- 
+2.56.0
+

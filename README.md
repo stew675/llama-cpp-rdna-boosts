@@ -26,7 +26,10 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 6050b467c
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (15 commits)
 
-# OPTIONAL: a beta candidate on top (NOT the release tree -- for beta testing only)
+# OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
+bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .   # 16 blocks + optional/*/*.patch
+
+# OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + beta/*/*.patch
 ```
 
@@ -143,6 +146,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── wip/                   # ACTIVE exploration only, never applied; index: wip/CAMPAIGNS.md
 ├── beta/                  # promotion-candidate patches pending a beta test (NOT part of the delivery;
 │                          #   apply with `apply-all.sh --include-beta`; currently empty, see beta/README.md)
+├── optional/              # opt-in features with no validated win here (NOT part of the delivery; apply with
+│                          #   `apply-all.sh --include-optional`; see optional/README.md)
 ├── upstream/              # upstream-PR candidates: one sub-directory each (README.md + patch) + index
 └── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```

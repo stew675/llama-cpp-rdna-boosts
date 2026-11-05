@@ -1,3 +1,99 @@
+## 261105.006 (r220) -- PR #268 assessed: the copy-event fix is promoted into block 12, the two-lane prefill becomes the first `optional/` artifact
+
+**Released as `v16-6050b467c-r220` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`4be5690b696ae635cbbcd5ab8303a3d0cd7bc2d4`**, tree
+**`e77a08d9d2f553b53fdbae19b50d5e61b3a2200c`**.  Contribution: **[PR #268](https://github.com/stew675/llama-cpp-rdna-boosts/pull/268)
+by @slavap** -- a two-lane prefill (`LLAMA_PREFILL_LANES`, two consecutive prefill ubatches on two backend
+schedulers with interleaved splits) plus the copy-event diagnosis that made it work.  Cut against r205; rebased,
+reviewed, and split into two very different fates.
+
+### The assessment (all measured here, 3 x R9700 / gfx1201)
+
+1. **It cannot reach either split this delivery validates -- measured, not inferred.**  The feature's gate
+   counts non-CPU *backends* (`n_gpu >= 2`), and under `-sm tensor` this tree has exactly **one**: a tensor
+   split is a single **Meta device** wrapping N GPUs (`llama_prepare_model_devices` ->
+   `ggml_backend_meta_device`).  Measured: `sched_reserve: LLAMA_PREFILL_LANES ignored (n_gpu = 1,
+   pipeline_parallel = 0)`.  Plain `-sm layer` is refused too, because the scheduler's own pipeline
+   parallelism is enabled in exactly that configuration: `ignored (n_gpu = 3, pipeline_parallel = 1)`.  The
+   only reachable layouts are ones where pipeline parallelism is *already* off (`--override-tensor`, `-sm
+   row`) -- which is the submitter's MoE layout (`-sm layer -ts 1,0 -ot ...`).  **The PR's own dense
+   reference layout (`-sm layer -ts 1,1`, no `-ot`) is refused on the base it targets**, so the +13.3 % it
+   reports was not measured with this patch on this base.
+2. **On balanced devices the overlap buys nothing, with the pair engaged.**  Same binary, env-gated A/B,
+   pp8192 / `-ub 2048`, `-r 3`, two rounds in ABBA order, `pair decided: splits a=4 b=4, interleaved=1` in
+   both shapes: MoE 35B-A3B Q8_0 **+0.03 %** (6132.3/6182.2 vs 6130.5/6188.7 t/s), dense 27B Q6_K_XL
+   **nil** (1210.1/1201.0 vs 1204.0/1202.5).  The submitter's **+34 % / +13 %** are an RX 7900 XTX (gfx1100)
+   + Radeon Pro V620 (gfx1030) pair, whose devices differ **~3x** in throughput: the fast card waits on the
+   slow one at every split and a second ubatch fills that wait.  It is an **imbalance-hiding** technique, not
+   a general prefill win, which is why it is not a block (`INVARIANTS.md` r220 facts 1 and 3).
+3. **Two defects that would have shipped with it.**  `hipEventDefault` / `hipEventElapsedTime` were spelled
+   unconditionally in `ggml-cuda.cu`, which still builds under nvcc for CUDA and has no `cuda*` alias for
+   them (the tree's own precedent is the `#ifdef GGML_USE_HIP` form) -- an unguarded `hip*` call is a CUDA
+   build break; and *every* backend event was switched to a **timing** event so one diagnostic API could
+   work, a debug cost on users who never set the knob.  Both are fixed in the artifact below.
+
+### What shipped: the copy-event fix (block 12)
+
+The diagnosis is the valuable half and it is **not** about two lanes: the scheduler's cross-backend
+split-input copy recorded the backend's **shared** per-device `copy_event` and waited the destination
+stream on it, and a queued HIP stream wait resolves against the **latest** record at execution -- so a copy
+still in flight re-records the event and re-binds the consumers already queued on it, serializing
+independent copies.  That is reachable in this delivery wherever two copies overlap (the pipelined layer
+split does it).  `cpy_tensor_async`'s body is now `cpy_tensor_async_impl(..., ev_nowait)`; the new optional
+iface member `cpy_tensor_async_nowait` takes a **caller-owned** event, recorded on the source stream right
+behind the copy and waited on by the consumer, so no wait is ever re-bound.  The scheduler keeps a ring of
+those events per source backend (a slot is re-recorded only after its previous record completed) and
+restarts the rings at every full synchronize.  `GGML_SCHED_COPY_EVENT=shared` restores the old path (kill
+switch, A/B and bisection; `ENVIRONMENT.md` §2).
+
+**Bit-exact and throughput-neutral** (pp8192 3-GPU `-sm layer`: 6311 vs 6317 t/s): the repair decouples
+copies, it is not a speedup where they were not contending -- and on this box they were not.
+
+### What shipped: `optional/` -- a new artifact category (and the first artifact in it)
+
+Reviewing this patch produced a category the repo did not have.  `beta/` is a *validation window* for a
+promotion candidate; this is a *finished* feature with **no validated win on the delivery's own
+configurations**, which would put unvalidated code in everyone's build and owe the full gate ladder for a
+feature most consumers cannot reach.  `optional/<name>/` now holds exactly that (`AGENTS.md`,
+`optional/README.md`): a patch cut against the **current `release.json` tree**, rebased onto every release,
+applied only by `scripts/apply-all.sh --include-optional` (strict `git am` on the verified tree; a 3-way
+merge is refused, because a stale cut must fail loudly), reviewed for build / default-path neutrality /
+cross-backend consistency, and **not covered by the delivery's gates**.
+
+`optional/two-lane-prefill/` (sha256 `07b7bf14d5080f…`, applied tree `ada5e221e34b77aeffbb3747d16b126f022c3d5b`)
+is the PR rebased onto r220 and reduced: it **drops** the copy-event machinery and the per-copy ring (the
+delivery carries them now, so the artifact uses `ggml_backend_sched_next_copy_event` /
+`cpy_tensor_async_nowait` instead of redefining them -- the naive rebase produced a duplicate ring **and a
+duplicate free loop, i.e. a double free and an abort at exit**, which is how it was found), fixes the CUDA
+portability and the timing-event cost, and documents the reachability table above instead of implying
+`-sm layer -ts 1,1` works.  Verified on the new base: pair engages under `-ot` (`splits a=4 b=4,
+interleaved=1`), greedy text byte-identical between lanes and to the delivery build
+(`61d387d6e21c` on the `-ot` layout, `d34f2e4e737c` on `-sm tensor`), no abort, default path unchanged.
+
+### Gates
+
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict apply, 16 blocks, tree `e77a08d9`).
+Coherence: same-seed greedy identical to r219 on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe 20`
+(`d34f2e4e737c`), and the kill-switch arms agree (`GGML_SCHED_COPY_EVENT=shared`,
+`GGML_MOE_DEVREMAP=0`).  `scripts/gate-prefill-logits.sh` **PASS** -- mean KLD **0.000000**, same-top-p
+**100.000 %** (bit-identical, as a data-movement change must be).  `scripts/gate-per-block-build.sh
+--changed-from 2f7761bf5` **2/2** (amended block 12 + tip, `all` target).  `scripts/gate-host-pool.sh`
+**18/18** (four arms byte-identical, `a99ccbd97ecb`) -- it owns this file.  MTP: r219 vs r220 on the 27B
+`draft-mtp` arm is 104.3 vs 104.4 t/s and `none` 40.9 vs 40.9, with `llama-batched-bench -npl 1,4,8`
+within noise -- a *reduced* Protocol A (one axis, `-c 8192`) rather than the four-axis sweep, because the
+change is bit-exact (KLD 0.000000) and acceptance is a function of token ids that did not move.  GPU faults:
+`check-gpu-faults.sh` clean over the whole session window; the journal's only `page fault` entries are from
+2026-11-04 (the previous day's work).  Not run: `gate-kv-residency.sh` -- the change is not in the KV
+window/region provider, `is_streaming()` or the sparse decode arm.
+
+### What was declined, and why
+
+Block status (a block carries a validated win on a validated config -- this has none in any reachable
+layout), and default-on status (a feature with no measurable win here would cost everyone a second set of
+compute buffers and a second scheduler).  The reachability and imbalance findings are `INVARIANTS.md` r220;
+the artifact's future is in `optional/two-lane-prefill/README.md` (promotion needs an imbalanced
+multi-device pair as a validated target).
+
 ## 261105.005 (r219) -- issue #274: on Windows the host pool's fills could not be serviced, and a failed fill was served as resident (block 12)
 
 **Released as `v16-6050b467c-r219` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),

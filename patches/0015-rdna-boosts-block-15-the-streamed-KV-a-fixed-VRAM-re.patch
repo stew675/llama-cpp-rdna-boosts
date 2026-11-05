@@ -1,4 +1,4 @@
-From 1beee61a684dce6f97add91bf4d40a1e89323da2 Mon Sep 17 00:00:00 2001
+From 614143295648205fb854e78f4d4847329b50dbd2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -2916,7 +2916,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 50c65928a..f40e3f9cc 100644
+index 0177e7f46..08eea6151 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -4364,7 +4364,7 @@ index 50c65928a..f40e3f9cc 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -5894,13 +7217,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5913,13 +7236,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
              }
  
              if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
@@ -4387,7 +4387,7 @@ index 50c65928a..f40e3f9cc 100644
              ggml_cuda_gdn_gather_index gdn_gather_index;
              cuda_ctx->gdn_deferred_gathers.clear();
              for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -6272,7 +7599,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6291,7 +7618,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      use_cuda_graph = true;
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
@@ -4396,7 +4396,7 @@ index 50c65928a..f40e3f9cc 100644
                      cuda_graph_update_required = graph->instances.empty() ||
                          (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
                  }
-@@ -6416,7 +7743,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6435,7 +7762,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -4405,7 +4405,7 @@ index 50c65928a..f40e3f9cc 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -6447,7 +7774,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6466,7 +7793,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) {
                      ggml_cuda_mmb_mark_bf16_only(gr);
@@ -4414,7 +4414,7 @@ index 50c65928a..f40e3f9cc 100644
                      if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
                  }
-@@ -6462,7 +7789,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6481,7 +7808,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -4423,7 +4423,7 @@ index 50c65928a..f40e3f9cc 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
-@@ -6576,7 +7903,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6595,7 +7922,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              ggml_cuda_hc_combine_norm_args ca;
              if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
          }
@@ -4432,7 +4432,7 @@ index 50c65928a..f40e3f9cc 100644
          if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
          if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
              std::vector<const ggml_tensor *> blks;
-@@ -6682,7 +8009,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6701,7 +8028,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -4441,7 +4441,7 @@ index 50c65928a..f40e3f9cc 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -6704,14 +8031,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6723,14 +8050,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
          // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
          // size.  GGML_CUDA_QK_ROTATE=0: off.
@@ -4458,7 +4458,7 @@ index 50c65928a..f40e3f9cc 100644
          const auto is_had = [](const ggml_tensor * t) {
              return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
          };
-@@ -6831,7 +8158,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6850,7 +8177,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
          // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
          // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
@@ -4467,7 +4467,7 @@ index 50c65928a..f40e3f9cc 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -8058,6 +9385,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8078,6 +9405,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4482,7 +4482,7 @@ index 50c65928a..f40e3f9cc 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8087,7 +9422,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8107,7 +9442,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -4492,7 +4492,7 @@ index 50c65928a..f40e3f9cc 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8516,8 +9852,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8536,8 +9872,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4553,7 +4553,7 @@ index 50c65928a..f40e3f9cc 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8629,6 +10017,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8649,6 +10037,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  

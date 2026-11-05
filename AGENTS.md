@@ -170,6 +170,21 @@ current `release.json` tree; nothing in it is applied by `apply-all.sh`).  On co
 refutation it moves to `archive/work/<name>/` and is recorded in `WORKLOG.md` — same no-stub rule as
 `wip/`.
 
+**`optional/` is for a finished feature that has no validated win here — it is not a fourth source
+either.**  A contribution that is genuinely useful on hardware this repo does not validate (a
+heterogeneous multi-GPU pair, say), or that is unreachable in the splits the delivery validates (a
+backend-count gate is inert under `-sm tensor`, which is ONE backend — see `INVARIANTS.md`), earns an
+`optional/<name>/` artifact instead of a block: `<name>.patch` cut against the **current `release.json`
+tree**, a `README.md` that records its sha256, the tree it produces, the layouts it reaches and the
+layouts it cannot, and what it measured.  `scripts/apply-all.sh --include-optional` is the sanctioned way
+to apply one (strict `git am` on the verified release tree, one commit, tree reported; nothing here is
+picked up without that flag).  An optional artifact **is rebased onto every new release** and is never
+cut against a working branch or a part-applied set; it is promoted into `patches/` (with the full gate
+ladder) only once it has a validated win on one of the delivery's own configurations, and archived to
+`archive/work/` if it turns out wrong.  It is reviewed for build, default-path neutrality and
+cross-backend consistency, but it is **not** covered by the delivery's gates and a consumer who applies
+one is off the supported configuration — its `README.md` must say so.
+
 **A finished campaign leaves `wip/` — it does not become a stub.**  The moment a campaign is promoted
 (folded into `patches/`), closed, or refuted, its record moves to `archive/work/<campaign>/` and the
 result is recorded in `WORKLOG.md`, then the `wip/` entry is **deleted** and `wip/CAMPAIGNS.md` is
@@ -204,6 +219,7 @@ dated record (newest first); [`release.json`](release.json) is the single source
 | `prompts/` | versioned, hash-stable test prompts; sizes/token counts/**sha256** in `prompts/README.md`. A shipped prompt is **never edited in place** (add a new file); a result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs/tools — **NOT part of the delivery**; see the WIP rule. Each campaign is a self-contained handover under its own `README.md` (no `wip/README.md`); the open set is indexed in `wip/CAMPAIGNS.md` |
 | `beta/` | **promotion-candidate patches** staged for a beta test — **NOT part of the delivery**. Each candidate is `<name>/` with `README.md` (what/why/status), `BETA-TESTING.md` (the tester's apply + gate checklist) and `<name>.patch` cut against the current `release.json` tree. Nothing here is applied by default: `scripts/apply-all.sh --include-beta` applies `beta/*/*.patch` on top of the verified release tree for a tester. A confirmed or refuted candidate moves to `archive/work/` and is recorded in `WORKLOG.md` |
+| `optional/` | **opt-in artifacts that are NOT part of the delivery and not a beta.** Each is `<name>/` with `README.md` (what, sha256, applied tree, the layouts it reaches and cannot, what it measured) and `<name>.patch` cut against the current `release.json` tree, rebased onto every release. For a *finished* feature that has no validated win on the delivery's own configurations (it needs hardware this repo does not validate, or it is unreachable in the splits it validates). `scripts/apply-all.sh --include-optional` applies them strictly on the verified release tree; not covered by the delivery's gates. Promoted only on a validated win here |
 | `upstream/` | **upstream-PR candidates** (self-contained changes for unadulterated `ggml-org/llama.cpp`), one sub-directory per candidate (`README.md` + `UPSTREAM-PR-<name>.patch`); the index is its `README.md`. None is part of the delivery |
 | `archive/docs/` | moved-out historical records (validation/baseline history, the pre-cleanup AGENTS.md) — reference only |
 | `archive/work/` | closed experiments and campaigns, preserved for future re-evaluation (mmb/qsa3, moe-expert-cache, issues/PRs, …) — reference only |
@@ -221,6 +237,9 @@ bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 16 com
 
 # with the beta candidates on top (NOT the release tree; for a beta test only)
 bash <this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + beta/*/*.patch
+
+# with the optional artifacts on top (NOT the release tree; opt-in features, see optional/README.md)
+bash <this-repo>/scripts/apply-all.sh --include-optional .   # 16 blocks + optional/*/*.patch
 ```
 
 ### Verify (the coherence gate — mandatory after any change)

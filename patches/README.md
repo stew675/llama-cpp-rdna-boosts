@@ -2594,6 +2594,22 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r220 amendment (PR #268, @slavap): the cross-backend input copy is ordered on a PER-COPY event.**  The general
+> D2D split-input copy used the backend's shared per-device `copy_event` -- issue on the source stream, re-record
+> that event, wait the destination stream on it.  A queued HIP stream wait resolves against the **latest** record at
+> execution, so a copy still in flight re-records the event and re-binds the consumers already queued on it, and
+> independent cross-backend copies then serialize against each other (the submitter measured ~0 % overlap in a
+> two-lane prefill; it is reachable here wherever two copies overlap, which the pipelined layer split does).
+> `cpy_tensor_async`'s body is now `cpy_tensor_async_impl(..., ev_nowait)` and the new optional iface member
+> `cpy_tensor_async_nowait` takes a **caller-owned** event, recorded on the source stream right behind the copy and
+> waited on by the consumer, so no wait is ever re-bound; the scheduler keeps a ring of those events per source
+> backend (a slot is re-recorded only after its previous record completed) and restarts the rings at every full
+> synchronize.  `GGML_SCHED_COPY_EVENT=shared` restores the old path (kill switch, A/B and bisection).  The iface
+> member is APPENDED at the end of `ggml_backend_i` (it is initialized positionally).  Bit-exact: same-seed text
+> identical on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe`; throughput-neutral (pp8192 3-GPU `-sm layer`
+> 6311 vs 6317 t/s) -- the repair decouples copies, it is not a speedup where they were not contending.  Records:
+> `WORKLOG.md` 261105.006, `INVARIANTS.md` r220.
+
 > **r217 amendment (issue #273 items 2, 3 and 4): `seq_rm` stops at the parked bound, the drafter's prompt is
 > no longer copied per step, and this block's `getenv` reads are latched.**  (a) `llama_kv_cache::seq_rm()`
 > scanned to `used_max_p1()`, which with `--kv-unified --parallel 2` is the whole cache because the parked idle

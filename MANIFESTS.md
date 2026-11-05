@@ -64,8 +64,11 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
    itself cannot compare it (it builds `.base` from the commit tarball, so its commit ids differ by
    construction) — `scripts/fork-refresh.sh` does that comparison.  The `.tip` rule is in `AGENTS.md`.
    partially regenerated set fails here rather than at the build;
-5. `--include-beta` then applies `beta/*/*.patch` on top of the *verified* tree (one commit each).  The
-   checkout is then **not** the release tree, which the script reports.
+5. `--include-optional` then applies `optional/*/*.patch` on top of the *verified* tree (strict `git am`,
+   one commit each; an optional artifact is cut against exactly this tree, so the script refuses a 3-way
+   merge).  `--include-beta` then applies `beta/*/*.patch` the same way.  Either flag leaves the checkout
+   **not** the release tree, which the script reports; optional artifacts are not covered by the gates
+   below (`optional/README.md`).
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 

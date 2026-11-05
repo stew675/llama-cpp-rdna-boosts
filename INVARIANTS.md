@@ -1930,3 +1930,44 @@ path.**
    same class as `MoE expert cache (auto): arena ...`) and it carries the pool-source count
    (`141/141 pool sources registered`), which is the first number a "the pool never appeared" report needs.
    Do not "quiet" a decision line back to INFO: at the default level it does not exist.
+
+---
+
+## r220 -- a backend-count gate is inert under `-sm tensor`; the copy event must be per copy (PR #268)
+
+1. **`-sm tensor` is ONE backend, whatever the device count.**  `llama_prepare_model_devices()` wraps
+   N devices in a single **Meta device** (`ggml_backend_meta_device`), and `llama_context` creates one
+   backend per `model.devices` entry, so anything gated on "how many non-CPU backends" sees `1` under
+   `-sm tensor --device 0,1,2` (measured, 3 x R9700).  A feature that pairs *backend schedulers* can
+   therefore never reach a tensor split, and no amount of extra GPUs changes that: pairing devices inside
+   the Meta device is a different feature.  The same gate is also inert under **plain `-sm layer`**,
+   because the scheduler's own pipeline parallelism is enabled there
+   (`pipeline_parallel = n_devices > 1 && all layers on GPU && -sm layer && offload_kqv &&
+   !has_tensor_overrides() && moe_cache_size == 0`), and a two-lane prefill declines when it is on.  The
+   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor`, `-sm row`
+   -- which is exactly the layout the PR was measured in.  **Measure a scheduler feature's REACHABILITY
+   before its gain** (`optional/two-lane-prefill/README.md` carries the table).
+2. **A queued HIP stream wait binds to the LATEST record, so a shared copy event re-binds consumers.**
+   The cross-backend split-input copy used to record the backend's shared per-device `copy_event` and make
+   the destination stream wait on it.  A copy still in flight re-records that event, and a wait that is
+   already queued then resolves against the newer record: independent cross-backend copies serialize
+   against each other.  @slavap hit it as ~0 % overlap in a two-lane prefill (PR #268) and it is reachable
+   in this delivery wherever two copies overlap, which the pipelined layer split does.  r220 makes the
+   ordering event **per copy** (`cpy_tensor_async_nowait` + a per-source-backend ring, re-recording a slot
+   only after its previous record completed) and keeps `GGML_SCHED_COPY_EVENT=shared` as the A/B kill
+   switch.  Bit-exact: same-seed greedy text identical on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe`,
+   and throughput-neutral (pp8192 3-GPU `-sm layer` 6311 vs 6317 t/s) -- the repair is a decoupling, not a
+   speedup on a box where the copies were not actually contending.
+3. **An overlap technique buys nothing on devices of equal throughput.**  With identical cards every split
+   is already the critical path, so a second ubatch in flight adds queueing and no work: measured +0.03 %
+   (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with the pair engaged (`pair decided: splits a=4 b=4,
+   interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 % are a 7900 XTX (gfx1100) + V620 (gfx1030)
+   pair, whose devices differ ~3x: the overlap hides an imbalance.  A device-heterogeneous layout is not
+   one of this delivery's validated configurations, which is why that feature is `optional/`, not a block.
+4. **A `hip*` spelling in `ggml-cuda.cu` needs the `#ifdef GGML_USE_HIP` form.**  `ggml-cuda.cu` still
+   builds under nvcc for CUDA, and `hipEventDefault` / `hipEventElapsedTime` have no `cuda*` alias in this
+   toolchain (using `cudaEventElapsedTime` in a HIP build fails with `use of undeclared identifier`).  The
+   file's precedent is `#ifdef GGML_USE_HIP ... #else cudaEventDefault ... #endif`; an unguarded `hip*`
+   call breaks the CUDA build (PR #268 did, fixed in the optional artifact's rebase).  Related: do not
+   switch every backend event to a **timing** event to serve one diagnostic -- create the timing event only
+   on the debug path, or the cost lands on users who never set the knob.

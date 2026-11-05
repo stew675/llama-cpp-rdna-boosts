@@ -2,7 +2,10 @@
 # Apply the full rdna-boosts patch set (block 00 + blocks 01-N; N from release.json.n_blocks)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
-# Usage: ./apply-all.sh [--include-beta] [llama.cpp-checkout] [rdna-boosts-repo]
+# Usage: ./apply-all.sh [--include-optional] [--include-beta] [llama.cpp-checkout] [rdna-boosts-repo]
+#   --include-optional   also apply the optional/<name>/*.patch artifacts, after the release blocks and
+#                        before the beta candidates (OPTIONAL: tracked as extra commits, and the checkout
+#                        is then NOT the release tree -- see optional/README.md)
 #   --include-beta       also apply the promotion candidates in beta/<name>/*.patch, after the
 #                        release blocks (BETA: tracked as extra commits, and the checkout is then
 #                        NOT the release tree -- see beta/README.md)
@@ -25,9 +28,11 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 INCLUDE_BETA=0
+INCLUDE_OPTIONAL=0
 POSITIONAL=()
 for arg in "$@"; do
     case "$arg" in
+        --include-optional) INCLUDE_OPTIONAL=1 ;;
         --include-beta) INCLUDE_BETA=1 ;;
         -h|--help)      sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)             echo "ERROR: unknown option: $arg (try --help)" >&2; exit 1 ;;
@@ -133,6 +138,48 @@ fi
 echo "Applied tip: $(git rev-parse --short=9 HEAD) (this is the value for release.json .tip / the fork branch tip)"
 
 # ---------------------------------------------------------------------------
+# OPTIONAL artifacts (explicit opt-in, applied AFTER the release tree was verified)
+#
+# optional/ holds features that are useful on some hardware but are NOT part of the delivery: each is a
+# self-contained patch cut against this release's tree, kept because it is worth having on the layouts it
+# helps, and excluded because it is not beneficial (or not reachable) on the delivery's validated configs.
+# `--include-optional` applies them on top of the verified release tree, one commit each, so a consumer can
+# build and use them; the checkout is then NOT `release.json`'s tree, which is reported below and in the log.
+# They are cut against the release tree, so they only apply on top of THIS release -- rebase them if the
+# delivery moves and the patch does not apply (see optional/README.md).
+# ---------------------------------------------------------------------------
+OPTIONAL_COUNT=0
+if [ "$INCLUDE_OPTIONAL" -eq 1 ]; then
+    shopt -s nullglob
+    OPTIONAL_PATCHES=( "$RDNA"/optional/*/*.patch )
+    shopt -u nullglob
+    echo
+    if [ "${#OPTIONAL_PATCHES[@]}" -eq 0 ]; then
+        echo "No optional artifacts found under $RDNA/optional/*/*.patch -- nothing to add."
+    else
+        echo "Applying ${#OPTIONAL_PATCHES[@]} OPTIONAL artifact patch(es) on top of the release tree:"
+        for p in "${OPTIONAL_PATCHES[@]}"; do
+            echo "  ${p#"$RDNA"/}"
+        done
+        # An optional artifact is cut against the verified release tree, so it must apply strictly: a
+        # 3-way merge here would silently accept a stale cut against an older delivery.
+        if ! git am "${OPTIONAL_PATCHES[@]}"; then
+            echo "ERROR: strict 'git am' of the optional artifacts failed." >&2
+            echo "       They are cut against release.json .tree; this checkout is not that tree, or the" >&2
+            echo "       artifact has not been rebased onto this release (see optional/README.md)." >&2
+            git am --abort >/dev/null 2>&1 || true
+            exit 1
+        fi
+        OPTIONAL_COUNT="${#OPTIONAL_PATCHES[@]}"
+        echo
+        echo "NOTE: this checkout includes $OPTIONAL_COUNT OPTIONAL artifact(s) and is NOT the release tree."
+        echo "      release.json tree: $RELEASE_TREE"
+        echo "      applied tree:      $(git rev-parse HEAD^{tree})"
+        echo "      An optional tree is expected to differ; it is not covered by the delivery's gates."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # BETA candidates (explicit opt-in, applied AFTER the release tree was verified)
 #
 # beta/ holds promotion candidates that are deliberately NOT part of the delivery: a candidate that
@@ -174,7 +221,7 @@ if [ "$INCLUDE_BETA" -eq 1 ]; then
     fi
 fi
 
-git log --oneline -$((N_BLOCKS + BETA_COUNT))
+git log --oneline -$((N_BLOCKS + OPTIONAL_COUNT + BETA_COUNT))
 
 echo
 echo "Build (uses your system ROCm install; see patches/README.md for the full env-knob list):"
