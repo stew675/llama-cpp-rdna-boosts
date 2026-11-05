@@ -1,3 +1,76 @@
+## 261105.007 (r221) -- TODO #269: the sync-free decode remap becomes tensor-split and covering-pool aware (block 09, plus one line each in blocks 12 and 15)
+
+**Released as `v16-6050b467c-r221` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip
+**`75059f1c4efcaefa2cac911023645e5f457d412c`**, tree **`01363a187dd970cf2d93abd79e6ac41a28083324`**.
+Blocks 09, 12 and 15 amended; blocks 10/11/13/14 keep identical deltas.
+
+### What #269 actually was, once measured
+
+The item's title said "keep `GGML_MOE_DEVREMAP`, drop the rest of PR #266, and make the remap tensor-split
+aware before re-implementing it over pool slots".  The three questions behind it turned out to have three
+different answers:
+
+1. **Does the remap still pay?**  Yes -- but only under its own protocol.  Re-running r203's own cell
+   (`llama-batched-bench -npp 64 -ntg 512 -npl 1`, 35B-A3B UD-Q4_K_M, `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=8000`,
+   1 x R9700) reproduces **61.2 -> 67.6 t/s (+10.4 %)**.  A first pass with `llama-cli -n 300` and an
+   auto-sized arena read *negative* (-2.5 %) and sent this session hunting a phantom regression; the sign
+   flipped back on the same command minutes later, so the early cli numbers were a box state (prefill 1214 vs
+   2716 t/s at an identical arena -- never resolved, and no longer relevant because every number below was
+   taken ABBA, 2+ reps, with the disk-read delta and `MemAvailable`/VRAM recorded per run).  **Lesson, for the
+   record: a decode A/B on this box needs the ABBA protocol even for a 20-second arm, and a prefill rate that
+   halves is the tell that the run is not comparable.**
+2. **Where is it worth most?  On a tensor split**, because the eager path it replaces synchronizes the WHOLE
+   meta backend once per routed op.  35B-A3B Q8_0 `-ncmoe 40`, `MIB=8000`, `-sm tensor`: **+9.9 %** at 1 GPU
+   (57.6 -> 63.3), **+16.1 %** at 2 (64.0 -> 74.3), **+28.4 %** at 3 (59.4 -> 76.3).  So the maintainer's
+   acceptance condition was not a formality: the capability was inert there by construction and the
+   capability is worth an order of magnitude more on a split than on the single GPU r203 measured.
+3. **And over pool slots?**  Expressible only when the pool **covers** its tensor -- which is the *default*
+   `-lme auto` layout on a mapped load ("a pinned per-EXPERT pool of the whole host expert set (a MIRROR)"),
+   not a niche: **+9.9 %** (57.6 -> 63.3) on that config.  A sub-complement pool cannot be served by a
+   device-side map at all (the map would have a hole), so it declines every offer -- measured `0 of 3840
+   served` -- and keeps the eager path.  The item's "re-implement it over pool slots, per-device-slice aware"
+   is therefore done for the only regime where it is sound.
+
+### What shipped
+
+* **Block 09**: `ggml_backend_meta_moe_cache_remap` forwards the hook to each simple device with that
+  device's simple tensors (and the per-device routing view when the ids are a mirrored meta tensor), the
+  `check_only` pass answering for every device before any commit -- the same shape as `moe_cache_update` /
+  `take_over` / `gather`.  `devremap_cold_ok_locked` adds `dr_pool_ok`, latched once at sizing, and the map
+  builder emits `slots + pool slot` for a covering pool (`pool_live_slots`, `table_pool_peek_locked`,
+  `pool_covers_table_peek_locked`).  The exit report now prints `device remap: N tables served, M of K offers
+  declined`, which is the only way to tell "no gain" from "not engaged".
+* **Block 12**: a covering pool has nothing to re-rank, so `pool_rerank_from_heat_locked` reaps and then
+  returns before any bookkeeping -- the old code reached the same answer by coincidence, and the decode
+  remap's write-once cold map depends on it being stated.
+* **Block 15**: `keep_all` never retires a slot for a mirror (the surplus argument taken to its conclusion),
+  so a resident expert cannot lose its slot under the remap either.
+
+### Gates (all on this box, `soar`, 3 x R9700 / gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| same-seed greedy text, 300 and 1000 tokens | identical in every A/B: 1 GPU `4c3674469c52` (1000 tok), 2-GPU `-sm tensor` `c30a297f5bf4` (1000 tok) / `8d8dc18f9be3` (300 tok), 3-GPU `793df7eccea0`; sub-complement (`-lme 16`) and `MOE_HOST_POOL_COLD=0` arms identical |
+| MTP (`llama-server`, `--spec-type draft-mtp`, 122B 3-GPU `-sm tensor` and 35B 1-GPU) | acceptance bit-equal **0.74246 (689/928)** and **0.75655 (693/916)**, mean len 3.22 / 3.26, text sha equal; 35B decode 121.6 -> 128.1 t/s (+5.3 %) |
+| `llama-batched-bench -npp 64 -ntg 128 -npl 1/4/8`, 2-GPU `-sm tensor` | 63.3/180.1/281.6 -> 66.9/189.0/298.6 t/s (+5.8/+5.0/+6.0 %), prefill unchanged |
+| r203's own cell re-run | 61.2 -> 67.6 t/s (+10.4 %) |
+| `scripts/gate-prefill-logits.sh` | **PASS** -- mean KLD **0.000000**, same-top-p **100.000 %** |
+| `scripts/gate-host-pool.sh` | **18/18** (the four pool arms, sub-complement config) |
+| `test-backend-ops -o MUL_MAT_ID` | 931/931 |
+| `scripts/check-gpu-faults.sh` (journal + 7 logs, `--since "4 hours ago"`) | clean |
+| `scripts/validate-set.sh` | green: 16 blocks, strict apply, tree `01363a18`, no conflict markers, Windows scan clean |
+| `scripts/gate-per-block-build.sh --changed-from 4be5690b6 --fast` | **4/4** (blocks 09, 10, 12, 15 -- 10 is a rebase-only delta) |
+| `MOE_EXPERT_CACHE_MIB=0` control | identical on both arms (28.5 t/s), i.e. the whole effect is inside the cache path |
+
+### Retirement
+
+`TODO` #269 is closed.  Its two forward-looking clauses are answered: the tensor-split condition is met and
+measured, and the pool re-implementation is done where it is expressible (+9.9 %) and refuted as
+inexpressible where it is not (a sub-complement pool -- and `#141` already records that bound from the
+eager side).  `INVARIANTS.md` r221 carries the six facts a future extension has to respect, the important
+one being "is this answer constant for the shape once `g_sized`?" -- a captured graph bakes the take-over,
+so a decision that can flip is a wrong read, not a slow one.
+
 ## 261105.006 (r220) -- PR #268 assessed: the copy-event fix is promoted into block 12, the two-lane prefill becomes the first `optional/` artifact
 
 **Released as `v16-6050b467c-r220` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),

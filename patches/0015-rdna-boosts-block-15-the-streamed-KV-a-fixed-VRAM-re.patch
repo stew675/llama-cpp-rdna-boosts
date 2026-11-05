@@ -1,4 +1,4 @@
-From 614143295648205fb854e78f4d4847329b50dbd2 Mon Sep 17 00:00:00 2001
+From 438e9179547b9dde24fdcf65f7e1b4370873ae0c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -363,6 +363,11 @@ four-axis R/P/C/K 1.91x / 2.43x / 2.58x / 2.74x (acceptance 0.5869 / 0.8391 / 0.
 windowed arm failed before (3) and (4)); `GGML_CUDA_VMM_REGION_SELFTEST=1` PASS with a new multi-mapping arm;
 per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-window-split.sh`.  Record:
 `benchmarks/2026-11-01-kv-window-tensor-split-124.md`.
+
+TODO #269 (r221): a host pool whose capacity COVERS the tensor must never retire a slot for an expert it
+just copied into the arena -- it is a MIRROR, and retiring there un-loads an expert that is still
+resident (the comment above already says so for the surplus case).  One condition now covers both, and
+it is what makes the decode remap's pool-slot cold map write-once after sizing.
 ---
  common/common.cpp                          |   27 +-
  common/draft-reserve.cpp                   |   55 +-
@@ -380,7 +385,7 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  ggml/src/ggml-cuda/ggml-cuda.cu            | 1449 ++++++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 +++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
- ggml/src/ggml-cuda/moe-expert-cache.cu     |   38 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu     |   43 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   83 +-
  src/llama-context.cpp                      |   19 +-
@@ -397,7 +402,7 @@ per-block build 1/1; `validate-set.sh` strict 16/16.  Gate: `scripts/gate-kv-win
  src/llama-model.cpp                        |  144 +-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   66 +-
- 33 files changed, 6177 insertions(+), 835 deletions(-)
+ 33 files changed, 6182 insertions(+), 835 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -1198,7 +1203,7 @@ index bde0e01ae..db46f0180 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 562d0a386..9e08103b3 100644
+index d278893c0..176f2cdbf 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -4948,7 +4953,7 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index bd1b82ab7..67033c662 100644
+index 06f176145..b4b6dfb88 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -56,10 +56,6 @@ static void heat_pull_locked();
@@ -4962,7 +4967,7 @@ index bd1b82ab7..67033c662 100644
  namespace {
  
  // wip/host-expert-tier: the loader opens the persisted prior BEFORE it places any host-expert tensor (see
-@@ -1827,7 +1823,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
+@@ -1865,7 +1861,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
          // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
          // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
          // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
@@ -4971,7 +4976,7 @@ index bd1b82ab7..67033c662 100644
          const size_t pool_bytes = (size_t) slots * t.host_bytes;
          cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
          /**/ if (strcmp(pool_alloc, "thp") == 0) {
-@@ -2335,7 +2331,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
+@@ -2373,7 +2369,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
  }
  
  static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
@@ -4980,7 +4985,7 @@ index bd1b82ab7..67033c662 100644
      if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
          return;
      }
-@@ -2750,7 +2746,24 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+@@ -2799,7 +2795,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return cudaErrorInvalidDeviceFunction;
      }
      const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -5001,12 +5006,17 @@ index bd1b82ab7..67033c662 100644
 +    // page-cache memcpys in the first 300 decode tokens at full coverage).  A pool too small for the complement
 +    // retires it, so the space can hold a complement expert -- the historical bounded layout.
 +    const int  n_arena  = (int) t.expert_slot.size();
-+    const bool keep_all = pool != nullptr && pool->slots > t.n_experts - n_arena;
++    // TODO #269: a pool whose capacity COVERS the tensor mirrors it, so it must never un-load an expert just
++    // because the arena also holds it.  That is the same argument the surplus case below makes, taken to its
++    // conclusion -- and it is also what makes the decode remap's cold map stable: a retirement is the ONLY way
++    // an expert that is resident can lose its slot (the demand path never evicts a resident and a covering
++    // pool's re-rank is a no-op), so with this condition a covering pool's layout is write-once after sizing.
++    const bool keep_all = pool != nullptr && (pool->slots >= t.n_experts || pool->slots > t.n_experts - n_arena);
 +    expert_src_done(t, pool, src, stream, /*retire*/ !keep_all);
      return err;
  }
  
-@@ -4869,9 +4882,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -4927,9 +4945,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -5022,7 +5032,7 @@ index bd1b82ab7..67033c662 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -6670,7 +6686,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -6728,7 +6749,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {

@@ -1971,3 +1971,49 @@ path.**
    call breaks the CUDA build (PR #268 did, fixed in the optional artifact's rebase).  Related: do not
    switch every backend event to a **timing** event to serve one diagnostic -- create the timing event only
    on the debug path, or the cost lands on users who never set the knob.
+
+## r221 -- the sync-free decode remap is worth what the SYNC it replaces costs, so it grows with the device count; a covering pool is a legitimate cold source
+
+`TODO` #269's acceptance condition ("the remap must be tensor-split aware") is met by forwarding
+`moe_cache_remap` from the Meta backend to each simple device, exactly as `moe_cache_update` / `take_over` /
+`gather` already are.  The facts, all measured this session on 35B-A3B Q8_0 `-ncmoe 40`, byte-identical
+greedy text throughout:
+
+1. **The gain scales with the device count because the eager path synchronizes the WHOLE meta backend.**  The
+   remap replaces `ggml_backend_synchronize(input_backend)` + the ids readback (a full meta synchronize, i.e.
+   every child device) with a kernel plus a host-side policy one call late, so its value is that sync's cost:
+   **+9.9 %** at 1 GPU (57.6 -> 63.3 t/s, `-sm tensor` == `-sm layer`), **+16.1 %** at 2 (64.0 -> 74.3) and
+   **+28.4 %** at 3 (59.4 -> 76.3) at `MOE_EXPERT_CACHE_MIB=8000`.  The r203 single-device numbers (+8.4 %
+   pinned, +4.8 % pool-cold) still reproduce on their own protocol (`llama-batched-bench -npp 64 -ntg 512`,
+   Q4_K_M, `MIB=8000`: 61.2 -> 67.6 t/s).
+2. **Nothing in the remap is device-shared, which is why the forwarding is a delegation and not a redesign.**
+   The routing ids are global expert ids; each device maps them through its OWN expert -> slot map into its
+   OWN `remap_dev`, and the cold half of the map is expressed with THAT device's slot count -- `t.slots`
+   differs per device, so a single shared map would name different experts.  `check_only` must answer for all
+   devices before anything commits (the scheduler's skip-copy decision is all-or-nothing); a decline in the
+   committing pass falls through to the eager path, which resets `remap_n_used`, so a partial commit can only
+   cost a synchronize.
+3. **A host pool that COVERS its tensor is a cold source, so `dr_pool_ok` makes the cold id `slots + pool
+   slot`.**  That is the default `-lme auto` layout on a mapped load ("a pinned per-EXPERT pool of the whole
+   host expert set (a MIRROR)"), and it previously took the eager path for want of a cold encoding even
+   though every expert was pool-resident: +9.9 % on that config.  It is expressible ONLY under coverage: a
+   sub-complement pool declines every offer (measured `0 of 3840 served`), because a device-side map cannot
+   express a miss whose expert is neither in the arena nor in the pool.  Do not "fix" that by pointing the
+   unmapped expert at `slots + e` -- the kernel would resolve it against the pool base.
+4. **A covering pool's expert -> slot map is WRITE-ONCE after sizing, and that is the freshness answer.**
+   The demand path never evicts a resident (`pool_fill_empty_locked` only takes EMPTY slots), and the one
+   re-rank (`pool_rerank_from_heat_locked`) frees nothing and fills nothing when `want` is every expert -- so
+   r221 makes that early-return explicit, and `keep_all` in `expert_host_src` no longer retires a slot for a
+   mirror.  Coverage is therefore a property of the BUDGET, not of the run, which is what lets a one-call-late
+   map be safe without a synchronize (`TODO` #269's "layout epoch or freeze" -- this is the freeze, by
+   construction).  Count LIVE slots (`slot_state == 1`): a slot retiring into the arena still has an index
+   and cannot serve a cold read.
+5. **`dr_pool_ok` is latched once, at sizing, because a captured graph bakes the take-over.**  A decision that
+   could flip later would leave a replayed node reading a baked `remap` pointer while the host had taken the
+   eager path -- a wrong read, not a slow one.  Gate any future extension of the remap's scope on the same
+   question: "is this answer constant for the shape once `g_sized`?"
+6. **Two independent kill switches compose, and the counter is the oracle.**  `MOE_HOST_POOL_COLD=0` and
+   `MOE_HOST_POOL_COLD_MULTIDEV=0` both make `pool_cold_geometry_ok` false, so a covering pool's remap stands
+   down with them; `GGML_MOE_DEVREMAP=0` is the remap's own.  The exit report's `device remap: N tables
+   served, M of K offers declined` line is what tells "no gain" from "not engaged" -- read it before
+   concluding anything about this path.

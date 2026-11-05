@@ -1,4 +1,4 @@
-From 1220c1c6b9c702d776e55324b9d0120bbe3dd149 Mon Sep 17 00:00:00 2001
+From 6c63d464e1bb3ccdd7631d4ebd1ec71e777ed2f4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -494,7 +494,7 @@ index d83b3fb76..b47a1423e 100644
  
  bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 4d669eb8d..ca91b1fb1 100644
+index 9a1a7c283..d2e982b1d 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -262,7 +262,11 @@ extern "C" {
@@ -511,7 +511,7 @@ index 4d669eb8d..ca91b1fb1 100644
          // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
          // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 598dadd52..e66e46922 100644
+index a7018fccd..76193ce94 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -21765,10 +21765,10 @@ index 35f625eaa..ea7ce5ad9 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a70650fa7..58d725d1a 100644
+index c2d8f89c0..c386ee560 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -1786,6 +1786,40 @@ static void pool_rank_from_prefill_locked() {
+@@ -1825,6 +1825,40 @@ static void pool_rank_from_prefill_locked() {
  // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
  // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
  // to token - and that variability is what broke CUDA graph replay.
@@ -21809,7 +21809,7 @@ index a70650fa7..58d725d1a 100644
  moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                                const int32_t * protect = nullptr, int n_protect = 0,
                                bool * out_cold = nullptr) {
-@@ -1942,6 +1976,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -1981,6 +2015,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
              const bool pool_sync = (n_protect > pool->slots);
              pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
          }
@@ -21832,7 +21832,7 @@ index a70650fa7..58d725d1a 100644
          const bool from_pool = pool_expert != nullptr;
          const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
          const char * src = from_pool
-@@ -1991,6 +2041,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -2030,6 +2080,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  
  // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
  // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
@@ -21858,7 +21858,7 @@ index a70650fa7..58d725d1a 100644
  // `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
  // (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
  // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
-@@ -1999,7 +2068,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -2038,7 +2107,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  void apply_prefill_seed_locked(table_t & t) {
      const bool from_tally = g_prefill_seed;
      if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
@@ -21867,7 +21867,7 @@ index a70650fa7..58d725d1a 100644
          return;
      }
      if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
-@@ -2088,7 +2157,8 @@ void apply_prefill_seed_locked(table_t & t) {
+@@ -2127,7 +2196,8 @@ void apply_prefill_seed_locked(table_t & t) {
  // MOE_EXPERT_CACHE_PREFILL_SEED.  Call it BEFORE `apply_prefill_seed_locked` so the persisted prior
  // wins the (empty-arena) race for slots 0...
  void apply_heat_seed_locked(table_t & t) {
@@ -21877,7 +21877,7 @@ index a70650fa7..58d725d1a 100644
          return;
      }
      if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
-@@ -2919,23 +2989,11 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -2958,23 +3028,11 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -21904,7 +21904,7 @@ index a70650fa7..58d725d1a 100644
              if (err != cudaSuccess) {
                  (void) cudaGetLastError();
                  ok = false;
-@@ -3011,7 +3069,24 @@ static bool moe_cache_tables_complete_locked() {
+@@ -3050,7 +3108,24 @@ static bool moe_cache_tables_complete_locked() {
              expected += g_preflight_device_bytes[d];
          }
      }
@@ -21930,7 +21930,7 @@ index a70650fa7..58d725d1a 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -4698,7 +4773,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -4746,7 +4821,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -21940,7 +21940,7 @@ index a70650fa7..58d725d1a 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -4716,6 +4792,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4764,6 +4840,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -21954,7 +21954,7 @@ index a70650fa7..58d725d1a 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -4745,6 +4828,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4793,6 +4876,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -21966,7 +21966,7 @@ index a70650fa7..58d725d1a 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -4813,7 +4901,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4861,7 +4949,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -21975,7 +21975,7 @@ index a70650fa7..58d725d1a 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -5087,6 +5175,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
+@@ -5135,6 +5223,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
      return span <= host_bytes - src_off;
  }
  
@@ -22003,7 +22003,7 @@ index a70650fa7..58d725d1a 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5334,7 +5443,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5382,7 +5491,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -22013,7 +22013,7 @@ index a70650fa7..58d725d1a 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -5377,7 +5487,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5425,7 +5535,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -22039,7 +22039,7 @@ index a70650fa7..58d725d1a 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5394,7 +5521,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5442,7 +5569,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -22049,7 +22049,7 @@ index a70650fa7..58d725d1a 100644
      if (table < 0) {
          return false;
      }
-@@ -5446,7 +5574,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5494,7 +5622,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -22058,16 +22058,16 @@ index a70650fa7..58d725d1a 100644
          g_decline_all++;
          return false;
      }
-@@ -5792,7 +5920,7 @@ static bool devremap_alloc_locked(table_t & t) {
+@@ -5849,7 +5977,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
--    return g_sized && !t.dr_failed && table_cold_ok(t) && !t.identity &&
-+    return g_sized && !t.dr_failed && table_cold_ok(t) && t.n_slices == 0 && !t.identity &&
+-    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && !t.identity &&
++    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -6002,7 +6130,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6100,7 +6228,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }
@@ -22077,7 +22077,7 @@ index a70650fa7..58d725d1a 100644
          }
          // Fold in this device's slice offset so the kernel never needs to know the tensor-split
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index d404abe04..6991fce67 100644
+index e6b328148..6fb4ff8cb 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -196,9 +196,13 @@ bool moe_cache_is_sized();
@@ -22095,7 +22095,7 @@ index d404abe04..6991fce67 100644
  
  // wip/host-expert-dio-cache Phase 1 (plumbing, inert): register the on-disk source of a host-resident
  // expert tensor, keyed by its host data pointer (== the `host` passed to `moe_cache_table`).  Called by
-@@ -269,7 +273,8 @@ bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_te
+@@ -272,7 +276,8 @@ bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_te
  bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,

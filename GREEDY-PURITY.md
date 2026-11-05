@@ -2227,7 +2227,17 @@ MTP acceptance and prefill KLD 0.000000.
    demand path never evicts a resident and retiring slots are excluded, but `pool_rerank_from_heat_locked`
    rewrites slots with plain host copies from `moe_cache_update_host`, which runs after
    `ggml_backend_synchronize(input_backend)` and the ids readback's sync.  Remove that sync and the pool-cold
-   read -- and the pool-sourced fills -- lose their guard.
+   read -- and the pool-sourced fills -- lose their guard.  **r221 answers this for the remap's own pool cold
+   source by construction rather than by a sync**: a covering pool (the only one the remap may use -- a
+   sub-complement pool declines every offer) has a *write-once* `expert -> slot` map after sizing, because
+   the demand path never evicts a resident, `pool_rerank_from_heat_locked` now returns before any bookkeeping
+   when `want` is every expert, and `keep_all` no longer retires a mirror's slot.  Coverage is a property of
+   the budget, not of the run; a lazy `pool_rerank` would reintroduce the hazard.
+4. **The take-over must be constant for a shape once `g_sized`.**  A captured graph bakes the redirect (the
+   arena base and the `remap` pointer become kernel arguments), so a decision that flips later -- a cold
+   source that becomes available mid-run, a table that stops being covered -- leaves a replayed node reading
+   a baked address while the host has taken the eager path.  That is a wrong read, not a slow one: latch such
+   predicates once, at sizing (`dr_pool_ok`), and re-check them only to *decline*, never to acquire.
 
 **The oracle.**  Not a concurrent two-slot text diff (`§38`: the unchanged eager build read two text basins
 run to run here).  Use single-sequence arms, a *sequentially* driven 2-slot server, the MTP acceptance counts
@@ -2237,10 +2247,16 @@ and the prefill-logit gate.
 both switches, 128 and 1000 tokens, a 2048 MiB thrash arena, gpt-oss-20b MXFP4, sequential 2-slot); MTP
 acceptance 0.76089 = 1397/1836 (P) and 0.83340 = 2141/2569 (R) on both arms; prefill KLD 0.000000 /
 100.000 %; **+8.4 %** TG pinned (60.6 -> 65.7), **+4.8 %** pool (57.6 -> 60.4), +14.1 % / +9.2 % at
-`-npl 4`/`-npl 8`, inert under `-sm tensor` (98.0 vs 98.1 t/s).
+`-npl 4`/`-npl 8`.
 
-**Record:** `WORKLOG.md` 261101.011, `benchmarks/2026-11-01-host-expert-device-remap.md`,
-`archive/work/pinned-decode-remap/`, `patches/README.md` (block 09).
+**r221 broadened the scope to every split and to a covering pool** (`TODO` #269) and re-measured it there:
+`-sm tensor` at 1 / 2 / 3 devices **+9.9 % / +16.1 % / +28.4 %** (the eager path's meta synchronize is what
+the remap removes, so the win scales with the device count), the default `-lme auto` **pool mirror** (a
+covering pool) **+9.9 %**, `llama-batched-bench -npl 1/4/8` +5.0..6.0 %, MTP +5.3 % with a bit-identical
+0.75655 = 693/916.  A sub-complement pool declines (`0 of 3840 offers served`) and keeps the eager path.
+
+**Record:** `WORKLOG.md` 261101.011 and 261105.007, `benchmarks/2026-11-01-host-expert-device-remap.md`,
+`archive/work/pinned-decode-remap/`, `INVARIANTS.md` r221, `patches/README.md` (block 09).
 
 ## 83. Skipping a routed expert is not a speed-up — it is a different model (2026-11-02, from the no-XNACK / Avalon analysis)
 

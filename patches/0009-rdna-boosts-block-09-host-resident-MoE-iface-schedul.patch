@@ -1,4 +1,4 @@
-From 7ca8209c97c33f4212d4d55c33774dcc150a554a Mon Sep 17 00:00:00 2001
+From 81e48149202ce7c27078b6ff8f6008d28a4e64de Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -341,6 +341,40 @@ have copied.  Safe because the demand path never evicts a pool resident, a retir
 excluded, and the eager path it rides synchronizes the backend before the hook; single visible device,
 single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 misses served in place,
 +4.9 % TG (57.5 -> 60.4 t/s), identical text.  `MOE_HOST_POOL_COLD=0` restores the fill-every-miss arm.
+
+TODO #269 (r221): the decode remap reaches a TENSOR SPLIT and a covering host pool.  The Meta backend
+now forwards `moe_cache_remap` to each simple device with that device's simple tensors, exactly as it
+already forwards `moe_cache_update`/`take_over`/`gather` -- one `check_only` pass answering for all
+devices, then one committing pass, so the scheduler's all-or-nothing skip-copy decision is unchanged.
+That is not a formality: the remap is per (table, device) by construction (each device holds its own
+arena, slot count, map and lag buffer), and the eager path it replaces synchronizes the WHOLE meta
+backend once per routed op, which is why the win grows with the device count --
+1 GPU 57.6 -> 63.3 t/s (+9.9 %), 2 GPUs `-sm tensor` 64.0 -> 74.3 (+16.1 %), 3 GPUs 59.4 -> 76.3
+(+28.4 %), all 35B-A3B Q8_0 `-ncmoe 40` `MOE_EXPERT_CACHE_MIB=8000`, byte-identical greedy text
+(300 and 1000 tokens), and +5.0..6.0 % on `llama-batched-bench` at `-npl 1/4/8`.  Under `-sm tensor`
+the remap was previously inert by construction (the iface member was NULL).
+
+The second half is the COLD SOURCE.  A `--host-experts pool` table has a pageable master
+(`host_dev == nullptr`), so it had no cold encoding at all and took the eager path even when its pool
+COVERED the tensor -- which is the default `-lme auto` layout on a mapped load ("a pinned per-EXPERT
+pool of the whole host expert set (a MIRROR)").  Such a table now maps a cold expert to
+`slots + pool slot` (the pool slot, a host-side fact at map-build time) instead of `slots + e`; the
+consumer already resolved that id (`moe_cache_get_cold`'s pool branch).  Measured on that default
+config, 1 GPU: 57.6 -> 63.3 t/s (+9.9 %), and +5.3 % under `--spec-type draft-mtp` with bit-identical
+acceptance (0.75655 = 693/916, mean len 3.26) and text.  A sub-complement pool (any `-lme N` below the
+set) still declines every offer (0 of 3840 served, exactly as before), because there a device-side map
+would have a hole it cannot express; so does a covering pool with `MOE_HOST_POOL_COLD=0`.
+
+The freshness invariant the maintainer conditioned #269 on is now structural rather than incidental:
+`dr_pool_ok` is latched once, at sizing (a graph capture needs a per-shape-constant take-over), and a
+covering pool's expert -> slot map is WRITE-ONCE after sizing -- the demand path never evicts a
+resident, and the one covering-pool re-rank is a no-op (`pool_rerank_from_heat_locked` returns before
+any bookkeeping).  `devremap_prep_locked` re-counts the LIVE slots on every map rebuild and declines
+rather than emit an id it cannot resolve.
+
+Gates: prefill-logit KLD 0.000000 / same-top-p 100.000 % (data movement only), MTP acceptance
+bit-identical, `test-backend-ops -o MUL_MAT_ID` 931/931, `scripts/gate-host-pool.sh` 18/18,
+`check-gpu-faults.sh` clean.  Kill switch unchanged (`GGML_MOE_DEVREMAP=0`).
 ---
  common/CMakeLists.txt                         |    2 +
  common/arg.cpp                                |   75 +-
@@ -357,8 +391,8 @@ single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 mis
  ggml/include/ggml-alloc.h                     |    1 +
  ggml/include/ggml-backend.h                   |  131 +
  ggml/src/ggml-alloc.c                         |   85 +-
- ggml/src/ggml-backend-impl.h                  |  256 +
- ggml/src/ggml-backend-meta.cpp                | 1506 +++-
+ ggml/src/ggml-backend-impl.h                  |  258 +
+ ggml/src/ggml-backend-meta.cpp                | 1562 +++-
  ggml/src/ggml-backend.cpp                     | 1314 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    7 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    7 +
@@ -372,8 +406,8 @@ single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 mis
  ggml/src/ggml-cuda/ggml-cuda.cu               | 2741 ++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 6499 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  344 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 6598 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  347 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
  ggml/src/ggml-cuda/vendors/hip.h              |   13 +
@@ -410,7 +444,7 @@ single slice.  Measured (pool arm, 1 x R9700): fills 21747 -> 15270 and 8445 mis
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17210 insertions(+), 540 deletions(-)
+ 68 files changed, 17370 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -2422,7 +2456,7 @@ index 022ff710e..d83b3fb76 100644
 +    galloc->layout_valid = false;
 +}
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..4d669eb8d 100644
+index dc7367dec..9a1a7c283 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -30,6 +30,26 @@ extern "C" {
@@ -2500,7 +2534,7 @@ index dc7367dec..4d669eb8d 100644
      };
  
      struct ggml_backend_i {
-@@ -152,8 +206,88 @@ extern "C" {
+@@ -152,8 +206,90 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -2583,13 +2617,15 @@ index dc7367dec..4d669eb8d 100644
 +        bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
 +        // Sync-free decode device remap (GGML_MOE_DEVREMAP): the backend turns the device routing `ids` into slot ids
 +        // itself, so the scheduler skips the ids readback and its synchronize.  The residency policy runs one call late
-+        // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
-+        // backends' positional initializers stay valid (NULL).
++        // on the previous call's routing.  check_only: report, change nothing.  Like `moe_cache_update` the Meta backend
++        // forwards it to each simple backend, with that device's simple tensors, so a tensor split gets the map too
++        // (TODO #269); the per-device cold-id encoding comes from the per-device table.  Appended at the END of the
++        // struct, so the other backends' positional initializers stay valid (NULL).
 +        bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
      };
  
      struct ggml_backend {
-@@ -216,6 +350,128 @@ extern "C" {
+@@ -216,6 +352,128 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -2719,7 +2755,7 @@ index dc7367dec..4d669eb8d 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 479ed3ae3..598dadd52 100644
+index 479ed3ae3..a7018fccd 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -4458,7 +4494,7 @@ index 479ed3ae3..598dadd52 100644
          ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
          memset(ret, 0, sizeof(ggml_tensor));
          ret->op   = GGML_OP_NONE;
-@@ -2579,6 +3519,176 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2579,6 +3519,232 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -4610,6 +4646,62 @@ index 479ed3ae3..598dadd52 100644
 +    return all;
 +}
 +
++// Sync-free decode device remap (GGML_MOE_DEVREMAP, TODO #269): forward to every simple device, exactly as
++// the gather above does.  The remap is per (table, device) BY CONSTRUCTION -- the routing ids are global
++// expert ids, so each device maps them through its OWN expert -> slot map into its OWN `remap_dev`, and the
++// cold half of that map (`slots + e` for a pinned master, `slots + pool slot` for a covering host pool) is
++// expressed with THIS device's slot count, which is what the consumer (`moe_cache_get_table` +
++// `moe_cache_get_cold` on that device) expects.  Nothing here is device-shared: `t.slots`, the arena, the
++// map and the lag buffer are per table, and a table is per (host tensor, device).
++//
++// The two-call protocol is what makes the all-or-nothing skip-copy decision safe: `check_only` answers for
++// every device without changing anything, and only when ALL of them say yes does the scheduler issue the
++// committing call.  A decline in the committing pass (a residency change that landed in between) returns
++// false, and the scheduler falls through to the gather / eager path, which repopulates the split input and
++// clears `remap_n_used` -- i.e. a partial commit can only cost a synchronize, never a wrong read.
++static bool ggml_backend_meta_moe_cache_remap(ggml_backend_t backend, const struct ggml_tensor * weight,
++        const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only) {
++    if (weight == nullptr || weight_cpy == nullptr || ids == nullptr || weight->ne[2] < 2) {
++        return false;
++    }
++    if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
++        return false;
++    }
++    const size_t              n_backends = ggml_backend_meta_n_backends(backend);
++    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
++    if (ss.n_segments != 1 || ss.nr[0] != 1 || ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
++        return false;   // a fused or mirrored table has no per-device slot geometry
++    }
++    const bool ids_meta = ggml_backend_buffer_is_meta(ids->buffer);
++    if (!ids_meta && n_backends > 1) {
++        return false;   // a single device routing tensor cannot be read by every device
++    }
++    bool all = true;
++    for (size_t j = 0; j < n_backends; j++) {
++        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
++        ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
++        if (simple_tensor == nullptr || simple_backend->iface.moe_cache_remap == nullptr) {
++            return false;
++        }
++        const ggml_tensor * ids_j = ids;
++        if (ids_meta) {
++            ggml_tensor * si = ggml_backend_meta_buffer_simple_tensor(ids, j);
++            if (si == nullptr) {
++                return false;
++            }
++            ids_j = si;
++        }
++        if (!simple_backend->iface.moe_cache_remap(simple_backend, weight, simple_tensor, ids_j, check_only)) {
++            // Short-circuit BOTH passes: on the check pass one device's no is the whole answer, and on the
++            // committing pass the scheduler must stop redirecting and take the fallback (which resets the
++            // tables that did commit).
++            all = false;
++            break;
++        }
++    }
++    return all;
++}
++
 +// UPSTREAM PR #22466 (adapted): fan the loader's per-upload event record/wait out to every simple
 +// backend so the meta backend can serve as the async-upload backend under `-sm tensor`.
 +static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -4635,7 +4727,7 @@ index 479ed3ae3..598dadd52 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2593,9 +3703,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2593,9 +3759,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_plan_update       = */ nullptr,
      /* .graph_plan_compute      = */ nullptr,
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
@@ -4656,7 +4748,7 @@ index 479ed3ae3..598dadd52 100644
 +    /* .moe_cache_take_over     = */ ggml_backend_meta_moe_cache_take_over,
 +    /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
 +    /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
-+    /* .moe_cache_remap         = */ nullptr,   // not forwarded: -sm tensor keeps the eager path
++    /* .moe_cache_remap         = */ ggml_backend_meta_moe_cache_remap,
  };
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
@@ -11021,10 +11113,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a70650fa7
+index 000000000..c2d8f89c0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6499 @@
+@@ -0,0 +1,6598 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11180,6 +11272,11 @@ index 000000000..a70650fa7
 +    bool        dr_lag_flag = false;
 +    bool        dr_map_ok   = false;
 +    bool        dr_failed   = false;
++    // TODO #269: this table's cold source at sizing was a host pool that COVERS it (every expert has a
++    // resident pool slot), so the remap's cold ids can be `slots + pool_slot`.  Decided once, at sizing:
++    // it is a per-shape constant for a graph capture, and (see `pool_rerank_from_heat_locked`) a covering
++    // pool's layout is write-once, so a cold id stays valid for the life of the run.
++    bool        dr_pool_ok  = false;
 +    const void * dr_last_ids    = nullptr;   // routing buffer and stream of the last take-over: a sibling joins a launch
 +    void *       dr_last_stream = nullptr;   // only when both match, so a launch never touches another context's table
 +
@@ -11723,10 +11820,31 @@ index 000000000..a70650fa7
 +//   coverage is a property of the budget (`slots`), not of the run.
 +//
 +// `p->slots` is fixed at the first pool build and `expert_slot` can never hold more than `n_experts`
-+// entries, so this is a static property; the residency half is re-checked in O(1) here rather than
-+// trusted, and a pool with a genuine sub-complement budget (any `-lme N` below the set, any
-+// `MOE_HOST_POOL_FRAC` below 100) fails the first test and keeps the historical arena bound.  Caller
-+// holds `g_mutex`.
++// entries, so this is a static property; the residency half is re-checked here rather than trusted (LIVE
++// slots only -- a slot retiring into the arena still has an index but cannot serve a cold read), and a pool
++// with a genuine sub-complement budget (any `-lme N` below the set, any `MOE_HOST_POOL_FRAC` below 100) fails
++// the first test and keeps the historical arena bound.  TODO #269: this is also the predicate that decides
++// whether the decode remap may encode a cold id as `slots + pool slot`.  Caller holds `g_mutex`.
++static int pool_live_slots(const host_pool_t & p) {
++    int n = 0;
++    for (int s = 0; s < p.slots && s < (int) p.slot_expert.size(); s++) {
++        if (p.slot_expert[(size_t) s] >= 0 && p.slot_state[(size_t) s] == 1) {
++            n++;
++        }
++    }
++    return n;
++}
++
++// The pool that already serves this table, or null.  Unlike `table_pool_locked` this never CREATES a pool, so
++// it is safe on the `check_only` remap path and on any pure query.  Caller holds `g_mutex`.
++static host_pool_t * table_pool_peek_locked(table_t & t) {
++    if (!g_pool_enabled || t.host_dev != nullptr || !t.src_known || t.host == nullptr) {
++        return nullptr;
++    }
++    const auto it = g_host_pools.find(t.host);
++    return (it != g_host_pools.end() && !it->second.failed) ? &it->second : nullptr;
++}
++
 +static bool pool_covers_table(table_t & t) {
 +    if (t.host_dev != nullptr) {
 +        return false;   // a pinned master serves its own cold ids; the pool is for a pageable master
@@ -11735,8 +11853,21 @@ index 000000000..a70650fa7
 +    if (!pool_cold_geometry_ok(t, p) || p->slots < t.n_experts) {
 +        return false;
 +    }
-+    return (int) p->expert_slot.size() >= t.n_experts;   // every expert is a resident cold source
++    return pool_live_slots(*p) >= t.n_experts;   // every expert is a resident cold source
 +}
++
++// The same coverage test without the pool-creating lookup: `devremap_ok_locked` is a pure predicate
++// (`check_only` must not mutate anything), so it answers only from a pool that already exists.  A table that
++// has not built its pool yet has never filled from one either, so declining here cannot strand it -- the
++// eager path builds the pool on its next pass and the remap is offered again.
++static bool pool_covers_table_peek_locked(table_t & t) {
++    host_pool_t * p = table_pool_peek_locked(t);
++    if (!pool_cold_geometry_ok(t, p) || p->slots < t.n_experts) {
++        return false;
++    }
++    return pool_live_slots(*p) >= t.n_experts;
++}
++
 +// Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
 +// device is sized from its free VRAM at `alloc_all_locked`), otherwise the requested MiB/device.
 +static const char * budget_desc() {
@@ -14573,6 +14704,15 @@ index 000000000..a70650fa7
 +            g_rearm_slots[t.layer] = t.slots;
 +        }
 +    }
++    // TODO #269: latch each table's remap cold SOURCE while the layout is final and `g_sized` is still
++    // false, so `devremap_ok_locked` never has to ask a question whose answer could change later (a graph
++    // capture needs a per-shape constant).  A host pool that covers the tensor gives every expert a
++    // resident slot, so the remap can encode a cold read as `slots + pool slot` even though the master is
++    // pageable and has no device mapping -- which is the default `-lme auto` layout on a mapped load
++    // ("a pinned per-EXPERT pool of the whole host expert set (a MIRROR)").
++    for (table_t & t : g_tables) {
++        t.dr_pool_ok = t.slots > 0 && !table_cold_ok(t) && pool_covers_table_peek_locked(t);
++    }
 +}
 +
 +} // namespace
@@ -16773,6 +16913,8 @@ index 000000000..a70650fa7
 +    return e == nullptr || atoi(e) != 0;
 +}();
 +static int64_t g_devremap_calls = 0;
++static int64_t g_devremap_offers = 0;   // hosted-expert inputs offered to the remap, and how many it declined
++static int64_t g_devremap_declined = 0;
 +
 +struct devremap_batch_t {
 +    const void *     ids    = nullptr;
@@ -16817,9 +16959,16 @@ index 000000000..a70650fa7
 +    return true;
 +}
 +
++// The remap's COLD SOURCE for a table: a pinned master (`table_cold_ok`, cold id = `slots + e`) or a host
++// pool that covers the tensor (cold id = `slots + pool slot`).  Both give every expert a valid cold id, which
++// is what a device-side map needs: it is built once per residency change and then read blindly by the kernel.
++static bool devremap_cold_ok_locked(const table_t & t) {
++    return table_cold_ok(t) || t.dr_pool_ok;
++}
++
 +// Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
 +static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
-+    return g_sized && !t.dr_failed && table_cold_ok(t) && !t.identity &&
++    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && !t.identity &&
 +           t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
 +           n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
 +           (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
@@ -16866,8 +17015,45 @@ index 000000000..a70650fa7
 +            (void) cudaGetLastError();
 +            return false;
 +        }
++        const bool pinned = table_cold_ok(t);
++        host_pool_t * pool = nullptr;
++        if (!pinned) {
++            // A covering host pool: the cold id is this expert's POOL slot, which is a host-side fact (the
++            // policy runs here, on the host, one call late) while the arena slot would be per device.  Every
++            // expert must have a live slot -- `t.dr_pool_ok` decided that at sizing, and a pool that has
++            // since lost one (impossible for a covering pool after sizing) declines rather than emit an id
++            // the kernel would resolve against the wrong bytes.
++            pool = table_pool_peek_locked(t);
++            if (pool == nullptr || !pool_cold_geometry_ok(t, pool) || pool->slots < t.n_experts) {
++                t.dr_map_ok = false;
++                return false;
++            }
++        }
 +        for (int e = 0; e < t.n_experts; e++) {
 +            t.dr_map_host[e] = t.slots + e;
++        }
++        if (pool != nullptr) {
++            int n_cold = 0;
++            for (int ps = 0; ps < pool->slots && ps < (int) pool->slot_expert.size(); ps++) {
++                const int32_t e = pool->slot_expert[(size_t) ps];
++                if (e >= 0 && e < t.n_experts && pool->slot_state[(size_t) ps] == 1) {
++                    t.dr_map_host[e] = t.slots + ps;
++                    n_cold++;
++                }
++            }
++            if (n_cold < t.n_experts) {
++                // Not every expert is pool-resident after all: the map would have a hole and the kernel
++                // would read the pool at `expert * stride`.  Decline (the eager path serves the input).
++                static bool warned = false;
++                if (!warned) {
++                    warned = true;
++                    GGML_LOG_WARN("%s: layer=%d role=%s: the host pool no longer covers the table (%d of %d "
++                                  "experts resident); the device remap stands down for it\n",
++                                  __func__, t.layer, t.role.c_str(), n_cold, t.n_experts);
++                }
++                t.dr_map_ok = false;
++                return false;
++            }
 +        }
 +        for (int sl = 0; sl < t.slots && sl < (int) t.slot_expert.size(); sl++) {
 +            const int32_t e = t.slot_expert[sl];
@@ -16909,6 +17095,10 @@ index 000000000..a70650fa7
 +    table_t & t = g_tables[id];
 +    const bool ok = devremap_ok_locked(t, n_used, n_tok, device);
 +    if (check_only) {
++        g_devremap_offers++;
++        if (!ok) {
++            g_devremap_declined++;
++        }
 +        return ok;
 +    }
 +    g_write_seq++;
@@ -17277,8 +17467,9 @@ index 000000000..a70650fa7
 +    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
 +                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
 +                  n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
-+    if (g_devremap_calls > 0) {
-+        GGML_LOG_INFO("%s: device remap: %lld calls\n", __func__, (long long) g_devremap_calls);
++    if (g_devremap_offers > 0 || g_devremap_calls > 0) {
++        GGML_LOG_INFO("%s: device remap: %lld tables served, %lld of %lld offers declined\n", __func__,
++                      (long long) g_devremap_calls, (long long) g_devremap_declined, (long long) g_devremap_offers);
 +    }
 +    if (g_pool_enabled) {
 +        int64_t p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
@@ -17526,10 +17717,10 @@ index 000000000..a70650fa7
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..d404abe04
+index 000000000..e6b328148
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,347 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -17795,7 +17986,10 @@ index 000000000..d404abe04
 +// backend it computes them per device and forwards here once per simple device.
 +// Sync-free decode device remap (GGML_MOE_DEVREMAP): remap the device routing `ids` to slot ids on `stream` with the
 +// residency policy one call late; true = the op reads the arena through the table's remap.  `check_only`: report
-+// whether the call would take the input, change nothing.
++// whether the call would take the input, change nothing.  Per table AND per device: each device maps the
++// (global) routing through its own expert -> slot map, and the cold half of that map is expressed with this
++// device's slot count -- `slots + e` for a pinned master, `slots + pool slot` for a host pool that covers the
++// table (TODO #269).  Under `-sm tensor` the Meta backend forwards it to every simple device.
 +bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
 +                         void * stream, int device, bool check_only);
 +bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
