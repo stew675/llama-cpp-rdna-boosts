@@ -26,6 +26,11 @@
 #   cannot leave the resident arm is not a gate), or if their text differs by a single token.
 #
 # ARMS
+#   The provider's SELFTEST (`GGML_CUDA_VMM_REGION_SELFTEST=1`; the primitive's own oracle, and the only
+#   check of the VMM hazard):
+#     wselftest     default arm -- must print the PASS verdict
+#     wselftest0    `LLAMA_KV_REGION_QUARANTINE=0` -- must print the FAIL verdict, or the oracle is vacuous
+#   (Both need `llama-cli -v`: the PASS verdict is a WARN line -- see `ENVIRONMENT.md` block 15.)
 #   Window (4B Q8_0, 1 GPU, `-c 16384` f16 KV, a 5 246-token prompt, so the run depth is ~5 300):
 #     wref          no knob: the plain device KV (the reference text)
 #     wres          W=8192, ABOVE the run depth: nothing spills, so no mapping may ever flip to host
@@ -133,7 +138,7 @@ for arg in "$@"; do
         --window-only) DO_POOL=0; DO_MULTI=0 ;;
         --pool-only) DO_WINDOW=0 ;;
         --multi-only) DO_WINDOW=0; DO_POOL=0 ;;
-        -h|--help) sed -n '2,107p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,112p' "$0"; exit 0 ;;
         *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -237,6 +242,31 @@ info "window arm   : $MODEL_WIN, -c $CTX_WIN"
 [ "$DO_POOL" = 1 ] && info "pool arm     : $MODEL_POOL (+ $(basename "$DRAFT_POOL")), -c $CTX_POOL"
 [ "$DO_MULTI" = 1 ] && info "multi arm    : the same pool arms on HIP_VISIBLE_DEVICES=$MULTI_DEVICES (-sm layer), when that names 2+ devices"
 info "logs         : $KEEPOUT"
+
+# ===== the provider's own selftest (the only sensitive check of the VMM primitive) ========================
+# `GGML_CUDA_VMM_REGION_SELFTEST=1` exercises the primitive directly (reserve, prefix+span growth, a
+# HOST-backed span, aligned window flips with a straddling request REFUSED, the host-mapping hazard replayed
+# over a whole flip sequence, the watermark contract and clear-on-map).  TWO arms, because a diagnostic that
+# cannot fail is not a gate: the default arm must PASS, and the arm with the quarantine hold disabled
+# (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) must FAIL.  Neither arm asks for a window, so the KV is
+# the plain device buffer and the generated text is irrelevant -- the VERDICT line is what is graded.  That
+# line is WARN on PASS / ERROR on FAIL (r222: it used to be INFO, invisible at every default, so a FAIL read
+# exactly like a PASS); `run_arm` passes `-v`, which is what makes the PASS visible.
+echo "-- the provider's selftest (the primitive's oracle: PASS by default, FAIL without the quarantine hold)"
+run_arm wselftest  "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 -- -c 2048 || exit 1
+run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LLAMA_KV_REGION_QUARANTINE=0 -- -c 2048 || exit 1
+
+[ "$(count wselftest 'selftest: device 0: PASS')" -ge 1 ] \
+    && pass "wselftest PASSED the provider's selftest (growth, host span, flips, the hazard, the watermark)" \
+    || fail "wselftest printed no PASS verdict ($(count wselftest 'selftest: device 0:') verdict line(s); the selftest may not have run)"
+[ "$(count wselftest 'selftest: device 0: FAIL')" = 0 ] \
+    && pass "wselftest reported no failed check" \
+    || fail "wselftest FAILED: $(grep -m3 'selftest\|FAILED:' "$KEEPOUT/wselftest.err" 2>/dev/null | tr '\n' ' ')"
+# ... and the oracle must be SENSITIVE: without the hold the hazard case is a wrong answer, and the selftest
+# is the only thing that notices.  An arm that passes here too means the selftest stopped testing the hazard.
+[ "$(count wselftest0 'selftest: device 0: FAIL')" -ge 1 ] \
+    && pass "wselftest0 FAILED with the quarantine hold off (the selftest is sensitive, not a formality)" \
+    || fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 (the hazard arm is vacuous)"
 
 # ===== the window ========================================================================================
 if [ "$DO_WINDOW" = 1 ]; then

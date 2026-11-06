@@ -57,6 +57,22 @@ cd "$FORK"
 git rev-parse --verify "$BASELINE" >/dev/null 2>&1 || { echo "ERROR: baseline $BASELINE not found in $FORK" >&2; exit 1; }
 git rev-parse --verify "$TIP" >/dev/null 2>&1 || { echo "ERROR: blocks tip $TIP not found in $FORK" >&2; exit 1; }
 
+# STALENESS GUARD (r222): the default tip comes from release.json, so a block amendment made in the checkout
+# (an amended block commit, a new block) silently re-cut the PREVIOUS set -- it printed "Regenerated 16
+# patches" and exit 0 while the amend was nowhere in the delivery, and only a grep of the patch found it.
+# If the fork's checked-out tip is not the recorded one and no tip was passed explicitly, refuse and name both.
+if [ -z "${3:-}" ]; then
+    HEAD_TIP="$(git rev-parse HEAD 2>/dev/null || true)"
+    TIP_FULL="$(git rev-parse "$TIP")"
+    if [ -n "$HEAD_TIP" ] && [ "$HEAD_TIP" != "$TIP_FULL" ]; then
+        echo "ERROR: the tip default came from release.json ($TIP) but $FORK is checked out at $HEAD_TIP." >&2
+        echo "ERROR: pass the tip explicitly (scripts/make-patches.sh <fork> $BASELINE $HEAD_TIP) if that commit" >&2
+        echo "ERROR: is the amended block set, or re-cut the canonical chain first and update release.json." >&2
+        echo "ERROR: refusing to re-cut the RECORDED set while the checkout carries a different one." >&2
+        exit 1
+    fi
+fi
+
 rm -f "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch
 
 git format-patch --start-number 0 "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null

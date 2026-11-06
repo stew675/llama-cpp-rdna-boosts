@@ -1,4 +1,4 @@
-From 438e9179547b9dde24fdcf65f7e1b4370873ae0c Mon Sep 17 00:00:00 2001
+From 80bfb80bed3e1752910aa82257404adb7b3894e8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -380,9 +380,9 @@ it is what makes the decode remap's pool-slot cold map write-once after sizing.
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
  ggml/src/ggml-cuda/fattn-qsa.cu            |   40 +-
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1238 ++++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  122 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1449 ++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1278 +++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  144 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1468 ++++++++++++++++++-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 +++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
  ggml/src/ggml-cuda/moe-expert-cache.cu     |   43 +-
@@ -402,7 +402,7 @@ it is what makes the decode remap's pool-slot cold map write-once after sizing.
  src/llama-model.cpp                        |  144 +-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   66 +-
- 33 files changed, 6182 insertions(+), 835 deletions(-)
+ 33 files changed, 6263 insertions(+), 835 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -1550,10 +1550,10 @@ index e17d4bf60..93fc0641f 100644
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
 new file mode 100644
-index 000000000..d31f94bf0
+index 000000000..6cca09d0c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
-@@ -0,0 +1,1238 @@
+@@ -0,0 +1,1278 @@
 +// wip/kv-residency (TODO #117): the grow-only VMM region -- the O1 "fixed KV region" primitive.
 +// Contract, driver facts and the two traps: ggml-cuda-vmm-region.h.
 +//
@@ -1640,6 +1640,18 @@ index 000000000..d31f94bf0
 +    return a == 0 ? x : ((x + a - 1) / a) * a;
 +}
 +
++// DEVICE DISCIPLINE (issue #275): every entry point that can reach the driver binds the device FIRST, so the
++// VMM traffic (`cuMemAddressReserve`, `cuMemCreate`/`Map`/`SetAccess`, `cuMemUnmap`, `cuMemAddressFree`, the
++// cudaMalloc/hostAlloc quarantine and the staging copies) always runs in the region's own context.  Binding
++// here rather than at each call site is the invariant: a new caller cannot forget it, and a caller that
++// merely *constructs* a buffer type cannot run cross-context driver traffic by accident (which is exactly
++// what broke the first kernel launch on Windows/HCC -- see the header).
++static void vmm_bind_device(int device) {
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++        ggml_cuda_set_device(device);
++    }
++}
++
 +// The backend already queried this once at init (`ggml_cuda_info().devices[].vmm_granularity`, the
 +// RECOMMENDED granularity) and latched whether the driver offers VMM at all, so there is no second query
 +// and no need for the `CUresult`/`CU_MEM_ALLOC_GRANULARITY_MINIMUM` macros -- which `vendors/hip.h` does
@@ -1656,6 +1668,7 @@ index 000000000..d31f94bf0
 +        return cache[device];
 +    }
 +    done[device] = true;
++    vmm_bind_device(device);   // the granularity query is a driver call (issue #275)
 +    CUmemAllocationProp prop = {};
 +    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
 +    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -1847,6 +1860,7 @@ index 000000000..d31f94bf0
 +        return fail("zero size");
 +    }
 +
++    vmm_bind_device(device);   // `cuMemAddressReserve`/`cuMemCreate` are driver calls (issue #275)
 +    const int phys = ggml_cuda_get_physical_device(device);
 +    const size_t gran = vmm_granularity(device);
 +    if (gran == 0) {
@@ -1958,6 +1972,7 @@ index 000000000..d31f94bf0
 +    if (off > r->size || bytes > r->size - off) {
 +        return false;   // outside the reservation -- the caller sized the region for its own extent
 +    }
++    vmm_bind_device(r->device);   // cuMemCreate/Map/SetAccess + the quarantine cudaMalloc (issue #275)
 +    // Round OUTWARD to the driver's minimum granularity (a host mapping must be a whole multiple of it, and a
 +    // mixed-backing boundary is 4 KiB-granular), then map in <=`unit` pieces.  Rounding outward can only touch
 +    // more VA than asked for, never a byte outside the reservation.
@@ -2277,6 +2292,7 @@ index 000000000..d31f94bf0
 +    if (off > r->size || bytes > r->size - off) {
 +        return false;
 +    }
++    vmm_bind_device(r->device);   // a flip is unmap + map + a staged copy (issue #275)
 +    const size_t g = r->gran != 0 ? r->gran : (size_t) 4096;
 +    size_t a = (off / g) * g;
 +    size_t b = vmm_up(off + bytes, g);
@@ -2390,6 +2406,7 @@ index 000000000..d31f94bf0
 +    if (r == nullptr) {
 +        return;
 +    }
++    vmm_bind_device(r->device);
 +    for (const vmm_mapping & m : r->maps) {
 +        if (cudaMemset((char *) r->base + m.off, value, m.bytes) != cudaSuccess) {
 +            (void) cudaGetLastError();
@@ -2412,6 +2429,7 @@ index 000000000..d31f94bf0
 +    if (r == nullptr || path == nullptr) {
 +        return false;
 +    }
++    vmm_bind_device(r->device);
 +    FILE * f = fopen(path, "wb");
 +    if (f == nullptr) {
 +        GGML_LOG_ERROR("%s: cannot open %s\n", __func__, path);
@@ -2451,6 +2469,7 @@ index 000000000..d31f94bf0
 +    if (r == nullptr) {
 +        return;
 +    }
++    vmm_bind_device(r->device);   // `cuMemUnmap`/`cuMemAddressFree` are driver calls (issue #275)
 +    if (const char * dump = getenv("LLAMA_KV_REGION_DUMP")) {
 +        if (dump[0] != '\0') {
 +            fprintf(stderr, "KVREGION_FREE dev=%d maps=%zu mapped=%.2f host=%.2f dump=%s\n", r->device,
@@ -2487,9 +2506,18 @@ index 000000000..d31f94bf0
 +    delete r;
 +}
 +
++bool ggml_cuda_vmm_region_capable(int device) {
++    // No driver traffic: the backend latched both facts at init, in the right context.  A buffer type asks
++    // THIS (issue #275) -- see the header.
++    const ggml_cuda_device_info & info = ggml_cuda_info();
++    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && info.devices[device].vmm &&
++            info.devices[device].vmm_granularity != 0;
++}
++
 +bool ggml_cuda_vmm_region_available(int device) {
 +    // One real probe per device: reserve one unit, map it, unmap it, free it.  Cached, because the answer
-+    // cannot change inside a process and the probe costs two driver round trips.
++    // cannot change inside a process and the probe costs two driver round trips.  The device is BOUND first,
++    // so the probe's VMM traffic runs in the probed device's own context (issue #275).
 +    static bool     ok[GGML_CUDA_MAX_DEVICES] = {};
 +    static bool     done[GGML_CUDA_MAX_DEVICES] = {};
 +    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
@@ -2499,6 +2527,7 @@ index 000000000..d31f94bf0
 +        return ok[device];
 +    }
 +    done[device] = true;
++    vmm_bind_device(device);
 +    const size_t g = vmm_granularity(device);
 +    if (g == 0) {
 +        return ok[device] = false;
@@ -2564,6 +2593,7 @@ index 000000000..d31f94bf0
 +    const size_t unit = (size_t) 64 << 20;
 +    const size_t n_units = 6;
 +
++    vmm_bind_device(device);   // the kernels below run in this device's context (issue #275)
 +    char err[128] = {0};
 +    ggml_cuda_vmm_region * r = ggml_cuda_vmm_region_create(device, n_units * unit, unit, err, sizeof(err));
 +    if (r == nullptr) {
@@ -2786,18 +2816,28 @@ index 000000000..d31f94bf0
 +    ggml_cuda_vmm_region_free(r);
 +    (void) cudaFree(d_bad);
 +
-+    GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
-+                  "a HOST-backed span, aligned window flips (a partial one is REFUSED), the host-mapping hazard (a whole "
-+                  "flip sequence re-verified), the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
-+                  (n_units * unit) >> 20, n_units, unit >> 20);
++    // The VERDICT is WARN/ERROR, never INFO (issue #275 follow-up).  An INFO line is invisible at every
++    // default: `common_log_get_verbosity()` maps GGML_LOG_LEVEL_INFO to TRACE, so the release gate that asks
++    // for this diagnostic got no verdict at all -- and a FAIL was as quiet as a PASS was.  A FAIL is now an
++    // ERROR (always printed, by `llama-cli` too: it lowers the threshold to error-only for its interactive
++    // UI), a PASS is a WARN and needs `-lv 2` there, which `ENVIRONMENT.md` block 15 states.
++    if (ok) {
++        GGML_LOG_WARN("%s: device %d: PASS (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
++                "a HOST-backed span, aligned window flips (a partial one is REFUSED), the host-mapping hazard (a whole "
++                "flip sequence re-verified), the watermark contract and clear-on-map verified)\n", __func__, device,
++                (n_units * unit) >> 20, n_units, unit >> 20);
++    } else {
++        GGML_LOG_ERROR("%s: device %d: FAIL (the refused check is the GGML_LOG_ERROR line above; a FAIL here means "
++                "the windowed KV must not be used with this driver)\n", __func__, device);
++    }
 +    return ok;
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
 new file mode 100644
-index 000000000..5d2618b48
+index 000000000..5f47fce87
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,144 @@
 +#pragma once
 +
 +// wip/kv-residency (TODO #117): a grow-only VMM region for the KV cache -- the O1 "fixed region" primitive.
@@ -2834,6 +2874,17 @@ index 000000000..5d2618b48
 +//
 +// All entry points fail soft: a driver refusal returns false/nullptr and leaves nothing half-created, so a
 +// caller can fall back to the plain allocation path.  No `GGML_ASSERT` ends the process.
++//
++// DEVICE DISCIPLINE (issue #275)
++//   Every entry point below that can reach the driver BINDS the region's device first, so the VA reservation
++//   and the map/unmap/set-access traffic always happen in the probed device's own context.  This is not
++//   defensive: the module used to inherit whatever context the calling thread was on, which was right for
++//   `alloc_buffer` (it binds) and wrong for the capability PROBE, reached from `llama_kv_cache` init through
++//   a Meta (tensor-split) device while the current context was still the last device model load touched.  On
++//   Windows/HCC that cross-context VMM traffic is what killed the first kernel launch (access violation in
++//   `hipHccModuleLaunchKernel`, both device orders, 2 GPUs, no window requested).  And only the probe may run
++//   at BUFFER-TYPE CONSTRUCTION time: a constructor asks `_capable` (latched flags, no driver traffic), which
++//   is why the plain `-sm tensor` path now performs no VMM driver call at all.
 +
 +#include <stddef.h>
 +#include <stdint.h>
@@ -2912,7 +2963,18 @@ index 000000000..5d2618b48
 +void   ggml_cuda_vmm_region_verify_host(ggml_cuda_vmm_region * r, const char * where);
 +
 +// Is VMM usable on this device at all (reserve + one map + unmap succeeded once)?  Cached per device.
++// This is the ORACLE and it costs real driver round trips, so it is only ever called from a context that has
++// BOUND the device (allocation time).  A buffer-type CONSTRUCTION asks `_capable` instead (issue #275).
 +bool   ggml_cuda_vmm_region_available(int device);
++
++// Can this device host a region, answered WITHOUT driver traffic: the two facts the backend already latched
++// at init (`devices[].vmm` and its RECOMMENDED granularity).  This is the question a buffer type may ask
++// while it is being CONSTRUCTED -- e.g. `llama_kv_cache` init probing every child of a Meta (tensor-split)
++// device -- because a constructor runs on whatever driver context the calling thread happens to be on, and a
++// VMM round trip there is cross-context traffic (issue #275: an access violation at the first kernel launch
++// on Windows/HCC).  The real reserve/map validation is deferred to allocation time, where the device is
++// bound and a refusal still falls back to the plain device buffer.
++bool   ggml_cuda_vmm_region_capable(int device);
 +
 +// Diagnostic (GGML_CUDA_VMM_REGION_SELFTEST=1, run from the CUDA backend init): exercise the primitive on
 +// this device -- reserve, grow in steps, verify a pattern per unit, verify the watermark contract, reach
@@ -2921,7 +2983,7 @@ index 000000000..5d2618b48
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0177e7f46..08eea6151 100644
+index 0177e7f46..0be84ea23 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,7 @@
@@ -3004,7 +3066,7 @@ index 0177e7f46..08eea6151 100644
  };
  
  // See ggml-cuda-arena.cuh: the compute-buffer chunk decision needs this buffer type's device, because
-@@ -2453,6 +2487,769 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
+@@ -2453,6 +2487,788 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
      return &ggml_backend_cuda_buffer_types[device];
  }
  
@@ -3631,9 +3693,20 @@ index 0177e7f46..08eea6151 100644
 +
 +    ggml_cuda_set_device(buft_ctx->device);
 +
++    // Issue #275: this is where the region's REAL capability is decided -- the device is bound, we are about to
++    // allocate, and a refusal here still falls back to the plain device buffer (one step later than the old
++    // construction-time probe, with exactly the same outcome).  `ggml_cuda_vmm_region_capable` (the flag pair)
++    // has already answered the question a buffer type may ask; this validates "the driver actually reserves and
++    // maps one unit" before any KV byte is committed, so a device that reserves but refuses a map does not get
++    // a region it cannot grow into mid-batch.
 +    char err[192] = {0};
-+    ggml_cuda_vmm_region * region = ggml_cuda_vmm_region_create(buft_ctx->device, size, ggml_cuda_kv_region_unit(),
-+            err, sizeof(err));
++    ggml_cuda_vmm_region * region = nullptr;
++    if (!ggml_cuda_vmm_region_available(buft_ctx->device)) {
++        // `available` has already logged the reason (the probe line above).
++        snprintf(err, sizeof(err), "the one-unit VMM probe was refused");
++    } else {
++        region = ggml_cuda_vmm_region_create(buft_ctx->device, size, ggml_cuda_kv_region_unit(), err, sizeof(err));
++    }
 +    if (region == nullptr) {
 +        // The provider must not be the only one: fall back to the plain device buffer, with the same
 +        // allocation and the same numbers as without this campaign (the `ROCm_Host` buft's own fallback
@@ -3700,7 +3773,15 @@ index 0177e7f46..08eea6151 100644
 +    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
 +        return nullptr;
 +    }
-+    if (!ggml_cuda_vmm_region_available(device)) {
++    // CONSTRUCTING a buffer type must not touch the driver (issue #275).  `llama_kv_cache` init asks this once
++    // per child of a Meta (tensor-split) device, before any batch or allocation, while the current driver
++    // context is still whatever model load left it on; the real probe used to run here and its whole VMM round
++    // trip (reserve/create/map/set-access/unmap/free, plus the quarantine cudaMalloc) therefore executed in a
++    // FOREIGN context.  On Windows/HCC that kills the first kernel launch (access violation in
++    // `hipHccModuleLaunchKernel`, 2 GPUs, no window asked for).  So the construction-time answer is the two
++    // flags the backend latched at init, and the reserve/map validation happens at ALLOC time -- where the
++    // device is bound and a refusal still falls back to the plain device buffer (see alloc_buffer).
++    if (!ggml_cuda_vmm_region_capable(device)) {
 +        return nullptr;
 +    }
 +
@@ -3774,7 +3855,7 @@ index 0177e7f46..08eea6151 100644
  // Communication context for multi-GPU AllReduce during tensor parallelism.
  //
  // Created once per meta backend instance.  Resources for the selected mode
-@@ -3500,6 +4297,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -3500,6 +4316,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -4170,7 +4251,7 @@ index 0177e7f46..08eea6151 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -3666,7 +4852,7 @@ static bool    g_cgc_reg = false;
+@@ -3666,7 +4871,7 @@ static bool    g_cgc_reg = false;
  static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
  static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
  static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
@@ -4179,7 +4260,7 @@ index 0177e7f46..08eea6151 100644
  // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
  // under -sm tensor), so it is resolved once instead of per call.
  static const bool g_cuda_splice_env_on = [] {
-@@ -4932,6 +6118,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -4932,6 +6137,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
              break;
@@ -4189,7 +4270,7 @@ index 0177e7f46..08eea6151 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -5026,11 +6215,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+@@ -5026,11 +6234,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -4239,7 +4320,7 @@ index 0177e7f46..08eea6151 100644
  
      // A pinned-source cudaMemcpyAsync is read by the copy engine when the stream reaches it, not when it is
      // issued, so the caller must not modify `data` until the copy has completed -- and this path's caller
-@@ -5076,7 +6302,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -5076,7 +6321,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4271,7 +4352,7 @@ index 0177e7f46..08eea6151 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-@@ -5087,7 +6336,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -5087,7 +6355,37 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4310,7 +4391,7 @@ index 0177e7f46..08eea6151 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -5181,11 +6460,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -5181,11 +6479,55 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -4369,7 +4450,7 @@ index 0177e7f46..08eea6151 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -5913,13 +7236,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5913,13 +7255,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
              }
  
              if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
@@ -4392,7 +4473,7 @@ index 0177e7f46..08eea6151 100644
              ggml_cuda_gdn_gather_index gdn_gather_index;
              cuda_ctx->gdn_deferred_gathers.clear();
              for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -6291,7 +7618,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6291,7 +7637,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      use_cuda_graph = true;
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
@@ -4401,7 +4482,7 @@ index 0177e7f46..08eea6151 100644
                      cuda_graph_update_required = graph->instances.empty() ||
                          (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
                  }
-@@ -6435,7 +7762,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6435,7 +7781,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -4410,7 +4491,7 @@ index 0177e7f46..08eea6151 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -6466,7 +7793,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6466,7 +7812,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) {
                      ggml_cuda_mmb_mark_bf16_only(gr);
@@ -4419,7 +4500,7 @@ index 0177e7f46..08eea6151 100644
                      if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
                  }
-@@ -6481,7 +7808,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6481,7 +7827,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -4428,7 +4509,7 @@ index 0177e7f46..08eea6151 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
-@@ -6595,7 +7922,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6595,7 +7941,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              ggml_cuda_hc_combine_norm_args ca;
              if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
          }
@@ -4437,7 +4518,7 @@ index 0177e7f46..08eea6151 100644
          if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
          if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
              std::vector<const ggml_tensor *> blks;
-@@ -6701,7 +8028,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6701,7 +8047,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -4446,7 +4527,7 @@ index 0177e7f46..08eea6151 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -6723,14 +8050,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6723,14 +8069,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
          // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
          // size.  GGML_CUDA_QK_ROTATE=0: off.
@@ -4463,7 +4544,7 @@ index 0177e7f46..08eea6151 100644
          const auto is_had = [](const ggml_tensor * t) {
              return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
          };
-@@ -6850,7 +8177,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6850,7 +8196,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
          // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
          // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
@@ -4472,7 +4553,7 @@ index 0177e7f46..08eea6151 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -8078,6 +9405,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8078,6 +9424,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4487,7 +4568,7 @@ index 0177e7f46..08eea6151 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8107,7 +9442,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8107,7 +9461,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -4497,7 +4578,7 @@ index 0177e7f46..08eea6151 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8536,8 +9872,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8536,8 +9891,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4558,7 +4639,7 @@ index 0177e7f46..08eea6151 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8649,6 +10037,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8649,6 +10056,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
