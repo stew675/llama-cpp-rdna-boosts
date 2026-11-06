@@ -1,3 +1,43 @@
+## 261106.003 (campaign) -- the demote works: +21.7 % single-user at -lme 36, with the ranking
+
+**Fork only.**  `MOE_HOST_POOL_SINK` measured on the single-user cell (`llama-cli`, prose, `-n 64`, one
+R9700, `MOE_HOST_POOL_DIO=1`, `-lzm off`, `-lme 36`, pool active, text byte-identical at `880c932888f8`):
+
+| arm | gen t/s | vs 22.6 | demoted | declines |
+|---|---|---|---|---|
+| `combined`, no demote | 22.6 | -- | -- | -- |
+| `decode`, no demote | 25.1 | +11.1 % | -- | -- |
+| `combined` + demote K=16 | 24.3 | +7.5 % | 9 922 | 9 % |
+| `decode` + demote K=8 | 27.0 | +19.5 % | 8 921 | 15 % |
+| **`decode` + demote K=16** | **27.5** (2 runs) | **+21.7 %** | 10 113 | **1.8 %** |
+| `decode` + demote K=32 | 27.0 | +19.5 % | 10 398 | 0 |
+
+So the two changes **compose**: the ranking (+11.1 %) and the demote (+7.6 % on top of it) are independent
+in mechanism -- one improves what the pool holds at layout time, the other what it learns from evictions --
+and together they are +21.7 % against the shipped default.  Every arm is placement-only: 3/3 configs
+(`SINK=0`, `SINK=1 K=8`, `SINK=1 K=16`) hash to `880c932888f8`.
+
+**Two bugs found on the way, both of which looked like "the knob does nothing":**
+
+1. **Reserving headroom by shrinking `slots` reserves nothing.**  `slots` is the capacity everywhere, so
+   `slots -= K` just builds a smaller pool that the fill paths fill completely; the decline rate was
+   identical at K=2 (4 631), K=4 (4 690) and K=8 (4 765) -- and *rising*, which was the tell.  The reserve
+   must be a `keep_free` argument on `pool_free_slot_locked` that every fill path respects and only the
+   demote may dip below.  With that fixed, declines fell 4 631 -> 2 361 -> 1 020 -> 184 as K rose 2 -> 8 ->
+   16, i.e. the knob started behaving like a knob.
+2. **A miss frees one slot but wants two.**  `retired == demoted + declined` to the digit (11 089 == 6 458
+   + 4 631) showed the incoming fill competing with the demote for the same freed slot.  Under the sink the
+   incoming expert is now refused an empty pool slot (`allow_empty_fill = !g_pool_sink`) and arrives via
+   the pinned bounce ring -- exactly what already happens on a full pool.
+3. Also split the decline counter by cause (issue #274's lesson): `no-free-slot` vs `geometry` vs
+   `copy-error`.  The split is what proved the 42 % decline rate was pure headroom and not the 1-D
+   geometry guard; `geometry` and `copy-error` are 0 in every run.
+
+K=16 is tuned, not derived: 16/512 = 3.1 % of a table's slots, and K=32 costs 0.5 t/s because the reserve's
+coverage loss overtakes the extra demotes.  Owed: express the reserve as a fraction, an A/B of
+`allow_empty_fill` now that the reserve protects the headroom, the batched gate, MTP four-axis,
+prefill-logit, and W3 (the `-lme` 30->47 sweep).
+
 ## 261106.002 (campaign) -- W2 demote implemented (the in-pool exchange), and a vacuous gate found and fixed
 
 **Fork only; nothing in `patches/`.**  Two things.
