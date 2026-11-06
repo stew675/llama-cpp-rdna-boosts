@@ -1,3 +1,28 @@
+## 261106.008 (campaign) -- the exchange is inert against a full mirror, and can never exceed one
+
+Two invariants, requested and verified on the shipping build:
+
+1. **spare = 0 and the exchange INERT when a table's pool can hold every expert** (`slots >= n_experts`).
+   There coverage is exact, so a demote has nothing to fix and its copies are pure cost.  The important part
+   is the failure mode this prevents: on a mirror a demote finds no free slot, sets the need flag, and
+   **retires a resident to make room -- destroying the mirror**.  `pool_sink_active()` now gates the demote,
+   the incoming-fill competition *and* the retirement on `slots < n_experts`.
+2. **pool + headroom never exceeds a full mirror.**  `slots` is clamped to `n_experts` at sizing, so the
+   reserve is always drawn from that budget and never adds to it.
+
+| `-lme` | slots | pinned | demoted | retired | mirror tables | gen t/s |
+|---|---|---|---|---|---|---|
+| 36 (sub-mirror) | 56 592 | 36 815 MiB | 10 033 | 10 300 | 0 | 27.5 |
+| **48 (full mirror)** | **73 728** (144x512) | **47 962.5 MiB** | **0** | **0** | **144** | **31.2** |
+
+The mirror pins exactly the whole host expert set (47 962.5 MiB), so the "never more than a mirror" bound is
+visible in the allocation.  And the mirror remains the fastest configuration by a clear margin -- **31.2 vs
+27.5 t/s** for the same build -- which is the correct outcome: where a mirror fits, it wins outright, and
+the exchange exists for the budgets where it does not.  **31.2 t/s is the asymptote W3's curve should
+approach** as `-lme` rises.
+
+Next per the agreed order: W3 (the `-lme` 30->47 sweep, now on the shipping configuration), then the gates.
+
 ## 261106.007 (campaign) -- DECISION: both changes ship ON by default; defaults implemented and verified
 
 **Maintainer's decision, recorded as a judgement rather than a measurement:** ship the ranking AND the demote

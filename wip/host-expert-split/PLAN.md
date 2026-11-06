@@ -199,6 +199,17 @@ change nothing else.
 > restore 22.6 exactly.  Note the fraction must be *of slots*, not of experts: at `-lme 36` a table has
 > ~393 slots, so K=16 is 4.1 % of slots -- 3 % under-shot to 11 slots and 26.8 t/s.
 >
+> **Mirror invariants (2026-11-06, requested).**  (1) **spare = 0 and the exchange INERT** when a table's
+> pool can hold every expert (`slots >= n_experts`): coverage is exact, so the copies are pure cost -- and,
+> worse, a demote there would find no free slot, ask for one, and **retire a resident, destroying the
+> mirror**.  `pool_sink_active()` gates the demote, the incoming-fill competition and the retirement on
+> `slots < n_experts`.  (2) **pool bytes + headroom never exceed a full mirror**: `slots` is clamped to
+> `n_experts` at sizing, so the headroom is always drawn from that budget.  Verified: `-lme 36` -> 56 592
+> slots / 36 815 MiB / 10 033 demoted / **27.5 t/s**; `-lme 48` -> 73 728 slots (144x512) / **47 962.5 MiB =
+> the whole host expert set** / 0 demoted / 0 retired / 144 mirror tables / **31.2 t/s**.  So a mirror that
+> fits is still the fastest configuration, as it must be -- and 31.2 is the asymptote W3's curve should
+> approach.
+>
 > Owed before promotion: `MOE_HOST_POOL_RANK=invert` must be REMOVED (a diagnostic, must not ship);
 > `ENVIRONMENT.md` entries for `MOE_HOST_POOL_RANK`/`_FLOOR`/`SINK`/`_SPARE`/`_SPARE_PCT`/`_SPARE_MIN`
 > (classes: kill switch / tuning) with `SINK_TAX` excluded; the `INVARIANTS.md` r113 "no write-back" entry
