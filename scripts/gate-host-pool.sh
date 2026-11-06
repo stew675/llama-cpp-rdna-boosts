@@ -30,6 +30,11 @@
 #     late    MOE_HOST_POOL_FILL_FAULT=late      (each table gets ONE source, then loses it -- the
 #                                                mid-run shape @briansp2020 reported: fills that had
 #                                                already succeeded, then a failing call)
+#     sink    MOE_HOST_POOL_SINK=1               (the eviction demote, wip/host-expert-split W2: an admitted
+#                                                miss copies its arena victim into a free pool slot)
+#     sinkfail MOE_HOST_POOL_SINK=1 + MOE_HOST_POOL_SINK_FAULT=1
+#                                                (every demote COPY fails: the demote must DECLINE -- drop
+#                                                the victim as before -- and never publish the slot)
 #   HARD  * `ref`, `dio` and `nodisk` are byte-identical and build a real pool (the exit census must report
 #           `host pool (L2): N tensors, <slots> slots, <MiB> pinned` with slots > 0 and MiB > 0)
 #   HARD  * `ref`, `dio` and `nodisk` log NO `fill failed`, NO `no pinned host source` and NO
@@ -45,6 +50,10 @@
 #           filled.  The TEXT half of that is box-dependent (a stale-but-valid `input_cpy` can hide it -- it
 #           did here; it corrupted the reporter's server), but the take-over counter is not: measured
 #           takeover=128/129 on the pre-fix code and 0 with the fix, in both arms.
+#   HARD  * `sink` demotes at least once (the arm is not vacuous) and its text is byte-identical to `ref`
+#   HARD  * `sinkfail`: text byte-identical to `ref`, the census reports copy-error declines > 0 (the arm
+#           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
+#           resident victim, or that slot serves stale bytes for the life of the run
 #   HARD  * no arm logs `async fill failed` (the old, cause-hiding message) or aborts
 #   INFO  the pool's pinned size/slot count, its hit rate, the fill mode and the throughput per arm
 #
@@ -64,6 +73,9 @@
 #   PROMPT_FILE read the prompt from a file instead of PROMPT (a longer prompt reaches more tables)
 #   EXTRA_ARGS  extra llama-cli args
 #   KEEPOUT     dir for the per-arm logs (default: mktemp -d); the exit census is read from there
+#   HEATMAP     MOE_EXPERT_HEATMAP for every arm (default: load -- the persisted prior is an INPUT and a
+#               writable one is rewritten per run, so the arms would otherwise be compared across different
+#               priors; `HEATMAP=1` overrides, which no gate should need)
 #
 # Exit: 0 = pass, 1 = fail, 2 = usage/startup error.
 set -uo pipefail
@@ -114,6 +126,7 @@ run_arm() {
     mkdir -p "$dir"
     echo "==> arm $arm${*:+ ($*)}"
     env "$@" HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \
+        MOE_EXPERT_HEATMAP="${HEATMAP:-load}" \
         timeout 3600 "$LLAMA_CLI" -v -m "$MODEL" --fit off -ngl all --n-cpu-moe "$NCMOE" \
         --load-mode mmap --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
         -b "$UB" -ub "$UB" -t 8 --jinja --spec-type none \
@@ -139,6 +152,14 @@ failed_fills(){ grep -o 'FAILED fills: [0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 |
 # the take-over counter: `takeover=<n> decline_all=<n> get_ok=<n>`.  With a fill fault active it MUST be 0:
 # a call that failed a fill may not take its op over (the consumer refuses the table a few lines later).
 takeover()   { grep -o 'takeover=[0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/takeover=//'; }
+# the demote census: `sink (MOE_HOST_POOL_SINK): <n> demoted, ... | declined: <a> no-free-slot, <b> geometry
+# (structural), <c> copy-error | ...`.  The line is printed only when the sink is on.
+sink_line()  { grep -o 'sink (MOE_HOST_POOL_SINK): .*' "$KEEPOUT/$1/err.txt" | tail -1; }
+# NB: every count digit class is `[0-9][0-9]*`, not `[0-9]*` -- a greedy `.*` before an empty-capable `[0-9]*`
+# matches the empty string and the helper silently returns nothing (measured: the first version of this check
+# reported "no copy-error declines" against a log that said 4069, i.e. a gate that fails for its own bug).
+sink_demoted(){ sink_line "$1" | sed -n 's/.*SINK): \([0-9][0-9]*\) demoted.*/\1/p'; }
+sink_copyerr(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) copy-error.*/\1/p'; }
 # `gt0 <value>`: true when value is a number above zero (empty/garbage is false)
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
@@ -148,14 +169,16 @@ run_arm dio    MOE_HOST_POOL_DIO=1 || exit 2
 run_arm nodisk MOE_HOST_POOL_DIO=1 MOE_HOST_POOL_DIO_FAULT=1 || exit 2
 run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
 run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
+run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
+run_arm sinkfail MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1 || exit 2
 
-for a in ref dio nodisk fail late; do text_only "$a"; done
+for a in ref dio nodisk fail late sink sinkfail; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
 
 # ---- HARD: identical greedy text ---------------------------------------------------------------
-for a in dio nodisk fail late; do
+for a in dio nodisk fail late sink sinkfail; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
@@ -196,6 +219,36 @@ if grep -q 'O_DIRECT fills are NOT available on this platform' "$KEEPOUT/nodisk/
     ok "nodisk really has no pool disk tier (the refusal is logged once)"
 else
     fail "nodisk did not log the disk-tier refusal: the arm may be vacuous"
+fi
+
+# ---- HARD: the demote (wip/host-expert-split W2) ---------------------------------------------
+# `sink` proves the arm reaches the code at all: a sub-mirror pool admits misses in the decode band, so a
+# victim should be demoted.  If it does not, the two checks below would pass vacuously.
+hard
+sd="$(sink_demoted sink)"
+if gt0 "$sd"; then
+    ok "sink: $sd demoted ($(sink_copyerr sink) copy-error declines) -- the demote path was exercised"
+else
+    fail "sink: 0 demoted -- the sink arm is vacuous (LIMIT_FRAC/NGEN do not reach a decode-band admission)"
+fi
+# A demote COPY that fails must DECLINE: the victim is dropped exactly as before the exchange existed and the
+# slot is never published.  Publishing it would leave a slot that serves stale bytes for the life of the run --
+# the same class of bug as #274's fill that was recorded resident anyway, and invisible to the text.
+hard
+sd="$(sink_demoted sinkfail)"
+sc="$(sink_copyerr sinkfail)"
+if gt0 "$sc" && [ "${sd:-x}" = "0" ]; then
+    ok "sinkfail: $sc demote copies failed and nothing was published (0 demoted)"
+elif ! gt0 "$sc"; then
+    fail "sinkfail: no copy-error declines -- MOE_HOST_POOL_SINK_FAULT did not reach the demote (vacuous)"
+else
+    fail "sinkfail: ${sd} demoted despite every copy failing -- a failed demote was published as resident"
+fi
+hard
+if [ -n "$(sink_line sinkfail)" ]; then
+    ok "sinkfail: the demote census is reported"
+else
+    fail "sinkfail: no sink census line (the arm did not reach the sink at all)"
 fi
 
 # ---- HARD: the failure arm is CORRECT, and says so --------------------------------------------

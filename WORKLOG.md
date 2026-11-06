@@ -63,9 +63,24 @@ be `-n 64`.
 1144.69 (shipping) vs 1292.88 (r223) = **-11.5 %**; npl 8 total 45.3 s vs 35.9 s (MemAvailable min 40 GiB, so
 not the memory-collapse trap).  One rep each — enough to keep D1 open, not to size the cost.
 
-Still owed: the `-lme` sweep with the frozen prior, the control curve, the prefill-logit base from the delivery
-tip (also the first proof of the `stage_table` span path, on 35B-A3B), MTP four-axis, `gate-host-pool.sh` demote
-arm, `invert` removal, per-block build, then the promotion fold into blocks 09/12.
+
+**Gate ladder progress (same session, after the commit above).**  (1) `MOE_HOST_POOL_RANK=invert` **removed** from
+the fork (D7): the parse branch, the inverted sort direction and the extra report mode are gone; the shipping
+decode arm is unchanged (26.1 t/s, 10 203 demoted, 326 no-free-slot, 0 copy-error) and text is still
+`sha=880c932888f8`.  (2) `scripts/gate-host-pool.sh` **extended to seven arms and PASSING 28/28**: a new
+`MOE_HOST_POOL_SINK_FAULT=1` diagnostic in the fork routes a demote copy failure through the same branch a real
+copy error takes, so the gate can prove the issue-#274 rule for the demote — `sink` arm: 4 006-4 009 demoted
+(not vacuous); `sinkfail` arm: **0 demoted** with 4 069-4 081 `copy-error` declines, text byte-identical to
+`ref` (`a99ccbd97ecb`).  A failed demote declines and is never published as a resident victim (a published
+victim would serve stale bytes for the life of the run).  The gate also now runs every arm with
+`MOE_EXPERT_HEATMAP=load`, so its seven arms are compared across one prior; `MANIFESTS.md` gate 19 and
+`scripts/README.md` updated.  (3) Still owed on the ladder: the prefill-logit base from the delivery tip (also
+the first proof of the `stage_table` span path), the MTP four-axis, the per-block build, and the `-lme` sweep
+with the frozen prior.
+
+Still owed (unchanged): the release table sweep, MTP four-axis, the prefill-logit base from the delivery tip,
+the per-block build, then the promotion fold into blocks 09/12.
+
 
 ## 261106.011 (campaign) -- session handover written; campaign state frozen for a fresh session
 

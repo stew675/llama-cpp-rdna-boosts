@@ -398,12 +398,18 @@ in CI.  The model-level gates are manual:
    claims otherwise is wrong.  r209: 4 TUs token-identical, coherence `897 a77fa8c1107a` / `964 eab86065e67e`
    (== r208), KLD 0.000000 / 100.000 %, per-block 4/4, no faults.
 
-19. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274; five arms since r223): one pool-backed host-expert config
+19. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274; five arms since r223, **seven** with the
+   demote arms added for the host-expert-split campaign): one pool-backed host-expert config
    (Flash-Next, `--n-cpu-moe 47`, `--load-mode mmap`, a `MOE_HOST_LIMIT_FRAC` low enough that the set does not
    fit), arms and same-seed greedy text: shipped / `MOE_HOST_POOL_DIO=1` / `MOE_HOST_POOL_DIO_FAULT=1` (a
    platform with NO pool disk tier: the Windows shape) / `MOE_HOST_POOL_FILL_FAULT=1` (no source can be
    resolved at all) / `MOE_HOST_POOL_FILL_FAULT=late` (each table gets one source, then loses it: the mid-run
-   shape of the issue #274 follow-up).  It **fails** unless the three healthy arms are byte-identical with a
+   shape of the issue #274 follow-up) / `MOE_HOST_POOL_SINK=1` (the eviction demote: an admitted miss copies its
+   arena victim into a free pool slot, and the arm must actually demote or it is vacuous) /
+   `MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1` (every demote copy fails, so the arm proves the #274 rule
+   holds for the demote too: **`0 demoted`** with `copy-error` declines > 0 -- a failed demote declines and is
+   never published as a resident victim, which would serve stale bytes for the life of the run).  Every arm runs
+   with `MOE_EXPERT_HEATMAP=load`, so the seven arms are compared across one prior.  It **fails** unless the three healthy arms are byte-identical with a
    real pool (slots > 0, MiB pinned > 0) and no fill failure, the disk-tier arms are not vacuous, and the two
    failure arms are still byte-identical with `FAILED fills: N`, `the slot is NOT resident` per table and
    **`takeover=0`** (the call that fails a fill must decline; taking the op over leaves `input_cpy` unfilled
