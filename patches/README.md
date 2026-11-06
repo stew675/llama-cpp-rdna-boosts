@@ -721,6 +721,19 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 
 **Knobs.**  `GGML_CUDA_GRID_STALL_PAD`, `GGML_CUDA_MMQ_J_MAX`, `GGML_CUDA_OP_TIMING` (diagnostic); build-time `-DGGML_HIP_Q6K_DENSE_VDR1` (r170, the dense Q6_K VDR=1 reproducibility escape — see `ENVIRONMENT.md` §14).
 
+> **r226 amendment (issue #277): the pad helper gains a site tag and a REFUSAL, and this block's own call site
+> names itself.**  `ggml_cuda_grid_stall_pad(grid, block, site, pad_blocks)`: `site` is printed by
+> `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` (a new diagnostic), and `pad_blocks` is how many blocks the caller's
+> one-step pad ADDS — the mmvf/mmvq/norm/FA sites add one, but a `get_rows` grid's x is its gathered-row count,
+> so one extra y row adds that many (block 08's sites pass `block_nums.x`).  The helper now returns **false**
+> when the padded count would land on another multiple of 256: a grid whose x is itself a multiple of 256 (the
+> MoE expert-cache remap gathers at `grid.x = 16384`) cannot be padded off the stall, and spending an empty
+> block row on it is pure waste.  Arithmetic unchanged everywhere, i.e. bit-identical; a site with the default
+> `pad_blocks = 1` behaves exactly as before.  `mmvf.cu`'s call site passes `"mul_mat_vec_f"`.  (Block 10
+> relocates this function later in `common.cuh` and carries the final form; blocks 07 and 10 are both amended,
+> and the tip tree is what ships.)  Gate: `scripts/gate-grid-stall-pad.sh`, `INVARIANTS.md` r226,
+> `WORKLOG.md` 261106.015.
+
 **Dense Q6_K VDR is upstream's now, on every arch (r170).**  The block's own per-arch gate
 (`#if defined(RDNA4) || defined(RDNA3_0)` → VDR=2, upstream's VDR=1 elsewhere) went away with the
 `6050b467c` re-base: upstream #30517 (`2744e48d1`, "faster MMVQ for low-bit types") made
@@ -850,6 +863,25 @@ kernel at *every* width, i.e. width-uniform and wrong — which is why the defec
 artifact and why the default arm's own MTP acceptance moved with the fix (r202: pre-fix 977/710
 `sha=eca29f334d6a`, post-fix 988/704 `sha=152af1d9feb7`, both arms identical).  Record:
 `benchmarks/2026-11-01-kill-switch-arm-130.md`.
+
+> **r226 amendment (issue #277): the four `get_rows` launches ask the grid-stall pad, and the `GET_ROWS` op
+> oracle gains the shapes that reach them.**  `getrows.cu` was the one kernel family in the tree with a
+> grid-stall shape and no pad call (`mul_mat_vec_f`/`mul_mat_vec_q_ksplit`/`mul_mat_vec_q_moe` in block 07/08,
+> the FA stream-K fixup and the GDN q/k norm pair since r217 all ask it).  All four launches — the vec float
+> copy, the plain float copy, the sub-block dequantizing path and the super-block k-quant path — are a
+> grid-stride over y, so an extra block row either copies nothing (`i00`/`i` starts at or past the row bound)
+> or merely re-partitions the same super-blocks between blocks (`ib += gridDim.y`): every element is still
+> computed exactly once, by the same arithmetic.  The pad is taken on **y** because x is the gathered-row index
+> (`i10 = blockIdx.x` reads `src1`), and it is guarded by the y clamp and by the helper's new refusal: one extra
+> y row adds `grid.x` blocks, so a row count that is itself a multiple of 256 (the `getrows` site sees
+> `grid=(16384,1,1)` in a MoE expert-cache remap) is declined instead of padded for nothing.  **No performance
+> claim**: the reporter measured no stall at their 768-block shape, which matches `INVARIANTS.md` r217 fact 1
+> (the stall is a fixed ~10 us, hidden above ~2048 blocks) — this is coverage of the launch site, not a win.
+> `tests/test-backend-ops.cpp` gains four `GET_ROWS` cases so the padded launches are checked against the **CPU**
+> reference on every run: `F32 512/8/1/be1=256` (`(1,1,256)`, the vec branch — only an F32 src0 reaches it,
+> because `ggml_get_rows` always returns F32 and the vec copy needs `src0_t == dst_t`), `F32 1002/8/1/be1=64`
+> (`(1,4,64)`, the plain float branch) and `Q4_0 2048` / `IQ4_NL 1024` with `be1=64` (`(1,4,64)`, the two
+> dequantizing branches).  `scripts/gate-grid-stall-pad.sh`, `INVARIANTS.md` r226, `WORKLOG.md` 261106.015.
 
 **Knobs.**  `GGML_CUDA_DISABLE_FUSION` (master), `_DISABLE_MOE_MMQ_FUSION`, `_DISABLE_MMQ_ROUTED`,
 `_DISABLE_TOPK_MOE_FUSION`, `_DISABLE_CONV_FUSION`, `_DISABLE_NORM_ROWS`, `GGML_CUDA_TOPK_SORTED`,
@@ -1572,7 +1604,12 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 > bit-identical; `GGML_CUDA_GRID_STALL_PAD=0` still turns the whole pad off.  Worth it where the grid is short
 > (the reporter's model launches these at 256 blocks: 15.48 -> 10.08 us and 15.8 -> 2.4 us per launch);
 > neutral on a 16384-block grid, where the stall's fixed ~10 us is hidden by the kernel's own runtime
-> (`INVARIANTS.md` r217 fact 1, `benchmarks/2026-11-05-issue-273.md`).  The same change latches every
+> (`INVARIANTS.md` r217 fact 1, `benchmarks/2026-11-05-issue-273.md`).  **r226 (issue #277)** names every call
+> site in the `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` line (`"mul_mat_vec_q_moe"`, `"rms_norm_scale_pair"`,
+> `"fa_stream_k_fixup"`, plus block 07's `"mul_mat_vec_f"` and block 08's `"get_rows_*"`), which is what lets a
+> gate assert that a site really padded instead of assuming it; this block also relocates the helper in
+> `common.cuh` and carries the pad refusal described in block 07's r226 note (every site that pads by one block
+> is unchanged).  The same change latches every
 > `getenv` in this block's files (`common.cuh`, `mmb.cu`, `mmvq.cu`, `norm.cu`, `fattn*.cu/.cuh`, `mmvf.cu`,
 > `gdn-conv.cu`, `gated_delta_net.cu`, `ple-conv.cu`, `topk-moe.cu`, `unary.cu`, `norm-gated.cu`,
 > `moe-weighted-reduction.cu`, `mmq.cu`, `concat.cu`, `cpy-batch.cu`): one read per variable, stored.  Two

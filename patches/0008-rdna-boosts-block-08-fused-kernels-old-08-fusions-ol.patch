@@ -1,4 +1,4 @@
-From 789a5152d56c1d500d90455715c82f4dcbbdff70 Mon Sep 17 00:00:00 2001
+From 1e87586617e0581f939110425d2bfa6d586fe6c0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused kernels (old-08 fusions +
@@ -60,7 +60,7 @@ text; prefill-logit KLD -0.000000 / same-top-p 100.000 %).
  ggml/src/ggml-cuda/common.cuh                 |  172 ++
  ggml/src/ggml-cuda/gdn-conv.cu                |  135 ++
  ggml/src/ggml-cuda/gdn-conv.cuh               |   16 +
- ggml/src/ggml-cuda/getrows.cu                 |   12 +-
+ ggml/src/ggml-cuda/getrows.cu                 |   41 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  632 +++++-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
  ggml/src/ggml-cuda/mmq.cu                     |  389 +++-
@@ -89,8 +89,8 @@ text; prefill-logit KLD -0.000000 / same-top-p 100.000 %).
  ggml/src/ggml-cuda/topk-moe.cu                |  233 +-
  ggml/src/ggml-cuda/unary.cu                   |  231 ++
  ggml/src/ggml-cuda/unary.cuh                  |   12 +
- tests/test-backend-ops.cpp                    |    2 +-
- 35 files changed, 5546 insertions(+), 436 deletions(-)
+ tests/test-backend-ops.cpp                    |   12 +-
+ 35 files changed, 5581 insertions(+), 440 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/mmvq-rdna-params.cuh
@@ -154,7 +154,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index b63d5efc3..673ceb058 100644
+index 0bb0536c1..380f9ccfb 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,33 @@
@@ -191,7 +191,7 @@ index b63d5efc3..673ceb058 100644
  #define STRINGIZE_IMPL(...) #__VA_ARGS__
  #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
  
-@@ -1591,6 +1618,132 @@ struct ggml_backend_cuda_context {
+@@ -1622,6 +1649,132 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -324,7 +324,7 @@ index b63d5efc3..673ceb058 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1648,6 +1801,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1679,6 +1832,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -345,7 +345,7 @@ index b63d5efc3..673ceb058 100644
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
      const ggml_tensor * shared_up = nullptr;
-@@ -1660,6 +1827,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1691,6 +1858,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -521,10 +521,67 @@ index 000000000..a843b460a
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
-index d97e8fdb0..34e5cb755 100644
+index d97e8fdb0..96c22ebb0 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
-@@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
+@@ -165,7 +165,12 @@ static void get_rows_cuda_q(
+         cudaStream_t stream) {
+     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+     const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
+-    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    // issue #277: the y dimension is a grid-stride over the row, so an extra block row writes nothing (its threads
++    // start at or past ne00).  One row is grid.x blocks, hence the pad_blocks argument.
++    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_q", block_nums.x)) {
++        block_nums.y++;
++    }
+ 
+     // strides in elements
+     // const size_t s0 = nb0 / sizeof(dst_t);
+@@ -204,7 +209,12 @@ static void get_rows_cuda_kq(
+     const int64_t nsb = ne00/QK_K;
+ 
+     const dim3 block_dims(block_dim, 1, 1);
+-    const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    // issue #277: the y dimension strides over the super-blocks (`ib += gridDim.y`), so one extra block row only
++    // re-partitions the same super-blocks between blocks -- every one of them is still computed exactly once.
++    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_kq", block_nums.x)) {
++        block_nums.y++;
++    }
+ 
+     // strides in elements
+     // const size_t s0 = nb0 / sizeof(dst_t);
+@@ -267,7 +277,14 @@ static void get_rows_cuda_float(
+ 
+         if (can_vec) {
+             const int block_num_y = vec_block_num_y;
+-            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++            dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++            // issue #277: the vec copy is a grid-stride over y (`i += gridDim.y*blockDim.x`, bounded by ne00v), so an
++            // extra block row copies nothing and the output stays bit-identical.  The grid's x is the token count, so
++            // one extra row adds grid.x blocks -- the helper refuses the pad when that keeps a multiple of 256.
++            if (block_nums.y < UINT16_MAX &&
++                ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_float_vec", block_nums.x)) {
++                block_nums.y++;
++            }
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
+                 (const dst_t *) src0_d, src1_d, dst_d,
+@@ -280,7 +297,11 @@ static void get_rows_cuda_float(
+     }
+ 
+     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+-    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
++    // issue #277: same grid-stride row loop as the vec kernel (`i00 += gridDim.y*blockDim.x`).
++    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_float", block_nums.x)) {
++        block_nums.y++;
++    }
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
+@@ -393,8 +414,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
                  ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
              break;
          case GGML_TYPE_IQ4_NL:
@@ -2926,7 +2983,7 @@ index 000000000..c845ce7c5
 +    return 0;
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 31859d7ef..12a70e968 100644
+index 31859d7ef..14f88e890 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -129,6 +129,8 @@ enum mmvq_parameter_table_id {
@@ -4154,7 +4211,7 @@ index 31859d7ef..12a70e968 100644
 +                    nrows_loop   = nrows_x;
 +                    dims.first.x = (nblocks + iters - 1) / iters;
 +                }
-+                if (ggml_cuda_grid_stall_pad(dims.first, dims.second)) {
++                if (ggml_cuda_grid_stall_pad(dims.first, dims.second, "mul_mat_vec_q_ksplit")) {
 +                    dims.first.x++;          // the kernel stops at nrows_loop
 +                    nrows_loop = nrows_x;
 +                }
@@ -7687,10 +7744,27 @@ index c6ffdb9d6..76059e335 100644
 +int ggml_cuda_add_softplus_mul_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_scale_unary_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4e9cc0833..92601c191 100644
+index 4e9cc0833..3ed9a1fde 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11667,7 +11667,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10335,6 +10335,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+ 
++    // issue #277: shapes whose dispatch is a multiple of 256 blocks and CAN be padded by one more block row
++    // (one row is grid.x = r blocks, so r must not itself be a multiple of 256).  Each of the four GET_ROWS
++    // launches gets one: the vec float path, the plain float path, the sub-block dequantizing path and the
++    // super-block (k-quant) path.  `ggml_cuda_grid_stall_pad`'s y pad only re-partitions a grid-stride row
++    // loop, so these cases are also the oracle for "the extra block row writes nothing".
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,     512, 8, 1, 256, 1, false)); // vec: (1,1,256)
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,    1002, 8, 1,  64, 1, false)); // plain: (1,4,64)
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_0,   2048, 8, 1,  64, 1, false)); // q: (1,4,64)
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 1024, 8, 1,  64, 1, false)); // kq: (1,4,64)
++
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
+     for (ggml_type type : all_types) {
+@@ -11667,7 +11677,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
  
      for (int bs : {1, 4, 512}) {

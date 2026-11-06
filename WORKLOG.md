@@ -1,3 +1,77 @@
+## 261106.015 (r226) -- issue #277: the four `get_rows` launches take the grid-stall pad, and the pad learns to refuse one it cannot make
+
+**Release `v16-6050b467c-r226`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`3753eccf2`**, tree `a07a5f81e2ce308aa39fba95878a4b3fb220a668`.  Blocks **07, 08 and 10 amended**; blocks
+00-06 and 09/11-15 keep identical deltas (their `.patch` files change only in the `From <sha>` line, because
+the series was re-cut from this checkout).  Delivery records that changed: `INVARIANTS.md` (r226),
+`patches/README.md` (the three block notes), `ENVIRONMENT.md` (`GGML_CUDA_GRID_STALL_PAD_DEBUG`, and the
+`GGML_CUDA_GRID_STALL_PAD` row now names every site), `MANIFESTS.md` (release gate 21), `AGENTS.md` +
+`scripts/README.md` (the gate), and the new `scripts/gate-grid-stall-pad.sh`.
+
+**The report (a code reading, no measurement).**  #277 says `get_rows_cuda_float`'s `can_vec` branch builds its
+grid from `vec_block_num_y` and never asks `ggml_cuda_grid_stall_pad()`, while every call site added after #273
+does.  They measured **no stall** on their own shape (7.88 us at 768 blocks and 7.88 at 769) and filed it only so
+the site would be covered.  Scope: one R9700, gfx1201, ROCm 10; not built or run on r224.
+
+**What was actually true.**  The gap is real and wider than reported: from r46 to r225 the whole `getrows.cu`
+family (four launches: the vec float copy, the plain float copy, the sub-block dequantizing path and the
+super-block k-quant path) was the only grid-stall-shaped kernel with no pad call, while `mul_mat_vec_f`,
+`mul_mat_vec_q_ksplit`, `mul_mat_vec_q_moe`, the FA stream-K fixup and the GDN q/k norm pair all had one.  Two
+things the report could not see from outside:
+* **A pad there adds `grid.x` blocks, not one.**  `blockIdx.x` is the gathered-row index (`i10`, read from
+  `src1`), so the only cheap axis is y -- but one extra y row adds `grid.x` blocks.  When that count is itself a
+  multiple of 256 (a 256-multiple prefill ubatch; the MoE expert-cache remap's gather at `grid=(16384,1,1)`)
+  the block count *and* the work-item condition stay on the stall, so the pad cannot work at all.
+* **The reporter's 768-block launch is the vec branch of an F32 source or nothing at all.**  `ggml_get_rows`
+  always returns F32 (upstream's "TODO: implement non F32 return") and the vec copy is inside
+  `if constexpr (std::is_same<src0_t, dst_t>)`, so an f16/BF16 embedding lookup takes the plain path.  Their
+  `can_vec` observation therefore had an F32 src0 -- worth knowing before reading a `get_rows_float` line in a
+  trace as a declined vec branch.
+
+**The fix.**  `ggml_cuda_grid_stall_pad(grid, block, site, pad_blocks)` (block 07 owns the helper):
+`site` is printed by the new `GGML_CUDA_GRID_STALL_PAD_DEBUG=1` diagnostic, `pad_blocks` is how many blocks the
+caller's one-step pad adds, and the helper now **refuses** a pad whose padded count would land on another
+multiple of 256 (it logs `NO pad possible`) instead of launching a block row that cannot help.  Default
+`pad_blocks = 1` keeps every existing site exactly as it was, and all six sites now carry a label.  All four
+`getrows.cu` launches pad on y, guarded by the `UINT16_MAX` clamp: the y loop is grid-stride (`i +=
+gridDim.y*blockDim.x`, `ib += gridDim.y`), so an extra row either starts at or past the row bound (copies
+nothing) or only re-partitions the same super-blocks between blocks -- every element is still computed once, by
+the same arithmetic.  `tests/test-backend-ops.cpp` gains four `GET_ROWS` shapes so the padded launches are
+checked against the **CPU** reference on every run (`F32 512/8/1/be1=256` -> `(1,1,256)`; `F32 1002/8/1/be1=64`
+-> `(1,4,64)`; `Q4_0 2048` and `IQ4_NL 1024`, `be1=64` -> `(1,4,64)`).
+
+**`scripts/gate-grid-stall-pad.sh` (new, MANIFESTS gate 21).**  **A1** runs the `GET_ROWS` oracle in the pad arm
+and with `GGML_CUDA_GRID_STALL_PAD=0`: 224/224 cases pass in both, each of the four sites logs its pad in the pad
+arm (`get_rows_float_vec (1,1,256) 256 -> 257`, `get_rows_float (1,4,64) 256 -> 257`, `get_rows_q`,
+`get_rows_kq`), and the kill switch logs none.  **A2** runs `MUL_MAT_ID` (931/931 both arms) and requires the new
+refusal to be reached: 12 launches refuse (`get_rows_* (16384,1,1) NO pad possible`) rather than padding.
+**B** compares same-seed greedy text, pad on vs off, on a dense 1-device arm, a 3-device `-sm tensor` arm and a
+MoE `-ncmoe 40` arm, with a verbose 1-token probe of each: identical text, 419 / 1752 / 1156 pad lines with the
+pad on and 0 with it off.
+
+**Gates.**  New gate **PASS** (both sections, and a second full run to confirm).  Coherence: 4B Q8_0 1 GPU
+`100 chars sha=1c5d32ac537d` identical to the pre-change build, and the gate's arms give 4B 1 GPU and 4B 3 GPU
+`147 b065f37593b3` (the delivery's long-standing 4B value) and 35B-A3B UD-Q4_K_M `-ncmoe 40`
+`150 4ac3a523160f`.  Prefill logits: **`mean KLD = 0.000000`, `same top p = 100.000 %`** against the base
+recorded from `build=37148d118` (the r223 delivery tree, 27B Q8_0, gfx1201).  `gate-per-block-build.sh --base
+6050b467c --tip <re-cut> --changed-from 6b51f002d`: **4/4** (blocks 07, 08, 10 and the tip) build the `all`
+target (378 / 385 / 338 / 4 s, 1105 s total).  `fork-refresh.sh --build --gates` on the canonical re-cut: tree
+matches, build ok, coherence + prefill-logit PASS.  `validate-set.sh` nine checks GREEN (checksums, fresh-tarball
+strict apply, tree, conflict markers, Windows portability over 287 added files).  `check-gpu-faults.sh` clean
+over the gate's 14 logs and the kernel journal.
+
+**Not run, and why.**  The MTP four-axis protocol: nothing here touches a decode kernel's arithmetic, the text
+and acceptance arms of the coherence gate are byte-identical, and the pad only adds a returning block.  No
+benchmark arm was run either -- there is no performance claim to make (the reporter measured the stall absent on
+their shape, and r217 fact 1 says a grid this size is above where the fixed cost is hidden anyway); the pad's
+value is coverage of a launch site, and the gate is what keeps that honest.
+
+**One thing found on the way (recorded, not changed).**  `test-backend-ops -o MUL_MAT_ID` reaches the same
+`get_rows` sites from the MoE expert-cache remap at `grid=(16384,1,1)` -- always unpaddable by the new rule --
+which is why the refusal branch has a deterministic oracle rather than a model shape.  On a model the four
+`get_rows` sites are never padded in a decode (all three probe arms pad only mmvq/FA sites), so nothing in a
+CLI run would ever have noticed this site either way.
+
 ## 261106.014 (r225) -- issue #276: the norm-rows fusion's gate pre-dispatch is now checked for aliasing at launch, not only through the scheduler's alloc deps
 
 **Release `v16-6050b467c-r225`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip

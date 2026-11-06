@@ -1,4 +1,4 @@
-From a98fe86a4affbf2508dff1a249bb7fc14cc9ec87 Mon Sep 17 00:00:00 2001
+From 57bfd824fc0db3f960b609942d682c1385708fd8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 07/15] rdna-boosts: block 07: k-quant boosts (mmvq VDR, Q6_K
@@ -21,7 +21,7 @@ NOTE: the mmvq multi-row/row-loop decode hunks (old-15 PR #57) are NOT here --
 they are interleaved with the fused-MoE item-split in the same function and are
 deferred to 09 (see PHASE1-STATUS.md).
 ---
- ggml/src/ggml-cuda/common.cuh         |  27 ++
+ ggml/src/ggml-cuda/common.cuh         |  58 +++
  ggml/src/ggml-cuda/ggml-cuda.cu       |   5 +-
  ggml/src/ggml-cuda/mmq-load-tiles.cuh |  54 ++-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh    |  57 ++-
@@ -30,13 +30,13 @@ deferred to 09 (see PHASE1-STATUS.md).
  ggml/src/ggml-cuda/mmvq.cu            | 120 +++++-
  ggml/src/ggml-cuda/vecdotq.cuh        | 542 +++++++++++++++++++++++---
  tests/test-backend-ops.cpp            |  38 +-
- 9 files changed, 899 insertions(+), 137 deletions(-)
+ 9 files changed, 930 insertions(+), 137 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index cb5d89baf..b63d5efc3 100644
+index cb5d89baf..0bb0536c1 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1247,6 +1247,33 @@ struct ggml_cuda_device_info {
+@@ -1247,6 +1247,64 @@ struct ggml_cuda_device_info {
  
  const ggml_cuda_device_info & ggml_cuda_info();
  
@@ -48,7 +48,14 @@ index cb5d89baf..b63d5efc3 100644
 +// their grids around the same stall.
 +// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
 +// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
-+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
++//
++// `site` names the launch in the GGML_CUDA_GRID_STALL_PAD_DEBUG line (`-lv 4`, or plain stderr), which is how a gate
++// observes that a given site really padded instead of trusting it.  `pad_blocks` is how many blocks the caller's
++// one-step pad ADDS: a grid whose x dimension is the row/tile count adds one block per extra y row, but a grid whose
++// x dimension is a token count adds that many (issue #277, get_rows).  The pad is refused when it would land on
++// another multiple of 256 -- launching an extra empty block row that cannot leave the condition is pure waste.
++static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block,
++                                            const char * site = nullptr, const int64_t pad_blocks = 1) {
 +#if defined(GGML_USE_HIP)
 +    static const bool on = [] {
 +        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
@@ -59,10 +66,34 @@ index cb5d89baf..b63d5efc3 100644
 +    }
 +    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
 +    const int64_t nthr = (int64_t) block.x * block.y * block.z;
-+    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
++    if (nblk <= 0 || (nblk % 256 != 0 && (nblk * nthr) % 65536 != 0)) {
++        return false;
++    }
++    static const bool debug = [] {
++        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD_DEBUG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    const int64_t nblk_pad = nblk + pad_blocks;
++    if (nblk_pad % 256 == 0 || (nblk_pad * nthr) % 65536 == 0) {
++        // A one-step pad adds a multiple of 256 blocks (a grid.x that is itself one): this launch cannot be padded
++        // off the stall without adding a dimension, so do not spend an empty block row on it.
++        if (debug) {
++            GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) %lld blocks: NO pad possible (+%lld keeps the multiple)\n",
++                          site ? site : "?", grid.x, grid.y, grid.z, (long long) nblk, (long long) pad_blocks);
++        }
++        return false;
++    }
++    if (debug) {
++        GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) block=(%u,%u,%u): %lld -> %lld blocks\n",
++                      site ? site : "?", grid.x, grid.y, grid.z,
++                      block.x, block.y, block.z, (long long) nblk, (long long) nblk_pad);
++    }
++    return true;
 +#else
 +    GGML_UNUSED(grid);
 +    GGML_UNUSED(block);
++    GGML_UNUSED(site);
++    GGML_UNUSED(pad_blocks);
 +    return false;
 +#endif // defined(GGML_USE_HIP)
 +}
@@ -331,7 +362,7 @@ index 1de9e7357..45be9f6ea 100644
          if (config.type == GGML_TYPE_COUNT) {
              continue;
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 752d28c4f..a89bf70ac 100644
+index 752d28c4f..a8469c200 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -11,12 +11,15 @@ static __global__ void mul_mat_vec_f(
@@ -564,7 +595,7 @@ index 752d28c4f..a89bf70ac 100644
 -    const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
 +    dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
      const dim3 block_dims(block_size_best, 1, 1);
-+    if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
++    if (ggml_cuda_grid_stall_pad(block_nums, block_dims, "mul_mat_vec_f")) {
 +        block_nums.x++;   // the kernel returns for row >= nrows
 +    }
      switch (block_size_best) {

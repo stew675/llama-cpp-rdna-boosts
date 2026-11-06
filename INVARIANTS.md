@@ -2243,3 +2243,38 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
   `--no-fuse` arm).  The decision is observable with `GGML_CUDA_NORM_ROWS_DEBUG=1` (INFO, so `-lv 4`), which
   is also how the gate detects a **dropped dep**: the text stays correct either way because the guard falls
   back, so only `declined=0` distinguishes "the dep holds" from "the guard is doing the work".
+
+## r226 -- a pad can be IMPOSSIBLE: one extra y row adds `grid.x` blocks, so the helper must refuse; and `GET_ROWS` returns F32 (issues #273 / #277)
+
+**Measured facts behind issue #277.  Do not re-derive; do not claim a win for a pad that cannot fire.**
+
+1. **A pad adds `grid.x` blocks wherever the caller pads an axis that is not the block multiplier.**  The four
+   `get_rows` launches index `src1` with `blockIdx.x` (`i10 = blockIdx.x`), stride their row/column loop with
+   `gridDim.y`/`gridDim.z` and clamp both to `UINT16_MAX`, so x cannot be padded and y is the only cheap axis --
+   but one extra y row adds `grid.x` blocks, not one.  When `grid.x` is itself a multiple of 256 (a 256-multiple
+   prefill ubatch; the MoE expert-cache remap's gather at `grid=(16384,1,1)`) the product stays a multiple of 256
+   **and** the work-item multiple stays true, so no one-step pad on y or z can leave the stall.  The helper now
+   REFUSES that pad (`pad_blocks` argument; `NO pad possible` under `GGML_CUDA_GRID_STALL_PAD_DEBUG=1`) instead
+   of launching an empty block row that cannot help.  Every site that pads by exactly one block
+   (`mul_mat_vec_f`, `mul_mat_vec_q_ksplit`, `mul_mat_vec_q_moe`, the FA stream-K fixup, the GDN q/k norm pair)
+   passes the default `pad_blocks = 1` and is byte-for-byte unaffected.
+2. **`GET_ROWS` always returns F32, so `get_rows_cuda_float`'s vec branch is reachable only from an F32 src0.**
+   `ggml_get_rows` sets `type = GGML_TYPE_F32` unless the source is I32 (upstream's "TODO: implement non F32
+   return"), and the `int4` copy sits inside `if constexpr (std::is_same<src0_t, dst_t>)`.  An f16/BF16 embedding
+   lookup therefore takes the plain `k_get_rows_float` path, not `k_get_rows_float_vec`; do not read a
+   `get_rows_float` launch in a trace as "the vec path did not fire".  Both are padded now, and each has an
+   oracle shape (`F32 n=512, be1=256` -> `(1,1,256)` vec; `F32 n=1002, be1=64` -> `(1,4,64)` plain; `Q4_0 n=2048`
+   and `IQ4_NL n=1024`, `be1=64` -> `(1,4,64)` for the two dequantizing paths).
+3. **A missing pad site is a coverage gap, not a measured loss.**  The reporter's 27B shape launched this copy at
+   768 blocks and measured **7.88 us at 768 blocks and 7.88 us at 769** -- no stall -- which is consistent with
+   r217 fact 1 (a fixed ~10 us cost, hidden above ~2048 blocks) and with the r224/r225 arms (all gates and the
+   whole test suite pass with `GGML_CUDA_GRID_STALL_PAD=0`).  So the r226 change is site coverage: `get_rows` was
+   the one grid-stall-shaped launch family with no pad call from r46 to r225, and a shape that *does* stall there
+   would have gone unnoticed.  Do not book it as a speedup.
+4. **A pad site without an oracle shape cannot be verified.**  `test-backend-ops -o GET_ROWS` had **0 pad events
+   in 220 cases** before the four shapes above were added, and no model run reaches them either (the 4B Q8_0,
+   4B 3-device `-sm tensor` and 35B-A3B `-ncmoe 40` decode probes pad `mul_mat_vec_q_ksplit`,
+   `mul_mat_vec_q_moe`, `mul_mat_vec_f` and the FA fixup, never `get_rows_*`), so the op oracle is the only
+   non-vacuous arm for these sites.  `scripts/gate-grid-stall-pad.sh` is that arm: the padded launch must equal
+   the **CPU** reference in both pad arms, each site must log its pad, the `MUL_MAT_ID` arm must reach the
+   refusal, and the same-seed text must be identical with `GGML_CUDA_GRID_STALL_PAD=0`.

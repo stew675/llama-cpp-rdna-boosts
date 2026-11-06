@@ -1,4 +1,4 @@
-From acad77a3c6c52519b36d46b788aee7f8fe39c223 Mon Sep 17 00:00:00 2001
+From 4c49d576ec3a7dbb49c8f05d64fd833756c628a7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:38 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher, async
@@ -297,7 +297,7 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  ggml/src/ggml-backend.cpp                     |   92 +-
  ggml/src/ggml-cuda/allreduce-hip.cu           |    3 +
  ggml/src/ggml-cuda/allreduce.cu               |    3 +
- ggml/src/ggml-cuda/common.cuh                 |  574 +-
+ ggml/src/ggml-cuda/common.cuh                 |  636 +-
  ggml/src/ggml-cuda/concat.cu                  |   82 +
  ggml/src/ggml-cuda/cpy-batch.cu               |   14 +-
  ggml/src/ggml-cuda/cpy-batch.cuh              |    1 +
@@ -373,7 +373,7 @@ device 1) and its text matches the GGML_CUDA_SLAB=0 arm.
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 84 files changed, 15813 insertions(+), 5461 deletions(-)
+ 84 files changed, 15844 insertions(+), 5492 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -1077,7 +1077,7 @@ index fbbe48432..a5e3a3a44 100644
              bf16_tmp[i].alloc(ne);
              ggml_cuda_set_device(p->devices[i]);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6337c2879..266ded19d 100644
+index b7d39e766..6512d3890 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -130,6 +130,7 @@ static inline bool ggml_cuda_rms_norm_vec() {
@@ -1103,7 +1103,7 @@ index 6337c2879..266ded19d 100644
  static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
  #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
      return 64;
-@@ -1353,33 +1362,6 @@ struct ggml_cuda_device_info {
+@@ -1353,64 +1362,6 @@ struct ggml_cuda_device_info {
  
  const ggml_cuda_device_info & ggml_cuda_info();
  
@@ -1115,7 +1115,14 @@ index 6337c2879..266ded19d 100644
 -// their grids around the same stall.
 -// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
 -// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
--static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
+-//
+-// `site` names the launch in the GGML_CUDA_GRID_STALL_PAD_DEBUG line (`-lv 4`, or plain stderr), which is how a gate
+-// observes that a given site really padded instead of trusting it.  `pad_blocks` is how many blocks the caller's
+-// one-step pad ADDS: a grid whose x dimension is the row/tile count adds one block per extra y row, but a grid whose
+-// x dimension is a token count adds that many (issue #277, get_rows).  The pad is refused when it would land on
+-// another multiple of 256 -- launching an extra empty block row that cannot leave the condition is pure waste.
+-static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block,
+-                                            const char * site = nullptr, const int64_t pad_blocks = 1) {
 -#if defined(GGML_USE_HIP)
 -    static const bool on = [] {
 -        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
@@ -1126,10 +1133,34 @@ index 6337c2879..266ded19d 100644
 -    }
 -    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
 -    const int64_t nthr = (int64_t) block.x * block.y * block.z;
--    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
+-    if (nblk <= 0 || (nblk % 256 != 0 && (nblk * nthr) % 65536 != 0)) {
+-        return false;
+-    }
+-    static const bool debug = [] {
+-        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD_DEBUG");
+-        return e != nullptr && atoi(e) != 0;
+-    }();
+-    const int64_t nblk_pad = nblk + pad_blocks;
+-    if (nblk_pad % 256 == 0 || (nblk_pad * nthr) % 65536 == 0) {
+-        // A one-step pad adds a multiple of 256 blocks (a grid.x that is itself one): this launch cannot be padded
+-        // off the stall without adding a dimension, so do not spend an empty block row on it.
+-        if (debug) {
+-            GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) %lld blocks: NO pad possible (+%lld keeps the multiple)\n",
+-                          site ? site : "?", grid.x, grid.y, grid.z, (long long) nblk, (long long) pad_blocks);
+-        }
+-        return false;
+-    }
+-    if (debug) {
+-        GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) block=(%u,%u,%u): %lld -> %lld blocks\n",
+-                      site ? site : "?", grid.x, grid.y, grid.z,
+-                      block.x, block.y, block.z, (long long) nblk, (long long) nblk_pad);
+-    }
+-    return true;
 -#else
 -    GGML_UNUSED(grid);
 -    GGML_UNUSED(block);
+-    GGML_UNUSED(site);
+-    GGML_UNUSED(pad_blocks);
 -    return false;
 -#endif // defined(GGML_USE_HIP)
 -}
@@ -1137,7 +1168,7 @@ index 6337c2879..266ded19d 100644
  void ggml_cuda_set_device(int device);
  int ggml_cuda_get_device();
  
-@@ -1394,6 +1376,13 @@ struct ggml_cuda_pool {
+@@ -1425,6 +1376,13 @@ struct ggml_cuda_pool {
  
      virtual void * alloc(size_t size, size_t * actual_size) = 0;
      virtual void free(void * ptr, size_t size) = 0;
@@ -1151,7 +1182,7 @@ index 6337c2879..266ded19d 100644
  };
  
  template<typename T>
-@@ -1440,6 +1429,25 @@ struct ggml_cuda_pool_alloc {
+@@ -1471,6 +1429,25 @@ struct ggml_cuda_pool_alloc {
      ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
  };
  
@@ -1177,7 +1208,7 @@ index 6337c2879..266ded19d 100644
  
  // backend interface
  
-@@ -1466,19 +1474,35 @@ struct ggml_cuda_graph {
+@@ -1497,19 +1474,35 @@ struct ggml_cuda_graph {
      std::vector<cudaGraphNode_t> nodes;
      bool disable_due_to_gpu_arch = false;
      bool warmup_complete = false;
@@ -1219,7 +1250,7 @@ index 6337c2879..266ded19d 100644
  
      bool is_enabled() const {
          static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-@@ -1683,6 +1707,29 @@ bool ggml_cuda_slab_active(int device);
+@@ -1714,6 +1707,29 @@ bool ggml_cuda_slab_active(int device);
  void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
  size_t ggml_cuda_slab_ring_slot_capacity(int device);
  void   ggml_cuda_slab_ring_set(int device, bool arm);
@@ -1249,7 +1280,7 @@ index 6337c2879..266ded19d 100644
  
  // The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
  // larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
-@@ -1695,6 +1742,33 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+@@ -1726,6 +1742,64 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
      return stage_max_bytes;
  }
  
@@ -1261,7 +1292,14 @@ index 6337c2879..266ded19d 100644
 +// their grids around the same stall.
 +// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
 +// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
-+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
++//
++// `site` names the launch in the GGML_CUDA_GRID_STALL_PAD_DEBUG line (`-lv 4`, or plain stderr), which is how a gate
++// observes that a given site really padded instead of trusting it.  `pad_blocks` is how many blocks the caller's
++// one-step pad ADDS: a grid whose x dimension is the row/tile count adds one block per extra y row, but a grid whose
++// x dimension is a token count adds that many (issue #277, get_rows).  The pad is refused when it would land on
++// another multiple of 256 -- launching an extra empty block row that cannot leave the condition is pure waste.
++static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block,
++                                            const char * site = nullptr, const int64_t pad_blocks = 1) {
 +#if defined(GGML_USE_HIP)
 +    static const bool on = [] {
 +        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
@@ -1272,10 +1310,34 @@ index 6337c2879..266ded19d 100644
 +    }
 +    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
 +    const int64_t nthr = (int64_t) block.x * block.y * block.z;
-+    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
++    if (nblk <= 0 || (nblk % 256 != 0 && (nblk * nthr) % 65536 != 0)) {
++        return false;
++    }
++    static const bool debug = [] {
++        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD_DEBUG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    const int64_t nblk_pad = nblk + pad_blocks;
++    if (nblk_pad % 256 == 0 || (nblk_pad * nthr) % 65536 == 0) {
++        // A one-step pad adds a multiple of 256 blocks (a grid.x that is itself one): this launch cannot be padded
++        // off the stall without adding a dimension, so do not spend an empty block row on it.
++        if (debug) {
++            GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) %lld blocks: NO pad possible (+%lld keeps the multiple)\n",
++                          site ? site : "?", grid.x, grid.y, grid.z, (long long) nblk, (long long) pad_blocks);
++        }
++        return false;
++    }
++    if (debug) {
++        GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) block=(%u,%u,%u): %lld -> %lld blocks\n",
++                      site ? site : "?", grid.x, grid.y, grid.z,
++                      block.x, block.y, block.z, (long long) nblk, (long long) nblk_pad);
++    }
++    return true;
 +#else
 +    GGML_UNUSED(grid);
 +    GGML_UNUSED(block);
++    GGML_UNUSED(site);
++    GGML_UNUSED(pad_blocks);
 +    return false;
 +#endif // defined(GGML_USE_HIP)
 +}
@@ -1283,7 +1345,7 @@ index 6337c2879..266ded19d 100644
  // Issue/TODO #42: the shared device-allocation helper (defined in ggml-cuda.cu).  It yields the
  // lowest-priority MoE expert-cache arena when an allocation cannot otherwise be satisfied, so every
  // device allocation inherits the same fail-soft policy.
-@@ -1704,15 +1778,33 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+@@ -1735,15 +1809,33 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
  // the fusion dispatcher lives in its own TU (ggml-cuda-try-fuse.cu).
  bool ggml_cuda_fusion_disabled();
  
@@ -1321,7 +1383,7 @@ index 6337c2879..266ded19d 100644
  
      int curr_stream_no = 0;
  
-@@ -1807,10 +1899,58 @@ struct ggml_backend_cuda_context {
+@@ -1838,10 +1930,58 @@ struct ggml_backend_cuda_context {
      size_t q8_1_arena_size = 0;
      std::vector<char *> q8_1_arena_retired;
  
@@ -1380,7 +1442,7 @@ index 6337c2879..266ded19d 100644
      const ggml_tensor * glu_q8_1_mm   = nullptr;
      std::vector<q8_1_cache_entry> q8_1_cache;
      size_t q8_1_arena_pos = 0;
-@@ -1823,13 +1963,53 @@ struct ggml_backend_cuda_context {
+@@ -1854,13 +1994,53 @@ struct ggml_backend_cuda_context {
      // Returns the cached buffer for (src1, stream_no, layout) if present,
      // otherwise allocates a new one from the arena and records it. The buffer
      // is valid until the next q8_1_cache_clear().
@@ -1437,7 +1499,7 @@ index 6337c2879..266ded19d 100644
                  found = true;
                  return q8_1_arena + e.offset;
              }
-@@ -1927,14 +2107,23 @@ struct ggml_backend_cuda_context {
+@@ -1958,14 +2138,23 @@ struct ggml_backend_cuda_context {
      // The growth policy is not a performance lever (exact-fit realloc measured the same).
      char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
      size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
@@ -1464,7 +1526,7 @@ index 6337c2879..266ded19d 100644
              total += fattn_stage_size[i];
          }
          return total;
-@@ -1953,35 +2142,101 @@ struct ggml_backend_cuda_context {
+@@ -1984,35 +2173,101 @@ struct ggml_backend_cuda_context {
      //
      // `size_hint`, when non-zero, is the eventual full size this arena will be asked for (the F16
      // size of the K/V view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB; computed by
@@ -1582,7 +1644,7 @@ index 6337c2879..266ded19d 100644
                  // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
                  // still leave when the movable-boundary slab is active (see
                  // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
-@@ -2007,11 +2262,16 @@ struct ggml_backend_cuda_context {
+@@ -2038,11 +2293,16 @@ struct ggml_backend_cuda_context {
                  }
              }
              if (fattn_stage[stream_no] != nullptr) {
@@ -1601,7 +1663,7 @@ index 6337c2879..266ded19d 100644
          }
          return fattn_stage[stream_no];
      }
-@@ -2065,10 +2325,10 @@ struct ggml_backend_cuda_context {
+@@ -2096,10 +2356,10 @@ struct ggml_backend_cuda_context {
          // Qwen3.8-Flash-Next where the largest staged slice is 270 MiB.  Cap the auto hole so it stays
          // proportional to a real table (GGML_CUDA_SLAB_RING_MIB); a staged request larger than a slot falls
          // back to cudaMalloc, the pre-change path.  An explicit GGML_SCHED_STAGE_MAX_MB still wins.
@@ -1616,7 +1678,7 @@ index 6337c2879..266ded19d 100644
          if (bound > cap) {
              bound = cap;
          }
-@@ -2175,6 +2435,22 @@ struct ggml_backend_cuda_context {
+@@ -2206,6 +2466,22 @@ struct ggml_backend_cuda_context {
          return (size_t) h2d_stage_slots() * (max_slot + 512);
      }
  
@@ -1639,7 +1701,7 @@ index 6337c2879..266ded19d 100644
      void * h2d_stage_buffer(int slot, size_t size) {
          GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
          if (size > h2d_stage_size[slot]) {
-@@ -2192,18 +2468,48 @@ struct ggml_backend_cuda_context {
+@@ -2223,18 +2499,48 @@ struct ggml_backend_cuda_context {
              // it does not draw on the free VRAM the G4 cap protects.
              if (!h2d_stage_slab[slot]) {
                  const size_t cap = ggml_cuda_slab_ring_slot_capacity(device);
@@ -1693,7 +1755,7 @@ index 6337c2879..266ded19d 100644
              // fit-slab-accounting revival (G4, issue #117): bound the ring by the free VRAM it would still
              // leave.  See `optional_alloc_within_free_cap` above.
              if (!optional_alloc_within_free_cap(h2d_stage_total - old_size + new_size)) {
-@@ -2399,6 +2705,8 @@ struct ggml_backend_cuda_context {
+@@ -2430,6 +2736,8 @@ struct ggml_backend_cuda_context {
      nv_bfloat16 * bf16_src1_cache_put(const ggml_tensor * root, int64_t n) {
          auto & c = bf16_src1_cache;
          c.buf.reset();
@@ -1702,7 +1764,7 @@ index 6337c2879..266ded19d 100644
          c.buf       = std::make_unique<ggml_cuda_pool_alloc<nv_bfloat16>>(pool(), n);
          c.src1      = root;
          c.data      = root->data;
-@@ -2421,6 +2729,40 @@ struct ggml_backend_cuda_context {
+@@ -2452,6 +2760,40 @@ struct ggml_backend_cuda_context {
      }
  };
  
@@ -1743,7 +1805,7 @@ index 6337c2879..266ded19d 100644
  struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * x_bias = nullptr;
      const ggml_tensor * gate = nullptr;
-@@ -2446,6 +2788,10 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -2477,6 +2819,10 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * shared_up = nullptr;
      const ggml_tensor * shared_gate = nullptr;
      ggml_tensor * shared_dst = nullptr;
@@ -1754,7 +1816,7 @@ index 6337c2879..266ded19d 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -2464,6 +2810,47 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2495,6 +2841,47 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * shared_gate = nullptr;
      float * shared_dst = nullptr;
      uint32_t shared_stride_col_dst = 0;
@@ -1802,7 +1864,7 @@ index 6337c2879..266ded19d 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -2591,5 +2978,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -2622,5 +3009,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -2291,7 +2353,7 @@ index 2d0b3cfea..ecb0a13f6 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index a420182e0..f9865cb9f 100644
+index a420182e0..798008a13 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,6 +3,8 @@
@@ -2824,7 +2886,7 @@ index a420182e0..f9865cb9f 100644
 +
 +            const dim3 block_dim_combine(DV, 1, 1);
 +            dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
-+            if (ggml_cuda_grid_stall_pad(blocks_num_combine, block_dim_combine)) {
++            if (ggml_cuda_grid_stall_pad(blocks_num_combine, block_dim_combine, "fa_stream_k_fixup")) {
 +                blocks_num_combine.x++;   // the kernel returns for a tile at or past nblocks_stream_k
 +            }
 +
@@ -18466,7 +18528,7 @@ index 50976330d..eef461c05 100644
 +int ggml_cuda_mul_mat_q_swiglu_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index a89bf70ac..1d9f444a9 100644
+index a8469c200..592d0c87d 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -2,24 +2,35 @@
@@ -18604,7 +18666,7 @@ index a89bf70ac..1d9f444a9 100644
 +        fusion_launch.sma_nblk = (int) ((fusion.sma_ne0 + block_size_best - 1) / block_size_best);
 +        block_nums.x = fusion_launch.sma_nblk;
 +    }
-     if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
+     if (ggml_cuda_grid_stall_pad(block_nums, block_dims, "mul_mat_vec_f")) {
 -        block_nums.x++;   // the kernel returns for row >= nrows
 +        block_nums.x++;   // the kernel returns for row >= nrows (sma_nblk)
      }
@@ -19418,7 +19480,7 @@ index 000000000..451a9282c
 +    }
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..6a50d247c
+index 000000000..cbde50413
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
 @@ -0,0 +1,457 @@
@@ -19812,7 +19874,7 @@ index 000000000..6a50d247c
 +    // Upstream's fused shared-expert lane is the last blockIdx.y column.
 +    dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
 +    const dim3 block_dims(warp_size, ncols_dst);
-+    if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
++    if (ggml_cuda_grid_stall_pad(block_nums, block_dims, "mul_mat_vec_q_moe")) {
 +        block_nums.x++;   // the kernel returns for row0 >= nrows_x
 +    }
 +    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
@@ -20002,7 +20064,7 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index da6289642..7af55bbdc 100644
+index ded382fc9..fd3189670 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -22355,7 +22417,7 @@ index e8b5888dc..261e9697e 100644
  void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 +int  ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index e2ebe1e8a..1a60a3544 100644
+index e2ebe1e8a..9d29faf4a 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -1,5 +1,6 @@
@@ -22449,7 +22511,7 @@ index e2ebe1e8a..1a60a3544 100644
 +
 +    dim3 blocks_num(2*nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
 +    const dim3 block_dims(256, 1, 1);
-+    if (ggml_cuda_grid_stall_pad(blocks_num, block_dims)) {
++    if (ggml_cuda_grid_stall_pad(blocks_num, block_dims, "rms_norm_scale_pair")) {
 +        // issue #273: at 8 tokens in the batch this grid is 2*nrows*nchannels = 256 blocks on a 16-layer GDN model,
 +        // i.e. 65536 work-items, which pays the gfx1201 dispatch stall.  The kernel returns past 2*nrows.
 +        blocks_num.x++;
@@ -25441,7 +25503,7 @@ index 6df35c4e0..f427334f0 100644
      void print_info() const;
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 92601c191..87cd4b6d5 100644
+index 3ed9a1fde..18b7d606c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -63,7 +63,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -25523,7 +25585,7 @@ index 92601c191..87cd4b6d5 100644
  
          for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
              ggml_tensor * t = out->src[i];
-@@ -11038,7 +11059,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11048,7 +11069,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
  
@@ -25532,7 +25594,7 @@ index 92601c191..87cd4b6d5 100644
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
      }
-@@ -11081,7 +11102,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11091,7 +11112,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (auto multi_add : {false, true}) {
          for (auto set_rows : {false, true}) {
              for (auto broadcast : {false, true}) {
@@ -25541,7 +25603,7 @@ index 92601c191..87cd4b6d5 100644
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
-@@ -11237,6 +11258,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11247,6 +11268,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
@@ -25549,7 +25611,7 @@ index 92601c191..87cd4b6d5 100644
  
      // Qwen3.6-27B Q6_K prefill shapes (perf tuning targets):
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // ffn_up/ffn_gate
-@@ -11975,6 +11997,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11985,6 +12007,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
@@ -25560,7 +25622,7 @@ index 92601c191..87cd4b6d5 100644
      }
  
      for (int n = 1; n < 5; ++n) {
-@@ -12374,6 +12400,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12384,6 +12410,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      // sparse mask with large batch size
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -25572,7 +25634,7 @@ index 92601c191..87cd4b6d5 100644
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-@@ -12618,6 +12649,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12628,6 +12659,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                      test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
@@ -25580,7 +25642,7 @@ index 92601c191..87cd4b6d5 100644
                      // rows at and just past the limit where one block still covers all rows
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
-@@ -12808,6 +12840,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12818,6 +12850,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  

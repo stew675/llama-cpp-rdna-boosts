@@ -1,4 +1,4 @@
-From d83b23e204edf7bd23d4c92b278ceacbc2a2b77c Mon Sep 17 00:00:00 2001
+From d8ec14b94419d540334e84d2081a7e3e85d37b07 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -6644,7 +6644,7 @@ index 297d9ffc9..01737d1b7 100644
      file(GLOB   SRCS "template-instances/mmq*.cu")
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 673ceb058..6337c2879 100644
+index 380f9ccfb..b7d39e766 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,17 @@
@@ -6785,7 +6785,7 @@ index 673ceb058..6337c2879 100644
  }
  
  template<typename T, int width = WARP_SIZE>
-@@ -1304,6 +1383,12 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
+@@ -1335,6 +1414,12 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
  void ggml_cuda_set_device(int device);
  int ggml_cuda_get_device();
  
@@ -6798,7 +6798,7 @@ index 673ceb058..6337c2879 100644
  struct ggml_cuda_pool {
      virtual ~ggml_cuda_pool() = default;
  
-@@ -1383,6 +1468,10 @@ struct ggml_cuda_graph {
+@@ -1414,6 +1499,10 @@ struct ggml_cuda_graph {
      bool warmup_complete = false;
      uint64_t uid = 0;
      int64_t last_used_time = 0;
@@ -6809,7 +6809,7 @@ index 673ceb058..6337c2879 100644
      struct node_properties {
          ggml_tensor node;
          void *   node_src_data_ptrs[GGML_MAX_SRC];
-@@ -1549,6 +1638,72 @@ struct ggml_cuda_stream_context {
+@@ -1580,6 +1669,72 @@ struct ggml_cuda_stream_context {
      }
  };
  
@@ -6882,7 +6882,7 @@ index 673ceb058..6337c2879 100644
  struct ggml_backend_cuda_context {
      int device;
      std::string name;
-@@ -1561,14 +1716,18 @@ struct ggml_backend_cuda_context {
+@@ -1592,14 +1747,18 @@ struct ggml_backend_cuda_context {
  
      int curr_stream_no = 0;
  
@@ -6905,7 +6905,7 @@ index 673ceb058..6337c2879 100644
          const int64_t time_now = ggml_time_us();
  
          // sweep every 5s, evicting cuda graphs unused for >=10s
-@@ -1583,9 +1742,9 @@ struct ggml_backend_cuda_context {
+@@ -1614,9 +1773,9 @@ struct ggml_backend_cuda_context {
              }
          }
  
@@ -6917,7 +6917,7 @@ index 673ceb058..6337c2879 100644
          }
          it->second->last_used_time = time_now;
          return it->second.get();
-@@ -1647,6 +1806,12 @@ struct ggml_backend_cuda_context {
+@@ -1678,6 +1837,12 @@ struct ggml_backend_cuda_context {
      char * q8_1_arena = nullptr;
      size_t q8_1_arena_size = 0;
      std::vector<char *> q8_1_arena_retired;
@@ -6930,7 +6930,7 @@ index 673ceb058..6337c2879 100644
      std::vector<q8_1_cache_entry> q8_1_cache;
      size_t q8_1_arena_pos = 0;
  
-@@ -1673,7 +1838,10 @@ struct ggml_backend_cuda_context {
+@@ -1704,7 +1869,10 @@ struct ggml_backend_cuda_context {
          if (q8_1_arena_pos + size > q8_1_arena_size) {
              const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
              char * new_arena = nullptr;
@@ -6942,7 +6942,7 @@ index 673ceb058..6337c2879 100644
              if (q8_1_arena != nullptr) {
                  CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
                  // Captured CUDA/HIP graphs keep pointers into the old arena, and the multi-token graph that
-@@ -1746,6 +1914,432 @@ struct ggml_backend_cuda_context {
+@@ -1777,6 +1945,432 @@ struct ggml_backend_cuda_context {
  
      ggml_cuda_stream_context concurrent_stream_context;
  
@@ -7375,7 +7375,7 @@ index 673ceb058..6337c2879 100644
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
-@@ -1781,6 +2375,38 @@ struct ggml_backend_cuda_context {
+@@ -1812,6 +2406,38 @@ struct ggml_backend_cuda_context {
      // pool
      std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
  
@@ -7414,7 +7414,7 @@ index 673ceb058..6337c2879 100644
      static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(ggml_backend_cuda_context & ctx, int device, int stream_no);
  
      ggml_cuda_pool & pool(int device) {
-@@ -1964,3 +2590,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1995,3 +2621,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -10789,7 +10789,7 @@ index 1d15c57be..df84f3464 100644
          /* .guid    = */ ggml_backend_cuda_guid(),
          /* .iface   = */ ggml_backend_cuda_interface,
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 12a70e968..da6289642 100644
+index 14f88e890..ded382fc9 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
