@@ -89,6 +89,12 @@ transition), **#279** (narrow-2), **#280** (parity/crossover).  The touch sweep 
    pool delivers without any registration -- **76.9 % = 26.0, 93.7 % = 33.9 (+19-21 % from the demote),
    100 % = 38.2** (CLI, one R9700).  Plus the two remaining transport items (#276, #278) or their measured
    refutation, and the crossover table (#280).
-5. **Then**: post that as the PR's closing summary ("integrated rather than merged": every mechanism is either
+5. **Posted 2026-11-06** (the config + numbers above, the r228 rules, the repro conditions and the
+   taken/rejected/open mapping):
+   <https://github.com/stew675/llama-cpp-rdna-boosts/pull/267#issuecomment-6698266713> -- awaiting the
+   reporter's confirmation before the close.  The reply also flags that the fill mode follows `--load-mode`
+   (his box measured `dio` decisively better; the pool and the span read follow it) and that the demote
+   declines on a `-sm tensor` axis-0 slice, which matters for the second GPU he is bringing up.
+6. **Then**: post that as the PR's closing summary ("integrated rather than merged": every mechanism is either
    in the delivery in a different shape, measured and rejected, or recorded with a handle) and close it.  Do not
    mark it merged -- nothing of the branch is applied.
