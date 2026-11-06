@@ -1,3 +1,35 @@
+## 261106.002 (campaign) -- W2 demote implemented (the in-pool exchange), and a vacuous gate found and fixed
+
+**Fork only; nothing in `patches/`.**  Two things.
+
+**1. W2: the demote, using the maintainer's in-pool exchange.**  `S7` in `PLAN.md` turned out to be false --
+the pool slot that serves an admission holds the *incoming* expert until its H2D drains, and that H2D has
+already overwritten the victim, so "the victim takes the vacated slot" is not implementable and a staging buffer
+would make it two copies.  The maintainer's fix is better than the three options PLAN.md recorded: plan **K
+slots of exchange headroom below the budget** (`slots -= K`, so the pool does not grow), let the demote write
+the victim straight into a free slot (**one** D2H, so W1's 9.6 us/copy stands), and retire the promoted
+expert's slot back into the free list only when the headroom has run dry.  That preserves #87's
+keep-the-duplicate win in the steady state and makes the retirement harmless, because the vacancy is refilled
+by a just-evicted hot expert rather than left empty.  `MOE_HOST_POOL_SINK=1` / `MOE_HOST_POOL_SINK_SPARE=2`
+(default off).  1-D only (`n_slices == 0`), declines rather than disturbing a fill.  First run at `-lme 36`:
+**3712 demoted (2401 MiB), 6497 slots retired, 4983 declined**; slot count 56304 instead of 56592, i.e. the
+288 reserved slots are visible in the layout.  The 57 % decline rate is the open tuning item (incoming misses
+also draw on the headroom).
+
+**2. The coherence gate was vacuous.**  `sha=dfc26e26f38c`, quoted since P1 as "text-neutral with the pool",
+came from `-p "The capital of France is" -n 24` -- a 9-token prompt that never reaches the first decode-band
+pass, so **no pool was built** and the hash only proved the non-pool path unchanged.  Found while checking why
+the coherence arm printed no pool line.  Two independent log traps on the way: the pool report is a WARN and
+default verbosity filters it (`-lv 1` = ERROR only), while `-lv 3` shows it but interleaves per-token timing
+into the generated text (1691 chars vs 126).  Fixed: the arm uses the prose prompt, hashes at default
+verbosity, and pool engagement is asserted out-of-band at `-lv 2` on the identical config.  With the pool
+engaged, **4/4 arms are byte-identical at `sha=880c932888f8`** (combined/decode x SINK 0/1), which is now the
+reference hash for a pool-active arm.
+
+Also fixed on the fork: `expert_src_done` was called twice per successful fill (harmless today -- an
+idempotent event re-record -- but the second call sat outside the success guard, so a future fallback would
+have published a slot as drained that was never written).
+
 ## 261106.001 (campaign) -- W1: the swap's marginal cost, and the batched/lazy methodology corrections
 
 **No delivery change.**  Three things, in the order they mattered.

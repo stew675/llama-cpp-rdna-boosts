@@ -113,7 +113,16 @@ change nothing else.
 >    only the transient not-yet-full window); or (iii) stop, and take "buy the RAM" as the answer for the
 >    constrained box, since the demote's cost has doubled and its slot policy contradicts a standing design.
 >
-> Do not write W2 until that is decided.
+> **RESOLVED (2026-11-06) — the maintainer's design, and it is better than all three options.**  Put the
+> bounce buffer *inside* the pool: plan K slots of **exchange headroom** below the budget (`slots -= K`, so
+> nothing grows), let a demote write the victim straight into a free slot (ONE D2H, no staging, no second
+> copy), and retire the promoted expert's slot back into the free list only when the headroom has run dry
+> (`pool_free_slot_locked() < 0`).  That keeps #87's keep-the-duplicate win in the steady state and makes the
+> duplicate-retirement harmless when it does happen, because the vacancy is refilled by a just-evicted hot
+> expert instead of being left empty.  Implemented as `MOE_HOST_POOL_SINK` + `MOE_HOST_POOL_SINK_SPARE`
+> (default 2).  First run at `-lme 36`: **3 712 demoted (2 401 MiB), 6 497 slots retired, 4 983 declined** —
+> the decline rate (57 %) is the open tuning item: incoming misses also draw on the headroom, so K=2 per
+> table is not enough to keep the rotation ahead of the fills.  Next: sweep K, then W3.
 
 Design constraints, all of which come from something measured:
 

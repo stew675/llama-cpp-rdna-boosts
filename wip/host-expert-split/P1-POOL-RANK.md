@@ -112,6 +112,20 @@ text.  Clean logging, nine identical hashes.  Worth remembering: never hash an `
   mirror is also the fastest row by a wide margin (833 t/s prefill against 309 at a 77 % pool), which is the
   post-cache baseline to beat — and exactly why a partial pool has to earn its place.
 
+**The coherence claim was measured without a pool (corrected 2026-11-06).**  The arm that produced
+`sha=dfc26e26f38c` used `-p "The capital of France is" -n 24`, whose 9-token prompt never reaches the first
+decode-band pass, so **no pool was ever built** and the hash proved only that the non-pool path is unchanged.
+Re-run with the prose prompt, which does engage it (verified at `-lv 2` on the identical config), at default
+verbosity (an `-lv 3` log cannot be hashed: its timing lines inflate the extraction from 126 to 1691 chars):
+
+| `-lme 36`, pool active, prose, `-n 24` | `SINK=0` | `SINK=1` |
+|---|---|---|
+| `combined` | `880c932888f8` | `880c932888f8` |
+| `decode` | `880c932888f8` | `880c932888f8` |
+
+**4/4 byte-identical with the pool engaged**, so both the ranking change and the W2 demote are placement-only,
+as they must be.  `880c932888f8` (126 chars) is the reference hash for a pool-active arm.
+
 ### `llama-batched-bench -npl 1,4,8` — a GATE, not a decision input (corrected 2026-11-06)
 
 **The +20.8 % at 8 slots was a cold-start artifact and is RETRACTED.**  Three alternating repeats on the

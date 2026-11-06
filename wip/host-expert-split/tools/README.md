@@ -13,7 +13,7 @@ SAMPLE_NOTE=<tag> ../../../scripts/gpu-watch.sh --out /tmp/<tag>.csv --interval 
 |---|---|---|
 | `arm-decay.sh RANK TAG` (`LME=`, `NGEN=`, `CACHE_MIB=`, `RANK_FLOOR=` in env) | `-n 64`, `-ub 4096`, the trace config | P1's +10.6 % generation A/B (`P1-POOL-RANK.md`) |
 | `arm-prefill.sh RANK TAG` (`LME=` in env) | `-n 20`, `-ub 6144` | the prefill A/B across `-lme` 36/44/47 |
-| `arm-coherence.sh RANK TAG` (`LME=` in env) | `-p "The capital of France is" -n 24`, **no `-lv`** | text identity (9/9 byte-identical).  **Never hash an `-lv 3` log** — its timing lines interleave into the generated text |
+| `arm-coherence.sh RANK TAG` (`LME=`, `SINK=` in env) | the **prose prompt**, `-n 24`, **default verbosity** | text identity.  Two traps, both measured 2026-11-06: (1) **never hash an `-lv 3` log** — its per-token timing interleaves into the generated text (1691 chars instead of 126); `-lv 2` is also unusable (WARN lines land in the captured region), so hash at **default verbosity**; (2) **the pool is built at the first decode-band pass**, so a short prompt (`-p "The capital of France is"`) never engages it — the original 9/9 claim was measured **with no pool at all**.  The arm now uses the prose prompt; pool engagement is verified out-of-band at `-lv 2` on the identical config (it cannot change the computation, only the logging), because the pool report is a WARN and default verbosity hides it.  Reference hash with the pool active: **`sha=880c932888f8`** (126 chars) |
 | `arm-batched.sh RANK TAG` | `llama-batched-bench -npl 1,4,8`, `-lme 44` | the batched gate |
 
 Fixed for every arm, and each for a measured reason:
