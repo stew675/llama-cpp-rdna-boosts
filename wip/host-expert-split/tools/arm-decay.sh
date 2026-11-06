@@ -11,9 +11,9 @@ export MOE_HOST_POOL_RAM_PCT=0
 export MOE_HOST_POOL_DIO=1                 # a pool miss IS a disk read, whatever the page cache holds
 export MOE_EXPERT_CACHE_MIB=${CACHE_MIB:-4096}
 export MOE_HOST_POOL_RANK=$RANK
-export MOE_HOST_POOL_SINK=${SINK:-0}
-export MOE_EXPERT_CACHE_PERIOD=${PERIOD:-32}   # LFRU decay: halves count/ghost every N accesses per table
-export MOE_HOST_POOL_SINK_SPARE=${SINK_SPARE:-2}
+if [ -n "${SINK:-}" ]; then export MOE_HOST_POOL_SINK=$SINK; fi   # unset = the binary default
+if [ -n "${PERIOD:-}" ]; then export MOE_EXPERT_CACHE_PERIOD=$PERIOD; fi   # unset = the binary default
+if [ -n "${SINK_SPARE:-}" ]; then export MOE_HOST_POOL_SINK_SPARE=$SINK_SPARE; fi   # unset = auto (4 % of slots)
 export MOE_HOST_POOL_SINK_TAX=${SINK_TAX:-0}   # W1 diagnostic: one extra D2H per admitted miss
 export MOE_HOST_POOL_RANK_FLOOR=${RANK_FLOOR:-50}
 LOG=/tmp/arm-decay-$TAG.log

@@ -1,3 +1,45 @@
+## 261106.009 (campaign) -- W3 curve (prefill + gen), and a saturation fix that must be duplicate-only
+
+**Fork only.**  W3's budget sweep on the shipping configuration (`decode` + exchange on, `-lzm off`, arena
+4 GiB, prose prompt, `-n 64`, one R9700), and the fix that came out of it.
+
+| `-lme` | pinned | prefill t/s | gen t/s | pool h | demoted | declines | reclaimed |
+|---|---|---|---|---|---|---|---|
+| 12 | 12.0 GiB | 94.3 | 10.4 | 0.0446 | 4 875 | 14 949 | 833 |
+| 15 | 14.7 | 103.8 | 12.0 | -- | 5 730 | 12 005 | -- |
+| 18 | 17.7 | 116.3 | 14.1 | 0.0644 | 6 808 | 8 893 | 1 675 |
+| 21 | 20.6 | 131.3 | 16.2 | -- | 7 389 | 6 843 | -- |
+| 24 | 23.5 | 149.9 | 19.0 | 0.0936 | 8 219 | 4 620 | 2 048 |
+| 27 | 26.4 | 173.9 | 21.3 | -- | 8 592 | 3 424 | -- |
+| 30 | 29.9 | 206.6 | 24.4 | 0.1408 | 9 588 | 1 506 | 1 610 |
+| 33 | 32.9 | 250.9 | 25.8 | -- | 9 856 | 863 | -- |
+| 36 | 35.9 | 331.3 | 27.8 | 0.2311 | 10 152 | 42 | 441 |
+| 39 | 39.0 | 472.5 | 28.3 | -- | 9 978 | 93 | -- |
+| 42 | 42.0 | 672.3 | 28.7 | -- | 9 876 | 79 | -- |
+| 44 | 43.9 | 740.0 | 29.4 | 0.7799 | 9 864 | 0 | 37 |
+| 46 | 45.9 | 777.9 | 29.1 | -- | 9 862 | 26 | -- |
+| 48 (mirror) | 46.8 | -- | 31.2 | -- | 0 | -- | -- |
+
+**The saturation freeze, found because the disk stopped at ~2.4 GB/s on a 7 GB/s drive.**  At low budgets the
+pool is full of the prior's bad guess, so no fill can happen, so nothing retires, so every demote declines and
+the pool never learns: at `-lme 12`, `h=0.0439`, 0 disk fills, 15 212 victims discarded, and every miss on the
+**synchronous bounce ring** -- one 0.6 MiB expert read at a time, queue depth 1, ~250 us each = **~2.4 GB/s**,
+which is exactly the observed ceiling and is latency, not bandwidth.  Depth 4 would plausibly reach the drive's
+~7 GB/s, but the fill runs under `g_mutex`, so the I/O has to come out from under the lock (the bounce ring
+already has multiple slots, so a small prefetch pool is feasible).  That is now the largest remaining lever at
+sub-mirror sizes.
+
+**Two reclamation policies measured, and only one is safe.**  Reclaiming the LRU resident unfroze the pool but
+was a net LOSS at mid budgets: at `-lme 24` it evicted 10 220 residents, doubled the demotions (8 019 ->
+17 367) and lost a third of the throughput (18.7 -> 12.4 t/s), because a 4 GiB arena holds too few duplicates
+and the pool's ONLY copy of an expert was being thrown away.  **Reclaim a DUPLICATE only** (an expert the arena
+also holds, whose pool copy is worth nothing) and decline otherwise: a small gain at every budget and no
+regression (18.7 -> 19.0, 23.9 -> 24.4, 27.6 -> 27.8, 29.1 -> 29.4; declines at 36 fell 258 -> 42, at 44
+38 -> 0).
+
+Owed: the `combined`/`SINK=0` control arm across this sweep (the old-default curve, for the release table); the
+pipelined fill; then the gates (MTP four-axis, prefill-logit, per-block build) and promotion.
+
 ## 261106.008 (campaign) -- the exchange is inert against a full mirror, and can never exceed one
 
 Two invariants, requested and verified on the shipping build:

@@ -5,8 +5,8 @@ cd /llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S || exit 1
 export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0
 export GGML_CUDA_SLAB_HEADROOM_MIB=1536 LLAMA_KV_REGION_POOL=0 MOE_HOST_POOL_RAM_PCT=0
 export MOE_HOST_POOL_DIO=1 MOE_EXPERT_CACHE_MIB=4096 MOE_HOST_POOL_RANK=$1
-export MOE_HOST_POOL_SINK=${SINK:-0}            # W2 demote
-export MOE_HOST_POOL_SINK_SPARE=${SINK_SPARE:-2}
+if [ -n "${SINK:-}" ]; then export MOE_HOST_POOL_SINK=$SINK; fi   # unset = the binary default
+if [ -n "${SINK_SPARE:-}" ]; then export MOE_HOST_POOL_SINK_SPARE=$SINK_SPARE; fi   # unset = auto (4 % of slots)
 LOG=/tmp/arm-coh-$3.log
 "$HOME/llama.cpp/build-rocm/bin/llama-cli" \
   -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
