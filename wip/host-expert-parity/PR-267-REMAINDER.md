@@ -31,11 +31,26 @@ design) and [`archive/work/host-pool-speed/README.md`](../../archive/work/host-p
 
 Worth stating once, because a reviewer of the PR will ask:
 
-* **His swap is slot-neutral-ish (victim → the promoted expert's slot) with a spare per table; ours is a demote
-  into exchange headroom planned *below* the budget** (`K = 4 %` of a table's slots, floor 2, cap slots/8), so
-  nothing grows, the mirror stays impossible to exceed, and the demote is **inert** against a mirror
-  (`slots >= n_experts`).  `S7` in `PLAN.md` records why the literal slot-neutral swap could not be built (the
-  incoming fill is reading that slot and has already overwritten the victim).
+* **In the saturated case ours *is* his swap.**  His `tier_swap_locked` (0004) sends the victim D2H into a
+  **spare tier slot**, repoints `cold_ptrs[victim]` at it, and parks the promoted expert's vacated slot in
+  `ram_pending` until `swap_ev` fires -- so his "spare" is just the promoted expert's old slot, one event later.
+  Ours retires the promoted expert's pool slot, waits on `slot_state == 2`, and publishes the victim into it, and
+  the measurement shows the pairing (`demoted == retired`: 9 933/9 933 at `-lme` 44, 10 037/10 681 at 36).  Same
+  mechanism, same **one extra copy** per admission (the victim D2H; the incoming expert's fill happens anyway).
+  The difference is the **accounting**, and it is the one that mattered:
+  - his spares are **on top of** the budget (`ram_free.assign(1, j)`, K+1 slots per table with precopy), so the
+    complement can never be starved;
+  - our headroom is **inside** it (`K = 4 %` of a table's slots), i.e. coverage given up -- which is exactly why
+    `K > gap` displaced the complement at 97.7 % coverage and cost 43-53 % of the field prefill until r228 capped
+    it by the gap and disengaged the exchange below 4 %.
+  Our third path has no analogue in his design: a **duplicate** (an expert the arena also holds) is reclaimed
+  when the pool is saturated (`g_sink_evicted`) because that copy is worthless -- his tier is the complement by
+  construction, so he can only decline (`g_tier_nospare`).
+* **`K` is a transient reserve, his spares are a permanent rotation** -- which decides #277: a precopy cannot
+  live in our headroom (a prefill fill may consume it, and r228 deliberately lets it), so precopy needs a
+  dedicated K-slot ring with a side stream, i.e. his 0006/0007 shape.  `S7` in `PLAN.md` records why the literal
+  slot-neutral swap cannot be built *from the incoming fill's own slot* (the fill is reading it and has already
+  overwritten the victim) -- the promoted expert's *retired* slot is the one that works.
 * **Ours declines rather than lies**: no slot, a geometry it cannot express (a `-sm tensor` axis-0 slice), or a
   failed copy ⇒ the victim is dropped exactly as before, nothing is published, and the admitted expert's own copy
   is unaffected (`gate-host-pool.sh`'s `sinkfail` arm asserts it).
@@ -66,8 +81,8 @@ for the PR's remaining mechanisms:
 | # | item | what decides it | where | state after r228 |
 |---|---|---|---|---|
 | 1 | **parity/crossover table** (`TODO` #280): pinned GiB vs decode vs first-pass prefill vs storage MiB/token, mirror as the asymptote | the field matrix at a budget the sink is *live* at, plus the DIO/buffered pair | PLAN P0.2/P0.3 | **half done**: CLI 76.9 % = 26.0, 93.7 % = 33.9, mirror = 38.2; field mirror 1 932-1 938 / 83.7 vs `auto` 1 837 / 76.6.  Owed: the DIO-vs-buffered field pair, the span-reach pair, and a partial field row (`-lme 44`) |
-| 2 | **the demote's transport** (`TODO` #276): is the `cudaMemcpyAsync` D2H on the token path where the sink is live?  Then a **copy-kernel form + a drain on a failed event record** (0004/0006/0007) | PLAN P1.1 -- the `SINK=0/1` delta at `-lme 44`, not at 97.7 % | this campaign | **open**, now measurable on a live cell |
-| 3 | **precopy** (`TODO` #277, 0006/0007/0008): K spares + a side stream, incl. the drain semantics | only if #276 leaves a residual >~1 % of the step | PLAN P1.2 | **open, conditional** |
+| 2 | **the demote's copy submission** (`TODO` #276): his copy-kernel + drain rationale is the *paired-device* stall, not 1-GPU cost (the demote measures net +19-21 % at `-lme` 44, so the copy does not dominate) | a 2-GPU arm, a copy-kernel A/B, and a stall in the flight record right after an admission -- not a throughput delta | this campaign | **open, narrowed to the multi-device hazard** (not testable on this one-GPU box) |
+| 3 | **precopy** (`TODO` #277, 0006/0007/0008): a **dedicated** K-slot ring + a side stream + the drain semantics (our headroom cannot hold a pre-copied victim -- a prefill fill consumes it) | only if #276 leaves a residual on a multi-device arm | PLAN P1.2 | **open, conditional; the shape is decided (his 0006/0007, not more headroom)** |
 | 4 | **the slab keeps the arena across a decode→prefill transition** (`TODO` #278, 0003b) | PLAN P1.4 -- first count the `evicted … re-armed` census on the field shape | PLAN P1.4 | **open, promoted** -- it is now the field prefill's main residual, not a demote artefact |
 | 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (`TODO` #279, 0003a) | PLAN P1.5 -- one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | PLAN P1.5 | **open** |
 | 6 | **`MOE_EXPERT_CACHE_TOUCH` 2 vs 3 with the demote on** (0008) -- a knob, no code | PLAN P1.3, on a live cell | this campaign | **open** (the replay predicts the sink's advantage shrinks a third; never measured on device) |
