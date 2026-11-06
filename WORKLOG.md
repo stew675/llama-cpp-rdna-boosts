@@ -1,3 +1,34 @@
+## 261106.007 (campaign) -- DECISION: both changes ship ON by default; defaults implemented and verified
+
+**Maintainer's decision, recorded as a judgement rather than a measurement:** ship the ranking AND the demote
+on by default with kill switches.  +21.7 % single-stream outweighs -5.1 % / -13.2 % at npl 1/4, and a
+single-user stream is the common case.  **`npl 4` is an accepted limitation**, to be documented as such at
+promotion -- not quietly buried.
+
+Implemented on the fork (`~/llama.cpp`, branch `p1-pool-rank-r223`):
+
+| variable | default | class |
+|---|---|---|
+| `MOE_HOST_POOL_RANK` | `decode` (was `combined`) | kill switch: `combined` restores the previous behaviour |
+| `MOE_HOST_POOL_SINK` | on (was `0`) | kill switch: `0` |
+| `MOE_HOST_POOL_SINK_SPARE_PCT` | 4 (% of a table's slots; floor 2, cap slots/8) | tuning |
+| `MOE_HOST_POOL_SINK_SPARE` | -1 = auto | absolute override |
+| `MOE_HOST_POOL_SINK_SPARE_MIN` | 2 | tuning |
+
+**Verified with no environment variables at all:** 27.5 t/s (twice, vs 22.6 for the old defaults), 268/269
+declines, 7.7-7.9 % reuse, text byte-identical at `880c932888f8`; `RANK=combined SINK=0` restores 22.6
+exactly, so the kill switches work.
+
+The fraction had to be *of slots*, not of experts: at `-lme 36` a table has ~393 slots, so the measured
+optimum K=16 is 4.1 % of slots.  3 % under-shot it to 11 slots and gave 26.8 t/s with 902 declines; 4 %
+gives 27.5 with 268.  A flat default would have been silently wrong on a model with a different slot count.
+
+Owed before promotion (unchanged plan: fraction done -> W3 -> gates -> present): W3's `-lme` 30->47 sweep now
+measures the SHIPPING configuration; the MTP four-axis protocol; the prefill-logit gate (base must be
+recorded from the delivery tip); the per-block build gate; `invert` must be REMOVED from the build;
+`ENVIRONMENT.md` entries for the six variables (`SINK_TAX` excluded -- diagnostic only); and the r113
+"no write-back" invariant corrected in place.
+
 ## 261106.006 (campaign) -- batched gate re-run with the demote: it repairs half of the ranking's 4-slot loss
 
 **Fork only.**  The batched gate had only ever been measured for the ranking, so it was re-run with the

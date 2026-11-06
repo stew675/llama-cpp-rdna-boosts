@@ -188,7 +188,21 @@ change nothing else.
 > looks exactly like a policy regression.  `arm-batched.sh` therefore defaults `LZM=auto`; the single-user
 > arms keep `-lzm off` because there the PLE confound matters and the memory does not.
 >
-> Owed: the reserve as a *fraction* of slots (K=16 is tuned to 512 experts/table); an `allow_empty_fill` A/B
+> **DECISION (2026-11-06, maintainer): both ship ON by default, with kill switches.**  The reasoning is
+> recorded because it is a judgement, not a measurement: +21.7 % single-stream outweighs -5.1 %/‑13.2 % at
+> npl 1/4, and a single-user stream is the common case.  **`npl 4` is an accepted limitation**, to be written
+> up as such at promotion (not hidden).  Implementation on the fork:
+> `MOE_HOST_POOL_RANK` default `decode` (`combined` = kill switch), `MOE_HOST_POOL_SINK` default on
+> (`0` = kill switch), and the headroom derived as **4 % of a table's slots** (floor 2, cap slots/8,
+> `MOE_HOST_POOL_SINK_SPARE` absolute override, -1 = auto).  Verified with no env vars at all: **27.5 t/s
+> twice** (old defaults 22.6), 268/269 declines, 7.7-7.9 % reuse, text `880c932888f8`; the kill switches
+> restore 22.6 exactly.  Note the fraction must be *of slots*, not of experts: at `-lme 36` a table has
+> ~393 slots, so K=16 is 4.1 % of slots -- 3 % under-shot to 11 slots and 26.8 t/s.
+>
+> Owed before promotion: `MOE_HOST_POOL_RANK=invert` must be REMOVED (a diagnostic, must not ship);
+> `ENVIRONMENT.md` entries for `MOE_HOST_POOL_RANK`/`_FLOOR`/`SINK`/`_SPARE`/`_SPARE_PCT`/`_SPARE_MIN`
+> (classes: kill switch / tuning) with `SINK_TAX` excluded; the `INVARIANTS.md` r113 "no write-back" entry
+> corrected in place; and the reserve as a *fraction* is now done.; an `allow_empty_fill` A/B
 > now that the reserve protects the headroom; the batched gate; the MTP four-axis; the prefill-logit gate;
 > and **W3**, the `-lme` 30->47 sweep, which is the only place the "does the demote buy back pinned bytes"
 > question is actually answered.
