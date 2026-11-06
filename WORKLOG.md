@@ -1,3 +1,16 @@
+## 261105.013 (r223 addendum, no delivery change) -- the per-block ladder and the GPU-fault scan, taken after the tag
+
+**No delivery change.**  `patches/`, `release.json`, the tag `v16-6050b467c-r223` (tip `37148d118`, tree
+`680e043b3c`) and the fork branch are untouched; this adds the two gates the release entry listed as outstanding.
+
+* `scripts/gate-per-block-build.sh --fast --changed-from 21644fb51 --tip 37148d118` (the amended block 12 plus
+  the replayed 13/14/15, a wiped build dir per commit): **4/4 built, 0 failed in 128 s** (block 12 / 13 / 14 /
+  15: 10 s / 11 s / 101 s / 6 s).  `--fast` is the release profile, not the r2 `all` standard; the tip's own
+  release gates cover `all`.
+* `scripts/check-gpu-faults.sh --since "4 hours ago"`: **clean** (kernel journal and the session's logs).
+
+Still not run, and only a Windows box can: finding 4's mechanism and finding 5's attribution (`TODO` #95).
+
 ## 261105.012 (r223) -- issue #274 follow-up: a call that fails a fill must decline, and a refused pinned allocation is a latch
 
 **Released as `v16-6050b467c-r223` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
