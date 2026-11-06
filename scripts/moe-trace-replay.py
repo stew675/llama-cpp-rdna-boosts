@@ -998,6 +998,14 @@ def main(argv=None):
                          "the ranking mismatch at once out of the SAME pass-boundary decision, so it should be "
                          "more copy-efficient than K rounds of K=1: each swap re-reads the coldest resident, "
                          "which a previous swap in the same round has already made hot.")
+    ap.add_argument("--pool-band", choices=("all", "decode"), default="all",
+                    help="which persisted counter ranks the POOL (default 'all', what the delivery uses: "
+                         "`pool_rerank_from_heat_locked` ranks by the combined prefill+decode heat because the "
+                         "pool stages whole tables for prefill).  'decode' ranks by the decode-only counter "
+                         "(the one the ARENA seeds from, TODO #88).  Measured 2026-11-05 on the Flash-Next "
+                         "prose trace: the combined counter is WORSE THAN CHANCE for decode routing (top-64 "
+                         "overlap 10.5 %% against 12.5 %% chance) while the decode counter is 2x chance "
+                         "(24.2 %%), which is why the pool answers only 56 %% of arena misses.")
     ap.add_argument("--pool-init", default="heat",
                     help="initial host-pool content: 'heat' = ranked by this trace's routing (an ORACLE "
                          "prior, the best any prior can do), 'id' = expert order (a tally-less prewarm, "
@@ -1063,7 +1071,7 @@ def main(argv=None):
     sidecar = None
     if args.pool_init.startswith("sidecar"):
         sc_path = args.pool_init.split(":", 1)[1]
-        sidecar = load_heat_sidecar(sc_path, band="all")
+        sidecar = load_heat_sidecar(sc_path, band=args.pool_band)
         args.pool_init = args.pool_init.split(":", 1)[0]
         matched = sum(1 for k, t in tables.items()
                       if len((sidecar or {}).get(k) or []) == t.n_experts)

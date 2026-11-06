@@ -173,3 +173,63 @@ every "MiB saved per MiB copied" figure ~5.7x and inverted the ranking above.  T
 
 So the periodic swap is negative on a box where the miss was already cheap, and positive but dominated on a
 box where it is not.  The sink is the shape to build; the periodic variant is not worth a second knob.
+
+## 7. The anomaly, resolved: the pool is ranked by a counter that is worse than chance for decode
+
+§5.4 left one number unexplained: the arena holds 93.5 % of reaches at **39.5 %** of the set (202 of 512
+slots/table at a 19 GiB budget), while the pool — a 50 %-of-the-set, prior-ranked complement — answers only
+**56.5 %** of the arena's misses, where covering 256 of the 310 complement experts predicts ~83 %.
+
+**Two of my own errors first, because they framed the question wrongly.**
+
+1. `pool_h` is `p_hits / misses`, and `p_hits` counts only misses **promoted from the pool**.  A miss whose
+   expert is pool-resident but which is *rejected* by the admission gate is served in place and counted as
+   `pool_cold`, not `p_hits`.  So under `--admit touch` the column is 0.088 at the very cell where
+   `--admit always` gives 0.565 — neither is "the fraction of misses the pool answered".  The 83 % figure was
+   never a like-for-like comparison.
+2. The 83 % assumed misses are uniform over the complement.  They are not: the arena's misses are, by
+   construction, the experts it does *not* hold, i.e. the cold tail.
+
+**The actual measurement** (decode band, 806 430 reaches, 144 tables):
+
+| reach mass by | decile 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| the persisted prior's rank (0 = its hottest 10 %) | 10.3 | 11.0 | 11.4 | 10.7 | 12.1 | 12.0 | 10.9 | 8.8 | 8.0 | 4.8 |
+| expert id | 10.0 | 10.5 | 9.7 | 10.1 | 10.0 | 10.7 | 10.0 | 9.3 | 9.0 | 10.8 |
+
+A decile of a **random** ranking is 10 %.  The persisted prior is therefore almost perfectly flat against this
+workload's decode routing.  Overlap of the prior's top-K with the trace's *own* hot set, averaged per table:
+
+| K | combined counter (what the pool uses) | decode counter (`heat_dec`, what the arena seeds from) | expert id | chance |
+|---|---|---|---|---|
+| 16 | 3.1 % | **9.5 %** | 3.5 % | 3.1 % |
+| 64 | **10.5 %** (worse than chance) | **24.2 %** | 12.8 % | 12.5 % |
+| 202 | 47.9 % | **54.8 %** | 40.9 % | 39.5 % |
+
+**So: the arena's 93.5 % comes entirely from its own F-LRU tracking, not from the prior — and the pool is
+ranked by the *combined* (prefill-dominated) heat counter, which is anti-predictive for decode**
+(`pool_rank_experts_locked` sorts by `t.heat`; the design comment defends that because the pool also stages
+whole tables for prefill — a real tension, but it means the decode half is being paid for by the wrong vector).
+
+**What that is worth, modelled (arena 19 GiB, frac 50, no copies either way):**
+
+| admission | pool ranked by `heat` (shipped) | pool ranked by `heat_dec` | change |
+|---|---:|---:|---:|
+| always | 26.13 MiB/tok | 23.32 | **-10.7 %** |
+| touch 2 | 31.65 | 29.69 | -6.2 % |
+| touch 2, frac 40 | 46.81 | 38.99 | **-16.7 %** |
+
+i.e. **12-19 % of the decode L3 traffic for zero copies** — the cheapest candidate this campaign has produced,
+and it ships on its own if it measures on the device.
+
+**And it bounds the demote's value.**  With an *oracle* pool content the sink reaches 3.0 MiB/token
+(touch 2) where no fixed layout gets below 23-30.  A layout is limited by the prior's ability to predict which
+experts the arena will not hold; a demote gets that knowledge by construction.  So the residual gap is
+**foreknowledge**, not transport — which is the same conclusion r113 reached from the other direction, now with
+the number to go with it.
+
+**Revised order of work.**  (1) The pool's ranking vector is its own change: rank the complement by
+`heat_dec` (or keep a prefill-hot floor and rank the remainder by decode), A/B against the shipped vector on
+both bands, and ship it alone if the prefill row is not regressed.  (2) The demote, if it is still wanted,
+must be measured **against the decode-ranked layout**, not against the combined-ranked one — otherwise most of
+its advantage is a bug in the baseline.

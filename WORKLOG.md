@@ -1,3 +1,25 @@
+## 261105.016 (campaign, no delivery change) -- the pool is ranked by a counter that is worse than chance for decode
+
+**No delivery change.**  Investigation before implementing (the maintainer's call), and it changed the plan.
+
+* The campaign's open number (`STEP1-REPLAY.md` §5.4) is resolved: the arena holds 93.5 % of reaches at
+  39.5 % of the set while a 50 %-of-the-set prior-ranked complement answers 56.5 % of its misses.  Two of my
+  own errors framed it wrongly (the tool's `pool_h` counts only *promotions*, not in-place `pool_cold` reads,
+  and the 83 % expectation assumed uniform misses over the complement).  The real cause:
+  **`pool_rank_experts_locked` sorts by `t.heat`, the combined prefill+decode counter, which overlaps this
+  workload's own hot set at 10.5 % over top-64 against 12.5 % chance — worse than chance**, while `heat_dec`
+  (the counter the ARENA already seeds from, TODO #88) is 24.2 %.  The persisted prior is otherwise flat:
+  reach mass by its rank decile is 4.8-12.1 % against a uniform 10 %.
+* **Worth 12-19 % of the decode L3 traffic for zero copies**: ranking the pool by `heat_dec` models as
+  26.1 -> 23.3 MiB/token (`always`), 31.6 -> 29.7 (`touch 2`), 46.8 -> 39.0 (frac 40).  This is now the
+  cheapest candidate in the campaign and ships on its own if the device measurement holds — **but the pool
+  also stages whole tables for prefill, so the ranking change owes a prefill A/B** (the design comment that
+  chose the combined vector is about prefill, and it is not wrong about prefill).
+* **It also bounds the demote**: with an *oracle* pool content the on-demand sink reaches 3.0 MiB/token where
+  no fixed layout gets below 23-30, so the residual gap is **foreknowledge**, not transport.  Order of work
+  revised: the ranking vector first, and any demote measured against the decode-ranked layout.
+* Tooling: `scripts/moe-trace-replay.py --pool-band all|decode` (with the finding recorded in its help text).
+
 ## 261105.015 (campaign, no delivery change) -- `wip/host-expert-split/` step 1: the trace, the replay, two replayer fixes, and the answer to "is a swap worth it"
 
 **No delivery change.**  `patches/`, `release.json` and the tag are untouched.
