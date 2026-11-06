@@ -1,3 +1,29 @@
+## 261106.005 (campaign) -- decay knee located: a plateau 32-64 with 32 at its top edge
+
+Filled in the decay curve between 16 and 64 (2 runs each at 24/28/32, single runs elsewhere),
+`decode`+K=16, `-lme 36`, one R9700:
+
+| period | 16 | 20 | 24 | 28 | **32** | 36 | 40 | 44 | 48 | 56 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| t/s | 27.0 | 27.1 | 27.2 | 27.2 | **27.6** | 27.3 | 27.4 | 27.3 | 27.3 | 27.3 | 27.5 | 26.9 | 26.1 |
+| demoted | 8 683 | 9 168 | 9 579 | 9 828 | 10 110 | 10 433 | 10 793 | 10 903 | 11 146 | 11 280 | 11 798 | 13 492 | 15 232 |
+
+It is a **plateau from ~32 to ~64 with 32 at its top edge** and the fewest demotions of the fast
+configurations.  The step below 32 is real (27.0-27.2, reproducible across repeats), so 32 is not merely
+"the default we started with".  **Keep 32.**
+
+**Correction to a natural but wrong inference -- fewer demotions is not fewer disk reads.**  `fills` is
+**60 513 in every period from 16 to 128**, identical to the digit, so the pool's fill traffic (the reads that
+reach the mapping/disk) does not move with the decay at all.  What moves is arena churn, and a *rejected*
+admission is not a read avoided: it is served cold per access for as long as the expert is routed.  That is
+why period 16 has both the fewest demotions (8 683) and the lowest throughput (27.0) -- the short half-life
+shrinks `ghost`, the `touch`-2 gate rejects more, and those experts are re-read on every use instead of being
+admitted once.  Fewer demotions is better **at equal coverage**, which is why 32 beats 16 as well as 56.
+
+The cold-traffic half of that argument is mechanism + throughput, not a printed counter: these logs do not
+emit `takeover=`/`cold_reaches=`.  Owed: make the report print `cold_reaches`/`cold_bytes` unconditionally
+and re-run 16 vs 32, which turns the inference into a measurement.
+
 ## 261106.004 (campaign) -- the demote's reuse measured (7.9 %), and the decay swept: keep 32
 
 **Fork only.**  Added a reuse instrument to the sink: a per-slot flag marking content that came from a

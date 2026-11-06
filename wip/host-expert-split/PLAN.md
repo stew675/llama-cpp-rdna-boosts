@@ -150,8 +150,22 @@ change nothing else.
 > `MOE_EXPERT_CACHE_PERIOD=32`**, i.e. well above W1's ~3 % break-even on this box's NVMe (0.2 % on slow
 > storage) -- the mechanistic reason the demote is worth +7.6 % on top of the ranking, not a coincidence.
 > Sweeping the decay at `decode`+K=16: 32 -> **27.6 t/s** / 7.9 %; 64 -> 27.5 / 12.0 %; 128 -> 26.9 /
-> 16.1 %; 256 -> 26.1 / 20.9 %.  A longer half-life raises reuse but costs throughput *and* raises the
+> 16.1 %; 256 -> 26.1 / 20.9 %.  Refined 16-56 by 4 to locate the knee (2 runs each at 24/28/32):
+> 16 -> 27.0, 20 -> 27.1, 24 -> 27.2, 28 -> 27.2, **32 -> 27.6**, 36 -> 27.3, 40 -> 27.4, 44 -> 27.3,
+> 48 -> 27.3, 56 -> 27.3.  So it is a **plateau from ~32 to ~64 with 32 at its top edge**, and the fewest
+> demotions of any fast configuration (10 110 against 11 798 at 64).  A longer half-life raises reuse but costs throughput *and* raises the
 > demotion count, so the extra reuse is low-value churn.  **32 stays.**
+
+> **Do not read "fewer demotions" as "fewer disk reads".**  `fills` is **60 513 in every period** from 16 to
+> 128 -- identical to the digit -- so the pool's own fill traffic does not move with the decay; what moves is
+> arena churn.  And a *rejected* admission is not a read avoided: it is served cold **per access**, for as
+> long as the expert keeps being routed, which is why period 16 has both the fewest demotions (8 683) and the
+> lowest throughput (27.0) -- a fast decay shrinks `ghost`, the `touch`-2 gate rejects more, and those
+> experts are re-read on every use instead of admitted once.  Fewer demotions is better **at equal
+> coverage**, which is why 32 beats 16 as well as 56.  Unproven part: the logs do not emit the cold counters
+> (`takeover=`/`cold_reaches=` are absent at this verbosity), so the cold-traffic half of this argument
+> rests on the mechanism plus throughput, not on a printed counter.  Making the report print `cold_reaches`/
+> `cold_bytes` unconditionally and re-running 16 vs 32 would settle it.
 >
 > Owed: the reserve as a *fraction* of slots (K=16 is tuned to 512 experts/table); an `allow_empty_fill` A/B
 > now that the reserve protects the headroom; the batched gate; the MTP four-axis; the prefill-logit gate;
