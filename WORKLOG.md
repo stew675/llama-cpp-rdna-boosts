@@ -1,3 +1,44 @@
+## 261105.010 (r222 addendum, no delivery change) -- the r222 release's MTP four-axis and batched-bench arms, taken on the tagged tree
+
+**Docs only.**  `patches/`, `release.json`, `scripts/` and the artefact hashes are untouched; the tag
+`v16-6050b467c-r222` (tree `d9495be3`) predates this entry by its commit alone, which is a documentation
+delta and not a code one.  The release entry above (261105.009) recorded the gates the change *owes*; this
+records the two model-level arms the release flow asks for as well, so the r222 record is complete against
+`MANIFESTS.md` -> *Release gates* without moving a published tag.
+
+### MTP four-axis (Protocol A, adaptive, dense) -- bit-identical to r219 and r217
+
+27B `Qwen3.8-27B-UD-Q4_K_XL`, 1 GPU (`HIP_VISIBLE_DEVICES=0`), `-c 32768`, bf16 KV, `-n 2000`, seed 42,
+greedy, `--spec-type draft-mtp` (adaptive, no `--spec-draft-n-max`), `--reasoning on` for R and `off` for
+P/C/K, and the protocol's own sampler set (`--top-k 20 --top-p 0.95 --min-p 0.001 --presence-penalty 1.5
+--repeat-penalty 1.0`, `-b/-ub 1024`, `-fa on`, `--load-mode mlock`).
+
+| axis | text | chars | acceptance | mean len | t/s (r219) |
+|---|---|---|---|---|---|
+| R (reasoning) | `0ffad0c34953` | 9243 | **0.52690** (1224/2323) | 2.58 | 54.3 (54.6) |
+| P (prose) | `4f0d1ea854e9` | 5830 | **0.81305** (1383/1701) | 3.44 | 71.0 (71.2) |
+| C (code) | `95603a6a89a4` | 8966 | **0.86236** (1441/1671) | 3.59 | 74.8 (74.9) |
+| K (recall) | `a87c4318b649` | 2174 | **0.99200** (372/375) | 3.98 | 82.8 (82.8) |
+
+Every text hash, every acceptance count and every mean accepted length is **identical** to r219's r217-vs-r218
+record, i.e. this release changes no decode, verify or draft numerics -- which is what the change predicts (it
+touches only the region PROVIDER's capability answer and its device binding; no kernel, graph or scheduler
+line moves).
+
+**A sampler flag is part of the protocol, and its absence forges a false positive.**  The first cut of this
+run omitted the protocol's sampler set (it used only `-n 2000 --seed 42 --temp 0`): R read `d59a861ed03b`
+(8575 chars, acc 0.58349) and C `39b564382557` (8768, 0.91917) against the recorded `0ffad0c34953` /
+`95603a6a89a4` -- while K matched exactly (`a87c4318b649`, acc 0.99200).  `--presence-penalty 1.5` is a logit
+transform, so it changes greedy output: it is not a sampling-only knob.  Any MTP arm compared against a
+recorded hash must carry the recorded flags verbatim.
+
+### `llama-batched-bench -npl 1,4,8` (35B-A3B UD-Q4_K_M, `-ncmoe 40`, 2 GPU, `-npp 512 -ntg 128`)
+
+tg128 **65.56 / 209.03 / 307.56** t/s at B=1/4/8 (r219 on the same box: 69.18 / 210.08 / 306.59), pp512
+92.7 / 2993.9 / 3126.0 t/s.  B=4 and B=8 are within 1 % of the r219 record, B=1 is the single-token arm and
+moved 5 % -- the box-state noise `INVARIANTS.md` (r221 fact 7) describes for a one-rep decode arm, and not a
+signal for a change that alters no compute path.  Reported, not gated.
+
 ## 261105.009 (r222) -- issue #275: the VMM capability probe ran in a FOREIGN driver context, which on Windows kills the first kernel launch of a plain 2-GPU `-sm tensor` run (block 15)
 
 **Released as `v16-6050b467c-r222` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip
