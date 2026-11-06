@@ -139,8 +139,8 @@ run_driver fused || true
 run_driver nofuse --no-fuse || true
 
 if [ "$A_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
-    fused_ref="$(sed -n 's/^arm=ref .*digest=\([0-9a-f]*\)$/\1/p' "$KEEPOUT/drv_fused.log")"
-    chain_ref="$(sed -n 's/^arm=ref .*digest=\([0-9a-f]*\)$/\1/p' "$KEEPOUT/drv_nofuse.log")"
+    fused_ref="$(sed -n 's/^case=[a-z]* arm=ref .*digest=\([0-9a-f]*\)$/\1/p' "$KEEPOUT/drv_fused.log")"
+    chain_ref="$(sed -n 's/^case=[a-z]* arm=ref .*digest=\([0-9a-f]*\)$/\1/p' "$KEEPOUT/drv_nofuse.log")"
     note "fused ref digest=$fused_ref  chain ref digest=$chain_ref"
     if [ -z "$fused_ref" ] || [ "$fused_ref" != "$chain_ref" ]; then
         fail "the fused launch is not bit-identical to the unfused chain at this shape"
@@ -148,17 +148,17 @@ if [ "$A_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
     # Every arm must report its own digest equal to ref (the driver checks ref_match; this is the
     # independent cross-check that a declined arm really reproduced ref and a fused arm too).
     for arm in ref alias_gate alias_dst_row alias_dst_exact; do
-        got="$(sed -n "s/^arm=$arm .*digest=\([0-9a-f]*\)$/\1/p" "$KEEPOUT/drv_fused.log")"
+        got="$(sed -n "s/^case=[a-z]* arm=$arm .*digest=\([0-9a-f]*\)$/\1/p" "$KEEPOUT/drv_fused.log")"
         [ "$got" = "$fused_ref" ] || fail "arm $arm digest $got != ref $fused_ref"
     done
     # Non-vacuity: the arms really forced an overlap and the guard really declined.
     for arm in alias_gate alias_dst_row; do
-        grep -q "^arm=$arm .*declined=[1-9]" "$KEEPOUT/drv_fused.log" ||
+        grep -q "^case=[a-z]* arm=$arm .*declined=[1-9]" "$KEEPOUT/drv_fused.log" ||
             fail "arm $arm did not reach the aliasing guard (the arm would be vacuous)"
         grep -q "^norm-rows: i=.* declined=" "$KEEPOUT/drv_fused.log" ||
             fail "arm $arm declined without a decision line (nothing to observe)"
     done
-    grep -q '^arm=alias_dst_exact .*fused=1' "$KEEPOUT/drv_fused.log" ||
+    grep -q '^case=[a-z]* arm=alias_dst_exact .*fused=1' "$KEEPOUT/drv_fused.log" ||
         fail "the benign exact alias (dst == x) was declined: the guard is too strict"
 fi
 

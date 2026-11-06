@@ -75,7 +75,10 @@ by the same guard but has **no** alloc dep, and its `x` is measurably non-contig
 (`contig_x=0` at `-lv 4` on Qwen3.6-35B-A3B and Gemma4-E4B prefill).  It is safe today because `MUL` takes
 `rms`'s buffer **in place** (the gallocr's `ggml_op_can_inplace` path), so `dst` never lands on `x`; if a
 future graph makes `rms` ineligible, the fusion now declines instead of corrupting.  That is the right
-trade for the hot path (an alloc dep there would hold a 4-16 MiB buffer for every per-head norm).
+trade for the hot path (an alloc dep there would hold a 4-16 MiB buffer for every per-head norm).  The same
+holds for upstream's own `ggml_cuda_can_fuse({RMS_NORM, MUL})` launch, which has no guard of its own: it
+is safe for exactly the in-place reason, and the driver cannot use the plain form as a reference arm because
+only the master `GGML_CUDA_DISABLE_FUSION` turns that one off.
 
 ## 261106.013 (r224) -- the host-expert-split campaign lands: a DECODE-ranked pool, an eviction demote, coalesced prefill reads (+81 % at `-lme` 12), and the heat-map fixes
 
