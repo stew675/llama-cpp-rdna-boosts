@@ -1,3 +1,65 @@
+## 261105.011 (r222 tooling, no delivery change) -- the container images name their RELEASE, not only the fork point (issue #272 follow-up)
+
+**No delivery change.**  `patches/`, `release.json` and the artefact hashes are untouched (the release stays
+`v16-6050b467c-r222`, tip `80bfb80be`, tree `d9495be3`); this is `scripts/build-containers.sh`, the Dockerfile's
+labels and `CONTAINERS.md`.
+
+### Why
+
+@hermeticvm confirmed the r218 fix for issue #272 on his RX 6700 XT (both DSpark replay arms pass, plus a real
+six-task agent run) and added the one thing he could not do: attribute the image he tested.  His words: "labels
+identify fork point `6050b467c` but not the patch release ... I cannot attest it is exactly r218 or r219".
+That was true and it was our defect, in two layers:
+
+* the GHCR tags were fork-point only (`server-rocm-10.1-6050b467c`), and the moving tags (`rocm-10.1`,
+  `latest`) are overwritten on every release, so the fork-point tag is the only stable handle -- and one fork
+  point serves every release on it;
+* `build-containers.sh` passed `APP_VERSION=base` and `APP_REVISION=base`, so even
+  `org.opencontainers.image.version` / `.revision` named the fork point twice, and nothing in the image
+  identified the release.
+
+### What changed
+
+* every target also gets a `<tag>-<release>` tag (`full|light|server-rocm-<line>-v<blocks>-<base>-r<N>`, and a
+  `rocm-<line>-<release>` alias for the server image).  The moving and fork-point tags stay for compatibility,
+  and they are what the GHCR retention keep-rule matches, so the prune is unaffected: one push is one manifest
+  version however many tags point at it;
+* new build args `RELEASE_TAG` / `RELEASE_TIP` / `RELEASE_BLOCKS` (read from `release.json`) feed the OCI
+  labels: `org.opencontainers.image.version` is now the release, `.revision` its canonical tip, and
+  `io.github.stew675.rdna-boosts.fork-point` / `.blocks` carry what those two used to name.  `APP_VERSION`
+  stays the fork point because the `web` stage uses it as `LLAMA_BUILD_NUMBER`, which must stay a build
+  number;
+* `CONTAINERS.md` documents the tag scheme, the `podman inspect --format '{{json .Labels}}'` one-liner a
+  reporter should quote, and the awkward fact that **the worker runs the script as it exists in the TAG it is
+  building**, so a script/Dockerfile fix never reaches an already-published release without a manual build
+  from `main` on the worker (hold `$HOME/.cache/rdna-containers/.lock`, then write the tag into `last-built`
+  so cron does not rebuild the unlabelled images).  That is exactly how r222's images were re-cut: the
+  watcher's own r222 build had not started yet, so the labelled build is the only one, and the 18:30 tick
+  logged `another watcher/build is running; skipping` as designed.
+
+### Result
+
+The r222 images are being re-cut on `radiance` from `main` with the new tags and labels (the watcher's own
+r222 build had not started, so this is the only r222 build; the watcher's `flock` was held by hand and the
+18:30 tick logged `another watcher/build is running; skipping` as designed).  The run was still pushing the
+10.1 line at hand-off, so **verify it rather than trusting this note**:
+
+```
+# on radiance: the marker is only written after a fully successful --push
+cat ~/.cache/rdna-containers/last-built            # want v16-6050b467c-r222
+tail -1 ~/.cache/rdna-containers/build-v16-6050b467c-r222-labelled.log   # want RELABEL-DONE
+# and from anywhere, the provenance the reporter needed:
+podman inspect --format '{{json .Labels}}' \
+  ghcr.io/stew675/llama-cpp-rdna-boosts:server-rocm-10.1-v16-6050b467c-r222 | python3 -m json.tool
+```
+
+If the build failed, the run leaves `last-built` at r221 and the next 10-minute watcher tick rebuilds r222 from
+its tag with the OLD labels; the fix above then applies to the next release tag instead (every tag cut after
+this commit carries the new script).
+
+Images built before r222 keep the fork point in `version`/`revision` and carry no release label; `CONTAINERS.md`
+says to treat their release as unknown rather than guess.
+
 ## 261105.010 (r222 addendum, no delivery change) -- the r222 release's MTP four-axis and batched-bench arms, taken on the tagged tree
 
 **Docs only.**  `patches/`, `release.json`, `scripts/` and the artefact hashes are untouched; the tag
