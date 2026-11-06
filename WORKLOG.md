@@ -1,3 +1,23 @@
+## 261105.020 (campaign) -- `PLAN.md`: the forward path, and the one constant it turns on
+
+**No delivery change.**  Post-investigation / pre-implementation plan for the rest of the campaign:
+`wip/host-expert-split/PLAN.md`.  It fixes the eleven settled facts (the ranking finding, the mirror
+inertness, holes-not-transport, why r113's refusal does not bound this case, slot-neutrality, the warmer's
+mmap-only scope, the periodic swap's rejection), then orders the work:
+
+* **W0** close out P1: the MTP four-axis protocol (**not run**), `gate-prefill-logits.sh` (needs a base recorded
+  from the *delivery tip* first), the `-npl 8` repeat, `ENVIRONMENT.md`, the default-on call.
+* **W1** measure `c_pcie` for a 1-D D2H **before writing the policy**: the demote adds exactly one D2H per
+  admission, so a `SINK_TAX` instrument reproduces its marginal cost in ~30 lines.  Go/no-go at ~1.5 ms/token.
+* **W2** the demote itself (`MOE_HOST_POOL_SINK`, default 0), with the seven measured constraints (slot-neutral,
+  kernel copy not `hipMemcpyAsync`, retire-then-publish, decline-never-lie, 1-D only, no new memory, counters).
+* **W3** the three-arm split curve (combined / decode / decode+SINK) over `-lme` 30-47 at two arena shapes,
+  accepted at >= 12.8 GiB of equivalent pinned RAM.
+* **W4** the mmap-only, self-disabling warmer (`fadvise(WILLNEED)`, no thread), never sold as a fix for the
+  constrained case.  **W5** the promotion path.
+* The exchange rate that makes it a decision: matching an exclusive tier costs **+9.2 to +17.7 GiB (mean
+  12.8)** of pinned RAM, or ~1.1 ms/token of copies at `c_pcie` 0.04 ms/MiB — and it is worthless at 0.4.
+
 ## 261105.019 (campaign, no delivery change) -- write-back vs page-cache warmer, priced
 
 The maintainer's question: an admitted expert's arena victim is dropped and re-read from storage; why not
