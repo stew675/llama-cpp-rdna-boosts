@@ -122,7 +122,41 @@ change nothing else.
 > expert instead of being left empty.  Implemented as `MOE_HOST_POOL_SINK` + `MOE_HOST_POOL_SINK_SPARE`
 > (default 2).  First run at `-lme 36`: **3 712 demoted (2 401 MiB), 6 497 slots retired, 4 983 declined** —
 > the decline rate (57 %) is the open tuning item: incoming misses also draw on the headroom, so K=2 per
-> table is not enough to keep the rotation ahead of the fills.  Next: sweep K, then W3.
+> table is not enough to keep the rotation ahead of the fills.
+>
+> **MEASURED (2026-11-06), `-lme 36`, single-user, pool active, text byte-identical at `880c932888f8`:**
+>
+> | arm | gen t/s | vs 22.6 | demoted | declines |
+> |---|---|---|---|---|
+> | `combined`, no demote | 22.6 | -- | -- | -- |
+> | `decode`, no demote | 25.1 | +11.1 % | -- | -- |
+> | `combined` + demote K=16 | 24.3 | +7.5 % | 9 922 | 9 % |
+> | `decode` + demote K=8 | 27.0 | +19.5 % | 8 921 | 15 % |
+> | **`decode` + demote K=16** | **27.5-27.6** (3 runs) | **+21.7 %** | 10 110 | **1.8 %** |
+> | `decode` + demote K=32 | 27.0 | +19.5 % | 10 398 | 0 |
+>
+> The two changes **compose**: the ranking decides what the pool holds at layout time, the demote decides
+> what it learns from evictions.  K=16 is tuned, not derived (16/512 = 3.1 % of a table's slots); K=32
+> removes the last declines and costs 0.5 t/s because the reserve's coverage loss overtakes the extra
+> demotes.  Two bugs had to be fixed first, and both looked like "the knob does nothing": (1) reserving
+> headroom by *shrinking `slots`* reserves nothing -- `slots` is the capacity everywhere, so the fill paths
+> just filled the smaller pool, which is why declines were identical at K=2/4/8 and *rising*; the reserve
+> must be a `keep_free` argument that fills respect and only the demote may dip below.  (2) A miss frees one
+> slot but wants two (demote + incoming fill): `retired == demoted + declined` to the digit.  Under the sink
+> the incoming expert is refused an empty slot and arrives via the pinned bounce ring.
+>
+> **Reuse measured, and the decay swept (2026-11-06).**  A per-slot flag marks demote-sourced content, so
+> the run reports how often a demoted victim is wanted again: **7.9 % at the default
+> `MOE_EXPERT_CACHE_PERIOD=32`**, i.e. well above W1's ~3 % break-even on this box's NVMe (0.2 % on slow
+> storage) -- the mechanistic reason the demote is worth +7.6 % on top of the ranking, not a coincidence.
+> Sweeping the decay at `decode`+K=16: 32 -> **27.6 t/s** / 7.9 %; 64 -> 27.5 / 12.0 %; 128 -> 26.9 /
+> 16.1 %; 256 -> 26.1 / 20.9 %.  A longer half-life raises reuse but costs throughput *and* raises the
+> demotion count, so the extra reuse is low-value churn.  **32 stays.**
+>
+> Owed: the reserve as a *fraction* of slots (K=16 is tuned to 512 experts/table); an `allow_empty_fill` A/B
+> now that the reserve protects the headroom; the batched gate; the MTP four-axis; the prefill-logit gate;
+> and **W3**, the `-lme` 30->47 sweep, which is the only place the "does the demote buy back pinned bytes"
+> question is actually answered.
 
 Design constraints, all of which come from something measured:
 

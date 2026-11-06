@@ -1,3 +1,31 @@
+## 261106.004 (campaign) -- the demote's reuse measured (7.9 %), and the decay swept: keep 32
+
+**Fork only.**  Added a reuse instrument to the sink: a per-slot flag marking content that came from a
+demote, and a counter for how often such a slot is later wanted again.  `copies` alone cannot say whether
+the demote pays -- a demoted expert never read back is pure wasted bandwidth.
+
+`-lme 36`, `decode`, K=16, one R9700, single device, pool active:
+
+| `MOE_EXPERT_CACHE_PERIOD` | gen t/s | demoted | reuse of demoted slots |
+|---|---|---|---|
+| **32 (current default)** | **27.6** | 10 110 | **7.9 %** |
+| 64 | 27.5 | 11 798 | 12.0 % |
+| 128 | 26.9 | 13 492 | 16.1 % |
+| 256 | 26.1 | 15 232 | 20.9 % |
+
+**The decay is not the lever; 32 stays.**  A longer half-life (`count`/`ghost` halved every N accesses per
+table -- 32 is ~a 4-token horizon with top-k routing) raises reuse but costs throughput *and* raises the
+demotion count, so the extra reuse is concentrated in low-value experts that churn between the tiers.
+
+**7.9 % reuse against W1's ~3 % break-even on this box's NVMe (0.2 % on a 125 MB/s device)** is the
+mechanistic reason the demote adds +7.6 % on top of the ranking rather than a coincidence: it is not merely
+cheap transport, it is being spent on experts that do come back.  On slow storage the same 7.9 % is worth
+far more.
+
+Still owed (unchanged): W3 (the `-lme` 30->47 sweep -- the only place "does this buy back pinned bytes" is
+answered), the batched gate, the MTP four-axis protocol, the prefill-logit gate, the reserve as a fraction
+of slots, and an `allow_empty_fill` A/B now that the reserve protects the headroom.
+
 ## 261106.003 (campaign) -- the demote works: +21.7 % single-user at -lme 36, with the ranking
 
 **Fork only.**  `MOE_HOST_POOL_SINK` measured on the single-user cell (`llama-cli`, prose, `-n 64`, one
