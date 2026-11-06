@@ -1,3 +1,17 @@
+## 261106.011 (campaign) -- session handover written; campaign state frozen for a fresh session
+
+**No code change.**  `wip/host-expert-split/HANDOVER.md` is the pick-up point for the next session: decisions
+D1-D8 (both changes ship default-on, `npl 4` accepted, K as a fraction, period 32, `invert` must not ship, prefill
+granularity next), the exact code state (fork `p1-pool-rank-r223` @ `bfb9b0b22`, every branch commit annotated,
+the eight environment variables with defaults and classes), the proven numbers with their cells (+21.7 % at
+`-lme 36`; the 12->48 budget curve; the batched gate; the 9.6 us/copy and 7.9 % reuse economics; the 31.2 t/s
+mirror), what is explicitly NOT proven (one model/prompt/device, no control curve below 36, `floor` unswept,
+multi-device untested), the eight gates owed, the prefill span-coalescing spec with the `dd` drive measurements,
+the six negative results not to repeat, and the eight methodology traps.
+
+Frozen state: fork clean at `bfb9b0b22`, built binary matches it, nothing from this campaign in `patches/`,
+`release.json` untouched.
+
 ## 261106.010 (campaign) -- the streaming ceiling is PREFILL read granularity (0.6 MB per expert), not the drive
 
 **No delivery change; fork reverted to `bfb9b0b22`.**  Chasing the maintainer's observation that disk streaming
