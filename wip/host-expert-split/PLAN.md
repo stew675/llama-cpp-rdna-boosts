@@ -50,9 +50,19 @@ and it is ~30 lines rather than ~150.
 |---|---|---|
 | MTP four-axis (`benchmarks/mtp-adaptive-methodology.md`, `-n 3000`) | MANIFESTS demands it for any decode-path change; **not run** | within noise of `combined` on R/P/C/K, and text byte-identical |
 | `scripts/gate-prefill-logits.sh` | needs a base; none exists for this model | record the base **from the delivery tip** (one build of the unmodified tree) first, then run — recording from the modified build is vacuous |
-| repeat the `-npl 8` batched-bench row | the +20.8 % was a single run | confirms or kills it |
+| the ranking default, decided on **single-user cells only** | the batched utility is a gate: it is prefill-dominated and its sign inverts against the real workload (see below) | `llama-cli` single-stream prose at >= 2 budgets, 3 alternating reps, plus `llama-server` at 1 slot |
+| `-npl 1,4,8` batched-bench | **gate only** — "did we regress the multi-slot path?", never "what should the default be" | recorded as an observation; a regression there blocks a default flip, it does not choose one |
+| `floor` on both cells | the only candidate that can serve single-user and parallel | wins most of `decode`'s single-user gain and recovers `combined` on the 4-slot path |
 | `ENVIRONMENT.md` | rule 9: `MOE_HOST_POOL_RANK`, `MOE_HOST_POOL_RANK_FLOOR`; `invert` must not ship | entry written, classes assigned |
 | default-on decision | repo policy is "beneficial ⇒ on, env only disables" | maintainer's call; `floor` is the defensible flip value because of the staging duty |
+
+**Decision-set rule (added 2026-11-06, after a methodology error).**  The campaign's decision inputs are the
+**single-user cells**: `llama-cli` single-stream (the cell S2's +10.7 % was measured in) and `llama-server` at
+1 slot.  `llama-batched-bench` is a *gate* on the multi-slot path and is never a tie-breaker.  The reason is
+measured, not stylistic: at `-lme 36` the ranking is **+10.7 %** single-stream and **-11.4 %** at 4 batched
+slots, because `npp 512 -ntg 128 -npl 8` is prefill-dominated (4 096 prefill per 1 024 decode tokens) and the
+pool's content is one early decision that `combined` heat predicts better under that mix.  Quoting a batched
+number as evidence *for* the ranking is what produced the retracted +20.8 % in `P1-POOL-RANK.md`.
 
 ### W1 — instrument the swap's marginal cost (`MOE_HOST_POOL_SINK_TAX=1`, diagnostic)
 

@@ -112,18 +112,40 @@ text.  Clean logging, nine identical hashes.  Worth remembering: never hash an `
   mirror is also the fastest row by a wide margin (833 t/s prefill against 309 at a 77 % pool), which is the
   post-cache baseline to beat — and exactly why a partial pool has to earn its place.
 
-### `llama-batched-bench -npl 1,4,8` — PASS at 1 and 4, better at 8 (single run each)
+### `llama-batched-bench -npl 1,4,8` — a GATE, not a decision input (corrected 2026-11-06)
 
-`-lme 44` (the cell where the ranking matters most), pp512/tg128:
+**The +20.8 % at 8 slots was a cold-start artifact and is RETRACTED.**  Three alternating repeats on the
+unmodified binary give **+0.96 %** (npl 8: per-rep +4.06 / +0.03 / −1.20), −0.57 % at npl 1 and +1.29 % at
+npl 4, with the pool hit rate **identical to three decimals** (`combined` 0.4665–0.4712, `decode`
+0.4750–0.4654–0.4663) — at `-lme 44` the pool is 94 % of the set, i.e. nearly a mirror, where the ranking is
+inert by construction (S3).  The original pair compared a cold first run with a warm second one; the same
+first-run penalty is visible in today's `combined` r1 (31.00 t/s) against its r2/r3 (32.87/33.30).
 
-| npl | combined tg t/s | decode tg t/s | combined pp t/s | decode pp t/s |
-|---|---|---|---|---|
-| 1 | 38.41 | 38.60 | 20.83 | 21.13 |
-| 4 | 83.99 | 83.18 | 1197.72 | 1154.07 |
-| 8 | 24.99 | **30.20 (+20.8 %)** | 1224.52 | 1228.19 |
+Two things follow, and they are worth keeping:
 
-Single run per arm, so the 8-slot +20.8 % needs a repeat before it is quoted as a number; the 1- and 4-slot
-rows are within ±1 %.
+1. **This utility must never be a tie-breaker for a default.**  `npp 512 -ntg 128 -npl 1,4,8` is a
+   prefill-dominated synthetic (4 096 prefill tokens per 1 024 decode tokens at 8 slots, eight independent
+   512-token sequences).  The campaign's workload is one user, a 5 298-token prompt, 512 generated tokens,
+   one stream.  A sign flip between the two populations says the ranking is *workload-sensitive* (true and
+   useful) and says nothing about which default a single user should get.
+2. **On the concurrency path the ranking's sign inverts, so `decode` cannot be the default.**  At `-lme 36`
+   (a budget where the prior actually decides placement) three alternating repeats give
+   **−6.35 % / −11.41 % / +0.10 %** at npl 1 / 4 / 8, per-rep consistent and with no memory confound
+   (MemAvailable ≈ 41.9 GiB in every arm), while the pool hit rate falls slightly (0.1738 → 0.1694).  The
+   mechanism is the staging duty: the pool's content is *one* decision made early, and with a
+   prefill-dominated mix `combined` heat is the better predictor of it.  This is a **gate observation on the
+   multi-slot path**, which the delivery does ship — it is not evidence about the single-user default.
+
+**What decides it is the single-user cell**, measured 3/3 in alternating order on this binary at `-lme 36`:
+
+| `llama-cli`, prose, `-n 64` | gen t/s | prompt t/s | pool h |
+|---|---|---|---|
+| `combined` | 22.5 ×3 | 309–312 | 0.2090 (14445/69105) |
+| `decode` | **24.9 ×3 (+10.7 %)** | 313–315 | 0.2205 (15061/68295) |
+
+So: `decode` is a real **+10.7 %** on the single-user path and a real **−11 %** on the 4-slot batched path.
+The only candidate that can serve both is **`floor`** (combined heat for the top `MOE_HOST_POOL_RANK_FLOOR`
+experts, decode heat below), which is what the next arm must test — on both cells.
 
 ### Still owed (not run, and why)
 

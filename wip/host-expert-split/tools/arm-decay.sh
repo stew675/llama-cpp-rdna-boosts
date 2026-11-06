@@ -21,6 +21,9 @@ LOG=/tmp/arm-decay-$TAG.log
   -f "$HOME/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt" \
   -n ${NGEN:-64} --seed 42 --temp 0 --no-display-prompt --single-turn -lv 3 > "$LOG" 2>&1 &
 PID=$!
+# a wrapper that is killed (a bare `timeout` on this script) must not orphan the model: it
+# would hold the whole VRAM and OOM the next arm (measured, 2026-11-06).
+trap 'kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT INT TERM
 RB=0
 while kill -0 $PID 2>/dev/null; do
   v=$(awk '/^read_bytes:/{print $2}' /proc/$PID/io 2>/dev/null)
