@@ -106,7 +106,7 @@ KEEP=0
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
-        -h|--help) sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
         *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
     esac
 done
