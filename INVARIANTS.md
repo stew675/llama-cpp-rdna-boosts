@@ -2076,3 +2076,43 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    1844) while the interleaved gather control stayed at 1616-1629 (+-0.3 %), and the pinned tier swung 36 %
    across identical censuses.  Only interleaved ABAB within one cycle is trustworthy; `AnonHugePages` was 0 GiB
    in both pool alloc shapes and neither `MOE_HOST_POOL_ALLOC` nor `MOE_HOST_POOL_H2D` moved any arm.
+
+## r222 -- a buffer type may not touch the driver while it is CONSTRUCTED, and a gate's verdict level is part of the gate (issue #275)
+
+1. **A driver call made from a buffer-type CONSTRUCTOR runs in whatever context the calling thread is on, and
+   that is not the probed device (r222, block 15, issue #275).**  `llama_kv_cache` init asks every child of a
+   Meta (tensor-split) device for the region buffer type
+   (`ggml_backend_meta_kv_region_buft(kv_dev, 1)`); the construction-time capability probe then executed its
+   whole VMM round trip -- `cuMemAddressReserve` -> `cuMemCreate`/`Map`/`SetAccess` -> unmap ->
+   `cuMemAddressFree`, plus the quarantine `cudaMalloc` -- in the LAST device's context.  Measured directly on
+   Linux with a `cudaGetDevice()` print at the probe (`HIP_VISIBLE_DEVICES=0,2 -sm tensor`):
+   `VMMPROBE device=0 current_context=1 cross=1`.  Linux tolerates it; on Windows/HCC the first kernel launch
+   then dies with an access violation in `hipHccModuleLaunchKernel`, which is the reporter's crash and looks
+   like a kernel defect rather than a bookkeeping one.  The construction-time answer must therefore come from
+   facts already latched at init (`devices[].vmm` + granularity), and the real reserve/map validation belongs
+   at ALLOCATION time, where the device is bound and a refusal still falls back to the plain device buffer.
+   **The test of a fix here is the log**: a plain `-sm tensor` run must print no `VMM region` line at all.
+2. **Bind the device in the MODULE, at every entry point that can reach the driver -- not at the call sites.**
+   `alloc_buffer` bound it and the probe did not; `ggml_cuda_vmm_region_free` (reached from a buffer context's
+   destructor) did not either, so it unmapped and released VA in a foreign context on every multi-device
+   teardown.  A caller-by-caller audit does not survive the next caller; one `vmm_bind_device()` at the top of
+   `create`/`free`/`map_span`/`ensure_span`/`clear`/`dump`/`available`/`selftest` and the granularity query
+   does.  The numbers that prove nothing moved: same-seed text is identical to the pre-fix build on 1, 2 and 3
+   GPUs (`1c5d32ac537d` in all three arms).
+3. **A verdict that is logged at INFO does not exist, which makes a FAIL as quiet as a PASS (r222; this is r219
+   fact 3 taken to a release gate).**  `GGML_CUDA_VMM_REGION_SELFTEST`'s PASS/FAIL line was `GGML_LOG_INFO`,
+   and `common_log_get_verbosity()` maps INFO to TRACE -- so at every default neither verdict appeared, while
+   `ENVIRONMENT.md` had said since r178 that the gate "must print PASS ... and must print FAIL with
+   `LLAMA_KV_REGION_QUARANTINE=0`".  Two more layers hide a WARN in `llama-cli`: its default verbosity is
+   error-only (`tools/cli/cli.cpp` sets `params.verbosity = LOG_LEVEL_ERROR`), and the `--fit` probe wraps the
+   logger so anything below its own minimum is rewritten to DEBUG.  **A diagnostic that a gate asks for must
+   emit its failure at ERROR** (and its pass at WARN, with the run's `-v` named in `ENVIRONMENT.md`).
+   `scripts/gate-kv-residency.sh` now runs both arms (`wselftest` PASS, `wselftest0` with the quarantine off
+   must FAIL), so the oracle is proven sensitive on every run.
+4. **`release.json.tip` as a script default is a staleness trap after a block amendment (r222, tooling).**
+   `scripts/make-patches.sh` defaults its tip from `release.json`, so re-cutting the set after amending a block
+   -- without updating `release.json` first -- exported the PREVIOUS series, printed "Regenerated 16 patches"
+   and exited 0 while the amendment was nowhere in the delivery.  It now refuses when the fork is checked out
+   at a tip that is not `release.json.tip` unless the tip is passed explicitly (and the amended block's commit
+   id is still reproducible: the canonical re-cut of the new series prints `Applied tip: 80bfb80be`, matching
+   `release.json`).

@@ -1,3 +1,96 @@
+## 261105.009 (r222) -- issue #275: the VMM capability probe ran in a FOREIGN driver context, which on Windows kills the first kernel launch of a plain 2-GPU `-sm tensor` run (block 15)
+
+**Released as `v16-6050b467c-r222` (16 blocks).**  Fork point unchanged (`6050b467c`), canonical tip
+**`80bfb80bed3e1752910aa82257404adb7b3894e8`**, tree **`d9495be3ba2fbfbd601e8740d1da2d759b9bc256`**.
+Block 15 amended; blocks 00-14 keep identical deltas (their `.patch` files change only in the `From <sha>`
+line, because the series was re-cut from this checkout).
+
+### The report
+
+`jagalves` (Windows 11/Server, 2 x R9700 gfx1201, ROCm 10.1 Windows dist): a PLAIN 2-GPU `-sm tensor` run dies
+at the first kernel launch with an access violation in `hipHccModuleLaunchKernel`, no stdout, both device
+orders; 1 GPU unaffected; bisected r203 PASS / r204 FAIL, i.e. the release that added the Meta
+`ggml_backend_meta_kv_region_buft` hook (`TODO` #124).  No window and no pool is asked for
+(`LLAMA_KV_RESIDENT_CELLS` unset, so `kv_resident_cells == 0`), and `LLAMA_KV_REGION=0` makes it pass -- which
+points at the one piece of driver traffic the plain path still does: the CAPABILITY PROBE.
+
+### Reproduced on Linux, and what the defect actually is
+
+The crash needs the Windows/HCC context handling, so Linux does not fault -- but the wrong context is
+reproducible and was measured directly.  With a temporary `cudaGetDevice()` print at the top of
+`ggml_cuda_vmm_region_available` (r221 tree, `HIP_VISIBLE_DEVICES=0,2 -sm tensor`):
+
+```
+VMMPROBE device=0 current_context=1 cross=1
+VMMPROBE device=1 current_context=1 cross=0
+```
+
+Device 0's probe -- `cuMemAddressReserve`, `cuMemCreate`/`Map`/`SetAccess`, `cuMemUnmap`,
+`cuMemAddressFree`, plus the quarantine `cudaMalloc`/`cudaFree` -- runs its whole round trip in **device 1's
+context**, because `llama_kv_cache` init asks each child of the Meta device in turn (via
+`ggml_backend_meta_kv_region_buft(kv_dev, 1)`) and nothing in the chain binds the device.  `alloc_buffer`
+does bind it; the probe was the one path that did not.  That is exactly the class of traffic the reporter
+identified, and the reason it is invisible on 1 GPU (there is only one context to be on).
+
+### The fix (block 15, three parts)
+
+1. **Device discipline in the provider.**  Every entry point that can reach the driver binds the region's
+   device first (`vmm_bind_device` -> `ggml_cuda_set_device`): `create`, `free`, `map_span`, `ensure_span`,
+   `clear`, `dump`, `available`, `selftest`, and the `cuMemGetAllocationGranularity` query.  Binding in the
+   module rather than at each call site is the invariant -- a new caller cannot forget it, and `free` (which
+   unmaps and releases VA from a context destructor) had the same latent defect.
+2. **A buffer type may not touch the driver while it is constructed.**  New
+   `ggml_cuda_vmm_region_capable(device)` answers from the two facts the backend latched at init
+   (`devices[].vmm` + its RECOMMENDED granularity) with no driver traffic, and
+   `ggml_backend_cuda_kv_region_buffer_type_split` now asks THAT.  This is the reporter's option 2, and it is
+   the part that fixes the crash: the plain `-sm tensor` path now performs **no VMM driver call at all** (the
+   `VMM region available` line is gone from the 2-GPU arm).
+3. **The real probe moved to allocation time.**  `alloc_buffer` (which already bound the device) runs
+   `ggml_cuda_vmm_region_available` once, before `create`, and still falls back to the plain device buffer
+   with the same warning -- so "reserves but refuses a one-unit map" is still caught BEFORE any KV byte is
+   committed, one step later than before and in the right context.  The reporter's objection to option 2
+   (the `LLAMA_LOG_INFO` line moves) is answered: the refusal now happens at alloc, the fallback is
+   unchanged.
+
+### Also fixed on the way (both in block 15's files)
+
+* **The selftest's verdict was invisible.**  `ENVIRONMENT.md` has said "must print PASS, and must print FAIL
+  with `LLAMA_KV_REGION_QUARANTINE=0`" since r178, but the verdict was a `GGML_LOG_INFO` line and
+  `common_log_get_verbosity()` maps INFO to TRACE -- so at every default BOTH verdicts were suppressed, and a
+  FAIL was as quiet as a PASS.  Two more layers hide it in `llama-cli`: its default verbosity is error-only,
+  and the `--fit` probe wraps the logger so anything below its own minimum becomes DEBUG.  The verdict is now
+  WARN (PASS) / ERROR (FAIL), so a failure can no longer pass a gate silently; a PASS is visible with `-v`
+  (which `scripts/gate-kv-residency.sh` passes) and `ENVIRONMENT.md` says so.
+* **`scripts/make-patches.sh` silently re-cut the PREVIOUS set.**  Its default tip comes from
+  `release.json`, so running it after amending a block (without updating `release.json` first) regenerated
+  the old patch series, printed "Regenerated 16 patches" and exited 0 while the amendment was nowhere in the
+  delivery -- this session hit it and only a `grep` of the patch found it.  It now refuses when the fork is
+  checked out at a tip that is not `release.json.tip` and no tip was passed explicitly.
+* **`scripts/gate-kv-residency.sh` now gates the provider's selftest**: `wselftest` must PASS and
+  `wselftest0` (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) must FAIL, so the oracle is proven
+  sensitive on every run instead of on trust.  The selftest was previously a documented-but-ungated
+  diagnostic.
+
+### Gates (this box, `soar`, 3 x R9700 gfx1201, ROCm 10.1.0)
+
+| gate | result |
+|---|---|
+| defect reproduction (instrumented r221 build) | `VMMPROBE device=0 current_context=1 cross=1`, i.e. the probe's whole VMM round trip in device 1's context |
+| same-seed greedy text, pre-fix vs post-fix build | identical: 1 GPU `1c5d32ac537d`, 2-GPU `-sm tensor` `1c5d32ac537d`, 3-GPU `1c5d32ac537d` (100 chars each) |
+| plain 2-GPU `-sm tensor` arm: VMM driver traffic | **none** (`VMM region`/`KVRegion` lines: 0; the pre-fix build printed two `VMM region available` lines) |
+| `GGML_CUDA_VMM_REGION_SELFTEST=1` | PASS (`-v`), and FAIL with `LLAMA_KV_REGION_QUARANTINE=0` at DEFAULT verbosity (the new ERROR verdict) |
+| `scripts/gate-kv-residency.sh` (full: window + pool + multi-device + the new selftest arms) | PASS, both placements byte-identical to their resident arms and provably leaving them (numbers in the gate's own output) |
+| `scripts/gate-prefill-logits.sh` | **PASS** -- mean KLD **0.000000**, same-top-p **100.000 %** (build `80bfb80be`) |
+| `scripts/gate-per-block-build.sh --changed-from 75059f1c --fast` | **1/1** (block 15; blocks 00-14 unchanged) |
+| `scripts/validate-set.sh` | green: 16 blocks, strict apply, tree `d9495be3`, checksums, Windows scan clean |
+| `scripts/check-gpu-faults.sh` | clean |
+
+**What is NOT claimed:** the Windows box was not available, so the crash itself is fixed by construction
+(no VMM driver call is left on that path, which is what the reporter's own verified option 2 did) and not by
+re-measuring it here.  The reporter's `LLAMA_KV_REGION=0` A/B and its 1-GPU/2-GPU text identity stand as the
+external evidence; this release removes the traffic AND binds the context, so either mechanism alone is
+covered.
+
 ## 261105.008 (no release) -- `wip/host-expert-mirror` CLOSED: the mirror's prefill transport is the gather (serialised at the link's rate), the r114 single-launch staging kernel is the worst option, and the copy-engine path wins only in a 1-GPU width band
 
 **No delivery change.**  `patches/`, `release.json`, every block and `ENVIRONMENT.md` are untouched; the delivery

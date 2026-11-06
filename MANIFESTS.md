@@ -377,8 +377,11 @@ in CI.  The model-level gates are manual:
    resolve node unclaimable and the *load* aborts).  `MULTI_DEVICES=0` skips the section on a 1-GPU box.  Required
    for any change to the window/region provider, the pool, `is_streaming()`, the sparse decode arm, block 15's
    `--fit` interaction, `memory_breakdown()`'s KV accounting or anything that makes a buffer type per device;
-   every release that touches block 15.  ~15 s (`--window-only`), ~5 min (`--pool-only`), ~4 min (`--multi-only`),
-   ~10 min (all).
+   every release that touches block 15.  **r222 adds the provider's own SELFTEST as a gated arm pair**
+   (`wselftest` must PASS and `wselftest0`, with `LLAMA_KV_REGION_QUARANTINE=0`, must FAIL), so the primitive's
+   oracle is proven sensitive on every run instead of on trust -- it was a documented-but-ungated diagnostic
+   whose verdict was an INFO line, i.e. invisible at every default until r222.  ~15 s (`--window-only`),
+   ~5 min (`--pool-only`), ~4 min (`--multi-only`), ~10 min (all).
 
 18. **A Windows-only change (r209, PR #269)** — there is no Windows toolchain on the primary box (`TODO` #95),
    so the gate is **inertness on Linux**, and it is proved rather than inspected: compile each changed
