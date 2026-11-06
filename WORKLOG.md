@@ -1,3 +1,28 @@
+## 261105.017 (campaign, fork branch `p1-pool-rank-r223` @ `b2a8d2e76`) -- the pool ranked by the DECODE counter: +10.6 % generation
+
+**No delivery change.**  `patches/`, `release.json` and the tag are untouched; the default is unchanged, so
+delivery behaviour is byte-identical.  The fork arm is `~/llama.cpp` branch `p1-pool-rank-r223`.
+
+* **The change** (+68 lines): `MOE_HOST_POOL_RANK=combined|decode|floor|invert` selects which persisted
+  counter ranks the pool's complement.  `combined` (default) is the shipped `t.heat`; `decode` is
+  `heat_rank_vec()` — the vector the arena already seeds from (TODO #88); `floor` keeps the prefill-hot
+  `MOE_HOST_POOL_RANK_FLOOR` % ahead so the pool's whole-table prefill staging duty survives; `invert` is a
+  diagnostic inversion probe.
+* **Measured** (1 x R9700, Flash-Next GSQ-RCO IQ3_S, `-ncmoe 48 -lme 36` = a pool below the complement,
+  4 GiB arena, `MOE_HOST_POOL_DIO=1` so a miss is a real disk read, three runs per arm in both orders):
+  **generation 22.6 -> 25.0 t/s (+10.6 %)**, prompt 311.0 -> 314.3 (+1.1 %), pool `h` 0.2090 -> 0.2205.
+  Order-independent.  Record: `wip/host-expert-split/P1-POOL-RANK.md`.
+* **The inversion probe is the negative result that matters**: ascending heat collapses to `h` 0.114 /
+  16.7 t/s, so the counters are not read backwards and the pool's low `h` (0.22 at 77 % coverage) is not an
+  inversion bug — it is the pool's prefill staging traffic and the arena's miss distribution sharing one
+  counter, which is also why `h` must never be quoted as "the fraction of misses the pool answered".
+* **Owed before a flip**: the prefill A/B (`floor` sweep, prefill-heavy shapes), the four-axis MTP protocol,
+  `llama-batched-bench -npl 1,4,8`, `gate-prefill-logits.sh` (a placement prior must be KLD 0), and the
+  `ENVIRONMENT.md` entries.  The default-on call is the maintainer's — `floor` rather than `decode` is the
+  defensible flip value because of the staging duty.
+* **The demote is now clearly second**: its whole advantage was "foreknowledge of the arena's complement",
+  and the cheapest 10.6 % came from fixing the ranking instead.  `STEP1-REPLAY.md` §7 keeps the bound.
+
 ## 261105.016 (campaign, no delivery change) -- the pool is ranked by a counter that is worse than chance for decode
 
 **No delivery change.**  Investigation before implementing (the maintainer's call), and it changed the plan.
