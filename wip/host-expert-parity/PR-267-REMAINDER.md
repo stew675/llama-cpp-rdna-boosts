@@ -1,9 +1,11 @@
 # PR #267 — what is left, per patch (re-assessment 2026-11-06, against the r224 tree)
 
-**Status: assessment only.  Nothing here is applied, and no patch of the PR can be applied as-is** (they are cut
-against r204 and touch code that moved in r209-r224; `archive/work/host-expert-split/DESIGN.md` §5 has the port
-analysis).  This file exists so the PR can be closed as **integrated rather than merged**, and so a future
-session does not re-review a mechanism we have already measured.
+**Status: assessment + the r228 follow-up.**  Nothing of the PR is applied, and no patch of it can be applied
+as-is (they are cut against r204 and touch code that moved in r209-r228; `archive/work/host-expert-split/DESIGN.md`
+§5 has the port analysis).  **r228 changed the frame** (§3.0): the demote that 0004/0006/0008 target is now a
+decode-class mechanism that only runs where it pays, so every remaining comparison is made at a budget *below*
+the near-mirror boundary.  This file exists so the PR can be closed as **integrated rather than merged**, and so
+a future session does not re-review a mechanism we have already measured.
 
 Read with [`DESIGN.md`](../../archive/work/host-expert-split/DESIGN.md) (the original review + the convergence
 design) and [`archive/work/host-pool-speed/README.md`](../../archive/work/host-pool-speed/README.md) §4.3/§4.4/§6
@@ -42,25 +44,51 @@ Worth stating once, because a reviewer of the PR will ask:
 
 ## 3. What remains, in one list
 
-| # | item | what decides it | where |
-|---|---|---|---|
-| 1 | **the demote's transport** on a Gen5 x16 host: is the `cudaMemcpyAsync` D2H still ~free, or does it sit on the token path?  Then (and only then) a **copy-kernel form + a drain on a failed event record** | PLAN P0.1 (the constant) → P1.1 (the code) | this campaign |
-| 2 | **precopy** (K spares + a side stream; 0006/0007, incl. the drain) | only if P1.1 leaves a residual >~1 % of the step | this campaign |
-| 3 | **touch 2 vs 3 with the demote on** — a knob, no code: it bounds the copy volume and the measured says it costs a third of the sink's advantage | PLAN P1.3 | this campaign |
-| 4 | **the slab keeps the arena across a decode→prefill transition** (0003b): first count whether the arena is actually dropped on the field shape (`evicted … re-armed` census), then decide | PLAN P1.4 | this campaign |
-| 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (0003a) | PLAN P1.5, one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | this campaign |
-| 6 | **the tier's policy and visibility** (0009's non-registration half): a cgroup-aware figure, an authoritative `-lme`, one verdict line | already scoped, do not duplicate | [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) |
-| 7 | **sparse registration** (0002) | **non-goal.**  Re-entry only if a partial tier cannot be made cheap by the tier itself.  That is the question P0.2/P0.3 answer, so this is decided *by* this campaign, not inside it | — |
+### 3.0 r228 changed the frame (read this before ranking the items)
 
-Every item above is a `TODO` handle, so none of them can be lost: **#276** (transport), **#277** (precopy),
-**#278** (arena across a prefill transition), **#279** (narrow-2 preference), **#280** (the parity/crossover
-measurement itself).  The touch sweep needs no handle: it is a knob.
+r228 (`TODO` #281, block 12) made the demote a **decode-class** mechanism: its headroom is capped by the pool's
+coverage gap, a prefill fill ignores it, and a **near-mirror pool disengages it entirely**.  Three consequences
+for the PR's remaining mechanisms:
+
+1. **A demote comparison at 97.7 % coverage is no longer meaningful** -- the exchange does not fire there, by
+   design (`sink near-mirror tables ... 144`, 0 demoted).  Judge 0004/0006/0008 at the cells where the sink is
+   live: `-lme 44` (93.7 %, gap 32) and `-lme 36` (76.9 %, gap 119) on the CLI, and a *partial* field row
+   (`-lme 44` / a low `MOE_HOST_LIMIT_FRAC`) on the rig.
+2. **The field shape's first-pass prefill is no longer a demote question.**  At `auto` (97.7 %) the shipping
+   configuration is now the `SINK=0` path to the counter (1 907-1 938 t/s measured).  What is left of that
+   number is the miss path itself -- which is exactly what **0003b** (`TODO` #278, the arena across a
+   prefill transition) and the staging transport are about, and that is now the highest-value prefill item in
+   this list.
+3. **The demote's transport (0004) matters on fewer cells** but still matters on the ones where it runs: it is
+   worth +19-21 % generation at 94 %, so its D2H is on the hot path exactly there.  The A/B is unchanged in
+   shape, only cheaper to justify.
+
+| # | item | what decides it | where | state after r228 |
+|---|---|---|---|---|
+| 1 | **parity/crossover table** (`TODO` #280): pinned GiB vs decode vs first-pass prefill vs storage MiB/token, mirror as the asymptote | the field matrix at a budget the sink is *live* at, plus the DIO/buffered pair | PLAN P0.2/P0.3 | **half done**: CLI 76.9 % = 26.0, 93.7 % = 33.9, mirror = 38.2; field mirror 1 932-1 938 / 83.7 vs `auto` 1 837 / 76.6.  Owed: the DIO-vs-buffered field pair, the span-reach pair, and a partial field row (`-lme 44`) |
+| 2 | **the demote's transport** (`TODO` #276): is the `cudaMemcpyAsync` D2H on the token path where the sink is live?  Then a **copy-kernel form + a drain on a failed event record** (0004/0006/0007) | PLAN P1.1 -- the `SINK=0/1` delta at `-lme 44`, not at 97.7 % | this campaign | **open**, now measurable on a live cell |
+| 3 | **precopy** (`TODO` #277, 0006/0007/0008): K spares + a side stream, incl. the drain semantics | only if #276 leaves a residual >~1 % of the step | PLAN P1.2 | **open, conditional** |
+| 4 | **the slab keeps the arena across a decode→prefill transition** (`TODO` #278, 0003b) | PLAN P1.4 -- first count the `evicted … re-armed` census on the field shape | PLAN P1.4 | **open, promoted** -- it is now the field prefill's main residual, not a demote artefact |
+| 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (`TODO` #279, 0003a) | PLAN P1.5 -- one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | PLAN P1.5 | **open** |
+| 6 | **`MOE_EXPERT_CACHE_TOUCH` 2 vs 3 with the demote on** (0008) -- a knob, no code | PLAN P1.3, on a live cell | this campaign | **open** (the replay predicts the sink's advantage shrinks a third; never measured on device) |
+| 7 | **the tier's policy and visibility** (0009's non-registration half): cgroup-aware figure, authoritative `-lme`, one verdict line | already scoped, do not duplicate | [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) | **open there** |
+| 8 | **sparse registration** (0002) | **non-goal.**  Re-entry only if a partial tier cannot be made cheap by the tier itself -- and r228 + the r224 span made the partial tier's *prefill* cheap, so this is closer to closed than open | -- | **non-goal, unchanged** |
+
+Every code item is a `TODO` handle: **#276** (transport), **#277** (precopy), **#278** (arena across a prefill
+transition), **#279** (narrow-2), **#280** (parity/crossover).  The touch sweep needs no handle: it is a knob.
 
 ## 4. What would close the PR (the reply, once the numbers exist)
 
 1. **Absorbed or superseded**: 0001, 0005, 0010 (with its measurement), and 0009's placement half.
 2. **Borrowed, pending the A/Bs here**: 0004 (+0007's drain), 0008's value, 0003's two halves.
 3. **Deferred with a condition**: 0006 (precopy) behind 0004's result; 0002 behind "a partial tier cannot be
-   made cheap".
-4. **The numbers to quote**: his 82.7 t/s / 1949 t/s prefill row against the shipping tier on this box at the
-   same 56 GiB container shape, plus the crossover table (`PLAN.md` P0.2).
+   made cheap" (r228 makes the *prefill* half of that cheap; the decode half is the +19-21 % the tier already
+   has, so the condition looks answered in the negative for the registration mechanism).
+4. **The numbers to quote** (r228, this box): his **82.7 t/s / 1 949 t/s prefill** row against our **mirror
+   83.7 / 1 932-1 938** at the same 56 GiB container shape (parity on the mirror), and the tier curve that the
+   pool delivers without any registration -- **76.9 % = 26.0, 93.7 % = 33.9 (+19-21 % from the demote),
+   100 % = 38.2** (CLI, one R9700).  Plus the two remaining transport items (#276, #278) or their measured
+   refutation, and the crossover table (#280).
+5. **Then**: post that as the PR's closing summary ("integrated rather than merged": every mechanism is either
+   in the delivery in a different shape, measured and rejected, or recorded with a handle) and close it.  Do not
+   mark it merged -- nothing of the branch is applied.

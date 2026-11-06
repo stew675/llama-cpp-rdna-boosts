@@ -4,11 +4,13 @@
 switch, each gated on its own.**  Read [`README.md`](README.md) first (why this campaign and what changed about
 the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdicts that produced P1).
 
-> **First pass measured 2026-11-06 — [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md).**  P0.1 and P0.2 are done
-> (P0.3 partial), and they produced the campaign's first code item, **P1.0** below, plus a shipped-default
-> finding (`TODO` #281): at `auto` (97.7 % coverage) the demote costs **53 % of the first-pass prefill** for no
-> decode gain, while at `-lme 44` it is worth **+21 %** decode.  The MTP four-axis, the 35B-A3B
-> prefill-logit/span arm and the `-npl` gate (P0.4/P0.5) are still owed.
+> **First pass measured 2026-11-06 — [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md); the fix shipped in r228.**
+> P0.1/P0.2/P0.4/P0.5 are done and P1.0 is **done in r228** (the demote is a decode-class notion: headroom capped
+> by the coverage gap, prefill fills exempt, near-mirror pools disengaged — the field cell is now the `SINK=0`
+> path to the counter, and `-lme 44` keeps +19-21 %).  **What remains is the PR #267 integration** (ranked in
+> [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0): P0.3's DIO/buffered + span-reach pairs and a *live* partial
+> field row for the crossover table (#280), then P1.1 (#276), P1.3, P1.4 (#278), P1.5 (#279), with P1.2 (#277)
+> conditional on P1.1.
 
 ## 1. Settled — do not re-derive
 

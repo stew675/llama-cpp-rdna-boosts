@@ -5,7 +5,12 @@ nothing applied to the fork, nothing in `patches/`, `release.json` untouched.  *
 [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md)**: the demote reproduces at `-lme` 36 (+8 %), is worth **+21 %**
 at 94 % coverage, and **costs 53 % of the field prefill at `auto` (97.7 %)** — a shipped-default defect that was
 **fixed in r228** (`TODO` #281 closed: the demote is a decode-class notion now — headroom capped by the
-coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of the results file).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
+coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of the results file).  Released as
+`v16-6050b467c-r228` (fork tip `32d0dc3f1`, tree `44b8fc4d…`), which also picked up r225-r227.
+**What is left here is the PR #267 integration**, re-framed by r228: a demote comparison is only meaningful at a
+budget *below* the near-mirror boundary (≤96 % coverage), and the field shape's remaining prefill cost is the
+miss path, not the demote — see [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 for the ranked remainder
+(`TODO` #276-#280).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
 [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
 [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) (the campaign that
 shipped in r224) and the rig is [`wip/bench-56gb/`](../bench-56gb/README.md).
@@ -115,6 +120,8 @@ mirror `slots >= n_experts` case stays inert, both as shipped.)
 |---|---|
 | the standing plan and the arm matrix | [`PLAN.md`](PLAN.md) |
 | **the first measurement pass (2026-11-06)** | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
+| the PR #267 integration checklist (re-framed by r228) | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 |
+| the release the fix shipped in | `WORKLOG.md` 261106.019, `patches/README.md` block 12 |
 | the per-patch re-assessment of PR #267 | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) |
 | the campaign that shipped in r224 (do not re-derive) | [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) |
 | the rig this runs on | [`wip/bench-56gb/`](../bench-56gb/README.md) (`run.sh`, `measure.sh`, `bench.py`, `ballast.c`) |
