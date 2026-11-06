@@ -64,3 +64,73 @@ pool answered" (see `STEP1-REPLAY.md` §7).
 5. **The default-on decision** is the maintainer's: the measured +10.6 % decode at a below-complement budget
    is exactly the shape `AGENTS.md`'s default-on policy describes (flip in the same change as the gate, keep
    the kill switch), but the prefill duty above is the argument for `floor` over `decode` as the flip value.
+
+## The gate ladder, as far as it can honestly be run today
+
+All arms: 1 × R9700, Flash-Next GSQ-RCO IQ3_S, `-ncmoe 48`, 4 GiB arena, `MOE_HOST_POOL_DIO=1`,
+`MOE_HOST_POOL_RAM_PCT=0`, every run under `scripts/gpu-watch.sh --cmd`.
+
+### Coherence — PASS, 9/9 byte-identical
+
+`-p "The capital of France is" -n 24 --seed 42 --temp 0 --single-turn`, at **three pool budgets × three
+rankings** (`-lme 36` below the complement, `-lme 44` at it, `-lme 47` the mirror):
+
+```
+lme36/44/47 × combined/decode/floor  ->  137 chars sha=dfc26e26f38c   (all nine)
+```
+
+A placement prior must not move a token, and this one does not.  (The first attempt looked like it failed —
+nine different hashes at the *same* length — because `-lv 3` interleaves timing lines into the generated
+text.  Clean logging, nine identical hashes.  Worth remembering: never hash an `-lv 3` log.)
+
+### Prefill A/B — `decode`/`floor` are never worse, and the mirror is provably inert
+
+5246-token prose prompt, `-ub 6144`, `-n 20`, DIO pool:
+
+| `-lme` | pool covers | rank | prompt t/s | gen t/s | pool `h` |
+|---|---|---|---|---|---|
+| 36 | 76.9 % (below the complement) | combined | 309.5 | 18.2 | 0.1916 |
+| | | **decode** | **313.1** | **20.6** | 0.1999 |
+| | | floor | 315.3 | 20.2 | 0.1980 |
+| 44 | ≈ the complement | combined | 719.5 | 22.8 | 0.6662 |
+| | | **decode** | **727.4** | **23.9** | **0.7950** |
+| | | floor | 727.2 | 23.6 | 0.7926 |
+| 47 | **mirror** (all 46.84 GiB) | combined | 833.7 | 24.8 | 1.0000 |
+| | | decode | 835.0 | 25.1 | 1.0000 |
+| | | floor | 833.4 | 24.8 | 1.0000 |
+
+**Answers to the two questions.**
+
+* **A full complement, yes — that is where it is biggest.**  At `-lme 44` the pool's hit rate goes
+  **0.666 -> 0.795 (+19 % relative)**, prompt +1.1 %, gen +4.8 %.  The mechanism is that the loader's
+  "complement" is the *prior's* complement, and the prior is a bad predictor of what the arena will actually
+  hold; the decode vector predicts it better, so a budget that is exactly the complement's size lands its
+  slots on the experts that are actually cold.
+* **A full mirror, no — provably inert.**  At `-lme 47` the pool holds every expert, so the ranking can only
+  change slot *order*: the arena/pool counters are **identical to the digit** (`h=1.0000 (13606/13606)`, arena
+  0.5028 / 15009 hits at the same shape) and prompt/gen are within run noise (833.7 / 835.0 / 833.4).  A
+  mirror is also the fastest row by a wide margin (833 t/s prefill against 309 at a 77 % pool), which is the
+  post-cache baseline to beat — and exactly why a partial pool has to earn its place.
+
+### `llama-batched-bench -npl 1,4,8` — PASS at 1 and 4, better at 8 (single run each)
+
+`-lme 44` (the cell where the ranking matters most), pp512/tg128:
+
+| npl | combined tg t/s | decode tg t/s | combined pp t/s | decode pp t/s |
+|---|---|---|---|---|
+| 1 | 38.41 | 38.60 | 20.83 | 21.13 |
+| 4 | 83.99 | 83.18 | 1197.72 | 1154.07 |
+| 8 | 24.99 | **30.20 (+20.8 %)** | 1224.52 | 1228.19 |
+
+Single run per arm, so the 8-slot +20.8 % needs a repeat before it is quoted as a number; the 1- and 4-slot
+rows are within ±1 %.
+
+### Still owed (not run, and why)
+
+* **The four-axis MTP protocol** (`benchmarks/mtp-adaptive-methodology.md`) — needs the MTP draft head and
+  `-n 3000` per axis; it is the gate `MANIFESTS.md` demands for a decode-path change and it has **not** run.
+* **`scripts/gate-prefill-logits.sh`** — there is no recorded base for this model (`~/.cache/rdna-boosts/gates/`
+  has gpt-oss and 35B-A3B only), and recording one from this modified build would make the comparison
+  vacuous.  It needs either the 35B-A3B's existing base (a different model, so it checks the change on a
+  config with a known-good reference) or a base recorded from the delivery tip before the change.
+* **A repeat of the 8-slot batched-bench row.**

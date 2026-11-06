@@ -1,3 +1,23 @@
+## 261105.018 (campaign, fork branch `p1-pool-rank-r223`) -- the prefill A/B and the runnable half of the gate ladder
+
+**No delivery change**; the default stays `combined`.  Record: `wip/host-expert-split/P1-POOL-RANK.md`.
+
+* **Coherence: 9/9 byte-identical** (`sha=dfc26e26f38c`) across three pool budgets (`-lme 36` below the
+  complement, 44 at it, 47 the mirror) x three rankings.  The first attempt looked like a nine-way failure at
+  identical length because `-lv 3` interleaves timing lines into the generated text — never hash an `-lv 3`
+  log.
+* **Prefill A/B**: `decode`/`floor` are never worse than `combined` and the mirror is provably inert.
+  `-lme 36`: prompt 309.5 -> 313.1, gen 18.2 -> 20.6.  **`-lme 44` (a full complement) is where it is
+  biggest: pool `h` 0.666 -> 0.795 (+19 % relative)**, prompt 719.5 -> 727.4, gen 22.8 -> 23.9.  `-lme 47`
+  (mirror, all 46.84 GiB): identical counters to the digit (`h=1.0000 (13606/13606)`), 833.7/835.0/833.4 t/s
+  — a mirror holds every expert, so a ranking cannot matter there.  Mechanism for the complement case: the
+  loader's "complement" is the *prior's* complement, and the decode vector predicts the arena's actual
+  residency better.
+* **`llama-batched-bench -npl 1,4,8`** (at `-lme 44`): tg 38.41 -> 38.60 (npl 1), 83.99 -> 83.18 (npl 4),
+  **24.99 -> 30.20 (npl 8, +20.8 %, single run — needs a repeat)**; prompt within ±3.6 %.
+* **Owed, and stated as owed**: the four-axis MTP protocol has **not** run, and `gate-prefill-logits.sh`
+  cannot be run honestly (no base for this model; recording one from the modified build is vacuous).
+
 ## 261105.017 (campaign, fork branch `p1-pool-rank-r223` @ `b2a8d2e76`) -- the pool ranked by the DECODE counter: +10.6 % generation
 
 **No delivery change.**  `patches/`, `release.json` and the tag are untouched; the default is unchanged, so
