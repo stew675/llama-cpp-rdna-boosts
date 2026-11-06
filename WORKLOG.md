@@ -1,3 +1,43 @@
+## 261106.010 (campaign) -- the streaming ceiling is PREFILL read granularity (0.6 MB per expert), not the drive
+
+**No delivery change; fork reverted to `bfb9b0b22`.**  Chasing the maintainer's observation that disk streaming
+stops at ~2.3 GB/s on a drive that does ~7 GB/s.  The answer is read SHAPE, and the target is prefill.
+
+**The drive measured with `dd iflag=direct` on the model shard (this box):**
+
+| shape | throughput |
+|---|---|
+| single 0.6 MB (627 200 B) read, depth 1 | **520 MiB/s** (1.1 ms) |
+| same, 630 784 B (4 KiB-aligned) | 565 MiB/s -- alignment is NOT the issue |
+| 2 MiB, depth 1 | 1.5 GiB/s |
+| 16 MiB, depth 1 | **4.2 GiB/s** |
+| 0.6 MB at depth 16 / 32 | 3.0 / **4.5 GiB/s** |
+| 4 concurrent sequential streams | **6.7 GB/s** (matches the drive's rating) |
+
+So the drive is fine; a 0.6 MB read is **latency-dominated** (~1.1 ms fixed), and throughput is set by read size
+and by outstanding depth.  ~2.3 GB/s is consistent with an effective depth of ~10 -- which is what the kernel's
+readahead and/or our own serial reads deliver.
+
+**The offending path.**  `moe_cache_stage_table` walks `e = 0..n_experts` and calls
+`expert_host_src` + one `cudaMemcpyAsync` PER EXPERT, so every non-resident expert is a separate 0.6 MB read:
+sequential, at ~520 MiB/s each, for every ubatch that has to stream it.  Experts `e..e+n` are CONTIGUOUS in the
+file (`file_offs + e*host_bytes`), so a run of non-resident experts can be one span read.  The same code's own
+comment records the scale ("27 minutes of disk reads for one 68K prompt").
+
+**Fix spec (not yet implemented):** in the stage loop, for the 1-D case (`n_slices == 0`,
+`pool->host_bytes == t.expert_bytes`, disk mode, no `do2d`, no batch), coalesce maximal runs of consecutive
+non-resident experts into chunk reads -- e.g. 16 experts (~10 MB) into a reusable pinned buffer, one `pread` +
+one `cudaMemcpyAsync` per chunk.  Pool-resident and arena-resident experts keep their existing copies.  Expected
+4-8x on the disk legs (520 MiB/s -> 4.2 GiB/s at 10 MB; up to 6.7 GB/s chunked in parallel), which on the
+`-lme 12` prefill (94 t/s) is plausibly the largest single remaining win in this campaign.
+
+**Two negative results worth keeping, so nobody repeats them:** (1) a concurrent 4-worker fill pool for the
+demand path changed nothing -- at sub-mirror budgets the pool is SATURATED, so `pool_free_slot_locked` returned
+no slot and ZERO jobs were dispatched; (2) `madvise(MADV_WILLNEED)` prefetch hints on the routed experts changed
+nothing, because this box's page cache is warm (dropping it needs root).  Both were reverted rather than shipped
+unverified.  Any re-test of either needs a cold cache -- the `wip/bench-56gb/` rig is the venue, and it is
+password-blocked.
+
 ## 261106.009 (campaign) -- W3 curve (prefill + gen), and a saturation fix that must be duplicate-only
 
 **Fork only.**  W3's budget sweep on the shipping configuration (`decode` + exchange on, `-lzm off`, arena
