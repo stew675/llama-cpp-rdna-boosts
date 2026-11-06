@@ -4,10 +4,11 @@
 # WHY THIS EXISTS (issue #231):
 #   The delivery's host-side CUDA code is built with HIP *on Windows* too (clang-cl + the MSVC STL),
 #   where <unistd.h>/<fcntl.h> do not exist and `close`, `pread`, `open`, `fsync`, ... are undeclared.
-#   `ggml/src/ggml-cuda/moe-expert-cache.cu` is consciously portable: the bounded host pool is a POSIX
-#   feature, so every file call goes through five helpers (`pool_open_file`, `pool_fd_align`,
-#   `pool_pread`, `pool_aligned_alloc`, `pool_close_file`; issue #130) whose Windows versions are
-#   no-ops -- the pool never opens a file there, so a miss is served from the pinned master.
+#   `ggml/src/ggml-cuda/moe-expert-cache.cu` is consciously portable: every file call goes through five
+#   helpers (`pool_open_file`, `pool_fd_align`, `pool_pread`, `pool_aligned_alloc`, `pool_close_file`;
+#   issue #130) with a POSIX branch (`open`/`pread`/`posix_memalign`) and a Windows branch
+#   (`CreateFileA`/`ReadFile`/`_aligned_malloc`, and `pool_aligned_free` with it; the disk tier became real
+#   there in r227).  The helpers are what keep a POSIX-only call out of the Windows build.
 #   r143 then added two direct `close()` calls in `pool_free_locked` / `moe_cache_forget_all` teardown,
 #   which is a hard compile error on Windows and invisible to every gate we can run here: there is no
 #   Windows runner, so the only other detector is a reporter's build log (#231 was exactly that).

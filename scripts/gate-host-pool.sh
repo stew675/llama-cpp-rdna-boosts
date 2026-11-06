@@ -6,8 +6,10 @@
 #   `--host-experts pool` / `-lme auto` in the NOT-FITTING band places the host expert master in the read-only
 #   model mapping and serves every GPU read through the bounded pinned pool.  A pool fill can be served from two
 #   places: the mapping itself (a plain memcpy out of the page cache, always available) and the pool's DISK
-#   TIER (`MOE_HOST_POOL_DIO=1`, `pread`/`O_DIRECT`), which is a POSIX feature and is a compile-time STUB that
-#   returns -1 on Windows.  Three things were wrong and together they silently produced garbage on Windows:
+#   TIER (`MOE_HOST_POOL_DIO=1`), which reads the GGUF with positional aligned reads -- `pread`/`O_DIRECT` on
+#   POSIX, `ReadFile`/`FILE_FLAG_NO_BUFFERING` on Windows (r227; before that Windows had a stub that returned -1,
+#   which is the shape this gate was written against).  Three things were wrong and together they silently
+#   produced garbage on Windows:
 #     1. requesting the disk tier on a platform without it failed EVERY pool fill, which FAILED every pool and
 #        made `table_pool_locked()` return null for the whole run (so the pool "never appeared");
 #     2. the fallback for a failed pool was the per-table bounce ring, which asked for the SAME missing tier and
@@ -55,6 +57,11 @@
 #           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
 #           resident victim, or that slot serves stale bytes for the life of the run
 #   HARD  * no arm logs `async fill failed` (the old, cause-hiding message) or aborts
+#   HARD  * every arm prints the exit census ONCE, from the MODEL TEARDOWN and before it (`host pool (L2)` above
+#           `model teardown: dropped ...`).  On Windows the `atexit` hook runs after `main` and llama-server's
+#           async log is gone, so a census that only prints there is invisible -- the reporter's clean Ctrl+C
+#           showed every teardown line except the census (issue #274 follow-up).  One report also proves the
+#           hook does not print a second copy.
 #   INFO  the pool's pinned size/slot count, its hit rate, the fill mode and the throughput per arm
 #
 # Usage:
@@ -293,6 +300,24 @@ if grep -q 'async fill failed' "$KEEPOUT/fail/err.txt"; then
 else
     ok "fail: the cause-hiding 'async fill failed' message is gone"
 fi
+
+# ---- HARD: the census is printed by the MODEL TEARDOWN, once, while the log is still open ------
+# issue #274 follow-up (@DanoPTT): `moe_cache_report` is an `atexit` hook, and on Windows that runs after
+# `main` has returned, inside ggml-hip.dll, when llama-server's async log is already gone -- the reporter's
+# clean Ctrl+C printed the memory breakdown, the slab line and `model teardown: dropped 141 ...` but not one
+# MoE census line.  The report must therefore be emitted from the teardown, and exactly once (the hook must not
+# print a second copy).  In llama-cli the ordering is observable: the report lines precede the teardown line.
+for a in ref fail sink; do
+    hard
+    nrep="$(grep -c 'MoE expert cache: h=' "$KEEPOUT/$a/err.txt")"
+    rline="$(grep -n 'host pool (L2):' "$KEEPOUT/$a/err.txt" | head -1 | cut -d: -f1)"
+    tline="$(grep -n 'model teardown: dropped' "$KEEPOUT/$a/err.txt" | head -1 | cut -d: -f1)"
+    if [ "${nrep:-0}" = "1" ] && [ -n "$rline" ] && [ -n "$tline" ] && [ "$rline" -lt "$tline" ]; then
+        ok "$a: census printed once, from the teardown (pool line $rline before teardown line $tline)"
+    else
+        fail "$a: census count '${nrep:-0}', pool line '${rline}' teardown line '${tline}' (want exactly one report, before the teardown)"
+    fi
+done
 
 # ---- HARD: no abort anywhere ------------------------------------------------------------------
 for a in ref dio nodisk fail late; do

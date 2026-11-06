@@ -2278,3 +2278,50 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    non-vacuous arm for these sites.  `scripts/gate-grid-stall-pad.sh` is that arm: the padded launch must equal
    the **CPU** reference in both pad arms, each site must log its pad, the `MUL_MAT_ID` arm must reach the
    refusal, and the same-seed text must be identical with `GGML_CUDA_GRID_STALL_PAD=0`.
+
+## r227 -- the host pool's disk tier exists on Windows, the census belongs to the MODEL TEARDOWN, and the Windows pinned ceiling is not the RAM formula (issue #274)
+
+**Measured facts behind the #274 follow-up.  Do not re-derive; do not ship a Windows figure that was measured
+on Linux.**
+
+1. **A pool disk tier on Windows is `ReadFile`, not a stub, and the tight band needs it.**  From issue #130 to
+   r226 `pool_open_file` returned -1 on `_WIN32`, so a Windows pool always filled by `memcpy` out of the
+   read-only mapping.  The reporter measured what that costs when the expert set does not fit: ~250 MiB/s of
+   disk reads, ~65 k pages-input/s and the GPU computing **~2 %** of a 4,180-token prefill, with the whole
+   ~40 GiB set re-faulted per pass (`c`, default auto pool, 47 and 64 GiB).  A mapped view has no readahead to
+   speak of, so the fix is a real direct tier: `CreateFileA` + positional `ReadFile` + `_aligned_malloc`, with
+   `FILE_FLAG_NO_BUFFERING` for the DIO mode and `FILE_FLAG_OVERLAPPED` always.  It is the same five-helper
+   abstraction the POSIX `pread`/`O_DIRECT` path uses, so the fill, the mirror prepopulate and the coalesced
+   prefill span all reach it with no other change.  **Unmeasured here** (no Windows toolchain on this box): the
+   value is the reporter's to confirm, and `MOE_HOST_POOL_DIO=0` is the escape hatch.
+2. **The disk tier is best-effort on every platform, and a REFUSED pool allocation must say so.**  r219 already
+   made a fill fall back to the mapping; a failed `cudaHostAlloc` for the pool itself was still silent, which
+   is exactly the "the pool never appeared" shape the issue was opened for.  It now prints the real
+   `cudaGetErrorString` and the size once, and on Windows it latches the pinned tier off for the run (the same
+   policy the bounce ring's first refusal uses) instead of asking 141 more times for memory the driver will not
+   give.  No cap is derived from any formula -- see 4.
+3. **`moe_cache_report` cannot be the only printer on Windows.**  It is an `atexit` hook inside ggml-hip.dll, so
+   on Windows it runs after `main` has returned, when llama-server's async log is already gone: the reporter's
+   clean Ctrl+C printed `cleaning up before exit...`, the memory breakdown, `SLAB_STATS context-exit` and
+   `model teardown: dropped 141 ...` and **not one** `MoE expert cache:` / `pool fills:` / `host pool (L2)` line.
+   The census is now emitted from the **first `moe_cache_forget_all`**, under the same lock and before anything
+   is un-sized, and the atexit hook is the backstop for a run that never tore down; a flag keeps it to exactly
+   one report.  This also fixed a latent ordering bug: the teardown used to fold the heat delta into the
+   persisted prior *before* the report, so the "this session" coverage line read `0.00 %` at exit.  The gate
+   asserts the ordering (`host pool (L2)` before `model teardown: dropped`) and the single print.
+4. **The Windows pinned ceiling is the adapter's SHARED (aperture) budget, and the `(RAM/2)/visible GPUs` model
+   does not predict it.**  The reporter's own numbers: GPU shared usage tops out at **9.32-9.35 GiB** on a
+   47 GiB box and again on the same box at 64 GiB (one R9700, one visible adapter, ~60 GiB of commit headroom
+   left), with `-lme 4/8/auto` all landing on the same level and the first refusal arriving four minutes into a
+   prefill for a 0.5 MiB bounce entry.  So MemAvailable is not the budget, the RAM formula is not either, and
+   something already counts against it before the pool does.  What ships is measurement, not a guess: the
+   pinned tier's realized bytes in the census, and on Windows the aperture segments' `CommitLimit` and
+   `BytesResident` (all processes) from the same `D3DKMTQueryStatistics` call the WDDM free-memory path already
+   uses.  Do not add a ceiling derived from the formula; it would cap a healthy box.
+5. **Windows VRAM is charged to the process commit 1:1, and that is not the RAM the run is short of.**  The
+   reporter traced ~40 GB of private commit to device allocations (`ROCm0 model buffer` +4.7 GiB, KV/compute
+   +~2 GiB, the VMM slab +24.7 GiB at `SLAB_INIT`, the pinned pool +4.6-9.3 GiB) while the 70.6 GB of
+   read-only GGUF views stayed out of the commit charge.  What actually binds a 47 GiB box is the **working
+   set** (34-38 GB: resident mapping pages plus the pinned pool), which is why the small pinned pool (`l4`)
+   was the better configuration there and why adding 16 GB of RAM moved prefill 16 -> 94 t/s with nothing in
+   the delivery changing.

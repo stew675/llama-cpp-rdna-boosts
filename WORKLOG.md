@@ -1,3 +1,77 @@
+## 261106.016 (r227) -- issue #274 follow-up: the host pool's disk tier is real on Windows, a refused pool allocation reports and latches, and the exit census prints from the model teardown
+
+**Release `v16-6050b467c-r227`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`43a106ac3`**, tree `54840073af5d0c85d8380b7b4020e4a864ab23c8`.  Block **12** amended; blocks 00-11 and
+13-15 keep identical deltas (their `.patch` files change only in the `From <sha>` line, because the series
+was re-cut from this checkout).  Delivery records that changed: `INVARIANTS.md` (r227),
+`patches/README.md` (the block-12 row and note), `ENVIRONMENT.md` (`MOE_HOST_POOL_DIO`,
+`MOE_HOST_POOL_DIO_FAULT`, `MOE_HOST_POOL_RAM_PCT`), `MANIFESTS.md` (release gate 19 and the block-12 row),
+`AGENTS.md` + `scripts/README.md` + `scripts/check-windows-portability.sh` (the gate and the helper note),
+and `scripts/gate-host-pool.sh` (three teardown-census arms).
+
+**Where this came from.**  The thread's last two comments, both after r224.  @briansp2020's mid-run
+fill-failure finding was already fixed in r223 and he confirmed it.  What @DanoPTT still could not use was
+(a) no exit census from `llama-server` on Windows at all, (b) `c` (the default auto pool, 26.6 GiB planned)
+still demand-paging the mapped GGUF at ~250 MiB/s with the GPU ~98 % idle through a prefill, and (c) a pinned
+ceiling that stops at 9.32-9.35 GiB of adapter shared usage on both his 47 GiB box and the same box at 64 GiB,
+which contradicts the `(RAM/2)/visible GPUs` model r223's message quoted.  Nothing here is Windows-measured
+(there is no Windows box in this fleet); what this release does is make each of the three observable, and give
+(b) a real path.
+
+**What changed (all block 12, all in `moe-expert-cache.cu` / `wddm-mem.cu`).**
+* **A real Windows disk tier.**  `pool_open_file`/`pool_fd_align`/`pool_pread`/`pool_aligned_alloc`/
+  `pool_close_file` were a stub returning -1 on `_WIN32`; they are now `CreateFileA` + positional `ReadFile`
+  + `_aligned_malloc`, with `FILE_FLAG_NO_BUFFERING` in the DIO mode and `FILE_FLAG_OVERLAPPED` always, and
+  `pool_fd_t` is pointer-sized because a HANDLE does not fit an `int` on Win64 (`pool_aligned_free` exists so
+  the DIO bounce is freed with the matching allocator).  In the **memory-tight band**
+  (`pool + host expert set > MemAvailable`) Windows now takes the direct tier even under `--load-mode mmap`:
+  there a mapped fill is a demand fault per page, and the reporter's own trace is the argument.  `=0` forces
+  the page cache back.  This is the one part of the release with no measurement behind it on this box.
+* **A refused pool allocation is loud and, on Windows, final.**  It used to be silent -- the exact "the pool
+  never appeared" shape #274 was opened for.  It now prints the real `cudaGetErrorString` and the size once,
+  plus how many MiB of the pinned tier had been obtained, and on Windows it latches the pinned tier off for
+  the run (the policy the bounce ring's first refusal already used) instead of asking another 140 tables for
+  memory the driver has refused.
+* **The exit census belongs to the model teardown.**  `moe_cache_report` is an `atexit` hook inside
+  ggml-hip.dll, so on Windows it runs after `main` has returned and llama-server's async log is gone -- the
+  reporter's clean Ctrl+C printed `cleaning up before exit...`, the memory breakdown, `SLAB_STATS
+  context-exit` and `model teardown: dropped 141 ...` and not one `MoE expert cache:` / `pool fills:` /
+  `host pool (L2)` line.  The same report is now printed from the **first `moe_cache_forget_all`**, under the
+  same lock and before anything is un-sized, exactly once (a flag suppresses the hook's copy).  Found on the
+  way and fixed by the reorder: the teardown used to fold the heat delta into the persisted prior *before*
+  the report, so the "this session" coverage line always read `0.00 %` at exit (now 85.71 % on the field
+  config).
+* **The pinned ceiling is reported, not guessed.**  The census now prints the pinned tier's realized total
+  (pool + bounce rings + coalesced span ring), and on Windows the adapter's **shared (aperture)** segments'
+  `CommitLimit`/`BytesResident` for all processes (`ggml_hip_win_shared_mem_info`, the same
+  `D3DKMTQueryStatistics` call `wddm_free` already uses, the other segment class).  The three log messages
+  that asserted `(RAM/2)/visible GPUs` now say what was measured (9.3-9.4 GiB on 47 and 64 GiB boxes) and
+  send the operator to the census; no ceiling is derived from the formula, because the reporter's numbers
+  refute it as a predictor.
+
+**Gates.**  `gate-host-pool.sh` **31/31** (the 28 from r224 plus three teardown-census arms: census printed
+ONCE and `host pool (L2)` above `model teardown: dropped` on `ref`/`fail`/`sink`).  All seven arms byte-identical
+(`182 chars sha=a99ccbd97ecb`), pools live (60066 / 60912 / 61053 slots, 33.3/33.8/33.8 GiB pinned, fill mode
+buffered / O_DIRECT / buffered), `sink` 5057 demoted, `sinkfail` 5135 copy-error declines with 0 published,
+`fail` 2790 and `late` 2732 rolled-back fills with `takeover=0`.  Coherence: 4B Q8_0 1 GPU and 3 GPU
+`-sm tensor` both `100 chars sha=1c5d32ac537d` (the r226 value).  Prefill logits: **mean KLD 0.000000,
+same top p 100.000 %** against the base recorded from the r223 delivery tree (27B Q8_0, gfx1201).
+MTP Protocol A (canonical dense 27B Q4_K_XL, prose, `-n 3000`): `plain` == `draft-mtp`, **11413 chars
+`sha=b9c10f46b5ae`** in both, acceptance **0.47043** (350/744) with draft-mtp at 57.8 t/s.
+`gate-per-block-build.sh --base 6050b467c --tip 43a106ac3 --changed-from 3753eccf2`: **2/2** (block 12 340 s,
+block 15 6 s).  `fork-refresh.sh --build --gates`: tree matches, build ok, coherence + prefill-logit PASS.
+`validate-set.sh` nine checks GREEN (checksums, fresh-tarball strict apply, tree, conflict markers, Windows
+portability over 287 added files).  `check-gpu-faults.sh` clean over the five gate logs and the kernel
+journal.
+
+**Not run, and why.**  The MTP **four-axis** R/P/C/K matrix: nothing here touches a decode kernel, the
+adaptive depth controller, a fusion or a speculator, and on POSIX the only change on the decode path is the
+(non-triggering) pool-allocation failure branch plus a counter.  The pool gate's seven arms and the coherence
+arms are byte-identical, and the prose Protocol A arm above is identical with acceptance in band.  The
+Windows arms themselves (`ReadFile` disk tier, aperture census, latch) cannot be run here at all -- the
+reporter builds on Windows and will report; that is the whole reason the three are now logged rather than
+inferred.
+
 ## 261106.015 (r226) -- issue #277: the four `get_rows` launches take the grid-stall pad, and the pad learns to refuse one it cannot make
 
 **Release `v16-6050b467c-r226`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
