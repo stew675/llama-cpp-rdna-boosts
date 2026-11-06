@@ -223,8 +223,15 @@ fi
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "PASS: the norm-rows fusion declines every unsafe alias, keeps the benign one, reproduces the"
-    echo "      unfused chain byte for byte, and on a real gated GGUF still fuses with nothing declined."
+    echo "PASS: the norm-rows fusion declines every unsafe alias, keeps the benign one, and reproduces the"
+    echo "      unfused chain byte for byte."
+    if [ "$B_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ]; then
+        echo "      On the real gated GGUF it still fused every node with nothing declined (the scheduler's"
+        echo "      alloc deps hold) and its text equals the kill-switch arm."
+    else
+        echo "      The real-GGUF section was SKIPPED (MODEL_ARM=$MODEL_ARM B_ARM=$B_ARM): the guard is proven,"
+        echo "      the alloc deps are NOT.  Run it without MODEL_ARM=0 before a release."
+    fi
     exit 0
 fi
 echo "FAIL: $fails check(s) failed -- logs in $KEEPOUT"
