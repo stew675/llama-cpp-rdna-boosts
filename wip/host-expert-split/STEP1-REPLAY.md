@@ -233,3 +233,45 @@ the number to go with it.
 both bands, and ship it alone if the prefill row is not regressed.  (2) The demote, if it is still wanted,
 must be measured **against the decode-ranked layout**, not against the combined-ranked one — otherwise most of
 its advantage is a bug in the baseline.
+
+## 8. Addendum — write-back vs page-cache warmer (maintainer's question, 2026-11-05)
+
+The question: an admitted expert's arena victim is dropped and re-read from storage later; D2H is far faster
+than a storage read, so why not write the victim back — and if the profile is O_DIRECT, is a D2H swap not
+*always* better?  And, separately: with mmap, could a background reader pull the dropped expert into the page
+cache, so a later miss is a page-cache hit?
+
+**The observation is correct and the code does exactly what was described.**  On a miss the arena victim's
+bytes are abandoned (bookkeeping only, no write-back), and in the complement case the pool does **not** hold
+the victim (it holds the complement), so it is genuinely lost to storage.
+
+**Why the delivery does not do it — and why that reason does not cover this case.**  r113 implemented the
+write-back (`pool-swap-slot`) and dropped it at **2× decode**, and `INVARIANTS.md` carries the rule.  Two
+properties of that arm matter and neither holds here: the pool **covered** the complement, so the swap saved
+**0 MiB** of L3 (nothing to win), and the copies were **2-D strided `cudaMemcpy2DAsync`** on a 2-device tensor
+split (6 259 swaps).  The complement-scarce, single-device case is 1-D contiguous, and there the replay says
+the swap removes ~65 % of the L3 at 1.55 copies per MiB removed.  **A write-back is slot-neutral**: the
+promoted expert came from the pool, so the slot it vacates takes the victim — no extra memory, which is what
+makes it structurally cheap.  It needs the ordering the pool already has (`slot_state == 2` retiring) plus a
+copy-ahead on a side stream to keep the D2H off the admission's path (the PR's 0006 precopy).
+
+**Your second proposal, measured.**  `--evict-warm` models it exactly: nothing is moved by us, each arena
+victim is read into the page cache off the critical path, and its next miss is a page-cache hit.
+
+| arena / frac (`--admit touch 2`) | no warmer | `--evict-warm` | change | device copies |
+|---|---:|---:|---:|---:|
+| 19 GiB / 50 % | 29.69 | **23.60** | **-20.5 %** | 0 |
+| 19 GiB / 40 % | 38.99 | **32.87** | -15.7 % | 0 |
+| 10 GiB / 50 % | 65.98 | **56.09** | -15.0 % | 0 |
+
+**And that measurement makes the distinction that decides the design:**
+
+* a **write-back** *eliminates* the storage read — it saves **bandwidth**, and costs PCIe copies;
+* a **warmer** keeps the storage read and only takes its **latency** off the token path — it saves **no
+  bandwidth at all**, and on a box where the fill path is bandwidth-bound (the 56 GiB rig measures ~125 MB/s
+  effective) it competes with the critical path for the same storage queue.
+
+So the warmer is close to free when there is spare storage bandwidth and spare page cache (a big box, where a
+miss was already cheap), and it is the *wrong* instrument on a memory-tight box, which is the only place the
+campaign cares about.  A write-back is the one that helps the constrained case.  Both are worth having, for
+different boxes, and neither exists in the delivery.

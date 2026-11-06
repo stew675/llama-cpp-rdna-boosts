@@ -475,12 +475,13 @@ class TwoTier:
     every expert that reaches the arena crosses the host link once (pool->arena, or L3->pool->arena),
     and a hand-over is whatever extra copies the policy needs to move the arena victim into the pool."""
 
-    __slots__ = ("slots_a", "slots_p", "a_slot", "a_map", "a_count", "a_ghost", "a_last",
+    __slots__ = ("warm_on_evict", "slots_a", "slots_p", "a_slot", "a_map", "a_count", "a_ghost", "a_last",
                  "p_slot", "p_map", "p_last", "clock", "pclock", "last_decay",
                  "hits", "misses", "p_hits", "p_cold", "l3", "promote", "handover", "evictions",
-                 "p_evict", "rebalances")
+                 "p_evict", "rebalances", "warm", "warm_hits")
 
-    def __init__(self, t, slots_a, slots_p):
+    def __init__(self, t, slots_a, slots_p, warm_on_evict=False):
+        self.warm_on_evict = warm_on_evict
         self.slots_a = min(slots_a, t.n_experts)
         self.slots_p = min(slots_p, t.n_experts)
         self.a_slot = [-1] * self.slots_a
@@ -496,6 +497,8 @@ class TwoTier:
         self.last_decay = 0
         self.hits = self.misses = self.p_hits = self.p_cold = self.l3 = self.promote = 0
         self.handover = self.evictions = self.p_evict = self.rebalances = 0
+        self.warm = set()      # experts whose bytes were (or will be) pulled into the page cache off-path
+        self.warm_hits = 0     # misses served by such a warmed page instead of a cold storage read
 
     # -- pool helpers ---------------------------------------------------------
     def p_free(self):
@@ -542,6 +545,10 @@ class TwoTier:
         if self.slots_p > 0 and e in self.p_map:
             self.p_cold += 1
             self.p_last[e] = self.pclock
+            return
+        if e in self.warm:
+            self.warm.discard(e)            # the page cache already has it: a PCIe read, not a storage read
+            self.warm_hits += 1
             return
         self.l3 += 1
 
@@ -674,6 +681,8 @@ class TwoTier:
         if victim is not None:
             self.a_map.pop(victim, None)    # the victim leaves the arena (its bytes are overwritten below)
             self.evictions += 1
+            if self.warm_on_evict:
+                self.warm.add(victim)       # the warmer reads it into the page cache, off the critical path
             if self.slots_p <= 0:
                 pass
             elif policy == "pool-none":
@@ -791,11 +800,12 @@ def load_heat_sidecar(path, band="decode"):
 
 
 def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", period=32, admit="touch",
-               touch=2, decode_only=True, sidecar=None, rebalance=0, rebalance_heat="carry",
+               touch=2, decode_only=True, sidecar=None, rebalance=0, rebalance_heat="carry", evict_warm=False,
                rebalance_prior=None, rebalance_k=1):
     states = {}
     for key, t in tables.items():
-        states[key] = TwoTier(t, slots_a, slots_p.get(key, 0) if isinstance(slots_p, dict) else slots_p)
+        states[key] = TwoTier(t, slots_a, slots_p.get(key, 0) if isinstance(slots_p, dict) else slots_p,
+                              warm_on_evict=evict_warm)
 
     # The pool's ranking source (`pool_rank_experts_locked`): the prior, desc, ties by expert id, and
     # expert id where this table has no prior.  NEVER fall back to `heat` for a missing sidecar entry --
@@ -893,6 +903,7 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
     hits = sum(s.hits for s in states.values())
     misses = sum(s.misses for s in states.values())
     p_hits = sum(s.p_hits for s in states.values())
+    warm_hits = sum(s.warm_hits for s in states.values())
     l3 = sum(s.l3 for s in states.values())
     p_cold = sum(s.p_cold for s in states.values())
     promote = sum(s.promote for s in states.values())
@@ -922,6 +933,8 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
         # "L3 MiB saved per MiB copied" ratio -- quote THESE columns, never hand-divided ones.
         "handover_mib_per_tok": (handover_mib / tokens) if tokens else 0.0,
         "hostlink_mib_per_tok": ((promote_mib + handover_mib) / tokens) if tokens else 0.0,
+        "warm_hits": warm_hits,
+        "warm_mib_per_tok": (warm_hits * sum(tables[k].expert_bytes for k in tables) / len(tables) / 1048576.0 / tokens) if tokens else 0.0,
         "copies_per_saved": (handover_mib / max(1e-9, (l3_mib))) if l3_mib else 0.0,
         "handover_per_miss": (handover / misses) if misses else 0.0,
         "evictions": evict, "tokens": tokens,
@@ -998,6 +1011,11 @@ def main(argv=None):
                          "the ranking mismatch at once out of the SAME pass-boundary decision, so it should be "
                          "more copy-efficient than K rounds of K=1: each swap re-reads the coldest resident, "
                          "which a previous swap in the same round has already made hot.")
+    ap.add_argument("--evict-warm", action="store_true", default=False,
+                    help="model an eviction WARMER: each arena victim is pulled into the page cache off the "
+                         "critical path (a background/readahead read, nothing moved by us), so its next miss "
+                         "is a page-cache hit instead of a storage read.  The bandwidth is still spent -- it "
+                         "is reported as `warm/tok` -- but the latency is not on the token path.")
     ap.add_argument("--pool-band", choices=("all", "decode"), default="all",
                     help="which persisted counter ranks the POOL (default 'all', what the delivery uses: "
                          "`pool_rerank_from_heat_locked` ranks by the combined prefill+decode heat because the "
@@ -1129,7 +1147,7 @@ def main(argv=None):
                            period=args.period, admit=args.admit, touch=args.touch, rebalance=args.rebalance,
                            decode_only=args.decode_only, sidecar=sidecar,
                            rebalance_heat=args.rebalance_heat, rebalance_prior=prior,
-                           rebalance_k=args.rebalance_k)
+                           rebalance_k=args.rebalance_k, evict_warm=args.evict_warm)
             results[pol] = r
         pols = [p for p in pols if not p.startswith("pool-")]
     for pol in pols:

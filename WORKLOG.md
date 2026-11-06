@@ -1,3 +1,22 @@
+## 261105.019 (campaign, no delivery change) -- write-back vs page-cache warmer, priced
+
+The maintainer's question: an admitted expert's arena victim is dropped and re-read from storage; why not
+write it back, and (with mmap) why not at least warm the dropped expert into the page cache?
+
+* **The description is correct**, and the delivery does drop the victim (no write-back) — in the complement
+  case the pool does not hold it either.
+* **Why r113's refusal does not cover this case**: its `pool-swap-slot` arm had a pool that *covered* the
+  complement (0 MiB of L3 to win) and ran `-sm tensor`, where the copy is a 2-D strided
+  `cudaMemcpy2DAsync` (6 259 swaps).  The complement-scarce single-device case is 1-D and the replay says it
+  removes ~65 % of the L3 at 1.55 copies per MiB; and a write-back is **slot-neutral** (the promoted expert
+  vacated the pool slot the victim takes), so it needs no extra memory.
+* **The warmer was modelled and measured** (`--evict-warm` in the replayer): **-20.5 % / -15.7 % / -15.0 %**
+  of the storage-read traffic at 19 GiB/50 %, 19 GiB/40 %, 10 GiB/50 %, with **zero device copies**.
+* **The distinction that decides it**: a write-back *eliminates* the read and so saves **bandwidth**; a warmer
+  only moves the read's **latency** and saves no bandwidth, so on a bandwidth-bound box it competes with the
+  critical path.  The warmer is right for a big box where a miss was already cheap; the write-back is the one
+  that helps the memory-tight box the campaign cares about.  Neither exists in the delivery.
+
 ## 261105.018 (campaign, fork branch `p1-pool-rank-r223`) -- the prefill A/B and the runnable half of the gate ladder
 
 **No delivery change**; the default stays `combined`.  Record: `wip/host-expert-split/P1-POOL-RANK.md`.
