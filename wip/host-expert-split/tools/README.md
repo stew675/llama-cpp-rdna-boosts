@@ -2,7 +2,8 @@
 
 One script per arm shape, so W1/W3 in [`../PLAN.md`](../PLAN.md) are reproduced rather than re-derived.
 Every arm is meant to be run **under `scripts/gpu-watch.sh`**, which supplies the `timeout` and the flight
-record:
+record.  **Put every env prefix on the WRAPPER, never inside `--cmd`**: gpu-watch word-splits `--cmd`, so
+`FOO=1 cmd` becomes argv[0] and the arm silently never runs:
 
 ```bash
 SAMPLE_NOTE=<tag> ../../../scripts/gpu-watch.sh --out /tmp/<tag>.csv --interval 3 --rocm-every 0 \
@@ -11,10 +12,23 @@ SAMPLE_NOTE=<tag> ../../../scripts/gpu-watch.sh --out /tmp/<tag>.csv --interval 
 
 | script | shape | used for |
 |---|---|---|
-| `arm-decay.sh RANK TAG` (`LME=`, `NGEN=`, `CACHE_MIB=`, `RANK_FLOOR=` in env) | `-n 64`, `-ub 4096`, the trace config | P1's +10.6 % generation A/B (`P1-POOL-RANK.md`) |
-| `arm-prefill.sh RANK TAG` (`LME=` in env) | `-n 20`, `-ub 6144` | the prefill A/B across `-lme` 36/44/47 |
-| `arm-coherence.sh RANK TAG` (`LME=`, `SINK=` in env) | the **prose prompt**, `-n 24`, **default verbosity** | text identity.  Two traps, both measured 2026-11-06: (1) **never hash an `-lv 3` log** — its per-token timing interleaves into the generated text (1691 chars instead of 126); `-lv 2` is also unusable (WARN lines land in the captured region), so hash at **default verbosity**; (2) **the pool is built at the first decode-band pass**, so a short prompt (`-p "The capital of France is"`) never engages it — the original 9/9 claim was measured **with no pool at all**.  The arm now uses the prose prompt; pool engagement is verified out-of-band at `-lv 2` on the identical config (it cannot change the computation, only the logging), because the pool report is a WARN and default verbosity hides it.  Reference hash with the pool active: **`sha=880c932888f8`** (126 chars) |
-| `arm-batched.sh RANK TAG [LME]` (`LME=` default 44) | `llama-batched-bench -npl 1,4,8` | the batched gate.  **Runs `-lzm auto`, not `off`**: with PLE resident (~24 GiB) plus a 36.8 GiB pool and a 23 GiB arena the box over-subscribes and `npl 8` collapses from ~33.7 to 8-18 t/s (MemAvailable min 46 -> 18 GiB), which reads exactly like a policy regression and is not one |
+| `arm-decay.sh RANK TAG` (`LME=`, `NGEN=`, `CACHE_MIB=`, `RANK_FLOOR=`, `SINK=` in env) | `-n 64`, `-ub 4096`, the trace config | the headline decode A/B and the 4-arm decomposition (`P1-POOL-RANK.md`, `HANDOVER.md` §4.2) |
+| `arm-prefill.sh RANK LME TAG` (`NGEN=`, `SINK=` in env) | `-n ${NGEN:-20}`, `-ub 6144` | the prefill A/B across `-lme`.  **Use `NGEN=64` for any gen number**: a 20-token generation under-reports gen by 13-15 % (41.6 vs 35.8 ms/token — warm-up plus the pool's first ~20 decoded tokens) |
+| `arm-coherence.sh RANK LME TAG` (`NGEN=`, `SINK=` in env) | the **prose prompt**, `-n 24`, `-lv 3`, **streams split** | text identity.  Three traps, all measured: (1) **the pool is built at the first decode-band pass**, so a short prompt never engages it — the original 9/9 claim was measured **with no pool at all**; (2) this CLI logs **nothing** at its default threshold (not even ggml `WARN`), so the old vacuity check reported VACUOUS on every run *while the pool was engaged* — the arm now runs `-lv 3`; (3) the old "never hash an `-lv 2/3` log" rule was about a **merged** `2>&1` file (the per-token timing interleaves into the captured region).  The arm now runs `> OUT 2> LOG`, and because the logger writes every level to stderr while the generated text is written raw to stdout, the hashed text is byte-clean at any verbosity while the pool report lands in the log — one run proves both.  Reference hash with the pool active: **`sha=880c932888f8`** (126 chars) |
+| `arm-batched.sh RANK TAG [LME]` (`LME=` default 44, `SINK=` in env) | `llama-batched-bench -npl 1,4,8` | the batched gate.  **Runs `-lzm auto`, not `off`**: with PLE resident (~24 GiB) plus a 36.8 GiB pool and a 23 GiB arena the box over-subscribes and `npl 8` collapses from ~33.7 to 8-18 t/s (MemAvailable min 46 -> 18 GiB), which reads exactly like a policy regression and is not one |
+
+## Two knobs every arm honours, and both are measurement-critical
+
+* **`LV=`** (default 3).  **Any counter you intend to quote needs `LV=4`**: `common_log_get_verbosity()` maps
+  ggml `INFO` to `LOG_LEVEL_TRACE` (4), so at `-lv 3` every ggml counter line (`pool fills`, `prefill cache
+  staging`, `coalesced prefill reads`, `per-expert storage reads`, `scheduler pageable-master fallback`) is
+  invisible.  That is how this campaign once blamed the wrong function.  `-lv 4` costs nothing measurable.
+* **`HEATMAP=`** (default **`load`**).  The persisted prior is an **input**, not scratch state: a writable one
+  is rewritten by every run, and if the workload is the benchmark prompt the prior converges on *that prompt*
+  and the number stops measuring the delivery (measured at `-lme 36`: 26.2 t/s on a frozen real-world map vs
+  27.9 on one drifted by the benchmark's own runs).  The arms default to `MOE_EXPERT_HEATMAP=load` and the
+  sidecar is additionally `chmod 444` in the model directory, which the code itself treats as the freeze
+  signal.  `HEATMAP=1` is only for regenerating a map on purpose.
 
 Fixed for every arm, and each for a measured reason:
 `-lm mmap -lzm off` (**`LZM` overrides**; the batched arm defaults to `auto` for the memory reason above) — under `-lzm auto` the CPU-offloaded PLE tensor is mmap-lazy and

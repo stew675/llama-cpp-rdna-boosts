@@ -1,3 +1,72 @@
+## 261106.012 (campaign) -- W4 prefill read granularity (+81 % prefill at `-lme` 12); the heat prior is an INPUT; the headline was prior leakage
+
+**Fork: `p1-pool-rank-r223` + this session's work.  Nothing in `patches/`; `release.json` untouched.**  Record:
+`wip/host-expert-split/W4-SPAN-READS.md`, `HANDOVER.md`.
+
+**The disk-I/O ceiling was read SIZE, and the record had the wrong function.**  §7 of the previous handover
+blamed `moe_cache_stage_table`; with the counters visible that path *never runs* on this configuration (0 calls,
+0 declines).  The reads are `pool_prepopulate_locked` (60 624 reads / 38.5 GiB / 18.1 s = 2191 MiB/s, once at
+sizing) and the **gather pre-pass** in `moe_cache_gather_host` (at `-lme 12`: 198 723 reads, 128 GiB, **56.3 s
+of a 73 s run**).  `/proc/diskstats` at 2 Hz shows the drive pinned at ~2.1 GiB/s for 40 s against 4.2 GiB/s
+for a 16 MiB direct read and 6.7 GB/s for four concurrent streams.  One ~0.65 MiB O_DIRECT read per expert is
+latency-bound at depth 1.
+
+**The fix (`stage_span_fill`, default on, `MOE_HOST_POOL_STAGE_SPAN=0` = kill switch).**  A maximal run of >= 2
+consecutive experts in neither tier is served by one aligned O_DIRECT read of up to 16 experts (~10.9 MiB) into
+a pinned ring buffer, then one H2D per expert; the pool admission and the destination bytes are unchanged; a
+short read falls back to the per-expert path and never fails the stage.  The ring grows on demand to the
+backlog (a fixed 2-deep ring spent 5.6 s of a 16 s prefill waiting on a backlogged compute stream; 4-deep, 5.0 s;
+growing, 1.5 ms).  `SPAN_MIN = 2` is a code constant, not a knob (measured at `-lme 36`: 1 -> 362, 2 -> 379,
+4 -> 331 t/s).
+
+| `-lme` | prefill SPAN=0 | SPAN=1 | d prefill | gen (n=64) |
+|---|---|---|---|---|
+| 12 | 94.2 | **170.7** | **+81 %** | 9.9 / 9.9 |
+| 18 | 115.6 | **181.6** | **+57 %** | 12.8 / 12.9 |
+| 36 | 330.9 (3 reps +-0.9) | **375.5-378.8** (3 reps +-0.3) | **+13.5..+14.6 %** | 26.2 / 26.2 |
+
+Span reads ran at 4828 MiB/s (`-lme` 12) / 3729 MiB/s (36) against 2263-2332 MiB/s per expert; 0 fallbacks; text
+`sha=880c932888f8` identical on both arms at `-lme 12` (the budget where spans serve 168 536 experts / 108.9
+GiB); `check-gpu-faults.sh` clean.
+
+**The campaign's headline was measuring its own leakage.**  `<model>.moe-heatmap` is rewritten by every run and
+it ranks the pool's content, so the session that produced `22.6 -> 27.5 (+21.7 %)` had been re-ranking the pool
+for its own 5 298-token test prompt.  On the **frozen real-world map** (restored from `radix`, 601 376 B, 144
+tables, mode 444, sha256 `6195152358e1…`) the decomposition at `-lme 36` (`arm-decay`, `-n 64`, 2 reps) is:
+control (`combined` + `SINK=0`, = r223) **24.3**, ranking only **24.6 (+1.2 %)**, demote only **25.6 (+5.3 %)**,
+shipping **26.2 (+7.8 %)**.  The policy counters are unchanged from the old record (10 203 demoted, 6-8 %
+reuse, 326 no-free-slot), i.e. the same mechanism on a different input.  **D1 (ranking default on) is reopened:
+the demote carries the campaign, the ranking is +1.2 % single-stream and still -11.5 % prefill at npl 4.**
+Recommendation: default `MOE_HOST_POOL_RANK=combined`.  Maintainer's call.
+
+**Heat prior protocol.**  A read-only sidecar IS the freeze signal (`heat_map_open_locked`: "read-only; loading
+and seeding from it, not updating it"; the save path re-checks, so it can be frozen mid-run).  Verified with the
+map at 444 and `MOE_EXPERT_HEATMAP=1`: the run refuses to write and the sha256 is unchanged.  The arm scripts
+now default to `MOE_EXPERT_HEATMAP=load`; `HEATMAP=1` is for regenerating a map on purpose.
+
+**A real bug, fixed: a writable heat map was truncated to a 32-byte stub.**  `moe_cache_report`'s exit-time save
+walks `g_tables`, but `moe_cache_forget_all` drops them first, so any run shorter than the 60 s debounce wrote a
+header-only sidecar — a valid *empty* map that silently destroys a curated prior (it did exactly that to this
+campaign's map before the freeze).  `forget_all` now flushes the tallies before the tables go; verified: a 45 s
+run writes 601 376 B / 144 tables instead of 32 B.  **Delivery-relevant (block 09) — fold with the campaign.**
+
+**Methodology corrections.**  (1) Every ggml `INFO` counter line needs **`-lv 4`** (`INFO` maps to
+`LOG_LEVEL_TRACE`), so the arms' `-lv 3` hid `pool fills`, `prefill cache staging` and every counter this
+campaign reasons about — that is how the wrong function got blamed.  The arms now honour `LV=`.  (2)
+`arm-coherence.sh` reported VACUOUS on every run *while the pool was engaged* (default verbosity logs nothing at
+all); fixed with `-lv 3` plus a stream split (`> OUT 2> LOG`), which also retires the "never hash an `-lv 3` log"
+rule that only ever applied to a merged `2>&1` file.  (3) A 20-token generation under-reports gen by 13-15 %
+(41.6 vs 35.8 ms/token: warm-up plus the pool's first ~20 decoded tokens) — the release table's gen column must
+be `-n 64`.
+
+**Batched gate on the frozen prior** (`-lme 36`, `-lzm auto`, npl 1/4/8): npl 1 unchanged; npl 4 prefill
+1144.69 (shipping) vs 1292.88 (r223) = **-11.5 %**; npl 8 total 45.3 s vs 35.9 s (MemAvailable min 40 GiB, so
+not the memory-collapse trap).  One rep each — enough to keep D1 open, not to size the cost.
+
+Still owed: the `-lme` sweep with the frozen prior, the control curve, the prefill-logit base from the delivery
+tip (also the first proof of the `stage_table` span path, on 35B-A3B), MTP four-axis, `gate-host-pool.sh` demote
+arm, `invert` removal, per-block build, then the promotion fold into blocks 09/12.
+
 ## 261106.011 (campaign) -- session handover written; campaign state frozen for a fresh session
 
 **No code change.**  `wip/host-expert-split/HANDOVER.md` is the pick-up point for the next session: decisions

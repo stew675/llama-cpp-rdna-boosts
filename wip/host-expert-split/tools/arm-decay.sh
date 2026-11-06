@@ -11,6 +11,9 @@ export MOE_HOST_POOL_RAM_PCT=0
 export MOE_HOST_POOL_DIO=1                 # a pool miss IS a disk read, whatever the page cache holds
 export MOE_EXPERT_CACHE_MIB=${CACHE_MIB:-4096}
 export MOE_HOST_POOL_RANK=$RANK
+# The persisted prior is an INPUT, not scratch state (../HANDOVER.md §5): load+seed only.
+# `HEATMAP=1` accumulates and rewrites it -- only for regenerating a map deliberately.
+export MOE_EXPERT_HEATMAP=${HEATMAP:-load}
 if [ -n "${SINK:-}" ]; then export MOE_HOST_POOL_SINK=$SINK; fi   # unset = the binary default
 if [ -n "${PERIOD:-}" ]; then export MOE_EXPERT_CACHE_PERIOD=$PERIOD; fi   # unset = the binary default
 if [ -n "${SINK_SPARE:-}" ]; then export MOE_HOST_POOL_SINK_SPARE=$SINK_SPARE; fi   # unset = auto (4 % of slots)
@@ -23,7 +26,7 @@ LOG=/tmp/arm-decay-$TAG.log
   -ot 'per_layer_token_embd.*=CPU' \
   -lm mmap -lzm ${LZM:-off} -fa on -c 8192 -ub 4096 \
   -f "$HOME/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt" \
-  -n ${NGEN:-64} --seed 42 --temp 0 --no-display-prompt --single-turn -lv 3 > "$LOG" 2>&1 &
+  -n ${NGEN:-64} --seed 42 --temp 0 --no-display-prompt --single-turn -lv ${LV:-3} > "$LOG" 2>&1 &
 PID=$!
 # a wrapper that is killed (a bare `timeout` on this script) must not orphan the model: it
 # would hold the whole VRAM and OOM the next arm (measured, 2026-11-06).

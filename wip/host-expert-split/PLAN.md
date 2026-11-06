@@ -254,7 +254,15 @@ mirror it is **inert or disabled** (S3: there is nothing to win and the copies a
 **Accept for B to ship:** it is ≥ 5 % better than A at the below-complement budgets and no worse anywhere —
 which the P1 record already suggests.
 
-### W4 — the mmap-only warmer (optional, only after W3)
+### W4 — prefill read granularity — **DONE 2026-11-06** (see `W4-SPAN-READS.md`)
+
+Coalesced the per-expert prefill reads into one read per run-of-missing-experts: **+81 % prefill at `-lme` 12,
++57 % at 18, +14 % at 36**, generation unchanged, text byte-identical, 0 fallbacks, no GPU faults.  Default on
+(`MOE_HOST_POOL_STAGE_SPAN=0` = kill switch).  The record also corrects where the reads were (`moe_cache_stage_table`
+never ran; the gather pre-pass and the pool prepopulate are the sites) and found that every ggml counter line
+needs `-lv 4`.
+
+### W4b — the mmap-only warmer (optional, deferred)
 
 `MOE_HOST_POOL_WARM`: on arena eviction, `posix_fadvise(POSIX_FADV_WILLNEED)` on the victim's file range.  No
 thread (the tree already does this in `llama-lazy-reader.cpp`, `llama-mmap.cpp`, `qwen4exp.cpp`), **armed only
@@ -262,6 +270,15 @@ in buffered fill mode** (`pool_decide_dio_locked` resolves it), self-disabling o
 evictions, warmed pages found non-resident (`mincore`), or reclaim pressure (`/proc/vmstat` `pgscan`/`pgsteal`)
 rising while armed.  Long window, one-way latch per session — the idiom `g_pinned_off` / `g_heat_dead` already
 use.  **Never presented as a fix for the constrained case**: it moves latency, not bytes (S8).
+
+### W5 — promotion path — **started 2026-11-06**
+### D1 reopened (2026-11-06, W4 session)
+
+The ranking's `+11.1 %` was **prior leakage**: it was measured against a heat map that the session's own short
+benchmark runs had rewritten, so the pool had been ranked for the test prompt.  On a frozen real-world map the
+same decomposition at `-lme 36` is **control 24.3 → ranking only 24.6 (+1.2 %) → demote only 25.6 (+5.3 %) →
+shipping 26.2 (+7.8 %)**, while the batched gate still costs the ranking `-11.5 %` prefill at npl 4.
+**Recommendation: default `MOE_HOST_POOL_RANK=combined` (demote stays on).  Maintainer's call.**
 
 ### W5 — promotion path, if and only if one arm wins
 
