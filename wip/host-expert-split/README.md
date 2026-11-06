@@ -1,7 +1,11 @@
 # wip/host-expert-split - the split between pool, arena and page cache (and whether a swap can ever beat a layout)
 
-**Status: OPEN - scoping note (2026-11-05).  Nothing implemented, nothing in `patches/`, nothing applied to the
-fork.  Re-opens a shape that was measured and refuted in r113, for a narrower reason and with a cheaper gate.**
+**Status: OPEN - review + design done (2026-11-05), nothing implemented, nothing in `patches/`, nothing applied
+to the fork.  Re-opens a shape that was measured and refuted in r113, for a narrower reason and with a cheaper
+gate.**  PR #267 is reviewed and the convergence plan is written in [`DESIGN.md`](DESIGN.md): the delta worth
+testing is the **arena's eviction sink** (the tier is the arena's complement, an admission is a swap), *not* the
+PR's `--host-experts mmap` mode or its sparse registration.  Step 1 (the offline replay) is waiting on one
+bounded trace run — the only GPU run this campaign needs before deciding.
 
 **What this is.**  `briansp2020`'s host tier is an extension of the VRAM arena: experts are swapped to it on
 evict, so a miss never leaves RAM.  Ours is a LAYOUT: the pool's content is chosen up front as the arena's
@@ -50,11 +54,14 @@ of uncovered bytes cost 8.8 s).  If a miss were a single PCIe copy of one expert
 
 ## 3. The work, in the order I would take it
 
-1. **Offline replay first, three miss models.**  On this model's heat map, replay the decode trace with the
-   two-tier split under (a) today's bounce-ring cost, (b) a single-expert PCIe copy cost, (c) a free miss (the
-   page-cache shape Brian's design gets).  *Accept:* a curve of "best split vs miss cost" and a yes/no on whether
-   any partial split can beat the mirror at 56 GiB.  If the ranking does not move, park the campaign here - that
-   is the cheap, honest outcome, and it is the same shape of result r113 produced.
+1. **Offline replay first, three miss models — DONE 2026-11-05**, see [`STEP1-REPLAY.md`](STEP1-REPLAY.md).
+   On this model's heat map, replay the decode trace with the two-tier split under (a) today's bounce-ring
+   cost, (b) a single-expert PCIe copy cost, (c) a free miss (the page-cache shape Brian's design gets).
+   *Result:* where the pool covers the arena's complement the sink gains nothing and pays 5-6 MiB/token of
+   extra copies (r113 reproduces); below the complement the sink cuts L3 by 33-74 %, but most of that gap is
+   a **tool artefact** (`pool-none` never models the shipped "complement, then mirror residents" re-rank),
+   and the one genuine advantage is a **degraded prior** (no `.moe-heatmap`: 35.9 -> 26.0 MiB/token).  So the
+   surviving cases are the PR's own (same speed, fewer pinned bytes) and robustness — neither is throughput.
 2. **Make a miss cheap, measured alone.**  A single-expert staging path (one reusable pinned staging buffer per
    device, or the pool alias when the expert happens to be resident) instead of the per-table bounce ring.
    *Accept:* 50k prefill at 92 % coverage within 5 % of the mirror, with the mirror row unmoved.

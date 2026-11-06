@@ -11,6 +11,13 @@ and this tool replays it (stdlib only, no model, no GPU).  See `ENVIRONMENT.md`
 (`MOE_EXPERT_TRACE`) for the file format, and `benchmarks/moe-cache-coverage/` for the study that
 this tool was built for.
 
+Two-tier policies (`--pool-frac`, what happens to the arena victim) are `pool-none`, `pool-retire`,
+`pool-shipped`, `pool-swap-slot`, `pool-swap-weakest` and **`pool-layout`** -- the LAST is the delivered
+policy: the arena is heat-seeded and the pool is RE-LAID OUT at the first scored pass as the arena's
+complement plus its mirrored residents (`pool_rerank_from_heat_locked`).  Read a comparison against
+`pool-none`/`pool-retire` as a lower bound for the delivery: neither models that re-rank, so both carry the
+L3 cost of a pool that no longer matches the arena's actual residency.
+
 Policies scored (all on the same trace, same arena):
 
   shipped   the delivered policy: per-table uniform slots, F-LRU eviction with a decay period,
@@ -471,7 +478,7 @@ class TwoTier:
     __slots__ = ("slots_a", "slots_p", "a_slot", "a_map", "a_count", "a_ghost", "a_last",
                  "p_slot", "p_map", "p_last", "clock", "pclock", "last_decay",
                  "hits", "misses", "p_hits", "p_cold", "l3", "promote", "handover", "evictions",
-                 "p_evict")
+                 "p_evict", "rebalances")
 
     def __init__(self, t, slots_a, slots_p):
         self.slots_a = min(slots_a, t.n_experts)
@@ -488,7 +495,7 @@ class TwoTier:
         self.pclock = 0
         self.last_decay = 0
         self.hits = self.misses = self.p_hits = self.p_cold = self.l3 = self.promote = 0
-        self.handover = self.evictions = self.p_evict = 0
+        self.handover = self.evictions = self.p_evict = self.rebalances = 0
 
     # -- pool helpers ---------------------------------------------------------
     def p_free(self):
@@ -537,6 +544,78 @@ class TwoTier:
             self.p_last[e] = self.pclock
             return
         self.l3 += 1
+
+    def rebalance(self, mode="carry", prior_row=None, k=1):
+        """Up to `k` swaps in one round: the hottest POOL expert that is not resident takes the COLDEST arena
+        slot, and only if it is hotter than that slot's resident.  The counters travel with the bytes, so the
+        decision uses exactly what the cache already keeps: `a_count` (decaying uses while resident) and
+        `a_ghost` (decaying demand while not resident).  Returns the extra copies paid (2 per swap: the victim
+        D2H and the promotion H2D -- a later miss would have paid the H2D anyway, but here it is proactive).
+
+        This is the maintainer's proposal (2026-11-05) and it is the cheapest possible demote: unlike
+        `pool-swap-slot` it never moves a victim merely because something was demanded, so a routing detour
+        cannot churn the tier, and unlike the layout it can repair a prior that guessed wrong.
+
+        `k > 1` repairs more of the ranking mismatch out of the SAME pass-boundary decision.  Each iteration
+        re-reads the coldest resident, which the previous swap has already replaced with a hot expert, so the
+        round terminates early (`_rebalance_one` returns 0) once the guard refuses."""
+        paid = 0
+        for _ in range(max(1, k)):
+            n = self._rebalance_one(mode, prior_row)
+            if n == 0:
+                break          # the guard refused: nothing left to repair in this round
+            paid += n
+        return paid
+
+    def _rebalance_one(self, mode, prior_row):
+        if self.slots_a <= 0 or self.slots_p <= 0:
+            return 0
+        heat = (lambda e: prior_row[e]) if mode == "prior" and prior_row else \
+               (lambda e: self.a_ghost[e])
+        v_best, v_slot = None, -1
+        for s in range(self.slots_a):
+            e = self.a_slot[s]
+            if e < 0:
+                continue
+            if v_best is None or self.a_count[e] < self.a_count[v_best] or \
+                    (self.a_count[e] == self.a_count[v_best] and self.a_last[e] < self.a_last[v_best]):
+                v_best, v_slot = e, s
+        if v_best is None:
+            return 0
+        c_best = None
+        for e in self.p_map:
+            if e in self.a_map:
+                continue
+            if c_best is None or heat(e) > heat(c_best) or (heat(e) == heat(c_best) and e < c_best):
+                c_best = e
+        v_heat = prior_row[v_best] if (mode == "prior" and prior_row) else self.a_count[v_best]
+        if c_best is None:
+            return 0
+        if mode != "blind" and heat(c_best) <= v_heat:
+            return 0   # `blind` = the guard-off A/B arm: always rotate, whatever the heat says
+        p_slot = self.p_map.pop(c_best, -1)
+        if 0 <= p_slot < self.slots_p and self.p_slot[p_slot] == c_best:
+            self.p_slot[p_slot] = -1
+        old = self.a_count[v_best]
+        self.a_map.pop(v_best, None)
+        self.a_slot[v_slot] = c_best
+        self.a_map[c_best] = v_slot
+        if mode == "carry":
+            # the hotness travels with the expert, between the two counters
+            self.a_count[c_best] = max(self.a_count[c_best], self.a_ghost[c_best])
+        else:
+            # the SHIPPED bookkeeping: an admission starts the resident count from 1 ...
+            self.a_count[c_best] = 1
+        self.a_last[c_best] = self.clock
+        self.a_ghost[c_best] = 0
+        self.a_count[v_best] = 0
+        # ... and an eviction does NOT remember what the victim had demonstrated while resident
+        self.a_ghost[v_best] = max(self.a_ghost[v_best], old) if mode == "carry" else 0
+        if 0 <= p_slot:
+            self.pclock += 1
+            self.p_put(p_slot, v_best)
+        self.rebalances += 1
+        return 2
 
     def access(self, e, policy, protect, period, admit, touch):
         self.clock += 1
@@ -712,57 +791,92 @@ def load_heat_sidecar(path, band="decode"):
 
 
 def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", period=32, admit="touch",
-               touch=2, decode_only=True, sidecar=None):
+               touch=2, decode_only=True, sidecar=None, rebalance=0, rebalance_heat="carry",
+               rebalance_prior=None, rebalance_k=1):
     states = {}
     for key, t in tables.items():
         states[key] = TwoTier(t, slots_a, slots_p.get(key, 0) if isinstance(slots_p, dict) else slots_p)
+
+    # The pool's ranking source (`pool_rank_experts_locked`): the prior, desc, ties by expert id, and
+    # expert id where this table has no prior.  NEVER fall back to `heat` for a missing sidecar entry --
+    # that silently turns a sidecar measurement into the oracle's number (the r114 correction).
+    base_init = pool_init[:-len("-complement")] if pool_init.endswith("-complement") else pool_init
+    complement = pool_init.endswith("-complement")
+
+    def pool_order(key, t):
+        if base_init == "heat":
+            # The ORACLE prior (this trace's own counts) -- an upper bound, never the achievable one.
+            order = [e for e, _ in sorted(t.freq.items(), key=lambda kv: -kv[1])]
+            return order + [e for e in range(t.n_experts) if t.freq.get(e, 0) == 0]
+        prior = (sidecar or {}).get(key) if base_init == "sidecar" else None
+        if prior is not None and len(prior) == t.n_experts:
+            return sorted(range(t.n_experts), key=lambda e: (-prior[e], e))
+        return list(range(t.n_experts))
+
+    def lay_pool(key, st, t, mirror_residents):
+        """Lay the pool out over its slots.  `mirror_residents` is the shipped re-rank
+        (`pool_rerank_from_heat_locked`): the COMPLEMENT first, then the arena-resident experts in the same
+        rank order while capacity remains.  Without it a pool that no longer matches the arena's actual
+        residency is never repaired -- which is what made the old `pool-none` row read 2-4x too much L3."""
+        order = pool_order(key, t)
+        if mirror_residents:
+            order = [e for e in order if e not in st.a_map] + [e for e in order if e in st.a_map]
+        else:
+            order = [e for e in order if e not in st.a_map]
+        for s_ in range(st.slots_p):
+            st.p_slot[s_] = -1
+        st.p_map.clear()
+        for s_, e_ in enumerate(order[:st.slots_p]):
+            st.p_slot[s_] = e_
+            st.p_map[e_] = s_
+            st.p_last[e_] = 0
 
     # Initial pool content: the load-time prewarm.  `heat` is the ORACLE prior (ranked by the whole
     # trace's routing), `id` is what a prewarm with no tally does, `none` starts empty (the prefill
     # then fills it in staging order, which is expert id order).
     if pool_init != "none":
-        complement = pool_init.endswith("-complement")
-        base_init = pool_init[:-len("-complement")] if complement else pool_init
         for key, t in tables.items():
             st = states[key]
             if st.slots_p <= 0:
                 continue
-            prior = None
-            prior = None
-            if base_init == "sidecar":
-                prior = (sidecar or {}).get(key)
-                if prior is None or len(prior) != t.n_experts:
-                    prior = None
-            if base_init == "heat":
-                # The ORACLE prior (this trace's own counts) -- an upper bound, never the achievable one.
-                order = [e for e, _ in sorted(t.freq.items(), key=lambda kv: -kv[1])]
-                order += [e for e in range(t.n_experts) if t.freq.get(e, 0) == 0]
-            elif prior is not None:
-                # ranked by the persisted counter, ties by expert id (exactly `pool_prepopulate_locked`)
-                order = sorted(range(t.n_experts), key=lambda e: (-prior[e], e))
-            else:
-                # No prior for this table: the delivery's next rank source is the prefill tally, then expert
-                # id (`pool_rank_experts_locked`).  NEVER fall back to `heat` here -- that silently turns a
-                # sidecar measurement into the oracle's number.
-                order = list(range(t.n_experts))
-            if complement:
+            if complement or policy == "pool-layout":
                 # The real system heat-seeds the ARENA at sizing, so the pool's job is the complement of
                 # the arena, ranked by the same prior: that is what makes arena U pool cover the set.
-                for s_, e_ in enumerate(order[:st.slots_a]):
+                for s_, e_ in enumerate(pool_order(key, t)[:st.slots_a]):
                     st.a_slot[s_] = e_
                     st.a_map[e_] = s_
-                order = [e for e in order if e not in st.a_map]
-            for s, e in enumerate(order[:st.slots_p]):
-                st.p_slot[s] = e
-                st.p_map[e] = s
-                st.p_last[e] = 0
+            # `pool-layout` also mirrors the arena's residents into whatever capacity the complement does
+            # NOT use -- without that a budget ABOVE the complement leaves slots EMPTY at init (a 100 %
+            # budget left 220 of 512 empty and read 16.6 MiB/token), which the shipped re-rank never does.
+            lay_pool(key, st, t, mirror_residents=(policy == "pool-layout"))
 
+    # `pool-layout` = the SHIPPED policy: the arena is heat-seeded, and at the first scored pass the pool is
+    # re-laid out as the arena's complement plus its mirrored residents (`pool_rerank_from_heat_locked`).
+    # Without this relayout the pool keeps the set it was prewarmed with, the arena drifts away from its seed,
+    # and the residual L3 reads are attributed to the policy instead of to the missing re-rank: that is what
+    # made the old `pool-none` row read 26.1 MiB/token where the shipped cache reads the uncovered fraction.
+    relayout_pending = policy == "pool-layout"
+    scored_pass = 0
     tokens = 0
     for p in passes:
         band_tokens = p[0].n_tok if p else 0
         is_decode = band_tokens <= 64
         if is_decode:
             tokens += band_tokens
+        # `--rebalance N`: every N scored passes, give each table one hottest-pool/coldest-arena swap if the
+        # pool side is hotter.  Applied AFTER the pass whose index is a multiple of N has run (a pass boundary
+        # is where the shipped cache does its own policy work, and where a graph is not in flight).
+        if rebalance > 0 and (is_decode or not decode_only) and scored_pass % rebalance == 0 and scored_pass > 0:
+            for k_, st_ in states.items():
+                row = (rebalance_prior or {}).get(k_) if rebalance_heat == "prior" else None
+                st_.handover += st_.rebalance(mode=rebalance_heat, prior_row=row, k=rebalance_k)
+        if is_decode or not decode_only:
+            scored_pass += 1
+        if relayout_pending and (is_decode or not decode_only):
+            for key_, t_ in tables.items():
+                if states[key_].slots_p > 0:
+                    lay_pool(key_, states[key_], t_, mirror_residents=True)
+            relayout_pending = False
         for r in p:
             key = (r.layer, r.role)
             st = states.get(key)
@@ -802,6 +916,13 @@ def score_pool(tables, passes, slots_a, slots_p, policy, pool_init="heat", perio
         "l3": l3, "l3_mib": l3_mib, "l3_mib_per_tok": (l3_mib / tokens) if tokens else 0.0,
         "promote_mib": promote_mib, "handover_mib": handover_mib,
         "hostlink_mib": promote_mib + handover_mib,
+        # PER-TOKEN columns, using the same `tokens` denominator as `l3_mib_per_tok` (the DECODE band only:
+        # a prefill position never reaches the cache's access path).  Dividing by the trace's total token
+        # count instead understates this by ~6x on a 5k-token prompt and silently inflates any
+        # "L3 MiB saved per MiB copied" ratio -- quote THESE columns, never hand-divided ones.
+        "handover_mib_per_tok": (handover_mib / tokens) if tokens else 0.0,
+        "hostlink_mib_per_tok": ((promote_mib + handover_mib) / tokens) if tokens else 0.0,
+        "copies_per_saved": (handover_mib / max(1e-9, (l3_mib))) if l3_mib else 0.0,
         "handover_per_miss": (handover / misses) if misses else 0.0,
         "evictions": evict, "tokens": tokens,
         "resident_mib": resident, "pool_resident_mib": pool_res,
@@ -861,6 +982,22 @@ def main(argv=None):
                     help="model `--host-experts pool`: a pinned L2 of this %% of each table's experts in "
                          "front of the arena.  Selects the two-tier policy family (pool-*) and is REQUIRED "
                          "for them")
+    ap.add_argument("--rebalance", type=int, default=0, metavar="N",
+                    help="every N scored passes, swap each table's COLDEST arena resident with its HOTTEST "
+                         "non-resident pool expert, but only if the pool expert is hotter (decaying "
+                         "`a_ghost` > `a_count`).  0 = off.  A rate-limited, conditional demote: it repairs a "
+                         "prior that guessed wrong without churning the tier on every admission.")
+    ap.add_argument("--rebalance-heat", choices=("carry", "reset", "prior", "blind"), default="carry",
+                    help="which heat the `--rebalance` swap compares: 'carry' transfers the hotness between "
+                         "the resident (`count`) and non-resident (`ghost`) counters as the bytes move; 'reset' "
+                         "is the SHIPPED bookkeeping (an admission starts `count` at 1, an eviction forgets "
+                         "what the victim demonstrated); 'prior' compares the static persisted prior instead "
+                         "of either decayed counter (the `heat`/`heat_dec` vector).")
+    ap.add_argument("--rebalance-k", type=int, default=1, metavar="K",
+                    help="swaps per table per `--rebalance` round (default 1).  A round at K>1 repairs more of "
+                         "the ranking mismatch at once out of the SAME pass-boundary decision, so it should be "
+                         "more copy-efficient than K rounds of K=1: each swap re-reads the coldest resident, "
+                         "which a previous swap in the same round has already made hot.")
     ap.add_argument("--pool-init", default="heat",
                     help="initial host-pool content: 'heat' = ranked by this trace's routing (an ORACLE "
                          "prior, the best any prior can do), 'id' = expert order (a tally-less prewarm, "
@@ -981,8 +1118,10 @@ def main(argv=None):
         slots_p = {k: min(int(t.n_experts * args.pool_frac / 100), t.n_experts) for k, t in tables.items()}
         for pol in pool_pols:
             r = score_pool(tables, passes, uni, slots_p, pol, pool_init=args.pool_init,
-                           period=args.period, admit=args.admit, touch=args.touch,
-                           decode_only=args.decode_only, sidecar=sidecar)
+                           period=args.period, admit=args.admit, touch=args.touch, rebalance=args.rebalance,
+                           decode_only=args.decode_only, sidecar=sidecar,
+                           rebalance_heat=args.rebalance_heat, rebalance_prior=prior,
+                           rebalance_k=args.rebalance_k)
             results[pol] = r
         pols = [p for p in pols if not p.startswith("pool-")]
     for pol in pols:
@@ -1003,15 +1142,15 @@ def main(argv=None):
 
     bound = static_bound(tables, arena_bytes)
     if pool_pols and not args.quiet:
-        hdr = "%-17s %8s %8s %8s %11s %11s %11s" % ("pool policy", "h", "pool_h", "L3/MiB", "L3 MiB/tok",
-                                                     "handover MiB", "hostlink MiB")
+        hdr = "%-17s %8s %8s %8s %11s %9s %9s" % ("pool policy", "h", "pool_h", "L3/MiB", "L3 MiB/tok",
+                                                   "copy/tok", "link/tok")
         print(hdr)
         print("-" * len(hdr))
         for pol in pool_pols:
             r = results[pol]
-            print("%-17s %8.4f %8.4f %8d %11.3f %11.1f %11.1f"
-                  % (pol, r["h"], r["pool_h"], r["l3"], r["l3_mib_per_tok"], r["handover_mib"],
-                     r["hostlink_mib"]))
+            print("%-17s %8.4f %8.4f %8d %11.3f %9.2f %9.2f"
+                  % (pol, r["h"], r["pool_h"], r["l3"], r["l3_mib_per_tok"],
+                     r["handover_mib_per_tok"], r["hostlink_mib_per_tok"]))
         print("(L3 = experts in NEITHER tier: the disk reads a pool policy exists to remove; "
               "handover = the extra device copies a policy pays to keep the pool useful)")
         print()

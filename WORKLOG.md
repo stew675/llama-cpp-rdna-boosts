@@ -1,3 +1,70 @@
+## 261105.015 (campaign, no delivery change) -- `wip/host-expert-split/` step 1: the trace, the replay, two replayer fixes, and the answer to "is a swap worth it"
+
+**No delivery change.**  `patches/`, `release.json` and the tag are untouched.
+
+* **The trace** (one bounded `llama-cli` run, 1 R9700, no all-reduce, no drafter, 83 s) is in
+  `wip/host-expert-split/STEP1-REPLAY.md` with the full grid.  Model calibration: `h` 0.6117 against the run's
+  own turn counter 0.6300.
+* **Two replayer defects found and fixed** (`scripts/moe-trace-replay.py`, `scripts/README.md`):
+  (a) `--pool-init sidecar-complement` leaves slots EMPTY when the budget exceeds the arena's complement, which
+  the shipped re-rank never does — the new **`pool-layout`** policy models the delivery (heat-seeded arena, pool
+  re-laid out as complement + mirrored residents at the first decode pass) and reproduces the measured mirror
+  (0.00 MiB/token of L3, as `wip/bench-56gb/RESULTS.md` measured); `pool-none` read 16.6 for the same budget.
+  (b) the pool table's copy columns are now per-token from the tool's own decode-band denominator — dividing by
+  the trace's total token count inflated every "MiB saved per MiB copied" ratio ~5.7x and inverted a ranking
+  for an hour of this session.
+* **The answer.**  A swap is worth it **exactly where an arena miss would be expensive**: it removes ~1 MiB of
+  L3 per 1.55 MiB of extra PCIe copy (0.65 MiB saved per MiB copied), so on a 56 GiB disk-bound box it is
+  decisive and on a page-cached box it is ~+9 %.  At a budget that covers the complement it removes nothing and
+  costs 5-6 MiB/token: r113 stands, and so does PR #267's own -3 %.
+* **The maintainer's periodic conditional swap** (every N rounds, coldest arena vs hottest pool, only if
+  hotter; K per round) was modelled as `--rebalance`: it is **4-5x less copy-efficient than the on-demand sink**
+  (0.12-0.18 against 0.65), K=4 is *worse* than K=1, and converted to time it is **negative on a page-cached
+  box**.  The guard is doing real work (guard off costs 3.3x the copies); the counter-transfer subtlety is not
+  (`carry`/`reset`/`prior` are identical on this trace, because after decay every resident's count sits at 0-1).
+  Reported, not adopted.
+* **Next**: no C1 until the open question in `STEP1-REPLAY.md` §5.4 is answered — our arena holds 93.5 % at 43 %
+  of the set while a 50 %-of-the-set prior-ranked complement answers only 56 % of its misses, where the
+  coverage arithmetic predicts ~88 %.  If that is the prior being weak, the fix is `pool_rerank_from_heat_locked`
+  and a demote buys little; if it is the replay's arena drift, the demote is worth building.  That is one
+  measurement on the 56 GiB rig, and it decides the campaign.
+
+## 261105.014 (campaign, no delivery change) -- `wip/host-expert-split/` opened: PR #267 reviewed and designed; `scripts/gpu-watch.sh` added after a hard lockup
+
+**No delivery change.**  `patches/`, `release.json` and the tag `v16-6050b467c-r223` are untouched.  This
+starts the campaign `wip/CAMPAIGNS.md` had as a scoping note and adds one tool.
+
+* **PR #267 reviewed** (`@briansp2020`, `wip-mmap-host-experts-r204`, head `691108ffab8d`, 10 patches on
+  **r204**, ~2 600 lines): `--host-experts mmap` + an 873-line sparse registration of a file alias, a **RAM
+  tier** that holds exactly the arena's non-resident experts with a one-spare swap-on-admission, K spare RAM
+  slots with a **copy-back-ahead** side stream, and one pin budget with a partial tier by hotness.  The review
+  and the convergence plan are `wip/host-expert-split/DESIGN.md`.  **No patch applies as-is** (r209-r223 moved
+  every file it touches).
+* **The delta is smaller than the PR implies.**  Since r223 the placement is one budget (`-lme [auto|N]`;
+  `--host-experts` is a deprecated alias), and below the host expert set `-lme N` *is* a per-expert pinned pool
+  laid out as the arena's complement with in-place cold reads and a promote path.  So the only missing
+  direction is **demote**: an arena eviction drops its victim instead of parking it in the pool slot the
+  promoted expert vacated.  That is one call site, not a tier.  The PR's `mmap` mode and its sparse
+  registration are **not** adopted first (the win being chased — a cheap miss — is bought by demote alone).
+* **Why r113 is not simply repeated.**  Its refutation of the literal swap was measured on `-sm tensor`,
+  where an axis-0 slice makes the copy a 2-D strided `cudaMemcpy2DAsync` (6 259 swaps = 2× decode), and with a
+  pool that already covered the complement (nothing left to win on L3).  The PR is single-device and 1-D, and
+  the open case is a pool **below** the complement on a 56 GiB box, where a miss is a file read.
+* **Step 1 is the offline replay** (`scripts/moe-trace-replay.py`; `pool-swap-slot`/`pool-swap-weakest` are his
+  shape, `pool-none`/`pool-retire` are ours) across three miss models.  The command line was smoke-tested on a
+  synthetic trace; it needs **one** bounded trace run, which is held pending the maintainer's go-ahead.
+* **`scripts/gpu-watch.sh` added.**  On 2026-11-05 this box locked up with a R9700 pinned at 100 % and had to be
+  power-cycled, and the kernel journal recorded **nothing** — the previous boot's last line was ~70 min before
+  the end (no ring timeout, no `GPU reset begin!`, no OOM, no hung-task trace), and no build or benchmark from
+  this session was running.  An out-of-band 2 s sampler is the only evidence that survives that, so every long
+  arm now runs under `gpu-watch.sh --cmd` (sysfs GPU-use/VRAM + `MemAvailable`/`Shmem`/`Mlocked` + the llama
+  pids, `rocm-smi` every N ticks as the cross-check, a kernel-log snapshot on exit).  Indexed in
+  `scripts/README.md`; it is a flight recorder, not a fault check (`check-gpu-faults.sh` keeps that job).
+
+Open, waiting on the maintainer: the go-ahead for the one trace run; whether a demote is in scope for
+`-sm tensor` (a 2-D strided copy there is the r113 mechanism) or 1-D only; and the `gate-host-pool.sh`
+extension a demote implies (a failed demote must DECLINE, the same rule the failed fill already has).
+
 ## 261105.013 (r223 addendum, no delivery change) -- the per-block ladder and the GPU-fault scan, taken after the tag
 
 **No delivery change.**  `patches/`, `release.json`, the tag `v16-6050b467c-r223` (tip `37148d118`, tree
