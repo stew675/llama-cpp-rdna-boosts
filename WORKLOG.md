@@ -1,3 +1,34 @@
+## 261106.006 (campaign) -- batched gate re-run with the demote: it repairs half of the ranking's 4-slot loss
+
+**Fork only.**  The batched gate had only ever been measured for the ranking, so it was re-run with the
+demote present.  `-lme 36`, `-lzm auto`, npl 1/4/8, one R9700:
+
+| arm | npl 1 | npl 4 | npl 8 |
+|---|---|---|---|
+| `combined`, no demote | 26.22 | **50.07** | 33.72 |
+| `decode`, no demote | 24.89 (-5.1 %) | 43.46 (**-13.2 %**) | 33.64 |
+| `decode` + demote | 25.21 (-3.8 %) | 45.90 (-8.3 %) | 33.53 |
+| `combined` + demote | **26.70** (+1.8 %) | 49.60 (-0.9 %) | 33.81 |
+
+**The demote repairs about half of the ranking's 4-slot loss and no more**, which splits the default
+decision cleanly:
+
+* **the demote is safe in every cell measured** -- +7.5 % single-stream, +1.8/-0.9/+0.3 % at npl 1/4/8 --
+  so it is a defensible default-on with an env kill-switch once its gates pass;
+* **the ranking stays opt-in** -- +11.1 % single-stream, -13.2 % at 4 slots.  Its sign is workload-dependent
+  and the demote does not rescue it.  That conclusion survives this round.
+
+**Two of my own bugs surfaced on the way, both of which looked like policy results:**
+
+1. `pool_free_slot_locked` did a full count pass over 56 592 slots on EVERY fill (the reserve check), i.e.
+   ~10^9 iterations a run, on the `SINK=0` path too.  Fixed: the count only happens when a reserve is asked
+   for; otherwise it is the original single scan.
+2. The batched arm had been switched to `-lzm off` by me earlier, which makes PLE resident (~24 GiB).  With
+   a 36.8 GiB pool and a 23 GiB arena the box over-subscribes and **npl 8 collapses from 33.7 to 8-18 t/s**
+   (MemAvailable min 46 -> 18 GiB).  That is indistinguishable from a policy regression in the numbers.
+   `arm-batched.sh` now defaults `LZM=auto`; the single-user arms keep `-lzm off`, where the PLE confound
+   matters and the memory does not.  Recorded in `tools/README.md` and `PLAN.md`.
+
 ## 261106.005 (campaign) -- decay knee located: a plateau 32-64 with 32 at its top edge
 
 Filled in the decay curve between 16 and 64 (2 runs each at 24/28/32, single runs elsewhere),

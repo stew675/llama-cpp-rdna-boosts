@@ -167,6 +167,27 @@ change nothing else.
 > rests on the mechanism plus throughput, not on a printed counter.  Making the report print `cold_reaches`/
 > `cold_bytes` unconditionally and re-running 16 vs 32 would settle it.
 >
+> **Batched gate re-run WITH the demote (2026-11-06)** -- the ranking's 4-slot loss is only half repaired, so
+> the default decision splits in two.  `-lme 36`, `-lzm auto`, npl 1/4/8:
+>
+> | arm | npl 1 | npl 4 | npl 8 |
+> |---|---|---|---|
+> | `combined`, no demote | 26.22 | **50.07** | 33.72 |
+> | `decode`, no demote | 24.89 (-5.1 %) | 43.46 (**-13.2 %**) | 33.64 |
+> | `decode` + demote | 25.21 (-3.8 %) | 45.90 (-8.3 %) | 33.53 |
+> | `combined` + demote | **26.70** (+1.8 %) | 49.60 (-0.9 %) | 33.81 |
+>
+> * **The demote is safe in every cell** (+7.5 % single-stream, +1.8/-0.9/+0.3 % at npl 1/4/8) -> a
+>   defensible **default-on** with an env kill-switch, once its gates pass.
+> * **The ranking stays opt-in**: +11.1 % single-stream but -13.2 % at 4 slots.  Its sign is workload
+>   dependent and the demote only recovers half of the 4-slot loss.  That conclusion survives the demote.
+>
+> **Methodology trap, recorded because it cost a whole measurement round:** the batched arm must not run
+> `-lzm off`.  PLE becomes resident (~24 GiB) and with a 36.8 GiB pool + 23 GiB arena the box
+> over-subscribes, so `npl 8` collapses (33.7 -> 8-18 t/s, MemAvailable min 46 -> 18 GiB).  The collapse
+> looks exactly like a policy regression.  `arm-batched.sh` therefore defaults `LZM=auto`; the single-user
+> arms keep `-lzm off` because there the PLE confound matters and the memory does not.
+>
 > Owed: the reserve as a *fraction* of slots (K=16 is tuned to 512 experts/table); an `allow_empty_fill` A/B
 > now that the reserve protects the headroom; the batched gate; the MTP four-axis; the prefill-logit gate;
 > and **W3**, the `-lme` 30->47 sweep, which is the only place the "does the demote buy back pinned bytes"
