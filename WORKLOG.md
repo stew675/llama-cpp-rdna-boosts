@@ -1,3 +1,43 @@
+## 261106.001 (campaign) -- W1: the swap's marginal cost, and the batched/lazy methodology corrections
+
+**No delivery change.**  Three things, in the order they mattered.
+
+**1. The `-npl 8 +20.8 %` is retracted.**  Three alternating repeats give +0.96 % (per-rep +4.06 / +0.03 /
+-1.20) with the pool hit rate identical to three decimals -- at `-lme 44` the pool is 94 % of the set, i.e.
+nearly a mirror, where the ranking is inert by construction.  The original pair compared a cold first run with
+a warm second one.  Methodology rule added to `PLAN.md`: `llama-batched-bench` is a **gate**, never a
+tie-breaker; decisions are made on the single-user cells.  The reason is measured: at `-lme 36` the ranking is
+**+9.6 %** single-stream and **-11.4 %** at 4 batched slots (3 reps each, no memory confound), because the
+benefit depends on the prompt population.
+
+**2. The lazy-PLE confound.**  Every arm ran `-lm mmap -lzm auto`.  `auto` does not engage the managed PLE
+reader (`llama_lazy_managed_budget()` is 0 without `LLAMA_LAZY_BUF_MB`) but it does leave the CPU-offloaded PLE
+on the classic mmap-lazy path, page-fault loading *during* the measurement and competing for the page cache the
+pool's `MOE_HOST_POOL_DIO=1` makes it bypass.  With `-lzm off` the single-user ranking delta is **+9.6 %**
+(22.6 -> 24.77) against +10.7 % under `auto`.  Corollary: process `read_bytes` is not comparable across lazy
+modes (78 GB vs ~102 GB on the same cells) -- quote the pool's own DIO counters.  All four harness arms now
+default to `-lzm off`.
+
+**3. W1 -- the campaign's decisive constant, measured and a GO** (`W1-SINK-TAX.md`).  A `SINK_TAX=1`
+diagnostic issues exactly the one D2H the demote would issue per admitted miss, at exactly its stream position,
+changing nothing else.  Measured on one R9700, arena 4 GiB, `MOE_HOST_POOL_DIO=1`, `-lzm off`:
+
+| `-lme` | gen t/s tax0 | gen t/s tax1 | copies (decode share) | copies/token | ms/token | `c_pcie` |
+|---|---|---|---|---|---|---|
+| 36 | 22.60 (3) | 22.07 (3) | 11 685 (7 098) | 111 | 1.06 (-2.3 %) | **0.0140 ms/MiB** |
+| 44 | 27.75 (2) | 26.25 (2) | 10 572 (5 988) | 94 | 2.06 (-5.4 %) | 0.0324 ms/MiB |
+
+The prefill share (4 587 / 4 584) came from `-n 0`, so the per-decode-token rate is a subtraction.  **9.6 µs
+per 679 762 B copy is ~2/3 hidden behind compute** (~71 GB/s effective, against a naive 26 µs/26 GB/s) --
+the opposite direction from the 0.04 ms/MiB assumption `PLAN.md` §2 carried.  Against a read that must cost
+>= 0.3 ms on this box (>= 5.4 ms on a 125 MB/s device), the break-even reuse rate is **~3 % here, ~0.2 % on
+slow storage**: the demote does not need a better prior, only that a few percent of demoted victims are wanted
+again.  The cost is roughly constant in pool size (arena-driven) while the benefit falls as the pool grows, so
+its best cell is the below-complement one -- where the holes are.  **W2 (the demote) is GO.**
+
+Also found, not fixed (an instrument must not fix what it measures): `fill_slot_from_host` calls
+`expert_src_done(..., retire=false)` **twice** on the success path -- a latent double-retire.
+
 ## 261105.020 (campaign) -- `PLAN.md`: the forward path, and the one constant it turns on
 
 **No delivery change.**  Post-investigation / pre-implementation plan for the rest of the campaign:

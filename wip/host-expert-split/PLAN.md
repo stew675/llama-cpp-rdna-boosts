@@ -42,6 +42,16 @@ single unmeasured constant: the marginal cost of our own 1-D swap.
 **Therefore: measure `c_pcie` for a 1-D contiguous D2H on this tree BEFORE writing the policy.**  That is W1,
 and it is ~30 lines rather than ~150.
 
+> **ANSWERED (2026-11-06) — see [`W1-SINK-TAX.md`](W1-SINK-TAX.md).**  Measured `c_pcie` = **0.0140 ms/MiB**
+> at `-lme 36` (**9.6 µs** per 679 762 B copy, ~2/3 of it hidden behind compute) and 0.0324 ms/MiB at
+> `-lme 44`.  Decode cost **-2.3 %** (1.06 ms/token) and -5.4 % (2.06 ms/token) respectively, at **111**
+> and **94** D2H copies per decode token.  Against a read that must cost >= ~0.3 ms on this box, the copy is
+> ~30x cheaper (~570x on a 125 MB/s device), so the break-even reuse rate is **~3 % here and ~0.2 % on slow
+> storage**: the demote does not need a better prior, only that a few percent of demoted victims are wanted
+> again.  **W2 is GO.**  The cost is roughly constant in pool size while the benefit falls as the pool grows,
+> so the demote's best cell is the below-complement one -- exactly where the holes are.  Caveat: the tax pays
+> transport only, so W2 must re-measure with its own bookkeeping.
+
 ## 3. Work items, in order
 
 ### W0 — close out P1 (cheap, and it may be the campaign's real deliverable)
@@ -78,7 +88,7 @@ change nothing else.
 * **Go/no-go:** cost ≤ ~1.5 ms/token at the full-complement cell ⇒ build W2.  ≥ ~3 ms/token ⇒ stop, close the
   campaign with "buy the RAM" and hand the analysis to the PR.
 
-### W2 — implement the demote (`MOE_HOST_POOL_SINK`, default **0** until gated)
+### W2 — implement the demote (`MOE_HOST_POOL_SINK`, default **0** until gated) — **GO, W1 passed**
 
 Design constraints, all of which come from something measured:
 
