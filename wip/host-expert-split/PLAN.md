@@ -20,7 +20,7 @@ measured).
 | S4 | Our deficit is **holes**, not transport: at a full-complement budget (94 % of the set) the pool answers 0.795 of arena misses and **23–30 MiB/token** still comes from storage | — | STEP1 §7, PLAN §5 |
 | S5 | An exclusive tier (the PR's shape) has **no holes by construction**; that — not D2H economics — is its entire advantage | — | STEP1 §8 |
 | S6 | r113's refusal of the literal swap was measured **with a covering pool** (0 MiB of L3 available to win) **and** 2-D strided `cudaMemcpy2DAsync` copies on a tensor split. It does not bound the complement-scarce, single-device case | — | STEP1 §8 |
-| S7 | A write-back is **slot-neutral**: the promoted expert vacated the pool slot the victim takes, so it needs no extra memory | 1 D2H per admission | STEP1 §8 |
+| S7 | ~~A write-back is slot-neutral~~ **WRONG (2026-11-06, from the code)** — see the W2 precondition below.  The incoming fill is *reading* that slot and the victim's arena bytes are overwritten by the same fill, so the victim cannot take it | needs 2 copies (staging) or a pool-eviction policy | W2 precondition |
 | S8 | A page-cache **warmer** is worth −15…−20 % of storage reads at **zero** copies, but **only in mmap/buffered mode** — with `MOE_HOST_POOL_DIO=1` the page cache is bypassed and it is a no-op | — | STEP1 §8 |
 | S9 | A better prior and a demote are **not independent**: P1 already removed 12–19 % of the hole traffic for free | — | P1, STEP1 §7 |
 | S10 | A periodic conditional swap (N rounds, K per round, hottest-pool vs coldest-arena) is **4–5× less copy-efficient** than an on-demand one and is negative on a page-cached box. **Not worth a knob.** | 0.12–0.18 vs 0.65 MiB saved/MiB copied | STEP1 §6 |
@@ -88,7 +88,32 @@ change nothing else.
 * **Go/no-go:** cost ≤ ~1.5 ms/token at the full-complement cell ⇒ build W2.  ≥ ~3 ms/token ⇒ stop, close the
   campaign with "buy the RAM" and hand the analysis to the PR.
 
-### W2 — implement the demote (`MOE_HOST_POOL_SINK`, default **0** until gated) — **GO, W1 passed**
+### W2 — implement the demote (`MOE_HOST_POOL_SINK`, default **0** until gated) — **GO on cost, BLOCKED on slot policy**
+
+> **Precondition found 2026-11-06, before any W2 code.**  S7 is false.  Tracing the miss path
+> (`expert_host_src` → `pool_peek_locked` | `pool_fill_empty_locked`) shows the pool slot that serves an
+> admission holds the **incoming** expert's bytes until its H2D drains, and the same H2D has already
+> overwritten the victim in the arena.  So "the victim takes the slot the promoted expert vacated" cannot be
+> implemented as stated: the victim's copy must be issued *before* the fill, into a slot that is free at that
+> moment.  Consequences, in order of severity:
+>
+> 1. **The demote is 2 copies, not 1** (arena → staging → pool slot, ≈19 µs at the measured 9.6 µs/copy), so
+>    the break-even reuse roughly doubles (~6 % on this box's NVMe, still ~0.4 % on a 125 MB/s device).  W1's
+>    cost stands as a *bound*: the demote cannot be cheaper than one copy.
+> 2. **The pool has nowhere to put a victim in the two clean cases.**  In the exact-complement case it is full
+>    of residents *and* coverage is exact, so there are no holes to fix; in the surplus case (`keep_all`) it
+>    mirrors residents and coverage is again near-exact.  The demote only has work to do where the prior is
+>    *wrong* (our measured 79 % coverage at a 94 % budget), and there the only slot a victim can take belongs
+>    to another expert — i.e. a **pool eviction policy**, exactly the "churning cache" §87 rejected when it
+>    measured the periodic variant.
+> 3. So W2 is not a 150-line local change: it is a **pool slot-policy decision** plus a staging path.  The
+>    open question for the maintainer is which of these to implement: (i) staging + evict the pool's
+>    *worst-value* resident on demote (on-demand churn, which S10 says is 4-5x more copy-efficient than the
+>    periodic variant it rejected); (ii) staging + demote only into genuinely free slots (cheap, but covers
+>    only the transient not-yet-full window); or (iii) stop, and take "buy the RAM" as the answer for the
+>    constrained box, since the demote's cost has doubled and its slot policy contradicts a standing design.
+>
+> Do not write W2 until that is decided.
 
 Design constraints, all of which come from something measured:
 
