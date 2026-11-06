@@ -2693,6 +2693,31 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
+> demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
+> headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per
+> 512-expert table), so the reserve held free the very slots the complement needed, every prefill fill was
+> refused, and each ubatch re-read the missing experts through the bounce ring — first-pass 50k prefill
+> **1 837 t/s with `MOE_HOST_POOL_SINK=0` against 867 with it**, decode flat, the gather's "neither tier" volume
+> 10.8 k → 46 k experts.  Three rules now hold, all in `moe-expert-cache.cu`:
+> 1. **`K` is capped by the coverage gap** (`n_experts - slots`), so a near-mirror pool cannot reserve slots it
+>    could never refill;
+> 2. **a PREFILL fill ignores the headroom** (`expert_host_src(..., prefill=true)` from the gather and the
+>    staging path, and `stage_span_fill`): it is the coverage path, and leaving slots free for a demote is
+>    meaningless while a ubatch stages the whole host table.  A new census line reports
+>    `sink headroom: N prefill fills took the exchange slots` so the override is visible, not inferred;
+> 3. **a NEAR-MIRROR pool disengages the exchange** (coverage gap < 4 % of the set).  At 97.7 % the demote
+>    measured **no decode gain** (75.6 vs 76.2) and cost 43-53 % of the first prefill, because the decode-band
+>    churn moves the pool's content away from the complement the next prefill must read; with the disengagement
+>    that cell is byte-for-byte the `SINK=0` path (census `sink near-mirror tables ... 144`, 0 demoted, 0
+>    headroom fills) and the prefill returns to 1 907-1 938 t/s.
+>
+> **Unchanged, and re-measured on the fixed tree:** `-lme 44` (93.7 %, gap 32) **+19 % generation / +48 %
+> prompt**, `-lme 36` (76.9 %) **+8-9 %**, a full mirror inert (0 demoted, 144 mirror tables).  Gates:
+> same-seed greedy text `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh` **31/31**
+> (including `sink` / `sinkfail`), per-block build 2/2, `validate-set.sh` green.  Record:
+> `wip/host-expert-parity/RESULTS-2026-11-06.md`, `WORKLOG.md` 261106.019.
+
 > **r224 amendment (the `host-expert-split` campaign): the pool LEARNS from evictions, is ranked by the
 > DECODE counter, and its prefill reads are coalesced — plus the heat-save truncation fix.**  Four things landed
 > together, all in `moe-expert-cache.cu` (the cache-side hooks they use — `host_pool_t`, the pool prepopulate, the

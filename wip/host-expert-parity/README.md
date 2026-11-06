@@ -3,8 +3,9 @@
 **Status: OPEN (2026-11-06) — scoping + measurement plan, and a first measurement pass.**  Nothing implemented,
 nothing applied to the fork, nothing in `patches/`, `release.json` untouched.  **The first pass is in
 [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md)**: the demote reproduces at `-lme` 36 (+8 %), is worth **+21 %**
-at 94 % coverage, and **costs 53 % of the field prefill at `auto` (97.7 %)** — a shipped-default defect carried
-as `TODO` #281.  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
+at 94 % coverage, and **costs 53 % of the field prefill at `auto` (97.7 %)** — a shipped-default defect that was
+**fixed in r228** (`TODO` #281 closed: the demote is a decode-class notion now — headroom capped by the
+coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of the results file).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
 [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
 [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) (the campaign that
 shipped in r224) and the rig is [`wip/bench-56gb/`](../bench-56gb/README.md).

@@ -2348,12 +2348,21 @@ on Linux.**
   a demoted victim at 94 % coverage is much more likely to be wanted again, and the pool's content (recency)
   replaces a prior layout.  A 94 % tier is −11 % of a mirror for 3.0 GiB less pinned RAM; 76.9 % is −32 % for
   11.1 GiB less.
-- **The demote's exchange headroom must never exceed the pool's coverage gap, and must never gate the prefill
-  fill path (measured 2026-11-06, r224 code; `TODO` #281).**  `K = 4 %` of a table's slots (floor 2, cap
-  slots/8) is ≈19 slots on a 500-slot table, while `-lme auto` on a 59 GiB box leaves a gap of 12 experts/table.
-  `K > gap` ⇒ the reserve holds free the slots the complement needs, every fill is refused, and each prefill
-  ubatch re-reads the missing experts through the bounce ring: first-pass 50k prefill **1 837 t/s with
-  `SINK=0` against 867 with `SINK=1` (−53 %)**, decode flat (76.6 vs 76.1), the census's "neither tier" volume
-  10.8 k → 46 k experts.  At `-lme 44` (gap 32 > K 19) the same demote is +21 %, so this is structural: the
-  headroom is a decode-band notion and must be capped by the gap.  `MOE_HOST_POOL_SINK=0` is the interim
-  workaround on an `auto`/near-mirror field box.
+- **The demote is a DECODE-CLASS notion: its headroom is capped by the coverage gap, a prefill fill ignores it,
+  and a near-mirror pool disengages it (r228, block 12; found as `TODO` #281 on the r224 code).**  Three rules,
+  each measured on a 59 GiB field box (56 GiB cgroup + ballast, one R9700), first as a defect then as the fix:
+  1. `K = 4 %` of a table's slots (≈19 on a 500-slot table) exceeded `-lme auto`'s 12-expert gap, so the reserve
+     held free the slots the complement needed: every prefill fill was refused and each ubatch re-read the
+     missing experts through the bounce ring -- first-pass 50k prefill **1 837 t/s (`SINK=0`) against 867
+     (`SINK=1`)**, decode flat, the gather's "neither tier" volume 10.8 k → 46 k experts.  `K` is now capped
+     by the gap, and a PREFILL fill (`expert_host_src(..., prefill=true)`, `stage_span_fill`) ignores it.
+  2. **A near-mirror pool disengages the exchange entirely** (coverage gap < 4 % of the set).  At 97.7 % the
+     demote measured **no decode gain** (75.6 vs 76.2) and cost 43-53 % of the first prefill, because the
+     decode-band churn moves the pool's content away from the complement the next prefill must read.  With the
+     disengagement that cell is the `SINK=0` path to the counter (`sink near-mirror tables ... 144`, 0 demoted)
+     and prefill returns to 1 907-1 938 t/s.
+  3. Below that boundary the demote is a real win and the boundary is the **gap, not the budget**: `-lme 44`
+     (93.7 %, gap 32) measured **+19-21 %** generation and +10-48 % prompt, `-lme 36` (76.9 %) +8-9 %, and a
+     full mirror stays inert (0 demoted, 144 mirror tables).
+  Gates on the fixed tree: coherence `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh`
+  **31/31** (the `sink`/`sinkfail` arms still prove a failed demote declines and never publishes).

@@ -1,3 +1,81 @@
+## 261106.019 (r228) -- TODO #281: the eviction demote becomes a DECODE-CLASS notion (headroom capped by the gap, prefill fills exempt, near-mirror disengaged)
+
+**Release `v16-6050b467c-r228`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`4aa51cbec`**, tree **`44b8fc4d8b928082e7cb485a8be4f5d79533089d`**.  One block amended: **block 12**
+(+65/-9 in `ggml/src/ggml-cuda/moe-expert-cache.cu`); blocks 00-11 and 13-15 keep identical deltas (their
+`.patch` files change only in the `From <sha>` line, because the series was re-cut from this checkout).  This
+release also **picks up r225-r227**: the delivery repo was rebased onto `93f78044` (r227: the Windows pool disk
+tier, the latched refused-allocation, the teardown census) and the fork was re-cut at its tree (`43a106ac3`)
+before the amendment, so the fix is folded into block 12 on the r227 base, not the r224 one.
+
+**The defect (`TODO` #281), measured on a 59 GiB field box** (56 GiB cgroup + 31 GiB mlocked ballast outside
+it, `MemAvailable` 57-58 GiB, one R9700, `auto` = 97.7 % coverage = a 12-expert gap per 512-expert table).  The
+r224 demote's exchange headroom is `K = 4 %` of a table's slots (~20) while the gap is 12, so the reserve held
+free the very slots the complement needed: every prefill fill was refused, and each ubatch re-read the missing
+experts through the bounce ring.  First-pass 50k prefill **1 837 t/s with `MOE_HOST_POOL_SINK=0` against 867
+with `SINK=1` (-53 %)**, decode flat (76.6 vs 76.1), the gather's "neither tier" volume 10.8 k -> 46 k experts.
+`MOE_HOST_POOL_SINK=0` was the interim workaround.  **r224's default was therefore a net loss on exactly the
+box the tier exists for.**
+
+**The fix, three rules (all in block 12):**
+1. **`K` is capped by the coverage gap** (`n_experts - slots`) -- a near-mirror pool cannot reserve slots it
+   could never refill.
+2. **A PREFILL fill ignores the headroom** -- `expert_host_src(..., prefill=true)` from the gather and the
+   staging path, and `stage_span_fill`.  It is the coverage path; leaving slots free for a demote is meaningless
+   while a ubatch stages the whole host table.  A new census line, `sink headroom: N prefill fills took the
+   exchange slots`, makes the override visible rather than inferred.
+3. **A NEAR-MIRROR pool disengages the exchange** (coverage gap < 4 % of the set).  At 97.7 % the demote
+   measured **no decode gain** (75.6 vs 76.2) and cost 43-53 % of the first prefill, because the decode-band
+   churn moves the pool's content away from the complement the next prefill must read.  The rule is the **gap,
+   not the budget**: below the boundary the same demote is `-lme 44` (93.7 %, gap 32) **+19-21 % generation and
+   +10-48 % prompt**, `-lme 36` (76.9 %) **+8-9 %**, and a full mirror stays inert (0 demoted, 144 mirror
+   tables, `spare=0`).
+
+**Measured after the fix.**  Field shape, `auto` + `SINK=1`: the census reports
+`sink near-mirror tables ... : 144`, **0 demoted, 0 headroom fills**, and identical traffic to `SINK=0`
+(fills 75 245 vs 75 372, `h` 0.8740 vs 0.8641, "neither tier" 9 261 vs 10 125) -- the two arms are the same
+path to the counter; the first-pass prefill measured 1 907-1 938 t/s in the box's fast drive state (627 in its
+slow state, which is a property of the NVMe's small-read latency, not of the change -- **quote the pair, never a
+single first-pass number**).  `-lme 44`: 28.9 -> 34.5 t/s (+19 %), prompt 638 -> 946.  `-lme 36`: 23.8 -> 26.0
+(+9 %).  Coherence `sha=880c932888f8` identical on both `SINK` arms.
+
+**Gates.**  `scripts/gate-host-pool.sh` **31/31** (the r227 version: `ref`/`dio`/`nodisk`/`fail`/`late`/`sink`/
+`sinkfail`, including "the census prints once, from the teardown"); `scripts/gate-per-block-build.sh --fast
+--changed-from 43a106ac3` **2/2**; `scripts/validate-set.sh` green (16/16 strict `git am` on a fresh tarball,
+tree `44b8fc4d...`, the conflict-marker scan and the Windows portability scan of 287 delivery-added files).
+
+**Prefill-logit: PASS, with the demote actually engaged.**  `scripts/gate-prefill-logits.sh --model
+.../Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --extra "-ncmoe 40 -lme 24" --ab "MOE_HOST_POOL_SINK=0"` (a 24 GiB pool over a
+32.6 GiB set, so the sink is live; the base file is
+`prefill-logit-gfx1201-Qwen3.6-35B-A3B-UD-Q4_K_M-xncmoe-40-lme-24.kld`) reads **mean KLD -0.000000 / same-top-p
+100.000 %** -- the demote is placement-only, to the digit.
+
+**GPU faults: clean.**  `scripts/check-gpu-faults.sh --since "4 hours ago"` over the kernel journal and the four
+key run logs (the two field arms, the two CLI arms): no faults, no runtime error strings.
+
+**MTP four-axis (dense 27B UD-Q4_K_XL, 1 GPU, protocol A, `-n 3000`, `--reasoning on` only for R) -- PASS, and
+it is inert as expected** (a dense model has no host pool).  `draft-mtp` against `none` on the same build:
+
+| axis | none | draft-mtp | delta | draft acceptance |
+|---|---|---|---|---|
+| R reasoning | 30.2 | 56.1 | +86 % | 0.532 |
+| P prose | 29.9 | 73.0 | +144 % | 0.813 |
+| C code | 30.2 | 76.6 | +154 % | 0.867 |
+| K recall | 30.3 | 84.1 | +178 % | 0.992 |
+
+MTP beats plain decode on every axis and acceptance is healthy everywhere (the 2026-09-02 collapse read
+0.000), so gates 1 and 2 of the methodology pass.  (Q8_0 is not runnable for this on one GPU: `-c 102400`
+bf16 KV needs 6.4 GiB and the 27 GiB Q8_0 leaves 6.4 -- the gate's own reference rows are 2-3 GPU; Q4_K_XL is
+the documented dense baseline that fits.)
+
+**Batched gate `-npl 1,4,8` (3 reps, `-lme 36`, `-lzm auto`) -- no regression.**  npl 1: 12.6-15.7 pp t/s /
+19.9-21.4 tg; npl 4: 18.0-19.8 s total (129-143 total t/s, 33.3-37.0 tg); npl 8: 39.7-42.6 s in two reps and
+one **113.8 s** collapse that is this box's documented over-subscription mode (the campaign's `npl 8` trap:
+PLE resident + a 36.8 GiB pool + the arena), not the change -- the fix leaves `-lme 36`'s sink live and the
+ranking untouched.  Numbers are in family with the r224 record's accepted row.
+
+`-sm layer` is not runnable on this box (one R9700 + the gfx1036 iGPU).
+
 ## 261106.018 (campaign) -- first measurement pass on the PCIe 5.0 box: the demote is +21 % at 94 % coverage, and -53 % of the field prefill at 97.7 % (a shipped-default defect)
 
 **No delivery change.**  `release.json` untouched at `v16-6050b467c-r224`; `~/llama.cpp` is the same tree

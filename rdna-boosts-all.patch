@@ -61691,10 +61691,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4f03f80c2
+index 000000000..40ad8e8d3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9420 @@
+@@ -0,0 +1,9476 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -62433,8 +62433,15 @@ index 000000000..4f03f80c2
 +int64_t                             g_sink_uses        = 0;
 +// Tables whose pool can hold EVERY expert: the exchange is inert there (see `pool_sink_active`).
 +int64_t                             g_sink_mirror_tables = 0;
++// Tables with a coverage gap under 4 % of the set: the exchange is DISENGAGED there (TODO #281 -- a near-mirror
++// pool pays the decode-band churn at the next prefill and measures no decode gain).
++int64_t                             g_sink_near_mirror_tables = 0;
 +// Slots reclaimed from a RESIDENT because the pool was saturated (see the demote path).
 +int64_t                             g_sink_evicted     = 0;
++// TODO #281: PREFILL coverage fills that took a slot the decode-band exchange headroom would have kept free.
++// Non-zero proves the band override fired; it is the counter that tells "the fix ran" from "the arm changed
++// nothing".
++int64_t                             g_sink_prefill_fills = 0;
 +int64_t                             g_sink_retire     = 0;
 +// Set when a demote could not find a free slot, cleared when the next successful fill retires its
 +// promoted slot.  Makes the retirement DEMAND-DRIVEN: the pool keeps every duplicate it can (the
@@ -63800,6 +63807,8 @@ index 000000000..4f03f80c2
 +    }
 +    if (g_pool_sink && slots >= t.n_experts) {
 +        g_sink_mirror_tables++;   // a full mirror: no exchange, no reserve, no demotions
++    } else if (g_pool_sink && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts) {
++        g_sink_near_mirror_tables++;   // gap < 4 % of the set: exchange DISENGAGED (TODO #281)
 +    }
 +    slots = pool_clamp_slots_to_ram(slots, t.host_bytes, planned_pool, t);
 +    GGML_LOG_INFO("%s: host pool (%s): %zu host tensors, %lld MiB host expert bytes; layer=%d role=%s -> "
@@ -64125,12 +64134,38 @@ index 000000000..4f03f80c2
 +// demote there would find no free slot, ask for one, and RETIRE a resident to make room, destroying the
 +// mirror it was supposed to improve.  `pool + headroom <= a full mirror` holds by construction: `slots` is
 +// clamped to `n_experts` at sizing, so the headroom always comes out of that budget and never adds to it.
++// TODO #281: a NEAR-MIRROR pool disengages the exchange.  Measured on a 59 GiB field box at `-lme auto`
++// (97.7 % coverage = a 12-expert gap per 512-expert table, one R9700): decode 75.6 (`SINK=0`) against 76.2
++// (`SINK=1`) -- no gain -- while the first-pass 50k prefill fell from 1 238 to 708 t/s, because the decode-band
++// demote moves the pool's content away from the complement the next prefill has to read (the gather's
++// "neither tier" volume went 10.1 k -> 32.5 k experts).  At `-lme 44` (93.7 %, a 32-expert gap) the same demote
++// is worth **+21 %** decode and +10 % prefill.  So the boundary is the GAP, not the budget: below 4 % of the set
++// the pool is a near-mirror whose few holes are cheaper to pay than to learn.
++static bool pool_sink_near_mirror(const host_pool_t * p) {
++    if (p == nullptr || p->n_experts <= 0 || p->slots >= p->n_experts) {
++        return false;
++    }
++    return (int64_t) (p->n_experts - p->slots) * 25 < (int64_t) p->n_experts;   // gap < 4 % of the set
++}
++
 +static bool pool_sink_active(const host_pool_t * p) {
-+    return g_pool_sink && p != nullptr && p->n_experts > 0 && p->slots < p->n_experts;
++    return g_pool_sink && p != nullptr && p->n_experts > 0 && p->slots < p->n_experts &&
++           !pool_sink_near_mirror(p);   // TODO #281
 +}
 +
 +// The exchange headroom for one pool: an absolute override if one was given, else ~3 % of that table's
 +// slots with a floor of 2 and a 1/8 cap (a reserve that large would starve the layout).
++//
++// TODO #281: the headroom is a DECODE-BAND notion, and it is capped by the pool's coverage gap.  Measured on a
++// 59 GiB field box at `-lme auto` (97.7 % coverage, one R9700): the derived K was ~20 slots/table against a
++// 12-expert gap, so the reserve held free the very slots the complement needed, every prefill fill was refused,
++// and each prefill ubatch re-read the missing experts through the bounce ring -- first-pass 50k prefill
++// 1837 t/s with `MOE_HOST_POOL_SINK=0` against 867 with it, decode flat (76.6 vs 76.1).  Two rules follow and
++// both are load-bearing:
++//   * a PREFILL fill passes `prefill=true` and ignores the headroom entirely (`pool_fill_empty_locked`,
++//     `stage_span_fill`): it is the coverage path, and leaving slots free for a demote is meaningless while a
++//     ubatch is staging the whole host table, and
++//   * K never exceeds the gap, so a near-mirror pool cannot reserve slots it could never refill.
 +static int pool_sink_reserve(const host_pool_t & p) {
 +    if (!pool_sink_active(&p)) {
 +        return 0;   // no reserve against a mirror: the layout may use every slot
@@ -64144,6 +64179,10 @@ index 000000000..4f03f80c2
 +    }
 +    if (k > p.slots / 8) {
 +        k = p.slots / 8;
++    }
++    const int gap = p.n_experts - p.slots;
++    if (gap > 0 && k > gap) {
++        k = gap;   // TODO #281: a reserve larger than the gap starves the complement it is meant to protect
 +    }
 +    return k;
 +}
@@ -64198,17 +64237,21 @@ index 000000000..4f03f80c2
 +}
 +
 +// Fill the first EMPTY slot with `expert` and return its slot base (null when the pool is full or the read
-+// failed).  Never evicts.  Caller holds `g_mutex`.
-+static char * pool_fill_empty_locked(host_pool_t & p, int expert, int * out_slot) {
++// failed).  Never evicts.  `prefill` marks the PREFILL band's coverage fills, which ignore the exchange
++// headroom (TODO #281 -- see `pool_sink_reserve`).  Caller holds `g_mutex`.
++static char * pool_fill_empty_locked(host_pool_t & p, int expert, int * out_slot, bool prefill = false) {
 +    if (expert < 0 || expert >= p.n_experts || p.failed) {
 +        return nullptr;
 +    }
 +    if (p.expert_slot.find(expert) != p.expert_slot.end()) {
 +        return nullptr;   // already resident (or retiring): the caller must peek, not fill
 +    }
-+    const int slot = pool_free_slot_locked(p, pool_sink_reserve(p));
++    const int slot = pool_free_slot_locked(p, prefill ? 0 : pool_sink_reserve(p));
 +    if (slot < 0) {
 +        return nullptr;
++    }
++    if (prefill && pool_sink_active(&p)) {
++        g_sink_prefill_fills++;   // a coverage fill that the decode-band reserve would have refused
 +    }
 +    char * dst = p.base + (size_t) slot * p.host_bytes;
 +    if (!pool_fill_slot_locked(p, expert, dst)) {
@@ -64750,7 +64793,7 @@ index 000000000..4f03f80c2
 +// the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
 +// Caller holds `g_mutex`.
 +static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, bool allow_empty_fill,
-+                            expert_src_t * out, const char ** why = nullptr) {
++                            expert_src_t * out, const char ** why = nullptr, bool prefill = false) {
 +    *out = expert_src_t{};
 +    if (why != nullptr) {
 +        *why = nullptr;
@@ -64791,7 +64834,7 @@ index 000000000..4f03f80c2
 +            return true;
 +        }
 +        if (allow_empty_fill) {
-+            p = pool_fill_empty_locked(*pool, expert, &s);
++            p = pool_fill_empty_locked(*pool, expert, &s, prefill);
 +            if (p != nullptr && s >= 0) {
 +                out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
 +                                          : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
@@ -66252,6 +66295,8 @@ index 000000000..4f03f80c2
 +    }
 +    if (g_pool_sink && slots >= t.n_experts) {
 +        g_sink_mirror_tables++;   // a full mirror: no exchange, no reserve, no demotions
++    } else if (g_pool_sink && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts) {
++        g_sink_near_mirror_tables++;   // gap < 4 % of the set: exchange DISENGAGED (TODO #281)
 +    }
 +    if (slots < 0) {
 +        slots = 0;
@@ -69132,7 +69177,12 @@ index 000000000..4f03f80c2
 +                const char * s  = base + i * t.expert_bytes;
 +                if (pool != nullptr && !pool->failed &&
 +                    pool->expert_slot.find(ee) == pool->expert_slot.end()) {
-+                    const int slot = pool_free_slot_locked(*pool, pool_sink_reserve(*pool));
++                    // TODO #281: a PREFILL fill is the coverage path -- it ignores the exchange headroom
++                    // (the decode-band reserve is what keeps a demote's landing zone).
++                    const int slot = pool_free_slot_locked(*pool, 0);
++                    if (slot >= 0 && pool_sink_active(pool)) {
++                        g_sink_prefill_fills++;
++                    }
 +                    if (slot >= 0) {
 +                        memcpy(pool->base + (size_t) slot * pool->host_bytes, s, t.expert_bytes);
 +                        pool_slot_assign_locked(*pool, slot, ee);
@@ -69395,7 +69445,7 @@ index 000000000..4f03f80c2
 +            }
 +            char * d = (char *) weight_cpy->data + (size_t) e * expert_bytes;
 +            expert_src_t hsrc;
-+            if (!expert_host_src(t, e, gpool, /*allow_empty_fill*/ true, &hsrc)) {
++            if (!expert_host_src(t, e, gpool, /*allow_empty_fill*/ true, &hsrc, nullptr, /*prefill*/ true)) {
 +                return false;
 +            }
 +            if (t.split_axis == 0 && t.host_pitch != 0) {
@@ -69609,7 +69659,7 @@ index 000000000..4f03f80c2
 +                // 68K prompt).  The copy below keeps the pool entry (retire = false) because the staging
 +                // destination is a transient ring slot, not the arena.
 +                expert_src_t hsrc;
-+                if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc)) {
++                if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc, nullptr, /*prefill*/ true)) {
 +                    err = k_no_host_source;   // see `fill_slot_from_host`: a host-side answer, never a device error
 +                    break;
 +                }
@@ -70791,12 +70841,18 @@ index 000000000..4f03f80c2
 +                      g_pool_sink_spare >= 0 ? g_pool_sink_spare : g_pool_sink_spare_pct);
 +        GGML_LOG_WARN("%s: sink reclaimed %lld saturated slots (evict duplicate/LRU instead of declining)\n",
 +                      __func__, (long long) g_sink_evicted);
++        GGML_LOG_WARN("%s: sink headroom: %lld prefill fills took the exchange slots (a prefill never honours the "
++                      "reserve; TODO #281)\n", __func__, (long long) g_sink_prefill_fills);
 +        GGML_LOG_WARN("%s: sink reuse: %lld uses against %lld demotions (%.1f %% used; W1 break-even ~3 %% "
 +                      "on NVMe, ~0.2 %% on slow storage)\n", __func__, (long long) g_sink_uses,
 +                      (long long) g_sink_copies,
 +                      g_sink_copies > 0 ? 100.0 * (double) g_sink_uses / (double) g_sink_copies : 0.0);
 +        GGML_LOG_WARN("%s: sink mirror tables (full coverage -> exchange INERT, spare=0): %lld\n", __func__,
 +                      (long long) g_sink_mirror_tables);
++        if (g_sink_near_mirror_tables > 0) {
++            GGML_LOG_WARN("%s: sink near-mirror tables (coverage gap < 4 %% of the set -> exchange DISENGAGED): "
++                          "%lld\n", __func__, (long long) g_sink_near_mirror_tables);
++        }
 +    }
 +    GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
 +                  __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
