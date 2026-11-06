@@ -117,13 +117,19 @@ fi
 base="$(jq -r .base "$MANIFEST")"
 tip="$(jq -r .tip "$MANIFEST")"
 tree="$(jq -r .tree "$MANIFEST")"
+release="$(jq -r .release "$MANIFEST")"
 n_blocks="$(jq -r .n_blocks "$MANIFEST")"
-for x in base tip tree; do
+for x in base tip tree release; do
     v="$(eval "echo \$$x")"
     [ -n "$v" ] && [ "$v" != "null" ] || die "release.json is missing .$x"
 done
 
-echo "==> release ${base} -> tip ${tip}, ${n_blocks} blocks, tree ${tree}"
+# PROVENANCE (issue #272 follow-up): the fork-point tags (and the fork point in `version`/`revision`) could not
+# say WHICH release an image carried -- a reporter testing a "newer fork image" could not tell r218 from r219.
+# Every image now also gets a `<tag>-<release>` tag, and the image labels name the release (and its canonical
+# tip) instead of only the fork point, so `docker inspect` answers the question.  The fork-point tags stay for
+# compatibility and are what the GHCR retention keep-rule matches.
+echo "==> release ${release} (fork point ${base} -> tip ${tip}, ${n_blocks} blocks, tree ${tree})"
 echo "==> engine=${ENGINE}  image=${IMAGE}  src=${SRC}"
 
 remove_src() {
@@ -207,10 +213,10 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 tags_for() { # $1=target  $2=rocm-line
     case "$1" in
-        full)   echo "$IMAGE:full-rocm-$2 $IMAGE:full-rocm-$2-$base" ;;
-        light)  echo "$IMAGE:light-rocm-$2 $IMAGE:light-rocm-$2-$base" ;;
+        full)   echo "$IMAGE:full-rocm-$2 $IMAGE:full-rocm-$2-$base $IMAGE:full-rocm-$2-$release" ;;
+        light)  echo "$IMAGE:light-rocm-$2 $IMAGE:light-rocm-$2-$base $IMAGE:light-rocm-$2-$release" ;;
         server)
-            local t="$IMAGE:server-rocm-$2 $IMAGE:server-rocm-$2-$base $IMAGE:rocm-$2"
+            local t="$IMAGE:server-rocm-$2 $IMAGE:server-rocm-$2-$base $IMAGE:server-rocm-$2-$release $IMAGE:rocm-$2 $IMAGE:rocm-$2-$release"
             [ "$2" = "10.1" ] && t="$t $IMAGE:latest"
             echo "$t" ;;
         *) die "unknown target: $1" ;;
@@ -232,6 +238,9 @@ for v in $ROCM_LINES; do
             --build-arg "BUILD_DATE=$BUILD_DATE"
             --build-arg "APP_VERSION=$base"
             --build-arg "APP_REVISION=$base"
+            --build-arg "RELEASE_TAG=$release"
+            --build-arg "RELEASE_TIP=$tip"
+            --build-arg "RELEASE_BLOCKS=$n_blocks"
         )
         [ -n "$ARCH" ] && barg+=(--build-arg "ROCM_DOCKER_ARCH=$ARCH")
 

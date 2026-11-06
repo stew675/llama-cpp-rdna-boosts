@@ -35,6 +35,14 @@ ARG BASE_ROCM_DEV_CONTAINER=docker.io/rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_V
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
+# PROVENANCE (issue #272 follow-up): APP_VERSION is the fork point and is ALSO the web UI's build number,
+# so it cannot name the release.  These carry the release identity instead: `RELEASE_TAG` is
+# `release.json .release` (e.g. v16-6050b467c-r222) and `RELEASE_TIP` its canonical tip commit, which is
+# what a reporter needs to say WHICH release an image carries.  A reporter on issue #272 could not tell
+# whether the image he tested was r218 or r219, because version/revision both named only the fork point.
+ARG RELEASE_TAG=N/A
+ARG RELEASE_TIP=N/A
+ARG RELEASE_BLOCKS=N/A
 ARG IMAGE_URL=https://github.com/stew675/llama-cpp-rdna-boosts
 ARG IMAGE_SOURCE=https://github.com/stew675/llama-cpp-rdna-boosts
 
@@ -154,11 +162,16 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
+ARG RELEASE_TAG=N/A
+ARG RELEASE_TIP=N/A
+ARG RELEASE_BLOCKS=N/A
 ARG IMAGE_URL=https://github.com/stew675/llama-cpp-rdna-boosts
 ARG IMAGE_SOURCE=https://github.com/stew675/llama-cpp-rdna-boosts
 LABEL org.opencontainers.image.created=$BUILD_DATE \
-      org.opencontainers.image.version=$APP_VERSION \
-      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.version=$RELEASE_TAG \
+      org.opencontainers.image.revision=$RELEASE_TIP \
+      io.github.stew675.rdna-boosts.fork-point=$APP_VERSION \
+      io.github.stew675.rdna-boosts.blocks=$RELEASE_BLOCKS \
       org.opencontainers.image.title="llama.cpp (rdna-boosts)" \
       org.opencontainers.image.description="llama.cpp patched with the rdna-boosts RDNA feature/perf set (ROCm)" \
       org.opencontainers.image.url=$IMAGE_URL \

@@ -26,8 +26,10 @@ the patched tree the same way the consumer workflow does:
    an adaptation of upstream llama.cpp's `.devops/rocm.Dockerfile`
    (adds `-DGGML_HIP_RCCL=ON`, an RDNA-only `AMDGPU_TARGETS`, and a
    `ROCM_IMAGE_SUFFIX` switch for the `-complete`/`-full` base images),
-4. tag `full`, `light` and `server` per ROCm line and, with `--push`, push
-   them to GHCR.
+4. tag `full`, `light` and `server` per ROCm line with the moving tag, the
+   fork-point tag and the **release** tag (`<tag>-<release>`, r222), pass the
+   release provenance as build args (`RELEASE_TAG`/`RELEASE_TIP`/`RELEASE_BLOCKS`
+   become the OCI labels) and, with `--push`, push them to GHCR.
 
 ## Images
 
@@ -48,9 +50,37 @@ release uncut.  The 7.2 line is still buildable with `--rocm 7.2` (or a manual `
 asking for `7.2`), but expect it to be slow and possibly to time out.
 
 Each tag also has an immutable `<tag>-<fork-point>` variant pinned to the fork
-point (currently `<tag>-a55e952b8`; earlier releases used
-`<tag>-84e76d8a2`, `<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
-image); `latest` points at the newest ROCm (10.1) server image.
+point (currently `<tag>-6050b467c`; earlier releases used `<tag>-a55e952b8`,
+`<tag>-84e76d8a2`, `<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`)
+and a `<tag>-<release>` variant pinned to the RELEASE (e.g.
+`ghcr.io/stew675/llama-cpp-rdna-boosts:server-rocm-10.1-v16-6050b467c-r222`).
+`rocm-<version>` is an alias of `server-rocm-<version>` (the serving image, with
+its own `-<release>` variant); `latest` points at the newest ROCm (10.1) server
+image.
+
+**Provenance: pin the release, and read the labels (r222, issue #272 follow-up).**
+The fork-point variants cannot say *which release* an image carries, because one
+fork point serves many releases, and the moving tags (`rocm-10.1`, `latest`) are
+overwritten every release.  A reporter on issue #272 could not tell whether the
+"newer fork image" he had tested was r218 or r219.  So every image also carries
+`-<release>` tags, and its labels name the release instead of only the fork point:
+
+```
+$ podman inspect --format '{{json .Labels}}' ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-10.1 | python3 -m json.tool
+{
+  "org.opencontainers.image.version": "v16-6050b467c-r222",     # the release (release.json .release)
+  "org.opencontainers.image.revision": "80bfb80be...",          # its canonical tip (.tip)
+  "io.github.stew675.rdna-boosts.fork-point": "6050b467c",      # the fork point (.base)
+  "io.github.stew675.rdna-boosts.blocks": "16",
+  "org.opencontainers.image.created": "...",
+  ...
+}
+```
+
+Images built before r222 carry the fork point in `version`/`revision` and no
+release label; treat their release as unknown.  When reporting a container
+issue, quote the `-<release>` tag or the `org.opencontainers.image.version`
+label, never a digest alone.
 
 The binaries are built for `gfx1030;gfx1100;gfx1150;gfx1151;gfx1200;gfx1201`
 (RDNA2 best-effort / RDNA3 / RDNA3.5 / RDNA4) with runtime dispatch, so one
@@ -201,6 +231,13 @@ packaging stays in CI:
   sees the new tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.1"
   --push --prune` there.  For a manual build, run the same script on whichever box
   you prefer; either way it reads the tree from `release.json`, not from the tag.
+  **The watcher runs the script as it exists in the TAG it is building**, so a
+  fix to the script or the Dockerfile only reaches the images of a release whose
+  tag already contains it.  To re-label an already-published release, run the
+  build by hand from `main` on the worker (same command), holding the watcher's
+  `flock` (`$HOME/.cache/rdna-containers/.lock`) so cron skips, then write the
+  tag into `$HOME/.cache/rdna-containers/last-built` so the watcher does not
+  rebuild the unlabelled images (r222 did exactly this).
 - `docker-ghcr.yml` no longer runs automatically (no tag or schedule trigger);
   it is a manual `workflow_dispatch` fallback.
 
