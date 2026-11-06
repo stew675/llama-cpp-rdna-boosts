@@ -2325,3 +2325,35 @@ on Linux.**
    set** (34-38 GB: resident mapping pages plus the pinned pool), which is why the small pinned pool (`l4`)
    was the better configuration there and why adding 16 GB of RAM moved prefill 16 -> 94 t/s with nothing in
    the delivery changing.
+- **The demote's cost and the pool's fill cost are properties of the HOST LINK, not of the delivery
+  (recorded 2026-11-06, before r225; `wip/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
+  D2H, 0.0140 ms/MiB, ~2/3 hidden behind compute, ~3 % break-even reuse on this box's NVMe — were measured on a
+  host whose link the same record's own naive-transport figure puts at **~26 GB/s** (26 µs per copy).  A host
+  that negotiates more (one R9700 on PCIe 5.0 x16 = `32.0 GT/s` x 16) moves both the demote's marginal cost and
+  the mirror-vs-partial gap, so a policy conclusion must not be carried across hosts without re-measuring the
+  `MOE_HOST_POOL_SINK=0/1` delta.  Corollary: W1's instrument (`MOE_HOST_POOL_SINK_TAX`) was **removed at r224
+  by design** — the shipped demote is the instrument now, and `SINK=0` is its control.
+- **The coalesced prefill read is O_DIRECT-only (r224, block 12; recorded 2026-11-06).**  `stage_span_fill()`
+  returns immediately unless `t.src_fd >= 0`, and that fd is opened only in O_DIRECT mode (`pool_open_file(t.src_path,
+  g_pool_dio)`), so the `+81 %` at `-lme` 12 / `+57 %` at 18 / `+14 %` at 36 describe the
+  **`MOE_HOST_POOL_DIO=1`** arm.  A buffered fill — the default whenever `--load-mode` is `mmap`, which r212
+  made the policy — reads the mapping per expert and does not coalesce.  Quote the arm with the number, and
+  never read a DIO-vs-buffered pair as a span A/B: the fill source changes with the mode, so that pair is two
+  changes at once.
+- **The demote's value is BUDGET-shaped, and it is positive up to a near-mirror budget (measured 2026-11-06;
+  `wip/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
+  (76.9 % coverage) **+8 %** generation (24.0 → 26.0 t/s), `-lme` 44 (93.7 %) **+21 %** (28.0 → 33.9), mirror
+  (100 %) **inert by construction** (0 demoted, 144 mirror tables).  This corrects `W1-SINK-TAX.md`'s inference
+  that "the cost is constant while the benefit falls as the pool grows": the copy count is roughly constant, but
+  a demoted victim at 94 % coverage is much more likely to be wanted again, and the pool's content (recency)
+  replaces a prior layout.  A 94 % tier is −11 % of a mirror for 3.0 GiB less pinned RAM; 76.9 % is −32 % for
+  11.1 GiB less.
+- **The demote's exchange headroom must never exceed the pool's coverage gap, and must never gate the prefill
+  fill path (measured 2026-11-06, r224 code; `TODO` #281).**  `K = 4 %` of a table's slots (floor 2, cap
+  slots/8) is ≈19 slots on a 500-slot table, while `-lme auto` on a 59 GiB box leaves a gap of 12 experts/table.
+  `K > gap` ⇒ the reserve holds free the slots the complement needs, every fill is refused, and each prefill
+  ubatch re-reads the missing experts through the bounce ring: first-pass 50k prefill **1 837 t/s with
+  `SINK=0` against 867 with `SINK=1` (−53 %)**, decode flat (76.6 vs 76.1), the census's "neither tier" volume
+  10.8 k → 46 k experts.  At `-lme 44` (gap 32 > K 19) the same demote is +21 %, so this is structural: the
+  headroom is a decode-band notion and must be capped by the gap.  `MOE_HOST_POOL_SINK=0` is the interim
+  workaround on an `auto`/near-mirror field box.

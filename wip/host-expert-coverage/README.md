@@ -123,6 +123,35 @@ explicit budget, no verdict line).  But it makes the coverage question cost some
 `INVARIANTS.md` r221 fact 6 (`device remap: N tables served, M of K offers declined`) is the per-run tell; this
 campaign's step 3 would replace reading it with one operator-facing line.
 
+## 4c. r224 (2026-11-06) made the FILL MODE a policy and left its decision invisible -- a third instance of defect 3
+
+**Nothing in §3 changed; this is a new measured instance, found while opening `wip/host-expert-parity/`.**  r224
+folded `pool_decide_dio_locked` (block 12): the pool's fill mode is now a **policy** — it mirrors the operator's
+`--load-mode` (a mapped load fills through the page cache, `--load-mode dio` gets O_DIRECT), and the old
+MemAvailable heuristic survives only for a consumer that reports no load mode.  Two consequences for this
+campaign's step 3:
+
+* **The decision, and the warning attached to it, are `GGML_LOG_INFO`** — i.e. invisible at the default
+  verbosity, exactly like the plan line §2's defect 3 describes.  The line that matters in the middle band is:
+  `host pool fill mode: buffered (page cache as L3) -- mirroring --load-mode mmap …; NOTE MemAvailable does not
+  hold the pool AND the host expert set, so the page cache cannot keep it -- MOE_HOST_POOL_DIO=1 is the
+  memory-tight arm`.  On a 59 GiB box with a 46.84 GiB set and a ~46 GiB pool this is **the** operator-facing
+  fact of the run, and it is filtered.  Step 3's one visible verdict should carry it: `MIRROR 512/512` /
+  `PARTIAL 479/512 (93.6 %)` / `NONE` **plus** `fills: buffered (page cache as L3)` or `O_DIRECT`.
+* **The middle band is unmeasured by the code's own admission.**  `pool_decide_dio_locked`'s comment says the
+  case "the set fits, the set + a full pool does not" is unmeasured and points at the forced
+  `MOE_HOST_POOL_DIO=0|1` escape hatch — and the `bench-56gb` rig **is** that band (46.84 GiB set against 57.3 GiB
+  of `MemAvailable`, i.e. the set fits and the set + a 45.8 GiB mirror does not).  So this is not a corner case:
+  it is the shipped shape of the box the tier exists for, and the arm that decides it is the rig's
+  `DIO=auto` vs `DIO=1` pair.
+* **The census distinguishes the two arms**, which is what makes the A/B legible: the exit line prints
+  `pool fills: N storage reads … ms, M mapping memcpys … ms` separately (`-lv 4`).  Quote that line, not the
+  process `read_bytes` — under `-lzm auto` the CPU-offloaded PLE moves its reads into load time and the process
+  total is not comparable across lazy modes.
+
+The measurement itself (the field matrix, the parity/crossover table) is `wip/host-expert-parity/` P0.2; this
+note exists so step 3 does not ship a verdict line that omits the fill mode.
+
 ## 5. Records
 
 | where | what |

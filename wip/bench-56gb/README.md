@@ -21,7 +21,11 @@ its own cgroup, the ballast stops being needed for sizing and stays only as a me
 | `run.sh` | starts a launch script inside scope `<tag>`, logs to `runs/<tag>/server.log`, samples `memory.current` into `runs/<tag>/mem.txt` |
 | `measure.sh` | health, three 600-token decode passes, one 50k prefill, one 179.5k prefill, then `memory.peak` and the cgroup anon/file split |
 | `bench.py` | `/completion` client that prints the server's own `timings` (prompt and predicted t/s), plus a bounded `health` poll |
-| `gen_prompt.py` | writes `prompt_short.txt`, `prompt_50k.txt`, `prompt_long.txt` (179.5k tokens on this model) |
+| `gen_prompt.py` | writes `prompt_short.txt` and `prompt_long.txt` (179.5k tokens on this model).  `prompt_50k.txt` (used by `measure.sh`) is the first ~250 000 characters of `prompt_long.txt`, cut at a line boundary: `awk 'BEGIN{n=0} {if(n>=250000) exit; print; n+=length($0)+1}' prompt_long.txt > prompt_50k.txt` |
+for x in l:
+  if n>=250000: break
+  o.append(x); n+=len(x)
+open("prompt_50k.txt","w").write("".join(o))'` |
 | `ballast.c` | allocates and `mlock`s N GiB of anonymous memory, then sleeps; `gcc -O2 -o ballast ballast.c` |
 | `runme-56gb-mirror.sh` | the host-expert config the campaigns compare against (`-lme 47`, `RAM_PCT=0`, KV pool off) |
 | `RESULTS.md` | the measured matrix |

@@ -1,3 +1,102 @@
+## 261106.018 (campaign) -- first measurement pass on the PCIe 5.0 box: the demote is +21 % at 94 % coverage, and -53 % of the field prefill at 97.7 % (a shipped-default defect)
+
+**No delivery change.**  `release.json` untouched at `v16-6050b467c-r224`; `~/llama.cpp` is the same tree
+(`88e7d88a7`, build 12:51).  Ran on this box (`radix`: Ryzen 7 9800X3D, 93 GiB, one R9700 on **PCIe 5.0 x16**).
+Record: [`wip/host-expert-parity/RESULTS-2026-11-06.md`](wip/host-expert-parity/RESULTS-2026-11-06.md); new
+`TODO` **#281**; the rig gained `wip/bench-56gb/runme-56gb-tier.sh` (a parameterised sibling of the mirror
+runme).  Heat prior frozen read-only for the whole pass, **sha256 `a07822d3727d…`** (the record's canonical
+
+**r225-r227 landed after these runs.**  Every number here is the **r224** tree (`88e7d88a7`, build
+12:51) and is re-measured on r226 once the `TODO` #281 fix is in — note r226's grid-stall pad touches the
+four `get_rows` launches, which is the PLE lookup path this model offloads to the CPU.
+`6195152358e1…` is not on this box; backup at `~/.cache/llama-moe-heatmap/radix-261106-a07822d3.moe-heatmap`).
+
+**CLI decision cells** (`arm-decay.sh decode`, `-ncmoe 48`, `-lme N`, 4 GiB arena, `MOE_HOST_POOL_DIO=1`,
+`MOE_HOST_POOL_RAM_PCT=0`, prose 5 298 tok, `-n 64`, seed 42/temp 0):
+
+| `-lme` | coverage | `SINK=0` | `SINK=1` | delta | reuse |
+|---|---|---|---|---|---|
+| 36 | 76.9 % | 23.8 / 24.2 (**24.0**) | 26.2 / 25.8 (**26.0**) | **+8.3 %** | 4.7 % |
+| 44 | 93.7 % | 26.3 / 27.8 / 29.9 (**28.0**) | 34.2 / 33.5 / 34.1 (**33.9**) | **+21 %** (14…30) | 4.4 % |
+| 47 | mirror | 36.4 / 40.2 / 37.9 (**38.2**) | 39.6 (inert) | — | 0 demoted |
+
+So r224's +7.8 % reproduces exactly at 36 on a different prior and a different host link, and the sink is worth
+**+21 %** at a near-complement budget — a cell the record never measured (W1's copy *tax* there suggested the
+opposite).  The tier curve is 26.0 / 33.9 / 38.2 t/s, i.e. **94 % = −11 % of a mirror for 3.0 GiB less pinned
+RAM**, 77 % = −32 % for 11.1 GiB.  The mirror's sink-inertness invariant held to the counter (0 demoted, 144
+mirror tables).
+
+**The field shape (56 GiB rig, `auto` = 97.7 %, buffered fills, warm page cache) is where it breaks.**  First-pass
+50k prefill: `SINK=0` **1 763 / 1 865 / 1 884 (mean 1 837)**, `SINK=1` **855 / 819 / 928 (mean 867)** — **−53 %** —
+with decode flat (75.8-77.9 vs 76.1).  The census names it: the pool's "neither tier" volume goes **10.8 k →
+46 k experts** (≈7 → 30 GiB) when the demote is on, i.e. every prefill ubatch re-reads the missing experts
+through the bounce ring instead of admitting them.  **The mechanism is structural:** the exchange headroom is
+`K = 4 %` of slots (≈19/table) while the coverage gap at 97.7 % is **12/table** — `K > gap`, so the reserve holds
+free exactly the slots the complement needs and every fill is refused.  At `-lme 44` the gap is 32 > 19 and the
+same demote is +21 %.  ⇒ **`TODO` #281: cap `K` by the gap, and never let the reserve gate the prefill fill
+path.**  Until it is fixed, `MOE_HOST_POOL_SINK=0` is the workaround on an `auto`/near-mirror field box.
+
+**Two secondary results.**  The ranking at 97.7 % is a wash (`decode` 1 763 / 75.8 vs `combined` 1 865-1 884 /
+77.8-77.9), so r224's ranking default is not the field-shape problem — one 779 t/s reading on the `decode` arm
+did not reproduce (1 763 on the repeat) and is recorded as an outlier.  And 97.7 % coverage itself is cheap
+against a mirror: **−5 % prefill / −8 % decode for 2.2 GiB less pinned RAM**, so `auto` is a fine budget and the
+demote default is what ruins it.
+
+**Protocol lessons for the record.**  (1) The first 50k prefill on a cold page cache is **1 063.6** against
+**1 932.5** warm on the identical arm — the record's 1 941 is the warm number, so quote warm/warm or cold/cold.
+(2) The span-off arm is **bimodal** (prompt 280 vs 81 t/s, same config) because a 0.65 MiB O_DIRECT read is
+~0.65 ms warm but ~10 ms on the first touch after idle; the coalesced arm is stable (292-321) and fires 7 220
+reads / 10.4 GiB with 0 fallbacks.  Quote the pair, never a single SPAN=0 arm.
+
+## 261106.017 (campaign) -- `wip/host-expert-parity/` opened: the demote regime is re-measured on a PCIe 5.0 host, and PR #267's remainder is four open mechanisms, not ten
+
+**No delivery change.**  `release.json` untouched at `v16-6050b467c-r224`; `patches/` unchanged; `~/llama.cpp` is
+the same r224 tree (`88e7d88a7`).  New campaign record: [`wip/host-expert-parity/`](wip/host-expert-parity/README.md)
+(`README.md`, `PLAN.md`, `PR-267-REMAINDER.md`), indexed in `wip/CAMPAIGNS.md`; five new `TODO` handles
+(#276-#280).
+
+**Why a new campaign.**  Two things the r224 promotion left open, and no existing `wip/` entry covered either
+(`host-expert-coverage/` owns policy/visibility, `bench-56gb/` the rig, `moe-static-hot-tier/` the VRAM tier;
+the host-expert campaigns that owned the transport are archived).  (1) The demote's economics were measured on a
+box whose host link the record's own calibration puts at **~26 GB/s**; this box (`radix`) is **PCIe 5.0 x16**
+(`current_link_speed 32.0 GT/s`, width 16), one R9700, 93 GiB — much closer to `briansp2020`'s rig — so the
+exchange rate, the break-even reuse and the mirror-vs-partial gap are re-measured, not inherited.  (2) PR #267's
+mechanisms that we have neither integrated nor implemented differently.
+
+**The box changes what is even askable.**  With 86 GiB available and a 46.84 GiB host expert set, `-lme auto`
+plans a **MIRROR**, so every parity question lives only inside the `bench-56gb` 56 GiB rig — which is, by the
+r224 code's own comment, the **"middle band" it calls unmeasured** (`pool_decide_dio_locked`: the set fits, the
+set + the planned pool does not).  And the coalesced prefill read (`stage_span_fill`) returns unless
+`t.src_fd >= 0`, i.e. it is **O_DIRECT-only**, while the field `runme` mirrors `--load-mode mmap`: the r224
+`+81 %/+57 %/+14 %` prefill numbers are DIO-arm cache-staging numbers and may be inert on the shipped config.
+That is the first thing to measure, not to argue.
+
+**Two reproducibility gaps found while opening it** (both are why a re-measure cannot reuse the record's
+deltas): the frozen real-world heat prior the record quotes (`sha256 6195152358e1…`, 601 376 B, mode 444) is
+**not on this box** — `~/.cache/llama-moe-heatmap/` is empty and the model-dir sidecar is mode 644 with sha256
+`a07822d3…` — and **no prefill-logit base here matches the r224 tip** (the 27B and 35B-A3B bases are r191-era,
+`50d9e90ee` / `561696677`; the record's `build=37148d118` base is absent).  Both must be re-frozen/re-recorded
+from `88e7d88a7` before any number is comparable.
+
+**PR #267, re-assessed patch by patch** (`wip/host-expert-parity/PR-267-REMAINDER.md`).  Absorbed/superseded:
+0001 (the mode; `-lme` is the placement budget), 0005 (tier × devremap, `dr_pool_ok` r221), 0010 (**rejected with
+a number**: capping the bounce ring costs 8-25 % of prefill at FRAC 80, and r224's span coalescing addresses its
+premise by fewer/larger reads instead).  Split off: 0009's registration half is moot, its policy half is
+`host-expert-coverage/` steps 1-3.  Non-goal: 0002 sparse registration (`mlock` + `hipHostRegister(ReadOnly)` +
+`MAP_FIXED`), re-entry only if a partial tier cannot be made cheap.  **Still open, four mechanisms:** the demote's
+`cudaMemcpyAsync` vs a copy-kernel form + drain (#276), precopy (#277, conditional on #276), the arena across a
+decode→prefill transition (#278, measure first — the census's `evicted … re-armed` decides), and narrow-2
+preferring `cudaMalloc` over evicting arena tables (#279, an A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB`).
+
+**One defect recorded on the way** (in the policy campaign, not here): r224 made the pool's fill mode a policy,
+and its decision plus the middle-band warning are `GGML_LOG_INFO` — invisible at the default verbosity, the same
+class as `host-expert-coverage/`'s defect 3.  That campaign's §4c now requires the visible verdict line to carry
+the fill mode too.
+
+**Next:** `wip/host-expert-parity/PLAN.md` P0 — the `SINK=0/1` exchange rate on this link (W1's `SINK_TAX`
+instrument is gone at r224, so the real path is the instrument), the 56 GiB field matrix (mirror / `auto` / 94 % /
+76.9 % × `SINK` × `DIO`), the span-reach pair, and the two gates r224 owes (35B-A3B prefill-logit re-recorded
+here, MTP four-axis on dense 27B).
 ## 261106.016 (r227) -- issue #274 follow-up: the host pool's disk tier is real on Windows, a refused pool allocation reports and latches, and the exit census prints from the model teardown
 
 **Release `v16-6050b467c-r227`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
@@ -71,7 +170,6 @@ arms are byte-identical, and the prose Protocol A arm above is identical with ac
 Windows arms themselves (`ReadFile` disk tier, aperture census, latch) cannot be run here at all -- the
 reporter builds on Windows and will report; that is the whole reason the three are now logged rather than
 inferred.
-
 ## 261106.015 (r226) -- issue #277: the four `get_rows` launches take the grid-stall pad, and the pad learns to refuse one it cannot make
 
 **Release `v16-6050b467c-r226`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
@@ -227,7 +325,6 @@ trade for the hot path (an alloc dep there would hold a 4-16 MiB buffer for ever
 holds for upstream's own `ggml_cuda_can_fuse({RMS_NORM, MUL})` launch, which has no guard of its own: it
 is safe for exactly the in-place reason, and the driver cannot use the plain form as a reference arm because
 only the master `GGML_CUDA_DISABLE_FUSION` turns that one off.
-
 ## 261106.013 (r224) -- the host-expert-split campaign lands: a DECODE-ranked pool, an eviction demote, coalesced prefill reads (+81 % at `-lme` 12), and the heat-map fixes
 
 **Release `v16-6050b467c-r224`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
