@@ -101,6 +101,28 @@ call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
+* **The Windows pinned-host ceiling has no cap, only a latch — measure it before adding one** (r223, issue
+  #274 follow-up; **no `TODO` id** — waiting on Windows hardware we do not have, `TODO` #95).  `hipHostAlloc`
+  there is budgeted by WDDM against the adapter's shared segment once per visible adapter, so the usable figure
+  is about `(total RAM / 2) / visible HIP devices` (measured: ~13.4 GiB on a 27.6 GiB box with one adapter,
+  ~6.5 GiB with two — ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339), which is why a 26.6 GiB pool plan on
+  a 47 GB box is refused at the tail.  A ceiling derived from that model was implemented and then **deliberately
+  withdrawn**: it is a heuristic, it cannot be measured here, and it would cap a healthy box.  The shipped guard
+  is mechanism-independent — the first refused bounce-ring `cudaHostAlloc` logs once with the driver's error and
+  latches the pinned tier off (a Windows refusal surfaces as `hipErrorLaunchFailure`, which latches
+  process-wide), and the exit census repeats it.  **The work item is the measurement**: read the aperture
+  segment's `CommitLimit` via `D3DKMTQueryStatistics` (the call `wddm-mem.cu` already makes for the WDDM free
+  figure), compare it with the reporter's plan, then decide whether a cap is worth having.  Record:
+  `WORKLOG.md` 261105.012, `INVARIANTS.md` r223 fact 4.
+* **A reported ~40 GB of "process private" on a mapped `--host-experts pool` load is not explained by our code**
+  (r223, issue #274 follow-up @DanoPTT; **no `TODO` id** — waiting on the reporter).  A `PAGE_READONLY`
+  `MapViewOfFile` is file-backed and the delivery copies nothing at load (`ggml_backend_host_buffer_from_ptr`
+  over the mapping + `mark_mmap_used`), so the only calls that touch the range are the pool/bounce fill memcpys
+  (whose byte count the census prints as `pool fills: N mapping memcpys, X GiB total`) and the scheduler's
+  fallback copy.  A read-only file mapping should not be commit charge, so the first thing to check is which
+  column was read (Task Manager `Committed` / RAMMap mapped-file pages).  If it turns out to be real, it is a
+  loader or HIP-runtime issue on Windows, not the host-pool path.  Record: `INVARIANTS.md` r223 fact 5.
+
 * **A sub-complement host pool is never served by the device remap** (r221; **no `TODO` id** — the pool
   side of closed `#269`).  A `--host-experts pool` table whose budget does not cover its tensor has, for some
   experts, neither an arena slot nor a pool slot, and a device-side `expert -> slot` map is built once per

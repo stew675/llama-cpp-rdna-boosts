@@ -2116,3 +2116,54 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    at a tip that is not `release.json.tip` unless the tip is passed explicitly (and the amended block's commit
    id is still reproducible: the canonical re-cut of the new series prints `Applied tip: 80bfb80be`, matching
    `release.json`).
+
+## r223 -- a fill failure inside the call must decline that call; a pinned-allocation refusal is a LATCH, not a retry (issue #274 follow-up)
+
+1. **The entry guard is not enough: a fill that fails DURING `moe_cache_update_host`'s pass 1 must decline THAT
+   call (r223, block 12, issue #274 follow-up @briansp2020).**  `access_locked` rolls the failed admission back
+   and sets `t.fill_failed`, but the hook's `fill_failed` guard sits at the TOP of the function, so the call that
+   actually failed kept going: pass 2 found a cold id (pinned master) or a pool id (`pool_cold_slot_locked`; a
+   pool HIT is rolled back as an arena admission but is still resident in the pool) for the failed expert, `all`
+   stayed true, and the hook returned TRUE.  The scheduler then skipped `input_cpy` -- and `moe_cache_get_table`,
+   which the consuming op calls a few lines later, sees the SAME flag and returns false, so the op read a buffer
+   nobody filled.  That is the reported mid-run corruption (`This` followed by `!`), and it is invisible to a
+   text gate whenever the stale `input_cpy` happens to hold the right experts (measured here: identical text on
+   the pre-fix build, so the gate asserts the MECHANISM: `takeover=0` under a fill fault, 128/129 pre-fix).  The
+   fix is one re-check after pass 1, plus `!t.fill_failed` in `devremap_ok_locked` so the one-call-late device
+   remap follows the same wholesale-stand-down rule.
+2. **`MOE_HOST_POOL_FILL_FAULT` needs a `late` shape to reach a mid-run failure (r223 diagnostic).**  A fault
+   from the first call (`=1`) stands every table down before any take-over question can be asked, which is why
+   the r219 arm did not find fact 1.  `=late` (each table's second call on) reproduces "fills that had already
+   succeeded, then a failing call" deterministically on any box; a process-wide `=N` start does not, because the
+   landing point moves with the box's arena/pool sizing (measured: two runs of the same command, different
+   sha).  `=0` is off -- and note the r219 form treated ANY value as "on", so `FOO=0` used to mean "fail
+   everything".
+3. **A refused pinned allocation is a one-way latch on Windows, and retrying it manufactures a cascade (r223,
+   block 12, issue #274 follow-up @DanoPTT).**  `hipHostMalloc`/`cudaHostAlloc` refusing a pinned range there
+   surfaces as `hipErrorLaunchFailure` (719), which latches process-wide: every later HIP call -- the fill
+   copies and even `hipHostFree` -- fails too (`ROCM-33542` / rocm-systems#14578, relaying ROCm/TheRock#9339).
+   The shipment used to retry the per-table bounce `cudaHostAlloc` on every later fill, so one refusal became
+   thousands of failures whose message named a different (synthesized) error.  The first refusal now logs once
+   with the driver's error string and latches `g_pinned_off`; every later source resolution takes the pageable
+   fallback or declines (slow, correct) instead of calling the driver again.
+4. **The Windows PINNED ceiling is not `MemAvailable`, and a formula for it must NOT ship unmeasured
+   (r223).**  WDDM budgets pinned host pages against the adapter's shared segment and the PAL maps them onto
+   EVERY visible adapter without deduplicating, so the usable figure is about `(total RAM / 2) / visible
+   adapters` -- measured by ROCm as ~13.4 GiB on a 27.6 GiB box with one adapter and ~6.5 GiB with two
+   (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  A 47 GiB box therefore pins ~23 GiB while
+   `MOE_HOST_POOL_RAM_PCT` (a percentage of MemAvailable) planned ~26 GiB, which is why the reporter's tail
+   pools and then every bounce entry were refused.  **A cap derived from that model was implemented and then
+   deliberately withdrawn**: it is a heuristic, it cannot be measured here (no Windows box, `TODO` #95), and it
+   would cap a healthy box (an APU-only box, or a multi-GPU box where the adapter sum does not behave as the
+   model says).  The shipped guards do not guess: the first refused `cudaHostAlloc` latches the pinned tier off
+   with one WARN that names the platform cause (fact 3), and the exit census repeats the latch and its error.
+   The real figure is the aperture segment's `CommitLimit` (`D3DKMTQueryStatistics`, the same call
+   `wddm-mem.cu` already makes for the device free-memory query) -- measure it before adding a ceiling.
+5. **`Private Bytes` for a read-only file mapping is not commit charge, so a 40 GB figure there is a
+   measurement artifact until proven (r223, issue #274 follow-up @DanoPTT).**  `CreateFileMapping(PAGE_READONLY)`
+   + `MapViewOfFile(FILE_MAP_READ)` makes the GGUF page-cache-backed; the process's commit only grows for page
+   tables and for anything that COPIES the range.  On a mapped `--host-experts pool` load the delivery copies
+   nothing at load (`ggml_backend_host_buffer_from_ptr` over the mapping, `mark_mmap_used` only), so the only
+   calls that touch the range are the pool/bounce fill `memcpy`s and the scheduler's fallback copy -- the exit
+   census reports the bytes (`pool fills: N mapping memcpys, X GiB total`).  Attribute a large "private" figure
+   with Task Manager's `Committed` / RAMMap's mapped-file page count before chasing it as a leak.

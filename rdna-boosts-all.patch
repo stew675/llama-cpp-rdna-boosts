@@ -61595,10 +61595,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..b4b6dfb88
+index 000000000..a4e2a2a64
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,8440 @@
+@@ -0,0 +1,8557 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61741,6 +61741,9 @@ index 000000000..b4b6dfb88
 +    // nothing -- measured as corrupt greedy text on the issue-#274 forced-failure arm.  One failed fill is
 +    // enough: a source that failed once (no pool, no bounce, no mapping) does not come back.
 +    bool        fill_failed  = false;
++    // Diagnostic counter for `MOE_HOST_POOL_FILL_FAULT=late` (see `pool_fill_fault`): how many times THIS
++    // table's demand path asked for a source, so the fault can be "this table is already warm".
++    int32_t     fill_src_calls = 0;
 +    // Session 7 identity fast path: slots == n_experts, slot == expert, the whole table was copied
 +    // in at sizing time, and the consumer reads the arena with the raw routing ids (no remap, no
 +    // per-token host routing readback).
@@ -62109,6 +62112,16 @@ index 000000000..b4b6dfb88
 +int64_t                             g_fill_memcpy_us    = 0;
 +int64_t                             g_fill_total_bytes  = 0;   // (bytes; `g_fill_bytes` is the pre-existing traffic counter)
 +static uint64_t                     g_bounce_seq      = 0;
++// issue #274 follow-up (@DanoPTT): the PINNED tier is latched OFF by the first refused `cudaHostAlloc`.  A
++// pinned-allocation failure is not a transient on every platform: on Windows ROCm a `hipHostMalloc` refusal
++// surfaces as `hipErrorLaunchFailure` and LATCHES process-wide, so every later HIP call (including the fill
++// copies and `hipHostFree`) fails too -- one refusal then looks like a cascade of unrelated defects
++// (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  The bounce ring is the last pinned consumer, so its
++// first refusal latches: every later source resolution takes the pageable fallback or declines (slow but
++// correct) instead of hammering a driver that is no longer answering.  Nothing clears it: a source that
++// failed once does not come back (the same policy as `table_t::fill_failed`).
++static bool                         g_pinned_off       = false;
++static cudaError_t                  g_pinned_alloc_err = cudaSuccess;
 +int64_t                             g_gather_calls    = 0;
 +int64_t                             g_gather_pool     = 0;
 +int64_t                             g_gather_fills    = 0;
@@ -63229,6 +63242,15 @@ index 000000000..b4b6dfb88
 +    }
 +    if (g_pool_ram_cap < 0) {
 +        const int64_t avail = pool_available_ram_bytes();
++        // issue #274 follow-up (@DanoPTT): on Windows this figure is NOT the pinned ceiling.  WDDM charges
++        // pinned host pages against the adapter's shared segment once per VISIBLE adapter, so the real budget
++        // is roughly (total RAM / 2) / visible GPUs (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339:
++        // ~13.4 GiB on a 27.6 GiB box with one adapter, ~6.5 GiB with two).  A cap derived from that model was
++        // considered and deliberately NOT shipped: it is a heuristic, it cannot be measured on this box, and
++        // getting it wrong caps a healthy box.  The guards that do not guess are `g_pinned_off` (the first
++        // refused cudaHostAlloc latches the pinned tier off with one WARN naming the platform cause) and the
++        // exit census, and the fix for the report's crash was the mid-run decline above.  Measure the aperture
++        // segment's CommitLimit before adding a ceiling here.
 +        g_pool_ram_cap = avail > 0 ? (int64_t) ((double) avail * (double) g_pool_ram_pct / 100.0) : 0;
 +        if (g_pool_ram_cap > 0) {
 +            GGML_LOG_INFO("%s: host pool RAM ceiling: %d%% of MemAvailable = %.1f MiB (MOE_HOST_POOL_RAM_PCT)\n",
@@ -64150,11 +64172,15 @@ index 000000000..b4b6dfb88
 +    // path never exceeds ~5 entries, so a cap there is inert.  The fix for the memory is fewer, LARGER fills
 +    // (coalesce a run of consecutive missing experts into one pinned read), not a smaller ring -- see
 +    // wip/host-pool-speed README §16.
++    if (g_pinned_off) {
++        return -1;   // the pinned tier is latched off (see `g_pinned_off`): do not ask the driver again
++    }
 +    device_guard dg(t.device);
 +    void *      mem = nullptr;
 +    cudaEvent_t ev  = nullptr;
-+    if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
-+        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++    const cudaError_t alloc_err = cudaHostAlloc(&mem, t.host_bytes,
++                                                cudaHostAllocPortable | cudaHostAllocMapped);
++    if (alloc_err != cudaSuccess || cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        if (mem != nullptr) {
 +            (void) cudaFreeHost(mem);
@@ -64162,6 +64188,23 @@ index 000000000..b4b6dfb88
 +        if (ev != nullptr) {
 +            (void) cudaEventDestroy(ev);
 +        }
++        // ONE line, then the tier is off.  This used to be silent apart from the fill-failure line, which
++        // named a synthesized error instead of the allocation that actually failed (issue #274 follow-up).
++        g_pinned_off       = true;
++        g_pinned_alloc_err = alloc_err;
++        GGML_LOG_WARN("%s: the pinned bounce ring could not grow (%.1f MiB for layer=%d role=%s): %s.  The "
++                      "pinned host tier is now OFF for the rest of this run -- every fill that needs it is "
++                      "served from the model mapping/pageable path, or the op is declined (correct, slower).\n",
++                      __func__, (double) t.host_bytes / (1024.0 * 1024.0), t.layer, t.role.c_str(),
++                      cudaGetErrorString(g_pinned_alloc_err));
++#if defined(GGML_USE_HIP) && defined(_WIN32)
++        GGML_LOG_WARN("%s: on Windows the pinned ceiling is the adapter's shared-memory budget counted once "
++                      "per VISIBLE GPU, so it is far below MemAvailable and shrinks with every extra device "
++                      "(ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  Lower MOE_HOST_POOL_RAM_PCT "
++                      "or -lme, or make one GPU visible (HIP_VISIBLE_DEVICES).  A refused pinned allocation "
++                      "can latch a process-wide HIP error on this platform, which is why the tier is not "
++                      "retried.\n", __func__);
++#endif
 +        return -1;
 +    }
 +    bounce_t b;
@@ -64207,18 +64250,39 @@ index 000000000..b4b6dfb88
 +// bounce ring cannot be allocated.  The point of the arm is the SLOT state, not the fill: a failed fill must
 +// roll the admission back and decline the op (correct, slow) instead of leaving a resident slot full of stale
 +// bytes (fast, wrong).  Only the pool/bounce path is faulted; a pinned master is untouched.
-+static bool pool_fill_fault() {
-+    static const bool v = getenv("MOE_HOST_POOL_FILL_FAULT") != nullptr;
-+    return v;
++//
++//   =1        fault EVERY source, the issue's original shape (r219's arm).
++//   =N (N>1)  start at the N-th call PROCESS-WIDE.  The landing point then depends on the box's arena/pool
++//             sizing (free VRAM and MemAvailable move the fill count), so a run using it is not
++//             reproducible across box states -- useful to reproduce a report, not to gate a text hash.
++//   =late     fault from THIS TABLE's SECOND call on.  Every table gets exactly one successful source, then
++//             loses it, which is the "fills that had already succeeded, then a failing call" shape
++//             @briansp2020 reported -- deterministically, per table, on any box.
++//   =0/unset  off.
++static bool pool_fill_fault(table_t & t) {
++    static const char * mode = getenv("MOE_HOST_POOL_FILL_FAULT");
++    static const bool   late = mode != nullptr && strcmp(mode, "late") == 0;
++    static const long long start = (mode == nullptr || late) ? 0LL : atoll(mode);
++    static long long seen = 0;
++    if (late) {
++        return ++t.fill_src_calls >= 2;
++    }
++    return start > 0 && ++seen >= start;
 +}
 +
 +// TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
 +// the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
 +// Caller holds `g_mutex`.
 +static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, bool allow_empty_fill,
-+                            expert_src_t * out) {
++                            expert_src_t * out, const char ** why = nullptr) {
 +    *out = expert_src_t{};
++    if (why != nullptr) {
++        *why = nullptr;
++    }
 +    if (t.host == nullptr || t.host_bytes == 0 || expert < 0 || expert >= t.n_experts) {
++        if (why != nullptr) {
++            *why = "the table has no usable host master";
++        }
 +        return false;
 +    }
 +    if (!table_master_pageable(t)) {
@@ -64226,7 +64290,10 @@ index 000000000..b4b6dfb88
 +        out->kind = cudaMemcpyHostToDevice;
 +        return true;
 +    }
-+    if (pool_fill_fault()) {
++    if (pool_fill_fault(t)) {
++        if (why != nullptr) {
++            *why = "the diagnostic MOE_HOST_POOL_FILL_FAULT makes every pageable source unavailable";
++        }
 +        return false;
 +    }
 +    if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
@@ -64276,6 +64343,10 @@ index 000000000..b4b6dfb88
 +            GGML_LOG_WARN("%s: no pinned bounce entry for layer=%d role=%s (cudaHostAlloc failed); the host "
 +                          "pool and the bounce ring are both unavailable for this table\n", __func__, t.layer,
 +                          t.role.c_str());
++        }
++        if (why != nullptr) {
++            *why = g_pinned_off ? "the pinned host tier is off (the first cudaHostAlloc was refused; see the WARN above)"
++                                : "the pinned bounce ring could not allocate an entry (cudaHostAlloc failed)";
 +        }
 +        return false;
 +    }
@@ -64380,20 +64451,28 @@ index 000000000..b4b6dfb88
 +// The SIZING-time bulk fill (identity table, prefill/heat seed): acquire, copy the whole table in, and
 +// retire the pool copy -- a seeded expert is wholly resident, so its pool slot is dead weight and is freed
 +// for a later `pool_fill_empty_locked` (the one-shot seeds are the only eviction this helper may cause).
++//
++// issue #274 follow-up: "no host source could be resolved" is a HOST-side answer, not a CUDA error, but this
++// helper's contract returns `cudaError_t`.  The sentinel is never handed to `cudaGetErrorString` (every caller
++// only tests it) and it deliberately is not a plausible device error: it used to be
++// `cudaErrorInvalidDeviceFunction`, which printed `invalid device function` and sent the issue-#274 reporter
++// looking at the device instead of at the refused `cudaHostAlloc` behind it.
++static const cudaError_t k_no_host_source = cudaErrorMemoryAllocation;
 +static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, cudaStream_t stream) {
 +    if (t.host == nullptr || t.host_bytes == 0 || t.expert_bytes == 0) {
-+        return cudaErrorInvalidDeviceFunction;
++        return k_no_host_source;
 +    }
 +    host_pool_t * pool = table_pool_locked(t);
 +    expert_src_t  src;
-+    if (!expert_host_src(t, (int32_t) expert, pool, true, &src)) {
++    const char *  why = nullptr;
++    if (!expert_host_src(t, (int32_t) expert, pool, true, &src, &why)) {
 +        static bool warned = false;
 +        if (!warned) {
 +            warned = true;
-+            GGML_LOG_WARN("%s: no pinned host source for layer=%d role=%s expert=%d (pool and bounce both "
-+                          "unavailable)\n", __func__, t.layer, t.role.c_str(), (int) expert);
++            GGML_LOG_WARN("%s: no pinned host source for layer=%d role=%s expert=%d (%s)\n", __func__, t.layer,
++                          t.role.c_str(), (int) expert, why != nullptr ? why : "no source could be resolved");
 +        }
-+        return cudaErrorInvalidDeviceFunction;
++        return k_no_host_source;
 +    }
 +    const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
 +    // wip/host-expert-pool-region: retire the source slot ONLY when the pool is a BOUNDED complement of the
@@ -64559,18 +64638,22 @@ index 000000000..b4b6dfb88
 +        // policy within 250 MiB of the others' L3 reads, against a 15x difference for the pool's CONTENT.
 +        expert_src_t hsrc;
 +        cudaError_t  err = cudaSuccess;
-+        if (!expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc)) {
-+            err = cudaErrorInvalidDeviceFunction;
-+        }
-+        if (err == cudaSuccess) {
++        const char * why = nullptr;
++        // issue #274 follow-up (@DanoPTT): `expert_host_src` failing is a HOST-side answer (no pool slot, no
++        // pinned bounce, no mapping), so it has no CUDA error to report.  The old code synthesized
++        // `cudaErrorInvalidDeviceFunction` here, which printed `invalid device function` and sent the
++        // reporter looking at the device -- the actual cause was a refused `cudaHostAlloc`.  Keep the two
++        // cases apart and report each one's real reason.
++        const bool   no_src = !expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc, &why);
++        if (!no_src) {
 +            err = copy_slot_from_src(t, dst, hsrc, (cudaStream_t) stream);
 +        }
-+        if (err == cudaSuccess) {
++        if (err == cudaSuccess && !no_src) {
 +            // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
 +            // being in VRAM now does not mean the pool should forget where to find it next time.
 +            expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
 +        }
-+        if (err != cudaSuccess) {
++        if (err != cudaSuccess || no_src) {
 +            // issue #274: a fill that failed must NOT leave the expert RESIDENT.  The remap is built from
 +            // `t.expert_slot`, so recording a slot whose bytes were never copied does not degrade the answer,
 +            // it CORRUPTS it (the reporter's run produced one token and stopped: every fill had failed and
@@ -64591,12 +64674,20 @@ index 000000000..b4b6dfb88
 +            const bool first_for_table = !t.fill_fail_warned;
 +            t.fill_fail_warned = true;
 +            if (first_for_table || (g_fill_fail % 10000) == 0) {
-+                // Report the REAL cause: `err` is what `expert_host_src`/`copy_slot_from_src` returned, and
-+                // `cudaGetLastError()` is empty for both (`"no error"` is what made this look like a driver
-+                // problem in issue #274).
-+                GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: %s; the slot is NOT resident "
-+                              "(%lld failed fills so far)\n", __func__, t.layer, t.role.c_str(), expert,
-+                              cudaGetErrorString(err), (long long) g_fill_fail);
++                // Report the REAL cause: `err` is what `copy_slot_from_src` returned, and `cudaGetLastError()`
++                // is empty for a host-side failure (`"no error"` is what made this look like a driver problem
++                // in issue #274).  A source that could not be resolved says so in words instead of naming a
++                // device error it never had.
++                if (no_src) {
++                    GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: no pinned host source (%s); "
++                                  "the slot is NOT resident (%lld failed fills so far)\n", __func__, t.layer,
++                                  t.role.c_str(), expert, why != nullptr ? why : "no source could be resolved",
++                                  (long long) g_fill_fail);
++                } else {
++                    GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: %s; the slot is NOT resident "
++                                  "(%lld failed fills so far)\n", __func__, t.layer, t.role.c_str(), expert,
++                                  cudaGetErrorString(err), (long long) g_fill_fail);
++                }
 +            }
 +            if (cold_ok && out_cold != nullptr) {
 +                *out_cold = true;
@@ -68646,7 +68737,7 @@ index 000000000..b4b6dfb88
 +                // destination is a transient ring slot, not the arena.
 +                expert_src_t hsrc;
 +                if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc)) {
-+                    err = cudaErrorInvalidDeviceFunction;
++                    err = k_no_host_source;   // see `fill_slot_from_host`: a host-side answer, never a device error
 +                    break;
 +                }
 +                if (do2d) {
@@ -69112,6 +69203,22 @@ index 000000000..b4b6dfb88
 +        (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
 +    }
 +
++    // issue #274 follow-up (@briansp2020): a fill can fail DURING the pass above, and that is the moment the
++    // table's `fill_failed` is set.  The guard at the top of this function only covers a table that had
++    // ALREADY failed on a previous call, so the call that fails half way through used to carry on: pass 1 had
++    // admitted the experts before the failure (and rolled the failed one back), pass 2 then found a valid
++    // cold or pool id for the failed expert (a pool HIT is rolled back the same way but is still resident in
++    // the pool), `all` stayed true and the hook returned TRUE.  The scheduler then skipped its `input_cpy`
++    // copy -- while `moe_cache_get_table`, which the consuming op calls a few lines later, sees the SAME
++    // `fill_failed` and returns false.  The op therefore read an `input_cpy` that was never populated, which
++    // is the reported "correct until the pool starts failing, then `This!!!!!!`" output (NaN-shaped logits),
++    // reproduced on stock r220 with `MOE_HOST_POOL_FILL_FAULT=200`.  Decline HERE, after the fills and before
++    // anything is remapped, so the scheduler populates the copy the op will actually read.
++    if (t.fill_failed) {
++        g_decline_all++;
++        return false;
++    }
++
 +    // Pass 2: build the remap from the FINAL map.  Nothing evicts between here and the read.
 +    //
 +    const int  n_res_slots = t.slots;
@@ -69262,7 +69369,7 @@ index 000000000..b4b6dfb88
 +
 +// Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
 +static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
-+    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
++    return g_sized && !t.dr_failed && !t.fill_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
 +           t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
 +           n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
 +           (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
@@ -69938,6 +70045,16 @@ index 000000000..b4b6dfb88
 +        GGML_LOG_WARN("%s: FAILED fills: %lld (each one was rolled back -- the slot is not resident and the "
 +                      "routed op was declined, so the scheduler served it from the host master)\n",
 +                      __func__, (long long) g_fill_fail);
++    }
++    if (g_pinned_off) {
++        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once and is latched off for the run,
++        // so the tier is being served from the pageable mapping.  Say WHICH error and WHY it is not retried --
++        // a silent fallback reads as "the pool never appeared" all over again.
++        GGML_LOG_WARN("%s: the pinned host tier is OFF for this run (the first cudaHostAlloc was refused: %s); "
++                      "every fill that needed it went through the model mapping/pageable path or declined.  "
++                      "On Windows the ceiling is (RAM/2) per visible GPU, not MemAvailable -- lower "
++                      "MOE_HOST_POOL_RAM_PCT / -lme or make one GPU visible (ROCm/TheRock#9339)\n",
++                      __func__, cudaGetErrorString(g_pinned_alloc_err));
 +    }
 +    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
 +        const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;

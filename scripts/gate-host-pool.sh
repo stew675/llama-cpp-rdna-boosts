@@ -27,16 +27,24 @@
 #     nodisk  MOE_HOST_POOL_DIO=1 + MOE_HOST_POOL_DIO_FAULT=1
 #                                                (a platform with NO pool disk tier -- the Windows shape)
 #     fail    MOE_HOST_POOL_FILL_FAULT=1         (no source can be resolved for a pageable master)
+#     late    MOE_HOST_POOL_FILL_FAULT=late      (each table gets ONE source, then loses it -- the
+#                                                mid-run shape @briansp2020 reported: fills that had
+#                                                already succeeded, then a failing call)
 #   HARD  * `ref`, `dio` and `nodisk` are byte-identical and build a real pool (the exit census must report
 #           `host pool (L2): N tensors, <slots> slots, <MiB> pinned` with slots > 0 and MiB > 0)
 #   HARD  * `ref`, `dio` and `nodisk` log NO `fill failed`, NO `no pinned host source` and NO
 #           `async fill failed` (the #274 symptom)
 #   HARD  * `nodisk` is not vacuous: it must log the fill-mode refusal / mapping fallback, and `dio` must
 #           report the disk tier it was asked for
-#   HARD  * `fail` is CORRECT, not corrupt: byte-identical text to `ref`, every failure reported as `the slot
-#           is NOT resident`, and the exit census (`FAILED fills: N`, N > 0).  This is the invariant the
-#           reporter's broken output violated: a cache that cannot fill must decline the op, never serve the
-#           slot.
+#   HARD  * `fail` and `late` are CORRECT, not corrupt: byte-identical text to `ref`, every failure reported
+#           as `the slot is NOT resident`, and the exit census (`FAILED fills: N`, N > 0).
+#   HARD  * `fail` and `late`: **the take-over counter is 0**.  This is the issue-#274 follow-up invariant
+#           (@briansp2020): the call that fails a fill must DECLINE, so the scheduler populates the
+#           `input_cpy` the op will read; if it takes the op over instead, `moe_cache_get_table` (which sees
+#           the same `fill_failed`) refuses it a few lines later and the op reads an `input_cpy` nobody
+#           filled.  The TEXT half of that is box-dependent (a stale-but-valid `input_cpy` can hide it -- it
+#           did here; it corrupted the reporter's server), but the take-over counter is not: measured
+#           takeover=128/129 on the pre-fix code and 0 with the fix, in both arms.
 #   HARD  * no arm logs `async fill failed` (the old, cause-hiding message) or aborts
 #   INFO  the pool's pinned size/slot count, its hit rate, the fill mode and the throughput per arm
 #
@@ -79,7 +87,7 @@ KEEP=0
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
-        -h|--help) sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
     esac
 done
@@ -128,6 +136,9 @@ pool_slots() { grep -o 'host pool (L2): [0-9]* tensors, [0-9]* slots' "$KEEPOUT/
 pool_mib()   { grep -o 'host pool (L2): .* MiB pinned' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9.]*\) MiB pinned/\1/'; }
 fill_mode()  { grep -o 'host pool fill mode: [a-zA-Z_]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
 failed_fills(){ grep -o 'FAILED fills: [0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+# the take-over counter: `takeover=<n> decline_all=<n> get_ok=<n>`.  With a fill fault active it MUST be 0:
+# a call that failed a fill may not take its op over (the consumer refuses the table a few lines later).
+takeover()   { grep -o 'takeover=[0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/takeover=//'; }
 # `gt0 <value>`: true when value is a number above zero (empty/garbage is false)
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
@@ -136,14 +147,15 @@ run_arm ref    MOE_HOST_POOL_DIO=0 || exit 2
 run_arm dio    MOE_HOST_POOL_DIO=1 || exit 2
 run_arm nodisk MOE_HOST_POOL_DIO=1 MOE_HOST_POOL_DIO_FAULT=1 || exit 2
 run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
+run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
 
-for a in ref dio nodisk fail; do text_only "$a"; done
+for a in ref dio nodisk fail late; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
 
 # ---- HARD: identical greedy text ---------------------------------------------------------------
-for a in dio nodisk fail; do
+for a in dio nodisk fail late; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
@@ -195,10 +207,32 @@ else
     fail "fail: no FAILED fills in the census: the forced-failure arm is vacuous"
 fi
 hard
-if grep -q 'the slot is NOT resident' "$KEEPOUT/fail/err.txt"; then
-    ok "fail: every failed fill reports the slot as NOT resident"
+ff="$(failed_fills late)"
+if gt0 "$ff"; then
+    ok "late: $ff fills failed after their table was warm (reported in the census)"
 else
-    fail "fail: no 'the slot is NOT resident' line (a failed fill would be served as resident)"
+    fail "late: no FAILED fills in the census: the mid-run arm is vacuous"
+fi
+
+# issue #274 follow-up (@briansp2020): the call that FAILS a fill must decline, so the scheduler populates
+# the input the op reads.  Taking the op over there leaves `input_cpy` unfilled while `moe_cache_get_table`
+# refuses the same table -- measured on the reporter's server as `This!!!!!!` output, and here as a
+# take-over whose op reads a stale-but-valid copy (so the text alone cannot catch it).
+for a in fail late; do
+    hard
+    tko="$(takeover "$a")"
+    if [ "${tko:-x}" = "0" ]; then
+        ok "$a: no op was taken over while its table stood down (takeover=0)"
+    else
+        fail "$a: takeover='${tko}' -- the failing call still handed the op over (its input was never copied)"
+    fi
+done
+hard
+if grep -q 'the slot is NOT resident' "$KEEPOUT/fail/err.txt" && \
+   grep -q 'the slot is NOT resident' "$KEEPOUT/late/err.txt"; then
+    ok "fail, late: every failed fill reports the slot as NOT resident"
+else
+    fail "fail/late: no 'the slot is NOT resident' line (a failed fill would be served as resident)"
 fi
 hard
 if grep -q 'async fill failed' "$KEEPOUT/fail/err.txt"; then
@@ -208,7 +242,7 @@ else
 fi
 
 # ---- HARD: no abort anywhere ------------------------------------------------------------------
-for a in ref dio nodisk fail; do
+for a in ref dio nodisk fail late; do
     hard
     if grep -qE 'GGML_ASSERT|terminate called|what\(\):|HAVE_ABORT' "$KEEPOUT/$a/err.txt"; then
         fail "$a aborted (see $KEEPOUT/$a/err.txt)"
@@ -220,7 +254,7 @@ done
 
 echo
 echo "==> $((CHECKS - FAILED))/$CHECKS checks passed"
-for a in ref dio nodisk fail; do
+for a in ref dio nodisk fail late; do
     printf "    %-7s %-52s %s\n" "$a" "$(text_hash "$a")" "$(grep -o 'Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s' "$KEEPOUT/$a/out.txt" | tail -1)"
 done
 echo "    logs: $KEEPOUT"

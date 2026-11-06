@@ -1,3 +1,85 @@
+## 261105.012 (r223) -- issue #274 follow-up: a call that fails a fill must decline, and a refused pinned allocation is a latch
+
+**Released as `v16-6050b467c-r223` (16 blocks; block 12 amended).**  Fork point unchanged (`6050b467c`),
+canonical tip **`37148d118`**, tree **`680e043b3cbd9f3508061c5ccbfa355fd8f0a68a`**.  Blocks 00-11 and 13-15 keep
+identical deltas; the series was re-cut from `6050b467c` with `scripts/apply-all.sh` (strict `git am`, so the
+block-12 commit id changes while the block bodies are byte-identical).
+
+### What was reported (three findings on the closed issue, after r219/r220)
+
+* **@briansp2020** -- when fills start failing *after* earlier ones succeeded, the pool-mode output on stock
+  r220 is still wrong (`This` then `!` for the two long-prompt chats), and the fix on his own tree is a decline
+  right after `moe_cache_update_host`'s first pass.  His shape is not reachable from
+  `MOE_HOST_POOL_FILL_FAULT=1`, because a fault from the first call stands every table down before any
+  take-over question can be asked.
+* **@DanoPTT** (Windows, r220) -- the r219 correctness fix works (coherent text, the census line appears), but
+  (1) ~40 GB of "process private" that does not track the pool budget, (2) pinned allocations failing while
+  ~20 GB of RAM is free, and (3) `fill failed ...: invalid device function` naming the wrong cause.
+* **@briansp2020** again -- a correction that it IS specific to the take-over path, with the decline patch.
+
+### What was actually wrong (two defects, one misleading message, one platform ceiling)
+
+1. **A fill failure inside the call did not decline that call** (confirmed by reading the code, then measured):
+   `access_locked` rolls the failed admission back and sets `t.fill_failed`, but the guard in
+   `moe_cache_update_host` sits at the top of the function.  The failing call continued: pass 2 found a cold or
+   pool id for the failed expert (a pool HIT is rolled back as an arena admission but is still pool-resident),
+   `all` stayed true, and the hook returned TRUE -- the scheduler skipped `input_cpy`, while
+   `moe_cache_get_table`, which the consuming op calls a few lines later, saw the same flag and returned false.
+   The op read a buffer nobody filled.  Fix: re-check `t.fill_failed` right after pass 1, before anything is
+   remapped, and add `!t.fill_failed` to `devremap_ok_locked` so the one-call-late remap follows the same rule.
+2. **The failure message named a synthesized device error.**  `expert_host_src` failing is a host-side answer
+   (no pool slot, no pinned bounce, no mapping) yet the caller substituted `cudaErrorInvalidDeviceFunction`,
+   which printed `invalid device function`.  Replaced by a named `k_no_host_source` sentinel that is never
+   passed to `cudaGetErrorString`, plus a real reason per failure (`no pinned host source (<why>)`).
+3. **A refused pinned allocation was retried forever.**  On Windows a `hipHostMalloc` refusal surfaces as
+   `hipErrorLaunchFailure` and latches process-wide (`ROCM-33542` / rocm-systems#14578, relayed in
+   ROCm/TheRock#9339), so the per-table bounce `cudaHostAlloc` retry turned one refusal into thousands of
+   failures.  The first refusal now logs once with the driver's string and latches the pinned tier OFF.
+4. **The pool was sized against `MemAvailable` on a platform whose pin ceiling is not `MemAvailable`.**
+   WDDM charges pinned host pages against the adapter's shared segment once per visible adapter, so the ceiling
+   is ~`(total RAM / 2) / visible adapters`: ~23 GiB on the reporter's 47 GB box against the ~26.6 GiB pool
+   `MOE_HOST_POOL_RAM_PCT=75` planned -- the tail pools and then every bounce entry are refused and the tier
+   collapses to the pageable path.  A ceiling derived from that model was implemented, measured to be
+   unverifiable here, and **withdrawn on the maintainer's call** (a heuristic that cannot be measured would cap
+   a healthy box): the shipped guard is the latch in (3) plus a census line, and `TODO.md` carries "measure the
+   aperture segment's `CommitLimit` before adding a ceiling".
+5. **The 40 GB "private commit" is very likely the reported column, not commit.**  A `PAGE_READONLY`
+   `MapViewOfFile` is file-backed: the delivery copies nothing at load (host buffer over the mapping,
+   `mark_mmap_used` only), so the only touches are the pool/bounce fill memcpys and the scheduler fallback --
+   whose byte count the census already prints.  Asked the reporter to check Task Manager's `Committed` /
+   RAMMap's mapped-file pages; no code change (INVARIANTS r223 fact 5).
+
+### Verification (working tree, `~/bin/build-llama-rocm`, ROCm 10.1.0, 1 GPU, gfx1201)
+
+| gate | result |
+|---|---|
+| `gate-host-pool.sh` (five arms, new `late` arm and `takeover=0` checks) | **PASS 23/23**; all five texts `a99ccbd97ecb` (182 chars); a live pool in the three healthy arms (57105 / 56823 / 56964 slots, **31.6 / 31.5 / 31.6 GiB** pinned, buffered / **O_DIRECT** / buffered) with zero fill failures; `fail` 2790, `late` 2732 rolled-back fills, `the slot is NOT resident` per table |
+| pre-fix vs post-fix, the same two fault arms | pre-fix **`takeover=128` / `129`, `get_ok=0`** (the failing call handed the op over; the text happened to stay correct on this box because the stale `input_cpy` held the right experts) -- post-fix **`takeover=0`, `get_ok=0`**, text unchanged.  This is the case's real discriminator: the text half is box-dependent, the mechanism is not |
+| long-prompt reproduction (`prompts/prose-rdna-boosts.txt`, `-c 8192 -n 64`) | reference `bd6b7b26eac9` (334 chars); `MOE_HOST_POOL_FILL_FAULT=late` post-fix **same hash, twice** (deterministic); the process-wide `=2000` form is **not** reproducible across box states (two runs of one command gave two shas, because the box's sizing moves where the global fault lands) -- which is why `=late` exists and why only it is gateable |
+| `check-windows-portability.sh` | OK, 287 files (the new code is inside the `GGML_USE_HIP && _WIN32` region) |
+| build | clean (`~/bin/build-llama-rocm`) |
+| `fork-refresh.sh --build --gates` (the re-cut branch) | tree == `release.json.tree`; build ok; coherence PASS; **prefill-logit mean KLD 0.000000 / same-top-p 100.000 %** |
+| `validate-set.sh` | **GREEN** -- artifact checksums, strict **16/16** on a fresh tarball at `6050b467c`, applied tree == `release.json.tree`, Windows portability lint 287 files |
+| MTP four-axis (Protocol A, 27B UD-Q4_K_XL, 1 GPU, `-c 32768`, bf16 KV, `-n 2000`, adaptive, seed 42, the protocol's sampler set, `--reasoning on` for R) | text **bit-identical 4/4** to the r222/r219/r217 record: R `0ffad0c34953` (9243), P `4f0d1ea854e9` (5830), C `95603a6a89a4` (8966), K `a87c4318b649` (2174) |
+
+**Still not run:** the per-block build ladder (`gate-per-block-build.sh`) against the re-cut set, and a real
+Windows arm -- finding 4's mechanism and finding 5's attribution can only be confirmed there (`TODO` #95).
+
+### Docs changed with it
+
+`patches/README.md` (block 12 follow-up bullet), `MANIFESTS.md` (block-12 row), `INVARIANTS.md` (r223 facts
+1-5), `ENVIRONMENT.md` (`MOE_HOST_POOL_FILL_FAULT` forms), `scripts/README.md` and `scripts/gate-host-pool.sh`
+(the `late` arm + `takeover=0`).  No new environment variable.
+
+### Decisions (maintainer, same session)
+
+1. **Ship it as r223** -- the block-12 amend is committed and the set re-cut.
+2. **Do NOT ship a Windows pinned-ceiling formula.**  The latch (`g_pinned_off`) + the WARN + the census line are
+   the guard, because they cannot make a working box worse; the real figure is the aperture segment's
+   `CommitLimit`, and measuring it needs Windows hardware (`TODO` #95).  The withdrawn cap is recorded in
+   `INVARIANTS.md` r223 fact 4 so it is not re-proposed blind.
+3. **Reply to @DanoPTT** with the r223 answer and the `Committed` / RAMMap measurement correction for the 40 GB.
+
 ## 261105.011 (r222 tooling, no delivery change) -- the container images name their RELEASE, not only the fork point (issue #272 follow-up)
 
 **No delivery change.**  `patches/`, `release.json` and the artefact hashes are untouched (the release stays

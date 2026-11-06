@@ -3245,6 +3245,29 @@ a hook is CUDA-only (the non-CUDA entries stay NULL and the feature is simply in
   failure on Linux (the only way to reach them from this box).  Measured: 7281 pre-fix `async fill failed`
   lines and garbled text against 0 and byte-identical text post-fix.
 
+* **A call that fails a fill must DECLINE, and the pinned tier latches off on a refused allocation (r223,
+  issue #274 follow-up).**  (a) @briansp2020: when fills start failing after earlier ones succeeded, the call
+  that fails can still take its op over.  `access_locked` rolls the failed admission back and sets
+  `t.fill_failed`, pass 2 then finds a valid cold/pool id for that expert (a pool HIT is rolled back the same
+  way but is still resident in the pool), `all` stays true, and `moe_cache_update_host` returns TRUE -- so the
+  scheduler skips its `input_cpy` copy, while `moe_cache_get_table`, which the consuming op calls a few lines
+  later, sees the same `fill_failed` and returns false.  The op then reads an `input_cpy` nobody filled
+  (the reporter's `This!!!!!!` reply, and a pool-heavy 5 t/s run).  The hook now re-checks `t.fill_failed`
+  right after pass 1, before anything is remapped, and `devremap_ok_locked` refuses a failed table too.
+  (b) @DanoPTT: a fill failure named a synthesized `cudaErrorInvalidDeviceFunction` (`invalid device function`)
+  although the cause was a host-side refusal -- the sentinel is now named `k_no_host_source`, never printed via
+  `cudaGetErrorString`, and each failure reports its real reason ("no pinned host source (<why>)").  A refused
+  bounce-ring `cudaHostAlloc` now logs once with the driver's error string and **latches the pinned tier off**
+  for the rest of the run: on Windows a `hipHostMalloc` refusal surfaces as `hipErrorLaunchFailure`, which
+  latches process-wide (ROCM-33542 / rocm-systems#14578), so retrying it turns one refusal into a cascade.
+  (c) The window's pinned ceiling is NOT `MemAvailable` (WDDM charges pinned pages against the adapter's
+  shared segment once per visible adapter: ~`(RAM/2)/GPUs`, ROCm/TheRock#9339), which is why a 26.6 GiB pool
+  plan on a 47 GiB box was refused at the tail.  A ceiling derived from that model was **deliberately not
+  shipped** (a heuristic cannot be measured here and would cap a healthy box); the guards are the latch above
+  and the exit census, and the real figure to query is the aperture segment's `CommitLimit`.  Gated by
+  `gate-host-pool.sh`'s new `late` arm and its `takeover=0` check (pre-fix: `takeover=128/129`, `get_ok=0`;
+  post-fix: `0`), 23/23.
+
 ---
 
 ## Facts that span blocks

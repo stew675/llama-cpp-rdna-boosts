@@ -1,4 +1,4 @@
-From b55ae4d808f703ef74cab323221f1bbc9f3fe7b6 Mon Sep 17 00:00:00 2001
+From 02854cd753fd9f1f0fe947f17a14522b87281064 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 13:54:26 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -375,7 +375,7 @@ garbled text); see WORKLOG.md 261105.005.
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   35 +-
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  251 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  172 +-
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 2799 +++++++++++++----
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 2916 +++++++++++++----
  ggml/src/ggml-cuda/moe-expert-cache.h         |   31 +
  .../template-instances/generate_cu_files.py   |   46 +-
  ggml/src/ggml-rpc/ggml-rpc.cpp                |    3 +
@@ -434,7 +434,7 @@ garbled text); see WORKLOG.md 261105.005.
  tools/server/server-task.cpp                  |  104 +-
  tools/server/server-task.h                    |   11 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 80 files changed, 6359 insertions(+), 1033 deletions(-)
+ 80 files changed, 6476 insertions(+), 1033 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index d07aac4c3..1840d87d3 100644
@@ -2824,7 +2824,7 @@ index 8bffa48f1..0177e7f46 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index c386ee560..06f176145 100644
+index c386ee560..7c084b4fb 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -22,11 +22,8 @@
@@ -2869,7 +2869,7 @@ index c386ee560..06f176145 100644
      int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
  
      int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
-@@ -126,6 +135,15 @@ struct table_t {
+@@ -126,6 +135,18 @@ struct table_t {
      int64_t     fills       = 0;
      int64_t     evictions   = 0;
      bool        alloc_failed= false;
@@ -2882,10 +2882,13 @@ index c386ee560..06f176145 100644
 +    // nothing -- measured as corrupt greedy text on the issue-#274 forced-failure arm.  One failed fill is
 +    // enough: a source that failed once (no pool, no bounce, no mapping) does not come back.
 +    bool        fill_failed  = false;
++    // Diagnostic counter for `MOE_HOST_POOL_FILL_FAULT=late` (see `pool_fill_fault`): how many times THIS
++    // table's demand path asked for a source, so the fault can be "this table is already warm".
++    int32_t     fill_src_calls = 0;
      // Session 7 identity fast path: slots == n_experts, slot == expert, the whole table was copied
      // in at sizing time, and the consumer reads the arena with the raw routing ids (no remap, no
      // per-token host routing readback).
-@@ -173,6 +191,19 @@ struct table_t {
+@@ -173,6 +194,19 @@ struct table_t {
      int         prs_slots   = 0;        // slot count the snapshot was built against
      std::vector<int32_t> prs_host;      // persistent staging (the async H2D must not race its source)
  
@@ -2905,7 +2908,7 @@ index c386ee560..06f176145 100644
      // Provisional slots (MOE_EXPERT_CACHE_PROVISIONAL=1): a pre-filled/loaded expert is "provisional"
      // until it is hit.  While it is, the touch doorkeeper is bypassed for it, so the entry is evictable
      // like an empty slot while still serving hits - the model-both-ways behaviour arbitrary pre-fill
-@@ -190,15 +221,27 @@ struct table_t {
+@@ -190,15 +224,27 @@ struct table_t {
      // band by the device tally (`moe_cache_heat_observe`, so the staged path and the identity path
      // are covered).  NOT decayed (unlike `count`/`ghost`) - it is a workload prior, not eviction state.
      std::vector<uint32_t> heat;             // [n_experts], saturating
@@ -2933,7 +2936,7 @@ index c386ee560..06f176145 100644
  std::mutex                          g_mutex;
  std::vector<table_t>                g_tables;
  // Stable registration key: (host master weight, device).  It must not be the tensor the op reads
-@@ -242,13 +285,19 @@ struct host_pool_t {
+@@ -242,13 +288,19 @@ struct host_pool_t {
      std::string path;                    // GGUF path
      size_t      file_offs   = 0;         // tensor data offset in the file
      int         fd          = -1;
@@ -2957,7 +2960,7 @@ index c386ee560..06f176145 100644
      std::vector<uint8_t>                 slot_state;
      // Per (slot, device) in-flight events.  The pool is PROCESS-WIDE, so the same slot can be copied to
      // several devices and every copy must drain before the slot is reused or retired.  Indexed
-@@ -271,7 +320,11 @@ struct host_pool_t {
+@@ -271,7 +323,11 @@ struct host_pool_t {
  // Keyed by the host tensor only: the pool is PROCESS-WIDE (one copy of each whole expert for every
  // device), and `MOE_HOST_POOL_MIB` is the total non-swappable budget, split equally over the registered
  // host tensors.  Per-(slot, device) events make a shared slot safe to copy to several devices.
@@ -2970,7 +2973,7 @@ index c386ee560..06f176145 100644
  bool    g_pool_enabled     = false;
  // wip/host-expert-pool-region (TODO #139): an explicit PROCESS-WIDE budget for the pinned pool, in bytes
  // (-1 = no override; the MOE_HOST_POOL_* knobs decide).  The loader sets it from `-lme N` when N is below the
-@@ -279,29 +332,64 @@ bool    g_pool_enabled     = false;
+@@ -279,29 +335,64 @@ bool    g_pool_enabled     = false;
  int64_t g_pool_budget_override = -1;
  bool    g_pool_requested   = false;  // --host-experts pool (set by the loader before tables are registered)
  bool    g_pool_auto        = false;  // MOE_HOST_POOL_MIB unset/auto: size from the MoE host expert bytes
@@ -3055,7 +3058,7 @@ index c386ee560..06f176145 100644
  
  // An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
  // several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
-@@ -334,6 +422,23 @@ static int alias_find_checked(const void * key, int device, int layer) {
+@@ -334,6 +425,23 @@ static int alias_find_checked(const void * key, int device, int layer) {
  bool                                g_enabled    = false;
  bool                                g_init_done  = false;
  bool                                g_report     = true;
@@ -3079,7 +3082,7 @@ index c386ee560..06f176145 100644
  bool                                g_fill       = false;   // opt-in: copy the master into the slot
  int                                 g_device     = -1;
  int64_t                             g_period     = 32;   // LFRU decay period, decode steps
-@@ -393,6 +498,23 @@ bool                                g_cold_uva        = false;  // MOE_EXPERT_CA
+@@ -393,6 +501,33 @@ bool                                g_cold_uva        = false;  // MOE_EXPERT_CA
  bool                                g_stage_cache     = true;
  // Prefill staging accounting (per call = per table per ubatch).
  int64_t                             g_stage_ok        = 0;
@@ -3097,13 +3100,23 @@ index c386ee560..06f176145 100644
 +int64_t                             g_fill_memcpy_us    = 0;
 +int64_t                             g_fill_total_bytes  = 0;   // (bytes; `g_fill_bytes` is the pre-existing traffic counter)
 +static uint64_t                     g_bounce_seq      = 0;
++// issue #274 follow-up (@DanoPTT): the PINNED tier is latched OFF by the first refused `cudaHostAlloc`.  A
++// pinned-allocation failure is not a transient on every platform: on Windows ROCm a `hipHostMalloc` refusal
++// surfaces as `hipErrorLaunchFailure` and LATCHES process-wide, so every later HIP call (including the fill
++// copies and `hipHostFree`) fails too -- one refusal then looks like a cascade of unrelated defects
++// (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  The bounce ring is the last pinned consumer, so its
++// first refusal latches: every later source resolution takes the pageable fallback or declines (slow but
++// correct) instead of hammering a driver that is no longer answering.  Nothing clears it: a source that
++// failed once does not come back (the same policy as `table_t::fill_failed`).
++static bool                         g_pinned_off       = false;
++static cudaError_t                  g_pinned_alloc_err = cudaSuccess;
 +int64_t                             g_gather_calls    = 0;
 +int64_t                             g_gather_pool     = 0;
 +int64_t                             g_gather_fills    = 0;
  int64_t                             g_stage_arena_bytes = 0;
  int64_t                             g_stage_host_bytes  = 0;
  int64_t                             g_stage_decline_geom = 0;
-@@ -426,7 +548,14 @@ bool                                g_heat_on         = false; // MOE_EXPERT_HEA
+@@ -426,7 +561,14 @@ bool                                g_heat_on         = false; // MOE_EXPERT_HEA
  // wip/moe-heatmap-persistence: the on-disk heat map (sidecar next to the model, geometry-keyed).
  // `g_heat_loaded` is keyed by (layer, sem_role, n_experts, host_bytes) and consulted at table
  // registration; `g_heat_path` is the chosen sidecar (model dir, else the cache-dir fallback).
@@ -3119,7 +3132,7 @@ index c386ee560..06f176145 100644
  std::string                         g_heat_path;
  std::string                         g_heat_path_fallback;   // used when the model dir is read-only
  bool                                g_heat_path_set   = false;
-@@ -503,6 +632,9 @@ int64_t                             g_acc_fills       = 0;
+@@ -503,6 +645,9 @@ int64_t                             g_acc_fills       = 0;
  int64_t                             g_acc_colds       = 0;
  int64_t                             g_fill_bytes      = 0;
  int64_t                             g_cold_bytes      = 0;
@@ -3129,7 +3142,7 @@ index c386ee560..06f176145 100644
  
  int env_int(const char * name, int dflt) {
      const char * e = getenv(name);
-@@ -599,7 +731,9 @@ static void devremap_free_locked(table_t & t) {
+@@ -599,7 +744,9 @@ static void devremap_free_locked(table_t & t) {
  // cold region requires it and stands down, while the
  // fill copies (which source `t.host` through cudaMemcpyAsync, pageable-safe) keep the cache correct.
  void bind_host_dev_locked(table_t & t) {
@@ -3140,7 +3153,7 @@ index c386ee560..06f176145 100644
          return;
      }
      t.host_dev_bound = true;
-@@ -611,11 +745,14 @@ void bind_host_dev_locked(table_t & t) {
+@@ -611,11 +758,14 @@ void bind_host_dev_locked(table_t & t) {
          return;
      }
      (void) cudaGetLastError();
@@ -3158,7 +3171,7 @@ index c386ee560..06f176145 100644
      }
  }
  
-@@ -749,6 +886,12 @@ static bool pool_covers_table_peek_locked(table_t & t) {
+@@ -749,6 +899,12 @@ static bool pool_covers_table_peek_locked(table_t & t) {
      return pool_live_slots(*p) >= t.n_experts;
  }
  
@@ -3171,7 +3184,7 @@ index c386ee560..06f176145 100644
  // Human-readable cache budget for the log lines: "auto" when MOE_EXPERT_CACHE_MIB was unset (each
  // device is sized from its free VRAM at `alloc_all_locked`), otherwise the requested MiB/device.
  static const char * budget_desc() {
-@@ -806,31 +949,68 @@ void parse_env() {
+@@ -806,31 +962,68 @@ void parse_env() {
          g_auto    = true;
          g_budget  = (size_t) -1;
      }
@@ -3252,7 +3265,7 @@ index c386ee560..06f176145 100644
          }
      }
      g_slots_hint  = env_int("MOE_EXPERT_CACHE_SLOTS",   0);
-@@ -1022,20 +1202,41 @@ void check_invariant(const table_t & t) {
+@@ -1022,20 +1215,41 @@ void check_invariant(const table_t & t) {
  
  // ---- wip/host-expert-dio-cache Phase 2: the bounded pinned host tier (L2) -------------------------
  
@@ -3299,7 +3312,7 @@ index c386ee560..06f176145 100644
      return open(path, O_RDONLY | (dio ? O_DIRECT : 0));
  }
  static void pool_fd_align(int fd, size_t * align) {
-@@ -1050,6 +1251,9 @@ static pool_ssize_t pool_pread(int fd, void * dst, size_t len, size_t off) {
+@@ -1050,6 +1264,9 @@ static pool_ssize_t pool_pread(int fd, void * dst, size_t len, size_t off) {
  static bool pool_aligned_alloc(size_t align, size_t size, void ** out) {
      return posix_memalign(out, align, size) == 0;
  }
@@ -3309,7 +3322,7 @@ index c386ee560..06f176145 100644
  #endif
  
  // One O_DIRECT read (the debug fallback; the default fill is a plain buffered `pread`) of `len` bytes at
-@@ -1066,8 +1270,13 @@ static bool pool_dio_read(int fd, void * dst, size_t len, size_t off, size_t ali
+@@ -1066,8 +1283,13 @@ static bool pool_dio_read(int fd, void * dst, size_t len, size_t off, size_t ali
      const size_t aoff = off & ~(align - 1);
      const size_t skip = off - aoff;
      const size_t blen = (skip + len + align - 1) & ~(align - 1);
@@ -3325,7 +3338,7 @@ index c386ee560..06f176145 100644
      if (bounce == nullptr || bounce_size < blen) {
          free(bounce);
          bounce = nullptr;
-@@ -1128,6 +1337,364 @@ static void pool_slot_sync(host_pool_t & p, int slot) {
+@@ -1128,6 +1350,373 @@ static void pool_slot_sync(host_pool_t & p, int slot) {
      }
  }
  
@@ -3624,6 +3637,15 @@ index c386ee560..06f176145 100644
 +    }
 +    if (g_pool_ram_cap < 0) {
 +        const int64_t avail = pool_available_ram_bytes();
++        // issue #274 follow-up (@DanoPTT): on Windows this figure is NOT the pinned ceiling.  WDDM charges
++        // pinned host pages against the adapter's shared segment once per VISIBLE adapter, so the real budget
++        // is roughly (total RAM / 2) / visible GPUs (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339:
++        // ~13.4 GiB on a 27.6 GiB box with one adapter, ~6.5 GiB with two).  A cap derived from that model was
++        // considered and deliberately NOT shipped: it is a heuristic, it cannot be measured on this box, and
++        // getting it wrong caps a healthy box.  The guards that do not guess are `g_pinned_off` (the first
++        // refused cudaHostAlloc latches the pinned tier off with one WARN naming the platform cause) and the
++        // exit census, and the fix for the report's crash was the mid-run decline above.  Measure the aperture
++        // segment's CommitLimit before adding a ceiling here.
 +        g_pool_ram_cap = avail > 0 ? (int64_t) ((double) avail * (double) g_pool_ram_pct / 100.0) : 0;
 +        if (g_pool_ram_cap > 0) {
 +            GGML_LOG_INFO("%s: host pool RAM ceiling: %d%% of MemAvailable = %.1f MiB (MOE_HOST_POOL_RAM_PCT)\n",
@@ -3690,7 +3712,7 @@ index c386ee560..06f176145 100644
  // The pool for `t`'s host tensor, created lazily and shared by every per-device table of that tensor.
  // Caller holds `g_mutex`.  Returns null (and every fill falls back to the full master) when the pool is
  // off, the source is unknown, or the budget is too small for one expert.
-@@ -1227,24 +1794,61 @@ static host_pool_t * table_pool_locked(table_t & t) {
+@@ -1227,24 +1816,61 @@ static host_pool_t * table_pool_locked(table_t & t) {
      // Budget: explicit MOE_HOST_POOL_MIB, else AUTO = MOE_HOST_POOL_FRAC % of the MoE host expert bytes.
      // The preflight accumulation is the full set; fall back to the registered tables if the preflight did
      // not run (a non-CLI consumer).  `g_pool_total_bytes` is set only for the explicit mode.
@@ -3764,7 +3786,7 @@ index c386ee560..06f176145 100644
      device_guard pdg(t.device);
      host_pool_t p;
      if (slots >= 1) {
-@@ -1297,6 +1901,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
+@@ -1297,6 +1923,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
              p.n_experts   = t.n_experts;
              p.path        = t.src_path;
              p.file_offs   = t.src_offs;
@@ -3772,7 +3794,7 @@ index c386ee560..06f176145 100644
              p.slot_expert.assign((size_t) slots, -1);
              p.slot_state.assign((size_t) slots, 0);
              p.last.assign((size_t) t.n_experts, 0);
-@@ -1362,10 +1967,234 @@ static void pool_reap_locked(host_pool_t & p) {
+@@ -1362,10 +1989,234 @@ static void pool_reap_locked(host_pool_t & p) {
      }
  }
  
@@ -4010,7 +4032,7 @@ index c386ee560..06f176145 100644
  static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool sync_on_evict) {
      if (expert < 0 || expert >= p.n_experts) {
          return nullptr;
-@@ -1382,9 +2211,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+@@ -1382,9 +2233,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
              }
              return p.base + (size_t) hs * p.host_bytes;
          }
@@ -4022,7 +4044,7 @@ index c386ee560..06f176145 100644
          return nullptr;
      }
      p.misses++;
-@@ -1425,18 +2253,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+@@ -1425,18 +2275,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
      if (slot < 0) {
          return nullptr;
      }
@@ -4042,7 +4064,7 @@ index c386ee560..06f176145 100644
      if (!ok) {
          p.failed = true;
          return nullptr;
-@@ -1452,153 +2270,6 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
+@@ -1452,153 +2292,6 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
      return dst;
  }
  
@@ -4196,7 +4218,7 @@ index c386ee560..06f176145 100644
  // Pre-warm a freshly created pool: fill every slot from the GGUF with O_DIRECT while there is no decode
  // latency to lose.  Experts are ranked by the prefill routing (`t.prefill_count`) when it is available, so
  // the decode's hot set is resident; otherwise experts are taken in order.  This is the whole point of a
-@@ -1660,139 +2331,176 @@ static bool pool_mirror_bulk_fill_locked(host_pool_t & p, const table_t & t) {
+@@ -1660,139 +2353,176 @@ static bool pool_mirror_bulk_fill_locked(host_pool_t & p, const table_t & t) {
      return true;
  }
  
@@ -4400,14 +4422,14 @@ index c386ee560..06f176145 100644
 +            continue;
          }
 -        rank.push_back(e);
--    }
--    if (rank.empty()) {
--        return;
 +        pool->expert_slot.erase(e);
 +        pool->slot_expert[(size_t) sl] = -1;
 +        pool->slot_state[(size_t) sl]  = 0;
 +        freed++;
      }
+-    if (rank.empty()) {
+-        return;
+-    }
 -    std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
 -        if (tally[(size_t) a] != tally[(size_t) b]) {
 -            return tally[(size_t) a] > tally[(size_t) b];
@@ -4466,7 +4488,7 @@ index c386ee560..06f176145 100644
          }
          bool any = false;
          for (uint32_t v : t.heat) {
-@@ -1804,41 +2512,255 @@ static void pool_rank_from_prefill_locked() {
+@@ -1804,41 +2534,304 @@ static void pool_rank_from_prefill_locked() {
          if (!any) {
              continue;
          }
@@ -4506,7 +4528,8 @@ index c386ee560..06f176145 100644
 +                continue;
              }
 +            t.bounce[(size_t) i].busy = false;
-+        }
+         }
+-        pool_rerank_from_tally_locked(t, tally);
 +        return i;
 +    }
 +    // wip/host-pool-speed: MEASURED, and deliberately NOT capped.  The grow-on-demand ring was suspected of
@@ -4517,21 +4540,41 @@ index c386ee560..06f176145 100644
 +    // path never exceeds ~5 entries, so a cap there is inert.  The fix for the memory is fewer, LARGER fills
 +    // (coalesce a run of consecutive missing experts into one pinned read), not a smaller ring -- see
 +    // wip/host-pool-speed README §16.
++    if (g_pinned_off) {
++        return -1;   // the pinned tier is latched off (see `g_pinned_off`): do not ask the driver again
+     }
 +    device_guard dg(t.device);
 +    void *      mem = nullptr;
 +    cudaEvent_t ev  = nullptr;
-+    if (cudaHostAlloc(&mem, t.host_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
-+        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
++    const cudaError_t alloc_err = cudaHostAlloc(&mem, t.host_bytes,
++                                                cudaHostAllocPortable | cudaHostAllocMapped);
++    if (alloc_err != cudaSuccess || cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        if (mem != nullptr) {
 +            (void) cudaFreeHost(mem);
 +        }
 +        if (ev != nullptr) {
 +            (void) cudaEventDestroy(ev);
-         }
--        pool_rerank_from_tally_locked(t, tally);
++        }
++        // ONE line, then the tier is off.  This used to be silent apart from the fill-failure line, which
++        // named a synthesized error instead of the allocation that actually failed (issue #274 follow-up).
++        g_pinned_off       = true;
++        g_pinned_alloc_err = alloc_err;
++        GGML_LOG_WARN("%s: the pinned bounce ring could not grow (%.1f MiB for layer=%d role=%s): %s.  The "
++                      "pinned host tier is now OFF for the rest of this run -- every fill that needs it is "
++                      "served from the model mapping/pageable path, or the op is declined (correct, slower).\n",
++                      __func__, (double) t.host_bytes / (1024.0 * 1024.0), t.layer, t.role.c_str(),
++                      cudaGetErrorString(g_pinned_alloc_err));
++#if defined(GGML_USE_HIP) && defined(_WIN32)
++        GGML_LOG_WARN("%s: on Windows the pinned ceiling is the adapter's shared-memory budget counted once "
++                      "per VISIBLE GPU, so it is far below MemAvailable and shrinks with every extra device "
++                      "(ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339).  Lower MOE_HOST_POOL_RAM_PCT "
++                      "or -lme, or make one GPU visible (HIP_VISIBLE_DEVICES).  A refused pinned allocation "
++                      "can latch a process-wide HIP error on this platform, which is why the tier is not "
++                      "retried.\n", __func__);
++#endif
 +        return -1;
-     }
++    }
 +    bounce_t b;
 +    b.host = (char *) mem;
 +    b.ev   = ev;
@@ -4577,18 +4620,39 @@ index c386ee560..06f176145 100644
 +// bounce ring cannot be allocated.  The point of the arm is the SLOT state, not the fill: a failed fill must
 +// roll the admission back and decline the op (correct, slow) instead of leaving a resident slot full of stale
 +// bytes (fast, wrong).  Only the pool/bounce path is faulted; a pinned master is untouched.
-+static bool pool_fill_fault() {
-+    static const bool v = getenv("MOE_HOST_POOL_FILL_FAULT") != nullptr;
-+    return v;
++//
++//   =1        fault EVERY source, the issue's original shape (r219's arm).
++//   =N (N>1)  start at the N-th call PROCESS-WIDE.  The landing point then depends on the box's arena/pool
++//             sizing (free VRAM and MemAvailable move the fill count), so a run using it is not
++//             reproducible across box states -- useful to reproduce a report, not to gate a text hash.
++//   =late     fault from THIS TABLE's SECOND call on.  Every table gets exactly one successful source, then
++//             loses it, which is the "fills that had already succeeded, then a failing call" shape
++//             @briansp2020 reported -- deterministically, per table, on any box.
++//   =0/unset  off.
++static bool pool_fill_fault(table_t & t) {
++    static const char * mode = getenv("MOE_HOST_POOL_FILL_FAULT");
++    static const bool   late = mode != nullptr && strcmp(mode, "late") == 0;
++    static const long long start = (mode == nullptr || late) ? 0LL : atoll(mode);
++    static long long seen = 0;
++    if (late) {
++        return ++t.fill_src_calls >= 2;
++    }
++    return start > 0 && ++seen >= start;
 +}
 +
 +// TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
 +// the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
 +// Caller holds `g_mutex`.
 +static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, bool allow_empty_fill,
-+                            expert_src_t * out) {
++                            expert_src_t * out, const char ** why = nullptr) {
 +    *out = expert_src_t{};
++    if (why != nullptr) {
++        *why = nullptr;
++    }
 +    if (t.host == nullptr || t.host_bytes == 0 || expert < 0 || expert >= t.n_experts) {
++        if (why != nullptr) {
++            *why = "the table has no usable host master";
++        }
 +        return false;
 +    }
 +    if (!table_master_pageable(t)) {
@@ -4596,7 +4660,10 @@ index c386ee560..06f176145 100644
 +        out->kind = cudaMemcpyHostToDevice;
 +        return true;
 +    }
-+    if (pool_fill_fault()) {
++    if (pool_fill_fault(t)) {
++        if (why != nullptr) {
++            *why = "the diagnostic MOE_HOST_POOL_FILL_FAULT makes every pageable source unavailable";
++        }
 +        return false;
 +    }
 +    if (pool != nullptr && t.src_off + t.expert_bytes <= t.host_bytes) {
@@ -4646,6 +4713,10 @@ index c386ee560..06f176145 100644
 +            GGML_LOG_WARN("%s: no pinned bounce entry for layer=%d role=%s (cudaHostAlloc failed); the host "
 +                          "pool and the bounce ring are both unavailable for this table\n", __func__, t.layer,
 +                          t.role.c_str());
++        }
++        if (why != nullptr) {
++            *why = g_pinned_off ? "the pinned host tier is off (the first cudaHostAlloc was refused; see the WARN above)"
++                                : "the pinned bounce ring could not allocate an entry (cudaHostAlloc failed)";
 +        }
 +        return false;
 +    }
@@ -4738,7 +4809,7 @@ index c386ee560..06f176145 100644
              if (err != cudaSuccess) {
                  return err;
              }
-@@ -1846,17 +2768,39 @@ static cudaError_t fill_slot_from_host(const table_t & t, void * dst, size_t exp
+@@ -1846,17 +2839,47 @@ static cudaError_t fill_slot_from_host(const table_t & t, void * dst, size_t exp
          }
          return cudaSuccess;
      }
@@ -4760,20 +4831,28 @@ index c386ee560..06f176145 100644
 +// The SIZING-time bulk fill (identity table, prefill/heat seed): acquire, copy the whole table in, and
 +// retire the pool copy -- a seeded expert is wholly resident, so its pool slot is dead weight and is freed
 +// for a later `pool_fill_empty_locked` (the one-shot seeds are the only eviction this helper may cause).
++//
++// issue #274 follow-up: "no host source could be resolved" is a HOST-side answer, not a CUDA error, but this
++// helper's contract returns `cudaError_t`.  The sentinel is never handed to `cudaGetErrorString` (every caller
++// only tests it) and it deliberately is not a plausible device error: it used to be
++// `cudaErrorInvalidDeviceFunction`, which printed `invalid device function` and sent the issue-#274 reporter
++// looking at the device instead of at the refused `cudaHostAlloc` behind it.
++static const cudaError_t k_no_host_source = cudaErrorMemoryAllocation;
 +static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, cudaStream_t stream) {
 +    if (t.host == nullptr || t.host_bytes == 0 || t.expert_bytes == 0) {
-+        return cudaErrorInvalidDeviceFunction;
++        return k_no_host_source;
 +    }
 +    host_pool_t * pool = table_pool_locked(t);
 +    expert_src_t  src;
-+    if (!expert_host_src(t, (int32_t) expert, pool, true, &src)) {
++    const char *  why = nullptr;
++    if (!expert_host_src(t, (int32_t) expert, pool, true, &src, &why)) {
 +        static bool warned = false;
 +        if (!warned) {
 +            warned = true;
-+            GGML_LOG_WARN("%s: no pinned host source for layer=%d role=%s expert=%d (pool and bounce both "
-+                          "unavailable)\n", __func__, t.layer, t.role.c_str(), (int) expert);
++            GGML_LOG_WARN("%s: no pinned host source for layer=%d role=%s expert=%d (%s)\n", __func__, t.layer,
++                          t.role.c_str(), (int) expert, why != nullptr ? why : "no source could be resolved");
 +        }
-+        return cudaErrorInvalidDeviceFunction;
++        return k_no_host_source;
      }
 -    return cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, stream);
 +    const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -4782,7 +4861,7 @@ index c386ee560..06f176145 100644
  }
  
  moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
-@@ -1984,100 +2928,73 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -1984,100 +3007,85 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
      if (g_fill && t.host != nullptr) {
          g_acc_fills++;
          g_fill_bytes += (int64_t) t.expert_bytes;
@@ -4859,18 +4938,6 @@ index c386ee560..06f176145 100644
 -                cudaEvent_t ev = pool_slot_event(*pool, pool_slot, t.device >= 0 ? t.device : 0);
 -                if (ev != nullptr) {
 -                    (void) cudaEventRecord(ev, (cudaStream_t) stream);
--                }
--            }
--            // ADDITIVE: the arena now owns this block; free the pool entry as soon as the copy drains
--            // (`pool_reap_locked`), so the pool stays the complement of the arena.
--            if (pool_slot < (int) pool->slot_state.size()) {
--                pool->slot_state[(size_t) pool_slot] = 2;
--            }
--        } else if (pool != nullptr) {
--            // The master served this fill (a background reservation held state 3, or the pool was full):
--            // cancel any in-flight background copy of this expert so the pool does not keep a duplicate
--            // the arena now owns.
--            pool_cancel_bg_locked(*pool, expert);
 +        char * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
 +        host_pool_t * pool = table_pool_locked(t);
 +
@@ -4883,20 +4950,22 @@ index c386ee560..06f176145 100644
 +        // policy within 250 MiB of the others' L3 reads, against a 15x difference for the pool's CONTENT.
 +        expert_src_t hsrc;
 +        cudaError_t  err = cudaSuccess;
-+        if (!expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc)) {
-+            err = cudaErrorInvalidDeviceFunction;
-+        }
-+        if (err == cudaSuccess) {
++        const char * why = nullptr;
++        // issue #274 follow-up (@DanoPTT): `expert_host_src` failing is a HOST-side answer (no pool slot, no
++        // pinned bounce, no mapping), so it has no CUDA error to report.  The old code synthesized
++        // `cudaErrorInvalidDeviceFunction` here, which printed `invalid device function` and sent the
++        // reporter looking at the device -- the actual cause was a refused `cudaHostAlloc`.  Keep the two
++        // cases apart and report each one's real reason.
++        const bool   no_src = !expert_host_src(t, expert, pool, /*allow_empty_fill*/ true, &hsrc, &why);
++        if (!no_src) {
 +            err = copy_slot_from_src(t, dst, hsrc, (cudaStream_t) stream);
 +        }
-+        if (err == cudaSuccess) {
++        if (err == cudaSuccess && !no_src) {
 +            // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
 +            // being in VRAM now does not mean the pool should forget where to find it next time.
 +            expert_src_done(t, pool, hsrc, stream, /*retire*/ false);
-         }
-         if (err != cudaSuccess) {
--            GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
--                          __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
++        }
++        if (err != cudaSuccess || no_src) {
 +            // issue #274: a fill that failed must NOT leave the expert RESIDENT.  The remap is built from
 +            // `t.expert_slot`, so recording a slot whose bytes were never copied does not degrade the answer,
 +            // it CORRUPTS it (the reporter's run produced one token and stopped: every fill had failed and
@@ -4917,18 +4986,39 @@ index c386ee560..06f176145 100644
 +            const bool first_for_table = !t.fill_fail_warned;
 +            t.fill_fail_warned = true;
 +            if (first_for_table || (g_fill_fail % 10000) == 0) {
-+                // Report the REAL cause: `err` is what `expert_host_src`/`copy_slot_from_src` returned, and
-+                // `cudaGetLastError()` is empty for both (`"no error"` is what made this look like a driver
-+                // problem in issue #274).
-+                GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: %s; the slot is NOT resident "
-+                              "(%lld failed fills so far)\n", __func__, t.layer, t.role.c_str(), expert,
-+                              cudaGetErrorString(err), (long long) g_fill_fail);
-+            }
++                // Report the REAL cause: `err` is what `copy_slot_from_src` returned, and `cudaGetLastError()`
++                // is empty for a host-side failure (`"no error"` is what made this look like a driver problem
++                // in issue #274).  A source that could not be resolved says so in words instead of naming a
++                // device error it never had.
++                if (no_src) {
++                    GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: no pinned host source (%s); "
++                                  "the slot is NOT resident (%lld failed fills so far)\n", __func__, t.layer,
++                                  t.role.c_str(), expert, why != nullptr ? why : "no source could be resolved",
++                                  (long long) g_fill_fail);
++                } else {
++                    GGML_LOG_WARN("%s: fill failed table layer=%d role=%s expert=%d: %s; the slot is NOT resident "
++                                  "(%lld failed fills so far)\n", __func__, t.layer, t.role.c_str(), expert,
++                                  cudaGetErrorString(err), (long long) g_fill_fail);
+                 }
+             }
+-            // ADDITIVE: the arena now owns this block; free the pool entry as soon as the copy drains
+-            // (`pool_reap_locked`), so the pool stays the complement of the arena.
+-            if (pool_slot < (int) pool->slot_state.size()) {
+-                pool->slot_state[(size_t) pool_slot] = 2;
 +            if (cold_ok && out_cold != nullptr) {
 +                *out_cold = true;
 +                g_acc_colds++;
 +                g_cold_bytes += (int64_t) t.expert_bytes;
-+            }
+             }
+-        } else if (pool != nullptr) {
+-            // The master served this fill (a background reservation held state 3, or the pool was full):
+-            // cancel any in-flight background copy of this expert so the pool does not keep a duplicate
+-            // the arena now owns.
+-            pool_cancel_bg_locked(*pool, expert);
+-        }
+-        if (err != cudaSuccess) {
+-            GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
+-                          __func__, t.layer, t.role.c_str(), expert, cudaGetErrorString(cudaGetLastError()));
 +            return { nullptr, false };
          }
 +        // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
@@ -4943,7 +5033,7 @@ index c386ee560..06f176145 100644
  // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
  // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
  // wip/first-prefill-latency: the arena is sized against the full slab region, but a wide prefill reclaims
-@@ -2140,25 +3057,14 @@ void apply_prefill_seed_locked(table_t & t) {
+@@ -2140,25 +3148,14 @@ void apply_prefill_seed_locked(table_t & t) {
      if (k > t.slots) {
          k = t.slots;
      }
@@ -4972,7 +5062,7 @@ index c386ee560..06f176145 100644
          if (err != cudaSuccess) {
              (void) cudaGetLastError();
              ok = false;
-@@ -2203,6 +3109,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -2203,6 +3200,9 @@ void apply_heat_seed_locked(table_t & t) {
      if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
          return;
      }
@@ -4982,7 +5072,7 @@ index c386ee560..06f176145 100644
      uint64_t total = 0;
      for (uint32_t v : t.heat) {
          total += v;
-@@ -2215,8 +3124,8 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -2215,8 +3215,8 @@ void apply_heat_seed_locked(table_t & t) {
          rank[(size_t) e] = e;
      }
      std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
@@ -4993,7 +5083,7 @@ index c386ee560..06f176145 100644
          }
          return a < b;
      });
-@@ -2227,25 +3136,13 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -2227,25 +3227,13 @@ void apply_heat_seed_locked(table_t & t) {
      if (k > t.slots) {
          k = t.slots;
      }
@@ -5021,7 +5111,7 @@ index c386ee560..06f176145 100644
          if (err != cudaSuccess) {
              (void) cudaGetLastError();
              ok = false;
-@@ -2266,8 +3163,9 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -2266,8 +3254,9 @@ void apply_heat_seed_locked(table_t & t) {
      if (seeded > 0) {
          t.fills     += seeded;
          t.slot_dirty = true;
@@ -5033,7 +5123,7 @@ index c386ee560..06f176145 100644
      }
  }
  
-@@ -2303,6 +3201,34 @@ static uint32_t heat_delta(const table_t & t, size_t e) {
+@@ -2303,6 +3292,34 @@ static uint32_t heat_delta(const table_t & t, size_t e) {
      return s > m ? (uint32_t) (s - m) : 0u;
  }
  
@@ -5068,15 +5158,13 @@ index c386ee560..06f176145 100644
  // Fold every table's NEW heat (host) into `g_heat_loaded` so a save writes the merged prior.  The
  // DELTA, not the running total: `heat` already contains the prior it was seeded from, so adding it
  // whole would double the prior at every flush (see `heat_merged`).
-@@ -2312,16 +3238,25 @@ static void heat_merge_into_loaded_locked() {
-         if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
+@@ -2313,15 +3330,24 @@ static void heat_merge_into_loaded_locked() {
              continue;
          }
--        const auto key = std::make_tuple(t.layer, t.role, t.n_experts, t.host_bytes);
+         const auto key = std::make_tuple(t.layer, t.role, t.n_experts, t.host_bytes);
 -        std::vector<uint32_t> & dst = g_heat_loaded[key];
 -        if (dst.size() != (size_t) t.n_experts) {
 -            dst.assign((size_t) t.n_experts, 0);
-+        const auto key = std::make_tuple(t.layer, t.role, t.n_experts, t.host_bytes);
 +        heat_prior_t & prior = g_heat_loaded[key];
 +        if (prior.all.size() != (size_t) t.n_experts) {
 +            prior.all.assign((size_t) t.n_experts, 0);
@@ -5101,7 +5189,7 @@ index c386ee560..06f176145 100644
      }
  }
  
-@@ -2348,11 +3283,14 @@ static void heat_map_save_locked() {
+@@ -2348,11 +3374,14 @@ static void heat_map_save_locked() {
      heat_merge_into_loaded_locked();
      std::vector<uint8_t> buf;
      mht1_hdr_t hdr{};
@@ -5119,7 +5207,7 @@ index c386ee560..06f176145 100644
              hdr.n_tables++;
          }
      }
-@@ -2362,7 +3300,7 @@ static void heat_map_save_locked() {
+@@ -2362,7 +3391,7 @@ static void heat_map_save_locked() {
          const std::string role     = std::get<1>(kv.first);
          const int         n_exp    = std::get<2>(kv.first);
          const uint64_t    host_b   = (uint64_t) std::get<3>(kv.first);
@@ -5128,7 +5216,7 @@ index c386ee560..06f176145 100644
              continue;
          }
          mht1_rec_t rec{};
-@@ -2371,8 +3309,14 @@ static void heat_map_save_locked() {
+@@ -2371,8 +3400,14 @@ static void heat_map_save_locked() {
          rec.n_experts  = (uint32_t) n_exp;
          rec.host_bytes = host_b;
          buf.insert(buf.end(), (const uint8_t *) &rec, (const uint8_t *) &rec + sizeof(rec));
@@ -5145,11 +5233,13 @@ index c386ee560..06f176145 100644
      }
      const std::string tmp = g_heat_path + ".tmp." + std::to_string((long) getpid());
      bool ok = true;
-@@ -2417,7 +3361,16 @@ static void heat_map_load_locked(const std::string & path) {
+@@ -2416,8 +3451,17 @@ static void heat_map_load_locked(const std::string & path) {
+     if (f == nullptr) {
          return;   // cold start
      }
-     mht1_hdr_t hdr{};
+-    mht1_hdr_t hdr{};
 -    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr.magic, "MHT1", 4) != 0 || hdr.version != 1) {
++    mht1_hdr_t hdr{};
 +    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
 +        fclose(f);
 +        return;
@@ -5163,7 +5253,7 @@ index c386ee560..06f176145 100644
          fclose(f);
          GGML_LOG_INFO("%s: ignoring an unreadable/stale heat map at %s\n", __func__, path.c_str());
          return;
-@@ -2427,8 +3380,15 @@ static void heat_map_load_locked(const std::string & path) {
+@@ -2427,8 +3471,15 @@ static void heat_map_load_locked(const std::string & path) {
          mht1_rec_t rec{};
          if (fread(&rec, sizeof(rec), 1, f) != 1) { break; }
          if (rec.n_experts == 0 || rec.n_experts > (1u << 22)) { break; }
@@ -5181,7 +5271,7 @@ index c386ee560..06f176145 100644
          const std::string role(rec.role, strnlen(rec.role, sizeof(rec.role)));
          g_heat_loaded[std::make_tuple((int) rec.layer, role, (int) rec.n_experts, (size_t) rec.host_bytes)] =
              std::move(h);
-@@ -2446,7 +3406,7 @@ static void heat_map_load_locked(const std::string & path) {
+@@ -2446,7 +3497,7 @@ static void heat_map_load_locked(const std::string & path) {
          size_t total = 0, sat = 0, nonzero = 0;
          uint32_t lo = 0xffffffffu, hi = 0;
          for (const auto & kv : g_heat_loaded) {
@@ -5190,7 +5280,7 @@ index c386ee560..06f176145 100644
                  total++;
                  if (v == 0xffffffffu) { sat++; }
                  if (v > 0) {
-@@ -2628,8 +3588,14 @@ static void heat_apply_loaded_locked(table_t & t) {
+@@ -2628,8 +3679,14 @@ static void heat_apply_loaded_locked(table_t & t) {
      if (it == g_heat_loaded.end()) {
          return;
      }
@@ -5207,7 +5297,7 @@ index c386ee560..06f176145 100644
  }
  
  // Coalesced copy of `n` bytes with `nt` threads.  dst/src are assumed 8-byte aligned for the bulk
-@@ -2664,11 +3630,19 @@ static __device__ __forceinline__ void moe_cache_policy_copy(char * __restrict__
+@@ -2664,11 +3721,19 @@ static __device__ __forceinline__ void moe_cache_policy_copy(char * __restrict__
  // alias (a 2-D strided copy for an axis-0 slice).  The destination is the ordinary staged table in
  // expert order, so every consumer is unchanged.  `prs` is the immutable prefill residency snapshot
  // (expert -> slot, -1 = not usable); it is never the decode policy and never mutated by decode.
@@ -5228,7 +5318,7 @@ index c386ee560..06f176145 100644
      const int e   = blockIdx.x;
      const int tid = threadIdx.x;
      const int nt  = blockDim.x;
-@@ -2679,6 +3653,14 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
+@@ -2679,6 +3744,14 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
          return;
      }
      const char * src = host_dev + (int64_t) e * host_bytes + src_off;
@@ -5243,7 +5333,7 @@ index c386ee560..06f176145 100644
      if (!do2d) {
          moe_cache_policy_copy(d, src, (size_t) expert_bytes, tid, nt);
          return;
-@@ -2704,11 +3686,20 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
+@@ -2704,11 +3777,20 @@ static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const cha
  // parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
  // thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
  // thread and dominated the kernel.
@@ -5265,7 +5355,7 @@ index c386ee560..06f176145 100644
      const int e = blockIdx.x % n_experts;
      const int s = blockIdx.x / n_experts;
  
-@@ -2733,7 +3724,22 @@ static __global__ void moe_cache_gather_kernel(
+@@ -2733,7 +3815,22 @@ static __global__ void moe_cache_gather_kernel(
      const int nt  = blockDim.x;
      char *       dst = dst_base + (int64_t) e * expert_bytes;
      const char * src = src_base + (int64_t) e * host_bytes + src_off;
@@ -5289,7 +5379,7 @@ index c386ee560..06f176145 100644
          const int64_t chunk = (expert_bytes + n_split - 1) / n_split;
          const int64_t off   = (int64_t) s * chunk;
          const int64_t len   = expert_bytes - off;
-@@ -2787,33 +3793,62 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
+@@ -2787,33 +3884,62 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
  // wip/moe-heatmap-persistence (R2): fold this table's device heat mirror into `heat`, then free the
  // mirror.  Called wherever a table is torn down or migrated devices.  Caller holds `g_mutex`.
  static void free_heat_dev_locked(table_t & t) {
@@ -5368,7 +5458,7 @@ index c386ee560..06f176145 100644
      ggml_cuda_graph_mem_freed(t.device >= 0 ? t.device : 0);
  }
  
-@@ -2851,6 +3886,21 @@ static bool heat_dev_ensure_locked(table_t & t, int device) {
+@@ -2851,6 +3977,21 @@ static bool heat_dev_ensure_locked(table_t & t, int device) {
      }
      t.heat_dev     = (uint32_t *) p;
      t.heat_dev_cap = t.n_experts;
@@ -5390,7 +5480,7 @@ index c386ee560..06f176145 100644
      return true;
  }
  
-@@ -2874,6 +3924,9 @@ static void free_table_buffers_locked(table_t & t) {
+@@ -2874,6 +4015,9 @@ static void free_table_buffers_locked(table_t & t) {
      devremap_free_locked(t);
      if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
      t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
@@ -5400,7 +5490,7 @@ index c386ee560..06f176145 100644
      free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
      (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
  
-@@ -3070,6 +4123,10 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -3070,6 +4214,10 @@ void alloc_table_locked(table_t & t, int slots) {
          (void) heat_dev_ensure_locked(t, t.device);
      }
      apply_prefill_seed_locked(t);
@@ -5411,7 +5501,7 @@ index c386ee560..06f176145 100644
      // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
      // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
      g_arena_bytes += (int64_t) slots * t.expert_bytes;
-@@ -3412,7 +4469,7 @@ void alloc_all_locked() {
+@@ -3412,7 +4560,7 @@ void alloc_all_locked() {
                  uint64_t s = 0;
                  for (const table_t & t : g_tables) {
                      if (!t.allocated && t.layer == i) {
@@ -5420,7 +5510,7 @@ index c386ee560..06f176145 100644
                              s += v;
                          }
                      }
-@@ -3522,7 +4579,8 @@ void alloc_all_locked() {
+@@ -3522,7 +4670,8 @@ void alloc_all_locked() {
              for (const auto & kv : by_layer) {
                  uint64_t s = 0;
                  for (int i : kv.second) {
@@ -5430,7 +5520,7 @@ index c386ee560..06f176145 100644
                          s += v;
                      }
                  }
-@@ -3851,10 +4909,18 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -3851,10 +5000,18 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
          g_preflight_device_seen [device] = true;
      }
      // The pool's AUTO budget is a fraction of the MoE host expert bytes.  This runs once per host-expert
@@ -5452,7 +5542,7 @@ index c386ee560..06f176145 100644
      }
      if (!g_auto) {
          return true;   // an explicit MOE_EXPERT_CACHE_MIB is used verbatim; no early floor
-@@ -4196,6 +5262,174 @@ bool moe_cache_release_arena() {
+@@ -4196,6 +5353,174 @@ bool moe_cache_release_arena() {
      return true;
  }
  
@@ -5627,7 +5717,7 @@ index c386ee560..06f176145 100644
  // Disable the cache outright and STREAM the experts from the host (the stock `-ncmoe` path).
  //
  // MUST be called BEFORE the first graph that can consult the cache -- i.e. from the movable-boundary
-@@ -4692,6 +5926,23 @@ void moe_cache_validate(const char * where) {
+@@ -4692,6 +6017,23 @@ void moe_cache_validate(const char * where) {
  // is fully device-resident -- `-ncmoe 0`, or a `-ncmoe` that did not offload, e.g. on unified memory --
  // can never take an input over, so the cache-band fusion guard must not stand anything down: a cache-on
  // run has to stay byte-identical to the cache-less one.  Returns false before sizing.
@@ -5651,7 +5741,7 @@ index c386ee560..06f176145 100644
  bool moe_cache_has_tables() {
      if (!g_enabled) {
          return false;
-@@ -4763,6 +6014,12 @@ void moe_cache_set_host_pool_budget(size_t bytes) {
+@@ -4763,6 +6105,12 @@ void moe_cache_set_host_pool_budget(size_t bytes) {
      g_pool_budget_override = (int64_t) bytes;
  }
  
@@ -5664,7 +5754,7 @@ index c386ee560..06f176145 100644
  void moe_cache_heat_open(const char * model_path) {
      ensure_env();
      std::lock_guard<std::mutex> lock(g_mutex);
-@@ -4785,11 +6042,11 @@ int64_t moe_cache_heat_table_score(int layer, const char * name, int n_experts,
+@@ -4785,11 +6133,11 @@ int64_t moe_cache_heat_table_score(int layer, const char * name, int n_experts,
          return -1;
      }
      const auto it = g_heat_loaded.find(std::make_tuple(layer, std::string(name), n_experts, host_bytes));
@@ -5678,7 +5768,7 @@ index c386ee560..06f176145 100644
          s += (int64_t) v;
      }
      return s;
-@@ -4949,7 +6206,8 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4949,7 +6297,8 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -5688,7 +5778,7 @@ index c386ee560..06f176145 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -5055,7 +6313,8 @@ static void moe_trace_emit(char band, int layer, const char * role, int n_tok, i
+@@ -5055,7 +6404,8 @@ static void moe_trace_emit(char band, int layer, const char * role, int n_tok, i
  // counts stay on the same scale as the exact tallies).
  static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, int64_t nb0, int64_t nb1,
                                               int n_used, int n_tok, int n_experts, uint32_t w,
@@ -5698,7 +5788,7 @@ index c386ee560..06f176145 100644
      const int64_t n = (int64_t) n_used * (int64_t) n_tok;
      for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += (int64_t) gridDim.x * blockDim.x) {
-@@ -5065,6 +6324,10 @@ static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, i
+@@ -5065,6 +6415,10 @@ static __global__ void moe_cache_heat_kernel(const int32_t * __restrict__ ids, i
                                                (size_t) j * (size_t) nb0);
          if (e >= 0 && e < n_experts) {
              atomicAdd(&heat[e], w);
@@ -5709,7 +5799,7 @@ index c386ee560..06f176145 100644
          }
      }
  }
-@@ -5132,6 +6395,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
+@@ -5132,6 +6486,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
      if (!prefill_band && !t.identity) {
          return;   // the eager host path tallies this table exactly; never double count it
      }
@@ -5718,7 +5808,7 @@ index c386ee560..06f176145 100644
      g_heat_dirty = true;
      // The mirror is pre-allocated at sizing (alloc_table_locked).  Never allocate here on the decode
      // band: that path is a captured graph, where a `cudaMalloc` aborts the capture.
-@@ -5149,7 +6414,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
+@@ -5149,7 +6505,8 @@ void moe_cache_heat_observe(const ggml_tensor * op, const ggml_tensor * src0, co
      }
      moe_cache_heat_kernel<<<(unsigned) nb, threads, 0, (cudaStream_t) stream>>>(
          (const int32_t *) ids->data, (int64_t) ids->nb[0], (int64_t) ids->nb[1],
@@ -5728,7 +5818,7 @@ index c386ee560..06f176145 100644
  }
  
  // Fold every table's device heat mirror into the host `heat` vector and zero the mirror.  Run at a
-@@ -5175,6 +6441,23 @@ static void heat_pull_locked() {
+@@ -5175,6 +6532,23 @@ static void heat_pull_locked() {
              const uint64_t s = (uint64_t) t.heat[(size_t) e] + (uint64_t) tmp[(size_t) e];
              t.heat[(size_t) e] = s > 0xffffffffull ? 0xffffffffu : (uint32_t) s;
          }
@@ -5752,7 +5842,7 @@ index c386ee560..06f176145 100644
      }
  }
  
-@@ -5244,6 +6527,93 @@ static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
+@@ -5244,6 +6618,93 @@ static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
      return total == expert_bytes;
  }
  
@@ -5846,7 +5936,7 @@ index c386ee560..06f176145 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5294,6 +6664,13 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5294,6 +6755,13 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // missing from that set - the arena then covers only the tables some other path happened to
      // register (observed: the last layer alone), and the decode band falls below the uncached path.
      // Registration is a cheap map insert and does not allocate (the deferred path leaves slots at 0).
@@ -5860,7 +5950,7 @@ index c386ee560..06f176145 100644
      {
          const int layer = name_layer(weight);
          if (layer >= 0) {
-@@ -5303,12 +6680,19 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5303,12 +6771,19 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
              // safe when the master has a device mapping; for a pageable model mapping the kernel read
              // is a fatal page-not-present fault (issue #116).  Decline and let the scheduler's host
              // path stage the experts through its pinned scratch instead.
@@ -5883,7 +5973,7 @@ index c386ee560..06f176145 100644
                  return false;
              }
          }
-@@ -5355,14 +6739,133 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5355,14 +6830,133 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
                  (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
          }
      }
@@ -6018,7 +6108,7 @@ index c386ee560..06f176145 100644
      return true;
  }
  
-@@ -5380,19 +6883,25 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5380,19 +6974,25 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      }
      static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -6050,7 +6140,7 @@ index c386ee560..06f176145 100644
          const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
          int64_t rows = 0;
          int64_t row_bytes = 0;
-@@ -5416,6 +6925,140 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5416,6 +7016,140 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  
          device_guard dg(device);
  
@@ -6153,7 +6243,7 @@ index c386ee560..06f176145 100644
 +                // destination is a transient ring slot, not the arena.
 +                expert_src_t hsrc;
 +                if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc)) {
-+                    err = cudaErrorInvalidDeviceFunction;
++                    err = k_no_host_source;   // see `fill_slot_from_host`: a host-side answer, never a device error
 +                    break;
 +                }
 +                if (do2d) {
@@ -6191,7 +6281,7 @@ index c386ee560..06f176145 100644
          // Refresh the immutable snapshot when the cache wrote since we built it, or the arena moved.
          const uint64_t seq = g_write_seq.load();
          if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
-@@ -5481,7 +7124,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5481,7 +7215,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
          moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) copy_stream>>>(
              (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.prs_dev, t.slots,
              (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
@@ -6200,7 +6290,7 @@ index c386ee560..06f176145 100644
          return cudaGetLastError() == cudaSuccess;
      }
      g_stage_decline_nomatch++;
-@@ -5577,6 +7220,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5577,6 +7311,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      std::lock_guard<std::mutex> lock(g_mutex);
      table_t & t = g_tables[table];
      t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
@@ -6214,7 +6304,7 @@ index c386ee560..06f176145 100644
  
      // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never
      // cache-managed (the arena serves the decode band only), but its routing is the strongest available
-@@ -5618,11 +7268,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5618,11 +7359,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      }
  
      // A pageable axis-0 slice (a `-sm tensor` `down_exps` split) has no device mapping and its only
@@ -6233,7 +6323,7 @@ index c386ee560..06f176145 100644
          g_decline_all++;
          return false;
      }
-@@ -5792,10 +7444,21 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5792,10 +7535,21 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          if ((int) t.heat.size() != t.n_experts) {
              t.heat.assign((size_t) t.n_experts, 0);
          }
@@ -6258,7 +6348,39 @@ index c386ee560..06f176145 100644
              }
          }
      }
-@@ -6003,10 +7666,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
+@@ -5827,6 +7581,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         (void) access_locked(t, e, stream, used.data(), (int) used.size(), &cold);
+     }
+ 
++    // issue #274 follow-up (@briansp2020): a fill can fail DURING the pass above, and that is the moment the
++    // table's `fill_failed` is set.  The guard at the top of this function only covers a table that had
++    // ALREADY failed on a previous call, so the call that fails half way through used to carry on: pass 1 had
++    // admitted the experts before the failure (and rolled the failed one back), pass 2 then found a valid
++    // cold or pool id for the failed expert (a pool HIT is rolled back the same way but is still resident in
++    // the pool), `all` stayed true and the hook returned TRUE.  The scheduler then skipped its `input_cpy`
++    // copy -- while `moe_cache_get_table`, which the consuming op calls a few lines later, sees the SAME
++    // `fill_failed` and returns false.  The op therefore read an `input_cpy` that was never populated, which
++    // is the reported "correct until the pool starts failing, then `This!!!!!!`" output (NaN-shaped logits),
++    // reproduced on stock r220 with `MOE_HOST_POOL_FILL_FAULT=200`.  Decline HERE, after the fills and before
++    // anything is remapped, so the scheduler populates the copy the op will actually read.
++    if (t.fill_failed) {
++        g_decline_all++;
++        return false;
++    }
++
+     // Pass 2: build the remap from the FINAL map.  Nothing evicts between here and the read.
+     //
+     const int  n_res_slots = t.slots;
+@@ -5977,7 +7747,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
+ 
+ // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
+ static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
+-    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
++    return g_sized && !t.dr_failed && !t.fill_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
+            t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
+            n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
+            (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
+@@ -6003,10 +7773,12 @@ static bool devremap_prep_locked(table_t & t, void * stream) {
          t.dr_lag_n = 0;
          if (g_heat_on) {   // the decode-band tally the eager path keeps, one call late
              if ((int) t.heat.size() != t.n_experts)     { t.heat.assign((size_t) t.n_experts, 0); }
@@ -6271,7 +6393,7 @@ index c386ee560..06f176145 100644
                  }
              }
          }
-@@ -6275,6 +7940,9 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -6275,6 +8047,9 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
      // slots, and the caller re-checks the remap shape, so a partially-evicted cache still serves its
      // residents.
      table_t & t = g_tables[id];
@@ -6281,7 +6403,7 @@ index c386ee560..06f176145 100644
      // Identity fast path: slot == expert, the whole table is resident, so the arena is indexed by the
      // raw routing ids and no remap (and no per-token host routing readback) is needed.  Restricted to
      // the decode/verify band: prefill keeps the normal path (its MMQ fusions and the MMQ dispatch read
-@@ -6455,45 +8123,61 @@ void moe_cache_report() {
+@@ -6455,45 +8230,61 @@ void moe_cache_report() {
          return;
      }
      std::lock_guard<std::mutex> lock(g_mutex);
@@ -6368,7 +6490,7 @@ index c386ee560..06f176145 100644
                        ptot > 0 ? (double) p_hits / (double) ptot : 0.0, (long long) p_hits, (long long) ptot,
                        (long long) p_fills, (long long) p_evict);
      }
-@@ -6624,7 +8308,16 @@ void moe_cache_report() {
+@@ -6624,7 +8415,26 @@ void moe_cache_report() {
                        (long long) g_prs_rebuilds);
      }
      GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
@@ -6381,6 +6503,16 @@ index c386ee560..06f176145 100644
 +        GGML_LOG_WARN("%s: FAILED fills: %lld (each one was rolled back -- the slot is not resident and the "
 +                      "routed op was declined, so the scheduler served it from the host master)\n",
 +                      __func__, (long long) g_fill_fail);
++    }
++    if (g_pinned_off) {
++        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once and is latched off for the run,
++        // so the tier is being served from the pageable mapping.  Say WHICH error and WHY it is not retried --
++        // a silent fallback reads as "the pool never appeared" all over again.
++        GGML_LOG_WARN("%s: the pinned host tier is OFF for this run (the first cudaHostAlloc was refused: %s); "
++                      "every fill that needed it went through the model mapping/pageable path or declined.  "
++                      "On Windows the ceiling is (RAM/2) per visible GPU, not MemAvailable -- lower "
++                      "MOE_HOST_POOL_RAM_PCT / -lme or make one GPU visible (ROCm/TheRock#9339)\n",
++                      __func__, cudaGetErrorString(g_pinned_alloc_err));
 +    }
 +    if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
          const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
