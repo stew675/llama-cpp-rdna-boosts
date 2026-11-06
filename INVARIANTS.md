@@ -428,9 +428,17 @@ change), and let `WORKLOG.md` carry the narrative.
   0-246 MiB of the others.  So: (1) `pool_rank_experts_locked` / `pool_rerank_from_heat_locked` lay the pool
   out as the arena's complement, in bulk, at sizing and at the first decode-band pass (the old flat
   prompt-tally re-rank is gone — a prefill routes every expert, so its tally cannot rank); (2) the **demand
-  path never evicts and never copies the arena victim into the pool** (`pool_peek_locked` /
-  `pool_fill_empty_locked`; the background worker and `MOE_HOST_POOL_BGFETCH` are gone) — do not reintroduce
-  one: the literal swap cost **2x decode** for 0 MiB of L3; (3) the whole-table prefill staging reads the
+  path never evicts a RESIDENT to hold a victim** (`pool_peek_locked` / `pool_fill_empty_locked`; the
+  background worker and `MOE_HOST_POOL_BGFETCH` are gone) — do not reintroduce one: the literal swap measured
+  here cost **2x decode** for 0 MiB of L3.  **CORRECTED IN PLACE (r224):** the r113 conclusion was "no
+  write-back at all"; what it actually measured was a *swap into a resident's slot* on a **covering** pool
+  where there was no L3 to win.  The demote now ships as `MOE_HOST_POOL_SINK=1`: the victim goes into a slot
+  the pool **already plans as headroom** (`MOE_HOST_POOL_SINK_SPARE_PCT`, 4 % of a table's slots, below the
+  budget — the pool does not grow), so it is one D2H and no eviction, and it declines (dropping the victim as
+  before) whenever no headroom slot is free, the geometry is a strided `-tm tensor` slice, or the copy fails.
+  Measured at `-lme 36` on a frozen real-world prior: +5.3 % alone, +7.8 % with the decode ranking; 6-8 % of
+  demoted slots are used again against a ~3 % break-even on this box's NVMe.  Losing the duplicate-retirement
+  win is why the headroom is a *fraction of slots* and not of experts.  (3) the whole-table prefill staging reads the
   pool and fills empty slots (it used to bypass it and re-read the whole host set per ubatch); (4)
   `MOE_HOST_POOL_RAM_PCT` (default **85** since r114) caps the whole pinned pool at that % of `MemAvailable` — `FRAC`
   is a percentage of the model's host expert set, not of RAM, and an oversized pool fails each table's
@@ -2167,3 +2175,49 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    calls that touch the range are the pool/bounce fill `memcpy`s and the scheduler's fallback copy -- the exit
    census reports the bytes (`pool fills: N mapping memcpys, X GiB total`).  Attribute a large "private" figure
    with Task Manager's `Committed` / RAMMap's mapped-file page count before chasing it as a leak.
+
+- **A prefill reads the host expert set ONE RUN AT A TIME, and the read SIZE is the ceiling, not the drive
+  (r224, block 12; `wip/`→`archive/work/host-expert-split/W4-SPAN-READS.md`).**  Below the mirror the prefill
+  band reads every expert that is in neither tier out of the GGUF, and it used to issue **one ~0.65 MiB
+  `O_DIRECT` read per expert**: at `-lme 12` that is 198 723 reads / 128 GiB / **56.3 s of a 73 s run**, with
+  the drive sitting at ~2.1 GiB/s against the 4.2 GiB/s it does on a 16 MiB read and 6.7 GB/s across four
+  streams.  A read that small is latency-bound at depth 1, so the lever is the read **size**: the experts of
+  one table are contiguous in the file (`src_offs + e*host_bytes`) and the missing ones form runs, so
+  `stage_span_fill()` serves a run of >= 2 with ONE aligned read per 16-expert chunk (~10.9 MiB) into a pinned
+  ring buffer, then one H2D per expert.  Measured prefill **+81 % at `-lme` 12, +57 % at 18, +14 % at 36**,
+  generation unchanged, text byte-identical.  Three things a future reader must not undo: (a) the pinned ring
+  is **grown on demand** (<= 32 entries/device) because the H2D copies are queued on the compute stream — a
+  fixed 2- or 4-deep ring spent 5.0-5.6 s of a 16 s prefill WAITING on its own copies; (b) `SPAN_MIN = 2` is a
+  code constant and is load-bearing (1 -> 362, 2 -> 379, 4 -> 331 t/s at `-lme` 36); (c) **zero byte
+  amplification** — bridging short islands of resident experts reads 4.3x the bytes to save 1.5x on the rate,
+  which loses at high pool coverage.
+- **The heat prior is a MEASUREMENT INPUT, not scratch state (r224, block 12; found the hard way).**
+  `<model>.moe-heatmap` is rewritten by every run (`MOE_EXPERT_HEATMAP=1`) and it decides the pool's **layout**,
+  so a benchmark that lets it write is measuring a prior that is **learning the benchmark prompt**.  Measured
+  at `-lme 36` on the same binary: a map drifted by the campaign's own 5 298-token prose runs gave 27.9 t/s,
+  the frozen real-world map 26.2, no prior at all 23.0 — i.e. the campaign's original "+21.7 % headline" was
+  **prior leakage**, and on a frozen map the honest decomposition is control 24.3 / ranking 24.6 (+1.2 %) /
+  demote 25.6 (+5.3 %) / both 26.2 (+7.8 %).  The freeze mechanism is the file's own permission:
+  `chmod 444` makes `heat_map_open_locked` load+seed and `heat_map_save_locked` refuse to write (it re-checks
+  at every flush, so it can be frozen mid-run), and no cache directory is used instead.  **Quote the map's
+  sha256 with any number that depends on it.**
+- **A failed demote DECLINES; it is never published (r224, block 12; the issue-#274 rule extended).**  A demote
+  copy that fails (`cudaMemcpyAsync` error, or the diagnostic `MOE_HOST_POOL_SINK_FAULT=1`) drops the victim
+  exactly as the pre-r224 path did, marks the incoming fill's own request as needing a bounce slot, and never
+  assigns the slot — a published victim whose bytes never arrived would serve stale bytes for the life of the
+  run, which is the same defect class as a fill recorded as resident.  `scripts/gate-host-pool.sh` proves it
+  on the gate's own pool config: `sink` 4 006-4 009 demoted with 0 copy-error; `sinkfail` **0 demoted** with
+  4 069-4 081 `copy-error` declines and byte-identical text.
+- **A writable heat map must never be truncated to a stub (r224, block 12; the bug that ate this campaign's
+  map).**  `moe_cache_report`'s exit-time save walks `g_tables`, but the model teardown
+  (`moe_cache_forget_all`) drops them first — so any run shorter than the 60 s heat debounce wrote a
+  **header-only 32-byte sidecar**, a valid *empty* map that silently destroys a curated prior.  The tallies
+  are now flushed in `forget_all`, before the tables go.  Verified: a 45 s run writes 601 376 B / 144 tables
+  instead of 32 B.
+- **Every ggml `INFO` counter line needs `-lv 4` (r224; a measurement invariant, not a code one).**
+  `common_log_get_verbosity()` maps `GGML_LOG_LEVEL_INFO` to `LOG_LEVEL_TRACE` (4) and the default threshold
+  is 1, so at `-lv 3` — what every arm script used — `pool fills`, `prefill cache staging`,
+  `coalesced prefill reads`, `per-expert storage reads` and `scheduler pageable-master fallback` are ALL
+  invisible.  That is how this campaign once attributed a 2.3 GB/s ceiling to a function that never ran
+  (`moe_cache_stage_table`; the reads were in `pool_prepopulate_locked` and the `moe_cache_gather_host`
+  pre-pass).  Never quote a counter you have not seen printed.

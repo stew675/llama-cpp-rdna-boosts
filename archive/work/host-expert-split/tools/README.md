@@ -1,4 +1,4 @@
-# Measurement harnesses for `wip/host-expert-split/`
+# Measurement harnesses for `archive/work/host-expert-split/`
 
 One script per arm shape, so W1/W3 in [`../PLAN.md`](../PLAN.md) are reproduced rather than re-derived.
 Every arm is meant to be run **under `scripts/gpu-watch.sh`**, which supplies the `timeout` and the flight

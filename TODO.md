@@ -25,7 +25,7 @@ The old numbers are **retired** — do not reuse them.
 > rather than done here.
 
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
-(the 2026-10-25 re-base), release **`v16-6050b467c-r222`** (read `.release` in `release.json` -- it is the
+(the 2026-10-25 re-base), release **`v16-6050b467c-r224`** (read `.release` in `release.json` -- it is the
 source of truth, not this line).  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
@@ -100,6 +100,17 @@ if it ever gets there: a new weight type + kernels + loader + converter is a **l
 call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+* **A prefill-dominated multi-slot mix (`-npl 4`, `-npl 8`) is slower with `MOE_HOST_POOL_RANK=decode`** (r224,
+  block 12; **`#275`**, maintainer-accepted).  The decode ranking is a **single-user** win and its sign inverts
+  under `llama-batched-bench`'s prefill-dominated mix: on the frozen real-world prior at `-lme 36`,
+  `-npl 4` prefill is 1144.69 t/s against 1292.88 for `combined` (**-11.5 %**) and one `-npl 8` rep measured a
+  -21 % total (memory was not the cause: `MemAvailable` stayed at 40 GiB).  Accepted because a single-user
+  stream is the common case, and the workaround is documented rather than hidden: **`MOE_HOST_POOL_RANK=combined`
+  restores the pre-r224 ranking while keeping the demote** — that is the setting for a deployment whose traffic
+  is parallel slots.  The demote itself is safe in every cell measured (+5.3 % single-stream, +1.8/-0.9/+0.3 %
+  at npl 1/4/8 in the earlier campaign sweep).  Record: `WORKLOG.md` 261106.012 + the r224 entry,
+  `archive/work/host-expert-split/HANDOVER.md` §4.3.
 
 * **The Windows pinned-host ceiling has no cap, only a latch — measure it before adding one** (r223, issue
   #274 follow-up; **no `TODO` id** — waiting on Windows hardware we do not have, `TODO` #95).  `hipHostAlloc`

@@ -219,7 +219,7 @@ the campaign patch, do not leave it in `wip/`.**
 
 | what | where |
 |---|---|
-| arm scripts (decay / prefill / batched / coherence) | `wip/host-expert-split/tools/` + its `README.md` (`LV=`, `NGEN=`, `SINK=`, `HEATMAP=`) |
+| arm scripts (decay / prefill / batched / coherence) | `archive/work/host-expert-split/tools/` + its `README.md` (`LV=`, `NGEN=`, `SINK=`, `HEATMAP=`) |
 | flight recorder + fault scan | `scripts/gpu-watch.sh`, `scripts/check-gpu-faults.sh` |
 | offline policy model | `scripts/moe-trace-replay.py` |
 | the evidence | [`W4-SPAN-READS.md`](W4-SPAN-READS.md), `STEP1-REPLAY.md`, `W1-SINK-TAX.md`, `P1-POOL-RANK.md` |

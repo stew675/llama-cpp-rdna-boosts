@@ -1,4 +1,4 @@
-# wip/host-expert-split - the split between pool, arena and page cache (and whether a swap can ever beat a layout)
+# archive/work/host-expert-split - the split between pool, arena and page cache (and whether a swap can ever beat a layout)
 
 **Status: OPEN - review + design done (2026-11-05), nothing implemented, nothing in `patches/`, nothing applied
 to the fork.  Re-opens a shape that was measured and refuted in r113, for a narrower reason and with a cheaper

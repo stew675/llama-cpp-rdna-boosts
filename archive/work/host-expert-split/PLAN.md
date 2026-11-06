@@ -327,10 +327,10 @@ invariant this campaign changed (the r113 "no write-back" entry) gets **correcte
 | what | where |
 |---|---|
 | the campaign's index entry and status | `wip/CAMPAIGNS.md` |
-| the scoping note (what was open before) | `wip/host-expert-split/README.md` |
-| the PR review + convergence design | `wip/host-expert-split/DESIGN.md` |
-| the evidence (trace, replay, surface, pricing) | `wip/host-expert-split/STEP1-REPLAY.md` |
-| the one implemented arm + its gates | `wip/host-expert-split/P1-POOL-RANK.md` |
+| the scoping note (what was open before) | `archive/work/host-expert-split/README.md` |
+| the PR review + convergence design | `archive/work/host-expert-split/DESIGN.md` |
+| the evidence (trace, replay, surface, pricing) | `archive/work/host-expert-split/STEP1-REPLAY.md` |
+| the one implemented arm + its gates | `archive/work/host-expert-split/P1-POOL-RANK.md` |
 | the fork arm | `~/llama.cpp` branch `p1-pool-rank-r223` (`b2a8d2e76`) |
 | the replayer's new knobs | `scripts/moe-trace-replay.py` (`pool-layout`, `--pool-band`, `--rebalance*`, `--evict-warm`) |
 | the flight recorder | `scripts/gpu-watch.sh` |

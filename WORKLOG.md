@@ -1,3 +1,55 @@
+## 261106.013 (r224) -- the host-expert-split campaign lands: a DECODE-ranked pool, an eviction demote, coalesced prefill reads (+81 % at `-lme` 12), and the heat-map fixes
+
+**Release `v16-6050b467c-r224`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`88e7d88a7`**, tree `7d4e504518b455a05a956f2a20b971fe8976c566`.  Campaign record:
+[`archive/work/host-expert-split/`](archive/work/host-expert-split/RESOLUTION.md) (promoted out of `wip/`, no stub).
+
+**The fold.**  The campaign's 14 fork commits (13 + the `SINK_TAX` removal) all touch one file,
+`ggml/src/ggml-cuda/moe-expert-cache.cu`, so they were squashed into **block 12** ("campaign remainder" -- the
+permanent block that owns `pool_rank_experts_locked`, `moe_cache_forget_all` and the pool's policy; the
+cache-side hooks it uses -- `host_pool_t`, the prepopulate, the gather/staging read paths -- stay in block 09).
+Blocks 13/14/15 replayed with no conflicts.  The fold is **provably content-free**: the rebased tip's tree is
+byte-identical to the campaign branch's (`7d4e5045…`), so no line changed, only its attribution.  Regenerated
+with `make-patches.sh` (block 12 +880/-166 lines; 13/14 changed only their `From` line; 15 only index lines),
+`make-release.sh`, then `fork-refresh.sh` in a scratch clone printed the canonical tip.
+
+**What shipped (`ENVIRONMENT.md` has the eight variables, `patches/README.md` block 12 the detail).**
+`MOE_HOST_POOL_RANK=decode` (default; `combined` = the parallel-slot workaround, `TODO` #275),
+`MOE_HOST_POOL_SINK=1` (the eviction demote into in-budget headroom), `MOE_HOST_POOL_STAGE_SPAN=1`
+(the coalesced prefill read), the heat-save truncation fix, and `invert` + `SINK_TAX` deleted.
+
+**The honest numbers (frozen real-world heat prior -- see 261106.012 for why).**  `-lme 36`, `-n 64`:
+control (`combined`+`SINK=0`) 24.3 -> shipping **26.2 t/s (+7.8 %)**, decomposed as ranking **+1.2 %** and
+demote **+5.3 %**.  Prefill: **+81 % at `-lme` 12, +57 % at 18, +14 % at 36** (94.2/115.6/330.9 ->
+170.7/181.6/375.5), generation unchanged.  Batched gate (`-npl 4` prefill): 1144.69 vs 1292.88 for `combined`
+(**-11.5 %**), accepted and documented.
+
+**Gates.**  Coherence, `-lme 12`, pool engaged (asserted per run): **`sha=880c932888f8` identical on all four
+arms** -- shipping, `MOE_HOST_POOL_SINK=0`, `MOE_HOST_POOL_RANK=combined`, `GGML_MOE_DEVREMAP=0` (no scheduler
+hook / iface member changed, so gate 1's 2-slot server arm is not triggered; the admission is covered by the
+pool gate below).  `gate-host-pool.sh` **28/28** on the folded tree (7 arms: `sink` 4009 demoted, `sinkfail`
+0 demoted / 4075 copy-error declines).  `gate-per-block-build.sh --changed-from 37148d118` (the r223 tip):
+**2/2 blocks build the `all` target** (12 and 15; 13/14 skipped as content-unchanged).  **Prefill-logit KLD:
+`mean KLD = 0.000000`, `same top p = 100.000 %`** against a base recorded from the **r223 delivery tree**
+(`build=37148d118`, 27B Q8_0, gfx1201) -- i.e. the block set's prefill numerics are bit-identical.
+**MTP**: on the shipping pool config (Flash-Next, `-lme 36`, `-c 16384`, `-n 3000`, prose, draft head
+`mtp-…-Q4_K_M.gguf` via `-md`) `--spec-type draft-mtp` is **byte-identical** to `none` (10 516 chars,
+`sha=f3e70bb2da19`) at **20.6 vs 18.3 t/s generation (+12.6 %)**.  `check-gpu-faults.sh` clean over the whole
+window; `validate-set.sh` green (checksums, fresh-tarball strict apply, tree, conflict-marker scan, Windows
+portability scan of the 287 delivery-added files).
+
+**Not run, and why** (no hiding): the MTP **four-axis** R/P/C/K matrix on the canonical dense 27B was not run
+this session -- the prose axis on the field config is recorded above and the change is inert on a dense model
+(no host pool), so it is the one gate a reviewer may still want before the tag; the `moe_cache_stage_table` arm
+of the coalesced read stays unexercised (the field config never reaches it -- the shared helper and its geometry
+guard are identical to the gather path's, which is proven).
+
+**Also recorded as `INVARIANTS.md` facts (r224):** the read SIZE is the prefill ceiling (one read per run of
+missing experts, growing pinned ring, `SPAN_MIN=2` load-bearing, no byte amplification); the heat prior is an
+**adaptive measurement input** (a writable map learns the benchmark prompt -- `chmod 444` freezes it at open and
+at every save); a failed demote **declines** and is never published; a writable heat map must never be truncated
+to a stub; and every ggml `INFO` counter line needs **`-lv 4`**.
+
 ## 261106.012 (campaign) -- W4 prefill read granularity (+81 % prefill at `-lme` 12); the heat prior is an INPUT; the headline was prior leakage
 
 **Fork: `p1-pool-rank-r223` + this session's work.  Nothing in `patches/`; `release.json` untouched.**  Record:

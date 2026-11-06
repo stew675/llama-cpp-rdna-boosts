@@ -131,5 +131,5 @@ win: at `-lme 36` reading every 16-expert window would read 4.3× the bytes to s
 | file | change |
 |---|---|
 | `ggml/src/ggml-cuda/moe-expert-cache.cu` | `span_buf_t`/`span_buf_ensure`/`span_buf_acquire`/`stage_span_fill`; the gather pre-pass call; the `stage_table` call; `g_stage_span_*` + `g_bounce_read_*` counters; `MOE_STAGE_SPAN_MIN`; two report lines |
-| `wip/host-expert-split/tools/*.sh` | `LV=`, `NGEN=`, `SINK=`, `HEATMAP=` honouring; coherence arm stream split + vacuity fix; batched arm `-lzm auto` |
+| `archive/work/host-expert-split/tools/*.sh` | `LV=`, `NGEN=`, `SINK=`, `HEATMAP=` honouring; coherence arm stream split + vacuity fix; batched arm `-lzm auto` |
 | fork branch | `p1-pool-rank-r223` + the W4 commit(s) on top |

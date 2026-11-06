@@ -1,4 +1,4 @@
-# PR #267 review + the convergence design — `wip/host-expert-split/`
+# PR #267 review + the convergence design — `archive/work/host-expert-split/`
 
 **Status: OPEN — review complete, NOTHING IMPLEMENTED, nothing applied to the fork, no `patches/` change.**
 Companion to [`README.md`](README.md) (the scoping note).  This file is the review of
