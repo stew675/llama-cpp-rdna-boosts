@@ -143,7 +143,22 @@ Two things follow, and they are worth keeping:
 | `combined` | 22.5 ×3 | 309–312 | 0.2090 (14445/69105) |
 | `decode` | **24.9 ×3 (+10.7 %)** | 313–315 | 0.2205 (15061/68295) |
 
-So: `decode` is a real **+10.7 %** on the single-user path and a real **−11 %** on the 4-slot batched path.
+**Confound check (2026-11-06).**  Every arm above ran `-lm mmap -lzm auto`.  `auto` does *not* engage the
+managed PLE reader here (`llama_lazy_managed_budget()` returns 0 without `LLAMA_LAZY_BUF_MB`, and its comment
+says so), but it does leave the CPU-offloaded PLE tensor (`-ot 'per_layer_token_embd.*=CPU'`) on the classic
+mmap-lazy path: page-fault loaded on demand, competing for the page cache that `MOE_HOST_POOL_DIO=1` makes the
+pool bypass.  Re-run with `-lzm off` (PLE prefaulted, no on-demand loading):
+
+| `-lme 36`, `-lzm off` | gen t/s | pool h |
+|---|---|---|
+| `combined` | 22.6 / 22.6 / 22.6 | 0.2090-0.2092 |
+| `decode` | 24.5 / 24.8 / 25.0 (mean 24.77) | 0.2207 |
+
+**+9.6 %**, so the effect survives the confound removal (the `-lzm auto` figure was +10.7 %); quote **+9.6 %**.
+Process `read_bytes` is *not* comparable across lazy modes (78 GB under `auto` vs ~102 GB under `off` on the
+same cells, because prefaulting PLE moves its reads into load time) — quote the pool's own DIO counters.
+
+So: `decode` is a real **+9.6 %** on the single-user path and a real **−11 %** on the 4-slot batched path.
 The only candidate that can serve both is **`floor`** (combined heat for the top `MOE_HOST_POOL_RANK_FLOOR`
 experts, decode heat below), which is what the next arm must test — on both cells.
 

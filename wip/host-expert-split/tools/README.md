@@ -17,6 +17,10 @@ SAMPLE_NOTE=<tag> ../../../scripts/gpu-watch.sh --out /tmp/<tag>.csv --interval 
 | `arm-batched.sh RANK TAG` | `llama-batched-bench -npl 1,4,8`, `-lme 44` | the batched gate |
 
 Fixed for every arm, and each for a measured reason:
+`-lm mmap -lzm off` (**`LZM` overrides**) — under `-lzm auto` the CPU-offloaded PLE tensor is mmap-lazy and
+page-fault loads *during* the measurement, competing for the page cache the pool deliberately bypasses; the
+same cell measured +10.7 % (`auto`) vs +9.6 % (`off`).  Never compare process `read_bytes` across lazy modes.
+
 `MOE_HOST_POOL_DIO=1` (a pool miss must be a real storage read, not a page-cache hit), `MOE_EXPERT_CACHE_MIB=4096`
 (a partial arena, so the pool is where misses go), `MOE_HOST_POOL_RAM_PCT=0` (never let a ceiling shave the
 arm), `LLAMA_KV_REGION_POOL=0` (not this campaign's question, and it costs 2.3 GiB), `-lzm auto -fa on`.

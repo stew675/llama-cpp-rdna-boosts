@@ -17,7 +17,7 @@ LOG=/tmp/arm-decay-$TAG.log
   -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   -ncmoe 48 -ngl 99 -lme ${LME:-36} \
   -ot 'per_layer_token_embd.*=CPU' \
-  -lm mmap -lzm auto -fa on -c 8192 -ub 4096 \
+  -lm mmap -lzm ${LZM:-off} -fa on -c 8192 -ub 4096 \
   -f "$HOME/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt" \
   -n ${NGEN:-64} --seed 42 --temp 0 --no-display-prompt --single-turn -lv 3 > "$LOG" 2>&1 &
 PID=$!

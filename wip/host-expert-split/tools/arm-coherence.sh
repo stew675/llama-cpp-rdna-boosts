@@ -9,6 +9,6 @@ LOG=/tmp/arm-coh-$3.log
 "$HOME/llama.cpp/build-rocm/bin/llama-cli" \
   -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   -ncmoe 48 -ngl 99 -lme $2 -ot 'per_layer_token_embd.*=CPU' \
-  -lm mmap -lzm auto -fa on -c 4096 -ub 4096 \
+  -lm mmap -lzm ${LZM:-off} -fa on -c 4096 -ub 4096 \
   -p "The capital of France is" -n 24 --seed 42 --temp 0 --no-display-prompt --single-turn > "$LOG" 2>&1
 echo -n "$3: "; python3 "$HOME/llama-cpp-rdna-boosts/scripts/extract-generated.py" "$LOG"

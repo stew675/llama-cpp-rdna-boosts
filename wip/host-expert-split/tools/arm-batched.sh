@@ -9,6 +9,6 @@ LOG=/tmp/arm-batched-$2.log
 "$HOME/llama.cpp/build-rocm/bin/llama-batched-bench" \
   -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   -ncmoe 48 -ngl 99 -lme $LME -ot 'per_layer_token_embd.*=CPU' \
-  -lm mmap -lzm auto -fa on -c 8192 -b 2048 -ub 6144 \
+  -lm mmap -lzm ${LZM:-off} -fa on -c 8192 -b 2048 -ub 6144 \
   -npp 512 -ntg 128 -npl 1,4,8 > "$LOG" 2>&1
 echo "== $2"; grep -E '^\|\s+[0-9]+' "$LOG" | tail -6

@@ -100,7 +100,7 @@ Design constraints, all of which come from something measured:
 
 ### W3 — the three-arm split curve (the campaign's answer)
 
-One binary, one model, `MOE_HOST_POOL_DIO=1`, stalls measured, `gpu-watch.sh` on every arm:
+One binary, one model, `MOE_HOST_POOL_DIO=1`, **`-lzm off`** (see §4), `gpu-watch.sh` on every arm:
 
 * **arm A** `MOE_HOST_POOL_RANK=combined` (today)
 * **arm B** `MOE_HOST_POOL_RANK=decode` (P1)
@@ -139,6 +139,11 @@ invariant this campaign changed (the r113 "no write-back" entry) gets **correcte
   The 2-D grid says the tier's advantage **grows** as the arena shrinks, so +12.8 GiB is conservative for small
   arenas.
 * `c_pcie = 0.04 ms/MiB` is an assumption until W1 measures it.  It is the whole decision.
+* **`-lzm off` is mandatory for every decision arm** (2026-11-06).  Under `-lzm auto` the CPU-offloaded PLE
+  tensor is mmap-lazy and page-fault loaded *during* the measurement, competing for the page cache the pool's
+  `MOE_HOST_POOL_DIO=1` makes it bypass; the same single-user cell moved from +10.7 % (`auto`) to +9.6 %
+  (`off`).  Corollary: **process `read_bytes` is not comparable across lazy modes** (78 GB vs ~102 GB on the
+  same cells) — quote the pool's own DIO counters, never the process total.
 * Every model number is a **hit/byte** model: the device measured P1's effect at +10.6 % while the model
   predicted 12–19 % of the *L3 traffic* — same direction, different currency.  Judge arms on device
   measurements; use the model only for ranking candidate policies.
