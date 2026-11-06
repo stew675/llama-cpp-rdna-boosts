@@ -2221,3 +2221,25 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
   invisible.  That is how this campaign once attributed a 2.3 GB/s ceiling to a function that never ran
   (`moe_cache_stage_table`; the reads were in `pool_prepopulate_locked` and the `moe_cache_gather_host`
   pre-pass).  Never quote a counter you have not seen printed.
+- **A fusion that pre-dispatches a graph node ahead of its own launch owes an aliasing check, not just an
+  alloc dep (r225, block 10, issue #276).**  The narrow-row norm fusion's sigmoid-gated form dispatches the
+  gate `MUL_MAT` (`nodes[nm.pre]`) *before* the fused kernel, which then reads `x`, `w` and that gate output,
+  and writes `dst`.  In **graph order** `x` is dead as soon as the `RMS_NORM` has consumed it, and the gate
+  output has exactly `x`'s shape, so the allocator's best fit for it is `x`'s own block — the pre-dispatch
+  then overwrites the activation the fused launch has not read.  Measured on Ling-3.0-tiny IQ4_NL
+  (`-c 8192`, the 5256-token `prompts/prose-rdna-boosts.txt`): with the `x -> nm.dst` alloc dep skipped, all
+  180 fused nodes take the alias and the 32-token greedy text collapses from **172 chars (`f476efaac086`,
+  identical to the unfused chain) to 52**.  `ggml_backend_cuda_graph_optimize`'s `x`/`w`/`z -> nm.dst` deps
+  are what make the shipped path correct, and they are **not** visible from `norm-gated.cu` — they were
+  registered for a buffer-size trade, in another file, and a caller that drives `ggml_backend_graph_compute()`
+  without a scheduler has none of them.  So the launch now verifies the byte ranges itself
+  (`norm_rows_alias_conflict()`): a gate output or fused output overlapping `x`, `w` or each other **declines**
+  the fusion (the unfused chain, byte-identical text), and the ONE allowed overlap is an exact dense alias of
+  `x` with `dst` (same address, same layout, contiguous `x` — a read-then-write of the same address by the
+  same thread).  Use `span = sum((ne[d]-1)*nb[d]) + type_size`, not `ggml_nbytes()`, which is the DENSE size
+  and understates a padded view; `x` is a strided reshape often enough for that to matter.  Equivalence is
+  proven two ways: `scripts/gate-norm-rows-alias.sh` (driver + real GGUF) and the fact that the fused launches
+  are bit-identical to the chain at the driver's shape (digest `bcc36422f9a120ac` in both the fused and the
+  `--no-fuse` arm).  The decision is observable with `GGML_CUDA_NORM_ROWS_DEBUG=1` (INFO, so `-lv 4`), which
+  is also how the gate detects a **dropped dep**: the text stays correct either way because the guard falls
+  back, so only `declined=0` distinguishes "the dep holds" from "the guard is doing the work".

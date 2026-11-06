@@ -1,3 +1,82 @@
+## 261106.014 (r225) -- issue #276: the norm-rows fusion's gate pre-dispatch is now checked for aliasing at launch, not only through the scheduler's alloc deps
+
+**Release `v16-6050b467c-r225`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip
+**`6b51f002d`**, tree `30e29a76a06ea04e06686b7be7def96bcee96902`.  Block **10** amended (it owns
+`ggml_cuda_norm_rows_try_fuse`, the fusion dispatcher); blocks 11-15 replayed with no conflicts.  The delivery
+records that changed: `INVARIANTS.md` (r225), `patches/README.md` (block 10 amendment + the `norm-gated.cu`
+bullet block 08 was missing), `ENVIRONMENT.md` (`GGML_CUDA_NORM_ROWS_DEBUG`), `MANIFESTS.md` gate 20,
+`AGENTS.md`/`scripts/README.md` (the gate), and the new `scripts/gate-norm-rows-alias.sh` +
+`scripts/norm-rows-alias.cpp`.
+
+**The report (a code reading, not a measurement).**  #276 says the gated form of the narrow-row norm fusion
+pre-dispatches the gate `MUL_MAT` and then reads `x`; in graph order `x` dies once the `RMS_NORM` consumed it,
+the gate output has exactly `x`'s shape, so the allocator's best fit for it is `x`'s own block and the
+pre-dispatch writes over the activation the fused launch has not read yet.  Its own scope note says the
+placement was harmless on the qwen4exp graph they could check.
+
+**What was actually true.**  The mechanism is real and the delivery depends on something the report could not
+see: `ggml_backend_cuda_graph_optimize` registers `x`/`w`/`z -> nm.dst` alloc deps for this fusion (since
+block 08), which keeps `x` alive past the gate output and makes the shipped path correct.  Those deps were
+added as a **buffer-size** trade in a different file (`ggml-cuda.cu`), so nothing in `norm-gated.cu` says a
+correctness invariant rests on them -- and a caller that drives `ggml_backend_graph_compute()` without the
+scheduler has none of them at all.  Measured on **Ling-3.0-tiny IQ4_NL** (the one local architecture that
+reaches the sigmoid-gated form -- bailingmoe3; there are no qwen4exp weights on this box), `-c 8192` over the
+5256-token `prompts/prose-rdna-boosts.txt`: **180 of 180** gated nodes fused, `ov(gate-out, x) = 0` with the
+deps; with the single `x -> nm.dst` dep skipped, **`ov(gate-out, x) = 2` (an exact full-block alias) on all
+180** and the 32-token greedy text collapsed from **172 chars (`f476efaac086`, identical to the unfused
+chain) to 52**.  So the report is a correct analysis of a latent hazard whose only guard was invisible.
+
+**The fix (two halves, and both are needed).**
+1. `norm_rows_alias_conflict()` in `norm-gated.cu` compares the byte ranges of the gate output and of `dst`
+   against `x`, `w` and each other **at dispatch time** and **declines** the fusion on any overlap, with one
+   exception: an exact dense alias of `x` with `dst` (same address, same layout, contiguous `x`) is a
+   read-then-write of the same address by the same thread, which is exactly what the allocator hands out for
+   the plain `x -> MUL` form.  Declining returns to the unfused chain, whose text is identical (both arms
+   above agree on `f476efaac086`).  Ranges use `sum((ne[d]-1)*nb[d]) + type_size`, never `ggml_nbytes()`
+   (dense, and it understates a padded view -- `x` is a strided reshape often enough to matter).
+2. The alloc-dep site in `ggml-cuda.cu` now says what it is: keeping `x` and `w` alive until `dst` is a
+   **correctness** requirement, with the measurement above, so the next reader cannot delete it as a
+   memory trade.  `GGML_CUDA_NORM_ROWS_DEBUG=1` (INFO, so `-lv 4`) logs one line per node, fused or declined
+   with its reason, which is what makes "nothing was declined" an observation.
+
+**`scripts/gate-norm-rows-alias.sh` (new, MANIFESTS gate 20).**  Two sections.  **A** drives the backend with
+no scheduler at all (`scripts/norm-rows-alias.cpp`: `ggml_backend_graph_compute()` on the gated shape, so no
+alloc deps exist) and forces each aliasing shape by pointing a tensor at another one's buffer after
+allocation: `alias_gate` (gate output == `x`) and `alias_dst_row` (fused output == `x` + 1 row) must be
+**declined**, `alias_dst_exact` (fused output == `x`) must still **fuse**, and every arm must equal `ref` and
+the driver's own `--no-fuse` digest.  **B** drives the delivery path on Ling and fails unless the gated form
+fused (else the text comparison is vacuous), **nothing was declined** (the deps still hold: the only
+assertion that catches a dropped dep, because the text stays correct either way now that the guard falls
+back), and the fused text equals `GGML_CUDA_DISABLE_NORM_ROWS=1`.  **Negative-tested three ways**: guard
+removed -> driver arms digest `bed78b1da3ac9b28` / `2b0800ea70a3eb6a` against a `bcc36422f9a120ac` reference
+(both FAIL); dep dropped -> Ling 52 chars as above; dep dropped -> section B FAILs on `declined=180` and
+"never fused the gated form".
+
+**Gates.**  New gate **PASS** on the canonical re-cut (driver 4/4 arms, digests `bcc36422f9a120ac` in the
+fused and the `--no-fuse` run, i.e. the fused launches are also bit-identical to the chain at that shape;
+model arms 180/180 gated fused, 0 declined, `172 f476efaac086` on both).  Coherence: 4B Q8_0 1 GPU and 3 GPU
+`-sm tensor` **`139 d2ffb97ccb76` on the fused and the kill-switch arm**, Ling `172 f476efaac086`.  Prefill
+logits: **`mean KLD = 0.000000`, `same top p = 100.000 %`** against the base recorded from `build=37148d118`
+(the r223 delivery tree, 27B Q8_0, gfx1201) -- i.e. the numerics of the path are bit-identical.
+`gate-per-block-build.sh --base 6050b467c --tip <re-cut> --changed-from 88e7d88a7`: **2/2** (blocks 10 and 15;
+11-14 skipped as content-unchanged) build the `all` target.  `check-gpu-faults.sh` clean (kernel journal +
+every arm's log); `validate-set.sh` green (checksums, fresh-tarball strict apply, tree, conflict-marker and
+Windows-portability scans of the 287 delivery-added files).
+
+**Not run, and why.**  The MTP four-axis protocol: the fusion's own matcher floor is `rows >= 4096` with
+`rows = x->ne[1]*ne[2]*ne[3]` (n_head x n_tokens for a per-head norm), and no decode or verify batch on any
+delivered model comes near it (Ling 16 heads, 4B 16/32, a 128-head model at an 8-token verify is still 1024),
+so every decode/verify arm is **unreachable by construction** and would only re-measure the base build.  The
+prefill-logit gate is the arm that does reach this code.  `-ctk/-ctv q8_0` was not re-run (the fusion is KV
+type independent: it keys on F32 activations, not on the cache).
+
+**One more thing found on the way (recorded, not changed):** the plain `RMS_NORM -> MUL(w)` form is protected
+by the same guard but has **no** alloc dep, and its `x` is measurably non-contiguous on real graphs
+(`contig_x=0` at `-lv 4` on Qwen3.6-35B-A3B and Gemma4-E4B prefill).  It is safe today because `MUL` takes
+`rms`'s buffer **in place** (the gallocr's `ggml_op_can_inplace` path), so `dst` never lands on `x`; if a
+future graph makes `rms` ineligible, the fusion now declines instead of corrupting.  That is the right
+trade for the hot path (an alloc dep there would hold a 4-16 MiB buffer for every per-head norm).
+
 ## 261106.013 (r224) -- the host-expert-split campaign lands: a DECODE-ranked pool, an eviction demote, coalesced prefill reads (+81 % at `-lme` 12), and the heat-map fixes
 
 **Release `v16-6050b467c-r224`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip

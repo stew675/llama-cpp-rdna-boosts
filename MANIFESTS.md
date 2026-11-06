@@ -420,6 +420,29 @@ in CI.  The model-level gates are manual:
    the `-lme`/`--host-experts pool` placement or the loader's host-expert source registration; every release.
    ~3 min on one GPU (the pool prewarm dominates).
 
+20. **Narrow-row norm fusion aliasing** — `scripts/gate-norm-rows-alias.sh` (r225, issue #276): the
+   `RMS_NORM -> MUL(w)` fusion (and its sigmoid-gated `-> MUL_MAT -> SIGMOID -> MUL` form) reads `x`, `w`
+   and the gate output `z` while it writes `dst`, but the gated form dispatches the gate `MUL_MAT`
+   **itself**, ahead of the launch.  In graph order `x` is dead as soon as the `RMS_NORM` has consumed it
+   and the gate output has exactly `x`'s shape, so the allocator's best fit for it is `x`'s own block.
+   The gate drives the fusion **without a scheduler** (`scripts/norm-rows-alias.cpp` calls
+   `ggml_backend_graph_compute()` directly, i.e. none of the alloc deps the sched's optimize pass
+   registers exist) and forces each aliasing shape by pointing a tensor at another one's buffer after
+   allocation: `alias_gate` (gate output == `x`) and `alias_dst_row` (fused output == `x` + one row) must
+   be **declined**, `alias_dst_exact` (fused output == `x` exactly, a read-then-write of the same address
+   by the same thread) must still **fuse**, and every arm must reproduce `ref` byte for byte and equal
+   the driver's own `--no-fuse` (chain) digest.  It then drives the **delivery path** on a real gated
+   GGUF (Ling-3.0-tiny, `-c 8192` over the 5256-token `prompts/prose-rdna-boosts.txt`) and fails unless
+   the gated form **fused** (>= 1 `norm-rows: ... fused=1 gated=1` line, so the text comparison cannot be
+   vacuous), **nothing was declined** (the scheduler's alloc deps still hold `x`/`w` for the fused
+   launch: this is the assertion that catches a dropped or renumbered dep, which is silent -- the text
+   stays correct because the guard falls back), the fused and `GGML_CUDA_DISABLE_NORM_ROWS=1` arms are
+   byte-identical, and neither arm aborts or faults a GPU.  `GGML_CUDA_NORM_ROWS_DEBUG=1` is the
+   diagnostic that makes the decision observable.  Required for any change to `norm-gated.cu`, to the
+   norm-rows alloc-dep registration in `ggml-cuda.cu`, or to the fusion's dispatch order; every release
+   (no other gate reaches this code, and `test-backend-ops` cannot: the fused kernel is compared against
+   a chain, not against an allocator).
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

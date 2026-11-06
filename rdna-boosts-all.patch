@@ -34918,7 +34918,7 @@ index 000000000..7570a3b06
 +void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
 +size_t ggml_cuda_slab_seed_floor(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a9a..0be84ea23 100644
+index aff687a9a..4f299817f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -45587,7 +45587,7 @@ index aff687a9a..0be84ea23 100644
          // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
          // TODO: consolidate fusion paths in graph_optimize and graph_compute
          ggml_cuda_set_device(cuda_ctx->device);
-@@ -5054,8 +8283,35 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5054,8 +8283,43 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
              }
  
@@ -45612,6 +45612,14 @@ index aff687a9a..0be84ea23 100644
 +                ggml_cuda_norm_gated_match nm;
 +                const int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
 +                if (sk > 0 && nm.pre >= 0) {
++                    // KEEPING x AND w ALIVE UNTIL dst IS A CORRECTNESS REQUIREMENT, not only a buffer-size
++                    // trade (issue #276).  The fusion dispatches the gate MUL_MAT ahead of the chain, so
++                    // x is still read after the RMS_NORM has consumed it in graph order, and the gate
++                    // output has x's shape: without these deps the allocator hands it x's block and the
++                    // fused kernel reads its own gate output as the activation (measured on
++                    // Ling-3.0-tiny: greedy text 172 -> 52 characters).  norm_rows_alias_conflict() in
++                    // norm-gated.cu re-checks the same ranges at dispatch time for a caller that runs
++                    // this graph with no scheduler (and therefore none of these deps).
 +                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.x), nm.dst);
 +                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.w), nm.dst);
 +                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.z->view_src ? nm.z->view_src : nm.z), nm.dst);
@@ -45625,7 +45633,7 @@ index aff687a9a..0be84ea23 100644
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                  if (match.expert_scale != nullptr) {
-@@ -5124,14 +8380,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5124,14 +8388,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -45643,7 +45651,7 @@ index aff687a9a..0be84ea23 100644
  
      static bool enable_graph_optimization = [] {
          const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-@@ -5142,6 +8393,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5142,6 +8401,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -45663,7 +45671,7 @@ index aff687a9a..0be84ea23 100644
      ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
      stream_context.reset();
  
-@@ -5367,6 +8631,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5367,6 +8639,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -45673,7 +45681,7 @@ index aff687a9a..0be84ea23 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -5383,7 +8650,21 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5383,7 +8658,21 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -45695,7 +45703,7 @@ index aff687a9a..0be84ea23 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -5409,6 +8690,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -5409,6 +8698,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -45710,7 +45718,7 @@ index aff687a9a..0be84ea23 100644
      return description;
  }
  
-@@ -5653,8 +8942,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5653,8 +8950,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -45721,7 +45729,7 @@ index aff687a9a..0be84ea23 100644
  }
  
  // TODO: move these functions here
-@@ -5814,6 +9103,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5814,6 +9111,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                          return true;
                      case GGML_TYPE_IQ4_NL:
@@ -45731,7 +45739,7 @@ index aff687a9a..0be84ea23 100644
                      case GGML_TYPE_MXFP4:
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
-@@ -5903,6 +9195,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5903,6 +9203,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -45740,7 +45748,7 @@ index aff687a9a..0be84ea23 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -6109,8 +9403,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6109,8 +9411,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -45782,7 +45790,7 @@ index aff687a9a..0be84ea23 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
-@@ -6134,7 +9461,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6134,7 +9469,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -45792,7 +45800,7 @@ index aff687a9a..0be84ea23 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -6155,6 +9483,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -6155,6 +9491,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -45809,7 +45817,7 @@ index aff687a9a..0be84ea23 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -6189,6 +9527,247 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -6189,6 +9535,247 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -46057,7 +46065,7 @@ index aff687a9a..0be84ea23 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -6205,6 +9784,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -6205,6 +9792,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -46089,7 +46097,7 @@ index aff687a9a..0be84ea23 100644
  };
  
  // backend reg
-@@ -6286,8 +9890,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -6286,8 +9898,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -46163,7 +46171,7 @@ index aff687a9a..0be84ea23 100644
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
          return (void *)ggml_backend_cuda_comm_init;
      }
-@@ -6384,6 +10053,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6384,6 +10061,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -71588,10 +71596,10 @@ index b72f947ab..31136cb03 100644
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
 new file mode 100644
-index 000000000..afa639852
+index 000000000..d69d1288d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/norm-gated.cu
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,232 @@
 +#include "norm-gated.cuh"
 +#include "ggml-impl.h"
 +
@@ -71650,6 +71658,66 @@ index 000000000..afa639852
 +        return env == nullptr || std::atoi(env) == 0;
 +    }();
 +    return enabled;
++}
++
++// Diagnostic only (never a behaviour switch): GGML_CUDA_NORM_ROWS_DEBUG=1 logs one decision line per
++// candidate node, fused or declined, so a gate can prove both that the fusion is live and that an
++// arm really reached the aliasing guard below.
++static bool norm_rows_debug() {
++    static const bool enabled = []() {
++        const char * env = getenv("GGML_CUDA_NORM_ROWS_DEBUG");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// The byte extent a tensor's elements actually span.  ggml_nbytes() is the DENSE size and understates a
++// padded view, which is a real shape here: x is frequently a strided reshape of a projection output.
++static size_t norm_rows_span(const ggml_tensor * t) {
++    size_t span = ggml_type_size(t->type);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        span += (size_t) (t->ne[d] - 1) * t->nb[d];
++    }
++    return span;
++}
++
++static bool norm_rows_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
++        return false;
++    }
++    const char * a0 = (const char *) a->data;
++    const char * b0 = (const char *) b->data;
++    return a0 < b0 + norm_rows_span(b) && b0 < a0 + norm_rows_span(a);
++}
++
++// The fused launch reads x, w and z (the gate output) and writes dst, all as the dense
++// [ncols, rows] layout the kernel indexes, so it may only run when none of those buffers is behind
++// another one -- with ONE exception: an exact alias of x with dst is a read-then-write of the same
++// address by the same thread (both tensors then have x's dense layout), which is what the allocator
++// hands out when it recycles x's block for the output (the common case for the x -> MUL form).
++//
++// issue #276: the gated form dispatches the gate MUL_MAT before the fused kernel runs, and in graph
++// order x is dead as soon as the RMS_NORM has consumed it while the gate output has exactly x's
++// shape, so the allocator's best fit is x's own block (measured on Ling-3.0-tiny: with the
++// scheduler's alloc deps disabled the gate output takes x's block outright and the greedy text
++// collapses from 172 to 52 characters).  The scheduler's optimize pass keeps x/w/z alive until dst
++// (ggml_backend_cuda_graph_optimize, "add alloc deps ... for performance positive fusions"), which
++// is what makes the shipped configuration safe -- but this function must not depend on a pass it
++// cannot see: ggml_backend_graph_compute() can be driven with no scheduler and therefore no deps at
++// all, and a fusion copied from this one inherits the hazard without inheriting the deps.  Verify the
++// aliasing here instead and fall back to the unfused chain, which computes the same text.
++static const char * norm_rows_alias_conflict(const ggml_cuda_norm_gated_match & m, const ggml_tensor * pre_out) {
++    if (pre_out != nullptr &&
++            (norm_rows_overlap(pre_out, m.x) || norm_rows_overlap(pre_out, m.w) || norm_rows_overlap(pre_out, m.dst))) {
++        return "gate-out";
++    }
++    if (norm_rows_overlap(m.dst, m.x) && !(m.x->data == m.dst->data && ggml_are_same_layout(m.x, m.dst) && ggml_is_contiguous(m.x))) {
++        return "dst-x";
++    }
++    if (norm_rows_overlap(m.dst, m.w)) {
++        return "dst-w";
++    }
++    return nullptr;
 +}
 +
 +static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * out) {
@@ -71734,21 +71802,35 @@ index 000000000..afa639852
 +    }
 +    ggml_cuda_norm_gated_match nm;
 +    int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
-+    if (sk > 0) {
-+        if (nm.pre >= 0) {
-+            if (!ggml_cuda_compute_forward(ctx, cgraph->nodes[nm.pre])) {
-+                GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
-+            }
++    if (sk == 0) {
++        sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
++    }
++    if (sk == 0) {
++        return 0;
++    }
++    // Aliasing guard (issue #276): see norm_rows_alias_conflict().  Never fires on the delivery's own
++    // path (the scheduler's alloc deps prevent it); it is the safety net for a caller that computes
++    // this graph without them.
++    const ggml_tensor * pre_out = nm.pre >= 0 ? cgraph->nodes[nm.pre] : nullptr;
++    if (const char * conflict = norm_rows_alias_conflict(nm, pre_out)) {
++        if (norm_rows_debug()) {
++            GGML_LOG_INFO("norm-rows: i=%d declined=%s gated=%d x=%p z=%p dst=%p\n",
++                    i, conflict, (int) (nm.pre >= 0), nm.x->data, pre_out ? pre_out->data : nullptr, nm.dst->data);
 +        }
-+        ggml_cuda_op_norm_gated(ctx, nm);
-+        return sk;
++        return 0;
 +    }
-+    sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
-+    if (sk > 0) {
-+        ggml_cuda_op_norm_gated(ctx, nm);
-+        return sk;
++    if (pre_out != nullptr) {
++        if (!ggml_cuda_compute_forward(ctx, cgraph->nodes[nm.pre])) {
++            GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
++        }
 +    }
-+    return 0;
++    if (norm_rows_debug()) {
++        GGML_LOG_INFO("norm-rows: i=%d fused=1 gated=%d rows=%lld ncols=%lld x=%p z=%p dst=%p\n",
++                i, (int) (nm.pre >= 0), (long long) (nm.x->ne[1] * nm.x->ne[2] * nm.x->ne[3]),
++                (long long) nm.x->ne[0], nm.x->data, pre_out ? pre_out->data : nullptr, nm.dst->data);
++    }
++    ggml_cuda_op_norm_gated(ctx, nm);
++    return sk;
 +}
 diff --git a/ggml/src/ggml-cuda/norm-gated.cuh b/ggml/src/ggml-cuda/norm-gated.cuh
 new file mode 100644
