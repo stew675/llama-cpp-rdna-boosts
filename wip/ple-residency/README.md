@@ -303,6 +303,66 @@ What is settled, whatever the cause:
   reader in the same change**: the staging buffer takes over its only unique role (a bounded, explicit PLE
   RAM budget) and does it at row granularity.
 
+## 4e. Prototype cut and measured (2026-11-06, r229 tree) — `ple-row-store.patch`
+
+`llama_lazy_reader` was reworked from a page-granular arena (4 KiB pages, clock LRU, `pread`) to a
+**row-granular store**: 90 B rows, open-addressed row map, clock LRU over row slots, a persistent
+8-16 thread I/O pool, and `POSIX_FADV_RANDOM` re-asserted after load (the loader sets `FADV_SEQUENTIAL`
+on the same file description, so a 90 B `pread` otherwise pulls a readahead window).  The public API is
+unchanged, so `LLAMA_LAZY_BUF_MB` is still the budget knob and the two arms are one binary.
+
+**Correctness first.** Text is byte-identical in every arm (`sha 6317a4054e25`, 2 299 chars), and the
+prefill-logit gate passes against the store arm:
+
+```
+scripts/gate-prefill-logits.sh --model .../Qwen3.8-Flash-Next-...-00001-of-00002.gguf \
+    --extra "-ncmoe 48 -lme 47" --ab "LLAMA_LAZY_BUF_MB=64 LLAMA_LAZY_IO_THREADS=8" \
+    --ctx 512 --chunks 20 --threads 7
+  ==> mean KLD = 0.000000 (limit 0.005), same top p = 100.000 % (floor 98.0 %)  PASS
+```
+
+**It is not a win, and the measurement says exactly why.**
+
+| 190k-token prefill | t/s | PLE cost per 3 036 448 rows |
+|---|---:|---|
+| delivered mmap path | 1708.2, 1707.3 | hint loop 7.12 s + faults 1.43 s (0.5 us/row) = **8.6 s** |
+| row store, 64 MiB | 1730.5, 1732.2 | fetch 7.46 s (2.6 us/row, 96 % of the gather) = **7.5 s** |
+
+| 512-token decode | t/s | PLE per step |
+|---|---:|---|
+| delivered mmap path | 41.5-43.7 | 4.0 ms |
+| row store, 64 MiB | 42.7-43.6 | 4.65 ms |
+
+A wash on both sides, and the decode number is not a mechanism question at all — it is the drive:
+
+| measured directly (`tools/lonepread.c`, `tools/burst.c`) | cost |
+|---|---:|
+| one cold 90 B read after 30 ms idle | **4.7 ms** |
+| a burst of 16 cold reads after 30 ms idle | **7.4-8.3 ms total** (~500 us/read) |
+| a warm read after 30 ms idle | **7 us** |
+| 4 096 cold reads back-to-back, 1 / 8 / 16 threads (`tools/preadbench.c`) | 107 / 7.2 / 4.4 us per read |
+
+So a decode step's ~16 rows are an *isolated* cold burst and pay the drive's ~4.7 ms "first cold read
+after idle" whatever fetches them — mapping fault, buffered `pread`, `O_DIRECT`, one thread or 16.  Only
+rows that are **already resident** avoid it (7 us), and the decode stream is ~90 % first touch (§4c), so
+nothing in the fetch path can help.  Why the store did not win prefill either:
+
+- the delivered path is already near-optimal: its 7.1 s of `madvise(WILLNEED)` converts 26.1 us/row of
+  serialised faults into 0.5 us/row.  **Removing that loop costs 40 % of prefill** (1708 -> 1046 t/s,
+  read+dq 1.43 s -> 79.17 s).  It is load-bearing; `LLAMA_PLE_NOHINT=1` is the A/B that shows it;
+- the store's own fetch is device-bound at 2.6 us/row (8 and 16 threads measure the same), because each
+  cold row still costs a 4 KiB page: 12.4 GB of device traffic to deliver 273 MB of rows.
+
+**What the prototype therefore establishes.**  The store is correct and replaces the page arena at row
+granularity (57 MiB of rows for this corpus against 2.3 GiB of page cache), but *fetch-on-demand* buys
+nothing: prefill is already hinted-and-batched, and decode is bounded by the drive's isolated-read
+latency.  The store only pays when it is **filled ahead of use** — i.e. Phase 2: prefetch the next
+ubatch's predicted rows while the current one computes (§4b), which is the ~7 % prefill win and the only
+way the RAM advantage becomes real.  Two follow-ups fall out of the same numbers: sub-page reads
+(`O_DIRECT` 512 B moved 0.6 KiB/read against 4.1 KiB buffered at the same time per read, so the store's
+12.4 GB could become ~1.8 GB), and for decode either accept the 4.7 ms or prefetch the MTP verify batch
+during drafting (§4c).
+
 ## 5. Options if this is picked up (none started)
 
 0. **Simplest and strongest — a per-request PLE staging buffer** (§4b): at request start enumerate the
@@ -355,8 +415,10 @@ coverage number without saying whether it is self-oracle (40-91 %) or cross-docu
 ## 7. Reproduce
 
 ```bash
-# 1. instrument (one hunk, block-15 tree), then rebuild
+# 1a. instrument only (trace + LLAMA_PLE_TIMING/PROBE), then rebuild
 cd ~/llama.cpp && git apply wip/ple-residency/ple-trace-and-timing.patch
+# 1b. the row-store prototype (includes 1a: trace + timing + the row-granular reader)
+cd ~/llama.cpp && git apply wip/ple-residency/ple-row-store.patch
 cmake --build build-rocm --target llama-cli llama-server -j 16
 
 # 2. trace a run (any arm; the PLE rows do not depend on the expert tier)
