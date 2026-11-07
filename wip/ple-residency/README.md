@@ -389,11 +389,27 @@ fallbacks on the decode path; `LLAMA_PLE_NOPREFETCH=1` turns it off.
 | store, prefetch off | 1721.8 | 226 ms/ubatch (2.7 us/row) |
 | store + prefetch | 1691.4-1719.7 | 224-161 ms/ubatch |
 
-and with the prefetch off the fetch is 226 ms/ubatch against 161 ms with it — but the total is the same,
-because **the job list is sorted by row id**: ubatch 1's rows are scattered through it, so the first
-gather ends up draining most of the prefetch.  The overlap needs the pool to deliver **in token order,
-one ubatch at a time** (dedup within an ubatch, enqueue per ubatch, gather consumes in order), which is
-the next change — the infrastructure (predictor, job list, per-row readiness) is now in place for it.
+The first cut delivered the job list **sorted by row id**, which scattered every ubatch through it, so
+the first gather drained the whole prefetch and the wall did not move.  Dropping the sort was the fix
+(the store's index already dedups: a row is indexed *pending* when it is enqueued, so a repeat inside the
+batch is skipped), and with the pool delivering in token order the overlap appears:
+
+| 190k prefill, `-b 24576 -ub 6144`, 4 ubatches per decode call | t/s | PLE fetch |
+|---|---:|---:|
+| delivered mmap | 1691.9 | 8.6 s total |
+| store, prefetch off | 1721.8 | 7.9 s (2.7 us/row) |
+| **store (192 MiB) + prefetch, token order** | **1736.1** | **4.9 s (1.7 us/row)**, 485 fallbacks |
+
+So the mechanism works: the fetch is 1.7 us/row against the device's own floor of ~1.5 us/row, 2.6 us/row
+on-demand, and the prefill gains **+2.6 % over the delivered path** (+0.8 % over the store alone) at the
+same `-b`.  The gain is bounded by the ubatch count per decode call: only ubatches 2..N can be hidden,
+so 4 ubatches hide at most 3/4 of it, and the delivered `runme` arm (`-b 6144 -ub 6144`, one ubatch per
+call) hides **nothing** — that is the open question this cut leaves, not the mechanism.
+
+Two more things fell out of finishing it: the store has to be sized for the document (64 MiB thrashed at
+190k tokens — 129 k fallbacks — while 192 MiB holds the corpus's 635 k rows), and both bugs below were
+found only by running it (the pass-2 fallback could take the pool from an in-flight prefetch, and a
+thrashing store saturated the probe table until an insert was silently dropped).
 
 Two incidental results from this cut: `-b 24576 -ub 6144` alone is not a win for the delivered path
 (mmap 1691.9 vs 1708.2 at `-b 6144`), and the decode arm measured its best number yet (44.2 t/s) with

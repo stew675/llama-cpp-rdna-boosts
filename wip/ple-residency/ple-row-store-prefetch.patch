@@ -14,7 +14,7 @@ index 25b303b58..0460bb7b7 100644
          const auto & ubatch = mctx->get_ubatch();
  
 diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
-index 9f9779b8c..3295a3fa5 100644
+index 9f9779b8c..7854e20c1 100644
 --- a/src/llama-lazy-reader.cpp
 +++ b/src/llama-lazy-reader.cpp
 @@ -3,11 +3,11 @@
@@ -85,7 +85,7 @@ index 9f9779b8c..3295a3fa5 100644
      if (fd < 0) {
          GGML_ABORT("%s: invalid fd", __func__);
      }
-@@ -68,143 +56,394 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
+@@ -68,143 +56,405 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
                  __func__, (long long) row_nelems, (long long) ggml_blck_size(cfg.type));
      }
      if (n_slots > INT32_MAX) {
@@ -156,24 +156,30 @@ index 9f9779b8c..3295a3fa5 100644
 +}
 +
 +void llama_lazy_reader::insert_row(int32_t row, int32_t slot) {
++    // Open addressing with lazy deletion: eviction overwrites slot_row, which makes the bucket
++    // that named it stale, and a stale bucket is reused.  The table can therefore saturate (a
++    // store that thrashes leaves one stale bucket per eviction), so the last resort overwrites
++    // the first stale bucket seen -- stealing another row's index instead of losing this one.
 +    size_t h = hash_row(row);
-+    for (int probe = 0; probe < 128; probe++) {
++    size_t first_stale = SIZE_MAX;
++    for (int probe = 0; probe < 32; probe++) {
 +        const int32_t r = map_r[h];
 +        if (r != -1 && (map_s[h] < 0 || (size_t) map_s[h] >= n_slots || slot_row[map_s[h]] != r)) {
-+            // stale bucket: reuse it
-+            map_r[h] = row;
-+            map_s[h] = slot;
-+            return;
-+        }
-+        if (r == -1) {
++            if (first_stale == SIZE_MAX) {
++                first_stale = h;
++            }
++        } else if (r == -1) {
 +            map_r[h] = row;
 +            map_s[h] = slot;
 +            return;
 +        }
 +        h = (h + 1) % n_buckets;
 +    }
-+    // table saturated: drop the entry (correctness does not depend on it -- pass 2
-+    // re-fetches a row it cannot find)
++    if (first_stale == SIZE_MAX) {
++        first_stale = hash_row(row);
++    }
++    map_r[first_stale] = row;
++    map_s[first_stale] = slot;
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -304,14 +310,11 @@ index 9f9779b8c..3295a3fa5 100644
 +
 +void llama_lazy_reader::prefetch(const int32_t * rows, size_t n) {
 +    if (n == 0 || getenv("LLAMA_PLE_NOPREFETCH") != nullptr) {
-         return;
-     }
--    n_misses++;
++        return;
++    }
 +    std::lock_guard<std::mutex> lock(mtx);
 +    drain_locked();
- 
--    slot = (int32_t) evict_one();
--    GGML_ASSERT(slot >= 0 && (size_t) slot < n_slots);
++
 +    // resolve against the store first: only the cold rows become jobs
 +    miss_scratch.clear();
 +    miss_scratch.reserve(n);
@@ -329,21 +332,19 @@ index 9f9779b8c..3295a3fa5 100644
 +    if (miss_scratch.empty()) {
 +        return;
 +    }
-+    std::sort(miss_scratch.begin(), miss_scratch.end());
-+    miss_scratch.erase(std::unique(miss_scratch.begin(), miss_scratch.end()), miss_scratch.end());
- 
--    // clamp the read to the table extent: the last page is partial (the byte
--    // offset of the last page can exceed the table end, so compute the range
--    // from the row extent, not the byte offset)
--    const uint64_t row0 = (uint64_t) page * rows_per_page;
--    const uint64_t row1 = std::min(row0 + rows_per_page, n_rows);
--    const size_t off = data_offs + (size_t) row0 * row_bytes;
--    const size_t want = (size_t) (row1 - row0) * row_bytes; // <= page_size
++    // NO sort here: the store's index already dedups (a row is indexed as pending when it is
++    // enqueued), and keeping the list in *token order* is what lets the pool deliver the first
++    // ubatch's rows first, so that gather waits for its own quarter while the rest streams in
++    // under the ubatches' compute.  Sorting by row id scattered every ubatch through the list.
++
 +    // a prefetch that does not fit would evict its own rows before the gather reads them
 +    if (miss_scratch.size() * 2 > n_slots) {
-+        return;
-+    }
+         return;
+     }
+-    n_misses++;
  
+-    slot = (int32_t) evict_one();
+-    GGML_ASSERT(slot >= 0 && (size_t) slot < n_slots);
 +    io_buf.clear();
 +    io_buf.reserve(miss_scratch.size());
 +    for (const int32_t row : miss_scratch) {
@@ -357,10 +358,17 @@ index 9f9779b8c..3295a3fa5 100644
 +        insert_row(row, slot);
 +    }
 +    pre_rows = miss_scratch;
-+
+ 
+-    // clamp the read to the table extent: the last page is partial (the byte
+-    // offset of the last page can exceed the table end, so compute the range
+-    // from the row extent, not the byte offset)
+-    const uint64_t row0 = (uint64_t) page * rows_per_page;
+-    const uint64_t row1 = std::min(row0 + rows_per_page, n_rows);
+-    const size_t off = data_offs + (size_t) row0 * row_bytes;
+-    const size_t want = (size_t) (row1 - row0) * row_bytes; // <= page_size
 +    n_misses     += miss_scratch.size();
 +    n_bytes_read += (uint64_t) miss_scratch.size() * row_bytes;
-+
+ 
 +    if (n_threads <= 1 || pool_th.empty() || io_buf.size() <= 1) {
 +        // no pool to overlap with: do it inline (the gather would pay it anyway)
 +        for (size_t i = 0; i < io_buf.size(); i++) {
@@ -393,11 +401,14 @@ index 9f9779b8c..3295a3fa5 100644
 +            for (size_t i = 0; i < io_buf.size(); i++) {
 +                slot_ready[io_buf[i].slot] = 1;
 +            }
-+        }
+         }
+-        got += (size_t) r;
 +        inflight = true;
 +        drain_locked();
 +        return;
-+    }
+     }
+-#else
+-    GGML_ABORT("%s: pread not available on this platform", __func__);
 +    inflight = true;
 +    publish_jobs();
 +}
@@ -406,6 +417,9 @@ index 9f9779b8c..3295a3fa5 100644
 +    if (rows.empty()) {
 +        return;
 +    }
++    // the pool serves one job list at a time, and pre_rows/io_buf are shared: never take it over
++    // while a prefetch is still being served (the pass-2 fallback can land here)
++    drain_locked();
 +#if defined(__linux__) && LLAMA_LAZY_READER_POSIX
 +    // The loader sets POSIX_FADV_SEQUENTIAL on this file description (the reader's
 +    // fd is a dup of it), so a 90-byte pread would pull a readahead window -- measured
@@ -414,13 +428,10 @@ index 9f9779b8c..3295a3fa5 100644
 +    if (!adv_random) {
 +        if (getenv("LLAMA_LAZY_NORAND") == nullptr) {
 +            posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
-         }
--        got += (size_t) r;
++        }
 +        adv_random = true;
-     }
--#else
--    GGML_ABORT("%s: pread not available on this platform", __func__);
- #endif
++    }
++#endif
 +    io_buf.clear();
 +    io_buf.reserve(rows.size());
 +    for (const int32_t row : rows) {
@@ -447,7 +458,7 @@ index 9f9779b8c..3295a3fa5 100644
 +            }
 +            got += (size_t) r;
 +        }
-+#endif
+ #endif
 +        slot_row[it.slot]   = rows[i];
 +        slot_ref[it.slot]   = 1;
 +        { std::lock_guard<std::mutex> lk(ready_m); slot_ready[it.slot] = 1; }
@@ -560,7 +571,7 @@ index 9f9779b8c..3295a3fa5 100644
                      have = true;
                  }
              }
-@@ -213,118 +452,35 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+@@ -213,118 +463,35 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
              }
          }
  #endif
@@ -928,10 +939,10 @@ index 9bbd1f4c4..f5fa544c9 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 59f342c09..e21279fc8 100644
+index 59f342c09..2e7412d6d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -389,6 +389,51 @@ static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams,
+@@ -389,6 +389,57 @@ static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams,
      return other;
  }
  
@@ -978,12 +989,18 @@ index 59f342c09..e21279fc8 100644
 +    std::vector<int32_t> idx((size_t) n * n_heads);
 +    qwen4exp_ple_rows(hparams, tok.data(), prev.data(), n, idx.data());
 +    lazy_reader->prefetch(idx.data(), idx.size());
++    if (getenv("LLAMA_PLE_DBG")) {
++        static uint64_t n_calls = 0, n_rows = 0;
++        n_calls++; n_rows += idx.size();
++        fprintf(stderr, "ple prefetch #%llu: %lld tokens -> %zu rows (total %llu rows)\n",
++                (unsigned long long) n_calls, (long long) n, idx.size(), (unsigned long long) n_rows);
++    }
 +}
 +
  void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
      // NextN/MTP: an extra trunk-shaped block appended past the trunk. Read this first, since
      // n_layer() == n_layer_all - n_layer_nextn feeds every per-layer array below.
-@@ -2897,6 +2942,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2897,6 +2948,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      return cur;
  }
  
@@ -1030,7 +1047,7 @@ index 59f342c09..e21279fc8 100644
  // PLE n-gram hash embedding: each token gathers ple_n_heads rows of a shared table.
  //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
  // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
-@@ -2930,6 +3015,17 @@ public:
+@@ -2930,6 +3021,17 @@ public:
      std::vector<float> emb_scratch;
  };
  
@@ -1048,7 +1065,7 @@ index 59f342c09..e21279fc8 100644
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
      const auto & hp = pmodel.hparams;
  
-@@ -2964,31 +3060,36 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -2964,31 +3066,36 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
      // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
      mctx->get_prev_tokens(*ubatch, n_prev, prev);
  
@@ -1106,7 +1123,7 @@ index 59f342c09..e21279fc8 100644
          }
      }
  
-@@ -2997,7 +3098,18 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -2997,7 +3104,18 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          // gather() lays dst out as dst[(i*n_heads + h)*ple_head_dim + d], which is
          // exactly the flat layout of emb ([ple_head_dim*n_heads, n_tokens])
          emb_scratch.resize(idx.size() * pmodel.hparams.ple_head_dim);
@@ -1125,7 +1142,7 @@ index 59f342c09..e21279fc8 100644
          ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
  
          if (debug) {
-@@ -3018,9 +3130,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -3018,9 +3136,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          GGML_ASSERT(tab->data != nullptr);
  
          const auto * traits = ggml_get_type_traits(tab->type);
@@ -1138,7 +1155,7 @@ index 59f342c09..e21279fc8 100644
              const long page = sysconf(_SC_PAGESIZE);
              if (page > 0) {
                  const uintptr_t base = (uintptr_t) tab->data;
-@@ -3041,22 +3155,124 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -3041,22 +3161,124 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          llama_prefetch_rows(tab, idx.data(), idx.size());
  #endif
  
