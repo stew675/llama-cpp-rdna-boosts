@@ -52,6 +52,10 @@ What changed against the `6050b467c` set:
   `CONCAT` + `SSM_CONV` whenever a draft was configured (`n_rs_seq > 0`): a 35B-A3B (qwen35moe) + DFlash prefill
   -6 % on gfx1151.  With it: 2017-2068 tok/s vs r227 2034-2050 (2592-token prompt), greedy text and draft
   acceptance identical with `GGML_CUDA_DISABLE_CONV_FUSION=1`; Qwen3.8-27B + MTP likewise.
+- **Verify band on RDNA3_5** -- block 10's four verify-band gates (`GGML_CUDA_FUSE_GDN_CONV_VERIFY`,
+  `GGML_CUDA_FUSE_CPY_BATCH`, `GGML_CUDA_MMVQ_CONCAT_REORDER`, `GGML_CUDA_FUSE_Q8_1_VERIFY`) now admit RDNA3_5 as
+  well as RDNA3_0 / RDNA4.  They were left out as unmeasured; on gfx1151 the greedy text and draft acceptance
+  match all four at `=0`, 35B-A3B + DFlash decode is +4 % (90 -> 94 tok/s), Qwen3.8-27B + MTP is unchanged.
 - **State I/O (upstream #30881)** -- upstream's batched `ggml_backend_tensor_get_n`/`set_n` replaces the
   delivery's `flush_async` / merge-gap paths and the staged checkpoint copies.
 - **Server checkpoints** -- upstream's checkpoints are shared and immutable; the delivery's buffer recycling

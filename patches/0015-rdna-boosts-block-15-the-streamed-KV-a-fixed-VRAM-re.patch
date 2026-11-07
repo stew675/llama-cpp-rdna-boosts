@@ -1,4 +1,4 @@
-From ed0ba2e71e11bc9151a328dc88ddf4534d0975ae Mon Sep 17 00:00:00 2001
+From a7a32272476969445b48d521672ef72cdf0e985e Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -2998,7 +2998,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b40c0e098..0e29075f5 100644
+index 7c88cdb88..7d4e5c2fd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,6 +30,7 @@
@@ -4566,7 +4566,7 @@ index b40c0e098..0e29075f5 100644
 -        static const bool cat_reorder = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER") == nullptr || atoi(getenv("GGML_CUDA_MMVQ_CONCAT_REORDER")) != 0;
 +        static const bool cat_reorder = [] { const char * e = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER"); return e == nullptr || atoi(e) != 0; }();
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
-         if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
+         if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
 @@ -8345,6 +9691,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
