@@ -1,3 +1,50 @@
+## 261107.012 (no release) -- the engine merge was built, measured and withheld: the box's copy-engine "phase" is SDMA dispatch latency
+
+**No delivery change.**  `patches/`, `release.json`, the r234 tag and every gate are untouched; the fork
+branch is still `2e31f8819`.  This entry exists because it settles a question three records had left open
+("the 8192 stall", "the band", "the cause is not identified") and because it *stops* a change that looked
+good on the mean.
+
+**What was tried.**  `TODO` #272's follow-up: make the copy-engine fill the only staged engine for both tiers
+(delete `moe_cache_stage_kernel` and the PRS device snapshot, fold the coalesced span read into the surviving
+arm, drop `MOE_HOST_POOL_STAGE_BATCH`).  Built, text-byte-identical (`d3d554954cba` 1 GPU / `301b143c1cf5`
+2-device tensor), prefill-logit **KLD 0.000000 / 100.000 %** vs `GGML_MOE_CACHE_STAGE=0` on a host-expert
+config, `gate-host-pool.sh` **41/41**, the span read preserved *exactly* (59 659 reads, 153 491.3 MiB,
+2.57 MiB/read at `-lme 12`, identical to the kernel arm) — and **not shipped**.
+
+**Why not: the engine ranking reverses with a run-to-run phase, and the phase is the DMA op count.**  Pinned
+master, `-ub 6144`, 43.4 % residency, arms interleaved so each appears in both phases: low → kernel 1761 vs
+copy-engine 1624 (**kernel +8.4 %**); high → kernel 1876 vs copy-engine 2147 (**CE +14.4 %**).  Amplitude by
+transport: gather (kernel read) ±0.1 %, one-launch kernel 6.5 %, whole-table bulk upload 17 %, per-expert copy
+engine 32 % — i.e. a cost proportional to the number of DMA operations, not to the bytes.  The whole-table
+bulk arm (`GGML_MOE_CACHE_STAGE=0`) beat the shipped kernel in **both** phases (+6 % low, +16 % high, 1 GPU /
+43 % residency), but loses 1-7 % on a 2-device 99 %-residency shape and sends the arena's bytes over PCIe, so
+it is not a default either.
+
+**What the phase is.**  A `rocprofv3` kernel trace of a low vs a high run: identical kernels and identical
+21 055 `copyBuffer` dispatches, but the low phase is **67 % GPU-busy against 85 %**, with the copy engine
+*less* busy (0.16 s vs 0.36 s) across a longer wall — the copies stall rather than transfer, and the GPU idles
+in many < 5 ms gaps.  `HSA_ENABLE_SDMA=0` removes the oscillation entirely (1635/1557/1541/1566 t/s — stable,
+at the low level).  So it is ROCm/SDMA dispatch latency, not the fill code.
+
+**Ruled out on the way** (each with its own measurement, because the field report suggested the PLE page
+cache): `--lazy-mode auto` / `off` / `mlock` all oscillate with the same ~1.30 ratio (1838/1456/1836/1462 and
+1832/1460/1834/1465); on this box `auto` is the *fastest* of the three, because a 47 962.5 MiB host-expert
+tier leaves no room for a 26.8 GiB PLE pin (`MemAvailable` 7.7 GiB, the model's non-PLE tensors lose the page
+cache) — `mlock`/`off` cost ~15 % here.  Also ruled out: memory pressure, GPU clock, `GGML_SCHED_STAGE_SLOTS`
+(8 vs 16: +1 %), the GPU slot (same on gpu0 x8 and gpu2).
+
+**Also re-measured, and the r234 band refuted with the stricter protocol**: pool tier, palindrome order —
+gather 1260.6/1261.4, 1322.4/1321.7, 1389.5/1384.2 at `-ub` 4096/4608/5120 against CE 1121.5/1122.9,
+1225.1/1216.6, 1331.3/1302.8 → the gather leads by 12.3/8.3/5.3 % (the r234 "+18 % for CE at 5120" does not
+reproduce; the CE arm moved ~29 % between sessions, the gather ~11 %).  There is no width threshold to
+encode, so the pool tier stays on the gather default and the "width-gated transport rule" idea is dropped.
+
+**What survives as knowledge** (`INVARIANTS.md` r234's second addendum, the campaign record §6c): a transport
+A/B on this box needs both phases or a gather control arm; a *default* should prefer the low-DMA-count engine;
+and the per-expert copy engine is worth up to +15 % where SDMA is behaving, which is why
+`MOE_HOST_POOL_STAGE_BATCH` remains a real (documented) choice rather than dead code.
+
 ## 261107.011 (r234) -- TODO #271 resolved and #272 closed: the prefill staging decline named (and measured free), the transport band re-measured with its upper edge gone
 
 **Shipped:** `v16-6050b467c-r234` (block **12** amended, +115/-10 in

@@ -20,18 +20,18 @@ export GGML_CUDA_SLAB_HEADROOM_MIB=1536
 if [ $# -gt 0 ]; then export "$@"; fi
 # HOST_ARGS: the tier spelling.  Default = the mirror's -lme 47; PINNED=1 pins the whole host set
 # (a duplicate in ROCm_Host), which is the "everything pinned" arm this spike needs.
-if [ "${PINNED:-0}" = "1" ]; then HOST_ARGS=(--host-experts pinned); else HOST_ARGS=(--limit-host-experts 47); fi
+if [ "${PINNED:-0}" = "1" ]; then HOST_ARGS=(--host-experts pinned); else HOST_ARGS=(--limit-host-experts ${LME:-47}); fi
 grep -E "MemAvailable|AnonHugePages" /proc/meminfo > "$DIR/mem_before.txt"
 # swap/paging deltas: on this box a 46.84 GiB pinned tier plus an 83.6 GB model is close enough to the
 # 91 GiB ceiling that a run can be disk-bound (INVARIANTS r215 item 8's pressure trap, one tier over).
 awk '/^pswpin|^pswpout|^pgmajfault/{printf "%s=%s ",$1,$2} END{print ""}' /proc/vmstat > "$DIR/vm_before.txt"
-( while true; do grep MemAvailable /proc/meminfo >> "$DIR/mem.txt"; rocm-smi --showclocks 2>/dev/null | grep -iE "pcie clock|sclk" | tr '\n' ' ' >> "$DIR/clk.txt"; echo >> "$DIR/clk.txt"; sleep 2; done ) &
+( while true; do grep -E "MemAvailable|AnonHugePages|Hugepagesize" /proc/meminfo >> "$DIR/mem.txt"; rocm-smi --showclocks 2>/dev/null | grep -iE "pcie clock|sclk" | tr '\n' ' ' >> "$DIR/clk.txt"; echo >> "$DIR/clk.txt"; sleep 2; done ) &
 MON=$!
 "${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}" \
   -m "$MODEL" \
   --fit off -ngl 99 --n-cpu-moe ${NCMOE:-48} "${HOST_ARGS[@]}" \
   -c "${CTX:-204800}" -fa on -ctk q8_0 -ctv q8_0 -sm "${SM:-layer}" ${SM:+$([ "$SM" = tensor ] && echo "-mg 0")} \
-  --load-mode mmap --lazy-mode auto -t 7 --cache-ram 1024 \
+  --load-mode mmap --lazy-mode ${LAZY:-auto} -t 7 --cache-ram 1024 \
   -b "$UB" -ub "$UB" \
   ${EXTRA_CLI:-} \
   -f ${PROMPT:-prompt_52k.txt} -n 1 --temp 0 --seed 42 --no-display-prompt --single-turn -lv 4 2>&1 | tee "$DIR/run.log"

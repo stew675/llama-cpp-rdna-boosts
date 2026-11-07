@@ -137,6 +137,91 @@ buffer) — use two devices for that shape, as above.
 the only one that fills the MoE iface hooks).  A **CPU-only** run never loads that backend, so the switch
 cannot change its throughput.
 
+## 6c. Addendum 2: the engine matrix, and the box's copy-engine phase (2026-11-07, evening)
+
+Measured while evaluating "one engine instead of two" (which would delete `moe_cache_stage_kernel`).  Same
+config as §2, 1 GPU unless stated, balanced ABBA, 4 runs per arm, `[ Prompt: ... ]` footer as the figure.
+
+### The engine ranking reverses with a run-to-run PHASE, it does not have a winner
+
+Pinned master, `-ub 6144`, 43.4 % residency — the cleanest dataset, because each arm appears in *both* phases:
+
+| position in the cycle | 1 (low phase) | 2 (high phase) | 3 (low) | 4 (high) |
+|---|---|---|---|---|
+| kernel (`moe_cache_stage_kernel`, the shipped default) | 1760.7 | — | — | 1876.1 |
+| per-expert copy-engine fill | — | 2146.4 | 1623.5 | — |
+
+Phase-matched: **low → kernel 1761 vs CE 1624 (kernel +8.4 %); high → kernel 1876 vs CE 2147 (CE +14.4 %).**
+Both arms swing with the same period; the amplitude is a property of the transport:
+
+| arm | DMA ops per table | low / high | amplitude |
+|---|---|---|---|
+| device gather (a KERNEL read, no DMA) | 0 | 1791 / 1793 / 1790 / 1788 | **±0.1 %** |
+| staging kernel (1 launch per table) | 1 launch | 1761 / 1876 | **6.5 %** |
+| whole-table bulk upload (`GGML_MOE_CACHE_STAGE=0`) | 1 DMA per table | 1866 / 2180 | **17 %** |
+| per-expert copy engine | 512 DMA per table | 1624 / 2147 | **32 %** |
+
+So the *cost* of the phase is proportional to the number of DMA operations the transport issues, and a
+kernel-read transport is immune.  The whole-table bulk arm is the only one that beat the shipped kernel in
+**both** phases (+6 % low, +16 % high), at the price of sending the arena-resident bytes over PCIe too.
+
+### What the phase is, and what it is not (each ruled out by measurement)
+
+* **Not PLE page cache / lazy mode.**  `--lazy-mode auto` (default), `off` (the 27 465 MiB PLE table read
+  into host RAM) and `mlock` (populated and pinned) all oscillate with the same ~1.30 ratio
+  (`off`: 1838/1456/1836/1462; `mlock`: 1832/1460/1834/1465).  On THIS box `auto` is also the fastest of the
+  three — with a 47 962.5 MiB host-expert tier there is no room for a 26.8 GiB PLE pin (`MemAvailable` falls
+  to 7.7 GiB and the model's non-PLE tensors lose the page cache), so `mlock`/`off` cost ~15 % here even
+  though they are the right answer when the PLE table is the only large host consumer.
+* **Not memory pressure**: `MemAvailable` minimum is identical within a lazy-mode series (31.2-31.5 GiB on
+  `auto`), and the amplitude does not grow when it is pushed to 7.7 GiB.
+* **Not the GPU clock**: `rocm-smi` sclk max is ~3220 MHz in both phases.
+* **Not the work**: arena 20 796.2 MiB (43.4 %), staged bytes `arena=113 363.1 MiB host=148 086.9 MiB
+  (H2D 56.6 %)`, evictions (7 536.0 + 150.0 MiB), `hits=768 fills=2202` — identical in both phases, as are the
+  kernel dispatch counts (21 055 `copyBuffer`) in the traces.
+* **Not the ring depth**: `GGML_SCHED_STAGE_SLOTS=16` (the compile-time maximum) vs 8 → +1 % (noise).
+* **Not the GPU slot**: the same pattern on gpu0 (Gen5 x8) and gpu2 (1630/2163/1642/2164).
+* **It IS the SDMA copy-engine path.**  A `rocprofv3` kernel trace of a low-phase vs a high-phase run shows
+  the low phase at **67 % GPU-busy** against 85 %, with the copy engine *less* busy (0.16 s vs 0.36 s) in a
+  longer wall — i.e. the copies stall instead of transferring, and the GPU waits.  The extra time is many
+  small GPU-idle gaps (< 5 ms each; the > 5 ms gap structure is identical in both phases).  And with
+  `HSA_ENABLE_SDMA=0` (copies issued as blit kernels instead of SDMA) the oscillation **disappears**:
+  1635 / 1557 / 1541 / 1566 t/s — stable, but pinned at the *low* level.
+
+**Conclusion: a ROCm/SDMA dispatch-latency effect on this box, not a property of the fill code.**  A consumer
+cannot be asked to set `HSA_ENABLE_SDMA=0` (it costs the fast phase), so the delivery keeps the *low-DMA-count*
+engine (the one-launch kernel on the pinned tier, the device gather on the pool tier) and the per-expert copy
+engine stays an A/B arm (`MOE_HOST_POOL_STAGE_BATCH=0`).  The engine merge that prompted this
+(copy-engine for both tiers, kernel deleted) was **built, measured and not shipped**: it is better in the high
+phase, worse in the low one, and its mean is not separable from the phase.
+
+### The engine matrix (all cells, for the record)
+
+Pinned tier, kernel vs per-expert copy engine, 4 runs per arm:
+
+| cell | kernel | CE | verdict |
+|---|---|---|---|
+| 1 GPU, `-ub 6144`, 43.4 % res | 1887/1860/1745/1871 | 2138/2128/2139 (one 1613) | CE ahead in the high phase, behind in the low one (see above) |
+| 1 GPU, `-ub 2048`, 43.4 % | 1051/1083/1084/1057 | 1115/1114/1116 (one 833) | CE +4.3 % on the consistent runs |
+| 2 dev `-sm layer`, 99.1 % res | 1953/1985/1928/1973 | 2104/1952/2086/1937 | CE +3.1 %, and the kernel is the stable arm |
+| 2 dev `-sm tensor` | 2406/2369/2350/2374 | 2387/2378/2363/2361 | tie (±1 %) |
+
+Text is byte-identical between the engines on every shape (`d3d554954cba` 1 GPU / `301b143c1cf5` 2-device
+tensor), and the prefill-logit A/B (staged vs `GGML_MOE_CACHE_STAGE=0`, Flash-Next `-ncmoe 44`) is
+**KLD 0.000000 / same-top-p 100.000 %** — so nothing here is a purity question, only a transport one.
+
+### The pool tier, re-measured with the same protocol (palindrome, not ABAB)
+
+| `-ub` | gather | CE staging | gather's lead |
+|---|---|---|---|
+| 4096 | 1260.6 / 1261.4 | 1121.5 / 1122.9 | +12.3 % |
+| 4608 | 1322.4 / 1321.7 | 1225.1 / 1216.6 | +8.3 % |
+| 5120 | 1389.5 / 1384.2 | 1331.3 / 1302.8 | +5.3 % |
+
+The r234 "CE wins from 5120 up (+18 %)" **does not reproduce** in this session state (the CE arm moved ~29 %,
+the gather ~11 %).  So there is no width threshold to encode: the gather is at least as good at every width
+measured, and much better at 2048/3072.  The pool tier keeps the gather as its default — no rule needed.
+
 ## 7. Reproduce
 
 ```sh

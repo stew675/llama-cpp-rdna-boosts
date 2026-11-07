@@ -316,6 +316,19 @@ deliberately not changed** (`archive/work/host-expert-transport/RESOLUTION.md` �
 whose lower edge (between 2048 and 5120) is unmeasured, it couples two switches, and every copy-engine arm is
 **bimodal**.
 
+**The engine was almost merged, and the box says no (2026-11-07).**  Making the per-expert copy engine the
+only staged engine (deleting `moe_cache_stage_kernel`) measured **+15 %** on a pinned master at 1 GPU in one
+run-to-run phase and **-8 %** in the other, byte-identically: the **engine ranking reverses with a box-level
+phase** whose cost is proportional to the number of DMA operations a transport issues (gather, a kernel read:
+±0.1 %; one-launch kernel: 6.5 %; one bulk upload per table: 17 %; 512 copies per table: 32 %).  That phase
+is **ROCm/SDMA dispatch latency** — a trace shows the slow phase at 67 % GPU-busy against 85 % with the copy
+engine *less* busy, and `HSA_ENABLE_SDMA=0` removes it (stable, but at the slow level) — so it is not fixable
+in the delivery and not attributable to the lazy-mode/PLE page cache (`auto`, `off` and `mlock` oscillate
+identically).  The merge was withheld; the shipped engines are the low-DMA-count ones (the one-launch kernel
+on the pinned tier, the gather on the pool tier) and `MOE_HOST_POOL_STAGE_BATCH=0` remains the A/B arm that
+wins where SDMA is behaving.  Records: `WORKLOG.md` 261107.012, `INVARIANTS.md` (r234, second addendum),
+`archive/work/host-expert-transport/README.md` §6c.
+
 **Judge a transport with `A B B A`.**  Identical consecutive runs of one unchanged arm on this box alternate
 between two levels with period 2 — measured **1873 / 2177 / 1865 / 2180 t/s**, amplitude 16 % on the pinned
 bulk arm and 17-32 % on the pool copy-engine arm, while the gather moves ±0.1 %.  Cause unidentified (not

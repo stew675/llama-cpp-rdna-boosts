@@ -2743,3 +2743,38 @@ Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README
   problem (a copy-engine or hybrid fill that keeps the arena source), not a reason to drop the feature.
   A `-ncmoe 24` arm is NOT a way to reach high residency on a 32 GiB card: the resident layers plus the
   auto arena over-commit and the context fails to initialise.
+- **A run-to-run transport "phase" on this box is the SDMA copy-engine path, and its cost scales with the
+  NUMBER of DMA operations (measured 2026-11-07, evening; record `archive/work/host-expert-transport/README.md`
+  §6c).**  With identical work (arena 20 796.2 MiB / 43.4 % residency, staged bytes 113 363.1 + 148 086.9 MiB,
+  the same evictions, the same 21 055 `copyBuffer` dispatches) consecutive runs alternate between a fast and a
+  slow level, and the amplitude is a property of the transport's DMA op count, not of its byte count:
+
+  | transport | DMA ops per table | low / high | amplitude |
+  |---|---|---|---|
+  | device gather (kernel read of the pool alias) | 0 | 1791 / 1793 / 1790 / 1788 | **±0.1 %** |
+  | staging kernel (1 launch per table) | 1 launch | 1761 / 1876 | 6.5 % |
+  | whole-table bulk upload (`GGML_MOE_CACHE_STAGE=0`) | 1 DMA | 1866 / 2180 | 17 % |
+  | per-expert copy engine | 512 DMA | 1624 / 2147 | 32 % |
+
+  **Ruled out, each by measurement**: PLE page cache (the oscillation is identical with `--lazy-mode auto`,
+  `off` and `mlock`; on this box `auto` is also the *fastest* of the three because a 47 962.5 MiB host-expert
+  tier leaves no room for a 26.8 GiB PLE pin), memory pressure (`MemAvailable` identical within a series),
+  the GPU clock (sclk max ~3220 MHz in both), the ring depth (`GGML_SCHED_STAGE_SLOTS` 16 vs 8: +1 %), and the
+  GPU slot (same on gpu0 x8 and gpu2).  **What it is**: a `rocprofv3` trace shows the low phase at 67 % GPU-busy
+  against 85 %, with the copy engine *less* busy (0.16 s vs 0.36 s) in a longer wall — the copies stall instead of
+  transferring and the GPU idles in many < 5 ms gaps — and `HSA_ENABLE_SDMA=0` removes the oscillation entirely
+  (1635/1557/1541/1566 t/s: stable, at the low level).  So it is a ROCm/SDMA dispatch-latency effect, not the
+  fill code, and it cannot be fixed here.
+- **Consequence for transport decisions.**  (1) A transport A/B on this box must report both phases or include a
+  gather control arm: the phase reverses the per-expert-copy-engine vs one-launch-kernel ranking
+  (low: kernel +8.4 %; high: CE +14.4 %), so a mean over an unbalanced sample is a phase measurement.
+  (2) A *default* should prefer the low-DMA-count engine — which is what ships (staging kernel on the pinned
+  tier, gather on the pool tier).  (3) The whole-table bulk upload is the only arm that beat the shipped
+  kernel in **both** phases (+6 % low, +16 % high, 1 GPU / 43 % residency), but it sends the arena-resident
+  bytes over PCIe as well, and on a 2-device 99 %-residency shape the staged kernel wins by 1-7 % — so it is
+  not a universal default either.
+- **`MOE_HOST_POOL_STAGE_BATCH` stays, and its two arms are not interchangeable.**  The engine merge
+  (per-expert copy engine for both tiers, kernel deleted) was built and measured: it wins the high phase and
+  loses the low one, and the pinned tier's copy-engine fill would be a coin flip.  The switch therefore still
+  describes a real choice: `1` = one launch (the low-variance default), `0` = one copy per expert (the A/B arm
+  that wins the high phase and on 1 GPU at `-ub 2048`).
