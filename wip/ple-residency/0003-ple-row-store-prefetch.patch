@@ -1,0 +1,546 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 25b303b58..0460bb7b7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3076,6 +3076,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         }
+     };
+ 
++    // WIP/ple-residency Phase 2: predict this batch's per-layer-embedding rows and start fetching them
++    // in the background, so the I/O runs under the ubatches' compute instead of in front of each gather.
++    model.ple_prefetch(batch_inp);
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
+index 115e87591..7854e20c1 100644
+--- a/src/llama-lazy-reader.cpp
++++ b/src/llama-lazy-reader.cpp
+@@ -40,6 +40,7 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
+     budget_bytes(lazy_n_slots(cfg.budget, cfg.row_bytes) * cfg.row_bytes),
+     slot_row(n_slots, -1),
+     slot_ref(n_slots, 0),
++    slot_ready(n_slots, 0),
+     map_r(n_buckets, -1),
+     map_s(n_buckets, -1),
+     data(budget_bytes) {
+@@ -111,24 +112,30 @@ int32_t llama_lazy_reader::find_row(int32_t row) const {
+ }
+ 
+ void llama_lazy_reader::insert_row(int32_t row, int32_t slot) {
++    // Open addressing with lazy deletion: eviction overwrites slot_row, which makes the bucket
++    // that named it stale, and a stale bucket is reused.  The table can therefore saturate (a
++    // store that thrashes leaves one stale bucket per eviction), so the last resort overwrites
++    // the first stale bucket seen -- stealing another row's index instead of losing this one.
+     size_t h = hash_row(row);
+-    for (int probe = 0; probe < 128; probe++) {
++    size_t first_stale = SIZE_MAX;
++    for (int probe = 0; probe < 32; probe++) {
+         const int32_t r = map_r[h];
+         if (r != -1 && (map_s[h] < 0 || (size_t) map_s[h] >= n_slots || slot_row[map_s[h]] != r)) {
+-            // stale bucket: reuse it
+-            map_r[h] = row;
+-            map_s[h] = slot;
+-            return;
+-        }
+-        if (r == -1) {
++            if (first_stale == SIZE_MAX) {
++                first_stale = h;
++            }
++        } else if (r == -1) {
+             map_r[h] = row;
+             map_s[h] = slot;
+             return;
+         }
+         h = (h + 1) % n_buckets;
+     }
+-    // table saturated: drop the entry (correctness does not depend on it -- pass 2
+-    // re-fetches a row it cannot find)
++    if (first_stale == SIZE_MAX) {
++        first_stale = hash_row(row);
++    }
++    map_r[first_stale] = row;
++    map_s[first_stale] = slot;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -196,6 +203,11 @@ void llama_lazy_reader::pool_run() {
+                 got += (size_t) r;
+             }
+ #endif
++            {
++                std::lock_guard<std::mutex> lk(ready_m);
++                slot_ready[it.slot] = 1;
++            }
++            cv_ready.notify_all();
+             {
+                 std::lock_guard<std::mutex> lk(pool_m);
+                 if (--pool_pending == 0) {
+@@ -218,10 +230,120 @@ int32_t llama_lazy_reader::evict_one() {
+     }
+ }
+ 
++void llama_lazy_reader::publish_jobs() {
++    {
++        std::lock_guard<std::mutex> lk(pool_m);
++        pool_items   = &io_buf;
++        pool_next    = 0;
++        pool_pending = io_buf.size();
++        pool_gen++;
++    }
++    pool_cv.notify_all();
++}
++
++void llama_lazy_reader::drain_locked() {
++    if (!inflight) {
++        return;
++    }
++    {
++        std::unique_lock<std::mutex> lk(pool_m);
++        pool_done.wait(lk, [&] { return pool_pending == 0; });
++        pool_items = nullptr;
++    }
++    inflight = false;
++}
++
++void llama_lazy_reader::prefetch(const int32_t * rows, size_t n) {
++    if (n == 0 || getenv("LLAMA_PLE_NOPREFETCH") != nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(mtx);
++    drain_locked();
++
++    // resolve against the store first: only the cold rows become jobs
++    miss_scratch.clear();
++    miss_scratch.reserve(n);
++    for (size_t j = 0; j < n; j++) {
++        const int32_t row = rows[j];
++        GGML_ASSERT(row >= 0 && (uint64_t) row < n_rows);
++        const int32_t slot = find_row(row);
++        if (slot >= 0 && slot_ready[slot]) {
++            continue;
++        }
++        if (slot < 0) {
++            miss_scratch.push_back(row);
++        }
++    }
++    if (miss_scratch.empty()) {
++        return;
++    }
++    // NO sort here: the store's index already dedups (a row is indexed as pending when it is
++    // enqueued), and keeping the list in *token order* is what lets the pool deliver the first
++    // ubatch's rows first, so that gather waits for its own quarter while the rest streams in
++    // under the ubatches' compute.  Sorting by row id scattered every ubatch through the list.
++
++    // a prefetch that does not fit would evict its own rows before the gather reads them
++    if (miss_scratch.size() * 2 > n_slots) {
++        return;
++    }
++
++    io_buf.clear();
++    io_buf.reserve(miss_scratch.size());
++    for (const int32_t row : miss_scratch) {
++        const int32_t slot = evict_one();
++        GGML_ASSERT(slot >= 0 && (size_t) slot < n_slots);
++        io_buf.push_back({ data_offs + (size_t) row * row_bytes, row_bytes, slot });
++        // index it now (the gather can see that it is pending) but do not mark it readable
++        slot_row[slot]   = row;
++        slot_ref[slot]   = 1;
++        slot_ready[slot] = 0;
++        insert_row(row, slot);
++    }
++    pre_rows = miss_scratch;
++
++    n_misses     += miss_scratch.size();
++    n_bytes_read += (uint64_t) miss_scratch.size() * row_bytes;
++
++    if (n_threads <= 1 || pool_th.empty() || io_buf.size() <= 1) {
++        // no pool to overlap with: do it inline (the gather would pay it anyway)
++        for (size_t i = 0; i < io_buf.size(); i++) {
++            const io_item & it = io_buf[i];
++            uint8_t * dst = data.data() + (size_t) it.slot * row_bytes;
++            size_t got = 0;
++#if LLAMA_LAZY_READER_POSIX
++            while (got < it.len) {
++                const ssize_t r = pread(fd, dst + got, it.len - got, (off_t) (it.off + got));
++                if (r < 0) {
++                    GGML_ABORT("%s: pread failed: %s", __func__, strerror(errno));
++                }
++                if (r == 0) {
++                    GGML_ABORT("%s: unexpected EOF at offset %zu", __func__, it.off + got);
++                }
++                got += (size_t) r;
++            }
++#endif
++        }
++        {
++            std::lock_guard<std::mutex> lk(ready_m);
++            for (size_t i = 0; i < io_buf.size(); i++) {
++                slot_ready[io_buf[i].slot] = 1;
++            }
++        }
++        inflight = true;
++        drain_locked();
++        return;
++    }
++    inflight = true;
++    publish_jobs();
++}
++
+ void llama_lazy_reader::fetch_rows(const std::vector<int32_t> & rows) {
+     if (rows.empty()) {
+         return;
+     }
++    // the pool serves one job list at a time, and pre_rows/io_buf are shared: never take it over
++    // while a prefetch is still being served (the pass-2 fallback can land here)
++    drain_locked();
+ #if defined(__linux__) && LLAMA_LAZY_READER_POSIX
+     // The loader sets POSIX_FADV_SEQUENTIAL on this file description (the reader's
+     // fd is a dup of it), so a 90-byte pread would pull a readahead window -- measured
+@@ -261,24 +383,12 @@ void llama_lazy_reader::fetch_rows(const std::vector<int32_t> & rows) {
+             got += (size_t) r;
+         }
+ #endif
+-        slot_row[it.slot] = rows[i];
+-        slot_ref[it.slot] = 1;
++        slot_row[it.slot]   = rows[i];
++        slot_ref[it.slot]   = 1;
++        { std::lock_guard<std::mutex> lk(ready_m); slot_ready[it.slot] = 1; }
+         insert_row(rows[i], it.slot);
+     };
+ 
+-    const bool dbg = getenv("LLAMA_LAZY_DBG") != nullptr;
+-    double one_pread_us = 0;
+-    if (dbg) {
+-        // control: one synchronous 90 B pread from this very process, right now
+-        struct timespec t0, t1;
+-        char scratch[128];
+-        clock_gettime(CLOCK_MONOTONIC, &t0);
+-        if (pread(fd, scratch, row_bytes, (off_t) (data_offs + (size_t) rows[0] * row_bytes)) != (ssize_t) row_bytes) {}
+-        clock_gettime(CLOCK_MONOTONIC, &t1);
+-        one_pread_us = (t1.tv_sec-t0.tv_sec)*1e6 + (t1.tv_nsec-t0.tv_nsec)/1e3;
+-    }
+-    auto ns = [] { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e9 + t.tv_nsec; };
+-    const double tp0 = dbg ? ns() : 0;
+     if (n_threads <= 1 || pool_th.empty() || io_buf.size() <= 1) {
+         for (size_t i = 0; i < io_buf.size(); i++) {
+             read_one(i);
+@@ -286,33 +396,13 @@ void llama_lazy_reader::fetch_rows(const std::vector<int32_t> & rows) {
+         return;
+     }
+ 
+-    {
+-        std::lock_guard<std::mutex> lk(pool_m);
+-        pool_items   = &io_buf;
+-        pool_next    = 0;
+-        pool_pending = io_buf.size();
+-        pool_gen++;
+-    }
+-    pool_cv.notify_all();
+-    {
+-        std::unique_lock<std::mutex> lk(pool_m);
+-        pool_done.wait(lk, [&] { return pool_pending == 0; });
+-        pool_items = nullptr;
+-    }
++    pre_rows = rows;
++    inflight = true;
++    publish_jobs();
++    drain_locked();
+ 
+-    const double tp1 = dbg ? ns() : 0;
+-    // the workers only move bytes; the index is published here, on one thread
+-    for (size_t i = 0; i < io_buf.size(); i++) {
+-        const io_item & it = io_buf[i];
+-        slot_row[it.slot] = rows[i];
+-        slot_ref[it.slot] = 1;
+-        insert_row(rows[i], it.slot);
+-    }
+-    if (dbg) {
+-        const double tp2 = ns();
+-        fprintf(stderr, "lazy fetch: %zu rows, n_threads %d, pool %.1f us, publish %.1f us, one-pread control %.1f us\n",
+-                io_buf.size(), n_threads, (tp1-tp0)/1e3, (tp2-tp1)/1e3, one_pread_us);
+-    }
++    // read_one's bookkeeping is inside drain_locked() for the pooled path
++    GGML_UNUSED(read_one);
+ }
+ 
+ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+@@ -320,15 +410,22 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+     std::lock_guard<std::mutex> lock(mtx);
+ 
+     // pass 1: resolve every row; collect the misses (deduped: a gather can name
+-    // the same row more than once, and a prefill ubatch names thousands)
++    // the same row more than once, and a prefill ubatch names thousands).
++    // Phase 2: a row an in-flight prefetch is still bringing in is waited for
++    // individually, so this gather never pays for rows a later ubatch needs.
+     miss_scratch.clear();
+     miss_scratch.reserve(n);
+     for (size_t j = 0; j < n; j++) {
+         const int32_t row = rows[j];
+         GGML_ASSERT(row >= 0 && (uint64_t) row < n_rows);
+ 
+-        const int32_t slot = find_row(row);
+-        if (slot >= 0) {
++        int32_t slot = find_row(row);
++        if (slot >= 0 && !slot_ready[slot]) {
++            std::unique_lock<std::mutex> lk(ready_m);
++            cv_ready.wait(lk, [&] { return slot_ready[slot] != 0 || slot_row[slot] != row; });
++            slot = find_row(row);
++        }
++        if (slot >= 0 && slot_ready[slot]) {
+             slot_ref[slot] = 1;   // refresh the clock bit
+             n_hits++;
+             continue;
+@@ -336,6 +433,8 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+         miss_scratch.push_back(row);
+     }
+     if (!miss_scratch.empty()) {
++        // the pool serves one job list at a time: finish any prefetch before queueing its own
++        drain_locked();
+         std::sort(miss_scratch.begin(), miss_scratch.end());
+         miss_scratch.erase(std::unique(miss_scratch.begin(), miss_scratch.end()), miss_scratch.end());
+ #if defined(__linux__) && LLAMA_LAZY_READER_POSIX
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+index b9114d90a..21306faf6 100644
+--- a/src/llama-lazy-reader.h
++++ b/src/llama-lazy-reader.h
+@@ -50,6 +50,11 @@ public:
+     llama_lazy_reader(const llama_lazy_reader &) = delete;
+     llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
+ 
++    // WIP/ple-residency Phase 2: start fetching rows[] without waiting -- the I/O pool runs in the
++    // background and the next gather() (or the next prefetch) drains it first.  The caller is the
++    // model's predictor, which knows a whole decode batch's rows before the first ubatch needs them.
++    void prefetch(const int32_t * rows, size_t n);
++
+     // Dequantize rows[] (n entries) into dst, laid out as dst[j*row_nelems + d].
+     // Loads missing rows with pread(), evicts with the clock LRU, all under
+     // one lock hold so no row can disappear mid-gather.
+@@ -75,7 +80,9 @@ private:
+     int32_t find_row(int32_t row) const;      // slot holding row, -1 = absent (stale-tolerant)
+     void    insert_row(int32_t row, int32_t slot);
+     int32_t evict_one();                      // called with mtx held (clock scan)
+-    void    fetch_rows(const std::vector<int32_t> & rows); // called with mtx held
++    void    fetch_rows(const std::vector<int32_t> & rows); // called with mtx held (waits)
++    void    publish_jobs();                   // called with mtx held: hand io_buf to the pool, no wait
++    void    drain_locked();                   // called with mtx held: wait for the pool and index it
+     void    pool_start();
+     void    pool_stop();
+     void    pool_run();
+@@ -96,11 +103,14 @@ private:
+     std::mutex              mtx;
+     std::vector<int32_t>    slot_row;      // n_slots: row id in the slot, -1 = empty
+     std::vector<uint8_t>    slot_ref;      // n_slots: second-chance bit
++    std::vector<uint8_t>    slot_ready;    // n_slots: 1 = the row's bytes are in `data`
+     std::vector<int32_t>    map_r;         // n_buckets: bucket -> row id (-1 empty)
+     std::vector<int32_t>    map_s;         // n_buckets: bucket -> slot (-1 empty)
+     std::vector<uint8_t>    data;          // n_slots * row_bytes
+     std::vector<int32_t>    miss_scratch;  // per-gather dedup buffer
+     std::vector<io_item>    io_buf;        // jobs handed to the pool
++    std::vector<int32_t>    pre_rows;      // rows of an in-flight prefetch (io_buf[i] <-> pre_rows[i])
++    bool                    inflight = false;
+     size_t                  clock = 0;
+     bool                    adv_random = false;  // POSIX_FADV_RANDOM asserted after load
+ 
+@@ -108,6 +118,8 @@ private:
+     std::mutex              pool_m;
+     std::condition_variable pool_cv;       // workers wait for a generation
+     std::condition_variable pool_done;     // the gather waits for pending == 0
++    std::condition_variable cv_ready;      // a prefetched row became readable
++    std::mutex              ready_m;       // guards slot_ready (workers never take mtx)
+     std::vector<std::thread> pool_th;
+     const std::vector<io_item> * pool_items = nullptr;
+     size_t                  pool_next = 0;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 74f90509c..df1d2c842 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -17,6 +17,7 @@
+ struct llama_cparams;
+ struct llama_ubatch;
+ struct llama_model_loader;
++struct llama_batch_ext;
+ struct llama_model;
+ 
+ // available models
+@@ -958,6 +959,11 @@ struct llama_model {
+ 
+     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+ 
++    // WIP/ple-residency Phase 2: predict the per-layer-embedding rows a decode batch will gather and
++    // start fetching them into the reader's store without blocking (no-op for a model with no such
++    // table).  Called once per decode() batch, before the ubatch loop.
++    virtual void ple_prefetch(const llama_batch_ext & batch) const { GGML_UNUSED(batch); }
++
+     virtual void load_stats  (llama_model_loader & ml) = 0;
+     virtual void load_hparams(llama_model_loader & ml) = 0;
+     virtual void load_vocab  (llama_model_loader & ml) = 0;
+diff --git a/src/models/models.h b/src/models/models.h
+index c2b337233..f5fa544c9 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -169,6 +169,7 @@ struct llm_build_rwkv7_base : public llm_graph_context {
+ 
+ struct llama_model_llama : public llama_model_base {
+     llama_model_llama(const struct llama_model_params & params) : llama_model_base(params) {}
++
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
+@@ -2748,6 +2749,8 @@ struct llama_model_qwen4exp : public llama_model_base {
+     class llm_graph_input_qsa;
+     class llm_graph_input_qsa_k;
+ 
++    void ple_prefetch(const llama_batch_ext & batch) const override;   // WIP/ple-residency Phase 2
++
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 38707cf26..2e7412d6d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -389,6 +389,57 @@ static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams,
+     return other;
+ }
+ 
++// defined with the gather below; shared so the two cannot drift
++static void qwen4exp_ple_rows(const llama_hparams & hp, const llama_token * tok, const llama_token * prev,
++                              int64_t n_tokens, int32_t * idx);
++
++// WIP/ple-residency Phase 2: predict a decode batch's PLE rows and hand them to the reader's store
++// before the first ubatch needs them.  Predicted from the batch's own token ids (the rows are a pure
++// function of the token window), with the two preceding tokens taken from the batch itself; the first
++// tokens of a batch that continues a cached prefix therefore predict a row or two wrong and the gather
++// fetches those on demand -- a cache miss, never a wrong answer.
++void llama_model_qwen4exp::ple_prefetch(const llama_batch_ext & batch) const {
++    if (!lazy_reader || hparams.ple_n_heads == 0 || batch.tokens.empty() || batch.n_embd > 0) {
++        return;   // no managed store, no PLE table, nothing to do, or an embd batch (no token ids)
++    }
++    const int64_t n      = (int64_t) batch.tokens.size();
++    const int64_t n_gram = hparams.ple_ngram_size;
++    const int64_t n_prev = n_gram - 1;
++    const int64_t n_heads = hparams.ple_n_heads;
++    if (n_heads <= 0 || n_prev <= 0) {
++        return;
++    }
++
++    std::vector<llama_token> tok(n);
++    std::vector<llama_token> prev((size_t) n * n_prev, LLAMA_TOKEN_NULL);
++    for (int64_t i = 0; i < n; i++) {
++        tok[i] = batch.tokens[i].id;
++    }
++    for (int64_t i = 0; i < n; i++) {
++        const llama_pos p = batch.tokens[i].pos[0];
++        if (batch.tokens[i].seq_ids.empty()) {
++            continue;
++        }
++        const llama_seq_id seq = *batch.tokens[i].seq_ids.begin();
++        for (int64_t k = 1; k <= n_prev && k <= i; k++) {
++            const auto & t = batch.tokens[i - k];
++            if (t.pos[0] == p - k && t.seq_ids.count(seq)) {
++                prev[(size_t) i * n_prev + (n_prev - k)] = t.id;
++            }
++        }
++    }
++
++    std::vector<int32_t> idx((size_t) n * n_heads);
++    qwen4exp_ple_rows(hparams, tok.data(), prev.data(), n, idx.data());
++    lazy_reader->prefetch(idx.data(), idx.size());
++    if (getenv("LLAMA_PLE_DBG")) {
++        static uint64_t n_calls = 0, n_rows = 0;
++        n_calls++; n_rows += idx.size();
++        fprintf(stderr, "ple prefetch #%llu: %lld tokens -> %zu rows (total %llu rows)\n",
++                (unsigned long long) n_calls, (long long) n, idx.size(), (unsigned long long) n_rows);
++    }
++}
++
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     // NextN/MTP: an extra trunk-shaped block appended past the trunk. Read this first, since
+     // n_layer() == n_layer_all - n_layer_nextn feeds every per-layer array below.
+@@ -2897,6 +2948,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+     return cur;
+ }
+ 
++// The PLE n-gram hash, shared by the gather (set_input) and the Phase-2 predictor so the two cannot
++// drift: idx[i*n_heads + h] for token i, given the token ids and their predecessors.
++// prev[i*n_prev + k] is oldest-first (k = n_prev-1 is 1 back), LLAMA_TOKEN_NULL where there is none.
++static void qwen4exp_ple_rows(const llama_hparams & hp,
++                              const llama_token * tok, const llama_token * prev,
++                              int64_t n_tokens, int32_t * idx) {
++    const int64_t n_gram   = hp.ple_ngram_size;
++    const int64_t n_heads  = hp.ple_n_heads;
++    const int64_t per_gram = hp.ple_heads_per_ngram;
++    const int64_t eos      = hp.ple_eos_token_id;
++    const int64_t n_prev   = n_gram - 1;
++
++    std::vector<int64_t> ctx(n_gram);
++    for (int64_t i = 0; i < n_tokens; ++i) {
++        // an EOS in the window resets everything at or before it
++        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
++        // the EOS of the token itself does not cut its own context, as in the reference
++        ctx[0] = tok[i];
++        bool cut = false;
++        for (int64_t s = 1; s < n_gram; ++s) {
++            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
++            cut = cut || t < 0 || t == eos;
++            ctx[s] = cut ? eos : t;
++        }
++
++        for (int64_t n = 2; n <= n_gram; ++n) {
++            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
++            for (int64_t j = 1; j < n; ++j) {
++                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
++            }
++            const int64_t base = (n - 2) * per_gram;
++            for (int64_t g = 0; g < per_gram; ++g) {
++                const int64_t h_i = base + g;
++                idx[i * n_heads + h_i] =
++                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
++            }
++        }
++    }
++}
++
+ // PLE n-gram hash embedding: each token gathers ple_n_heads rows of a shared table.
+ //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
+ // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
+@@ -2975,32 +3066,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+     mctx->get_prev_tokens(*ubatch, n_prev, prev);
+ 
+-    for (int64_t i = 0; i < n_tokens; ++i) {
+-        // an EOS in the window resets everything at or before it
+-        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
+-        // the EOS of the token itself does not cut its own context, as in the reference
+-        std::vector<int64_t> ctx(n_gram);
+-        ctx[0] = tok_of(i);
+-        bool cut = false;
+-        for (int64_t s = 1; s < n_gram; ++s) {
+-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
+-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
+-            cut = cut || t < 0 || t == eos;
+-            ctx[s] = cut ? eos : t;
+-        }
+-
+-        for (int64_t n = 2; n <= n_gram; ++n) {
+-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+-            for (int64_t j = 1; j < n; ++j) {
+-                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+-            }
+-            const int64_t base = (n - 2) * per_gram;
+-            for (int64_t g = 0; g < per_gram; ++g) {
+-                const int64_t h_i = base + g;
+-                idx[i * n_heads + h_i] =
+-                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+-            }
++    {
++        std::vector<llama_token> tok(n_tokens);
++        for (int64_t i = 0; i < n_tokens; ++i) {
++            tok[i] = tok_of(i);
+         }
++        qwen4exp_ple_rows(hp, tok.data(), prev.data(), n_tokens, idx.data());
+     }
+ 
+     // EXPERIMENT (r-session, not for delivery): dump the PLE gather indices so the row/page usage of

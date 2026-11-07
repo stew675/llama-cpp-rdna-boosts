@@ -1,6 +1,9 @@
 # PLE residency — how much of the 26.8 GiB per-layer-embedding table a conversation actually uses
 
-**Status: OPEN — measurement complete (2026-11-06), nothing implemented, nothing in `patches/`.**
+**Status: PARKED (2026-11-06) — campaign complete to its Phase 2 first cut; nothing in `patches/`.**
+The question was answered, a prototype was built and measured, and the remaining work is a *decision*
+(a lookahead runway) rather than an unknown.  Apply it with §0; resume from §8.
+
 Question asked: *"can we get an idea of what percentage of the PLE weights are actually used, so a
 heat-map mechanism could keep the top ~1 GiB RAM-resident and leave the rest cold in the page cache?"*
 
@@ -26,6 +29,45 @@ Measured on one R9700.  The footprint/predictability work (§§1-4b) was made on
 (`32d0dc3f1`); everything from §4c on was re-measured on the r229 tree (`5c3ef0354`), text byte-identical
 throughout (`sha 6317a4054e25` for the decode arms).
 
+## 0. Apply this campaign
+
+Nothing here is in `patches/` and none of it is part of the delivery.  The three patches are cut against
+the **r229 release tree** (`release.json`: base `6050b467c`, fork `rdna-boosts` tip **`5c3ef0354`**, tree
+**`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7`**) and apply **in order** with `git apply`:
+
+| patch | what | lines |
+|---|---|---:|
+| [`0001-ple-probe.patch`](0001-ple-probe.patch) | **measurement only.**  The `LLAMA_PLE_TRACE` gather dump, `LLAMA_PLE_TIMING` / `LLAMA_PLE_PROBE` (per-row read vs upload time, first-touch vs repeat rows, `mincore`, `/proc/self/io`), and the `LLAMA_PLE_NOHINT` / `LLAMA_LAZY_NOADV` / `LLAMA_LAZY_NORAND` A/B switches.  No behaviour change unless an env var is set. | 283 |
+| [`0002-ple-row-store.patch`](0002-ple-row-store.patch) | the **row-granular store**: `llama_lazy_reader`'s 4 KiB page arena becomes 90 B rows, an open-addressed row index, a clock LRU over row slots, a persistent 8-16 thread I/O pool and `POSIX_FADV_RANDOM` re-asserted after load.  Activates with `LLAMA_LAZY_BUF_MB=<MiB>`. | 842 |
+| [`0003-ple-row-store-prefetch.patch`](0003-ple-row-store-prefetch.patch) | **Phase 2**: the n-gram hash factored into a shared `qwen4exp_ple_rows()`, a `llama_model::ple_prefetch(batch)` virtual called once per `decode()` batch from `llama-context.cpp`, the reader's asynchronous `prefetch()` and per-row `slot_ready` so a gather waits only for its own rows.  `LLAMA_PLE_NOPREFETCH=1` disables it. | 546 |
+
+```bash
+REPO=~/llama-cpp-rdna-boosts
+# in a clean checkout at the r229 tree (scripts/apply-all.sh produces one)
+git rev-parse --short=9 HEAD            # must be 5c3ef0354
+for p in 0001-ple-probe 0002-ple-row-store 0003-ple-row-store-prefetch; do
+    git apply --check "$REPO/wip/ple-residency/$p.patch"
+    git apply         "$REPO/wip/ple-residency/$p.patch"
+done
+git add -A && git write-tree            # 12b0cc0f3b907b95ed0cbb52c1be1058b03b08df
+```
+
+**Verified 2026-11-06**: applied in that order to `5c3ef0354` the series produces tree
+`12b0cc0f3b907b95ed0cbb52c1be1058b03b08df`, which is exactly the tree every number below was measured
+on.  `git apply --check` passes for each patch in sequence; `0002` and `0003` are *not* independent
+(they build on the one before), so apply them in order or not at all.
+
+Runtime switches a tester will want: `LLAMA_LAZY_BUF_MB` (store size; unset = the delivered mmap path),
+`LLAMA_LAZY_IO_THREADS` (default 4), `LLAMA_LAZY_READER_STATS=1` (hits/misses/bytes at teardown),
+`LLAMA_PLE_TIMING=1` + `LLAMA_PLE_PROBE=1` (the timing report), `LLAMA_PLE_NOPREFETCH=1`,
+`LLAMA_PLE_NOHINT=1`, `LLAMA_LAZY_NOADV=1`, `LLAMA_LAZY_NORAND=1`, `LLAMA_PLE_TRACE=<path>`.
+
+The `tools/` are the measurement harness, not part of the feature: `analyze.py` / `report.py` / `sim.py` /
+`cover.py` / `sectors.py` (trace analysis, footprint, hot-set and LRU simulations), `predict.c` (the
+hash's cost), `bulkread.c` (page vs sector reads), `dqbench.c` / `dq2.c` (read vs dequant isolation),
+`faultpath.c` (mapping hints), `lonepread.c` / `burst.c` / `preadbench.c` (the drive's isolated-read
+latency, which is what bounds decode).
+
 ## 1. What the table is
 
 `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf`, the only tensor in that shard:
@@ -46,7 +88,7 @@ exactly, offline, and independent of the expert tier or the GPU.
 
 ## 2. Method
 
-1. **Instrument the gather** (`ple-trace-and-timing.patch`: the trace hunk in `src/models/qwen4exp.cpp`, plus the env-gated
+1. **Instrument the gather** (`0001-ple-probe.patch`: the trace hunk in `src/models/qwen4exp.cpp`, plus the env-gated
    `LLAMA_PLE_TIMING` / `LLAMA_PLE_PROBE` timing; env
    `LLAMA_PLE_TRACE=<path>`): after `set_input()` computes `idx[]`, dump
    `{u32 n_tokens, i32 tok[n], i32 row[n*16]}` per ubatch. ~68 B/token; the full 190k-token trace is
@@ -212,7 +254,7 @@ What this means for the idea:
 
 Measured on the same box, `-lme 47` (a pinned expert mirror, so the expert tier cannot confound it),
 512 greedy tokens, byte-identical text (`sha 6317a4054e25`) in every arm, with the gather timed inside
-`set_input()` (`LLAMA_PLE_TIMING`, in `ple-trace-and-timing.patch`):
+`set_input()` (`LLAMA_PLE_TIMING`, in `0001-ple-probe.patch`):
 
 | decode arm (16 rows/token) | generation | PLE read+dequant per step | per row |
 |---|---:|---:|---:|
@@ -303,7 +345,7 @@ What is settled, whatever the cause:
   reader in the same change**: the staging buffer takes over its only unique role (a bounded, explicit PLE
   RAM budget) and does it at row granularity.
 
-## 4e. Prototype cut and measured (2026-11-06, r229 tree) — `ple-row-store.patch`
+## 4e. Prototype cut and measured (2026-11-06, r229 tree) — `0002-ple-row-store.patch`
 
 `llama_lazy_reader` was reworked from a page-granular arena (4 KiB pages, clock LRU, `pread`) to a
 **row-granular store**: 90 B rows, open-addressed row map, clock LRU over row slots, a persistent
@@ -363,9 +405,9 @@ way the RAM advantage becomes real.  Two follow-ups fall out of the same numbers
 12.4 GB could become ~1.8 GB), and for decode either accept the 4.7 ms or prefetch the MTP verify batch
 during drafting (§4c).
 
-## 4f. Phase 2, first cut (2026-11-06, r229) — the predictor and the async prefetch are in, the overlap is not
+## 4f. Phase 2 (2026-11-06, r229) — the predictor, the async prefetch and the overlap
 
-`ple-row-store-prefetch.patch` adds the three pieces Phase 2 needs and measures where it stops:
+`0003-ple-row-store-prefetch.patch` adds the three pieces Phase 2 needs:
 
 1. **A predictor.**  The n-gram hash is factored into one `qwen4exp_ple_rows()` shared by the gather and
    the predictor, and `llama_model::ple_prefetch(batch)` (a virtual, no-op for every other arch) is called
@@ -381,7 +423,7 @@ during drafting (§4c).
 **Correctness: text byte-identical** with the prefetch on (`sha 6317a4054e25`, 2 299 chars) and no
 fallbacks on the decode path; `LLAMA_PLE_NOPREFETCH=1` turns it off.
 
-**Measured: the fetch gets cheaper but the wall does not move.**
+**First cut: the fetch got cheaper but the wall did not move.**  (The fix is below — delivery order.)
 
 | 190k prefill, `-b 24576 -ub 6144` (4 ubatches per decode call) | t/s | PLE fetch |
 |---|---:|---:|
@@ -415,9 +457,11 @@ Two incidental results from this cut: `-b 24576 -ub 6144` alone is not a win for
 (mmap 1691.9 vs 1708.2 at `-b 6144`), and the decode arm measured its best number yet (44.2 t/s) with
 the prefetch — which is a store-hit effect, not an overlap one.
 
-## 5. Options if this is picked up (none started)
+## 5. Options — 0 is built (`0002` + `0003`); 1-6 are not started
 
-0. **Simplest and strongest — a per-request PLE staging buffer** (§4b): at request start enumerate the
+0. **BUILT — the per-request PLE staging buffer** (§4b), as the row-granular store: *was* the
+   recommendation, and `0002`/`0003` implement it (see §4e/§4f and §8 for what is still open).  Original
+   rationale: the staging buffer at request start enumerate the
    new prompt's 16 rows/token (15 ms/190k tok), dedup into a page bitmap, and bulk-read the rows (sector
    reads, 364 MiB / 3.5 s for 190k tok) into a buffer sized by the prompt (54.6 MiB). The gather then
    reads RAM. No persistence, no heat map, no eviction policy; ~55 MiB replaces 2.3 GiB of page cache and
@@ -467,10 +511,11 @@ coverage number without saying whether it is self-oracle (40-91 %) or cross-docu
 ## 7. Reproduce
 
 ```bash
-# 1a. instrument only (trace + LLAMA_PLE_TIMING/PROBE), then rebuild
-cd ~/llama.cpp && git apply wip/ple-residency/ple-trace-and-timing.patch
-# 1b. the row-store prototype (includes 1a: trace + timing + the row-granular reader)
-cd ~/llama.cpp && git apply wip/ple-residency/ple-row-store.patch
+# 1. the campaign's patches (see §0 for the order and the tree check)
+cd ~/llama.cpp   # at 5c3ef0354
+git apply wip/ple-residency/0001-ple-probe.patch          # measurement only
+git apply wip/ple-residency/0002-ple-row-store.patch      # row-granular store
+git apply wip/ple-residency/0003-ple-row-store-prefetch.patch   # Phase 2 lookahead
 cmake --build build-rocm --target llama-cli llama-server -j 16
 
 # 2. trace a run (any arm; the PLE rows do not depend on the expert tier)
@@ -498,3 +543,39 @@ Traces are not committed (13 MB for the 190k run); regenerate them from the prom
 above — the corpora were 80 KB and 573 KB of `~/llama.cpp` sources, `INVARIANTS.md` + `MANIFESTS.md` +
 `GREEDY-PURITY.md` + `BASELINE.md` for the prose sample, `convert_hf_to_gguf.py`, a 20 KB JSON, and the
 user's three.js prompt (all in `/tmp/ple`, not reproducible from the repo alone).
+
+## 8. Where to resume (parked 2026-11-06)
+
+The mechanism is built and measured; what is left is one design decision and three improvements, in this
+order.  Each is independent, and the measurements that decide it are already in this file.
+
+1. **The lookahead runway (the open question).**  Phase 2 hides the fetch behind the *ubatches* of one
+   `decode()` batch, so the win scales with `n_batch / n_ubatch`.  Measured at `-b 24576 -ub 6144`:
+   1736.1 t/s against 1721.8 (store, no prefetch) and 1691.9 (delivered mmap).  The delivered `runme`
+   arm is `-b 6144 -ub 6144` — **one ubatch per decode call, so it hides nothing**.  Two ways out, and
+   this is the decision to make: (a) raise `-b` on the prefill path (costs batch-buffer memory and
+   changes batch shapes, so it needs its own gate pass), or (b) predict one level up — the server/CLI
+   submits chunk *k+1*'s prediction before calling `decode()` for chunk *k*, which the virtual
+   `ple_prefetch` already supports and which needs no `-b` change.  (b) is the smaller change and the one
+   this campaign favours; it touches `common/` or `tools/server`, not the model.
+2. **Store sizing.**  64 MiB thrashes at 190k tokens (129 k fallbacks); 192 MiB holds the corpus's
+   635 k rows.  A delivery knob needs a policy: size from the predicted row count (§4b — the count is
+   known before the prompt runs), not a fixed MiB, and decline the prefetch when it does not fit
+   (`prefetch()` already refuses a list larger than half the store).
+3. **Sub-page reads.**  The store still reads a 4 KiB page per cold row (12.4 GB of device traffic for
+   273 MB of rows).  `O_DIRECT` at 512 B measured 0.6 KiB per read against 4.1 KiB buffered at the same
+   time per read (`tools/preadbench.c`), i.e. ~6x less traffic; `/proc/self/fd/N` reopen gives an
+   `O_DIRECT` fd without a path, and the worker needs an aligned scratch + a 90 B copy.
+4. **Decode.**  Nothing in the fetch path helps (§4c/§4d): a step is an isolated cold burst and the drive
+   charges ~4.7 ms for the first cold read after idle.  The only levers are a prefetch of the MTP verify
+   batch during drafting (the addresses exist a few ms early) and, if that is not enough, accepting it.
+
+**What promotion would require** (none of it started): a decision on (1); the gate ladder for a block-11
+change — `scripts/validate-set.sh`, `scripts/gate-per-block-build.sh`, `scripts/gate-prefill-logits.sh`
+(this campaign already passes it at KLD 0.000000 / top-p 100.000 % with the prefetch on), the MTP
+four-axis and `llama-batched-bench -npl 1,4,8` for the decode arms, coherence text on every device count
+used, `scripts/check-gpu-faults.sh`; plus `ENVIRONMENT.md` (every switch above, with its default and
+class), `patches/README.md` block 11, `INVARIANTS.md` (the two surprises: the delivered `WILLNEED` loop
+is load-bearing, and the drive's isolated-read latency), and a `WORKLOG.md` entry.  The default-on
+question is separate: the store is a *placement* change with a real RAM cost, so it would ship behind
+`LLAMA_LAZY_BUF_MB` (opt-in) unless (1) is resolved in favour of the delivered config.
