@@ -209,7 +209,7 @@ tail (§3), not by the decode design.
 | **P0.2/P0.3** `-lme 44` partial field row | **done** (B1/B0/B1d/B0d) |
 | P1.0 (r228) | unchanged and confirmed: `auto` demotes 0 and reads the `SINK=0` path |
 | P1.3 (`MOE_EXPERT_CACHE_TOUCH` 2 vs 3) | still open |
-| P1.5 (`TODO` #279, narrow-2) | still open |
+| P1.5 (`TODO` #279, narrow-2) | still open **at the time of this pass** — closed later the same day, see [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) (measured / do not implement) |
 
 ## 6. Exact reproduction
 
