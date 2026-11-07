@@ -57,6 +57,13 @@ different `sha`s because `-lv 4` interleaves statistics lines into llama-cli's g
 it, five arms agree (`cf7f8b23f404`); `extract-generated.py`'s docstring says exactly that, which is why it is
 there.
 
+**Published:** the personal fork's `rdna-boosts` branch was force-pushed to the canonical tip **`a19aab55e`**
+(`git push --force-with-lease` after a fetch, tree `5aeb007deac`; the branch previously carried r230's
+`2028e44cd`), the delivery repo's `main` and the tag **`v16-6050b467c-r231`** were pushed, and the three
+workflows are green (`Validate delivery set` on `main` and on the tag, `Release patch set`).  `release.json`'s
+16 patch hashes and the all-patch hash verify against the committed files.  The ROCm images are the off-host
+`radiance` watcher's job (`CONTAINERS.md`), as for every release.
+
 **5. Also answered (`PLAN.md` P0).**  The span read **does** fire on this box and is worth **+8 %** at 77 %
 coverage (1 037 vs 958, 66 GiB coalesced, 0 fallbacks) -- the r224 `+81/+57/+14 %` remain DIO-arm
 cache-staging numbers and the buffered field path still does not coalesce (`INVARIANTS.md`, updated in place).
