@@ -61704,10 +61704,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..eb5c395a3
+index 000000000..8bc727c72
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9757 @@
+@@ -0,0 +1,9862 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61836,6 +61836,11 @@ index 000000000..eb5c395a3
 +    const void * host       = nullptr;
 +    void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
 +    bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
++    // TODO #271: this table's PREFILL STAGING decline has been recorded (once per table, for the exit
++    // census).  A declined table's whole-table upload stays on the scheduler's own path, so it is not
++    // staged and not counted in the staging census -- which is exactly how 50 of 144 tables stayed
++    // invisible on a pinned master.  See `stage_decline_note`.
++    bool        stage_declined = false;
 +    bool        host_pinned = false;    // `host` is pinned (cudaHostGetDevicePointer succeeded): the in-place reads need it
 +    // wip/host-expert-master-drop (TODO #55): pinned per-table bounce ring for a PAGEABLE master, grown on
 +    // demand (see `expert_host_src`).  Empty for a pinned master.
@@ -62302,6 +62307,19 @@ index 000000000..eb5c395a3
 +int64_t                             g_stage_host_bytes  = 0;
 +int64_t                             g_stage_decline_geom = 0;
 +int64_t                             g_stage_decline_usable = 0;
++// Split out of `unusable` (TODO #271) so the number keeps its meaning, "this table will never be staged":
++// the priming pass declines by design (the arena does not exist yet), and counting it as unusable made a
++// prompt-only run's very first ubatch look like a defect.
++int64_t                             g_stage_decline_unsized = 0;
++// The deduped per-table record of a staging decline (layer, role, reason), for the exit census.  One entry
++// per affected TABLE, not per call: a declined table declines on every ubatch of the prefill.
++struct stage_decline_t {
++    int         layer = -1;
++    std::string role;
++    std::string why;
++    int         device = -1;   // a tensor split registers one table per device; the reason is the same
++};
++std::vector<stage_decline_t>        g_stage_declined;
 +int64_t                             g_stage_decline_nomatch = 0;
 +// W4 span-read accounting (see `moe_cache_stage_table`): `span_reads` = storage reads issued for a run,
 +// `span_bytes` = the bytes they covered, `span_experts` = experts a span served, `span_fallback` = chunks
@@ -68229,6 +68247,7 @@ index 000000000..eb5c395a3
 +    moe_cache_sync_devices_locked();
 +
 +    size_t freed = 0;
++    int    n_down = 0;
 +    for (table_t & t : g_tables) {
 +        if (t.arena == nullptr || t.device != device || t.arena_reserved == 0) {
 +            continue;
@@ -68258,6 +68277,7 @@ index 000000000..eb5c395a3
 +        t.slot_expert.clear();
 +        t.expert_slot.clear();
 +        t.allocated      = true;   // it was decided; a re-arm can rebuild it
++        n_down++;
 +    }
 +    if (freed > 0) {
 +        // TODO #70: a captured graph bakes a table's arena address into the MoE kernels' launch parameters
@@ -68269,8 +68289,13 @@ index 000000000..eb5c395a3
 +        // drop also shrinks the boundary and bumps through `work_alloc`, but a NARROW boundary move -- a
 +        // wider verify view, a wide-aux grow -- evicts without any other bump).
 +        ggml_cuda_graph_mem_freed(device);
-+        GGML_LOG_WARN("%s: evicted %.1f MiB of arena tables from the taken slab chunks (arena now %.1f MiB)\n",
-+                      __func__, (double) freed / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024));
++        // Name the table count as well as the bytes (TODO #271): a stood-down table is not staged during the
++        // prefill (it has no arena to read), so this number is the size of the prefill's switch to the
++        // scheduler's own whole-table upload -- otherwise the two lines are in different parts of the log
++        // and neither says the other exists.
++        GGML_LOG_WARN("%s: evicted %.1f MiB of arena tables from the taken slab chunks (arena now %.1f MiB; "
++                      "%d table(s) stood down until the compute-buffer drop re-arms them)\n",
++                      __func__, (double) freed / (1024 * 1024), (double) g_arena_bytes / (1024 * 1024), n_down);
 +    }
 +    return freed;
 +}
@@ -69720,6 +69745,22 @@ index 000000000..eb5c395a3
 +
 +
 +
++// TODO #271: record (once per table) why the prefill staging path declined it.  This was silent at every
++// verbosity: the census counted the decline but named nothing, so "which tables, and why" needed a patch.
++// A declined table is NOT a slower table by itself -- measured on 1 GPU with a pinned master, `-ub 6144`,
++// 50 declined tables: 1826 t/s declined against 1824 t/s staged (ABBA, +-0.1 %), because the scheduler's
++// own whole-table upload is a single bulk async copy on the same copy stream.  What it costs is the
++// TRANSPORT ACCOUNTING (its bytes are missing from the staging census, and its engine is not the ring's)
++// and, on a shape where the two transports really do differ, the wrong one being chosen without a line in
++// the log saying so.
++static void stage_decline_note(table_t & t, const char * why) {
++    if (t.stage_declined) {
++        return;
++    }
++    t.stage_declined = true;
++    g_stage_declined.push_back({ t.layer, t.role, why, t.device });
++}
++
 +// Fill a whole-table staging copy from the arena + the pinned host
 +// master.  `host_src`/`offset` identify the registered table (the same key the decode hooks use), and
 +// `width`/`stride_src`/`n_copies` describe the exact copy the caller asked for; a geometry mismatch
@@ -69739,18 +69780,38 @@ index 000000000..eb5c395a3
 +        }
 +        if (t.n_experts <= 0 || t.host == nullptr) {
 +            g_stage_decline_usable++;
++            stage_decline_note(t, "the cache holds no expert count/master for it");
 +            return false;
 +        }
 +        // The pinned-master path needs a built arena (the staging kernel reads it) and a device-readable
 +        // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
 +        // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
 +        // pageable master must never reach the ring through the pageable upload).
-+        if (t.host_pinned && (t.arena == nullptr || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe)) {
-+            g_stage_decline_usable++;
-+            return false;
-+        }
-+        if (t.host_pinned && !g_sized) {
-+            return false;
++        if (t.host_pinned) {
++            // The arena requirement is the one that fires in practice, and it is TRANSIENT: the slab hands
++            // the chunks a table's arena lived in to the compute layout, the table is stood down for the
++            // rest of the prefill, and the drop at the prefill -> decode transition re-arms it (TODO #42).
++            // Which of the four conditions fired, and for which tables, used to be unrecorded -- this is
++            // the line that answers it (TODO #271).
++            const char * why =
++                !t.cold_safe         ? "its host geometry is not representable by a staged copy (a fused/sliced table)"
++              : t.host_dev == nullptr ? "its host master has no device-readable (pinned) mapping"
++              : t.arena == nullptr || t.slots <= 0
++                  ? (t.alloc_failed ? "its arena allocation failed"
++                     : t.allocated  ? "it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down"
++                                    : "the cache has not sized yet")
++              : nullptr;
++            if (why != nullptr) {
++                g_stage_decline_usable++;
++                stage_decline_note(t, why);
++                return false;
++            }
++            if (!g_sized) {
++                // The priming pass (the arena does not exist yet).  Its own counter, so `unusable` keeps
++                // meaning "a table that will never be staged".
++                g_stage_decline_unsized++;
++                return false;
++            }
 +        }
 +        const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
 +        int64_t rows = 0;
@@ -71242,12 +71303,56 @@ index 000000000..eb5c395a3
 +                      g_trace_path.c_str());
 +    }
 +
++    if (!g_stage_declined.empty()) {
++        // TODO #271: ONE line naming every table the prefill staging path declined, with the reason, plus
++        // the per-table detail at INFO.  A WARN because it is a decision that changes which transport
++        // carries the tier's prefill (the same level `report_host_expert_placement` uses for the same class
++        // of decision) -- and once per RUN, because a declined table declines on every ubatch.
++        const char * first_why = g_stage_declined.front().why.c_str();
++        bool same_why = true;
++        for (const stage_decline_t & d : g_stage_declined) {
++            same_why = same_why && d.why == first_why;
++        }
++        // A tensor split registers one table per device, so the same layer/role can appear N times.  The
++        // summary names each shape once (the reason is a property of the shape, not of the device); the
++        // per-table INFO lines below carry the device.
++        std::vector<std::pair<int, std::string>> named;
++        for (const stage_decline_t & d : g_stage_declined) {
++            if (std::find(named.begin(), named.end(), std::make_pair(d.layer, d.role)) == named.end()) {
++                named.push_back({ d.layer, d.role });
++            }
++        }
++        std::string tables;
++        for (size_t i = 0; i < named.size() && i < 12; i++) {
++            char buf[160];
++            snprintf(buf, sizeof(buf), "%s%d/%s", i ? ", " : "", named[i].first, named[i].second.c_str());
++            tables += buf;
++        }
++        if (named.size() > 12) {
++            char buf[64];
++            snprintf(buf, sizeof(buf), ", +%zu more (see the per-table lines below)", named.size() - 12);
++            tables += buf;
++        }
++        GGML_LOG_WARN("%s: prefill staging declined %zu of %zu host table(s): %s%s.  Affected: %s.  They are "
++                      "served by the scheduler's own whole-table upload instead (not staged, so their bytes "
++                      "are missing from the staging census above); a stood-down one is re-armed at the "
++                      "compute-buffer drop, so this is a prefill-only state\n",
++                      __func__, g_stage_declined.size(), g_tables.size(),
++                      same_why ? first_why : "several reasons --", same_why ? "" : " each listed per table below",
++                      tables.c_str());
++        for (const stage_decline_t & d : g_stage_declined) {
++            GGML_LOG_INFO("%s: prefill staging declined: layer=%d role=%s dev=%d: %s\n", __func__, d.layer,
++                          d.role.c_str(), d.device, d.why.c_str());
++        }
++    }
 +    if (g_stage_ok + g_stage_decline_geom + g_stage_decline_usable + g_stage_decline_nomatch > 0) {
 +        const double total = (double) g_stage_arena_bytes + (double) g_stage_host_bytes;
-+        GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld; "
-+                      "arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); PRS rebuilds=%lld\n",
++        GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
++                      "unsized=%lld (the priming pass); arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); "
++                      "PRS rebuilds=%lld\n",
 +                      __func__, (long long) g_stage_ok, (long long) g_stage_decline_geom,
 +                      (long long) g_stage_decline_usable, (long long) g_stage_decline_nomatch,
++                      (long long) g_stage_decline_unsized,
 +                      (double) g_stage_arena_bytes / (1024 * 1024), (double) g_stage_host_bytes / (1024 * 1024),
 +                      total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0,
 +                      (long long) g_prs_rebuilds);

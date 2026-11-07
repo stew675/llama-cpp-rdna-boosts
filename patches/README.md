@@ -2766,6 +2766,31 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > **not** in this release: +38 % on top of this change but -41 % on its own, and exactly neutral when the pages are
 > cacheable, so it is a headroom bet — recorded in `wip/host-pool-fill-transport/` and `WORKLOG.md` 261107.006.
 
+> **r234 amendment (`TODO` #271/#272): name the prefill staging decline, and split the priming pass out of
+> the census.**  Two additions in `moe-expert-cache.cu`, both log/accounting only (no data path changes):
+> 1. **`stage_decline_note()` records, once per table, which predicate declined the prefill staging copy**, and
+>    `report_locked` prints **one WARN per run** with the count, the reason and up to 12 tables (the rest at
+>    INFO).  Before this, a pinned master's `ok=819 unusable=450` named nothing at any verbosity.  The reason
+>    it names is `arena == nullptr && slots == 0` — a table **stood down for the prefill only**, because the
+>    prefill's compute layout took the slab chunks its arena lived in (`moe_cache_evict_slab_range`, mostly
+>    `--cache-ram`'s context checkpoints); `moe_cache_rearm()` rebuilds it at the compute-buffer drop.  The
+>    eviction line now names the table count too, so the two halves of the story are in one place.
+> 2. **The census splits `unsized=` (the priming pass, which declines by design because the arena does not
+>    exist yet) from `unusable=`**, so `unusable` keeps meaning "a table that will never be staged".
+>
+> **Nothing else was changed, deliberately.**  Measured (1 GPU, locked config, balanced `A B B A`): declining
+> those 50 tables costs **nothing** (1826 t/s declined against 1824 t/s staged, ±0.1 %) because the scheduler's
+> own upload is one bulk async copy on the same copy stream; relaxing the predicate so they stage through this
+> block's one-launch kernel is **-10 %**, and staging them with one bulk copy each is ±0 %.  The transport
+> ranking itself (`TODO` #272) was re-measured and documented in `ENVIRONMENT.md` rather than defaulted: on one
+> GPU the gather wins at `-ub 2048` (+20 %), the copy-engine arm wins from 5120 up (+10-18 %, including 8192,
+> which the archived record said it lost) and ties at 16384, while on a **pinned** master
+> `GGML_MOE_CACHE_STAGE=0` is **+12.8 %** over this block's staging kernel.  Both winning arms are bimodal on
+> this box (identical runs 1873/2177/1865/2180 t/s), so no default was moved.  Gates: `gate-host-pool.sh`
+> **41/41**, coherence `d3d554954cba` across 4 host-expert arms, prefill-logit KLD **0.000000 / 100.000 %**,
+> `validate-set.sh` green, per-block build 2/2.  Records: `WORKLOG.md` 261107.010,
+> `archive/work/host-expert-transport/`, `INVARIANTS.md` (r234), `ENVIRONMENT.md` (the transport note).
+
 > **r233 amendment (issue #278): name the Windows HIP runtime, and make the pinned tier closable.**
 > The ~9.3 GiB pinned ceiling that r223/r227 recorded as "Windows/WDDM" is the **driver-shipped HIP runtime**,
 > not Windows.  Issue #278's box had `amdhip64_7.dll` from the Adrenalin driver in `System32`; with the

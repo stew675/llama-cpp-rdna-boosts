@@ -1,3 +1,67 @@
+## 261107.010 (r234) -- TODO #271 resolved and #272 closed: the prefill staging decline named (and measured free), the transport band re-measured with its upper edge gone
+
+**Shipped:** `v16-6050b467c-r234` (block **12** amended, +115/-10 in
+`ggml/src/ggml-cuda/moe-expert-cache.cu`; blocks 00-11 and 13-15 keep identical deltas).
+`release.json` tip `2e31f8819`, tree `ca208aed7763985904568ccd093cacafe70d995e` (base/base-tree unchanged).
+The only behaviour change is a log line and a census field; the data path is untouched, and the tempting
+"fixes" were built, measured and **not** shipped (below).
+
+**#271 — "54 of 144 tables never enter the staging path, and nothing says so".**  Two instrumented builds
+named it: on a real `--host-experts pinned` master 1 GPU / `-ub 6144` the census reads
+`ok=819 unusable=450` (50 of 144 tables, 9 of 9 ubatches, always the same layers) and **every decline is
+`arena == nullptr && slots == 0`** — the other three predicates never fire on a pinned unfused table.  The
+trigger is the prefill's own compute layout taking the slab chunks those arenas lived in
+(`evicted 7536.0 MiB … (arena now 13308.6 MiB)`, mostly `--cache-ram`'s 32 context checkpoints), so the
+tables are **stood down for the prefill only** and `moe_cache_rearm()` rebuilds them at the compute-buffer
+drop (exit census: 144 tables, 31 968 slots = 222 each).
+
+The item's premise — a silent prefill cost — **is refuted**: the fallback is one bulk async copy per table
+on the *same copy stream* the staging ring uses, and ABBA measures **1826 t/s declined against 1824 t/s
+staged** (±0.1 %).  Staging them through the pinned tier's own engine (`moe_cache_stage_kernel`, one
+512-block launch per table) is **-10 %** (1572/1595 against 1757/1765), and staging them with one bulk copy
+each is ±0 % — so no code path was added.  What ships is the visibility the item asked for: `stage_decline_note`
+records (once per table) the reason, `report_locked` prints **one WARN per run** naming the count, the reason
+and up to 12 tables (the rest at INFO), the eviction line now names **how many tables it stood down**, and
+the census splits `unsized=` (the priming pass, by design — it used to be counted as a defect) from
+`unusable=`.
+
+**#272 — "the transport should be chosen by width and device count".**  Three asks: name the 8192 stall, run
+the sweep, decide.  Answers:
+
+* **The 8192 stall does not exist.**  The suspect (ring depth `GGML_SCHED_STAGE_SLOTS` = 8 against the split
+  count) was tested at `=16`, the compile-time maximum: no systematic change (s8 2058/2095/1606/2141 against
+  s16 1679/2086/2134/1838).  What the archived trace saw is the **box's period-2 bimodality**: identical
+  consecutive runs of one unchanged arm measure 1873 / 2177 / 1865 / 2180 t/s (amplitude 16 %; 17-32 % on the
+  pool copy-engine arm; 0 % on the gather).  Cause unidentified — not paging, not `MemAvailable`, not the
+  arena/slot geometry, not THP accounting.
+* **The band, 1 GPU / mirror pool, ABBA and 4 runs per arm** (gather → per-expert copy-engine arm):
+  `-ub 2048` 1066 → 891 (**gather +20 %**); 5120 1564 → **1837-1849** (CE +18 %); 6144 1673 → 1721-2028
+  (+17 %); **8192 1791 → 1829-2133 (+10 %, 4 of 4 runs — the archived "loses by 8192" is refuted)**; 16384
+  1987 → 1996-2029 (tie).  The gather is the only arm that is stable.
+* **The pinned tier** (what `-lme auto` selects when the set fits): default staging kernel **1793**,
+  `GGML_MOE_CACHE_STAGE=0` **2023 (+12.8 %)**, `GGML_SCHED_DEVGATHER=1` 1493 (-16 %).  So the r114
+  single-launch kernel is the slowest engine on both tiers.
+* **No default changed, deliberately**: the band needs a width gate whose lower edge (between 2048 and 5120)
+  is unmeasured, it couples two switches (the gather/staging choice *and* the staging engine), the winning
+  arms are bimodal, and the ranking is tier-shaped — flipping one cell is the r114 mistake in reverse.  All
+  arms are now documented with their prefill effect in `ENVIRONMENT.md` (a zero-risk outcome the campaign
+  itself recommended); the reopen conditions are in the resolution.
+
+**Gates.**  `gate-host-pool.sh` **41/41** (the known `pinlate` WARN is `TODO` #282, unchanged).  Coherence
+`d3d554954cba` (136 chars) identical across 4 arms — current vs pre-change build × {pinned, pool} on
+Flash-Next `-ncmoe 44`, `-n 24`.  Prefill-logit KLD **0.000000 / same-top-p 100.000 %** against the recorded
+gfx1201 base (a logging-only change, as expected).  `validate-set.sh` green (checksums + a fresh-tarball
+strict 16/16 apply, applied tree `ca208aed7`).  `gate-per-block-build.sh --changed-from a46d18572 --fast`
+**2/2** (block 12 + the tip, 17 s).  `check-gpu-faults.sh` clean over the journal and two of the session's
+run logs.  Not run: the MTP gate (no decode path touched) and the server gates (no server path touched).
+
+**Records.**  `archive/work/host-expert-transport/` — `README.md` (config, protocol, every raw number, the
+harnesses `abba2.sh`/`abba2env.sh`/`abba3env.sh`, and `runs/` with all 43 run logs) and `RESOLUTION.md`
+(claim/rule/numbers, the reopen conditions, and why nothing was promoted).  `INVARIANTS.md` gains the r234
+facts (the decline is transient and free; the band has no upper edge; a "stall" that reproduces as a
+two-level oscillation is the box; `A B B A` or nothing).  `TODO` #271 and #272 are retired, and the `#NN`
+sequence continues from **#273**.
+
 ## 261107.010 (tooling) -- the Lexar's 16 ms idle wake is APST, and the oracle now records the power policy
 
 **No delivery change** (`patches/`, `release.json` and the gates untouched); follow-up to `261107.007`.

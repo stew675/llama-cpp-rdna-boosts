@@ -2682,3 +2682,47 @@ report means.
   Both are inert on a box that does not hit either condition; `gate-host-pool.sh`'s `pin0` arm proves the switch
   builds no pool, says so in the census, and leaves the greedy text byte-identical to `ref`.
 
+
+## r234 — the prefill staging decline, and the transport ranking is a band, not a stall (2026-11-07)
+
+Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README.md` and `RESOLUTION.md`,
+`WORKLOG.md` 261107.010).
+
+- **A staging decline is a TRANSIENT stand-down, not a sizing bug.**  On a pinned master
+  (`--host-experts pinned`, 47 962.5 MiB `ROCm_Host`) 50 of 144 tables decline
+  (`prefill cache staging: ok=819 unusable=450`, 9 of 9 ubatches) and every one of them declines on
+  `arena == nullptr && slots == 0`; the other three predicates (`host_dev == nullptr`, `!cold_safe`) never
+  fire on an unfused table, and `host_pinned` implies `host_dev != nullptr` by construction.  The trigger is
+  the prefill's own compute layout taking the slab chunks those arenas lived in
+  (`moe_cache_evict_slab_range`, 7 536 MiB + 150 MiB here, mostly `--cache-ram`'s 32 context checkpoints);
+  `moe_cache_rearm()` rebuilds them at the compute-buffer drop, before any decode, so the state is
+  **prefill-only and designed**.  A 0-slot table is not a defect — do not "fix" it by relaxing the
+  predicate.
+- **The decline is FREE: the fallback is the same bytes on the same stream.**  The scheduler's own
+  whole-table upload is one bulk async copy on the **copy stream** the staging ring uses, so the archived
+  "per-tensor copies serialised on the compute stream" reading was a trace of a different arm.  Measured
+  (1 GPU, pinned, `-ub 6144`, ABBA): **1826 t/s declined against 1824 t/s staged** (±0.1 %), both engines
+  bulk.  Staging those tables through the pinned tier's one-launch kernel instead measures **-10 %**
+  (1572/1595 against 1757/1765): the r114 kernel is a *worse* engine than a bulk DMA for a whole-table
+  copy, on the pinned tier as well as the pool tier (`LEAD-pool-staging-gap.md` §2's CU monopolisation).
+  So: a fallback is not a defect until it is measured against the alternative — and here both alternatives
+  were equal or worse.
+- **The transport band's upper edge does not exist (refutes `LEAD-pool-staging-gap.md` §1's "loses by
+  8192").**  1 GPU, mirror pool, Flash-Next, ABBA × 4 runs per arm: the gather wins at `-ub 2048`
+  (1066 vs 891), the per-expert copy-engine arm wins from 5120 up (5120 **+18 %**, 6144 +17 %, **8192
+  +10 % — 4 of 4 runs**, 16384 a tie), and the gather is the only arm that is stable (±0.1 %).
+- **A "stall" that reproduces as a two-level oscillation is the box, not the pipeline.**  Identical
+  consecutive runs of ONE unchanged arm measured 1873 / 2177 / 1865 / 2180 t/s (period 2, amplitude 16 %;
+  17-32 % on the pool copy-engine arm; 0 % on the gather).  Cause unidentified: not paging (`pswpin`
+  +≤200 pages/run), not `MemAvailable`, not the arena/slot geometry (identical in every run), not THP
+  accounting (`AnonHugePages` 0 GiB after every teardown).  Consequences: the archived `kernel/wall 0.80 at
+  8192` was the low phase; `GGML_SCHED_STAGE_SLOTS` 8 vs 16 (the compile-time max) changes nothing, so ring
+  depth was the wrong suspect.  **Protocol:** an interleaved `A B A B` reads as a ~6 % win for the even
+  positions (measured: base 1757 at position 1 against base 1863 at position 2), so a transport A/B needs
+  `A B B A` and must report the spread — never a single run, never a block-ordered set of reps.
+- **The tier changes the ranking, so one default cannot serve both.**  On a pinned master at 1 GPU,
+  `GGML_MOE_CACHE_STAGE=0` (no cache staging, one bulk H2D per table) measures **2023** against the shipped
+  staging kernel's **1793** (+12.8 %) and forcing the gather measures 1493 (-16 %).  That is a *tuning* note
+  today, not a default: it is one shape on one box (x8 link), it trades the arena's bytes for PCIe traffic,
+  and the arm that would replace it (copy-engine staging) is bimodal.  A rule needs the 2048-5120 crossover
+  measured first.
