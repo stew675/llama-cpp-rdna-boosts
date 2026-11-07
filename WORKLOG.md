@@ -1,3 +1,85 @@
+## 261107.006 (r232) -- issue #281: the buffered host-pool prefill coalesces now (block 12, +2x at a sub-complement budget), and the mid-run-latch finding is measured at ~1e-5
+
+**Shipped:** `v16-6050b467c-r232` (block **12** amended, +33/-10 in `ggml/src/ggml-cuda/moe-expert-cache.cu`;
+blocks 00-11 and 13-15 keep identical deltas).  `release.json` tip `8650138aa`, tree
+`53a43c6003307a2cf7f538767a4250aa44c596e8` (base/base-tree unchanged).  Issue
+[#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) (@DanoPTT, Windows 11, one R9700,
+Flash-Next IQ3_XXS, `--limit-host-experts 4 MOE_HOST_POOL_RAM_PCT=10`): *"forcing the direct tier for the same
+`l4` config makes prefill ~3x faster"*.  Campaign record: [`wip/host-pool-fill-transport/`](wip/host-pool-fill-transport/README.md).
+
+**1. The defect is one predicate.**  The coalesced prefill read (r224, `MOE_HOST_POOL_STAGE_SPAN`, default on)
+serves a run of >= 2 "neither tier" experts from one file read per 16-expert chunk, but both `span_geom`
+predicates required `g_pool_dio` -- and r212 made the *field* default `MOE_HOST_POOL_DIO=auto` mirroring
+`--load-mode`, i.e. buffered.  So the arm the delivery ships could not coalesce at all and read every missing
+expert out of the model mapping, one demand fault at a time.  The reporter's census is exactly that shape --
+`h=0.0330 (6584/199482)`, a 13.9 GiB bounce ring, 185 625 experts through the bounce/pool-fill path -- and it
+reproduces here as `h=0.0430 (39972/927541)`, 13 003 MiB and 758 634 experts, i.e. the shape is not a Windows
+bug; the *rate* is (a mapped fill is a demand fault per 4 KiB page on Windows, 715 MiB/s measured there against
+2 416-2 725 MiB/s here).
+
+**2. The fix.**  Drop the two `g_pool_dio` terms and let the span read the file with the mode's own open:
+O_DIRECT when the disk tier is on, a plain buffered `pread` otherwise.  A buffered `pread` reads the same
+page-cache pages the mapping does, so the fill *source* is unchanged -- only the granularity (and, on Windows,
+the fault behaviour, which is where their 3x lives).  Cold `pread`s also read exactly `len` at `off` instead of
+the O_DIRECT-padded window, because a padded read short-reads at EOF and silently declines the chunk the
+per-expert path could have served.
+
+**3. Measured** (`soar`, 1 x R9700, 56 GiB cgroup, no ballast, Flash-Next GSQ-RCO-IQ3_S + MTP draft,
+`-c 204800 -ub 6144`, page cache dropped per arm, two **interleaved** reps):
+
+| cell | r232 | r231 | |
+|---|---|---|---|
+| `-lme 12` (26 % coverage, the issue's shape), pp50k 1/2 | 820.9 / 875.0 | 513.3 / 469.5 | **+60 % / +86 %** |
+| `-lme 12`, second rep | 810.0 / 868.1 | 544.7 / 441.4 | **+49 % / +97 %** |
+| `-lme 12`, storage reads (pass 1) | 95 GiB | 220-328 GiB | **2.3-3.5x fewer** |
+| `-lme 36` (77 %), pp50k 1/2 | 1307.0 / 1445.5 | 984.9 / 1235.4 | **+33 % / +17 %** |
+| `auto` (97.7 %, near-mirror) | 1889.1 / 1942.9 | 1889.7 / 1949.0 | **inert** (no runs >= 2 to coalesce) |
+| decode, 600-token gen (`-lme 36` / `auto`) | 9.31 s / 8.52 s | 9.28 s / 8.52 s | unchanged |
+| the issue's workaround (`DIO=1` + span), `-lme 12` | -- | 631.3 / 662.9, decode **25.9** t/s | r232 is +30 % *and* 2.4x better decode |
+
+So `auto` = buffered was already the fastest *mode* here; the read granularity was the whole gap.  The 2x2
+decomposition (span-only 821.9, file-fills-only 313.7, both 1138.1) is why the **fill-source** half is not in
+this release: `MOE_HOST_POOL_FILL_SRC` (make the *pool fill* read the file too) is +38 % on top of this change
+but **-41 % on its own** (per-expert `pread`s are latency-bound at depth 1) and **exactly neutral** in a
+RAM-rich cell (35B-A3B `-ncmoe 40 -lme 4`, no cgroup: 8 893 vs 8 984 MiB/s, prompt within 0.7 %) -- a
+page-cache-headroom bet, not a winner, recorded with `AB-full.diff` and deferred.
+
+**4. Gates.**  Coherence: same-seed greedy text **byte-identical to r231** on a dense arm (`7e6229b260f6`) and
+on a pool-engaged arm (35B-A3B `-ncmoe 40 -lme 12`, `461ca8cd0e88`) -- built r231, ran, applied, rebuilt, ran.
+`gate-prefill-logits.sh --extra "-ncmoe 40" --ab "MOE_HOST_POOL_STAGE_SPAN=0"`: **mean KLD 0.000000 / same-top-p
+100.000 %**.  `gate-host-pool.sh` **37/37** (with the `pinlate` mixture WARN below).  `validate-set.sh` green
+(fresh tarball, strict 16/16 `git am`, applied tree == `53a43c600`).  `fork-refresh.sh --build --gates` re-cut
+the branch from the set and reported tip `8650138aa` / tree `53a43c600`; per-block build 2/2.  The MTP
+four-axis and `-npl 1,4,8` arms were **not** re-run: this is a prefill read-granularity change with a
+byte-identical greedy text on both coherence arms and 0.000000 KLD, and r231 ran those arms on the same code
+path (the four-axis is inert on a dense model, and the change is inert at a near-mirror pool).
+
+**5. `TODO` #282 -- the mid-run-latch finding, now measured rather than suspected.**  Gating this change found
+`gate-host-pool.sh` **red on a clean r231 checkout** (36/37, `pinlate` 171 chars `b981e742aa13` against `ref`
+182 / `a99ccbd97ecb`, deterministic across two builds and two runs, one token at ~31 of 32).  Bisected: the cold
+in-place read, the decode device remap, the staging transport, prewarm and the ranking are all **not** the
+cause; the two *ends* of the fault spectrum are **bit-exact** (`fail`/`late`, `get_ok=0`, match `ref`), and
+`MOE_HOST_POOL_SINK=0` + latch reproduces `ref`, so the divergence is the **demote inside a mixture**.  It is
+**not corruption**: the delivery's own criterion on the gate's config reads **median KLD -0.000000, 99.9 %
+-0.000040, Same top p 100.000 %** over 2 x 512 tokens (two orders inside the 0.005 tolerance), and
+`MOE_HOST_POOL_VERIFY=1` reports **0** pool-read mismatches in the latched arm (a demoted-slot
+drain-before-serving diagnostic changed nothing).  So the ops that fall back take a ~1e-5 different arithmetic
+path and one near-tie flips.  `gate-host-pool.sh` now proves the fallback's byte-identity **in the same run**
+and reports the mixture as a WARN naming `TODO` #282; a wholesale fault arm that diverges still FAILS.
+
+**6. Docs.**  `ENVIRONMENT.md`: `MOE_HOST_POOL_STAGE_SPAN` (both modes, with the numbers) and the
+`MOE_HOST_POOL_DIO` row (its r231 "a sub-complement budget should set DIO=1" is superseded for the buffered
+arm).  `INVARIANTS.md`: the r224 "the coalesced prefill read is O_DIRECT-only" entry corrected in place, plus a
+new entry for the latch's ~1e-5 perturbation.  `patches/README.md`: the block-12 r232 amendment.
+`TODO` #282, `wip/CAMPAIGNS.md` and the campaign README carry the record.
+
+**Environment.**  `soar` (3 x R9700, 91 GiB; `HIP_VISIBLE_DEVICES=0` for every arm), ROCm 10.1.0-gfx120X,
+build 11903 lineage @ `a19aab55e` + the change.  Arms: `wip/bench-56gb/arms-issue281{,b,c}.txt`, the RAM-rich
+cell in `wip/host-pool-fill-transport/warm-fill-src.sh`.  `check-gpu-faults.sh` clean over the session.  One
+rig bug fixed on the way: `runme-56gb-tier.sh` exported the literal `-`/`auto` for "default" and
+`env_int("auto", ...)` is 0, so a `DIO=auto` arm silently forced buffered and `RANK=-` forced `combined`; the
+script now *unsets* them and two arms were re-run.
+
 ## 261107.005 (campaign) -- issue #281: the buffered host-pool prefill coalesces now (+49-97 %), and gating it found a mid-run-latch text divergence
 
 **No delivery change yet** (`patches/`, `release.json` and the fork branch stay `v16-6050b467c-r231`, tip

@@ -1,4 +1,4 @@
-From bc64f30c6e0cee65980496a188dc718980c5c7bf Mon Sep 17 00:00:00 2001
+From db31ef3903c40224d9c6a409914528599d7737da Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -5034,7 +5034,7 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 8966c31a5..68024d950 100644
+index 02c382cdb..a84e501a1 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -67,10 +67,6 @@ int64_t ggml_hip_win_available_ram_bytes();   // GlobalMemoryStatusEx (wddm-mem.
@@ -5113,7 +5113,7 @@ index 8966c31a5..68024d950 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -7778,7 +7799,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -7788,7 +7809,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {

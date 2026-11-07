@@ -220,9 +220,15 @@ echo "==> text: ref $(text_hash ref)"
 # stood down, get_ok=0) generate the same greedy text, which is what says the fallback computes the same
 # logits.  What is left is the mixture, and on `soar` at r231 it does not: pinlate measured 171 chars
 # sha=b981e742aa13 against ref 182 chars sha=a99ccbd97ecb (deterministic across two builds and two runs), a
-# one-token divergence at ~31 of 32 greedy tokens.  Recorded and owed as `TODO` #282 rather than papered over:
-# the check still fails loudly for a WHOLESALE fault arm, and for a mixture it requires both that the mixture
-# is real (get_ok > 0 and decline_all > 0) and that `fail` proved the fallback's identity in the same run.
+# one-token divergence at ~31 of 32 greedy tokens.  MEASURED as a path difference, not corruption: the same
+# contrast under the delivery's own logit criterion (`llama-perplexity -c 512 --chunks 2 --kl-divergence
+# --kl-divergence-base`, the gate's config) reads median KLD -0.000000, worst 0.1 % -0.000040, **same-top-p
+# 100.000 %** -- i.e. ~1e-5, two orders inside the 0.005 tolerance, flipping one near-tie in one 32-token run.
+# So a byte-identical TEXT assertion is simply the wrong instrument for a mixed fault state, while it is the
+# right one for the wholesale arms (which are bit-exact).  Recorded and owed as `TODO` #282 rather than
+# papered over: the check still fails loudly for a WHOLESALE fault arm, and for a mixture it requires both
+# that the mixture is real (get_ok > 0 and decline_all > 0) and that `fail` proved the fallback's identity in
+# the same run.
 for a in dio nodisk fail late sink sinkfail pinlate; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
@@ -232,7 +238,8 @@ for a in dio nodisk fail late sink sinkfail pinlate; do
         echo "  WARN  pinlate text != ref ($(text_hash pinlate) against $REF_HASH) -- the MID-RUN latch serves a"
         echo "        mixture (get_ok=$(get_ok pinlate) decline_all=$(decline_all pinlate)); the wholesale arms"
         echo "        (fail, late) match ref, so the fallback is byte-identical and only the mixture diverges."
-        echo "        Known, owed as TODO #282 -- see wip/host-pool-fill-transport/README.md"
+        echo "        Known, owed as TODO #282: a ~1e-5 path difference (same-top-p 100.000 % over 2 x 512\n"
+        echo "        tokens), not corruption -- see wip/host-pool-fill-transport/README.md"
     else
         fail "$a text != ref ($(text_hash "$a") against $REF_HASH)"
         sed 's/^/      /' "$KEEPOUT/$a/text.txt" | head -5

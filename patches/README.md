@@ -2747,6 +2747,25 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > pressure under the memory cap -- the fill *source*'s business: `MOE_HOST_POOL_DIO=1` removes ~90 % of it
 > (`ENVIRONMENT.md`, the `MOE_HOST_POOL_DIO` row).
 
+> **r232 amendment (issue #281): the coalesced prefill read runs in BOTH fill modes.**
+> `scripts/gate-host-pool.sh`'s lineage aside, this was a one-predicate defect with a 2x cost.  `stage_span_fill()`
+> serves a run of >= 2 experts that are in NEITHER tier with one file read per 16-expert chunk (r224), but both
+> call sites' `span_geom` required `g_pool_dio` — so the arm r212 made the field default (`MOE_HOST_POOL_DIO=auto`
+> mirrors `--load-mode`, and `mmap` is buffered) could not coalesce at all and read each missing expert out of the
+> model MAPPING, one ~0.65 MiB demand fault at a time.  The change drops the two `g_pool_dio` terms and lets the
+> span read the file with the mode's own open: O_DIRECT when the disk tier is on, a plain buffered `pread`
+> otherwise (same page-cache pages as the mapping, so the fill *source* is unchanged — only the granularity, and on
+> Windows the fault behaviour: a mapped fill there is a demand fault per 4 KiB page at 715 MiB/s).  Measured on the
+> 56 GiB rig, Flash-Next + MTP, `-c 204800 -ub 6144`, cold cache, 50k prefill x2, two interleaved reps: `-lme 12`
+> (26 % coverage, the issue's shape) **513-545 -> 821-875 t/s** and 220-330 GiB -> 95 GiB of storage reads;
+> `-lme 36` (77 %) **985-1235 -> 1307-1446**; a near-mirror pool **inert** (1889 vs 1890); decode unchanged
+> (9.31 s vs 9.28 s for 600 tokens).  It also beats the issue's workaround (`MOE_HOST_POOL_DIO=1` + span:
+> 631-663 t/s) by 30 % with 2.4x better decode.  Gates: greedy text byte-identical to r231 on a dense and a
+> pool-engaged arm, `gate-prefill-logits.sh` mean KLD 0.000000 / same-top-p 100.000 %, `gate-host-pool.sh` 37/37.
+> The fill-source half of the investigation (`MOE_HOST_POOL_FILL_SRC`, reading the pool fill from the file too) is
+> **not** in this release: +38 % on top of this change but -41 % on its own, and exactly neutral when the pages are
+> cacheable, so it is a headroom bet — recorded in `wip/host-pool-fill-transport/` and `WORKLOG.md` 261107.006.
+
 > **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
 > demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
 > headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per

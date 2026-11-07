@@ -61704,10 +61704,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..68024d950
+index 000000000..a84e501a1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9656 @@
+@@ -0,0 +1,9679 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -69281,6 +69281,12 @@ index 000000000..68024d950
 +// Serve every maximal RUN of consecutive experts that are in NEITHER tier from ONE storage read per chunk
 +// (`MOE_HOST_POOL_STAGE_SPAN_EXPERTS` experts), then one H2D per expert out of the pinned chunk.
 +//
++// The read is a FILE read in both fill modes -- positional `pread`/`ReadFile` -- O_DIRECT (aligned) when the
++// disk tier is on, buffered through the OS page cache otherwise.  It used to be file-only in the DIO arm; the
++// buffered arm read the model MAPPING per expert instead, which is a demand fault per page on Windows and so
++// cannot be coalesced away (issue #281).  A buffered `pread` reads the same page-cache pages the mapping
++// does, so the fill's SOURCE is unchanged -- only its granularity (and, on Windows, its fault behaviour).
++//
 +// `map[e]` is the two-tier residency encoding every prefill path already builds (`>= 0` arena slot, `<= -2`
 +// pool slot `-v-2`, `-1` in neither), and `dst_base + e*expert_bytes` is the destination, so this is the
 +// existing per-expert loop with the READ hoisted out of it: the bytes, the destination layout and the pool
@@ -69340,10 +69346,14 @@ index 000000000..68024d950
 +            }
 +            const size_t off   = t.src_offs + (size_t) e * t.host_bytes;
 +            const size_t len   = n * t.expert_bytes;
++            // O_DIRECT needs an aligned offset, length AND buffer, so a direct chunk is read padded and the
++            // bytes start part-way into it.  A buffered `pread` needs none of that, and reading exactly
++            // `len` at `off` also keeps the last chunk of the last table from padding past EOF (a short read
++            // would decline the chunk that the per-expert path could serve).
 +            const size_t align = t.src_align != 0 && (t.src_align & (t.src_align - 1)) == 0 ? t.src_align : 4096;
-+            const size_t aoff  = off & ~(align - 1);   // O_DIRECT needs an aligned offset ...
-+            const size_t skip  = off - aoff;           // ... so the bytes start part-way into the chunk
-+            const size_t blen  = (skip + len + align - 1) & ~(align - 1);
++            const size_t aoff  = g_pool_dio ? (off & ~(align - 1)) : off;
++            const size_t skip  = off - aoff;
++            const size_t blen  = g_pool_dio ? ((skip + len + align - 1) & ~(align - 1)) : len;
 +            span_buf_t * sb    = span_buf_acquire(device, len, align);
 +            const int64_t tr = ggml_time_us();
 +            const pool_ssize_t got = (sb != nullptr && blen <= sb->cap)
@@ -69605,11 +69615,21 @@ index 000000000..68024d950
 +        //
 +        // wip/host-expert-split W4 (prefill read granularity): this is where a PREFILL actually reads
 +        // storage (the scheduler staging path does not run for this shape -- it declines), and it used to
-+        // issue one ~0.7 MiB O_DIRECT read per expert.  The missing experts are contiguous in the file, so
-+        // serve each run of them from one read per chunk instead; anything a chunk cannot serve falls
-+        // through to the per-expert path below unchanged.
++        // issue one ~0.7 MiB read per expert.  The missing experts are contiguous in the file, so serve
++        // each run of them from one read per chunk instead; anything a chunk cannot serve falls through
++        // to the per-expert path below unchanged.
++        //
++        // A run is served from the FILE in BOTH fill modes (issue #281): O_DIRECT when the disk tier is on,
++        // a plain buffered `pread` otherwise.  This predicate used to require `g_pool_dio`, so a buffered
++        // --load-mode mmap run -- the field default since r212 -- could not coalesce at all and read every
++        // missing expert out of the model MAPPING one at a time: ~0.65 MiB demand faults at 715 MiB/s on
++        // the reporter's Windows box, a 13.9 GiB bounce ring, 185 k experts through the per-expert path and
++        // 22 t/s prefill where the same box measured 70 t/s with O_DIRECT.  A buffered `pread` is the same
++        // page cache `--load-mode mmap` asked for (the mapping and the file share its pages), so this is
++        // not a fill-source change on Linux -- it only stops the read granularity from depending on it,
++        // and it gives Windows the Cache Manager's readahead instead of a fault per 4 KiB page.
 +        std::vector<uint8_t> span_done;
-+        const bool span_geom = g_pool_stage_span && g_pool_dio && pool_file_io_available() &&
++        const bool span_geom = g_pool_stage_span && pool_file_io_available() &&
 +                               t.src_known && !t.src_path.empty() && t.n_slices == 0 &&
 +                               !(t.split_axis == 0 && t.host_pitch != 0) && t.src_off == 0 &&
 +                               t.host_bytes == expert_bytes && expert_bytes > 0 &&
@@ -69810,7 +69830,9 @@ index 000000000..68024d950
 +            // the per-expert arm's encodes only the arena.  The default (`MOE_HOST_POOL_STAGE_BATCH=1`) is the
 +            // arm that runs in practice; the per-expert arm is a debug A/B and keeps its own path.
 +            std::vector<uint8_t> span_done;
-+            const bool span_geom = batch && g_pool_stage_span && g_pool_dio && pool_file_io_available() &&
++            // Issue #281: no `g_pool_dio` here either -- a buffered fill coalesces too (see the gather
++            // path's note; `stage_span_fill` reads the file with the mode's own buffered/O_DIRECT open).
++            const bool span_geom = batch && g_pool_stage_span && pool_file_io_available() &&
 +                                   t.src_known && !t.src_path.empty() && !do2d && t.n_slices == 0 &&
 +                                   t.src_off == 0 && t.host_bytes == t.expert_bytes && t.expert_bytes > 0 &&
 +                                   pool != nullptr && pool->base != nullptr &&
@@ -71170,9 +71192,10 @@ index 000000000..68024d950
 +        // it sits near 0.7 MiB the missing experts are too fragmented for a span to help (the pool covers
 +        // most of the table) and this is the per-expert shape with extra overhead.  `read` is the time inside
 +        // the pread, `wait` the time the two-deep ring had to wait for a previous chunk's copies to drain.
-+        GGML_LOG_INFO("%s: coalesced prefill reads: %lld reads, %.1f MiB (%.2f MiB/read), %lld experts, "
++        GGML_LOG_INFO("%s: coalesced prefill reads (%s): %lld reads, %.1f MiB (%.2f MiB/read), %lld experts, "
 +                      "%lld us waiting for a ring buffer, fallbacks=%lld\n",
-+                      __func__, (long long) g_stage_span_reads,
++                      __func__, g_pool_dio ? "O_DIRECT" : "buffered pread",
++                      (long long) g_stage_span_reads,
 +                      (double) g_stage_span_bytes / (1024 * 1024),
 +                      g_stage_span_reads > 0
 +                          ? (double) g_stage_span_bytes / 1048576.0 / (double) g_stage_span_reads : 0.0,

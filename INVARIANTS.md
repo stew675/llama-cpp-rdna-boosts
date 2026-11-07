@@ -2348,6 +2348,15 @@ on Linux.**
   made the policy — reads the mapping per expert and does not coalesce.  Quote the arm with the number, and
   never read a DIO-vs-buffered pair as a span A/B: the fill source changes with the mode, so that pair is two
   changes at once.
+  **CORRECTED at r232 (issue #281): the span is no longer O_DIRECT-only.**  Both `span_geom` predicates dropped
+  their `g_pool_dio` term and `stage_span_fill` opens the file with the mode's own flag, so a buffered fill
+  coalesces too (a buffered `pread` reads the same page-cache pages as the mapping — the granularity is what
+  changed, not the source).  It is not a small correction: on the 56 GiB rig at `-lme 12` (26 % coverage, the
+  field shape) the buffered arm goes **513-545 -> 821-875 t/s** with 2.3-3.5x fewer storage reads, `-lme 36`
+  (77 %) **985-1235 -> 1307-1446**, near-mirror **inert**, decode unchanged — and it is **+30 % over the
+  `DIO=1` arm with the span**, whose decode is 2.4x worse (61 vs 26 t/s).  So the r224 percentages above are
+  the *direct-tier* numbers and the buffered arm now has its own; a DIO-vs-buffered pair is still two changes
+  at once, but it is no longer a coalescing pair.
 - **The demote's value is BUDGET-shaped, and it is positive up to a near-mirror budget (measured 2026-11-06;
   `archive/work/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
   (76.9 % coverage) **+8 %** generation (24.0 → 26.0 t/s), `-lme` 44 (93.7 %) **+21 %** (28.0 → 33.9), mirror
@@ -2563,3 +2572,19 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
 3. **The demote's break-even is not in doubt at these coverages.**  Sink reuse measured **13.6-15.8 %** at 77-94 %
    coverage, against W1's ~3 % break-even on NVMe (~0.2 % on slow storage) -- so the r231 decode-parity result
    holds, and `TOUCH=3`'s -18 % of copies changes the amount, not the verdict.
+
+- **A MID-RUN pinned-tier latch perturbs the logits by ~1e-5, and that is enough to flip a near-tie token
+  (measured 2026-11-07, `soar`, issue #281's gate run; `TODO` #282).**  `scripts/gate-host-pool.sh`'s `pinlate`
+  arm (`MOE_HOST_POOL_PIN_FAULT=late`) serves a MIXTURE — some ops from the arena, some stood down — and
+  reproduces the greedy text of neither end: 171 chars `b981e742aa13` against `ref`'s 182 / `a99ccbd97ecb`,
+  deterministic across two builds and two runs, one token at ~31 of 32.  **The two ends are bit-exact**, which is
+  what makes the mixture the whole story: `fail`/`late` (every table stood down, `get_ok=0`) match `ref`
+  exactly, so the fallback computes the same logits and the divergence is not a wrong-expert read.  The
+  delivery's own criterion on the same contrast reads **median KLD -0.000000, 99.9 % -0.000040, same-top-p
+  100.000 %** over 2 x 512 tokens — two orders inside the 0.005 tolerance — and `MOE_HOST_POOL_VERIFY=1` finds
+  **0** pool-read mismatches.  Ruled out by arm: the cold in-place read (`MOE_EXPERT_CACHE_COLD_UVA=0` still
+  diverges), the decode remap (`GGML_MOE_DEVREMAP=0` still diverges), the staging transport
+  (`MOE_HOST_POOL_STAGE_BATCH=0` still diverges), prewarm and the ranking.  **Narrowed to the demote**:
+  `MOE_HOST_POOL_SINK=0` + latch reproduces `ref` exactly.  Consequence for gates: a byte-identical *text*
+  assertion is the right instrument for a wholesale fault arm (bit-exact) and the wrong one for a mixed state —
+  a ~1e-5 arithmetic difference flips near-ties, so that arm's evidence has to be the logit criterion.

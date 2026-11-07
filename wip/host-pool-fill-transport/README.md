@@ -122,8 +122,17 @@ Narrowed with four arms against the gate's own config (each control byte-identic
 | `MOE_HOST_POOL_PIN_FAULT=late` | `b981e742aa13` | `decline_all=1711 get_ok=552`, 119 rolled-back fills — **a mixture** |
 
 So the divergence is in the **mixture** (some ops cache-served, some stood down inside one run), not in either
-path taken alone. Open work is `TODO` **#282** (next: the per-table `hits/misses/fills` line to name the table,
-and the prefill-staging snapshot built before a rolled-back admission — the r219 class one layer deeper).
+path taken alone. A further bisect narrowed it to the **demote**: `MOE_HOST_POOL_SINK=0` + latch reproduces
+`ref` exactly (`a99ccbd97ecb`), while `PREWARM=0`, `STAGE_SPAN=0` and `RANK=combined` + latch all still diverge.
+
+**It is not corruption — it is ~1e-5 of arithmetic.** The delivery's own criterion on the gate's config
+(`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000,
+99.9 % -0.000040, Same top p 100.000 %**, i.e. two orders of magnitude inside the 0.005 tolerance; and
+`MOE_HOST_POOL_VERIFY=1` reports **0 pool-read mismatches** in the latched arm, while a
+drain-a-demoted-slot-before-serving diagnostic changed nothing. So the ops that fall back take a slightly
+different arithmetic path (a different kernel instantiation is the likely shape), and one near-tie in one
+32-token greedy run flips. A byte-identical *text* assertion is therefore the wrong instrument for a mixed
+fault state — it is the right one for the wholesale arms, which are bit-exact and still enforced.
 
 The gate now **proves the fallback's byte-identity in the same run** (`fail`/`late` must match `ref`) and
 reports the mixture as a WARN naming `TODO` #282 instead of passing it blindly; a *wholesale* fault arm that
