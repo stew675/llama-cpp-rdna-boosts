@@ -1,0 +1,386 @@
+# PLE residency — how much of the 26.8 GiB per-layer-embedding table a conversation actually uses
+
+**Status: OPEN — measurement complete (2026-11-06), nothing implemented, nothing in `patches/`.**
+Question asked: *"can we get an idea of what percentage of the PLE weights are actually used, so a
+heat-map mechanism could keep the top ~1 GiB RAM-resident and leave the rest cold in the page cache?"*
+
+Short answer: **a 190k-token prefill touches 0.20 % of the table (54.6 MiB of rows out of 26.8 GiB)**;
+a whole 240k-token mixed session touches 0.30 %. The table is a 16-head n-gram hash and is ~99.7 %
+dead weight for any single conversation. The interesting number is *not* the fraction of the table, it
+is the **43× page amplification** of the current 4 KiB cold path and the fact that a **row-granular**
+store needs only ~50-130 MiB to hold everything measured, where the page cache needs 3.5 GiB for the
+same rows. "Top 1 GiB hot" is ~10× more RAM than the entire measured working set; **32-128 MiB is the
+sweet spot**, and the residual is cold no matter how big the hot set is (a fresh document's n-grams
+are mostly novel: 49 % of a same-corpus document, 14-36 % of a different one).
+
+**Both sides are now measured**, and they need different mechanisms.  Prefill: the rows are exactly
+predictable from the token ids (15 ms for 190k tokens), so a per-request staging buffer can bulk-load
+them (364 MiB of sector reads / 3.5 s, one ubatch of lookahead hides it 24x over) — §4b.  Decode: the
+next token does not exist yet, the stream is ~90 % first touch, and a cold row costs **292 us** against
+**0.2 us** once the page is in the process — and the page cache cannot hold it, because the delivered
+config is at the RAM ceiling (39 MiB of PLE resident while `MemFree` falls to 2 GiB) — §4c/§4d.  So
+decode wants a small **explicit** row store, not page-cache warmth; and `-lzm off`'s 26.8 GiB is the
+wrong extreme (it pushes the box into zram swap).
+
+Measured on one R9700.  The footprint/predictability work (§§1-4b) was made on the r228 tree
+(`32d0dc3f1`); everything from §4c on was re-measured on the r229 tree (`5c3ef0354`), text byte-identical
+throughout (`sha 6317a4054e25` for the decode arms).
+
+## 1. What the table is
+
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf`, the only tensor in that shard:
+
+| property | value |
+|---|---|
+| tensor | `per_layer_token_embd.weight`, **IQ4_NL**, `[160, 320 001 536]` |
+| on-disk size | **28 800 138 240 B = 26.8 GiB** (row = 160 elems × 4.5 bpw = **90 B**) |
+| structure | 16 heads (`ple.ngram_size 3` × `heads_per_ngram 8`), each head a ~20 M-row hash range (`head_offsets` / `head_vocab_sizes`) |
+| heads 0-7 | bigram heads: `hash(t[i], t[i-1]) % vsize + off` |
+| heads 8-15 | trigram heads: `hash(t[i], t[i-1], t[i-2]) % vsize + off` |
+| gathers | **16 rows per token**, always (one per head), in one layer (`ple.layers = [1]`) |
+| delivery arm | `runme` uses `--load-mode mmap --lazy-mode auto`, so >4 GiB tables are *lazily mapped*: the PLE is served from the OS page cache, 4 KiB faults, `MADV_WILLNEED` batched. It is **not** held resident (`-lzm off` would hold 26.8 GiB of RSS) |
+
+So a token does not read "the PLE weights"; it reads 16 pseudo-random 90-byte rows, and the row ids are
+a pure function of the token ids (no weights involved). That is what makes the footprint measurable
+exactly, offline, and independent of the expert tier or the GPU.
+
+## 2. Method
+
+1. **Instrument the gather** (`ple-trace-and-timing.patch`: the trace hunk in `src/models/qwen4exp.cpp`, plus the env-gated
+   `LLAMA_PLE_TIMING` / `LLAMA_PLE_PROBE` timing; env
+   `LLAMA_PLE_TRACE=<path>`): after `set_input()` computes `idx[]`, dump
+   `{u32 n_tokens, i32 tok[n], i32 row[n*16]}` per ubatch. ~68 B/token; the full 190k-token trace is
+   13 MB. Nothing else changes — same text, same path.
+2. **Analyse offline** (`tools/analyze.py`, `tools/report.py`, `tools/sim.py`): unique rows, unique
+   4 KiB pages, n-gram census, Heaps curves, hot-set coverage, LRU simulations of a row-granular and a
+   page-granular cache.
+3. **Validate the model against the real lazy reader.** With `LLAMA_LAZY_BUF_MB=4096` (bigger than the
+   document's page footprint, so no eviction) + `LLAMA_LAZY_READER_STATS=1`, the managed reader printed
+   `324 654 hits, 606 446 misses, 2 456 106 300 bytes` for the 190k-token prompt; the offline model
+   predicts `324 702 / 606 782 / 2 457 467 100` for the same run and `(-48 / -336 / -1.36 MB)` for the
+   24 fewer decode tokens that arm used. Exact to the last page — the page model (4096/90 = 45 rows per
+   page, `n_pages = 7 111 146`) and the trace are both right.
+4. **Cold vs warm, end to end.** `tools/evict.py` `posix_fadvise(DONTNEED)`s the 26.8 GiB PLE range and
+   the same 190k prompt is re-run: cold **1 707-1 715 t/s** (134-136 s) vs warm **1 763-1 816 t/s**
+   (127-133 s), two rounds. The whole cold fill is 2.37 GiB, ~4 s, **~3 % of the prefill**.
+   `--lazy-mode off` (the PLE resident in its own host buffer) gives the same prefill rate
+   (1 765 t/s) for **+33 s of load and +26.8 GiB RSS**.
+
+Workloads: the three prompt from the request (server arm, via `runme`), 80 KB of llama.cpp source,
+a 573 KB / 190k-token mixed code corpus (17 real files), plus 30 KB prose, 13 KB Python, 20 KB JSON and
+a Chinese prompt for domain spread.
+
+## 3. Results
+
+### 3.1 Footprint of a pass (16 rows/token)
+
+| run | tokens | row gathers | distinct rows | row MiB | % of table | 4 KiB pages | page MiB | % of pages | gathers/row |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `runme` server, three.js prompt + 384 gen | 768 | 12 288 | 10 592 | 0.91 | 0.0033 % | 10 581 | 41.3 | 0.15 % | 1.16 |
+| three.js prompt + 384 gen (CLI) | 576 | 9 216 | 8 152 | 0.70 | 0.0025 % | 8 144 | 31.8 | 0.11 % | 1.13 |
+| 80 KB of source | 25 085 | 401 360 | 164 741 | 14.1 | 0.0515 % | 162 839 | 636 | 2.29 % | 2.44 |
+| 573 KB / 190k-token code corpus | 189 809 | 3 036 944 | 635 581 | **54.6** | **0.199 %** | 606 782 | **2 370** | 8.53 % | 4.78 |
+| all 8 runs (237k tokens, mixed) | 237 513 | 3 800 208 | 953 123 | **81.8** | **0.298 %** | 889 563 | 3 475 | 12.5 % | 3.99 |
+
+Distinct rows grow **sublinearly** (Heaps): 19.0k at 5k tokens, 95k at 20k, 356k at 120k, 636k at 190k —
+3.3 distinct rows per token and falling, because the *distinct n-gram* count saturates, not the access
+count. The 190k corpus has 29 028 distinct bigrams and 50 416 distinct trigrams; rows = 8× each.
+
+### 3.2 Page granularity is the real cost
+
+A 90-byte row lives inside a 4 KiB page holding 45 rows, so a *cold* gather pulls 4 KiB per row:
+
+- 190k-token document: **2 370 MiB read to deliver 54.6 MiB of rows (43× amplification)**, and that is
+  *after* the per-ubatch page dedup the gather already does;
+- per 1 000 new tokens: up to **62.5 MiB of cold pages** for **1.37 MiB of useful rows**;
+- the whole 8-run workload is **3.5 GiB of pages** for **81.8 MiB of rows**.
+
+Measured end-to-end, though, that costs only ~3 % of prefill (2.37 GiB of 4 KiB reads ≈ 4 s on this
+NVMe), because `MADV_WILLNEED` + the kernel's readahead already overlap it. **The PLE is not a prefill
+throughput problem today.** It is a RAM-footprint problem: 26.8 GiB of file whose hot part is 50-130 MiB.
+
+### 3.3 Hot-set coverage — the shape of the answer
+
+Ranked by their own frequency (the ceiling for any heat map that knows the workload), 190k corpus:
+
+| hot set | rows | covers |
+|---|---|---|
+| 0.5 MiB | 5 825 | **40.3 %** of that document's gathers |
+| 2 MiB | 23 301 | 57.7 % |
+| 8 MiB | 93 206 | 74.8 % |
+| 32 MiB | 372 827 | 91.4 % |
+| ≥54.6 MiB | 635 581 | 100 % |
+
+Cross-document is the honest number, because a heat map is trained on *other* content:
+
+- train on the first 60 % of the same corpus → **48.7 %** of the held-out 40 % is covered, and that is
+  with the *whole* 29.1 MiB training set resident — the curve is flat from 64 MiB up;
+- train on the other six runs (30.7 MiB of rows) → **36.5 %** hit on a new 190k-token code document
+  with a 256 MiB row cache (**33.7 %** with a 1 GiB *page* cache);
+- cross-domain (code history → prose/JSON/Chinese prompts): **14-21 %**;
+- an exact re-read of the same document: 100 %, and in the server it is not re-gathered at all (the
+  prompt cache / checkpoints skip the prefill, so the PLE is only touched for genuinely new tokens).
+
+### 3.4 Row-granular vs page-granular cache (LRU over 2 passes of all 7 CLI runs)
+
+| budget | row cache hit | bytes read | page cache hit | bytes read |
+|---:|---:|---:|---:|---:|
+| 8 MiB | 21.3 % | 183 MiB | 0.3 % | 10 536 MiB |
+| 32 MiB | 28.3 % | 167 MiB | 0.7 % | 10 500 MiB |
+| **128 MiB** | **65.0 %** (the whole 81.6 MiB working set fits) | **81.6 MiB** | 5.8 % | 9 962 MiB |
+| 512 MiB | 65.0 % | 81.6 MiB | 24.4 % | 7 992 MiB |
+| 1 GiB | 65.0 % | 81.6 MiB | 29.0 % | 7 506 MiB |
+| 4 GiB | 65.0 % | 81.6 MiB | 67.2 % | 3 467 MiB |
+
+(the 65 % is "second pass warm, first pass cold"; above 128 MiB there is nothing left to cache, and the
+page path needs 4 GiB to reach what 128 MiB of rows already holds, for 42× the bytes read.)
+
+## 4. What this says about the design idea
+
+- **The used fraction is tiny and bounded**: 0.2 % of the table for a 190k-token document, 0.3 % for a
+  week of measured sessions. Hedged: a much bigger real-world history has a bigger n-gram vocabulary,
+  but Heaps says it stays a fraction of a percent per document and the *union* grows slowly.
+- **"Top 1 GiB resident" is the wrong size.** 1 GiB of rows = 11.9 M rows = 1.49 M n-grams = 12× the
+  entire 573 KB corpus's n-gram vocabulary and 15× everything measured. 32-128 MiB already holds the
+  whole measured working set; beyond that the curve is flat *for this workload* and the remaining 50-65 %
+  of a fresh document's gathers are novel n-grams that no static map can contain.
+- **Granularity, not capacity, is the lever.** 90-byte rows behind a 4 KiB cold path: a row-granular
+  store is 43× smaller for the same coverage and, at equal RAM, strictly better (36.5 % at 256 MiB of
+  rows vs 33.7 % at 1 GiB of pages on the same held-out document).
+- **The current path is already near-optimal *per document***: the gather dedups pages within a ubatch
+  and `MADV_WILLNEED`s them, so each distinct page is read once. A cache only helps for pages that a
+  *previous* document already read (the 36-49 % above) — i.e. the win is surviving page-cache eviction
+  and multi-document reuse, worth ~3 % of prefill and a first-token-latency edge, not a throughput win.
+- **The machinery already exists, twice.** `llama_lazy_reader` (block 11) is a budgeted host arena with
+  clock-LRU + `pread` + I/O threads, keyed on 4 KiB pages (`LLAMA_LAZY_BUF_MB`; currently off by default
+  because it measured slower than mmap on gfx1151). The expert heat map (`MOE_EXPERT_HEATMAP`) is the
+  persisted-ranking precedent, and block 15's attendance pool is the "hot window + cold tail" precedent
+  (204 MiB of VRAM for ~90 % of attended KV pages). A PLE hot tier is those three ideas fused:
+  row-granular (90 B) rather than page-granular, seeded from a persisted per-row heat map, with the
+  existing `pread` path as the tail.
+
+## 4b. YES — the whole prompt's rows are predictable before the first token (2026-11-06, same session)
+
+This is the property that changes the design: **row selection never touches the weights.** A row id is
+`mixed % head_vocab + head_offset`, `mixed = XOR_i token[i] * layer_multiplier[i]` over the current token
+and its 1-2 predecessors — pure token-id arithmetic. So given a prompt (and the positions/prefix the
+server already knows) every row the prefill will gather is known **before the first ubatch**, and can be
+enumerated, deduped and read as one bulk operation.
+
+**Proven, not asserted.** Re-implementing the hash from the GGUF metadata alone and replaying the traced
+token stream reproduces **189 806 of 189 809 tokens (99.998 %)** of the 190k-token run's 3 036 944 row
+ids exactly; the 3 misses are the CLI's own re-prefill of positions 0-1 (a new sequence start, so the
+window has fewer than 2 predecessors — also known in advance). `tools/predict.c`.
+
+**Cost of the prediction** (measured, `tools/predict.c`, one core, exactly the same integer ops the
+gather does): **15.4 ms for 190 000 tokens** (3.0 M rows, 16 mul/xor/mod per token) + ~48 ms for a
+bitmap census of the 320 M-row table and the 7.1 M-page space; 2 ms for an 80 KB prompt. That is
+~1/9 000 of the 132 s prefill.
+
+**Cost of a bulk load of exactly those rows** (measured, `tools/bulkread.c`, 16 threads, cold = the
+26.8 GiB range `posix_fadvise(DONTNEED)`ed first; the device does **~180 k random IOPS regardless of
+request size**, so a smaller request costs the same time and less transfer):
+
+| prompt | rows | pages (4 KiB) | 4 KiB read | 512 B-sector reads |
+|---|---:|---:|---:|---:|
+| 80 KB of source (25 085 tok) | 164 741 (14.1 MiB) | 162 839 (629 MiB) | 0.9 s | **94 MiB**, 0.9 s |
+| 573 KB / 190k tok | 635 581 (54.6 MiB) | 606 782 (2 344 MiB) | 3.3 s (5.8 s in an earlier pass) | **364 MiB**, 3.5 s |
+
+(warm page-cache reads of the same 2 344 MiB: 0.06 s — memcpy-bound. `O_DIRECT` row reads bypass the
+cache, which is why their warm time equals their cold time.)
+
+The useful shape is therefore **one ubatch of lookahead, not a whole-prompt preload** (measured over the
+35 prefill ubatches of the 190k run): a 6 144-token ubatch needs a mean of **26 670 distinct rows
+(2.3 MiB), 26 599 pages (102.7 MiB) / 15.3 MiB of sector reads, ~0.15 s of I/O at 180 k IOPS** against
+~3.6 s of GPU work for that ubatch — a **24x margin**, so pipelining the predicted list one ubatch ahead
+hides all of it, and the staging buffer is a couple of MiB with no page→slot map (sort the ubatch's rows
+and binary-search them).
+
+What this means for the idea:
+
+- A **per-request staging buffer of the predicted rows** (54.6 MiB for a 190k-token prompt, 14.1 MiB for
+  80 KB) is cheaper than any heat map, needs no persistence, no eviction policy and no statistics, and
+  replaces 2 344 MiB of page cache. Rows are read once per request at ~1 row/page (1.05), so the sector
+  granularity is free.
+- A heat map is then only about **cross-request** reuse (the 36-49 % above) — i.e. whether to re-read the
+  same 55 MiB next time or keep it. That is a much smaller question than "what is hot".
+- Prediction cannot cover decode tokens (they do not exist yet) or MTP drafts, but that volume is
+  16-64 rows per step: 1-4 pages, noise. It also must be applied to the **new suffix only** — a cached
+  prefix is not re-evaluated, so its rows are never gathered.
+
+## 4c. The generation side: it is fault LATENCY, not bandwidth, and it is unpredictable
+
+Measured on the same box, `-lme 47` (a pinned expert mirror, so the expert tier cannot confound it),
+512 greedy tokens, byte-identical text (`sha 6317a4054e25`) in every arm, with the gather timed inside
+`set_input()` (`LLAMA_PLE_TIMING`, in `ple-trace-and-timing.patch`):
+
+| decode arm (16 rows/token) | generation | PLE read+dequant per step | per row |
+|---|---:|---:|---:|
+| mmap, PLE **cold** (pages `DONTNEED`ed) | 41.5-43.7 t/s | 3.7 ms | 231 us |
+| mmap, second run right after (pages nominally cached) | 52.1-54.7 t/s | 2.0-4.0 ms | 250 us |
+| `-lzm off`, whole table in its own host buffer | 51.1-53.2 t/s | **0.51 ms** | 32 us |
+| managed reader (`LLAMA_LAZY_BUF_MB=256`), either | 42.1-44.8 t/s | (own path, ~2 ms) | - |
+
+and the isolated read (`tools/dqbench.c`, the same rows from the same file):
+
+| | per 160-elem IQ4_NL row |
+|---|---:|
+| `to_float` from a local buffer (the dequant itself) | **47 ns** |
+| mapped row, cold, **with** the `fadvise(WILLNEED)` hint | **162 us** |
+| mapped row, page resident | **0.2 us** |
+
+So the decode cost is **cold-page fault latency, ~1 000x a resident read**, and:
+- the hint does not remove it (`madvise` *or* `posix_fadvise`: 162 us/row cold — the loader marks the
+  lazy ranges `MADV_RANDOM`, and the readahead hint stays asynchronous while the `to_float` read faults
+  synchronously right behind it);
+- **prefill amortises it 10-15x** (15.6 us/row cold, because thousands of rows fault together in one
+  batch) which is exactly why prefill loses 3 % and decode loses 20-25 %;
+- the existing managed reader does not win: its own path costs ~2 ms/step even when every page is warm,
+  so it spends the fault saving.  That overhead is unexplained and is the first thing to measure if this
+  goes further (the `M gather` path, the mutex, or the arena copy).
+
+Why decode cannot be staged the way prefill can: **the next token does not exist yet**, and the decode
+stream is ~90 % first touch (1.09 gathers row), so a cache only buys repeats — 100 % for a replayed
+prompt (same prompt/seed, measured), 0-16 % across unrelated prompts.  The one part of decode that *is*
+predictable is the **MTP verify batch**: its 4 tokens (and their 64 rows) are known as soon as the drafts
+are produced, a few draft-forwards before the gather that needs them — the only decode work that can be
+prefetched into a staging buffer.  Everything else is either a bigger batch (spec decode already gives
+4x) or an accept-the-latency.
+
+## 4d. Where the decode time actually goes, and what that says about the managed reader
+
+Split of the decode gather, timed inside `set_input()` (`LLAMA_PLE_TIMING`; 512 tokens, 511 decode
+gathers, 16 rows each, text identical):
+
+| | per gather | per row |
+|---|---:|---:|
+| `madvise(WILLNEED)` hint loop | 25 us | 1.6 us |
+| **row read + dequant** (16 rows from the mapping) | **4.0 ms** | **250 us** |
+| H2D upload of the 16x160 F32 embedding | 0.3 us | - |
+
+and the same read in isolation (`tools/dqbench.c`: same file, same rows, plain `MAP_PRIVATE` +
+`MADV_RANDOM`, no GPU): **47 ns** dequant from a local buffer, **0.2 us** per row when the page is
+resident, **162 us** per row when it has to be faulted in.
+
+So the 250 us/row is *not* the dequant (5 000x smaller), not the upload (800x smaller) and not the hint.
+**Settled (same session), and the answer is memory pressure:**
+
+- an in-process probe (`LLAMA_PLE_PROBE`) separates rows whose page this process has **already touched**
+  from rows on a **new** page: **1 126 repeat rows at 0.2 us, 7 050 new-page rows at 291.9 us**.  A repeat
+  access is fast — so the mapping and the page-table path are fine;
+- a standalone benchmark over 7 500 *distinct* rows, with the pages pre-warmed by `pread`, measures
+  **0.8 us** for the first mapping touch of a page-cache-resident page (`tools/dq2.c`).  So a cached page
+  is cheap too;
+- therefore the new-page rows are **cold reads**, and watching the page cache from outside *during* a run
+  says why: `MemFree` collapses 43 GiB -> **2 GiB** in ~12 s while the 47 GiB expert master is pinned, and
+  the PLE's resident pages sit at **39 MiB** and do not grow.  The box is at its RAM ceiling, so the
+  kernel evicts each PLE page almost immediately after it is used;
+- `-lme 44` (3 GiB less pinned) and `--host-experts pool` (no pinned master) measure the same 14 %
+  mapped-residency and the same 285-292 us/row: on this box *any* expert tier leaves the page cache too
+  small to hold the PLE's 30 MiB working set.
+
+**Consequence — the opposite of "warm it into the page cache".**  A page-cache-warming reader cannot work
+here: the pages are evicted faster than they are re-read, so every warm-up is thrown away.  What stays
+resident is what the process holds **explicitly** — which is why `-lzm off` (own host buffer) is 7x
+cheaper per row (32 us, and that arm was itself swap-throttled) and why the same rows cost 0.2 us once
+they are in a buffer this process owns.  The reader's *purpose* was right; its *mechanism* (page-granular
+arena + LRU + `pread` per gather) is what loses.
+
+What is settled, whatever the cause:
+
+- **The managed reader has no measured win anywhere.**  Decode 42.1-44.8 t/s against 52.1-54.7 for the
+  mmap path; its own fetch is 2-4 ms/step even with a 4 GiB arena and every page warm; its page-granular
+  LRU is the wrong granularity anyway (43x amplification, §3.2).  It is off by default
+  (`LLAMA_LAZY_BUF_MB` unset), so it costs nothing at runtime — what it costs is the `--lazy-mode auto` +
+  `LLAMA_LAZY_BUF_MB` story in `ENVIRONMENT.md` and the maintenance surface.
+- **"Warm it into the page cache" is necessary but not sufficient.**  The pages *are* cached (§ above)
+  and the gather still pays 250 us/row, so a page-cache-warming variant of the reader would inherit the
+  same cost.  It only becomes the answer if 250 us/row turns out to be reclaim pressure that a bounded
+  PLE budget avoids.
+- **The staging buffer is the design that does not depend on the answer**: it reads the rows *once* per
+  request into a few MiB of buffer that is pre-touched and stays hot (dqbench's 0.2 us/row), and it never
+  touches the 26.8 GiB mapping in the hot path.  That is also the argument for **dropping the managed
+  reader in the same change**: the staging buffer takes over its only unique role (a bounded, explicit PLE
+  RAM budget) and does it at row granularity.
+
+## 5. Options if this is picked up (none started)
+
+0. **Simplest and strongest — a per-request PLE staging buffer** (§4b): at request start enumerate the
+   new prompt's 16 rows/token (15 ms/190k tok), dedup into a page bitmap, and bulk-read the rows (sector
+   reads, 364 MiB / 3.5 s for 190k tok) into a buffer sized by the prompt (54.6 MiB). The gather then
+   reads RAM. No persistence, no heat map, no eviction policy; ~55 MiB replaces 2.3 GiB of page cache and
+   the I/O is one bulk issue instead of 16 faults/token. A persisted heat map / hot tier is the *next*
+   step (cross-request reuse), not the first.
+1. **Cheapest useful step — row-granular hot tier on `llama_lazy_reader`.** Index the arena by rows
+   (45 rows/page → a row-slot map), keep the `pread` tail, add a persisted heat map with the
+   `.moe-heatmap` conventions (writable by default, freeze with `chmod 444`, `sha256` quoted with any
+   number that depends on it). Budget ~128 MiB default, `0` disables. Expected: 36-49 % of a new
+   document served from RAM, everything measured served from 128 MiB, no change to text.
+2. **Only if the RAM cliff is the driver** (the `runme` comments about `GGML_CUDA_SLAB_HEADROOM_MIB` and
+   the near-mirror pool live there): a *static* pinned prefix of the hottest rows (say 64 MiB) is 400×
+   smaller than the table and frees 2.4-3.5 GiB of page cache for the expert mirror. That is a memory
+   decision, not a speed one.
+3. **Do nothing, deliberately.** The measured cold cost is 3 % of prefill and ~4 s per 190k-token
+   document; the whole feature buys that plus RAM. If the delivery's remaining prefill budget matters
+   more than 3 GiB of page cache, this campaign should close here with this README as the record.
+
+Non-goals / traps: do **not** shrink or re-quantize the table (the *cold* rows are what make the model
+correct on new text — the hash is over token ids, so any new n-gram lands anywhere); do **not** treat the
+page cache as free (it competes with the 46.84 GiB pinned expert mirror on a 93 GiB box); do not quote a
+coverage number without saying whether it is self-oracle (40-91 %) or cross-document (36-49 %).
+5. **Decode (§4c/§4d): keep a small explicit row store, not the page cache.**  The delivered config is
+   at the RAM ceiling, so page-cache warmth is worth ~nothing (39 MiB resident, 291.9 us per new-page
+   row against 0.2 us per row already in the process).  A bounded row store is the only thing that
+   holds: 30 MiB covers a 512-token generation and 55 MiB a 190k-token prompt, and it adds no pressure
+   (unlike `-lzm off`'s 26.8 GiB, which pushed the box into zram swap — 7.7 M major faults).
+   (a) Size it per request from the predicted list (prefill) and let it also serve the decode tail;
+   (b) the only *predictable* decode work is the MTP verify batch (drafts are known a few ms ahead),
+   so that is the one prefetch worth wiring;  (c) do not chase the mapping hints — measured inert.
+6. **Do not build the decode answer on page-cache warmth.** Measured twice: a cold row costs 162-292 us
+   *with* the mapping and fd hints in place, and the resident pages do not survive the run on this box.
+
+## 6. Caveats
+
+- One R9700, one box, `--host-experts pool` for the CLI arms (the expert tier does not touch the PLE
+  index stream — the rows are a pure function of the token ids — but it does compete for the page cache;
+  the `runme` server arm was run as shipped).
+- One session's corpus: 573 KB of llama.cpp source + a few prompts. The cross-document numbers are the
+  useful ones; the *fraction of the table* is the solid one.
+- The server arm confirms the decode shape: with `--spec-type draft-mtp --spec-draft-n-max 3` every
+  decode step is a 4-token verify batch, so decode gathers **64 rows/step** (4 × 16), i.e. ~24k rows per
+  1 000 generated tokens — still nothing, and mostly novel (1.16 gathers/row over the request).
+- The 3 % cold/warm figure is a wall-clock delta on a warm expert page cache; a box whose page cache is
+  being thrashed by the expert tier will see more.
+
+## 7. Reproduce
+
+```bash
+# 1. instrument (one hunk, block-15 tree), then rebuild
+cd ~/llama.cpp && git apply wip/ple-residency/ple-trace-and-timing.patch
+cmake --build build-rocm --target llama-cli llama-server -j 16
+
+# 2. trace a run (any arm; the PLE rows do not depend on the expert tier)
+LLAMA_PLE_TRACE=/tmp/ple/code80k.bin \
+  ./build-rocm/bin/llama-cli -m /llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  -ngl all -ncmoe 48 --host-experts pool -c 32768 -t 7 --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q8_0 --load-mode mmap --lazy-mode auto \
+  -b 6144 -ub 6144 -f /tmp/ple/code80k.txt -n 16 --seed 42 --temp 0 --no-display-prompt
+
+# 3. analyse
+python3 wip/ple-residency/tools/analyze.py /tmp/ple/*.bin     # per-run footprint
+python3 wip/ple-residency/tools/report.py                     # the tables above (needs all traces)
+python3 wip/ple-residency/tools/sim.py                        # row vs page cache LRU
+
+# 4. validate against the real reader, and the cold/warm pair
+LLAMA_LAZY_BUF_MB=4096 LLAMA_LAZY_IO_THREADS=8 LLAMA_LAZY_READER_STATS=1 <same run as above>
+python3 wip/ple-residency/tools/evict.py && <run again>       # cold, then warm
+```
+
+Prediction and bulk-read costs (§4b): `tools/predict.c` and `tools/bulkread.c` (`gcc -O2 -o predict
+predict.c`, `gcc -O2 -o bulkread bulkread.c -lpthread`; `bulkread` needs the offset/row lists, which
+`tools/sectors.py` writes from a trace).
+
+Traces are not committed (13 MB for the 190k run); regenerate them from the prompt files described
+above — the corpora were 80 KB and 573 KB of `~/llama.cpp` sources, `INVARIANTS.md` + `MANIFESTS.md` +
+`GREEDY-PURITY.md` + `BASELINE.md` for the prose sample, `convert_hf_to_gguf.py`, a 20 KB JSON, and the
+user's three.js prompt (all in `/tmp/ple`, not reproducible from the repo alone).

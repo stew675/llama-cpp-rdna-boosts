@@ -1,0 +1,283 @@
+diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
+index 9f9779b8c..179d0cdfa 100644
+--- a/src/llama-lazy-reader.cpp
++++ b/src/llama-lazy-reader.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <ctime>
+ #include <cstdlib>
+ 
+ #if LLAMA_LAZY_READER_POSIX
+@@ -155,7 +156,12 @@ void llama_lazy_reader::ensure_page(uint32_t page) {
+     n_bytes_read += want;
+ }
+ 
++static double lazy_now(void) {
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e9 + t.tv_nsec;
++}
++
+ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
++    const double t_g0 = lazy_now();
+     std::lock_guard<std::mutex> lock(mtx);
+ 
+     // pass 1: split the distinct pages this gather needs into resident hits and
+@@ -216,6 +222,8 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+         fetch_misses(misses);
+     }
+ 
++    const double t_g1 = lazy_now();
++
+     // pass 2: dequantize. Normally all needed pages are resident and cannot
+     // be evicted because we still hold the lock (eviction only happens inside
+     // the fetch paths above). If the working set of this gather exceeds the
+@@ -239,6 +247,8 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+             memcpy(dst_row, arena + (size_t) slot * page_size + off, (size_t) row_nelems * sizeof(float));
+         }
+     }
++    n_ns_fetch  += (uint64_t) (t_g1 - t_g0);
++    n_ns_gather += (uint64_t) (lazy_now() - t_g0);
+ }
+ 
+ void llama_lazy_reader::fetch_misses(const std::vector<uint32_t> & misses) {
+@@ -248,7 +258,7 @@ void llama_lazy_reader::fetch_misses(const std::vector<uint32_t> & misses) {
+     }
+ 
+     // small fetches (decode, shallow prefills): keep the direct serial path
+-    if (n_threads <= 1 || M <= 16) {
++    if (n_threads <= 1 || M <= 1) {
+         for (const uint32_t page : misses) {
+             ensure_page(page);
+         }
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+index bff603a21..c46b5f19f 100644
+--- a/src/llama-lazy-reader.h
++++ b/src/llama-lazy-reader.h
+@@ -54,6 +54,9 @@ public:
+ 
+     // counters
+     uint64_t hits()        const { return n_hits.load(); }
++    // WIP/ple-residency: split the gather cost (env LLAMA_PLE_TIMING prints it)
++    uint64_t ns_fetch()    const { return n_ns_fetch.load(); }
++    uint64_t ns_gather()   const { return n_ns_gather.load(); }
+     uint64_t misses()      const { return n_misses.load(); }
+     uint64_t bytes_read()  const { return n_bytes_read.load(); }
+ 
+@@ -88,4 +91,5 @@ private:
+ 
+     // stats
+     std::atomic<uint64_t>  n_hits{0}, n_misses{0}, n_bytes_read{0};
++    std::atomic<uint64_t>  n_ns_fetch{0}, n_ns_gather{0};   // WIP/ple-residency
+ };
+diff --git a/src/models/models.h b/src/models/models.h
+index 9bbd1f4c4..c2b337233 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2721,11 +2721,14 @@ struct llama_model_clef : public llama_model_qwen35 {
+ };
+ 
+ 
++void llama_qwen4exp_ple_timing_report();   // WIP/ple-residency
++
+ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
+     // env: LLAMA_LAZY_READER_STATS
+     ~llama_model_qwen4exp() override {
++        llama_qwen4exp_ple_timing_report();   // WIP/ple-residency, env LLAMA_PLE_TIMING
+         if (lazy_reader) {
+             static const bool stats = []() {
+                 const char * env = getenv("LLAMA_LAZY_READER_STATS");
+@@ -2868,6 +2871,7 @@ struct llama_model_qwen4exp : public llama_model_base {
+     // non-null in managed mode: the PLE n-gram table is cached on demand in a
+     // fixed-size host buffer instead of being mmap'd
+     std::shared_ptr<llama_lazy_reader> lazy_reader;
++
+ };
+ 
+ struct llama_model_qwen35moe : public llama_model_base {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 59f342c09..a18395836 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2930,6 +2930,16 @@ public:
+     std::vector<float> emb_scratch;
+ };
+ 
++// WIP/ple-residency: where does the decode gather spend its time?  LLAMA_PLE_TIMING=1
++static struct { uint64_t calls, fetch_ns, dequant_ns, upload_ns, rows, bytes_rows;
++                uint64_t r_calls, r_gather_ns, r_fetch_ns, r_fetch_mark;
++                // WIP/ple-residency probe: first-touch vs repeat rows, and mincore residency
++                uint64_t rows_new, ns_new, rows_rep, ns_rep, mc_res, mc_n; } g_ple_t, g_ple_d;
++static std::vector<uint8_t> g_ple_seen;   // 1 bit per 4 KiB page of the table
++static double ple_now(void) {
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e9 + t.tv_nsec;
++}
++
+ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     const auto & hp = pmodel.hparams;
+ 
+@@ -2992,12 +3002,46 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         }
+     }
+ 
++    // EXPERIMENT (r-session, not for delivery): dump the PLE gather indices so the row/page usage of
++    // a run can be analysed offline.  Format: "PLETRC01" then records of
++    // {uint32 n_tokens, int32 tok[n_tokens], int32 row[n_tokens * n_heads]}.  LLAMA_PLE_TRACE=<path>
++    if (const char * trace_path = getenv("LLAMA_PLE_TRACE")) {
++        static FILE * trace_f = [trace_path]() {
++            FILE * fh = fopen(trace_path, "wb");
++            if (fh != nullptr) {
++                fwrite("PLETRC01", 1, 8, fh);
++            } else {
++                fprintf(stderr, "ple trace: cannot open %s\n", trace_path);
++            }
++            return fh;
++        }();
++        if (trace_f != nullptr) {
++            const uint32_t nt = (uint32_t) n_tokens;
++            fwrite(&nt, sizeof(nt), 1, trace_f);
++            for (int64_t i = 0; i < n_tokens; ++i) {
++                const int32_t t = ubatch->token != nullptr ? (int32_t) ubatch->token[i] : (int32_t) -1;
++                fwrite(&t, sizeof(t), 1, trace_f);
++            }
++            fwrite(idx.data(), sizeof(int32_t), idx.size(), trace_f);
++            fflush(trace_f);
++        }
++    }
++
+     if (pmodel.lazy_reader) {
+         // managed path: dequantize the needed rows straight into the graph input.
+         // gather() lays dst out as dst[(i*n_heads + h)*ple_head_dim + d], which is
+         // exactly the flat layout of emb ([ple_head_dim*n_heads, n_tokens])
+         emb_scratch.resize(idx.size() * pmodel.hparams.ple_head_dim);
++        const double t_rd0 = ple_now();
+         pmodel.lazy_reader->gather(idx.data(), idx.size(), emb_scratch.data());
++        const double t_rd1 = ple_now();
++        if (getenv("LLAMA_PLE_TIMING")) {
++            auto & acc = (n_tokens == 1) ? g_ple_d : g_ple_t;
++            acc.r_calls++;
++            acc.r_gather_ns += (uint64_t) (t_rd1 - t_rd0);
++            acc.r_fetch_ns  += pmodel.lazy_reader->ns_fetch() - acc.r_fetch_mark;
++            acc.r_fetch_mark = pmodel.lazy_reader->ns_fetch();
++        }
+         ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
+ 
+         if (debug) {
+@@ -3018,6 +3062,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         GGML_ASSERT(tab->data != nullptr);
+ 
+         const auto * traits = ggml_get_type_traits(tab->type);
++        const double t_fetch0 = ple_now();
+ 
+ #if defined(__linux__) || defined(__APPLE__)
+         {
+@@ -3041,22 +3086,107 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         llama_prefetch_rows(tab, idx.data(), idx.size());
+ #endif
+ 
++        const double t_fetch1 = ple_now();
++
++        const bool probe = getenv("LLAMA_PLE_PROBE") != nullptr;
++        const long probe_page = probe ? sysconf(_SC_PAGESIZE) : 0;
++        const size_t n_tab_pages = probe ? (size_t) ((tab->ne[1]*row_size) / (size_t) probe_page + 1) : 0;
++        if (probe && g_ple_seen.size() < (n_tab_pages + 7)/8) {
++            g_ple_seen.assign((n_tab_pages + 7)/8, 0);
++        }
++        // are this gather's pages resident in the page cache right now?
++        if (probe && n_tokens == 1) {
++            const uintptr_t base = (uintptr_t) tab->data;
++            unsigned char vec = 0;
++            for (const int32_t r : idx) {
++                const void * pg = (const void *) ((base + (size_t) r * row_size) & ~(uintptr_t)(probe_page-1));
++                g_ple_d.mc_n++;
++                if (mincore((void *) pg, (size_t) probe_page, &vec) == 0 && (vec & 1)) {
++                    g_ple_d.mc_res++;
++                }
++            }
++        }
++
+         emb_scratch.resize(idx.size() * (size_t) dim);
+         for (size_t k = 0; k < idx.size(); ++k) {
+             const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+             float *      dst = emb_scratch.data() + k * (size_t) dim;
++            bool fresh = false;
++            const size_t pg = probe ? (size_t) (idx[k] * row_size / (size_t) probe_page) : 0;
++            if (probe) {
++                if (g_ple_seen[pg >> 3] & (1u << (pg & 7))) {
++                    fresh = false;
++                } else {
++                    g_ple_seen[pg >> 3] |= 1u << (pg & 7);
++                    fresh = true;
++                }
++            }
++            const double t_row0 = probe ? ple_now() : 0;
+             if (tab->type == GGML_TYPE_F32) {
+                 memcpy(dst, src, dim * sizeof(float));
+             } else {
+                 traits->to_float(src, dst, dim);
+             }
++            if (probe) {
++                const uint64_t ns = (uint64_t) (ple_now() - t_row0);
++                auto & acc = (n_tokens == 1) ? g_ple_d : g_ple_t;
++                if (fresh) { acc.rows_new++; acc.ns_new += ns; }
++                else       { acc.rows_rep++; acc.ns_rep += ns; }
++            }
+         }
++        const double t_dq = ple_now();
+         ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        const double t_up = ple_now();
++        if (getenv("LLAMA_PLE_TIMING")) {
++            auto & acc = (n_tokens == 1) ? g_ple_d : g_ple_t;
++            acc.calls++;
++            acc.fetch_ns   += (uint64_t) (t_fetch1 - t_fetch0);
++            acc.dequant_ns += (uint64_t) (t_dq - t_fetch1);
++            acc.upload_ns  += (uint64_t) (t_up - t_dq);
++            acc.rows       += idx.size();
++            acc.bytes_rows += idx.size() * row_size;
++        }
+     } else {
+         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+     }
+ }
+ 
++static void ple_report_one(const char * tag, const void * p) {
++    const auto & a = *(const decltype(g_ple_t) *) p;
++    if (a.calls == 0) return;
++    fprintf(stderr, "ple timing %s: %llu gathers, %llu rows (%.2f MiB)\n"
++                    "            hint    %8.2f ms total, %7.1f us/gather\n"
++                    "            read+dq %8.2f ms total, %7.1f us/gather, %6.1f us/row\n"
++                    "            upload  %8.2f ms total, %7.1f us/gather\n",
++            tag, (unsigned long long) a.calls, (unsigned long long) a.rows, a.bytes_rows/1048576.0,
++            a.fetch_ns/1e6, a.fetch_ns/1e3/a.calls,
++            a.dequant_ns/1e6, a.dequant_ns/1e3/a.calls, a.dequant_ns/1e3/a.rows,
++            a.upload_ns/1e6, a.upload_ns/1e3/a.calls);
++}
++void llama_qwen4exp_ple_timing_report() {
++    if (!getenv("LLAMA_PLE_TIMING")) return;
++    ple_report_one("decode (1 tok)", &g_ple_d);
++    ple_report_one("prefill       ", &g_ple_t);
++    if (getenv("LLAMA_PLE_PROBE")) {
++        for (auto * a : { &g_ple_d, &g_ple_t }) {
++            if (!a->rows_new && !a->rows_rep) continue;
++            fprintf(stderr, "ple probe: new-page rows %llu @ %.1f us, repeated-page rows %llu @ %.1f us"
++                            " | mincore resident %llu/%llu (%.0f%%)\n",
++                    (unsigned long long) a->rows_new, a->rows_new ? a->ns_new/1e3/a->rows_new : 0.0,
++                    (unsigned long long) a->rows_rep, a->rows_rep ? a->ns_rep/1e3/a->rows_rep : 0.0,
++                    (unsigned long long) a->mc_res, (unsigned long long) a->mc_n,
++                    a->mc_n ? 100.0*a->mc_res/a->mc_n : 0.0);
++        }
++    }
++    if (g_ple_d.r_calls) {
++        fprintf(stderr, "ple timing managed decode: %llu gathers, %7.1f us/gather total,"
++                        " of which fetch %7.1f us/gather (%.0f%%)\n",
++                (unsigned long long) g_ple_d.r_calls, g_ple_d.r_gather_ns/1e3/g_ple_d.r_calls,
++                g_ple_d.r_fetch_ns/1e3/g_ple_d.r_calls,
++                100.0*g_ple_d.r_fetch_ns/(double) g_ple_d.r_gather_ns);
++    }
++}
++
+ // Read a conv history out of its own recurrent row and write the new tail back.
+ // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
+ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
