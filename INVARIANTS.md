@@ -1952,8 +1952,12 @@ path.**
    because the scheduler's own pipeline parallelism is enabled there
    (`pipeline_parallel = n_devices > 1 && all layers on GPU && -sm layer && offload_kqv &&
    !has_tensor_overrides() && moe_cache_size == 0`), and a two-lane prefill declines when it is on.  The
-   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor`, `-sm row`
-   -- which is exactly the layout the PR was measured in.  **Measure a scheduler feature's REACHABILITY
+   reachable case is a layout where pipeline parallelism is *already* off -- `--override-tensor` -- which is
+   exactly the layout the PR was measured in.  **`-sm row` is not a layout on this backend at all**: it fails
+   at model load (`llama_model_load: device ROCm0 does not support split buffers`), so the r220 artifact's
+   "`-sm row`, `-sm none` with 2+ GPU backends engage" line was an inference from the gate and is wrong for
+   ROCm -- `-sm none` is one GPU backend, i.e. the `-sm tensor` case.  **`-sm layer` plus any `-ot`, and
+   nothing else, is reachable here.**  **Measure a scheduler feature's REACHABILITY
    before its gain** (`optional/two-lane-prefill/README.md` carries the table).
 2. **A queued HIP stream wait binds to the LATEST record, so a shared copy event re-binds consumers.**
    The cross-backend split-input copy used to record the backend's shared per-device `copy_event` and make
@@ -1966,12 +1970,16 @@ path.**
    switch.  Bit-exact: same-seed greedy text identical on `-sm tensor`, `-sm layer` and `-sm layer -ncmoe`,
    and throughput-neutral (pp8192 3-GPU `-sm layer` 6311 vs 6317 t/s) -- the repair is a decoupling, not a
    speedup on a box where the copies were not actually contending.
-3. **An overlap technique buys nothing on devices of equal throughput.**  With identical cards every split
-   is already the critical path, so a second ubatch in flight adds queueing and no work: measured +0.03 %
-   (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with the pair engaged (`pair decided: splits a=4 b=4,
-   interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 % are a 7900 XTX (gfx1100) + V620 (gfx1030)
-   pair, whose devices differ ~3x: the overlap hides an imbalance.  A device-heterogeneous layout is not
-   one of this delivery's validated configurations, which is why that feature is `optional/`, not a block.
+3. **An overlap technique buys nothing on devices of equal throughput -- when both ubatches are ALREADY wide.**
+   With identical cards every split of a wide ubatch is already the critical path, so a second *whole* ubatch
+   in flight adds queueing and no work: measured +0.03 % (MoE 35B-A3B Q8_0) and nil (dense 27B Q6_K_XL) with
+   the pair engaged (`pair decided: splits a=4 b=4, interleaved=1`) on 3 x R9700.  The submitter's +34 %/+13 %
+   are a 7900 XTX (gfx1100) + V620 (gfx1030) pair, whose devices differ ~3x: there the overlap hides an
+   imbalance.  A device-heterogeneous layout is not one of this delivery's validated configurations, which is
+   why that feature is `optional/`, not a block.  **The r229 cut qualifies this rather than overturning it**
+   (see *"no release, r229 tree"* below): pair two halves that were SPLIT out of one wide ubatch and balanced
+   devices gain +27 %/+41 %, because one unsplit ubatch serializes the layer-split pipeline and the split hands
+   the second lane work to do.  The pair *alone* is still worth nothing -- the split is what unlocks it.
 4. **A `hip*` spelling in `ggml-cuda.cu` needs the `#ifdef GGML_USE_HIP` form.**  `ggml-cuda.cu` still
    builds under nvcc for CUDA, and `hipEventDefault` / `hipEventElapsedTime` have no `cuda*` alias in this
    toolchain (using `cudaEventElapsedTime` in a HIP build fails with `use of undeclared identifier`).  The
@@ -2412,3 +2420,36 @@ on Linux.**
   `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and its priming pass reserves the work region at the
   width the real prefills need.  So this is not the field prefill's residual -- that one is the near-mirror miss
   path.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
+
+## (no release, r229 tree) -- the two-lane pair only pays when the SPLIT creates its partner; a declined pair must not still split
+
+PR #279 (@slavap) re-cut `optional/two-lane-prefill` onto r229 and added the sub-ubatch split, which turns
+r220's "nil on balanced devices" into a real win -- and a real regression that the same rule has to cover.
+
+1. **A single wide prefill ubatch serializes the layer-split pipeline; splitting it and running the halves on
+   two lanes is worth a quarter of the prefill.**  3 x R9700 gfx1201, the only reachable layout (`-sm layer
+   -ts 1/1/1 -ot`, which turns pipeline parallelism off), `-ub 2048`, ABBA x4: MoE 35B-A3B Q8_0 pp2048 **6621
+   -> 8436 t/s (+27.4 %)**, pp4096 6486 -> 8245 (+27.1 %), pp8192 with `-b 8192` (one decode call, 4 ubatches
+   paired 2x2) 6240 -> 9251 (+48.3 %); dense 27B Q6_K_XL pp2048 1293 -> **1823 (+41.0 %)**, pp8192 1488 ->
+   1745 (+17.3 %); tg nil.  The 2x2 says why it needs BOTH halves: **split alone** (lanes unset, `-ub 1152`,
+   the same two ubatch boundaries run serially) is a **loss** (-15.3 % MoE, -3.6 % dense) and **pair alone**
+   (`LLAMA_LANES_SPLIT_MIN=0`, one ubatch so nothing to pair) is nil (+1.2 % / -1.2 %).  That is r220 fact 3
+   qualified, not contradicted: the pair added nothing when both partners were already wide.
+2. **The pair itself is bit-exact; the split's divergence IS a ubatch-boundary change.**  lanes=2 vs lanes
+   unset at the same ubatching measures **exactly** the divergence of a plain `-ub 1152` vs `-ub 2048` change on
+   the same build (mean KLD `0.004088`, same-top-p `97.898 %`, identical to six digits -- the `GREEDY-PURITY.md`
+   §46 benign-reordering scale), and the default path stays bit-identical to the delivery (KLD `0.000000`,
+   same-top-p 100 %).  So "greedy text byte-identical between lanes" is true but it is the greedy path's luck:
+   judge this artifact on the KLD equality, not on the text.
+3. **A feature that declines a workload at one gate must decline it at EVERY gate.**  The split was gated on
+   `prefill_lanes >= 2 && sched_lane && cb_eval == nullptr` while the pair also requires
+   `!embeddings_nextn && !lf_layer_inp_dev`; a draft workload (MTP / DFlash) therefore declined the pair and was
+   still split, paying a narrower ubatch for nothing -- 35B-A3B Q8_0 + DFlash2 pp2048 **3981.8 -> 3427.4 t/s
+   (-13.9 %)** with diverging greedy text.  Mirroring the pair's fields in the split gate restores both (text
+   sha `f61214fad249` == lanes unset).  Residual: arming the lanes on a draft context still costs ~4 % prefill /
+   ~2 % decode (second compute-buffer set + one drain per ubatch) even though nothing pairs.
+4. **The reachable layout costs ~1.4 GiB and is not free at the edges.**  A second compute-buffer set per armed
+   context (441/430/430/65 MiB at `-ub 2048`); a **second context in one process is ~8 % slower** with the lanes
+   armed (pp8192 7976 -> 7347, lanes unset flat 7513-7519 over three contexts); `llama-batched-bench -npp 2048
+   -npl 1,4,8` gives **B=8 prefill -3.5 %** (8776 -> 8467) while B=1 gains +28.8 %.  Do not enable this on a
+   many-slot server; it is a single-long-prompt design.

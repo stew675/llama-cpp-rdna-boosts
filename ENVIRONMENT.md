@@ -1056,11 +1056,13 @@ These exist only in a checkout made with `scripts/apply-all.sh --include-optiona
 never reads them.  They are catalogued here because a consumer who applies an optional artifact is running
 these code paths and needs the same default/class discipline (`optional/README.md`).
 
-`optional/two-lane-prefill` (from PR #268, @slavap):
+`optional/two-lane-prefill` (from PR #268/#279, @slavap):
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `LLAMA_PREFILL_LANES` | `1` | opt-in (value) | `2` enables the two-lane prefill (two consecutive prefill ubatches on two backend schedulers, splits submitted alternately).  Anything else, or a layout the artifact cannot reach, logs one WARN and stays single-lane.  **Read and refused under `-sm tensor` (one backend) and under plain `-sm layer` (pipeline parallelism on)** — the reachability table is in `optional/two-lane-prefill/README.md`. |
+| `LLAMA_PREFILL_LANES` | `1` | opt-in (value) | `2` enables the two-lane prefill (two consecutive prefill ubatches on two backend schedulers, splits submitted alternately).  Anything else, or a layout the artifact cannot reach, logs one WARN and stays single-lane.  **Read and refused under `-sm tensor` (one backend) and under plain `-sm layer` (pipeline parallelism on)**; `-sm row` does not load on ROCm at all, so `-sm layer` + any `-ot` is the only reachable layout — the reachability table is in `optional/two-lane-prefill/README.md`.  Arming the lanes on a draft context costs ~4 % prefill / ~2 % decode even though the pair declines there. |
+| `LLAMA_LANES_SPLIT_MIN` | `1024` | opt-in (value) | minimum batch size in tokens for the two-lane sub-ubatch split; `0` disables the split (whole-ubatch pairing only, the r220 behaviour).  The split is gated exactly like the pair, so a draft workload (`nextn` / F1 layer inputs) declines both.  `optional/two-lane-prefill` only. |
+| `LLAMA_LANES_SPLIT_FRAC` | `0.55` | tuning (value) | fraction of the batch the first sub-ubatch takes (clamped to [0.1, 0.9], rounded up to 64, the chunked-GDN chunk).  `optional/two-lane-prefill` only. |
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 

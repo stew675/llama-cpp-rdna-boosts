@@ -1,3 +1,66 @@
+## 261106.022 (optional) -- PR #279: the two-lane artifact is re-cut onto r229, its split now declines with its pair, and it finally measures a win here
+
+**Nothing ships.**  `patches/` and `release.json` are untouched (no block changed, tree
+`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7`), so there is no tag: this is `optional/two-lane-prefill/` only,
+plus the variable catalogue, the rulebook and this record.  Contribution: **[PR #279](https://github.com/stew675/llama-cpp-rdna-boosts/pull/279)
+by [@slavap](https://github.com/slavap)** -- a re-cut of the r220 artifact with the *sub-ubatch split* and
+output-aware pairing.  Artifact sha256 `c451d99696aa13218147e2117db3d411804cb74a6b2a41e98c6009203e87457e`,
+applied tree `0d8d509d78bb5ba2f3797af0a39e9466fd1e6668` (strict `git am` on a fresh `.tip` checkout).
+
+### The claim check first (all of it, on 3 x R9700 / gfx1201, ROCm 10.1)
+
+Verified: the sha256 and both trees are exact; the patch applies **strictly** at the r229 tree; the base side
+really is byte-identical to the r220 cut (only `src/llama-context.cpp/.h` differ -- the other files differ in
+`index`/hunk offsets and the trailing git version, nothing else); it builds; and the default path is
+**bit-identical** (prefill-logit KLD `0.000000` / same-top-p 100 % against a base recorded from the delivery
+build, pp2048 6604-6628 vs 6618-6636 t/s ABBA).
+
+Not supported as written: **the headline +60.8 % is not attributable** -- it bundles the new split with the
+pair, and on this box each alone is a loss or nil (below); the artifact README's *"throughput-neutral on
+balanced devices (+0.03 % MoE, nil dense)"* is the **r220 cut's** number and is false for this one; `-sm row`
+is listed as a reachable layout but does not load on ROCm (`device ROCm0 does not support split buffers`);
+and "greedy text byte-identical" is the greedy path's luck, not identity -- the logits move exactly as a
+`-ub` change does.
+
+### What it turns out to be worth (and why r220 measured nothing)
+
+r220 paired two *already wide* ubatches and got +0.03 %.  This cut creates the partner by **splitting one wide
+ubatch**, and that is the whole difference: one 2048-token ubatch serializes the layer-split pipeline, its two
+halves on two lanes do not.  2x2 at pp2048, `-sm layer -ot`: MoE 35B-A3B Q8_0 **split alone -15.3 %** (5608 vs
+6621), **pair alone nil** (6703 with `LLAMA_LANES_SPLIT_MIN=0`), **split + pair 8436 (+27.4 %)**; dense 27B
+Q6_K_XL -3.6 % / -1.2 % / **1823 (+41.0 %)**.  Also pp4096 +27.1 %, pp8192 `-b 8192` (one decode call)
+**+48.3 %**, pp512 neutral, tg nil, and a 27B `-mtp` gguf +27.7 % prefill.  The pair adds no approximation of
+its own: lanes=2 vs lanes unset measures *exactly* the `-ub 1152` vs `-ub 2048` divergence (KLD 0.004088,
+same-top-p 97.898 %, identical to six digits).
+
+### Two amendments (they are in the artifact, not filed as TODOs)
+
+1. **The split is now gated exactly like the pair** -- `!cparams.embeddings_nextn && !cparams.lf_layer_inp_dev`.
+   A draft workload declined the pair and was still split, i.e. it paid a narrower ubatch for nothing: 35B-A3B
+   + DFlash2 pp2048 **3981.8 -> 3427.4 t/s (-13.9 %)** with diverging greedy text.  Both restored (lanes unset
+   4026/4042 vs armed 3894/3867, text sha `f61214fad249`); the ~4 % that remains is the arming cost (second
+   compute-buffer set + one drain per ubatch), documented.
+2. **Restored the delivery comment line the r220 cut had dropped** in `src/llama-context.h` (the MTP sched2 note
+   read "… every cycle; with / scheduler, so both stay allocated").  The artifact no longer deletes delivery
+   text it does not mean to.
+
+### What it costs, and why it is still not a block
+
+A second compute-buffer set per armed context (~1.4-1.5 GiB at `-ub 2048`); **a second context in one process
+is ~8 % slower** with the lanes armed (pp8192 7976 -> 7347; lanes unset flat 7513-7519); `llama-batched-bench
+-npp 2048 -npl 1,4,8` gives **-3.5 % at B=8** while B=1 gains +28.8 %.  And it is **inert in both splits the
+delivery validates** (`-sm tensor` is one backend; plain `-sm layer` has pipeline parallelism on) -- reaching it
+costs an `-ot` override.  So: keep it `optional/`, document the numbers and the costs, and revisit promotion
+when it reaches `-sm tensor` (pairing inside the Meta device) or plain `-sm layer`, or when the three edges
+above are gone.  `INVARIANTS.md` gains the r229-tree section and r220 facts 1/3 are corrected in place;
+`ENVIRONMENT.md` gains `LLAMA_LANES_SPLIT_MIN`/`_FRAC`.
+
+**Gates run:** strict apply on a fresh `.tip` checkout (tree asserted); build of the artifact tree in the
+`scripts/scratch-tree.sh` path (`all` targets); `scripts/gate-prefill-logits.sh` **PASS** (KLD 0.000000) for the
+default path with the amendment built; greedy text `f61214fad249` (MoE, incl. DFlash2) and `8c1c642fc7cd`
+(dense) across lanes; `llama-batched-bench -npl 1,4,8`; `check-gpu-faults.sh` clean on the session window.  Not
+run and not owed: the block gates -- the artifact is not in the delivery and `release.json` did not move.
+
 ## 261106.021 (campaign) -- `TODO` #276/#277/#278 close: the demote never runs beside a paired all-reduce, and the arena transition is unmeasurable
 
 **A second measurement pass on the same day, on a different box.**  The first pass

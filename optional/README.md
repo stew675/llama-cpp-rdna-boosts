@@ -47,4 +47,4 @@ and recorded in `WORKLOG.md`; no stubs are left behind.
 
 | artifact | what | measured | status |
 |---|---|---|---|
-| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits (from PR #268, @slavap) | throughput-neutral on balanced devices (+0.03 % MoE, nil dense); the submitter's +34 %/+13 % are on a 7900 XTX + V620 pair, where the overlap hides a ~3× device imbalance | **optional**, 2026-11-05, on r220 |
+| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits, plus the sub-ubatch split that makes a single wide batch pair (from PRs #268/#279, @slavap) | **+27.4 % MoE 35B-A3B pp2048, +41.0 % dense 27B pp2048, +48.3 % at pp8192/-b 8192** on 3 x R9700 gfx1201 in the `-sm layer -ot` layout (the only one it reaches); nil decode, default path bit-identical.  The gain needs both halves -- the split alone is −15 %, the pair alone nil.  Costs: a second compute-buffer set (~1.4 GiB/context), ~8 % on a second context, −3.5 % at `-npl 8`, ~4 % if armed with a draft | **optional**, r229 re-cut, 2026-11-06 |
