@@ -36,10 +36,17 @@ priming pass.
 | E2 | field ubatch `-c 204800 -ub 6144 -npp 2048,8192` | 3 | 1062 MiB | 1 × **12 tables** | 95.4\* / 1704.2 |
 | E3 | field ubatch, `-npp 4096,4096,4096` | 2 | 184 MiB | 2 × 3 tables | 154.0\* / 1406.9 / **1629.0** |
 | N1 | **3 GPU `-sm tensor`**, `-c 16384 -ub 2048 -npp 1024,2048,4096` | **0** | — | — | 16.3\* / 2084.1 / 2207.5 |
-| N2 | 35B-A3B Q4_K_M, 1 GPU (`-ncmoe 40` *and* `-ncmoe 48`; arena auto *and* `MOE_EXPERT_CACHE_MIB=26000`) | **0** | — | — | — |
+| N2 | 35B-A3B **Q4_K_M**, 1 GPU (`-ncmoe 40` *and* `-ncmoe 48`; arena auto *and* `MOE_EXPERT_CACHE_MIB=26000`) | **0** | — | — | — |
+| **E4** | **35B-A3B Q8_0**, 1 GPU, `-ncmoe 40 -lme 12 -c 16384 -ub 2048 -npp 4096,4096,4096` | **2** | **380 MiB** | 2 × 3 tables | 565.6\* / 3579.3 / **3649.2** |
 
 `*` the first row of every arm is the pool build/prepopulate (a one-off 45 GiB read for the Flash-Next arms),
 never a cache number.
+
+**E4 is the cheap reproduction** (Q8_0 loads in a fraction of Flash-Next's 84 GB and runs at 3.6 k t/s): 2 events,
+380 MiB, `re-armed 3 stood-down` twice, arena 22 695.0 MiB inside a 25.81 GiB region (slab 28.00 GiB, work
+2.19 GiB), and the post-transition row is again **+2.0 %** over its predecessor.  The eviction is driven by the
+*work region outgrowing its reservation*, not by the arena filling the slab — which is why Q4_K_M, whose priming
+pass already saw the full `-ub` prefill and so reserved enough, never evicts (N2).
 
 ### 1.2 The cost, bounded two ways
 
@@ -53,14 +60,16 @@ never a cache number.
   E1's row 4 (1 578.9) is +0.4 % over row 3 (1 572.6) with an extra eviction in between.  The warm-up gradient
   dominates; there is no transition penalty to find.
 
-### 1.3 Why the cheap model cannot reproduce it (a trap worth recording)
+### 1.3 Why the cheaper Q4_K_M arm cannot reproduce it (a trap worth recording)
 
-35B-A3B Q4_K_M cannot be made slab-bound on a 32 GiB card: its whole host expert set is **18 662 MiB** (120
-tables × 256 experts, `-ncmoe 40` already hosts every MoE layer — `-ncmoe 48` is the same set), and
-`alloc_table_locked` **clamps slots at `n_experts`**, so no `MOE_EXPERT_CACHE_MIB` value can force the arena past
-it.  At `-ub 2048` the slab's arena region is 25.75 GiB; at `-ub 8192` the slab reserves the larger work region
-up front (`work 8.62 GiB + arena 19.19 GiB`) so nothing ever grows into the arena.  **Zero evictions in every
-35B-A3B arm** — the reproduction needs a set larger than the slab's arena region (Flash-Next, or a Q8_0 35B-A3B).
+35B-A3B **Q4_K_M** does not evict on a 32 GiB card in any configuration tried: its whole host expert set is only
+**18 662 MiB** (120 tables x 256 experts, `-ncmoe 40` already hosts every MoE layer — `-ncmoe 48` is the same set),
+`alloc_table_locked` **clamps slots at `n_experts`** so no `MOE_EXPERT_CACHE_MIB` can force the arena past it, and
+its priming pass already sees the full `-ub 2048` prefill so the work region is reserved at the size the real
+prefills need (`work 8.62 GiB + arena 19.19 GiB` at `-ub 8192`).  **Zero evictions in every Q4_K_M arm.**  The
+cheap reproduction is **Q8_0** of the same model (E4: 380 MiB, 2 events) — the set is ~33 GiB, the arena lands at
+22 695.0 MiB and the work region does outgrow its reservation.  The cost is the same nothing: 380 MiB is 13-20 ms
+at 19-28.7 GB/s, <=1.4 % of a 4 096-token prompt, and measured as **+2.0 %** (faster) across the transition.
 
 ### 1.4 Verdict
 
@@ -135,6 +144,24 @@ preceded by a transition, and it measures **faster** than the second.
 
 Controls: the same command with **`-sm tensor` at 3 devices** (`HIP_VISIBLE_DEVICES=0,1,2`) is **0 evictions**;
 **35B-A3B Q4_K_M at 1 GPU** is 0 evictions for every `MOE_EXPERT_CACHE_MIB` / `-ncmoe` / `-ub` tried (§1.3).
+
+**The cheap reproduction (E4, 35B-A3B Q8_0 — no 84 GB model, 3.6 k t/s):**
+
+```bash
+cd ~/llama.cpp && HIP_VISIBLE_DEVICES=0 MOE_HOST_POOL_FRAC=80 MOE_HOST_POOL_RAM_PCT=0 \
+  timeout 1800 ./build-rocm/bin/llama-batched-bench \
+    -m /llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf \
+    -ngl 99 -ncmoe 40 -lme 12 -fa 1 -c 16384 -b 2048 -ub 2048 \
+    -npp 4096,4096,4096 -ntg 32 -npl 1 -t 8 -lv 4 2>&1 | tee /tmp/278-q8.log
+
+grep -c "evicted .* arena tables" /tmp/278-q8.log          # expect 2
+grep -o "evicted [0-9.]* MiB" /tmp/278-q8.log | awk '{s+=$2} END {print s" MiB"}'   # 380
+grep -oE "re-armed [0-9]+ stood-down" /tmp/278-q8.log | sort | uniq -c              # 2x 3 tables
+grep -E "^\|\s+[0-9]+\s+\|" /tmp/278-q8.log                                      # row 3 >= row 2
+```
+
+Reference: slab 28.00 GiB (`work 2.19 GiB + arena 25.81 GiB`), arena ends at 22 695.0 MiB, rows
+565.6 / 3579.3 / 3649.2 t/s.  The measured control is the same shape on **Q4_K_M** (N2), where the count is **0**.
 
 **#276, the two layouts:**
 

@@ -2407,7 +2407,8 @@ on Linux.**
   got at `ggml_cuda_slab_init_locked`: Flash-Next, one GPU, `-c 204800 -ub 6144` -> 3 events, **1 062 MiB**, one
   `re-armed 12 stood-down` (37-56 ms, <=0.2-1.2 % of the prompt), and three identical 4 096-token rows measure the
   post-transition row **+15.8 % over** its predecessor.  On the 3-GPU `-sm tensor` field shape the count is
-  **zero**, and 35B-A3B Q4_K_M cannot reproduce it at all: its whole host set is 18 662 MiB (the arena clamps at
-  `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and a big `-ub` makes the slab reserve the work
-  region up front instead of growing into the arena.  So this is not the field prefill's residual -- that one is
-  the near-mirror miss path.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
+  **zero**, and the cheap reproduction is **Q8_0** 35B-A3B (2 events, 380 MiB, `re-armed 3 stood-down` twice, the
+  post-transition row +2.0 %) -- `Q4_K_M` cannot show it: its whole host set is 18 662 MiB (the arena clamps at
+  `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and its priming pass reserves the work region at the
+  width the real prefills need.  So this is not the field prefill's residual -- that one is the near-mirror miss
+  path.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.

@@ -189,8 +189,11 @@ does not generalise: `soar` has 3 × R9700 and a PCIe 5.0 x16 link each** — mu
 all-reduce run there, and the canonical heat prior (`6195152358e1…`) is present on that box.  Say which box.
 6. **A first-run penalty is real on this rig** (`bench-56gb`'s cold-start rows): interleave arms, never judge a
    pair from one block-ordered pass.
-7. **35B-A3B cannot be made slab-bound on a 32 GiB card**, so it cannot reproduce the arena transition eviction:
-   its whole host expert set is 18 662 MiB (`-ncmoe 40` already hosts every MoE layer) and `alloc_table_locked`
-   clamps slots at `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces the arena past it — and at a large `-ub` the
-   slab reserves the bigger work region up front instead of growing into the arena.  Use Flash-Next (set
-   46.84 GiB) for that question; the reproduction is in `RESULTS-2026-11-06-soar.md` §3.
+7. **35B-A3B Q4_K_M cannot reproduce the arena transition eviction**, so use **Q8_0** of the same model for it:
+   Q4_K_M's whole host expert set is 18 662 MiB (`-ncmoe 40` already hosts every MoE layer) and
+   `alloc_table_locked` clamps slots at `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces the arena past it — and
+   its priming pass already sees the full `-ub` prefill, so the work region is reserved at the width the real
+   prefills need and never outgrows it (**0 evictions in every arm**).  **Q8_0 35B-A3B does evict**
+   (`-ncmoe 40 -lme 12 -c 16384 -ub 2048`: 2 events, 380 MiB, `re-armed 3 stood-down` twice) at 3.6 k t/s, which
+   is the cheap reproduction; Flash-Next is only needed for the field ubatch.  Both commands are in
+   `RESULTS-2026-11-06-soar.md` §3.

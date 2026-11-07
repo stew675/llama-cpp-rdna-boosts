@@ -46,9 +46,11 @@ transport handles closed together:
   `re-armed 12 stood-down expert-cache tables`.  The cost is bounded by the evicted bytes — 37-56 ms, i.e.
   **≤0.2-1.2 % of the prompt** — and invisible where it matters: three identical 4 096-token rows measure the
   post-transition one **+15.8 %** over its predecessor.  On the 3-GPU `-sm tensor` field shape there are **zero**
-  events, and 35B-A3B cannot be made slab-bound at all (its whole set is 18 662 MiB and the arena clamps at
-  `n_experts`), which is the trap to know.  Re-entry: an arena *exactly* slab-full with short (≤4k) prompts, or the
-  56 GiB rig measured directly.
+  events.  The cheap reproduction is **Q8_0** 35B-A3B (2 events, 380 MiB, `re-armed 3 stood-down` twice, the
+  post-transition row **+2.0 %**) — `Q4_K_M` cannot show it, because its whole set is 18 662 MiB, the arena clamps
+  at `n_experts` and its priming pass reserves the work region at the width the real prefills need; that clamp is
+  the trap to know.  Re-entry: an arena *exactly* slab-full with short (≤4k) prompts, or the 56 GiB rig measured
+  directly.
 
 **The closes correct the r228 frame** (`PR-267-REMAINDER.md` §3.0/§3): 0003b is not "the field prefill's main
 residual" — that residual at `auto` is the near-mirror **miss path**, which `SINK=0` already takes.  What remains of

@@ -35,11 +35,12 @@ one `re-armed 12 stood-down expert-cache tables`** -- bounded by the evicted byt
 the prompt**, and invisible where it counts: three identical 4 096-token rows measure the post-transition one
 **+15.8 % over** its predecessor (1 629.0 vs 1 406.9 t/s), and at `-c 16384 -ub 2048` rows 3 and 4 are flat (1 572.6
 -> 1 578.9) across the same events.  On the **3-GPU `-sm tensor` field shape there are zero events** (arena 16 065
-MiB, well inside the slab's 25.25 GiB), and 35B-A3B Q4_K_M **cannot be made slab-bound at all** -- its whole host
-set is 18 662 MiB, `alloc_table_locked` clamps slots at `n_experts` so no `MOE_EXPERT_CACHE_MIB` forces the arena
-past it, and at `-ub 8192` the slab reserves the wider work region up front (`work 8.62 GiB + arena 19.19 GiB`)
-instead of growing into the arena.  That clamp is the trap the reproduction notes carry: the cheap model cannot
-show this, Flash-Next (46.84 GiB set) or a Q8_0 35B-A3B is needed.
+MiB, well inside the slab's 25.25 GiB), and 35B-A3B **Q4_K_M** cannot show it at all -- its whole host set is
+18 662 MiB, `alloc_table_locked` clamps slots at `n_experts` so no `MOE_EXPERT_CACHE_MIB` forces the arena past it,
+and its priming pass reserves the work region at the width the real prefills need.  That clamp is why the cheap
+reproduction is **Q8_0** of the same model: `-ncmoe 40 -lme 12 -c 16384 -ub 2048 -npp 4096,4096,4096` gives **2
+events, 380 MiB, `re-armed 3 stood-down` twice**, arena 22 695.0 MiB inside a 25.81 GiB region, at 3.6 k t/s -- and
+the post-transition row is **+2.0 %** (faster), the same nothing the Flash-Next arms show.
 
 **The r228 frame is corrected by that number.**  `PR-267-REMAINDER.md` §3.0 ranked 0003b as "now the highest-value
 prefill item" and "the field prefill's main residual".  It is not: the residual at `auto` (97.7 %) is the
