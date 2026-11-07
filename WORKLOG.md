@@ -1,3 +1,58 @@
+## 261107.007 (tooling) -- `utilities/storage-oracle`: which load mode and residency this model file wants on its device (refs issue #281)
+
+**New: `utilities/` -- a reporter, not the delivery.**  Nothing in `patches/`, `release.json` or the
+gates changes.  `utilities/storage-oracle/storage-oracle.sh` takes one model file and measures **that file
+on that device**: a band map (an average over the whole file hides the single number that decides the
+verdict -- one shard here reads 0.23 GB/s in its first GiB and 12 GB/s from 17 GiB on), cold 4 KiB
+latency for `O_DIRECT` / buffered `pread` / `mmap` fault, cold 1 MiB, sequential throughput, the
+**idle-gap wake ladder** (no datasheet publishes it; 74 us while busy against **16.2 ms** after a 250 ms
+pause on the Lexar, 0.6 ms on the SN850X), cold reads *while the file streams*, page-cache residency, and
+the `MemAvailable`/`RLIMIT_MEMLOCK` budget.  The report ranks `--load-mode`/`--lazy-mode` on **two axes --
+the first cold load and every restart** -- states the measurement behind every cell, and carries an
+explicit avoid list (`AVOID` / `BROKEN` / `INERT` / `UNCONFIRMED` / `UNKNOWN` / `TRADEOFF` / `ADVISORY`).
+`--verify` loads the model three times (shipped default cold, the recommendation cold, the recommendation
+**warm**) and compares wall clock, **the bytes the block device actually read**, and the restart.  It is
+referenced from **issue #281** because the transport trade-off that issue turns on is exactly what these
+probes measure: the same file's buffered-pread rate against its `O_DIRECT` rate (3.7 against 6.9 GB/s on
+one model here, 3.7 against 3.4 on another -- the ranking is file *and* device specific, which is the
+whole reason a tool has to measure it), how many bytes each arm really reads
+(`--load-mode dio` reads **15 % more than the file holds** from alignment re-reads: 4 921 vs 4 275 MiB),
+and whether an on-demand read during decode is survivable at all.
+
+**Three findings from building it -- the first two are traps in the measurement itself.**
+
+1. **`POSIX_FADV_DONTNEED` cannot drop a 4 KiB page out of a large folio.**  On XFS with large folios a
+   page-granular eviction silently does nothing and the "cold" read returns from cache in **0.2 us**; the
+   first version of the probe reported exactly that on a file with 39 GiB of hot page cache and believed
+   it.  The probe now evicts with folio-aligned windows (2/32/256 MiB), **verifies with `mincore`**, and
+   counts and skips samples it cannot make cold (`skipped_warm=`).  Corrected, verified-cold, on the
+   Lexar: `O_DIRECT` **74 us**, buffered `pread` **150 us**, `mmap` fault **150 us** at 4 KiB -- the two
+   page-cache mechanisms cost ~2x `O_DIRECT` at page granularity, not the parity an unverified probe
+   reports.
+2. **A failed `llama-cli` arm looks like a spectacularly fast one.**  `--verify` first reported a 0.86 s
+   "load" that had read 11 MiB: the arm had OOMed (`-sm layer -ngl 99` put 34.7 GiB on device 0) and the
+   tool timed the failure.  An arm now has to exit 0 **and** print a prompt-eval line, or it is `FAILED`
+   with its root-cause log line, and the section says the prediction was neither confirmed nor refuted.
+3. **`--lazy-mode mlock` is inert on a model with no `TENSOR_READ_LAZY` table.**  Qwen3.5-4B has none:
+   `mmap --lazy-mode mlock` 5.17 s against `mmap --lazy-mode off` 5.18 s cold, i.e. the mode did nothing.
+   Gemma4-E4B has one (`pinned 1 table(s), 2856 MiB`), and that is the form r230's fastest restart used.
+   So the tool reads the loader's `pinned N table(s), X MiB` line out of `--verify`, marks the pinning
+   plans `UNCONFIRMED` when the model was never loaded, `INERT` when 0 tables are pinned (and rewrites
+   the pin-specific advice, since there is nothing to pin), and prefers the pin on both mapped forms
+   (`none`/`mmap`) whenever the working set fits `MemAvailable` and `RLIMIT_MEMLOCK` allows it -- which
+   is r230's own conclusion, restated as a measurement: a pin survives the process, a copy does not.
+
+**Measured against the r232 tree** (`8650138aa`, tree `53a43c600`): Gemma4-E4B Q8_0, one R9700,
+`/llm` = the Lexar -- cold **7.08 s** reading 7 813 MiB, warm restart **1.30 s reading 0 MiB**, so the
+second start is 18 % of the first; on that file `O_DIRECT` reaches 2.97 GB/s, buffered `pread` 2.44 and
+the `mmap` fault-in path 1.28, and the idle-gap ladder reads 2.5 / 4.7 / 16.3 / 16.3 ms for 5 / 50 / 250 /
+1000 ms -- i.e. the pin/stream question and the "never read on demand" question, both answered from the
+same run.  Records:
+[`utilities/storage-oracle/README.md`](utilities/storage-oracle/README.md) (thresholds, the why, and the
+design rules), [`utilities/storage-oracle/EXAMPLE-REPORT.md`](utilities/storage-oracle/EXAMPLE-REPORT.md)
+(a real run, verifying arm by arm).  Not a campaign and not a `wip/` entry: it is a shipped utility, and
+it carries no gate of its own.
+
 ## 261107.006 (r232) -- issue #281: the buffered host-pool prefill coalesces now (block 12, +2x at a sub-complement budget), and the mid-run-latch finding is measured at ~1e-5
 
 **Shipped:** `v16-6050b467c-r232` (block **12** amended, +33/-10 in `ggml/src/ggml-cuda/moe-expert-cache.cu`;
