@@ -2633,6 +2633,25 @@ the tool is the reproduction, and none of this is a delivery change.
    (+15 %) for the same model load here.  Any A/B that charges `dio` only its throughput advantage is understating
    its cost -- read the device's byte counter per arm.
 
+
+6. **The Lexar's 16 ms idle wake is APST, and it is removable -- but only by re-probing the controller.**  `nvme
+   id-ctrl` shows APST enabled at `ITPT 100 ms -> PS3`; with APST off the same file measures **88 us** after a
+   5 ms gap and **50 us** after 50 ms, against **2 533 us / 4 743 us** at the default, and the 250 ms step falls
+   **16 313 -> 4 716 us**.  Nothing else moves: `O_DIRECT` bulk is 2.46 GB/s either way and every page-cache arm is
+   unchanged, so this is a power-policy effect and not a throughput one.  Three shortcuts do NOT work, each tried:
+   `nvme set-feature -f 0x0c -v 0` returns `EPERM` (the kernel driver owns the APST feature), `nvme reset` does not
+   re-read `nvme_core.default_ps_max_latency_us`, and a user-space admin passthrough of Set Features is refused
+   the same way.  What works is writing the parameter and **unbind/bind that PCI function** -- the parameter is
+   read at controller *creation* -- which also scopes the change to one drive (the SN850X keeps its APST and its
+   0.6 ms wake).  A ~5 ms firmware level survives any setting and is reached after roughly a second of idleness, so
+   "APST off" means 50-90 us in use and ~5 ms cold; never "instant".
+7. **Watts are NOT readable in band, so never quote one as a measurement.**  `id-ctrl`'s `mp` is a per-state
+   *ceiling* -- this drive declares 10 W while TechPowerUp measured 7.0 W reading, 8.5 W writing and 1.454 W idle
+   with ASPM disabled -- `IDLP`/`ACTP` are unpopulated on both drives here, NVMe SMART has no power field, the
+   `nvme` hwmon has temperature channels only, and RAPL/`powercap` is the CPU socket (`package-0`, `core`) while
+   the drive hangs off the 12 V rail.  Per-state watts need a shunt (Quarch/Monsoon, or an M.2 riser with an
+   INA228) or a wall meter and a delta method; and any idle figure quoted without its APST/ASPM state is useless.
+
 ## (r233) -- the Windows pinned ceiling is the loaded HIP runtime, not Windows: name the module before believing a number
 
 Established from issue #278's reporter (Windows 11, one R9700, 64 GiB), same r229 binary, same command, only the

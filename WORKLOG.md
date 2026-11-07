@@ -1,3 +1,51 @@
+## 261107.010 (tooling) -- the Lexar's 16 ms idle wake is APST, and the oracle now records the power policy
+
+**No delivery change** (`patches/`, `release.json` and the gates untouched); follow-up to `261107.007`.
+
+**The finding.**  The 16.2 ms "cold read after a pause" that `utilities/storage-oracle` reports on `/llm` is
+not the drive's NAND latency and not thermal (Warning/Critical temperature time 0, T1/T2 transitions 0,
+41 C composite against an 83 C threshold): it is **APST**, the host-managed autonomous power-state
+transition the driver programs as `ITPT 100 ms -> PS3`.  Turning it off takes the same file from
+**2 533 us to 88 us** after a 5 ms gap, **4 743 -> 50 us** after 50 ms, and the 250 ms step from
+**16 313 -> 4 716 us**, with bulk throughput and every page-cache arm unchanged (`O_DIRECT` 2.46 GB/s both
+ways).  A ~5 ms firmware level survives any setting and is reached after roughly a second of idleness,
+so the honest summary is "50-90 us in use, ~5 ms cold" rather than "instant".
+
+**Three shortcuts do not work**, each tried: `nvme set-feature -f 0x0c -v 0` returns **EPERM** (the kernel
+driver owns the APST feature -- my earlier note that "disabling APST changed nothing" was this: the
+command had failed and I read the echo as success); `nvme reset` does not re-read
+`nvme_core.default_ps_max_latency_us`; and a user-space admin passthrough of Set Features is refused the
+same way.  What works is writing the parameter and **unbind/bind-ing that one PCI function**, because the
+parameter is read at controller *creation* -- which also scopes the change to the Lexar (the SN850X keeps
+its APST and its 0.6 ms wake).  Executed here with `/llm` unmounted, then remounted on the same
+`nvme0n1p1`; the drive reports `APSTE: Disabled` afterwards and `nvme1` still reports `0x00000001`.
+
+**Configured at boot, scoped to one drive.**  `/usr/local/sbin/nvme-apst-off` + a
+`Before=local-fs-pre.target` oneshot (`nvme-apst-off-lexar.service`, `WantedBy=sysinit.target`) do it
+before `/llm` mounts, when nothing has the device open; the unit refuses to run while `/llm` is mounted
+and exits non-zero only if the controller ends up unbound.  Both failure paths were exercised.  These two
+files are **host configuration, not repo content** -- `utilities/` is for tools that measure and change
+nothing, so the recipe lives in the tool's README instead of shipping a root-level hook.
+
+**The power cost, which is why this is acceptable**: Watts are not readable in band at all (`id-ctrl`'s
+`mp` is a per-state ceiling; `IDLP`/`ACTP` are unpopulated on both drives; NVMe SMART has no power field;
+the `nvme` hwmon is temperature-only; RAPL is the CPU socket, the drive is on 12 V).  TechPowerUp measured
+this model at **1.454 W idle with ASPM disabled** (the configured state here), **7.0 W reading** and
+**8.5 W writing** -- against a 10 W descriptor, which is the ceiling-not-measurement argument in one line.
+So APST off costs sub-watt-to-~1 W over that figure.
+
+**Re-measured, same file as the example** (Gemma4-E4B Q8_0, one R9700): ladder 88/50/4 716/5 359 us for
+5/50/250/1000 ms gaps, `O_DIRECT` 2.46 GB/s, buffered 2.51, `mmap` fault-in 1.23, warm 29.7; recommendation
+unchanged at `--load-mode none --lazy-mode mlock` with `pinned 1 table(s), 2856 MiB`, cold 6.88 s reading
+7 813 MiB, warm restart **1.29 s reading 0 MiB**.  The `AVOID any on-demand disk tier` entry still fires --
+4.7 ms is still 4.7x the 1 ms threshold -- so "never read on demand during decode" survives the change.
+
+**Tool change**: the report now records the policy (`power policy (APST)` in the facts table, read from
+`nvme_core.default_ps_max_latency_us` and the controller's own table when root is available) and states it
+in the idle-gap caption, because a ladder from a box with APST at its default is not comparable with one
+from a box with it off.  `utilities/storage-oracle/EXAMPLE-REPORT.md` was regenerated on this build and is
+now self-consistent with the facts row; the README gained the finding, the three dead ends and the recipe.
+
 ## 261107.009 (tooling) -- the release container watcher died silently on a `head -1` + `pipefail` SIGPIPE, and r232/r233 were never imaged
 
 **Found while verifying the r233 release's image push.**  `scripts/container-watch.sh` (the off-host release

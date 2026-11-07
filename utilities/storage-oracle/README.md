@@ -38,6 +38,7 @@ So the tool measures the file, not the drive.
 | working set vs `MemAvailable` and `RLIMIT_MEMLOCK` | whether "keep it resident" plans (`--lazy-mode mlock`) are viable, and whether the kernel will refuse |
 | `--verify` restart arm (cache deliberately not evicted) | what a second start actually costs, which is the number the residency decision turns on |
 | page-cache residency (`mincore`) | how much of the file is already hot, so a number is never misread as a cold one |
+| **APST state** (`nvme_core.default_ps_max_latency_us` + the controller's table when readable) | recorded, not judged: the idle-gap ladder is a property of the *power policy* as much as of the drive (see below) |
 
 ## How each verdict is decided
 
@@ -159,6 +160,47 @@ device upload and graph setup, which this report does not model: **compare the a
   never parses prose.
 - **Single-threaded, QD1, one probe at a time** — except the deliberate under-stream arm, which runs a
   sequential reader and a random reader against the same file at once. Never run it beside a benchmark.
+
+## The power policy changes the answer, so the report records it
+
+The idle-gap ladder is a property of the drive **and** of its APST policy, and on the maintainer's box
+the policy is worth more than any load-mode choice: the Lexar NM1090 PRO's APST idle state cost
+**16.3 ms** per cold read, and turning APST off takes that to **50-90 us** for gaps up to ~50 ms and
+**~5 ms** after a longer pause (the drive's own firmware level, which no host setting reaches):
+
+| idle gap | APST at its default | APST off |
+|---|---|---|
+| 5 ms | 2 533 us | 88 us |
+| 50 ms | 4 743 us | 50 us |
+| 250 ms | 16 313 us | 4 716 us |
+| 1000 ms | 16 320 us | 5 359 us |
+
+It is host-managed, but three plausible shortcuts do **not** work, and all three were tried:
+`nvme set-feature -f 0x0c -v 0` is refused with `EPERM` (the kernel driver owns the APST feature);
+`nvme reset` does not re-read `nvme_core.default_ps_max_latency_us` (a controller *reset* is not a
+re-probe); and a user-space admin passthrough of Set Features is refused for the same reason as the
+ioctl. What works is writing the parameter and **re-probing that one controller**:
+
+```sh
+echo 0 | sudo tee /sys/module/nvme_core/parameters/default_ps_max_latency_us
+sudo umount /llm
+echo 0000:04:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+echo 0000:04:00.0 | sudo tee /sys/bus/pci/drivers/nvme/bind
+sudo mount /llm
+```
+
+Because the parameter is read at controller *creation*, re-probing one function scopes the change to
+that drive (the SN850X keeps APST and its 0.6 ms wake). On this box that runs at boot from a
+`Before=local-fs-pre.target` oneshot, so `/llm` mounts after the re-probe — the tool itself still needs
+no root and changes nothing. The cost is that the drive never drops below PS0: TechPowerUp measured
+this model at **1.454 W idle with ASPM disabled**
+([review](https://www.techpowerup.com/review/lexar-nm1090-pro-4-tb/7.html)), and PS0 adds sub-watt to
+that. Note the same review measured **7.0 W reading / 8.5 W writing** against a 10 W `id-ctrl`
+descriptor — i.e. the descriptor is a ceiling, which is why the report treats every watt figure as a
+declaration and only trusts its own latencies.
+
+So the facts table prints the policy, and a ladder from a box with APST at its default is not
+comparable with one from a box with it off.
 
 ## What it does not do
 

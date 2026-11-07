@@ -221,6 +221,29 @@ if [ -n "${PCIE_PORT:-}" ] && have lspci; then
     PCI_SHARED=$(lspci -s "$PCIE_PORT" -t 2>/dev/null | tr '|' '\n' | grep -c -- '--')
 fi
 
+# The idle-gap ladder below is a property of the drive AND of the power policy in force: APST on this
+# box costs 16 ms per cold read, off it costs ~5 ms.  Record what produced the numbers.
+NVME_CTRL=$(basename "$(readlink -f "/sys/block/${BLK}/device" 2>/dev/null)" 2>/dev/null)
+APST_PARAM=$(cat /sys/module/nvme_core/parameters/default_ps_max_latency_us 2>/dev/null || echo "")
+APST_LINE=""
+if [ -n "${NVME_CTRL:-}" ] && have nvme; then
+    apst_out=$(nvme get-feature "/dev/$NVME_CTRL" -f 0x0c -H 2>/dev/null || true)
+    case $apst_out in
+        *"(APSTE): Disabled"*) APST_LINE="disabled on $NVME_CTRL" ;;
+        *"(APSTE): Enabled"*)
+            itpt=$(printf '%s\n' "$apst_out" | sed -nE 's/.*\(ITPT\): *([0-9]+) ms.*/\1/p' | head -1)
+            itps=$(printf '%s\n' "$apst_out" | sed -nE 's/.*\(ITPS\): *([0-9]+).*/\1/p' | head -1)
+            APST_LINE="enabled on $NVME_CTRL: idle ${itpt:-?} ms -> PS${itps:-?}" ;;
+    esac
+fi
+if [ -n "$APST_LINE" ]; then
+    APST_NOTE="$APST_LINE (nvme_core.default_ps_max_latency_us=${APST_PARAM:-?})"
+elif [ -n "${APST_PARAM:-}" ]; then
+    APST_NOTE="nvme_core.default_ps_max_latency_us=$APST_PARAM (applied at controller creation; the live table needs root to read)"
+else
+    APST_NOTE="unknown"
+fi
+
 if have filefrag; then
     F_EXTENTS=$(filefrag "$FP" 2>/dev/null | sed -nE 's/.*: ([0-9]+) extents? found.*/\1/p' | head -1)
 else
@@ -811,6 +834,7 @@ cat <<EOF
 | memory | MemTotal $(awk -v k="$MEM_TOTAL_KB" 'BEGIN{printf "%.1f", k/1048576}') GiB, MemAvailable $(gib $((MEM_AVAIL_KB * 1024))) GiB |
 | working set | ${NEED_MIB} MiB = model files + ${RESIDENT_GIB} GiB (KV/pools/compute, \`--resident-gib\`) |
 | RLIMIT_MEMLOCK | $( [ "$MEMLOCK_MIB" = -1 ] && echo unlimited || echo "${MEMLOCK_MIB} MiB" ) |
+| power policy (APST) | $APST_NOTE |
 | lazy tables (all --lazy-mode mlock can pin) | $( if [ "${LAZY_TABLES:-}" = 0 ]; then echo "**none** - the mode is inert on this model"; elif [ -n "${LAZY_TABLES:-}" ]; then echo "${LAZY_TABLES} table(s) -- ${LAZY_PIN}"; else echo "unknown (run --verify) - the pin only covers TENSOR_READ_LAZY tables"; fi ) |
 | kernel / cpu | $(uname -r) / $(nproc) threads, page size ${PSIZE} |
 | probe cost | about ${PLAN_GIB} GiB read |
@@ -865,6 +889,9 @@ Every sample evicted and verified cold (\`mincore\`); skipped-warm samples are c
 ### 4.4 Idle-gap ladder — cost of a read after a pause
 
 This is the number no specification publishes, and it decides whether a read *during* decode is safe.
+**It is also a property of the power policy, not just the drive:** APST transitions can multiply it
+several-fold (measured on this box: 16.3 ms with APST at its default against 4.7 ms with APST off).
+APST here: $APST_NOTE.
 
 | idle before the read | p50 latency |
 |---|---|
