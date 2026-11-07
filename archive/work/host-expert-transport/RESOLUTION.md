@@ -4,7 +4,7 @@
 (no default changed).**  The delivery change is one file, `ggml/src/ggml-cuda/moe-expert-cache.cu`, block
 12, +106/−10: the declined tables are named once per run and the census stops counting the priming pass
 as a defect.  Numbers, protocol and raw runs: [`README.md`](README.md); the delivery record is
-`WORKLOG.md` 261107.010.
+`WORKLOG.md` 261107.011.
 
 ## 1. Claim (#271)
 

@@ -1,4 +1,4 @@
-## 261107.010 (r234) -- TODO #271 resolved and #272 closed: the prefill staging decline named (and measured free), the transport band re-measured with its upper edge gone
+## 261107.011 (r234) -- TODO #271 resolved and #272 closed: the prefill staging decline named (and measured free), the transport band re-measured with its upper edge gone
 
 **Shipped:** `v16-6050b467c-r234` (block **12** amended, +115/-10 in
 `ggml/src/ggml-cuda/moe-expert-cache.cu`; blocks 00-11 and 13-15 keep identical deltas).

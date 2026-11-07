@@ -2788,7 +2788,7 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > `GGML_MOE_CACHE_STAGE=0` is **+12.8 %** over this block's staging kernel.  Both winning arms are bimodal on
 > this box (identical runs 1873/2177/1865/2180 t/s), so no default was moved.  Gates: `gate-host-pool.sh`
 > **41/41**, coherence `d3d554954cba` across 4 host-expert arms, prefill-logit KLD **0.000000 / 100.000 %**,
-> `validate-set.sh` green, per-block build 2/2.  Records: `WORKLOG.md` 261107.010,
+> `validate-set.sh` green, per-block build 2/2.  Records: `WORKLOG.md` 261107.011,
 > `archive/work/host-expert-transport/`, `INVARIANTS.md` (r234), `ENVIRONMENT.md` (the transport note).
 
 > **r233 amendment (issue #278): name the Windows HIP runtime, and make the pinned tier closable.**

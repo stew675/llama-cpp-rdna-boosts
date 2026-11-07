@@ -2686,7 +2686,7 @@ report means.
 ## r234 — the prefill staging decline, and the transport ranking is a band, not a stall (2026-11-07)
 
 Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README.md` and `RESOLUTION.md`,
-`WORKLOG.md` 261107.010).
+`WORKLOG.md` 261107.011).
 
 - **A staging decline is a TRANSIENT stand-down, not a sizing bug.**  On a pinned master
   (`--host-experts pinned`, 47 962.5 MiB `ROCm_Host`) 50 of 144 tables decline
