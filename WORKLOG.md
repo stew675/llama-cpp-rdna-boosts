@@ -1,3 +1,53 @@
+## 261106.021 (campaign) -- `TODO` #276/#277/#278 close: the demote never runs beside a paired all-reduce, and the arena transition is unmeasurable
+
+**A second measurement pass on the same day, on a different box.**  The first pass
+(`WORKLOG.md` 261106.018, [`wip/host-expert-parity/RESULTS-2026-11-06.md`](wip/host-expert-parity/RESULTS-2026-11-06.md))
+ran on `radix` -- one R9700, so no paired all-reduce was available there -- and it left `TODO` #276 recorded as
+"not testable on this box".  This pass ran on **`soar`**: Ryzen 9 9950X3D, **3 x R9700**, 91 GiB, three **PCIe 5.0
+x16** links, and the **canonical** heat prior is present there
+(`6195152358e132a50189272102d19ba54b3aec9d012751988b601e8e72651cdd`, 601 376 B, mode 444; every arm seeded from it
+and left it untouched -- `a07822d3…` is `radix`'s, not this box's).  Tree `~/llama.cpp` @ **`5c3ef0354`**, tree
+`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7` (= `release.json`, `v16-6050b467c-r229`), build `5c3ef0354`.  **Nothing
+ships**: `patches/` and `release.json` are untouched, no block changed, and the only gate a measurement owes is the
+fault scan -- `check-gpu-faults.sh` clean on the kernel journal and all six logs.  Record with the numbers and the
+exact reproduction: [`wip/host-expert-parity/RESULTS-2026-11-06-soar.md`](wip/host-expert-parity/RESULTS-2026-11-06-soar.md)
+(the logs were not kept).  `INVARIANTS.md` gains both facts, `TODO.md` loses all three rows, and
+[`wip/CAMPAIGNS.md`](wip/CAMPAIGNS.md) carries the close.
+
+**`TODO` #276 (the demote's copy submission) closes as UNREACHABLE BY CONSTRUCTION; `#277` (precopy) retires with
+it.**  PR #267's 0004/0006/0007 rationale is that a small pinned copy can leave later queued work unsubmitted on
+ROCm, which stalls the *paired* peer past its all-reduce spin timeout -- so the hazard needs a copy **and** a paired
+all-reduce, and the delivery never has both.  The demote declines when `t.n_slices != 0` (a split table has no
+single contiguous pool image; the copy would be a strided 2-D one, the class r113 measured as a 2x decode loss), and
+a tensor split is the only layout with an intra-token all-reduce.  Measured, 2 GPU 35B-A3B Q4_K_M `-ncmoe 40 -lme 12`
+(`MOE_EXPERT_CACHE_MIB=4096`, prose prefill 1 024 + 2 048, `-lv 4`): **`-sm tensor` -> 0 demoted, 14 480 `geometry
+(structural)` declines, with `all-reduce: host-resident experts -- large tensors use the RCCL ring` in the log**;
+**`-sm layer` -> 7 862 demoted (4 771.4 MiB), 0 geometry declines, and no all-reduce line at all**.  `-lme 12` (61 %
+coverage) is what makes the demote *want* to fire, so those are offers that were actually made, not an idle switch.
+The cost half was already answered (+19-21 % generation at `-lme` 44), so 0004 is a transport optimisation with no
+reachable defect.  #277's own condition ("only if #276 leaves a residual on a multi-device arm") fails with it.
+
+**`TODO` #278 (the arena across a decode->prefill transition) closes as MEASURED, not worth a code change.**  P1.4's
+do-it-if was "the census shows arena tables actually dropped **and** the re-fill is a measurable share of the
+prompt": the first half is confirmed, the second fails.  Flash-Next GSQ-RCO-IQ3_S, one GPU, `-ncmoe 48 -lme 44 -lm
+mmap`, at the campaign's own field ubatch (`-c 204800 -ub 6144`): **3 `moe_cache_evict_slab_range` events, 1 062 MiB,
+one `re-armed 12 stood-down expert-cache tables`** -- bounded by the evicted bytes to 37-56 ms, i.e. **<=0.2-1.2 % of
+the prompt**, and invisible where it counts: three identical 4 096-token rows measure the post-transition one
+**+15.8 % over** its predecessor (1 629.0 vs 1 406.9 t/s), and at `-c 16384 -ub 2048` rows 3 and 4 are flat (1 572.6
+-> 1 578.9) across the same events.  On the **3-GPU `-sm tensor` field shape there are zero events** (arena 16 065
+MiB, well inside the slab's 25.25 GiB), and 35B-A3B Q4_K_M **cannot be made slab-bound at all** -- its whole host
+set is 18 662 MiB, `alloc_table_locked` clamps slots at `n_experts` so no `MOE_EXPERT_CACHE_MIB` forces the arena
+past it, and at `-ub 8192` the slab reserves the wider work region up front (`work 8.62 GiB + arena 19.19 GiB`)
+instead of growing into the arena.  That clamp is the trap the reproduction notes carry: the cheap model cannot
+show this, Flash-Next (46.84 GiB set) or a Q8_0 35B-A3B is needed.
+
+**The r228 frame is corrected by that number.**  `PR-267-REMAINDER.md` §3.0 ranked 0003b as "now the highest-value
+prefill item" and "the field prefill's main residual".  It is not: the residual at `auto` (97.7 %) is the
+near-mirror **miss path** that `SINK=0` already takes (r228's own 1 837 vs 1 932-1 938 t/s), and the transition
+contributes <=1 % of it.  What is left of the PR #267 integration is `TODO` **#279** (narrow-2, one A/B), **#280**
+(the crossover table plus P0.2/P0.3's DIO-buffered and span-reach pairs) and the handle-less
+`MOE_EXPERT_CACHE_TOUCH` sweep.
+
 ## 261106.020 (r229) -- issue #278: a latched pinned tier keeps the pools it already built, and an arena it cannot fill is not armed
 
 **Release `v16-6050b467c-r229`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tip **`5c3ef0354`**,

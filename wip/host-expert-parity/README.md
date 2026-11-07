@@ -9,8 +9,19 @@ coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of
 `v16-6050b467c-r228` (fork tip `32d0dc3f1`, tree `44b8fc4d…`), which also picked up r225-r227.
 **What is left here is the PR #267 integration**, re-framed by r228: a demote comparison is only meaningful at a
 budget *below* the near-mirror boundary (≤96 % coverage), and the field shape's remaining prefill cost is the
-miss path, not the demote — see [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 for the ranked remainder
-(`TODO` #276-#280).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
+miss path, not the demote — see [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 for the ranked remainder.
+
+**The three transport items closed on 2026-11-06 (second pass, on `soar` —**
+[`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)**).**  `TODO` **#276** (the demote's copy submission)
+and **#277** (precopy) are **unreachable by construction**: the demote declines on every `n_slices != 0` table, so
+it issues no copy on the tensor split — the only layout with an intra-token all-reduce (0 demoted / 14 480
+structural declines), while the layout where it does fire (`-sm layer`, 7 862 copies) has no all-reduce to poison.
+`TODO` **#278** (the arena across a decode→prefill transition) is **measured and not worth a code change**: the
+drop is real (12 tables / 1 062 MiB at the field ubatch) but the re-fill is bounded by the evicted bytes —
+≤0.2-1.2 % of the prompt, invisible in paired rows — and it does not fire at all on the 3-GPU tensor shape.
+**Both closes correct the r228 frame**: the field prefill's residual at `auto` is the near-mirror miss path, not
+PR 0003b.  What remains is `TODO` **#279** (narrow-2, an A/B) and **#280** (the crossover table, plus P0.2/P0.3's
+DIO-buffered and span-reach pairs).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
 [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
 [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) (the campaign that
 shipped in r224) and the rig is [`wip/bench-56gb/`](../bench-56gb/README.md).
@@ -70,6 +81,13 @@ Two artefacts of those are inherited rather than re-derived:
 | the frozen heat prior | `/llm/models/.../*.moe-heatmap`, 601 376 B, sha256 `6195152358e1…`, mode 444 | **not present**: `~/.cache/llama-moe-heatmap/` is empty and the model-dir sidecar is mode 644, sha256 `a07822d3…` | a number that depends on the prior is only comparable **within a run set**.  Restore or re-freeze the map and quote its sha256 with every arm (`INVARIANTS.md`, r224) |
 | gate bases | a base recorded from the r223 delivery tree (`build=37148d118`) | **no base here matches the r224 tip**; the 27B and 35B-A3B bases are r191-era (`50d9e90ee`, `561696677`) | re-record the base from `88e7d88a7` (the tree in `~/llama.cpp` today) before using `gate-prefill-logits.sh` as an A/B |
 
+**That table describes `radix`, and the second pass of the day ran elsewhere.**  The 2026-11-06 close-out pass
+([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)) ran on **`soar`**: Ryzen 9 9950X3D, **3 × R9700**
+(gfx1201) on three **PCIe 5.0 x16** links, 91 GiB RAM, and the **canonical** prior is present there
+(`6195152358e1…`, 601 376 B, mode 444, seeded read-only).  So multi-device arms, `-sm tensor`/`-sm layer` and the
+paired all-reduce all run on that box, and no number from one box is comparable with the other's.  State which box
+with every figure.
+
 ## 4. What r224 changed that this campaign must cover
 
 Both were part of the r224 fold and both are load-bearing for a box like this one:
@@ -119,7 +137,8 @@ mirror `slots >= n_experts` case stays inert, both as shipped.)
 | what | where |
 |---|---|
 | the standing plan and the arm matrix | [`PLAN.md`](PLAN.md) |
-| **the first measurement pass (2026-11-06)** | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
+| **the first measurement pass (2026-11-06, `radix`)** | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
+| **the `soar` pass: the #276/#277/#278 closes + exact reproduction** | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) |
 | the PR #267 integration checklist (re-framed by r228) | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 |
 | the release the fix shipped in | `WORKLOG.md` 261106.019, `patches/README.md` block 12 |
 | the per-patch re-assessment of PR #267 | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) |

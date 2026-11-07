@@ -4,8 +4,10 @@
 as-is (they are cut against r204 and touch code that moved in r209-r228; `archive/work/host-expert-split/DESIGN.md`
 §5 has the port analysis).  **r228 changed the frame** (§3.0): the demote that 0004/0006/0008 target is now a
 decode-class mechanism that only runs where it pays, so every remaining comparison is made at a budget *below*
-the near-mirror boundary.  This file exists so the PR can be closed as **integrated rather than merged**, and so
-a future session does not re-review a mechanism we have already measured.
+the near-mirror boundary.  **Two mechanisms closed on 2026-11-06** (`soar`, 3 × R9700): 0004/0006/0007's hazard is
+**unreachable by construction** and 0003b costs **≤0.2-1.2 % of a prompt** — [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
+This file exists so the PR can be closed as **integrated rather than merged**, and so a future session does not
+re-review a mechanism we have already measured.
 
 Read with [`DESIGN.md`](../../archive/work/host-expert-split/DESIGN.md) (the original review + the convergence
 design) and [`archive/work/host-pool-speed/README.md`](../../archive/work/host-pool-speed/README.md) §4.3/§4.4/§6
@@ -19,10 +21,10 @@ design) and [`archive/work/host-pool-speed/README.md`](../../archive/work/host-p
 | 0001 | `--host-experts mmap` puts the `-ncmoe`/`-cmoe` experts back in the pageable mapping; GPU-keyed host-expert accounting | the **mode is gone and must not come back**: since r209-r212 the placement is one budget, `-lme [auto\|N]` (below the set = a per-expert pinned pool over the read-only mapping; at/above it = a mirror), and `MOE_HOST_TIER=tensor` is the whole-tensor escape hatch | **superseded** |
 | **0002** | sparse registration: a second read-only `MAP_SHARED` alias, `mlock` + `hipHostRegister(ReadOnly)` for the expert ranges a GPU may read, `madvise(WILLNEED)`, trim after a device sync, `MAP_FIXED` remap of KFD's leftover range; owner-device routing; whole-table prefill staged from arena+alias | **not adopted.**  The job is done by two mechanisms we already ship: a pool-resident miss is an **in-place PCIe read of pinned RAM** (`MOE_HOST_POOL_COLD` + `_MULTIDEV`, r203/r210) and a declined read goes through the per-table **bounce ring** (`expert_host_src`, the `gate-host-pool.sh` arms).  `-sm layer` owner routing is the semantic key (r215+) | **non-goal**, re-entry condition in §3 |
 | 0003a | the narrow-2 (draft compute) pin prefers its `cudaMalloc` fallback when it fits **outside** the slab instead of evicting arena tables | **partially.**  `ggml_cuda_slab_narrow2_pin_locked` prefers the unmapped spare, **refuses** when the region would leave less than `GGML_CUDA_SLAB_MIN_ARENA_MIB`, maps the VA above `mapped`, and falls back to `cudaMalloc` only on a refusal — but once the arena floor is satisfied it *will* evict arena tables for the draft's buffer | **delta remains** → PLAN P1.5 (an A/B, ~1 branch) |
-| 0003b | `GGML_CUDA_SLAB_RING_PREFILL=0` (implied by mmap): keep the expert-cache arena across a decode→prefill transition | **absent** — no such variable exists.  The slab's H2D ring *is* reclaimed on the prefill→decode drop; whether arena **tables** are dropped going the other way on the field shape is unmeasured | **measure first** → PLAN P1.4 |
-| **0004** | the swap is two custom **copy kernels**, not `hipMemcpyAsync`, because a small pinned copy can leave later queued work unsubmitted on ROCm | our demote is one `cudaMemcpyAsync(D2H)` on the compute stream into a free pool slot (block 12).  It measured +5.3 % net on r224's box, so no stall was visible there — but that box's link is not this one | **open** → PLAN P1.1 |
+| 0003b | `GGML_CUDA_SLAB_RING_PREFILL=0` (implied by mmap): keep the expert-cache arena across a decode→prefill transition | **absent** — no such variable exists.  The slab's H2D ring *is* reclaimed on the prefill→decode drop, and the arena **is** dropped going the other way when the work region outgrows its reservation (`moe_cache_evict_slab_range` + `re-armed N stood-down`) | **measured 2026-11-06 → `TODO` #278 CLOSED, do not implement**: 12 tables / 1 062 MiB per transition at the field ubatch, ≤0.2-1.2 % of the prompt and invisible in paired rows; 0 events on the 3-GPU tensor shape ([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §1) |
+| **0004** | the swap is two custom **copy kernels**, not `hipMemcpyAsync`, because a small pinned copy can leave later queued work unsubmitted on ROCm | our demote is one `cudaMemcpyAsync(D2H)` on the compute stream into a free pool slot (block 12).  It measured +5.3 % net on r224's box, so no stall was visible there — but that box's link is not this one | **closed 2026-11-06 → `TODO` #276: unreachable by construction.**  The hazard needs a copy *and* a paired all-reduce; on `-sm tensor` (RCCL banner present) the demote declines **0 demoted / 14 480 geometry (structural)**, and on `-sm layer` (7 862 copies) there is no all-reduce |
 | 0005 | tier × device-remap, and a tier table never uses the pool's cold read | ours already declines on a **partial** pool and serves a mirror (`dr_pool_ok`, r221) | **absorbed** |
-| **0006/0007** | precopy: K spare RAM slots + a side stream that copies the policy's likely victims ahead of time; a failed event record drains the side stream, a failed wait fails the swap | **absent** (`MOE_HOST_POOL_PREFETCH`, the knob the earlier review named as the survivor, no longer exists).  Our demote only pays the D2H when the miss proves the demand | **conditional** → PLAN P1.2 (only if P1.1 leaves a residual cost) |
+| **0006/0007** | precopy: K spare RAM slots + a side stream that copies the policy's likely victims ahead of time; a failed event record drains the side stream, a failed wait fails the swap | **absent** (`MOE_HOST_POOL_PREFETCH`, the knob the earlier review named as the survivor, no longer exists).  Our demote only pays the D2H when the miss proves the demand | **retired 2026-11-06 → `TODO` #277**: its condition was "0004 leaves a residual on a multi-device arm" and 0004 closed as unreachable |
 | **0008** | a tier admits from the **3rd** touch (`GGML_MOE_TIER_TOUCH=3`) to damp churn; 8 spares | the knob exists (`MOE_EXPERT_CACHE_TOUCH`, default **2**), the spares are our exchange headroom; the *value* was never swept with the demote on.  The replay says touch-3 **shrinks the sink's advantage by a third** (it bounds copies, it does not save L3 — `STEP1-REPLAY.md` §4) | **measurement** → PLAN P1.3 |
 | 0009 | **one** pin budget for tier + registration (`GGML_MOE_PIN_BUDGET_MIB`), a **partial tier by hotness**, bounded warm-up registrations, a refused registration not retried until the next trim | half landed elsewhere: `-lme` **is** the one budget (r209-r212) and since r207 a shrunken plan is a per-table **distribution**, not a tail shave, so a partial tier is already hotness-ordered by content.  The registration half is moot.  What is left is the *policy/visibility* half — and it is owned by [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) steps 1-3 (cgroup-aware `MemAvailable`, an authoritative explicit `-lme`, one visible `MIRROR/PARTIAL/NONE` verdict) | **split off, not here** |
 | 0010 | a declined read goes through an **8-entry** per-table bounce ring (capped so a whole-master declined read cannot pin a copy of the master) | the ring exists and is **deliberately uncapped**: measured, a cap of 2/4/8 costs **8-25 % of prefill** at FRAC 80 (`bounce_acquire`'s comment), and r224's span coalescing addresses his *concern* (fewer, larger reads ⇒ fewer entries in flight) instead | **rejected, with a number** |
@@ -71,39 +73,46 @@ for the PR's remaining mechanisms:
    (`-lme 44` / a low `MOE_HOST_LIMIT_FRAC`) on the rig.
 2. **The field shape's first-pass prefill is no longer a demote question.**  At `auto` (97.7 %) the shipping
    configuration is now the `SINK=0` path to the counter (1 907-1 938 t/s measured).  What is left of that
-   number is the miss path itself -- which is exactly what **0003b** (`TODO` #278, the arena across a
-   prefill transition) and the staging transport are about, and that is now the highest-value prefill item in
-   this list.
+   number is the miss path itself (the near-mirror gap), **not 0003b**: measured 2026-11-06 on a 3 × R9700 box,
+   the arena transition evicts 12 tables / 1 062 MiB per event and costs ≤0.2-1.2 % of the prompt, and it does
+   not fire at all on the 3-GPU tensor shape — so the staging transport and the coverage gap are the items, and
+   0003b is closed ([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §1).
 3. **The demote's transport (0004) matters on fewer cells** but still matters on the ones where it runs: it is
-   worth +19-21 % generation at 94 %, so its D2H is on the hot path exactly there.  The A/B is unchanged in
-   shape, only cheaper to justify.
+   worth +19-21 % generation at 94 %, so its D2H is on the hot path exactly there — but the hazard 0004 exists
+   for needs the copy *and* a paired all-reduce, and the delivery never has both: the demote declines 100 % of
+   offers on the tensor split (`n_slices != 0`, no contiguous pool image) and `-sm layer` has no all-reduce to
+   poison.  **0004 is a transport optimisation with no reachable defect; 0006/0007 retire with it.**
 
 | # | item | what decides it | where | state after r228 |
 |---|---|---|---|---|
 | 1 | **parity/crossover table** (`TODO` #280): pinned GiB vs decode vs first-pass prefill vs storage MiB/token, mirror as the asymptote | the field matrix at a budget the sink is *live* at, plus the DIO/buffered pair | PLAN P0.2/P0.3 | **half done**: CLI 76.9 % = 26.0, 93.7 % = 33.9, mirror = 38.2; field mirror 1 932-1 938 / 83.7 vs `auto` 1 837 / 76.6.  Owed: the DIO-vs-buffered field pair, the span-reach pair, and a partial field row (`-lme 44`) |
-| 2 | **the demote's copy submission** (`TODO` #276): his copy-kernel + drain rationale is the *paired-device* stall, not 1-GPU cost (the demote measures net +19-21 % at `-lme` 44, so the copy does not dominate) | a 2-GPU arm, a copy-kernel A/B, and a stall in the flight record right after an admission -- not a throughput delta | this campaign | **open, narrowed to the multi-device hazard** (not testable on this one-GPU box) |
-| 3 | **precopy** (`TODO` #277, 0006/0007/0008): a **dedicated** K-slot ring + a side stream + the drain semantics (our headroom cannot hold a pre-copied victim -- a prefill fill consumes it) | only if #276 leaves a residual on a multi-device arm | PLAN P1.2 | **open, conditional; the shape is decided (his 0006/0007, not more headroom)** |
-| 4 | **the slab keeps the arena across a decode→prefill transition** (`TODO` #278, 0003b) | PLAN P1.4 -- first count the `evicted … re-armed` census on the field shape | PLAN P1.4 | **open, promoted** -- it is now the field prefill's main residual, not a demote artefact |
+| 2 | **the demote's copy submission** (`TODO` #276): his copy-kernel + drain rationale is the *paired-device* stall, not 1-GPU cost (the demote measures net +19-21 % at `-lme` 44, so the copy does not dominate) | a 2-GPU arm, a copy-kernel A/B, and a stall in the flight record right after an admission -- not a throughput delta | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §2 | **CLOSED 2026-11-06 -- unreachable by construction**: the demote declines **100 %** of offers on the tensor split (the only layout with the paired all-reduce: `0 demoted / 14 480 geometry (structural)`) and `-sm layer` (7 862 copies) has no all-reduce.  Re-entry: only if the demote is extended to an `n_slices != 0` table |
+| 3 | **precopy** (`TODO` #277, 0006/0007/0008): a **dedicated** K-slot ring + a side stream + the drain semantics (our headroom cannot hold a pre-copied victim -- a prefill fill consumes it) | only if #276 leaves a residual on a multi-device arm | PLAN P1.2 | **RETIRED 2026-11-06** with #276; the condition fails, and the shape was already decided (his 0006/0007, not more headroom) |
+| 4 | **the slab keeps the arena across a decode→prefill transition** (`TODO` #278, 0003b) | PLAN P1.4 -- first count the `evicted … re-armed` census on the field shape | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §1 | **CLOSED 2026-11-06 -- measured, do not implement**: the drop is real (12 tables / 1 062 MiB per event at `-c 204800 -ub 6144`), the re-fill is bounded by the evicted bytes (≤0.2-1.2 % of the prompt) and invisible in paired rows, and the 3-GPU tensor shape never evicts |
 | 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (`TODO` #279, 0003a) | PLAN P1.5 -- one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | PLAN P1.5 | **open** |
 | 6 | **`MOE_EXPERT_CACHE_TOUCH` 2 vs 3 with the demote on** (0008) -- a knob, no code | PLAN P1.3, on a live cell | this campaign | **open** (the replay predicts the sink's advantage shrinks a third; never measured on device) |
 | 7 | **the tier's policy and visibility** (0009's non-registration half): cgroup-aware figure, authoritative `-lme`, one verdict line | already scoped, do not duplicate | [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) | **open there** |
 | 8 | **sparse registration** (0002) | **non-goal.**  Re-entry only if a partial tier cannot be made cheap by the tier itself -- and r228 + the r224 span made the partial tier's *prefill* cheap, so this is closer to closed than open | -- | **non-goal, unchanged** |
 
-Every code item is a `TODO` handle: **#276** (transport), **#277** (precopy), **#278** (arena across a prefill
-transition), **#279** (narrow-2), **#280** (parity/crossover).  The touch sweep needs no handle: it is a knob.
+Every code item is a `TODO` handle: **#276** (transport, **closed**), **#277** (precopy, **retired**), **#278**
+(arena across a prefill transition, **closed**), **#279** (narrow-2, open) and **#280** (parity/crossover, open --
+the campaign's product).  The touch sweep needs no handle: it is a knob.  Items 2-4 closed on 2026-11-06; see
+[`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
 
 ## 4. What would close the PR (the reply, once the numbers exist)
 
 1. **Absorbed or superseded**: 0001, 0005, 0010 (with its measurement), and 0009's placement half.
-2. **Borrowed, pending the A/Bs here**: 0004 (+0007's drain), 0008's value, 0003's two halves.
-3. **Deferred with a condition**: 0006 (precopy) behind 0004's result; 0002 behind "a partial tier cannot be
-   made cheap" (r228 makes the *prefill* half of that cheap; the decode half is the +19-21 % the tier already
-   has, so the condition looks answered in the negative for the registration mechanism).
+2. **Borrowed, pending the A/Bs here**: 0008's value, 0003a (0003b is **closed**: measured, no addressable cost).
+3. **Deferred with a condition**: 0002 behind "a partial tier cannot be made cheap" (r228 makes the *prefill*
+   half of that cheap; the decode half is the +19-21 % the tier already has, so the condition looks answered in
+   the negative for the registration mechanism).
 4. **The numbers to quote** (r228, this box): his **82.7 t/s / 1 949 t/s prefill** row against our **mirror
    83.7 / 1 932-1 938** at the same 56 GiB container shape (parity on the mirror), and the tier curve that the
    pool delivers without any registration -- **76.9 % = 26.0, 93.7 % = 33.9 (+19-21 % from the demote),
-   100 % = 38.2** (CLI, one R9700).  Plus the two remaining transport items (#276, #278) or their measured
-   refutation, and the crossover table (#280).
+   100 % = 38.2** (CLI, one R9700).  **The two transport items are answered as of 2026-11-06** (0004's hazard is
+   unreachable -- the demote declines 100 % beside a paired all-reduce; 0003b costs ≤0.2-1.2 % of a prompt), so
+   what the reply still owes is the crossover table (#280) and 0003a's A/B (#279).
+   [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
 5. **Posted 2026-11-06** (the config + numbers above, the r228 rules, the repro conditions and the
    taken/rejected/open mapping):
    <https://github.com/stew675/llama-cpp-rdna-boosts/pull/267#issuecomment-6698266713> -- awaiting the

@@ -7,10 +7,19 @@ the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdi
 > **First pass measured 2026-11-06 — [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md); the fix shipped in r228.**
 > P0.1/P0.2/P0.4/P0.5 are done and P1.0 is **done in r228** (the demote is a decode-class notion: headroom capped
 > by the coverage gap, prefill fills exempt, near-mirror pools disengaged — the field cell is now the `SINK=0`
-> path to the counter, and `-lme 44` keeps +19-21 %).  **What remains is the PR #267 integration** (ranked in
-> [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0): P0.3's DIO/buffered + span-reach pairs and a *live* partial
-> field row for the crossover table (#280), then P1.1 (#276), P1.3, P1.4 (#278), P1.5 (#279), with P1.2 (#277)
-> conditional on P1.1.
+> path to the counter, and `-lme 44` keeps +19-21 %).
+>
+> **Second pass the same day, on `soar` (3 × R9700, canonical prior) —
+> [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md): P1.1, P1.2 and P1.4 are SETTLED.**  `TODO` #276 and
+> #277 close as **unreachable by construction** (the demote declines on every `n_slices != 0` table, so it never
+> runs beside a paired all-reduce: 0 demoted / 14 480 structural declines on `-sm tensor`, 7 862 copies on
+> `-sm layer` where no all-reduce exists) and `TODO` #278 closes as **measured, not worth a code change** (the
+> drop is real — 12 tables / 1 062 MiB at the field ubatch — but the re-fill is bounded by the evicted bytes,
+> ≤0.2-1.2 % of the prompt, invisible in paired rows, and absent on the 3-GPU tensor shape).
+>
+> **What remains is** P0.3's DIO/buffered + span-reach pairs and a *live* partial field row for the crossover
+> table (`TODO` #280), then P1.3 (a knob sweep) and **P1.5 (`TODO` #279, an A/B)**.  Ranked in
+> [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0.
 
 ## 1. Settled — do not re-derive
 
@@ -134,10 +143,10 @@ Every item: **kill switch, default unchanged until it has a device win here**, o
 | # | item | do it only if | gate |
 |---|---|---|---|
 | **P1.0** (TODO #281 — **DONE in r228**) | **the exchange headroom must not exceed the pool's coverage gap, and must not gate the prefill fill path** — at `auto` (97.7 %) `K = 4 %` of slots (≈19/table) is larger than the gap (12/table), so every prefill fill is refused and the missing experts are re-read through the bounce ring on every ubatch (measured: 1 837 → 867 t/s first-pass prefill, `SINK=0` → `SINK=1`, decode flat) | already measured — this is a defect, not a candidate | coherence, `gate-host-pool.sh` (the existing `sink`/`sinkfail` arms), the `-lme 44` cell must keep its +21 %, the 97.7 % cell must return to ≈1 840 prefill, prefill-logit |
-| **P1.1** (TODO #276) | the demote's transport: a copy-kernel form of the D2H + a drain on a failed event record (PR 0004/0006/0007's rationale: a small pinned copy can leave later queued work unsubmitted on ROCm) | P0.1 shows the copy costs >~1 % of the step, **or** a stall is visible right after an admission in the flight record | coherence, `gate-host-pool.sh` (the `sink`/`sinkfail` arms), MTP four-axis, faults |
-| **P1.2** (TODO #277) | precopy: K spares + a side stream that copies the policy's likely victims ahead of time (PR 0006/0008), including 0007's drain semantics | P1.1 leaves a residual on the admission path | same as P1.1, plus a failed-record-downs-the-stream arm |
+| **P1.1** (TODO #276 — **CLOSED 2026-11-06, unreachable**) | the demote's transport: a copy-kernel form of the D2H + a drain on a failed event record (PR 0004/0006/0007's rationale: a small pinned copy can leave later queued work unsubmitted on ROCm) | **settled: the hazard needs a copy AND a paired all-reduce, and the delivery never has both.**  On `-sm tensor` (the RCCL banner is in the log) the demote declines **100 %** of offers — `0 demoted / 14 480 geometry (structural)` — because a split table has no contiguous pool image; on `-sm layer` (7 862 copies) there is no all-reduce.  The cost side is net-positive (+19-21 % at `-lme 44`).  Re-entry: only if the demote is extended to an `n_slices != 0` table (a strided 2-D D2H, r113 = 2× decode loss) |
+| **P1.2** (TODO #277 — **RETIRED 2026-11-06**) | precopy: K spares + a side stream that copies the policy's likely victims ahead of time (PR 0006/0008), including 0007's drain semantics | its own condition was "P1.1 leaves a residual on the admission path", and P1.1 closed as unreachable — the shape was already decided to need a dedicated K-spare ring, never more headroom (`PR-267-REMAINDER.md` §2) |
 | **P1.3** | `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 **with the demote on** (a knob: no code) | always — one arm set | coherence only |
-| **P1.4** (TODO #278) | keep the arena across a decode→prefill transition (PR 0003b) | the field census shows arena tables actually dropped at the transition (`evicted … re-armed …`) **and** the re-fill is a measurable share of the prompt | prefill-logit, per-block build, faults |
+| **P1.4** (TODO #278 — **CLOSED 2026-11-06, measured**) | keep the arena across a decode→prefill transition (PR 0003b) | **settled negative: the drop is real, the cost is not.**  Flash-Next 1 GPU, field ubatch (`-c 204800 -ub 6144`): 3 `moe_cache_evict_slab_range` events, 1 062 MiB, one `re-armed 12 stood-down` — bounded by the evicted bytes to 37-56 ms, i.e. ≤0.2-1.2 % of the prompt, and the paired 4 096-token rows measure row 3 **+15.8 % over** row 2 across a transition.  **0 evictions** on the 3-GPU `-sm tensor` field shape.  Re-entry: an arena *exactly* slab-full with short (≤4k) prompts, or the 56 GiB rig measured directly |
 | **P1.5** (TODO #279) | narrow-2: prefer the `cudaMalloc` fallback over evicting arena tables when the draft compute region would fit there (PR 0003a) | the A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` shows the eviction costs a resident set | per-block build, coherence, faults |
 
 Not here: the tier's policy/visibility work (cgroup figure, authoritative `-lme`, verdict line) is
@@ -153,7 +162,7 @@ bounce-ring cap is rejected with a number (S8).
 * `scripts/gate-host-pool.sh` (a failed demote must DECLINE, never publish; the `sink`/`sinkfail` arms);
 * `scripts/gate-prefill-logits.sh` for any read/staging-source change (the fill-mode A/B is a good first use:
   buffered vs O_DIRECT should be KLD 0);
-* MTP four-axis for any decode-path change (P1.1/P1.2 are decode-path);
+* MTP four-axis for any decode-path change (the demote's own transport is one);
 * `scripts/gate-per-block-build.sh --changed-from <prev tip>` and `scripts/check-gpu-faults.sh` before a tag;
 * `scripts/validate-set.sh` only when the delivery set changes.
 
@@ -175,7 +184,13 @@ New for this campaign:
    a warm page cache hides it (`bench-56gb/RESULTS.md`'s asterisk is exactly this).
 4. **The ballast must stay up for the whole matrix** (one `./ballast 31 &`), or `MemAvailable` differs between
    arms and the sizing decision (`MOE_HOST_LIMIT_FRAC`) moves under you.
-5. **`-sm layer` and multi-device arms are not runnable here** (one R9700 + the gfx1036 iGPU).  Say "not
-   measured on this box", never "unchanged".
+5. **`-sm layer` and multi-device arms were not runnable on `radix`** (one R9700 + the gfx1036 iGPU).  **That
+does not generalise: `soar` has 3 × R9700 and a PCIe 5.0 x16 link each** — multi-device arms and the paired
+all-reduce run there, and the canonical heat prior (`6195152358e1…`) is present on that box.  Say which box.
 6. **A first-run penalty is real on this rig** (`bench-56gb`'s cold-start rows): interleave arms, never judge a
    pair from one block-ordered pass.
+7. **35B-A3B cannot be made slab-bound on a 32 GiB card**, so it cannot reproduce the arena transition eviction:
+   its whole host expert set is 18 662 MiB (`-ncmoe 40` already hosts every MoE layer) and `alloc_table_locked`
+   clamps slots at `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces the arena past it — and at a large `-ub` the
+   slab reserves the bigger work region up front instead of growing into the arena.  Use Flash-Next (set
+   46.84 GiB) for that question; the reproduction is in `RESULTS-2026-11-06-soar.md` §3.

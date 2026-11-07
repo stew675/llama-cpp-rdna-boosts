@@ -2391,3 +2391,23 @@ on Linux.**
   its `g_rearm_slots[layer]` is zeroed so the caller's second pass does not repeat it.  Measured on the
   reporter's config with the latch forced: the arena stays at **13 645 MiB instead of growing back to 19 225**,
   with the same declined-op behaviour and byte-identical text.
+- **The eviction demote can never run beside a paired all-reduce, by construction (r229, campaign; `TODO` #276
+  closed).**  `MOE_HOST_POOL_SINK`'s D2H declines when `t.n_slices != 0` (a tensor-split table has no single
+  contiguous pool image, so the copy would be a strided 2-D one -- the class r113 measured as a 2x decode loss).
+  A tensor split is the delivery's only layout with an intra-token all-reduce, so the two never coexist: 2 GPU
+  35B-A3B `-sm tensor -ncmoe 40 -lme 12` gives `0 demoted / 14 480 geometry (structural)` with the RCCL banner in
+  the log, and the same config under `-sm layer` gives **7 862** copies (4 771.4 MiB) with **no** all-reduce line.
+  This is why PR #267's 0004/0006/0007 rationale (`hipMemcpyAsync` leaving later queued work unsubmitted, which
+  stalls the *paired* peer past its spin timeout) has no reachable defect to fix here: do not re-open it without
+  first extending the demote to a split table.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §2.
+- **The slab's arena eviction at a decode->prefill transition costs at most the evicted bytes, i.e. nothing you can
+  measure (r229, campaign; `TODO` #278 closed).**  `moe_cache_evict_slab_range` hands the work pool the LOWEST
+  arena chunks and `moe_cache_rearm` re-arms what fits afterwards, so a dropped table loses its slots and its
+  experts must be re-filled at the next prefill.  It fires only when the work region outgrows the reservation it
+  got at `ggml_cuda_slab_init_locked`: Flash-Next, one GPU, `-c 204800 -ub 6144` -> 3 events, **1 062 MiB**, one
+  `re-armed 12 stood-down` (37-56 ms, <=0.2-1.2 % of the prompt), and three identical 4 096-token rows measure the
+  post-transition row **+15.8 % over** its predecessor.  On the 3-GPU `-sm tensor` field shape the count is
+  **zero**, and 35B-A3B Q4_K_M cannot reproduce it at all: its whole host set is 18 662 MiB (the arena clamps at
+  `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and a big `-ub` makes the slab reserve the work
+  region up front instead of growing into the arena.  So this is not the field prefill's residual -- that one is
+  the near-mirror miss path.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
