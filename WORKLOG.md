@@ -1,3 +1,69 @@
+## 261107.002 (r231) -- TODO #280: the 56 GiB field crossover table (the tier's headline), and the band-transition tail it found
+
+**Shipped:** `v16-6050b467c-r231` (block **12** amended, +24/-3 in `ggml/src/ggml-cuda/moe-expert-cache.cu`;
+blocks 00-11 and 13-15 keep identical deltas).  `release.json` tip `a19aab55e`, tree
+`5aeb007deac55d5b5895284d34bae3e911e777b2` (base/base-tree unchanged).  `scripts/fork-refresh.sh --build
+--gates` re-cut the branch from the set and reported exactly that tip/tree, and its **prefill-logit KLD gate
+PASSED**; `scripts/validate-set.sh` green (fresh tarball, strict 16/16 `git am`, applied tree == recorded tree);
+`scripts/gate-per-block-build.sh --changed-from 2028e44cd` **2/2 built, 0 failed** (block 12 + tip -- the only
+deltas that changed); `scripts/gate-host-pool.sh` **37/37, every arm `sha=a99ccbd97ecb`**; coherence
+`sha=cf7f8b23f404` identical across five arms (r230 x2, r231 with `MOE_HOST_POOL_FILL_ORDER=rank`, r231 default
+x2, `35B-A3B` Q4_K_M `-ncmoe 40 -lme 12`, greedy); `scripts/check-gpu-faults.sh` clean over the whole session.
+The prefill-logit gate cannot reach this code (its 27B point has no host expert tables) -- it was run as the
+contract's self-test, and the reachable gates are the host-pool one plus the text equality above.
+
+**`TODO` #280 closes as measured, and its product is the table** in
+[`wip/host-expert-parity/RESULTS-2026-11-07-radix.md`](wip/host-expert-parity/RESULTS-2026-11-07-radix.md)
+(the campaign's P0.2/P0.3, on `radix`: one R9700, 93 GiB, the 56 GiB rig = a 32.4 GiB mlocked ballast outside a
+`MemoryMax=56G` scope, `MemAvailable` 57.2 GiB at load).  Every arm is one model load of Flash-Next GSQ-RCO-IQ3_S
++ its MTP draft at `-c 204800 -ub 6144`, `-lv 4`, page cache dropped first, 10 arms in pass 1 and 7 in pass 2
+plus a 7-arm old/new A/B.
+
+**1. The tier curve has two shapes, and only decode is flat.**  `gen3` / first-pass 50k prefill (t/s):
+mirror `-lme 47` **83.8 / 1 895** (pinned 46.8 GiB); `auto` 97.9 % **75.6 / 1 431** (45.5); `-lme 44` 93.8 %
+**76.2 / 735** (43.9); `-lme 36` 76.8 % **76.1 / 1 037** (36.0).  So **decode is within 9-10 % of a mirror from
+98 % all the way down to 77 % coverage** (10.8 GiB less pinned RAM), while prefill is not (-7 % / -13…-30 % /
+-46 %).  The demote is what holds decode: at 77 % with `SINK=0` it collapses to **45.4 t/s** and reads 19.0 GiB
+from storage per 1 800-token turn (2.2 GiB with it), census **50 793 demotions / 32.2 GiB / 67.6 % reuse** --
+the CLI cells of the 11-06 pass measured 4.7-7.9 %, because a spec-decode step verifies four tokens at once.
+**The one sentence: 77 % coverage is a decode-parity tier (-9 % for 10.8 GiB), not a prefill-parity tier.**
+
+**2. The fill mode is the biggest prefill lever below a mirror.**  `MOE_HOST_POOL_DIO=1` at `-lme 44` with the
+demote: **1 329 t/s against 735 buffered (+81 %)**, decode flat (75.9 vs 76.2), for 2.1x the bytes; without the
+demote 1 699 vs 1 191 (+43 %) at -16 % decode.  At `auto` buffered wins (75.6 decode vs 67.7, 2.1 GiB vs
+11.2).  Documented, not defaulted (`ENVIRONMENT.md`'s `MOE_HOST_POOL_DIO` row) -- it reproduces what PR #267's
+reporter measured independently on his box (mmap 799 vs dio 1 188).
+
+**3. The defect the table exposed: the band-transition tail.**  After the last prefill ubatch the arena's slot
+count has changed (179 -> 79 per table at this ubatch), so `pool_rerank_from_heat_locked` re-derives the pool's
+"arena complement + mirrored residents" layout **inside the request**: 1 500-6 400 single-expert fills, every
+one charged to the first token.  Feature-attributed (the window between the last `progress = 1.00` and
+`prompt eval time` is 100 % that function): **0.6 s on a mirror** (a covering pool returns early), **1.2-1.3 s
+under `DIO`**, **7.2 s at `auto` buffered**, **13.5-18.6 s at `-lme 44` buffered**.  That is why the 11-06 pass
+saw a 3x prefill swing it could not explain, and why `A1`/`A0` looked like a SINK effect and then reversed
+(`A0` 1 810 vs `A0b` 1 329 t/s, same config): it is page-cache/reclaim state, not the demote.  A microbenchmark
+of the fill shape (40 cold 0.65 MiB slices) is 0.74-1.61 ms for a mapping memcpy and 0.89-1.04 ms for a buffered
+`pread`, so the arm's 4.6-10.8 ms is the cgroup reclaiming for every new page -- which is also why `DIO` (reading
+around the page cache) removes ~90 % of it.
+
+**4. The fix (r231, block 12, default on).**  The re-layout's fill loop walked `want` in heat order = random file
+offsets, although one table's experts are contiguous.  It now sorts the to-fill set ascending
+(`MOE_HOST_POOL_FILL_ORDER=rank` restores the old order).  The fill *set* is unchanged -- a slot is
+interchangeable by construction -- so nothing moves but the order the reads are issued in.  Old/new interleaved
+at `-lme 44` (the cell with the largest tail): **tail 13.5/18.6 s -> 9.7/9.4 s**, prefill 769/780 -> 874/779,
+fills 8 315 -> 7 352, `DIO` arm 1.6 -> 1.2 s, decode unchanged.  The rest of the tail is the fill *source*'s
+business (documented, above).  **A false alarm is recorded too**: the first coherence attempt showed four
+different `sha`s because `-lv 4` interleaves statistics lines into llama-cli's generated text -- re-run without
+it, five arms agree (`cf7f8b23f404`); `extract-generated.py`'s docstring says exactly that, which is why it is
+there.
+
+**5. Also answered (`PLAN.md` P0).**  The span read **does** fire on this box and is worth **+8 %** at 77 %
+coverage (1 037 vs 958, 66 GiB coalesced, 0 fallbacks) -- the r224 `+81/+57/+14 %` remain DIO-arm
+cache-staging numbers and the buffered field path still does not coalesce (`INVARIANTS.md`, updated in place).
+Still open in the campaign: `P1.3` (`MOE_EXPERT_CACHE_TOUCH` 2 vs 3) and `P1.5` (`TODO` #279, narrow-2).
+**PR #267's reply now owes only the `#279` A/B**: the crossover table it asked for exists, and the two transport
+items closed on 2026-11-06.
+
 ## 261107.001 (r230) -- `--lazy-mode mlock`: the PLE/engram tables pinned in the page cache instead of copied (block 00)
 
 **Shipped:** `v16-6050b467c-r230` (**block 00**; the loader's lazy-table residency, no kernel and no

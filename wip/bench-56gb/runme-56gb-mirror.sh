@@ -13,7 +13,9 @@ export MOE_HOST_POOL_RAM_PCT=0
 export LLAMA_KV_REGION_POOL=0
 export GGML_CUDA_SLAB_HEADROOM_MIB=1536
 
-SERVER=${SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}
+# run.sh starts this inside `systemd-run --scope` as ROOT, where $HOME is /root: resolve the build from the
+# invoking user, not from HOME (a missing binary here is a silent "server never became healthy").
+SERVER=${SERVER:-$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)/llama.cpp/build-rocm/bin/llama-server}
 exec "$SERVER" \
   --model Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf \

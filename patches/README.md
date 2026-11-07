@@ -2731,6 +2731,22 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > `pinlate` arm included), coherence `1c5d32ac537d` at 1 GPU and 3 GPU `-sm tensor`, MTP four-axis at `-n 3000`
 > on the dense 27B, `validate-set.sh` green, per-block build 2/2.  Record: `WORKLOG.md` 261106.020.
 
+> **r231 amendment: the pool's re-layout fills are issued in FILE order, not heat order.**
+> `TODO` #280's crossover pass (`wip/host-expert-parity/RESULTS-2026-11-07-radix.md`) found that the biggest
+> single term in a non-mirror tier's field prefill is not bandwidth but the **band-transition tail**:
+> `pool_rerank_from_heat_locked` runs after the last prefill ubatch (the arena's slot count changed 179 -> 79, so
+> the pool's "arena complement + mirrored residents" layout is re-derived), it frees and re-fills 1 500-6 400
+> pool slots one 0.65 MiB expert copy at a time, and the client pays all of it before its first token (measured:
+> 13.5-18.6 s of a 50k first pass at `-lme 44`, 7.2 s at `auto`, 0.6 s on a mirror, which returns early).  The
+> loop walked `want` in **heat order**, i.e. random offsets in the GGUF, although one table's experts are
+> contiguous (`src_offs + e*host_bytes`).  It now collects the to-fill set and sorts it ascending when
+> `MOE_HOST_POOL_FILL_ORDER` is not `rank`.  The fill **set** is unchanged (a slot is interchangeable by
+> construction), so no decision moves: measured **tail 13.5-18.6 s -> 9.4-9.7 s**, prefill 769/780 -> 874/779 t/s,
+> fills 8 315 -> 7 352, `DIO` arm unchanged (1.6 -> 1.2 s), decode unchanged, greedy text byte-identical
+> (`sha=cf7f8b23f404`, five arms) and `gate-host-pool.sh` 37/37.  The rest of the tail is page-cache/reclaim
+> pressure under the memory cap -- the fill *source*'s business: `MOE_HOST_POOL_DIO=1` removes ~90 % of it
+> (`ENVIRONMENT.md`, the `MOE_HOST_POOL_DIO` row).
+
 > **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
 > demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
 > headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per

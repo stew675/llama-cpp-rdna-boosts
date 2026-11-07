@@ -17,9 +17,18 @@ the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdi
 > drop is real — 12 tables / 1 062 MiB at the field ubatch — but the re-fill is bounded by the evicted bytes,
 > ≤0.2-1.2 % of the prompt, invisible in paired rows, and absent on the 3-GPU tensor shape).
 >
-> **What remains is** P0.3's DIO/buffered + span-reach pairs and a *live* partial field row for the crossover
-> table (`TODO` #280), then P1.3 (a knob sweep) and **P1.5 (`TODO` #279, an A/B)**.  Ranked in
-> [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0.
+> **Third pass, 2026-11-07, on `radix` — [`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md):
+> `TODO` #280 is CLOSED and P0.2/P0.3 are DONE.**  The crossover table (mirror / `auto` / `-lme 44` / `-lme 36`,
+> shipping vs `SINK=0`, buffered vs `DIO`, 17 arms + a 7-arm old/new A/B), the parity sentence, the fill-mode
+> answer and the span pair are all in that file.  Two things came out of it that matter beyond the table: (a) the
+> field shape's non-mirror prefill is dominated by the **band-transition tail** — the pool's re-layout after the
+> last prefill ubatch, 0.6 s on a mirror, 7.2 s at `auto`, 13.5-18.6 s at `-lme 44`, all before the first token —
+> and its fill order is now **file order** (r231, block 12); (b) **decode is flat from 98 % to 77 % coverage**
+> (−9 % for 10.8 GiB less pinned RAM) while prefill is not, and a sub-complement budget should set
+> `MOE_HOST_POOL_DIO=1` (+43-81 % prefill, decode neutral with the demote).
+>
+> **What remains is** P1.3 (the `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 sweep, a knob) and **P1.5 (`TODO` #279, an A/B)**.
+> Ranked in [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0.
 
 ## 1. Settled — do not re-derive
 

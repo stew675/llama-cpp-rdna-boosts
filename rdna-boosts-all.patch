@@ -61704,10 +61704,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..36f7f774c
+index 000000000..68024d950
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9633 @@
+@@ -0,0 +1,9656 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -64664,12 +64664,35 @@ index 000000000..36f7f774c
 +    }
 +    // 2. Fill the wanted experts that are not resident (the pool was already prewarmed from the same
 +    //    prior, so on a warm start this is a handful of reads; slots freed in 1. are reused, never evicted).
-+    int filled = 0;
++    //
++    // r231: the fills are issued in ASCENDING EXPERT ID, not in rank order.  One table's experts are
++    // contiguous in the file (`src_offs + e*host_bytes`), so expert order IS file order, and `want` is in
++    // rank order -- i.e. this loop used to walk the file at random.  It issues 1 500-6 400 single-expert
++    // fills per band transition, all of it charged to the request that triggers the re-layout (measured on
++    // the 56 GiB rig: 13.5-18.6 s of a 50k first pass at `-lme 44`, 0.6 s on a mirror, which never
++    // re-lays-out).  File order recovers ~30 % of that (13.5-18.6 s -> 9.4-9.7 s, and the generated text is
++    // unchanged); the rest is not read latency but page-cache/reclaim pressure under the memory cap -- a
++    // microbenchmark of the same fill shape is 0.7-1.6 ms per expert, and `MOE_HOST_POOL_DIO=1` (which reads
++    // around the page cache) removes ~90 % of the tail, which is the fill SOURCE's business, not this
++    // loop's.  The SLOT an expert lands in is arbitrary by construction (`pool_fill_empty_locked` takes the
++    // first empty slot), so this changes nothing but the order the reads are issued in.
++    static const bool order_offset = [] {
++        const char * e = getenv("MOE_HOST_POOL_FILL_ORDER");
++        return e == nullptr || strcmp(e, "rank") != 0;   // `rank` = the pre-r231 order, for the A/B
++    }();
++    std::vector<int32_t> todo;
++    todo.reserve((size_t) n);
 +    for (int i = 0; i < n; i++) {
 +        const int32_t e = want[(size_t) i];
-+        if (pool->expert_slot.find(e) != pool->expert_slot.end()) {
-+            continue;
++        if (pool->expert_slot.find(e) == pool->expert_slot.end()) {
++            todo.push_back(e);
 +        }
++    }
++    if (order_offset) {
++        std::sort(todo.begin(), todo.end());
++    }
++    int filled = 0;
++    for (int32_t e : todo) {
 +        if (pool_fill_empty_locked(*pool, e, nullptr) == nullptr) {
 +            break;
 +        }

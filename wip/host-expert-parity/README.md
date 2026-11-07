@@ -11,18 +11,27 @@ coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of
 budget *below* the near-mirror boundary (≤96 % coverage), and the field shape's remaining prefill cost is the
 miss path, not the demote — see [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 for the ranked remainder.
 
-**The three transport items closed on 2026-11-06 (second pass, on `soar` —**
-[`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)**).**  `TODO` **#276** (the demote's copy submission)
-and **#277** (precopy) are **unreachable by construction**: the demote declines on every `n_slices != 0` table, so
-it issues no copy on the tensor split — the only layout with an intra-token all-reduce (0 demoted / 14 480
-structural declines), while the layout where it does fire (`-sm layer`, 7 862 copies) has no all-reduce to poison.
-`TODO` **#278** (the arena across a decode→prefill transition) is **measured and not worth a code change**: the
-drop is real (12 tables / 1 062 MiB at the field ubatch) but the re-fill is bounded by the evicted bytes —
-≤0.2-1.2 % of the prompt, invisible in paired rows — and it does not fire at all on the 3-GPU tensor shape.
-**Both closes correct the r228 frame**: the field prefill's residual at `auto` is the near-mirror miss path, not
-PR 0003b.  What remains is `TODO` **#279** (narrow-2, an A/B) and **#280** (the crossover table, plus P0.2/P0.3's
-DIO-buffered and span-reach pairs).  Read [`PLAN.md`](PLAN.md) (the work and its accept criteria) and
-[`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
+**`TODO` #280 is CLOSED — measured 2026-11-07, on `radix`, with the 56 GiB rig**
+([`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md)): the crossover table (mirror / `auto` / `-lme 44` /
+`-lme 36`, shipping vs `SINK=0`, buffered vs `DIO`), the parity sentence, the span pair, and the answer to the
+fill-mode question.  It reproduced the campaign's earlier findings *and* found the defect it shipped with in r231:
+the **band-transition tail** — the pool's re-layout after the last prefill ubatch, 1 500-6 400 single-expert fills
+charged to the first token (0.6 s on a mirror, 7.2 s at `auto` buffered, 13.5-18.6 s at `-lme 44` buffered) —
+whose fill order is now file order.  The headline: **77 % coverage is a decode-parity tier (−9 % for 10.8 GiB
+less pinned RAM, with the demote), not a prefill-parity one (−46 %)**; and for a sub-complement budget
+`MOE_HOST_POOL_DIO=1` is worth +43-81 % prefill (`ENVIRONMENT.md`).  What remains here is `TODO` **#279**
+(narrow-2, an A/B) and `P1.3` (`MOE_EXPERT_CACHE_TOUCH` 2 vs 3).
+
+**The 2026-11-06 closes stand** ([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)).  `TODO` **#276** (the
+demote's copy submission) and **#277** (precopy) are **unreachable by construction**: the demote declines on every
+`n_slices != 0` table, so it issues no copy on the tensor split — the only layout with an intra-token all-reduce
+(0 demoted / 14 480 structural declines), while the layout where it does fire (`-sm layer`, 7 862 copies) has no
+all-reduce to poison.  `TODO` **#278** (the arena across a decode→prefill transition) is **measured and not worth a
+code change**: the drop is real (12 tables / 1 062 MiB at the field ubatch) but the re-fill is bounded by the
+evicted bytes — ≤0.2-1.2 % of the prompt, invisible in paired rows — and it does not fire at all on the 3-GPU
+tensor shape.  Both closes correct the r228 frame: the field prefill's residual at `auto` is the near-mirror miss
+path **plus the band-transition tail** (r231), not PR 0003b.  Read [`PLAN.md`](PLAN.md) (the work and its accept
+criteria) and [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
 [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) (the campaign that
 shipped in r224) and the rig is [`wip/bench-56gb/`](../bench-56gb/README.md).
 
@@ -139,6 +148,7 @@ mirror `slots >= n_experts` case stays inert, both as shipped.)
 | the standing plan and the arm matrix | [`PLAN.md`](PLAN.md) |
 | **the first measurement pass (2026-11-06, `radix`)** | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
 | **the `soar` pass: the #276/#277/#278 closes + exact reproduction** | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) |
+| **the 2026-11-07 pass: the crossover table, the parity answer and the band-transition tail (#280 closed, r231)** | [`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md) |
 | the PR #267 integration checklist (re-framed by r228) | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 |
 | the release the fix shipped in | `WORKLOG.md` 261106.019, `patches/README.md` block 12 |
 | the per-patch re-assessment of PR #267 | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) |

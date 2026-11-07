@@ -21,11 +21,12 @@ its own cgroup, the ballast stops being needed for sizing and stays only as a me
 | `run.sh` | starts a launch script inside scope `<tag>`, logs to `runs/<tag>/server.log`, samples `memory.current` into `runs/<tag>/mem.txt` |
 | `measure.sh` | health, three 600-token decode passes, one 50k prefill, one 179.5k prefill, then `memory.peak` and the cgroup anon/file split |
 | `bench.py` | `/completion` client that prints the server's own `timings` (prompt and predicted t/s), plus a bounded `health` poll |
-| `gen_prompt.py` | writes `prompt_short.txt` and `prompt_long.txt` (179.5k tokens on this model).  `prompt_50k.txt` (used by `measure.sh`) is the first ~250 000 characters of `prompt_long.txt`, cut at a line boundary: `awk 'BEGIN{n=0} {if(n>=250000) exit; print; n+=length($0)+1}' prompt_long.txt > prompt_50k.txt` |
-for x in l:
-  if n>=250000: break
-  o.append(x); n+=len(x)
-open("prompt_50k.txt","w").write("".join(o))'` |
+| `gen_prompt.py` | writes `prompt_short.txt` and `prompt_long.txt` (179.5k tokens on this model).  `prompt_50k.txt` (used by `measure.sh`) is its first ~250 000 characters, cut at a line boundary: `awk 'BEGIN{n=0} {if(n>=250000) exit; print; n+=length($0)+1}' prompt_long.txt > prompt_50k.txt` |
+| `runme-56gb-tier.sh` | the parameterised launch script: `[LME] [SINK] [DIO] [SPAN] [RANK] [HEATMAP] [SERVER]` as **positional arguments** (see the trap below) |
+| `parity-arm.sh` | one arm end to end: drop the page cache, start the scope, wait healthily (bounded), three 600-token decode passes, **two** 50k prefill passes, `/proc/<pid>/io` storage deltas per stage, the census, stop.  Writes `runs/<tag>/{parity.txt,server.log,mem.txt}` |
+| `parity-matrix.sh` | an arm list (`TAG LME SINK DIO SPAN RANK SERVER` per line), one arm at a time, never in parallel |
+| `parity-summary.py` | the whole matrix as one markdown table (`gen3`, `pp50k#1/#2`, the **transition tail**, MiB/request, fills, demoted, reuse) |
+| `pp-analysis.py` | one log: per-pass processing vs `prompt eval time`, and the events (rearm/evict/rerank) that fill the gap |
 | `ballast.c` | allocates and `mlock`s N GiB of anonymous memory, then sleeps; `gcc -O2 -o ballast ballast.c` |
 | `runme-56gb-mirror.sh` | the host-expert config the campaigns compare against (`-lme 47`, `RAM_PCT=0`, KV pool off) |
 | `RESULTS.md` | the measured matrix |
@@ -79,6 +80,20 @@ a warm page cache (13 to 30 s of load plus pool fill, 3 x 8 s decode, 26 s for 5
 * `MOE_HOST_POOL_H2D=0|1` and `MOE_HOST_POOL_ALLOC=thp|portable` rows (`archive/work/host-expert-mirror/` step 4, CLOSED -- the alloc shape does not move any transport);
 * a 93 GiB control row (no cgroup, no ballast) so the effect of the emulation itself is measured once;
 * a cold-page-cache arm for the mirror row, since every row above was warm.
+
+## Traps (measured, both cost a pass)
+
+* **`sudo` resets the environment**, and `run.sh` starts the launch script inside `sudo systemd-run --scope`:
+  an exported `LME=44 SINK=0 ./run.sh ...` reaches **nothing** and silently runs the defaults (which looks
+  plausible).  That is why the knobs are positional arguments, why `parity-arm.sh` prints
+  `applied tier: slots=N/512` read back from the server's own placement log, and why `SERVER` is argument 7.
+* **Never hash llama-cli text taken with `-lv 4`**: its statistics lines interleave into the generated text, so
+  identical output hashes differently.  `-lv 4` is for the census, not for `scripts/extract-generated.py`.
+* The page cache decides a non-mirror tier's first prefill (the band-transition tail): quote the pair and
+  never one rep -- the same arm moved 1 810 -> 1 329 t/s between reps in one session
+  (`wip/host-expert-parity/RESULTS-2026-11-07-radix.md` §3).
+* `ballast` takes a **fractional GiB** (`./ballast 32.4`): a whole-GiB step is ~1 GiB of `MemAvailable`, and the
+  emulation needs 57.2 GiB (a 59 GiB box), not 55.3.
 
 ## Caveats
 

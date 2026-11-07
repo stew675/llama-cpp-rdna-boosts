@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one llama-server config inside a memory-limited cgroup scope.
 #
-#   usage: ./run.sh <tag> <launch script>
+#   usage: ./run.sh <tag> <launch script> [args...]
 #   env:   DIR=<results dir>      default ./runs/<tag>
 #          MEM=56G                the container limit to emulate
 #          PORT is the launch script's business
@@ -22,7 +22,7 @@ timeout 20 sudo systemctl stop "$UNIT.scope" 2>/dev/null
 rm -f "$DIR/mem.txt"
 
 nohup sudo systemd-run --scope --unit="$UNIT" -p MemoryMax="$MEM" -p MemorySwapMax=0 --collect \
-  bash "$LAUNCH" > "$DIR/server.log" 2>&1 &
+  bash "$LAUNCH" "${@:3}" > "$DIR/server.log" 2>&1 &
 echo $! > "$DIR/runner.pid"
 
 ( while kill -0 "$(cat "$DIR/runner.pid" 2>/dev/null)" 2>/dev/null; do

@@ -2481,3 +2481,31 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
 5. **`mlock` is refused, not emulated.**  Under a small `RLIMIT_MEMLOCK` (tested at `ulimit -l 2048`) the one
    `mlock` of the range fails, the loader warns and leaves the table on the evictable page-cache path (text
    unchanged).  There is no partial pin: `llama_mlock::grow_to` locks the whole range or nothing.
+
+- **A non-mirror host tier's field prefill is dominated by the band-transition tail, and the tail is the pool
+  RE-LAYOUT (measured 2026-11-07, `radix`; `wip/host-expert-parity/RESULTS-2026-11-07-radix.md`; r231).**  When
+  the arena's slot count changes between the bands (179 -> 79 per table at `-ub 6144`, the prefill's work region
+  taking the slab), `pool_rerank_from_heat_locked` re-derives the pool's "arena complement + mirrored residents"
+  layout **after the last ubatch and inside the request**: 1 500-6 400 single-expert fills, all charged to the
+  first token.  Measured tails (feature-attributed, not estimated -- the window between the last
+  `progress = 1.00` row and `prompt eval time` is 100 % `pool_rerank_from_heat_locked`): **0.6 s on a mirror**
+  (a covering pool returns early), **1.2-1.3 s with `MOE_HOST_POOL_DIO=1`**, **7.2 s at `-lme auto` buffered**,
+  **13.5-18.6 s at `-lme 44` buffered** -- i.e. the tail, not the miss path, is what makes a buffered sub-mirror
+  tier's first prefill look 2-3x worse than its processing rate.  Two consequences: (a) a per-fill cost is
+  **0.45 ms warm (DIO) to 10.8 ms** on the same bytes, so never quote one rep -- the same arm moved 735 -> 1 191
+  t/s between reps as page-cache state changed (`A0` 1 810 vs `A0b` 1 329); (b) the lever is the fill **source**
+  (`MOE_HOST_POOL_DIO`, ~90 % of the tail) plus the fill **order** (r231: file order, ~30 % of it), not more
+  bandwidth.  A microbenchmark of the fill shape (40 cold 0.65 MiB slices, `drop_caches`) is 0.74-1.61 ms for a
+  mapping memcpy and 0.89-1.04 ms for a buffered `pread`, so the arm's 4.6-10.8 ms is the cgroup
+  (`MemoryMax` + `MemorySwapMax=0`) reclaiming for every new page, not read latency.
+- **On the field shape a low-coverage tier decodes at near-parity, and the demote is why (measured 2026-11-07,
+  `radix`, 56 GiB rig, Flash-Next + MTP drafting; `wip/host-expert-parity/RESULTS-2026-11-07-radix.md`).**
+  Decode (third 600-token pass, `-ub 6144`, one load per arm): **mirror 83.8 t/s; `auto` 97.9 % 75.6; `-lme 44`
+  93.8 % 76.2; `-lme 36` 76.8 % 76.1** -- flat from 98 % down to 77 % coverage, 10.8 GiB of pinned RAM saved for
+  ~9 %, and only the mirror is faster.  With `MOE_HOST_POOL_SINK=0` the same 77 % tier falls to **45.4 t/s**
+  (-46 %): its decode turn reads **19.0 GiB** from storage against 2.2 GiB with the demote, whose census there is
+  **50 793 demotions / 32.2 GiB / 67.6 % reuse** (the CLI cells measured 4.7-7.9 % reuse, because a spec-decode
+  step verifies four tokens at once and re-uses exactly the experts a demote captures).  Prefill is *not* flat:
+  mirror 1 895-1 939, `auto` 1 785-1 818 (`DIO`) / 1 431-1 810 (buffered), `-lme 44` 1 329-1 699 (`DIO`) / 735-1 191
+  (buffered), `-lme 36` 1 037 (`DIO`) -- so **decode-parity at 77 %, not prefill-parity**, and a sub-complement
+  budget should set `MOE_HOST_POOL_DIO=1` (`+43-81 %` prefill, decode neutral with the demote, 2.1x the bytes).
