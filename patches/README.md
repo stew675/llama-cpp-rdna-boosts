@@ -1,7 +1,7 @@
 # The delivery patches — what each block is and what it does
 
-**16 blocks** (block 00 + blocks 01-15; block 09 amended in r210, repaired in r211) against `release.json.base` (**`6050b467c`**; the base is the
-2026-10-25 re-base), one
+**16 blocks** (block 00 + blocks 01-15; block 09 amended in r210, repaired in r211) against `release.json.base` (**`cf659f240`**; the base is the
+2026-11-07 re-base, see "Re-base onto `cf659f240`" below), one
 `git am` commit each.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
@@ -15,6 +15,47 @@ and every environment variable is catalogued in [`../ENVIRONMENT.md`](../ENVIRON
 > [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) and is what
 > `WORKLOG.md` entries and `archive/work/<campaign>/` records cite.  Everything below describes the
 > **current** blocks in **V2.0** numbering.
+
+
+## Re-base onto `cf659f240` (r230 content, 2026-11-07)
+
+The r230 block set re-cut onto upstream `cf659f240` (`6050b467c..cf659f240` = 300 commits, TODO #134).  The
+blocks keep their scope and messages; where upstream had grown its own form of a delivery mechanism the
+re-base follows upstream's design and drops (or adapts) the delivery's copy.  Validated on gfx1151 (Strix Halo,
+ROCm 10.0): `test-backend-ops` 22119/22119 vs CPU, plus `MUL_MAT_ID` with the duplicate-id cases re-enabled
+and Qwen3.8-Flash-Next / 35B-A3B prefill shapes (965/965); nine real models load and generate (Qwen3.8-27B MTP,
+Qwen3.8-Flash-Next MTP + mmproj, Qwen3.6-35B-A3B, a 35B-A3B + DFlash incl. a 13k-token prompt, a Qwen3.5-9B +
+DFlash + mmproj image request, LFM2.5-8B-A1B, LFM3-1.7B).  The per-block build gate was **not** re-run: the
+re-base fixes were folded into the last block that owns each file, so only the tip is known to build.
+
+What changed against the `6050b467c` set:
+
+- **Linearized MoE layout (upstream #31047)** -- MMQ/MMF now consume upstream's `tile_spec` list instead of
+  `expert_bounds`.  `mmid.cu` keeps the delivery's duplicate-id semantics and both fast paths (the templated
+  token-batched helper and `mm_ids_helper_512_10`) but writes `tile_spec`; an overload still produces
+  `expert_bounds` for the MMB routed path.  The MMF compact kernel builds its tiles with
+  `tile_width == cols_per_block`, so it serves every `MUL_MAT_ID` width (the duplicate-id fix).
+- **Block 08 MoE MMQ fusion / routed-compact** -- not carried: upstream's linearized tiles replace the
+  routed-compact grid and upstream #31188 fuses `MUL_MAT_ID` gate/up + GLU in MMQ.  The `has_gate` arm, the
+  `swiglu -> mmq` fold and block 10's `mul_mat_q_pair` / swiglu MMQ fusions are gone; their `*_try_fuse`
+  entry points remain and decline.  Measured on gfx1151: 35B-A3B prefill -2..-7 %, decode unchanged.
+- **Attention mask (upstream #29510 `flash_attn_ext_rows`, #31558)** -- the derived kq mask is registered on
+  top of `llm_attn_mask` (`build_attn_inp_kq_derived`), never for the `kv_rows` layout and never for a
+  block-uniform (DSpark) mask.  Upstream uses `src[5]` for `kv_rows`, so the derived inputs moved to
+  `src[6..8]`.  The native quantized K/V loaders and the masked-group skip honour `kv_rows`; the KV-chunked
+  launch is disabled with `kv_rows`.
+- **Recurrent rollback (upstream #31368 `rs_max`)** -- upstream's per-cell bound replaces the delivery's
+  boundary warning; upstream's single `set_rows` conv-snapshot store (#31660) replaces the per-slot loop.
+- **State I/O (upstream #30881)** -- upstream's batched `ggml_backend_tensor_get_n`/`set_n` replaces the
+  delivery's `flush_async` / merge-gap paths and the staged checkpoint copies.
+- **Server checkpoints** -- upstream's checkpoints are shared and immutable; the delivery's buffer recycling
+  only reclaims a checkpoint the slot holds the last reference to, and uses `common_state_data`.
+- **DFlash device features** -- the delivery's F1 path (`GGML_LF_DFLASH_DEV`) runs first; upstream's
+  `embd_row` device features (`LLAMA_DFLASH_DEV`) are used only when F1 is off.
+- **Q8_1 correction sum (upstream #31247)** applied inside the delivery's chunked `quantize_mmq_q8_1`.
+- **Small API adaptations** -- `no_alloc` moved out of `llama_hparams` (#31141), `n_pad` removed (#31200),
+  per-layer K/V rotations (#31073), the `model` member of `llm_graph_context` (#31733),
+  `ggml_rope_yarn_corr_dims(..., truncate)`, `RDNA4_M` in the mmvq tables.
 
 ## Apply
 

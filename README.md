@@ -11,7 +11,7 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point
-**`6050b467c`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
+**`cf659f240`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
@@ -23,7 +23,7 @@ not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 6050b467c
+git checkout cf659f240
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (15 commits)
 
 # OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
@@ -257,7 +257,7 @@ Applying the 14 patches to the fork point in [`release.json`](release.json) ther
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 6050b467c          # the base recorded in release.json
+git checkout cf659f240          # the base recorded in release.json
 bash <path-to-this-repo>/scripts/apply-all.sh .   # 15/15 strict, tree checked against release.json
 ```
 
