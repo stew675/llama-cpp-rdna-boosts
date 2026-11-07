@@ -7,9 +7,15 @@ unchanged (`6050b467c` / `cb3251e17`).  `scripts/validate-set.sh` green (fresh t
 `mlock`/`auto`/`off` on Flash-Next GSQ-IQ3_S 3 GPU `-sm tensor` (125 chars `7d898d3d3e58`, also under
 `--load-mode none`) and on Gemma4-E4B single GPU (`5dd272b4f316`); `llama-bench` at parity (pp2048
 2570.4 / 2549.1 / 2574.8 and tg32 77.41 / 77.55 / 76.27 for mlock/auto/off).
-`scripts/gate-per-block-build.sh --changed-from 5c3ef0354` builds the blocks whose own delta moved (00 and
-09 -- 09 because the `llama-bench` option table it edits gained a value) plus the tip.  No kernel or
-prefill change, so the prefill-logit gate does not apply (same call as r122).  Records:
+`scripts/gate-per-block-build.sh --changed-from 5c3ef0354`: **4/4 built, 0 failed** in 788 s (blocks 00,
+09 and 11 -- 09 and 11 because the `llama-bench` / tool-README tables they edit gained a value -- plus the
+tip).  No kernel and no numerics change, so nothing in the default arms moves, but the prefill-logit gate
+was run anyway from the canonical build: **PASS** (mean KLD 0.000000, same-top-p 100.000 % against the
+recorded gfx1201 `Qwen3.8-27B-Q8_0` base).  `scripts/check-gpu-faults.sh` clean (kernel window + four
+`mlock` arm logs).  The fork branch `rdna-boosts` was re-cut from the set and force-pushed to the personal
+fork at `2028e44cd` (strict 16/16, tree `b336da22e` == release.json), the tag was pushed (Validate
+delivery set on `main` and the tag, Release patch set / GitHub Release assets: green), and the ROCm images
+are built by the off-host `radiance` watcher.  Records:
 [`benchmarks/2026-11-07-lazy-mode-mlock.md`](benchmarks/2026-11-07-lazy-mode-mlock.md).
 
 **1. r122's `off` bought residency with a copy; this buys it with a pin.**  `--lazy-mode off` reads the
