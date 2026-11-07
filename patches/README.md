@@ -38,7 +38,7 @@ What changed against the `6050b467c` set:
 - **Block 08 MoE MMQ fusion / routed-compact** -- not carried: upstream's linearized tiles replace the
   routed-compact grid and upstream #31188 fuses `MUL_MAT_ID` gate/up + GLU in MMQ.  The `has_gate` arm, the
   `swiglu -> mmq` fold and block 10's `mul_mat_q_pair` / swiglu MMQ fusions are gone; their `*_try_fuse`
-  entry points remain and decline.  Measured on gfx1151: 35B-A3B prefill -2..-7 %, decode unchanged.
+  entry points remain and decline.  Measured on gfx1151: 35B-A3B prefill and decode unchanged against r227.
 - **Attention mask (upstream #29510 `flash_attn_ext_rows`, #31558)** -- the derived kq mask is registered on
   top of `llm_attn_mask` (`build_attn_inp_kq_derived`), never for the `kv_rows` layout and never for a
   block-uniform (DSpark) mask.  Upstream uses `src[5]` for `kv_rows`, so the derived inputs moved to
@@ -46,6 +46,12 @@ What changed against the `6050b467c` set:
   launch is disabled with `kv_rows`.
 - **Recurrent rollback (upstream #31368 `rs_max`)** -- upstream's per-cell bound replaces the delivery's
   boundary warning; upstream's single `set_rows` conv-snapshot store (#31660) replaces the per-slot loop.
+  Block 10's GDN direct-conv matcher (`gdn_conv_check`) accepts that store: the `SET_ROWS` and its 4D view of
+  overlapping 3-column windows read only the concat tail, so the fold takes them like the old snapshot `CPY`s
+  minus the snapshot fold (the `SET_ROWS` still runs as its own node).  Without it every GDN layer fell back to
+  `CONCAT` + `SSM_CONV` whenever a draft was configured (`n_rs_seq > 0`): a 35B-A3B (qwen35moe) + DFlash prefill
+  -6 % on gfx1151.  With it: 2017-2068 tok/s vs r227 2034-2050 (2592-token prompt), greedy text and draft
+  acceptance identical with `GGML_CUDA_DISABLE_CONV_FUSION=1`; Qwen3.8-27B + MTP likewise.
 - **State I/O (upstream #30881)** -- upstream's batched `ggml_backend_tensor_get_n`/`set_n` replaces the
   delivery's `flush_async` / merge-gap paths and the staged checkpoint copies.
 - **Server checkpoints** -- upstream's checkpoints are shared and immutable; the delivery's buffer recycling

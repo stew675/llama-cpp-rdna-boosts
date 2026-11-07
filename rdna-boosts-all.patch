@@ -27125,10 +27125,10 @@ index 000000000..cd9b1d3b4
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
 new file mode 100644
-index 000000000..88d194d34
+index 000000000..8bf5c38a8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,482 @@
 +#include "gdn-conv.cuh"
 +#include "unary.cuh"
 +#include "mmvq.cuh"
@@ -27342,6 +27342,22 @@ index 000000000..88d194d34
 +        bool reads = false;
 +        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == cc || t->src[s]->view_src == cc) reads = true;
 +        if (!reads) continue;
++        // the rollback snapshots of build_conv_state_store (n_rs_seq > 0): one SET_ROWS over a 4D view of overlapping
++        // 3-column windows [3, Kw, C, 1] (window w starts one column after window w-1).  It reads the concat tail like
++        // the per-slot CPYs did; it runs as its own node (no snapshot fold), so only the tail columns are needed.
++        if (t->op == GGML_OP_VIEW && t->ne[0] == 3 && t->ne[2] == C && t->ne[1] >= 1 && t->ne[3] == 1 &&
++                t->nb[0] == sizeof(float) && t->nb[1] == sizeof(float) && t->nb[2] == cc->nb[1]) {
++            if (t->view_offs % sizeof(float)) return false;
++            const int64_t col = (int64_t) (t->view_offs / sizeof(float));
++            if (col < 0 || col + t->ne[1] + 2 > T + 3) return false;
++            tail_from = std::min(tail_from, col); snap_ok = false; continue;
++        }
++        if (t->op == GGML_OP_SET_ROWS) {
++            const ggml_tensor * s0 = t->src[0];
++            if (s0 == nullptr || s0->op != GGML_OP_VIEW || s0->view_src != cc || s0->ne[0] != 3 || s0->ne[2] != C ||
++                    s0->nb[1] != sizeof(float) || s0->nb[2] != cc->nb[1]) return false;
++            snap_ok = false; continue;
++        }
 +        if (t->op == GGML_OP_VIEW) {
 +            if (t->ne[0] != 3 || t->ne[1] != C || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float)) return false;
 +            const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
