@@ -1,3 +1,70 @@
+## 261107.008 (r233) -- issue #278: the Windows pinned ceiling is the loaded HIP runtime, so name it (block 12) and give the tier a kill switch
+
+**Shipped:** `v16-6050b467c-r233` (block **12** amended, +165/-17 in
+`ggml/src/ggml-cuda/{moe-expert-cache,wddm-mem}.cu`; blocks 00-11 and 13-15 keep identical deltas).
+`release.json` tip `a46d18572`, tree `f198555eb313480090804634368e8fbf5e62259c` (base/base-tree unchanged).
+Issue [#278](https://github.com/stew675/llama-cpp-rdna-boosts/issues/278) (@DanoPTT, Windows 11, one R9700,
+64 GB).  The r229 fix was correct but could not reach the remaining hang: the reporter's post-prefill state is
+"pools exist, tier latched", so the r229 re-arm rule (a table with no fill source stays DISARMED) does not
+apply, and the two spinning threads are inside the HIP runtime's own yield-wait loop, not in the block set.
+
+**The missing variable is the runtime module, not Windows.**  `amdhip64_7.dll` on that box came from the
+Adrenalin driver in `C:\Windows\System32` (file version 10.0.3661.0); the ROCm tree beside the binary only
+supplied rocBLAS/hipBLAS/hipBLASLt.  The reporter put the official TheRock ROCm 10.1.0 Windows runtime
+(`amdhip64_7.dll` 10.0.3684.0, `amd_comgr.dll`, `hiprtc0716.dll`, `rocm_kpack.dll`) next to the same r229
+binary and re-ran the arms:
+
+| arm | driver HIP runtime | ROCm 10.1 HIP runtime |
+|---|---|---|
+| #278 arm, 5k prompt | **hang 2/2** (240 s watchdog) | OK 2/2: prefill 16.1 / 40.2 t/s, decode 9.4 / 11.8, draft 272/378 |
+| pinned tier | latched OFF at ~9.3-9.4 GiB | **16 004 / 14 913 MiB**, no ceiling warning, 0 failed fills |
+| disk-tier `c`, 5k | 39.8 t/s, 39/141 tensors, 1 455 failed fills | **370.7 t/s**, **141/141** tensors (40 078 MiB, full mirror `h=1.0000`), 0 failed fills |
+| `l4`, 5k | latched (and cold-cache dependent) | 26.0 t/s, 16 117 MiB pinned, 141/141 |
+| output | `c` differed from the reference | byte-identical to the reference on every good run |
+
+So the ~9.3 GiB "Windows aperture ceiling" recorded in r223/r227 is the **driver-shipped HIP runtime's** stop,
+not WDDM's, and it does not exist on the TheRock runtime (the same binary pins 16-40 GiB).  This also explains
+why r229 could not reproduce the hang here: this box runs ROCm 10.1 throughout.
+
+**1. The delivery now names the loaded runtime.**  `wddm-mem.cu` gains `ggml_hip_runtime_module_info()`:
+it resolves the loaded `amdhip64_7.dll` (by module name), reports the file path, whether it is the
+`GetSystemDirectoryA()` copy, and `hipRuntimeGetVersion()` (HIP_VERSION encoding).  `moe_cache_init` logs one
+INFO line, `HIP runtime 7.16.26385 from <path>`, and when the module is the system-directory driver copy one
+WARN that states the measured consequence (the ~9.3 GiB stop and the latched tier), the remedy (put the
+ROCm/TheRock runtime DLLs beside the executable) and the kill switch below.  A report can now be decision-
+relevant without asking which runtime was loaded.
+
+**2. `MOE_HOST_POOL_PIN=0` is new and closes the pinned tier on any platform.**  It is a kill switch (default
+`1`), not an opt-in: setting `0` closes the tier from the start with a named reason, so no host pool is built,
+the bounce ring and the coalesced-span ring never allocate, and every fill takes the pageable model-mapping
+fallback (correct, slower).  The exit census names the switch instead of reporting a fictitious refused
+`cudaHostAlloc`, and the re-arm's DISARMED line names it too.  This is the arm for a box that cannot switch
+runtimes; it is **not** made the default for the driver runtime yet -- a small `-lme` pool that stays under the
+driver ceiling still works and benefits, and there is no Windows box here to validate a default flip.  The
+issue asks the reporter to run `MOE_HOST_POOL_PIN=0` on the driver runtime; if that removes the spin, the
+default for that runtime is the next change.
+
+**3. Gates.**  `gate-host-pool.sh` **41/41** (a ninth `pin0` arm: `MOE_HOST_POOL_PIN=0` builds no pool, the
+census names it, and the text is byte-identical `a99ccbd97ecb` to `ref`; `pinlate` still reports the known
+`TODO` #282 mid-run-mixture WARN).  Coherence `1c5d32ac537d` at 1 GPU `-sm tensor`.  Prefill-logit KLD
+**0.000000 / same-top-p 100.000 %** against the recorded gfx1201 base.  `validate-set.sh` green (sha256s + a
+fresh-tarball strict 16/16 apply, applied tree `f198555eb`).  `gate-per-block-build.sh --changed-from pre-r233
+--fast` **2/2** (block 12 + the tip, 43 s).  `check-gpu-faults.sh --since "3 hours ago"` clean.
+`check-windows-portability.sh` clean over the 287 added files.  No Windows toolchain exists here: the Windows-only branch was syntax-checked with stubbed
+Win32/HIP declarations and the Linux build is byte-identical in behaviour (the new code is behind
+`GGML_USE_HIP && _WIN32` except the kill switch, which the new `pin0` arm exercises).
+
+**4. Docs.**  `README.md` gains a "Windows: use the ROCm (TheRock) HIP runtime" section with the measured
+table and the log line; `COMMUNITY-CONFIG.md` a gotcha pointing at it; `ENVIRONMENT.md` gains
+`MOE_HOST_POOL_PIN` and r233 corrections to `MOE_HOST_POOL_RAM_PCT` / `MOE_HOST_POOL_PIN_FAULT`;
+`INVARIANTS.md` corrects r223 fact 4 in place and appends the r233 entry; `patches/README.md` the block-12
+r233 amendment.  The README's stale `v15-...-r177` current-release line and its `15 commits` / `12/12` apply
+comments are updated too.
+
+**Environment.**  `soar` (3 x R9700, 91 GiB; `HIP_VISIBLE_DEVICES=0` for every arm), ROCm 10.1.0-gfx120X,
+ccache-warm `~/llama.cpp` at the r232 tree + the amendment.  Logs: `gate-host-pool.sh` temp dir (9 arms);
+the reporter's runtime table is quoted from issue #278's 2026-11-07 comments.
+
 ## 261107.007 (tooling) -- `utilities/storage-oracle`: which load mode and residency this model file wants on its device (refs issue #281)
 
 **New: `utilities/` -- a reporter, not the delivery.**  Nothing in `patches/`, `release.json` or the

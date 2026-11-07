@@ -2175,6 +2175,12 @@ Measured 2026-11-05 on `soar` (1 x R9700, gfx1201, ROCm 10.1.0, 91 GiB host RAM,
    with one WARN that names the platform cause (fact 3), and the exit census repeats the latch and its error.
    The real figure is the aperture segment's `CommitLimit` (`D3DKMTQueryStatistics`, the same call
    `wddm-mem.cu` already makes for the device free-memory query) -- measure it before adding a ceiling.
+   **r233 corrects the premise: the ~9.3 GiB stop is the loaded HIP RUNTIME, not Windows or WDDM.**  Issue
+   #278's box had `amdhip64_7.dll` from the Adrenalin driver in `System32`; with the ROCm/TheRock 10.1
+   runtime (a different DLL file version) beside the same r229 binary the tier pinned **16 004 / 40 078
+   MiB** with 141/141 host tensors and 0 failed fills, where the driver runtime stopped at ~9.3 GiB.  So
+   a Windows report's pinned ceiling is not interpretable until the loaded runtime module is named --
+   the delivery now logs it at startup (see the r233 entry at the end of this file).
 5. **`Private Bytes` for a read-only file mapping is not commit charge, so a 40 GB figure there is a
    measurement artifact until proven (r223, issue #274 follow-up @DanoPTT).**  `CreateFileMapping(PAGE_READONLY)`
    + `MapViewOfFile(FILE_MAP_READ)` makes the GGUF page-cache-backed; the process's commit only grows for page
@@ -2626,3 +2632,34 @@ the tool is the reproduction, and none of this is a delivery change.
    arms, but O_DIRECT's alignment handling re-reads the unaligned prefix of a chunk: 4 921 MiB against 4 275 MiB
    (+15 %) for the same model load here.  Any A/B that charges `dio` only its throughput advantage is understating
    its cost -- read the device's byte counter per arm.
+
+## (r233) -- the Windows pinned ceiling is the loaded HIP runtime, not Windows: name the module before believing a number
+
+Established from issue #278's reporter (Windows 11, one R9700, 64 GiB), same r229 binary, same command, only the
+HIP runtime swapped.  This is the missing half of the r223 fact 4 above and it changes what a Windows pinning
+report means.
+
+- **The ~9.3-9.4 GiB pinned stop belongs to the driver-shipped `amdhip64_7.dll` in `C:\Windows\System32`.**  That
+  box had been running with the Adrenalin driver's HIP runtime (file version 10.0.3661.0) while the ROCm tree
+  beside the binary supplied only rocBLAS/hipBLAS/hipBLASLt.  Putting the official TheRock ROCm 10.1.0 Windows
+  runtime (`amdhip64_7.dll` 10.0.3684.0, `amd_comgr.dll`, `hiprtc0716.dll`, `rocm_kpack.dll`) next to the
+  executable -- confirmed loaded from the binary's directory, not `System32` -- removed **both** symptoms:
+  the #278 hang (2/2 runs before, 0/2 after; prefill 16.1 and 40.2 t/s, decode 9.4 and 11.8 t/s, MTP 272/378)
+  and the ceiling (pinned tier **16 004 / 14 913 MiB** on the #278 arm, **40 078 MiB** on the disk-tier `c` arm
+  with **141/141** tensors, a full mirror `h=1.0000`, 0 failed fills, 5k prefill **370.7 t/s** against 39.8).
+  Text was byte-identical to the reference on the good runs and differed on the latched driver-runtime run.
+- **What this does NOT say.**  The two spinning threads were sampled inside the HIP runtime's own yield-wait
+  loop (`SwitchToThread` under `amdhip64_7.dll`, one started by the runtime, one under `ggml-hip.dll`'s
+  `hipGetDevice`); the hang is a runtime defect on that box, not something the block set can fix.  It also does
+  not license a WDDM/aperture formula: the driver runtime's ~9.3 GiB stop is still not derivable from RAM, the
+  commit limit, or the adapter count.  Do not cap a healthy box from any of them.
+- **What the delivery does about it (r233, block 12).**  `wddm-mem.cu` gains
+  `ggml_hip_runtime_module_info()`: it resolves the loaded `amdhip64_7.dll` by name, asks for its file path,
+  compares it case-insensitively with `GetSystemDirectoryA()`, and reads `hipRuntimeGetVersion()`; the MoE cache
+  logs one INFO line (`HIP runtime 7.16.26385 from <path>`) and, when the module came from the system directory,
+  one WARN that names the measured consequence and the remedy (put the TheRock DLLs beside the executable).  The
+  new kill switch `MOE_HOST_POOL_PIN=0` closes the pinned tier from the start on any platform, so a box stuck on
+  the driver runtime can still run the host-expert path (pageable mapping; correct, slower) without touching it.
+  Both are inert on a box that does not hit either condition; `gate-host-pool.sh`'s `pin0` arm proves the switch
+  builds no pool, says so in the census, and leaves the greedy text byte-identical to `ref`.
+

@@ -15,7 +15,7 @@ It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp check
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v15-6050b467c-r177`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v16-6050b467c-r233`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -24,7 +24,7 @@ not the changelog.
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 6050b467c
-bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (15 commits)
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (16 commits)
 
 # OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .   # 16 blocks + optional/*/*.patch
@@ -198,7 +198,7 @@ FORK=https://github.com/ggml-org/llama.cpp
 git clone $FORK && cd llama.cpp
 git checkout "$BASE"
 
-# 2. apply the set (automated; strict 12/12 git am on the recorded base)
+# 2. apply the set (automated; strict 16/16 git am on the recorded base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0000…0011  (one commit per block on a fresh `rdna-boosts` branch)
 
@@ -228,10 +228,35 @@ cmake --build build -j
 > drops hunks (30 files / 2483 lines vs the correct 35 / 6094, verified
 > 2026-08-29). `git am` (or `scripts/apply-all.sh`) is the required flow.
 
+### Windows: use the ROCm (TheRock) HIP runtime, not the display driver's
+
+On Windows the HIP runtime (`amdhip64_7.dll`) is usually resolved from `C:\Windows\System32`, i.e. the copy
+the **Adrenalin display driver** ships, even when a ROCm/TheRock tree sits beside `llama-server.exe`.  The two
+runtimes are not interchangeable for the host-expert path.  On the driver copy the pinned host tier stops at
+**~9.3 GiB** of adapter shared (aperture) usage even on a 64 GiB machine, the tier latches off, and on one
+reported box the process then spins inside the runtime's own wait loop after the post-prefill re-arm
+([issue #278](https://github.com/stew675/llama-cpp-rdna-boosts/issues/278)).  The **same binary** with the
+official TheRock ROCm 10.1 runtime beside it pinned **16-40 GiB**, filled the whole host expert set
+(141/141 tensors, a full mirror) and ran the same arm clean at **370.7 t/s** prefill where the driver runtime
+managed 39.8.
+
+Copy the ROCm/TheRock runtime DLLs next to the executable -- `amdhip64_7.dll`, `amd_comgr.dll`,
+`hiprtc0716.dll`, `rocm_kpack.dll`, plus the rocBLAS/hipBLAS/hipBLASLt DLLs from the same tree -- and confirm
+the startup line names the binary's directory:
+
+```
+moe_cache_init: HIP runtime 7.16.26385 from C:\path\to\llama-server\amdhip64_7.dll
+```
+
+If it instead names `C:\Windows\System32`, the delivery logs a WARN with this remedy.  A box that cannot
+switch runtimes can still run the host-expert path with **`MOE_HOST_POOL_PIN=0`**: the pinned tier stays closed
+(no pool, no bounce/span ring) and every fill takes the pageable model mapping -- correct and slower, but it
+avoids the tier that the driver runtime cannot grow.  See `ENVIRONMENT.md` for both variables.
+
 ### Manual equivalent
 
 ```bash
-git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch   # blocks 01-14
+git am patches/00*.patch   # block 00 + blocks 01-15
 ```
 
 ### The `mmb` campaign is in the delivery

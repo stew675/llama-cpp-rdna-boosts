@@ -61704,10 +61704,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a84e501a1
+index 000000000..eb5c395a3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9679 @@
+@@ -0,0 +1,9757 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -61775,6 +61775,9 @@ index 000000000..a84e501a1
 +// The adapter's SHARED (aperture) segments, all processes: what a pinned host allocation is charged
 +// against on Windows, and NOT the same figure as `ggml_hip_win_available_ram_bytes()` (issue #274).
 +bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib);
++// The loaded HIP runtime module (`amdhip64_7.dll`) and whether it is the Windows driver's System32 copy
++// rather than the ROCm/TheRock runtime shipped beside the binary (issue #278, r233).
++bool    ggml_hip_runtime_module_info(char * path_out, size_t path_cap, bool * system_dir_out, int * version_out);
 +#endif
 +
 +namespace {
@@ -62277,6 +62280,9 @@ index 000000000..a84e501a1
 +// correct) instead of hammering a driver that is no longer answering.  Nothing clears it: a source that
 +// failed once does not come back (the same policy as `table_t::fill_failed`).
 +static bool                         g_pinned_off       = false;
++// Why the tier is closed, when it was closed by a run-time decision rather than a refused allocation
++// (`MOE_HOST_POOL_PIN=0`, r233).  Null for a real refusal, whose cause is `g_pinned_alloc_err`.
++static const char *                 g_pinned_off_why   = nullptr;
 +static cudaError_t                  g_pinned_alloc_err = cudaSuccess;
 +// How much pinned memory the pool/ring/span tiers had obtained when a refusal happened: the number that
 +// names the platform's real ceiling (on the reporter's box it stops at ~9.3 GiB of shared usage whether the
@@ -63766,6 +63772,20 @@ index 000000000..a84e501a1
 +    return mode != nullptr && strcmp(mode, "0") != 0;
 +}
 +
++// `MOE_HOST_POOL_PIN=0` (r233, issue #278): close the pinned host tier for the whole run on ANY platform --
++// the same state a Windows driver refusal latches into.  Default on; this only ever DISABLES, so it is a
++// kill-switch, not an opt-in.  It exists because on Windows the loaded HIP runtime may be the display
++// driver's copy in System32, which refuses a pinned allocation at ~9.3 GiB of adapter shared usage and can
++// spin in its own wait loop afterwards (see `ggml_hip_runtime_module_info`); a box stuck on that runtime can
++// still run the host-expert path (correct, read through the mapping) without touching the pinned tier.
++static bool pinned_tier_disabled() {
++    static const bool off = [] {
++        const char * e = getenv("MOE_HOST_POOL_PIN");
++        return e != nullptr && atoi(e) == 0;
++    }();
++    return off;
++}
++
 +static host_pool_t * table_pool_locked(table_t & t) {
 +    if (!g_pool_enabled || !t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
 +        return nullptr;
@@ -63787,9 +63807,10 @@ index 000000000..a84e501a1
 +#if defined(_WIN32)
 +    if (g_pinned_off) {
 +#else
-+    if (g_pinned_off && pinned_latch_emulated()) {
++    if (g_pinned_off && (pinned_latch_emulated() || pinned_tier_disabled())) {
 +        // POSIX: a refused pinned allocation is transient, so production code keeps trying (the guard above is
-+        // Windows-only).  The `MOE_HOST_POOL_PIN_FAULT` diagnostic asks for the Windows latch semantics here.
++        // Windows-only).  The `MOE_HOST_POOL_PIN_FAULT` diagnostic asks for the Windows latch semantics here,
++        // and `MOE_HOST_POOL_PIN=0` asks for the tier to be closed from the start on either platform.
 +#endif
 +        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once (a latched HIP error on this
 +        // platform, see `g_pinned_off`) and a pool is entirely pinned memory, so no NEW pool can be built --
@@ -63801,8 +63822,8 @@ index 000000000..a84e501a1
 +            warned = true;
 +            GGML_LOG_WARN("%s: the pinned host tier is OFF for this run, so no NEW host pool can be built; "
 +                          "layer=%d role=%s falls back to the bounce ring / model mapping, and so will every "
-+                          "table that has no pool yet (pools built before the refusal keep serving).  See the "
-+                          "pinned-refusal line above for the cause.\n",
++                          "table that has no pool yet (pools built before a refusal keep serving).  See the "
++                          "pinned-tier line above for the cause.\n",
 +                          __func__, t.layer, t.role.c_str());
 +        }
 +        return nullptr;
@@ -64980,7 +65001,9 @@ index 000000000..a84e501a1
 +                          t.role.c_str());
 +        }
 +        if (why != nullptr) {
-+            *why = g_pinned_off ? "the pinned host tier is off (the first cudaHostAlloc was refused; see the WARN above)"
++            *why = g_pinned_off ? (g_pinned_off_why != nullptr
++                                       ? g_pinned_off_why
++                                       : "the pinned host tier is off (the first cudaHostAlloc was refused; see the WARN above)")
 +                                : "the pinned bounce ring could not allocate an entry (cudaHostAlloc failed)";
 +        }
 +        return false;
@@ -68171,7 +68194,8 @@ index 000000000..a84e501a1
 +                      "take the arena and fail every seed fill; the ops decline exactly as they did while "
 +                      "stood down) (arena now %.1f MiB)\n",
 +                      __func__, n_nosrc, n_nosrc_layers,
-+                      g_pinned_off ? "the pinned host tier is latched off"
++                      g_pinned_off ? (g_pinned_off_why != nullptr ? g_pinned_off_why
++                                                                 : "the pinned host tier is latched off")
 +                                   : "no host source can be resolved",
 +                      (double) g_arena_bytes / (1024 * 1024));
 +    }
@@ -69201,6 +69225,10 @@ index 000000000..a84e501a1
 +static span_buf_t * span_buf_ensure(span_buf_t & b, size_t need, size_t align) {
 +    if (align == 0 || (align & (align - 1)) != 0) {
 +        align = 4096;
++    }
++    if (pinned_tier_disabled()) {
++        g_span_off = true;   // MOE_HOST_POOL_PIN=0: do not ask the driver for a pinned ring either
++        return nullptr;
 +    }
 +    // One partial block ahead of the span (`skip` at the call site) plus the chunk itself; `skip` can be a
 +    // whole block, hence two.  `cap` is what the caller must not overrun.
@@ -70958,6 +70986,13 @@ index 000000000..a84e501a1
 +        ensure_env();
 +        if (!g_init_done) {
 +            g_init_done = true;
++            // r233 (issue #278): a run-time kill switch for the pinned tier.  Setting `g_pinned_off` here is
++            // the same latch every pinned consumer already honours, so no new code path decides "closed".
++            // Applied even when the cache is disabled, so a later enable cannot outrun it.
++            if (pinned_tier_disabled()) {
++                g_pinned_off     = true;
++                g_pinned_off_why = "MOE_HOST_POOL_PIN=0";
++            }
 +            if (!g_enabled) {
 +                return;
 +            }
@@ -70969,6 +71004,36 @@ index 000000000..a84e501a1
 +                    atexit(moe_cache_report);
 +                }
 +            }
++#if defined(GGML_USE_HIP) && defined(_WIN32)
++            {
++                // r233 (issue #278): name the HIP runtime that is really loaded.  The driver's System32 copy
++                // and the ROCm/TheRock runtime behave differently enough on the pinned tier that a report
++                // without this line is ambiguous (see `ggml_hip_runtime_module_info`).
++                char path[512]     = {};
++                bool from_system   = false;
++                int  hip_ver       = 0;
++                if (ggml_hip_runtime_module_info(path, sizeof(path), &from_system, &hip_ver)) {
++                    char ver[32] = "unknown";
++                    if (hip_ver > 0) {
++                        snprintf(ver, sizeof(ver), "%d.%d.%d",
++                                 hip_ver / 10000000, (hip_ver / 100000) % 100, hip_ver % 100000);
++                    }
++                    GGML_LOG_INFO("%s: HIP runtime %s from %s\n", __func__, ver, path);
++                    if (from_system) {
++                        GGML_LOG_WARN("%s: the loaded HIP runtime is the Windows display driver's copy (%s), "
++                                      "not the ROCm/TheRock runtime shipped beside the executable.  On this "
++                                      "runtime a pinned host allocation is refused at ~9.3 GiB of adapter "
++                                      "shared (aperture) usage even on a 64 GiB box (issues #274/#278), so "
++                                      "the host pool is capped and the pinned tier latches off.  The same "
++                                      "binary with the TheRock `amdhip64_7.dll` beside it pins 16-40 GiB and "
++                                      "runs the same arm clean.  Put the ROCm/TheRock runtime DLLs next to "
++                                      "llama-server.exe.  To stay on this runtime and still run the "
++                                      "host-expert path, set MOE_HOST_POOL_PIN=0 (pinned tier off; correct, "
++                                      "slower).\n", __func__, path);
++                    }
++                }
++            }
++#endif
 +            GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%s MiB/device, period=%lld steps, %s\n",
 +                          __func__, device, budget_desc(), (long long) g_period,
 +                          g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
@@ -71235,19 +71300,32 @@ index 000000000..a84e501a1
 +        // 64 GiB box), and on POSIX it is how much of RAM the pool/ring/span tiers took.
 +        GGML_LOG_INFO("%s: pinned tier: %.1f MiB allocated in total (host pool + bounce rings + coalesced span "
 +                      "ring)%s\n", __func__, (double) g_pinned_tier_bytes / (1024.0 * 1024.0),
-+                      g_pinned_off ? " -- the tier was refused after this, see the line below" : "");
++                      g_pinned_off ? (g_pinned_off_why != nullptr ? " -- the tier is closed, see the line below"
++                                                                 : " -- the tier was refused after this, see the line below")
++                                   : "");
 +    }
 +    if (g_pinned_off) {
-+        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once and is latched off for the run,
-+        // so the tier is being served from the pageable mapping.  Say WHICH error and WHY it is not retried --
-+        // a silent fallback reads as "the pool never appeared" all over again.
-+        GGML_LOG_WARN("%s: the pinned host tier is OFF for this run (the first cudaHostAlloc was refused: %s); "
-+                      "every fill that needed it went through the model mapping/pageable path or declined.  "
-+                      "The ceiling is NOT MemAvailable: on Windows it is the adapter's shared-memory "
-+                      "(aperture) budget, and it does not scale with RAM (measured 9.3-9.4 GiB of shared "
-+                      "usage on both a 47 and a 64 GiB box, issue #274).  Lower MOE_HOST_POOL_RAM_PCT / -lme, "
-+                      "or make one GPU visible (ROCm/TheRock#9339)\n",
-+                      __func__, cudaGetErrorString(g_pinned_alloc_err));
++        // issue #274 follow-up (@DanoPTT): the pinned tier is closed for the run, so the tier is being served
++        // from the pageable mapping.  Say WHY -- a silent fallback reads as "the pool never appeared" all over
++        // again.  A `MOE_HOST_POOL_PIN=0` run (r233) closed it deliberately; a refusal on Windows is the
++        // platform's aperture budget, which the driver-shipped HIP runtime reaches where TheRock's does not
++        // (issue #278).
++        if (g_pinned_off_why != nullptr) {
++            GGML_LOG_WARN("%s: the pinned host tier is OFF for this run (%s); every fill that needed it went "
++                          "through the model mapping/pageable path or declined (correct, slower)\n",
++                          __func__, g_pinned_off_why);
++        } else {
++            GGML_LOG_WARN("%s: the pinned host tier is OFF for this run (the first cudaHostAlloc was refused: "
++                          "%s); every fill that needed it went through the model mapping/pageable path or "
++                          "declined.  The ceiling is NOT MemAvailable: on Windows it is the adapter's "
++                          "shared-memory (aperture) budget, and it does not scale with RAM (measured 9.3-9.4 "
++                          "GiB of shared usage on both a 47 and a 64 GiB box, issue #274) -- and the "
++                          "driver-shipped HIP runtime reaches it where the ROCm/TheRock runtime does not "
++                          "(issue #278, see the runtime line at startup).  Lower MOE_HOST_POOL_RAM_PCT / -lme, "
++                          "make one GPU visible (ROCm/TheRock#9339), or put the ROCm/TheRock runtime DLLs "
++                          "beside the executable\n",
++                          __func__, cudaGetErrorString(g_pinned_alloc_err));
++        }
 +        if (g_pool_after_latch > 0) {
 +            // issue #278: the complement of a latched refusal.  A pool that was built before the ceiling was
 +            // hit is pinned memory the run already owns, so it keeps serving; only NEW pools and new ring
@@ -80443,10 +80521,10 @@ index 22126decf..f012d82b6 100644
  #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel
 diff --git a/ggml/src/ggml-cuda/wddm-mem.cu b/ggml/src/ggml-cuda/wddm-mem.cu
 new file mode 100644
-index 000000000..a3e661715
+index 000000000..7f906e274
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/wddm-mem.cu
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,280 @@
 +// Free device memory on Windows (WDDM).
 +//
 +// hipMemGetInfo counts only this process's allocations, so when other processes hold memory on the card it reports more
@@ -80471,6 +80549,7 @@ index 000000000..a3e661715
 +#include <winternl.h>   // NTSTATUS, for d3dkmthk.h
 +#include <d3dkmthk.h>
 +
++#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <mutex>
@@ -80609,6 +80688,75 @@ index 000000000..a3e661715
 +// far below `(RAM/2)/visible GPUs`.  Same statistics call as `wddm_free`, the other segment class.  Returns
 +// false (and leaves the outputs at -1) when the query is unavailable, so a caller can report "unknown" rather
 +// than a made-up number.
++// The HIP runtime module that is ACTUALLY loaded, on Windows.  `amdhip64_7.dll` is normally resolved from
++// the directory of the executable (the ROCm/TheRock tree dropped beside llama-server), but Windows will
++// silently load the Adrenalin driver's copy from `C:\Windows\System32` instead when that directory has no
++// copy.  The two are NOT interchangeable for the pinned host tier: the driver-shipped runtime (measured
++// 10.0.3661.0 on issue #278's box) refuses a pinned allocation at ~9.3 GiB of adapter shared (aperture)
++// usage even on a 64 GiB machine, latches the pinned tier off, and on that box spins two threads inside its
++// own yield-wait loop after the post-prefill re-arm; the same binary with the TheRock ROCm 10.1 runtime
++// (`amdhip64_7.dll` 10.0.3684.0) beside it pins 16-40 GiB and runs the same arm clean.  So the loaded module
++// is the thing to report -- a HIP version alone cannot tell them apart.
++//
++// Fills `path_out` with the module file name, `system_dir_out` with true when it came from the Windows
++// system directory (the driver copy), and `version_out` with `hipRuntimeGetVersion()` in the HIP_VERSION
++// encoding (major*1e7 + minor*1e5 + patch).  Returns false when no HIP runtime module can be resolved;
++// every output is then left at its neutral value.
++bool ggml_hip_runtime_module_info(char * path_out, size_t path_cap, bool * system_dir_out, int * version_out) {
++    if (path_out != nullptr && path_cap > 0) { path_out[0] = '\0'; }
++    if (system_dir_out != nullptr) { *system_dir_out = false; }
++    if (version_out    != nullptr) { *version_out    = 0; }
++
++    static const char * const names[] = { "amdhip64_7.dll", "amdhip64.dll", "libamdhip64.dll" };
++    HMODULE mod = nullptr;
++    for (const char * name : names) {
++        mod = GetModuleHandleA(name);
++        if (mod != nullptr) {
++            break;
++        }
++    }
++    if (mod == nullptr) {
++        return false;
++    }
++
++    char path[MAX_PATH] = {};
++    const DWORD n = GetModuleFileNameA(mod, path, (DWORD) sizeof(path));
++    if (n == 0 || n >= sizeof(path)) {
++        return false;
++    }
++    if (path_out != nullptr && path_cap > 0) {
++        snprintf(path_out, path_cap, "%s", path);
++    }
++
++    if (system_dir_out != nullptr) {
++        char sys[MAX_PATH] = {};
++        const UINT sd = GetSystemDirectoryA(sys, (UINT) sizeof(sys));
++        if (sd > 0 && sd < sizeof(sys)) {
++            const size_t sl = strlen(sys);
++            // `GetSystemDirectoryA` gives `...\System32`; a case-insensitive prefix plus a separator is the
++            // whole test (no other Windows directory is the driver's runtime location).  ASCII-only fold, so
++            // this does not depend on the CRT's `_strnicmp`.
++            bool prefix = sl > 0;
++            for (size_t i = 0; i < sl && prefix; ++i) {
++                char a = path[i];
++                char b = sys[i];
++                if (a >= 'A' && a <= 'Z') { a = (char) (a - 'A' + 'a'); }
++                if (b >= 'A' && b <= 'Z') { b = (char) (b - 'A' + 'a'); }
++                prefix = a == b;
++            }
++            *system_dir_out = prefix && (path[sl] == '\\' || path[sl] == '/');
++        }
++    }
++
++    int ver = 0;
++    if (hipRuntimeGetVersion(&ver) == hipSuccess && version_out != nullptr) {
++        *version_out = ver;
++    } else {
++        (void) hipGetLastError();
++    }
++    return true;
++}
++
 +bool ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib) {
 +    if (limit_mib    != nullptr) { *limit_mib    = -1; }
 +    if (resident_mib != nullptr) { *resident_mib = -1; }

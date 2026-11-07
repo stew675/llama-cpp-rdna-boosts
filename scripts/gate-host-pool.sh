@@ -23,7 +23,7 @@
 #
 # WHAT IT CHECKS
 #   One pool-backed host-expert config (the issue's: Flash-Next, `-ncmoe` most of the trunk, `--load-mode mmap`,
-#   a `MOE_HOST_LIMIT_FRAC` low enough that the set does not fit), four arms, same-seed greedy text:
+#   a `MOE_HOST_LIMIT_FRAC` low enough that the set does not fit), nine arms, same-seed greedy text:
 #     ref     the shipped default (buffered fills out of the model mapping)
 #     dio     MOE_HOST_POOL_DIO=1                (the disk tier, available on Linux)
 #     nodisk  MOE_HOST_POOL_DIO=1 + MOE_HOST_POOL_DIO_FAULT=1
@@ -45,6 +45,11 @@
 #                                                already owns, so the existing pools must keep serving the
 #                                                fills (`N expert fills were served from a host pool built
 #                                                BEFORE the refusal`, N > 0) and the text must not move)
+#     pin0    MOE_HOST_POOL_PIN=0                (r233: the kill switch closes the pinned tier from the start
+#                                                on ANY platform -- the state a Windows box stuck on the
+#                                                driver-shipped HIP runtime can run in, issue #278.  No pool
+#                                                may be built, the census must say why, and the text must be
+#                                                byte-identical to `ref`: the fallback is correct, just slower)
 #   HARD  * `ref`, `dio` and `nodisk` are byte-identical and build a real pool (the exit census must report
 #           `host pool (L2): N tensors, <slots> slots, <MiB> pinned` with slots > 0 and MiB > 0)
 #   HARD  * `ref`, `dio` and `nodisk` log NO `fill failed`, NO `no pinned host source` and NO
@@ -207,8 +212,9 @@ run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
 run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
 run_arm sinkfail MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1 || exit 2
 run_arm pinlate MOE_HOST_POOL_PIN_FAULT=late || exit 2
+run_arm pin0    MOE_HOST_POOL_PIN=0          || exit 2
 
-for a in ref dio nodisk fail late sink sinkfail pinlate; do text_only "$a"; done
+for a in ref dio nodisk fail late sink sinkfail pinlate pin0; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
@@ -229,7 +235,7 @@ echo "==> text: ref $(text_hash ref)"
 # papered over: the check still fails loudly for a WHOLESALE fault arm, and for a mixture it requires both
 # that the mixture is real (get_ok > 0 and decline_all > 0) and that `fail` proved the fallback's identity in
 # the same run.
-for a in dio nodisk fail late sink sinkfail pinlate; do
+for a in dio nodisk fail late sink sinkfail pinlate pin0; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
@@ -342,6 +348,23 @@ else
     fail "pinlate: no FAILED fills in the census: the latch never refused a fill (vacuous)"
 fi
 
+# ---- HARD: MOE_HOST_POOL_PIN=0 closes the pinned tier (r233, issue #278) ----------------------
+# The kill switch must be usable from a box that cannot pin: no pool may be built, the census must name
+# the switch as the reason, and the text must be byte-identical to `ref` (the fallback is correct).
+hard
+ps="$(pool_slots pin0)"
+if [ "${ps:-x}" = "0" ]; then
+    ok "pin0: MOE_HOST_POOL_PIN=0 built no host pool (0 slots)"
+else
+    fail "pin0: a host pool was built despite MOE_HOST_POOL_PIN=0 (slots='${ps}')"
+fi
+hard
+if grep -q 'the pinned host tier is OFF for this run (MOE_HOST_POOL_PIN=0)' "$KEEPOUT/pin0/err.txt"; then
+    ok "pin0: the census names MOE_HOST_POOL_PIN=0 as the reason"
+else
+    fail "pin0: the census does not report the kill switch (the tier may still be pinning)"
+fi
+
 # ---- HARD: the failure arm is CORRECT, and says so --------------------------------------------
 hard
 ff="$(failed_fills fail)"
@@ -404,7 +427,7 @@ for a in ref fail sink; do
 done
 
 # ---- HARD: no abort anywhere ------------------------------------------------------------------
-for a in ref dio nodisk fail late pinlate; do
+for a in ref dio nodisk fail late pinlate pin0; do
     hard
     if grep -qE 'GGML_ASSERT|terminate called|what\(\):|HAVE_ABORT' "$KEEPOUT/$a/err.txt"; then
         fail "$a aborted (see $KEEPOUT/$a/err.txt)"
@@ -416,7 +439,7 @@ done
 
 echo
 echo "==> $((CHECKS - FAILED))/$CHECKS checks passed"
-for a in ref dio nodisk fail late pinlate; do
+for a in ref dio nodisk fail late pinlate pin0; do
     printf "    %-7s %-52s %s\n" "$a" "$(text_hash "$a")" "$(grep -o 'Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s' "$KEEPOUT/$a/out.txt" | tail -1)"
 done
 echo "    logs: $KEEPOUT"

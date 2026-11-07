@@ -153,6 +153,13 @@ HIP_VISIBLE_DEVICES=0 MOE_EXPERT_CACHE_MIB=12288 MOE_EXPERT_CACHE_DEVMAP=1 \
   22.1 + 21.2 GiB of slab per device), which leaves headroom on a 91 GB box; `-ncmoe 48` pins ~85 GB and
   the OOM killer takes the run (measured 2026-10-26, `WORKLOG.md` 261026.004).  Same rule for any quant:
   pinned host experts = (n_cpu_moe / n_layer_moe) x the expert bytes, and the arena needs them resident.
+* **Windows: check which HIP runtime is loaded before you trust a pinned-host number.**  If the startup
+  line says `HIP runtime ... from C:\Windows\System32`, that is the **display driver's** copy, not the
+  ROCm/TheRock runtime, and its pinned host tier stops at ~9.3 GiB of adapter shared usage (issue #278)
+  regardless of RAM -- so the pool caps out or latches off.  Put the ROCm/TheRock `amdhip64_7.dll` (and
+  the rest of its runtime DLLs) beside the executable; the same binary then pins 16-40 GiB.  If you cannot
+  switch runtimes, `MOE_HOST_POOL_PIN=0` closes the pinned tier (correct, slower).  See `README.md` →
+  "Windows: use the ROCm (TheRock) HIP runtime".
 
 ## Verify your build (recommended)
 

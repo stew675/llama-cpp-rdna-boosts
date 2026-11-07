@@ -2766,6 +2766,28 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > **not** in this release: +38 % on top of this change but -41 % on its own, and exactly neutral when the pages are
 > cacheable, so it is a headroom bet — recorded in `wip/host-pool-fill-transport/` and `WORKLOG.md` 261107.006.
 
+> **r233 amendment (issue #278): name the Windows HIP runtime, and make the pinned tier closable.**
+> The ~9.3 GiB pinned ceiling that r223/r227 recorded as "Windows/WDDM" is the **driver-shipped HIP runtime**,
+> not Windows.  Issue #278's box had `amdhip64_7.dll` from the Adrenalin driver in `System32`; with the
+> official TheRock ROCm 10.1 runtime beside the same r229 binary the tier pinned **16 004 / 40 078 MiB** with
+> **141/141** host tensors and 0 failed fills (and no hang), where the driver runtime latched at ~9.3 GiB.
+> Two additions, both inert on a box that does not hit the condition:
+> 1. **`wddm-mem.cu`: `ggml_hip_runtime_module_info()`** resolves the loaded `amdhip64_7.dll`, returns its
+>    path, whether it is the `GetSystemDirectoryA()` copy, and `hipRuntimeGetVersion()`.  `moe_cache_init`
+>    logs one INFO line (`HIP runtime 7.16.26385 from <path>`), and when the module is the system-directory
+>    driver copy it logs one WARN naming the measured ceiling/hang, the remedy (put the TheRock runtime DLLs
+>    beside the executable) and the kill switch below.
+> 2. **`MOE_HOST_POOL_PIN`** (default `1`, kill-switch): `0` closes the pinned tier from the start on ANY
+>    platform (`g_pinned_off` with a named reason), so no host pool is built and the bounce/coalesced-span
+>    rings never allocate; every fill takes the pageable model-mapping fallback (correct, slower).  The exit
+>    census names the switch instead of reporting a fictitious refused `cudaHostAlloc`.
+>
+> The r229 latch and re-arm rules are unchanged (the r229 report's remaining state is "pools exist, tier
+> latched"; with the TheRock runtime that state no longer occurs, and on the driver runtime the switch avoids
+> it).  Gates: `gate-host-pool.sh` **41/41** (9 arms: the new `pin0` arm proves no pool + the census line +
+> byte-identical `a99ccbd97ecb` text), coherence `1c5d32ac537d` at 1 GPU, `validate-set.sh` green.  Records:
+> `WORKLOG.md` 261107.008, `INVARIANTS.md` (r233), `ENVIRONMENT.md` (`MOE_HOST_POOL_PIN`).
+
 > **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
 > demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
 > headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per
