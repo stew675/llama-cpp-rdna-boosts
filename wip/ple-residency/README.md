@@ -363,6 +363,42 @@ way the RAM advantage becomes real.  Two follow-ups fall out of the same numbers
 12.4 GB could become ~1.8 GB), and for decode either accept the 4.7 ms or prefetch the MTP verify batch
 during drafting (§4c).
 
+## 4f. Phase 2, first cut (2026-11-06, r229) — the predictor and the async prefetch are in, the overlap is not
+
+`ple-row-store-prefetch.patch` adds the three pieces Phase 2 needs and measures where it stops:
+
+1. **A predictor.**  The n-gram hash is factored into one `qwen4exp_ple_rows()` shared by the gather and
+   the predictor, and `llama_model::ple_prefetch(batch)` (a virtual, no-op for every other arch) is called
+   once per `decode()` batch, before the ubatch loop, from `llama-context.cpp`.  It walks the batch's
+   token ids and positions, takes the 1-2 predecessors from the batch itself, computes every row the
+   batch will gather and hands the list to the reader.
+2. **An asynchronous prefetch** in the reader (`prefetch()`): resolve against the store, index the cold
+   rows immediately as *pending*, hand the job list to the existing 8-16 thread pool and **return
+   without waiting**.
+3. **Per-row readiness** (`slot_ready` + its own mutex, so the workers never take the gather's lock): a
+   gather waits for the individual rows it needs, not for the whole prefetch.
+
+**Correctness: text byte-identical** with the prefetch on (`sha 6317a4054e25`, 2 299 chars) and no
+fallbacks on the decode path; `LLAMA_PLE_NOPREFETCH=1` turns it off.
+
+**Measured: the fetch gets cheaper but the wall does not move.**
+
+| 190k prefill, `-b 24576 -ub 6144` (4 ubatches per decode call) | t/s | PLE fetch |
+|---|---:|---:|
+| delivered mmap | 1691.9 | hint 240 ms + fault 38 ms per ubatch |
+| store, prefetch off | 1721.8 | 226 ms/ubatch (2.7 us/row) |
+| store + prefetch | 1691.4-1719.7 | 224-161 ms/ubatch |
+
+and with the prefetch off the fetch is 226 ms/ubatch against 161 ms with it — but the total is the same,
+because **the job list is sorted by row id**: ubatch 1's rows are scattered through it, so the first
+gather ends up draining most of the prefetch.  The overlap needs the pool to deliver **in token order,
+one ubatch at a time** (dedup within an ubatch, enqueue per ubatch, gather consumes in order), which is
+the next change — the infrastructure (predictor, job list, per-row readiness) is now in place for it.
+
+Two incidental results from this cut: `-b 24576 -ub 6144` alone is not a win for the delivered path
+(mmap 1691.9 vs 1708.2 at `-b 6144`), and the decode arm measured its best number yet (44.2 t/s) with
+the prefetch — which is a store-hit effect, not an overlap one.
+
 ## 5. Options if this is picked up (none started)
 
 0. **Simplest and strongest — a per-request PLE staging buffer** (§4b): at request start enumerate the
