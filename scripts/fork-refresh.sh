@@ -160,6 +160,13 @@ if [ "$DO_PUSH" -eq 1 ]; then
         read -r ans || ans=""
         case "$ans" in y|Y|yes|YES) ;; *) echo "    aborted"; exit 1 ;; esac
     fi
+    # FETCH FIRST (r232): the re-cut above DELETED and re-created the local branch, so the remote-tracking
+    # ref this lease compares against can be arbitrarily stale (a month of releases is normal), and
+    # `--force-with-lease` then refuses with "stale info" AFTER the whole re-cut + build + gates have run --
+    # which is what happened on r232's first attempt and cost a manual fetch-and-retry.  A bare fetch is safe
+    # (read-only) and makes the lease mean what it is supposed to mean: "the remote is still what I last saw".
+    git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+    echo "    lease: remote $BRANCH at $(git rev-parse --short "origin/$BRANCH" 2>/dev/null || echo '<unknown>')"
     git push --force-with-lease origin "$BRANCH"
     echo "==> pushed: $(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')"
 else
