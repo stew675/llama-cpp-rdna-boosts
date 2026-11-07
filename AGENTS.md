@@ -33,8 +33,11 @@ touch.
 
 1. **Apply with `scripts/apply-all.sh`** (strict `git am`). Never `git apply` the concatenated series — it
    silently drops hunks.
-2. **`llama-cli` needs `--single-turn`** (plus `--no-display-prompt` for scripted output), and anything that
-   can block goes inside `timeout`.
+2. **`llama-cli` needs `--single-turn`** (plus `--no-display-prompt` for scripted output), anything that can
+   block goes inside `timeout`, and **`-lv` is picked by the arm, never by habit**: a **text/hash** arm takes
+   **no `-lv` at all** (the same stream carries the generated text), a **census/mechanism** arm takes
+   **`-lv 4`**.  `-lv 3` is the trap — it pollutes the text *and* still hides the ggml censuses.  Table under
+   *Verify* below.
 3. **Pin `HIP_VISIBLE_DEVICES` on every multi-device arm** — the iGPU is otherwise enumerated and the load
    aborts with `invalid kernel file`.
 4. **Throughput is not a correctness signal.** Verify with same-seed greedy text, then the gate the change
@@ -264,6 +267,27 @@ trap so easy to hit only on the 3-GPU arm.
 
 Diff against a known-good build: same-seed output must be IDENTICAL. `GGML_CUDA_ALLREDUCE=nccl` is not
 a bit-identical reference under `-sm tensor` (see `INVARIANTS.md`); treat it as a smoke comparison.
+
+**`-lv` is a threshold you pick per arm, and `llama-cli` starts at errors-only.**  One flag, two mappings:
+`common_log_get_verbosity()` sends ggml's `GGML_LOG_INFO` to **TRACE** while llama.cpp's own `LOG_INF` is
+**INFO**, and `llama-cli` sets `params.verbosity = LOG_LEVEL_ERROR` (the common default is INFO, which is why a
+`llama-server` arm differs — see below).  So:
+
+| `-lv` | what it adds | use it for |
+|---|---|---|
+| **none** (the `llama-cli` default) | errors only — the banner, generic output, the generated text | **every text/hash arm**: `scripts/extract-generated.py` needs the clean stream, and the rates come from the `[ Prompt: … \| Generation: … ]` footer |
+| `2` | ggml/gate WARN: the slab line, `narrow-2 … pinned at`, the pool/sink census WARNs | a quick mechanism spot-check |
+| `3` | llama-cli's own INFO, i.e. its **per-slot statistics block**, printed *between* streamed tokens | **nothing** — it corrupts a hash and still hides every ggml INFO census |
+| `4` | ggml INFO: `MoE expert cache:`, `expert access:`, `takeover=`, `cold admission=`, `sched_reserve`, the `draft acceptance`/spec lines | **every census/mechanism arm** |
+
+A hash and a census are therefore **two runs**: hash with no `-lv`, then repeat with `-lv 4` for the numbers
+(that is what `wip`-style arm harnesses do; `archive/work/host-expert-parity/touch-ab.sh` is an example, and its
+`VERBOSE=` is an explicit space, because `${VERBOSE:-default}` silently takes the default for an empty value).
+`llama-server` differs: its generated text comes back over **HTTP**, so `-lv 4` pollutes only the log — which is
+why `gate-ckpt-reuse.sh` hashes the API responses at `-lv 4` safely.  Every gate that hashes `llama-cli` text
+passes no `-lv` at all (`gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-kv-window-split.sh`,
+`gate-grid-stall-pad.sh`, `gate-norm-rows-alias.sh`, `gate-hc-fusions.sh`).  Code paths and the measured
+consequences: `INVARIANTS.md` (2026-11-07).
 
 The coherence gate is a decode/greedy check and is **blind to a uniform prefill-logit shift**. For any
 change to a prefill kernel (GDN/SSM, FA, MMQ/MMVF/MMB, MoE prefill) or a default-on approximate path,

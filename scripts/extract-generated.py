@@ -13,8 +13,10 @@ actually generated.  This strips the backspaces first, then takes the span betwe
 the prompt echo (`> `) and the `[ Prompt: ... ]` footer, exactly as the delivery's
 text-purity gate does.
 
-Run llama-cli with `--single-turn --no-display-prompt` and, for this check, WITHOUT
-`-lv 4` (the verbose log interleaves statistics lines into the generated text).
+Run llama-cli with `--single-turn --no-display-prompt` and **no `-lv` at all**: llama-cli's own default is
+errors-only, so the stream carries only the generated text.  Every level that prints its per-slot statistics
+block (`-lv 3` and up) interleaves log lines into that stream, and `-lv 3` still hides ggml's INFO censuses --
+so a number/census arm is a SEPARATE `-lv 4` run (see AGENTS.md, Verify, the `-lv` table).
 """
 
 import hashlib
