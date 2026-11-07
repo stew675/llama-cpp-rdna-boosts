@@ -1,0 +1,11 @@
+# issue #281 repro (2026-11-07, `soar`): the field shape is "almost every routed expert is in NEITHER tier".
+# On this rig that is -lme 12 (12 of 46.84 GiB resident = 26 %), which is also r224's +81 % cell.
+#   I1 = the reporter's arm: buffered fills (--load-mode mmap), SPAN cannot fire (it is O_DIRECT-only today)
+#   I2 = the reporter's workaround: DIO + the coalesced span
+#   I3 = DIO with the span OFF -- isolates the COALESCING inside one fill source
+#   I4 = buffered with the span forced off -- proves SPAN is inert under a buffered fill today (I1 == I4)
+# tag  LME SINK DIO  SPAN RANK
+I1     12  1    auto  -
+I2     12  1    1     -
+I3     12  1    1     0
+I4     12  1    auto  0
