@@ -118,6 +118,25 @@ arena-resident bytes over PCIe too) is **+12.8 %**.  This is a real finding, but
 box** (1 GPU, `-ub 6144`, a Gen5 **x8** link, a 47 962 MiB host tier) and the copy-engine arms are
 bimodal, so it was recorded, not defaulted (see `RESOLUTION.md` §3).
 
+## 6b. Addendum (2026-11-07, after r234 shipped): where the staging copy actually pays
+
+`GGML_MOE_CACHE_STAGE=0` is the kill switch for the whole feature, so "does it pay" decides the default.
+Four runs per arm, balanced ABBA, same config as §2:
+
+| tier / shape | staging (default) | `GGML_MOE_CACHE_STAGE=0` | verdict |
+|---|---|---|---|
+| **pageable master** (pool, `-sm layer`, `GGML_SCHED_DEVGATHER=0`) | 1052-1556 t/s | **103-281** | staging is **5-10x** faster: without it every byte goes through `moe_cache_upload_pageable` (a host `memcpy` into a pinned bounce + a pinned H2D per expert) instead of the arena's D2D |
+| pinned, **2 devices `-sm layer`, 99.1 % residency** (arena 47 534.9 MiB of 47 962.5 MiB) | **1961** (1933-1982, stable) | 1885 (1811-1961) | staging **+4.0 %**; with the arena covering the set it moves `arena=322 875 MiB host=0.0 MiB` (H2D 0.0 %), so nothing crosses PCIe |
+| pinned, **1 device, 43.4 % residency** (arena 20 796.2 MiB) | 1793 | **2023** | staging **-12.8 %**: the one-launch fill kernel is the slow engine and the arena saves too few bytes |
+
+A `-ncmoe 24` arm cannot reach high residency on one 32 GiB card: the resident layers plus the auto arena
+over-commit and the context fails to initialise (`cudaMalloc failed: out of memory` on the pp compute
+buffer) — use two devices for that shape, as above.
+
+`GGML_MOE_CACHE_STAGE` is read only in `ggml/src/ggml-cuda/moe-expert-cache.cu` (the CUDA/HIP backend is
+the only one that fills the MoE iface hooks).  A **CPU-only** run never loads that backend, so the switch
+cannot change its throughput.
+
 ## 7. Reproduce
 
 ```sh

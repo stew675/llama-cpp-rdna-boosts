@@ -29,7 +29,7 @@ awk '/^pswpin|^pswpout|^pgmajfault/{printf "%s=%s ",$1,$2} END{print ""}' /proc/
 MON=$!
 "${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}" \
   -m "$MODEL" \
-  --fit off -ngl 99 --n-cpu-moe 48 "${HOST_ARGS[@]}" \
+  --fit off -ngl 99 --n-cpu-moe ${NCMOE:-48} "${HOST_ARGS[@]}" \
   -c "${CTX:-204800}" -fa on -ctk q8_0 -ctv q8_0 -sm "${SM:-layer}" ${SM:+$([ "$SM" = tensor ] && echo "-mg 0")} \
   --load-mode mmap --lazy-mode auto -t 7 --cache-ram 1024 \
   -b "$UB" -ub "$UB" \

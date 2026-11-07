@@ -2726,3 +2726,20 @@ Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README
   today, not a default: it is one shape on one box (x8 link), it trades the arena's bytes for PCIe traffic,
   and the arm that would replace it (copy-engine staging) is bimodal.  A rule needs the 2048-5120 crossover
   measured first.
+- **The prefill staging copy pays or loses depending on the TIER and the RESIDENCY, not the switch
+  (measured 2026-11-07, Flash-Next GSQ-RCO IQ3_S, 52 512-token prompt, balanced ABBA, 4 runs/arm).**
+  `GGML_MOE_CACHE_STAGE=0` (the plain whole-table upload) is 1 GPU / `-ub 6144`:
+  * **Pageable master** (`--host-experts pool`): **5-10x slower** (103-281 t/s against 1052-1556 with
+    `GGML_SCHED_DEVGATHER=0`).  The staging copy is the only fill that reads the arena (D2D); without it
+    every byte goes through `moe_cache_upload_pageable`, i.e. a host `memcpy` into a pinned bounce plus a
+    pinned H2D per expert.  **Never disable it on that tier** — this is the r83 case (+32-54 %) and the
+    reason the default exists.
+  * **Pinned master at 99.1 % residency, 2 devices `-sm layer`**: staging is **+4.0 %** (1961 against
+    1885) and is the stable arm; with the arena covering the host set the staged copy moves ~0 bytes over
+    PCIe (H2D 0.0 %) and the copy stream hides the rest.
+  * **Pinned master at 43.4 % residency, ONE device**: staging is **-12.8 %** (1793 against 2023) — the
+    one-launch fill kernel monopolises the CUs and there are too few arena bytes for the saving to pay.
+  So "is the switch worth it" is a tier-and-residency question, and the 1-GPU pinned answer is an *engine*
+  problem (a copy-engine or hybrid fill that keeps the arena source), not a reason to drop the feature.
+  A `-ncmoe 24` arm is NOT a way to reach high residency on a 32 GiB card: the resident layers plus the
+  auto arena over-commit and the context fails to initialise.
