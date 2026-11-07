@@ -2334,7 +2334,7 @@ on Linux.**
    was the better configuration there and why adding 16 GB of RAM moved prefill 16 -> 94 t/s with nothing in
    the delivery changing.
 - **The demote's cost and the pool's fill cost are properties of the HOST LINK, not of the delivery
-  (recorded 2026-11-06, before r225; `wip/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
+  (recorded 2026-11-06, before r225; `archive/work/host-expert-parity/`).**  r224's exchange rates — 9.6 µs per 679 762 B
   D2H, 0.0140 ms/MiB, ~2/3 hidden behind compute, ~3 % break-even reuse on this box's NVMe — were measured on a
   host whose link the same record's own naive-transport figure puts at **~26 GB/s** (26 µs per copy).  A host
   that negotiates more (one R9700 on PCIe 5.0 x16 = `32.0 GT/s` x 16) moves both the demote's marginal cost and
@@ -2349,7 +2349,7 @@ on Linux.**
   never read a DIO-vs-buffered pair as a span A/B: the fill source changes with the mode, so that pair is two
   changes at once.
 - **The demote's value is BUDGET-shaped, and it is positive up to a near-mirror budget (measured 2026-11-06;
-  `wip/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
+  `archive/work/host-expert-parity/RESULTS-2026-11-06.md`).**  One box, one model, `-n 64`, DIO, prose: `-lme` 36
   (76.9 % coverage) **+8 %** generation (24.0 → 26.0 t/s), `-lme` 44 (93.7 %) **+21 %** (28.0 → 33.9), mirror
   (100 %) **inert by construction** (0 demoted, 144 mirror tables).  This corrects `W1-SINK-TAX.md`'s inference
   that "the cost is constant while the benefit falls as the pool grows": the copy count is roughly constant, but
@@ -2407,7 +2407,7 @@ on Linux.**
   the log, and the same config under `-sm layer` gives **7 862** copies (4 771.4 MiB) with **no** all-reduce line.
   This is why PR #267's 0004/0006/0007 rationale (`hipMemcpyAsync` leaving later queued work unsubmitted, which
   stalls the *paired* peer past its spin timeout) has no reachable defect to fix here: do not re-open it without
-  first extending the demote to a split table.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §2.
+  first extending the demote to a split table.  Record: `archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md` §2.
 - **The slab's arena eviction at a decode->prefill transition costs at most the evicted bytes, i.e. nothing you can
   measure (r229, campaign; `TODO` #278 closed).**  `moe_cache_evict_slab_range` hands the work pool the LOWEST
   arena chunks and `moe_cache_rearm` re-arms what fits afterwards, so a dropped table loses its slots and its
@@ -2419,7 +2419,7 @@ on Linux.**
   post-transition row +2.0 %) -- `Q4_K_M` cannot show it: its whole host set is 18 662 MiB (the arena clamps at
   `n_experts`, so no `MOE_EXPERT_CACHE_MIB` forces it larger) and its priming pass reserves the work region at the
   width the real prefills need.  So this is not the field prefill's residual -- that one is the near-mirror miss
-  path.  Record: `wip/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
+  path.  Record: `archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md` §1.
 
 ## (no release, r229 tree) -- the two-lane pair only pays when the SPLIT creates its partner; a declined pair must not still split
 
@@ -2483,7 +2483,7 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
    unchanged).  There is no partial pin: `llama_mlock::grow_to` locks the whole range or nothing.
 
 - **A non-mirror host tier's field prefill is dominated by the band-transition tail, and the tail is the pool
-  RE-LAYOUT (measured 2026-11-07, `radix`; `wip/host-expert-parity/RESULTS-2026-11-07-radix.md`; r231).**  When
+  RE-LAYOUT (measured 2026-11-07, `radix`; `archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`; r231).**  When
   the arena's slot count changes between the bands (179 -> 79 per table at `-ub 6144`, the prefill's work region
   taking the slab), `pool_rerank_from_heat_locked` re-derives the pool's "arena complement + mirrored residents"
   layout **after the last ubatch and inside the request**: 1 500-6 400 single-expert fills, all charged to the
@@ -2499,7 +2499,7 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
   mapping memcpy and 0.89-1.04 ms for a buffered `pread`, so the arm's 4.6-10.8 ms is the cgroup
   (`MemoryMax` + `MemorySwapMax=0`) reclaiming for every new page, not read latency.
 - **On the field shape a low-coverage tier decodes at near-parity, and the demote is why (measured 2026-11-07,
-  `radix`, 56 GiB rig, Flash-Next + MTP drafting; `wip/host-expert-parity/RESULTS-2026-11-07-radix.md`).**
+  `radix`, 56 GiB rig, Flash-Next + MTP drafting; `archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`).**
   Decode (third 600-token pass, `-ub 6144`, one load per arm): **mirror 83.8 t/s; `auto` 97.9 % 75.6; `-lme 44`
   93.8 % 76.2; `-lme 36` 76.8 % 76.1** -- flat from 98 % down to 77 % coverage, 10.8 GiB of pinned RAM saved for
   ~9 %, and only the mirror is faster.  With `MOE_HOST_POOL_SINK=0` the same 77 % tier falls to **45.4 t/s**
@@ -2521,7 +2521,7 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
    deliberate fallback (the tensor-split drafter that used to abort in `graph_reserve`), never a routine path.
    Measured on four probes (Flash-Next + MTP 1 GPU, 35B-A3B + DFlash2 1 GPU and 3 GPU `-sm tensor`, and a `-ub`
    sweep to a 1.50 GiB region): all `unmapped VA spare`.  **Do not chase this branch as a performance item** —
-   `wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md`.
+   `archive/work/host-expert-parity/RESULTS-2026-11-07-narrow2.md`.
 2. **When it is forced, its eviction is re-absorbed; the resident-set loss is not a loss.**  `GGML_CUDA_SLAB_RESERVE_MIB`
    sets the reserve verbatim, i.e. `spare = value - headroom`, which is the only knob that reaches the branch (and
    a >46k ubatch at a 64k context is the smallest natural shape that closes the gap).  Six interleaved arms: the
@@ -2538,7 +2538,28 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
    would give up the evicted bytes of cushion permanently for one ~20 ms re-fill — the wrong trade, since that
    cushion is what r206 raised to 1280 MiB/GPU to stop a hipBLASLt OOM.  Verdict: **do not implement**;
    `TODO` #279 closed 2026-11-07.
-4. **`-lv 3` interleaves the statistics block into llama-cli's generated text, exactly as `-lv 4` does.**  Any
-   text-identity arm runs at the DEFAULT verbosity and takes its numbers from the `[ Prompt: … | Generation: … ]`
-   footer; only a mechanism/census arm takes `-lv 3` (`-lv 4` adds the per-node trace).  r231's note blamed
-   `-lv 4` specifically; the correct rule is "no `-lv` at all for a hash".
+4. **`-lv` is TWO thresholds, and a census arm needs 4 while a text arm needs none.**  `common_log_get_verbosity()`
+   maps `GGML_LOG_LEVEL_INFO` to `LOG_LEVEL_TRACE` (4), so every **ggml** census line (`MoE expert cache:`,
+   `expert access:`, `takeover=`, `cold admission=`, the sink block's INFO) is `-lv 4`-only, while llama-cli's own
+   `LLAMA_LOG_INFO` is `LOG_LEVEL_INFO` (3) and its per-slot statistics block is what pollutes the generated text.
+   So `-lv 3` is the one setting that gives you the pollution WITHOUT the numbers: **census/mechanism arms take
+   `-lv 4`, text-identity arms take no `-lv` at all** (and read their rates from the `[ Prompt: … | Generation: … ]`
+   footer).  r231 blamed `-lv 4` for the pollution; the sharper rule is above.
+
+## (no release, r231 tree) -- `MOE_EXPERT_CACHE_TOUCH` is a churn damper with no decode win, and the tier's cold read is why PR #267's registration is not needed
+
+1. **`TOUCH=3` does damp churn, and the on-device outcome is a wash (measured 2026-11-07, `radix`).**  Flash-Next +
+   MTP, `-c 204800 -ub 6144 -ncmoe 48`, `MOE_HOST_POOL_DIO=1`, `-lme 36` and `-lme 44` (the two budgets where the
+   demote is live), 3 + 3 interleaved reps: demotions **-17.3 % / -18.3 %** (-17.2 % / -18.2 % of the bytes),
+   sink uses **-27 %**, arena hit **-0.78 / -0.81 pt**, cold-served misses **+35 %** (3.27 -> 4.43 %, 3.39 ->
+   4.58 %) at an unchanged fill count, and decode **+1.3 to +2.2 %** at 93.8 % coverage (inside the box's spread)
+   with prefill flat.  **The default stays 2**; the replay's prediction ("touch-3 shrinks the sink's advantage by a
+   third") was right about the mechanism and irrelevant to throughput.  `archive/work/host-expert-parity/RESULTS-2026-11-07-touch.md`.
+2. **A pool-backed table already serves a rejected miss in place, so PR #267's 0002 registration has nothing to
+   buy.**  With `admit=touch` live, `MOE_EXPERT_CACHE_COLD_UVA` (default on) served **3.27-4.58 %** of all reaches
+   (15 147-21 206 misses) with **zero** declines on those arms, from the tier's own pinned-RAM alias.  A "the GPU
+   cannot read the pageable master" premise was answered by the pool plus the per-table bounce ring; registering the
+   expert ranges would add a second mapping for a path that is already cheap.
+3. **The demote's break-even is not in doubt at these coverages.**  Sink reuse measured **13.6-15.8 %** at 77-94 %
+   coverage, against W1's ~3 % break-even on NVMe (~0.2 % on slow storage) -- so the r231 decode-parity result
+   holds, and `TOUCH=3`'s -18 % of copies changes the amount, not the verdict.

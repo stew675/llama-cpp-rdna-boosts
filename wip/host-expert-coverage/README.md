@@ -125,7 +125,7 @@ campaign's step 3 would replace reading it with one operator-facing line.
 
 ## 4c. r224 (2026-11-06) made the FILL MODE a policy and left its decision invisible -- a third instance of defect 3
 
-**Nothing in §3 changed; this is a new measured instance, found while opening `wip/host-expert-parity/`.**  r224
+**Nothing in §3 changed; this is a new measured instance, found while opening `archive/work/host-expert-parity/`.**  r224
 folded `pool_decide_dio_locked` (block 12): the pool's fill mode is now a **policy** — it mirrors the operator's
 `--load-mode` (a mapped load fills through the page cache, `--load-mode dio` gets O_DIRECT), and the old
 MemAvailable heuristic survives only for a consumer that reports no load mode.  Two consequences for this
@@ -149,7 +149,7 @@ campaign's step 3:
   process `read_bytes` — under `-lzm auto` the CPU-offloaded PLE moves its reads into load time and the process
   total is not comparable across lazy modes.
 
-The measurement itself (the field matrix, the parity/crossover table) is `wip/host-expert-parity/` P0.2; this
+The measurement itself (the field matrix, the parity/crossover table) is `archive/work/host-expert-parity/` P0.2; this
 note exists so step 3 does not ship a verdict line that omits the fill mode.
 
 ## 5. Records

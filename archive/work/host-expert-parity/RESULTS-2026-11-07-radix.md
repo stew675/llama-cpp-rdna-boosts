@@ -5,7 +5,7 @@ r231.**  This is the third pass of the campaign and the first one that is a *mat
 [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) (CLI decision cells + the field shape on `radix`),
 [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) (the #276/#277/#278 closes on `soar`).  It ran on
 **`radix`** — Ryzen 7 9800X3D, **one R9700** (gfx1201, PCIe 5.0 x16), 93 GiB RAM — inside the 56 GiB rig
-([`wip/bench-56gb/`](../bench-56gb/README.md)): a `MemoryMax=56G`/`MemorySwapMax=0` scope for the server plus a
+([`wip/bench-56gb/`](../../../wip/bench-56gb/README.md)): a `MemoryMax=56G`/`MemorySwapMax=0` scope for the server plus a
 32.4 GiB **mlocked ballast outside it**, which puts `MemAvailable` at **57.2 GiB** at load (a 59 GiB box).  No
 number here is comparable with the `soar` pass (3 × R9700) or with the CLI cells in the 11-06 file.
 
@@ -252,6 +252,6 @@ scripts/check-gpu-faults.sh --since "4 hours ago" --log runs/B1/server.log
 | this pass (the matrix, the crossover, the transition tax, r231) | this file |
 | the CLI decision cells and the r228 fix | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
 | the #276/#277/#278 closes (`soar`) | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) |
-| the rig, its harness and the summary tool | [`../bench-56gb/`](../bench-56gb/README.md) (`parity-arm.sh`, `parity-matrix.sh`, `parity-summary.py`, `pp-analysis.py`, `fillbench.c`-style microbench in §4) |
+| the rig, its harness and the summary tool | [`../bench-56gb/`](../../../wip/bench-56gb/README.md) (`parity-arm.sh`, `parity-matrix.sh`, `parity-summary.py`, `pp-analysis.py`, `fillbench.c`-style microbench in §4) |
 | the fix that shipped (r231) | `WORKLOG.md` 261107.002, `patches/README.md` block 12, `ENVIRONMENT.md` (`MOE_HOST_POOL_FILL_ORDER`) |
 | the demote's policy rules (do not re-derive) | `INVARIANTS.md` (r228, r224) |

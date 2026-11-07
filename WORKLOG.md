@@ -1,9 +1,62 @@
+## 261107.004 (campaign) -- P1.3 closes the campaign's last measurement: touch 3 damps churn and buys nothing, and PR #267's 0002 registration is not needed
+
+**No delivery change** (`patches/`, `release.json` and the fork branch are untouched; the release stays
+`v16-6050b467c-r231`).  `archive/work/host-expert-parity/` now has **no open measurement**: PLAN P1.3 (`MOE_EXPERT_CACHE_TOUCH`
+2 vs 3) closed with its default unchanged, and PR #267's 0002 (sparse registration) closed as *not needed*, which is
+what leaves every mechanism in the PR with a verdict.  Record:
+[`archive/work/host-expert-parity/RESULTS-2026-11-07-touch.md`](archive/work/host-expert-parity/RESULTS-2026-11-07-touch.md) plus the
+harness (`touch-ab.sh` / `touch-ab.py`).
+
+**1. Touch 3 is exactly the churn damper PR 0008 claimed, and it is not a performance lever.**  Two live-demote
+cells (Flash-Next GSQ-RCO-IQ3_S + MTP, `-c 204800 -ub 6144 -ncmoe 48`, `MOE_HOST_POOL_DIO=1`, `-lme 36` = 36 815
+MiB pinned and `-lme 44` = 44 964.8 MiB, 3 + 3 interleaved reps, greedy 192 tokens, heat prior frozen).  The
+cache census is identical across reps, so the mechanism columns are single numbers: demotions **10 102 -> 8 353**
+(-17.3 %) at 36 and **9 758 -> 7 973** (-18.3 %) at 44, sink uses **-27.4 % / -26.1 %**, at an unchanged fill count
+(70 340 / 73 656).  The cost is residency: arena hit **0.9217 -> 0.9139** and **0.9213 -> 0.9132** (-0.78 / -0.81 pt)
+and cold-served misses **+35.2 %** (3.27 -> 4.43 %, 3.39 -> 4.58 %).  The rates are a wash: decode **+1.6 %** at 36
+(no direction: 42.2-48.0 inside one arm) and **+2.2 %** raw / **+1.3 %** dropping each cell's first rep at 44 over six
+interleaved reps, prefill **-0.6 %** / +1.8 % (one 621 outlier).  **The default stays 2** -- a knob does not move on a
+wash -- and `ENVIRONMENT.md` now carries the trade so an operator picking 3 knows what it buys and costs.
+
+**2. That same census closes 0002 (sparse registration) as NOT NEEDED.**  The premise was that a GPU cannot read the
+pageable master cheaply, so the expert ranges a GPU may read should be `mlock`ed, registered and remapped.  With
+`admit=touch` live, the tier's own in-place cold read (`MOE_EXPERT_CACHE_COLD_UVA`, default on) served **3.27-4.58 %**
+of all reaches -- **15 147 / 20 481 / 15 680 / 21 206** misses -- with **zero** declines and nothing registered.  The
+mechanism 0002 would have built for already works through the pool plus the per-table bounce ring, so the item closes
+rather than staying a standing non-goal.  Sink reuse measured **13.6-15.8 %** on those arms, still far above W1's ~3 %
+break-even, so the demote's verdict is unchanged.
+
+**3. Coherence.**  `TOUCH=2` vs `3` at `-lme 36`, default verbosity, same seed: **925 chars, `sha=0e3ed3d279f6` in
+both arms** -- the knob changes which experts are resident, never what is computed.
+
+**4. Two traps found while running it.**  (a) `-lv` is two thresholds: `common_log_get_verbosity()` maps
+`GGML_LOG_LEVEL_INFO` to `LOG_LEVEL_TRACE`, so every ggml census line is `-lv 4`-only while llama-cli's own INFO (and
+therefore the statistics block that pollutes the generated text) is `-lv 3`; `-lv 3` is the one setting that gives the
+pollution without the numbers.  r231 blamed `-lv 4`; `INVARIANTS.md` now carries the sharper rule (census arms 4, text
+arms no `-lv`).  (b) `VERBOSE=` in a `${VERBOSE:-default}` script silently takes the DEFAULT, so the first hash pair
+came out polluted and one run apart -- use an explicit space for "no flag".
+
+**5. So the campaign is done, and the PR has no owed number.**  Every patch in PR #267 now maps to a verdict:
+0001/0005/0010 absorbed or superseded (one with a number), 0002 closed as not needed, 0003a/0003b/0004/0006/0007 closed
+by measurement or by construction, 0008 measured with no change, 0009's placement half = `-lme` with its policy half
+living in `wip/host-expert-coverage/`.  The status reply is
+[PR #267 comment 6707697957](https://github.com/stew675/llama-cpp-rdna-boosts/pull/267#issuecomment-6707697957) and the
+PR is **CLOSED as *integrated rather than merged*** (nothing of the branch was ever applied).  The delivery remains
+r231.
+
+**6. The campaign left `wip/` in the same change, with no stub.**  `wip/host-expert-parity/` is now
+[`archive/work/host-expert-parity/`](archive/work/host-expert-parity/README.md) (its five RESULTS files, the
+per-patch verdict file and three arm harnesses travel with it, and every relative link inside was re-based for the
+new depth); `wip/CAMPAIGNS.md` lost its row and gained the ARCHIVED note, and the references in `ENVIRONMENT.md`,
+`INVARIANTS.md`, `patches/README.md`, `wip/bench-56gb/README.md` and `wip/host-expert-coverage/README.md` now name the
+archive path.  No broken markdown link was introduced (checked repo-wide against the file tree).
+
 ## 261107.003 (campaign) -- `TODO` #279 closes: the narrow-2 eviction branch is unreachable, and PR #267's 0003a preference cannot help
 
 **No delivery change** (`patches/`, `release.json` and the fork branch are untouched; the release stays
 `v16-6050b467c-r231`, tip `a19aab55e`).  Docs and the campaign record only, plus the reference diff that
 `TODO` #279 asked for — and the measured answer is **do not implement**, so there is no r232 and no tag.
-Records: [`wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md`](wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md)
+Records: [`archive/work/host-expert-parity/RESULTS-2026-11-07-narrow2.md`](archive/work/host-expert-parity/RESULTS-2026-11-07-narrow2.md)
 (the arms, the tables, the arithmetic), `narrow2-ab.sh` / `narrow2-ab.py` (the harness) and
 `narrow2-prefer-malloc.diff` (the implementation, built and A/B'd, applied by nothing).
 
@@ -42,7 +95,7 @@ at `0.19.448` s and the pin with the *same* 314 MiB eviction at `0.19.465` s —
 bytes of cushion **permanently** to save one ~20 ms re-fill, and that cushion is what r206 raised to 1280
 MiB/GPU because 768 MiB OOMed a Flash-Next prefill.
 
-**4. What that closes.**  `TODO` #279 is retired; `wip/host-expert-parity/` keeps only P1.3 (the handle-less
+**4. What that closes.**  `TODO` #279 is retired; `archive/work/host-expert-parity/` keeps only P1.3 (the handle-less
 `MOE_EXPERT_CACHE_TOUCH` sweep) and the policy half that lives in `host-expert-coverage/`.  **PR #267's reply now
 owes no number**: 0003a is answered (unreachable, re-absorbed, and a preference cannot avoid it without a latch
 that costs more than it saves), joining 0004/0006/0007 (unreachable by construction), 0003b (measured, do not
@@ -76,7 +129,7 @@ The prefill-logit gate cannot reach this code (its 27B point has no host expert 
 contract's self-test, and the reachable gates are the host-pool one plus the text equality above.
 
 **`TODO` #280 closes as measured, and its product is the table** in
-[`wip/host-expert-parity/RESULTS-2026-11-07-radix.md`](wip/host-expert-parity/RESULTS-2026-11-07-radix.md)
+[`archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`](archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md)
 (the campaign's P0.2/P0.3, on `radix`: one R9700, 93 GiB, the 56 GiB rig = a 32.4 GiB mlocked ballast outside a
 `MemoryMax=56G` scope, `MemAvailable` 57.2 GiB at load).  Every arm is one model load of Flash-Next GSQ-RCO-IQ3_S
 + its MTP draft at `-c 204800 -ub 6144`, `-lv 4`, page cache dropped first, 10 arms in pass 1 and 7 in pass 2
@@ -260,7 +313,7 @@ run and not owed: the block gates -- the artifact is not in the delivery and `re
 ## 261106.021 (campaign) -- `TODO` #276/#277/#278 close: the demote never runs beside a paired all-reduce, and the arena transition is unmeasurable
 
 **A second measurement pass on the same day, on a different box.**  The first pass
-(`WORKLOG.md` 261106.018, [`wip/host-expert-parity/RESULTS-2026-11-06.md`](wip/host-expert-parity/RESULTS-2026-11-06.md))
+(`WORKLOG.md` 261106.018, [`archive/work/host-expert-parity/RESULTS-2026-11-06.md`](archive/work/host-expert-parity/RESULTS-2026-11-06.md))
 ran on `radix` -- one R9700, so no paired all-reduce was available there -- and it left `TODO` #276 recorded as
 "not testable on this box".  This pass ran on **`soar`**: Ryzen 9 9950X3D, **3 x R9700**, 91 GiB, three **PCIe 5.0
 x16** links, and the **canonical** heat prior is present there
@@ -269,7 +322,7 @@ and left it untouched -- `a07822d3…` is `radix`'s, not this box's).  Tree `~/l
 `622d017f7a1fac093b24b7bb8dc65a8e15de4cb7` (= `release.json`, `v16-6050b467c-r229`), build `5c3ef0354`.  **Nothing
 ships**: `patches/` and `release.json` are untouched, no block changed, and the only gate a measurement owes is the
 fault scan -- `check-gpu-faults.sh` clean on the kernel journal and all six logs.  Record with the numbers and the
-exact reproduction: [`wip/host-expert-parity/RESULTS-2026-11-06-soar.md`](wip/host-expert-parity/RESULTS-2026-11-06-soar.md)
+exact reproduction: [`archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md`](archive/work/host-expert-parity/RESULTS-2026-11-06-soar.md)
 (the logs were not kept).  `INVARIANTS.md` gains both facts, `TODO.md` loses all three rows, and
 [`wip/CAMPAIGNS.md`](wip/CAMPAIGNS.md) carries the close.
 
@@ -469,7 +522,7 @@ ranking untouched.  Numbers are in family with the r224 record's accepted row.
 
 **No delivery change.**  `release.json` untouched at `v16-6050b467c-r224`; `~/llama.cpp` is the same tree
 (`88e7d88a7`, build 12:51).  Ran on this box (`radix`: Ryzen 7 9800X3D, 93 GiB, one R9700 on **PCIe 5.0 x16**).
-Record: [`wip/host-expert-parity/RESULTS-2026-11-06.md`](wip/host-expert-parity/RESULTS-2026-11-06.md); new
+Record: [`archive/work/host-expert-parity/RESULTS-2026-11-06.md`](archive/work/host-expert-parity/RESULTS-2026-11-06.md); new
 `TODO` **#281**; the rig gained `wip/bench-56gb/runme-56gb-tier.sh` (a parameterised sibling of the mirror
 runme).  Heat prior frozen read-only for the whole pass, **sha256 `a07822d3727d…`** (the record's canonical
 
@@ -515,10 +568,10 @@ demote default is what ruins it.
 ~0.65 ms warm but ~10 ms on the first touch after idle; the coalesced arm is stable (292-321) and fires 7 220
 reads / 10.4 GiB with 0 fallbacks.  Quote the pair, never a single SPAN=0 arm.
 
-## 261106.017 (campaign) -- `wip/host-expert-parity/` opened: the demote regime is re-measured on a PCIe 5.0 host, and PR #267's remainder is four open mechanisms, not ten
+## 261106.017 (campaign) -- `archive/work/host-expert-parity/` opened: the demote regime is re-measured on a PCIe 5.0 host, and PR #267's remainder is four open mechanisms, not ten
 
 **No delivery change.**  `release.json` untouched at `v16-6050b467c-r224`; `patches/` unchanged; `~/llama.cpp` is
-the same r224 tree (`88e7d88a7`).  New campaign record: [`wip/host-expert-parity/`](wip/host-expert-parity/README.md)
+the same r224 tree (`88e7d88a7`).  New campaign record: [`archive/work/host-expert-parity/`](archive/work/host-expert-parity/README.md)
 (`README.md`, `PLAN.md`, `PR-267-REMAINDER.md`), indexed in `wip/CAMPAIGNS.md`; five new `TODO` handles
 (#276-#280).
 
@@ -545,7 +598,7 @@ deltas): the frozen real-world heat prior the record quotes (`sha256 6195152358e
 `50d9e90ee` / `561696677`; the record's `build=37148d118` base is absent).  Both must be re-frozen/re-recorded
 from `88e7d88a7` before any number is comparable.
 
-**PR #267, re-assessed patch by patch** (`wip/host-expert-parity/PR-267-REMAINDER.md`).  Absorbed/superseded:
+**PR #267, re-assessed patch by patch** (`archive/work/host-expert-parity/PR-267-REMAINDER.md`).  Absorbed/superseded:
 0001 (the mode; `-lme` is the placement budget), 0005 (tier × devremap, `dr_pool_ok` r221), 0010 (**rejected with
 a number**: capping the bounce ring costs 8-25 % of prefill at FRAC 80, and r224's span coalescing addresses its
 premise by fewer/larger reads instead).  Split off: 0009's registration half is moot, its policy half is
@@ -560,7 +613,7 @@ and its decision plus the middle-band warning are `GGML_LOG_INFO` — invisible 
 class as `host-expert-coverage/`'s defect 3.  That campaign's §4c now requires the visible verdict line to carry
 the fill mode too.
 
-**Next:** `wip/host-expert-parity/PLAN.md` P0 — the `SINK=0/1` exchange rate on this link (W1's `SINK_TAX`
+**Next:** `archive/work/host-expert-parity/PLAN.md` P0 — the `SINK=0/1` exchange rate on this link (W1's `SINK_TAX`
 instrument is gone at r224, so the real path is the instrument), the 56 GiB field matrix (mirror / `auto` / 94 % /
 76.9 % × `SINK` × `DIO`), the span-reach pair, and the two gates r224 owes (35B-A3B prefill-logit re-recorded
 here, MTP four-axis on dense 27B).

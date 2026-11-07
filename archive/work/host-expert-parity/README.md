@@ -1,15 +1,13 @@
-# wip/host-expert-parity — the tier measured on a fast host link, and PR #267's remainder
+# archive/work/host-expert-parity (CLOSED) — the tier measured on a fast host link, and PR #267's remainder
 
-**Status: OPEN (2026-11-06) — scoping + measurement plan, and a first measurement pass.**  Nothing implemented,
-nothing applied to the fork, nothing in `patches/`, `release.json` untouched.  **The first pass is in
-[`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md)**: the demote reproduces at `-lme` 36 (+8 %), is worth **+21 %**
-at 94 % coverage, and **costs 53 % of the field prefill at `auto` (97.7 %)** — a shipped-default defect that was
-**fixed in r228** (`TODO` #281 closed: the demote is a decode-class notion now — headroom capped by the
-coverage gap, prefill fills exempt, a near-mirror pool disengages it; see §4 of the results file).  Released as
-`v16-6050b467c-r228` (fork tip `32d0dc3f1`, tree `44b8fc4d…`), which also picked up r225-r227.
-**What is left here is the PR #267 integration**, re-framed by r228: a demote comparison is only meaningful at a
-budget *below* the near-mirror boundary (≤96 % coverage), and the field shape's remaining prefill cost is the
-miss path, not the demote — see [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 for the ranked remainder.
+**Status: CLOSED (2026-11-07) — archived; every mechanism in PR #267 has a verdict and the PR is closed as
+*integrated rather than merged*.  Nothing here is delivery work and nothing is open.**  The five passes are
+[`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md), [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md),
+[`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md), [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md)
+and [`RESULTS-2026-11-07-touch.md`](RESULTS-2026-11-07-touch.md); the per-patch verdicts are in
+[`PR-267-REMAINDER.md`](PR-267-REMAINDER.md).  Two shipped fixes came out of it (r228, r231).  Nothing here was ever
+applied to the fork: `patches/` and `release.json` are untouched by this campaign, and the delivery stands at
+`v16-6050b467c-r231`.  Nothing in this campaign is in flight.
 
 **`TODO` #280 is CLOSED — measured 2026-11-07, on `radix`, with the 56 GiB rig**
 ([`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md)): the crossover table (mirror / `auto` / `-lme 44` /
@@ -19,8 +17,15 @@ the **band-transition tail** — the pool's re-layout after the last prefill uba
 charged to the first token (0.6 s on a mirror, 7.2 s at `auto` buffered, 13.5-18.6 s at `-lme 44` buffered) —
 whose fill order is now file order.  The headline: **77 % coverage is a decode-parity tier (−9 % for 10.8 GiB
 less pinned RAM, with the demote), not a prefill-parity one (−46 %)**; and for a sub-complement budget
-`MOE_HOST_POOL_DIO=1` is worth +43-81 % prefill (`ENVIRONMENT.md`).  What remains here is `P1.3`
-(`MOE_EXPERT_CACHE_TOUCH` 2 vs 3).
+`MOE_HOST_POOL_DIO=1` is worth +43-81 % prefill (`ENVIRONMENT.md`).
+
+**P1.3 and PR 0002 close the campaign's last measurement** ([`RESULTS-2026-11-07-touch.md`](RESULTS-2026-11-07-touch.md)):
+`MOE_EXPERT_CACHE_TOUCH=3` damps churn exactly as 0008 claimed (-17.3 %/-18.3 % demotions, -27 % sink uses) and buys
+nothing measurable (decode +1.3 to +2.2 % at 93.8 % coverage inside this box's spread, prefill flat, 0.78/0.81 pt of
+arena residency and 35 % more cold-served misses given up), so **the default stays 2**; text identical
+(`0e3ed3d279f6`).  Sparse registration (0002) closes with it as **not needed** - the pool's in-place cold read served
+3.27-4.58 % of all reaches with **zero declines** in those arms, which is the mechanism 0002 would have registered
+for.  **No open measurement is left in this campaign**; what is left is the external one, closing PR #267.
 
 **`TODO` #279 is closed too** ([`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md)): the narrow-2
 pin's eviction branch is **unreachable on every shipping shape** — the pin's VA spare *is* the draft context's
@@ -40,8 +45,8 @@ evicted bytes — ≤0.2-1.2 % of the prompt, invisible in paired rows — and i
 tensor shape.  Both closes correct the r228 frame: the field prefill's residual at `auto` is the near-mirror miss
 path **plus the band-transition tail** (r231), not PR 0003b.  Read [`PLAN.md`](PLAN.md) (the work and its accept
 criteria) and [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (what is actually left of the PR).  The evidence base is
-[`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) (the campaign that
-shipped in r224) and the rig is [`wip/bench-56gb/`](../bench-56gb/README.md).
+[`archive/work/host-expert-split/`](../host-expert-split/RESOLUTION.md) (the campaign that
+shipped in r224) and the rig is [`wip/bench-56gb/`](../../../wip/bench-56gb/README.md).
 
 ## 1. The two questions
 
@@ -67,11 +72,11 @@ An existing `wip/` campaign was checked for each half before opening this one:
 
 | campaign | what it owns | why it does not cover this |
 |---|---|---|
-| [`host-expert-coverage/`](../host-expert-coverage/README.md) | the tier's **policy and visibility**: cgroup-aware `MemAvailable`, an authoritative `-lme`, one MIRROR/PARTIAL/NONE verdict | policy only — it explicitly leaves the transport question here.  This campaign *adds* one measured instance to it (the fill-mode decision is INFO) |
-| [`bench-56gb/`](../bench-56gb/README.md) | the **rig**: a 56 GiB cgroup plus mlocked ballast outside it, and its measured matrix | the instrument, not the question.  This campaign uses it and fills the matrix rows it is missing |
-| [`moe-static-hot-tier/`](../moe-static-hot-tier/README.md) | a static **VRAM** tier (heat vs layer) | a different tier (VRAM, not host) |
-| [`kv-residency-cleanup/`](../kv-residency-cleanup/README.md) | the KV window / attendance pool | a different pool |
-| [`vram-resident-slots/`](../vram-resident-slots/README.md), [`fp8-support/`](../fp8-support/README.md), [`moe-cpu-overlap/`](../moe-cpu-overlap/README.md) | parked / retained records | unrelated |
+| [`host-expert-coverage/`](../../../wip/host-expert-coverage/README.md) | the tier's **policy and visibility**: cgroup-aware `MemAvailable`, an authoritative `-lme`, one MIRROR/PARTIAL/NONE verdict | policy only — it explicitly leaves the transport question here.  This campaign *adds* one measured instance to it (the fill-mode decision is INFO) |
+| [`bench-56gb/`](../../../wip/bench-56gb/README.md) | the **rig**: a 56 GiB cgroup plus mlocked ballast outside it, and its measured matrix | the instrument, not the question.  This campaign uses it and fills the matrix rows it is missing |
+| [`moe-static-hot-tier/`](../../../wip/moe-static-hot-tier/README.md) | a static **VRAM** tier (heat vs layer) | a different tier (VRAM, not host) |
+| [`kv-residency-cleanup/`](../../../wip/kv-residency-cleanup/README.md) | the KV window / attendance pool | a different pool |
+| [`vram-resident-slots/`](../../../wip/vram-resident-slots/README.md), [`fp8-support/`](../../../wip/fp8-support/README.md), [`moe-cpu-overlap/`](../../../wip/moe-cpu-overlap/README.md) | parked / retained records | unrelated |
 
 Closed and archived, do not reopen as campaigns: `archive/work/host-expert-split/` (the demote's own campaign
 — its scope closed with r224), `archive/work/host-expert-mirror/` (the transport question, capped),
@@ -158,13 +163,14 @@ mirror `slots >= n_experts` case stays inert, both as shipped.)
 | **the `soar` pass: the #276/#277/#278 closes + exact reproduction** | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) |
 | **the 2026-11-07 pass: the crossover table, the parity answer and the band-transition tail (#280 closed, r231)** | [`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md) |
 | **the 2026-11-07 narrow-2 pass: the #279 close (a measured "do not implement")** | [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) + the reference diff `narrow2-prefer-malloc.diff` |
+| **the 2026-11-07 touch pass: P1.3 and PR 0002 closed, the campaign's last measurement** | [`RESULTS-2026-11-07-touch.md`](RESULTS-2026-11-07-touch.md) + the harness `touch-ab.sh`/`.py` |
 | the PR #267 integration checklist (re-framed by r228) | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 |
 | the release the fix shipped in | `WORKLOG.md` 261106.019, `patches/README.md` block 12 |
 | the per-patch re-assessment of PR #267 | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) |
-| the campaign that shipped in r224 (do not re-derive) | [`archive/work/host-expert-split/`](../../archive/work/host-expert-split/RESOLUTION.md) |
-| the rig this runs on | [`wip/bench-56gb/`](../bench-56gb/README.md) (`run.sh`, `measure.sh`, `bench.py`, `ballast.c`) |
-| the arm harnesses r224 used | [`archive/work/host-expert-split/tools/`](../../archive/work/host-expert-split/tools/README.md) |
+| the campaign that shipped in r224 (do not re-derive) | [`archive/work/host-expert-split/`](../host-expert-split/RESOLUTION.md) |
+| the rig this runs on | [`wip/bench-56gb/`](../../../wip/bench-56gb/README.md) (`run.sh`, `measure.sh`, `bench.py`, `ballast.c`) |
+| the arm harnesses r224 used | [`archive/work/host-expert-split/tools/`](../host-expert-split/tools/README.md) |
 | flight recorder + fault scan | `scripts/gpu-watch.sh`, `scripts/check-gpu-faults.sh` |
 | the offline policy model | `scripts/moe-trace-replay.py` |
-| the policy/visibility half | [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) |
-| the inherited head-to-head protocol | [`archive/work/host-pool-speed/HEAD-TO-HEAD.md`](../../archive/work/host-pool-speed/HEAD-TO-HEAD.md) |
+| the policy/visibility half | [`wip/host-expert-coverage/`](../../../wip/host-expert-coverage/README.md) |
+| the inherited head-to-head protocol | [`archive/work/host-pool-speed/HEAD-TO-HEAD.md`](../host-pool-speed/HEAD-TO-HEAD.md) |

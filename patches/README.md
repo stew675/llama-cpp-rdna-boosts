@@ -2732,7 +2732,7 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > on the dense 27B, `validate-set.sh` green, per-block build 2/2.  Record: `WORKLOG.md` 261106.020.
 
 > **r231 amendment: the pool's re-layout fills are issued in FILE order, not heat order.**
-> `TODO` #280's crossover pass (`wip/host-expert-parity/RESULTS-2026-11-07-radix.md`) found that the biggest
+> `TODO` #280's crossover pass (`archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`) found that the biggest
 > single term in a non-mirror tier's field prefill is not bandwidth but the **band-transition tail**:
 > `pool_rerank_from_heat_locked` runs after the last prefill ubatch (the arena's slot count changed 179 -> 79, so
 > the pool's "arena complement + mirrored residents" layout is re-derived), it frees and re-fills 1 500-6 400
@@ -2770,7 +2770,7 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > prompt**, `-lme 36` (76.9 %) **+8-9 %**, a full mirror inert (0 demoted, 144 mirror tables).  Gates:
 > same-seed greedy text `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh` **31/31**
 > (including `sink` / `sinkfail`), per-block build 2/2, `validate-set.sh` green.  Record:
-> `wip/host-expert-parity/RESULTS-2026-11-06.md`, `WORKLOG.md` 261106.019.
+> `archive/work/host-expert-parity/RESULTS-2026-11-06.md`, `WORKLOG.md` 261106.019.
 
 > **r224 amendment (the `host-expert-split` campaign): the pool LEARNS from evictions, is ranked by the
 > DECODE counter, and its prefill reads are coalesced — plus the heat-save truncation fix.**  Four things landed

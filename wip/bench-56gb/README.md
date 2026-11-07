@@ -91,7 +91,7 @@ a warm page cache (13 to 30 s of load plus pool fill, 3 x 8 s decode, 26 s for 5
   identical output hashes differently.  `-lv 4` is for the census, not for `scripts/extract-generated.py`.
 * The page cache decides a non-mirror tier's first prefill (the band-transition tail): quote the pair and
   never one rep -- the same arm moved 1 810 -> 1 329 t/s between reps in one session
-  (`wip/host-expert-parity/RESULTS-2026-11-07-radix.md` §3).
+  (`archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md` §3).
 * `ballast` takes a **fractional GiB** (`./ballast 32.4`): a whole-GiB step is ~1 GiB of `MemAvailable`, and the
   emulation needs 57.2 GiB (a 59 GiB box), not 55.3.
 

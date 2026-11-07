@@ -36,8 +36,13 @@ the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdi
 > so the pin is retried 13 ms later with the same eviction; latching it would spend the evicted bytes of cushion
 > permanently to save one ~20 ms re-fill.  No code ships; the reference diff is beside the record.
 >
-> **What remains is** P1.3 (the `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 sweep, a knob).
-> Ranked in [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0.
+> **Fifth pass, 2026-11-07 (`radix`) — [`RESULTS-2026-11-07-touch.md`](RESULTS-2026-11-07-touch.md): P1.3 is
+> done and the campaign has NO open measurement left.**  `MOE_EXPERT_CACHE_TOUCH=3` damps churn exactly as PR 0008
+> claimed (-17.3 %/-18.3 % demotions, -27 % sink uses) and pays 0.78/0.81 pt of arena hit rate plus 35 % more
+> cold-served misses for a decode wash (+1.3 to +2.2 % at 93.8 % coverage, inside this box's spread), so **the
+> default stays 2**; text identical (`0e3ed3d279f6`).  PR 0002 (sparse registration) closes with it as *not
+> needed*: the cold path it would have registered for is live and served 3.3-4.6 % of all reaches with zero
+> declines.  Every mechanism in PR #267 now has a verdict ([`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3).
 
 ## 1. Settled — do not re-derive
 
@@ -47,7 +52,7 @@ the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdi
 | S2 | On r224's box the demote measured **+5.3 % alone / +7.8 % combined** single-stream at `-lme 36` on a frozen real-world prior; the campaign's own "+21.7 %" was prior leakage | `archive/work/host-expert-split/HANDOVER.md` §4.2 |
 | S3 | The demote's copy was **9.6 µs per 679 762 B** (≈0.0140 ms/MiB, ~2/3 hidden), break-even reuse ~3 % on that NVMe, ~0.2 % on a 125 MB/s device — on a **~26 GB/s host link** | `archive/work/host-expert-split/W1-SINK-TAX.md` |
 | S4 | A mirror is still the fastest configuration (31.2 t/s vs 27.5 shipping at `-lme` 36/48 on that box, drifted prior), and the demote is **inert** against one (`slots >= n_experts`) | `archive/work/host-expert-split/PLAN.md` §3 (W2) |
-| S5 | On the 56 GiB rig a mirror is 78.5 t/s / 1941 prefill, `auto` (97.7 %) is 75.6 / 1443, 92.4 % is 76.6 / 1061 — measured **before** r224 | [`wip/bench-56gb/RESULTS.md`](../bench-56gb/RESULTS.md) |
+| S5 | On the 56 GiB rig a mirror is 78.5 t/s / 1941 prefill, `auto` (97.7 %) is 75.6 / 1443, 92.4 % is 76.6 / 1061 — measured **before** r224 | [`wip/bench-56gb/RESULTS.md`](../../../wip/bench-56gb/RESULTS.md) |
 | S6 | The span read is **O_DIRECT-only** (`stage_span_fill` returns unless `t.src_fd >= 0`); the field `runme` mirrors `--load-mode mmap` | block 12 `stage_span_fill`, `pool_decide_dio_locked` |
 | S7 | The pool's fill mode is a **policy** (mirror `--load-mode`, else a MemAvailable test) and its own comment calls the **middle band unmeasured** — the 56 GiB rig *is* that band | block 12 `pool_decide_dio_locked` |
 | S8 | The bounce ring is deliberately **uncapped** (a cap costs 8-25 % prefill) and a whole-master declined read is answered by r224's span coalescing instead | `bounce_acquire`'s comment; PR #267 0010 |
@@ -163,12 +168,12 @@ Every item: **kill switch, default unchanged until it has a device win here**, o
 | **P1.0** (TODO #281 — **DONE in r228**) | **the exchange headroom must not exceed the pool's coverage gap, and must not gate the prefill fill path** — at `auto` (97.7 %) `K = 4 %` of slots (≈19/table) is larger than the gap (12/table), so every prefill fill is refused and the missing experts are re-read through the bounce ring on every ubatch (measured: 1 837 → 867 t/s first-pass prefill, `SINK=0` → `SINK=1`, decode flat) | already measured — this is a defect, not a candidate | coherence, `gate-host-pool.sh` (the existing `sink`/`sinkfail` arms), the `-lme 44` cell must keep its +21 %, the 97.7 % cell must return to ≈1 840 prefill, prefill-logit |
 | **P1.1** (TODO #276 — **CLOSED 2026-11-06, unreachable**) | the demote's transport: a copy-kernel form of the D2H + a drain on a failed event record (PR 0004/0006/0007's rationale: a small pinned copy can leave later queued work unsubmitted on ROCm) | **settled: the hazard needs a copy AND a paired all-reduce, and the delivery never has both.**  On `-sm tensor` (the RCCL banner is in the log) the demote declines **100 %** of offers — `0 demoted / 14 480 geometry (structural)` — because a split table has no contiguous pool image; on `-sm layer` (7 862 copies) there is no all-reduce.  The cost side is net-positive (+19-21 % at `-lme 44`).  Re-entry: only if the demote is extended to an `n_slices != 0` table (a strided 2-D D2H, r113 = 2× decode loss) |
 | **P1.2** (TODO #277 — **RETIRED 2026-11-06**) | precopy: K spares + a side stream that copies the policy's likely victims ahead of time (PR 0006/0008), including 0007's drain semantics | its own condition was "P1.1 leaves a residual on the admission path", and P1.1 closed as unreachable — the shape was already decided to need a dedicated K-spare ring, never more headroom (`PR-267-REMAINDER.md` §2) |
-| **P1.3** | `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 **with the demote on** (a knob: no code) | always — one arm set | coherence only |
+| **P1.3** (— **CLOSED 2026-11-07, measured: default unchanged**) | `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 **with the demote on** (a knob: no code) | done: two live-demote cells, 3+3 interleaved reps each; churn -18 %, residency -0.8 pt, decode a wash | coherence (text identical, `0e3ed3d279f6`) |
 | **P1.4** (TODO #278 — **CLOSED 2026-11-06, measured**) | keep the arena across a decode→prefill transition (PR 0003b) | **settled negative: the drop is real, the cost is not.**  Flash-Next 1 GPU, field ubatch (`-c 204800 -ub 6144`): 3 `moe_cache_evict_slab_range` events, 1 062 MiB, one `re-armed 12 stood-down` — bounded by the evicted bytes to 37-56 ms, i.e. ≤0.2-1.2 % of the prompt, and the paired 4 096-token rows measure row 3 **+15.8 % over** row 2 across a transition.  **0 evictions** on the 3-GPU `-sm tensor` field shape.  Re-entry: an arena *exactly* slab-full with short (≤4k) prompts, or the 56 GiB rig measured directly |
 | **P1.5** (TODO #279 — **CLOSED 2026-11-07, measured / do not implement**) | narrow-2: prefer the `cudaMalloc` fallback over evicting arena tables when the draft compute region would fit there (PR 0003a) | **settled negative**: the branch is unreachable on every shipping shape and, forced, its eviction is re-absorbed (identical arena MiB + hit rate); the preference cannot avoid it without a latch that costs the evicted bytes of cushion permanently.  [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) | — |
 
 Not here: the tier's policy/visibility work (cgroup figure, authoritative `-lme`, verdict line) is
-[`wip/host-expert-coverage/`](../host-expert-coverage/README.md); sparse registration is a non-goal (S9); the
+[`wip/host-expert-coverage/`](../../../wip/host-expert-coverage/README.md); sparse registration is a non-goal (S9); the
 bounce-ring cap is rejected with a number (S8).
 
 ## 4. Gates for anything that becomes code
