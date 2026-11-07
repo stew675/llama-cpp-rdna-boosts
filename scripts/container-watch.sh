@@ -92,7 +92,11 @@ else
     # "lower" base would otherwise be missed.  Release tags are annotated, so this is
     # the release order.
     # release tags are v<blocks>-<base>-r<N>; do NOT pin the block count (v12 -> v13 broke this)
-    tag="$(git tag -l --sort=-creatordate | grep -E '^v[0-9]+-[0-9a-f]+-r[0-9]+$' | head -1)"
+    # `sed -n '1p'`, not `| head -1`: with `set -o pipefail`, head exits after the first line and
+    # sends SIGPIPE to grep/git, so the whole pipeline returns 141 and `set -e` kills the watcher
+    # BEFORE it logs anything.  That is silent under cron (the log simply stops), and it is what
+    # stopped r232 and r233 from ever being built (2026-11-07: every run died on this line, rc 141).
+    tag="$(git tag -l --sort=-creatordate | grep -E '^v[0-9]+-[0-9a-f]+-r[0-9]+$' | sed -n '1p')"
     [ -n "$tag" ] || { log "no v<blocks>-<base>-r<N> release tag found"; exit 0; }
 fi
 

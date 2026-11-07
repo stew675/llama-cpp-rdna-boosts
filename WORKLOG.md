@@ -1,3 +1,25 @@
+## 261107.009 (tooling) -- the release container watcher died silently on a `head -1` + `pipefail` SIGPIPE, and r232/r233 were never imaged
+
+**Found while verifying the r233 release's image push.**  `scripts/container-watch.sh` (the off-host release
+watcher on `radiance`) picks the newest release tag with:
+
+```bash
+tag="$(git tag -l --sort=-creatordate | grep -E '^v[0-9]+-[0-9a-f]+-r[0-9]+$' | head -1)"
+```
+
+under `set -euo pipefail`.  `head` exits after the first line, `grep`/`git tag` get SIGPIPE and the pipeline
+returns **141**; `set -e` then kills the script **before its first `log` line**, so under cron there is no
+error at all -- `watch.log` simply stops.  Reproduced on `radiance`: five consecutive runs all returned 141.
+The watcher had built r231 at 06:47 and then silently skipped r232 (tagged 09:28) and r233 (tagged 10:16);
+`last-built` was still r231.  This is exactly the failure class the watcher's own header warns about (a silent
+`set -e` death with no log line), one line further down.
+
+**Fix:** `| head -1` -> `| sed -n '1p'` (sed reads the whole stream, so no SIGPIPE), with a comment naming the
+trap.  No delivery change: `patches/`, `release.json` and the r233 tag are untouched.  The worker's installed
+`~/bin/rdna-container-watch.sh` was refreshed from `scripts/container-watch.sh` and r232 + r233 are being built
+there.  Recorded because it is release infrastructure, and because "the images are already publishing" is not
+a safe assumption from a green tag workflow: check `last-built` and `watch.log` on the worker.
+
 ## 261107.008 (r233) -- issue #278: the Windows pinned ceiling is the loaded HIP runtime, so name it (block 12) and give the tier a kill switch
 
 **Shipped:** `v16-6050b467c-r233` (block **12** amended, +165/-17 in
