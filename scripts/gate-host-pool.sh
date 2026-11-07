@@ -37,6 +37,14 @@
 #     sinkfail MOE_HOST_POOL_SINK=1 + MOE_HOST_POOL_SINK_FAULT=1
 #                                                (every demote COPY fails: the demote must DECLINE -- drop
 #                                                the victim as before -- and never publish the slot)
+#     pinlate MOE_HOST_POOL_PIN_FAULT=late       (the platform LATCHES the pinned tier off mid-run -- the
+#                                                Windows shape at the adapter's shared-segment ceiling, issue
+#                                                #278: the pools are built, then one grow is refused and
+#                                                every later allocation is refused too.  The latch must stop
+#                                                the tier GROWING, not abandon the pinned memory the run
+#                                                already owns, so the existing pools must keep serving the
+#                                                fills (`N expert fills were served from a host pool built
+#                                                BEFORE the refusal`, N > 0) and the text must not move)
 #   HARD  * `ref`, `dio` and `nodisk` are byte-identical and build a real pool (the exit census must report
 #           `host pool (L2): N tensors, <slots> slots, <MiB> pinned` with slots > 0 and MiB > 0)
 #   HARD  * `ref`, `dio` and `nodisk` log NO `fill failed`, NO `no pinned host source` and NO
@@ -56,6 +64,14 @@
 #   HARD  * `sinkfail`: text byte-identical to `ref`, the census reports copy-error declines > 0 (the arm
 #           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
 #           resident victim, or that slot serves stale bytes for the life of the run
+#   HARD  * `pinlate` (issue #278): text byte-identical to `ref`; the arm is not vacuous (the latch line is
+#           there, the pools were built BEFORE it, and fills still fail afterwards); and the fix holds --
+#           `N expert fills were served from a host pool built BEFORE the refusal` with N > 0, i.e. one late
+#           refusal does not throw away the pinned memory the run already owns.  Measured with the lookup
+#           placed AFTER the latch guard (the pre-fix order): the same arm reports 0 (the census line is
+#           absent) and the run fails 1 587 fills instead of 110 -- the text is identical in both, because a
+#           pool-less fill still serves the right BYTES through the pageable mapping; it is the pinned memory,
+#           not the answer, that is lost
 #   HARD  * no arm logs `async fill failed` (the old, cause-hiding message) or aborts
 #   HARD  * every arm prints the exit census ONCE, from the MODEL TEARDOWN and before it (`host pool (L2)` above
 #           `model teardown: dropped ...`).  On Windows the `atexit` hook runs after `main` and llama-server's
@@ -156,6 +172,8 @@ pool_slots() { grep -o 'host pool (L2): [0-9]* tensors, [0-9]* slots' "$KEEPOUT/
 pool_mib()   { grep -o 'host pool (L2): .* MiB pinned' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9.]*\) MiB pinned/\1/'; }
 fill_mode()  { grep -o 'host pool fill mode: [a-zA-Z_]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
 failed_fills(){ grep -o 'FAILED fills: [0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+# issue #278: fills served from a pool that existed BEFORE the pinned tier latched off.
+pool_after_latch() { grep -o '[0-9][0-9]* expert fills were served from a host pool' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/ .*//'; }
 # the take-over counter: `takeover=<n> decline_all=<n> get_ok=<n>`.  With a fill fault active it MUST be 0:
 # a call that failed a fill may not take its op over (the consumer refuses the table a few lines later).
 takeover()   { grep -o 'takeover=[0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/takeover=//'; }
@@ -178,14 +196,15 @@ run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
 run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
 run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
 run_arm sinkfail MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1 || exit 2
+run_arm pinlate MOE_HOST_POOL_PIN_FAULT=late || exit 2
 
-for a in ref dio nodisk fail late sink sinkfail; do text_only "$a"; done
+for a in ref dio nodisk fail late sink sinkfail pinlate; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
 
 # ---- HARD: identical greedy text ---------------------------------------------------------------
-for a in dio nodisk fail late sink sinkfail; do
+for a in dio nodisk fail late sink sinkfail pinlate; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
@@ -258,6 +277,39 @@ else
     fail "sinkfail: no sink census line (the arm did not reach the sink at all)"
 fi
 
+# ---- HARD: a latched pinned tier keeps what it owns (issue #278) ------------------------------
+# `MOE_HOST_POOL_PIN_FAULT=late` refuses the first bounce grow after the arena is sized, which latches the
+# pinned tier off exactly as a Windows box does at its adapter ceiling.  `table_pool_locked` used to check the
+# latch BEFORE looking for an existing pool, so one refusal made every pool the run had already built
+# unreachable and every copy after it pageable -- the pin budget was spent and could not be used.
+hard
+if grep -q 'MOE_HOST_POOL_PIN_FAULT: refusing the pinned bounce grow' "$KEEPOUT/pinlate/err.txt"; then
+    ok "pinlate: the pinned tier latched off as forced (the arm is live)"
+else
+    fail "pinlate: no latch line -- MOE_HOST_POOL_PIN_FAULT=late did not reach a bounce grow (vacuous)"
+fi
+hard
+ps="$(pool_slots pinlate)"; pm="$(pool_mib pinlate)"
+if gt0 "$ps" && gt0 "$pm"; then
+    ok "pinlate: the pools were built BEFORE the latch ($ps slots/table, $pm MiB pinned)"
+else
+    fail "pinlate: no pool existed before the latch (slots='${ps}' MiB='${pm}'), so the arm proves nothing"
+fi
+hard
+pl="$(pool_after_latch pinlate)"
+if gt0 "$pl"; then
+    ok "pinlate: $pl fills were served from a pool built before the refusal (the latch stopped growth, not use)"
+else
+    fail "pinlate: 0 fills from a pool that existed before the latch (${pl:-none}) -- one refusal abandoned the pinned memory the run already owned"
+fi
+hard
+ff="$(failed_fills pinlate)"
+if gt0 "$ff"; then
+    ok "pinlate: $ff fills failed after the latch and were rolled back (reported in the census)"
+else
+    fail "pinlate: no FAILED fills in the census: the latch never refused a fill (vacuous)"
+fi
+
 # ---- HARD: the failure arm is CORRECT, and says so --------------------------------------------
 hard
 ff="$(failed_fills fail)"
@@ -320,7 +372,7 @@ for a in ref fail sink; do
 done
 
 # ---- HARD: no abort anywhere ------------------------------------------------------------------
-for a in ref dio nodisk fail late; do
+for a in ref dio nodisk fail late pinlate; do
     hard
     if grep -qE 'GGML_ASSERT|terminate called|what\(\):|HAVE_ABORT' "$KEEPOUT/$a/err.txt"; then
         fail "$a aborted (see $KEEPOUT/$a/err.txt)"
@@ -332,7 +384,7 @@ done
 
 echo
 echo "==> $((CHECKS - FAILED))/$CHECKS checks passed"
-for a in ref dio nodisk fail late; do
+for a in ref dio nodisk fail late pinlate; do
     printf "    %-7s %-52s %s\n" "$a" "$(text_hash "$a")" "$(grep -o 'Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s' "$KEEPOUT/$a/out.txt" | tail -1)"
 done
 echo "    logs: $KEEPOUT"

@@ -2693,6 +2693,31 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r229 amendment: a latched pinned tier keeps what it owns, and an arena it cannot fill is not armed
+> (issue #278).**  Two fixes in `moe-expert-cache.cu`, both only reachable on a box whose pinned tier has
+> **latched off** (the first refused `cudaHostAlloc`, which is Windows-at-the-aperture-ceiling in the field and
+> is emulated on Linux by the new diagnostic `MOE_HOST_POOL_PIN_FAULT`):
+> 1. **`table_pool_locked` looks for an existing pool BEFORE the latch guard.**  The guard is now about the tier
+>    no longer GROWING, not about discarding ~9 GiB of pinned memory the run already owns.  `bounce_acquire` always
+>    drew that line (it reuses a drained ring entry before its own latch check); this lookup did not, so one late
+>    refusal made every pool built during the load unreachable and every expert copy after it pageable — the
+>    driver-staged path the pool exists to avoid, on the box where pin budget is the scarce resource.  Measured on
+>    `gate-host-pool.sh`'s new `pinlate` arm: **7 060 fills served from pre-latch pools with 110 failed fills**
+>    against **0 and 1 587** for the guard-first order, with identical text.  The census names it:
+>    `N expert fills were served from a host pool built BEFORE the refusal`.
+> 2. **`moe_cache_rearm` no longer arms a layer that cannot fill** (`table_has_fill_source_locked`, layer-uniform
+>    because a mixed-slot layer reads the wrong expert).  Arming such a layer costs the arena, a
+>    `cudaDeviceSynchronize` per table and one doomed seed fill per slot, and changes no downstream decision: the
+>    ops decline either way.  A source-less layer is stood down wholesale, named once
+>    (`left N stood-down expert-cache tables in M layer(s) DISARMED ...`) and its `g_rearm_slots` entry zeroed so
+>    the caller's second re-arm pass does not repeat it.  Measured on the reporter's config with the latch
+>    forced: the arena stays at **13 645 MiB instead of growing back to 19 225**, text byte-identical.
+>
+> Both are inert unless the tier latches (the shipped default path never does), so no default and no gate
+> criterion changed.  Gates: `gate-host-pool.sh` **37/37** (8 arms, all byte-identical `a99ccbd97ecb`, the new
+> `pinlate` arm included), coherence `1c5d32ac537d` at 1 GPU and 3 GPU `-sm tensor`, MTP four-axis at `-n 3000`
+> on the dense 27B, `validate-set.sh` green, per-block build 2/2.  Record: `WORKLOG.md` 261106.020.
+
 > **r228 amendment: the eviction demote is a DECODE-CLASS notion.**  `TODO` #281, found by measuring the r224
 > demote on a 59 GiB field box (56 GiB cgroup + ballast, one R9700, `auto` = 97.7 % coverage): the exchange
 > headroom (`K = 4 %` of a table's slots, ≈20) was larger than the pool's coverage gap (12 experts per

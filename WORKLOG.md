@@ -1,3 +1,82 @@
+## 261106.020 (r229) -- issue #278: a latched pinned tier keeps the pools it already built, and an arena it cannot fill is not armed
+
+**Release `v16-6050b467c-r229`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tip **`5c3ef0354`**,
+tree **`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7`**.  One block amended: **block 12** (+171/-14 in
+`ggml/src/ggml-cuda/moe-expert-cache.cu`); blocks 00-11 and 13-15 keep identical deltas (their `.patch` files
+change only in the `From <sha>` line, because the series was re-cut from this checkout).  New diagnostic variable:
+`MOE_HOST_POOL_PIN_FAULT` (`ENVIRONMENT.md`, `pinlate` arm of `gate-host-pool.sh`).
+
+**The report (issue #278, @DanoPTT).**  r224, Windows 11 / ROCm 10.0, one R9700, 64 GB: `draft-mtp` +
+`--host-experts pool --limit-host-experts 2` loads, prefills a 4,180-token prompt, creates a context checkpoint,
+the slab takes the wide work region (`arena 13824.0 MiB`), `moe_cache_rearm` re-arms 39 tables (`arena now
+19381.1 MiB`) -- and then NOTHING for 9 minutes: GPU compute and copy engines 0 %, two threads at 100 % CPU each.
+Their box latches the pinned tier off during the load (`fill_slot_from_host: no pinned host source ...
+(the pinned host tier is off ...)` 20 ms before the re-arm), and its adapter ceiling is a hard ~9.3-9.5 GiB of
+aperture shared usage whatever the RAM, so their prefill fills through the pageable model mapping at ~105 t/s.
+
+**What reproduced here, and what did not.**  The reporter's exact config (same model, same draft, same flags,
+`-lme 2`, `MOE_HOST_POOL_RAM_PCT=10`) runs clean at r228 on this box: 5,246-token prefill 656 t/s, MTP decode
+77.7 t/s, re-arm `45 tables (arena now 19224.8 MiB)` -- the same slab layout to the MiB (`work=7424.0 ring=3648.0`).
+Forcing their degraded state (a latched tier, no pools, no ring: `MOE_HOST_POOL_PIN_FAULT=1`) also runs clean and
+correct (19.7 t/s, text identical) -- so the Windows spin itself is NOT reproducible here (no Windows box, no
+ROCm 10.0), exactly as `#274`'s three open points were not.  What IS reproducible is that the state the run died
+in was the WORST one to be in, and two defects lived there.
+
+**Defect 1: one late refusal threw away every pool the run had already built.**  `table_pool_locked` checked
+`g_pinned_off` BEFORE looking for an existing pool.  `bounce_acquire` has always drawn the line correctly (a
+drained ring entry is reused before its latch check), so a latched tier kept the bounce entries the run owned and
+abandoned the pool -- the same memory, allocated for the same purpose, and the reason `#274`'s reporter saw a
+pool that "never appeared".  The consequence is not a slow path, it is the wrong path: with `--host-experts pool`
+the master is the pageable model mapping, so a pool-less fill is a driver-staged `cudaMemcpyAsync` from pageable
+memory -- "slow and may tear", per the code's own warning -- on the box where the pin budget, not RAM, is what
+ran out.  Fix: look the existing pool up first; the latch now means "the tier may not GROW" (which is what the
+Windows comment always said it meant, and what r226 added the latch for).
+
+**Defect 2: the post-prefill re-arm re-took the arena for tables it could not fill.**  `moe_cache_rearm` arms
+every layer with a stood-down table.  When the tier is latched off and a table has neither a pool nor a ring
+entry, there is no host source at all, so each of those slots gets armed, seeded (one doomed `cudaHostAlloc`-less
+fill attempt from `apply_heat_seed_locked`/`apply_prefill_seed_locked`), and then declined on use -- identical to
+a stood-down table's behaviour, at 5.5 GiB of VRAM and a `cudaDeviceSynchronize` per table.  Fix:
+`table_has_fill_source_locked()` -- a pinned master always has one, a pageable master needs an existing pool or a
+ring entry, and a latched tier can create neither -- tested per LAYER (a skipped table between armed ones is the
+mixed-slot layer that reads the wrong expert), with a source-less layer stood down wholesale, named once, and its
+`g_rearm_slots[layer]` zeroed so the caller's second pass does not repeat it.
+
+**Measured (`gate-host-pool.sh`'s new `pinlate` arm, one R9700, `-ncmoe 47`, `LIMIT_FRAC=40`, `latched after the
+pools and the arena`):** 7 060 fills served from pre-latch pools and **110** failed fills, against **0** from a
+pre-latch pool and **1 587** failed fills with the lookup back in its old place (a temporary local revert, run
+for this comparison); text byte-identical in both, i.e. only the counter can see it -- which is why the arm
+asserts the counter and not the text.  Field shape (the reporter's MTP config, latch forced at load): the arena
+stays at **13 645 MiB instead of growing back to 19 225** with the same declined-op behaviour and byte-identical
+text (`left 45 stood-down expert-cache tables in 15 layer(s) DISARMED`).
+
+**New diagnostic `MOE_HOST_POOL_PIN_FAULT`.**  `=1` refuses every pinned allocation from the start (no pool, no
+ring); `=late` lets the load build its pools and size the arena and then refuses the first bounce grow after
+that -- the field's sequence.  It is how `pinlate` reaches the Windows degraded state from this Linux box, and it
+is documented as a gate/repro hook, never a run setting.
+
+**Gates.**  `gate-host-pool.sh` **37/37** (8 arms -- `ref`/`dio`/`nodisk`/`fail`/`late`/`sink`/`sinkfail`/
+`pinlate` -- all byte-identical `182 chars sha=a99ccbd97ecb`, `takeover=0` on both fill-fault arms, the census
+printed once from the teardown); **coherence** `1c5d32ac537d` on 4B Q8_0 at 1 GPU and at 3 GPU `-sm tensor`
+(matches the r227/r228 value); **MTP four-axis** (dense 27B UD-Q4_K_XL, 1 GPU, protocol A, `-n 3000`,
+`--reasoning on` only for R, `--spec-draft-n-max 3`): `draft-mtp` against `none` -- R 61.5 vs 31.0 (+98 %),
+P 75.3 vs 30.5 (+147 %), C 83.3 vs 31.0 (+169 %), K 89.1 vs 31.1 (+186 %); prose acceptance **0.80697**
+(1622/2010), `acc per pos` (0.922, 0.804, 0.694) -- healthy, no collapse; **`validate-set.sh`** green (16/16
+strict `git am` on a fresh tarball, tree `622d017f7`, the conflict-marker scan and the Windows portability scan
+of 287 delivery-added files); **prefill logits** `0.000000` / `100.000 %` against the recorded 27B Q8_0 base
+(placement-only, so a zero was the expectation, r228's shape); per-block build `--fast --changed-from
+32d0dc3f1` **2/2**.  `llama-batched-bench
+-npl 1,4,8` (35B-A3B UD-Q4_K_M, `-ncmoe 40 --limit-host-experts 36`, `-c 32768`, `-npp 512 -ntg 128`, 3 reps):
+total 162.3/164.6/166.7, 1217.1/1215.6/1214.5 and 1602.7/1595.5/1600.2 t/s, no abort -- recorded as a
+non-regression smoke, not a comparison: nothing latches in this arm, so both changed paths are byte-for-byte the
+ones the previous release ran.
+
+**What this does not claim.**  It is not a diagnosis of the Windows spin (no Windows box here; the reporter's
+state is now the best-behaved it can be instead: the pinned memory it already owns is used, the arena it cannot
+fill is not taken, and the pageable-copy storm after a latch is gone).  Their re-test on r229 is what settles it;
+the reply asks for the four lines that decide it (`pinned tier:`, `N expert fills were served from a host pool
+built BEFORE the refusal`, `DISARMED`, and any `FAILED fills:`).
+
 ## 261106.019 (r228) -- TODO #281: the eviction demote becomes a DECODE-CLASS notion (headroom capped by the gap, prefill fills exempt, near-mirror disengaged)
 
 **Release `v16-6050b467c-r228`** (16 blocks, fork point `6050b467c` unchanged -- no re-base).  Tag tip

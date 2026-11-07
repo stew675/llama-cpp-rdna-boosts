@@ -61691,10 +61691,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..40ad8e8d3
+index 000000000..36f7f774c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9476 @@
+@@ -0,0 +1,9633 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -62270,6 +62270,12 @@ index 000000000..40ad8e8d3
 +// machine has 47 or 64 GiB of RAM, which is why MemAvailable is not consulted for it).  Monotone: a freed
 +// ring entry is not subtracted, because the question is "how big did the tier get", not "what is live now".
 +static int64_t                      g_pinned_tier_bytes = 0;
++// issue #278: expert fills served from a host pool that was built BEFORE the pinned tier latched off.  This
++// is the number that says the latch stops the tier GROWING rather than discarding what it already owns: a row
++// of zeros after a `the pinned host tier is OFF` line means every pool that existed was abandoned and every
++// copy after that point went through the pageable model mapping (the shape a Windows box hit at its ~9.3 GiB
++// adaptor ceiling), which is what the gate arm `pinlate` asserts against.
++static int64_t                      g_pool_after_latch   = 0;
 +int64_t                             g_gather_calls    = 0;
 +int64_t                             g_gather_pool     = 0;
 +int64_t                             g_gather_fills    = 0;
@@ -63718,32 +63724,75 @@ index 000000000..40ad8e8d3
 +#endif
 +}
 +
++// Diagnostic (issue #278): emulate the platform's LATCHED pinned refusal -- what a Windows box does when WDDM
++// refuses a pinned allocation against the adapter's shared-segment budget (see `g_pinned_off`).  Two shapes,
++// because WHEN the tier goes is what the report is about:
++//   =1      refuse every pinned allocation from the start: no pool is ever built and no ring ever grows (the
++//           "the tier never came up" shape)
++//   =late   let the load build its pools and let the arena size, then refuse the FIRST bounce-ring grow
++//           after that -- the field's sequence: the pool works, a later fill needs one new ring entry, the
++//           driver says no, the tier latches off, and every pool that already exists must keep serving from
++//           the memory it already owns
++//   =0/unset off.
++// Diagnostic only: nothing here changes a default, and it is not part of the shipped environment surface.
++static bool pinned_alloc_fault(bool grow) {
++    static const char * mode = getenv("MOE_HOST_POOL_PIN_FAULT");
++    static const int    kind = mode == nullptr ? 0
++                             : (strcmp(mode, "late") == 0 ? 2 : (atoi(mode) != 0 ? 1 : 0));
++    // `late` waits until the run holds its pinned tier AND has sized the arena, because that is the field's
++    // shape: the pools and the arena exist, and a later grow is what is refused.  Refusing the very first
++    // grow would instead reproduce the `=1` shape with extra steps.
++    return kind == 1 || (kind == 2 && grow && g_sized);
++}
++
++// Is the latched-refusal SEMANTICS being emulated on a platform where production code does not latch (POSIX,
++// where a refused pinned allocation is transient)?  Any non-zero `MOE_HOST_POOL_PIN_FAULT` asks for the
++// Windows rule, which is that the tier refuses to GROW once it has been refused once.
++static bool pinned_latch_emulated() {
++    static const char * mode = getenv("MOE_HOST_POOL_PIN_FAULT");
++    return mode != nullptr && strcmp(mode, "0") != 0;
++}
++
 +static host_pool_t * table_pool_locked(table_t & t) {
 +    if (!g_pool_enabled || !t.src_known || t.host == nullptr || t.host_bytes == 0 || t.n_experts <= 0) {
 +        return nullptr;
 +    }
-+#if defined(_WIN32)
-+    if (g_pinned_off) {
-+        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once (a latched HIP error on this
-+        // platform, see `g_pinned_off`) and a pool is entirely pinned memory, so a build cannot succeed --
-+        // and asking again is what turned one refusal into a cascade of differently-worded failures.  Every
-+        // table then takes the per-table bounce ring / model-mapping path, which is the same policy the
-+        // arena follows when an allocation fails.  One line, once.
-+        static bool warned = false;
-+        if (!warned) {
-+            warned = true;
-+            GGML_LOG_WARN("%s: the pinned host tier is OFF for this run, so no host pool can be built; "
-+                          "layer=%d role=%s and every later table will fill through the model mapping "
-+                          "(correct, slower).  See the pinned-refusal line above for the cause.\n",
-+                          __func__, t.layer, t.role.c_str());
-+        }
-+        return nullptr;
-+    }
-+#endif
++    // An ALREADY-BUILT pool is looked up BEFORE the latch guard below, and that order is the point: the
++    // latch stops the pinned tier from GROWING, it does not throw away memory the driver has already
++    // granted.  `bounce_acquire` has always drawn that line (it reuses a drained ring entry before its own
++    // `g_pinned_off` check); this lookup did not, so ONE late refusal made every pool that had already been
++    // built unreachable -- and every fill from then on went through the pageable model mapping, i.e. a
++    // driver-staged copy, which is the exact thing the pool exists to avoid, on the exact box where the
++    // pinned budget is the scarce resource.  Field shape (issue #278): the pools are built at load, the
++    // ceiling is reached during the prefill, and from the latch on every expert copy is pageable.  A pool
++    // slot that exists is already pinned, so serving out of it asks the driver for nothing.
 +    const void * key = t.host;
 +    const auto it = g_host_pools.find(key);
 +    if (it != g_host_pools.end()) {
 +        return it->second.failed ? nullptr : &it->second;
++    }
++#if defined(_WIN32)
++    if (g_pinned_off) {
++#else
++    if (g_pinned_off && pinned_latch_emulated()) {
++        // POSIX: a refused pinned allocation is transient, so production code keeps trying (the guard above is
++        // Windows-only).  The `MOE_HOST_POOL_PIN_FAULT` diagnostic asks for the Windows latch semantics here.
++#endif
++        // issue #274 follow-up (@DanoPTT): the pinned tier was refused once (a latched HIP error on this
++        // platform, see `g_pinned_off`) and a pool is entirely pinned memory, so no NEW pool can be built --
++        // and asking again is what turned one refusal into a cascade of differently-worded failures.  A
++        // table without one then takes the per-table bounce ring / model-mapping path, which is the same
++        // policy the arena follows when an allocation fails.  One line, once.
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: the pinned host tier is OFF for this run, so no NEW host pool can be built; "
++                          "layer=%d role=%s falls back to the bounce ring / model mapping, and so will every "
++                          "table that has no pool yet (pools built before the refusal keep serving).  See the "
++                          "pinned-refusal line above for the cause.\n",
++                          __func__, t.layer, t.role.c_str());
++        }
++        return nullptr;
 +    }
 +    // Process-wide: every distinct host tensor shares the one budget, regardless of which device owns
 +    // its table(s).
@@ -63819,7 +63868,19 @@ index 000000000..40ad8e8d3
 +                  t.host_bytes, (double) ((int64_t) slots * (int64_t) t.host_bytes) / (1024.0 * 1024.0));
 +    device_guard pdg(t.device);
 +    host_pool_t p;
-+    if (slots >= 1) {
++    if (slots >= 1 && pinned_alloc_fault(/*grow*/ false)) {
++        // Diagnostic `MOE_HOST_POOL_PIN_FAULT` (issue #278): the platform refuses the pinned pool, exactly as
++        // a Windows box does when WDDM charges it against the adapter's shared-segment budget.
++        p.failed = true;
++        if (!g_pinned_off) {
++            g_pinned_off       = true;
++            g_pinned_alloc_err = cudaErrorMemoryAllocation;
++            GGML_LOG_WARN("%s: MOE_HOST_POOL_PIN_FAULT: refusing the pinned host pool for layer=%d role=%s "
++                          "(%.1f MiB) to emulate the platform's latched refusal (issue #278); the pinned host "
++                          "tier is now OFF for the rest of this run\n", __func__, t.layer, t.role.c_str(),
++                          (double) slots * (double) t.host_bytes / (1024.0 * 1024.0));
++        }
++    } else if (slots >= 1) {
 +        void * mem = nullptr;
 +        // PORTABLE + MAPPED pinned memory: the pool is process-wide, so a device other than the one that
 +        // allocated the pool copies out of it.  Plain `cudaMallocHost` is tied to the allocating ROCm
@@ -64680,6 +64741,19 @@ index 000000000..40ad8e8d3
 +    if (g_pinned_off) {
 +        return -1;   // the pinned tier is latched off (see `g_pinned_off`): do not ask the driver again
 +    }
++    if (pinned_alloc_fault(/*grow*/ true)) {
++        // Diagnostic (issue #278): the driver refuses this grow, which latches the pinned tier off for the
++        // rest of the run.  The refused fill takes the ordinary no-source path; what matters downstream is
++        // that an EXISTING pool entry keeps serving (see `table_pool_locked`).
++        g_pinned_off       = true;
++        g_pinned_alloc_err = cudaErrorMemoryAllocation;
++        GGML_LOG_WARN("%s: MOE_HOST_POOL_PIN_FAULT: refusing the pinned bounce grow (%.1f MiB for layer=%d "
++                      "role=%s) to emulate the platform's latched refusal (issue #278).  The pinned host tier "
++                      "is now OFF for the rest of this run; %.1f MiB of the pinned tier was allocated before "
++                      "this refusal.\n", __func__, (double) t.host_bytes / (1024.0 * 1024.0), t.layer,
++                      t.role.c_str(), (double) g_pinned_tier_bytes / (1024.0 * 1024.0));
++        return -1;
++    }
 +    device_guard dg(t.device);
 +    void *      mem = nullptr;
 +    cudaEvent_t ev  = nullptr;
@@ -64831,6 +64905,9 @@ index 000000000..40ad8e8d3
 +            out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
 +            out->pool_slot = s;
 +            out->pool_hit  = true;
++            if (g_pinned_off) {
++                g_pool_after_latch++;   // a pool built before the latch still serves (issue #278)
++            }
 +            return true;
 +        }
 +        if (allow_empty_fill) {
@@ -64841,6 +64918,9 @@ index 000000000..40ad8e8d3
 +                out->kind      = pool_h2d ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
 +                out->pool_slot = s;
 +                out->pool_hit  = false;
++                if (g_pinned_off) {
++                    g_pool_after_latch++;   // as above: an EMPTY slot is memory the run already owns
++                }
 +                return true;
 +            }
 +        }
@@ -67842,6 +67922,34 @@ index 000000000..40ad8e8d3
 +// slots).  A stood-down table makes `moe_cache_has_arena_locked()` false, so the cache-aware fusions stand
 +// down for every table and each per-table consumer declines -- the fuse-guard invariant.
 +
++// issue #278: can this table resolve a host source for an armed slot AT ALL, without the pinned tier
++// having to grow?  A pinned master is always a source (a plain H2D).  A PAGEABLE master needs the host
++// pool -- a resident slot or an EMPTY one, both of which are memory the driver already granted -- or a
++// bounce ring entry.  A latched pinned tier (`g_pinned_off`) can grow neither, so a table with no pool and
++// no ring entry has no source at all.
++//
++// This exists for the re-arm: arming slots that no fill can reach takes arena VRAM, syncs the device once
++// per table and then issues one doomed fill per seeded slot, and it changes NO downstream decision -- a
++// table that cannot fill declines the op exactly as a stood-down one does.  Measured shape (issue #278,
++// Windows): the pinned tier latches off during the prefill, and the post-prefill re-arm still re-takes
++// 5.5 GiB of the arena for 39 tables, none of which can ever be filled.
++static bool table_has_fill_source_locked(const table_t & t) {
++    if (t.host == nullptr || t.host_bytes == 0) {
++        return false;
++    }
++    if (!table_master_pageable(t)) {
++        return true;   // a pinned master: an H2D source, no allocation needed
++    }
++    const auto it = g_host_pools.find(t.host);
++    if (it != g_host_pools.end() && !it->second.failed) {
++        return true;   // the pool owns pinned slots already: a hit or an empty slot asks for nothing new
++    }
++    if (!g_pinned_off || !t.bounce.empty()) {
++        return true;   // the ring may still grow, or it already holds an entry that is reused
++    }
++    return false;
++}
++
 +// TODO #70: bring ONE layer's tables to a uniform slot count, or stand the whole layer down.  Returns the
 +// count the layer ended at (0 = stood down), or -1 when nothing was attempted.
 +static int moe_cache_rearm_layer_locked(int layer, std::vector<int> & ids, int want) {
@@ -67948,12 +68056,41 @@ index 000000000..40ad8e8d3
 +
 +    int n_rearmed   = 0;
 +    int n_stooddown = 0;
++    int n_nosrc     = 0;
++    int n_nosrc_layers = 0;
 +    for (auto & kv : by_layer) {
 +        const int         layer = kv.first;
 +        std::vector<int> &ids   = kv.second;
 +        const int want = (layer >= 0 && layer < 512) ? g_rearm_slots[layer] : -1;
 +        if (want <= 0) {
 +            continue;   // the layer was not cacheable at sizing time
++        }
++        // issue #278: never arm a layer that cannot fill.  The test is LAYER-level, not per table, because the
++        // arm is layer-uniform: a skipped table sandwiched between armed ones is exactly the mixed-slot layer
++        // that makes the fused gate+up kernel read the wrong expert.  So a layer with no fill source is stood
++        // down WHOLESALE (the survivors included -- they cannot fill either, so their slots are dead weight),
++        // which is uniform and is what the safety net below would do anyway.
++        bool any_src = false;
++        for (int i : ids) {
++            if (table_has_fill_source_locked(g_tables[i])) {
++                any_src = true;
++                break;
++            }
++        }
++        if (!any_src) {
++            for (int i : ids) {
++                if (g_tables[i].slots > 0) {
++                    free_table_buffers_locked(g_tables[i]);
++                    alloc_table_locked(g_tables[i], 0);   // the legal stood-down state (uniform 0 slots)
++                }
++            }
++            // Latched for the rest of the run (the condition is `g_pinned_off` plus no pool and no ring entry),
++            // so this layer can never be armed again: remember that, which also keeps the caller's second
++            // re-arm pass (one per device loop) from repeating the line for a layer this pass already took down.
++            g_rearm_slots[layer] = 0;
++            n_nosrc += (int) ids.size();
++            n_nosrc_layers++;
++            continue;
 +        }
 +        const int got = moe_cache_rearm_layer_locked(layer, ids, want);
 +        if (got > 0) {
@@ -67990,6 +68127,17 @@ index 000000000..40ad8e8d3
 +        GGML_LOG_WARN("%s: re-armed %d stood-down expert-cache tables after a compute-buffer drop "
 +                      "(%d stood down: the arena could not hold the layer uniformly) (arena now %.1f MiB)\n",
 +                      __func__, n_rearmed, n_stooddown, (double) g_arena_bytes / (1024 * 1024));
++    }
++    if (n_nosrc > 0) {
++        // issue #278: name it, so "the re-arm did nothing" is a decision in the log rather than a mystery.
++        GGML_LOG_WARN("%s: left %d stood-down expert-cache tables in %d layer(s) DISARMED: %s, and none of "
++                      "their tables has a host pool, so no armed slot could ever be filled (arming them would "
++                      "take the arena and fail every seed fill; the ops decline exactly as they did while "
++                      "stood down) (arena now %.1f MiB)\n",
++                      __func__, n_nosrc, n_nosrc_layers,
++                      g_pinned_off ? "the pinned host tier is latched off"
++                                   : "no host source can be resolved",
++                      (double) g_arena_bytes / (1024 * 1024));
 +    }
 +    return n_rearmed > 0;
 +}
@@ -71041,6 +71189,15 @@ index 000000000..40ad8e8d3
 +                      "usage on both a 47 and a 64 GiB box, issue #274).  Lower MOE_HOST_POOL_RAM_PCT / -lme, "
 +                      "or make one GPU visible (ROCm/TheRock#9339)\n",
 +                      __func__, cudaGetErrorString(g_pinned_alloc_err));
++        if (g_pool_after_latch > 0) {
++            // issue #278: the complement of a latched refusal.  A pool that was built before the ceiling was
++            // hit is pinned memory the run already owns, so it keeps serving; only NEW pools and new ring
++            // entries are refused.  Zero here with pools present is the defect (every existing pool thrown
++            // away, every expert copy pageable).
++            GGML_LOG_WARN("%s: %lld expert fills were served from a host pool built BEFORE the refusal (a pool "
++                          "slot is already pinned, so an existing pool keeps serving; only growing the tier is "
++                          "refused)\n", __func__, (long long) g_pool_after_latch);
++        }
 +#if defined(GGML_USE_HIP) && defined(_WIN32)
 +        {
 +            int64_t shm_limit = -1, shm_resident = -1;

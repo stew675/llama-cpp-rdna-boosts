@@ -2366,3 +2366,28 @@ on Linux.**
      full mirror stays inert (0 demoted, 144 mirror tables).
   Gates on the fixed tree: coherence `sha=880c932888f8` identical on both `SINK` arms, `gate-host-pool.sh`
   **31/31** (the `sink`/`sinkfail` arms still prove a failed demote declines and never publishes).
+
+- **A latched pinned tier stops the tier GROWING; it does not throw away what the run already owns (r229, block
+  12; issue #278).**  `g_pinned_off` is set by the first refused `cudaHostAlloc` (on Windows a refusal also
+  latches a process-wide HIP error, which is why the tier is not retried) and `bounce_acquire` has always drawn
+  the right line: it reuses a drained ring ENTRY before its latch check.  `table_pool_locked` did not -- it
+  checked the latch before looking for an existing pool, so ONE refusal (the reporter's box hits its adapter
+  ceiling at ~9.3-9.5 GiB of shared usage during the load) made every pool the run had already built
+  unreachable, and every expert copy after that point went through the pageable model mapping: a driver-staged
+  copy, i.e. the exact cost the pool exists to remove, on the box where the pin budget is the scarce resource.
+  Measured on the `pinlate` arm of `gate-host-pool.sh` (a latched tier forced after the pools and the arena
+  exist): the lookup-first order serves **7 060 fills from pre-latch pools with 110 failed fills**, the
+  guard-first order (the pre-r229 code) serves **0** from them with **1 587 failed fills** -- text identical in
+  both, so only the counter can see it.  The same rule is what the census line `N expert fills were served from
+  a host pool built BEFORE the refusal` reports.
+- **An expert-cache arena it cannot fill must not be armed (r229, block 12; issue #278).**  `moe_cache_rearm`
+  (the post-prefill, compute-buffer-drop re-arm) used to re-take the arena for every layer with a stood-down
+  table.  When the pinned tier is latched off and a table has neither a pool nor a ring entry, there is no host
+  source at all, so every one of those slots is armed, seeded (one doomed fill per slot, a `cudaDeviceSynchronize`
+  per table) and then declined on use -- which is exactly what a STOOD-DOWN table does, at 5.5 GiB of VRAM and a
+  sync per table.  The re-arm now tests the LAYER (`table_has_fill_source_locked`; layer-uniform, because a
+  skipped table between armed ones is the mixed-slot layer that reads the wrong expert): a source-less layer is
+  stood down wholesale and named once (`left N stood-down expert-cache tables in M layer(s) DISARMED ...`), and
+  its `g_rearm_slots[layer]` is zeroed so the caller's second pass does not repeat it.  Measured on the
+  reporter's config with the latch forced: the arena stays at **13 645 MiB instead of growing back to 19 225**,
+  with the same declined-op behaviour and byte-identical text.
