@@ -1,14 +1,14 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  On `r220` only** (cut against `release.json` tree
-`e77a08d9d2f553b53fdbae19b50d5e61b3a2200c`).
+**Optional artifact, not part of the delivery.  On `r229`** (cut against `release.json` tree
+`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7`).
 
 From **PR #268 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed and reduced
 (see *What changed in the rebase* below).  The submitter's own description and measurements are in the PR;
 this file records what *this repo* verified and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `07b7bf14d5080f176c05b9659d60b87db214050b5fb842a576a6a5fd7f027e43`
-* applies at `release.json` tree `e77a08d9…`, produces tree `ada5e221e34b77aeffbb3747d16b126f022c3d5b`
+* `two-lane-prefill.patch` — the artifact.  sha256 `1515bd63023602bec6b0546f82580a4552200a9e1353dc8ef4a93c0f2ea808fa`
+* applies at `release.json` tree `622d017f7a…`, produces tree `e40eabe6f10b27f405d3006ab7c6c5b69703119c`
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   ```
@@ -16,10 +16,17 @@ this file records what *this repo* verified and what it cannot reach.
 ## What it does
 
 `LLAMA_PREFILL_LANES=2` (default `1`) keeps a **second backend scheduler** with its own compute buffers
-and, in the decode loop, prepares two *consecutive* wide, output-free prefill ubatches on the two lanes and
+and, in the decode loop, prepares two *consecutive* wide prefill ubatches on the two lanes and
 submits their splits alternately (`ggml_backend_sched_graph_compute_async_pair`, `a0 b0 a1 b1 …`).  One
 device's routed-expert work then overlaps the other device's attention.  Lanes never move work: `-ts` /
 `-ot` placement decides which device owns what, the interleave only changes submission order.
+
+Since the r229 cut, a batch of [LLAMA_LANES_SPLIT_MIN (default 1024; 0 disables), 2 x n_ubatch) tokens
+is split into two wide sub-ubatches (the first taking LLAMA_LANES_SPLIT_FRAC of it, default 0.55,
+rounded up to 64, the chunked-GDN chunk), and the pair gate no longer requires both ubatches
+output-free: the batch output row lands in the second sub-ubatch and is extracted per lane, on the
+scheduler of each lane.  Before that cut, a prompt batch of fewer than two ubatches never paired, and
+only the output-free head of a longer prompt paired.
 
 It degrades to the existing single-lane path when `< 2` non-CPU **backends**, pipeline parallelism,
 `no_alloc`, or a draft context (`ctx_other`) is present; a ubatch is only paired when it is wide,
@@ -63,6 +70,24 @@ Correctness here: greedy text byte-identical between lanes (`prompts/prose-rdna-
 identical to the delivery build's text in every case; no abort with MTP (`-md`); the default
 (`LLAMA_PREFILL_LANES` unset) path is unchanged.
 
+*The r229 cut changed the submission structure (sub-ubatch split + output-aware pairing); the numbers
+above are for the r220 cut and need re-running on this cut before they can be cited again.*
+
+### Submitter measurement (r229 cut, imbalanced pair)
+
+RX 7900 XTX (gfx1100) + Radeon Pro V620 (gfx1030), MoE Q6_K_XL, `-sm layer -ts 1,0 -ot
+blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1 -dev ROCm0,ROCm1 --load-mode dio`, pair engaged:
+
+| test | 1 lane | 2 lanes | delta |
+|---|---|---|---|
+| pp2048 | 859.68 t/s | 1382.54 t/s | **+60.8 %** |
+| pp2048 @ d32768 | 786.93 t/s | 1200.86 t/s | **+52.6 %** |
+| tg256 | modestly up | | |
+
+Correctness: greedy text byte-identical L1 vs L2 at short and ~2100-token prompts; L1 (lanes unset)
+matches the delivery baseline.  For llama-cli on MTP models: auto-MTP must be disabled
+(--spec-type none); the feature declines MTP workloads by design (nextn gate).
+
 ## What changed in the rebase onto r220
 
 1. **Dropped what the delivery now carries.**  PR #268 also diagnosed and fixed the shared per-device
@@ -80,6 +105,27 @@ identical to the delivery build's text in every case; no abort with MTP (`-md`);
 4. **Docs corrected** to state the reachability table above rather than implying `-sm layer -ts 1,1`
    works.
 
+## What changed in the re-cut onto r229
+
+The r220-r229 delivery set touches none of the files this patch edits, so the base side of the cut is
+byte-identical to the r220 cut; only the two `src/llama-context.*` files differ from it.
+
+The r220 cut paired two consecutive whole ubatches and only when both were output-free, so a prompt
+batch of fewer than two ubatches never paired (its single ubatch carries the batch output row), and a
+2..3-ubatch batch paired only its output-free head.  On an imbalanced pair the feature therefore
+measured neutral in the submitter R223 test, and the r220-cut numbers above (balanced devices) never
+showed a win.  The r229 cut adds:
+
+1. **The sub-ubatch split.**  A batch of [LLAMA_LANES_SPLIT_MIN (default 1024; 0 disables), 2 x
+   n_ubatch) tokens is split into two wide ubatches, the first taking LLAMA_LANES_SPLIT_FRAC of it
+   (default 0.55, rounded up to 64, the chunked-GDN chunk); the batch output row lands in the second
+   ubatch.  Batches of 2 x n_ubatch or more keep the plain n_ubatch split.
+2. **Output-aware pairing.**  The pair gate no longer requires both ubatches output-free; either
+   partner may carry the outputs, which are extracted per lane after compute, on the scheduler of each
+   lane (extract_outputs, with sched-aware readback sync; the single-lane path runs the same function
+   on sched).  The readback sync is skipped on the final ubatch (the caller consumes its outputs and
+   syncs).  MTP (nextn) and F1 layer-input readback workloads stay single-lane as before.
+
 ## Known open points (unchanged from the PR)
 
 * On the pair-failure path (`graph_compute_pair != SUCCESS`) lane 1's ubatch has already been applied to
@@ -95,6 +141,8 @@ identical to the delivery build's text in every case; no abort with MTP (`-md`);
 | variable | default | what |
 |---|---|---|
 | `LLAMA_PREFILL_LANES` | `1` | `2` enables the pair.  Anything else (or a layout the table above refuses) logs one WARN and stays single-lane |
+| `LLAMA_LANES_SPLIT_MIN` | `1024` | `0` disables the sub-ubatch split (whole-ubatch pairing only, the r220 behaviour) |
+| `LLAMA_LANES_SPLIT_FRAC` | `0.55` | fraction of the batch the first sub-ubatch takes (clamped to [0.1, 0.9], rounded up to 64) |
 | `GGML_SCHED_PAIR_DEBUG` | `0` | `1`: log each pair decision; `>= 2`: also run the hazard self-test; `>= 3`: per-lane/per-backend GPU event spans (creates timing events) |
 | `GGML_SCHED_PAIR_HAZARD` | on | `0` keeps only the split-name guard, skipping the cache-hazard analysis (diagnostic) |
 
