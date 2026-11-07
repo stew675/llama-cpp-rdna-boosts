@@ -6,6 +6,10 @@ as-is (they are cut against r204 and touch code that moved in r209-r228; `archiv
 decode-class mechanism that only runs where it pays, so every remaining comparison is made at a budget *below*
 the near-mirror boundary.  **Two mechanisms closed on 2026-11-06** (`soar`, 3 × R9700): 0004/0006/0007's hazard is
 **unreachable by construction** and 0003b costs **≤0.2-1.2 % of a prompt** — [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
+**A third mechanism closed on 2026-11-07** with its A/B (`radix` + `soar`): 0003a's narrow-2 preference is
+**measured / do not implement** — [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md).  So of the ten
+patches: 0001/0005/0010 absorbed or superseded, 0002 a non-goal, 0003a/0003b/0004/0006/0007 closed by measurement
+or by construction, 0009 split off, 0008 the one open value.
 This file exists so the PR can be closed as **integrated rather than merged**, and so a future session does not
 re-review a mechanism we have already measured.
 
@@ -20,7 +24,7 @@ design) and [`archive/work/host-pool-speed/README.md`](../../archive/work/host-p
 |---|---|---|---|
 | 0001 | `--host-experts mmap` puts the `-ncmoe`/`-cmoe` experts back in the pageable mapping; GPU-keyed host-expert accounting | the **mode is gone and must not come back**: since r209-r212 the placement is one budget, `-lme [auto\|N]` (below the set = a per-expert pinned pool over the read-only mapping; at/above it = a mirror), and `MOE_HOST_TIER=tensor` is the whole-tensor escape hatch | **superseded** |
 | **0002** | sparse registration: a second read-only `MAP_SHARED` alias, `mlock` + `hipHostRegister(ReadOnly)` for the expert ranges a GPU may read, `madvise(WILLNEED)`, trim after a device sync, `MAP_FIXED` remap of KFD's leftover range; owner-device routing; whole-table prefill staged from arena+alias | **not adopted.**  The job is done by two mechanisms we already ship: a pool-resident miss is an **in-place PCIe read of pinned RAM** (`MOE_HOST_POOL_COLD` + `_MULTIDEV`, r203/r210) and a declined read goes through the per-table **bounce ring** (`expert_host_src`, the `gate-host-pool.sh` arms).  `-sm layer` owner routing is the semantic key (r215+) | **non-goal**, re-entry condition in §3 |
-| 0003a | the narrow-2 (draft compute) pin prefers its `cudaMalloc` fallback when it fits **outside** the slab instead of evicting arena tables | **partially.**  `ggml_cuda_slab_narrow2_pin_locked` prefers the unmapped spare, **refuses** when the region would leave less than `GGML_CUDA_SLAB_MIN_ARENA_MIB`, maps the VA above `mapped`, and falls back to `cudaMalloc` only on a refusal — but once the arena floor is satisfied it *will* evict arena tables for the draft's buffer | **delta remains** → PLAN P1.5 (an A/B, ~1 branch) |
+| 0003a | the narrow-2 (draft compute) pin prefers its `cudaMalloc` fallback when it fits **outside** the slab instead of evicting arena tables | **measured 2026-11-07 → `TODO` #279 CLOSED, do not implement**: the eviction branch is unreachable on every shape we ship (the pin's VA spare IS the draft's reserve minus the headroom, so it exceeds the compute region by construction), and when forced the eviction is re-absorbed — identical final arena MiB and decode hit rate in both arms.  The preference cannot avoid it (its fallback eats the free VRAM its own guard checks ⇒ the pin is retried 13 ms later with the same eviction) and a latched version trades the evicted bytes of cushion for one ~20 ms re-fill ([`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md)) |
 | 0003b | `GGML_CUDA_SLAB_RING_PREFILL=0` (implied by mmap): keep the expert-cache arena across a decode→prefill transition | **absent** — no such variable exists.  The slab's H2D ring *is* reclaimed on the prefill→decode drop, and the arena **is** dropped going the other way when the work region outgrows its reservation (`moe_cache_evict_slab_range` + `re-armed N stood-down`) | **measured 2026-11-06 → `TODO` #278 CLOSED, do not implement**: 12 tables / 1 062 MiB per transition at the field ubatch, ≤0.2-1.2 % of the prompt and invisible in paired rows; 0 events on the 3-GPU tensor shape ([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §1) |
 | **0004** | the swap is two custom **copy kernels**, not `hipMemcpyAsync`, because a small pinned copy can leave later queued work unsubmitted on ROCm | our demote is one `cudaMemcpyAsync(D2H)` on the compute stream into a free pool slot (block 12).  It measured +5.3 % net on r224's box, so no stall was visible there — but that box's link is not this one | **closed 2026-11-06 → `TODO` #276: unreachable by construction.**  The hazard needs a copy *and* a paired all-reduce; on `-sm tensor` (RCCL banner present) the demote declines **0 demoted / 14 480 geometry (structural)**, and on `-sm layer` (7 862 copies) there is no all-reduce |
 | 0005 | tier × device-remap, and a tier table never uses the pool's cold read | ours already declines on a **partial** pool and serves a mirror (`dr_pool_ok`, r221) | **absorbed** |
@@ -89,20 +93,23 @@ for the PR's remaining mechanisms:
 | 2 | **the demote's copy submission** (`TODO` #276): his copy-kernel + drain rationale is the *paired-device* stall, not 1-GPU cost (the demote measures net +19-21 % at `-lme` 44, so the copy does not dominate) | a 2-GPU arm, a copy-kernel A/B, and a stall in the flight record right after an admission -- not a throughput delta | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §2 | **CLOSED 2026-11-06 -- unreachable by construction**: the demote declines **100 %** of offers on the tensor split (the only layout with the paired all-reduce: `0 demoted / 14 480 geometry (structural)`) and `-sm layer` (7 862 copies) has no all-reduce.  Re-entry: only if the demote is extended to an `n_slices != 0` table |
 | 3 | **precopy** (`TODO` #277, 0006/0007/0008): a **dedicated** K-slot ring + a side stream + the drain semantics (our headroom cannot hold a pre-copied victim -- a prefill fill consumes it) | only if #276 leaves a residual on a multi-device arm | PLAN P1.2 | **RETIRED 2026-11-06** with #276; the condition fails, and the shape was already decided (his 0006/0007, not more headroom) |
 | 4 | **the slab keeps the arena across a decode→prefill transition** (`TODO` #278, 0003b) | PLAN P1.4 -- first count the `evicted … re-armed` census on the field shape | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) §1 | **CLOSED 2026-11-06 -- measured, do not implement**: the drop is real (12 tables / 1 062 MiB per event at `-c 204800 -ub 6144`), the re-fill is bounded by the evicted bytes (≤0.2-1.2 % of the prompt) and invisible in paired rows, and the 3-GPU tensor shape never evicts |
-| 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (`TODO` #279, 0003a) | PLAN P1.5 -- one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | PLAN P1.5 | **open** |
+| 5 | **narrow-2 prefers `cudaMalloc` over evicting arena tables** (`TODO` #279, 0003a) | PLAN P1.5 -- one A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` | [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) | **CLOSED 2026-11-07 -- measured / do not implement**: the branch is unreachable on every shipping shape and its eviction is re-absorbed (identical arena MiB, hit rate, decode); the preference is a churn without a latch, and latching costs more cushion than it saves |
 | 6 | **`MOE_EXPERT_CACHE_TOUCH` 2 vs 3 with the demote on** (0008) -- a knob, no code | PLAN P1.3, on a live cell | this campaign | **open** (the replay predicts the sink's advantage shrinks a third; never measured on device) |
 | 7 | **the tier's policy and visibility** (0009's non-registration half): cgroup-aware figure, authoritative `-lme`, one verdict line | already scoped, do not duplicate | [`wip/host-expert-coverage/`](../host-expert-coverage/README.md) | **open there** |
 | 8 | **sparse registration** (0002) | **non-goal.**  Re-entry only if a partial tier cannot be made cheap by the tier itself -- and r228 + the r224 span made the partial tier's *prefill* cheap, so this is closer to closed than open | -- | **non-goal, unchanged** |
 
 Every code item is a `TODO` handle: **#276** (transport, **closed**), **#277** (precopy, **retired**), **#278**
-(arena across a prefill transition, **closed**), **#279** (narrow-2, open) and **#280** (parity/crossover, open --
-the campaign's product).  The touch sweep needs no handle: it is a knob.  Items 2-4 closed on 2026-11-06; see
-[`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
+(arena across a prefill transition, **closed**), **#279** (narrow-2, **closed 2026-11-07 -- measured, do not
+implement**) and **#280** (parity/crossover, **closed -- the table exists**).  The touch sweep needs no handle: it
+is a knob.  Items 2-5 closed on 2026-11-06/07; see [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)
+and [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md).
 
 ## 4. What would close the PR (the reply, once the numbers exist)
 
 1. **Absorbed or superseded**: 0001, 0005, 0010 (with its measurement), and 0009's placement half.
-2. **Borrowed, pending the A/Bs here**: 0008's value, 0003a (0003b is **closed**: measured, no addressable cost).
+2. **Borrowed, pending the A/Bs here**: 0008's value.  0003a is **closed** (measured 2026-11-07: unreachable on
+   our shapes, re-absorbed when forced, and the preference cannot avoid the eviction without a latch that costs
+   the evicted bytes of cushion for one ~20 ms re-fill); 0003b is **closed** (measured, no addressable cost).
 3. **Deferred with a condition**: 0002 behind "a partial tier cannot be made cheap" (r228 makes the *prefill*
    half of that cheap; the decode half is the +19-21 % the tier already has, so the condition looks answered in
    the negative for the registration mechanism).
@@ -113,6 +120,10 @@ the campaign's product).  The touch sweep needs no handle: it is a knob.  Items 
    unreachable -- the demote declines 100 % beside a paired all-reduce; 0003b costs ≤0.2-1.2 % of a prompt), so
    what the reply still owes is the crossover table (#280) and 0003a's A/B (#279).
    [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md).
+   **Both are now answered**: #280's table is in [`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md) and
+   0003a is a measured "do not implement" in [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md)
+   (unreachable on our shapes; forced, the eviction is re-absorbed; the preference churns without a latch and the
+   latch costs more cushion than it saves).
 5. **Posted 2026-11-06** (the config + numbers above, the r228 rules, the repro conditions and the
    taken/rejected/open mapping):
    <https://github.com/stew675/llama-cpp-rdna-boosts/pull/267#issuecomment-6698266713> -- awaiting the

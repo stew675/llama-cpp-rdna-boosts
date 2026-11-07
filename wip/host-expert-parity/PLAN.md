@@ -27,7 +27,16 @@ the box), then [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) (the per-patch verdi
 > (−9 % for 10.8 GiB less pinned RAM) while prefill is not, and a sub-complement budget should set
 > `MOE_HOST_POOL_DIO=1` (+43-81 % prefill, decode neutral with the demote).
 >
-> **What remains is** P1.3 (the `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 sweep, a knob) and **P1.5 (`TODO` #279, an A/B)**.
+> **Fourth pass, 2026-11-07 (`radix` + `soar`) — [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md):
+> `TODO` #279 is CLOSED as measured / do not implement and P1.5 is done.**  The narrow-2 eviction branch is
+> unreachable on every shipping shape (four probes: the pin's VA spare *is* the draft's own reserve minus the
+> headroom, because the preflight skips `slab_extend` at the priming sizing), and when forced
+> (`GGML_CUDA_SLAB_RESERVE_MIB`) the eviction is re-absorbed — identical final arena MiB and decode hit rate in
+> both arms.  The 0003a preference cannot avoid it either: its own fallback eats the free VRAM its guard needs,
+> so the pin is retried 13 ms later with the same eviction; latching it would spend the evicted bytes of cushion
+> permanently to save one ~20 ms re-fill.  No code ships; the reference diff is beside the record.
+>
+> **What remains is** P1.3 (the `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 sweep, a knob).
 > Ranked in [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0.
 
 ## 1. Settled — do not re-derive
@@ -156,7 +165,7 @@ Every item: **kill switch, default unchanged until it has a device win here**, o
 | **P1.2** (TODO #277 — **RETIRED 2026-11-06**) | precopy: K spares + a side stream that copies the policy's likely victims ahead of time (PR 0006/0008), including 0007's drain semantics | its own condition was "P1.1 leaves a residual on the admission path", and P1.1 closed as unreachable — the shape was already decided to need a dedicated K-spare ring, never more headroom (`PR-267-REMAINDER.md` §2) |
 | **P1.3** | `MOE_EXPERT_CACHE_TOUCH` 2 vs 3 **with the demote on** (a knob: no code) | always — one arm set | coherence only |
 | **P1.4** (TODO #278 — **CLOSED 2026-11-06, measured**) | keep the arena across a decode→prefill transition (PR 0003b) | **settled negative: the drop is real, the cost is not.**  Flash-Next 1 GPU, field ubatch (`-c 204800 -ub 6144`): 3 `moe_cache_evict_slab_range` events, 1 062 MiB, one `re-armed 12 stood-down` — bounded by the evicted bytes to 37-56 ms, i.e. ≤0.2-1.2 % of the prompt, and the paired 4 096-token rows measure row 3 **+15.8 % over** row 2 across a transition.  **0 evictions** on the 3-GPU `-sm tensor` field shape.  Re-entry: an arena *exactly* slab-full with short (≤4k) prompts, or the 56 GiB rig measured directly |
-| **P1.5** (TODO #279) | narrow-2: prefer the `cudaMalloc` fallback over evicting arena tables when the draft compute region would fit there (PR 0003a) | the A/B against `GGML_CUDA_SLAB_MIN_ARENA_MIB` shows the eviction costs a resident set | per-block build, coherence, faults |
+| **P1.5** (TODO #279 — **CLOSED 2026-11-07, measured / do not implement**) | narrow-2: prefer the `cudaMalloc` fallback over evicting arena tables when the draft compute region would fit there (PR 0003a) | **settled negative**: the branch is unreachable on every shipping shape and, forced, its eviction is re-absorbed (identical arena MiB + hit rate); the preference cannot avoid it without a latch that costs the evicted bytes of cushion permanently.  [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) | — |
 
 Not here: the tier's policy/visibility work (cgroup figure, authoritative `-lme`, verdict line) is
 [`wip/host-expert-coverage/`](../host-expert-coverage/README.md); sparse registration is a non-goal (S9); the

@@ -19,8 +19,16 @@ the **band-transition tail** — the pool's re-layout after the last prefill uba
 charged to the first token (0.6 s on a mirror, 7.2 s at `auto` buffered, 13.5-18.6 s at `-lme 44` buffered) —
 whose fill order is now file order.  The headline: **77 % coverage is a decode-parity tier (−9 % for 10.8 GiB
 less pinned RAM, with the demote), not a prefill-parity one (−46 %)**; and for a sub-complement budget
-`MOE_HOST_POOL_DIO=1` is worth +43-81 % prefill (`ENVIRONMENT.md`).  What remains here is `TODO` **#279**
-(narrow-2, an A/B) and `P1.3` (`MOE_EXPERT_CACHE_TOUCH` 2 vs 3).
+`MOE_HOST_POOL_DIO=1` is worth +43-81 % prefill (`ENVIRONMENT.md`).  What remains here is `P1.3`
+(`MOE_EXPERT_CACHE_TOUCH` 2 vs 3).
+
+**`TODO` #279 is closed too** ([`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md)): the narrow-2
+pin's eviction branch is **unreachable on every shipping shape** — the pin's VA spare *is* the draft context's
+own reserve minus the headroom, because the MoE preflight skips `slab_extend` at the priming sizing — and when it
+is forced (`GGML_CUDA_SLAB_RESERVE_MIB`) the evicted arena is re-absorbed (identical final arena MiB and decode
+hit rate).  PR #267's 0003a preference cannot avoid it: its fallback eats the free VRAM its own guard checks, so
+the pin is retried 13 ms later with the same eviction, and a latched version would spend the evicted bytes of
+cushion permanently to save one ~20 ms re-fill.  **No code ships**; the reference diff is beside the record.
 
 **The 2026-11-06 closes stand** ([`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md)).  `TODO` **#276** (the
 demote's copy submission) and **#277** (precopy) are **unreachable by construction**: the demote declines on every
@@ -149,6 +157,7 @@ mirror `slots >= n_experts` case stays inert, both as shipped.)
 | **the first measurement pass (2026-11-06, `radix`)** | [`RESULTS-2026-11-06.md`](RESULTS-2026-11-06.md) |
 | **the `soar` pass: the #276/#277/#278 closes + exact reproduction** | [`RESULTS-2026-11-06-soar.md`](RESULTS-2026-11-06-soar.md) |
 | **the 2026-11-07 pass: the crossover table, the parity answer and the band-transition tail (#280 closed, r231)** | [`RESULTS-2026-11-07-radix.md`](RESULTS-2026-11-07-radix.md) |
+| **the 2026-11-07 narrow-2 pass: the #279 close (a measured "do not implement")** | [`RESULTS-2026-11-07-narrow2.md`](RESULTS-2026-11-07-narrow2.md) + the reference diff `narrow2-prefer-malloc.diff` |
 | the PR #267 integration checklist (re-framed by r228) | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) §3.0 |
 | the release the fix shipped in | `WORKLOG.md` 261106.019, `patches/README.md` block 12 |
 | the per-patch re-assessment of PR #267 | [`PR-267-REMAINDER.md`](PR-267-REMAINDER.md) |

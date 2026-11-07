@@ -1,3 +1,66 @@
+## 261107.003 (campaign) -- `TODO` #279 closes: the narrow-2 eviction branch is unreachable, and PR #267's 0003a preference cannot help
+
+**No delivery change** (`patches/`, `release.json` and the fork branch are untouched; the release stays
+`v16-6050b467c-r231`, tip `a19aab55e`).  Docs and the campaign record only, plus the reference diff that
+`TODO` #279 asked for — and the measured answer is **do not implement**, so there is no r232 and no tag.
+Records: [`wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md`](wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md)
+(the arms, the tables, the arithmetic), `narrow2-ab.sh` / `narrow2-ab.py` (the harness) and
+`narrow2-prefer-malloc.diff` (the implementation, built and A/B'd, applied by nothing).
+
+**The question.**  PR #267's 0003a: when the draft's compute region does not fit the slab's unmapped VA spare,
+`ggml_cuda_slab_narrow2_pin_locked()` *evicts* the arena tables in `[off, mapped)` to place it; the PR keeps the
+draft on its `cudaMalloc` fallback "whenever the region fits outside the slab" instead, on the theory that an
+evicted arena is a resident set the cache has to re-fill.  `PLAN.md` P1.5's condition was "the A/B shows the
+eviction costs a resident set".  It does not, and it cannot be made to.
+
+**1. The branch is unreachable on every shipping shape.**  Four probes, two boxes, all `unmapped VA spare`:
+Flash-Next + MTP at `-c 204800` on one GPU (spare 2.06 GiB vs a 0.75 GiB region); 35B-A3B + DFlash2 at
+`-c 204800` on one GPU (6.31 GiB vs 0.50); the same on 3 × R9700 `-sm tensor` (6.38/6.31/6.31 GiB vs 0.50 per
+device); and a `-ub` sweep that grows the region to 1.25/1.50 GiB against a 2.88 GiB spare.  The mechanism, not
+luck: the spare at creation is `reserve − headroom`, the reserve is `headroom + draft-context estimate`
+(kv + compute + slack), and the MoE preflight **skips `ggml_cuda_slab_extend_all()` at the priming sizing**
+(`wip/first-prefill-latency`), so nothing has eaten the spare when the pin runs.  The estimate's `compute` term
+is a floor over the same knob the pin would have to beat, so the straddle needs the estimate to be *short* —
+which is r106's deliberate fallback, not a configuration anyone ships.
+
+**2. Forced (`GGML_CUDA_SLAB_RESERVE_MIB`, the documented override that sets the reserve verbatim), its cost is
+nil.**  Six interleaved arms (Flash-Next + MTP, `-c 16384`, headroom 1536, two reserve/ubatch shapes): the pin
+evicts 314-450 MiB and the next sizing/re-arm pass **re-absorbs it** — the final arena MiB and the decode hit
+rate come out identical to four decimals in both arms (`20 712.6 MiB / h=0.9471` and `21 418.6 MiB / h=0.9239`),
+with prefill within +2.4 % and decode within −0.8 % (noise: the two arms end in the same state, same draft
+acceptance, same graph reuse).  The whole cost is one re-fill of the evicted bytes — ~15-20 ms at the box's
+~22 GB/s, once, against a 4-7 s first prefill.
+
+**3. The preference cannot avoid it, for two mechanical reasons.**  (a) *The window is the cushion*: the
+fallback lands the region in free VRAM outside the slab, so it can only fire while the eviction is ≤ free −
+cushion, i.e. a fraction of the slab's headroom (measured window ≲0.6 GiB at 1.42 GiB free and a 0.75 GiB
+cushion) — a *large* eviction cannot be avoided by definition, since there is no free VRAM to fall back on,
+which is why the region did not fit.  (b) *The pin is retried* (`narrow2_floor` latches only on a committed
+pin) and the fallback eats the free VRAM its own guard checked: measured in all six `pref=1` arms, the decline
+at `0.19.448` s and the pin with the *same* 314 MiB eviction at `0.19.465` s — 13 ms later, plus a 512 MiB
+`cudaMalloc` that is then released.  A latched version fixes (b) and loses the trade: it gives up the evicted
+bytes of cushion **permanently** to save one ~20 ms re-fill, and that cushion is what r206 raised to 1280
+MiB/GPU because 768 MiB OOMed a Flash-Next prefill.
+
+**4. What that closes.**  `TODO` #279 is retired; `wip/host-expert-parity/` keeps only P1.3 (the handle-less
+`MOE_EXPERT_CACHE_TOUCH` sweep) and the policy half that lives in `host-expert-coverage/`.  **PR #267's reply now
+owes no number**: 0003a is answered (unreachable, re-absorbed, and a preference cannot avoid it without a latch
+that costs more than it saves), joining 0004/0006/0007 (unreachable by construction), 0003b (measured, do not
+implement), 0001/0005/0010 (absorbed/superseded, one with a number) and 0002 (non-goal) — so the PR can be
+closed as *integrated rather than merged* once the maintainer posts it.  The reference diff is kept beside the
+record and is deliberately **not** an `optional/` artifact: `optional/` is for a finished feature with no
+validated win *on hardware this repo does not validate*, and this one is inert by arithmetic on any hardware.
+
+**5. One trap corrected for the record.**  r231's coherence note blamed `-lv 4` for interleaving statistics
+lines into llama-cli's generated text; it is **any** verbosity that prints the timing block — the same shas
+came apart at `-lv 3` here.  Text-identity arms run at the default verbosity and take their numbers from the
+`[ Prompt: … | Generation: … ]` footer; only the mechanism/census arms take `-lv 3`.
+
+**Environment.**  `radix` (1 × R9700) for the arms, `soar` (3 × R9700) for the multi-device reachability probe;
+`~/llama.cpp` @ `a19aab55e` = r231, `build-rocm` build `11903`, ROCm 10.1.0-gfx120X, `HIP_VISIBLE_DEVICES`
+pinned, heat prior frozen (`MOE_EXPERT_HEATMAP=load`).  `scripts/check-gpu-faults.sh` clean over the session,
+the source tree reverted to the r231 tree afterwards (the build was rebuilt from it).
+
 ## 261107.002 (r231) -- TODO #280: the 56 GiB field crossover table (the tier's headline), and the band-transition tail it found
 
 **Shipped:** `v16-6050b467c-r231` (block **12** amended, +24/-3 in `ggml/src/ggml-cuda/moe-expert-cache.cu`;

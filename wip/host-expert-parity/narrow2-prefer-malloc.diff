@@ -1,0 +1,66 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index d6ed08aeb..06b89f10f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -1009,6 +1009,28 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+ //     draft's: measured 1280 MiB for a DFlash2 drafter under `-sm tensor` against the estimator's 512 MiB
+ //     tier, i.e. bigger than the whole unmapped spare, which used to leave the draft on the cudaMalloc
+ //     path with the slab holding the VRAM (`graph_reserve: failed to allocate compute buffers`).
++// TODO #279 (PR #267 0003a): when the draft's compute region does not fit the slab's unmapped VA spare, the
++// pre-#279 pin EVICTED the arena tables in [off, mapped) to place it.  Those tables are a resident set the
++// cache paid for (a fill each time they come back), while the region could live in the free VRAM OUTSIDE the
++// slab.  Prefer that `cudaMalloc` fallback whenever the region fits there and half the slab's headroom
++// survives: the arena keeps what it holds, and the borrowed cushion is bounded to a half.
++//
++// This fires on the SHORTFALL path only (an operator-squeezed `GGML_CUDA_SLAB_RESERVE_MIB`, or a drafter
++// whose measured compute buffer exceeds its own reserve estimate).  The ordinary pin takes the unmapped
++// spare and never reaches here: the spare IS the draft context's reserve (kv + compute + slack) minus the
++// headroom, so it exceeds the compute region by construction.  Below the cushion the eviction stays the only
++// placement -- that is the r106 guard against `graph_reserve: failed to allocate compute buffers`.
++//
++// `GGML_CUDA_SLAB_NARROW2_PREFER_MALLOC=0` restores the evict-first behaviour (the A/B kill switch).
++static bool ggml_cuda_slab_narrow2_prefer_malloc() {
++    static int on = -1;
++    if (on < 0) {
++        const char * env = getenv("GGML_CUDA_SLAB_NARROW2_PREFER_MALLOC");
++        on = env != NULL ? (atoi(env) != 0) : 1;
++    }
++    return on != 0;
++}
++
+ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s, size_t bytes, bool * evict) {
+     *evict = false;
+     if (!s.inited || bytes == 0) {
+@@ -1034,7 +1056,31 @@ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s,
+         }
+         // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
+         // re-enters the slab through `arena_free`, so it cannot run under this lock).
+-        *evict = off < s.mapped;
++        if (off < s.mapped) {
++            if (ggml_cuda_slab_narrow2_prefer_malloc()) {
++                // free VRAM OUTSIDE the slab, i.e. the cushion every non-slab allocation draws on.  Half of
++                // the configured headroom must survive the fallback: the whole of it exists to absorb the
++                // hipBLASLt/Tensile workspace (104 MiB, library-owned), the Q8_1 arena and the prefill
++                // transients that are not slab-served (~300-400 MiB measured), so lending the region out of
++                // the OTHER half cannot starve them.
++                ggml_cuda_set_device(device);
++                size_t free_b = 0, total_b = 0;
++                const size_t cushion = ggml_cuda_slab_headroom_bytes() / 2;
++                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= nf2 + cushion) {
++                    GGML_LOG_WARN("%s: device %d: a %.2f GiB narrow-2 region would evict %.2f GiB of arena "
++                                  "tables; %.2f GiB is free outside the slab, so the draft compute buffer "
++                                  "stays on the cudaMalloc path (a %.2f GiB cushion is kept; "
++                                  "GGML_CUDA_SLAB_NARROW2_PREFER_MALLOC=0 evicts instead)\n",
++                                  __func__, device, (double) nf2 / (1ull << 30),
++                                  (double) (s.mapped - off) / (1ull << 30), (double) free_b / (1ull << 30),
++                                  (double) cushion / (1ull << 30));
++                    return 0;
++                }
++                // a failed query must not leave a sticky error behind for the allocation that follows
++                (void) cudaGetLastError();
++            }
++            *evict = true;
++        }
+         return off;
+     }
+     if (nf2 > s.narrow2_floor) {

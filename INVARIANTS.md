@@ -2509,3 +2509,36 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
   mirror 1 895-1 939, `auto` 1 785-1 818 (`DIO`) / 1 431-1 810 (buffered), `-lme 44` 1 329-1 699 (`DIO`) / 735-1 191
   (buffered), `-lme 36` 1 037 (`DIO`) -- so **decode-parity at 77 %, not prefill-parity**, and a sub-complement
   budget should set `MOE_HOST_POOL_DIO=1` (`+43-81 %` prefill, decode neutral with the demote, 2.1x the bytes).
+
+## (no release, r231 tree) -- the narrow-2 pin's eviction branch needs a SHORT estimate, and a `cudaMalloc` preference cannot avoid it (PR #267 0003a / `TODO` #279)
+
+1. **The pin's VA spare is the draft's own reserve, minus the headroom, so the eviction branch is unreachable in
+   the shipping geometry.**  `ggml_cuda_slab_narrow2_pin_locked()` straddles `mapped` only when the compute region
+   exceeds `size - mapped`; at creation that spare is `reserve - headroom`, `reserve` is `headroom + draft-context
+   estimate` (kv + compute + slack), and the MoE preflight **skips** `ggml_cuda_slab_extend_all()` at the priming
+   sizing (`wip/first-prefill-latency`), so nothing has eaten it when the pin runs.  The estimate's `compute` term
+   is a floor over the same measured quantity, so only a SHORT estimate reaches the branch — that is r106's
+   deliberate fallback (the tensor-split drafter that used to abort in `graph_reserve`), never a routine path.
+   Measured on four probes (Flash-Next + MTP 1 GPU, 35B-A3B + DFlash2 1 GPU and 3 GPU `-sm tensor`, and a `-ub`
+   sweep to a 1.50 GiB region): all `unmapped VA spare`.  **Do not chase this branch as a performance item** —
+   `wip/host-expert-parity/RESULTS-2026-11-07-narrow2.md`.
+2. **When it is forced, its eviction is re-absorbed; the resident-set loss is not a loss.**  `GGML_CUDA_SLAB_RESERVE_MIB`
+   sets the reserve verbatim, i.e. `spare = value - headroom`, which is the only knob that reaches the branch (and
+   a >46k ubatch at a 64k context is the smallest natural shape that closes the gap).  Six interleaved arms: the
+   pin evicts 314-450 MiB and the next sizing/`re-arm` pass returns it — the final arena MiB and the decode hit
+   rate are identical to four decimals in both arms (`20 712.6 / 0.9471`, `21 418.6 / 0.9239`), at prefill +2.4 %
+   and decode -0.8 % (noise).  The cost is one re-fill of the evicted bytes (~15-20 ms) — the same bound #278
+   measured for the arena transition.
+3. **A "prefer the cudaMalloc fallback" rule is a CHURN, not an avoidance** (PR #267 0003a).  Two mechanisms:
+   (a) the fallback spends the free VRAM outside the slab, i.e. the very resource its own guard has to see, so it
+   can only fire while the eviction is <= free - cushion (a fraction of the headroom) and can never prevent a
+   *large* one — there is no free VRAM in that case, which is why the region did not fit; (b) `narrow2_floor`
+   latches only on a COMMITTED pin, so the declined attempt is re-made on the next compute allocation and evicts
+   anyway (measured: decline at `0.19.448` s, the same 314 MiB eviction at `0.19.465` s).  Latching the decision
+   would give up the evicted bytes of cushion permanently for one ~20 ms re-fill — the wrong trade, since that
+   cushion is what r206 raised to 1280 MiB/GPU to stop a hipBLASLt OOM.  Verdict: **do not implement**;
+   `TODO` #279 closed 2026-11-07.
+4. **`-lv 3` interleaves the statistics block into llama-cli's generated text, exactly as `-lv 4` does.**  Any
+   text-identity arm runs at the DEFAULT verbosity and takes its numbers from the `[ Prompt: … | Generation: … ]`
+   footer; only a mechanism/census arm takes `-lv 3` (`-lv 4` adds the per-node trace).  r231's note blamed
+   `-lv 4` specifically; the correct rule is "no `-lv` at all for a hash".
