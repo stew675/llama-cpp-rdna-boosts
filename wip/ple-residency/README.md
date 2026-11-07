@@ -4,6 +4,13 @@
 The question was answered, a prototype was built and measured, and the remaining work is a *decision*
 (a lookahead runway) rather than an unknown.  Apply it with §0; resume from §8.
 
+**2026-11-07 update (r230) — the delivery now has a page-cache PIN, and §4d must be read with it.**  A new
+`--lazy-mode mlock` (block 00, r230) keeps the lazy data path and `mlock`s the *whole* PLE at load, so the
+table is resident without a copy.  On a box with 27 GiB spare this is ready to serve in **8.26 s** warm and
+prefills a 70K prompt at 4500 -> 3000 t/s (both records for that box), and decode can no longer pay the
+291.9 us/new-page row that §4d attributes to "page-cache warmth is worth nothing": that cost was *eviction*,
+and a pin removes the eviction.  §9 records it and re-scopes the campaign to the RAM-constrained case.
+
 Question asked: *"can we get an idea of what percentage of the PLE weights are actually used, so a
 heat-map mechanism could keep the top ~1 GiB RAM-resident and leave the rest cold in the page cache?"*
 
@@ -579,3 +586,75 @@ class), `patches/README.md` block 11, `INVARIANTS.md` (the two surprises: the de
 is load-bearing, and the drive's isolated-read latency), and a `WORKLOG.md` entry.  The default-on
 question is separate: the store is a *placement* change with a real RAM cost, so it would ship behind
 `LLAMA_LAZY_BUF_MB` (opt-in) unless (1) is resolved in favour of the delivered config.
+
+## 9. 2026-11-07 — the page cache can be *pinned*, and that re-scopes this campaign (r230)
+
+The delivery now ships `--lazy-mode mlock` (block 00, r230): the `on` data path (rows read from the
+mapping on demand) plus one populate + `mlock` of the **whole** PLE at load.  Nothing is copied, and the
+table cannot be evicted or swapped while the process runs; the pin is released at exit and the pages stay
+in the page cache.  This is the arm §4d said could not work — and it works when the box can afford the
+27 GiB, which is exactly the condition §4d's box could not meet.
+
+### What was measured (r230 tree, 3 x R9700, no expert tier, Flash-Next GSQ-RCO-IQ3_S)
+
+| | `auto` (no residency) | `off` (host copy) | **`mlock` (pinned page cache)** |
+|---|---|---|---|
+| `--load-mode mmap` load | 29.1 s | 25.7 s | 32.5 s |
+| maxrss / of it anonymous | 5.0 GB / - | 32.2 GB / **27 GiB anon** | 32.2 GB / **1.3 GB anon** |
+| pin (`VmLck`) | - | n/a (mlock of the copy) | **26.82 GiB = the whole 27,465 MiB table** |
+| pp2048 / tg32 | 2549.1 / 77.55 | 2574.8 / 76.27 | 2570.4 / 77.41 |
+| reusable after exit | - | no (freed) | **yes (page cache)** |
+
+Same-seed greedy text is identical in all three arms.  The pin is a page-table walk when the shard is
+already cached (**0.19 s** for 27 GiB) and ~7 s cold (the kernel's `__mm_populate` rate).
+
+Maintainer's box, 2026-11-07, `--load-mode none --lazy-mode mlock`, PLE warm: **ready to serve in 8.26 s**;
+70K-token prefill **~4500 t/s at the start, ~3000 t/s at the 70K mark** (both records for that box);
+generation ~10 % above the usual figure (not attributable — MTP/draft variance).
+
+### What it does to §4c/§4d
+
+§4d's decode table attributed 250-292 us/row to the gather and then showed it was **cold-page** cost
+(1 126 repeat rows at 0.2 us against 7 050 new-page rows at 291.9 us), because `MemFree` collapsed and the
+PLE's resident pages sat at 39 MiB — the kernel evicted each page right after use.  A pin removes the
+eviction, so on a box that can hold the table:
+
+- there are **no new-page rows at all** — the resident-row cost (0.2 us) is the cost;
+- the phrase "the page cache cannot hold it" (top of this file, and §4d) is a statement about a box at its
+  RAM ceiling, not about the page cache: `mlock` is the difference;
+- the delivered alternative to a cold table is no longer `off`'s 27 GiB anonymous copy (7x cheaper per row
+  but swap-throttled, and it does not survive a restart) — the pin is cheaper in every respect we measured
+  and ties on throughput, so **`off` should not be the residency reference any more**.  This file's
+  comparisons that used `-lzm off` as "the resident arm" (e.g. §4d's 32 us/row, the swap-throttled arm)
+  should be read as "a resident copy", not "the best available residency".
+
+### What it does to this campaign
+
+The thesis survives — a **bounded** hot tier beats the page cache *at equal RAM* — but its comparison
+point has moved from "a page cache that is being thrashed" to "a page cache that is pinned and free of
+copies".  Concretely:
+
+1. **The store's value narrows to the RAM-constrained case.**  When 27 GiB is spare, the pin is strictly
+   better than 32-128 MiB of rows: full coverage instead of 36-49 %, no fetch path at all, no predictor, no
+   size policy.  The row store only wins when the table *cannot* be pinned (a box whose expert tier and
+   page cache are already at the ceiling — this campaign's original box), or must not be (a shared host).
+   So the promotion candidate should be re-scoped and re-titled: **the residency tier for a PLE that does
+   not fit**, not "the faster PLE".
+2. **§4b's staging buffer loses its prefill argument on a pinning box.**  Its 3 % cold cost and the 43x page
+   amplification are costs of a cold table; pinned, the prefill reads are resident-row reads.  The staging
+   buffer keeps only its bounded-RAM role (tier 1).
+3. **The open decision (§8.1, the lookahead runway) is now tier-1-only.**  It decides how fast a *miss* is
+   hidden; with no misses it is moot.  Resolve it only if tier 1 is going to be promoted.
+4. **The managed reader (page-granular arena + LRU + `pread`) is now dominated by both tiers** — by the pin
+   when the table fits, by the row store when it does not.  §4d's "drop it in the same change" stands and is
+   stronger.
+5. **The decisive next measurement** is small: re-run §4c/§4d's decode tables on the r230 tree with
+   `--lazy-mode mlock` on the same box/arm (the one with the pinned expert mirror, `MemFree` collapsing)
+   and watch `Mlocked`/`MemFree` beside the per-row timings.  If decode reaches the 0.2 us resident-row
+   cost even there, then the pin is the answer on every box that can spare the table and this campaign
+   closes as "tier 1 only" with the row store unpromoted; if the pin cannot be afforded there, the row
+   store's 36-49 % coverage is still the only thing that helps, and §8 becomes its task list.
+
+**Do not** read the 8.26 s / 4500 t/s numbers as support for `LLAMA_LAZY_BUF_MB` or for a hot tier: they
+are the pin, which is the *opposite* of a bounded working set — they are the bar any bounded tier now has
+to beat, and on a box with the RAM, it cannot.

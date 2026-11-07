@@ -1,3 +1,57 @@
+## 261107.001 (r230) -- `--lazy-mode mlock`: the PLE/engram tables pinned in the page cache instead of copied (block 00)
+
+**Shipped:** `v16-6050b467c-r230` (**block 00**; the loader's lazy-table residency, no kernel and no
+numerics change, default unchanged).  `release.json` tip `2028e44cd`, tree `b336da22e`; base and base tree
+unchanged (`6050b467c` / `cb3251e17`).  `scripts/validate-set.sh` green (fresh tarball, strict 16/16
+`git am`, applied tree == recorded tree).  Coherence: same-seed greedy text byte-identical across
+`mlock`/`auto`/`off` on Flash-Next GSQ-IQ3_S 3 GPU `-sm tensor` (125 chars `7d898d3d3e58`, also under
+`--load-mode none`) and on Gemma4-E4B single GPU (`5dd272b4f316`); `llama-bench` at parity (pp2048
+2570.4 / 2549.1 / 2574.8 and tg32 77.41 / 77.55 / 76.27 for mlock/auto/off).
+`scripts/gate-per-block-build.sh --changed-from 5c3ef0354` builds the blocks whose own delta moved (00 and
+09 -- 09 because the `llama-bench` option table it edits gained a value) plus the tip.  No kernel or
+prefill change, so the prefill-logit gate does not apply (same call as r122).  Records:
+[`benchmarks/2026-11-07-lazy-mode-mlock.md`](benchmarks/2026-11-07-lazy-mode-mlock.md).
+
+**1. r122's `off` bought residency with a copy; this buys it with a pin.**  `--lazy-mode off` reads the
+whole `TENSOR_READ_LAZY` table into a private host buffer (27 GiB of anonymous memory for the Flash-Next
+`per_layer_token_embd`), while `on`/`auto` read the same bytes from the model mapping on demand.  The
+copy therefore adds nothing to the *data path* -- both are `host_gather` reads -- it only makes the table
+un-evictable.  `mlock` is that same guarantee without the copy: the tensor keeps the lazy mapped buffer
+and the loader does one populate + `mlock` of its whole extent at load.  Measured on the 3-GPU server arm:
+`VmLck 28125136 kB` (26.82 GiB, i.e. the entire 27,465 MiB table, which is the whole of shard 2 of that
+GGUF) with `RssAnon` **1.3 GB**, where the `off` arm's `RssAnon` is 32.2 GB.  `/proc/meminfo`
+`Mlocked == Unevictable == ` the same figure.
+
+**2. It is the fastest residency arm on this box, and the state is shared.**  `--load-mode mmap` load:
+`mlock` 32.5 s, `off` 25.7 s (a 3.9 GB/s `read_raw` + copy), `auto` 29.1 s (reads nothing).  The 7 s is
+the kernel's `__mm_populate` (~4.2 GB/s), not I/O; with the shard already in page cache the pin is a
+page-table walk (**0.19 s** for 27 GiB).  That is the number the maintainer's warm restart rides:
+`--load-mode none --lazy-mode mlock` is **ready to serve in 8.26 s** on the Flash-Next server (vs 13.6 s
+for r122's best cold arm), and the pin releases at exit (`Mlocked`/`Unevictable` -> 0, `Cached` stays), so
+the next start re-pins cached pages instead of re-reading 27 GiB.  Maintainer's 70K-token prefill on that
+arm: **~4500 t/s at the start and ~3000 t/s at the 70K mark**, both records for the box; generation ~10 %
+above the usual figure (not attributable -- MTP/draft variance moves it by itself).
+
+**3. Three traps, all of them real in this tree.**  (a) The range must NOT go into `lazy_read::ranges`:
+that set is handed to `llama_mmap`, which applies `POSIX_MADV_RANDOM`, and readahead is exactly what the
+one bulk populate needs (r122 measured 0.22 GB/s for that fault-in path).  It goes into a separate `pin`
+map instead.  (b) `lazy_read::any()` gates mapping creation on `!ranges.empty()`, so a pin-only mode would
+have created no mapping under `--load-mode none`; it now counts the recorded tensors too (verified).  (c)
+`llama_mlock::grow_to` is a monotonic prefix lock, so the per-file mlock object must not be reused for a
+sparse range -- each pinned table gets its own object.  Also: no 4 GiB threshold (the mode pins the whole
+marked set) and a refused `mlock` (`RLIMIT_MEMLOCK`, tested at `ulimit -l 2048`) warns and leaves the table
+on the evictable page-cache path, text unchanged -- there is no partial pin.
+
+**4. The pin is per process, deliberately.**  The locks live in the model (`pimpl->mlock_lazy`, declared
+after `mappings`), so a model free or a process exit returns every page to ordinary reclaimable page cache;
+nothing survives that could hold 27 GiB hostage after `llama-server` quits.
+
+**5. Docs/knobs.**  `--lazy-mode` help + the generated `tools/{cli,completion,server}/README.md` tables,
+`llama-bench -lzm mlock`, `ENVIRONMENT.md` (`LLAMA_ARG_LAZY_MODE` accepts `mlock`), `patches/README.md`
+block 00, `INVARIANTS.md` (r230), and the `upstream/lazy-mode-off-resident/` candidate now points at
+`mlock` as the arm to lead with.  The fork branch refresh, the tag push and the off-host container images
+are the normal release steps.
+
 ## 261106.022 (optional) -- PR #279: the two-lane artifact is re-cut onto r229, its split now declines with its pair, and it finally measures a win here
 
 **Nothing ships.**  `patches/` and `release.json` are untouched (no block changed, tree

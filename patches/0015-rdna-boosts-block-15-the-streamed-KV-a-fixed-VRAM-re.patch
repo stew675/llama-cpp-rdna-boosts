@@ -1,4 +1,4 @@
-From 3a3b933c438c6ddf048646fd03072954861c0d94 Mon Sep 17 00:00:00 2001
+From dd1b3b7840293c096c991d0beaae685377ff3a2b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -6831,7 +6831,7 @@ index b33c7aee4..6a4822c9f 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 22e9dd693..f0889b471 100644
+index a91851595..4bc68f476 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,888 +53,886 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -8475,7 +8475,7 @@ index 22e9dd693..f0889b471 100644
      }
  
      if (param_overrides_p != nullptr) {
-@@ -1777,7 +1775,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1865,7 +1863,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
                  tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
                  tn.bid <  (int) hparams.n_layer()) {
@@ -8486,7 +8486,7 @@ index 22e9dd693..f0889b471 100644
                  fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
                  fflush(stderr);
              }
-@@ -2064,7 +2064,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -2152,7 +2152,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
  // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
  // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
  static bool llama_load_release_mmap() {
@@ -8496,10 +8496,10 @@ index 22e9dd693..f0889b471 100644
  }
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 2eb492f58..1d6dd315c 100644
+index 89e7f078b..fd2401054 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2653,6 +2653,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
+@@ -2664,6 +2664,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
      return max_slice;
  }
  
@@ -8517,7 +8517,7 @@ index 2eb492f58..1d6dd315c 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -3121,6 +3132,94 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+@@ -3132,6 +3143,94 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
      return layers[il].rope_short;
  }
  
@@ -8612,7 +8612,7 @@ index 2eb492f58..1d6dd315c 100644
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
-@@ -3585,7 +3684,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3596,7 +3695,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
@@ -8622,7 +8622,7 @@ index 2eb492f58..1d6dd315c 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
-@@ -3691,6 +3791,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3702,6 +3802,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
@@ -8665,7 +8665,7 @@ index 2eb492f58..1d6dd315c 100644
                          res = new llama_kv_cache(
                                  *this,
                                  hparams,
-@@ -3699,11 +3835,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3710,11 +3846,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,

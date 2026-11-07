@@ -1,4 +1,4 @@
-From f3868e2bb8b1c5068b1ac6229ec77f46844cc540 Mon Sep 17 00:00:00 2001
+From fd5eec998fb0816bffa4c287b090c722a5abac57 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -129,7 +129,7 @@ nothing.
  create mode 100644 tests/test-lazy-reader.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 7023fd21a..d07aac4c3 100644
+index 7e92f0649..e2fe31507 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2788,7 +2788,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -140,8 +140,8 @@ index 7023fd21a..d07aac4c3 100644
 +        "- auto: on, but only for tensors larger than 4 GiB; the optional managed host-arena\n"
 +        "        PLE reader is enabled with LLAMA_LAZY_BUF_MB=<MiB>\n"
          "- off: always keep them resident, even with a mapped load (--load-mode mmap):\n"
-         "       the tensors are read into host RAM instead of being served from the mapping",
-         [](common_params & params, const std::string & value) {
+         "       the tensors are read into host RAM instead of being served from the mapping\n"
+         "- mlock: on, and every row of such a tensor is also pulled into the page cache and\n"
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
 index ecf0a3a6d..28d2187b9 100644
 --- a/ggml/include/ggml-rpc.h
@@ -10257,7 +10257,7 @@ index 97e4e8a81..e942d8e88 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 4b867612d..086c9ed8d 100644
+index 64906f51f..48a136475 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -16,17 +16,35 @@
@@ -10329,7 +10329,7 @@ index 4b867612d..086c9ed8d 100644
  ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
      if (dev == nullptr) {
          return nullptr;
-@@ -1540,6 +1538,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
+@@ -1628,6 +1626,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
              __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
  }
  
@@ -10344,7 +10344,7 @@ index 4b867612d..086c9ed8d 100644
  // wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
  // fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
  // layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
-@@ -1667,9 +1673,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1755,9 +1761,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -10358,7 +10358,7 @@ index 4b867612d..086c9ed8d 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1933,10 +1941,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2021,10 +2029,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -10372,7 +10372,7 @@ index 4b867612d..086c9ed8d 100644
          const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
          is_lazy = lazy.add(tn.str(), cur, w);
  
-@@ -2504,8 +2512,10 @@ bool llama_model_loader::load_all_data(
+@@ -2592,8 +2600,10 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
@@ -10386,7 +10386,7 @@ index 4b867612d..086c9ed8d 100644
  
          size_done += n_size;
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 7da0d51de..70cbbf73d 100644
+index c94af98d8..74379b025 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -68,6 +68,7 @@ struct llama_model_loader {
@@ -10421,10 +10421,10 @@ index 7da0d51de..70cbbf73d 100644
          // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
          // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index fd0d3dc43..904a28c86 100644
+index c4e650340..1335cfd70 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3208,10 +3208,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3219,10 +3219,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
          default:
              {
                  // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
@@ -10477,7 +10477,7 @@ index fd0d3dc43..904a28c86 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -4058,7 +4099,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4069,7 +4110,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),

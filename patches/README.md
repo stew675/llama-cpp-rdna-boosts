@@ -36,7 +36,7 @@ only as a rough shape.
 
 | # | patch | subject | +/− | files |
 |---|---|---|---|---|
-| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator | +1314 / −1000 | 54 |
+| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator | +1366 / −909 | 56 |
 | 01 | `0001-…-block-01-hybrid-HIP-all-reduce-RDNA4-gat` | hybrid HIP all-reduce | +2365 / −44 | 4 |
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth (+ r218: `spec_draft_align_cache()` realigns the drafter's KV with the batch it ingests, issue #272) | +1186 / −54 | 24 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker | +3182 / −15 | 22 |
@@ -100,6 +100,19 @@ band rule it satisfies starts here.
   `-sm tensor` load: `--load-mode none --lazy-mode off` **32.2 s -> 13.6 s**, and
   `--load-mode mmap --lazy-mode off` keeps the 27 GiB PLE resident at 23.8 s (vs `mmap` + `auto` 18.9 s
   with the PLE lazy); same-seed greedy text is byte-identical on Gemma4-E4B and Flash-Next.
+* **`--lazy-mode mlock`: the PLE tables pinned in the page cache, with no copy** (r230): the `on` data
+  path (rows read from the mapping on demand) plus **one populate + `mlock`** of every `TENSOR_READ_LAZY`
+  table at load, so the bytes are never duplicated and can never be reclaimed or swapped.  The range is
+  deliberately NOT put in the lazy `ranges` set -- that set gets `POSIX_MADV_RANDOM`, and readahead is
+  exactly what the one bulk populate needs -- and there is no 4 GiB threshold (the mode pins the whole
+  marked set).  Flash-Next GSQ-IQ3_S, 3 GPU `-sm tensor`: `VmLck` **26.82 GiB = the whole 27,465 MiB
+  table**, `RssAnon` 1.3 GB where the `off` arm holds a 27 GiB anonymous copy; same-seed greedy text
+  identical to `auto` and `off` (125 chars, `7d898d3d3e58`), and `llama-bench` pp2048/tg32 at parity
+  (2570.4 / 77.41 vs `auto` 2549.1 / 77.55 and `off` 2574.8 / 76.27).  A warm page cache makes the pin a
+  page-table walk (**0.19 s** for 27 GiB); a cold populate costs ~7 s (the kernel's `__mm_populate` rate,
+  not I/O).  The pin is per process -- `Mlocked`/`Unevictable` return to 0 at exit and the pages are
+  ordinary reclaimable page cache again -- and a refused `mlock` (`RLIMIT_MEMLOCK`) warns and leaves the
+  table on the evictable page-cache path.
 * **`ggml-alloc`**: release view sources whose views are never consumed (a real leak), and fingerprint the
   graph layout by node order + output marking so a *different* graph cannot reuse a layout computed for
   another (issue #183).

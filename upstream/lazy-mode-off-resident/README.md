@@ -7,6 +7,14 @@
 **Status:** upstream-PR candidate, cut against `097cf33d9`; **in the delivery as block 00** (r122).
 `UPSTREAM-PR-lazy-mode-off-resident.patch` applies clean to unadulterated `097cf33d9`.
 
+> **r230 follow-up (2026-11-07):** the delivery also gained `--lazy-mode mlock`, which reaches the same
+> residency **without the copy** -- it keeps the lazy (mapped, on-demand) data path and `mlock`s the whole
+> marked table at load, so the table is pinned in the page cache instead of duplicated into host RAM
+> (`VmLck` 26.82 GiB = the whole 27,465 MiB Flash-Next table, `RssAnon` 1.3 GB, same greedy text and
+> `llama-bench` parity; warm restart 8.26 s).  If this candidate is ever filed, `mlock` is the arm to lead
+> with and `off`'s copy is the fallback for a system where the pin is refused.  Not part of this patch yet:
+> a re-cut would carry both, and the wording below ("read into host RAM") is now the `off` arm only.
+
 ## What it is
 
 `TENSOR_READ_LAZY` marks a tensor the arch wants read row-by-row on demand (the PLE / engram tables:

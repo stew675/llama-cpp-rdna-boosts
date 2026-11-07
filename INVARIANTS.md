@@ -2453,3 +2453,31 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
    armed (pp8192 7976 -> 7347, lanes unset flat 7513-7519 over three contexts); `llama-batched-bench -npp 2048
    -npl 1,4,8` gives **B=8 prefill -3.5 %** (8776 -> 8467) while B=1 gains +28.8 %.  Do not enable this on a
    many-slot server; it is a single-long-prompt design.
+
+## r230 -- the PLE's residency is a *pin*, not a copy: `--lazy-mode mlock` keeps the lazy data path and mlocks the mapping (block 00)
+
+1. **The three lazy arms differ in residency only, and the copy is the odd one out.**  `auto`/`on` read the
+   rows from the mapping on demand (nothing resident); `off` reads the whole table into a private host buffer
+   (resident, 27 GiB of anonymous memory, swappable, nothing reused across restarts); `mlock` reads the rows
+   from the mapping on demand *and* pins that mapping in the page cache.  All three feed the same
+   `host_gather` path, so same-seed text is identical (`7d898d3d3e58`, 125 chars, Flash-Next GSQ-IQ3_S 3 GPU
+   `-sm tensor`) and `llama-bench` is at parity: pp2048 2570.4 / 2549.1 / 2574.8 and tg32 77.41 / 77.55 /
+   76.27 for mlock / auto / off.  The `off` copy buys nothing but an allocation -- register the copy as an
+   allocation, not as the residency mechanism.
+2. **"Resident" must be measured with `VmLck`, not RSS.**  With `--lazy-mode mlock` on the whole table,
+   `/proc/<pid>/status` reads `VmLck 28125136 kB` (26.82 GiB = the entire 27,465 MiB `per_layer_token_embd`,
+   which is the whole of shard 2 of that GGUF) with `RssAnon` 1.3 GB, and `/proc/meminfo` `Mlocked` ==
+   `Unevictable` == the same number.  RSS cannot tell a pinned page-cache table from a copied one.
+3. **The pin costs the kernel's populate rate, which is the same order as the copy it replaces.**  `mlock`
+   populates through `__mm_populate` (~4.2 GB/s here: 27.5 GiB in ~7 s cold), so `--load-mode mmap
+   --lazy-mode mlock` loads in 32.5 s against `off`'s 25.7 s (a 3.9 GB/s `read_raw` + copy) and `auto`'s
+   29.1 s (which reads nothing).  With the table already in page cache the pin is a page-table walk -- **0.19 s
+   for 27 GiB** -- which is why a warm-cache restart (`--load-mode none --lazy-mode mlock`) is ready to serve
+   in **8.26 s** (maintainer's box, 2026-11-07).
+4. **A pin is per process; the page cache is not.**  The kernel releases the lock at exit (verified:
+   `Mlocked`/`Unevictable` 28125136 kB -> 0 while `Cached` stays high) and the pages remain as ordinary
+   reclaimable page cache.  That is what makes the mode useful: the next start re-pins cached pages instead
+   of re-reading the table.
+5. **`mlock` is refused, not emulated.**  Under a small `RLIMIT_MEMLOCK` (tested at `ulimit -l 2048`) the one
+   `mlock` of the range fails, the loader warns and leaves the table on the evictable page-cache path (text
+   unchanged).  There is no partial pin: `llama_mlock::grow_to` locks the whole range or nothing.
