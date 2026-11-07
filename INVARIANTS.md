@@ -2588,3 +2588,41 @@ r220's "nil on balanced devices" into a real win -- and a real regression that t
   `MOE_HOST_POOL_SINK=0` + latch reproduces `ref` exactly.  Consequence for gates: a byte-identical *text*
   assertion is the right instrument for a wholesale fault arm (bit-exact) and the wrong one for a mixed state —
   a ~1e-5 arithmetic difference flips near-ties, so that arm's evidence has to be the logit criterion.
+
+## (no release, r232 tree) -- measuring a cold read here: eviction is FOLIO-granular, and an unverified arm will lie to you
+
+Established while building [`utilities/storage-oracle/`](utilities/storage-oracle/) (WORKLOG `261107.007`);
+the tool is the reproduction, and none of this is a delivery change.
+
+1. **`POSIX_FADV_DONTNEED` is a folio operation, not a page operation.**  On XFS with large folios, asking for a
+   4 KiB range that sits inside a larger cached folio **silently does nothing**: `fadvise64` returns 0, the folio
+   stays in the page cache, and the next read is a cache hit in **~0.2 us** instead of a device read.  The first
+   version of the probe reported exactly that as a p50 on a file with 39 GiB of hot page cache, and the number was
+   plausible enough to believe.  Two rules follow, and the second one is the one that matters: evict with
+   **folio-aligned windows** (2 MiB, escalating to 32/256 MiB), **verify with `mincore` on a bare mapping**, and
+   count and *skip* (never time) a sample that could not be made cold.  A page that our own `mmap` has already
+   faulted also pins its folio, so `madvise(map, MADV_DONTNEED)` has to come before the `fadvise`.  A cold-read
+   benchmark on this filesystem without a `mincore` check is measuring the page cache.
+2. **The corrected ordering at page granularity is `O_DIRECT` < the page-cache mechanisms, not parity.**  Verified
+   cold, 4 KiB, QD1, random, on `/llm` (the Lexar): `O_DIRECT` **74 us**, buffered `pread` **150 us**, `mmap`
+   fault **150 us**.  Both page-cache paths cost about **2x** `O_DIRECT` per page (a cold buffered read pulls a
+   folio; a fault pays the fault machinery), which is the opposite of the "buffered is free" default assumption and
+   is why `--load-mode dio` can win a *cold* load it looks like it should lose.  The unverified numbers from
+   before this check were optimistic by up to 2x on those two arms.
+3. **A `llama-cli` arm that failed to load reads ~10 MiB in under a second and looks like the fastest arm.**
+   Measured: `--verify` reported a 0.86 s "load" that had read 11 MiB, where the arm had actually OOMed
+   (`-sm layer -ngl 99` put 34.7 GiB on device 0).  Rule: an arm is only an arm if it exited 0 **and** printed a
+   prompt-eval line; otherwise it is FAILED with the **first** ` E ` log line (the last one is usually the generic
+   "server exited").  A load-time comparison also has to count **bytes the block device read** (`/sys/block/*/stat`
+   sector field), because a mapped load defers its reading into the first forward pass.
+4. **`--lazy-mode mlock` pins only `TENSOR_READ_LAZY` tables, and is INERT on a model without one** (the r230 mode,
+   qualified).  Qwen3.5-4B has no such table: `mmap --lazy-mode mlock` **5.17 s** against `mmap --lazy-mode off`
+   **5.18 s** cold, i.e. the flag did nothing, and only the ordinary page cache gave the 1.00 s restart.  Gemma4-E4B
+   has one and logs `pinned 1 table(s), 2856 MiB`.  So residency must be confirmed from the loader's
+   `pinned N table(s), X MiB` line (or `VmLck`, r230 §2), never inferred from the flag.  `--load-mode none` still
+   creates a mapping for exactly those tables (the loader keeps one for them), which is why `none + mlock` is a
+   valid composed arm -- and the form r230's fastest restart used.
+5. **`--load-mode dio` does NOT read the same number of bytes as `mmap`/`none`.**  r215 §1 holds for the mapped
+   arms, but O_DIRECT's alignment handling re-reads the unaligned prefix of a chunk: 4 921 MiB against 4 275 MiB
+   (+15 %) for the same model load here.  Any A/B that charges `dio` only its throughput advantage is understating
+   its cost -- read the device's byte counter per arm.
