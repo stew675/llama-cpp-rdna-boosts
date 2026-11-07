@@ -1,0 +1,14 @@
+# issue #281, the 2x2 fill decomposition (2026-11-07, `soar`, r231 + patch A/B), field shape -lme 12 (26 %).
+# Every knob is EXPLICIT (`DIO=0` not `auto`, `RANK=decode` not `-`): the rig used to export the literal
+# "auto"/"-", which `env_int`/`strcmp` read as 0 -> the buffered arm and RANK=combined.
+#   KA = the candidate default: fills read the FILE through the page cache (B) + the coalesced span in
+#        buffered mode (A)
+#   KB = the pre-r232 default: mapping fills, no span
+#   KC = A only (span on, mapping fills)      KD = B only (file fills, no span)
+#   KE = the reporter's workaround (O_DIRECT + span), the reference the candidate has to match
+# tag  LME SINK DIO SPAN RANK    SERVER FILLSRC
+KA     12  1    0   1    decode  -      file
+KC     12  1    0   1    decode  -      map
+KB     12  1    0   0    decode  -      map
+KD     12  1    0   0    decode  -      file
+KE     12  1    1   1    decode  -      -

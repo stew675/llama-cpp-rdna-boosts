@@ -38,7 +38,7 @@ for line in sys.stdin:
     print("%s prompt_n=%s prompt_tps=%s pred_tps=%s wall_s=%s" % (tag, t.get("prompt_n"), t.get("prompt_tps", t.get("prompt_per_second")), t.get("pred_tps", t.get("predicted_per_second")), d.get("wall_s")))'
 tps() { python3 -c "$TAGROW" "$@"; }
 
-echo "=== $TAG  LME=${LME:-47} SINK=${SINK:-default} DIO=${DIO:-auto} SPAN=${SPAN:-default} RANK=${RANK:-default}  $(date -Is) ===" | tee -a "$OUT"
+echo "=== $TAG  LME=${LME:-47} SINK=${SINK:-default} DIO=${DIO:-auto} SPAN=${SPAN:-default} RANK=${RANK:-default} FILLSRC=${FILLSRC:-default}  $(date -Is) ===" | tee -a "$OUT"
 if [ "${CACHE_DROP:-1}" = "1" ]; then
   echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
 fi
@@ -46,7 +46,7 @@ fi
 # NOT piped: run.sh leaves a background memory-sampling subshell holding stdout, so a pipe never closes.
 # The knobs go as ARGUMENTS: sudo resets the environment inside the scope, so an exported LME never arrives.
 awk '/MemAvailable/{printf "MemAvailable at arm start: %.2f GiB\n", $2/1048576}' /proc/meminfo | tee -a "$OUT"
-./run.sh "$TAG" ./runme-56gb-tier.sh "${LME:-}" "${SINK:-}" "${DIO:-}" "${SPAN:-}" "${RANK:-}" "${HEATMAP:-load}" "${SERVER:-}" >> "$OUT" 2>&1
+./run.sh "$TAG" ./runme-56gb-tier.sh "${LME:-}" "${SINK:-}" "${DIO:-}" "${SPAN:-}" "${RANK:-}" "${HEATMAP:-load}" "${SERVER:-}" "${FILLSRC:-}" >> "$OUT" 2>&1
 # bounded: a launch script that fails (a missing binary in the root scope, a refused -lme) would otherwise
 # block the health poll for an hour and look like a hang.
 if ! timeout "${HEALTH_TIMEOUT:-900}" python3 bench.py "$PORT" health | tee -a "$OUT"; then

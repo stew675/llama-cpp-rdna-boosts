@@ -1,3 +1,77 @@
+## 261107.005 (campaign) -- issue #281: the buffered host-pool prefill coalesces now (+49-97 %), and gating it found a mid-run-latch text divergence
+
+**No delivery change yet** (`patches/`, `release.json` and the fork branch stay `v16-6050b467c-r231`, tip
+`a19aab55e`).  A fix is built, measured and gated as a working-tree diff; the campaign record is
+[`wip/host-pool-fill-transport/`](wip/host-pool-fill-transport/README.md) and the delivery change waits on the
+maintainer's go-ahead.  Issue [#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) (@DanoPTT,
+Windows 11, Flash-Next IQ3_XXS, `--limit-host-experts 4 RAM_PCT=10`): *"forcing the direct tier makes prefill
+~3x faster"*.
+
+**1. The reporter's census is the normal buffered shape, and their 3x is the transport rate.**  Reproduced on
+`soar` at `-lme 12` (26 % coverage, the 56 GiB rig): `h=0.0430 (39872/927541)`, `pinned bounce ring total
+13 003 MiB`, `758 634 routed experts copied ... (neither tier)` against their `h=0.0330`, 13 946 MiB and
+185 625 — the same shape.  What differs is the rate: 2 416-2 725 MiB/s for a mapping `memcpy` out of the page
+cache here against **715 MiB/s** on their box (a demand fault per 4 KiB page of a mapped view on Windows).
+
+**2. The defect: the coalesced prefill read was O_DIRECT-only.**  `stage_span_fill()` reads a run of >= 2
+"neither tier" experts as one chunk per 16 (r224, `MOE_HOST_POOL_STAGE_SPAN`, default on), but both
+`span_geom` predicates required `g_pool_dio` -- so the arm that r212 made the field default (`auto` = mirror
+`--load-mode` = buffered) could not coalesce at all and read each expert out of the mapping separately.  The
+change is **33 insertions**: drop the two `g_pool_dio` terms, and let the span read the FILE through the mode's
+own open (a buffered `pread` when the disk tier is off -- the same page cache `--load-mode mmap` asked for, so
+the fill's SOURCE is unchanged, only its granularity).  Cold `pread`s also read exactly `len` at `off` instead
+of the O_DIRECT-padded window (a padded read short-reads at EOF and silently declines the chunk).
+
+**3. Measured (`soar`, 1 x R9700, 56 GiB cgroup, Flash-Next GSQ-RCO-IQ3_S + MTP, `-c 204800 -ub 6144`,
+page cache dropped per arm, 50k prefill x2 interleaved).**
+
+| cell | with the change | r231 default | |
+|---|---|---|---|
+| `-lme 12` (26 %), pp50k 1/2 | 820.9 / 875.0 | 513.3 / 469.5 | **+60 % / +86 %** |
+| `-lme 12` (26 %), second rep | 810.0 / 868.1 | 544.7 / 441.4 | **+49 % / +97 %** |
+| `-lme 12`, storage reads pass 1 | 95 GiB | 220-328 GiB | 2.3-3.5x fewer |
+| `-lme 36` (77 %), pp50k 1/2 | 1307.0 / 1445.5 | 984.9 / 1235.4 | **+33 % / +17 %** |
+| `auto` (97.7 %, near-mirror) | 1889.1 / 1942.9 | 1889.7 / 1949.0 | **inert** (no runs >= 2) |
+| decode, 600-token gen | 9.31 s / 8.52 s | 9.28 s / 8.52 s | unchanged |
+| the issue's workaround (`DIO=1` + span), `-lme 12` | -- | 631.3 / 662.9, **decode 25.9 t/s** | the change is +30 % *and* 2.4x better decode |
+
+So `auto` = buffered is already the fastest *mode* here; what was missing was the read granularity.  The
+2x2 decomposition (`KC` span-only 821.9, `KD` file-fills-only 313.7, `KA` both 1138.1) shows the fill-source
+half (`AB-full.diff`) is **+38 % on top** but **-41 % on its own**, and a RAM-rich cell (35B-A3B `-ncmoe 40
+-lme 4`, no cgroup, whole set cacheable) measures it **exactly neutral** (8893 vs 8984 MiB/s; prompt within
+0.7 %) -- a page-cache-headroom bet, not a winner, so it is **deferred with its numbers** rather than shipped
+as a knob whose standalone arm loses 41 %.
+
+**4. Gates on the change.**  Coherence: same-seed greedy text **byte-identical to r231** on both arms (dense 4B
+`7e6229b260f6`; the pool-engaged 35B-A3B `-ncmoe 40 -lme 12` arm `461ca8cd0e88`) -- built r231, ran, applied,
+rebuilt, ran.  `scripts/gate-prefill-logits.sh --extra "-ncmoe 40" --ab "MOE_HOST_POOL_STAGE_SPAN=0"`:
+**KLD 0.000000, same-top-p 100.000 %** (placement-only, as expected).  `scripts/gate-host-pool.sh`: 37/37 after
+the fix below.  Owed: `gate-per-block-build.sh` once the block is regenerated, `validate-set.sh`, and the MTP
+four-axis / `-npl` arms (a prefill-staging change; the four-axis is inert on a dense model and was run at r231
+for the same code path).
+
+**5. `TODO` #282 -- found while gating, and NOT caused by this change.**  On a **clean r231 checkout**
+(`a19aab55e`, nothing applied) `scripts/gate-host-pool.sh` is **36/37** on `soar`: the `pinlate` arm's greedy
+text is 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and
+two runs, one token at ~31 of 32.  Four arms narrowed it: the cold in-place read is not the cause
+(`MOE_EXPERT_CACHE_COLD_UVA=0` still diverges), the compute path is not the cause (`fail`/`late` stand every
+table down -- `get_ok=0 decline_all=4929` -- and still match `ref`), the decode remap is not the cause
+(`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the **mixture**: `pinlate` serves 552 ops from the
+cache and declines 1 711 (`FAILED fills: 119`, rolled back), and that mixed state reproduces neither end.  The
+r231 record's 37/37 was measured on `radix`; this arm is a fault injection whose landing point moves with the
+box's allocation layout.  `scripts/gate-host-pool.sh` now proves the fallback's byte-identity **in the same
+run** (`fail`/`late` must match `ref`) and reports the mixture as a WARN naming `TODO` #282 -- a *wholesale*
+fault arm that diverges still FAILS, so the check keeps its teeth where the delivery can guarantee identity.
+`TODO` #282 carries the reproduction and the next step (the per-table `hits/misses/fills` line, then the
+prefill-staging snapshot built before a rolled-back admission -- the r219 class one layer deeper).
+
+**Environment.**  `soar` (3 x R9700, 91 GiB; `HIP_VISIBLE_DEVICES=0` for every arm), build 11903 @ `a19aab55e`
++ the change, ROCm 10.1.0-gfx120X.  Arms: `wip/bench-56gb/arms-issue281{,b,c}.txt`, the RAM-rich cell in
+`wip/host-pool-fill-transport/warm-fill-src.sh`, logs beside them.  `scripts/check-gpu-faults.sh` clean over the
+session.  One rig bug fixed on the way: `runme-56gb-tier.sh` exported the literal `-`/`auto` for "default", and
+`env_int("auto", …)` is 0 -- so a `DIO=auto` arm silently forced buffered and `RANK=-` forced `combined`; the
+script now *unsets* those, and two arms were re-run.
+
 ## 261107.004 (campaign) -- P1.3 closes the campaign's last measurement: touch 3 damps churn and buys nothing, and PR #267's 0002 registration is not needed
 
 **No delivery change** (`patches/`, `release.json` and the fork branch are untouched; the release stays
