@@ -1,0 +1,74 @@
+From 554e127a08704b4e74a7b4a0dc3b7e22667b0b1b Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 05:01:26 +0800
+Subject: [PATCH] sched: copy a large host-resident split input synchronously
+
+ggml_backend_sched_copy_input uploads a host-resident split input asynchronously on the split backend's stream (the
+host_src && dev_dst branch).  The copy reads its source when the stream reaches it, not when it is issued.  The CUDA
+backend snapshots uploads up to 1 MiB through its pinned ring, so those are safe, but a larger one is read in place.
+
+A CPU split's output -- the token embeddings when the table is on the CPU, model.input_embed / node_1, 41,943,040 bytes
+per 2048-token ubatch -- is rewritten in place by the next ubatch's CPU split, so a copy still queued behind earlier work
+read the next ubatch's bytes, or a torn mix.  With large device-to-host readbacks keeping the stream busy (32 or more
+layer inputs exported per ubatch), the prefill was corrupted from layer 0 on (0.3% at the layer-1 input, 22% at layer 63),
+differently from run to run; AMD_SERIALIZE_KERNEL=3 and AMD_SERIALIZE_COPY=2 made it go away, AMD_SERIALIZE_COPY=1 did not.
+
+A host input above 1 MiB whose buffer is not a weight buffer now takes the synchronous fallback, which is what upstream
+ggml does for every host input.  A weight (partial offload, a host expert master) is never rewritten in place and keeps
+the asynchronous copy at any size.  GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1 restores the previous asynchronous copy (A/B).
+
+Measured on gfx1201 (Qwen3.8-27B UD-Q4_K_XL, token embeddings on the CPU, -ub 2048, 1 slot): prefill -0.4..-0.7%, decode
+unchanged, tokens unchanged; the corruption no longer reproduces, and reproduces again with the switch set.
+
+Written by Claude (AI).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 169f901a9..0758991ea 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2455,6 +2455,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++// A host-resident split input up to this size is uploaded asynchronously below: the CUDA backend snapshots such an upload
++// through its pinned ring (ggml_backend_cuda_set_tensor_async), so the copy never reads memory the caller rewrites.  A larger
++// one is not snapshotted -- the copy reads its source when the stream reaches it -- and is copied synchronously instead.
++static constexpr size_t GGML_SCHED_HOST_INPUT_ASYNC_MAX = 1u << 20;
++// GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1: upload the larger ones asynchronously too (the previous behaviour; A/B only)
++static bool sched_async_large_host_input(void) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_SCHED_ASYNC_LARGE_HOST_INPUT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
+ static ggml_backend_event_t sched_stage_ev(ggml_backend_sched_t sched, int backend_id, int slot, bool done) {
+     struct ggml_backend_event ** pev = done
+         ? &sched->stage_done_ev[backend_id][slot]
+@@ -3187,7 +3200,16 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             // `set_tensor_async` only understands a whole split tensor, so it keeps the copy below.
+             const bool host_src = input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer);
+             const bool dev_dst  = input_cpy->buffer != NULL && !ggml_backend_buffer_is_host(input_cpy->buffer);
+-            if (host_src && dev_dst && split_backend->iface.set_tensor_async != NULL &&
++            // Not for a host input above GGML_SCHED_HOST_INPUT_ASYNC_MAX that is not a weight: a CPU split's output -- the
++            // token embeddings when the table is on the CPU, 40 MiB per 2048-token ubatch -- is rewritten in place by the
++            // next ubatch's CPU split, and an asynchronous copy still queued behind earlier work (e.g. large device-to-host
++            // readbacks) read the next ubatch's bytes: a corrupted prefill, different from run to run.  Those take the
++            // synchronous copy below, as upstream ggml does for every host input.  A weight is never rewritten, so a
++            // host-resident weight (partial offload, a host expert master) keeps the asynchronous copy at any size.
++            const bool host_large = ggml_nbytes(input_cpy) > GGML_SCHED_HOST_INPUT_ASYNC_MAX && input->buffer != NULL &&
++                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                !sched_async_large_host_input();
++            if (host_src && dev_dst && !host_large && split_backend->iface.set_tensor_async != NULL &&
+                 split_backend->iface.event_wait != NULL) {
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+-- 
+2.43.0
+
