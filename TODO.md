@@ -56,7 +56,7 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
-| **302** | the re-base lost r235's flash-attention win: with the packed mask r235's FA kernel is 14 % faster than unpatched upstream and r236's is 20 % slower than r235's (16.0 vs 13.4 ms on 30B-A3B pp512), spilling 40 B more per thread | performance (delivery, `fattn-mma-f16.cuh`; the `#301` residue) | **OPEN** — found 2026-11-08 localising #301; the only signature change is upstream's `KV_rows_ptr`, the derived-mask path costs the same +19-22 % in both trees — §302 |
+| **303** | the dense MMQ kernel is 1.4 % slower than r235 at the **same** instantiation, grid and launch count (VGPR 232 → 216): `mul_mat_q<Q8_0, 128, …>` carries the residual −1.5 % on dense prefill | performance (delivery, block 00/08 `mmq.cu`/`mmq.cuh`; found closing `#302`) | **OPEN** — found 2026-11-08 in the `rocprofv3` census of the 27B arm; the run is 986 launches in both builds — §303 |
 
 ## Handle numbering
 
@@ -534,31 +534,27 @@ residency/thrash hypothesis is needed.
 The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
 never run on RDNA3.5 before this validation.
 
-## 302. The re-base lost r235's flash-attention win (the `#301` residue)
+## 303. The dense MMQ kernel is 1.4 % slower than r235 at identical geometry (the last prefill gap)
 
-Found while localising `TODO` #301 (`benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md`).
-`rocprofv3`, 30B-A3B Q4_K_M `-p 512`, `flash_attn_ext_f16<128,128,8,8,…>`, 96 launches, **identical grid
-(6144, 4) and VGPR count in every arm**:
+Found while closing `TODO` #302 (`benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md`).  The dense 27B Q8_0
+arm is still **−1.3 / −1.6 / −1.5 %** on `llama-bench -p 512 -r 5` after the ids-compaction (`#301`) and FA
+(`#302`) fixes, and the `rocprofv3` census says the residue is `mul_mat_q`:
 
-| build | derived kq mask (shipped) | packed mask (`LLAMA_KQ_MASK_DERIVED=0`) | scratch |
-|---|---|---|---|
-| upstream `a691b2345`, unpatched | — (no derived mask) | 15 539 us | 348 B |
-| ours r235 | 15 867 us | **13 362 us** | 336 B |
-| ours r236 (after the #301 fix) | 19 576 us | 16 021 us | **376 B** |
+| | r235 | r236 (after #302) |
+|---|---|---|
+| `mul_mat_q` kernel time (986 launches) | 535.4 / 543.0 ms (before / after) | +1.4 % |
+| instantiation | `mul_mat_q<(ggml_type)8, 128, false, (ggml_prec)30, false, false>` | **same** |
+| launch count / grid / workgroup | 986 / (128, …) / 32 | **same** |
+| VGPR count | 232 | **216** |
 
-So: the derived mask costs +19-22 % over the packed one in **both** of our trees (that machinery ported fine),
-and the actual regression is that r235's packed path carried a **14 % win over unpatched upstream** which r236
-no longer has — only 3 % off upstream now.  The kernel also spills 40 B more per thread (336 → 376 B) at the
-same 256 VGPRs, and the one signature difference is upstream's `KV_rows_ptr` (`#29510`).
-
-**Closing it:** a focused port of block 05's FA hunks onto the new base's body — recover the packed-path win,
-then re-check the derived path.  Instrument: `rocprofv3 --kernel-trace` on this exact arm, reading the
-`flash_attn_ext_f16` rows' duration + `Scratch_Size` (the spill is the mechanism, so the scratch column is the
-progress meter), and the `LLAMA_KQ_MASK_DERIVED=0` arm as the packed reference.  Gates: `gate-prefill-logits.sh`
-(the FA is a prefill kernel, so a KLD run is mandatory even when the text is unchanged), same-seed greedy text,
-`gate-kv-window-split.sh` / `gate-kv-residency.sh` if the derived-mask inputs move.  Worth ~1 % of the MoE
-prefill wall time and ~0.3 % of a dense 27B's; do **not** trade the derived mask's allocation win (1.03 GiB of
-device + 0.94 GiB of pinned host memory, r172) for it.
+Same template, same geometry, same count, different register footprint — so the *body* or the runtime J/ntj
+split changed in the re-base's MMQ re-expression (R01/R08/R09: the `mmq_args`/`tile_spec` work is block 00/08's).
+**Closing it:** `rocprofv3 --kernel-trace` on the 27B arm for both binaries (the census above), then diff
+`mul_mat_q`'s `mmq.cuh` body and the runtime `J`/`ntj`/`nthreads` selection between the trees — a J one band
+lower needs no numerical change to show up as this.  Gates: `gate-prefill-logits.sh` (a prefill kernel, so KLD is
+mandatory even when the text is unchanged; a fresh base from the unpatched build already exists at
+`~/.cache/rdna-boosts/gates/`), same-seed greedy text, `test-backend-ops -o MUL_MAT_ID` 931/931 and the dense
+`MUL_MAT` suite.  Worth ~1.1 % of dense prefill (the 27B arm) and ~0.4 % of the MoE arms' prefill.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 

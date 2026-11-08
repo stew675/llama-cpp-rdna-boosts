@@ -1100,6 +1100,46 @@ dated one.
 
 - status: **DONE** · fork `30277a117` (block 00/08) · `benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md` · session 2026-11-08
 
+## P5 — pre-R17: `TODO` #302, the FA tile loader's row indirection — recovered · **DONE 2026-11-08**
+
+The `#301` residue.  r236's port of upstream's `kv_rows` (`#29510`) put a runtime `indices ? max(indices[i],0) : i`
+select inside `flash_attn_ext_f16_load_tile`'s **per-chunk** loop, on every shape that never uses kv_rows.
+
+**Measured, one arm, four builds** (`rocprofv3`, 30B-A3B Q4_K_M pp512, `flash_attn_ext_f16<128,128,8,8,...>`,
+96 launches, identical grid and VGPR count):
+
+| build | FA time | scratch |
+|---|---|---|
+| upstream `a691b2345`, unpatched | 15 539 us | 348 B |
+| ours r235 | 15 867 us | 336 B |
+| ours r236, as shipped | **19 576 us** | **376 B** |
+| ours r236 + the fix | **15 727 us** | **336 B** |
+
+**Three approaches that failed first** (recorded so nobody re-tries them): hoisting the index out of the chunk
+loop and making it 32-bit changed nothing (19 284 us -- it is register pressure, not loop placement); a runtime
+branch around a lambda-inlined pair of specialisations was **worse** (35 489 us, 1504 B scratch, because both
+are inlined into one live range); and a kernel-level template bool would double the instantiations of **290**
+template-instance TUs.
+
+**The fix** (`2ff384571`): `load_tile_impl<..., bool use_indices>` (the body, compile-time), a `__noinline__`
+`load_tile_rows` for the kv_rows variant (upstream's rare multi-sequence unified-KV path, disjoint from sparse by
+the `GGML_ASSERT(!kv_rows || !use_sparse)` in `fattn-common.cuh`), and the existing `load_tile` entry now picks
+one of the two **once per tile load**.  Call sites unchanged.
+
+**Result:** scratch back to r235's 336 B and time to r235's level, i.e. the FA regression is gone.  Wall clock
+(interleaved `-p 512 -r 5`, 3 rounds): 30B-A3B **+0.1/+1.8/-0.7 %**, 35B-A3B 3 GPU tensor
+**-1.5/-0.3/+1.9 %** -- both parity (they were -2.0..-3.2 % before `#301`+`#302`).  Dense 27B is still **-1.5 %**:
+its FA is now 8.8 vs r235's 8.5 ms, and the residue is `mul_mat_q` (**+1.4 %** at the *same* instantiation, grid
+and launch count, VGPR 232 -> 216) -> `TODO` **#303**.
+
+**Gates:** `gate-prefill-logits.sh` **PASS** against a base recorded from the **unpatched `a691b2345`** build
+(mean KLD 0.000697, same-top-p 98.784 %) -- this also satisfies R17 step 5's "record from a clean unpatched
+build" for the f16 arm, and `build-rocm-base` is kept for the `--kv q8_0` arm; `gate-spec-draft-window.sh` PASS
+(the 2-slot unified-KV path, identical acceptance both arms); 30B text `e1325adad141`, Flash-Next
+`13406dc51399` unchanged.
+
+- status: **DONE** · fork `2ff384571` (block 05) · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1131,6 +1171,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P5 | — | `2ff384571` (fork, block 05 hunk) | #302: the FA tile loader's per-chunk `kv_rows` select (r236's port) cost 25 % of the FA kernel | fixed (inlined fast path + `__noinline__` kv_rows variant); 30B/35B parity, KLD gate PASS | 2026-11-08 | scratch 376 -> 336 B, 19.6 -> 15.7 ms; residue is the dense `mul_mat_q` (#303) |
 | P4 | — | `30277a117` (fork, block 00/08 hunk) | #301: MoE prefill −2..−3 % localised by kernel census → a duplicate ids compaction (our R01 re-expression) | fixed; 3 arms now −0.1..−1.1 %; 931/931 + texts identical; FA port split out as #302 | 2026-11-08 | one compaction + `mm_id_retile_kernel`; `GGML_CUDA_DISABLE_MMQ` correction recorded |
 | P3 | — | `9b7dfb47a` (fork, block 10 hunk) | #298: one live pool-order violation in the cublas BF16 src1 cache path (plus 4 sites audited clean) | reproduced (F16 4B + `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`), fixed, inert (3 hashes + `gate-hc-fusions` PASS) | 2026-11-08 | the registered block is reserved before any plain pool allocation |
 | P2 | — | `08d6c343b` (fork, block 11 hunk) | #297: the sparse arm had no gate (and no census to prove it ran) | three arms on the r236 build, incl. a below-the-width negative test that FAILs | 2026-11-08 | 23-line `GGML_CUDA_QSA_SCORE_LOG` census (inert, measured); gate section E |

@@ -92,6 +92,40 @@ arm 1's retiled layout instead of the shared one — identical text — and the 
 why it is recorded as defensive.  The prefill-logit KLD gate is owed at R17 against the base recorded from
 `build-rocm-base`.
 
+## Update (same session): the FA port, `TODO` #302 — recovered
+
+The FA residue above was fixed rather than deferred.  The cost was one line: r236's port of upstream's `kv_rows`
+(`#29510`) put a runtime `indices ? max(indices[i],0) : i` select inside `flash_attn_ext_f16_load_tile`'s
+**per-chunk** loop, on every shape that never uses kv_rows.  Hoisting it out of the loop, or making it 32-bit,
+changed nothing (register pressure, not loop placement); inlining both specialisations behind a runtime branch was
+much worse (35 489 µs); a kernel-level template bool would double 290 template-instance TUs.  The fix keeps the
+fast path monomorphic — the body is templated on `use_indices`, the kv_rows variant is a `__noinline__` function,
+and the existing entry picks one per tile load (fork `2ff384571`, block 05).
+
+| build | FA kernel (30B pp512) | scratch |
+|---|---|---|
+| upstream `a691b2345`, unpatched | 15 539 µs | 348 B |
+| ours r235 | 15 867 µs | 336 B |
+| ours r236, as shipped | 19 576 µs | 376 B |
+| ours r236 + the fix | **15 727 µs** | **336 B** |
+
+Wall clock after both fixes (interleaved `-p 512 -r 5`, 3 rounds, same box/session):
+
+| arm | before (#301 localisation) | after #301 | after #301 + #302 |
+|---|---|---|---|
+| 30B-A3B Q4_K_M, 1 GPU | −2.0 … −3.2 % | −0.7 … −1.1 % | **+0.1 / +1.8 / −0.7 %** |
+| 35B-A3B Q8_0, 3 GPU tensor | −2.0 % | −0.1 … −0.5 % | **−1.5 / −0.3 / +1.9 %** |
+| dense 27B Q8_0, 1 GPU | −1.4 % | −0.1 … −1.1 % | **−1.3 / −1.6 / −1.5 %** |
+
+Both MoE arms are at parity.  The dense 27B is not, and it is a *different* kernel: its FA is now 8.8 vs r235's
+8.5 ms, and the residue is `mul_mat_q` **+1.4 %** at the same instantiation, grid and launch count with VGPR
+232 → 216 — filed as `TODO` **#303**.
+
+Gates on the fixed build: `gate-prefill-logits.sh` **PASS** against a base recorded from the **unpatched**
+`a691b2345` build (mean KLD **0.000697**, same-top-p **98.784 %**), `gate-spec-draft-window.sh` **PASS** (2-slot
+unified KV, identical acceptance), texts unchanged (`e1325adad141`, `13406dc51399`).
+
 ## Records
 
-`WORKLOG.md` 261108.005, `RUNGS.md` `P4`, `TODO` #301 (closed) and #302 (the FA port), fork `30277a117`.
+`WORKLOG.md` 261108.005 + 261108.006, `RUNGS.md` `P4` + `P5`, `TODO` #301/#302 (closed) and #303 (the dense MMQ
+residue), forks `30277a117` and `2ff384571`.

@@ -1,3 +1,40 @@
+## 261108.006 (no release) -- `TODO` #302 closes: the FA tile loader's `kv_rows` select is out of the fast path, and both MoE prefill arms are back to parity
+
+**Fork change, block 05** (`ggml/src/ggml-cuda/fattn-mma-f16.cuh`, +36/-5, fork `2ff384571`, tree `eda002cc2`).
+This is the residue `#301` localised: r236's port of upstream's `kv_rows` (`#29510`) put a runtime
+`indices ? max(indices[i],0) : i` select inside `flash_attn_ext_f16_load_tile`'s **per-chunk** loop, i.e. on every
+shape that never uses `kv_rows` — which is every single-sequence prefill.
+
+**Measured on one arm, four builds** (`rocprofv3`, 30B-A3B Q4_K_M pp512, 96 launches, identical grid/VGPRs):
+upstream `a691b2345` unpatched **15 539 µs / 348 B** scratch, ours r235 **15 867 / 336**, ours r236 **19 576 /
+376**, ours r236 with the fix **15 727 / 336**.  So the re-base had taken a loader that r235 ran at upstream's
+speed and made it the slowest of the three.
+
+**Three cheaper attempts failed, and the failures are informative:** hoisting the index out of the chunk loop
+and keeping it 32-bit changed nothing (19 284 µs) — it is register pressure (spilling), not loop placement; a
+runtime branch selecting between two lambda-inlined specialisations was far worse (35 489 µs, 1504 B) because
+both get inlined into one live range; and a kernel-level template bool would double the instantiations of the
+**290** template-instance TUs.  The fix that works keeps the fast path monomorphic: the body is
+`load_tile_impl<..., bool use_indices>`, the kv_rows variant is a `__noinline__` `load_tile_rows` (it is the rare
+multi-sequence unified-KV path, and `GGML_ASSERT(!kv_rows || !use_sparse)` keeps it disjoint from sparse), and
+the existing `load_tile` entry picks one of the two **once per tile load**.  Call sites unchanged.
+
+**Result, interleaved `llama-bench -p 512 -r 5`, 3 rounds:** 30B-A3B Q4_K_M 1 GPU **+0.1 / +1.8 / −0.7 %**,
+35B-A3B Q8_0 3 GPU `-sm tensor` **−1.5 / −0.3 / +1.9 %** — parity, against −2.0 … −3.2 % before `#301`+`#302`.
+Decode untouched throughout.
+
+**Dense 27B is still −1.3 / −1.6 / −1.5 %**, and it is a *different* kernel: its FA is now 8.8 vs r235's 8.5 ms
+(scratch 640 vs 476 — a different instantiation, improved but not fully), and the residue is `mul_mat_q`
+**+1.4 %** at the *same* instantiation, the same grid and the same launch count, with VGPR 232 → 216.  That is the
+MMQ body/J selection from the re-base, filed as `TODO` **#303** rather than folded in here.
+
+**Gates run:** `gate-prefill-logits.sh` **PASS** against a base recorded from the **unpatched `a691b2345`** build
+(mean KLD **0.000697** vs the 0.005 limit, same-top-p **98.784 %** vs the 98 % floor) — which also discharges R17
+step 5's "record the base from a clean unpatched build" for the f16 arm (`~/llama.cpp/build-rocm-base` is kept
+for the `--kv q8_0` arm); `gate-spec-draft-window.sh` **PASS** (the 2-slot unified-KV path, byte-identical text
+and identical acceptance — this is the path where `kv_rows` lives, so the `__noinline__` variant is exercised);
+30B `e1325adad141` and Flash-Next `13406dc51399` unchanged; kernel journal clean.
+
 ## 261108.005 (no release) -- `TODO` #301 closes: the MoE prefill delta was a duplicate ids compaction (our own re-base artefact), fixed and measured; the residue is our FA port, now `#302`
 
 **Fork change, block 00/08** (`mmid.cu`, `mmid.cuh`, `mmq.cu`, +46/−3, fork `30277a117`, tree `f351a38e4`).
