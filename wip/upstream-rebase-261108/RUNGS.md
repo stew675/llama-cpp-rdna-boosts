@@ -931,6 +931,54 @@ instead of residency numbers that cannot exist.  Rationale lives in the gate's o
 - status: **DONE** · sha: `2dc4511b8` (tree `7d6e24c12`) + follow-up `328a155a9` (tree `a101f0d66`) · session 2026-11-08
 
 
+## P1 — pre-R17: `TODO` #294, the gates' kernel-journal window · **DONE 2026-11-08**
+
+The pre-R17 list runs as `P<n>` items, not rungs (a rung is a block).  `P1` is `TODO` #294: a gate that cannot
+tell "a fault in my run" from "a fault earlier today" costs a re-run and invites the wrong conclusion.
+
+**The handle's premise was slightly off, and the correction is the reason the change is bigger than 3 files:**
+
+| gate | actual state before |
+|---|---|
+| `gate-grid-stall-pad.sh` | called the check with **no `--since`**, and only **inside `if B_ARM=1`** — an `A_ARM=1 B_ARM=0` run had *no* fault verdict |
+| `gate-spec-draft-window.sh` | **never called it** (its header said "the caller's job") |
+| `gate-spec-reuse-window.sh` | same — never called it |
+| `gate-ckpt-reuse.sh`, `gate-state-pipe.sh`, `gate-spec-ckpt-device.sh` | `--since "30 min ago"` |
+| `gate-spec-align.sh`, `gate-spec-width-band.sh` | `--since "120 min ago"` |
+| `gate-hc-fusions.sh`, `gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-kv-window-split.sh`, `gate-park-idle-slots.sh`, `gate-prefill-logits.sh`, `gate-qwen4exp-quant-coherence.sh` | **no fault check at all** |
+
+**A fixed window is wrong in both directions**, which is why every site moved rather than just the 3: too wide
+reaches back into an earlier arm's fault (the #294 false FAIL), and too narrow **misses the gate's own early
+arms** on a run longer than the constant — a false PASS, which is the dangerous direction (`gate-kv-residency.sh`
+runs 25-40 min).
+
+**Resolution (maintainer's call: keep the 9, and add the missing checks).**  Every one of the 16 gates that
+touches the GPU now:
+* takes a **start timestamp before the first arm** (`GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S')"`,
+  the form `gate-norm-rows-alias.sh` already used — one second of slack for the journal's timestamp granularity)
+  and passes it as `--since`;
+* accepts **`--no-faults`** (uniform interface across all 16; for a box with no readable kernel log);
+* feeds **every log it wrote** to `--log` rather than a hand-picked subset;
+* prints a **PASS line on success** — a silent check is indistinguishable from a skipped one, and the point of the
+  handle is a trustworthy verdict.
+
+`gate-per-block-build.sh` is the one gate with **no** check, by design and now documented in its header: it only
+compiles, so it cannot record a GPU fault.
+
+Two placements were wrong beyond the window: `gate-grid-stall-pad.sh`'s check was nested in its `B_ARM` block, and
+`gate-norm-rows-alias.sh`'s was nested in its model-arm block and only ever scanned `fused.log`/`chain.log` — so
+section A's GPU driver arms were never scanned.  Both now run unconditionally over `$KEEPOUT`.
+
+**Verified (not just `bash -n`).**  `bash -n` on all 17 gate scripts; `--help`/`--no-faults`/unknown-arg→exit 2 on
+the gates that gained flags; `check-gpu-faults.sh --since "YYYY-MM-DD HH:MM:SS"` accepted by journalctl; real runs
+on the r236 build: `gate-grid-stall-pad.sh` **A-only PASS** (the new `==> GPU faults (since …)` block, 4 logs),
+**B-only PASS**, **`--no-faults` correctly skips**; `gate-qwen4exp-quant-coherence.sh` (IQ3_XXS, `NGEN=8`) **PASS**
+with `PASS  GPU faults: kernel journal (since 2026-11-08 14:52:54) and every arm log clean`;
+`gate-park-idle-slots.sh` **PASS** with its own fault line.  A *stale* fault cannot be injected from userspace, so
+that direction rests on the mechanism (the window starts at the gate) — which is the whole change.
+
+- status: **DONE** · scripts only (no fork change) · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -962,3 +1010,4 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P1 | — | (delivery repo only) | #294 premise corrected: 8 gates had **no** journal check, 5 had a fixed window | `bash -n` ×17 + real PASS runs of `gate-grid-stall-pad` (A-only/B-only/`--no-faults`), `gate-qwen4exp-quant-coherence`, `gate-park-idle-slots` | 2026-11-08 | every GPU gate: `--since` = its own start timestamp, `--no-faults` opt-out, every log scanned, PASS line on success |

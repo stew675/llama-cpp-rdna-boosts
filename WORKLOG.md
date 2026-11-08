@@ -1,3 +1,38 @@
+## 261108.002 (no release) -- `TODO` #294 closes: every gate's GPU-fault verdict is scoped to the gate's own window, and the 8 gates that had none now have one
+
+**No delivery change** (`patches/`, `release.json` and the fork tree stay untouched until R17).  Scripts only: 10
+`scripts/gate-*.sh` files, `+~250/-~40`.  Re-base record: `wip/upstream-rebase-261108/RUNGS.md` → `P1`.
+
+**The handle was right about the symptom and wrong about the scope.**  It said 9 gates end with
+`check-gpu-faults.sh` and 3 of them take no `--since`/`--no-faults`.  In the tree: 8 gates called it at all; two of
+the three named (`gate-spec-draft-window.sh`, `gate-spec-reuse-window.sh`) **never called it** (their headers said
+"the caller's job"), so they had no fault verdict rather than a stale-window one, and `gate-grid-stall-pad.sh` had
+its check **nested inside `if B_ARM=1`**, so an `A_ARM=1 B_ARM=0` run silently skipped it.  Seven more gates
+(`gate-hc-fusions`, `gate-host-pool`, `gate-kv-residency`, `gate-kv-window-split`, `gate-park-idle-slots`,
+`gate-prefill-logits`, `gate-qwen4exp-quant-coherence`) ran real GPU work with **no journal check at all**.
+
+**A fixed window is wrong in both directions, which is why the 9 sites moved and not just the 3.**
+`--since "120 min ago"` reaches back into an earlier arm's fault (the #294 false FAIL); `--since "30 min ago"` on a
+gate that runs longer than 30 minutes **misses its own early arms** -- a false PASS, the dangerous direction
+(`gate-kv-residency.sh` is 25-40 min).  So every gate now takes `GATE_SINCE_TS` **before its first arm** (the form
+`gate-norm-rows-alias.sh` already used, one second of slack for journal timestamp granularity) and passes it as
+`--since`; `--no-faults` is a uniform opt-out on all 16; every log the gate wrote is fed to `--log` (two gates
+scanned a hand-picked subset -- `gate-norm-rows-alias.sh` never scanned section A's GPU driver arms); and every
+gate prints a **PASS line on success**, because a silent check cannot be distinguished from a skipped one.
+`gate-per-block-build.sh` is the documented exception: it only compiles, so it cannot record a GPU fault.
+
+**Verified by running, not by reading.**  `bash -n` on all 17 gate scripts; `--help` / `--no-faults` / unknown-arg
+(exit 2) on the gates that gained flags; `check-gpu-faults.sh --since "YYYY-MM-DD HH:MM:SS"` accepted by
+journalctl; and three real arms on the r236 build -- `gate-grid-stall-pad.sh` A-only **PASS** (the new
+`==> GPU faults (since 2026-11-08 14:44:55)` block over its 4 `test-backend-ops` logs), B-only **PASS**, and
+`--no-faults` **correctly skipping** the block; `gate-qwen4exp-quant-coherence.sh` (IQ3_XXS, `NGEN=8`) **PASS**
+with `PASS  GPU faults: kernel journal (since 2026-11-08 14:52:54) and every arm log clean`;
+`gate-park-idle-slots.sh` **PASS** with its own fault line.  A stale fault cannot be injected from userspace, so
+that direction rests on the mechanism (the window starts at the gate) rather than on a reproduced stale journal.
+
+**Also fixed on the way:** `gate-qwen4exp-quant-coherence.sh`'s `[llama-cli]` positional (documented in its usage,
+silently ignored by the code) is now parsed.
+
 ## 261108.001 (no release) -- the next re-base, set up as a ladder: 16 blocks from `6050b467c` onto `a691b2345`
 
 **No delivery change.**  `patches/`, `release.json` and the fork tree are untouched (r235 is the release).
