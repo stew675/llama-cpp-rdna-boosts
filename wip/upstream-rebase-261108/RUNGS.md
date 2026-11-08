@@ -920,6 +920,14 @@ MiB); on gfx1100 Flash-Next `-ncmoe 48` runs clean `7a8734a9f1a6`.
 | fingon | dense 9B coherence (no 4B on the box) | `1de99b7e6ee6` |
 | fingon | Flash-Next `-ncmoe 48` | exit 0, `7a8734a9f1a6` — **identical to the gfx1201 3-GPU tensor arm**, and host experts work on a discrete card |
 
+**Two gate defects fixed in the same session** (they read FAIL on a healthy platform): `wselftest0` asserted a
+*driver* property (the quarantine hold is needed) as if it were universal — the hazard does not reproduce on
+gfx1151, where the whole hazard sequence verifies with the hold off — so the arm now asserts the MECHANISM on every
+arch (the verdict names `quarantine hold on|off`, the hazard case must be present in both arms) and the corruption
+expectation only for arches in `SELFTEST_HOLD_VACUOUS_ARCHS` (default `gfx1151`, added with that measurement;
+`SELFTEST_STRICT=1` forces it anywhere); and the pool section now grades a platform's *decline* (`TODO` #300)
+instead of residency numbers that cannot exist.  Rationale lives in the gate's own header.
+
 - status: **DONE** · sha: `2dc4511b8` (tree `7d6e24c12`) + follow-up `328a155a9` (tree `a101f0d66`) · session 2026-11-08
 
 

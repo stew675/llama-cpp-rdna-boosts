@@ -522,6 +522,9 @@ identically, so it was pre-existing.  The rule is R13's `hc_combine_norm` rule: 
 be created before a `pool_stack` push in the same scope**.  Verified on halo: the sparse and pool arms now both
 run and are byte-identical (`1e944569dbd6`).
 
+It blocks `gate-kv-residency.sh`'s pool section on gfx1151 only while it is unfixed -- the arms all attach
+the drafter -- and `812deb221` clears that.
+
 **Open — the class, not the site.**  The same violation was seen once on gfx1201 in a *dense* 4B warmup (two
 2 KiB blocks freed in allocation order) on a build that differs only by a diagnostic, i.e. it is latent and
 layout/timing sensitive: 5/5 aborts on one build, 0/4 on the next.  So `GGML_CUDA_POOL_TRACE=1` exists now
@@ -529,31 +532,6 @@ layout/timing sensitive: 5/5 aborts on one build, 0/4 on the next.  So `GGML_CUD
 every `pool_stack_push` site (`common.cuh`'s `bf16_src1_cache_put`, `hyperconn.cu`'s `hc_base_copy`,
 `mmb.cu`'s `mmb_cache_insert`/`mmb_slot_reserve`) for plain allocations in the same scope above it is owed
 before the next release — one site is fixed, the *rule* is what keeps breaking.
-
-## 299. `gate-kv-residency.sh`'s quarantine control is a per-driver property (fixed at r236, recorded)
-
-The `wselftest0` arm used to require the provider's selftest to FAIL with `LLAMA_KV_REGION_QUARANTINE=0`.  The hold
-is a *driver* workaround: the host-mapping hazard reproduces on gfx1201 + ROCm 10.1 and **not** on gfx1151, where
-the whole hazard sequence verifies with the hold off (measured 2026-11-08, halo).  The arm consequently read FAIL on
-a healthy platform.  It now asserts the MECHANISM on every arch (the verdict names `quarantine hold on|off` and the
-hazard case must be present in both arms) and the corruption only for arches in `SELFTEST_HOLD_VACUOUS_ARCHS`
-(default `gfx1151`, added with that measurement); an unlisted arch that passes the control is still a FAIL, and
-`SELFTEST_STRICT=1` forces the strict verdict anywhere.
-
-Found at R16 validating on `halo` (gfx1151 Strix Halo, VMM build).  With an MTP drafter attached
-(`-md <mtp> --spec-type draft-mtp`), a Flash-Next run dies mid-decode in
-`ggml_cuda_pool_vmm::free`'s ordering check (`ggml-cuda.cu:1360`: `ptr == pool_addr + pool_used`);
-the pre-re-base r235 binary dies identically at its own `:1375`, so it is **not** a re-base regression.
-It is the same class as the `hc_combine_norm` (R13) and MMB/BF16 (pre-R12) ordering fixes — a pool block
-freed below a live one — but on a path those fixes do not cover, and it blocks `gate-kv-residency.sh`'s
-pool section on gfx1151 (the `pref`/`pres`/`pfloor` arms all attach the drafter).
-
-Also from the same session, a **gate** defect rather than a delivery one: `gate-kv-residency.sh`'s
-`wselftest0` arm asserts that the provider's selftest must FAIL with `LLAMA_KV_REGION_QUARANTINE=0`, which
-is true on gfx1201 + ROCm 10.1 (the driver hazard reproduces) but **false on gfx1151**, where the whole
-hazard case verifies with the hold off.  The delivery is fine there; the arm should assert the MECHANISM
-(the quarantine hold was acquired and the hazard case ran) and keep the corruption expectation only for the
-platform(s) where it has been observed — recorded with the arch, like every other platform-bound number.
 
 ## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
 
