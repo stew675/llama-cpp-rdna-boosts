@@ -277,16 +277,26 @@ instance again (the box sets it by hand; the clean configure used the default `q
 
 - status: **DONE** · sha: `b5d32e0c7`
 
-## R07 — block 06: MMB quantized prefill GEMM
+## R07 — block 06: MMB quantized prefill GEMM · **DONE 2026-11-08**
 
-* block sha `398fe6ab3` · 7 files · +2903 / −3 · **expected conflicts: 0**
+* block sha `398fe6ab3` · 7 files · +2903 / −3 · **expected conflicts: 0** — clean, as the probe predicted
+* **result: `75ba21116`** · 11 files · +2955 / −17 (MMB + the mm_ids_helper API change + `mmf32.cu` + `tests/test-logits-width-probe.cpp`), build green,
+  `MMB_DENSE` fires (`MMB_CFG … dense_geom=1 … routed=0`), `GGML_CUDA_MMB=0` **byte-identical**
+  (108 chars, sha `d94aef3f5033`) on Qwen3-Coder-30B-A3B.
 
 `#31047` (linearised MoE layout) and `#31296` (NVFP4) are in the same files but did not conflict in the
 probe — confirm the MMB dispatcher keys still compile and the RDNA arm is still selected.
 
 **Exit:** build + coherence + MMB still dispatched (`-lv 4` line) on a Q8_0 prefill.
 
-- status: **TODO** · sha: —
+**Resolution:** the block applied clean but its **routed** path called the pre-re-base
+`ggml_cuda_launch_mm_ids_helper`, which produced only `expert_bounds`.  Since block 00's re-implementation
+emits upstream's `tile_spec`, the helper gained an **optional `expert_bounds` output**: one compaction serves
+MMQ/MMF (`tile_spec`) and MMB (per-expert bounds), and both MMB call sites allocate the tile_spec buffer they
+never read.  No MMB kernel logic changed.  (On gfx1201 `mmb_cfg().routed == 0`, so the routed path this touches
+is RDNA3 coverage; the compile break was real either way.)
+
+- status: **DONE** · sha: `75ba21116`
 
 ## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
 
@@ -483,7 +493,7 @@ climb touched has a maintainer decision recorded.
 | R04 | 03 | `5a214716b` | 1 expected → 2 found (+1 in delta-net-base) | build + coherence + GDN census + kill-switch arm byte-identical + `test-recurrent-state-depth` **0 failures** (3 phases) | 2026-11-08 | upstream absorbed the conv-state store; `D4` decided: tracker dropped, `rs_max` is the bound; found+fixed an upstream `find_slot` bug (`rs_max` not swapped) → `TODO #289` |
 | R05 | 04 | `92cf39297` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
 | R06 | 05 | `b5d32e0c7` | 9 files expected → 9 files / 48 hunks | build + coherence + derived==packed A/B + q8_0 KV | 2026-11-08 | **derived mask ABI moved to src[6..8]** (kv_rows took src[5]); upstream absorbed the per-ubatch rot fill; no band kernel dropped (`D5`) |
-| R07 | 06 | | | | | |
+| R07 | 06 | `75ba21116` | 0 expected → 0 found | build + MMB_DENSE line + byte-identical MMB=0 arm | 2026-11-08 | helper API re-expressed with an optional `expert_bounds` output (MMB's own bounds representation kept) |
 | R08 | 07 | | | | | |
 | R09 | 08 | | | | | |
 | R10 | 09 | | | | | |
