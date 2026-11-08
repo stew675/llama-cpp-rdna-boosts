@@ -130,7 +130,12 @@ configs we validate (gfx1201, gfx1151, gfx1100)?  Any unreachable kernel is a de
 **Measurement:** after the re-derivation: `gate-prefill-logits.sh` (with `--family-switch` if a family cap
 moves, `--kv q8_0` for the staging arm) + prefill `t/s` per band on the 4B and 35B-A3B models.
 
-- status: **OPEN** · rung R06 · record: —
+- status: **DECIDED (R06, 2026-11-08) — no delivery kernel dropped.**  The entry-point restructure is absorbed
+  (both parameters on every kernel), the band/tile/prefill kernels keep their dispatch, and the derived mask had
+  to move its ABI to `src[6..8]` because upstream's `kv_rows` took `src[5]` (merged as-is, the derived probe
+  silently failed and every batch fell back to the packed mask).  The remaining coverage question — does the
+  band family still fire at head 256/512 — is the R17 `--family-switch` gate's, not a code decision.
+  Rung log: `RUNGS.md` R06.
 
 ## D6 — `ggml : fix bf16`
 

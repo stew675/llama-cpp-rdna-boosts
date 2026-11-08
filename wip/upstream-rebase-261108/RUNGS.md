@@ -218,9 +218,15 @@ that `-ctk bf16 -ctv bf16` still runs the native FA arm.
 
 - status: **DONE** · sha: `a4c3c35c5`
 
-## R06 — block 05: flash-attention band, native quantized K/V, derived kq mask
+## R06 — block 05: flash-attention band, native quantized K/V, derived kq mask · **DONE 2026-11-08**
 
-* block sha `41248b885` · 295 files · +5565 / −624 · **expected conflicts: 9**
+* block sha `41248b885` · 295 files · +5565 / −624 · **expected conflicts: 9 files** — found 9 files /
+  **48 hunks** (the probe counted files, not hunks: `fattn-mma-f16.cuh` alone has 8, `llama-graph.cpp` 22)
+* **result: `b5d32e0c7` · 295 files · +5565 / −623**, build green, and:
+  * `derived kq mask flash attention enabled` (the probe now passes; see the ABI finding below),
+  * derived vs `LLAMA_KQ_MASK_DERIVED=0` **byte-identical** at a 4096-ctx prefill (149 chars, sha
+    `30c7fc8705a6`),
+  * `-ctk q8_0 -ctv q8_0 -fa on` runs (`K (q8_0): 2176.00 MiB, V (q8_0): 2176.00 MiB`), coherence green.
 
 | conflicted path | what to expect |
 |---|---|
@@ -236,7 +242,40 @@ delivery's band kernels.
 **Exit:** build + coherence + `scripts/gate-prefill-logits.sh` on the FA-relevant arms is deferred to R17,
 but a *same-build* A/B (`GGML_CUDA_FA_*` kill switch) must show the delivery arm still fires at `-lv 4`.
 
-- status: **TODO** · sha: —
+### R06 resolution log
+
+`D5` is resolved the "complementary" way: **no delivery kernel was dropped.**  Upstream's entry-point
+restructure is absorbed, and the delivery's band/tile/prefill kernels keep their dispatch.  What took the time
+was a silent ABI collision and two upstream API removals that our code still used.
+
+| site | resolution |
+|---|---|
+| `fattn-common.cuh`, `fattn-tile.cuh`, `fattn-vec.cuh`, `fattn-mma-f16.cuh` | **both parameters** (upstream's `KV_rows` then the delivery's `kq_blocks`); loaders take upstream's kv_rows `indices` with the delivery's native-KV arguments (`swz`, `kv_native.*`); the VKQ C-tile sizing keeps the delivery's fp32-aware expression under upstream's renamed macro `AMD_WMMA_256B_AVAILABLE` (256B == RDNA3; upstream's branch is the same case, its expression is the fp32-at-`DV%32==0` bug our comment records). |
+| `fattn.cu` | upstream's predicates + our `has_mask` helper extended to the derived form (see below): `use_gqa_opt`/`gqa_opt_applies` now count all three mask forms and test `K->ne[1]` for the stride (upstream's), not the kv_rows count. |
+| `llama-graph.h`, `llama-graph.cpp` | upstream's **`llm_attn_mask` (raw/rows)** replaces the `self_kq_mask`/`_cnv` members; `build_attn_inp_kq_mask` stays the delivery's derived-aware **member** and `build_attn_inp_attn_mask` becomes a member too (it adds inputs, so it needs `res`/`ctx0`), with `allow_derived` threaded through.  The derived registration lives in the dense (non-`fused_kv_rows`) branch.  `llm_graph_input_kq_derived`'s `set_input`/`can_reuse` are restored. |
+| `llama-context.cpp` | both: upstream's gemma4-assistant FA follow-through *and* the delivery's derived-mask env/probe block (`LLAMA_KQ_MASK_DERIVED`, `LLAMA_KQ_MASK_PACKED_RESERVE`, the multi-stream refusal); `graph_reserve` grows our `packed_kq_mask` argument on top of upstream's `no_alloc()` rename. |
+| `llama-kv-cache.h` | upstream's declarations plus the delivery's derived-mask API. |
+
+**Finding (correctness, silent): the derived kq mask ABI had to move — both mechanisms claimed `src[5]`.**
+Upstream's `ggml_flash_attn_ext_rows` stores its `kv_rows` tensor in `dst->src[5]`; the delivery's
+`ggml_flash_attn_ext_add_kq_derived` stored `cell_pos` there.  Merged as-is, the derived probe resolved to
+`derived kq mask flash attention not supported` ("layer 3 is assigned to device ROCm0 but derived kq mask flash
+attention is assigned to device CPU") and **every batch silently fell back to the packed mask** — no error, no
+warning, just the 860 MiB the derived form exists to save.  Fix: the derived form is now `src[6]`/`src[7]`/`src[8]`
+(`ggml.c`, `ggml-cpu/ops.cpp` ×2, the CUDA launcher, `fattn.cu`'s `has_mask` and support gate), with `src[5]`
+reserved for kv_rows.  After the move the same probe prints `derived kq mask flash attention enabled`.  **Trap
+for future ops: `FLASH_ATTN_EXT`'s `src[5]` is taken.**
+
+**Finding (upstream absorbed a delivery mechanism): the rotation constants are no longer filled per ubatch.**
+The block called `set_input_k_rot`/`set_input_v_rot` on the cache, an API that exists only at the base —
+upstream `#31073` ("keep rotation constants on the GPU") removed it and consumes `get_k_rot()` at **graph-build**
+time (`llama_mul_mat_hadamard`).  Our calls had no definition left to link to, so they and their two header
+declarations are dropped.  No loss: the rotation is applied where upstream applies it.
+
+**R17 note:** with block 05 in, the release configure's `GGML_CUDA_FA_QUANTS` may carry the `iq4_nl-iq4_nl`
+instance again (the box sets it by hand; the clean configure used the default `q4_0,q8_0,f16,bf16`).
+
+- status: **DONE** · sha: `b5d32e0c7`
 
 ## R07 — block 06: MMB quantized prefill GEMM
 
@@ -443,7 +482,7 @@ climb touched has a maintainer decision recorded.
 | R03 | 02 | `2f0385c71` | 4 expected → 4 found | build + coherence + adaptive line | 2026-11-08 | upstream absorbed the conv-state snapshot store (one set_rows, same `Kw` bound) |
 | R04 | 03 | `5a214716b` | 1 expected → 2 found (+1 in delta-net-base) | build + coherence + GDN census + kill-switch arm byte-identical + `test-recurrent-state-depth` **0 failures** (3 phases) | 2026-11-08 | upstream absorbed the conv-state store; `D4` decided: tracker dropped, `rs_max` is the bound; found+fixed an upstream `find_slot` bug (`rs_max` not swapped) → `TODO #289` |
 | R05 | 04 | `92cf39297` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
-| R06 | 05 | | | | | |
+| R06 | 05 | `b5d32e0c7` | 9 files expected → 9 files / 48 hunks | build + coherence + derived==packed A/B + q8_0 KV | 2026-11-08 | **derived mask ABI moved to src[6..8]** (kv_rows took src[5]); upstream absorbed the per-ubatch rot fill; no band kernel dropped (`D5`) |
 | R07 | 06 | | | | | |
 | R08 | 07 | | | | | |
 | R09 | 08 | | | | | |
