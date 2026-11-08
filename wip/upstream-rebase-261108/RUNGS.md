@@ -145,10 +145,10 @@ the MTP config; MTP four-axis is R17's job, not a per-rung cost — a single `-n
 
 - status: **DONE** · sha: `2f0385c71`
 
-## R04 — block 03: chunked gated-delta-net prefill · **DONE 2026-11-08 (D4 resolution PROVISIONAL — see below)**
+## R04 — block 03: chunked gated-delta-net prefill · **DONE 2026-11-08 (`D4` DECIDED: tracker dropped)**
 
 * block sha `670aa557d` · 25 files · +3182 / −15 · **expected conflicts: 1** (probe said 1 file; actually 2)
-* **result: `797f8b0cb` · 25 files · +3390 / −16**, build green, coherence green, chunked GDN dispatch proven
+* **result: `5a214716b` · 25 files · +3324 / −25**, build green, coherence green, chunked GDN dispatch proven
   (`-lv 4`: `whole-batch chunked GDN prefill n=32 K=1 n_seqs=1 (> 16: no snapshot tail needed)`), and the
   block's own A/B is byte-identical (`GGML_CUDA_GDN_CHUNKED=0` vs default, 199 chars,
   sha `a2ce6989d94f`)
@@ -166,24 +166,39 @@ maintainer's call.
 **Exit:** build + coherence + chunked GDN still selected (`GGML_CUDA_GDN_CHUNKED` census) + the rollback
 case above resolved and recorded.
 
-**What the merge actually produced (and the state of `D4`):**
+**What the merge actually produced, and what the maintainer decided (2026-11-08: drop the tracker):**
 
 | site | resolution |
 |---|---|
 | `src/models/delta-net-base.cpp` | **upstream's `build_conv_state_store()`**.  Block 03's inline store (per-snapshot `ggml_cpy` loop + the pre-batch copy into slot `n_seq_tokens`) is dropped: upstream's helper already writes `Kw = min(n_seq_tokens, K)` slots in one `set_rows`, and with `#31368`'s bound (`rs_max = min(n, n_rs_seq)` for a short ubatch, `0` for a longer one) the *pre-batch* slot is unreachable — a legal rollback is always `< n`.  Keeping our block would have written the same slots twice. |
 | `src/llama-memory-recurrent.cpp` ctor | **both**: upstream's `no_alloc`/`ctxs_bufs(no_alloc)` (`#31141`) plus the delivery's `n_rs_batch` parameter (the call sites on both sides already pass both). |
-| `src/llama-memory-recurrent.cpp` `seq_rm` | **upstream's `cell.rs_max` bound**, with the delivery's per-sequence ubatch tracker + `LLAMA_RS_ROLLBACK_DEBUG` trace + warn-once kept *inside* it.  This is the conservative half of `D4`: nothing is deleted, but the delivery's own `rollback <= n_rs_seq` test is gone, so the tracker's state now only feeds the diagnostic.  Per the campaign's mandate, the deletion itself waits for the maintainer. |
+| `src/llama-memory-recurrent.h/.cpp` | **the r91 ubatch rollback tracker is removed** (`last_ubatch_nseq_tokens[_by_seq]`, `last_ubatch_pos_last[_by_seq]`, `warned_rollback_boundary`, the RSROLL trace and the crossed-boundary warn): `seq_rm` keeps upstream's `rollback <= cell.rs_max` and nothing else.  `n_rs_batch` **stays** — it is not tracker bookkeeping but the GDN chunked threshold floor (`max(K, 16, n_rs_batch)`, `ggml_gated_delta_net()`'s op parameter) and the slab's verify reserve.  `LLAMA_RS_ROLLBACK_DEBUG` **stays** as the RSPREP prepare-order instrument (it never needed the tracker). |
 
-**`D4` — measured argument, ready for the decision.**  Upstream `#31368` stores `rs_max` per cell, and upstream's
-conv-state helper writes every slot a legal rollback can read, so on the rebased tree the delivery's
-`rollback crossed a batch boundary` warn is **unreachable** — it can only fire if the delivery's own chunked /
-fused GDN path wrote fewer snapshots than the bound promises (and that path already writes
-`min(n_seq_tokens, K)`).  So the choice is "keep a diagnostic that is inert on a correct build" vs "drop the
-r91 fold, the `last_ubatch_*_by_seq` vectors, `n_rs_batch` and the warn".  The recommended deletion touches
-`src/llama-memory-recurrent.{h,cpp}` + `src/llama-cparams.h` + the call sites; it is a ~120-line net removal
-and changes no behaviour.  `TODO #288` tracks the decision (opened in this rung).
+**The tracker's removal exposed a real bug in the merged code — found, fixed, and it is also an upstream bug.**
+Upstream's `find_slot()` gather/re-order loop swaps a cell's `pos`, `src` and `seq_id` (and re-points the tails)
+but **not** `mem_cell::rs_max`, so a moved state kept the *destination* cell's bound while its snapshots live in
+the *source* cell (the r195 plane move).  Symptom, before the fix, on the delivery's own
+`test-recurrent-state-depth`: Phase C (moved cell) refused rollbacks 2..4 and 6..8 at `n_rs_seq` 4 and 8 in the
+batched `[seq 0, seq 2]` arm only; after `std::swap(dst_cell.rs_max, src_cell.rs_max)` **all three phases pass**
+(`PASS: total failures = 0`).  Upstream has the same omission and its `rollback_bound` cases never move a cell →
+`TODO #289` (an `upstream/` PR: the one-line swap + Phase C as the test).
 
-- status: **DONE (D4 provisional)** · sha: `797f8b0cb`
+**Test contract updated (block 03's `tests/test-recurrent-state-depth.cpp`).**
+* Phase A (the shipped speculative verify shape, `n_tokens = K = n_rs_seq+1`, rollback 1..`n_rs_seq`) —
+  **PASS 1..15**, unchanged: `rs_max = n_seq_tokens - 1 = n_max`, so the real deep-draft rollback is legal.
+* Phase B used to assert parity for a rollback into a batch of `n_rs_batch > K` tokens, which the delivery's
+  tracker allowed and `#31368` refuses (`rs_max = 0` for `n_seq_tokens > n_rs_seq + 1`).  It now **asserts the
+  refusal** instead (the old relaxation is gone with the tracker).  This costs nothing in a shipped config:
+  `cparams.n_rs_seq = draft.n_max` and `n_rs_batch = draft.n_max + 1`, i.e. `n_rs_batch == n_rs_seq + 1`
+  always, so a verify batch is exactly at the bound.
+* Phase C — the moved-cell parity case, now passing (see above).
+
+**Documentation owed at R17** (nothing is delivery until then): `ENVIRONMENT.md`'s `LLAMA_RS_ROLLBACK_DEBUG`
+row loses its RSROLL half (RSPREP only) and `GGML_CUDA_GDN_CHUNKED`'s `n_rs_batch` note stays valid;
+`patches/README.md`'s block-03 section loses the tracker/warn text; `INVARIANTS.md`'s guard entry is corrected
+to "upstream's `rs_max`, with the delivery's diagnostic".
+
+- status: **DONE** · sha: `5a214716b`
 
 ## R05 — block 04: BF16 KV cache and native-BF16 flash attention · **DONE 2026-11-08**
 
@@ -426,8 +441,8 @@ climb touched has a maintainer decision recorded.
 | R01 | 00 | `4aaffd1c0` | 12 expected → 12 found | build + coherence + MUL_MAT_ID 931/931 | 2026-11-08 | ballast dropped (94 -Wshadow warnings); mmid re-expressed on upstream's `tile_spec` |
 | R02 | 01 | `cadab8c45` | 1 expected → 3 found (one struct, one heuristic, one function) | build + coherence + AR pipeline line | 2026-11-08 | both sides kept; crossover keyed on `n_ranks()` |
 | R03 | 02 | `2f0385c71` | 4 expected → 4 found | build + coherence + adaptive line | 2026-11-08 | upstream absorbed the conv-state snapshot store (one set_rows, same `Kw` bound) |
-| R04 | 03 | `797f8b0cb` | 1 expected → 2 found (+1 in delta-net-base) | build + coherence + GDN census + byte-identical kill-switch arm | 2026-11-08 | upstream absorbed the conv-state store; **D4 provisional**: `rs_max` bound taken, delivery tracker kept as a diagnostic only |
-| R05 | 04 | `a4c3c35c5` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
+| R04 | 03 | `5a214716b` | 1 expected → 2 found (+1 in delta-net-base) | build + coherence + GDN census + kill-switch arm byte-identical + `test-recurrent-state-depth` **0 failures** (3 phases) | 2026-11-08 | upstream absorbed the conv-state store; `D4` decided: tracker dropped, `rs_max` is the bound; found+fixed an upstream `find_slot` bug (`rs_max` not swapped) → `TODO #289` |
+| R05 | 04 | `92cf39297` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
 | R06 | 05 | | | | | |
 | R07 | 06 | | | | | |
 | R08 | 07 | | | | | |

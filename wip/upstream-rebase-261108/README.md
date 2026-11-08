@@ -160,6 +160,12 @@ Not a rung in the climb — the release gate set, in the order the traps fire:
    numbers, `patches/README.md` per-block notes for what moved, `BASELINE.md` current baseline,
    `INVARIANTS.md` appended facts, `ENVIRONMENT.md` for any variable that appeared/vanished,
    `TODO.md` for the deferred decision items, and this campaign moved to `archive/work/`.
+   **Known doc debts collected during the climb** (fix them at R17, they are listed per rung):
+   * `ENVIRONMENT.md`: `LLAMA_RS_ROLLBACK_DEBUG` loses its RSROLL half (RSPREP only, R04); the r34
+     `GGML_CUDA_FA_QUANTS` note if the instance list changes (R06);
+   * `patches/README.md`: block 03's tracker/warn text (R04), block 00's MUL_MAT_ID shape (R01), the
+     `-Wshadow` statement in the block-00 note (R01);
+   * `INVARIANTS.md`: the recurrent rollback guard entry becomes "upstream's `rs_max` + our diagnostic" (R04).
 
 ## §5  Resuming
 
