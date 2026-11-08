@@ -92,6 +92,56 @@ That reframes step 1: the question is not "can we close the hole?" but **"does t
 all, given that the prefill cannot use it (below ~83 % residency) and only the decode band can?"** — a decode
 times prefill trade in pure VRAM bytes, with the freed VRAM going to KV / a wider ubatch.
 
+## 2f. `-ncmoe` DOES move residency — measured, and it reframes the guidance
+
+I claimed it did not (arguing that a pinned layer removes the same bytes from the host set and from free
+VRAM).  That is only true while `F ≥ H`; with a real context it is wrong.  Measured, 1 GPU, `-c 204800`,
+`-sm layer`, `--host-experts pinned`, a `-n 1` load:
+
+| `-ncmoe` | arena | host set | residency |
+|---|---|---|---|
+| 48 | 21 639.3 MiB | 47 962.5 | **45.1 %** |
+| 46 | 19 925.6 | 46 162.5 | 43.2 % |
+| 44 | 17 971.5 | 44 237.5 | 40.6 % |
+| 42 | 16 115.1 | 42 312.5 | 38.1 % |
+| 40 | 14 084.9 | 40 287.5 | **35.0 %** |
+
+Each pinned layer removes ~950 MiB from the host set **and** ~950 MiB from free VRAM (the layer's VRAM copy),
+and the arena was already the smaller quantity, so the ratio falls ~1.25 points per layer.  In the `F ≥ H`
+regime (2 devices, `-c 4096`) residency instead stays at **100 %** for every `-ncmoe` from 48 down to 32,
+because the arena just covers the shrinking host set.  So:
+
+* `residency = F / H`, and a pinned layer subtracts the same bytes from both → residency **falls when F < H**,
+  stays at 100 % while F ≥ H;
+* "offload the minimum" therefore lands in **bulk's regime by construction** — the maintainer's lever works,
+  and it is now measured rather than asserted.
+
+## 2g. Maintainer proposal: permanently pin half the residency (a static tier)
+
+For a > 80 %-residency config: pin a static fraction of the set in VRAM, keep the arena for the rest, so a
+prefill never pays PCIe for the pinned part.  Evaluated against the transport, the answer depends on who reads
+the pinned bytes:
+
+* **Under bulk: no effect.**  Bulk copies 100 % of the host set per ubatch because the op reads one contiguous
+  `input_cpy`; its PCIe bytes are `H` whatever is resident (that is why bulk measured flat, ~1900 t/s, in every
+  residency cell).
+* **Under staging: it *raises* the host traffic** if it merely converts adaptive residency into static
+  residency — staging sends `1 − residency`, so "90 % adaptive" → "45 % static + 45 % dynamic" moves the local
+  fraction from 90 % to 45 % (10 % → 55 % over PCIe).  The gain is **stability** (a static tier cannot be
+  evicted mid-prefill, which is what stood 50 tables down in #271), not bytes.
+* **The version that would actually win** pins a **contiguous** expert range rather than the hottest set: the
+  non-resident complement is then one contiguous run in the master → **one DMA per table** (bulk-like
+  transaction count) *and* a partial byte saving.  Viability depends on expert popularity being flat enough that
+  index order ≈ heat order.  The r234 heat census is encouraging but not decisive: the in-run adaptive set held
+  27.95 % of the routed mass while a static top-N placement of the same slots would hold **84.66 %**.
+* **Decode cost**: at equal residency a (heat-seeded) static set loses ~1.8 points of hit rate to the adaptive
+  arena (r74, `wip/moe-static-hot-tier/`), and the freeze fights the movable-boundary slab — "a frozen slot
+  inside a lendable chunk is not frozen".  Both are the named hard parts of that (still unimplemented) campaign.
+
+**So the static-tier idea is a separate stage, not a transport fix**, and it is only worth building in the
+contiguous form.  If the arena-sizing step (§6.1) shows a large arena does not earn its bytes for decode, this
+proposal is moot on the delivery's supported shapes.
+
 ## 3. The hole, stated plainly
 
 * **bulk** is the simplest and the most stable, and it wins at ≤ 67 % residency (the shape any 24-32 GB card
@@ -160,3 +210,7 @@ close it; until that is measured, this patch is evidence, not a delivery candida
 4. Keep the phase (SDMA dispatch) as a measurement protocol note; do not tune to it.
 5. Only if step 1 shows decode genuinely needs the big arena: the trade is real, and it is a workload policy
    (prefill bytes vs decode hits) — to be decided by the maintainer per shape, not defaulted from one cell.
+6. **Separate stage — a static tier, contiguous form only** (§2g): pin experts `0..N` in VRAM outside the
+   movable boundary, keep the arena for the complement, and measure (a) decode hit rate vs the adaptive arena at
+   equal bytes, (b) the prefill with the complement as one DMA.  Read `wip/moe-static-hot-tier/` first — the
+   freeze-vs-slab problem and the r74 -1.8-point static penalty are that campaign's recorded results.
