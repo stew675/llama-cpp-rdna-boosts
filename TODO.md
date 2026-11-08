@@ -46,7 +46,6 @@ climbed and its pre-R17 items are closed except `#287` (an upstream candidate) a
 | **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
-| **290** | the fusion dispatcher exists twice while upstream's arms are reconciled | delivery (`ggml-cuda-try-fuse.cu`, `ggml-cuda.cu`) | **OPEN until verified in the re-cut patch at R17 step 1** — resolved at R11, "closed" only once r236 ships it — §290 |
 | **291** | upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | delivery vs upstream (`D1`) | **OPEN — deferred to its own session** (maintainer, 2026-11-08) — a measurement, not a code change — §291 |
 | **292** | `gate-hc-fusions.sh`'s dsv4 soft arms reproduce r235's numerics, not the unfused chain's | gate expectation / `hyperconn.cu` | **OPEN** — created at R12; quantify with the KLD gate at R17 — §292 |
 | **293** | decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support | model file (`src/models/qwen4exp.cpp`) + the fused HC/indexer kernels | **OPEN** — kept at R12 on a measured +31 % decode; the discriminating arm is Q8_0 on 2/3 devices — §293 |
@@ -371,22 +370,6 @@ and `MUL_MAT` suites green, no GPU fault, and a launch census showing the duplic
 delivery must stay green too -- it is now **16/16** (`#304` closed: the compact-ids MMF kernel was dispatching a
 column tile narrower than the grid its seams were built with, see `WORKLOG.md` 261108.009; that fix is the MMF half
 of what this candidate needs).  Delivery-neutral: it must not change the delivery tree.
-
-## 290. The dispatcher merge debt must actually LAND with r236 (resolved at R11)
-
-R11 reconciled the two `ggml_cuda_try_fuse` copies into one and deleted the stale duplicates (`RUNGS.md` R11
-defect 3, `GREEDY-PURITY.md` §84 rule 3) — but the resolution lives in the working chain, so "closed" is only true
-once **r236 ships it**.  **Closing it:** after `scripts/make-patches.sh` at R17, confirm block 10's patch is the
-single-dispatcher body (no `ggml_cuda_try_fuse_legacy()`, no delivery duplicates of upstream arms) and that
-`gate-norm-rows-alias.sh` + `MUL_MAT_ID 931/931` are green on the *re-cut* tree, then close it in `WORKLOG.md`.
-
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-**The fusion dispatcher exists twice while upstream's arms are reconciled**: block 10 moves it into `ggml-cuda-try-fuse.cu`, but upstream added 7 arms to the inline copy in the same re-base range (the MoE weighted-reduction fold, the norm+MUL→mmvq Q8_1 fold, the GDN/SSM state-scatter caches, the SSM conv+l2+gate/beta pre-scan, the DSV4 HC post op).  The interim merge keeps upstream's copy as `ggml_cuda_try_fuse_legacy()` behind the delivery's dispatcher (delivery first, fallback second)
-
-**Kind:** delivery (`ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu`, `ggml-cuda.cu`).
-
-**RESOLVED in the re-base campaign (rung R11, fork `ed1d36436`) — lands with r236.**  Audit result: every upstream arm is already reachable from the delivery's dispatcher (`match_shared_expert_try_fuse` IS upstream's arm; `moe_weighted_reduction_try_fuse` is its superset; `gdn_cache_cpy`/`ssm_scan_cache_cpy` wrap upstream's), so only the DSV4 HC post arm needed folding in — at upstream's own position.  `ggml_cuda_try_fuse_legacy()` and the interim `GGML_CUDA_FUSE_LEGACY` switch are deleted, together with the superseded `ggml_cuda_match_moe_weighted_reduction` matcher/struct/constexpr (143 lines) that only they used.  The audit also proved the "fallback" copy was NOT upstream's text: it carried stale duplicates of delivery arms, one of which (the inline SSM conv-input fold) was not bit-identical in a state-carrying path — `GREEDY-PURITY.md` §84
 
 ## 291. The arena vs upstream's MoE cache: finish the measurement (`D1`, MEASURING)
 

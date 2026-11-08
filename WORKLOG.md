@@ -1,3 +1,21 @@
+## 261108.010 (no release) -- `TODO` #290 closed: the single fusion dispatcher is verified in the tree that R17 cuts from
+
+**`#290` (the dispatcher merge debt) — VERIFIED, not merely asserted.**  R11 reconciled the two
+`ggml_cuda_try_fuse` copies, but the item could only close once the resolution was seen in the tree the patches
+are cut from.  On `rebase-r236` at `3b0978888`:
+
+* `ggml_cuda_try_fuse_legacy` — **0** references; `GGML_CUDA_FUSE_LEGACY` — **0** references (the interim fallback
+  switch and the 143-line superseded matcher are gone, per R11);
+* one dispatcher TU, `ggml-cuda-try-fuse.cu` (3213 lines), with a **single** call site in `ggml-cuda.cu` (plus two
+  comments) — there is no second copy and no upstream arm left unrouted;
+* `scripts/gate-norm-rows-alias.sh` **PASS** ("declines every unsafe alias, keeps the benign one, and reproduces the
+  unfused chain byte for byte");
+* `test-backend-ops -o MUL_MAT_ID` **947/947** (the item asked for 931/931; the extra 16 are the duplicate-id oracle
+  enabled by `#304` earlier today).
+
+`scripts/make-patches.sh` at R17 exports this same tree, so the re-cut patch carries the single-dispatcher body by
+construction; `scripts/validate-set.sh` still has to confirm it applies cleanly.  No code change was needed.
+
 ## 261108.009 (no release) -- `TODO` #304 fixed (a real wrong-answer bug, with a standing oracle), `#279` closed by the new release gate, and the pre-release verdict is now ONE command
 
 `#303` closed earlier today as an inherited cost; this entry is the other half of the pre-R17 list, plus the
