@@ -300,15 +300,24 @@ single run (see the last paragraph):
 | tier | arm | switches | 1-GPU prefill |
 |---|---|---|---|
 | **pool (mirror)** | device gather (**default**) | — | `-ub 2048` **1066**; 5120 1564; 6144 1673; 8192 1791; 16384 1987 |
-| pool | per-expert copy-engine staging | `GGML_SCHED_DEVGATHER=0 MOE_HOST_POOL_STAGE_BATCH=0` | 891; **1837-1849**; 1721-2028; 1829-2133; 1996-2029 |
+| pool | per-expert copy-engine staging | `GGML_SCHED_DEVGATHER=0 MOE_HOST_POOL_STAGE_BATCH=0` | 891; 1837-1849 (see the caveat below); 1721-2028; 1829-2133; 1996-2029 |
 | pool | one-launch staging kernel | `GGML_SCHED_DEVGATHER=0` | the worst of the three at every width measured (-10 to -20 %) |
 | **pinned** | staging kernel (**default**) | — | `-ub 6144` **1793** (phase-balanced) |
 | pinned | no cache staging: one bulk H2D per table | `GGML_MOE_CACHE_STAGE=0` | **2023** (+12.8 %) |
 | pinned | device gather | `GGML_SCHED_DEVGATHER=1` | 1493 (-16 %) |
 
+**CAVEAT (added the same day, from the next session's re-measurement):** the pool tier's width band is **not
+reproducible**.  With a palindrome-order protocol (each point sampled twice, symmetric in the sequence) the
+gather led at every width measured — 4096 `1260.6/1261.4` vs `1121.5/1122.9` (+12.3 %), 4608
+`1322.4/1321.7` vs `1225.1/1216.6` (+8.3 %), 5120 `1389.5/1384.2` vs `1331.3/1302.8` (+5.3 %) — i.e. the
+`1837-1849` above (a previous session, same width) did not reproduce: the copy-engine arm moved ~29 % between
+sessions while the gather moved ~11 %.  So there is **no width threshold to encode** and the gather stays the
+pool tier's default at every width.  Full record: `WORKLOG.md` 261107.012 and
+[`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md).
+
 So, on one GPU: the **gather is the stable default and wins at small ubatches** (a 20 % edge at `-ub 2048`,
-where the routed set is a small fraction of the table); **from `-ub` 5120 up the copy-engine arm is ahead by
-10-18 %** and at 16384 the two tie; the **one-launch kernel should not be selected on either tier** (it
+where the routed set is a small fraction of the table); **from `-ub` 5120 up the copy-engine arm was ahead by
+10-18 % in the r234 session** (not reproduced — see the caveat) and at 16384 the two tie; the **one-launch kernel should not be selected on either tier** (it
 monopolises the CUs and starves the compute kernels — the r114 rationale was a *pageable* master paying a
 bounce memcpy per copy, which a pinned master and a pool alias do not pay).  The archived "the gather wins by
 8192" does **not** reproduce (the copy-engine arm was ahead in 4 of 4 runs at 8192).  **The defaults were
