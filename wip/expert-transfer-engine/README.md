@@ -1,8 +1,13 @@
 # expert-transfer-engine — ONE prefill transport for every shape (OPEN, scoping + a parked experiment)
 
-**Status: OPEN — decision pending on which of the two live transports to consolidate onto.  Nothing in
-`patches/`; the delivery is unchanged at `v16-6050b467c-r234`.  The experiment that produced the numbers below
-is parked as [`0001-no-pinned-staging.patch`](0001-no-pinned-staging.patch) (never applied to the fork).**
+**Status: OPEN — the transport question is now bounded, and the answer is not a transport.  Nothing in
+`patches/`; the delivery is at `v16-6050b467c-r235` and unchanged by this campaign.  Two experiments are parked
+here and **neither is applied to the fork**: [`0001-no-pinned-staging.patch`](0001-no-pinned-staging.patch)
+(the bulk-direction merge, evidence not a candidate) and
+[`0002-stage-copy-streams.patch`](0002-stage-copy-streams.patch) (a selectable fill-stream count — wins on
+dispatch-bound fills, **loses 4 % on the field config**).  Read §7 first: it measures on a **gen5 x16** host, and
+it says the prefill gap is bytes and first-completion latency, not the transport *engine* and not the number of
+VRAM copies.**
 
 ## 1. The problem, in the maintainer's words
 
@@ -258,3 +263,132 @@ close it; until that is measured, this patch is evidence, not a delivery candida
    movable boundary, keep the arena for the complement, and measure (a) decode hit rate vs the adaptive arena at
    equal bytes, (b) the prefill with the complement as one DMA.  Read `wip/moe-static-hot-tier/` first — the
    freeze-vs-slab problem and the r74 -1.8-point static penalty are that campaign's recorded results.
+
+
+## 7. Measured 2026-11-07 on a gen5 x16 host: the gap is not transport (and not the copies)
+
+Artifacts: [`h2d-probe.cpp`](h2d-probe.cpp) (bare `hipcc`, no model: host-kind sweep, granularity x stream count,
+pull kernel, interference, time-to-first-completion), [`heat-run-layout.py`](heat-run-layout.py) (offline
+run-layout analyser over the persisted `MHT2` heat maps), the pipeline arms below (a `llama-cli` harness,
+`-ncmoe 40`/`46`, one R9700).
+
+### 7.1 The box differs from every number in §§2-4, so the crossover must be re-derived
+
+The campaign's transport and residency numbers come from PCIe5 **x8** (`soar` x4 = 14.45 GB/s, `fingon` gen4 x16
+= 28.6 GB/s).  This session's host reports **16 lanes @ 32 GT/s** at the endpoint and the delivery's own
+calibration agrees: `H2D bandwidth calibration: 51.7-52.1 GB/s`, which collapses the staging width gate to
+`min_tokens = 64`.  Measured directly: **55.8 GB/s** for one 333 MiB pinned H2D.  At 2x the link, bulk's PCIe cost
+per ubatch is half what §§2-4 assume, so any "which transport wins" conclusion has to be re-measured here (or
+labelled an x8 number).
+
+### 7.2 Copy-engine mechanics (`h2d-probe.cpp`)
+
+| shape | 1 stream | 2 streams | 4 streams |
+|---|---|---|---|
+| one 333 MiB copy, pinned | 55.8 GB/s | - | - |
+| one 333 MiB copy, registered mmap / write-combined / pageable | 55.8 / 55.8 / 55.4 | - | - |
+| **290 per-expert copies** (0.65 MiB each, the 43 %-resident complement) | **41.1** | **54.8** | 54.9 |
+| 125 run-coalesced copies | 48.2 | 53.9 | 53.7 |
+| vectorised **pull kernel** (int4, 1 CTA/run) | 50.7 | - | - |
+| 8 x 343 MiB copies (one per table) | 55.8 | 55.8 | 55.8 |
+
+* **Allocation kind does not matter for async copies** (all within 1 %).  But a **synchronous `hipMemcpy` out of a
+  `hipHostMalloc` allocation is 27 % slower** (40.7 vs 55.8 GB/s) while sync-from-malloc/registered/WC are full
+  speed — a benchmarking trap, and the delivery's `stage_h2d_gbps()` times a synchronous copy (it uses `malloc`,
+  i.e. the fast path, so the shipped number is honest; change it to pinned and the width gate silently moves).
+* **Run-coalescing the complement is a free 1.17x** (41.1 -> 48.2 GB/s) at zero mass cost — the complement has
+  ~2.3-expert runs, not the ~1.3 §4 assumed.
+* **A second stream is the big lever for dispatch-bound fills** (+33 % on per-expert copies: 41.1 -> 54.8 GB/s,
+  i.e. back to single-big-copy speed; 4 streams add nothing).
+* **A kernel that pulls is not faster than the copy engine on this link** (50.7 vs 55.8 GB/s), and it showed no
+  interference with a concurrent compute kernel in isolation (+0.3 %).  The r221 record's "33 GB/s kernel read vs
+  28.6 GB/s DMA" advantage does not reproduce on a fast link.
+
+### 7.3 The rule: one stream per consumer chain — extra streams delay the FIRST completion
+
+8 x 343 MiB copies, same total bytes every arm:
+
+| streams | **time to first copy** | all copies |
+|---|---|---|
+| 1 | **6.26 ms** | 49.95 ms |
+| 2 | **10.94 ms** (+75 %) | 49.99 ms |
+| 4 | **10.93 ms** (+75 %) | 49.98 ms |
+
+Aggregate bandwidth is invariant (link-bound), but the copy the consumer waits on arrives much later when the link
+is shared with a copy it does not need yet.  So: **extra streams pay only when a fill is DISPATCH-bound; they cost
+you first-completion latency when it is LINK-bound.**  That single rule explains every number in 7.2 and 7.4.
+
+### 7.4 What it does end-to-end
+
+| arm | 1 stream | 2 streams | verdict |
+|---|---|---|---|
+| 35B-A3B, pool mirror, 43 % arena, per-expert copy-engine fill, `-ub 8192` | 3551 | **4702** | **+32 %** (dispatch-bound) |
+| 35B-A3B, same, `-ub 2048` | 1647 | 2060 | +25 %, still 45 % behind the gather (3728) |
+| 35B-A3B, pinned master, staging kernel | 5090 | 5096 | flat (one launch per table) |
+| 35B-A3B, pinned master, bulk | 5219 | 5238 | flat (one copy per table) |
+| 35B-A3B, pool gather (shipped default) | 4931 | 4957 | flat |
+| **Flash-Next, the maintainer's `runme` shape** (pageable master, bulk, 48.2 % residency) | **1538** | **1475** | **-4.1 %** |
+| Flash-Next, same master, default staging | 1449 | 1380 | -4.7 % |
+| Flash-Next, pinned master + bulk, `-ub 2048` / `-ub 8192` | 1380 / 1495 | 1325 / 1436 | -4.0 % both |
+
+Text is byte-identical in every arm and stream count (`262 chars sha=e9db5cb8db0b`), and the staged bytes are
+identical (`ok=117; arena=7733.9 MiB host=10430.1 MiB (H2D 57.4 %)`), so the delta is pure transport.
+**The global stream knob is therefore NOT promotable**: it wins by 32 % on a config whose fill is dispatch-bound
+and loses 4 % on the field config, where the fill is link-bound.  A scoped version (second stream only inside the
+many-small-copy fill loop, whole-table bulk and the staging kernel left on `copy_stream()`) is the only defensible
+form, and it is not worth a block on a 55 GB/s link.
+
+**Also found:** `--load-mode none` silently **disables** the host-expert pool (`a pool needs a mapped load`), so
+a `runme` built on it runs the *pageable bulk* path its own comments do not describe.
+
+### 7.5 The three VRAM copies, and why unifying them does not buy arena
+
+For a host-resident table at prefill, VRAM holds three copies, and each is charged to a **different budget pool**
+(Flash-Next, `--n-cpu-moe 46`, `-c 32768`, 23.69 GiB slab):
+
+| copy | pool | size |
+|---|---|---|
+| arena slots (duplicates of the resident `r x H`) | the arena region, sized at init from `free - reserve - aux` | 22.06 GiB (48.2 % residency) |
+| ring slot pool (`GGML_CUDA_SLAB_RING_MIB`, auto = slots x largest table, capped 6144) | a work sub-region of the slab | `ring_req` 4-6 GiB |
+| `input_cpy` (the consumer's real `src0`) | the work region (narrow floor 1.62 GiB) | ~1.0 GiB (3 tables of a layer) |
+
+Measured (`GGML_CUDA_SLAB_RING_MIB` 6144 -> 2560, two runs each): ring 6.00 -> 2.50 GiB, **arena unchanged at
+22269.8 MiB (48.2 %)**, prefill **1490 -> 1324 (-11 %)**, decode **48.3 -> 49.6 (+2.7 %)**.  So shrinking the
+transport footprint **strands** VRAM instead of converting it into residency (the arena is sized once; `--fit off`
+never re-derives it), and the ring's VRAM is buying prefill, not idle.  Converting freed VRAM into arena needs the
+arena *sizing policy* (the §6.1 question), not a structural merge.
+
+### 7.6 A unified expert store — design direction, not a campaign (`TODO` #285)
+
+Representing **every** expert is cheap: 138 x 512 = 70 656 experts, 4 B residency id each = **276 KiB**; with
+{VA offset, host offset} per expert, **1.08 MiB**; VMM range entries per expert, the same; the ids remap
+(`remap_dev`) 276 KiB.  **~1.5 MiB all-in**, 0.005 % of the card.  What costs is the *backing* (46.2 GiB to hold
+them all), so the only viable form is a **VA reservation with VRAM backing for a resident subset** — block 15's
+KV-window pattern at expert granularity.
+
+What it would fix *structurally*: the arena's stand-down after a slab chunk reclamation makes `arena == nullptr &&
+slots == 0`, i.e. **the whole table leaves the staging path** (`TODO` #271: 50 of 144 tables), whereas a page table
+would flip the evicted experts to host-backed and keep the table addressable.  It also collapses the three
+allocations into one (the fill lands in the table's own VA, the op reads `table + e*stride`, so the ids remap
+disappears) and replaces three sizing rules with one.
+
+What it does **not** fix: the bytes.  Every prefill ubatch routes essentially the whole table (measured: ~15.5 GB
+of *used* experts per ubatch, independent of ubatch size), so a paged store has no cross-ubatch reuse at prefill
+widths; and a host-backed page read in place is 33 GB/s serialised on the compute stream, which loses to the copy
+engine's 55.8 GB/s overlapped.  It is therefore a complexity/robustness win, and the measured baseline it must
+beat is the current fallback, which is **free** (r234: 1826 t/s declined vs 1824 staged, +-0.1 %).
+
+**Constraint that kills the naive form:** it must stay *yieldable*.  A raw `cudaMalloc` outside the slab is the
+pre-slab crash mode (`INVARIANTS.md`, issue #136): a wide prefill's transient work needs that VRAM.  VA outside the
+slab is fine; *backing* outside the movable boundary is not.
+
+### 7.7 Next state
+
+1. `TODO` #284 — defer the ring's redirect restore to `stage_free_ev` so the third copy (`input_cpy`, ~1 GiB) can
+   go; then re-measure it on Flash-Next (the record's one clean A/B put the D2D at +0.3 %, on a shape 4x smaller).
+2. The arena-sizing policy question (§6.1) — now with the number: ~4-5 GiB of transport footprint that only a
+   policy change can turn into residency.
+3. Only if a config with a dispatch-bound fill matters: the scoped stream change (`0002` minus the global knob).
+4. Do **not** re-enter the contiguous static tier (§2g) — 7.4's run-layout analysis prices it at 7-14 points of
+   decode mass (see `heat-run-layout.py`; §2's "one bulk DMA from the contiguous complement" needs a resident set
+   whose heat-weighted mass survives being made contiguous, and it does not).

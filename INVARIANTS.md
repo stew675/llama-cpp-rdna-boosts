@@ -2819,3 +2819,41 @@ rewrites) must use the synchronous copy.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` 
 conservative today (every upload flushes `done_pending`, and `has_done` then waits on the *latest* graph on that
 origin), which is why it was left alone; it is noted so a future third context on one thread is checked, not
 assumed.
+
+## (no release, after r235) -- a fill chain is issued on ONE stream, and the link's first completion is what the pipeline waits on
+
+Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d-probe.cpp` + the pipeline arms;
+`WORKLOG.md` 261107.014).  No delivery change.
+
+- **A fill chain that feeds one consumer must be issued on ONE stream, so completion order matches NEED order.**
+  Extra copy streams do not add link bandwidth: eight 343 MiB H2D copies take **49.95 / 49.99 / 49.98 ms at 1 / 2 / 4
+  streams**, while the **first** copy lands at **6.26 / 10.94 / 10.93 ms**.  A link-bound fill therefore *loses* the
+  earliest-completion latency the 1-deep staging pipeline depends on (measured end-to-end: **-4.1 %** prefill on
+  Flash-Next `-ncmoe 46`, bulk, 48.2 % residency, in every arm including the one-copy-per-table control), while a
+  **dispatch-bound** fill gains strongly (**+33 %** fill bandwidth: 290 x 0.65 MiB copies 41.1 -> 54.8 GB/s;
+  **+32 %** end-to-end on a 35B pool mirror at 43 % arena).  Concurrency is legitimate only across independent
+  resources: copy engine vs compute engine, or one stream per device over its own link (`-sm tensor`'s
+  `stage_input`).  `copy_stream()` is `stream(device, 1)` and that is load-bearing, not incidental.
+- **`GGML_CUDA_GRAPH_OPT=1`'s branch streams collide with the staging copy stream's index.**  The fork/join mapping
+  is `stream_mapping[n] = branch_idx + 1`, i.e. branch 0 lands on `stream(device, 1)` -- the same stream
+  `copy_stream()` returns -- so enabling it queues the staging fills behind branch compute instead of beside it.
+  Dormant (the option is default-off); recorded so it is fixed before anyone enables it (`TODO` #283).
+- **A synchronous copy is not a benchmark for the async path, and one host allocation kind is a trap.**
+  `hipMemcpy` out of a `hipHostMalloc` buffer measures **40.7 GB/s** against the **55.8 GB/s** the same buffer does
+  asynchronously (registered mmap / write-combined / pageable are full speed both ways).  `stage_h2d_gbps()`
+  calibrates the staging width gate with a *synchronous* copy; it happens to use `malloc`, i.e. the fast path, so
+  the shipped gate is honest -- pointing that probe at a pinned buffer would move the gate by ~27 % with no warning.
+- **A host-resident table costs three VRAM copies, and they are three different BUDGET POOLS.**  Arena (duplicates
+  of the resident fraction; sized once from `free - reserve - aux`), the ring sub-region
+  (`GGML_CUDA_SLAB_RING_MIB`, a *work* sub-region), and `input_cpy` (the consumer's real `src0`, inside the narrow
+  work floor).  Measured: cutting the ring 6.00 -> 2.50 GiB leaves the arena **unchanged** (22269.8 MiB, 48.2 %)
+  and costs **-11 %** prefill while returning **+2.7 %** decode -- so transport VRAM is not convertible into
+  residency by shrinking it; that needs the arena *sizing policy*, and the ring's VRAM is buying prefill.
+- **Representing every expert is almost free; backing them is not.**  70 656 experts (Flash-Next: 138 x 512) cost
+  **276 KiB** as int32 residency ids and **~1.5 MiB** with per-expert {VA, host} offsets and the ids remap.  A
+  unified store is therefore a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
+  granularity) -- and it must stay **yieldable**: a raw `cudaMalloc` outside the slab is the pre-slab crash mode
+  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285).
+- **`--load-mode none` silently disables the `--host-experts pool`** (`a pool needs a mapped load`), so a
+  `runme` built on it runs the bulk/pageable path its own comments do not describe.  Read
+  `report_host_expert_placement` before attributing anything to the pool.

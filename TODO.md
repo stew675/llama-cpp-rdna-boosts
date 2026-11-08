@@ -416,6 +416,47 @@ delivery requires for a pref/prefill change — `gate-prefill-logits.sh` must re
 same bytes, so anything else is a bug), same-seed greedy text, `check-gpu-faults.sh`.  **Value:** up to ~3x on the
 default mode's prefill, which is also the baseline every pool claim is divided by.
 
+## 283. `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index
+
+**Status: open, latent (found 2026-11-07 while auditing transfer concurrency; `WORKLOG.md` 261107.014).**  The
+fork/join scheduler maps a concurrent branch to `stream(device, branch_idx + 1)`, so **branch 0 lands on
+`stream(device, 1)` -- exactly `copy_stream()`**, the stream every staging fill, `stage_gather` and the pool fill
+use.  With `GGML_CUDA_GRAPH_OPT=1` a split's whole-table uploads would therefore queue *behind* branch compute
+instead of overlapping it, and a second copy stream (the parked
+`wip/expert-transfer-engine/0002-stage-copy-streams.patch`) would collide at index 2 the same way.  Default-off, so
+nothing ships wrong today.  **Fix when the option is next touched:** give the branch streams their own index base
+(or make `copy_stream()` reserve its index), and add a `-lv 4` assertion that no concurrent branch ever runs on the
+copy stream's index.
+
+## 284. The ring's redirect restore should be deferred to `stage_free_ev` (removes the third VRAM copy)
+
+**Status: open, cheap, measured shape on a small config (`WORKLOG.md` 261107.014; `archive/docs/TENSOR-CORRUPTION.md`).**
+`GGML_SCHED_STAGE_MODE=1` points the split input at the ring slot so the bytes move once instead of twice
+(`H2D` + full-table `D2D` into `input_cpy`), but the generic ring's restore runs at the top of the next
+`sched_stage_issue` -- the "the kernels have been launched" assumption the meta path disproved -- and the record
+lists it as "mode 1 = abort, mode 0 = corrupt" on `-sm layer`.  The fix shape is written down there: **defer the
+restore to the free-event boundary** (the slots already carry `stage_free_ev` for exactly this ordering).  What it
+would buy is real VMEM, not speed on the old box: `input_cpy` is ~1.0 GiB of the 1.62 GiB work floor on Flash-Next
+at `-ncmoe 46`, i.e. +4.5 % arena once a sizing policy can claim it; the one clean A/B on the record (meta path,
+`-sm tensor`, IQ4_XS) put the D2D at **+0.3 %**, so re-measure before believing the 6 % the Flash-Next arithmetic
+suggests.  Gates: same-seed text on Flash-Next at 48 % residency, `gate-prefill-logits.sh` KLD 0.000000.
+
+## 285. A unified expert store: one VA per device, expert-granular residency (`wip/expert-transfer-engine/` §7.6)
+
+**Status: open design direction, not scheduled (scoped 2026-11-07; `WORKLOG.md` 261107.014).**  Today a
+host-resident table is represented by three allocations (arena slots, ring slot, `input_cpy`) with three sizing
+rules and three reclamation semantics, and a slab chunk reclamation stands a whole table down
+(`arena == nullptr && slots == 0`, `TODO` #271).  A single store -- one VA reservation per device, an
+expert-granular page table (**~1.5 MiB for all 70 656 Flash-Next experts**), residency by policy, fills landing in
+the table's own VA, the op reading `table + e*stride` with **no ids remap** -- would make a stand-down a host-backed
+page instead of an unusable table, and collapse the three allocations and three rules into one.  It is **not** a
+prefill speed-up: every prefill ubatch routes essentially the whole table (~15.5 GB of used experts), so there is no
+cross-ubatch reuse, and a host-backed page read in place is 33 GB/s serialised against the copy engine's 55.8 GB/s
+overlapped.  The baseline to beat is the current bulk fallback, which is **free** (r234: 1826 declined vs 1824
+staged).  **Two constraints:** it must stay *yieldable* (a raw `cudaMalloc` outside the slab is the pre-slab crash
+mode, issue #136), and block 15's VMM region maps in whole units and refuses an idle-slot park on a region-backed
+cache -- read `ggml-cuda-vmm-region.cu` and `wip/kv-residency-cleanup/` before designing the page table.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship

@@ -1,3 +1,69 @@
+## 261107.014 (no release) -- expert-transfer-engine: the prefill gap is not the transport engine, and it is not the VRAM copies either
+
+**No delivery change.**  `patches/`, `release.json` and the fork tree are untouched (r235 is the release).  This
+records three measurements and one design direction from `wip/expert-transfer-engine/`, taken on a **PCIe5 x16**
+host -- which is itself the first finding, because every transport conclusion in the campaign was derived on an
+x8 or x4 link.
+
+**The box differs, so the campaign's crossover does not transfer.**  Endpoint reports 16 lanes @ 32 GT/s; the
+delivery's own calibration agrees (`H2D bandwidth calibration: 51.7-52.1 GB/s`, which collapses the staging width
+gate to `min_tokens = 64`), and a 333 MiB pinned H2D measures **55.8 GB/s** against the campaign's 14.45 (x4) and
+28.6 (gen4 x16) GB/s.  At twice the link, bulk's per-ubatch PCIe cost is half of what §§2-4 assume.
+
+**Copy-engine mechanics** (`h2d-probe.cpp`, bare `hipcc`, no model).  (1) Host allocation kind is irrelevant to an
+**async** copy: pinned, registered mmap, write-combined and pageable all measure 55.4-55.8 GB/s.  But a
+**synchronous `hipMemcpy` out of `hipHostMalloc` is 27 % slower** (40.7) while sync-from-malloc/registered/WC are
+full speed -- and `stage_h2d_gbps()` calibrates the staging gate with a *synchronous* copy (it uses `malloc`, i.e.
+the fast path, so the shipped number is honest; point that probe at a pinned buffer and the width gate silently
+moves).  (2) Run-coalescing the complement is a free **1.17x** (41.1 -> 48.2 GB/s) because the complement's runs
+average **2.3** experts, not the ~1.3 §4 assumed.  (3) A second copy stream takes per-expert fills from 41.1 to
+**54.8 GB/s** (+33 %, i.e. single-big-copy speed); four streams add nothing.  (4) A vectorised pull *kernel*
+reaches only 50.7 GB/s against the copy engine's 55.8, so the r221 "kernel read beats the DMA" advantage does not
+reproduce on a fast link; it showed no interference with a concurrent compute kernel in isolation (+0.3 %).
+
+**The rule, and the number behind it: one stream per consumer chain.**  Eight one-table (343 MiB) copies, identical
+bytes every arm: aggregate time is **49.95 / 49.99 / 49.98 ms at 1 / 2 / 4 streams** (link-bound, invariant), but
+the **time to the FIRST copy is 6.26 / 10.94 / 10.93 ms**.  Extra streams do not add bandwidth; they delay the copy
+the consumer is waiting on by sharing the link with one it does not need yet.  So extra streams pay only for a
+**dispatch-bound** fill and cost first-completion latency for a **link-bound** one.
+
+**End-to-end.**  35B-A3B (`-ncmoe 40`, one R9700): pool mirror at 43 % arena with the per-expert copy-engine fill
+goes **3551 -> 4702 t/s (+32 %)** at `-ub 8192` and 1647 -> 2060 at `-ub 2048`; the two arms whose fill is one
+launch (pinned staging kernel 5090 -> 5096) or one copy (pinned bulk 5219 -> 5238) per table are flat, as is the
+shipped pool gather (4931 -> 4957) -- i.e. the gain appears exactly where the op count per table is high.
+Flash-Next in the maintainer's `runme` shape (pageable master, bulk, 48.2 % residency) goes the other way:
+**1538 -> 1475 (-4.1 %)**, and so does every Flash-Next arm including the one-copy control (-4.0 to -4.7 %), because
+its fills are link-bound.  Text is byte-identical in all arms (`262 chars sha=e9db5cb8db0b`) and the staged bytes
+are identical (`ok=117; arena=7733.9 MiB host=10430.1 MiB (H2D 57.4 %)`), so the delta is pure transport.
+**A global stream knob is therefore not promotable**; the experiment is parked as
+`wip/expert-transfer-engine/0002-stage-copy-streams.patch` (never applied to the fork) and only a version scoped to
+the many-small-copy fill loop is defensible.  **Also found:** `--load-mode none` silently disables the host-expert
+pool (`a pool needs a mapped load`), so a `runme` built on it runs the pageable-bulk path its comments do not
+describe.
+
+**The three VRAM copies are three different budget pools, so unifying them does not buy arena.**  Flash-Next at
+`-ncmoe 46`, `-c 32768`, 23.69 GiB slab: arena 22.06 GiB (48.2 % residency, sized once from `free - reserve - aux`),
+ring sub-region `ring_req` 4-6 GiB, `input_cpy` ~1.0 GiB inside the 1.62 GiB narrow work floor.  Measured with
+`GGML_CUDA_SLAB_RING_MIB` 6144 -> 2560: ring 6.00 -> 2.50 GiB, **arena unchanged at 22269.8 MiB**, prefill
+**1490 -> 1324 (-11 %)**, decode **48.3 -> 49.6 (+2.7 %)**.  Shrinking the transport footprint *strands* VRAM rather
+than converting it into residency (the arena is sized once and `--fit off` never re-derives it), and the ring's
+VRAM is buying prefill.  Turning freed VRAM into arena is the §6.1 arena-sizing-policy question, not a merge.
+
+**Design direction recorded, not scheduled** (`TODO` #285): representing **all** experts costs ~**1.5 MiB** (70 656
+experts x 4 B residency id = 276 KiB; + {VA, host} offsets = 1.08 MiB; the ids remap 276 KiB) -- negligible -- so a
+unified store is a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
+granularity).  It would fix `TODO` #271 *structurally* (a stand-down becomes a host-backed page instead of
+`slots == 0`, so the table stays addressable) and collapse three allocations and three sizing rules into one; it
+does **not** change the bytes, because every prefill ubatch routes essentially the whole table (~15.5 GB of *used*
+experts per ubatch) and a host-backed page read in place is 33 GB/s serialised against the copy engine's 55.8
+overlapped.  Its baseline to beat is free (r234: 1826 declined vs 1824 staged, +-0.1 %).  **Constraint:** the
+store must stay *yieldable* -- a raw `cudaMalloc` outside the slab is the pre-slab crash mode (issue #136).
+
+**Recorded:** `INVARIANTS.md` (stream-per-consumer + first-completion, the sync-copy calibration trap, the three
+VRAM pools, the expert-metadata cost), `TODO` #283 (the `GGML_CUDA_GRAPH_OPT` branch streams collide with
+`copy_stream()`'s index), #284 (defer the ring's redirect restore to `stage_free_ev` to remove the third copy), #285
+(the unified store), and `wip/expert-transfer-engine/README.md` §7 with the full tables.
+
 ## 261107.013 (r235) -- PR #283 promoted: the scheduler's async host-input copy stops at the ring's snapshot limit (block 09)
 
 **Delivery change, new release.**  `ggml/src/ggml-backend.cpp` (block 09) + the shared limit in
