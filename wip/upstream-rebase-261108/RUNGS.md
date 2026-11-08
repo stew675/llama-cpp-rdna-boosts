@@ -799,7 +799,7 @@ Exit verified on the real flint model (`/llm/models/RecursiveAI/Flint/Q8_0/flint
 
 - status: **DONE** · sha: `617ee7152` (tree `f6ce37555`) · session 2026-11-09
 
-## R16 — block 15: the streamed KV (window + attendance pool)
+## R16 — block 15: the streamed KV (window + attendance pool) · **NEXT (cold-start brief: `HANDOVER-R16.md`)**
 
 * block sha `69d36099b` · 33 files · +5294 / −56 · **expected conflicts: 9**
 

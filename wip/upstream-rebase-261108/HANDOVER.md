@@ -30,7 +30,12 @@ draft-reserve fold).  `--spec-draft-mtp-vocab N` verified on both head paths and
 **R15 is DONE as well** (`617ee7152`, tree `f6ce37555`, 2026-11-09): block 14 applied with **zero conflicts and
 no drift edits**, and the flint model on this box confirms the block's claim (`-sm relaxed-tensor` == `-sm layer`
 text, while `-sm tensor` is still refused with the block's own message).
-**Your next job is R16** (block 15, the streamed KV — 9 expected conflicts, `D12`/`D13`) — see `RUNGS.md` → R16.  The R13 brief
+**Your next job is R16** (block 15, the streamed KV — 9 expected conflicts, `D12`/`D13`), then R17 (the release
+ladder).  **Read [`HANDOVER-R16.md`](HANDOVER-R16.md) first**: it is the cold-start brief for both — the conflict
+map, the two decisions, the gate list with runtimes and prerequisites (all present on this box), the exact rung
+procedure (deterministic commit ids, squash, identity), the R17 ladder in order, the documentation owed, and the
+traps R13–R15 paid for (unregistered graph inputs, the pool-stack local rule, shared checkpoints, per-build
+coherence oracles).  The R13 brief
 below is kept as the record of how it was resolved.
 
 **The pre-R13 brief (R13, block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
