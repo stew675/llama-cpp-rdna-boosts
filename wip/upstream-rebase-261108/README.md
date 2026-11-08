@@ -91,6 +91,10 @@ numerics; a difference there is recorded, not "fixed".
   configure fail for blocks 00-04 with `unknown type "iq4_nl"`.  This is the "r2 lesson" already recorded in
   `scripts/gate-per-block-build.sh`; the `iq4_nl` instance must be re-set by hand when R06 lands, because that
   variable is set by hand on this box, not by the delivery.
+- **Build with `GGML_HIP_NO_VMM=OFF`** (the maintainer's decision, 2026-11-08: the delivery's host-expert tier
+  needs VMM and upstream's HIP default is `ON`).  `~/bin/build-llama-rocm` now passes
+  `-DGGML_HIP_NO_VMM=OFF`; the earlier `build-rocm-vmm` dir is redundant but kept.  `ENVIRONMENT.md` still calls
+  the flag "an open investigation" — that row needs correcting at R17.
 - **A rung's diff may shrink, and that is the point.**  R01 delivered 34 files / +986−340 from a block of 56
   files / +1366−909 because the difference was rename-only `-Wshadow` ballast (see `RUNGS.md` R01).  Judge a
   rung by its resolutions, not by its line count.

@@ -414,9 +414,14 @@ both beat streaming.  This is one shape, not the delivery's field config (2-3 GP
 
 - status: **DONE (`D1` open)** · sha: `5654a5f95`
 
-## R11 — block 10: slab, fusion dispatcher, async input ring
+## R11 — block 10: slab, fusion dispatcher, async input ring · **BLOCKED 2026-11-08 (GPU fault; branch rolled back to R10)**
 
-* block sha `7342cd95a` · 84 files · +15813 / −5461 · **expected conflicts: 8**
+* block sha `7342cd95a` · 84 files · +15813 / −5461 · **expected conflicts: 8** — found 8 files / 22 hunks
+* **the whole block resolves and builds green**, but the resulting binary **aborts with GPU page faults at
+  `-c 8192`** on a plain dense 4B — a regression this rung introduces, not a merge artefact of the conflicts
+  (see the bisect below).  The branch is therefore back at `5654a5f95` (R10, clean, green) and the full
+  resolution is parked as **`/tmp/r11-resolution.patch`** (83 files, +16987/−5484, 26 832 lines) for the next
+  session.  Nothing of R11 is committed.
 
 | conflicted path | what to expect |
 |---|---|
@@ -432,7 +437,46 @@ territory — the delivery's replay guard must be re-checked, not merged blind.
 **Exit:** build + coherence + `gate-per-block-build` is R17; here run `scripts/gate-norm-rows-alias.sh`
 and the fusion-gate oracle (`tests/test-backend-ops --fusion-gate`, if the flag survives the test refactor).
 
-- status: **TODO** · sha: —
+### R11 conflict map and the resolutions already worked out (in `/tmp/r11-resolution.patch`)
+
+| site | resolution |
+|---|---|
+| `mmid.cu` (9 hunks) | **ours** (the branch): every hunk is block 10's pre-re-base `expert_bounds`-only helper against the re-based `tile_spec` + optional-bounds helper from R01/R09. |
+| `ggml-cuda.cu` (3) | upstream's batched `set_tensor_n`/`get_tensor_n` **plus** the delivery's `ggml_cuda_peer_copy_staged` declaration; `ggml_cuda_should_fuse_mul_mat_q` gains upstream's NVFP4 scale params and stays non-static; **the dispatcher**: block 10 moves it to `ggml-cuda-try-fuse.cu`, upstream added arms to the inline copy — the interim answer is to keep both, delivery first and upstream's as a fallback (see the merge debt below). |
+| `mmq.cuh` (2) | `#include "mmid.cuh"` **and** `"moe-expert-cache.h"`; upstream's `mmq_fusion_is_efficient(prec_requested, …)` plus the delivery's three `*_try_fuse` declarations. |
+| `mmvq.cu` (2) | the delivery's two-arg `mmvq_mmid_max_batch_band(cap, floor)` clamp with upstream's `RDNA4_M` family folded in (RDNA3_5 keeps its own floor, RDNA4_M follows upstream). |
+| `llama-ext.h`, `llama-context.h` | **both APIs**: upstream grew its own device-layer-input feature (`llama_set_embeddings_layer_inp_dev`, `llama_supports_embd_row`, `llama_batch_ext_add_embd_row`) next to the delivery's `llama_lf_*` F1 surface.  **This is a `D15` decision point for R13** — upstream's `embd_row` + `#31506` device-copy DFlash may subsume the F1 draft-feature path. |
+| `llama-context.cpp` (3) | both: the `GGML_FORCE_N_RS_SEQ` diagnostic plus upstream's `!hparams.causal_attn` clamp condition; the F1 `lf_dev_rows` inverse map plus upstream's `embd_row` event recording; the early return for the device layer-input buffer. |
+| `tests/test-backend-ops.cpp` (2) | both: the extra rms_norm widths, and `set_rows` BF16; the `{512,22}` top-k MoE case plus upstream's `{384,…}` ones. |
+| clean-applied sites that needed the merged signatures | the FA chunked-ring launch was missing `kv_rows`; `topk-moe.cu`'s 384-expert arm was missing upstream's five expert-scale/ids arguments; `model.hparams.no_alloc` → `model.no_alloc()` (13 sites). |
+
+**Merge debt created by the dispatcher split (now `TODO #290`):** block 10 moves the fusion dispatcher into
+`ggml-cuda-try-fuse.cu`, but upstream added its own arms to the inline copy in the same range — the MoE
+weighted-reduction fold, the norm+MUL→mmvq Q8_1 fold, the GDN/SSM state-scatter caches, the SSM
+conv+l2+gate/beta pre-scan and the DSV4 HC post op (7 arms).  The interim merge keeps upstream's inline copy as
+`ggml_cuda_try_fuse_legacy()` behind the delivery's dispatcher (delivery first, fallback second), so no arm is
+lost and none is displaced; the debt is to fold the 7 arms into the single dispatcher in a reconciled priority
+order and delete the duplicate.
+
+### The blocking regression (bisected to this rung)
+
+* **Repro:** `llama-cli -m Qwen3.5-4B-Q8_0.gguf -c 8192 -ngl 99 -f prompts/prose-rdna-boosts.txt -n 16
+  --seed 42 --temp 0 --single-turn` → `Aborted` (exit 134), `Memory access fault by GPU node-1 … Page not
+  present`, 11 page-fault lines in the kernel journal.
+* **R10's tree at the same command: exit 0, zero faults.**  R10 also runs `-c 8192` fine on the *VMM* build
+  (the D1 arms), so `GGML_HIP_NO_VMM=OFF` is not the trigger on its own.
+* `gate-norm-rows-alias.sh` fails the same way on its model arms (both `fused` and `chain`), which is the first
+  time that gate could run at all — the fusion dispatcher arrives with this block.
+* **Eliminated by env bisect:** the slab (`GGML_CUDA_SLAB=0`), the expert arena (`MOE_EXPERT_CACHE_MIB=0`), the
+  FA prefill staging arena (`GGML_CUDA_FA_STAGE_MAX_MB=1`) and the interim legacy-dispatcher fallback (rebuilt
+  with it disabled — still faults).  The chunked FA ring is opt-in and off.
+* **Remaining suspects, in the order to try:** the async graph-input ring (`GGML_SCHED_STAGE_SLOTS`,
+  `GGML_SCHED_STAGE_*`), the `ggml-alloc`/`ggml-backend` staging changes in the same block, the peer-copy staged
+  path, the CUDA-graph key/eviction changes in `common.cuh`, and the mmid/mmq/topk-moe launch adaptations above.
+  The fastest discriminator is `GGML_SCHED_STAGE_SLOTS=0`-class switches first, then splitting block 10's own
+  patch into its subsystems for a proper `git bisect`.
+
+- status: **BLOCKED** · resolution parked at `/tmp/r11-resolution.patch`
 
 ## R12 — block 11: qwen4exp
 
@@ -553,7 +597,7 @@ climb touched has a maintainer decision recorded.
 | R08 | 07 | | | | | |
 | R09 | 08 | `af0cae2f1` | 5 expected → 5 files / 8 hunks | build + MUL_MAT_ID 931/931 + fused/chain byte-identical | 2026-11-08 | `D2` complementary (two template arms); `mmq_args` carries `expert_bounds` next to `tile_spec`; norm-rows gate moved to R11 |
 | R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
-| R11 | 10 | | | | | |
+| R11 | 10 | — (rolled back) | 8 expected → 8 files / 22 hunks, all resolved | **build green but a GPU memory fault at `-c 8192`**; R10 does not fault | 2026-11-08 | blocked on a regression inside block 10; resolutions parked in `/tmp/r11-resolution.patch`; candidates eliminated: slab, arena, FA staging, legacy dispatcher |
 | R12 | 11 | | | | | |
 | R13 | 12 | | | | | |
 | R14 | 13 | | | | | |
