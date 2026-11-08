@@ -4,18 +4,19 @@
 (the per-file conflict map) → [`DECISIONS.md`](DECISIONS.md) (`D8`, `D15`) → [`HANDOVER.md`](HANDOVER.md)
 (§0.1 hard rules, §0.2 environment — they still apply verbatim) → [`../../AGENTS.md`](../../AGENTS.md).
 
-**State as of 2026-11-08, end of the session that finished R12.**
+**State as of 2026-11-09, end of the session that finished R13 (this file is now the cold-start brief for
+R14-R17; the R13 brief below is kept as the record of how it was resolved).**
 
 | item | value |
 |---|---|
-| fork checkout | `~/llama.cpp`, branch **`rebase-r236`**, **`b1b0fa807`** (block 11), tree `7baf3ba40`, working tree clean |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r236`**, **`2b09a50b0`** (block 12), tree `87e2841f7`, working tree clean; the R13 work tree is also on `r13-work` (4 wip commits) until the next rung makes it redundant |
 | `master` in `~/llama.cpp` | the pristine snapshot at `a691b2345` — never commit to it |
 | build | `~/bin/build-llama-rocm` (VMM on: `-DGGML_HIP_NO_VMM=OFF`, required by the slab). Green at R12 |
-| ladder | **12 of 16 blocks done** (R01–R12 = blocks 00–11). **R13 is surveyed and PARKED**, then R14 (block 13), R15 (block 14), R16 (block 15), R17 (release ladder) |
+| ladder | **13 of 16 blocks done** (R01–R13 = blocks 00–12). Next: **R14** (block 13), R15 (block 14), R16 (block 15), R17 (release ladder) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-r236`** (pushed); `main` still holds the pre-re-base delivery — the switch-over is R17 |
-| nothing of R13 is committed | the cherry-pick was rolled back deliberately; `patches/`, `release.json` and the fork's `rdna-boosts` branch stay untouched until R17 |
+| R13 committed | `d84c5d74c`, re-cut as `2b09a50b0` with the series identity (deterministic committer date) so the tip is reproducible; `patches/`, `release.json` and the fork's `rdna-boosts` branch stay untouched until R17 |
 
-## §1 Why R13 is parked, and what the next session must do
+## §1 How R13 was resolved (it was parked; this is the outcome)
 
 `be4749a56` (block 12, 81 files, +5893/−995) cherry-picks into **8 files / 24 hunks**, and three of those
 places are **not merges**: upstream and the delivery independently built the same thing, so each needs a
@@ -99,7 +100,15 @@ with r235.  Same command shape: `llama-cli -ngl 99 -c 8192 -f prompts/prose-rdna
 
 If a text moves, that is a finding to report *before* committing — do not "fix" it back.
 
-## §5 R13 verification (the exit criteria, in order)
+## §5 R13 verification — DONE, results in `RUNGS.md` → R13
+
+The exit criteria were met: build green, coherence unchanged against the R12 tree on the dense 4B,
+30B-A3B, 35B-A3B 3-GPU tensor and Flash-Next, `gate-state-pipe.sh` / `gate-park-idle-slots.sh` /
+`gate-ckpt-reuse.sh` green, and the DFlash2 drafter attaches **and drafts** (0.754 / 0.741 / 0.405
+acceptance on the 27B / 35B-A3B / Flash-Next arms — it was 0.000 because of an unregistered graph
+input, see `INVARIANTS.md`).  The commands below are kept as the reference for re-running them.
+
+## §5.1 The R13 verification commands (as issued)
 
 ```bash
 cd ~/llama.cpp && ~/bin/build-llama-rocm            # green, no `<<<<<<<` (git grep '<<<<<<<')

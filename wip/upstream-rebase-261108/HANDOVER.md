@@ -17,7 +17,16 @@ qwen4exp, so the rung was a measured choice between two implementations — the 
 with byte-identical text** on the field config, so it stays.  Read `RUNGS.md` → R12 before touching that model.
 A pre-rung fix also landed: `5f412b011` releases the per-graph MMB/BF16 pool blocks in LIFO order (the VMM pool
 asserts it; every qwen3.8 run crawled to a halt on the first compute step without it).
-**Your next job is R13** (block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
+**R13 is DONE** (`2b09a50b0`, tree `87e2841f7`, 2026-11-09): block 12 resolved as three measured decisions —
+`D15` (F1 deleted, upstream's `embd_row` kept, the Meta refusal carried, the host-experts guard re-measured and
+dropped), the state pipe (kept: 43.7 ms vs 74.7 ms restore, byte-identical), and the prompt cache (upstream's
+API + the delivery's residency/parking policy, with the checkpoint recycle restricted to uniquely-owned
+objects).  Two pre-existing R12 defects were fixed to get there (`-sm layer` ran for the first time after the
+`hc_combine_norm` pool-stack fix; the DFlash drafter was silently dead from an unregistered graph input).
+**Your next job is R14** (block 13, the MTP draft vocabulary subset) — see `RUNGS.md` → R14.  The R13 brief
+below is kept as the record of how it was resolved.
+
+**The pre-R13 brief (R13, block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
 which replaces the R11/R12 history below as the working brief.  R13 is **surveyed and parked**, not started: the
 cherry-pick was examined and rolled back, and `RUNGS.md` → R13 plus **`r13-survey.md`** in this directory are
 the cold-start brief.  It is not one merge but three decisions, each with an oracle: `D15` (the delivery's F1

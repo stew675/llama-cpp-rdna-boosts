@@ -633,7 +633,7 @@ re-examined if the conflict cost per rung keeps growing (`GREEDY-PURITY.md` §84
 
 - status: **DONE (`D3` DECIDED)** · sha: `b1b0fa807`
 
-## R13 — block 12: campaign remainder (CPU wins, iface fills, DFlash, server) · **PARKED 2026-11-08 (survey in `r13-survey.md`)**
+## R13 — block 12: campaign remainder (CPU wins, iface fills, DFlash, server) · **DONE 2026-11-09 (D15 DECIDED: F1 deleted, upstream's `embd_row` kept; host-experts guard dropped after measurement)**
 
 * block sha `be4749a56` · 81 files · +5893 / −995 · **expected conflicts: 8** — found **8 files / 24 hunks**
 * **parked, not blocked**: the cherry-pick was surveyed and rolled back (the branch is at the green R12 tip
@@ -668,7 +668,63 @@ tail, the KV/noise reserve, the in-graph layer-input store, the KV realign; bloc
 is exactly what this rung carries -- but R13's exit must show the drafter attach and generate, because it is
 the one thing the gates above do not cover.
 
-- status: **TODO** · sha: —
+**Result (`d84c5d74c` -> re-cut as `2b09a50b0` with the series identity, tree `87e2841f7`):** build green, no
+conflict markers, warning-clean in the touched files.
+
+* **`D15` — F1 is subsumed, deleted; upstream's `embd_row` surface kept.**  Removed tree-wide: the 5
+  `llama_lf_*` API entries, `cparams.lf_layer_inp_dev` / `lf_dev_inject` / `lf_layer_inp_dev_store[]` /
+  `lf_row_offset`, `llm_graph_result::set_layer_inp` / `lf_emit_layer_inp_store` / `lf_store_armed` /
+  `lf_pending_il` / `t_lf_rows` / `get_lf_rows`, the `dflash.cpp` helper (`llm_graph_input_lf_rows`,
+  `lf_dflash_target_features`), the `speculative.cpp` `lf_dev` / `batch_inject_tok` injection path, and the
+  **31 arch-graph call sites** back to `res->t_layer_inp[il] = ...` (those files end up identical to
+  upstream).  One thing carried, as predicted: **the Meta refusal** — upstream allocates the layer-input
+  buffer on `model.dev_output()`, which under `-sm tensor` is the Meta device, and the draft's
+  `ggml_get_rows` over it GPU-faults (`k_get_rows_float_vec`, 3x gfx1201, first injection).
+  `layer_inp_dev_alloc()` now keeps the host-copies path there.
+* **The F1 host-experts guard was re-measured and DROPPED.**  Condition: `n_seq > 1` + host-resident MoE
+  experts (`-ncmoe`), where r163 had measured the armed slab breaking the draft's device reads.  Two-slot
+  `llama-server` arms, `-sm layer`, 3 GPU, 5256-token prompt, greedy, guard bypassed (device buffer) vs guard
+  active (host copies): Flash-Next GSQ + DFlash2 at `-ncmoe 24` **0.53793 / 0.51678 both ways** (78/145 and
+  77/149, mean len 2.59/2.54, same wall time) and at `-ncmoe 10` **0.55245 / 0.47134 both ways**; 35B-A3B
+  Q8_0 + its DFlash2 at `-ncmoe 10` **0.63918 / 0.62887 both ways**.  Identical to the accepted/generated
+  count.  The guard's premise does not reproduce on the re-based slab, so only the Meta refusal remains, and
+  `LLAMA_DFLASH_DEV=0` stays as the lever.  (Recorded in `../../INVARIANTS.md`.)
+* **State save/restore: the delivery's staged/pipelined copy is NOT subsumed on ROCm.**  Upstream's
+  `ggml_backend_tensor_get_n()` batches per buffer type, but `ggml_cuda_get_tensor_n()` returns false under
+  `GGML_USE_HIP` (the pinned/batched path is CUDA/MUSA-only), so on a tensor split it degenerates to one
+  pageable D2H copy per piece -- exactly the cost r96 removed.  The delivery's pinned `state_stage` +
+  `LLAMA_STATE_PIPE_GROUPS` + threaded streaming copy is kept, re-derived on upstream's `winfos`/`base_ptr`
+  shape, with `get_n`/`set_n` as the fallback; the delivery's per-tensor merge-gap code and
+  `LLAMA_STATE_GET_MERGE_GAP` are gone.  **`gate-state-pipe.sh` PASS**: restore 43.7 ms vs 74.7 ms (sync),
+  server save+load 19.0 vs 39.4 ms, `pipe1` -4.8 %, `copy0` -9.1 %, every arm 5/5 cycles byte-identical.
+* **Server prompt cache: upstream's entry API + the delivery's policy.**  `find()` stays split out of
+  `load(ctx_tgt, ctx_dft, id_slot)`.  Upstream's `shared_ptr` checkpoints forced one behavioural fix: a
+  dropped checkpoint's buffers may only be recycled when uniquely owned, or the cached copy is emptied and a
+  later restore "succeeds" from a state-less checkpoint and then fails `seq_rm` (the state-pipe gate's
+  fresh-reference request aborted before the fix).  **`gate-park-idle-slots.sh` PASS** (6 parks / 2 unparks,
+  park == lazyoff on A-D, parkoff still reproduces #210); **`gate-ckpt-reuse.sh`** hard checks PASS (3 kept,
+  5 vs 8 checkpoints, A2-A4 33/32/32 vs 46/43/43 ms, texts and memory equal).
+* **Two pre-existing R12 defects found and fixed (they blocked the measurements above):**
+  (a) `hc_combine_norm`'s base-out pool copy was a plain local allocated before `bf16_src1_cache_put()`
+  pushes its block -> LIFO violation -> `GGML_ASSERT` in `ggml_cuda_pool_vmm::free` on **every `-sm layer`
+  run of a qwen4exp model** (reproduced identically on the R12 build; fixed by putting the copy on the pool
+  stack); (b) the DFlash `graph<false>` and `graph_dsv4` injection blocks never registered their
+  target-feature input (`res->add_input`), so the drafter was silently dead -- acceptance **0.000 -> 0.754**
+  on 27B+DFlash2 1 GPU (mean len 3.26), 0.741 on 35B-A3B 3 GPU tensor, 0.405 on Flash-Next GSQ, device and
+  host transports identical in every arm.
+* **Coherence (same-session A/B against the R12 tree):** dense 4B `1de99b7e6ee6`, 30B-A3B `4b4d56191368`,
+  35B-A3B 3 GPU tensor rccl `86b7f9b5aa80` -- all unchanged; Flash-Next GSQ `7a8734a9f1a6` (the only §4
+  oracle that reproduces; the other three recorded hashes are pre-re-base and were re-recorded here).
+* **DFlash2 drafter acceptance after the fix** (the R13 headline): 27B+DFlash2 1 GPU 0.754 (3.26),
+  35B-A3B+DFlash2 3 GPU tensor 0.741 (3.15), Flash-Next GSQ+DFlash2 3 GPU tensor 0.405 (2.21) and
+  `-sm layer` 0.384 (2.14), MTP control on the same Flash-Next arm 0.493 (2.42).
+* `D8` (which CPU wins survive the CPU-backend rewrite): block 12's CPU hunks (`arch-fallback.h`,
+  `arch/x86/quants.c`, `ggml-cpu.c`, `ggml-cpu.cpp`, `repack.cpp`) merged without conflict, and `#31854`'s
+  F32-src1 `type_traits_cpu` entry did not collide with them, so nothing was dropped.  **No CPU measurement
+  was taken at this rung** -- the `pp`/`tg` + `test-backend-ops` + `-lv 4` census arm stays owed (moved to
+  `TODO.md` as a column for R17's release ladder).
+
+- status: **DONE** · sha: `2b09a50b0` (tree `87e2841f7`) · session 2026-11-09
 
 ## R14 — block 13: MTP draft vocabulary subset
 
@@ -746,7 +802,7 @@ climb touched has a maintainer decision recorded.
 | R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
 | R11 | 10 | `ed1d36436` | 8 expected → 8 files / 22 hunks | build + 3-model coherence + `gate-norm-rows-alias.sh` PASS + MUL_MAT_ID 931/931 + every fusion arm byte-identical to the unfused chain | 2026-11-08 | unblocked: pair `ncols_max`→`ntj` (the fault), routed-compact gate on `nchannels_y` + `tile_y_j_max`→`tile_y_j_sup` (two latent delivery-code losses, +1.9 % prefill), two-copy dispatcher reconciled to one (TODO #290 closed, stale delivery duplicates incl. a non-pure conv-input fold removed) |
 | R12 | 11 | `b1b0fa807` | 7 expected → 9 files / 34 hunks | build + 4B/30B unchanged + `gate-hc-fusions.sh` PASS + `gate-qwen4exp-quant-coherence.sh` PASS | 2026-11-08 | **D3 DECIDED by measurement**: upstream has its own qwen4exp; the delivery's is bit-identical on Flash-Next 3-GPU tensor and +31 % decode (70.1 vs 53.5 t/s), neutral on 27B → keep ours; `n_pad` ctor/member dropped (#31200), `get_n_kv` requires n_tokens, `#31733`/`#31073`/`#29510` drift re-derived; quant-coherence gate's model selection fixed; dsv4 soft-arm drift recorded as `TODO` #292 |
-| R13 | 12 | — (parked) | 8 expected → 8 files / 24 hunks | — | 2026-11-08 | **surveyed and parked** at the R12 tip; three subsumption decisions need measurement (`D15` F1-vs-`embd_row`, state-pipe-vs-`llama_io_write_host`, prompt cache) — see `r13-survey.md` |
+| R13 | 12 | `2b09a50b0` | 8 expected → 8 files / 24 hunks | build + 4-model coherence (R12-identical) + `gate-state-pipe.sh` PASS + `gate-park-idle-slots.sh` PASS + `gate-ckpt-reuse.sh` PASS (hard checks) + DFlash2 attach/acceptance arms | 2026-11-09 | **`D15` DECIDED**: F1 deleted tree-wide, upstream's `embd_row` kept, Meta refusal carried, host-experts guard re-measured and dropped (identical acceptance on Flash-Next + 35B-A3B, 2 slots, `-ncmoe` 10/24). State pipe kept (gate: 43.7 vs 74.7 ms). Prompt cache = upstream API + delivery policy, with `ckpt_recycle` restricted to uniquely-owned checkpoints. Two pre-existing R12 defects fixed on the way: the `hc_combine_norm` pool-stack LIFO abort on `-sm layer` (`-sm layer` runs for the first time) and the DFlash injection input never registered (dead drafter: 0.000 → 0.754) |
 | R14 | 13 | | | | | |
 | R15 | 14 | | | | | |
 | R16 | 15 | | | | | |

@@ -213,7 +213,14 @@ gains), and does anything become dead code?  Drop only what measurably no longer
 **Measurement:** CPU-side `pp`/`tg` on the host-expert config, `test-backend-ops` for the touched quant
 types, and the delivery's `-lv 4` CPU-path census.
 
-- status: **OPEN** · rung R13 · record: —
+- status: **OPEN — partially addressed at R13, one measurement still owed** · record: `RUNGS.md` R13
+  *R13 (block 12, 2026-11-09): block 12's CPU hunks (`arch-fallback.h`, `arch/x86/quants.c`, `ggml-cpu.c`,
+  `ggml-cpu.cpp`, `repack.cpp`) merged without conflict and `#31854`'s F32-src1 `type_traits_cpu` entry did not
+  collide with ours, so **nothing was dropped** — the wins are still in the tree by construction.  The
+  discriminating measurement (`pp`/`tg` on a host-expert config, `test-backend-ops` for the touched quant
+  types, the `-lv 4` CPU-path census) was **not** taken; it is owed as an R17 release-ladder arm (see
+  `TODO.md`).*
+
 
 ## D9 — Graph cache, views and the allocator
 
@@ -294,3 +301,41 @@ touch.  Pure refactor churn with no decision attached — resolve mechanically, 
 avoids redoing hunks.
 
 - status: **OPEN** · rungs R11..R16 · record: —
+
+## D15 — The delivery's F1 layer-input device store vs upstream's `embd_row` surface
+
+**Upstream:** `llama_set_embeddings_layer_inp_dev()` / `llama_supports_embd_row()` /
+`llama_batch_ext_add_embd_row()` plus `#31506`: the target writes its extracted layer inputs into one
+persistent device buffer (`llm_graph_context::build_layer_inp_dev()`, one `SET_ROWS` per layer, indexed by the
+batch's row ids) and the drafter reads rows of it (`ggml_get_rows`), with a per-batch event so the target does
+not overwrite a row the draft is still reading.
+**Delivery (F1, r163):** `llama_lf_*` + `cparams.lf_layer_inp_dev_store[]` + `llm_graph_result::set_layer_inp()`
+emitting the per-layer `set_rows` store in-graph, plus `lf_row_offset` / `lf_dev_rows` / `lf_dev_inject` and a
+token-batch injection whose token ids are device rows.
+
+**Relation:** the same feature, independently built — upstream's is the successor.
+
+**Decision (R13, 2026-11-09): upstream's, F1 deleted.**  Measured after the deletion, on the re-based tree:
+* 27B UD-Q4_K_XL + DFlash2-Q4_K_M, 1 GPU: acceptance **0.754** (43/57, mean len 3.26), device and host
+  transports bit-identical (same accepted/generated counts).
+* 35B-A3B Q8_0 + DFlash2, 3 GPU `-sm tensor`: 0.741 (3.15); 3 GPU `-sm layer`: 0.639/0.629 with 2 slots.
+* Flash-Next GSQ + DFlash2: 0.405 (2.21) on `-sm tensor`, 0.384 (2.14) on `-sm layer`.
+* MTP control on the same Flash-Next arm: 0.493 (2.42).
+
+**Two things had to be carried/added on upstream's path:**
+1. **The Meta refusal.**  Upstream allocates the layer-input buffer on `model.dev_output()`, which under
+   `-sm tensor` is the Meta device; the draft's `ggml_get_rows` over a Meta buffer GPU-faults
+   (`k_get_rows_float_vec`, 3x gfx1201, first injection).  `layer_inp_dev_alloc()` keeps the host-copies path
+   when the output device is Meta — the same refusal F1 encoded.  Harness note: `LLAMA_DFLASH_DEV` has no
+   device value left to test there; the only lever is the layout.
+2. **The host-experts guard, re-measured and dropped.**  F1 forced the host path when the target had
+   host-resident MoE experts (`-ncmoe`) and `n_seq > 1` (r163: the armed slab was measured to break the
+   draft's device reads there).  Re-measured on the re-based slab with two-slot servers (`-sm layer`, 3 GPU,
+   guard bypassed vs guard active): Flash-Next GSQ `-ncmoe 24` **0.53793/0.51678 both ways** (identical
+   accepted/generated and mean len, same wall time), `-ncmoe 10` **0.55245/0.47134 both ways**; 35B-A3B
+   `-ncmoe 10` **0.63918/0.62887 both ways**.  The premise does not reproduce, so the guard is gone;
+   `LLAMA_DFLASH_DEV=0` remains the lever that forces host copies anywhere, and the 100-128 MiB device buffer
+   that the guard avoided has a graceful host fallback if it does not fit.
+
+**Record:** `RUNGS.md` R13; `INVARIANTS.md` (the Meta-buffer, unregistered-input and per-build-oracle
+entries); the rung commit's body.

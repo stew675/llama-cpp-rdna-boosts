@@ -2908,3 +2908,50 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   is really freed when it reaches the top; `graph_compute`'s per-graph yield drains what is left, top first.
   Any *new* cache or scratch that keeps a `ggml_cuda_pool_alloc` across statements must join that stack --
   and a VMM build is the only build where the mistake is loud.
+- **A feature input that was never registered with `res->add_input()` looks exactly like a bug in whatever
+  consumes it, and every env bisect you try will "move" it (r236, re-base R13).**  `src/models/dflash.cpp`
+  built the DFlash drafter's target-feature tensor (`build_inp_target_features()`) in two of its four
+  injection paths and never called `res->add_input(std::move(inp))`, so `llm_graph_input_embd::set_input()`
+  never ran: the host path uploaded nothing (all-zero features) and the device path consumed an
+  **uninitialized** row-index tensor.  Both still *ran*: the target text stayed coherent, the draft produced
+  tokens, and draft acceptance sat at 0.000-0.019 -- the signature of a silently dead drafter.  Because the
+  uninitialized content changed with whatever else the allocator/slab left in that buffer, the symptom moved
+  with unrelated switches (the delivery's prompt-ingest tail and `GGML_CUDA_SLAB=0` each "fixed" it), which is
+  what made it look like a slab bug.  **Rule: for any graph input that reads as garbage, check that the
+  building code registered it (`res->add_input`) before bisecting env switches** -- grep the `set_input`-ed
+  tensors of that graph against its `add_input` calls.  Detection for the draft case: acceptance ~0 while the
+  generated text is correct (`-lv 4`, the `draft acceptance =` line).
+- **The device pool's LIFO also forbids a plain *local* allocation that is created before a `pool_stack`
+  push in the same scope (r236, re-base R13).**  The `pool_stack` rule above fixes buffers that outlive a
+  statement, but the mirror case is just as fatal: `ggml_cuda_hc_combine_norm_try_fuse()` took its base-out
+  copy as a stack `ggml_cuda_pool_alloc<char>` and then called `set_bf16*()`, whose `bf16_src1_cache_put()`
+  pushes a block of its own -- the local's destructor then freed below a live block and the VMM pool asserted
+  (`ggml-cuda.cu:1360`).  It fired on **every `-sm layer` run of a qwen4exp model** (plain decode, no draft),
+  i.e. a configuration the campaign had never run, and it was pre-existing at R12.  Rule: in a fusion helper,
+  a pool block that must live until the kernel launch and is allocated before a cache `put()` joins the
+  stack too; only allocations made *after* the last push may be plain locals.
+- **Upstream's layer-input device buffer is allocated on `model.dev_output()`, and under `-sm tensor` that is
+  the Meta device -- `ggml_get_rows` over a Meta buffer GPU-faults (r236, re-base R13).**  The DFlash
+  drafter's target-feature gather (`ggml_get_rows(g.layer_inp_src, rows)`) faults in `k_get_rows_float_vec`
+  on the first injection (3x gfx1201, `-sm tensor`, reproducible).  `layer_inp_dev_alloc()` therefore keeps
+  the host-copies path when the output device is Meta -- the same refusal the delivery's F1 encoded
+  ("layer inputs are in a Meta buffer").  A Meta buffer has `set_tensor_n`/`get_tensor_n`/`cpy_tensor_n` all
+  NULL, so every batched state/device copy through one lands on the per-tensor pageable path; that is why the
+  delivery's pinned `state_stage` path exists for those shapes (`gate-state-pipe.sh`, `-sm tensor`).
+- **A prompt-cache checkpoint is shared, not owned: recycle its state buffers only when it is uniquely
+  referenced (r236, re-base R13).**  Upstream's `server_prompt::checkpoints` is `shared_ptr`, shared with a
+  `server_prompt_cache_state` entry; the delivery's r155 buffer-reuse fold *empties* a dropped checkpoint's
+  `data_tgt`/`data_dft` into a spare pool, so recycling a checkpoint the cache still references leaves the
+  cached copy state-less.  A later restore then matches it, `load_tgt()` is a no-op for it, the server
+  believes the slot holds its position, and the KV remove for the rest of the prefix fails:
+  `memory_seq_rm(0, 5242, -1)` -> `GGML_ABORT` in `common_memory::seq_rm`.  `ckpt_recycle()` now takes the
+  `shared_ptr` and returns early unless `use_count() == 1`; the "keep the checkpoint a task just restored"
+  fold moves the pointer to the back of the list instead of rewriting `id_task`/`pos` on the shared object.
+  `gate-state-pipe.sh`'s fresh-reference request is what caught it (R12 runs the same gate clean).
+- **A re-base's coherence oracles are per-build, not carried numbers (r236, re-base R13).**  The campaign's
+  recorded hashes were inherited from the pre-re-base tree: dense 4B `1472ebdadd46`, 30B-A3B `013d09f165a5`
+  and 3-GPU 35B-A3B `90decf558d96` do **not** reproduce on the a691b2345 base (the R12 tree gives
+  `1de99b7e6ee6`, `4b4d56191368`, `86b7f9b5aa80` for the same commands, and R13 gives the same three);
+  only Flash-Next GSQ `7a8734a9f1a6` reproduces.  A re-base moves numerics on purpose, so the oracle table
+  must be re-recorded from a known-good build of the *current* base and the comparison made same-session
+  (R12 vs R13), never against a number from the previous fork point.

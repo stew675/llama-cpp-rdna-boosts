@@ -1,6 +1,13 @@
 # R13 (block 12, campaign remainder) — conflict survey, 2026-11-08
 
-**State: PARKED.**  The branch is back at the green R12 tip (`b1b0fa807`, tree `7baf3ba40`); nothing of
+**State: RESOLVED at R13 (`2b09a50b0`, tree `87e2841f7`) — kept as the record of what the survey got right and
+what it did not.  All three decisions are in `DECISIONS.md` (`D15`) and `RUNGS.md` → R13.  Two things the survey
+did not predict: the state-pipe's competitor (`ggml_backend_tensor_get_n`) is CUDA/MUSA-only on the read side
+(`ggml_cuda_get_tensor_n` returns false under `GGML_USE_HIP`), and the drafter's `0.000` acceptance that the
+DFlash arms showed was neither a feature misalignment nor the slab -- it was a graph input that was built and
+never registered (`res->add_input`), see `INVARIANTS.md`.**
+
+**Original state: PARKED.**  The branch is back at the green R12 tip (`b1b0fa807`, tree `7baf3ba40`); nothing of
 R13 is committed.  This file is the cold-start brief for the next session: it lists what conflicted,
 which conflicts are mechanical, and the **three** places where upstream and the delivery built the same
 thing (those are decisions, not merges).

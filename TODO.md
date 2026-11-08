@@ -464,6 +464,36 @@ staged).  **Two constraints:** it must stay *yieldable* (a raw `cudaMalloc` outs
 mode, issue #136), and block 15's VMM region maps in whole units and refuses an idle-slot park on a region-backed
 cache -- read `ggml-cuda-vmm-region.cu` and `wip/kv-residency-cleanup/` before designing the page table.
 
+## 294. `gate-ckpt-reuse.sh` / `gate-state-pipe.sh` fail on *stale* kernel-journal GPU faults
+
+Both gates end with `check-gpu-faults.sh`, which scans a fixed journal window.  A fault left by an unrelated
+earlier arm in the same session fails the gate even when every one of its own server logs is clean (R13,
+2026-11-09: a pre-guard DFlash arm faulted at 09:31 and the checkpoint gate, which ran 09:45-09:49, reported
+FAIL; `check-gpu-faults.sh --since "12 min ago"` was clean over exactly that window).  `gate-state-pipe.sh` has
+`--no-faults`; the others need either the same flag or a `--since` scoped to the gate's own start time (a
+timestamp taken before the first server starts is the careful form).  Nothing is wrong with the kernels — a
+gate that cannot distinguish "a fault in my run" from "a fault earlier today" costs a re-run and invites the
+wrong conclusion.
+
+## 295. R17 must include a host-expert multi-slot DFlash arm (the guard's detector)
+
+R13 dropped the F1 host-experts guard (`n_seq > 1` + `-ncmoe` -> host copies) because the device buffer and
+the host copies measured identically on the re-based slab (Flash-Next GSQ `-ncmoe` 10/24, 35B-A3B `-ncmoe`
+10, 2 slots, `-sm layer`: 0.53793/0.51678, 0.55245/0.47134, 0.63918/0.62887, both ways).  The failure mode it
+guarded against is **silent** (draft acceptance -> ~0 while the text stays correct), so the release ladder must
+keep one arm that would catch a regression: a host-expert (`-ncmoe`) **two-slot** server with a DFlash drafter
+and the acceptance axis read at `-lv 4`.  Add it to `RUNGS.md` R17's arm list if it is not there — the MTP
+four-axis protocol alone does not cover a `-ncmoe` multi-slot DFlash run.
+
+## 296. `D8`'s CPU-win measurement is still owed at R17
+
+The re-base kept block 12's CPU hunks untouched (`arch-fallback.h`, `arch/x86/quants.c`, `ggml-cpu.c`,
+`ggml-cpu.cpp`, `repack.cpp`; `#31854`'s F32-src1 `type_traits_cpu` entry did not collide with ours), but
+*which* of those wins still pays on the rewritten CPU backend was never measured (`DECISIONS.md` `D8`).  The
+R17 ladder should run the CPU-side `pp`/`tg` on a host-expert config, `test-backend-ops` for the touched quant
+types, and the delivery's `-lv 4` CPU-path census, then either record the surviving wins in `patches/README.md`
+or drop the dead ones.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship
