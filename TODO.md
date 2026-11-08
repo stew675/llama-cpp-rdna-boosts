@@ -596,6 +596,22 @@ residency/thrash hypothesis is needed.
 The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
 never run on RDNA3.5 before this validation.
 
+## 301. r236 is −2 … −3 % on MoE PREFILL against the shipped r235 (decode flat); localise it
+
+First head-to-head (`benchmarks/2026-11-08-rebase-r235-vs-r236.md`, 3 × R9700, interleaved `llama-bench`):
+decode is flat (±0.1 %) on every arm, but prefill is **−3.2 %** on 30B-A3B Q4_K_M (1 GPU), **−2.0 %** on 35B-A3B
+Q8_0 (3 GPU `-sm tensor`) and −1.4 % on a dense 27B, while the dense 4B is flat (−0.2 %) and a host-expert arm
+(`-ncmoe 30`) is +0.7 %.  So it is device-resident-expert prefill, not decode and not the host-expert path.
+
+It is **not** MMB (`GGML_CUDA_MMB=0`: −3.5 %), **not** MMQ (`GGML_CUDA_DISABLE_MMQ=1`: −3.2 %) and **not** the
+fusion dispatcher (`GGML_CUDA_DISABLE_FUSION=1`: −1.6 %) — the gap survives each switch and its absolute size is
+roughly constant (~130-160 t/s), which reads as a per-launch/per-batch cost rather than one kernel.  Next: profile
+both binaries on `30B-A3B Q4_K_M -p 512` (rocprofv3 kernel list + the `-lv 4` launch census), or bisect the rung
+ladder (`gate-per-block-build.sh` already produces all 16 trees' binaries); the bisect is ~16 builds + 16 benches.
+
+Until then, do not claim "r236 is no slower" on MoE prefill — the delivery's headline wins are decode, and this is
+a prefill cost on the MoE field shapes.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship
