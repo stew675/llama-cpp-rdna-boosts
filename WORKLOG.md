@@ -44,6 +44,13 @@ failure is `MUL_MAT_ID(type_a=f16, n_mats=28, n_used=10, n=9, k=256, dup=1)` (ER
 duplicate-id handling survived the re-base with one narrow-`f16` hole — and because upstream keeps the cases
 disabled, **nothing tests it** in `patches/`.  Filed as `#304` (delivery correction, with the recipe).
 
+**The kernel journal in this session carries faults — self-inflicted, and they bound a window.**  The `#287`
+experiments ran the *incomplete* candidate patch on a pristine `a691b2345` build on purpose, and its known-broken
+`MUL_MAT_ID` path page-faulted in `mul_mat_q<(ggml_type)8, 16, …>` at **16:35-16:36** (`pasid` 3083/3137, the
+`test-backend-ops` process); two earlier `dup=1` runs died the same way.  Nothing was a delivery fault (the
+delivery's own runs after that point are clean), but **any gate whose window overlaps 16:29-16:37 on 2026-11-08
+needs `--since` past it** — which is exactly what `#294` made the gates do.
+
 **`#290` (the dispatcher merge debt) — pre-checked on the working chain.**  `ggml_cuda_try_fuse_legacy()` and
 `GGML_CUDA_FUSE_LEGACY` are **absent** from the tree, `ggml-cuda-try-fuse.cu` is the single dispatcher TU, and
 `R11`'s reconciliation is what ships.  The handle stays open only for its own acceptance text: confirm it in the

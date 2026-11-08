@@ -56,6 +56,10 @@ Running the **delivery's** tree (r236, fork `2ff384571`) with those `#if 0` dup 
 handling survived the re-base, with one narrow-`f16` hole → recorded as its own `TODO` entry (`#304`), because it
 is a delivery correctness gap and this PR job is not the place to fix it.
 
+**The journal is now dirty for that window**: the `q8_0`/`f16` runs above page-faulted on 2026-11-08 at
+**16:29-16:37** (`pasid` 3083/3137).  A gate that starts before that needs `check-gpu-faults.sh --since` past it
+(`#294`).
+
 ## How to continue (next session)
 
 ```bash
