@@ -652,7 +652,13 @@ touches 33 of this block's 81 files.  Expect mostly mechanical re-derivation.
 `D8`: which of our CPU wins survive `#31854` (F32 src1), `#31179` (concat rewrite), `#31276`?
 
 **Exit:** build + coherence + `scripts/gate-park-idle-slots.sh` + `scripts/gate-ckpt-reuse.sh` +
-`scripts/gate-state-pipe.sh` (whichever of the three still has its code after the merge).
+`scripts/gate-state-pipe.sh` (whichever of the three still has its code after the merge), **plus a DFlash2 draft
+attach smoke**: at R12, `llama-cli -m <Flash-Next> -md <the DFlash2 drafter> --spec-draft-n-max 3` aborts with
+`dflash requires ctx_other to be set` (llama-context.cpp), i.e. the drafter cannot be attached at all on the
+pre-block-12 tree.  That is *not* a regression this campaign introduced -- the DFlash2 draft path (the ingest
+tail, the KV/noise reserve, the in-graph layer-input store, the KV realign; block 12's r106/r130/r162/r163/r218)
+is exactly what this rung carries -- but R13's exit must show the drafter attach and generate, because it is
+the one thing the gates above do not cover.
 
 - status: **TODO** · sha: —
 
