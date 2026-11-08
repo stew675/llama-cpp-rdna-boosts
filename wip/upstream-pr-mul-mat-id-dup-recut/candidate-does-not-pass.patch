@@ -1,0 +1,256 @@
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 040d390e0..8ce1aa613 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -70,7 +70,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
+         nchannels_y      = ids->ne[0];
+     }
+ 
+-    if (ids && ncols_dst > 16) {
++    // The compact map is built for EVERY MUL_MAT_ID, not only for wide batches: a repeated expert id inside
++    // one token's row is a legal column of its own, and the non-compact path stores one slot per token (it
++    // cannot represent a duplicate at all), so restricting this to ncols_dst > 16 left every narrow
++    // MUL_MAT_ID -- the dup test cases are n = 9 and n = 16 -- on the broken path.
++    if (ids) {
+         const int64_t n_expert_used = ids->ne[0];
+         const int64_t n_experts     = ne02;
+         const int64_t n_tokens      = ne12;
+diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
+index 64de4fb27..ca8b71516 100644
+--- a/ggml/src/ggml-cuda/mmid.cu
++++ b/ggml/src/ggml-cuda/mmid.cu
+@@ -1,30 +1,15 @@
+ #include "common.cuh"
+ #include "mmid.cuh"
+ 
+-// To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
+-struct mm_ids_helper_store {
+-    uint32_t data;
+-
+-    __device__ mm_ids_helper_store(const uint32_t it, const uint32_t iex_used) {
+-        data = (it & 0x003FFFFF) | (iex_used << 22);
+-    }
+-
+-    __device__ uint32_t it() const {
+-        return data & 0x003FFFFF;
+-    }
+-
+-    __device__ uint32_t iex_used() const {
+-        return data >> 22;
+-    }
+-};
+-static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+-
+ // the generic path passes 0, which needs no padding since it never groups lanes by token
+ template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
+ template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
+ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+ 
+-// Helper function for mul_mat_id, converts ids to a more convenient format.
++// Helper function for mul_mat_id, converts ids to a more convenient format.  A repeated expert id inside
++// one token's row is a separate column: every occurrence gets its own compact row (the CPU reference and the
++// Vulkan prepass already treat it that way), which is what keeps a duplicated id from leaving an
++// uninitialised compact tail for the MMQ quantize to read.
+ // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
+ // ids_dst describes the same mapping but for the dst tensor.
+ // The first (n_tokens*n_expert_used + J - 1) / tile_width elements of tile_spec contain the specication for
+@@ -41,83 +26,108 @@ static __global__ void mm_ids_helper(
+     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+     const int expert = blockIdx.x;
+ 
+-    extern __shared__ char data_mm_ids_helper[];
+-    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+-
++    // An expert id may repeat inside one token's id row.  Every occurrence is an independent destination
++    // column and gets its own compact row (the CPU reference and the Vulkan prepass already do this), so the
++    // columns are counted and written per (token, iex) pair, in (token, iex) order -- never one per token.
+     int nex_prev   = 0; // Number of columns for experts with a lower index.
+-    int it_compact = 0; // Running index for the compact slice of this expert.
++    int it_compact = 0; // Number of columns of this expert.
+ 
+     if constexpr (n_expert_used_template == 0) {
+-        // Generic implementation:
++        // Generic implementation: one warp iteration per token, two warp reductions per token.
++        const int lane = threadIdx.x;
++
++        // Pass 1: the compact column count of the experts with a lower index.
+         for (int it = 0; it < n_tokens; ++it) {
+-            int iex_used = -1; // The index at which the expert is used, if any.
+-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+-                const int expert_used = ids[it*si1 + iex];
+-                nex_prev += expert_used < expert;
+-                if (expert_used == expert) {
+-                    iex_used = iex;
+-                }
++            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
++                nex_prev += ids[it*si1 + iex] < expert;
+             }
++        }
+ 
+-            if (iex_used != -1) {
+-                store[it_compact] = mm_ids_helper_store(it, iex_used);
++        // Pass 2: write this expert's columns, one per matching (token, iex) pair.
++        for (int it = 0; it < n_tokens; ++it) {
++            int lane_count = 0;
++            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
++                lane_count += ids[it*si1 + iex] == expert;
+             }
+-
+-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
+-                it_compact++;
++            const int tok_count = warp_reduce_sum<warp_size>(lane_count);
++            const int lane_base = warp_prefix_inclusive_sum<int, warp_size>(lane_count) - lane_count;
++
++            int j = 0;
++            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
++                if (ids[it*si1 + iex] == expert) {
++                    const int pos = nex_prev + it_compact + lane_base + j;
++                    ids_dst[pos] = it*n_expert_used + iex;
++                    // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
++                    if (write_inverse) {
++                        ids_src1[it*n_expert_used + iex] = pos;
++                    } else {
++                        ids_src1[pos] = it*sis1 + iex % nchannels_y;
++                    }
++                    ++j;
++                }
+             }
++            it_compact += tok_count;
+         }
++
++        nex_prev   = warp_reduce_sum<warp_size>(nex_prev);
++        it_compact = warp_reduce_sum<warp_size>(it_compact);
+     } else {
+         // Implementation optimized for specific numbers of experts used:
+         // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
+         constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
+         static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
+-        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
+-            const int it = it0 + threadIdx.x / neu_padded;
+ 
+-            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
++        // Pass 1: the compact column count of the experts with a lower index.
++        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
++            const int it  = it0 + threadIdx.x / neu_padded;
++            const int iex = threadIdx.x % neu_padded;
+             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+                 ids[it*si1 + iex] : INT_MAX;
+-            const int iex_used = expert_used == expert ? iex : -1;
+             nex_prev += expert_used < expert;
++        }
++
++        // Pass 2: write this expert's columns, one per matching (token, iex) pair.  The number of
++        // occurrences of this expert in a token (duplicates allowed) and this lane's rank among them come
++        // from reductions within the token's padded lane group.
++        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
++            const int it  = it0 + threadIdx.x / neu_padded;
++            const int iex = threadIdx.x % neu_padded;
++            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
++                ids[it*si1 + iex] : INT_MAX;
++            const bool match = expert_used == expert;
+ 
+-            // Whether the threads at this token position have used the expert:
+-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
++            const int tok_count = warp_reduce_sum<neu_padded>((int) match);
++            const int lane_rank = warp_prefix_inclusive_sum<int, neu_padded>((int) match) - (int) match;
+ 
+-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
+-            int it_compact_add_lower = 0;
++            // Scan over the tokens at lower positions in the warp for this expert's compact offset.
++            int tok_base = 0;
+ #pragma unroll
+             for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
++                const int tmp = __shfl_up_sync(0xFFFFFFFF, tok_count, offset, warp_size);
+                 if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+-                    it_compact_add_lower += tmp;
++                    tok_base += tmp;
+                 }
+             }
+ 
+-            if (iex_used != -1) {
+-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
++            if (match) {
++                const int pos = nex_prev + it_compact + tok_base + lane_rank;
++                ids_dst[pos] = it*n_expert_used + iex;
++                if (write_inverse) {
++                    ids_src1[it*n_expert_used + iex] = pos;
++                } else {
++                    ids_src1[pos] = it*sis1 + iex % nchannels_y;
++                }
+             }
+ 
+-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
+-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
++            // The thread with the highest index in the warp always has the sum over the whole warp.
++            it_compact += __shfl_sync(0xFFFFFFFF, tok_base + tok_count, warp_size - 1, warp_size);
+         }
+-    }
+-    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+-    ggml_cuda_syncwarp();
+ 
+-    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
+-        const mm_ids_helper_store store_it = store[itc];
+-        const int it       = store_it.it();
+-        const int iex_used = store_it.iex_used();
+-        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
+-        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+-        if (write_inverse) {
+-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
+-        } else {
+-            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+-        }
++        nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+     }
+ 
++    ggml_cuda_syncwarp();
++
+     if (threadIdx.x != 0) {
+         return;
+     }
+@@ -145,21 +155,14 @@ static void launch_mm_ids_helper(
+         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
+         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int tile_width,
+         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+-    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
+-    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+-
+     const int id = ggml_cuda_get_device();
+     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+ 
+     const uint3 tile_width_fd = init_fastdiv_values(tile_width);
+ 
+     const dim3 num_blocks(n_experts, 1, 1);
+     const dim3 block_size(warp_size, 1, 1);
+-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+-    GGML_ASSERT(nbytes_shared <= smpbo);
+-    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
++    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
+         (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
+ }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 852b62701..6e45e2d54 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11906,8 +11906,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+ 
+-    // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
+-#if 0
++    // (the CPU reference and the Vulkan prepass already treat every occurrence of an id as its own column;
++    // the CUDA/HIP helper does too since the duplicate-id fix, so these are enabled)
+     // repeated expert ids within a row
+     for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+         for (int n : {9, 16, 33, 64}) {
+@@ -11919,7 +11919,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 0, true));
+         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
+     }
+-#endif
+ 
+     for (ggml_type type_a : all_types) {
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));

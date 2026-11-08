@@ -33,9 +33,16 @@ delivery then carries only the fork-local remainder.
 
 | directory | what | in the delivery | status |
 |---|---|---|---|
+> **`mul-mat-id-dup/` is being re-cut for `a691b2345`** (`TODO` #287): the old patch no longer applies (upstream's
+> `#31047` rewrote the `MUL_MAT_ID` tile grid), and the partial re-cut — compaction ported, both `mmf` gates
+> removed, dup cases enabled, the MMQ/MMF ids kernels still missing — lives in
+> [`../wip/upstream-pr-mul-mat-id-dup-recut/`](../wip/upstream-pr-mul-mat-id-dup-recut/README.md).  Do not use the
+> directory's patch against the current base.
+
 | [`fa-kv-split-width/`](fa-kv-split-width/README.md) | ggml-cuda: make the FA KV-split (`parallel_blocks`) heuristic query-width independent for small batches, so decode and every spec-verify width reduce identically | **block 00** | validated (gfx1201, issue #25), applies clean to its base |
 | [`fa-decode-verify-kernel-family/`](fa-decode-verify-kernel-family/README.md) | ggml-cuda: keep the decode/verify band on one FA kernel family (a quantized K/V cache took VEC for `n_q <= 2`, TILE from 3) | **block 05** | validated (3x gfx1201) |
 | [`fa-512-rdna-head-cap/`](fa-512-rdna-head-cap/README.md) | ggml-cuda: let RDNA4 use the WMMA FA kernel for head 512 (prefill-only), instead of always falling to the tile kernel | **block 05** (r92, issue #188) | builds and runs on `097cf33d9`; `FLASH_ATTN_EXT` 3993/3993 |
+| [`recurrent-find-slot-rs-max/`](recurrent-find-slot-rs-max/README.md) | llama: `find_slot()` must move `mem_cell::rs_max` with the cell (a rollback after a cell move is refused) | **block 03** (R04) | one line; `git apply --check` clean on **`a691b2345`** (applied tree `bf05f3c47`), validated in the delivery since R04 |
 | [`attn-k-null-mask-guard/`](attn-k-null-mask-guard/README.md) | llama: `llm_graph_input_attn_k` tolerates an absent kq mask (guard the fill, let `can_reuse_impl` accept null) | **block 05** | hardening only upstream — no reachable null-mask path there; the delivery reaches it at `-np 1` (hybrid-K, PR #222, r131) |
 | [`get-rows-iq4-nl-sub-qk-k/`](get-rows-iq4-nl-sub-qk-k/README.md) | ggml-cuda: `GET_ROWS` on an `iq4_nl` row that is not a whole `QK_K` super-block (keeps the node on the GPU) | **block 08** | validated on gfx1201 (split count 142 → 22, +25-36 % prefill) |
 | [`moe-router-tie-break/`](moe-router-tie-break/README.md) | ggml-cuda: make the fused MoE router bit-identical to the generic chain (softmax order, division, stable argsort tie-break) | **block 08** | validated on gfx1201 |

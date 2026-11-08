@@ -1140,6 +1140,41 @@ build" for the f16 arm, and `build-rocm-base` is kept for the `--kv q8_0` arm; `
 
 - status: **DONE** · fork `2ff384571` (block 05) · session 2026-11-08
 
+## P6 — pre-R17: the upstream candidates and the remaining measurements (`#286`, `#287`, `#289`, `#290`) · **DONE 2026-11-08 (one item halved)**
+
+Four handles off the list in one pass; no delivery code changed.  Record: `WORKLOG.md` 261108.007.
+
+**`#286` (Meta compute headroom, `D7`) — closed, both constants stay.**  `max(128*n_tensors, 256)` views: the
+floor only exceeds the multiplier at `n_tensors <= 2` (a Meta compute container holds far more), so it cannot
+replace the multiplier; and the container **grows** on demand, so neither can cause a failure — the multiplier is
+a first-context sizing heuristic.  Measured on Qwen3.5-4B Q8_0 (GDN hybrid), 2 GPU `-sm tensor`, headroom
+**128 / 16 / 1** and `GGML_COMPUTE_BUFFER_MARGIN_PCT=0`: five arms, Meta compute buffer **75.94 MiB** (69.04 with
+the byte margin off), one text `6541eadb9041`.  `D7`'s question answered: the hybrid recurrent graph allocates
+fine with the margin at 0.
+
+**`#289` (upstream PR owed: `find_slot()` must swap `mem_cell::rs_max`) — closed.**  `upstream/recurrent-find-slot-rs-max/`
+(README + patch, applied tree `bf05f3c47`, sha256 `8247e093…`), one line beside the three existing swaps,
+`git apply --check` **clean** on pristine `a691b2345`, repro + filing checklist in the README, row added to
+`upstream/README.md`.
+
+**`#287` (re-cut the mul-mat-id-dup candidate) — HALF DONE, parked as WIP.**  See
+[`../upstream-pr-mul-mat-id-dup-recut/README.md`](../upstream-pr-mul-mat-id-dup-recut/README.md): the
+per-occurrence compaction is ported onto upstream's `tile_spec` writer, both `mmf` gates are removed (the
+delivery's own 6-line delta) and the `#if 0` dup cases are enabled — and it still fails (`f16` numerically at
+every width, `q8_0` at `n=9` page-faults in `mul_mat_q<(ggml_type)8, 16, …>`).  The missing piece is the MMQ/MMF
+**ids kernel** work, entangled with the delivery's pair fusion, so it must be written rather than lifted.
+
+**`#290` (dispatcher merge debt) — pre-checked.**  `ggml_cuda_try_fuse_legacy()` / `GGML_CUDA_FUSE_LEGACY` are
+absent, `ggml-cuda-try-fuse.cu` is the only dispatcher TU, so R11's reconciliation is what ships; the handle keeps
+only its own R17-step-1 acceptance (confirm it **in the re-cut block-10 patch**).
+
+**A new delivery handle fell out of the #287 work — `#304`.**  With upstream's dup cases enabled, the **delivery**
+is **15/16**: everything passes except `MUL_MAT_ID(type_a=f16, n=9, dup=1)` (ERR 0.374).  Because upstream keeps
+those cases `#if 0`, the duplicate path has no standing oracle in `patches/` at all.  Recorded with the recipe
+(fix the narrow-`f16` compact path, then enable the cases in the delivery's test suite).
+
+- status: **DONE** (`#286`, `#289`, `#290` pre-check) / **HALF** (`#287` → WIP) · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1171,6 +1206,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P6 | — | `upstream/recurrent-find-slot-rs-max/` (candidate) | #286/#287/#289/#290: two upstream candidates, one re-cut halved, one pre-check | #286 measured (5 arms), #289 `git apply --check` clean on a691b2345, #287 WIP, #290 pre-checked | 2026-11-08 | found `#304` (delivery is 15/16 on upstream's dup suite) |
 | P5 | — | `2ff384571` (fork, block 05 hunk) | #302: the FA tile loader's per-chunk `kv_rows` select (r236's port) cost 25 % of the FA kernel | fixed (inlined fast path + `__noinline__` kv_rows variant); 30B/35B parity, KLD gate PASS | 2026-11-08 | scratch 376 -> 336 B, 19.6 -> 15.7 ms; residue is the dense `mul_mat_q` (#303) |
 | P4 | — | `30277a117` (fork, block 00/08 hunk) | #301: MoE prefill −2..−3 % localised by kernel census → a duplicate ids compaction (our R01 re-expression) | fixed; 3 arms now −0.1..−1.1 %; 931/931 + texts identical; FA port split out as #302 | 2026-11-08 | one compaction + `mm_id_retile_kernel`; `GGML_CUDA_DISABLE_MMQ` correction recorded |
 | P3 | — | `9b7dfb47a` (fork, block 10 hunk) | #298: one live pool-order violation in the cublas BF16 src1 cache path (plus 4 sites audited clean) | reproduced (F16 4B + `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`), fixed, inert (3 hashes + `gate-hc-fusions` PASS) | 2026-11-08 | the registered block is reserved before any plain pool allocation |

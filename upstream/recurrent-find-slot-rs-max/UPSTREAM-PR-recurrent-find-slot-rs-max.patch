@@ -1,0 +1,16 @@
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 9213ac1dc..b64a3b28a 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -646,6 +646,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+             std::swap(dst_cell.pos, src_cell.pos);
+             std::swap(dst_cell.src, src_cell.src);
+             std::swap(dst_cell.seq_id, src_cell.seq_id);
++            // the rollback bound belongs to the state, not to the cell index: the gather/re-order loop moves
++            // the cell's data (and re-points the tails), so the bound has to travel with pos/src/seq_id or a
++            // rollback after a move reads the *destination* cell's limit while the snapshots came from the
++            // source cell -- seq_rm() then refuses a legal rollback
++            std::swap(dst_cell.rs_max, src_cell.rs_max);
+ 
+             // swap tails
+             for (uint32_t j = 0; j < size; ++j) {

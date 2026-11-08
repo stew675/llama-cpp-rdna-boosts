@@ -1,3 +1,54 @@
+## 261108.007 (no release) -- `#286` and `#289` close, `#287` re-cut is half done (WIP) and it found a delivery gap (`#304`), `#290` pre-checked
+
+No delivery code changed in this entry; two upstream candidates and one campaign record were produced, and two
+`TODO` handles closed with measurements.
+
+**`#286` (the Meta compute headroom, `D7`) — measured, both constants stay.**  `ggml-backend-meta.cpp` sizes the
+compute container at `max(compute_headroom * n_tensors, compute_headroom_min)` views with `compute_headroom = 128`
+(delivery) and `compute_headroom_min = 256` (upstream `#31447`).  Two facts settle the question:
+
+* the floor is only larger than the multiplier when `n_tensors <= 2` (`128*n < 256`), and a Meta compute container
+  holds far more tensors than that — so **the floor cannot make the multiplier redundant**;
+* the container **grows** when a generation registers more views (`ctx_for_new_tensor`), so neither constant can
+  cause an allocation failure on the new base: the multiplier is a first-context *sizing* heuristic.
+
+Measured on Qwen3.5-4B Q8_0 (a GDN hybrid), 2 GPU `-sm tensor`, `GGML_META_COMPUTE_HEADROOM` at **128 / 16 / 1**
+(1 = the floor alone) and `GGML_COMPUTE_BUFFER_MARGIN_PCT=0`: all five arms run, the Meta compute buffer is
+**75.94 MiB** in the first four and **69.04 MiB** with the byte margin off (the margin is the byte knob; the
+headroom is the views knob), and every arm's greedy text is `6541eadb9041`.  So `D7`'s question — "does the
+hybrid recurrent allocation succeed with the margin at 0?" — is **yes**, and the multiplier is not something the
+floor can replace.  No code change: `ENVIRONMENT.md` already described `GGML_META_COMPUTE_HEADROOM` this way.
+
+**`#289` (upstream PR owed: `find_slot()` must swap `mem_cell::rs_max`) — candidate cut and checked.**
+`upstream/recurrent-find-slot-rs-max/` (README + patch, an applied tree `bf05f3c47`, sha256 `8247e093…`):
+one line beside the existing three swaps, `git apply --check` **clean** on a pristine `a691b2345`.  The README
+carries the reproduction (three sequences, a batched verify that makes `find_slot` re-order cells, then a legal
+rollback; the delivery's `test-recurrent-state-depth` Phase C refused rollbacks 2..4 / 6..8 before the swap and
+passes all three phases after it) and the note that upstream's own `rollback_bound` cases never move a cell.
+Row added to `upstream/README.md`.
+
+**`#287` (re-cut `UPSTREAM-PR-mul-mat-id-dup.patch`) — half done, and it is WIP now.**
+`wip/upstream-pr-mul-mat-id-dup-recut/` (`candidate-does-not-pass.patch`, sha256 `2e39b670…`) ports the
+**per-occurrence compaction** onto upstream's `tile_spec` writer, removes **both** `mmf` gates (`mmf.cu` builds the
+compact map for every `MUL_MAT_ID`, `mmf.cuh` selects the compact kernel for every `MUL_MAT_ID` — which is
+*exactly* the delivery's own 6-line delta), and re-enables upstream's `#if 0`'d dup cases.  It still fails:
+`f16` dup cases are numerically wrong at every width and `q8_0` at `n=9` **page-faults** inside
+`mul_mat_q<(ggml_type)8, 16, …>(…, ggml_mm_id_tile_spec const *, …)`.  The missing piece is the MMQ/MMF **ids
+kernel** work, which in the delivery is entangled with its gate+up pair fusion (`+589`/`+481` lines) and cannot be
+lifted out; the README names the three sites and the acceptance.  `upstream/README.md` now says the old patch
+must not be used against the current base.
+
+**A delivery finding that fell out of it (`#304`).**  Running the **delivery's** tree with those `#if 0` dup cases
+temporarily enabled gives **15/16**: every `q8_0`/`q4_0` and the wide `f16`/offset cases pass, and the single
+failure is `MUL_MAT_ID(type_a=f16, n_mats=28, n_used=10, n=9, k=256, dup=1)` (ERR 0.374 vs 5e-4).  So the
+duplicate-id handling survived the re-base with one narrow-`f16` hole — and because upstream keeps the cases
+disabled, **nothing tests it** in `patches/`.  Filed as `#304` (delivery correction, with the recipe).
+
+**`#290` (the dispatcher merge debt) — pre-checked on the working chain.**  `ggml_cuda_try_fuse_legacy()` and
+`GGML_CUDA_FUSE_LEGACY` are **absent** from the tree, `ggml-cuda-try-fuse.cu` is the single dispatcher TU, and
+`R11`'s reconciliation is what ships.  The handle stays open only for its own acceptance text: confirm it in the
+**re-cut** block-10 patch at R17 step 1.
+
 ## 261108.006 (no release) -- `TODO` #302 closes: the FA tile loader's `kv_rows` select is out of the fast path, and both MoE prefill arms are back to parity
 
 **Fork change, block 05** (`ggml/src/ggml-cuda/fattn-mma-f16.cuh`, +36/-5, fork `2ff384571`, tree `eda002cc2`).

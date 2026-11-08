@@ -46,9 +46,7 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **283** | `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index | correctness (latent, default off) | **OPEN** — fix when the option is next touched — §283 |
 | **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
-| **286** | the Meta compute-container headroom is carried two ways (the 128 multiplier *and* upstream's 256 floor) | correctness / allocation (`ggml-backend-meta.cpp`) | **OPEN** — found at R01 (`D7`); decide at R17 which constant sizes the buffer — §286 |
-| **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` onto `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN** — found at R01; a transcription plus a PR-body refresh — §287 |
-| **289** | upstream `find_slot()` moves a recurrent cell's state but not its rollback bound | upstream candidate, not delivery | **OPEN** — fixed in the delivery at R04; upstream has the omission — §289 |
+| **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **290** | the fusion dispatcher exists twice while upstream's arms are reconciled | delivery (`ggml-cuda-try-fuse.cu`, `ggml-cuda.cu`) | **OPEN until verified in the re-cut patch at R17 step 1** — resolved at R11, "closed" only once r236 ships it — §290 |
 | **291** | upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | delivery vs upstream (`D1`) | **OPEN — deferred to its own session** (maintainer, 2026-11-08) — a measurement, not a code change — §291 |
 | **292** | `gate-hc-fusions.sh`'s dsv4 soft arms reproduce r235's numerics, not the unfused chain's | gate expectation / `hyperconn.cu` | **OPEN** — created at R12; quantify with the KLD gate at R17 — §292 |
@@ -57,6 +55,7 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 | **303** | the dense MMQ kernel is 1.4 % slower than r235 at the **same** instantiation, grid and launch count (VGPR 232 → 216): `mul_mat_q<Q8_0, 128, …>` carries the residual −1.5 % on dense prefill | performance (delivery, block 00/08 `mmq.cu`/`mmq.cuh`; found closing `#302`) | **OPEN** — found 2026-11-08 in the `rocprofv3` census of the 27B arm; the run is 986 launches in both builds — §303 |
+| **304** | `MUL_MAT_ID` with repeated expert ids **fails for `f16` at `ncols_dst = 9`** (ERR 0.374 vs 5e-4); every other dup case passes.  Upstream keeps those cases `#if 0`, so nothing in `patches/` tests the duplicate path at all | correctness (delivery, narrow `f16`/`mmf` dispatch) | **OPEN** — found 2026-11-08 while re-cutting `#287`; the delivery is **15/16** on upstream's dup suite — §304 |
 
 ## Handle numbering
 
@@ -371,58 +370,26 @@ staged).  **Two constraints:** it must stay *yieldable* (a raw `cudaMalloc` outs
 mode, issue #136), and block 15's VMM region maps in whole units and refuses an idle-slot park on a region-backed
 cache -- read `ggml-cuda-vmm-region.cu` and `wip/kv-residency-cleanup/` before designing the page table.
 
-## 286. Re-measure the Meta compute headroom (the delivery's 128 multiplier vs upstream's 256 floor)
+## 287. Re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` onto `#31047`'s `tile_spec` grid
 
-`ggml/src/ggml-backend-meta.cpp` resolves the tensor-split compute headroom as
-`compute_headroom = 128` (delivery) inside a `std::max(..., compute_headroom_min = 256)` (upstream `#31447`-era).
-R01 kept **both** and recorded the question (`DECISIONS.md` `D7`, `RUNGS.md` R01).  Two constants with different
-meanings now compete, and nobody has checked whether the delivery's 128 multiplier is still doing anything under
-upstream's floor.
+**Status: HALF DONE (2026-11-08) — the work is in [`wip/upstream-pr-mul-mat-id-dup-recut/`](wip/upstream-pr-mul-mat-id-dup-recut/README.md)
+and it does NOT pass.**  The old patch was cut against `097cf33d9` and `git apply --check` fails on `a691b2345`
+(`mmq.cuh:995`), because upstream's `#31047` rewrote the same `MUL_MAT_ID` tile scheduling.
 
-**Closing it:** a 2-device `-sm tensor` arm with the headroom forced by each mechanism (`--fit` on a config that is
-marginal for VRAM, or a `test-backend-ops`/`llama-bench` pp arm at a context that makes the compute buffer the
-limiter), showing which constant actually sizes the buffer and that the other can go — or that both are needed, with
-the number.  Record the buffer sizes from the log, not the constants.
+Done in `candidate-does-not-pass.patch` (sha256 `2e39b670…`): `mmid.cu`'s helper rewritten for **per-occurrence**
+compaction on upstream's `tile_spec` writer (and the `mm_ids_helper_store` staging buffer dropped), `mmf.cu`'s
+build-the-compact-map gate and `mmf.cuh`'s select-the-compact-kernel gate both removed for **every** `MUL_MAT_ID`
+(this is exactly the delivery's own 6-line delta), and upstream's `#if 0` `[TAG_MUL_MAT_ID_DUPLICATE_ID]` cases
+re-enabled.  It still fails: `f16` dup cases are numerically wrong at every width and `q8_0` at `n = 9`
+**page-faults** in `mul_mat_q<(ggml_type)8, 16, …>(…, ggml_cuda_mm_id_tile_spec const *, …)`.
 
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-**The Meta compute-container headroom is now carried two ways** — `compute_headroom = 128` per tensor (block 00) *and* upstream `#31447`'s `compute_headroom_min = 256` floor.  The floor may make most of the raised multiplier redundant, or the multiplier may still cover shapes the floor does not (upstream's case is a KV cache shared by many layers; ours is `~2*(n_rs_seq+1)` conv-state snapshot views per recurrent layer)
-
-**Kind:** correctness/allocation (`ggml/src/ggml-backend-meta.cpp`; `BASELINE.md` provenance item 2, `INVARIANTS.md`).
-
-**OPEN — found 2026-11-08 at re-base rung R01 (`wip/upstream-rebase-261108/DECISIONS.md` → `D7`).**  The merge keeps both (the floor is strictly additive), so nothing is at risk; what is unmeasured is whether `GGML_COMPUTE_BUFFER_MARGIN_PCT=0` *plus* the 256 floor now allocates the hybrid recurrent graph that motivated the multiplier.  Measure at R17 on a hybrid recurrent model (qwen3.5/3.6/3.8 or deepseek41), then narrow the multiplier (correcting the invariant in the same change) or record why both stay
-
-## 287. Re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid
-
-The upstream PR candidate for the duplicate `mul_mat_id` launch was cut against the old base; `#31047` moved the
-grid/tile representation (`tile_spec`, `nchannels_y = 1` on the ids path — `GREEDY-PURITY.md` §84).  **Closing it:**
-re-cut the patch against `a691b2345`, confirm it applies to unadulterated upstream and still removes the duplicate
-launch (a launch-census before/after), then update `upstream/README.md`'s sha256.  Delivery-neutral; it is an
-upstream contribution, so it must not change the delivery tree.
-
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-**`upstream/UPSTREAM-PR-mul-mat-id-dup.patch` is stale: upstream rewrote the same MUL_MAT_ID tile scheduling in `#31047`** (`tile_spec`, one block per tile, no in-kernel column loop), so the duplicate-ids fix has to be re-expressed on that grid and the PR re-cut.  The delivery's own resolution is the reference: per-occurrence compaction in `mm_ids_helper` + upstream's seam writer, `test-backend-ops -o MUL_MAT_ID` **931/931** on gfx1201
-
-**Kind:** upstream candidate (`upstream/`), not delivery.
-
-**OPEN — found 2026-11-08 at re-base rung R01.**  The delivery side is solved (block 00 re-based on `rebase-r236` as commit `4aaffd1c0`), so the re-cut is a transcription plus a PR-body refresh; the `upstream/README.md` index row and the patch sha256 move with it.  Do not cut the PR against the delivery tree
-
-## 289. Upstream PR owed: `find_slot()` must swap `mem_cell::rs_max`
-
-Found and fixed **in the delivery** at R04: `find_slot()` recycles a cell by assigning `pos`/`src`/`seq_id` but leaves
-`rs_max`, so the moved cell's rollback bound refuses legal rollbacks.  The delivery's fix is in block 03; the
-**upstream PR is owed** (`HANDOVER.md` §5 item 8 has the full note).  **Closing it:** a patch under `upstream/` cut
-against `a691b2345` that applies to unadulterated upstream, with the reproduction (a `test-recurrent-state-depth`
-arm or the `-nrs` rollback scenario that fails without it).
-
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-**Upstream `find_slot()` moves a recurrent cell's state but not its rollback bound** — the gather/re-order loop swaps `pos`, `src` and `seq_id` (and re-points the tails) while `mem_cell::rs_max` (`#31368`) stays with the physical cell index.  After a move, `seq_rm()` therefore reads the *destination* cell's bound while the snapshots come from the *source* cell (planes 1..`n_rs_seq` are moved by index, r195), so a legal rollback is refused: measured on the delivery's `test-recurrent-state-depth` Phase C, `n_rs_seq` 4 and 8 refused rollbacks 2..4 and 6..8 only in the batched-`[seq 0, seq 2]` arm, and **every** phase passes once the bound is swapped with the state
-
-**Kind:** upstream candidate (`upstream/`), not delivery.
-
-**OPEN — found and fixed in the delivery on 2026-11-08 at re-base rung R04** (`git show` the `find_slot` swap in `src/llama-memory-recurrent.cpp`: `std::swap(dst_cell.rs_max, src_cell.rs_max)`).  Unadulterated upstream has the same omission, so it needs a PR: a one-line fix plus the `test-recurrent-state-depth` Phase C scenario as the test (upstream's own `rollback_bound` cases do not move a cell).  `test-backend-ops`/`test-llama-context` cannot see it -- it needs the multi-sequence move
+**Closing it:** the remaining piece is the **MMQ/MMF ids kernel** work (the column tile iterating `tile_spec`
+seams, the per-tile `tile_spec` read, `mul_mat_f_ids`'s store loop `continue` + per-tile C re-zero).  In the
+delivery that code is entangled with its gate+up pair fusion, so it has to be written, not lifted.  Acceptance:
+`test-backend-ops -o MUL_MAT_ID -p 'dup=1'` **16/16** on a pristine patched `a691b2345`, the full `MUL_MAT_ID`
+and `MUL_MAT` suites green, no GPU fault, and a launch census showing the duplicate columns are covered.  The
+delivery must stay green too (see `#304` for its own 15/16).  Delivery-neutral: it must not change the delivery
+tree.
 
 ## 290. The dispatcher merge debt must actually LAND with r236 (resolved at R11)
 
@@ -555,6 +522,32 @@ lower needs no numerical change to show up as this.  Gates: `gate-prefill-logits
 mandatory even when the text is unchanged; a fresh base from the unpatched build already exists at
 `~/.cache/rdna-boosts/gates/`), same-seed greedy text, `test-backend-ops -o MUL_MAT_ID` 931/931 and the dense
 `MUL_MAT` suite.  Worth ~1.1 % of dense prefill (the 27B arm) and ~0.4 % of the MoE arms' prefill.
+
+## 304. `MUL_MAT_ID` duplicate ids: `f16` at `ncols_dst = 9` is wrong (and nothing tests the path)
+
+Found 2026-11-08 while re-cutting `TODO` #287.  Upstream's `[TAG_MUL_MAT_ID_DUPLICATE_ID]` cases
+(`tests/test-backend-ops.cpp`, `test_mul_mat_id_dup`) are `#if 0` with the note *"disabled until CUDA backend
+support is added"* — in **r235 and r236 alike**, because the delivery never re-enabled them.  So the delivery's
+duplicate-id handling (block 00's foundation fix) has been shipping **untested** by its own oracle.
+
+Measured by temporarily enabling them on the r236 tree (fork `2ff384571`) and running
+`test-backend-ops -o MUL_MAT_ID -p 'dup=1'`: **15/16**.  Every `q8_0`/`q4_0` case and the wide `f16` /
+`ids_offset` cases pass; the single failure is
+
+```
+MUL_MAT_ID(type_a=f16, type_b=f32, n_mats=28, n_used=10, b=0, m=1024, n=9, k=256, m_v=0, ids_offset=0,
+           skip=0, dup=1):  ERR = 0.374 > 0.000500   FAIL
+```
+
+i.e. the narrow-`f16` shape only (the compact path there is `mmf`'s, and the delivery's `mmf` delta against
+upstream is only the two gates — so the narrow-width column handling in `mul_mat_f_ids`/the F16 tile loop is the
+suspect).  The `full MUL_MAT_ID` suite is 931/931 with the cases disabled, so nothing else is affected.
+
+**Closing it:** fix the narrow-`f16` compact path, then **enable the dup cases in the delivery's
+`tests/test-backend-ops.cpp`** so the path has a standing oracle (they are upstream's tests; enabling them is a
+test-only change and it is what makes `#287`'s upstream PR checkable against the delivery).  Gates: `dup=1`
+**16/16**, the full `MUL_MAT_ID` suite, `MUL_MAT`, same-seed greedy text on a MoE arm, `check-gpu-faults.sh`.
+The narrow-`f16` path is `mmf`'s, so run it on a box where `mmf` is selected (gfx1201, `ncols_dst <= 16`).
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
