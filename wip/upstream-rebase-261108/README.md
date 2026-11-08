@@ -12,6 +12,13 @@ one resumes with `git cherry-pick <next block>`.  The rungs are in [`RUNGS.md`](
 evidence the ladder was laid out from) in [`CONFLICT-MAP.md`](CONFLICT-MAP.md) — regenerate it with
 [`probe-conflicts.py`](probe-conflicts.py) (machine-readable output: `conflict-map.json`).
 
+**Scope: `patches/` only.**  The maintainer's ruling (2026-11-08): every open `wip/` campaign's patches are
+**ignored** for this re-base — they are *not* applied, not rebased and not consulted while resolving a rung,
+and a rung that seems to need one gets a `TODO.md`-shaped note instead.  They will each be adapted to the new
+base in their own later session.  The same goes for `beta/`, `optional/` and `archive/work/` artifacts.  The
+re-base's only inputs are the 16 block commits of `patches/` (and the reference records the rungs cite,
+which are read, not applied).
+
 ## §0  Baseline facts (as measured 2026-11-08)
 
 | item | value |
@@ -78,6 +85,15 @@ numerics; a difference there is recorded, not "fixed".
   once, at R17, from the finished branch.
 - **`-sm tensor` needs `HIP_VISIBLE_DEVICES` pinned** (the iGPU is otherwise enumerated and the load aborts
   with `invalid kernel file`).
+- **A rung build needs a CLEAN configure** (`~/bin/build-llama-rocm clean`; ~1m20s wall on warm ccache).  A
+  reused `CMakeCache.txt` carries the *tip's* options, and some of them are illegal at an earlier rung — the
+  live example is `GGML_CUDA_FA_QUANTS`, which holds block 05's `iq4_nl-iq4_nl` instances and makes the
+  configure fail for blocks 00-04 with `unknown type "iq4_nl"`.  This is the "r2 lesson" already recorded in
+  `scripts/gate-per-block-build.sh`; the `iq4_nl` instance must be re-set by hand when R06 lands, because that
+  variable is set by hand on this box, not by the delivery.
+- **A rung's diff may shrink, and that is the point.**  R01 delivered 34 files / +986−340 from a block of 56
+  files / +1366−909 because the difference was rename-only `-Wshadow` ballast (see `RUNGS.md` R01).  Judge a
+  rung by its resolutions, not by its line count.
 - **Report before deciding.**  Any rung that reaches a `DECISIONS.md` item stops there: present the
   measurement and the options to the maintainer and wait.  Never drop delivery code because "upstream's
   looked newer" (see `AGENTS.md` → report findings).

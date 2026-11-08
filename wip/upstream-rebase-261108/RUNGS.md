@@ -23,9 +23,11 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 
 ---
 
-## R01 — block 00: foundation (band uniformity, Meta wrapper, allocator)
+## R01 — block 00: foundation (band uniformity, Meta wrapper, allocator) · **DONE 2026-11-08**
 
 * block sha `a900d4703` · 56 files · +1366 / −909 · **expected conflicts: 12**
+* **result: `4aaffd1c0` · 34 files · +986 / −340** (tree `10a57f7c4`), build green (1m22s, clean
+  configure), coherence green, `test-backend-ops -o MUL_MAT_ID` **931/931** on gfx1201
 
 | conflicted path | what to expect |
 |---|---|
@@ -44,7 +46,39 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 
 **Exit:** build + coherence + `git grep '<<<<<<<'` clean + log.
 
-- status: **TODO** · sha: —
+### R01 resolution log (what was resolved, and why)
+
+Upstream met this block in three places: `#31047` (MoE data-layout linearisation → `tile_spec`), the
+graph/model/memory-instance refactors (→ 15 conflicts in `llama-model.cpp`), and `#31447` (Meta compute
+views).  Everything else in the block was **rename-only `-Wshadow` ballast** and was not carried.
+
+| site | resolution |
+|---|---|
+| `ggml-cuda/mmid.cu` | **re-implemented**: the delivery's per-occurrence compaction (generic + the pow2 fast path + the 512-expert/10-used kernel, `GGML_CUDA_DISABLE_MMID_512` kept) now emits upstream's `tile_spec` instead of `expert_bounds`.  Upstream's seam writer is reused verbatim (one seam-aligned entry per tile + one trailing entry per expert); the shared-memory `mm_ids_helper_store` staging buffer is gone with it.  Rationale: upstream has no duplicate handling at all (its `iex_used` is a single slot per token), so this is **not** a subsumption — it is our fix re-expressed on their grid, and it is now *simpler* (no in-kernel loop). |
+| `ggml-cuda/mmq.cuh`, `mmq.cu`, `mmf.cuh`, `mmf.cu` | **upstream's** (`tile_spec` grid, `ntj` = `ceil(n_tokens*n_expert_used/J)+n_experts`, `fusion_device`) — the compact column count is exactly `n_tokens*n_expert_used`, so the grid covers the expanded list and the delivery's column-tile loop / `stream_k ? ne_get_rows : ne12` width hack are unnecessary.  Kept the delivery's **correctness gate**: `mul_mat_f_switch_ids` takes the compact kernel for **every** `MUL_MAT_ID` (upstream still uses the single-slot `mul_mat_f` path for `ncols_dst <= 16`). |
+| `src/llama-model.cpp` | upstream's text + the three substantive delivery hunks re-applied: the `mlock_lazy` member, the `ml.lazy.mlock_ranges(...)` call in `load_tensors` (`--lazy-mode mlock`), and the `!is_resident` gate on the mmap-buffer path. |
+| `ggml-backend-meta.cpp` | **both**: `compute_headroom = 128` (ours) *and* upstream's `compute_headroom_min = 256` floor in the `std::max(...)`.  Whether the multiplier is still needed is `TODO #286` / `D7`. |
+| `src/CMakeLists.txt` | upstream (`Threads::Threads`, `#31785`); the `-Wshadow` enablement below it is ours and stays. |
+| `common/speculative.cpp` | ours (the `gemma4-assistant` arch guard for `is_mem_shared`; upstream bug #23398 is still unfixed upstream) with the duplicate `llama_set_embeddings_nextn` calls dropped (the post-merge context already has them). |
+| `src/llama-vocab.cpp` | ours (non-recursive `naive_trie::insert`; upstream's recursion on a GGUF-length token is the bug it fixes). |
+| `src/llama-kv-cache.cpp`, `src/llama-moe-cache.cpp`, `src/llama-graph.cpp`, + 17 `src/models/*.cpp` | **upstream's, delivered hunks dropped**: the whole block-00 delta in these files is `-Wshadow` variable renames (`n_stream`→`n_stream_l`, `params`→`params_l`, `s`→`s_seq`, …), verified rename-only line-for-line before dropping. |
+
+**Decision taken (reversible, needs the maintainer's blessing): stop carrying the `-Wshadow` rename sweeps.**
+Measured cost: ~1500 diff lines in 21 files, all of which the later blocks and every future re-base touch again
+(the repo's own `TODO #101` records the same cost for the `llama_model_loader * ml` rename).  Measured
+consequence of dropping them: **94 `-Wshadow` warnings** in the llama target (the r235 CMake comment claimed
+9 standing ones), 108 warnings total, none of them errors (`-Werror` is not on for this build).  `-Wshadow`
+itself stays enabled for new code.  If the maintainer prefers a quiet log, the renames can be re-applied per
+file *as those files are already being resolved* at a later rung — the ballast is mechanical.
+
+**Traps this rung produced** (now in `README.md` §1):
+* a rung build needs a **clean configure** (`~/bin/build-llama-rocm clean`) — a reused `CMakeCache.txt` keeps
+  the *tip's* options (`GGML_CUDA_FA_QUANTS` carries block 05's `iq4_nl` instances, which the base rejects at
+  configure time: this is the documented "r2 lesson" of `gate-per-block-build.sh`).
+* `GGML_CUDA_FA_QUANTS` is set by hand on this box, so at **R06** (block 05 lands) the `iq4_nl-iq4_nl`
+  instance must be re-set for the release configure.
+
+- status: **DONE** · sha: `4aaffd1c0`
 
 ## R02 — block 01: hybrid HIP all-reduce
 
@@ -326,7 +360,7 @@ climb touched has a maintainer decision recorded.
 | rung | block | commit on `rebase-r236` | conflicts found | exit | session/date | notes |
 |---|---|---|---|---|---|---|
 | R00 | — | `a691b2345` (branch point) | — | n/a | 2026-11-08 | campaign setup; probe run |
-| R01 | 00 | | | | | |
+| R01 | 00 | `4aaffd1c0` | 12 expected → 12 found | build + coherence + MUL_MAT_ID 931/931 | 2026-11-08 | ballast dropped (94 -Wshadow warnings); mmid re-expressed on upstream's `tile_spec` |
 | R02 | 01 | | | | | |
 | R03 | 02 | | | | | |
 | R04 | 03 | | | | | |
