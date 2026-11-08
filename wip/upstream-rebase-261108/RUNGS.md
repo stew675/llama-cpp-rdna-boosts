@@ -893,7 +893,35 @@ prints `slab draft reserve derived from '': draft CONTEXT 1102 MiB (kv 142 + com
 * `check-gpu-faults.sh --since "2026-11-08 10:47:00"` clean (the journal's pre-session faults from the R15
   session were outside every gate's window, `TODO` #294).
 
-- status: **DONE** · sha: `2dc4511b8` (tree `7d6e24c12`) · session 2026-11-08
+**R16 follow-up (`328a155a9`, tree `a101f0d66`) — cross-platform validation found a real bug.**  Validating the
+rung on the maintainer's RDNA3 (`fingon`, gfx1100) and RDNA3.5 (`halo`, gfx1151) boxes exposed the missing half of
+the umem guard: on an integrated GPU "host" and "device" are ONE pool, and the tier that serves a host-expert
+master is denied there — but the *placement* was not, so `-ncmoe N` put expert banks in a `ROCm_Host` buffer
+nothing could stage and the consumer read a page the GPU cannot address (Qwen3.8-Flash-Next GSQ-IQ3_XXS, gfx1151,
+`-ncmoe 48`/`24`: `mul_mat_q<Q2_0,16>` at a host VA, `HSA_STATUS_ERROR_MEMORY_FAULT`; with a drafter/KV live the
+same arm died in the VMM pool's free-order assert instead).  **The pre-re-base r235 binary faults identically**, so
+it is not a re-base regression.  `llama_model_loader::set_host_experts_umem()` now refuses every host-expert
+placement on any `GGML_BACKEND_DEVICE_TYPE_IGPU` device (one WARN; `-ncmoe`/`-cmoe`/`-lme`/a CPU expert
+`--override-tensor` are ignored and every weight stays on its layer's device).  Verified: halo Flash-Next
+`-ncmoe 48`/`24` and 35B-A3B `-ncmoe 48` now exit 0 (no fault, no assert), the dense 4B arm unchanged
+`1de99b7e6ee6`; on gfx1201 the guard is inert (4B `1de99b7e6ee6`, `35B-A3B -ncmoe 20` still host-pinned 16 320
+MiB); on gfx1100 Flash-Next `-ncmoe 48` runs clean `7a8734a9f1a6`.
+
+**Cross-platform results on the rung itself (all as expected, none a regression):**
+
+| box | arm | result |
+|---|---|---|
+| halo (gfx1151, 1 dev, UMA) | build | green (VMM on, as block 15 requires) |
+| halo | dense 4B coherence | `1de99b7e6ee6` — identical to gfx1201 |
+| halo | `gate-kv-residency.sh` window section | **all PASS**, `wref == wres == wspill` `be904e86f248` (identical to gfx1201), `wspill` 16 flips / 64 MiB host-backed; provider selftest PASS |
+| halo | `gate-kv-residency.sh` pool section | **blocked**: `pref` now gets past `-ncmoe` (the fix above) but still dies in the VMM pool free-order assert (`ggml-cuda.cu:1360`) once an MTP drafter is attached — r235 aborts identically (`:1375`), so pre-existing; `TODO` #298 |
+| halo | selftest sensitivity arm | `wselftest0` **passes with `LLAMA_KV_REGION_QUARANTINE=0`**: the hazard the hold guards does not reproduce on gfx1151's driver.  The delivery is fine (the hazard case verifies); the gate's "must FAIL without the hold" is gfx1201-observed driver behaviour — gate defect, `TODO` #298 |
+| fingon (gfx1100, 1 dev, 24 GiB) | build | green, but the box **rebooted 3× during full-parallel builds** (power draw); `JOBS=4` + a clean rebuild completed.  One power cut left a zero-length `refs/heads/rebase-r236` (repaired; `master` was intact) |
+| fingon | dense 9B coherence (no 4B on the box) | `1de99b7e6ee6` |
+| fingon | Flash-Next `-ncmoe 48` | exit 0, `7a8734a9f1a6` — **identical to the gfx1201 3-GPU tensor arm**, and host experts work on a discrete card |
+
+- status: **DONE** · sha: `2dc4511b8` (tree `7d6e24c12`) + follow-up `328a155a9` (tree `a101f0d66`) · session 2026-11-08
+
 
 ## R17 — the release ladder
 

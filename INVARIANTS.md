@@ -2982,3 +2982,17 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` came back.  Measured on 35B-A3B Q8_0, 1 GPU, `-ncmoe 48`,
   `-c 262144`, `--spec-type draft-mtp`: with the branch, `draft CONTEXT 1102 MiB` → arena 20 527.5 MiB
   (62.9 %); without it, the flat 3584 MiB → 17 977.5 MiB (55.1 %).  +2 550 MiB of arena.
+- **A shared host/device memory pool must not be split: `-ncmoe` is refused on an integrated GPU (r236, R16
+  cross-platform validation).**  On a UMA device (gfx1151) "host" and "device" are one physical pool, so a
+  host-resident expert set buys no capacity, and the tier that stages a host master is already denied there
+  (`moe-expert-cache.cu` refuses the arena on a shared pool).  The placement was not denied, so `-ncmoe N` put
+  the last N layers' expert banks in a `ROCm_Host` buffer nothing could stage and the consumer read a page the
+  GPU cannot address: Qwen3.8-Flash-Next GSQ-IQ3_XXS, `-ncmoe 48` (and `24`), `mul_mat_q<Q2_0,16>` at a host VA
+  -> `HSA_STATUS_ERROR_MEMORY_FAULT`; with a drafter + KV live the same arm died in the VMM pool's free-order
+  assert instead.  `-ncmoe 0` ran, and 35B-A3B `-ncmoe 48` ran (its expert GEMM never reads the master
+  in-kernel), which is what made it look model-specific.  The pre-re-base r235 binary faults identically, so it
+  is pre-existing.  `llama_model_loader::set_host_experts_umem()` (set once from `llama_model` when any device is
+  `GGML_BACKEND_DEVICE_TYPE_IGPU`) now drops `n_cpu_moe_from_end`, answers false from
+  `host_expert_selected()`, short-circuits `plan_host_expert_placement()` and skips a CPU expert
+  `--override-tensor`, with one WARN.  Inert on a discrete GPU (gfx1201: `35B-A3B -ncmoe 20` still pins
+  16 320 MiB of host experts).

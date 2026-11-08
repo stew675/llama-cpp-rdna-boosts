@@ -512,6 +512,23 @@ Two gaps to close, both cheapest at R17:
   FLASH_ATTN_QSA` covers the attention, not the score kernel, so the `corr_v`/truncate value fixed at R16 has no
   numeric oracle beyond the sparse arm's text.
 
+## 298. gfx1151: the VMM pool's free-order assert still fires on the MTP-draft path (pre-existing)
+
+Found at R16 validating on `halo` (gfx1151 Strix Halo, VMM build).  With an MTP drafter attached
+(`-md <mtp> --spec-type draft-mtp`), a Flash-Next run dies mid-decode in
+`ggml_cuda_pool_vmm::free`'s ordering check (`ggml-cuda.cu:1360`: `ptr == pool_addr + pool_used`);
+the pre-re-base r235 binary dies identically at its own `:1375`, so it is **not** a re-base regression.
+It is the same class as the `hc_combine_norm` (R13) and MMB/BF16 (pre-R12) ordering fixes — a pool block
+freed below a live one — but on a path those fixes do not cover, and it blocks `gate-kv-residency.sh`'s
+pool section on gfx1151 (the `pref`/`pres`/`pfloor` arms all attach the drafter).
+
+Also from the same session, a **gate** defect rather than a delivery one: `gate-kv-residency.sh`'s
+`wselftest0` arm asserts that the provider's selftest must FAIL with `LLAMA_KV_REGION_QUARANTINE=0`, which
+is true on gfx1201 + ROCm 10.1 (the driver hazard reproduces) but **false on gfx1151**, where the whole
+hazard case verifies with the hold off.  The delivery is fine there; the arm should assert the MECHANISM
+(the quarantine hold was acquired and the hazard case ran) and keep the corruption expectation only for the
+platform(s) where it has been observed — recorded with the arch, like every other platform-bound number.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship
