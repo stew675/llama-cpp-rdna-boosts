@@ -1,0 +1,593 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index 7623cb2d3..30e9b8bbc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -17,28 +17,21 @@ void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t s
+     return cuda_ctx->h2d_stage_buffer(slot, size);
+ }
+ 
+-// MoE expert cache: whole-table staging from the cache arena.  Fills the ring slot from the immutable
+-// prefill residency snapshot (an arena slot for a resident expert, the pinned host master for the rest),
+-// so only the non-resident experts cross PCIe; declines (false) when the table is not
+-// cache-managed/usable, so the caller falls back to the plain upload.  Kill switch
+-// `GGML_MOE_CACHE_STAGE=0`.  The deferred (in-place) read of the r36 design is not used: `defer` is
+-// ignored and the destination is always filled.
++// MoE expert cache: the staged fill, for a PAGEABLE (pool-backed) host master only -- arena (D2D), pool
++// alias (D2D), and one coalesced read per chunk for the experts in neither tier.  A PINNED master is not
++// staged: the caller's own single bulk copy per table is faster in both of this box's run-to-run phases
++// (r235).  Declines (false) when the table is not cache-managed/usable, so the caller falls back to the
++// plain upload.  Kill switch `GGML_MOE_CACHE_STAGE=0`.  The deferred (in-place) read of the r36 design is
++// not used: `defer` is ignored and the destination is always filled.
+ static bool ggml_backend_cuda_stage_from_cache(ggml_backend_cuda_context * cuda_ctx, const void * src, size_t offset,
+         size_t width, size_t stride_src, size_t n_copies, void * dst, ggml_backend_event_t ev, bool defer) {
+     GGML_UNUSED(defer);
+     if (!moe_cache_enabled()) {
+         return false;
+     }
+-    static cudaEvent_t order_ev[GGML_CUDA_MAX_DEVICES] = {};
+-    const int dev = cuda_ctx->device;
+-    if (order_ev[dev] == nullptr && cudaEventCreateWithFlags(&order_ev[dev], cudaEventDisableTiming) != cudaSuccess) {
+-        (void) cudaGetLastError();
+-        order_ev[dev] = nullptr;
+-        return false;
+-    }
+-    cudaStream_t s = cuda_ctx->copy_stream();
+-    if (!moe_cache_stage_table(dev, src, offset, width, stride_src, n_copies, dst,
+-                               cuda_ctx->stream(), s, order_ev[dev])) {
++    const int    dev = cuda_ctx->device;
++    cudaStream_t s   = cuda_ctx->copy_stream();
++    if (!moe_cache_stage_table(dev, src, offset, width, stride_src, n_copies, dst, s)) {
+         return false;
+     }
+     CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8bc727c72..67a956efb 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -206,17 +206,12 @@ struct table_t {
+     const void * dr_last_ids    = nullptr;   // routing buffer and stream of the last take-over: a sibling joins a launch
+     void *       dr_last_stream = nullptr;   // only when both match, so a launch never touches another context's table
+ 
+-    // Prefill residency snapshot (PRS): a small device copy of
+-    // `expert_slot` (-1 = not resident) consumed ONLY by the prefill staging kernel.  It is rebuilt from
+-    // the authoritative host map (immutable while in use), never mutated by the decode path, and is not
+-    // the removed device-remap policy.  Rebuilt when the cache write generation moves, the arena moves,
+-    // or the slot count changes (a slab stand-down/re-arm invalidates it).
+-    int32_t *   prs_dev     = nullptr;
+-    int64_t     prs_n       = 0;        // allocated elements
+-    uint64_t    prs_gen     = 0;        // `g_write_seq` the current snapshot reflects
+-    void *      prs_arena   = nullptr;  // arena base the snapshot was built against
+-    int         prs_slots   = 0;        // slot count the snapshot was built against
+-    std::vector<int32_t> prs_host;      // persistent staging (the async H2D must not race its source)
++    // Prefill tier map (r235): a HOST-side per-expert snapshot of which tier holds an expert (`>= 0` arena
++    // slot, `<= -2` pool slot `-v-2`, `-1` in neither), consulted by the coalesced span read so it reads
++    // only the experts in NEITHER tier.  It had a device mirror for a prefill staging kernel; that kernel is
++    // gone (a pinned master is not staged at all, and the pool tier copies per expert), so the mirror and
++    // the `g_write_seq` invalidation it needed went with it.  `expert_slot` stays authoritative.
++    std::vector<int32_t> prs_host;
+ 
+     // Gather residency snapshot (wip/host-pool-speed, mechanism (b)): the same two-tier encoding as `prs`
+     // (`>= 0` arena slot, `<= -2` pool slot `-v-2`, `-1` neither), but refreshed on the COMPUTE stream so
+@@ -407,8 +402,6 @@ bool    g_pool_dio_decided = false;
+ // r212: the loader's resolved `--load-mode` as a fill mode: 1 = O_DIRECT, 0 = mapped/page-cache,
+ // -1 = nobody told us (a consumer that is not the CLI loader -> the historical heuristic).
+ int     g_pool_load_mode    = -1;
+-bool    g_pool_stage_batch = true;   // MOE_HOST_POOL_STAGE_BATCH=0: one cudaMemcpyAsync per expert for the
+-                                     //   pool-backed prefill staging (the pre-r114 arm; A/B only)
+ // wip/host-expert-split W4 (prefill read granularity): the experts of a run that is in NEITHER tier are
+ // contiguous in the file, so their bytes are ONE read instead of one per expert.  A single 0.6 MiB O_DIRECT
+ // read is latency-bound on this box (measured 520 MiB/s at depth 1 against 4.2 GiB/s for a 16 MiB read on the
+@@ -597,10 +590,9 @@ int64_t                             g_stage_arena_bytes = 0;
+ int64_t                             g_stage_host_bytes  = 0;
+ int64_t                             g_stage_decline_geom = 0;
+ int64_t                             g_stage_decline_usable = 0;
+-// Split out of `unusable` (TODO #271) so the number keeps its meaning, "this table will never be staged":
+-// the priming pass declines by design (the arena does not exist yet), and counting it as unusable made a
+-// prompt-only run's very first ubatch look like a defect.
+-int64_t                             g_stage_decline_unsized = 0;
++// A PINNED master's prefill upload is the scheduler's own single bulk copy, not a staged one (r235): every
++// such call lands here, counted apart from a decline (a decline is something that went wrong).
++int64_t                             g_stage_skip_pinned = 0;
+ // The deduped per-table record of a staging decline (layer, role, reason), for the exit census.  One entry
+ // per affected TABLE, not per call: a declined table declines on every ubatch of the prefill.
+ struct stage_decline_t {
+@@ -627,7 +619,6 @@ int64_t                             g_stage_span_wait_us  = 0;   // time waiting
+ int64_t                             g_bounce_read_calls = 0;
+ int64_t                             g_bounce_read_us    = 0;
+ int64_t                             g_bounce_read_bytes = 0;
+-int64_t                             g_prs_rebuilds     = 0;   // immutable snapshot refreshes (churn indicator)
+ int64_t                             g_cold_reaches    = 0;
+ // Phase 1b fill-vs-cold admission policy (only consulted when a cold read is available):
+ //   0 = always : fill every miss (LFRU eviction is the whole admission control)
+@@ -1142,7 +1133,6 @@ void parse_env() {
+         // flag here is what made that report unreachable (a forced A/B arm logged no fill mode at all).
+         g_pool_dio = g_pool_dio_req != 0;
+     }
+-    g_pool_stage_batch = env_int("MOE_HOST_POOL_STAGE_BATCH", 1) != 0;
+     g_pool_stage_span  = env_int("MOE_HOST_POOL_STAGE_SPAN", 1) != 0;
+     g_pool_stage_span_n = env_int("MOE_HOST_POOL_STAGE_SPAN_EXPERTS", 16);
+     if (g_pool_stage_span_n < 1) {
+@@ -4420,41 +4410,6 @@ static __device__ __forceinline__ void moe_cache_policy_copy(char * __restrict__
+ // field config, where the pinned-master path already staged with a single launch).  `skip_miss` makes a `-1`
+ // entry a no-op: the host has already copied those experts (they are in neither tier, so they come from the
+ // mapping/the disk) into the destination before this kernel runs on the same stream.
+-static __global__ void moe_cache_stage_kernel(char * __restrict__ dst, const char * __restrict__ arena,
+-                                              const char * __restrict__ host_dev, const int32_t * __restrict__ prs,
+-                                              int slots, int64_t expert_bytes, int64_t host_bytes,
+-                                              int64_t src_off, int64_t rows, int64_t row_bytes, int64_t host_pitch,
+-                                              int do2d, const char * __restrict__ pool_dev,
+-                                              int64_t pool_stride, int skip_miss) {
+-    const int e   = blockIdx.x;
+-    const int tid = threadIdx.x;
+-    const int nt  = blockDim.x;
+-    char *    d   = dst + (int64_t) e * expert_bytes;
+-    const int s   = prs != nullptr ? prs[e] : -1;
+-    if (s >= 0 && s < slots) {
+-        moe_cache_policy_copy(d, arena + (int64_t) s * expert_bytes, (size_t) expert_bytes, tid, nt);
+-        return;
+-    }
+-    const char * src = host_dev + (int64_t) e * host_bytes + src_off;
+-    if (s <= -2) {
+-        if (pool_dev == nullptr) {
+-            return;   // can't happen: the encoding is only produced when a pool exists
+-        }
+-        src = pool_dev + (int64_t) (-s - 2) * pool_stride + src_off;
+-    } else if (skip_miss) {
+-        return;       // a pool-backed staging already served this expert from the mapping/the disk
+-    }
+-    if (!do2d) {
+-        moe_cache_policy_copy(d, src, (size_t) expert_bytes, tid, nt);
+-        return;
+-    }
+-    for (int64_t r = 0; r < rows; r++) {
+-        moe_cache_policy_copy(d + (size_t) r * (size_t) row_bytes, src + (size_t) r * (size_t) host_pitch,
+-                              (size_t) row_bytes, tid, nt);
+-    }
+-}
+-
+-
+ // Host-weight expert gather (B2, session 15): for an offloaded `MUL_MAT_ID` expert upload, copy only the
+ // experts the routing selects, straight from the host master into the scheduler's device `input_cpy`,
+ // ON DEVICE.  This replaces the non-staging path's host ids readback (`ggml_backend_tensor_get_async` +
+@@ -4705,8 +4660,6 @@ static void free_table_buffers_locked(table_t & t) {
+     }
+     if (t.remap_dev != nullptr){ (void) cudaFree(t.remap_dev); t.remap_dev = nullptr; }
+     devremap_free_locked(t);
+-    if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
+-    t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
+     if (t.gprs_dev != nullptr) { (void) cudaFree(t.gprs_dev); t.gprs_dev = nullptr; }
+     t.gprs_n = 0; t.gprs_arena = nullptr; t.gprs_slots = 0;
+     std::fill(t.gprs_last.begin(), t.gprs_last.end(), -1);
+@@ -8057,12 +8010,10 @@ static void stage_decline_note(table_t & t, const char * why) {
+ // declines and the caller falls back to the plain upload.  Returns true when the destination was
+ // filled and the caller's event recorded (the caller records `ev` after this returns).
+ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
+-                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
+-                           void * order_event) {
++                           size_t n_copies, void * dst, void * copy_stream) {
+     if (!g_stage_cache || !g_enabled || host_src == nullptr || dst == nullptr || width == 0 || n_copies == 0) {
+         return false;
+     }
+-    static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
+     std::lock_guard<std::mutex> lock(g_mutex);
+     for (table_t & t : g_tables) {
+         if (t.device != device || t.host != host_src || t.src_off != offset) {
+@@ -8073,35 +8024,22 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+             stage_decline_note(t, "the cache holds no expert count/master for it");
+             return false;
+         }
+-        // The pinned-master path needs a built arena (the staging kernel reads it) and a device-readable
+-        // master.  A POOL-BACKED master needs neither: it is filled expert by expert from the pinned pool
+-        // (or the per-table bounce), so it also serves the pre-sizing prefill (the whole point -- a
+-        // pageable master must never reach the ring through the pageable upload).
++        // A PINNED master is NOT staged (r235).  Its fill used to be a whole-table copy assembled from the
++        // expert-cache arena (a D2D from a resident slot) plus the pinned master (H2D for the rest), which
++        // saves PCIe bytes but pays for them in engine time: the scheduler's own single bulk
++        // `cudaMemcpyAsync` per table is faster in BOTH of this box's run-to-run phases (+6 % / +16 %, 1 GPU,
++        // `-ub 6144`, 43 % residency) and the measured low phase is as fast as anything else.  The staged
++        // copy stays for a POOL-BACKED master, where the alternative is not a bulk copy at all but
++        // `moe_cache_upload_pageable`'s per-expert pinned bounce (5-10x slower).
++        // A PINNED master is NOT staged (r235): the scheduler's own single bulk `cudaMemcpyAsync` per table
++        // is faster everywhere the arena holds less than ~83 % of the set (measured +6 % at 67 % residency,
++        // +16 % at 44 %, on 1 AND 2 devices), is stable in both of the box's run-to-run phases, and costs one
++        // PCIe transaction instead of 512.  The staged copy stays for a POOL-BACKED master, where the
++        // alternative is not a bulk copy at all but `moe_cache_upload_pageable`'s per-expert pinned bounce
++        // (5-10x slower).
+         if (t.host_pinned) {
+-            // The arena requirement is the one that fires in practice, and it is TRANSIENT: the slab hands
+-            // the chunks a table's arena lived in to the compute layout, the table is stood down for the
+-            // rest of the prefill, and the drop at the prefill -> decode transition re-arms it (TODO #42).
+-            // Which of the four conditions fired, and for which tables, used to be unrecorded -- this is
+-            // the line that answers it (TODO #271).
+-            const char * why =
+-                !t.cold_safe         ? "its host geometry is not representable by a staged copy (a fused/sliced table)"
+-              : t.host_dev == nullptr ? "its host master has no device-readable (pinned) mapping"
+-              : t.arena == nullptr || t.slots <= 0
+-                  ? (t.alloc_failed ? "its arena allocation failed"
+-                     : t.allocated  ? "it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down"
+-                                    : "the cache has not sized yet")
+-              : nullptr;
+-            if (why != nullptr) {
+-                g_stage_decline_usable++;
+-                stage_decline_note(t, why);
+-                return false;
+-            }
+-            if (!g_sized) {
+-                // The priming pass (the arena does not exist yet).  Its own counter, so `unusable` keeps
+-                // meaning "a table that will never be staged".
+-                g_stage_decline_unsized++;
+-                return false;
+-            }
++            g_stage_skip_pinned++;
++            return false;   // by design: the caller uploads the whole table in one copy
+         }
+         const bool do2d = t.split_axis == 0 && t.host_pitch != 0;
+         int64_t rows = 0;
+@@ -8126,227 +8064,101 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+ 
+         device_guard dg(device);
+ 
+-        // wip/host-expert-master-drop (TODO #55): a POOL-BACKED (pageable) master is not readable by the
+-        // staging kernel, so the bytes come from the two pinned tiers instead: the arena (a D2D copy) and
+-        // the pinned pool (a device-readable mapped alias).  Only the source of the bytes changes; the
+-        // destination layout is exactly the one the kernel produces, so every consumer is unchanged.
+-        //
+-        // TODO #87 (2): the tiers are filled by ONE kernel launch.  This loop used to issue one
+-        // `cudaMemcpyAsync` per expert for them (~200 per table per ubatch on the field config), and that
+-        // per-copy issue cost was the rest of the prefill gap to the pinned-master path, which has always
+-        // staged with a single launch.  The per-expert map encodes both tiers (`>= 0` arena slot,
+-        // `<= -2` pool slot `-v-2`, `-1` in neither), so the kernel needs no extra bookkeeping; the experts
+-        // in NEITHER tier are still copied here, one at a time, because each of those is a distinct read
+-        // from the mapping/disk.
+-        if (!t.host_pinned) {
+-            host_pool_t * pool = table_pool_locked(t);
+-            cudaError_t   err  = cudaSuccess;
+-            {
+-                const int64_t resident = (int64_t) t.expert_slot.size();
+-                g_stage_ok++;
+-                g_stage_arena_bytes += resident * (int64_t) t.expert_bytes;
+-                g_stage_host_bytes  += ((int64_t) t.n_experts - resident) * (int64_t) t.expert_bytes;
+-            }
+-            // The two-tier snapshot is rebuilt on EVERY pool-backed staging call: unlike the arena map it
+-            // also depends on the pool's slot map, which the demand path (and the bulk layout) changes
+-            // without bumping `g_write_seq`.  It is `n_experts` int32s (~1 KiB) against a whole-table
+-            // staging copy, so the freshness is free.
+-            if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
+-                if (t.prs_dev != nullptr) {
+-                    (void) cudaFree(t.prs_dev);
+-                    t.prs_dev = nullptr;
+-                }
+-                if (cudaMalloc((void **) &t.prs_dev, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
+-                    (void) cudaGetLastError();
+-                    t.prs_dev = nullptr;
+-                    return false;
+-                }
+-                t.prs_n   = t.n_experts;
+-                t.prs_gen = 0;
+-            }
+-            if ((int) t.prs_host.size() != t.n_experts) {
+-                t.prs_host.assign((size_t) t.n_experts, -1);
+-            } else {
+-                std::fill(t.prs_host.begin(), t.prs_host.end(), -1);
+-            }
+-            for (const auto & kv : t.expert_slot) {
+-                const int e = kv.first;
+-                if (e >= 0 && e < t.n_experts) {
+-                    t.prs_host[(size_t) e] = kv.second;
+-                }
+-            }
+-            const bool pool_dev_ok = pool != nullptr && pool->base_dev != nullptr &&
+-                                     t.src_off + t.expert_bytes <= t.host_bytes && !pool->failed;
+-            // Kill switch (`MOE_HOST_POOL_STAGE_BATCH=0`) for the single-launch arm: the pre-r114 behaviour
+-            // is one `cudaMemcpyAsync` per tier-resident expert, which is what the A/B is measured against.
+-            const bool batch = g_pool_stage_batch && pool_dev_ok;
+-            if (batch) {
+-                for (const auto & kv : pool->expert_slot) {
+-                    const int e = kv.first;
+-                    const int s = kv.second;
+-                    if (e < 0 || e >= t.n_experts || s < 0 || s >= pool->slots ||
+-                        (size_t) s >= pool->slot_state.size() || pool->slot_state[(size_t) s] != 1) {
+-                        continue;
+-                    }
+-                    if (t.prs_host[(size_t) e] < 0) {
+-                        t.prs_host[(size_t) e] = -(s + 2);
+-                    }
+-                }
+-            }
+-            if (cudaMemcpyAsync(t.prs_dev, t.prs_host.data(), (size_t) t.n_experts * sizeof(int32_t),
+-                                cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                return false;
++        host_pool_t * pool = table_pool_locked(t);
++        cudaError_t   err  = cudaSuccess;
++        {
++            const int64_t resident = (int64_t) t.expert_slot.size();
++            g_stage_ok++;
++            g_stage_arena_bytes += resident * (int64_t) t.expert_bytes;
++            g_stage_host_bytes  += ((int64_t) t.n_experts - resident) * (int64_t) t.expert_bytes;
++        }
++        // The tier map the coalesced span read consults (skip the experts a tier already holds).  It is
++        // rebuilt on every pool-backed call: unlike the arena map it also depends on the pool's slot map,
++        // which the demand path changes without bumping `g_write_seq`, and it is `n_experts` int32s against
++        // a whole-table copy.
++        if ((int) t.prs_host.size() != t.n_experts) {
++            t.prs_host.assign((size_t) t.n_experts, -1);
++        } else {
++            std::fill(t.prs_host.begin(), t.prs_host.end(), -1);
++        }
++        for (const auto & kv : t.expert_slot) {
++            const int e = kv.first;
++            if (e >= 0 && e < t.n_experts) {
++                t.prs_host[(size_t) e] = kv.second;
+             }
+-            t.prs_gen   = g_write_seq.load();
+-            t.prs_arena = (void *) t.arena;
+-            t.prs_slots = t.slots;
+-            g_prs_rebuilds++;
+-            // wip/host-expert-split W4 (prefill read granularity): the experts in NEITHER tier are the only
+-            // ones this loop reads from STORAGE, and they are contiguous in the file.  Serve each run of them
+-            // with one read per ~16-expert chunk (`stage_span_fill`) and skip them below.  Only the single-
+-            // launch arm can do this: its snapshot is the one that encodes BOTH tiers (`-1` = neither), while
+-            // the per-expert arm's encodes only the arena.  The default (`MOE_HOST_POOL_STAGE_BATCH=1`) is the
+-            // arm that runs in practice; the per-expert arm is a debug A/B and keeps its own path.
+-            std::vector<uint8_t> span_done;
+-            // Issue #281: no `g_pool_dio` here either -- a buffered fill coalesces too (see the gather
+-            // path's note; `stage_span_fill` reads the file with the mode's own buffered/O_DIRECT open).
+-            const bool span_geom = batch && g_pool_stage_span && pool_file_io_available() &&
+-                                   t.src_known && !t.src_path.empty() && !do2d && t.n_slices == 0 &&
+-                                   t.src_off == 0 && t.host_bytes == t.expert_bytes && t.expert_bytes > 0 &&
+-                                   pool != nullptr && pool->base != nullptr &&
+-                                   pool->host_bytes == t.expert_bytes;
+-            if (span_geom) {
+-                err = stage_span_fill(t, pool, t.prs_host.data(), device, (char *) dst, copy_stream, span_done);
+-            }
+-            for (int e = 0; e < t.n_experts && err == cudaSuccess; e++) {
+-                if (!span_done.empty() && span_done[(size_t) e] != 0) {
+-                    continue;   // already copied from a coalesced span read above
+-                }
+-                if (batch && t.prs_host[(size_t) e] != -1) {
+-                    continue;   // served by the kernel (arena or pool)
+-                }
+-                char * d = (char *) dst + (size_t) e * t.expert_bytes;
+-                if (!batch) {
+-                    const auto hit = t.expert_slot.find(e);
+-                    if (hit != t.expert_slot.end() && hit->second >= 0 && hit->second < t.slots) {
+-                        err = cudaMemcpyAsync(d, (const char *) t.arena + (size_t) hit->second * t.expert_bytes,
+-                                              t.expert_bytes, cudaMemcpyDeviceToDevice,
+-                                              (cudaStream_t) copy_stream);
+-                        continue;
+-                    }
+-                }
+-                // TODO #87: the PREFILL band reads a pool slot but never evicts one, and a miss fills an
+-                // EMPTY slot (so the next ubatch finds it there).  Only an expert in neither tier is read
+-                // from the file/mapping -- which is the whole point: a prefill stages the whole host table
+-                // per ubatch, so without this every ubatch re-read the entire host expert set from disk
+-                // (measured on the IQ4_NL field config: 39 t/s prefill, 27 minutes of disk reads for one
+-                // 68K prompt).  The copy below keeps the pool entry (retire = false) because the staging
+-                // destination is a transient ring slot, not the arena.
+-                expert_src_t hsrc;
+-                if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc, nullptr, /*prefill*/ true)) {
+-                    err = k_no_host_source;   // see `fill_slot_from_host`: a host-side answer, never a device error
+-                    break;
++        }
++        if (pool != nullptr) {
++            for (const auto & kv : pool->expert_slot) {
++                const int e  = kv.first;
++                const int ps = kv.second;
++                if (e < 0 || e >= t.n_experts || ps < 0 || ps >= pool->slots ||
++                    (size_t) ps >= pool->slot_state.size() || pool->slot_state[(size_t) ps] != 1) {
++                    continue;
+                 }
+-                if (do2d) {
+-                    err = cudaMemcpy2DAsync(d, (size_t) row_bytes, hsrc.base + t.src_off, t.host_pitch,
+-                                            (size_t) row_bytes, (size_t) rows, hsrc.kind,
+-                                            (cudaStream_t) copy_stream);
+-                } else {
+-                    err = cudaMemcpyAsync(d, hsrc.base + t.src_off, t.expert_bytes, hsrc.kind,
+-                                          (cudaStream_t) copy_stream);
++                if (t.prs_host[(size_t) e] < 0) {
++                    t.prs_host[(size_t) e] = -(ps + 2);
+                 }
+-                if (err == cudaSuccess) {
+-                    expert_src_done(t, pool, hsrc, copy_stream, /*retire*/ false);
+-                }
+-            }
+-            if (err != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                return false;
+             }
+-            // The copies above are on `copy_stream`, so this kernel is ordered after every miss fill.
+-            if (batch && t.n_experts > 0) {
+-                moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) copy_stream>>>(
+-                    (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.prs_dev, t.slots,
+-                    (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
+-                    rows, row_bytes, (int64_t) t.host_pitch, do2d ? 1 : 0,
+-                    pool_dev_ok && pool != nullptr ? (const char *) pool->base_dev : nullptr,
+-                    pool != nullptr ? (int64_t) pool->host_bytes : 0, /*skip_miss*/ 1);
+-                if (cudaGetLastError() != cudaSuccess) {
+-                    (void) cudaGetLastError();
+-                    return false;
+-                }
+-            }
+-            return true;
+         }
+-
+-        // Refresh the immutable snapshot when the cache wrote since we built it, or the arena moved.
+-        const uint64_t seq = g_write_seq.load();
+-        if (t.prs_dev == nullptr || t.prs_n != t.n_experts) {
+-            if (t.prs_dev != nullptr) {
+-                (void) cudaFree(t.prs_dev);
+-                t.prs_dev = nullptr;
+-            }
+-            if (cudaMalloc((void **) &t.prs_dev, (size_t) t.n_experts * sizeof(int32_t)) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                t.prs_dev = nullptr;
+-                return false;
+-            }
+-            t.prs_n   = t.n_experts;
+-            t.prs_gen = 0;
++        // wip/host-expert-split W4 (prefill read granularity): the experts in NEITHER tier are the only ones
++        // this loop reads from STORAGE, and they are contiguous in the file.  Serve each run of them with
++        // one read per ~16-expert chunk (`stage_span_fill`) and skip them below.
++        std::vector<uint8_t> span_done;
++        // Issue #281: no `g_pool_dio` gate -- a buffered fill coalesces too (see the gather path's note;
++        // `stage_span_fill` reads the file with the mode's own buffered/O_DIRECT open).
++        const bool span_geom = g_pool_stage_span && pool_file_io_available() &&
++                               t.src_known && !t.src_path.empty() && !do2d && t.n_slices == 0 &&
++                               t.src_off == 0 && t.host_bytes == t.expert_bytes && t.expert_bytes > 0 &&
++                               pool != nullptr && pool->base != nullptr &&
++                               pool->host_bytes == t.expert_bytes;
++        if (span_geom) {
++            err = stage_span_fill(t, pool, t.prs_host.data(), device, (char *) dst, copy_stream, span_done);
+         }
+-        if (t.prs_gen != seq || t.prs_arena != (void *) t.arena || t.prs_slots != t.slots) {
+-            if ((int) t.prs_host.size() != t.n_experts) {
+-                t.prs_host.assign((size_t) t.n_experts, -1);
+-            } else {
+-                std::fill(t.prs_host.begin(), t.prs_host.end(), -1);
++        // ONE `cudaMemcpyAsync` per expert: the arena slot for a resident expert (D2D), the pool slot from
++        // its mapped alias (D2D), or a read from the file/mapping for an expert in neither tier.  This is the
++        // only engine (r235 deleted the one-launch kernel, which lost to per-expert copies on both tiers and
++        // held the compute units while it ran).
++        for (int e = 0; e < t.n_experts && err == cudaSuccess; e++) {
++            if (!span_done.empty() && span_done[(size_t) e] != 0) {
++                continue;   // already copied from a coalesced span read above
++            }
++            char * d = (char *) dst + (size_t) e * t.expert_bytes;
++            const auto hit = t.expert_slot.find(e);
++            if (hit != t.expert_slot.end() && hit->second >= 0 && hit->second < t.slots) {
++                err = cudaMemcpyAsync(d, (const char *) t.arena + (size_t) hit->second * t.expert_bytes,
++                                      t.expert_bytes, cudaMemcpyDeviceToDevice,
++                                      (cudaStream_t) copy_stream);
++                continue;
+             }
+-            for (const auto & kv : t.expert_slot) {
+-                const int e = kv.first;
+-                if (e >= 0 && e < t.n_experts) {
+-                    t.prs_host[(size_t) e] = kv.second;
+-                }
++            // TODO #87: the PREFILL band reads a pool slot but never evicts one, and a miss fills an EMPTY
++            // slot (so the next ubatch finds it there).  Only an expert in neither tier is read from the
++            // file/mapping -- which is the whole point: a prefill stages the whole host table per ubatch, so
++            // without this every ubatch re-read the entire host expert set from disk (measured on the
++            // IQ4_NL field config: 39 t/s prefill, 27 minutes of disk reads for one 68K prompt).  The copy
++            // below keeps the pool entry (retire = false) because the staging destination is a transient
++            // ring slot, not the arena.
++            expert_src_t hsrc;
++            if (!expert_host_src(t, e, pool, /*allow_empty_fill*/ true, &hsrc, nullptr, /*prefill*/ true)) {
++                err = k_no_host_source;   // see `fill_slot_from_host`: a host-side answer, never a device error
++                break;
+             }
+-            // The snapshot covers the whole arena (no freeze partition): it is rebuilt whenever the cache
+-            // writes (`g_write_seq`), the arena moves or the slot count changes, and the decode path never
+-            // mutates it, so a resident expert can never change under the staging kernel.
+-            // Upload on the COPY stream: the staging kernel follows it on the same stream, so the map is
+-            // ordered where it is read, and the copy stream is NOT forced to wait for the compute stream
+-            // just because a map was (re)built.  Only an arena write orders against compute below.
+-            if (cudaMemcpyAsync(t.prs_dev, t.prs_host.data(), (size_t) t.n_experts * sizeof(int32_t),
+-                                cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                return false;
++            if (do2d) {
++                err = cudaMemcpy2DAsync(d, (size_t) row_bytes, hsrc.base + t.src_off, t.host_pitch,
++                                        (size_t) row_bytes, (size_t) rows, hsrc.kind,
++                                        (cudaStream_t) copy_stream);
++            } else {
++                err = cudaMemcpyAsync(d, hsrc.base + t.src_off, t.expert_bytes, hsrc.kind,
++                                      (cudaStream_t) copy_stream);
+             }
+-            t.prs_gen   = seq;
+-            t.prs_arena = (void *) t.arena;
+-            t.prs_slots = t.slots;
+-            g_prs_rebuilds++;
+-        }
+-
+-        // Order the copy stream after the compute stream ONLY when the arena may have been written since
+-        // the last staging on this device (a decode admission between prefill ubatches).  During a pure
+-        // prefill nothing writes, so the staging keeps overlapping the previous split's compute.
+-        if (ordered_seq[device] != seq) {
+-            if (cudaEventRecord((cudaEvent_t) order_event, (cudaStream_t) compute_stream) != cudaSuccess ||
+-                cudaStreamWaitEvent((cudaStream_t) copy_stream, (cudaEvent_t) order_event, 0) != cudaSuccess) {
+-                (void) cudaGetLastError();
+-                return false;
++            if (err == cudaSuccess) {
++                expert_src_done(t, pool, hsrc, copy_stream, /*retire*/ false);
+             }
+-            ordered_seq[device] = seq;
+         }
+-
+-        {
+-            const int64_t resident = (int64_t) t.expert_slot.size();
+-            g_stage_ok++;
+-            g_stage_arena_bytes += resident * (int64_t) t.expert_bytes;
+-            g_stage_host_bytes  += ((int64_t) t.n_experts - resident) * (int64_t) t.expert_bytes;
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
+         }
+-        moe_cache_stage_kernel<<<t.n_experts, 256, 0, (cudaStream_t) copy_stream>>>(
+-            (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.prs_dev, t.slots,
+-            (int64_t) t.expert_bytes, (int64_t) t.host_bytes, (int64_t) t.src_off,
+-            rows, row_bytes, (int64_t) t.host_pitch, do2d ? 1 : 0, nullptr, 0, /*skip_miss*/ 0);
+-        return cudaGetLastError() == cudaSuccess;
++        return true;
+     }
+     g_stage_decline_nomatch++;
+     return false;
+@@ -8530,8 +8342,6 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             // Slab-backed arenas go back to the slab's free list; `cudaFree` can unmap the slab.
+             if (old_arena != nullptr) { free_arena_backing(old_device, old_arena, old_reserved, old_slots, t); }
+             if (old_remap != nullptr) { (void) cudaFree(old_remap); }
+-            if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
+-            t.prs_n = 0; t.prs_gen = 0; t.prs_arena = nullptr; t.prs_slots = 0;
+             (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
+         }
+         t.device = device;
+@@ -9638,14 +9448,13 @@ static void report_locked() {
+     if (g_stage_ok + g_stage_decline_geom + g_stage_decline_usable + g_stage_decline_nomatch > 0) {
+         const double total = (double) g_stage_arena_bytes + (double) g_stage_host_bytes;
+         GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
+-                      "unsized=%lld (the priming pass); arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); "
+-                      "PRS rebuilds=%lld\n",
++                      "NOT staged (a pinned master, uploaded whole by the scheduler)=%lld; "
++                      "arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged)\n",
+                       __func__, (long long) g_stage_ok, (long long) g_stage_decline_geom,
+                       (long long) g_stage_decline_usable, (long long) g_stage_decline_nomatch,
+-                      (long long) g_stage_decline_unsized,
++                      (long long) g_stage_skip_pinned,
+                       (double) g_stage_arena_bytes / (1024 * 1024), (double) g_stage_host_bytes / (1024 * 1024),
+-                      total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0,
+-                      (long long) g_prs_rebuilds);
++                      total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0);
+     }
+     if (g_stage_span_reads + g_stage_span_fallback > 0) {
+         // W4: the coalesced prefill read.  `MiB/read` is the chunk the run structure actually allowed -- if
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 8cddb0a91..53002129f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -321,16 +321,15 @@ bool moe_cache_source_pageable(const void * p);
+ // call for every host-to-device upload.
+ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, void * stream, int device);
+ 
+-// Fill a whole-table staging copy from the expert-cache arena (the
+-// immutable prefill residency snapshot) + the pinned host master, instead of re-uploading every expert
+-// over PCIe.  `host_src`/`offset` identify a registered table; `width`/`stride_src`/`n_copies` are the
+-// exact copy the caller requested.  Fills `dst` on `copy_stream` (ordered after `compute_stream` when
+-// the arena may have been written) and returns true; the caller records its completion event.  A
+-// geometry mismatch or an unusable table declines (false) so the caller uses the plain upload.  Kill
+-// switch: `GGML_MOE_CACHE_STAGE=0` (the plain whole-table upload).
++// Fill a staged copy of a PAGEABLE (pool-backed) host table from the expert-cache arena (D2D), the pinned
++// pool (D2D from its alias) and one coalesced read per chunk for the experts in neither tier, instead of
++// re-uploading every expert over PCIe.  `host_src`/`offset` identify a registered table;
++// `width`/`stride_src`/`n_copies` are the exact copy the caller requested.  Fills `dst` on `copy_stream`
++// and returns true; the caller records its completion event.  A PINNED master declines by design (r235: its
++// caller's bulk copy is faster), as do a geometry mismatch or an unusable table, so the caller uses the
++// plain upload.  Kill switch: `GGML_MOE_CACHE_STAGE=0`.
+ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
+-                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
+-                           void * order_event);
++                           size_t n_copies, void * dst, void * copy_stream);
+ 
+ // Kernel consumer seam.  Given the op (`op`) and the (redirected) expert table the op will read
+ // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
