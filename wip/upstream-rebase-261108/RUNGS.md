@@ -726,7 +726,7 @@ conflict markers, warning-clean in the touched files.
 
 - status: **DONE** · sha: `2b09a50b0` (tree `87e2841f7`) · session 2026-11-09
 
-## R14 — block 13: MTP draft vocabulary subset
+## R14 — block 13: MTP draft vocabulary subset · **DONE 2026-11-09**
 
 * block sha `6ee8eb290` · 19 files · +569 / −6 · **expected conflicts: 3**
 
@@ -737,7 +737,37 @@ conflict markers, warning-clean in the touched files.
 
 **Exit:** build + coherence + `--spec-draft-mtp-vocab N` runs and is inert when unset (default off).
 
-- status: **TODO** · sha: —
+**Result (`ed13a322e`, tree `c08c912a2`):** build green, no conflict markers, warning-clean.  4 files
+conflicted (predicted 3; `common/common.cpp` extra — an arg-plumbing hunk):
+
+* `common/common.cpp` — upstream replaced the inline fit block with `common_fit_apply()`, which already
+  derives the draft's post-slab reserve (the delivery's block-09 fold, absorbed upstream).  Call site stays
+  upstream's; block 13's one meaningful line (`cparams_dft.mtp_draft_vocab = params.speculative.draft.mtp_vocab`)
+  moved into `common_fit_apply()`'s existing `if (spec_mtp)`.
+* `src/llama-model.h` / `.cpp` — both sides add declarations at the same place; the `llama_rope_params` getters
+  (base drift) and the new `llama_mtp_draft_vocab` struct / `mtp_draft_vocab_get` are kept side by side, and the
+  shared `return res;` tail served **both** conflicted function bodies.
+* `src/llama-graph.h` — `llm_graph_params::can_reuse` compares both sides' terms; the block's `arch ==
+  other.arch` is dropped, because `arch` no longer exists on the params after `#31733` and `model ==
+  other.model` already implies it.
+* `src/llama-context.cpp` — `#31141` drift: `model.hparams.no_alloc` -> `model.no_alloc()` in the shared-NextN
+  head probe.
+
+**Functional check (both head paths):**
+* shared-NextN head (Flash-Next GSQ + `mtp-...-shared-Q8_0`, 3 GPU `-sm tensor`), `--spec-draft-mtp-vocab 98304`:
+  `mtp_draft_vocab = 98304: MTP draft head uses 98337 of 248320 rows (165.06 MiB of q5_K, Meta())` — built from
+  the target's borrowed LM head through `cparams.ctx_other`, exercising this block's row-range splice over a
+  vocabulary-split (Meta) tensor.  Acceptance identical to off (0.49333, 37/75, mean len 2.42); greedy text
+  identical (`55a50dee05e0`) across unset / `-vocab 0` / `-vocab 98304`.
+* self-headed (Gemma4-12B Q8_0 + its own MTP head, 1 GPU), cut 245760: 245766 of 262144 rows, acceptance and text
+  identical to off (0.68852, 42/61, mean len 3.00; `f8ef9d420320`).  An aggressive cut (98304, which this
+  tokenizer's distribution does not suit) drops acceptance to 0.31915 (30/94) and leaves the text **identical** —
+  the promised property (the trim can only lose proposals, never change an accepted token).  Consistent with the
+  block's own note that gemma4's useful cut is 245760 of 262144.
+* coherence unchanged against R13 on four arms: 4B `1de99b7e6ee6`, 30B-A3B `4b4d56191368`, 35B-A3B 3 GPU tensor
+  `86b7f9b5aa80`, Flash-Next GSQ `7a8734a9f1a6`.
+
+- status: **DONE** · sha: `ed13a322e` (tree `c08c912a2`) · session 2026-11-09
 
 ## R15 — block 14: `-sm relaxed-tensor` (TEMPORARY)
 
@@ -803,7 +833,7 @@ climb touched has a maintainer decision recorded.
 | R11 | 10 | `ed1d36436` | 8 expected → 8 files / 22 hunks | build + 3-model coherence + `gate-norm-rows-alias.sh` PASS + MUL_MAT_ID 931/931 + every fusion arm byte-identical to the unfused chain | 2026-11-08 | unblocked: pair `ncols_max`→`ntj` (the fault), routed-compact gate on `nchannels_y` + `tile_y_j_max`→`tile_y_j_sup` (two latent delivery-code losses, +1.9 % prefill), two-copy dispatcher reconciled to one (TODO #290 closed, stale delivery duplicates incl. a non-pure conv-input fold removed) |
 | R12 | 11 | `b1b0fa807` | 7 expected → 9 files / 34 hunks | build + 4B/30B unchanged + `gate-hc-fusions.sh` PASS + `gate-qwen4exp-quant-coherence.sh` PASS | 2026-11-08 | **D3 DECIDED by measurement**: upstream has its own qwen4exp; the delivery's is bit-identical on Flash-Next 3-GPU tensor and +31 % decode (70.1 vs 53.5 t/s), neutral on 27B → keep ours; `n_pad` ctor/member dropped (#31200), `get_n_kv` requires n_tokens, `#31733`/`#31073`/`#29510` drift re-derived; quant-coherence gate's model selection fixed; dsv4 soft-arm drift recorded as `TODO` #292 |
 | R13 | 12 | `2b09a50b0` | 8 expected → 8 files / 24 hunks | build + 4-model coherence (R12-identical) + `gate-state-pipe.sh` PASS + `gate-park-idle-slots.sh` PASS + `gate-ckpt-reuse.sh` PASS (hard checks) + DFlash2 attach/acceptance arms | 2026-11-09 | **`D15` DECIDED**: F1 deleted tree-wide, upstream's `embd_row` kept, Meta refusal carried, host-experts guard re-measured and dropped (identical acceptance on Flash-Next + 35B-A3B, 2 slots, `-ncmoe` 10/24). State pipe kept (gate: 43.7 vs 74.7 ms). Prompt cache = upstream API + delivery policy, with `ckpt_recycle` restricted to uniquely-owned checkpoints. Two pre-existing R12 defects fixed on the way: the `hc_combine_norm` pool-stack LIFO abort on `-sm layer` (`-sm layer` runs for the first time) and the DFlash injection input never registered (dead drafter: 0.000 → 0.754) |
-| R14 | 13 | | | | | |
+| R14 | 13 | `ed13a322e` | 3 expected → 4 files / 5 hunks | build + 4-arm coherence (R13-identical) + `--spec-draft-mtp-vocab` on both head paths (shared-NextN via `ctx_other`, self-headed gemma4) + inert when unset | 2026-11-09 | clean rung: no decision needed. `arch == other.arch` dropped from `can_reuse` (`#31733` moved the model into the graph context; `model == other.model` subsumes it); `common_fit_apply()` already carried the delivery's draft-reserve fold; block 13's row-range splice over a vocab-split Meta tensor is exercised by the shared-NextN arm |
 | R15 | 14 | | | | | |
 | R16 | 15 | | | | | |
 | R17 | — | | | | | |

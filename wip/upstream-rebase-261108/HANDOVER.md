@@ -23,7 +23,11 @@ dropped), the state pipe (kept: 43.7 ms vs 74.7 ms restore, byte-identical), and
 API + the delivery's residency/parking policy, with the checkpoint recycle restricted to uniquely-owned
 objects).  Two pre-existing R12 defects were fixed to get there (`-sm layer` ran for the first time after the
 `hc_combine_norm` pool-stack fix; the DFlash drafter was silently dead from an unregistered graph input).
-**Your next job is R14** (block 13, the MTP draft vocabulary subset) — see `RUNGS.md` → R14.  The R13 brief
+**R14 is DONE too** (`ed13a322e`, tree `c08c912a2`, 2026-11-09): block 13 was a clean rung (no decision) —
+four conflict sites, all "both sides add code here", plus two drift fixes (`arch` gone from
+`llm_graph_params::can_reuse` after `#31733`; upstream's `common_fit_apply()` already carried the delivery's
+draft-reserve fold).  `--spec-draft-mtp-vocab N` verified on both head paths and inert when unset.
+**Your next job is R15** (block 14, `-sm relaxed-tensor`, expected 0 conflicts) — see `RUNGS.md` → R15.  The R13 brief
 below is kept as the record of how it was resolved.
 
 **The pre-R13 brief (R13, block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
