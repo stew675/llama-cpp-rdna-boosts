@@ -2894,3 +2894,17 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   one-off setup (block 01's hybrid pipeline stages 32 MB per GPU), which made hybrid read 58.8 t/s against
   rccl's 82.7 on the 3-GPU `-sm tensor` 35B-A3B; at `-n 64` the same arms read 100.2/105.6 (hybrid) vs
   90.1/90.0 (rccl).  Judge an AR arm at >= 64 decode steps, or from a `llama-bench` tg run.
+- **The device pool is a STACK, so every pool buffer that outlives a statement must be released in reverse
+  allocation order -- through the context's `pool_stack`, never in place (r236, re-base R12).**
+  `ggml_cuda_pool_vmm::free()` asserts that the block being freed is the top of the pool
+  (`ggml-cuda.cu:1348`), and the non-VMM pool silently corrupts its accounting on an out-of-order free.  The
+  per-graph MMB/BF16 caches broke that four ways -- the yield freed the activation cache in vector order and
+  then the slots in ascending index order, `mmb_cache_insert()` evicted the *oldest* entry while newer ones
+  were live, and `mmb_slot_reserve()`/`bf16_src1_cache_put()` freed a grown/replaced block in place.  It was
+  invisible on the delivery's old NO_VMM builds and fatal on ours (the slab needs VMM): **every qwen3.8 run
+  aborted on the first compute step at `-ub 512`**, with three 17 MiB blocks live and the oldest freed first;
+  `-ub 128` stayed under the two-block threshold, which is why every gate and every other model passed.  The
+  fix is one per-context stack: register a block at allocation, `pool_stack_kill()` only MARKS it dead, and it
+  is really freed when it reaches the top; `graph_compute`'s per-graph yield drains what is left, top first.
+  Any *new* cache or scratch that keeps a `ggml_cuda_pool_alloc` across statements must join that stack --
+  and a VMM build is the only build where the mistake is loud.

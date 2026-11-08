@@ -1,6 +1,7 @@
 # HANDOVER — the upstream re-base, cold-start brief
 
-**Read this first, then `RUNGS.md` (the ledger) and `DECISIONS.md` (the open questions).**  Everything below is
+**Read this first, then [`HANDOVER-R13.md`](HANDOVER-R13.md) — the per-rung brief for the rung you are about to
+do (R13 and everything after it) — then `RUNGS.md` (the ledger) and `DECISIONS.md` (the open questions).**  Everything below is
 the state as of **2026-11-08, end of the session that reached rung R10**.
 
 You are continuing a **ladder climb**: re-basing this repo's 16-block delivery patch set (`patches/`) from the
@@ -16,7 +17,8 @@ qwen4exp, so the rung was a measured choice between two implementations — the 
 with byte-identical text** on the field config, so it stays.  Read `RUNGS.md` → R12 before touching that model.
 A pre-rung fix also landed: `5f412b011` releases the per-graph MMB/BF16 pool blocks in LIFO order (the VMM pool
 asserts it; every qwen3.8 run crawled to a halt on the first compute step without it).
-**Your next job is R13** (block 12, the campaign remainder).  It is **surveyed and parked**, not started: the
+**Your next job is R13** (block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
+which replaces the R11/R12 history below as the working brief.  R13 is **surveyed and parked**, not started: the
 cherry-pick was examined and rolled back, and `RUNGS.md` → R13 plus **`r13-survey.md`** in this directory are
 the cold-start brief.  It is not one merge but three decisions, each with an oracle: `D15` (the delivery's F1
 `llama_lf_*` layer-input device store vs upstream's `embd_row`/`#31506` — expected subsumption, keep the
