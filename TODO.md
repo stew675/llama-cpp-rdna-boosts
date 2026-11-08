@@ -423,6 +423,67 @@ delivery requires for a pref/prefill change — `gate-prefill-logits.sh` must re
 same bytes, so anything else is a bug), same-seed greedy text, `check-gpu-faults.sh`.  **Value:** up to ~3x on the
 default mode's prefill, which is also the baseline every pool claim is divided by.
 
+## 279. narrow-2 (draft compute) must prefer its `cudaMalloc` fallback over evicting arena tables (r236 re-validation)
+
+Measured **CLOSED 2026-11-07 as "do not implement"** on the pre-re-base tree
+(`archive/work/host-expert-parity/PLAN.md` P1.5, `PR-267-REMAINDER.md` item 5): when the draft's narrow-2 compute
+region fits *outside* the slab, taking the `cudaMalloc` fallback instead of evicting arena tables measured no better
+than the eviction, so the branch was not taken.
+
+The re-base moved the slab and the arena (R10/R11 re-derived the arena, R13 fixed the `hc_combine_norm` pool
+ordering, R16 fixed the `mmb_glu` pool-ordering site and added `GGML_CUDA_POOL_TRACE`), so the *measurement basis*
+is gone.  **Closing it on r236 means one A/B of the branch against `GGML_CUDA_SLAB_MIN_ARENA_MIB`** on the field
+config (35B-A3B or Flash-Next, `-ncmoe`, `-sm layer`), with the arena table count / residency census in the record —
+either it still measures neutral (close it again, with the r236 number) or the re-based slab changed the answer and
+it ships.
+
+## 286. Re-measure the Meta compute headroom (the delivery's 128 multiplier vs upstream's 256 floor)
+
+`ggml/src/ggml-backend-meta.cpp` resolves the tensor-split compute headroom as
+`compute_headroom = 128` (delivery) inside a `std::max(..., compute_headroom_min = 256)` (upstream `#31447`-era).
+R01 kept **both** and recorded the question (`DECISIONS.md` `D7`, `RUNGS.md` R01).  Two constants with different
+meanings now compete, and nobody has checked whether the delivery's 128 multiplier is still doing anything under
+upstream's floor.
+
+**Closing it:** a 2-device `-sm tensor` arm with the headroom forced by each mechanism (`--fit` on a config that is
+marginal for VRAM, or a `test-backend-ops`/`llama-bench` pp arm at a context that makes the compute buffer the
+limiter), showing which constant actually sizes the buffer and that the other can go — or that both are needed, with
+the number.  Record the buffer sizes from the log, not the constants.
+
+## 287. Re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid
+
+The upstream PR candidate for the duplicate `mul_mat_id` launch was cut against the old base; `#31047` moved the
+grid/tile representation (`tile_spec`, `nchannels_y = 1` on the ids path — `GREEDY-PURITY.md` §84).  **Closing it:**
+re-cut the patch against `a691b2345`, confirm it applies to unadulterated upstream and still removes the duplicate
+launch (a launch-census before/after), then update `upstream/README.md`'s sha256.  Delivery-neutral; it is an
+upstream contribution, so it must not change the delivery tree.
+
+## 290. The dispatcher merge debt must actually LAND with r236 (resolved at R11)
+
+R11 reconciled the two `ggml_cuda_try_fuse` copies into one and deleted the stale duplicates (`RUNGS.md` R11
+defect 3, `GREEDY-PURITY.md` §84 rule 3) — but the resolution lives in the working chain, so "closed" is only true
+once **r236 ships it**.  **Closing it:** after `scripts/make-patches.sh` at R17, confirm block 10's patch is the
+single-dispatcher body (no `ggml_cuda_try_fuse_legacy()`, no delivery duplicates of upstream arms) and that
+`gate-norm-rows-alias.sh` + `MUL_MAT_ID 931/931` are green on the *re-cut* tree, then close it in `WORKLOG.md`.
+
+## 291. The arena vs upstream's MoE cache: finish the measurement (`D1`, MEASURING)
+
+`DECISIONS.md` `D1`.  The first numbers are in (`RUNGS.md` R10: upstream's cache +17.6 % decode on one arm) and the
+maintainer deferred the analysis to its own session; the delivery's host-expert arena and upstream's cache may be
+complementary (different tiers) or redundant.  **Closing it:** the measurement set R10 named — one model at two
+`-ncmoe` levels, `MOE_EXPERT_CACHE_MIB` arms, the `-lv 4` census (`expert access:`, `takeover=`, cold admission),
+decode **and** prefill, and an A/B of "arena only" vs "upstream cache only" vs both — then a decision recorded in
+`DECISIONS.md` (keep both, keep one, drop one).  This is the largest item on the list; it is a measurement, not a
+code change, unless the numbers say otherwise.
+
+## 289. Upstream PR owed: `find_slot()` must swap `mem_cell::rs_max` (`TODO` #289, from R04)
+
+Found and fixed **in the delivery** at R04: `find_slot()` recycles a cell by assigning `pos`/`src`/`seq_id` but leaves
+`rs_max`, so the moved cell's rollback bound refuses legal rollbacks.  The delivery's fix is in block 03; the
+**upstream PR is owed** (`HANDOVER.md` §5 item 8 has the full note).  **Closing it:** a patch under `upstream/` cut
+against `a691b2345` that applies to unadulterated upstream, with the reproduction (a `test-recurrent-state-depth`
+arm or the `-nrs` rollback scenario that fails without it).
+
 ## 283. `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index
 
 **Status: open, latent (found 2026-11-07 while auditing transfer concurrency; `WORKLOG.md` 261107.014).**  The

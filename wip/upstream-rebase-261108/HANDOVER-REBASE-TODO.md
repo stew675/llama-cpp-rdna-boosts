@@ -51,21 +51,31 @@ rejected** (`TODO` #300).
 
 ## §1 The re-base TODO list (close these before R17)
 
-**The campaign's numbering window is `#286+`** — every open item from `#286` upward is this climb's, and `#286-#293`
-are all closed (their records are `RUNGS.md`/`WORKLOG.md`, so nothing in that range is in `TODO.md` any more).
-Seven are open, and they do **not** all block R17 — three of them ARE R17:
+**The campaign's handle list is `#279`, `#286`–`#298`, `#300`, `#301`** — the pre-existing backlog is `#116`,
+`#131`–`#134`, `#270`, `#283`–`#285`.  **Twelve** of the campaign's handles are still open (`#279`, `#286`, `#287`,
+`#289`, `#290`, `#291`, `#294`–`#298`, `#300`, `#301`); several were recorded as closed in the pre-re-base records and
+must be closed **on r236**, which is a different thing.
 
 | # | item | when |
 |---|---|---|
 | **#294** | the gates' kernel-journal window | **before R17** (makes every later gate verdict trustworthy) |
 | **#297** | the qwen4exp sparse QSA arm has no gate | **before R17** (~30 lines of shell + one hash) |
 | **#298** | sweep the `pool_stack_push` sites (the ordering class) | **before R17** |
-| **#301** | r236 is −2 … −3 % on MoE **prefill** vs r235 | **before R17** — the only *measured* regression, and the one that decides "no slower" |
+| **#301** | r236 is −2 … −3 % on MoE **prefill** vs r235 | **before R17** — the only *measured* regression, decides "no slower" |
+| **#279** | narrow-2 prefers `cudaMalloc` over evicting arena tables — measured CLOSED **pre-re-base**; the re-base moved the slab/arena so the basis is gone | **before R17** (one A/B) |
+| **#286** | re-measure the Meta compute headroom (delivery 128 multiplier vs upstream's 256 floor, `D7`) | **before R17** (one 2-device arm) |
+| **#290** | the dispatcher merge debt "lands with r236" — verify it in the **re-cut** patch, not the working tree | **at R17 step 1** |
+| **#287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `a691b2345`/`#31047` | **before R17** (delivery-neutral, upstream contribution) |
+| **#289** | upstream PR owed: `find_slot()` must swap `mem_cell::rs_max` (fixed here at R04) | **before R17** (upstream contribution) |
+| **#291** | the arena-vs-upstream-MoE-cache measurement (`D1`, MEASURING) | its own session — **the largest item**; a measurement, not a code change |
 | **#295** | R17 must include a host-expert **two-slot DFlash** arm | **during R17** (a ladder arm, not a fix) |
 | **#296** | `D8`'s CPU-win measurement | **during R17** (a ladder arm, not a fix) |
 | #300 | gfx1151 attendance pool | **parked** (mitigated: the knob declines there), not a blocker |
 
-So the pre-R17 work is **#294, #297, #298, #301**, and the ladder absorbs **#295** and **#296** as arms.
+So the pre-R17 work is **#279, #286, #287, #289, #294, #297, #298, #301** (+ #290 verified at R17 step 1),
+**#291** is its own session, and the ladder absorbs **#295**, **#296**.  `TODO.md` now carries every one of these
+handles with what "closing it" means — they were reconstructed from the campaign records because they had never been
+carried into `TODO.md` (they were only in this directory's "open handles" list).
 
 
 Four defects/gaps, one regression to localise, three decisions to close, plus housekeeping.  Everything below is
