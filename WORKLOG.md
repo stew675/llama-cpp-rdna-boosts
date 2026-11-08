@@ -41,11 +41,22 @@ the fix lives in block 09, and a promoted campaign leaves `wip/`.  (4) The PR's 
 place" is not strictly true for a pool-backed host expert master; the exemption is still safe because the
 delivery's own bounce/`busy` ring orders those, and the comment says so.
 
-**Gates** (r235): `validate-set.sh` green (16 blocks + the net patch, fresh-tarball strict `git am`),
-`gate-per-block-build.sh` 16/16, coherence greedy text identical (4B Q8_0 1 GPU `-sm layer`, 3 GPU `-sm tensor`) and
-27B `-ub 512`/`-ub 2048`, `gate-prefill-logits.sh` PASS, `gate-host-pool.sh` PASS (the weight exemption's path),
-`check-gpu-faults.sh` clean, `fork-refresh.sh --build --gates --push` re-cut and pushed `rdna-boosts` to the
-personal fork at the recorded `.tip`.
+**Gates** (r235).  `validate-set.sh`: green — 16 blocks + the net patch, per-artifact checksums, fresh-tarball
+strict `git am`, applied tree `ef5dcbcb0` (Windows path + portability scans clean).  `gate-per-block-build.sh
+--changed-from 2e31f8819 --fast`: **3/3** — blocks 09 and 10 carry the two hunks, and block 15's delta differs only
+through its re-cut parents; each builds, and the other blocks were skipped as byte-identical deltas.  Coherence, same-seed greedy
+text **identical** between the r234 build and this one on four arms: 4B Q8_0 1 GPU `-sm layer`, 4B 3 GPU
+`-sm tensor`, 27B UD-Q4_K_XL `-ub 512` (the arm that uploads 10 MiB per ubatch) and Flash-Next GSQ-RCO-IQ3_S
+`-ncmoe 44 --load-mode mmap` (the host-expert path the weight exemption leaves async).  `gate-prefill-logits.sh`:
+**mean KLD 0.000000 / same-top-p 100.000 %** against the recorded gfx1201 base (and again on the re-cut tree).
+`gate-host-pool.sh`: **41/41** (the known `pinlate` WARN is `TODO` #282, unchanged).  `test-backend-ops -o CPY`
+251/251.  `check-gpu-faults.sh` clean over the journal and every gate log.  `scripts/fork-refresh.sh --build
+--gates --push` re-cut the set from `patches/` at the fork point, produced the reproducible tip **69d36099b**
+(the working chain's amended commits carry wall-clock committer dates and so different ids; the tree is the
+same — per the `.tip` rule the re-cut id is the recorded one), re-built it and re-ran the coherence +
+prefill-logit gates on that tree (the MTP protocol is not run by the script), and force-pushed
+`rdna-boosts` to the personal fork (lease `2e31f8819`).  The worker watcher on `radiance` picked the tag up at
+19:50 and is building the ROCm 7.14.1 / 10.1 images.
 
 ## 261107.012 (no release) -- the engine merge was built, measured and withheld: the box's copy-engine "phase" is SDMA dispatch latency
 
