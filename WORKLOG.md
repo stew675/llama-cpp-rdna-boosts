@@ -1,3 +1,54 @@
+## 261108.008 (no release) -- `TODO` #303 closes with NO delivery change: the dense MMQ residue is the base commit, and the delivery is bit-identical to upstream in that kernel
+
+No delivery code changed.  `#303` is closed as an **inherited, understood cost**, the record that mis-diagnosed it
+is corrected, and the two candidate fixes were refuted at instruction level before any measurement was spent.
+Record: [`benchmarks/2026-11-08-dense-mmq-303.md`](benchmarks/2026-11-08-dense-mmq-303.md).
+
+**The filed premise was wrong, and the instrument says so exactly.**  `#303` was "the re-base's `mmq_args`/
+`tile_spec` re-expression changed the dense body" (VGPR 232 → 216).  Unbundling the gfx1201 code objects out of
+`libggml-hip.so` and comparing the dense instantiation's normalised instruction stream gives the static answer:
+**r236's `mul_mat_q<(ggml_type)8,128,false,(ggml_prec)30,false,false>` is identical to unpatched `a691b2345`'s**
+(1436 instructions, 0 diff lines).  The delivery has no code presence in that kernel at all, so VGPR 232 was never
+a mechanism — it was the *pre-`#31047`* body that r235 inherited, which R01 correctly replaced.
+
+**Four-build attribution** (2 interleaved `rocprofv3` rounds each; 794 launches, identical geometry in all four:
+workgroup `(32,8,1)`, the same six grids, `J = 128` — so no runtime `J`/`ntj`/`nthreads` difference exists):
+
+| build | mean dense-kernel ms | vs. next | instrs | VGPR |
+|---|---|---|---|---|
+| `6050b467c` unpatched | 521.32 | — | 1432 | 216 |
+| r235 = 6050 + delivery | 519.43 | **−0.36 %** | 1476 | 232 |
+| `a691b2345` unpatched | 528.14 | **+1.31 %** | 1436 | 216 |
+| r236 = a691 + delivery | 528.64 | **+0.09 %** | 1436 | 216 |
+
+So **~¾ of the r235→r236 gap is upstream's own change** between the two fork points and **~¼ is a 0.36 % allocation
+artefact of the body R01 dropped**.  The delivery is *neutral* on the new base, and *protective* on the whole trace
+(+1.47 % base-only vs +0.89 % with the blocks).  The same base also costs the FA kernel +8.2 % and ~1.85 ms of
+per-pass `fillBufferUnAligned` work, i.e. several kernels move together — a base-level characteristic.
+
+**Two fixes tried, both refuted free.**  (1) Drop the dense per-tile `min()` (r235's column-range shape): provably
+equivalent, compiled in, **1436 → 1435 instructions, VGPR unchanged**, and the arm wall clock with it was
+−1.16/−1.22/−1.29 % vs r235 — i.e. nothing.  (2) Put the NVFP4 scale plumbing back behind `if constexpr` (exactly
+what `a691b2345` restructured): compiled in and the Q8_0 ISA came out **byte-identical** — the compiler already
+folds it.  Both reverted; the tree is back to `2ff384571`/`eda002cc2` with device code verified byte-identical to
+the state this session started in.
+
+**The allocation win was dropped, by decision.**  The only live lever was r235's 232-VGPR body (−0.36 % of one
+kernel).  Recovering it means re-introducing a semantically dead construct (the one-iteration column-tile loop)
+purely to steer ptxas, for ~0.3 % of an arm, under a ±1 % measurement floor.  Not shipped.
+
+**Instrument corrections (the durable part).**  A single-run census cannot resolve this item: two traces of the
+**same** binary gave 521.26 and 527.11 ms (**±1.1 %**), larger than the effect.  Everything above is 2 interleaved
+rounds, and the arm wall clock (6 interleaved `-r 5` rounds across two sessions, −1.08…−1.29 %) remains the number
+to argue from.  Also corrected: the arm runs **794** dense `mul_mat_q` launches — **986** is the *total*
+`mul_mat_q` count (794 dense + 192 ids).
+
+**State.**  `master` in `~/llama.cpp` is pinned at `a691b2345` again and `HANDOVER-303.md` §7 + a new §5 trap now
+say to build the attribution base from `git checkout --detach a691b2345`, never from `master`: a local candidate
+commit on `master` (the #289 one, found there at session start) silently moves what every "unpatched upstream" arm
+measures and what R17 step 5 records as the KLD reference.  `patches/`/`release.json`/the fork's `rdna-boosts`
+untouched (cut at R17).  Pre-R17 list now: `#279`, `#304`, `#287` (WIP), then R17.
+
 ## 261108.007 (no release) -- `#286` and `#289` close, `#287` re-cut is half done (WIP) and it found a delivery gap (`#304`), `#290` pre-checked
 
 No delivery code changed in this entry; two upstream candidates and one campaign record were produced, and two

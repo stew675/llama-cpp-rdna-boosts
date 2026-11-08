@@ -54,7 +54,6 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
-| **303** | the dense MMQ kernel is 1.4 % slower than r235 at the **same** instantiation, grid and launch count (VGPR 232 → 216): `mul_mat_q<Q8_0, 128, …>` carries the residual −1.5 % on dense prefill | performance (delivery, block 00/08 `mmq.cu`/`mmq.cuh`; found closing `#302`) | **OPEN** — found 2026-11-08 in the `rocprofv3` census of the 27B arm; the run is 986 launches in both builds — §303 |
 | **304** | `MUL_MAT_ID` with repeated expert ids **fails for `f16` at `ncols_dst = 9`** (ERR 0.374 vs 5e-4); every other dup case passes.  Upstream keeps those cases `#if 0`, so nothing in `patches/` tests the duplicate path at all | correctness (delivery, narrow `f16`/`mmf` dispatch) | **OPEN** — found 2026-11-08 while re-cutting `#287`; the delivery is **15/16** on upstream's dup suite — §304 |
 
 ## Handle numbering
@@ -500,28 +499,6 @@ residency/thrash hypothesis is needed.
 
 The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
 never run on RDNA3.5 before this validation.
-
-## 303. The dense MMQ kernel is 1.4 % slower than r235 at identical geometry (the last prefill gap)
-
-Found while closing `TODO` #302 (`benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md`).  The dense 27B Q8_0
-arm is still **−1.3 / −1.6 / −1.5 %** on `llama-bench -p 512 -r 5` after the ids-compaction (`#301`) and FA
-(`#302`) fixes, and the `rocprofv3` census says the residue is `mul_mat_q`:
-
-| | r235 | r236 (after #302) |
-|---|---|---|
-| `mul_mat_q` kernel time (986 launches) | 535.4 / 543.0 ms (before / after) | +1.4 % |
-| instantiation | `mul_mat_q<(ggml_type)8, 128, false, (ggml_prec)30, false, false>` | **same** |
-| launch count / grid / workgroup | 986 / (128, …) / 32 | **same** |
-| VGPR count | 232 | **216** |
-
-Same template, same geometry, same count, different register footprint — so the *body* or the runtime J/ntj
-split changed in the re-base's MMQ re-expression (R01/R08/R09: the `mmq_args`/`tile_spec` work is block 00/08's).
-**Closing it:** `rocprofv3 --kernel-trace` on the 27B arm for both binaries (the census above), then diff
-`mul_mat_q`'s `mmq.cuh` body and the runtime `J`/`ntj`/`nthreads` selection between the trees — a J one band
-lower needs no numerical change to show up as this.  Gates: `gate-prefill-logits.sh` (a prefill kernel, so KLD is
-mandatory even when the text is unchanged; a fresh base from the unpatched build already exists at
-`~/.cache/rdna-boosts/gates/`), same-seed greedy text, `test-backend-ops -o MUL_MAT_ID` 931/931 and the dense
-`MUL_MAT` suite.  Worth ~1.1 % of dense prefill (the 27B arm) and ~0.4 % of the MoE arms' prefill.
 
 ## 304. `MUL_MAT_ID` duplicate ids: `f16` at `ncols_dst = 9` is wrong (and nothing tests the path)
 

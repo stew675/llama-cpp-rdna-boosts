@@ -3017,3 +3017,20 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   itself is wrong, at least partly racily.  The **window** (Goal A, one VA range, no mirror) and the sparse decode
   arm are fine on the same box (`be904e86f248`, identical to gfx1201), which is what localises the defect to the
   mirror/pool tier rather than to the KV placement.  Until fixed, do not claim the pool for gfx1151 (`TODO` #300).
+- **A single `rocprofv3 --kernel-trace` run cannot resolve a sub-1.5 % kernel delta — measure twice, and argue from
+  the arm (r236, `TODO` #303).**  Two consecutive traces of the **same** binary gave dense-`mul_mat_q` totals of
+  521.26 and 527.11 ms: a **±1.1 % run-to-run floor**, larger than the effect being chased.  Per-kernel numbers need
+  **2+ interleaved rounds** (interleave *builds* within a round, not rounds within a build — the second round of every
+  build was uniformly ~0.35 % slower, which interleaving cancels and sequential runs do not), and anything that has to
+  be argued should be quoted as the interleaved `llama-bench -r 5` wall-clock ratio.  A "VGPR count changed" signal is
+  not evidence of anything on its own: it tracks the *body*, so two builds with different bodies will always differ.
+- **The gfx1201 ISA is the exact, noise-free arbiter for "same template instantiation, different behaviour" (r236,
+  `TODO` #303).**  The whole device program is one `.hip_fatbin` section of `libggml-hip.so` holding one
+  `__CLANG_OFFLOAD_BUNDLE__` per TU (`llvm-objcopy --dump-section .hip_fatbin`, then parse the bundle header — note
+  the entry offsets are **bundle-relative**, not section-relative — then `llvm-objdump -d
+  --disassemble-symbols`; scripted in `wip/upstream-rebase-261108/isa-kernel-diff.py`).  Comparing the normalised instruction sequence answers in seconds what profiling cannot:
+  r236's dense MMQ came out **identical to unpatched `a691b2345`'s** (1436 instructions, 0 diff lines), which is what
+  closed `#303` as an inherited cost rather than a lost delivery win — and it refuted two candidate fixes (a `min()`
+  removal: 1436 → 1435 instructions; a type-gated NVFP4 prologue: byte-identical) before a single measurement was
+  spent.  Check the ISA *before* benchmarking a codegen hypothesis; the same dump also gives the static instruction
+  mix, which shows a "big" regression is usually four instructions and a scheduling change.

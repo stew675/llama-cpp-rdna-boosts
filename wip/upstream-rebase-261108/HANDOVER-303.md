@@ -1,5 +1,15 @@
 # HANDOVER — `TODO` #303: the dense MMQ kernel is 1.4 % slower than r235 at identical geometry
 
+> **CLOSED 2026-11-08 — no delivery change (`RUNGS.md` `P7`).**  The premise below is refuted: r236's dense
+> `mul_mat_q` is **instruction-for-instruction identical to unpatched `a691b2345`'s** (1436 instructions, 0 diff
+> lines), so the delivery has no code presence in that kernel.  Four-build attribution (2 interleaved rounds
+> each): base commit **+1.31 %**, r235's old body **−0.36 %**, delivery on the new base **+0.09 %**.  Two candidate
+> fixes were compiled and refuted at ISA level (a `min()` removal: 1436 → 1435 instructions; a type-gated NVFP4
+> prologue: byte-identical) and reverted; the 0.36 % allocation win was dropped by decision.  Record and the
+> corrected numbers (794 dense launches, not 986; single-run census floor ±1.1 %):
+> [`../../benchmarks/2026-11-08-dense-mmq-303.md`](../../benchmarks/2026-11-08-dense-mmq-303.md).  Everything below
+> is kept as the item's history.
+
 **Read order:** this file → [`RUNGS.md`](RUNGS.md) `P4`/`P5` (how #301/#302 were found and fixed) →
 [`../../benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md`](../../benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md)
 (the census and the gate numbers) → `DECISIONS.md` (`D2` is the MMQ-adjacent decision) →
@@ -115,6 +125,10 @@ Runtimes: one trace ≈ 20 s (27B load) — cheap enough to iterate.
    quote per-round ratios, never a min/max of raw t/s.
 5. **`build-rocm-base` must keep existing** — R17 step 5 re-records the prefill-logit base from it.
 6. Never `git apply` the block series; never push to upstream; the delivery's `patches/` are cut only at R17.
+7. **The attribution base is a SHA, not a branch.**  `build-rocm-base` must be built from a detached
+   `git checkout a691b2345`, never from `master` — `master` is only *supposed* to be that commit.  A local
+   commit on `master` (a #289-style candidate staged for `git apply --check`) silently changes what every
+   "unpatched upstream" arm measures and what R17 step 5 records as the KLD reference.
 
 ## §6 What else is left in this campaign (context, not this item)
 
@@ -144,7 +158,9 @@ cd ~/llama-cpp-rdna-boosts && git log --oneline -1
 
 # build (incremental is fine unless a widely-included header moved)
 ~/bin/build-llama-rocm                 # r236
-BUILD_DIR=build-rocm-base ~/bin/build-llama-rocm   # unpatched a691b2345 (checkout master first!)
+# unpatched a691b2345, for attribution and R17 step 5's KLD base.  PIN THE SHA, never `master`: a local
+# commit on `master` would silently move the reference base (it did once, #289, 2026-11-08).
+git checkout --detach a691b2345 && BUILD_DIR=build-rocm-base ~/bin/build-llama-rocm && git checkout rebase-r236
 
 # the census (kernel time + registers + geometry, one arm)
 HIP_VISIBLE_DEVICES=0 rocprofv3 --kernel-trace -f csv -o out -- ./build-rocm/bin/llama-bench \

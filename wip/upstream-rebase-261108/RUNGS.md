@@ -1175,6 +1175,53 @@ those cases `#if 0`, the duplicate path has no standing oracle in `patches/` at 
 
 - status: **DONE** (`#286`, `#289`, `#290` pre-check) / **HALF** (`#287` → WIP) · session 2026-11-08
 
+## P7 — pre-R17: `TODO` #303, the dense MMQ residue — it is the base commit, not the delivery · **DONE 2026-11-08**
+
+`#303` was the last prefill gap: the dense 27B Q8_0 arm **−1.3 … −1.6 %** against the shipped r235, filed as
+"the re-base's `mmq_args`/`tile_spec` re-expression changed the dense body (VGPR 232 → 216)".  It is closed with
+**no delivery change**, because the kernel turned out to be upstream's, byte for byte.
+
+**Method: the ISA, not the profiler, and 2 interleaved rounds when timing is unavoidable.**  The gfx1201 code
+objects were unbundled out of `libggml-hip.so` and the dense instantiation compared as a normalised instruction
+sequence (exact, noise-free): **r236's is identical to unpatched `a691b2345`'s** (1436 instructions, 0 diff lines).
+The delivery has no code presence in that kernel, so VGPR 232 was never a mechanism — it was the *pre-`#31047`*
+body r235 inherited, which R01 correctly replaced.
+
+**Attribution, four builds × 2 interleaved rounds** (`rocprofv3`, 794 launches, identical geometry and `J = 128`
+in all four — so no runtime `J`/`ntj`/`nthreads` difference exists):
+
+| build | mean dense-kernel ms | delta | instrs | VGPR |
+|---|---|---|---|---|
+| `6050b467c` unpatched | 521.32 | — | 1432 | 216 |
+| r235 = 6050 + delivery | 519.43 | **−0.36 %** | 1476 | 232 |
+| `a691b2345` unpatched | 528.14 | **+1.31 %** | 1436 | 216 |
+| r236 = a691 + delivery | 528.64 | **+0.09 %** | 1436 | 216 |
+
+So ~¾ of the gap is upstream's own change between the two fork points, ~¼ is a 0.36 % allocation artefact of the
+dropped body, the delivery is neutral on the new base and *protective* on the whole trace (+1.47 % base-only vs
++0.89 % with the blocks).  The same base also costs FA +8.2 % and ~1.85 ms of `fillBufferUnAligned` work — several
+kernels move together, i.e. a base-level characteristic.
+
+**Two fixes tried and both refuted at ISA level, free.**  (1) drop the dense per-tile `min()` (r235's column-range
+shape, provably equivalent): compiled in, **1436 → 1435 instructions, VGPR unchanged**, arm wall clock unchanged
+(−1.16/−1.22/−1.29 % vs r235).  (2) type-gate the NVFP4 scale plumbing behind `if constexpr` (exactly what
+`a691b2345` restructured): compiled in, Q8_0 ISA **byte-identical**.  Both reverted.  What remains between the fast
+and slow body is four static instructions (`v_cmpx_ge_i32` ↔ `v_cmpx_gt_i32`, one `s_min_i32`, four FMAs that stop
+pairing into `v_dual_fmac_f32`) — nothing to remove.
+
+**Dropped by decision:** the 232-VGPR allocation win (−0.36 % of one kernel) — recovering it needs a semantically
+dead construct to steer ptxas, for ~0.3 % of an arm under a ±1 % measurement floor.
+
+**Instrument facts that outlive the item:** two traces of the *same* binary differ by **1.1 %**, so a single-run
+census cannot resolve this class of delta (interleave builds *within* a round); and the arm runs **794** dense
+`mul_mat_q` launches — **986** is the *total* (`794` dense + `192` ids).  Both are in `INVARIANTS.md`.  Also
+fixed on the way: `master` in `~/llama.cpp` was carrying a local #289 candidate (so "unpatched upstream" would have
+silently been the wrong tree); it is pinned at `a691b2345` and `HANDOVER-303.md` §7 + §5 now say to build the
+attribution base from `git checkout --detach a691b2345`, never from `master` (R17 step 5 records the KLD base from
+it).
+
+- status: **DONE, no delivery change** · record: `benchmarks/2026-11-08-dense-mmq-303.md` · `WORKLOG.md` 261108.008 · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1206,6 +1253,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |
 | P6 | — | `upstream/recurrent-find-slot-rs-max/` (candidate) | #286/#287/#289/#290: two upstream candidates, one re-cut halved, one pre-check | #286 measured (5 arms), #289 `git apply --check` clean on a691b2345, #287 WIP, #290 pre-checked | 2026-11-08 | found `#304` (delivery is 15/16 on upstream's dup suite) |
 | P5 | — | `2ff384571` (fork, block 05 hunk) | #302: the FA tile loader's per-chunk `kv_rows` select (r236's port) cost 25 % of the FA kernel | fixed (inlined fast path + `__noinline__` kv_rows variant); 30B/35B parity, KLD gate PASS | 2026-11-08 | scratch 376 -> 336 B, 19.6 -> 15.7 ms; residue is the dense `mul_mat_q` (#303) |
 | P4 | — | `30277a117` (fork, block 00/08 hunk) | #301: MoE prefill −2..−3 % localised by kernel census → a duplicate ids compaction (our R01 re-expression) | fixed; 3 arms now −0.1..−1.1 %; 931/931 + texts identical; FA port split out as #302 | 2026-11-08 | one compaction + `mm_id_retile_kernel`; `GGML_CUDA_DISABLE_MMQ` correction recorded |
