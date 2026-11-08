@@ -24,6 +24,24 @@
 #     all-reduce), so a hash mismatch is reported as a WARN by default; set
 #     STRICT=1 (recommended with `-sm layer`) to make it a hard failure.
 #
+#
+# WHAT IT CHECKS TOO (`TODO` #297): the SPARSE QSA decode arm, which had no gate until now.
+#   The sparse arm is env-forced (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) and only engages above the
+#   indexer selection width (`indexer_top_k + r - 1`, ~2051 tokens of context), so every coherence
+#   arm and the harness-wide qwen4exp arms ran the DENSE arm -- and a delivery re-derivation broke
+#   the sparse one for five re-base rungs (R12-R16: `indexer-score.cu` called a ROPE-only accessor
+#   on its fused node and every sparse run aborted) with nothing to notice.  Section E therefore
+#   runs three arms on a prompt above that width and asserts, in this order:
+#     * `sparse` (fused node ON, the shipped default) logs the `indexer-score: fused-score launched`
+#       census -- reachability, which a text comparison cannot see;
+#     * `chain`   (`GGML_CUDA_QSA_INDEXER_SCORE=0`) logs NO census line and produces the SAME text
+#       -- the fused node is the op, and it is byte-identical to the per-op chain it replaces;
+#     * `dense`   (the shipped default policy) logs NO census line and produces DIFFERENT text --
+#       i.e. the sparse arm is a genuinely different path, so "sparse == chain" cannot be satisfied
+#       by never taking the sparse arm at all.
+#   The census comes from `GGML_CUDA_QSA_SCORE_LOG=1` (a stderr line, so it can never perturb the
+#   generated text); its sensitivity is proved by the other two arms on every run.
+#
 # Usage:
 #   ./gate-qwen4exp-quant-coherence.sh [--no-faults] [llama-cli]
 # Environment:
@@ -38,6 +56,13 @@
 #   STRICT       1 = a hash mismatch is a hard failure (default: 0 = warn)
 #   KEEPOUT      dir for the per-run logs (default: mktemp -d)
 #   --no-faults  skip the kernel-journal fault check (a box with no readable kernel log)
+#   QSA_ARM      1 = run the sparse-arm section E (default 1)
+#   QSA_QUANT    the quant directory section E uses (default GSQ-IQ3_XXS, 1 GPU, -sm layer)
+#   QSA_MODEL    override the model path outright
+#   QSA_PROMPT   the section's prompt (default prompts/prose-rdna-boosts.txt: ~5246 tokens, i.e.
+#                above the ~2051-token selection width the sparse arm needs)
+#   QSA_NGEN     generated tokens for the three arms (default 32)
+#   QSA_CTX      context size (default 8192)
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,6 +76,14 @@ NGEN="${NGEN:-32}"
 NGPU="${NGPU:-2}"
 STRICT="${STRICT:-0}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
+QSA_ARM="${QSA_ARM:-1}"
+QSA_QUANT="${QSA_QUANT:-GSQ-IQ3_XXS}"
+QSA_MODEL="${QSA_MODEL:-}"
+QSA_PROMPT="${QSA_PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
+QSA_NGEN="${QSA_NGEN:-32}"
+QSA_CTX="${QSA_CTX:-8192}"
+QSA_GPU="${QSA_GPU:-0}"
+QSA_NCMOE="${QSA_NCMOE:-48}"
 mkdir -p "$KEEPOUT"
 
 # the positional llama-cli the usage line has always documented was silently ignored; parse it (#294)
@@ -146,6 +179,101 @@ for q in $QUANTS; do
     fi
 done
 
+# ---------------------------------------------------------------------------------------------------
+# E. the SPARSE QSA decode arm (TODO #297) -- reachability + fused/chain purity
+#
+# The three arms are deliberately 1 GPU `-sm layer`: qwen4exp at temp 0 is run-to-run
+# nondeterministic under `-sm tensor` (see WHAT IT CHECKS), and this section asserts byte-identity.
+# ---------------------------------------------------------------------------------------------------
+if [ "$QSA_ARM" = "1" ]; then
+    echo
+    echo "==> E. the sparse QSA decode arm (LLAMA_QSA_DENSE_DECODE_UNTIL=0)"
+    qsa_model="${QSA_MODEL:-}"
+    if [ -z "$qsa_model" ]; then
+        qsa_model="$(ls "$MODEL_ROOT/$QSA_QUANT"/*.gguf 2>/dev/null |
+            grep -v -e mmproj -e /mtp- -e DFlash -e dflash | head -1 || true)"
+    fi
+    if [ -z "$qsa_model" ] || [ ! -f "$qsa_model" ]; then
+        echo "SKIP  E: no model for QSA_QUANT=$QSA_QUANT under $MODEL_ROOT (set QSA_MODEL=)"
+    elif [ ! -f "$QSA_PROMPT" ]; then
+        echo "SKIP  E: no prompt at $QSA_PROMPT (set QSA_PROMPT=)"
+    else
+        qsa_run() { # <arm> <env assignment...>
+            local arm="$1"; shift
+            env "$@" GGML_CUDA_QSA_SCORE_LOG=1 HIP_VISIBLE_DEVICES="$QSA_GPU" \
+                timeout 1800 "$LLAMA_CLI" -m "$qsa_model" -ngl 99 -ncmoe "$QSA_NCMOE" -sm layer \
+                -fa on -c "$QSA_CTX" -n "$QSA_NGEN" -f "$QSA_PROMPT" -t 8 \
+                --seed 42 --temp 0 --no-display-prompt --single-turn \
+                > "$KEEPOUT/qsa_$arm.out" 2> "$KEEPOUT/qsa_$arm.err"
+            local rc=$?
+            local cen sl
+            cen="$(grep -c 'indexer-score: fused-score launched' "$KEEPOUT/qsa_$arm.err" 2>/dev/null || true)"
+            sl="$(grep -o '////' "$KEEPOUT/qsa_$arm.out" 2>/dev/null | wc -l)"
+            echo "      $arm rc=$rc fused-census=${cen:-0} slashruns=$sl hash=$(extract_hash "$KEEPOUT/qsa_$arm.out")"
+            return $rc
+        }
+
+        qsa_ok=1
+        qsa_run sparse LLAMA_QSA_DENSE_DECODE_UNTIL=0                                    || qsa_ok=0
+        qsa_run chain  LLAMA_QSA_DENSE_DECODE_UNTIL=0 GGML_CUDA_QSA_INDEXER_SCORE=0      || qsa_ok=0
+        qsa_run dense  HIP_VISIBLE_DEVICES="$QSA_GPU"                                   || qsa_ok=0
+
+        if [ "$qsa_ok" -eq 0 ]; then
+            echo "FAIL  E: an arm failed to run (see $KEEPOUT/qsa_*.err)"
+            fails=$((fails + 1))
+        else
+            qsa_cen() { grep -c 'indexer-score: fused-score launched' "$KEEPOUT/qsa_$1.err" 2>/dev/null || true; }
+            cs="$(qsa_cen sparse)"; cc="$(qsa_cen chain)"; cd_="$(qsa_cen dense)"
+            hs="$(extract_hash "$KEEPOUT/qsa_sparse.out")"
+            hc="$(extract_hash "$KEEPOUT/qsa_chain.out")"
+            hd="$(extract_hash "$KEEPOUT/qsa_dense.out")"
+            echo "      census: sparse=$cs chain=$cc dense=$cd_"
+            grep -o 'indexer-score: fused-score launched.*' "$KEEPOUT/qsa_sparse.err" | head -2 | sed 's/^/        /'
+
+            # 1. the fused indexer-score op really launched (reachability: an op that never runs
+            #    cannot fail a comparison against itself)
+            if [ "${cs:-0}" -ge 1 ]; then
+                echo "PASS  E: the sparse arm launched the fused indexer-score op ($cs census line(s))"
+            else
+                echo "FAIL  E: the sparse arm launched NO fused indexer-score op: the arm is unreachable,"
+                echo "      so the hash comparison below would be vacuous (GGML_CUDA_QSA_SCORE_LOG=1 was set)"
+                fails=$((fails + 1))
+            fi
+            # 2. ... and the census is sensitive: the per-op chain (and the dense default) must log none
+            if [ "${cc:-1}" -eq 0 ] && [ "${cd_:-1}" -eq 0 ]; then
+                echo "PASS  E: the census is sensitive - 0 lines with the fused op off and on the dense arm"
+            else
+                echo "FAIL  E: the census fired without the fused op (chain=$cc dense=$cd_): it does not"
+                echo "      measure what the assertions above assume"
+                fails=$((fails + 1))
+            fi
+            # 3. the fused node is byte-identical to the per-op chain it replaces (the purity contract)
+            if [ -n "$hs" ] && [ "$hs" = "$hc" ]; then
+                echo "PASS  E: fused == chain on the sparse arm ($hs)"
+            else
+                echo "FAIL  E: the fused indexer score is not pure: fused=${hs:-<none>} chain=${hc:-<none>}"
+                fails=$((fails + 1))
+            fi
+            # 4. non-vacuity: the sparse arm is a different path from the shipped dense default
+            if [ -n "$hs" ] && [ "$hs" != "$hd" ]; then
+                echo "PASS  E: the sparse arm differs from the dense arm ($hs vs ${hd:-<none>}), so it is not vacuous"
+            else
+                echo "FAIL  E: the sparse arm produced the dense arm's text (${hs:-<none>}): either the sparse"
+                echo "      path no longer changes the numerics or the arm never engaged - investigate before"
+                echo "      relaxing this (the prompt must be above the ~2051-token selection width)"
+                fails=$((fails + 1))
+            fi
+            for arm in sparse chain dense; do
+                if grep -qE "GGML_ASSERT|terminate called|Segmentation fault|what\(\):" "$KEEPOUT/qsa_$arm.err"; then
+                    echo "FAIL  E: $arm aborted:"
+                    grep -m1 -E "GGML_ASSERT|terminate called|Segmentation fault|what\(\):" "$KEEPOUT/qsa_$arm.err" | sed 's/^/      /'
+                    fails=$((fails + 1))
+                fi
+            done
+        fi
+    fi
+fi
+
 echo
 # the kernel journal, scoped to this gate's own window (#294)
 if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
@@ -164,9 +292,11 @@ fi
 
 if [ "$fails" -eq 0 ]; then
     echo "==> PASS: every measured qwen4exp quant produced a coherent (0 '////') gather-ON output"
+    [ "$QSA_ARM" = "1" ] && echo "    and the sparse QSA decode arm launched the fused indexer score, byte-identical to the chain"
+    [ "$QSA_ARM" != "1" ] && echo "    (section E was SKIPPED with QSA_ARM=0 - the sparse arm was NOT checked)"
     [ "$warns" -gt 0 ] && echo "    ($warns quant(s) only WARNed on transparency - see above)"
     echo "    logs kept in $KEEPOUT"
     exit 0
 fi
-echo "==> FAIL: $fails quant(s) regressed (logs in $KEEPOUT)" >&2
+echo "==> FAIL: $fails check(s) failed - the per-quant coherence arms and/or the sparse QSA section E (logs in $KEEPOUT)" >&2
 exit 1

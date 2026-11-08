@@ -30,6 +30,7 @@ the documentation owed) → `../../AGENTS.md` → `../../TODO.md` → `../kv-res
 | `e61e354d2` | the VMM pool's free-order assert now prints sizes/offsets (stderr, abort path), plus `GGML_CUDA_POOL_TRACE=1` (POSIX only) recording a backtrace per live block.  Off by default |
 | `812deb221` | **the MTP-path pool-order fix**: `ggml_cuda_mul_mat_id_mmb_glu` took its long-lived `pool_stack` slot after five plain pool temporaries; the slot is now reserved first |
 | `2aac85e78` | **the attendance pool declines on an integrated GPU** (message names RDNA3.5/gfx1151 and `TODO` #300) |
+| `08d6c343b` | **the fused indexer ops' reachability census** (`GGML_CUDA_QSA_SCORE_LOG`, default off, block 11 — `TODO` #297's gate needs it; measured inert) |
 | — | (`2dc4511b8` is the R16 rung itself, i.e. the 16th block; `617ee7152`… are R13–R15) |
 
 Cross-platform state: **gfx1201** (primary, 3 × R9700) and **gfx1100** (`fingon`) both build and run;
@@ -183,10 +184,10 @@ green state, park the finding in this campaign directory and record it in `TODO.
    (never from the working chain), then `scripts/make-release.sh --base a691b2345`.
 2. `scripts/validate-set.sh` (checksums + fresh-tarball strict apply).
 3. `scripts/gate-per-block-build.sh` — all 16 blocks.  Expect **5 blocks to carry the follow-up commits' content**
-   (the UMA guard lands in block 09's host-expert area, the pool fixes in block 15, the diagnostic in block 15):
-   check which block owns each file before cutting, and put each follow-up's hunks in the block that owns the file
-   (`llama-model-loader.*` = block 09; `ggml-cuda.cu` pool = block 10 or 15; `mmb.cu` = block 06; `llama-kv-cache.*`
-   pool guard = block 15).
+   (the UMA guard lands in block 09's host-expert area, the pool fixes in block 15, the diagnostic in block 15, the
+   indexer-score census in block 11): check which block owns each file before cutting, and put each follow-up's
+   hunks in the block that owns the file (`llama-model-loader.*` = block 09; `ggml-cuda.cu` pool = block 10 or 15;
+   `mmb.cu` = block 06; `llama-kv-cache.*` pool guard = block 15; `indexer-score.cu` = block 11).
 4. Coherence on the four arms + the host-expert and hybrid arms.  **NEW:** the `-n 16` arm now emits only a
    `[Start thinking]` preamble on the qwen3.5/3.6/3.8 models — a model-independent boilerplate, so use **`-n 64`**
    for cross-box text comparisons and keep `-n 16` only as the campaign's historical oracle.

@@ -979,6 +979,48 @@ that direction rests on the mechanism (the window starts at the gate) — which 
 
 - status: **DONE** · scripts only (no fork change) · session 2026-11-08
 
+## P2 — pre-R17: `TODO` #297, the sparse QSA decode arm gets a gate · **DONE 2026-11-08**
+
+R16 found that `indexer-score.cu` called `ggml_rope_get_truncate(dst)` on a `GGML_OP_INDEXER_SCORE` node
+(upstream `#30206` asserts the op type), so **every** sparse QSA decode run aborted from R12 to R16 and nothing
+noticed: the coherence arms and both qwen4exp gates run the *dense* arm.  The gap, not the abort, is the item.
+
+**Why the dense arm is what everyone ran.**  The sparse arm is env-forced and conditional on depth:
+`LLAMA_QSA_DENSE_DECODE_UNTIL=0` disables the dense-decode branch, but the sparse path still only engages once
+`n_kv > width = indexer_top_k + r - 1` (~2051 tokens) — below that the `shortcut` branch stores keys and never
+builds a QSA graph.  So any prompt under ~2.1 k tokens runs no QSA at all, silently (the model file's own comment
+records the same trap for a `-c 2048` PPL exercise).
+
+**The gate (section E of `gate-qwen4exp-quant-coherence.sh`, 1 GPU `-sm layer`, ~20 s/arm).**  Three arms on
+`prompts/prose-rdna-boosts.txt` (5246 tokens, above the width), each `-n 32`, seed 42, temp 0:
+
+| arm | env | census | text |
+|---|---|---|---|
+| `sparse` | `LLAMA_QSA_DENSE_DECODE_UNTIL=0` | **4 fused-score lines** | `200edcd422c7` (160 chars) |
+| `chain` | + `GGML_CUDA_QSA_INDEXER_SCORE=0` | **0** | `200edcd422c7` — identical |
+| `dense` | (shipped default) | **0** | `13406dc51399` (167 chars) — different |
+
+Four assertions, in the order that makes each one non-vacuous: the sparse arm **launched the fused op** (a text
+comparison cannot see an op that never runs), the census is **sensitive** (0 lines with the op off and on the
+dense arm), **fused == chain** byte for byte (the purity contract: the fused op replicates the per-op rope +
+`mul_mat` + relu + head-sum chain exactly), and **sparse != dense** (so "fused == chain" cannot be satisfied by
+never taking the sparse arm at all).
+
+**The census needed 23 lines of delivery code** (`GGML_CUDA_QSA_SCORE_LOG=1`, block 11's `indexer-score.cu`):
+nothing logs the sparse path, `GGML_CUDA_IDX_RELU_SUM_LOG` cannot serve as the counter (its matcher needs
+`nt*ns >= 64`, and decode is `nt = 1`), and `rocprofv3` would be a per-box dependency.  stderr, so it lands in
+every arm's log at any verbosity and cannot perturb the generated text.  Measured **inert**: dense and sparse
+hashes are identical with the census compiled out and in (`13406dc51399` / `200edcd422c7`), and the census
+prints only when the env is set.  Fork commit `08d6c343b` (tree `ccbbcf7a4`).
+
+**Negative-tested**: pointing `QSA_PROMPT` at a 5-token prompt (i.e. below the selection width, the exact
+"unreachable arm" shape) makes the gate FAIL on two assertions — 0 census lines and sparse == dense — and exit 1.
+The `test-backend-ops` case the handle called optional was **not** added: `GGML_OP_INDEXER_SCORE` has no CPU
+implementation, so an op case would need a hand-written reference for the whole fused sequence; the per-op chain
+arm *is* that reference, at the model level.  Recorded in `ENVIRONMENT.md`.
+
+- status: **DONE** · fork `08d6c343b` (block 11) + `scripts/gate-qwen4exp-quant-coherence.sh` section E · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1010,4 +1052,5 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P2 | — | `08d6c343b` (fork, block 11 hunk) | #297: the sparse arm had no gate (and no census to prove it ran) | three arms on the r236 build, incl. a below-the-width negative test that FAILs | 2026-11-08 | 23-line `GGML_CUDA_QSA_SCORE_LOG` census (inert, measured); gate section E |
 | P1 | — | (delivery repo only) | #294 premise corrected: 8 gates had **no** journal check, 5 had a fixed window | `bash -n` ×17 + real PASS runs of `gate-grid-stall-pad` (A-only/B-only/`--no-faults`), `gate-qwen4exp-quant-coherence`, `gate-park-idle-slots` | 2026-11-08 | every GPU gate: `--since` = its own start timestamp, `--no-faults` opt-out, every log scanned, PASS line on success |

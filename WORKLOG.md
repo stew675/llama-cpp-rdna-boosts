@@ -1,3 +1,44 @@
+## 261108.003 (no release) -- `TODO` #297 closes: the sparse QSA decode arm has a gate, and the fused indexer score has a reachability census
+
+**Fork change, block 11** (`ggml/src/ggml-cuda/indexer-score.cu`, 23 lines, fork `08d6c343b`, tree `ccbbcf7a4`) plus
+a new section E in `scripts/gate-qwen4exp-quant-coherence.sh`.  `patches/`/`release.json` stay untouched (r235 is
+the release); the block-11 hunk lands at the R17 re-cut.  Re-base record: `wip/upstream-rebase-261108/RUNGS.md` → `P2`.
+
+**The gap.**  `indexer-score.cu` called `ggml_rope_get_truncate(dst)` on a `GGML_OP_INDEXER_SCORE` node, which
+upstream's `#30206` asserts against — so every sparse QSA decode run aborted from R12 to R16 and nothing noticed,
+because the coherence arms and both qwen4exp gates run the **dense** arm.  The reason is depth: the sparse path is
+env-forced (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) *and* conditional on `n_kv > indexer_top_k + r - 1` (~2051 tokens), so
+any prompt under ~2.1 k tokens runs no QSA at all — silently.  Fixing the abort (R16) was the symptom; this closes
+the class.
+
+**The gate: three arms, four ordered assertions** (`gate-qwen4exp-quant-coherence.sh` section E, 1 GPU `-sm layer`,
+`-n 32`, seed 42, temp 0, `prompts/prose-rdna-boosts.txt` = 5246 tokens, ~20 s/arm):
+
+| arm | env | census | text |
+|---|---|---|---|
+| `sparse` | `LLAMA_QSA_DENSE_DECODE_UNTIL=0` | **4** `fused-score` lines | `200edcd422c7` (160 chars) |
+| `chain` | + `GGML_CUDA_QSA_INDEXER_SCORE=0` | **0** | `200edcd422c7` — identical |
+| `dense` | the shipped default | **0** | `13406dc51399` (167 chars) — different |
+
+1. the sparse arm **launched the fused op** — reachability, which no text comparison can see (an op that never
+   launches cannot fail a comparison against itself);
+2. the census is **sensitive** — 0 lines with the op off and on the dense arm;
+3. **fused == chain** byte for byte — the fused op replicates the per-op rope + `mul_mat` + relu + head-sum chain
+   exactly (the purity contract it shipped with);
+4. **sparse != dense** — so (3) cannot be satisfied by never taking the sparse arm at all.
+
+**The census is 23 lines of delivery code** (`GGML_CUDA_QSA_SCORE_LOG=1`, default off, `ENVIRONMENT.md` row): nothing
+logs the sparse path, `GGML_CUDA_IDX_RELU_SUM_LOG` cannot serve (its matcher requires `nt*ns >= 64` and decode is
+`nt = 1`), and `rocprofv3` would be a per-box dependency.  stderr rather than the log stream, so it lands in every
+arm's log at any verbosity and can never perturb the generated text.  **Measured inert**: with the census compiled
+out and in, dense `13406dc51399` and sparse `200edcd422c7` are identical (two rebuilds, four runs, the same box).
+
+**Negative-tested**: `QSA_PROMPT` pointed at a 5-token prompt — the exact "unreachable arm" shape — makes the gate
+FAIL on assertions 1 and 4 and exit 1, which is the property #297 asked for.  The `test-backend-ops` case the handle
+called optional was **not** added: `GGML_OP_INDEXER_SCORE` has no CPU implementation, so an op case would need a
+hand-written reference for the whole fused sequence, and the chain arm is that reference at the model level
+(`ENVIRONMENT.md` §8 records it).
+
 ## 261108.002 (no release) -- `TODO` #294 closes: every gate's GPU-fault verdict is scoped to the gate's own window, and the 8 gates that had none now have one
 
 **No delivery change** (`patches/`, `release.json` and the fork tree stay untouched until R17).  Scripts only: 10
