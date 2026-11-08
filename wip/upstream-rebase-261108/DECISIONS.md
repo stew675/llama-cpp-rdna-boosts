@@ -139,7 +139,12 @@ and drop our duplicate bookkeeping?  Recommended shape: **take upstream's bound*
 job the refusal now does.  Verify with the rs-rollback-boundary scenario and `test-llama-context`'s rollback
 cases, text identical.
 
-- status: **OPEN** · rung R04 · record: —
+- status: **DECIDED (R04, 2026-11-08) — upstream's `rs_max` bound taken, the tracker dropped** (the status line
+  above was left OPEN by mistake; `RUNGS.md` R04 is the record).  R04: the block's duplicate bookkeeping went, the
+  conv-state store upstream absorbed it, and `rs_max` is the bound; a pre-existing upstream defect was found and
+  fixed on the way (`rs_max` not swapped on a reused slot) and filed as `TODO` #289.  The gate was
+  `test-recurrent-state-depth` (3 phases, 0 failures) plus the GDN census, not the full rs-rollback scenario — if
+  `#289`'s fix area is touched again, run `archive/work/rs-rollback-boundary/`'s scenario.
 
 ## D5 — The FA entry points after `flash_attn_ext_rows`
 
@@ -172,7 +177,10 @@ moves, `--kv q8_0` for the staging arm) + prefill `t/s` per band on the 4B and 3
 **Relation:** expected independent (a type-traits/`_flush` fix upstream, a new cache type and FA arm here) —
 verify, do not assume: the block's bf16 arm must still generate and the FA arm must still be selected.
 
-- status: **OPEN** · rung R05 · record: —
+- status: **CLOSED (R05, 2026-11-08) — independent, nothing changed on either side** (the status line above was
+  left OPEN by mistake; `RUNGS.md` R05 is the record).  R05 applied with **zero conflicts**, the bf16 KV/FA arm
+  generated, and the FA arm was still selected — upstream's `#31609` type-traits fix and the delivery's bf16 cache
+  type are disjoint.
 
 ## D7 — Compute views in the Meta backend
 

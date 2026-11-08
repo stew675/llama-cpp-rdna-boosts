@@ -1,5 +1,7 @@
 # HANDOVER — the upstream re-base, cold-start brief
 
+**The live brief is now [`HANDOVER-REBASE-TODO.md`](HANDOVER-REBASE-TODO.md)** — the ladder is climbed (R01–R16), what remains is the re-base TODO list (four defects/gaps, three decisions, one measured regression) and then R17 (the release ladder) as the last task.
+
 **Read this first, then [`HANDOVER-R13.md`](HANDOVER-R13.md) — the per-rung brief for the rung you are about to
 do (R13 and everything after it) — then `RUNGS.md` (the ledger) and `DECISIONS.md` (the open questions).**  Everything below is
 the state as of **2026-11-08, end of the session that reached rung R10**.
