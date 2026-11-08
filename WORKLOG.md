@@ -1,3 +1,49 @@
+## 261108.004 (no release) -- `TODO` #298 closes: the pool-order sweep found a LIVE violation in the cuBLAS BF16 src1 cache path, reproduced and fixed
+
+**Fork change, block 10** (`ggml/src/ggml-cuda/ggml-cuda.cu`, +38/-17, fork `9b7dfb47a`, tree `801148bb3`).
+`patches/`/`release.json` untouched; the hunk lands at the R17 re-cut.  Re-base record:
+`wip/upstream-rebase-261108/RUNGS.md` → `P3`.
+
+**The rule, restated because the pool's assert is unconditional:** a `pool_stack`-registered allocation must be
+created **before** any plain device-pool allocation in the same scope.  The pool is a strict LIFO stack
+(`free: GGML_ASSERT(ptr == pool_addr + pool_used)`), and a registered block lives to the end of the graph — so one
+allocated *after* a plain temporary is freed last, below a block that must go first.  Two sites had already been
+fixed this way (R13's `hc_combine_norm`, R16's `mul_mat_id_mmb_glu`); this is the sweep of the class.
+
+**Audited: all 4 push sites and every caller** (table in `RUNGS.md` `P3`).  Three are clean —
+`hc_base_copy_del`, `mmb_cache_insert` (all 4 callers), `mmb_slot_reserve` (all 10 callers, including the
+`unary.cu`/`dsv4-hc.cu` wrappers).  **One had the violation, and it is live, not latent:**
+`ggml_cuda_mul_mat_cublas_impl` fills `src0_alloc` (`src0->type != compute_type`) and only then calls
+`bf16_src1_cache_put()`, which registers a block that outlives the function.
+
+**Reproduced** (the part that matters — this class has twice been dismissed as "it passed once"): a 4B **F16**
+model (`llama-quantize --allow-requantize` from the Q8_0 file), `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`, a 121-token
+prompt → BF16 compute with an F16 src0:
+
+```
+free: device 0: pool free OUT OF ORDER: freeing 41943040 bytes at offset 0, but the LIFO contract expects
+the newest allocation at offset 619520 (live extent 42562560)
+```
+
+40 MiB is the src0 F16→BF16 conversion; 619520 bytes is `2560 x 121 x 2`, the BF16 copy of src1 sitting on top of
+it.  Armable in the field with a documented env var, so this was not a hypothetical.
+
+**Fix:** reserve the cached block (lookup *or* put) before `src0_alloc` is filled, with both conversions left
+exactly where they were, so nothing about the stream order or the numerics moves.  A cache *miss* still clears the
+previous block through `pool_stack_kill`, which only marks it dead and frees it when it surfaces — so hoisting the
+kill earlier in the function cannot invert anything.
+
+**Inert, measured on the class the cache exists for:** Flash-Next GSQ-IQ3_XXS is the FUSED (BF16 `hc_attn_down`)
+mixer class — dense `13406dc51399`, sparse `200edcd422c7`, chain `200edcd422c7`, all identical to the pre-fix
+build — and `gate-hc-fusions.sh` **PASS** with all five hard arms at `d62340fbf566` (the two `dsv4` soft arms
+still report the recorded r235-numerics drift, `TODO` #292, which stays open).  Both fixes from this session's
+pre-R17 work are in that run's window, and its new scoped fault check reports clean.
+
+**A caveat recorded for honesty:** the cache is a *conversion* cache, so a hit and a miss produce identical bytes —
+hash equality proves the fix moved no numerics, but it cannot prove the cache still hits.  The predicate and the
+`pool_stack` registration are byte-for-byte the same code, only moved earlier in the function; the arm that
+measures the cache's value is a prefill-timing one (`GGML_CUDA_BF16_SRC1_CACHE=0` vs on), not a correctness arm.
+
 ## 261108.003 (no release) -- `TODO` #297 closes: the sparse QSA decode arm has a gate, and the fused indexer score has a reachability census
 
 **Fork change, block 11** (`ggml/src/ggml-cuda/indexer-score.cu`, 23 lines, fork `08d6c343b`, tree `ccbbcf7a4`) plus

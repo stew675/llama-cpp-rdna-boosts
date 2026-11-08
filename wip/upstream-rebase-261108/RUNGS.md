@@ -1021,6 +1021,47 @@ arm *is* that reference, at the model level.  Recorded in `ENVIRONMENT.md`.
 
 - status: **DONE** · fork `08d6c343b` (block 11) + `scripts/gate-qwen4exp-quant-coherence.sh` section E · session 2026-11-08
 
+## P3 — pre-R17: `TODO` #298, the pool-order sweep (one live defect found and fixed) · **DONE 2026-11-08**
+
+The rule (R13's `hc_combine_norm`, re-learnt at R16's `mul_mat_id_mmb_glu`): **a `pool_stack`-registered
+allocation must be created before any plain device-pool allocation in the same scope.**  The pool is a strict
+LIFO stack — `ggml_cuda_pool_vmm::free` asserts `ptr == pool_addr + pool_used` — and a registered block lives to
+the end of the graph, so one allocated *after* a plain temporary is freed last, below a block that has to go
+first.  The sweep is a *reader's* job ("it passed once" is not evidence: one build aborted 5/5 in a dense 4B
+warmup and the next 0/4).
+
+**Every `pool_stack_push` site and its callers, audited:**
+
+| site | callers audited | verdict |
+|---|---|---|
+| `common.cuh` `bf16_src1_cache_put()` | `ggml_cuda_mul_mat_cublas_impl` (`ggml-cuda.cu`), `ggml_cuda_hc_combine_norm_set_bf16_src1` (`hyperconn.cu`) | **VIOLATION in the cublas caller** — `src0_alloc` filled before the put.  **Reproduced and fixed** (below).  The hyperconn caller allocates nothing in its scope: clean |
+| `hyperconn.cu` `hc_base_copy_del` | `ggml_cuda_hc_combine_norm_try_fuse` | clean — nothing plain precedes the push (this is R13's fix, still correct) |
+| `mmb.cu` `mmb_cache_insert()` | `mmb_bf16_activation` → `ggml_cuda_mul_mat_mmb` (2 sites), `mul_mat_id_mmb_glu`, `ggml_cuda_mmb_cache_reserve` | clean — every caller pushes before its first plain allocation |
+| `mmb.cu` `mmb_slot_reserve()` | `mul_mat_id_mmb_glu` (slot 2), `ggml_cuda_mul_mat_mmb` (slots 1/3), `ggml_cuda_mmb_reserve_auto` (`dsv4-hc.cu` x2, `unary.cu` x6), `ggml_cuda_mmb_cache_reserve` | clean — R16's fix holds (the slot is reserved first in `mmb_glu`), and the `unary.cu`/`dsv4-hc.cu` wrappers allocate nothing before the call |
+
+**The defect (live, not latent).**  `ggml_cuda_mul_mat_cublas_impl` declares `src0_alloc`/`src1_alloc`, fills
+`src0_alloc` when `src0->type != compute_type`, and only then takes the BF16 src1 cache path
+(`bf16_src1_cache_put` → registered, long-lived).  Arming it needs BF16 compute with a non-BF16 src0, which
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` (documented) or an F16 GEMM at acc-precision BF16 provides.  Reproduced on a
+4B **F16** model (`llama-quantize --allow-requantize` from Q8_0), `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`, 121-token
+prompt:
+
+```
+free: device 0: pool free OUT OF ORDER: freeing 41943040 bytes at offset 0, but the LIFO contract expects
+the newest allocation at offset 619520 (live extent 42562560)
+```
+
+40 MiB = the src0 F16→BF16 conversion; 619520 bytes = `2560 x 121 x 2` = the BF16 src1 copy sitting on top of it.
+Fix (`9b7dfb47a`, tree `801148bb3`): reserve the cached block (lookup or put) before `src0_alloc` is filled, keep
+both conversions in place so the stream order and the numerics are untouched.  After: rc=0, no assertion.
+
+**Inertness measured on the class the cache serves** — Flash-Next GSQ-IQ3_XXS is the FUSED (BF16 `hc_attn_down`)
+mixer class: dense `13406dc51399`, sparse `200edcd422c7`, chain `200edcd422c7` (all identical to the pre-fix
+build), and `gate-hc-fusions.sh` **PASS** with all five hard arms at `d62340fbf566` (the two `dsv4` soft arms
+still report the documented r235-numerics drift, `TODO` #292).
+
+- status: **DONE** · fork `9b7dfb47a` (block 10) · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1052,5 +1093,6 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P3 | — | `9b7dfb47a` (fork, block 10 hunk) | #298: one live pool-order violation in the cublas BF16 src1 cache path (plus 4 sites audited clean) | reproduced (F16 4B + `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`), fixed, inert (3 hashes + `gate-hc-fusions` PASS) | 2026-11-08 | the registered block is reserved before any plain pool allocation |
 | P2 | — | `08d6c343b` (fork, block 11 hunk) | #297: the sparse arm had no gate (and no census to prove it ran) | three arms on the r236 build, incl. a below-the-width negative test that FAILs | 2026-11-08 | 23-line `GGML_CUDA_QSA_SCORE_LOG` census (inert, measured); gate section E |
 | P1 | — | (delivery repo only) | #294 premise corrected: 8 gates had **no** journal check, 5 had a fixed window | `bash -n` ×17 + real PASS runs of `gate-grid-stall-pad` (A-only/B-only/`--no-faults`), `gate-qwen4exp-quant-coherence`, `gate-park-idle-slots` | 2026-11-08 | every GPU gate: `--since` = its own start timestamp, `--no-faults` opt-out, every log scanned, PASS line on success |

@@ -55,7 +55,6 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **293** | decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support | model file (`src/models/qwen4exp.cpp`) + the fused HC/indexer kernels | **OPEN** — kept at R12 on a measured +31 % decode; the discriminating arm is Q8_0 on 2/3 devices — §293 |
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
-| **298** | the VMM pool's free-order invariant: one site fixed, the class is worth a sweep | correctness (pool ordering; layout/timing sensitive) | **OPEN** — audit each `pool_stack_push` site's callers; `GGML_CUDA_POOL_TRACE=1` gives the stacks — §298 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 | **301** | r236 is -2 .. -3 % on MoE **prefill** against the shipped r235 (decode flat) | performance (the only measured regression) | **OPEN** — it decides whether r236 may ship as "no slower" on the MoE shapes — §301 |
 
@@ -493,27 +492,6 @@ The re-base kept block 12's CPU hunks untouched (`arch-fallback.h`, `arch/x86/qu
 R17 ladder should run the CPU-side `pp`/`tg` on a host-expert config, `test-backend-ops` for the touched quant
 types, and the delivery's `-lv 4` CPU-path census, then either record the surviving wins in `patches/README.md`
 or drop the dead ones.
-
-## 298. The VMM pool's free-order invariant: one site fixed (MMB gate/up slot), the class is worth a sweep
-
-**Fixed at r236 (`812deb221`)**: `ggml_cuda_mul_mat_id_mmb_glu` took its long-lived output slot (a `pool_stack`
-block, released after the whole graph) *after* five plain pool temporaries, so at scope exit the temporaries
-were freed below a live block.  That aborted **every** Flash-Next + MTP-drafter run on gfx1151 (r235 and r236
-alike) and therefore blocked `gate-kv-residency.sh`'s pool section there; the pre-re-base binary aborts
-identically, so it was pre-existing.  The rule is R13's `hc_combine_norm` rule: **no plain pool allocation may
-be created before a `pool_stack` push in the same scope**.  Verified on halo: the sparse and pool arms now both
-run and are byte-identical (`1e944569dbd6`).
-
-It blocks `gate-kv-residency.sh`'s pool section on gfx1151 only while it is unfixed -- the arms all attach
-the drafter -- and `812deb221` clears that.
-
-**Open — the class, not the site.**  The same violation was seen once on gfx1201 in a *dense* 4B warmup (two
-2 KiB blocks freed in allocation order) on a build that differs only by a diagnostic, i.e. it is latent and
-layout/timing sensitive: 5/5 aborts on one build, 0/4 on the next.  So `GGML_CUDA_POOL_TRACE=1` exists now
-(a backtrace per live block, printed on violation) and the assert always names the sizes/offsets.  A sweep of
-every `pool_stack_push` site (`common.cuh`'s `bf16_src1_cache_put`, `hyperconn.cu`'s `hc_base_copy`,
-`mmb.cu`'s `mmb_cache_insert`/`mmb_slot_reserve`) for plain allocations in the same scope above it is owed
-before the next release — one site is fixed, the *rule* is what keeps breaking.
 
 ## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
 
