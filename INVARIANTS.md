@@ -2955,3 +2955,30 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   only Flash-Next GSQ `7a8734a9f1a6` reproduces.  A re-base moves numerics on purpose, so the oracle table
   must be re-recorded from a known-good build of the *current* base and the comparison made same-session
   (R12 vs R13), never against a number from the previous fork point.
+- **A re-based call into an extended parameter list must be named, and a re-derived helper carries its node
+  type (r236, re-base R16).**  Two defects of the same shape (compiles, prints nothing, fails at first use):
+  (a) upstream inserted `is_indexer` **before** `v_enabled` in `llama_kv_cache`'s ctor tail, and the delivery's
+  positional call in `llama-memory-hybrid.cpp` carried the old comment-labels, so `is_indexer = true` and
+  `v_enabled = kv_pool` (false) — the attention cache allocated **no V tensor** and `llama_kv_cache::cpy_v`
+  null-dereferenced at `+0x20` on the first graph build, i.e. every hybrid/GDN model segfaulted at load
+  (`Qwen3.5-4B-Q8_0` died in the *fit probe*'s `sched_reserve`).  Four adjacent bare `bool`s: nothing warns.
+  Name the arguments, and audit **every** call site of the symbol (the other sites were correct: `hybrid-idx`
+  named it, `model.cpp` stops at `share`, `dsa`/`dsa-iswa`/`msa`/`dsv4` are upstream's).
+  (b) `ggml_rope_get_truncate()` asserts `a->op == GGML_OP_ROPE || ROPE_BACK` since `#30206`; the delivery's
+  fused `GGML_OP_INDEXER_SCORE` kernel (`indexer-score.cu`, added at R12) had been re-derived to call it on its
+  own node, so **every sparse QSA decode arm** (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, and every attendance-pool arm)
+  aborted after generating (`ggml.c:4648`), for four rungs, because every R12-R15 gate runs the *dense* arm.
+  The value is `/*truncate*/ true`: the graph's own `ggml_rope_multi` indexer-key node leaves `no_trunc` 0 and
+  nothing calls `ggml_rope_set_truncate` on it, and the pre-`#30206` 5-argument helper floor/ceil'd
+  unconditionally.  Rule: a fused kernel that borrows another node's parameter block owes a check of what each
+  borrowed helper *asserts on*, and each re-derived fused kernel owes a gate arm that **reaches** it
+  (`GREEDY-PURITY.md` §85, `TODO` #297).
+- **The r193 MTP draft window's reserve is derived in one place (r236, re-base R16).**  The reserve that makes
+  Goal C pay (the slab holds `headroom + aux` back *before* the draft context exists) is derived by
+  `common_draft_reserve_derive()`, which both `--fit` and the MoE preflight call; the `mtp_shared` branch
+  (embedded MTP head + an active draft window ⇒ estimate from the **target's** GGUF with the weights zeroed,
+  and pass `n_seq_max`/`kv_unified` into `llama_spec_draft_kv_cells()`) lives there and nowhere else.  When
+  upstream absorbed the fit plumbing into `common_fit_apply()`, the branch was the casualty: the flat
+  `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` came back.  Measured on 35B-A3B Q8_0, 1 GPU, `-ncmoe 48`,
+  `-c 262144`, `--spec-type draft-mtp`: with the branch, `draft CONTEXT 1102 MiB` → arena 20 527.5 MiB
+  (62.9 %); without it, the flat 3584 MiB → 17 977.5 MiB (55.1 %).  +2 550 MiB of arena.

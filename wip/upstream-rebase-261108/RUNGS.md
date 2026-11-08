@@ -799,9 +799,11 @@ Exit verified on the real flint model (`/llm/models/RecursiveAI/Flint/Q8_0/flint
 
 - status: **DONE** · sha: `617ee7152` (tree `f6ce37555`) · session 2026-11-09
 
-## R16 — block 15: the streamed KV (window + attendance pool) · **NEXT (cold-start brief: `HANDOVER-R16.md`)**
+## R16 — block 15: the streamed KV (window + attendance pool) · **DONE 2026-11-08**
 
-* block sha `69d36099b` · 33 files · +5294 / −56 · **expected conflicts: 9**
+* block sha `69d36099b` · 33 files on this base · +6263 / −835 (the brief's +5294/−56 is stale: the block
+  *moves* a large function block in `src/llama-model-loader.cpp`, 750/750, getenv latching + host-master buft)
+  · **expected conflicts: 9**
 
 | conflicted path | what to expect |
 |---|---|
@@ -820,7 +822,78 @@ state/rotary read shape the streaming provider must keep addressing.
 **Exit:** build + coherence + `scripts/gate-kv-residency.sh` (window and pool arms, plus the multi-device
 `-sm layer` section) + `scripts/gate-kv-window-split.sh`.
 
-- status: **TODO** · sha: —
+**Result (`2dc4511b8`, tree `7d6e24c12`):** build green (0 errors; the only `-Wshadow` warnings in the touched
+files are upstream's own `n_stream`/`v_trans`/`ml` shadows).  **8 files / 12 hunks** conflicted, not 9:
+`src/models/qwen4exp.cpp` auto-merged (`D3` residue did not conflict; its 59/−7 lines all landed).  A
+distinctive-added-line check over the 25 auto-merged files found no dropped delivery code.
+
+| conflicted path | resolution |
+|---|---|
+| `common/common.cpp` | **decision (maintainer, option 1):** upstream's `common_fit_apply()` call kept; block 15's `mtp_shared` reserve branch folded into `common_draft_reserve_derive()` (the one function `--fit` *and* the MoE preflight call) |
+| `common/fit.cpp` (3) | upstream's `common_fit_log_scope + the delivery's three kv out-params (`kv_bytes_out`/`kv_pool_vram_out`/`kv_pool_ram_out`) at the definition and at both call sites, each also taking upstream's new `hp_nsk` |
+| `ggml/src/ggml-backend-meta.cpp` | both sides: upstream's `ggml_backend_meta_inner_extent`/`_view_slab_dim` (R14's splice) + the delivery's `ggml_backend_meta_kv_region_grow` |
+| `src/llama-context.cpp` (2) | (a) both designated-init entries (`no_alloc = model.no_alloc()`, `kv_pool = cparams.ctx_other == nullptr`); (b) upstream's readback-sync hunk — the delivery side was stale F1 code (`layer_inp_host_fill`, deleted at R13) |
+| `src/llama-ext.h` | upstream's `llama_model_classifier_free_guidance` + the whole delivery declaration block |
+| `src/llama-kv-cache.cpp` (2) | (a) ctor tail `is_indexer, v_enabled, kv_pool_capable`; (b) `memory_breakdown()` **re-derived** over `ctxs_bufs.bufs` + `ctxs_bufs.no_alloc` + upstream's `attn_rot_bufs` sum (upstream moved the loop into `llama_memory_bufs`) |
+| `src/llama-memory.h` | `llama_memory_params` keeps upstream's `no_alloc` and adds the delivery's `kv_pool`, ahead of upstream's new `struct llama_memory_bufs` |
+| `src/llama-model.cpp` (2) | (a) block 15's two free functions above `create_memory`, and the parameter is upstream's `params` again (the delivery-side `params_l` rename is gone — the body was upstream's everywhere but two lines); (b) the MTP-window `llama_kv_cache` construction drops the `n_pad` argument (`#31200`) |
+
+**`D12` — quantized-KV state and rotation: no re-derivation needed beyond the buffer type.**  The provider still
+binds at the **buffer type**: `#31073`'s rotation constants are a per-cache, per-layer buffer (`attn_rot_bufs`),
+not cell-indexed, so they are outside the region (they are summed into `memory_breakdown()` and nothing else);
+the state copy keeps going through the region buffer's own copy.  Proven by the gates, whose spilling arms
+really spill (16 mapping flips / 64 MiB host-backed) and whose `win2mtp` arm takes the region path for the
+batched state save.
+
+**`D13` — memory instances: mechanical, but three drifts and two real defects.**
+* `hparams.no_alloc` → the ctor's `no_alloc` at all three block-15 sites (`#31141` moved it out of the hparams).
+* the pool's cell count rounded to the cache's `n_pad`, which no longer exists (`#31200`): it now rounds to whole
+  **pages** (the pool is addressed in pages of `compress_ratio` cells).
+* `memory_breakdown()` as above; the pool's mirror→host-bucket and the window's resident/spill split accounting
+  are unchanged.
+* **`src/llama-memory-hybrid.cpp` — silent ctor argument shift.**  Upstream inserted `is_indexer` **before**
+  `v_enabled`; the delivery's positional call passed the old tail, so `is_indexer = true` and
+  `v_enabled = kv_pool` (= false) and the attention cache allocated **no V tensor** →
+  `llama_kv_cache::cpy_v` null-deref at `+0x20` on the first graph build.  **Every hybrid (GDN) model
+  segfaulted at load** — the dense 4B coherence arm never generated (SIGSEGV, exit 139, in the fit probe's
+  `sched_reserve`).  Fixed by naming `/* is_indexer */ false`; the other call sites were audited (`hybrid-idx`
+  already named it, `model.cpp` stops at `share`, `dsa`/`dsa-iswa`/`msa`/`dsv4` are upstream's and correct).
+* **`ggml/src/ggml-cuda/indexer-score.cu` — latent R12 defect, NOT R16 drift** (`b1b0fa807`): the fused
+  `GGML_OP_INDEXER_SCORE` node called `ggml_rope_get_truncate(dst)`, and upstream's `#30206` added
+  `GGML_ASSERT(a->op == GGML_OP_ROPE || ROPE_BACK)`.  So **every sparse QSA decode run has aborted on this tree
+  since R12** — the coherence arms and both qwen4exp gates run the dense arm, and only block 15's residency gate
+  reaches the sparse one: its `pref` arm processed the whole 25 763-token prompt at 383.2 t/s and 63 tokens at
+  51.3 t/s, then aborted at `ggml.c:4648`.  Both call sites now pass `/*truncate*/ true` — the graph's own rope
+  node default (`ggml_rope_impl` initialises `no_trunc` 0; nothing calls `ggml_rope_set_truncate` on the
+  indexer-key node) and the pre-`#30206` 5-argument helper's unconditional floor/ceil, i.e. pre-re-base numerics.
+  Recorded as `GREEDY-PURITY.md` §85 and `TODO` #297 (that arm needs a gate).
+
+**The r193 draft reserve is preserved** (r236 absorbed the fit plumbing, so the block's inline derivation was the
+casualty): measured on 35B-A3B Q8_0, 1 GPU, `-ncmoe 48 -c 262144 --spec-type draft-mtp`, `-lv 4` — window `auto`
+prints `slab draft reserve derived from '': draft CONTEXT 1102 MiB (kv 142 + compute 768 + slack 192)` → arena
+**20 527.5 MiB / 62.9 %**; window `0` prints `keeping the flat 3584 MiB draft reserve` → arena 17 977.5 MiB /
+55.1 %.  **+2 550 MiB of arena, +7.8 points of residency**, text unaffected.
+
+**Coherence (this build family):** dense 4B `1de99b7e6ee6`, 30B-A3B `4b4d56191368`, 35B-A3B 3 GPU tensor rccl
+`86b7f9b5aa80`, Flash-Next GSQ `7a8734a9f1a6` — all four identical to R13/R14/R15.
+
+**Gates:**
+* `gate-kv-residency.sh` **PASS**: window `wref == wres == wspill` `be904e86f248` (wres 0 flips / 0 MiB
+  host-backed, wspill 16 flips / 64 MiB, every slide on the map grid); pool `pref == pres == pfloor`
+  `f260d1824ab3`, `bad 0`, 8192 pages (408.0 MiB) on `pres` vs 4104 (204.4 MiB) on `pfloor`, 252 resolves both,
+  claims 137.7 → 217.1 per resolve, hits 91.02 → 89.63 %; multi-device (`-sm layer` 0,1)
+  `pmref == pmres == pmfloor` `f260d1824ab3`, one mirror/pool/counter block per device, **2 counter blocks
+  summed**, 117.8 → 268.1 claims per resolve.
+* `gate-kv-window-split.sh` **PASS**, 38/38 — one region per device on a 3-device 4B, a 27B at `-c 524288`
+  sliding on **both** devices (32 flips each), `-c 1048576` windowed (the resident arm does not fit), 1-device
+  unchanged, `-nkvo` still declines, all five fit arms, and `win2mtp == ref2mtp` with acceptance `0.46154`
+  identical and the batched state save on the region path.
+* `gate-spec-draft-window.sh` **PASS** — `LLAMA_SPEC_DRAFT_WINDOW=1024` → `1024 cells per sequence, cache 3072
+  cells ((win + 512) x 2)`, all six requests across both slots byte-identical to win 0, acceptance identical.
+* `check-gpu-faults.sh --since "2026-11-08 10:47:00"` clean (the journal's pre-session faults from the R15
+  session were outside every gate's window, `TODO` #294).
+
+- status: **DONE** · sha: `2dc4511b8` (tree `7d6e24c12`) · session 2026-11-08
 
 ## R17 — the release ladder
 
@@ -851,5 +924,5 @@ climb touched has a maintainer decision recorded.
 | R13 | 12 | `2b09a50b0` | 8 expected → 8 files / 24 hunks | build + 4-model coherence (R12-identical) + `gate-state-pipe.sh` PASS + `gate-park-idle-slots.sh` PASS + `gate-ckpt-reuse.sh` PASS (hard checks) + DFlash2 attach/acceptance arms | 2026-11-09 | **`D15` DECIDED**: F1 deleted tree-wide, upstream's `embd_row` kept, Meta refusal carried, host-experts guard re-measured and dropped (identical acceptance on Flash-Next + 35B-A3B, 2 slots, `-ncmoe` 10/24). State pipe kept (gate: 43.7 vs 74.7 ms). Prompt cache = upstream API + delivery policy, with `ckpt_recycle` restricted to uniquely-owned checkpoints. Two pre-existing R12 defects fixed on the way: the `hc_combine_norm` pool-stack LIFO abort on `-sm layer` (`-sm layer` runs for the first time) and the DFlash injection input never registered (dead drafter: 0.000 → 0.754) |
 | R14 | 13 | `ed13a322e` | 3 expected → 4 files / 5 hunks | build + 4-arm coherence (R13-identical) + `--spec-draft-mtp-vocab` on both head paths (shared-NextN via `ctx_other`, self-headed gemma4) + inert when unset | 2026-11-09 | clean rung: no decision needed. `arch == other.arch` dropped from `can_reuse` (`#31733` moved the model into the graph context; `model == other.model` subsumes it); `common_fit_apply()` already carried the delivery's draft-reserve fold; block 13's row-range splice over a vocab-split Meta tensor is exercised by the shared-NextN arm |
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
-| R16 | 15 | | | | | |
+| R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |

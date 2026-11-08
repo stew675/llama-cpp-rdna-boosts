@@ -3797,6 +3797,20 @@ Purity notes: `GREEDY-PURITY.md` §58.
 > `models/qwen4exp.cpp`) are latched as well -- including `GGML_STAGE_TRACE`, which the loader read **per
 > tensor** (144-240 calls per run).  No behaviour change; the windowed/pooled arms are unchanged.
 
+> **r236 re-base amendment (`D12`/`D13`, tree `7d6e24c12`):** the rung collided with every surface the streamed
+> KV binds to (`#31141` `no_alloc`, `#31200` `n_pad` gone, `#30541` state copy sizes, `#31073` rotation constants
+> moved into `attn_rot_bufs`, `#31570` `kv_rows`, `#31447` the Meta device).  Re-derived, not carried: the provider
+> still binds at the **buffer type**, and the rotation constants are per-cache/per-layer (not cell-indexed), so they
+> are outside the region; `hparams.no_alloc` reads become the cache's `no_alloc`; the pool's cell count rounds to
+> whole **pages** (it used to round to `n_pad`); `memory_breakdown()` walks `ctxs_bufs.bufs` itself so the pool's
+> mirror-to-host-bucket and the window's resident/spill split stay reported now that upstream moved the accounting
+> into `llama_memory_bufs`.  The MTP-window `llama_kv_cache` construction drops the removed `n_pad` argument, and
+> Goal C's draft reserve is preserved by folding its `mtp_shared` branch into `common_draft_reserve_derive()`
+> (measured 35B-A3B `-ncmoe 48 -c 262144`: derived 1102 MiB → arena 20 527.5 MiB / 62.9 % vs the flat 3584 MiB →
+> 17 977.5 MiB / 55.1 %).  Gates: `gate-kv-residency.sh`, `gate-kv-window-split.sh` (38/38) and
+> `gate-spec-draft-window.sh` all PASS; `gate-kv-residency.sh`'s `pref` arm is also what exposed a latent R12 defect
+> in the qwen4exp fused indexer-score kernel (`GREEDY-PURITY.md` §85).
+
 This block is the delivery's "the KV does not have to be `O(-c)` of VRAM" work: **two** opt-in placements of the same cache, plus the third variant that is **default on** because it measures non-negative (the MTP draft window, r193).  The **window** (Goal A of `TODO` #118, r178) keeps the newest `W` cells in VRAM and spills the tail to pinned system RAM in the same VA reservation.  The **pool** (Goal B, r190) keeps the authoritative copy of the *whole* context in a pinned host mirror and only the pages a decode step attends to in VRAM, resolved through a page table.  They answer the same question from opposite ends (newest cells vs attended cells), they are mutually exclusive by construction (the pool declines while a window is active), and each is byte-identical to a build without it when its knob is unset.  Both report `is_streaming()`, so a streamed cache takes the sparse QSA decode arm (also this block: B2).
 
 ### The window (Goal A, r178)

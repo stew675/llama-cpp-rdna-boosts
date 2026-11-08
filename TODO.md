@@ -494,6 +494,24 @@ R17 ladder should run the CPU-side `pp`/`tg` on a host-expert config, `test-back
 types, and the delivery's `-lv 4` CPU-path census, then either record the surviving wins in `patches/README.md`
 or drop the dead ones.
 
+## 297. The qwen4exp sparse QSA decode arm had no gate until R16 (and the fused indexer-score node has no unit oracle)
+
+R16 found that `ggml/src/ggml-cuda/indexer-score.cu` called `ggml_rope_get_truncate(dst)` on a
+`GGML_OP_INDEXER_SCORE` node, which upstream's `#30206` asserts against — so **every** sparse QSA decode run
+(`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, which is also every pool arm) aborted since the R12 re-cut, and nothing
+noticed: the coherence arms and both qwen4exp gates (`gate-hc-fusions.sh`,
+`gate-qwen4exp-quant-coherence.sh`) run the *dense* arm, and the abort only fires once the fused node is built.
+Block 15's `gate-kv-residency.sh` reached it because its `pref` arm forces the sparse arm; that is the arm the
+R16 rung records.
+
+Two gaps to close, both cheapest at R17:
+* `gate-qwen4exp-quant-coherence.sh` (or a new short arm) should run **one** sparse-arm text pass
+  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, same-seed greedy, byte-identical to itself across the fused/chain switch),
+  so a fused-node re-derivation cannot pass the ladder again by being unreachable.  `GREEDY-PURITY.md` §85.
+* `GGML_OP_INDEXER_SCORE` has no `test-backend-ops` case (it is a delivery op).  `test-backend-ops -o
+  FLASH_ATTN_QSA` covers the attention, not the score kernel, so the `corr_v`/truncate value fixed at R16 has no
+  numeric oracle beyond the sparse arm's text.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship

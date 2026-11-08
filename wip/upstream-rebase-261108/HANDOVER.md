@@ -30,8 +30,17 @@ draft-reserve fold).  `--spec-draft-mtp-vocab N` verified on both head paths and
 **R15 is DONE as well** (`617ee7152`, tree `f6ce37555`, 2026-11-09): block 14 applied with **zero conflicts and
 no drift edits**, and the flint model on this box confirms the block's claim (`-sm relaxed-tensor` == `-sm layer`
 text, while `-sm tensor` is still refused with the block's own message).
-**Your next job is R16** (block 15, the streamed KV — 9 expected conflicts, `D12`/`D13`), then R17 (the release
-ladder).  **Read [`HANDOVER-R16.md`](HANDOVER-R16.md) first**: it is the cold-start brief for both — the conflict
+**R16 is DONE as well** (`2dc4511b8`, tree `7d6e24c12`, 2026-11-08): block 15 applied over **8** conflicted
+files / 12 hunks (`qwen4exp.cpp` auto-merged), `D12`/`D13` re-derived, build green, the four coherence arms
+identical to R13–R15, `gate-kv-residency.sh` / `gate-kv-window-split.sh` / `gate-spec-draft-window.sh` all PASS.
+Two real defects were fixed to get there — the hybrid ctor's positional argument shift (upstream inserted
+`is_indexer` before `v_enabled`, so no V tensor was allocated: every GDN model segfaulted at load) and a latent
+**R12** defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node: the sparse QSA decode arm has
+aborted since R12, no gate reached it) — both recorded as `GREEDY-PURITY.md` §85 and `TODO` #297.  The r193 draft
+reserve was preserved by folding its `mtp_shared` branch into `common_draft_reserve_derive()` (arena 20 527.5 vs
+17 977.5 MiB, +7.8 points of residency).  **Your next job is R17**, the release ladder.
+
+**R16's brief** (block 15, the streamed KV) follows; it is kept as the record of how the rung was resolved.  **Read [`HANDOVER-R16.md`](HANDOVER-R16.md) first**: it is the cold-start brief for both — the conflict
 map, the two decisions, the gate list with runtimes and prerequisites (all present on this box), the exact rung
 procedure (deterministic commit ids, squash, identity), the R17 ladder in order, the documentation owed, and the
 traps R13–R15 paid for (unregistered graph inputs, the pool-stack local rule, shared checkpoints, per-build

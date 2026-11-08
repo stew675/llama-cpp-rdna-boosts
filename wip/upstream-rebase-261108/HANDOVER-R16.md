@@ -13,10 +13,20 @@ feature is) → `wip/kv-residency-cleanup/README.md` (§2.1, the gate's own rati
 | fork checkout | `~/llama.cpp`, branch **`rebase-r236`**, **`617ee7152`** (block 14), tree `f6ce37555`, clean |
 | `master` in `~/llama.cpp` | the pristine snapshot at **`a691b2345`** — never commit to it |
 | build | `~/bin/build-llama-rocm` (VMM on: `-DGGML_HIP_NO_VMM=OFF`, required by the slab/region work). Green at R15 |
-| ladder | **15 of 16 blocks done** (R01–R15 = blocks 00–14). **R16 = block 15**, then R17 (release ladder) |
-| rung commits | R13 `2b09a50b0` (tree `87e2841f7`), R14 `ed13a322e` (tree `c08c912a2`), R15 `617ee7152` (tree `f6ce37555`) |
+| ladder | **16 of 16 block rungs done** (R01–R16 = blocks 00–15). **Next: R17 = the release ladder (§6)** |
+| rung commits | R13 `2b09a50b0` (tree `87e2841f7`), R14 `ed13a322e` (tree `c08c912a2`), R15 `617ee7152` (tree `f6ce37555`), **R16 `2dc4511b8` (tree `7d6e24c12`)** |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-r236`**, pushed, head `4b88d3ef`; `main` still holds the pre-re-base delivery — the switch-over is R17 |
 | nothing of R16 is committed | `patches/`, `release.json` and the fork's `rdna-boosts` branch stay untouched until R17 |
+
+> **R16 IS DONE (2026-11-08)** — `2dc4511b8`, tree `7d6e24c12`.  Build green, the four coherence arms identical
+> to R13–R15 (`1de99b7e6ee6` / `4b4d56191368` / `86b7f9b5aa80` / `7a8734a9f1a6`), `gate-kv-residency.sh` PASS
+> (`be904e86f248` / `f260d1824ab3`, `bad 0`, multi-device pool with 2 counter blocks), `gate-kv-window-split.sh`
+> PASS 38/38, `gate-spec-draft-window.sh` PASS, `check-gpu-faults.sh` clean over the session.  `D12`/`D13` are
+> DECIDED.  Two defects were fixed on the way: the hybrid `llama_kv_cache` ctor's positional argument shift
+> (every hybrid/GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu`
+> (`ggml_rope_get_truncate` on the fused non-ROPE node — the sparse QSA arm aborted since R12, and no R12–R15 gate
+> reached it).  Both are `GREEDY-PURITY.md` §85; the missing sparse-arm gate is `TODO` #297.  **This file is now
+> the record of how R16 was resolved; the live brief is R17's ladder in §6.**
 
 ## §1 What R16 is, and why it is the hard one
 

@@ -153,12 +153,13 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§81** | a fused kernel that stands in for a ggml chain must call that chain's **transcendental op verbatim**, and a decode-band fusion owes its purity check at the **verify width**, not only at `--ub 1`.  The SSM gate/beta fusions computed `logf(1.0f + expf(x))` where `unary.cu`'s `op_softplus` -- the node they replace -- computes `log1pf(expf(x))`; that is not the same float, and it made the fused path disagree with the chain at the widths an MTP verify batch runs (`gate-prefill-logits --ub 4`: 0.000562 KLD / 99.000 % on gfx1201, 0.000565 / 98.971 % on gfx1100) while `--ub 1` read 0.000000 -- **vacuously**, because at one token the SSM pre-scan fusion takes those same nodes on qwen3.5/3.6/3.8, so the Q8_0 sibling had no oracle at all.  The defect moved the target's own greedy text (4771 chars `sha=0ac05e4cb358` fused vs 4628 `sha=8631f9a3a623` chain on 27B `draft-mtp n3`) and its MTP acceptance (782/1247 vs 780/1257).  So: `--ub 1` **and** `--ub 4` for a decode-band fusion, `test-logits-width-probe` for a width-only fold, the type-correct unit oracle (extend `test-fusion-gate-beta-multiseq` to the Q8_0 sibling and the model's real K -- the test only exercised BF16 at K=1024), and a decoy width is not a substitute for the real one.  **A width-uniform result is not purity (r202, TODO #130 closed):** `GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates **only the verify band** (the `ne[1] == 1` decode arm is unconditional), so pre-r201 the default build ran the wrong-softplus kernel at *every* width -- 0-diff against itself, and a width probe called it PASS -- while a fuse-off arm (W=1 fused vs W>=2 chain) was the only place the defect showed (gfx1100 `maxdiff 0.138`, `7def98c5` vs `5e1cbbb4`).  So a fusion whose switch covers only part of the band owes *three* arms: default, the switch, and `GGML_CUDA_DISABLE_FUSION=1` (the chain) -- and the chain is the reference, never the default | doctrine + fix (r201, issue #265; r202, issue #263; `benchmarks/2026-11-01-ssm-softplus-265.md`, `benchmarks/2026-11-01-kill-switch-arm-130.md`) |
 | **§82** | a synchronized readback that a fast path removes must be replaced by a device-side map whose **freshness is the only thing that can make it wrong**: the decode band's slot-remap map is keyed on `slot_dirty` (set by every slot mutation -- fill/eviction/stand-down/slab eviction/shrink/migration/re-arm) and its cold encoding (`slots + e`) also depends on the slot COUNT, so a count change without a rebuild reads the **wrong expert / past the master** while a *stale policy* can only admit the wrong expert, never move a read address.  Keep the policy on the host, keep the lag policy-only, and prove it with byte-identical text plus identical MTP acceptance (r203, PR #266, block 09: 0.76089 = 1397/1836 both arms, prefill KLD 0.000000, +8.4 % TG) | doctrine + fix (r203, PR #266; `benchmarks/2026-11-01-host-expert-device-remap.md`, `archive/work/pinned-decode-remap/`) |
 | **§84** | a re-base owes a re-derivation of the **value** behind a renamed field, never a carry-over: `mmq_args.ncols_max` (count) -> `ntj` (J-tile count, consumed as `grid.x`) made the pair fusion's grid `ncols` instead of `ncols/J` (page fault at a large context, clean at a small one), and `tile_y_max_j` (max index) -> `tile_y_j_sup` (exclusive count) dropped a column per tile in the routed-compact kernel; the ids convention also moved the expert into `tile_spec` (`nchannels_y = 1`, `n_experts` in `nchannels_x`), which had silently turned that dispatch OFF since R09 and hidden the off-by-one behind it.  A re-based dispatch is proved by a census that it FIRES, and a fallback copy of upstream's dispatcher must be upstream's text verbatim (a merged copy re-enabled stale delivery duplicates, one of them not bit-identical in a state-carrying path) | doctrine + fix (r236, re-base R11) |
+| **§85** | a re-derived call into a new API owes the **node type** that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment: the fused `GGML_OP_INDEXER_SCORE` kernel took `ggml_rope_get_truncate(dst)` after `#30206` added an op-type assert (every sparse QSA decode arm aborted since R12, and no gate ran that arm), and `llama_kv_cache`'s ctor gained `is_indexer` **before** `v_enabled`, so the delivery's positional hybrid call put `kv_pool` into `v_enabled` — no V tensor, `cpy_v` null-deref, every GDN model segfaulted at load.  Name the arguments, audit every call site of the symbol, and give each re-derived fused kernel an arm that REACHES it | doctrine + fix (r236, re-base R16) |
 ---
 
 **How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
 behaviour · `fix` = a closed finding, kept because the *rule* it produced still binds.  The entries exist in
 three shapes: `§§1-10` are the **Background** block below (the k-quant rounding-order doctrine they all rest
-on), `§§11-76` and `§82` are full entries, and `§§77-81` are **row-only** -- their whole record is the row plus
+on), `§§11-76`, `§82`, `§84` and `§85` are full entries, and `§§77-81` are **row-only** -- their whole record is the row plus
 the `WORKLOG.md` entry it names.  A fact that changes is corrected in place, tagged with the revision that
 changed it; the dated narrative is always `WORKLOG.md` or the `benchmarks/` record.
 
@@ -2355,3 +2356,42 @@ as a whole is worth +26 % decode on the 4B (87.4 vs 69.0) and +38 % on the 35B-A
 **Record.**  This entry; `INVARIANTS.md` (the renamed-field, ids-convention and single-dispatcher entries);
 the rung log in `../wip/upstream-rebase-261108/RUNGS.md` (R11) and, at release, `WORKLOG.md`.
 
+
+## 85. A re-derived call into a new API owes the *node type* that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment (r236, re-base R16)
+
+**Claim.**  A re-base produces two defect classes that the compiler cannot see, both of which keep the build
+green and both of which a text-only gate passes *vacuously* because the arm that would reach them is not in the
+ladder.
+
+| defect | what the re-base did | what it looked like |
+|---|---|---|
+| `ggml_rope_get_truncate(dst)` in `ggml/src/ggml-cuda/indexer-score.cu` (R12, `b1b0fa807`) | the delivery's fused `GGML_OP_INDEXER_SCORE` kernel reuses the *rope* parameter block, so the re-derivation took upstream's new accessor after `#30206` gave `ggml_rope_yarn_corr_dims()` a `truncate` argument | the accessor asserts `a->op == GGML_OP_ROPE \|\| ROPE_BACK`; the fused node is neither.  **Every** sparse QSA decode run (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, and with it every attendance-pool arm) processed its whole prompt, generated, and then `GGML_ASSERT(... ) failed` at the next graph build — `ggml.c:4648`, core dumped.  It sat through R12–R15 because the coherence arms and both qwen4exp gates run the dense arm |
+| `llama_kv_cache`'s ctor tail in `src/llama-memory-hybrid.cpp` (R16) | upstream inserted `is_indexer` **before** `v_enabled`; the delivery's call site was positional with the comment-labels of the *old* tail (`name_tag, v_enabled, kv_pool_capable`) | `is_indexer = true`, `v_enabled = kv_pool` (= false), `kv_pool_capable` = default.  The attention cache allocated **no V tensor**, and `llama_kv_cache::cpy_v` null-dereferenced at `+0x20` on the first graph build: **every hybrid (GDN) model segfaulted at load**, the dense 4B coherence arm included — four adjacent bare `bool`s, so nothing warns |
+
+**Rule.**  *(1) An accessor carries its node type.*  When a delivery kernel stands in for a ggml node and reuses
+that node's parameter block, every helper it borrows is valid only for the op it was copied from — re-read what
+the helper *asserts on* (or indexes) and pass the value the fused node actually carries, derived from the
+reference: the graph's own node for that step (`ggml_rope_multi` here) and, where a pre-re-base signature had no
+such concept, from the pre-re-base helper's arithmetic (the 5-argument `ggml_rope_yarn_corr_dims` floor/ceil'd
+unconditionally, i.e. `truncate = true`; the graph's rope node leaves `no_trunc` 0 and nothing calls
+`ggml_rope_set_truncate` on the indexer-key node — both readings agree, which is the check to make).  *(2) A
+positional call is a contract on parameter ORDER.*  Any ctor or function whose tail is bare `bool`s/ints must be
+called with named arguments (or a designated init) after a re-base, and the audit must cover every call site of
+that symbol, not only the ones the compiler flags: `hybrid-idx` already named `is_indexer`, `model.cpp` stops at
+`share` and takes the defaults, and `dsa`/`dsa-iswa`/`msa`/`dsv4` are upstream's.  *(3) An arm that nothing runs
+is not coverage.*  Both defects above are "the ladder never reached the code": the fix is a gate arm that
+**reaches** it (the sparse decode arm; a hybrid model in the coherence set), not a note.  A re-base rung owes one
+such arm per re-derived fused kernel.
+
+**Numbers.**  gfx1201, ROCm 10.1, VMM build.  Indexer-score: 27B-class Flash-Next GSQ-IQ3_XXS (12 layers, 2.6
+GiB of indexer KV), 25 763-token prompt, `-ncmoe 48`, q8_0, `LLAMA_QSA_DENSE_DECODE_UNTIL=0`; pre-fix the arm
+completed its prompt at 383.2 t/s and 63 generated tokens (51.3 t/s, acceptance line present), then aborted;
+post-fix `gate-kv-residency.sh` is PASS, `pref == pres == pfloor` `f260d1824ab3`, `bad 0`, 252 resolves, claims
+137.7 → 217.1 per resolve (hits 91.02 → 89.63 %), and the multi-device `-sm layer` pool section
+`pmref == pmres == pmfloor` `f260d1824ab3` with 2 counter blocks.  Ctor shift: `Qwen3.5-4B-Q8_0` 1 GPU,
+`-ngl 99 -c 8192`, pre-fix `SIGSEGV` in `llama_kv_cache::cpy_v` (`llama-context` → `sched_reserve` →
+`build_attn`, via the *fit probe* context), post-fix `1de99b7e6ee6`, and all four coherence arms match the R13
+family (`1de99b7e6ee6` / `4b4d56191368` / `86b7f9b5aa80` / `7a8734a9f1a6`).
+
+**Record.**  This entry; `INVARIANTS.md` (the ctor-order entry); `wip/upstream-rebase-261108/RUNGS.md` R16;
+`TODO.md` #297 (the sparse arm's missing gate); `WORKLOG.md` at R17.

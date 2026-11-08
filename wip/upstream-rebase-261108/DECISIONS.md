@@ -236,7 +236,10 @@ delivery's replay guard and alloc-deps are correctness-critical (`GREEDY-PURITY.
 **Measurement:** `gate-park-idle-slots.sh`, `gate-ckpt-reuse.sh`, `gate-state-pipe.sh`, and coherence on a
 hybrid model; for `#31584`, a `test-backend-ops` pass (view-bounds regressions show as aborts, not as text).
 
-- status: **OPEN** · residue **R13/R16** · record: —
+- status: **OPEN** — no `D9` conflict was reached at R16 (the graph cache, the replay guard and the alloc-dep
+  registration merged as both sides; `memory_breakdown()`'s re-derivation is accounting, not allocator behaviour).
+  Residue: R13/R16 are done; the graph-cache arms (`gate-park-idle-slots.sh` / `gate-ckpt-reuse.sh` /
+  `gate-state-pipe.sh` / a `test-backend-ops` pass for `#31584`'s view bounds) belong to R17's ladder.  record: —
   *R11 (block 10, 2026-11-08): no D9 conflict was reached — the graph-cache key, the replay guard and the
   alloc-dep registration merged as both sides, and nothing in the rung's three defects was a graph/allocator
   issue (they were launch-geometry and dispatcher-merge defects).  R11 did produce the dispatcher reconciliation
@@ -272,7 +275,12 @@ invariant rather than conflict textually.
 **Measurement:** MTP four-axis (`benchmarks/mtp-adaptive-methodology.md`) after the rung that merges
 `#30141`/`#31660`; `llama-batched-bench -npl 1,4,8`.
 
-- status: **OPEN** · rung R03 (residue R13/R14) · record: —
+- status: **OPEN** · rung R03 (residue R13/R14; R16 added block 15 Goal C) · record: `RUNGS.md` R16/R17
+  *R16 (block 15 Goal C, the MTP draft KV window): the window is gated per sequence and `gate-spec-draft-window.sh`
+  PASS — `LLAMA_SPEC_DRAFT_WINDOW=1024` sizes `1024 cells per sequence, cache 3072 cells ((win + 512) x 2)` and all
+  six requests across both slots are byte-identical to `win 0` with identical acceptance.  The hidden-state /
+  conv-snapshot contract `#30141`/`#31660` touches is `R03`'s business and is unchanged here; the **MTP four-axis
+  protocol is still owed at R17**, which is the arm that can see a hidden-state defect.*
 
 ## D12 — Quantized-KV state, rotation and `kv_rows`
 
@@ -289,7 +297,18 @@ buffer-to-buffer copy, the provider's region binding is affected.
 **Measurement:** `gate-kv-residency.sh` (window + pool + the multi-device `-sm layer` section),
 `gate-state-pipe.sh`, `gate-kv-window-split.sh`, and the `-ctk/-ctv q8_0` arms.
 
-- status: **OPEN** · rung R16 · record: —
+- status: **DECIDED (R16, 2026-11-08) — no re-derivation needed beyond the buffer type** · record: `RUNGS.md` R16
+  *R16 (block 15): `#31073`'s rotation constants land as a per-cache, per-layer buffer (`attn_rot_bufs`), not a
+  cell-indexed tensor, so they are outside the region the provider binds at — they are summed into
+  `memory_breakdown()` and nothing else.  `#30541`'s on-device state copy keeps addressing the cache through the
+  same buffers, so `state_write`/`state_read` keep going through the region buffer's own copy (block 15's r204
+  path) and need no re-derivation.  `#31570` `kv_rows` is in the memory interface (`get_kv_rows_slices`), which
+  merged automatically.  Proven by measurement, not by reading: the residency gate's spilling arms really spill
+  (16 mapping flips, 64 MiB host-backed, `wref == wres == wspill` `be904e86f248`) and its `win2mtp` arm takes the
+  region path for the batched state save (`gate-kv-window-split.sh`, acceptance `0.46154` both ways).  The one
+  thing this rung did re-derive was **not** a state shape: the fused `GGML_OP_INDEXER_SCORE` kernel called
+  `ggml_rope_get_truncate(dst)` after `#30206` gave that accessor an op-type assert (a latent R12 defect, every
+  sparse QSA decode run aborted since then — `GREEDY-PURITY.md` §85, `TODO` #297).*
 
 ## D13 — Memory instances after `no_alloc` and `n_pad`
 
@@ -300,7 +319,17 @@ touch.  Pure refactor churn with no decision attached — resolve mechanically, 
 33 of block 12's 81 files are affected by it and resolving against the new member shape from the start
 avoids redoing hunks.
 
-- status: **OPEN** · rungs R11..R16 · record: —
+- status: **DECIDED (R16, 2026-11-08) — resolved mechanically, plus two defects it exposed** · record: `RUNGS.md`
+  R16
+  *R16 (block 15): `hparams.no_alloc` → the ctor's `no_alloc` at all three block-15 sites; the pool's cell count
+  rounds to whole PAGES now that `n_pad` is gone; `memory_breakdown()` is re-derived over `ctxs_bufs.bufs` +
+  `ctxs_bufs.no_alloc` with upstream's `attn_rot_bufs` summed on top; the delivery-side `params_l` rename is
+  dropped for upstream's `params`.  Two defects the mechanical merge could not see: (a) `src/llama-memory-hybrid.cpp`
+  passed `llama_kv_cache`'s extended tail positionally, so the newly-inserted `is_indexer` shifted `v_enabled` into
+  receiving `kv_pool` — no V tensor, `cpy_v` null-deref, **every hybrid/GDN model segfaulted at load**; (b)
+  `ggml/src/ggml-cuda/indexer-score.cu` used a ROPE-only accessor on its fused node (see `D12`).  Both fixed, both
+  recorded as `GREEDY-PURITY.md` §85 with the rule "a positional call into an extended parameter list must be
+  named, and every call site of the symbol audited".*
 
 ## D15 — The delivery's F1 layer-input device store vs upstream's `embd_row` surface
 
