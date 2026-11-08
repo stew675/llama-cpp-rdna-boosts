@@ -20,6 +20,8 @@
 #   scripts/gate-rebase-release.sh                       # everything
 #   scripts/gate-rebase-release.sh --quick               # skip steps 2 and 3 (the slow ones)
 #   scripts/gate-rebase-release.sh --perf-only           # just step 6 (an A/B while iterating)
+#   scripts/gate-rebase-release.sh --only text,faults    # one or more steps by name (build|logits|ops|text|perf)
+#                                                       # `state` is included only when named
 #   scripts/gate-rebase-release.sh --tolerance 1.0       # allowed regression per arm, percent (default 1.0)
 #
 # ENV (all optional)
@@ -45,11 +47,12 @@ REPS="${REPS:-5}"
 TOLERANCE="${TOLERANCE:-1.0}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-QUICK=0 PERF_ONLY=0
+QUICK=0 PERF_ONLY=0 ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --quick)     QUICK=1 ;;
         --perf-only) PERF_ONLY=1 ;;
+        --only)      ONLY="$2"; shift ;;
         --tolerance) TOLERANCE="$2"; shift ;;
         --rounds)    ROUNDS="$2"; shift ;;
         --reps)      REPS="$2"; shift ;;
@@ -93,6 +96,16 @@ record() { # record <status> <step> <detail>   (PASS|FAIL|WARN|INFO; only FAIL f
 }
 
 need_file() { [ -e "$1" ] || { record FAIL "$2" "missing $1"; return 1; }; return 0; }
+
+# split_arm <tokens...> -- an arm line mixes environment assignments with binary flags; they must be separated
+# (`env VAR=x -ngl 99` makes env parse -ngl as its own option).  Anything containing '=' is an assignment.
+split_arm() {
+    ENVS=(); FLAGS=()
+    local t
+    for t in "$@"; do
+        case "$t" in *=*) ENVS+=("$t") ;; *) FLAGS+=("$t") ;; esac
+    done
+}
 
 # ---------------------------------------------------------------------------------------------------------------
 # 1. state
@@ -183,7 +196,9 @@ step_text() {
         log="$LOGDIR/text-$name.log"
         # No -lv on a text arm: the same stream carries the generated text (see AGENTS.md).
         # shellcheck disable=SC2086
-        if ! env $args timeout 1800 "$cli" -m "$model" -p "The capital of France is" -n 20 --seed 42 --temp 0 \
+        split_arm $args
+        if ! env "${ENVS[@]}" timeout 1800 "$cli" -m "$model" "${FLAGS[@]}" \
+                -p "The capital of France is" -n 20 --seed 42 --temp 0 \
                 --no-display-prompt --single-turn > "$log" 2>&1; then
             record FAIL "text-$name" "llama-cli failed, see $log"; continue
         fi
@@ -203,14 +218,9 @@ step_text() {
 # ---------------------------------------------------------------------------------------------------------------
 bench_tps() { # bench_tps <binary> <model> <arm args...> -> t/s on stdout
     local bin="$1" model="$2"; shift 2
-    local envs=() flags=() t out
-    # The arm line mixes environment assignments (HIP_VISIBLE_DEVICES=...) with llama-bench flags; they must be
-    # separated -- `env VAR=x -sm tensor` would have env parse -sm as its own option.  Anything containing '='
-    # is an assignment and everything else is a flag, so an arm must not pass a --flag=value form.
-    for t in "$@"; do
-        case "$t" in *=*) envs+=("$t") ;; *) flags+=("$t") ;; esac
-    done
-    out="$(env "${envs[@]}" timeout 1800 "$bin/bin/llama-bench" -m "$model" -r "$REPS" "${flags[@]}" \
+    local out
+    split_arm "$@"
+    out="$(env "${ENVS[@]}" timeout 1800 "$bin/bin/llama-bench" -m "$model" -r "$REPS" "${FLAGS[@]}" \
             2>>"$LOGDIR/bench.err")"
     printf '%s' "$(printf '%s\n' "$out" | grep -oE '\|\s+[0-9]+\.[0-9]+ ±' | grep -oE '[0-9]+\.[0-9]+' | tail -1)"
 }
@@ -269,16 +279,22 @@ echo "gate-rebase-release: new=$NEW_BUILD base=$BASE_BUILD fork=$FORK base-commi
 echo "  started $START_HUMAN, logs in $LOGDIR"
 echo
 
+wanted() { # wanted <step> -- --only selects a comma-separated subset, everything when unset
+    [ -z "$ONLY" ] && return 0
+    case ",$ONLY," in *",$1,"*) return 0 ;; esac
+    return 1
+}
+
 if [ "$PERF_ONLY" = 1 ]; then
     step_perf
 else
-    step_state
-    [ "$QUICK" = 1 ] && record WARN per-block-build "skipped (--quick)" || step_build
-    [ "$QUICK" = 1 ] && record WARN prefill-logits "skipped (--quick)" || step_logits
-    step_ops
-    step_text
-    step_perf
-    step_faults
+    wanted state  && step_state
+    if [ "$QUICK" = 1 ]; then record WARN per-block-build "skipped (--quick)"; else wanted build  && step_build;  fi
+    if [ "$QUICK" = 1 ]; then record WARN prefill-logits "skipped (--quick)";  else wanted logits && step_logits; fi
+    wanted ops    && step_ops
+    wanted text   && step_text
+    wanted perf   && step_perf
+    wanted faults && step_faults
 fi
 
 echo
