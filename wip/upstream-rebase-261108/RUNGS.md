@@ -1062,6 +1062,44 @@ still report the documented r235-numerics drift, `TODO` #292).
 
 - status: **DONE** · fork `9b7dfb47a` (block 10) · session 2026-11-08
 
+## P4 — pre-R17: `TODO` #301, the MoE prefill delta — localised, fixed, and attributed · **DONE 2026-11-08**
+
+`TODO` #301 was the campaign's only *measured* regression: r236 −2 … −3 % on MoE prefill, decode flat.  The
+earlier record ruled out MMB, MMQ and the fusion dispatcher by switching each off; two of the three arms were
+real, and the profile below shows the answer was never in those switches.
+
+**Localised by kernel census, not by bisect.**  `-lv 4` on both binaries: **identical graph** (3033 nodes, 2
+splits, same buffers) and identical grids/blocks/launch counts for every kernel — so the delta is inside the
+work of two kernels, and `rocprofv3 --kernel-trace` named them:
+
+| kernel | r236 | r235 | delta |
+|---|---|---|---|
+| `mm_ids_helper<8>` | 282 launches, 19.0 ms | 188, 13.4 ms | **+94 launches** |
+| `flash_attn_ext_f16<128,128,8,8,…>` | 19.6 ms (96) | 15.9 ms (96) | **+23 %** at identical geometry |
+
+**The +94 was the re-base's own artefact.**  `ggml_cuda_mul_mat_q_pair` launched the ids compaction once per
+arm in r236 (its own comment: both calls "write the same mapping and only tile_spec/expert_bounds differ"); on
+r235 it launched it **once**.  R01's re-expression of the compaction onto upstream's `tile_spec` grid created
+the second launch.  Fix (`30277a117`): one compaction + reuse the tile_spec on equal `J` (measured `J0 = J1 =
+48`, always equal for a gate+up pair since `J` depends on type/`ne[1]`/ncols) or a new `mm_id_retile_kernel`
+(one block per expert, from the bounds the helper already wrote).  Census after: **188**, r235's count.
+
+**Result** (interleaved `llama-bench -p 512`, 2-4 rounds): 30B-A3B Q4_K_M 1 GPU **−0.7 … −1.1 %** (was
+−2.0 … −3.2), 35B-A3B Q8_0 3 GPU tensor **−0.1 … −0.5 %** (was −2.0), dense 27B **−0.1 … −1.1 %** (was −1.4).
+Decode untouched.  `MUL_MAT_ID` 931/931, texts byte-identical, `gate-hc-fusions` PASS.
+
+**What remains is a different defect, and it is ours:** the FA kernel.  With the *packed* mask, r235's FA was
+**14 % faster than unpatched upstream** and r236's is **20 % slower than r235's** (16.0 vs 13.4 ms), spilling
+40 B more per thread (scratch 336 → 376) at the same 256 VGPRs; the only signature change is upstream's
+`KV_rows_ptr`.  The derived-mask path costs +19-22 % over packed in *both* trees, so that part ported fine.
+Carried as `TODO` #302 (a `fattn-mma-f16.cuh` port job), ~1 % of the MoE wall time.
+
+**Also corrected:** `GGML_CUDA_DISABLE_MMQ` **does not exist** in this tree (only `GGML_CUDA_DISABLE_MMQ_ROUTED`),
+so the earlier "not MMQ" arm re-measured the default.  Recorded in the new benchmark file, not by editing the
+dated one.
+
+- status: **DONE** · fork `30277a117` (block 00/08) · `benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md` · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1093,6 +1131,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P4 | — | `30277a117` (fork, block 00/08 hunk) | #301: MoE prefill −2..−3 % localised by kernel census → a duplicate ids compaction (our R01 re-expression) | fixed; 3 arms now −0.1..−1.1 %; 931/931 + texts identical; FA port split out as #302 | 2026-11-08 | one compaction + `mm_id_retile_kernel`; `GGML_CUDA_DISABLE_MMQ` correction recorded |
 | P3 | — | `9b7dfb47a` (fork, block 10 hunk) | #298: one live pool-order violation in the cublas BF16 src1 cache path (plus 4 sites audited clean) | reproduced (F16 4B + `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16`), fixed, inert (3 hashes + `gate-hc-fusions` PASS) | 2026-11-08 | the registered block is reserved before any plain pool allocation |
 | P2 | — | `08d6c343b` (fork, block 11 hunk) | #297: the sparse arm had no gate (and no census to prove it ran) | three arms on the r236 build, incl. a below-the-width negative test that FAILs | 2026-11-08 | 23-line `GGML_CUDA_QSA_SCORE_LOG` census (inert, measured); gate section E |
 | P1 | — | (delivery repo only) | #294 premise corrected: 8 gates had **no** journal check, 5 had a fixed window | `bash -n` ×17 + real PASS runs of `gate-grid-stall-pad` (A-only/B-only/`--no-faults`), `gate-qwen4exp-quant-coherence`, `gate-park-idle-slots` | 2026-11-08 | every GPU gate: `--since` = its own start timestamp, `--no-faults` opt-out, every log scanned, PASS line on success |

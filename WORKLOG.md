@@ -1,3 +1,51 @@
+## 261108.005 (no release) -- `TODO` #301 closes: the MoE prefill delta was a duplicate ids compaction (our own re-base artefact), fixed and measured; the residue is our FA port, now `#302`
+
+**Fork change, block 00/08** (`mmid.cu`, `mmid.cuh`, `mmq.cu`, +46/−3, fork `30277a117`, tree `f351a38e4`).
+`patches/`/`release.json` untouched; the hunks land at the R17 re-cut.  Re-base record: `RUNGS.md` `P4`;
+numbers: `benchmarks/2026-11-08-rebase-r235-vs-r236-localisation.md`.
+
+**What the two binaries differ in.**  `-lv 4` on both: identical graph (3033 nodes, 2 splits), identical model
+and compute buffers, identical grids/blocks/launch counts per kernel.  The prefill gap is inside the *work* of
+two kernels, which `rocprofv3 --kernel-trace` named: `mm_ids_helper<8>` **282 launches in r236 vs 188 in r235**
+(+94, +5.6 ms) at the same grid, and `flash_attn_ext_f16<128,128,8,8,…>` **+23 %** at identical geometry.
+
+**The +94 is ours.**  `ggml_cuda_mul_mat_q_pair` launched the ids compaction **once per arm** after R01
+re-expressed it onto upstream's `tile_spec` grid — the pair's own comment already says both calls "write the
+same mapping and only tile_spec/expert_bounds differ".  On the r235 tree the pair launched it once.  So the
+regression was not upstream having become slower: it was our conflict resolution paying for the compaction
+twice, once per MoE layer per prefill pass.
+
+**Fix.**  One `mm_ids_helper` launch; then either reuse arm 0's `tile_spec` when `J_best_i[0] ==
+J_best_i[1]`, or re-emit arm 1's seams with a new `mm_id_retile_kernel` (one 32-thread block per expert, from
+the per-expert bounds the helper already writes).  `J` depends only on the weight type, `ne[1] % 128` and the
+column count — all shared by a gate+up pair — so equal `J` is the reachable case (measured `J0 = J1 = 48`,
+128 experts, 8 used, 4096 compact rows) and the retile branch is defensive; it was still exercised end-to-end
+with a temporary hook that *used* the retiled layout instead of the shared one (identical text `e1325adad141`,
+hook not committed).  Census after: **188 launches**, exactly r235's.
+
+**Measured after** (interleaved `llama-bench -p 512`, `-r 5`, 2-4 rounds, one benchmark at a time):
+
+| arm | before | after |
+|---|---|---|
+| 30B-A3B Q4_K_M, 1 GPU | −2.0 … −3.2 % | **−0.7 / −1.1 / −1.1 %** |
+| 35B-A3B Q8_0, 3 GPU `-sm tensor` | −2.0 % | **−0.2 / −0.1 / −0.5 / −0.5 %** |
+| dense 27B Q8_0, 1 GPU | −1.4 % | **−0.1 / −1.1 %** |
+
+`test-backend-ops -o MUL_MAT_ID` **931/931**, the 30B text byte-identical, Flash-Next dense `13406dc51399`,
+`gate-hc-fusions.sh` PASS (5/5 hard arms `d62340fbf566`).
+
+**The residue is a different defect and it is ours too** (`TODO` #302): with the *packed* mask r235's FA kernel
+was **14 % faster than unpatched upstream** (13.4 vs 15.5 ms) and r236's is **20 % slower than r235's**
+(16.0 ms), spilling 40 B more per thread (scratch 336 → 376 B at the same 256 VGPRs); the only signature change
+is upstream's `KV_rows_ptr`.  The derived-mask path costs +19-22 % over packed in **both** our trees, so that
+machinery ported fine.  Worth ~1 % of the MoE prefill wall time; it is a `fattn-mma-f16.cuh` port job, not the
+duplicate-launch job #301 was.
+
+**Correction owed and recorded:** the earlier benchmark file's `GGML_CUDA_DISABLE_MMQ=1` arm was a **no-op** —
+that variable does not exist in this tree (only `GGML_CUDA_DISABLE_MMQ_ROUTED`) — so "not MMQ" was never
+established; the profile shows the MoE prefill *is* MMQ-side work.  Recorded in the new file rather than by
+editing the dated one.
+
 ## 261108.004 (no release) -- `TODO` #298 closes: the pool-order sweep found a LIVE violation in the cuBLAS BF16 src1 cache path, reproduced and fixed
 
 **Fork change, block 10** (`ggml/src/ggml-cuda/ggml-cuda.cu`, +38/-17, fork `9b7dfb47a`, tree `801148bb3`).
