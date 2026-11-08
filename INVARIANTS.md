@@ -2996,3 +2996,14 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   `host_expert_selected()`, short-circuits `plan_host_expert_placement()` and skips a CPU expert
   `--override-tensor`, with one WARN.  Inert on a discrete GPU (gfx1201: `35B-A3B -ncmoe 20` still pins
   16 320 MiB of host experts).
+- **No plain device-pool allocation may be created before a `pool_stack` push in the same scope (r236, re-base R16
+  follow-up).**  `ggml_cuda_pool_vmm::free` asserts LIFO (and the non-VMM pool silently corrupts its accounting), so
+  a block that is *registered* on the context's `pool_stack` and released after the whole graph must be taken
+  **before** any plain temporary in that scope.  `ggml_cuda_mul_mat_id_mmb_glu` took the slot last, so on scope
+  exit it freed its five temporaries below a live slot -- `pool free OUT OF ORDER: freeing 2176 bytes ...`, with
+  `GGML_CUDA_POOL_TRACE=1` naming the allocator (gfx1151, Flash-Next + MTP drafter, every run, r235 and r236 alike).
+  Fixed by hoisting the slot; the same rule was already paid for by `hc_combine_norm` at R13 and by the MMB/BF16
+  pool blocks before R12.  Two consequences: (a) the violation is **layout/timing sensitive** -- the same source
+  gave 5/5 aborts on one build and 0/4 on the next -- so "it passed once" is not evidence, and the pool's free-order
+  assert always names sizes/offsets now (`GGML_CUDA_POOL_TRACE=1` adds the stacks); (b) the *class* is open: every
+  `pool_stack_push` site still owes a check that no plain allocation precedes it in its scope (`TODO` #298).

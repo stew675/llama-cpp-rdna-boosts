@@ -103,6 +103,11 @@
 #                is a REGRESSION floor and not a target -- it is set below the measured cost so the known
 #                behaviour passes and a further regression fails.  Read from llama-cli's own perf line on the
 #                two arms that share the prompt, the binary and the device.
+#   SELFTEST_STRICT        1 = the quarantine control must FAIL on every arch (default 0: an arch in
+#                          SELFTEST_HOLD_VACUOUS_ARCHS may report the driver does not exhibit the hazard)
+#   SELFTEST_HOLD_VACUOUS_ARCHS  arches where the host-mapping hazard has been MEASURED not to reproduce,
+#                          space-separated (default `gfx1151`, measured 2026-11-08).  Add an arch only with a
+#                          measurement; the right answer for an unlisted arch is to investigate, not to list it
 #   KEEPOUT      log dir (default: mktemp -d)
 #   REUSE        1 = do not run anything; RE-GRADE the logs already in KEEPOUT (the pool arms cost ~5 min, so
 #                a threshold or message change should not need a re-run).  The arms must all be present.
@@ -248,11 +253,26 @@ info "logs         : $KEEPOUT"
 # HOST-backed span, aligned window flips with a straddling request REFUSED, the host-mapping hazard replayed
 # over a whole flip sequence, the watermark contract and clear-on-map).  TWO arms, because a diagnostic that
 # cannot fail is not a gate: the default arm must PASS, and the arm with the quarantine hold disabled
-# (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) must FAIL.  Neither arm asks for a window, so the KV is
-# the plain device buffer and the generated text is irrelevant -- the VERDICT line is what is graded.  That
-# line is WARN on PASS / ERROR on FAIL (r222: it used to be INFO, invisible at every default, so a FAIL read
-# exactly like a PASS); `run_arm` passes `-v`, which is what makes the PASS visible.
-echo "-- the provider's selftest (the primitive's oracle: PASS by default, FAIL without the quarantine hold)"
+# (`LLAMA_KV_REGION_QUARANTINE=0`, the known-bad state) is the sensitivity control.  Neither arm asks for a
+# window, so the KV is the plain device buffer and the generated text is irrelevant -- the VERDICT line is what
+# is graded.  That line is WARN on PASS / ERROR on FAIL (r222: it used to be INFO, invisible at every default,
+# so a FAIL read exactly like a PASS); `run_arm` passes `-v`, which is what makes the PASS visible.
+#
+# WHAT THE CONTROL CAN AND CANNOT ASSERT (r236, measured on gfx1151).  The hold is a DRIVER workaround: the
+# hazard (a `cuMemUnmap` -> `cuMemCreate` pair zeroing a different LIVE host-location mapping in the same
+# reservation) reproduces on gfx1201 + ROCm 10.1 from the 6th flip and NOT on gfx1151's driver, where the whole
+# hazard sequence verifies with the hold off.  So "hold off => FAIL" is a property of the DRIVER, never of the
+# delivery, and asserting it unconditionally makes the arm fail on a healthy platform (halo, 2026-11-08: the
+# arm read FAIL while the delivery was correct).  The arms therefore assert the MECHANISM everywhere and the
+# corruption only where it has been observed:
+#   * arm 1  -- a PASS verdict that NAMES `quarantine hold on`, plus the hazard case in the text.
+#   * arm 2  -- a verdict that names `quarantine hold off`, plus the hazard case.  Then either a FAIL verdict
+#               (the hazard reproduces on this driver: the oracle is sensitive) or a PASS verdict on an arch in
+#               SELFTEST_HOLD_VACUOUS_ARCHS (the driver does not exhibit it: recorded as INFO, not a failure).
+#               Any other arch PASSing is a FAIL of this gate -- either the driver changed or the hazard case
+#               stopped testing anything -- and `SELFTEST_STRICT=1` forces that verdict on every arch.
+# A missing hazard case (compiled out, skipped) is a FAIL on every arch: that is the "oracle lost" case.
+echo "-- the provider's selftest (the primitive's oracle: PASS with the hold, and the hold's sensitivity)"
 run_arm wselftest  "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 -- -c 2048 || exit 1
 run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LLAMA_KV_REGION_QUARANTINE=0 -- -c 2048 || exit 1
 
@@ -262,11 +282,39 @@ run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LL
 [ "$(count wselftest 'selftest: device 0: FAIL')" = 0 ] \
     && pass "wselftest reported no failed check" \
     || fail "wselftest FAILED: $(grep -m3 'selftest\|FAILED:' "$KEEPOUT/wselftest.err" 2>/dev/null | tr '\n' ' ')"
-# ... and the oracle must be SENSITIVE: without the hold the hazard case is a wrong answer, and the selftest
-# is the only thing that notices.  An arm that passes here too means the selftest stopped testing the hazard.
-[ "$(count wselftest0 'selftest: device 0: FAIL')" -ge 1 ] \
-    && pass "wselftest0 FAILED with the quarantine hold off (the selftest is sensitive, not a formality)" \
-    || fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 (the hazard arm is vacuous)"
+
+# the mechanism, on BOTH arms: the hazard case ran, and each arm really ran with the intended hold state
+for arm in wselftest wselftest0; do
+    [ "$(count $arm 'the host-mapping hazard')" -ge 1 ] \
+        && pass "$arm exercised the host-mapping hazard case" \
+        || fail "$arm never reported the host-mapping hazard case: the sensitivity control has nothing to grade (the case was skipped or compiled out)"
+done
+[ "$(count wselftest 'quarantine hold on')" -ge 1 ] \
+    && pass "wselftest ran with the quarantine hold ON (the shipped configuration)" \
+    || fail "wselftest did not report 'quarantine hold on' (LLAMA_KV_REGION_QUARANTINE is not being read, or the verdict line is stale)"
+[ "$(count wselftest0 'quarantine hold off')" -ge 1 ] \
+    && pass "wselftest0 ran with the quarantine hold OFF (the control arm)" \
+    || fail "wselftest0 did not report 'quarantine hold off' (the control arm did not take the state it is asserting)"
+
+# ... and the control must say something.  A FAIL verdict means the hazard reproduces on this driver and the
+# selftest notices (the sensitive case).  A PASS verdict is only acceptable on an arch where the hazard has
+# been measured NOT to reproduce -- recorded, with the arch named, never assumed.
+ST_ARCH="$(grep -oE 'gfx[0-9a-f]{4,}' "$KEEPOUT/wselftest0.err" 2>/dev/null | head -1)"
+[ -n "$ST_ARCH" ] || ST_ARCH="unknown"
+if [ "$(count wselftest0 'selftest: device 0: FAIL')" -ge 1 ]; then
+    pass "wselftest0 FAILED with the quarantine hold off (the selftest is sensitive on $ST_ARCH, not a formality)"
+elif [ "${SELFTEST_STRICT:-0}" = 1 ]; then
+    fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 on $ST_ARCH and SELFTEST_STRICT=1 is set (the hazard case is vacuous on this driver)"
+else
+    case " ${SELFTEST_HOLD_VACUOUS_ARCHS:-gfx1151} " in
+        *" $ST_ARCH "*)
+            pass "wselftest0 PASSED with the quarantine hold off on $ST_ARCH -- the hazard does not reproduce on this driver (measured 2026-11-08: halo, gfx1151, the whole flip sequence verifies without the hold).  The primitive is unaffected; the hold is inert here"
+            ;;
+        *)
+            fail "wselftest0 PASSED with LLAMA_KV_REGION_QUARANTINE=0 on $ST_ARCH: the hazard case no longer distinguishes the hold, so it is not testing anything.  Either the driver changed (verify by hand) or the case needs attention -- re-run with SELFTEST_STRICT=1 to fail this arm unconditionally, and add an arch to SELFTEST_HOLD_VACUOUS_ARCHS only with a measurement"
+            ;;
+    esac
+fi
 
 # ===== the window ========================================================================================
 if [ "$DO_WINDOW" = 1 ]; then

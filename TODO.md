@@ -512,7 +512,33 @@ Two gaps to close, both cheapest at R17:
   FLASH_ATTN_QSA` covers the attention, not the score kernel, so the `corr_v`/truncate value fixed at R16 has no
   numeric oracle beyond the sparse arm's text.
 
-## 298. gfx1151: the VMM pool's free-order assert still fires on the MTP-draft path (pre-existing)
+## 298. The VMM pool's free-order invariant: one site fixed (MMB gate/up slot), the class is worth a sweep
+
+**Fixed at r236 (`812deb221`)**: `ggml_cuda_mul_mat_id_mmb_glu` took its long-lived output slot (a `pool_stack`
+block, released after the whole graph) *after* five plain pool temporaries, so at scope exit the temporaries
+were freed below a live block.  That aborted **every** Flash-Next + MTP-drafter run on gfx1151 (r235 and r236
+alike) and therefore blocked `gate-kv-residency.sh`'s pool section there; the pre-re-base binary aborts
+identically, so it was pre-existing.  The rule is R13's `hc_combine_norm` rule: **no plain pool allocation may
+be created before a `pool_stack` push in the same scope**.  Verified on halo: the sparse and pool arms now both
+run and are byte-identical (`1e944569dbd6`).
+
+**Open — the class, not the site.**  The same violation was seen once on gfx1201 in a *dense* 4B warmup (two
+2 KiB blocks freed in allocation order) on a build that differs only by a diagnostic, i.e. it is latent and
+layout/timing sensitive: 5/5 aborts on one build, 0/4 on the next.  So `GGML_CUDA_POOL_TRACE=1` exists now
+(a backtrace per live block, printed on violation) and the assert always names the sizes/offsets.  A sweep of
+every `pool_stack_push` site (`common.cuh`'s `bf16_src1_cache_put`, `hyperconn.cu`'s `hc_base_copy`,
+`mmb.cu`'s `mmb_cache_insert`/`mmb_slot_reserve`) for plain allocations in the same scope above it is owed
+before the next release — one site is fixed, the *rule* is what keeps breaking.
+
+## 299. `gate-kv-residency.sh`'s quarantine control is a per-driver property (fixed at r236, recorded)
+
+The `wselftest0` arm used to require the provider's selftest to FAIL with `LLAMA_KV_REGION_QUARANTINE=0`.  The hold
+is a *driver* workaround: the host-mapping hazard reproduces on gfx1201 + ROCm 10.1 and **not** on gfx1151, where
+the whole hazard sequence verifies with the hold off (measured 2026-11-08, halo).  The arm consequently read FAIL on
+a healthy platform.  It now asserts the MECHANISM on every arch (the verdict names `quarantine hold on|off` and the
+hazard case must be present in both arms) and the corruption only for arches in `SELFTEST_HOLD_VACUOUS_ARCHS`
+(default `gfx1151`, added with that measurement); an unlisted arch that passes the control is still a FAIL, and
+`SELFTEST_STRICT=1` forces the strict verdict anywhere.
 
 Found at R16 validating on `halo` (gfx1151 Strix Halo, VMM build).  With an MTP drafter attached
 (`-md <mtp> --spec-type draft-mtp`), a Flash-Next run dies mid-decode in
