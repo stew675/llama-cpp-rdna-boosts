@@ -216,7 +216,11 @@ delivery's replay guard and alloc-deps are correctness-critical (`GREEDY-PURITY.
 **Measurement:** `gate-park-idle-slots.sh`, `gate-ckpt-reuse.sh`, `gate-state-pipe.sh`, and coherence on a
 hybrid model; for `#31584`, a `test-backend-ops` pass (view-bounds regressions show as aborts, not as text).
 
-- status: **OPEN** · rung R11 (residue R13/R16) · record: —
+- status: **OPEN** · residue **R13/R16** · record: —
+  *R11 (block 10, 2026-11-08): no D9 conflict was reached — the graph-cache key, the replay guard and the
+  alloc-dep registration merged as both sides, and nothing in the rung's three defects was a graph/allocator
+  issue (they were launch-geometry and dispatcher-merge defects).  R11 did produce the dispatcher reconciliation
+  (one dispatcher; `TODO` #290 closed) and `GREEDY-PURITY.md` §84.*
 
 ## D10 — All-reduce
 

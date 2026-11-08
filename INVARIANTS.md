@@ -2857,3 +2857,40 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
 - **`--load-mode none` silently disables the `--host-experts pool`** (`a pool needs a mapped load`), so a
   `runme` built on it runs the bulk/pageable path its own comments do not describe.  Read
   `report_host_expert_placement` before attributing anything to the pool.
+- **A re-base that renames a kernel's field owes a re-derivation of the VALUE, not a carry-over (r236, re-base
+  R11).**  Two upstream renames in the `mmq` launch path changed the *meaning* of the value while keeping the
+  arithmetic around it identical, and both were carried across with the old meaning:
+  `mmq_args.ncols_max` (a column **count** the launcher divided by `J` itself) became `ntj` (the **J-tile
+  count**, consumed directly as `grid.x`), so `ggml_cuda_mul_mat_q_pair` launched `grid.x = ncols` instead of
+  `ncols/J` -- 512 instead of 4 on the 4B FFN -- and enumerated tiles past `src1_q8_1`/`dst`, which is a GPU
+  **page fault** at a large context and nothing at all at a small one (the grid scales with the context, so
+  `-c 2048` is in bounds); and `mul_mat_q_process_tile`'s `tile_y_max_j` (inclusive max index) became
+  `tile_y_j_sup` (exclusive count), so the routed-compact kernel's `col_diff - jt*J - 1` dropped the **last
+  column of every tile** (garbage text, no fault, no warning).  The discriminator for the first is a launch
+  dump compared against the single-node path (`ntj` must equal `ceil(ncols/J)`); for the second it is the
+  fused-vs-unfused text at a *prefill* width, which is the only width that kernel runs at.
+- **The routed (`ids`) convention in `mmq_args` puts the expert in `tile_spec`, not in `grid.z` (r236).**  For
+  `MUL_MAT_ID`, `nchannels_y` is **1**, `nchannels_x` carries `n_experts`, and `ntj = ceil(ne_get_rows/J) +
+  n_experts`; the kernel indexes `tile_spec[jt]` whenever `ids_dst` is set, so a routed launch that passes
+  `tile_spec = nullptr` is a null-deref on every path that is not the delivery's compact dispatch.  Every
+  gate that asks "how many experts" on the ids path must read `nchannels_x` -- the delivery's compact-MoE gate
+  read `nchannels_y` and was therefore **unreachable** from R09 until R11, which is how the off-by-one above
+  stayed invisible for three rungs.
+- **The fusion dispatcher exists once (`ggml_cuda_try_fuse.cu`), and a fallback copy of upstream's dispatcher
+  is only safe if it is upstream's text verbatim (r236, closes `TODO` #290).**  The interim two-copy merge
+  (`ggml_cuda_try_fuse_legacy()`) was ~490 lines larger than upstream's `ggml_cuda_try_fuse` because it had
+  been resolved *merged* with stale duplicates of delivery arms (`ssm_conv_in`,
+  `op_ssm_conv_l2_gatebeta`, `op_rms_norm_q8_1`, `add_softplus_mul`, `shexp_down_gate`, `l2_norm_pair`,
+  `gate_beta_verify`); the inline SSM conv-input fold then ran on qwen35moe decode where the delivery's
+  canonical arm declines, and it is not bit-identical to the unfused chain (a state-carrying path).  All
+  upstream arms are now reachable from the one dispatcher (delivery arms first, upstream's DSV4 HC post folded
+  in at upstream's position); the duplicates and the superseded `ggml_cuda_match_moe_weighted_reduction`
+  matcher are deleted.
+- **Fusion decisions on this tree are not deterministic run to run; the text is the oracle (r236).**  Identical
+  runs of one binary differ by a few fusions (4B: `CONCAT skip=1` 334/336, `CONT skip=2` 40/37) because several
+  arms are address-selected (`ggml_cuda_check_fusion_memory_ranges`).  A per-node fusion trace is therefore not
+  a valid A/B oracle for a merge -- compare per-arm *multisets* within that variance, or better, the text.
+- **A short decode run cannot compare all-reduce arms (r236).**  `Generation: t/s` over `-n 16` is dominated by
+  one-off setup (block 01's hybrid pipeline stages 32 MB per GPU), which made hybrid read 58.8 t/s against
+  rccl's 82.7 on the 3-GPU `-sm tensor` 35B-A3B; at `-n 64` the same arms read 100.2/105.6 (hybrid) vs
+  90.1/90.0 (rccl).  Judge an AR arm at >= 64 decode steps, or from a `llama-bench` tg run.

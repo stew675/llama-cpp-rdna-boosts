@@ -298,17 +298,22 @@ is RDNA3 coverage; the compile break was real either way.)
 
 - status: **DONE** · sha: `75ba21116`
 
-## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
+## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) · **DONE 2026-11-08**
 
-* block sha `98bb7bc61` · 9 files · +879 / −137 · **expected conflicts: 1**
+* block sha `98bb7bc61` · 9 files · +879 / −137 · **expected conflicts: 1** — found 1
+* **result: `f0a594fe1` · 9 files**, build green, coherence green (the rung's own mechanism lines fire)
 
-| conflicted path | what to expect |
+| conflicted path | resolution |
 |---|---|
-| `ggml/src/ggml-cuda/mmvq.cu` | #31679 (`get_mmvq_mmid_max_batch` arch table), #31247 (Q8_1 correction sum), the per-shape `nwarps` work |
+| `ggml/src/ggml-cuda/mmvq.cu` | upstream's `get_mmvq_mmid_max_batch` arch table (`#31679`), the Q8_1 correction sum (`#31247`) and the per-shape `nwarps` work all land in the same neighbourhood as the delivery's VDR/Q6_K J bands.  Resolved as **both**: upstream's table and family split kept, the delivery's `mmvq_mmid_max_batch_band()` clamp layered on top of it (the two-arg `(cap, floor)` form, with `RDNA3_5` keeping its own floor and `RDNA4_M` following upstream). |
 
-**Exit:** build + coherence + `test-backend-ops` on the touched quant types (the decode-numerics block).
+**Ledger-gap note (found 2026-11-08 at R11):** this rung was carried out and committed, but its
+section and ledger row were left as `TODO`/empty — the ladder went R07 → R09 in the record while
+the chain had the commit.  The row is filled below; the block's own verification is the standard
+one (build + coherence + the touched quant types), and `test-backend-ops -o MUL_MAT_ID` (931/931)
+and the per-quant `-o` sweeps were covered again at R09/R11.
 
-- status: **TODO** · sha: —
+- status: **DONE** · sha: `f0a594fe1`
 
 ## R09 — block 08: fused kernels · **DONE 2026-11-08 (`D2` DECIDED: complementary)**
 
@@ -348,6 +353,14 @@ the `#29948` pattern again — no delivery kernel dropped.
 | `quantize.cu` | the delivery's chunked/scatter quantizer body wins over the pre-restructure text it conflicted with (block 08 restructured that kernel; upstream's loop header is the same shape). |
 | `mmvq.cu` (2 hunks) | the delivery's `mmvq_mmid_max_batch_band()` clamp plus upstream's `RDNA4_M` family. |
 | `ggml-cuda.cu` | the delivery's SSM conv-input fusion block and the NVFP4 scale helpers (upstream had removed the block this hunk replaced). |
+
+**Correction (2026-11-08, found at R11 while unblocking it): the "byte-identical across default /
+`DISABLE_MOE_MMQ_FUSION` / `DISABLE_FUSION`" claim above was vacuous.**  The fusion *dispatcher*
+(`ggml-cuda-try-fuse.cu`) is block 10's TU, so on a blocks-00-08 tree every matcher is compiled but
+never invoked: the three arms ran the identical code path and of course produced identical text.
+It is a true statement about this build only now that R11 exists, and it was re-measured there —
+default / `GGML_PAIR_OFF` / `GGML_CUDA_DISABLE_MMQ_ROUTED` / `GGML_CUDA_DISABLE_FUSION` all read
+`013d09f165a5` on Qwen3-Coder-30B-A3B.  Do not use a pre-R11 rung's fusion A/B as evidence again.
 
 - status: **DONE** · sha: `af0cae2f1`
 
@@ -414,14 +427,14 @@ both beat streaming.  This is one shape, not the delivery's field config (2-3 GP
 
 - status: **DONE (`D1` open)** · sha: `5654a5f95`
 
-## R11 — block 10: slab, fusion dispatcher, async input ring · **BLOCKED 2026-11-08 (GPU fault; branch rolled back to R10)**
+## R11 — block 10: slab, fusion dispatcher, async input ring · **DONE 2026-11-08 (unblocked: 3 re-base defects found, all delivery-code losses)**
 
 * block sha `7342cd95a` · 84 files · +15813 / −5461 · **expected conflicts: 8** — found 8 files / 22 hunks
-* **the whole block resolves and builds green**, but the resulting binary **aborts with GPU page faults at
-  `-c 8192`** on a plain dense 4B — a regression this rung introduces, not a merge artefact of the conflicts
-  (see the bisect below).  The branch is therefore back at `5654a5f95` (R10, clean, green) and the full
-  resolution is parked as **`/tmp/r11-resolution.patch`** (83 files, +16987/−5484, 26 832 lines) for the next
-  session.  Nothing of R11 is committed.
+* **result: `ed1d36436`** (tree `d8fb72ad0`), build green, coherence green on the dense 4B, on
+  Qwen3-Coder-30B-A3B and on the 3-GPU `-sm tensor` 35B-A3B, `gate-norm-rows-alias.sh` **PASS**,
+  `test-backend-ops -o MUL_MAT_ID` **931/931**, and every fusion arm byte-identical to the unfused chain.
+* history: the parked two-copy resolution (`r11-resolution.patch`, 83 files, +16987/−5484) built green but
+  **GPU page-faulted at `-c 8192`** on a dense 4B.  The fault and the three defects behind it are below.
 
 | conflicted path | what to expect |
 |---|---|
@@ -476,7 +489,66 @@ order and delete the duplicate.
   The fastest discriminator is `GGML_SCHED_STAGE_SLOTS=0`-class switches first, then splitting block 10's own
   patch into its subsystems for a proper `git bisect`.
 
-- status: **BLOCKED** · resolution parked at `/tmp/r11-resolution.patch`
+### R11 bisect: what the fault was, and the three defects it exposed
+
+**The repro.**  `llama-cli -m Qwen3.5-4B-Q8_0.gguf -c 8192 -ngl 99 -f prompts/prose-rdna-boosts.txt -n 16
+--seed 42 --temp 0 --single-turn` → `Aborted` (exit 134), `Memory access fault … Page not present`, faulting
+kernel `mul_mat_q<Q8_0,128,…>` grid `[16384, 576, 1]`.  At `-lv 4` the death is at the FIRST prefill ubatch
+(`chunked GDN prefill n=512`; `task.n_tokens = 5256`), i.e. prefill, not model load.
+
+**Env bisect** (one run each): `GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_ASYNC_INPUT=0`, the async-batch form,
+`GGML_CUDA_DISABLE_NORM_Q8_1=1`, `GGML_CUDA_DISABLE_NORM_ROWS=1`, `GGML_CUDA_DISABLE_FUSED_ADDMUL=1`,
+`GGML_CUDA_FUSE_SWIGLU_MMQ=0` — all still fault.  `GGML_CUDA_DISABLE_FUSION=1` → **clean**, and
+`GGML_PAIR_OFF=1` → **clean**: the fault is `ggml_cuda_mul_mat_q_pair`.  (The previous session's "legacy
+dispatcher disabled → still faults" test was consistent with this: it removed upstream's arms, not the pair.)
+
+**Defect 1 — a renamed field with changed meaning (`ntj`).**  A temporary launch dump showed the two pair
+launches as `nrows_x=9216 ncols_dst=512 ntj=512 nti=72` while every correct single-node launch is `ntj=4`.
+Upstream renamed `mmq_args.ncols_max` (a column COUNT the launcher divided by J itself) to `ntj` (the J-tile
+count, consumed directly as `grid.x`); the re-base carried the old value over, so the dense gate+up pair
+launched `grid.x = ncols` instead of `ncols/J` and enumerated tiles past `src1_q8_1`/`dst` → page fault on
+unmapped VA.  The routed arm had two more pre-`#31047` conventions: `tile_spec` was passed as `nullptr`
+(upstream's kernel reads `tile_spec[jt]` whenever `ids_dst` is set) and `nchannels_y = ne02` (upstream's ids
+grid puts the expert in `tile_spec`, so `nchannels_y = 1` and the experts live in `nchannels_x`).  Fixed by
+deriving both arms exactly like the single-node path, including a per-arm `tile_spec` (the compaction is
+J-independent, so the shared quantize is still one launch).
+
+**Defect 2 — the delivery's routed-compact MoE MMQ had been dead since R09, and was wrong behind that.**
+Tracing the launches showed `compact=0` on ALL 1551 routed launches of the 30B-A3B: the compact gate keyed on
+`args.nchannels_y`, which upstream's ids convention sets to 1.  Making it reachable exposed the second half:
+`mul_mat_q_process_tile`'s parameter was renamed `tile_y_max_j` (inclusive max) → `tile_y_j_sup` (exclusive
+count) and upstream's plain path now passes `col_high - col_low`, while the compact kernel still passed
+`col_diff - jt*J - 1` — dropping the last column of every tile (measured: garbage text,
+`betwee 140000000000`).  The two bugs had been hiding each other (unreachable + wrong = invisible).  Fixed:
+gate on `nchannels_x` (+ require `expert_bounds`), pass `tile_y_j_sup = col_diff - jt*J`.  Result: compact ==
+plain == pair-off, byte-identical `013d09f165a5`, and **+1.9 % prefill** (3489 vs 3423 t/s, 5256-token prompt,
+2×2 reps).
+
+**Defect 3 — the "upstream arms" fallback was not upstream's arms (TODO #290, now closed).**  The parked
+resolution kept upstream's inline dispatcher as `ggml_cuda_try_fuse_legacy()`.  Auditing it against upstream
+`a691b2345` showed it was ~490 lines BIGGER than upstream's `ggml_cuda_try_fuse`: upstream's block merged with
+**stale duplicates of delivery arms** (`ssm_conv_in`, `op_ssm_conv_l2_gatebeta`, `op_rms_norm_q8_1`,
+`add_softplus_mul`, `shexp_down_gate`, `l2_norm_pair`, `gate_beta_verify`).  One of them, the inline SSM
+conv-input fold, fires on qwen35moe decode (6× per GDN layer) and produced text that **diverges from the
+unfused chain** (`b97e5d155ea3` vs `90decf558d96`) in a state-carrying path.  Resolution: reconciled into ONE
+dispatcher — every arm audited against upstream master; all but the DSV4 hyper-connection post are already
+owned by the delivery's dispatcher (or its newer successor: `match_shared_expert_try_fuse` IS upstream's arm,
+`moe_weighted_reduction_try_fuse` is its superset, `gdn_cache_cpy`/`ssm_scan_cache_cpy` wrap upstream's), so
+the DSV4 HC post arm is folded in at upstream's position and `ggml_cuda_try_fuse_legacy()` is deleted
+together with the superseded `ggml_cuda_match_moe_weighted_reduction` matcher + struct + constexpr (143 lines)
+that only it used.  The interim `GGML_CUDA_FUSE_LEGACY` switch is gone with the duplicate.
+
+**Measurement notes (both cost time here; both now recorded).**
+* Fusion decisions are **not deterministic run-to-run** on this tree: identical runs of the same binary differ
+  by a few fusions (4B: `CONCAT skip=1` 334/336, `CONT skip=2` 40/37) because several arms are
+  address-selected (`ggml_cuda_check_fusion_memory_ranges`).  A per-node fusion trace is therefore NOT a valid
+  A/B oracle; the text is.
+* `Generation: t/s` on a short `-n 16` run is dominated by one-off setup.  It made the block-01 hybrid
+  all-reduce look 29 % SLOWER than rccl (58.8 vs 82.7 t/s); at `-n 64` the same arms read **100.2/105.6
+  (hybrid) vs 90.1/90.0 (rccl)**, i.e. hybrid +11-17 % as designed.  Never compare all-reduce arms on a short
+  decode run.
+
+- status: **DONE** · sha: `ed1d36436` · tree `d8fb72ad0`
 
 ## R12 — block 11: qwen4exp
 
@@ -594,10 +666,10 @@ climb touched has a maintainer decision recorded.
 | R05 | 04 | `92cf39297` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
 | R06 | 05 | `b5d32e0c7` | 9 files expected → 9 files / 48 hunks | build + coherence + derived==packed A/B + q8_0 KV | 2026-11-08 | **derived mask ABI moved to src[6..8]** (kv_rows took src[5]); upstream absorbed the per-ubatch rot fill; no band kernel dropped (`D5`) |
 | R07 | 06 | `75ba21116` | 0 expected → 0 found | build + MMB_DENSE line + byte-identical MMB=0 arm | 2026-11-08 | helper API re-expressed with an optional `expert_bounds` output (MMB's own bounds representation kept) |
-| R08 | 07 | | | | | |
+| R08 | 07 | `f0a594fe1` | 1 expected → 1 found | build + coherence + the touched quant fusions | 2026-11-08 | recorded late (section + row were left `TODO` while the commit existed); mmvq band clamp layered on upstream's `get_mmvq_mmid_max_batch` table |
 | R09 | 08 | `af0cae2f1` | 5 expected → 5 files / 8 hunks | build + MUL_MAT_ID 931/931 + fused/chain byte-identical | 2026-11-08 | `D2` complementary (two template arms); `mmq_args` carries `expert_bounds` next to `tile_spec`; norm-rows gate moved to R11 |
 | R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
-| R11 | 10 | — (rolled back) | 8 expected → 8 files / 22 hunks, all resolved | **build green but a GPU memory fault at `-c 8192`**; R10 does not fault | 2026-11-08 | blocked on a regression inside block 10; resolutions parked in `/tmp/r11-resolution.patch`; candidates eliminated: slab, arena, FA staging, legacy dispatcher |
+| R11 | 10 | `ed1d36436` | 8 expected → 8 files / 22 hunks | build + 3-model coherence + `gate-norm-rows-alias.sh` PASS + MUL_MAT_ID 931/931 + every fusion arm byte-identical to the unfused chain | 2026-11-08 | unblocked: pair `ncols_max`→`ntj` (the fault), routed-compact gate on `nchannels_y` + `tile_y_j_max`→`tile_y_j_sup` (two latent delivery-code losses, +1.9 % prefill), two-copy dispatcher reconciled to one (TODO #290 closed, stale delivery duplicates incl. a non-pure conv-input fold removed) |
 | R12 | 11 | | | | | |
 | R13 | 12 | | | | | |
 | R14 | 13 | | | | | |

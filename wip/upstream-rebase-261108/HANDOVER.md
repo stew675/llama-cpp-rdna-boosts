@@ -8,9 +8,11 @@ old upstream fork point onto the new one, one block per rung, pausing at every p
 and the delivery's may be the same thing.  Nothing here is delivery until R17 — `patches/`, `release.json` and
 the fork stay untouched until then.
 
-**Your first job is not the next rung.  It is R11**, which is *blocked* on a GPU memory fault that this session
-bisected to block 10's content and then parked, because a rung that does not run is worse than a rung that is
-late.  Section §1 is the whole of it.
+**R11 is DONE** (block 10, fork commit `ed1d36436`, tree `d8fb72ad0`): the GPU fault it was blocked on was a
+re-base defect in the MUL_MAT pair fusion, and unblocking it turned up two more latent delivery-code losses and
+a two-copy dispatcher that had to be reconciled to one.  The bisect, the three defects and the measurement traps
+are in `RUNGS.md` → R11; the doctrine they produced is `GREEDY-PURITY.md` §84 plus the `INVARIANTS.md` entries.
+**Your next job is R12** (block 11, qwen4exp) — and its decision point `D3` is the one to read first.
 
 ---
 
@@ -22,10 +24,11 @@ late.  Section §1 is the whole of it.
 | new fork point | **`a691b2345`** (2026-11-08 11:50 +0200) — 318 upstream commits, 947 files, +116932/−45160 |
 | working branch | **`rebase-r236`** in `~/llama.cpp`, currently **`5654a5f95`** (block 09), tree `63ca1523`, clean |
 | `master` in `~/llama.cpp` | the **pristine snapshot** at `a691b2345`.  Never commit to it, never rebase onto it directly. |
-| blocks re-based | **10 of 16** — blocks 00-09 = rungs R01-R10 (see the table below) |
-| blocked | **R11 = block 10** — resolves and builds, but the binary GPU-faults at `-c 8192` (§1) |
+| blocks re-based | **11 of 16** — blocks 00-10 = rungs R01-R11 (see the table below) |
+| blocked | none |
 | not started | R12 (block 11 qwen4exp) … R16 (block 15 streamed KV), then R17 (the release ladder) |
-| parked work | **`r11-resolution.patch`** in this directory — the entire R11 resolution (83 files, +16987/−5484, sha256 starts `705b7a75f765e58a…`), applies to `5654a5f95` |
+| delivery repo | branch **`rebase-r236`** (main stays at the pre-re-base delivery; the switch-over is R17) |
+| historical | **`r11-resolution.patch`** in this directory — the R11 resolution as it was parked (83 files, +16987/−5484, sha256 `705b7a75f765e58a…`), applies to `5654a5f95`.  Kept as the record of the blocked state; the committed rung carries the fixes it was missing. |
 
 ```
 4aaffd1c0 block 00 foundation            R01  +986/−340    MUL_MAT_ID 931/931
@@ -38,6 +41,8 @@ b5d32e0c7 block 05 flash attention       R06  9 files / 48 h    derived kq mask 
 f0a594fe1 block 07 k-quant boosts        R08  1 file / 2 h     MMVQ table split + RDNA4_M
 af0cae2f1 block 08 fused kernels         R09  5 files / 8 h    D2 complementary; MUL_MAT_ID 931/931
 5654a5f95 block 09 host-resident MoE     R10  7 files / 12 h   D1 first numbers; NO_VMM finding
+ed1d36436 block 10 slab/dispatcher/ring R11  8 files / 22 h   pair ntj fault fixed; compact MoE dispatch revived (+1.9% pp);
+                                                              one dispatcher (TODO #290 closed); GREEDY-PURITY §84
 ```
 
 ## §0.1  The hard rules of this repo (they are not optional)
@@ -78,7 +83,10 @@ af0cae2f1 block 08 fused kernels         R09  5 files / 8 h    D2 complementary;
 
 ---
 
-## §1  FIRST: unblock R11 (block 10 — slab, fusion dispatcher, async input ring)
+## §1  HISTORY: how R11 was unblocked (block 10 — slab, fusion dispatcher, async input ring)
+
+*Resolved 2026-11-08; read `RUNGS.md` → R11 for the resolution.  The evidence below is what the blocked
+state looked like, kept because the same shapes will recur on the later rungs.*
 
 ### §1.1  Restore the parked resolution
 
@@ -233,8 +241,9 @@ pattern).  Do **not** put campaign detail there — that is `RUNGS.md`/`WORKLOG.
 
 Open TODO handles: **#286** (Meta headroom re-measure), **#287** (re-cut
 `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid), **#289** (upstream PR: `find_slot()`
-must swap `mem_cell::rs_max` — found and fixed in the delivery at R04), **#290** (the dispatcher merge debt),
-**#291** (the arena-vs-upstream investigation).  New handles continue from **#292**.
+must swap `mem_cell::rs_max` — found and fixed in the delivery at R04), **#290** (the dispatcher merge debt —
+**resolved at R11**, it lands with r236), **#291** (the arena-vs-upstream investigation).  New handles continue
+from **#292**.
 
 ## §4  Documentation owed at R17 (collected per rung — do not lose these)
 
