@@ -20,6 +20,7 @@ the documentation owed) → `../../AGENTS.md` → `../../TODO.md` → `../kv-res
 | `main` in the delivery repo | still the shipped **r235** — the switch-over is R17 |
 | build (primary) | `~/bin/build-llama-rocm` (canonical, `-DGGML_HIP_NO_VMM=OFF`, VMM on).  Green at `2aac85e78` |
 | comparison build (primary) | `~/llama.cpp/build-rocm-r235` = the pre-re-base `rdna-boosts` tree, same flags |
+| upstream baseline (NEW 2026-11-08) | `~/llama.cpp/build-rocm-base` = **unpatched upstream `a691b2345`**, same flags, at the same source path — R17 step 5 records the prefill-logit base from it |
 | reference numbers | [`../../benchmarks/2026-11-08-rebase-r235-vs-r236.md`](../../benchmarks/2026-11-08-rebase-r235-vs-r236.md) |
 
 ### §0.1 The five follow-up commits (they are part of r236, all pushed, all verified)
