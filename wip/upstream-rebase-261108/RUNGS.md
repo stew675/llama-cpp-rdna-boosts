@@ -351,9 +351,10 @@ the `#29948` pattern again — no delivery kernel dropped.
 
 - status: **DONE** · sha: `af0cae2f1`
 
-## R10 — block 09: host-resident MoE
+## R10 — block 09: host-resident MoE · **DONE 2026-11-08 (`D1` MEASURING — numbers in, decision pending)**
 
-* block sha `11c5544be` · 68 files · +16121 / −540 · **expected conflicts: 7**
+* block sha `11c5544be` · 68 files · +16121 / −540 · **expected conflicts: 7** — found 7 files / 12 hunks
+* **result: `5654a5f95` · 68 files · +17412 / −541**, build green, dense coherence green
 
 | conflicted path | what to expect |
 |---|---|
@@ -378,7 +379,40 @@ coexistence.  Questions for the maintainer, with measurements:
 **Exit:** build + coherence + `scripts/gate-host-pool.sh` (7 arms, `takeover=0` under the fill faults) +
 the census lines fire.
 
-- status: **TODO** · sha: —
+### R10 resolution log
+
+| site | resolution |
+|---|---|
+| `common/common.cpp`, `common/fit.cpp` | upstream factored the `--fit` block into **`common_fit_apply()`**; the delivery's draft reserve moved *into* it as `common_draft_reserve_derive()` (shared with the ctor's MoE preflight, which needs the same value).  `fit.cpp` keeps both sides: upstream's RAII `common_fit_log_scope` plus the delivery's host-expert accounting and its `hp_ngl_skip` + host-expert out-params — which also repaired the call sites written before upstream added the `n_skip` parameter. |
+| `ggml/src/ggml-backend.cpp` | upstream's prefetch-split early-out **and** the delivery's graph-input sync condition; both event families freed at teardown (`prefetch_events` + the `GGML_SCHED_STAGE_SLOTS` pairs). |
+| `ggml/src/ggml-cuda/common.cuh` | the delivery's **keyed** CUDA-graph cache (subgraph weight identity, r149) with upstream's idle-eviction window (`#30662`): eviction compares the key, not the first node pointer. |
+| `ggml/src/ggml-backend-meta.cpp` | the delivery's `GGML_META_COMPUTE_HEADROOM` knob **plus** upstream's 256-view floor (`#31447`). |
+| `src/llama-context.cpp`, `src/llama-cparams.h` | upstream's `kv_rows` auto-resolution and `moe_cache_cpu_share` plus the delivery's `drop_compute_buffers`, `fused_hc_mix`/`combine` and host-table accounting; `model.hparams.no_alloc` → `model.no_alloc()` (`#31141`). |
+
+**Finding (build-level, blocks the whole host-expert tier on a default configure): the arena needs VMM.**
+`ggml_cuda_slab_init_locked()` declines when the device does not report VMM, and **upstream's HIP default is
+`GGML_HIP_NO_VMM=ON`** (`ggml/CMakeLists.txt:219`), which neither `~/bin/build-llama-rocm*` overrides.  On
+`build-rocm` every host-expert run prints `the movable-boundary slab was armed … but could not be created (the
+device does not report VMM …). Disabling the MoE expert cache and streaming the experts` and silently streams —
+so a host-expert measurement on that build measures *stock `-ncmoe`*, not the delivery.  A second build dir
+(`build-rocm-vmm`, `-DGGML_HIP_NO_VMM=OFF`) was made for the `D1` numbers below.  **Decide before R17: should
+the delivery's build docs/scripts carry `GGML_HIP_NO_VMM=OFF` (and the ENVIRONMENT.md row at line 962 is
+currently "an open investigation") — it is the difference between the tier existing and not.**
+
+### `D1` first measurement (1 × R9700, 35B-A3B Q8_0, `-ncmoe 20`, `-c 8192`, 16.3 GiB host experts, VMM build)
+
+| arm | cache | prefill t/s | decode t/s | text |
+|---|---|---|---|---|
+| A | delivery arena, `MOE_EXPERT_CACHE_MIB=4096` (realized 4080 MiB) | **547.6** | 53.5 | 533 chars `8d6e74e98d89` |
+| B | upstream `--moe-cache-mib 4096` (our arena off) | 544.2 | **62.9** | identical |
+| C | none (`MOE_EXPERT_CACHE_MIB=0`, stock `-ncmoe`) | 470.9 | 49.0 | identical |
+
+Upstream's ClassLRU cache is **+17.6 % decode** over the delivery's arena at the same MiB on this shape, and
+both beat streaming.  This is one shape, not the delivery's field config (2-3 GPU `-sm tensor`, bf16 KV,
+262144 ctx), and the arms are either/or — coexistence (the shape the merge preserves) is untested.  `D1` stays
+**MEASURING**; the decision is the maintainer's, and the register records what a proper session must add.
+
+- status: **DONE (`D1` open)** · sha: `5654a5f95`
 
 ## R11 — block 10: slab, fusion dispatcher, async input ring
 
@@ -518,7 +552,7 @@ climb touched has a maintainer decision recorded.
 | R07 | 06 | `75ba21116` | 0 expected → 0 found | build + MMB_DENSE line + byte-identical MMB=0 arm | 2026-11-08 | helper API re-expressed with an optional `expert_bounds` output (MMB's own bounds representation kept) |
 | R08 | 07 | | | | | |
 | R09 | 08 | `af0cae2f1` | 5 expected → 5 files / 8 hunks | build + MUL_MAT_ID 931/931 + fused/chain byte-identical | 2026-11-08 | `D2` complementary (two template arms); `mmq_args` carries `expert_bounds` next to `tile_spec`; norm-rows gate moved to R11 |
-| R10 | 09 | | | | | |
+| R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
 | R11 | 10 | | | | | |
 | R12 | 11 | | | | | |
 | R13 | 12 | | | | | |

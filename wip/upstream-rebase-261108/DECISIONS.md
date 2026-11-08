@@ -46,7 +46,16 @@ allocation of "the device cache", so the merge is the work.
 `--moe-cache-mib + --moe-cache-cpu-share 0.5/0.95`, (d) the pool at `-lm mmap` with and without a
 cpu-share-style arm.  Report the three questions together.
 
-- status: **OPEN** · rung R10 · record: —
+- status: **MEASURING (R10, 2026-11-08) — numbers in, decision pending.**  First measurement, 1 × R9700,
+  `Qwen3.6-35B-A3B Q8_0 -ncmoe 20 -c 8192` (16.3 GiB host experts), VMM build, equal MiB, text byte-identical in
+  every arm: delivery arena 4080 MiB **547.6 / 53.5** t/s (pp/tg), upstream `--moe-cache-mib 4096`
+  **544.2 / 62.9**, streaming **470.9 / 49.0**.  Upstream's ClassLRU cache wins decode by 17.6 % on this shape.
+  **Not yet the decision**: one GPU and `-sm layer` (not the field's 2-3 GPU `-sm tensor`/bf16-KV shape), the
+  arms are either/or rather than the coexistence the merge preserves, and the arena's pool/prefetch/staging
+  tier is not exercised by a `-ncmoe` config at this size.  A proper session must repeat this on the field
+  shape, with the delivery's host-pool tier on, and with `--moe-cache-mib` + the arena both enabled (coexist).
+  **Build prerequisite discovered here:** the arena requires VMM and upstream's HIP default is
+  `GGML_HIP_NO_VMM=ON`, so all these arms ran on a separate `build-rocm-vmm` (`-DGGML_HIP_NO_VMM=OFF`).
 
 ## D2 — Fused MoE gate/up+GLU in MMQ (and top-k MoE)
 
