@@ -24,7 +24,8 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed and its pre-R17 items are closed except `#287` (an upstream candidate) and R17 itself; `patches/`/`release.json` are cut at R17.
+climbed; the remaining `#291`/`#292`/`#293`/`#295`/`#296` rows plus R17 are the live brief in
+`wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
 
 ## The open list
 
