@@ -142,6 +142,50 @@ the pinned bytes:
 contiguous form.  If the arena-sizing step (§6.1) shows a large arena does not earn its bytes for decode, this
 proposal is moot on the delivery's supported shapes.
 
+## 2h. Corrected: bulk DOES benefit from VRAM residency — measured, and it names the leading candidate
+
+My §2g claim ("under bulk it changes nothing") was true only for **duplicate** VRAM residency (the arena).  It
+is wrong for **exclusive** VRAM residency, i.e. moving a layer's experts out of the host tier: bulk's prefill
+traffic is exactly the host-set bytes per ubatch.  Measured with bulk itself (`GGML_MOE_CACHE_STAGE=0`), 1 GPU,
+`-c 204800`, `-ub 6144`, 52 512-token prompt:
+
+| `-ncmoe` | host set | bulk prefill |
+|---|---|---|
+| 48 | 47 962.5 MiB | 1872.0 t/s |
+| 44 | 44 237.5 | 1912.8 (+2.2 %) |
+| 40 | 40 287.5 | 1950.6 (+4.2 %) |
+| 36 | 36 887.5 | **1989.1 (+6.3 %)** |
+
+So the hierarchy is:
+
+1. **Host-set size is the primary lever** — and it is *transport-independent*: every transport's PCIe bytes
+   scale with it (~1 % of prefill per layer moved to VRAM, measured on bulk).
+2. **Arena residency (duplicate VRAM) is secondary** — only a transport that *reads* the duplicate can use it
+   (staged: `1 − residency` of the bytes; in-place: none).  Under bulk it is a decode cache and nothing else.
+3. **Transaction count** is the third axis, and it is what the SDMA phase punishes (§2d).
+
+### The candidate that satisfies all three: a contiguous static tier + a two-transaction fill
+
+If the VRAM-resident set is a **contiguous expert range**, a table's prefill is:
+
+1. **one bulk DMA** of the contiguous *complement* from the host master into `input_cpy` — bytes = the
+   complement only (the saving), one transaction (bulk's transaction count, no SDMA exposure);
+2. **one D2D** (or one small kernel) overlaying that contiguous range from the static tier.
+
+At 0 % residency it degenerates to plain bulk; at ~100 % to pure D2D.  It needs no per-expert copies, no
+512-transaction fill, no PRS map and no remap into the GEMM.  The resident range should be picked by a
+**heat-maximising sliding window** over the expert axis (cheap: the prior map is already loaded), so decode
+keeps close to a heat-optimal set while the complement stays contiguous.
+
+**What it costs, and the number to measure**: a heat-seeded *static* set already loses ~1.8 points of hit rate
+to the adaptive arena at equal residency (r74, `wip/moe-static-hot-tier/`); an index-contiguous set will lose
+some more.  Plus that campaign's recorded hard part — a frozen slot inside the slab's lendable chunk is not
+frozen — has to be solved for the static tier to exist at all.
+
+This is now the campaign's leading candidate for "one transport for every shape"; the arena-sizing step (§6.1)
+is still worth doing first because it is nearly free, and it tells us how much residency there even is to
+exploit on the delivery's supported shapes.
+
 ## 3. The hole, stated plainly
 
 * **bulk** is the simplest and the most stable, and it wins at ≤ 67 % residency (the shape any 24-32 GB card
