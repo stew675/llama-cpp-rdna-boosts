@@ -51,6 +51,23 @@ rejected** (`TODO` #300).
 
 ## §1 The re-base TODO list (close these before R17)
 
+**The campaign's numbering window is `#286+`** — every open item from `#286` upward is this climb's, and `#286-#293`
+are all closed (their records are `RUNGS.md`/`WORKLOG.md`, so nothing in that range is in `TODO.md` any more).
+Seven are open, and they do **not** all block R17 — three of them ARE R17:
+
+| # | item | when |
+|---|---|---|
+| **#294** | the gates' kernel-journal window | **before R17** (makes every later gate verdict trustworthy) |
+| **#297** | the qwen4exp sparse QSA arm has no gate | **before R17** (~30 lines of shell + one hash) |
+| **#298** | sweep the `pool_stack_push` sites (the ordering class) | **before R17** |
+| **#301** | r236 is −2 … −3 % on MoE **prefill** vs r235 | **before R17** — the only *measured* regression, and the one that decides "no slower" |
+| **#295** | R17 must include a host-expert **two-slot DFlash** arm | **during R17** (a ladder arm, not a fix) |
+| **#296** | `D8`'s CPU-win measurement | **during R17** (a ladder arm, not a fix) |
+| #300 | gfx1151 attendance pool | **parked** (mitigated: the knob declines there), not a blocker |
+
+So the pre-R17 work is **#294, #297, #298, #301**, and the ladder absorbs **#295** and **#296** as arms.
+
+
 Four defects/gaps, one regression to localise, three decisions to close, plus housekeeping.  Everything below is
 already written up in `TODO.md`/`DECISIONS.md`; this section says what to actually do.
 
