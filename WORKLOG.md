@@ -1,3 +1,60 @@
+## 261108.001 (no release) -- the next re-base, set up as a ladder: 16 blocks from `6050b467c` onto `a691b2345`
+
+**No delivery change.**  `patches/`, `release.json` and the fork tree are untouched (r235 is the release).
+This records the setup of `wip/upstream-rebase-261108/` — the campaign for the next re-base — and the one
+measurement behind it.  The maintainer snapshotted upstream `master` into `~/llama.cpp` on 2026-11-08; the
+target fork point is **`a691b2345`** (`webgpu : add COUNT_EQUAL support`, 2026-11-08 11:50 +0200).
+
+**The drift is 318 commits over 947 files** (`+116932 / −45160`) since `6050b467c` (2026-10-25), and it is
+not cosmetic: upstream now has its own MoE cache policy and CPU share (`#31233` ClassLRU, `#30966`
+`--moe-cache-cpu-share`), a refactored recurrent rollback bound (`#31368`), restructured FA entry points
+(`#29510` `flash_attn_ext_rows`), reworked QSA/indexer/sparse selection (`#31243`, `#31009`), fused MoE
+gate/up+GLU in MMQ (`#31188`, `#31288`, `#31296`), and three cross-cutting refactors that touch 30+ files per
+model block (`#31733` `model` becomes a member of `llm_graph_context`, `#31141` `no_alloc` out of
+`llama_hparams`, `#31142` model output structs).
+
+**Measured: the replay is tractable, and the map is per block.**  Replaying all 16 block commits onto the new
+base with `git merge-tree --write-tree --messages` (chained, so later blocks merge onto already-merged
+earlier ones) leaves **75 conflicted paths** in total: block 00 has 12, blocks 05 and 15 have 9, 10 and 12
+have 8, 09/11 have 7, 08 has 5, 02 has 4, 13 has 3, 01/03/07 have 1 each, and **blocks 04 (BF16 KV), 06
+(MMB) and 14 (`-sm relaxed-tensor`) apply clean**.  Caveat recorded in the campaign: a conflicted block
+leaves markers in the chained tree, so those counts are slightly pessimistic — "clean" is the solid result.
+The tool is kept as `wip/upstream-rebase-261108/probe-conflicts.py` so a later rung can re-run it.
+
+**The shape: 17 rungs, not one rebase.**  One `git cherry-pick` per block commit on a dedicated branch
+(`rebase-r236`, created at `a691b2345` in `~/llama.cpp`; `master` there stays the pristine snapshot), each rung
+ending in a committed, buildable branch, a green build, a coherence run and a written-down resolution.  That
+is what makes it resumable across sessions — a complete `git rebase --onto` would leave an uncommitted rebase
+state that a session boundary can lose.  The old delivery binaries are kept as `build-rocm/bin-r235`
+(`build 11903, commit 69d36099b`) for A/B, but **r235-identical text is explicitly not the rung oracle**:
+upstream moved numerics on purpose (`#31854` F32 src1 on the CPU backend, `#74298c10`-class conv-state
+refactor, the MoE layout linearisation), so a rung is judged by build + coherence + its own kill-switch A/B.
+
+**Two findings that need a maintainer decision before any delivery code is dropped** (register:
+`wip/upstream-rebase-261108/DECISIONS.md`, 13 items):
+
+1. **`D4` — upstream `#31368` is the enforcement counterpart of block 03's r91 rollback tracker.**  Upstream
+   now records `rs_max` per sequence (the deepest rollback the last ubatch guarantees) and **refuses** a
+   rollback past it, with `rollback_bound` tests over ubatches of 1, 2, `n_rs_seq + 1` and `n_rs_seq + 2`
+   tokens.  The delivery's r91 fold (issue #131) tracks the same per-ubatch composition and **warns**.  Same
+   defect (a snapshot the ubatch did not write), and upstream's answer is the stronger contract.  Recommended:
+   take upstream's bound, keep the `LLAMA_RS_ROLLBACK_DEBUG` instrument, drop the duplicate bookkeeping —
+   pending the decision at rung R04.  Record: `archive/work/rs-rollback-boundary/`.
+2. **Block 14 is NOT subsumed** (checked, so it is not a decision, it is a finding): upstream `#31147`
+   ("enable moe amax rescaling for laguna") only adds `LLM_ARCH_LAGUNA` to the **deny** list in
+   `llm_arch_supports_sm_tensor`, so `flint`/`mellum`/`mistral4` are still refused under `-sm tensor` and
+   `-sm relaxed-tensor` remains the only way to split them.  Block 14 keeps its reason to exist.
+
+The five register items that could drop delivery code are `D1` (MoE cache: coexist, and whether to adopt the
+CPU share / ClassLRU), `D3` (qwen4exp/indexer/sparse: `#31243`/`#31009` may make the derived kq mask
+redundant), `D4` (above), `D5` (FA entry restructure: whether any band kernel becomes unreachable) and `D7`
+(upstream's 256-view Meta compute floor vs the delivery's `GGML_COMPUTE_BUFFER_MARGIN_PCT`).  Each stops its
+rung with a measurement; none is resolved by this entry.
+
+Campaign: [`wip/upstream-rebase-261108/`](wip/upstream-rebase-261108/README.md) — `README.md` (method, traps,
+resume), `RUNGS.md` (the 17 rungs with per-rung conflict lists and exit criteria), `DECISIONS.md` (the
+register), `CONFLICT-MAP.md` (the measurement above, per block).
+
 ## 261107.014 (no release) -- expert-transfer-engine: the prefill gap is not the transport engine, and it is not the VRAM copies either
 
 **No delivery change.**  `patches/`, `release.json` and the fork tree are untouched (r235 is the release).  This
