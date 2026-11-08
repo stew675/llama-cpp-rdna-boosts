@@ -769,7 +769,7 @@ conflicted (predicted 3; `common/common.cpp` extra — an arg-plumbing hunk):
 
 - status: **DONE** · sha: `ed13a322e` (tree `c08c912a2`) · session 2026-11-09
 
-## R15 — block 14: `-sm relaxed-tensor` (TEMPORARY)
+## R15 — block 14: `-sm relaxed-tensor` (TEMPORARY) · **DONE 2026-11-09 (0 conflicts)**
 
 * block sha `59a3e5206` · 11 files · +130 / −16 · **expected conflicts: 0**
 
@@ -781,7 +781,23 @@ relaxed mode in the meantime, re-check `src/llama-arch.cpp` and `llama_model_cre
 **Exit:** build + coherence + `-sm relaxed-tensor` loads a flint/mellum/mistral4 MoE and matches `-sm layer`
 text (the block's own claim).
 
-- status: **TODO** · sha: —
+**Result (`617ee7152`, tree `f6ce37555`):** **zero conflicts**, no drift edits — the survey's "0 expected" held
+(the block's hunks sit in `common/arg.cpp`/`fit.cpp`, `ggml-backend-meta.cpp`, `include/llama.h`,
+`src/llama-{context,impl,model,moe-cache}.cpp`, `src/llama.cpp`, `src/models/dflash.cpp`, none of which moved).
+
+Exit verified on the real flint model (`/llm/models/RecursiveAI/Flint/Q8_0/flint-Q8_0.gguf`, 3 GPU):
+* `-sm tensor` still refuses it with this block's exact message — upstream's `#31081` deny is intact, the block
+  only adds the escape hatch: `LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE
+  amax rescale needs '-sm relaxed-tensor'`.
+* `-sm relaxed-tensor` loads and generates, and the greedy text is **identical to `-sm layer`**
+  (`904c62d1d4f9`, 169 chars) — the block's own claim, on the arch it was validated for.  `mellum`/`mistral4`
+  stay unvalidated here (no model — as the block itself says).
+* The mode is a no-op for a non-amax arch: 35B-A3B Q8_0 3 GPU `-sm relaxed-tensor` == `-sm tensor`
+  (`86b7f9b5aa80`).
+* Coherence unchanged: 4B `1de99b7e6ee6`, 30B-A3B `4b4d56191368`, Flash-Next GSQ `7a8734a9f1a6` (the
+  `ggml-backend-meta` / model-graph hunks touch the tensor-split path, so that arm matters).
+
+- status: **DONE** · sha: `617ee7152` (tree `f6ce37555`) · session 2026-11-09
 
 ## R16 — block 15: the streamed KV (window + attendance pool)
 
@@ -834,6 +850,6 @@ climb touched has a maintainer decision recorded.
 | R12 | 11 | `b1b0fa807` | 7 expected → 9 files / 34 hunks | build + 4B/30B unchanged + `gate-hc-fusions.sh` PASS + `gate-qwen4exp-quant-coherence.sh` PASS | 2026-11-08 | **D3 DECIDED by measurement**: upstream has its own qwen4exp; the delivery's is bit-identical on Flash-Next 3-GPU tensor and +31 % decode (70.1 vs 53.5 t/s), neutral on 27B → keep ours; `n_pad` ctor/member dropped (#31200), `get_n_kv` requires n_tokens, `#31733`/`#31073`/`#29510` drift re-derived; quant-coherence gate's model selection fixed; dsv4 soft-arm drift recorded as `TODO` #292 |
 | R13 | 12 | `2b09a50b0` | 8 expected → 8 files / 24 hunks | build + 4-model coherence (R12-identical) + `gate-state-pipe.sh` PASS + `gate-park-idle-slots.sh` PASS + `gate-ckpt-reuse.sh` PASS (hard checks) + DFlash2 attach/acceptance arms | 2026-11-09 | **`D15` DECIDED**: F1 deleted tree-wide, upstream's `embd_row` kept, Meta refusal carried, host-experts guard re-measured and dropped (identical acceptance on Flash-Next + 35B-A3B, 2 slots, `-ncmoe` 10/24). State pipe kept (gate: 43.7 vs 74.7 ms). Prompt cache = upstream API + delivery policy, with `ckpt_recycle` restricted to uniquely-owned checkpoints. Two pre-existing R12 defects fixed on the way: the `hc_combine_norm` pool-stack LIFO abort on `-sm layer` (`-sm layer` runs for the first time) and the DFlash injection input never registered (dead drafter: 0.000 → 0.754) |
 | R14 | 13 | `ed13a322e` | 3 expected → 4 files / 5 hunks | build + 4-arm coherence (R13-identical) + `--spec-draft-mtp-vocab` on both head paths (shared-NextN via `ctx_other`, self-headed gemma4) + inert when unset | 2026-11-09 | clean rung: no decision needed. `arch == other.arch` dropped from `can_reuse` (`#31733` moved the model into the graph context; `model == other.model` subsumes it); `common_fit_apply()` already carried the delivery's draft-reserve fold; block 13's row-range splice over a vocab-split Meta tensor is exercised by the shared-NextN arm |
-| R15 | 14 | | | | | |
+| R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | | | | | |
 | R17 | — | | | | | |

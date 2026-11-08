@@ -27,7 +27,10 @@ objects).  Two pre-existing R12 defects were fixed to get there (`-sm layer` ran
 four conflict sites, all "both sides add code here", plus two drift fixes (`arch` gone from
 `llm_graph_params::can_reuse` after `#31733`; upstream's `common_fit_apply()` already carried the delivery's
 draft-reserve fold).  `--spec-draft-mtp-vocab N` verified on both head paths and inert when unset.
-**Your next job is R15** (block 14, `-sm relaxed-tensor`, expected 0 conflicts) — see `RUNGS.md` → R15.  The R13 brief
+**R15 is DONE as well** (`617ee7152`, tree `f6ce37555`, 2026-11-09): block 14 applied with **zero conflicts and
+no drift edits**, and the flint model on this box confirms the block's claim (`-sm relaxed-tensor` == `-sm layer`
+text, while `-sm tensor` is still refused with the block's own message).
+**Your next job is R16** (block 15, the streamed KV — 9 expected conflicts, `D12`/`D13`) — see `RUNGS.md` → R16.  The R13 brief
 below is kept as the record of how it was resolved.
 
 **The pre-R13 brief (R13, block 12, the campaign remainder) — **read [`HANDOVER-R13.md`](HANDOVER-R13.md)**,
