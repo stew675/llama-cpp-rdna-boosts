@@ -555,6 +555,34 @@ hazard case verifies with the hold off.  The delivery is fine there; the arm sho
 (the quarantine hold was acquired and the hazard case ran) and keep the corruption expectation only for the
 platform(s) where it has been observed — recorded with the arch, like every other platform-bound number.
 
+## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
+
+Found at R16 validating on `halo` (gfx1151 Strix Halo, UMA) with `scripts/gate-kv-residency.sh`.  The **window**
+(Goal A) is fine (`wref == wres == wspill` `be904e86f248`, 16 flips / 64 MiB pinned host) and the **sparse**
+decode arm is fine, but the **pool** (Goal B) produces wrong results:
+
+| arm (Flash-Next GSQ-IQ3_XXS + MTP, `-c 32768` q8_0) | text | pool `bad` |
+|---|---|---|
+| `pref` (no pool, sparse ref) | `1e944569dbd6` | — |
+| `pres`, whole cache resident (8192 pages), VERIFY off | `b08d3dbcb1e9` | 0 (not verified) |
+| `pres`, whole cache resident, `LLAMA_KV_POOL_VERIFY=1` | `8c1b0d16ecd3` | **93 399 360** |
+| `pfloor` (4104 pages, forced misses), VERIFY on | differs | **95 173 888** |
+
+Three different texts from the same arm, and a *fully resident* pool (every block of the cache has a page) still
+reports ~93 M byte mismatches against its own mirror -- i.e. this is not a residency/thrash effect, the resolve
+is wrong.  The mismatch count moves run to run, so it is (at least partly) a race.  The gate therefore reports
+`FAIL pres != pref`, a different draft acceptance, and `FAIL pfloor: bad != 0`; everything else in that gate
+passes on the box (39 PASS).
+
+Prime suspect: the pool is a **discrete-GPU design** -- a pinned host *mirror* plus a device pool filled by DMA.
+On UMA the "mirror" and the weights are the same physical memory pool, so the MARK/CLAIM/MAP+FILL ordering (and
+the `kv_pool_invalidate()` / dirty-refill protocol) is reasoning about two kinds of memory that are one here.
+It may also be the per-device counter/page-table single-instance path (`bad` varies).
+
+**Until this is fixed, block 15's pool must not be claimed for gfx1151** (`patches/README.md` block 15 records
+it).  The window and the sparse arm are unaffected.  Pre-existing: the pool shipped in r235 and was never run on
+RDNA3.5 before this validation.
+
 ## Where the current lists live
 
 - **The KV-residency campaign — ARCHIVED** (`archive/work/kv-residency/CLOSEOUT.md`): Goals A, B and C all ship

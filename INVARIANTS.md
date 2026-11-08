@@ -3007,3 +3007,13 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   gave 5/5 aborts on one build and 0/4 on the next -- so "it passed once" is not evidence, and the pool's free-order
   assert always names sizes/offsets now (`GGML_CUDA_POOL_TRACE=1` adds the stacks); (b) the *class* is open: every
   `pool_stack_push` site still owes a check that no plain allocation precedes it in its scope (`TODO` #298).
+- **The attendance pool is a distinct-memory design and is wrong on a shared host/device pool (r236, measured on
+  gfx1151).**  `LLAMA_KV_REGION_POOL` keeps the authoritative KV in a pinned host *mirror* and fills a compact
+  device pool from it by DMA, keyed by a page table with a MARK/CLAIM/MAP+FILL resolve.  On an integrated GPU the
+  mirror and the weights are the same physical memory, and on gfx1151 the resolve is **wrong**: with the WHOLE
+  cache resident (8192 pages) `LLAMA_KV_POOL_VERIFY=1` reports ~93 M byte mismatches (93 399 360; 95 173 888 on
+  the forced-miss arm) and three runs of the same arm give three different texts, while the sparse reference is
+  stable (`1e944569dbd6`).  So it is not a residency/thrash effect and not a text-noise effect -- the resolve
+  itself is wrong, at least partly racily.  The **window** (Goal A, one VA range, no mirror) and the sparse decode
+  arm are fine on the same box (`be904e86f248`, identical to gfx1201), which is what localises the defect to the
+  mirror/pool tier rather than to the KV placement.  Until fixed, do not claim the pool for gfx1151 (`TODO` #300).

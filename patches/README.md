@@ -3797,6 +3797,14 @@ Purity notes: `GREEDY-PURITY.md` §58.
 > `models/qwen4exp.cpp`) are latched as well -- including `GGML_STAGE_TRACE`, which the loader read **per
 > tensor** (144-240 calls per run).  No behaviour change; the windowed/pooled arms are unchanged.
 
+> **Not validated on gfx1151 (RDNA3.5, measured 2026-11-08, `TODO` #300):** the **attendance pool**
+> (`LLAMA_KV_REGION_POOL`, Goal B) is **incorrect** on an integrated GPU.  A *fully resident* pool (every block of
+> the cache has a page) still reports ~93 M byte mismatches against its own mirror under `LLAMA_KV_POOL_VERIFY=1`
+> and produces a text that differs from the sparse reference and moves run to run.  The **window** (Goal A) and
+> the sparse decode arm are unaffected and validated there (`wref == wres == wspill` `be904e86f248`).  The pool is
+> a discrete-GPU design (pinned host mirror + DMA fill); on UMA the mirror and the weights share one physical pool,
+> which is the prime suspect.
+
 > **r236 re-base amendment (`D12`/`D13`, tree `7d6e24c12`):** the rung collided with every surface the streamed
 > KV binds to (`#31141` `no_alloc`, `#31200` `n_pad` gone, `#30541` state copy sizes, `#31073` rotation constants
 > moved into `attn_rot_bufs`, `#31570` `kv_rows`, `#31447` the Meta device).  Re-derived, not carried: the provider
