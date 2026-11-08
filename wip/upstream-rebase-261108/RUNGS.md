@@ -80,9 +80,12 @@ file *as those files are already being resolved* at a later rung — the ballast
 
 - status: **DONE** · sha: `4aaffd1c0`
 
-## R02 — block 01: hybrid HIP all-reduce
+## R02 — block 01: hybrid HIP all-reduce · **DONE 2026-11-08**
 
 * block sha `df940c14c` · 4 files · +2365 / −44 · **expected conflicts: 1**
+* **result: `cadab8c45` · 4 files · +2532 / −46**, build green, coherence green, and the hybrid arm came up on
+  the 3-GPU `-sm tensor` arm (`ggml_cuda_ar_pipeline_init: initialized HIP AllReduce pipeline: 3 GPUs,
+  1024 KB chunked kernel staging + 32 MB copy-engine staging per GPU`)
 
 | conflicted path | what to expect |
 |---|---|
@@ -91,11 +94,22 @@ file *as those files are already being resolved* at a later rung — the ballast
 **Exit:** build + coherence + the all-reduce arm is still reachable
 (`GGML_CUDA_ALLREDUCE=hybrid` on `-sm tensor --device 0,1,2`, `-lv 4` census line).
 
-- status: **TODO** · sha: —
+**Resolution:** all three sites are *both* sides, not either/or.
+* the `comm_context` struct keeps upstream's `world_size` + `n_ranks()` (#28967 multi-process NCCL) **and** the
+  delivery's copy-engine scratch block / `nccl_failed` / r165 auto-select state;
+* the NCCL small-tensor crossover now speaks in **ranks** (`is_small(ne, n_ranks())` in both call sites) and
+  keeps the delivery's measured **131072** threshold for <= 2 ranks (upstream's table says 32768 there);
+* `ggml_backend_cuda_comm_init_rank()` (upstream's multi-process bootstrap) is kept as-is next to the
+  delivery's hybrid dispatch comment.
 
-## R03 — block 02: adaptive MTP draft depth
+- status: **DONE** · sha: `cadab8c45`
+
+## R03 — block 02: adaptive MTP draft depth · **DONE 2026-11-08**
 
 * block sha `470729be7` · 24 files · +1186 / −54 · **expected conflicts: 4**
+* **result: `2f0385c71` · 23 files · +1381 / −57**, build green, coherence green, and the adaptive controller
+  is live on the MTP arm (`-lv 4`: `adaptive draft depth enabled (draft-mtp-adaptive)`, draft acceptance
+  0.849, mean len 3.50 on Qwen3.6-35B-A3B `-sm tensor` 3 GPUs)
 
 | conflicted path | what to expect |
 |---|---|
@@ -107,11 +121,37 @@ file *as those files are already being resolved* at a later rung — the ballast
 **Exit:** build + coherence + the adaptive controller still selects > 1 draft depth (`-lv 4` accept line) on
 the MTP config; MTP four-axis is R17's job, not a per-rung cost — a single `-n 300` smoke is enough here.
 
-- status: **TODO** · sha: —
+**Resolution (and one upstream absorption worth knowing):**
+* `common/common.cpp` — upstream factored the whole fit block into `common_fit_apply()`, **already including
+  the draft/MTP extra model** (`shares_model = !has_draft`, `ctx_type = MTP`), so our inline copy is dropped
+  and the call kept.  (Upstream detects the MTP type by `std::find` over `speculative.types`; the merged
+  function keeps that.)
+* `src/models/delta-net-base.cpp` — **upstream absorbed this delivery mechanism and went further**:
+  `build_conv_state_store()` (upstream, `#30878`+`#31660`) writes the rollback snapshots with **one
+  `ggml_set_rows` per conv layer** and already bounds them at `Kw = min(n_seq_tokens, K)` — the delivery's
+  `t_min` bound — and its comment cites `rs_max` (upstream `#31368`).  Upstream's helper is taken; the
+  delivery's fused-GDN path (blocks 03/10) must keep writing the same `Kw` snapshots, which is the same rule.
+  This is a *good* absorption: same invariant, one op instead of `K` copies per layer.
+* `common/speculative.cpp` — both sides again: upstream's `llama_set_embeddings_nextn` calls and shared-KV row
+  reduction (`is_mem_shared`, `all_rows_output`) merged with the delivery's prompt-tail reduction
+  (`ingest_prompt_end`, one row for a prompt batch) and its `accept_partial()`/`adaptive_feedback()` pair,
+  which sits beside upstream's new `get_state`/`set_state` (the boundary stash) in the same impl class.
+  The merged row selection is: shared-KV non-output -> 0 rows; prompt tail -> last row; shared-KV mixed
+  outputs -> last row; otherwise every row.
+* `tests/CMakeLists.txt` — upstream moved the generated-model fixtures out of the `NOT WIN32` branch
+  (`#30880`), so our two `test-recurrent-state-depth` registrations were re-placed next to `test-llama-context`
+  in the unconditional region; `llama_build(test-fusion.cpp)` is upstream's own test (the delivery's block 10
+  does not add a file of that name — checked: both sides are the same 589-line file).
 
-## R04 — block 03: chunked gated-delta-net prefill
+- status: **DONE** · sha: `2f0385c71`
 
-* block sha `670aa557d` · 25 files · +3182 / −15 · **expected conflicts: 1**
+## R04 — block 03: chunked gated-delta-net prefill · **DONE 2026-11-08 (D4 resolution PROVISIONAL — see below)**
+
+* block sha `670aa557d` · 25 files · +3182 / −15 · **expected conflicts: 1** (probe said 1 file; actually 2)
+* **result: `797f8b0cb` · 25 files · +3390 / −16**, build green, coherence green, chunked GDN dispatch proven
+  (`-lv 4`: `whole-batch chunked GDN prefill n=32 K=1 n_seqs=1 (> 16: no snapshot tail needed)`), and the
+  block's own A/B is byte-identical (`GGML_CUDA_GDN_CHUNKED=0` vs default, 199 chars,
+  sha `a2ce6989d94f`)
 
 | conflicted path | what to expect |
 |---|---|
@@ -126,11 +166,30 @@ maintainer's call.
 **Exit:** build + coherence + chunked GDN still selected (`GGML_CUDA_GDN_CHUNKED` census) + the rollback
 case above resolved and recorded.
 
-- status: **TODO** · sha: —
+**What the merge actually produced (and the state of `D4`):**
 
-## R05 — block 04: BF16 KV cache and native-BF16 flash attention
+| site | resolution |
+|---|---|
+| `src/models/delta-net-base.cpp` | **upstream's `build_conv_state_store()`**.  Block 03's inline store (per-snapshot `ggml_cpy` loop + the pre-batch copy into slot `n_seq_tokens`) is dropped: upstream's helper already writes `Kw = min(n_seq_tokens, K)` slots in one `set_rows`, and with `#31368`'s bound (`rs_max = min(n, n_rs_seq)` for a short ubatch, `0` for a longer one) the *pre-batch* slot is unreachable — a legal rollback is always `< n`.  Keeping our block would have written the same slots twice. |
+| `src/llama-memory-recurrent.cpp` ctor | **both**: upstream's `no_alloc`/`ctxs_bufs(no_alloc)` (`#31141`) plus the delivery's `n_rs_batch` parameter (the call sites on both sides already pass both). |
+| `src/llama-memory-recurrent.cpp` `seq_rm` | **upstream's `cell.rs_max` bound**, with the delivery's per-sequence ubatch tracker + `LLAMA_RS_ROLLBACK_DEBUG` trace + warn-once kept *inside* it.  This is the conservative half of `D4`: nothing is deleted, but the delivery's own `rollback <= n_rs_seq` test is gone, so the tracker's state now only feeds the diagnostic.  Per the campaign's mandate, the deletion itself waits for the maintainer. |
 
-* block sha `4db2b86d9` · 8 files · +630 / −214 · **expected conflicts: 0**
+**`D4` — measured argument, ready for the decision.**  Upstream `#31368` stores `rs_max` per cell, and upstream's
+conv-state helper writes every slot a legal rollback can read, so on the rebased tree the delivery's
+`rollback crossed a batch boundary` warn is **unreachable** — it can only fire if the delivery's own chunked /
+fused GDN path wrote fewer snapshots than the bound promises (and that path already writes
+`min(n_seq_tokens, K)`).  So the choice is "keep a diagnostic that is inert on a correct build" vs "drop the
+r91 fold, the `last_ubatch_*_by_seq` vectors, `n_rs_batch` and the warn".  The recommended deletion touches
+`src/llama-memory-recurrent.{h,cpp}` + `src/llama-cparams.h` + the call sites; it is a ~120-line net removal
+and changes no behaviour.  `TODO #288` tracks the decision (opened in this rung).
+
+- status: **DONE (D4 provisional)** · sha: `797f8b0cb`
+
+## R05 — block 04: BF16 KV cache and native-BF16 flash attention · **DONE 2026-11-08**
+
+* block sha `4db2b86d9` · 8 files · +630 / −214 · **expected conflicts: 0** — clean, as the probe predicted
+* **result: `a4c3c35c5` · 8 files · +602 / −191**, build green, and the bf16 arm runs:
+  `llama_kv_cache: … K (bf16): 4096.00 MiB, V (bf16): 4096.00 MiB` with `flash_attn = enabled`
 
 `D6`: upstream `162e2bb2e ggml : fix bf16` touches `ggml/src/ggml.c` + `tools/export-lora` — check it does
 not invalidate a delivery bf16-KV assumption (it is a type-traits/lora fix, so the expectation is "no"), and
@@ -138,7 +197,11 @@ that `-ctk bf16 -ctv bf16` still runs the native FA arm.
 
 **Exit:** build + coherence + a bf16-KV arm generates (`-ctk bf16 -ctv bf16`, native FA line at `-lv 4`).
 
-- status: **TODO** · sha: —
+**Result:** `D6` verified as "independent", as expected — upstream's `#31609` touches `ggml.c`'s type traits and
+`export-lora`, not the bf16 cache type or the FA arm.  The block needed no hunk.  (`FA_QUANTS` on this box shows
+`bf16-bf16` in the instance list, so the native bf16 FA arm is compiled in.)
+
+- status: **DONE** · sha: `a4c3c35c5`
 
 ## R06 — block 05: flash-attention band, native quantized K/V, derived kq mask
 
@@ -361,10 +424,10 @@ climb touched has a maintainer decision recorded.
 |---|---|---|---|---|---|---|
 | R00 | — | `a691b2345` (branch point) | — | n/a | 2026-11-08 | campaign setup; probe run |
 | R01 | 00 | `4aaffd1c0` | 12 expected → 12 found | build + coherence + MUL_MAT_ID 931/931 | 2026-11-08 | ballast dropped (94 -Wshadow warnings); mmid re-expressed on upstream's `tile_spec` |
-| R02 | 01 | | | | | |
-| R03 | 02 | | | | | |
-| R04 | 03 | | | | | |
-| R05 | 04 | | | | | |
+| R02 | 01 | `cadab8c45` | 1 expected → 3 found (one struct, one heuristic, one function) | build + coherence + AR pipeline line | 2026-11-08 | both sides kept; crossover keyed on `n_ranks()` |
+| R03 | 02 | `2f0385c71` | 4 expected → 4 found | build + coherence + adaptive line | 2026-11-08 | upstream absorbed the conv-state snapshot store (one set_rows, same `Kw` bound) |
+| R04 | 03 | `797f8b0cb` | 1 expected → 2 found (+1 in delta-net-base) | build + coherence + GDN census + byte-identical kill-switch arm | 2026-11-08 | upstream absorbed the conv-state store; **D4 provisional**: `rs_max` bound taken, delivery tracker kept as a diagnostic only |
+| R05 | 04 | `a4c3c35c5` | 0 expected → 0 found | build + bf16 KV/FA arm | 2026-11-08 | clean; upstream's bf16 fix is independent (`D6` closed) |
 | R06 | 05 | | | | | |
 | R07 | 06 | | | | | |
 | R08 | 07 | | | | | |
