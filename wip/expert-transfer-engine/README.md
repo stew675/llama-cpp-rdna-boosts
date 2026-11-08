@@ -67,6 +67,31 @@ copy engine *less* busy — the copies stall rather than transfer; `HSA_ENABLE_S
 `mlock` all oscillate identically), memory pressure, GPU clock, `GGML_SCHED_STAGE_SLOTS` (8 vs 16), the GPU slot.
 Records: `WORKLOG.md` 261107.012, `INVARIANTS.md` (r234, second addendum).
 
+## 2e. Where the ≥ 83 %-residency cell actually comes from — it is a MISCONFIGURATION, not a target
+
+The 99 % row above is not a configuration anyone needs; it is an axis point I constructed (by capping the arena
+at three other values) and it exists at all only because of how the arena is sized:
+
+* `alloc_all_locked` sizes the arena from **what is free NOW** — after `--fit`, the compute reserve and the KV
+  cache — minus `MOE_EXPERT_CACHE_RESERVE_MIB` (default 1024 MiB), capped at the host set's slot count.
+* So residency ≈ `min(1, (free VRAM − reserve) / host set)`.  **High residency therefore means "there was lots
+  of VRAM free"**, i.e. **the user offloaded more experts to the host than they needed to**.  The 99 % case was
+  2 × 32 GB = 64 GB of VRAM with *every* layer's experts forced onto the host (`-ncmoe 48`, a 48 GB set): the
+  obvious right answer there is `-ncmoe 0` (fully resident) or a much smaller `-ncmoe`.
+* Conversely a model that **just** does not fit has almost no free VRAM after its weights → a small arena →
+  **low residency → bulk wins**.  So the regimes where high residency appears are precisely the ones where the
+  host tier should not have been used for that much of the set.
+
+**The lever is not `-ncmoe`.**  Lowering `-ncmoe` keeps residency *high*: fewer host layers means a *smaller*
+host set with the same free VRAM, so the arena still covers all of it (`min(1, free/host)` → 1).  What lowers
+residency is (a) **capping the arena** (`MOE_EXPERT_CACHE_MIB`), or (b) raising `-ncmoe`, which is not a fix —
+it just moves more bytes.  So the honest deliverable is a **sizing policy** (what the arena should be *for*),
+not a transport rule.
+
+That reframes step 1: the question is not "can we close the hole?" but **"does the arena earn its auto size at
+all, given that the prefill cannot use it (below ~83 % residency) and only the decode band can?"** — a decode
+times prefill trade in pure VRAM bytes, with the freed VRAM going to KV / a wider ubatch.
+
 ## 3. The hole, stated plainly
 
 * **bulk** is the simplest and the most stable, and it wins at ≤ 67 % residency (the shape any 24-32 GB card
@@ -100,10 +125,12 @@ Records: `WORKLOG.md` 261107.012, `INVARIANTS.md` (r234, second addendum).
   dead; the caller was dropped in the r50 rebase") or hand the op the arena wholesale (`MOE_HOST_POOL_ALIAS`,
   refuted for the pool tier in `archive/work/host-expert-mirror/`).  Both are remap-shaped and big.
 
-**Recommendation: Direction A (bulk).**  It is the smallest, the most stable, already wins where most consumers
-live, and its one hole is closable by a *sizing* decision rather than by a new copy path — with one transport,
-one switch (`GGML_MOE_CACHE_STAGE`, kept only as the A/B kill switch), and the gather left as the pool tier's
-default (it is a decodable, measured win there and costs nothing to keep).
+**Recommendation: Direction A (bulk).**  It is the smallest, the most stable, already wins at ≤ 67 % residency
+on 1 **and** 2 devices, and — since the ≥ 83 % cells are misconfigurations (§2e) — its one hole is not a shape a
+consumer needs: a host expert set that the arena covers is a set that should have stayed resident.  What is left
+is a **sizing policy** for the arena (decode hits vs prefill bytes), not a transport rule.  One transport, one
+switch (`GGML_MOE_CACHE_STAGE`, A/B only), and the gather left as the pool tier's default (a measured win there
+at `-ub` ≤ 4096, and free to keep).
 
 ## 5. The parked experiment
 
@@ -122,10 +149,14 @@ close it; until that is measured, this patch is evidence, not a delivery candida
 
 ## 6. Next steps, in order
 
-1. Measure **decode** at a capped arena vs the auto arena (hit rate, fills, tg t/s) — does the arena's
-   prefill-driven size buy anything for the band it exists for?  (Cheap: one `llama-bench`/`llama-cli -n 256`
-   sweep at 2-3 arena caps.)
-2. If decode is insensitive above ~50 % residency, re-run §2a's 44/67/83/99 % cells with the arena capped to the
-   decode-optimal size and confirm bulk wins every cell.
-3. Only then cut the delivery change (Direction A step 1 + the parked patch) as one block-12 amendment.
+1. Measure **decode** at a capped arena vs the auto arena (tg t/s, hit rate, fills, `h=`) at 2-3
+   `MOE_EXPERT_CACHE_MIB` values — the real question of §2e: does the auto size earn its VRAM for the band the
+   arena exists for?  (One model, `-n 256`, 2 devices, interleaved.)
+2. If decode is flat above ~50 % residency, adopt a decode-sized arena default and confirm that residency then
+   lands ≤ ~67 % in every realistic shape — at which point **bulk wins every configuration the delivery
+   supports** and the ≥ 83 % rows are unreachable by construction.
+3. Then cut the delivery change (the parked patch + the sizing default) as one block-12 amendment, and delete
+   `MOE_HOST_POOL_STAGE_BATCH`.
 4. Keep the phase (SDMA dispatch) as a measurement protocol note; do not tune to it.
+5. Only if step 1 shows decode genuinely needs the big arena: the trade is real, and it is a workload policy
+   (prefill bytes vs decode hits) — to be decided by the maintainer per shape, not defaulted from one cell.
