@@ -12,6 +12,9 @@ one resumes with `git cherry-pick <next block>`.  The rungs are in [`RUNGS.md`](
 evidence the ladder was laid out from) in [`CONFLICT-MAP.md`](CONFLICT-MAP.md) — regenerate it with
 [`probe-conflicts.py`](probe-conflicts.py) (machine-readable output: `conflict-map.json`).
 
+**Cold start:** read [`HANDOVER.md`](HANDOVER.md) first — it carries the state, the environment and the blocked
+rung's debug plan.
+
 **Scope: `patches/` only.**  The maintainer's ruling (2026-11-08): every open `wip/` campaign's patches are
 **ignored** for this re-base — they are *not* applied, not rebased and not consulted while resolving a rung,
 and a rung that seems to need one gets a `TODO.md`-shaped note instead.  They will each be adapted to the new
@@ -173,9 +176,16 @@ Not a rung in the climb — the release gate set, in the order the traps fire:
 
 ## §5  Resuming
 
+**Start with [`HANDOVER.md`](HANDOVER.md)** — it is the cold-start brief: exact state, the environment, the blocked
+rung with its evidence and an ordered debug plan, the remaining rungs, the open decisions and the list of
+"already paid for" facts.
+
 ```bash
 cd ~/llama-cpp-rdna-boosts && sed -n '1,40p' wip/upstream-rebase-261108/RUNGS.md   # find the open rung
 cd ~/llama.cpp && git log --oneline -3 && git status                               # confirm the branch state
 ```
 A rung that was interrupted mid-conflict leaves `git status` dirty and `.git/CHERRY_PICK_HEAD` present —
 finish or `git cherry-pick --abort` and redo it; do not leave a half-resolved rung for the next session.
+A rung that is *blocked* by a regression is different: roll the branch back to the last green rung, park the
+resolution as a patch in this directory, and record it (that is what R11 did — see `RUNGS.md` R11 and
+`r11-resolution.patch`).
