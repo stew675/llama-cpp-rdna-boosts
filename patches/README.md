@@ -916,6 +916,28 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r235 amendment (PR #283, `overdoingism`): a host split input above the pinned ring's snapshot limit is
+> copied synchronously.**  `ggml_backend_sched_copy_input`'s `host_src && dev_dst` branch hands the split backend
+> the caller's **live** host pointer via `set_tensor_async`; the CUDA backend snapshots that through its pinned
+> ring only up to `GGML_BACKEND_ASYNC_SNAPSHOT_MAX` (**1 MiB**, r90/block 10), and above it the `cudaMemcpyAsync`
+> reads the source when the stream reaches it.  The buffer that bites is a CPU split's output written **in place**
+> — the token embeddings when `token_embd` is on the CPU (`CPU_Mapped`: `model.input_embed` / `node_1`,
+> **41,943,040 B** per 2048-token ubatch, 10,485,760 B at `-ub 512`), rewritten by the next ubatch's CPU split —
+> so a queued copy could read the next ubatch's bytes, or a torn mix, and corrupt the prefill from layer 0 on.
+> The branch now takes the existing **synchronous fallback** for a non-weight host input above the limit, which is
+> what upstream ggml does for every host input; ≤1 MiB keeps the ring snapshot and a host **weight** (partial
+> offload, host expert master — never rewritten in place; where the delivery does rewrite one its own staging ring
+> owns the ordering) keeps the asynchronous copy at any size.  The limit is now one `#define` in
+> `ggml-backend-impl.h` (`GGML_BACKEND_ASYNC_SNAPSHOT_MAX`) used by the scheduler, with this block's
+> `GGML_CUDA_ASYNC_INPUT_MAX` (block 10) defined from it so the two cannot drift.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1`
+> is the kill-switch (A/B and bisection only).  **Cost, measured here** (same binary, kill-switch A/B, 27B
+> `pp2048`, 4 alternating starts/arm): 1 GPU `-ub 2048` **−0.17 %**, `-ub 512` **−0.30 %**, 3 GPU `-sm layer`
+> **+0.08 %** — inside the arm spread.  **No shipped CLI config was corrupting**: r234 and r235 prefill logits are
+> byte-identical (0 of 1,013,178,324 B at `-ub 512`), and so are the default and an `AMD_SERIALIZE_COPY=2` arm —
+> this closes a **latent** hole (the third instance of the r35/#87 / r90 bug class) that needs something queueing
+> large device-to-host work between prefill ubatches.  Records: [`../WORKLOG.md`](../WORKLOG.md) 261107.013,
+> `INVARIANTS.md` r235, `ENVIRONMENT.md` `GGML_SCHED_ASYNC_LARGE_HOST_INPUT`.
+>
 > **r215 amendment: the host pool's MIRROR fill and its pinned BACKING.**  Two costs in the pinned L2 pool
 > that only a **mapped** load pays, both found by asking why `--load-mode mmap` reaches `listening` 1.6x later than
 > `--load-mode none` on the same model (Flash-Next IQ3_S, `-ncmoe 48`, cold page cache, 1 device: 26.3 s against

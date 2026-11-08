@@ -2778,3 +2778,44 @@ Facts from `TODO` #271/#272 (records: `archive/work/host-expert-transport/README
   loses the low one, and the pinned tier's copy-engine fill would be a coin flip.  The switch therefore still
   describes a real choice: `1` = one launch (the low-variance default), `0` = one copy per expert (the A/B arm
   that wins the high phase and on 1 GPU at `-ub 2048`).
+
+## (r235) — the scheduler's async host-input copy stops at the pinned ring's snapshot limit: above 1 MiB a non-weight host split input is copied synchronously
+
+**What is true.**  `ggml_backend_sched_copy_input`'s `host_src && dev_dst` branch (block 09) hands the split
+backend the **caller's live host pointer** via `set_tensor_async`.  The CUDA backend snapshots such an upload
+through its pinned ring **only up to `GGML_BACKEND_ASYNC_SNAPSHOT_MAX` (1 MiB, formerly the CUDA-local
+`GGML_CUDA_ASYNC_INPUT_MAX`); above it the `cudaMemcpyAsync` reads the source when the stream reaches the copy,
+not when it is issued.  The buffer that bites is a CPU split's output written **in place** — the token embeddings
+when `token_embd` is on the CPU (`CPU_Mapped`; `model.input_embed` / `node_1`, **41,943,040 B** per 2048-token
+ubatch, **10,485,760 B** at `-ub 512`), rewritten by the next ubatch's CPU split.  Since r235 the scheduler gates
+the async branch on the same constant and copies a non-weight host input above it **synchronously** — what
+upstream ggml does for every host input — leaving the ≤1 MiB ring snapshot (r90) and a host **weight** (never
+rewritten in place) on the async path.
+
+**How it was measured here (r234 tree; the PR's own config).**  Instrumented `ggml_backend_sched_copy_input` on
+`Qwen3.8-27B-UD-Q4_K_XL`, `-ngl 99`: `token_embd` in `CPU_Mapped` (682.03 MiB), the CPU split's output in a
+`ROCm_Host` compute buffer of **40.96 MiB**, and `node_1` / `model.input_embed` uploaded async at exactly
+10,485,760 B / 41,943,040 B per ubatch.  **No shipped CLI config corrupts prefill**: logits from the default arm
+and from an `AMD_SERIALIZE_COPY=2` (wait-after-every-copy) arm are **byte-identical** (0 differing bytes of
+1,013,178,324 at `-ub 512`; self-A/A also 0), and r234 vs r235 is 0.  So this is a **latent** hole here, not a live
+defect: it needs something that queues large device-to-host work between prefill ubatches (the reporter's
+layer-input exports — the delivery ships `llama_model_set_embeddings_layer_inp_preset` — and, in shipped opt-in
+features, the KV streaming and the host-expert sink do that class of work).  It is the **third instance** of one
+bug class this delivery has already fixed twice: r35 (issue #87, graph-input views) and r90 (block 10, the ≤1 MiB
+ring snapshot, `archive/work/async-input-graph-ordering/`).
+
+**Numbers of record (this box, 27B, `pp2048`, same binary, kill-switch A/B, 4 alternating starts/arm).**
+1 GPU `-ub 2048` **−0.17 %**, 1 GPU `-ub 512` **−0.30 %**, 3 GPU `-sm layer` `-ub 2048` **+0.08 %** — all inside
+the arm spread (old arm sd 12.7 t/s on a 1397 t/s mean).  The reporter's −0.4/−0.7 % (r220 fork, drift 1.2 %) is
+compatible but not reproduced.  Prefill logits, greedy text unchanged; `gate-prefill-logits.sh`, the coherence
+gate, `gate-host-pool.sh` and the per-block build ladder all green (r235).
+
+**The rule.**  A host-resident tensor handed to `set_tensor_async` must be stable for the whole life of the copy
+**or** snapshotted by the backend; a caller that cannot promise that (the scheduler, for a buffer another split
+rewrites) must use the synchronous copy.  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` restores the asynchronous copy
+(A/B and bisection only); the CUDA ring limit and the scheduler's gate are one `#define` so they cannot drift.
+**Not changed here:** the async-input ring's lazy done event is per host thread (`origins` keyed by
+`std::thread::id`), so a target and a draft context on one thread share one pending done event.  It is
+conservative today (every upload flushes `done_pending`, and `has_done` then waits on the *latest* graph on that
+origin), which is why it was left alone; it is noted so a future third context on one thread is checked, not
+assumed.

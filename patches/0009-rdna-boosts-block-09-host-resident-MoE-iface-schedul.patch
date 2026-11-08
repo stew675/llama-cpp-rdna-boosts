@@ -1,4 +1,4 @@
-From e8c82178ed3d7a6cf7b06cc1a5ea503ed3e3ab18 Mon Sep 17 00:00:00 2001
+From e702386b654e19ddb8f4ac4a5cc0dd1c43968162 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -391,9 +391,9 @@ bit-identical, `test-backend-ops -o MUL_MAT_ID` 931/931, `scripts/gate-host-pool
  ggml/include/ggml-alloc.h                     |    1 +
  ggml/include/ggml-backend.h                   |  131 +
  ggml/src/ggml-alloc.c                         |   85 +-
- ggml/src/ggml-backend-impl.h                  |  258 +
+ ggml/src/ggml-backend-impl.h                  |  267 +
  ggml/src/ggml-backend-meta.cpp                | 1562 +++-
- ggml/src/ggml-backend.cpp                     | 1314 +++-
+ ggml/src/ggml-backend.cpp                     | 1343 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    7 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    7 +
  ggml/src/ggml-cpu/amx/amx.cpp                 |    3 +
@@ -444,7 +444,7 @@ bit-identical, `test-backend-ops -o MUL_MAT_ID` 931/931, `scripts/gate-host-pool
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17370 insertions(+), 540 deletions(-)
+ 68 files changed, 17408 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -2456,10 +2456,26 @@ index 022ff710e..d83b3fb76 100644
 +    galloc->layout_valid = false;
 +}
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index dc7367dec..9a1a7c283 100644
+index dc7367dec..70e257e27 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -30,6 +30,26 @@ extern "C" {
+@@ -10,6 +10,15 @@ extern "C" {
+ 
+     #define GGML_BACKEND_API_VERSION 3
+ 
++    // The largest host-resident tensor a backend may upload ASYNCHRONOUSLY from the caller's live pointer: the
++    // backend must snapshot such a copy through its own stable staging memory (the CUDA backend's pinned upload
++    // ring) so the copy engine reads the snapshot, not memory the caller may rewrite as soon as the call returns.
++    // Above this size a backend copies in place, so a caller that does rewrite the source -- the scheduler with a
++    // CPU split's output, i.e. the token embeddings -- must not use the asynchronous path at all.  The CUDA
++    // backend defines its ring limit from this value (ggml-cuda.cu, block 10), so the two cannot drift: a backend
++    // that raises its ring limit raises the scheduler's gate with it.
++    #define GGML_BACKEND_ASYNC_SNAPSHOT_MAX (1u << 20)
++
+     //
+     // Backend buffer type
+     //
+@@ -30,6 +39,26 @@ extern "C" {
          size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
          // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
          bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
@@ -2486,7 +2502,7 @@ index dc7367dec..9a1a7c283 100644
      };
  
      struct ggml_backend_buffer_type {
-@@ -101,6 +121,12 @@ extern "C" {
+@@ -101,6 +130,12 @@ extern "C" {
      GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
      GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
      GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
@@ -2499,7 +2515,7 @@ index dc7367dec..9a1a7c283 100644
  
      GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
      GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
-@@ -117,6 +143,34 @@ extern "C" {
+@@ -117,6 +152,34 @@ extern "C" {
          // can be called multiple times for the same tensor: the longest lifetime applies
          void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
          void * user_data;
@@ -2534,7 +2550,7 @@ index dc7367dec..9a1a7c283 100644
      };
  
      struct ggml_backend_i {
-@@ -152,8 +206,90 @@ extern "C" {
+@@ -152,8 +215,90 @@ extern "C" {
          // wait for an event on on a different stream
          void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
  
@@ -2625,7 +2641,7 @@ index dc7367dec..9a1a7c283 100644
      };
  
      struct ggml_backend {
-@@ -216,6 +352,128 @@ extern "C" {
+@@ -216,6 +361,128 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -4753,7 +4769,7 @@ index 479ed3ae3..a7018fccd 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 22e5fd9c7..51a834d48 100644
+index 22e5fd9c7..af11f50f4 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,21 @@
@@ -5394,7 +5410,7 @@ index 22e5fd9c7..51a834d48 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
-@@ -1814,19 +2313,382 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1814,19 +2313,402 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -5741,6 +5757,26 @@ index 22e5fd9c7..51a834d48 100644
 +    return enabled;
 +}
 +
++// r235: a host-resident split input above the backends' async-snapshot limit (GGML_BACKEND_ASYNC_SNAPSHOT_MAX) is
++// copied synchronously instead of through the set_tensor_async branch below.  That branch hands the backend the
++// caller's LIVE host pointer, and above the limit no backend snapshots it (the CUDA ring stops at the limit), so
++// the copy engine reads the source when the stream reaches the copy, not when it is issued.  The input that bites
++// is a CPU split's output -- the token embeddings when the table is on the CPU (`model.input_embed` / `node_1`,
++// 41,943,040 bytes for a 2048-token ubatch) -- which the next ubatch's CPU split rewrites in place: a copy still
++// queued behind earlier work then reads the next ubatch's bytes, or a torn mix of the two, and the prefill is
++// corrupted from layer 0 on (wrong but fluent text, different from run to run).  Upstream ggml copies every host
++// input synchronously; this keeps that guarantee for the large ones while the small ones keep the ring snapshot
++// (r90) and a host-resident WEIGHT keeps the asynchronous copy at any size (a weight -- partial offload, a host
++// expert master -- is not rewritten in place, and where the delivery does rewrite one, its own staging ring owns
++// the ordering).  `GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` restores the asynchronous copy (A/B and bisection only).
++static bool sched_async_large_host_input(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_ASYNC_LARGE_HOST_INPUT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
 +
  static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
      return t->buffer != NULL &&
@@ -5779,7 +5815,7 @@ index 22e5fd9c7..51a834d48 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -1834,31 +2696,327 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -1834,31 +2716,336 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -6102,7 +6138,16 @@ index 22e5fd9c7..51a834d48 100644
 +            // `set_tensor_async` only understands a whole split tensor, so it keeps the copy below.
 +            const bool host_src = input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer);
 +            const bool dev_dst  = input_cpy->buffer != NULL && !ggml_backend_buffer_is_host(input_cpy->buffer);
-+            if (host_src && dev_dst && split_backend->iface.set_tensor_async != NULL &&
++            // ... but not for one above the snapshot limit that is not a weight: see
++            // sched_async_large_host_input().  Above the limit the backend reads the caller's live pointer in
++            // place, and a CPU split's output (40 MiB of token embeddings per 2048-token ubatch) is rewritten in
++            // place by the next ubatch, so those take the synchronous copy below -- as upstream ggml does for
++            // every host input.
++            const bool host_large = ggml_nbytes(input_cpy) > GGML_BACKEND_ASYNC_SNAPSHOT_MAX &&
++                input->buffer != NULL &&
++                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                !sched_async_large_host_input();
++            if (host_src && dev_dst && !host_large && split_backend->iface.set_tensor_async != NULL &&
 +                split_backend->iface.event_wait != NULL) {
 +                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 +                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -6127,7 +6172,7 @@ index 22e5fd9c7..51a834d48 100644
      }
  }
  
-@@ -1867,12 +3025,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1867,12 +3054,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      struct ggml_backend_sched_split * splits = sched->splits;
  
      int prev_backend_id = -1;
@@ -6143,7 +6188,7 @@ index 22e5fd9c7..51a834d48 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -1887,12 +3048,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1887,12 +3077,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -6158,7 +6203,7 @@ index 22e5fd9c7..51a834d48 100644
              }
          }
  
-@@ -1940,6 +3101,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1940,6 +3130,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
          }
  
@@ -6173,7 +6218,7 @@ index 22e5fd9c7..51a834d48 100644
          prev_backend_id = split_backend_id;
      }
  
-@@ -1959,14 +3128,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1959,14 +3157,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -6190,7 +6235,7 @@ index 22e5fd9c7..51a834d48 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2003,7 +3172,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2003,7 +3201,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -6206,7 +6251,7 @@ index 22e5fd9c7..51a834d48 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2012,6 +3188,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2012,6 +3217,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -6272,7 +6317,7 @@ index 22e5fd9c7..51a834d48 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2026,6 +3261,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2026,6 +3290,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -6283,7 +6328,7 @@ index 22e5fd9c7..51a834d48 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2090,6 +3329,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2090,6 +3358,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -6301,7 +6346,7 @@ index 22e5fd9c7..51a834d48 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2127,6 +3377,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2127,6 +3406,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -6310,7 +6355,7 @@ index 22e5fd9c7..51a834d48 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2592,6 +3844,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2592,6 +3873,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -6320,7 +6365,7 @@ index 22e5fd9c7..51a834d48 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2617,6 +3872,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2617,6 +3901,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,

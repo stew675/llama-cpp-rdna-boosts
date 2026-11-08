@@ -1,4 +1,4 @@
-From f79e167c5bf828692f5e6f59db2c5a597ce1e5b2 Mon Sep 17 00:00:00 2001
+From 91a0c45d753c7a654cb332f82822e75b43673c2a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 3 Nov 2026 13:54:26 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1308,10 +1308,10 @@ index b47a1423e..89b85fbce 100644
 -    galloc->layout_valid = false;
 -}
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index d2e982b1d..36df9bac9 100644
+index 0ae246f6d..8ed74913c 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -294,6 +294,25 @@ extern "C" {
+@@ -303,6 +303,25 @@ extern "C" {
          // (TODO #269); the per-device cold-id encoding comes from the per-device table.  Appended at the END of the
          // struct, so the other backends' positional initializers stay valid (NULL).
          bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
@@ -1337,7 +1337,7 @@ index d2e982b1d..36df9bac9 100644
      };
  
      struct ggml_backend {
-@@ -452,6 +471,15 @@ extern "C" {
+@@ -461,6 +480,15 @@ extern "C" {
          // table fits per slot.  Appended like the fields above.
          size_t (*slab_ring_slots)(ggml_backend_dev_t dev);
  
@@ -1353,7 +1353,7 @@ index d2e982b1d..36df9bac9 100644
          // (optional) TODO #59: the MoE expert cache's decode/verify band in tokens (the widest routed
          // `MUL_MAT_ID` batch the arena serves from VRAM), or 0 when the cache is disabled.  `common` clamps
          // the draftless (n-gram) speculators' draft length to `band - 1` so a speculative verify batch never
-@@ -478,6 +506,18 @@ extern "C" {
+@@ -487,6 +515,18 @@ extern "C" {
          void    (*moe_cache_set_host_pool_budget)(ggml_backend_dev_t dev, size_t bytes);
          void    (*moe_heat_open)(ggml_backend_dev_t dev, const char * model_path);
          int64_t (*moe_heat_score)(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
@@ -1674,7 +1674,7 @@ index 12ec0f510..0a09ca3c4 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f41f89928..169f901a9 100644
+index 0f0bf9b95..7eb6d3fa7 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -321,6 +321,13 @@ int64_t ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const
@@ -1864,7 +1864,7 @@ index f41f89928..169f901a9 100644
  static bool sched_sync_graph_inputs(void) {
      static const bool enabled = [] {
          const char * e = GGML_ENV_STR("GGML_SCHED_SYNC_GRAPH_INPUTS");
-@@ -2763,6 +2849,24 @@ struct ggml_backend_sched_copy_state {
+@@ -2783,6 +2869,24 @@ struct ggml_backend_sched_copy_state {
  // then used-expert pruning); upstream #29943 moved the pruning to llama_context::
  // sched_copy_experts, but the delivery keeps it here so the scheduler stays cache-aware
  // and upstream's llama_moe_cache (behind --moe-cache-mib) stays dormant.
@@ -1889,7 +1889,7 @@ index f41f89928..169f901a9 100644
  static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -2954,7 +3058,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2974,7 +3078,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              // experts from the host master into `input_cpy`, reading the routing on the device,
              // so the host ids readback and its full device synchronize are skipped.  A backend
              // that cannot serve the layout (or the gate off) falls through to the host path.
@@ -1898,7 +1898,7 @@ index f41f89928..169f901a9 100644
                  ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
                  split_backend->iface.moe_cache_gather != NULL) {
                  // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
-@@ -3091,10 +3195,27 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3120,10 +3224,27 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                      ggml_backend_synchronize(split_backend);
                  }
                  ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input_cpy));
@@ -1928,7 +1928,7 @@ index f41f89928..169f901a9 100644
                  ggml_backend_synchronize(input_backend);
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -3103,6 +3224,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3132,6 +3253,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  }
                  ggml_backend_tensor_copy(input, input_cpy);
              }
@@ -1936,7 +1936,7 @@ index f41f89928..169f901a9 100644
          }
      }
  }
-@@ -3314,8 +3436,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -3343,8 +3465,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
          // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
          // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
          // persistent/never-reused).
@@ -1957,7 +1957,7 @@ index f41f89928..169f901a9 100644
          if (sched->stage_enabled) {
              bool stage_capable = false;
              for (int b = 0; b < sched->n_backends; b++) {
-@@ -3348,6 +3481,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -3377,6 +3510,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -1967,7 +1967,7 @@ index f41f89928..169f901a9 100644
          for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
              ggml_backend_event_free(sched->stage_done_ev[b][s]);
              ggml_backend_event_free(sched->stage_free_ev[b][s]);
-@@ -3473,6 +3609,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -3502,6 +3638,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
          ggml_backend_synchronize(sched->backends[i]);
@@ -2551,10 +2551,10 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 762c9de61..89937e357 100644
+index a1bf1bf68..e850681dd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3500,6 +3500,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -3504,6 +3504,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -2632,7 +2632,7 @@ index 762c9de61..89937e357 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -4577,6 +4648,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -4581,6 +4652,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -2643,7 +2643,7 @@ index 762c9de61..89937e357 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -4976,6 +5051,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -4980,6 +5055,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -2668,7 +2668,7 @@ index 762c9de61..89937e357 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -5173,7 +5266,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -5177,7 +5270,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -2678,7 +2678,7 @@ index 762c9de61..89937e357 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -5227,16 +5321,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -5231,16 +5325,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -2711,7 +2711,7 @@ index 762c9de61..89937e357 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -5244,6 +5347,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -5248,6 +5351,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -2727,7 +2727,7 @@ index 762c9de61..89937e357 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -7182,6 +7294,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7186,6 +7298,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -2736,7 +2736,7 @@ index 762c9de61..89937e357 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7211,6 +7325,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7215,6 +7329,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -2745,7 +2745,7 @@ index 762c9de61..89937e357 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -7741,6 +7857,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7745,6 +7861,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -2754,7 +2754,7 @@ index 762c9de61..89937e357 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -8127,6 +8245,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -8131,6 +8249,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -2777,7 +2777,7 @@ index 762c9de61..89937e357 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -8146,6 +8280,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -8150,6 +8284,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -2789,7 +2789,7 @@ index 762c9de61..89937e357 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -8169,6 +8308,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -8173,6 +8312,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -2809,7 +2809,7 @@ index 762c9de61..89937e357 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -8303,11 +8455,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8307,11 +8459,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,

@@ -1,3 +1,52 @@
+## 261107.013 (r235) -- PR #283 promoted: the scheduler's async host-input copy stops at the ring's snapshot limit (block 09)
+
+**Delivery change, new release.**  `ggml/src/ggml-backend.cpp` (block 09) + the shared limit in
+`ggml-backend-impl.h` + the CUDA ring's definition (block 10, tie only): the `host_src && dev_dst` branch of
+`ggml_backend_sched_copy_input` no longer hands a split backend the caller's **live** host pointer for an upload
+the backend does not snapshot.  Above `GGML_BACKEND_ASYNC_SNAPSHOT_MAX` (1 MiB) a **non-weight** host split input
+takes the existing **synchronous** fallback -- what upstream ggml does for every host input.  ≤1 MiB keeps the r90
+ring snapshot; a host **weight** (partial offload, host expert master) keeps the asynchronous copy at any size.
+`GGML_SCHED_ASYNC_LARGE_HOST_INPUT=1` restores the old asynchronous copy (A/B and bisection only).  Block count
+stays 16; blocks 09-15 were re-cut (commit ids only -- the block bodies are unchanged apart from these hunks).
+
+**Why.**  PR #283 (`overdoingism`, written by Claude) found the leftover instance of the r35/#87 and r90 bug class:
+the CUDA backend snapshots a `set_tensor_async` upload through its pinned ring **only up to 1 MiB**, and the
+scheduler uses that path for a **CPU split's output** -- the token embeddings when `token_embd` lands in
+`CPU_Mapped` (`model.input_embed` / `node_1`, **41,943,040 B** per 2048-token ubatch, 10,485,760 B at `-ub 512`)
+-- which the next ubatch's CPU split rewrites **in place**.  Above 1 MiB the copy engine reads the source when the
+stream reaches the copy, so a copy still queued behind earlier work reads the next ubatch's bytes or a torn mix:
+a prefill corrupted from layer 0 on, in fluent text.  The reporter reproduced it only with 32+ layer-input
+exports per ubatch (1.3-2.7 GB of device-to-host readbacks keeping the stream busy) and not under a plain
+`llama-server` workload, which matches what this tree does.
+
+**What was verified here (r234 tree, the reporter's config).**  Instrumented the branch on
+`Qwen3.8-27B-UD-Q4_K_XL`, `-ngl 99`: `token_embd` in `CPU_Mapped` (682.03 MiB), the CPU split's output in a
+`ROCm_Host` compute buffer of **40.96 MiB**, `node_1`/`model.input_embed` uploaded async at exactly
+10,485,760 B (`-ub 512`) and 41,943,040 B (`-ub 2048`) per ubatch -- the PR's numbers are right.  **No shipped CLI
+config corrupts prefill**: default vs `AMD_SERIALIZE_COPY=2` logits are **byte-identical** (0 differing bytes of
+1,013,178,324 at `-ub 512`, 8 chunks; self-A/A also 0), and r234 vs r235 is 0.  So this ships as a **latent**-hole
+fix, not a live-defect fix -- the same judgement r35 made for graph-input views.
+
+**Cost (same binary, kill-switch A/B, 27B `pp2048`, `r5`, 4 alternating starts per arm, this box).**  1 GPU
+`-ub 2048` **−0.17 %** (1395.2 vs 1397.5 t/s, old arm sd 12.7), 1 GPU `-ub 512` **−0.30 %**, 3 GPU `-sm layer`
+`-ub 2048` **+0.08 %** -- inside the arm spread.  The PR's −0.4/−0.7 % (r220 fork, own drift 1.2 %) is compatible
+but not reproduced.  Greedy text and prefill logits unchanged.
+
+**Differences from the PR as filed.**  (1) The threshold is **one** `#define`
+(`GGML_BACKEND_ASYNC_SNAPSHOT_MAX` in `ggml-backend-impl.h`) that the scheduler uses and the CUDA backend's
+`GGML_CUDA_ASYNC_INPUT_MAX` is *defined from*, so a backend that raises its ring limit raises the scheduler's gate
+with it (the PR hard-coded a second `1u << 20` in the backend-agnostic scheduler).  (2) The env read uses the
+delivery's `GGML_ENV_STR` (Windows-safe).  (3) The PR's own `wip/host-input-sync/` artifacts are **not** merged --
+the fix lives in block 09, and a promoted campaign leaves `wip/`.  (4) The PR's "a weight is never rewritten in
+place" is not strictly true for a pool-backed host expert master; the exemption is still safe because the
+delivery's own bounce/`busy` ring orders those, and the comment says so.
+
+**Gates** (r235): `validate-set.sh` green (16 blocks + the net patch, fresh-tarball strict `git am`),
+`gate-per-block-build.sh` 16/16, coherence greedy text identical (4B Q8_0 1 GPU `-sm layer`, 3 GPU `-sm tensor`) and
+27B `-ub 512`/`-ub 2048`, `gate-prefill-logits.sh` PASS, `gate-host-pool.sh` PASS (the weight exemption's path),
+`check-gpu-faults.sh` clean, `fork-refresh.sh --build --gates --push` re-cut and pushed `rdna-boosts` to the
+personal fork at the recorded `.tip`.
+
 ## 261107.012 (no release) -- the engine merge was built, measured and withheld: the box's copy-engine "phase" is SDMA dispatch latency
 
 **No delivery change.**  `patches/`, `release.json`, the r234 tag and every gate are untouched; the fork
