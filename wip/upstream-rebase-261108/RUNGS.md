@@ -310,9 +310,12 @@ is RDNA3 coverage; the compile break was real either way.)
 
 - status: **TODO** · sha: —
 
-## R09 — block 08: fused kernels
+## R09 — block 08: fused kernels · **DONE 2026-11-08 (`D2` DECIDED: complementary)**
 
-* block sha `615e77323` · 35 files · +5500 / −440 · **expected conflicts: 5**
+* block sha `615e77323` · 35 files · +5500 / −440 · **expected conflicts: 5** — found 5 files / 8 hunks
+* **result: `af0cae2f1`** · build green, `test-backend-ops -o MUL_MAT_ID` **931/931**, and same-seed
+  greedy text byte-identical across default / `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` /
+  `GGML_CUDA_DISABLE_FUSION=1` (121 chars, sha `cecacc0e438e`) on Qwen3-Coder-30B-A3B
 
 | conflicted path | what to expect |
 |---|---|
@@ -327,7 +330,26 @@ which predicate decides each arm and prove the RDNA fused arm still fires (`-lv 
 
 **Exit:** build + coherence + `scripts/gate-norm-rows-alias.sh` (the block's own gate) green.
 
-- status: **TODO** · sha: —
+**Correction to this rung's exit criteria:** the norm-rows gate **cannot** run here.  The fusion *dispatcher*
+(`ggml-cuda-try-fuse.cu`) is **block 10's** TU, so on a blocks 00-08 tree every fusion matcher is compiled but
+never invoked — measured: `gate-norm-rows-alias.sh` reports `fused=0 declined=0` on all four arms while
+`nofuse` passes.  The gate therefore moves to **R11** (block 10) and must be green before R17.
+
+**Resolution (`D2` — upstream's `has_fusion` vs the delivery's `has_gate`): both, as two template arms on one
+kernel.**  Upstream's fused gate/up+GLU in MMQ (`#31188`/`#31288`/`#31296`, the interleaved/NVFP4 path) and the
+delivery's RDNA fused gate are selected by separate predicates and share `mul_mat_q_process_tile`, so this is
+the `#29948` pattern again — no delivery kernel dropped.
+
+| site | resolution |
+|---|---|
+| `mmq.cuh` (3 hunks) | the delivery's routed-compact MoE dispatch (descriptors per real `(expert, J-tile)` pair) is kept, followed by upstream's fused/tiling branch **extended** with `has_gate`: `x_gate_arg`/`glu_op_arg`/`glu_limit_arg` chosen per arm and `x_scale_arg`/`gate_scale_arg` nullptr on the delivery's arm; the stream-k launch likewise; the MUL_MAT_ID tile body takes upstream's `tile_spec` call shape with `has_gate` as the extra template argument. |
+| `mmq_args` | gains a per-expert **`expert_bounds`** next to upstream's `tile_spec`: the routed-compact dispatch keys on bounds, upstream's grid on tile_spec, and one compaction now emits both (see below). |
+| `mmid.cu` | `ggml_cuda_launch_mm_ids_helper`'s `tile_spec` became **optional** (the bounds-only callers — the delivery's Q8_1 pair fusion, MMB — pass `nullptr`, and the seam writer returns early). |
+| `quantize.cu` | the delivery's chunked/scatter quantizer body wins over the pre-restructure text it conflicted with (block 08 restructured that kernel; upstream's loop header is the same shape). |
+| `mmvq.cu` (2 hunks) | the delivery's `mmvq_mmid_max_batch_band()` clamp plus upstream's `RDNA4_M` family. |
+| `ggml-cuda.cu` | the delivery's SSM conv-input fusion block and the NVFP4 scale helpers (upstream had removed the block this hunk replaced). |
+
+- status: **DONE** · sha: `af0cae2f1`
 
 ## R10 — block 09: host-resident MoE
 
@@ -495,7 +517,7 @@ climb touched has a maintainer decision recorded.
 | R06 | 05 | `b5d32e0c7` | 9 files expected → 9 files / 48 hunks | build + coherence + derived==packed A/B + q8_0 KV | 2026-11-08 | **derived mask ABI moved to src[6..8]** (kv_rows took src[5]); upstream absorbed the per-ubatch rot fill; no band kernel dropped (`D5`) |
 | R07 | 06 | `75ba21116` | 0 expected → 0 found | build + MMB_DENSE line + byte-identical MMB=0 arm | 2026-11-08 | helper API re-expressed with an optional `expert_bounds` output (MMB's own bounds representation kept) |
 | R08 | 07 | | | | | |
-| R09 | 08 | | | | | |
+| R09 | 08 | `af0cae2f1` | 5 expected → 5 files / 8 hunks | build + MUL_MAT_ID 931/931 + fused/chain byte-identical | 2026-11-08 | `D2` complementary (two template arms); `mmq_args` carries `expert_bounds` next to `tile_spec`; norm-rows gate moved to R11 |
 | R10 | 09 | | | | | |
 | R11 | 10 | | | | | |
 | R12 | 11 | | | | | |

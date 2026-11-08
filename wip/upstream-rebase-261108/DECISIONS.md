@@ -65,7 +65,13 @@ still fires after the merge (`-lv 4` + a shape that reaches it), and that no NVI
 reachable on gfx1201.  `#31047`'s layout change is the real risk to our `mmid`/`mmq` hunks — re-derive, do
 not patch around it.
 
-- status: **OPEN** · rung R01/R09 · record: —
+- status: **DECIDED (R09, 2026-11-08) — complementary, no delivery kernel dropped.**  Upstream's `has_fusion`
+  (interleaved gate/up+GLU in MMQ, `#31188`/`#31288`/`#31296`) and the delivery's `has_gate` (RDNA fused gate)
+  are two template arms on one `mul_mat_q_process_tile` with separate selection predicates, exactly the
+  `#29948` pattern from the previous re-base.  The one structural need was `mmq_args` keeping per-expert
+  `expert_bounds` next to upstream's `tile_spec` (the routed-compact dispatch keys on bounds; one compaction
+  emits both).  Evidence: build + `MUL_MAT_ID` 931/931 + fused/chain byte-identical text.  Rung log: `RUNGS.md`
+  R09.
 
 ## D3 — qwen4exp, the indexer and the sparse selection
 
