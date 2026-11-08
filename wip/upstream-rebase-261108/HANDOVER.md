@@ -16,7 +16,14 @@ qwen4exp, so the rung was a measured choice between two implementations — the 
 with byte-identical text** on the field config, so it stays.  Read `RUNGS.md` → R12 before touching that model.
 A pre-rung fix also landed: `5f412b011` releases the per-graph MMB/BF16 pool blocks in LIFO order (the VMM pool
 asserts it; every qwen3.8 run crawled to a halt on the first compute step without it).
-**Your next job is R13** (block 12, the campaign remainder — the refactor-heaviest rung, `D8`/`D15`).
+**Your next job is R13** (block 12, the campaign remainder).  It is **surveyed and parked**, not started: the
+cherry-pick was examined and rolled back, and `RUNGS.md` → R13 plus **`r13-survey.md`** in this directory are
+the cold-start brief.  It is not one merge but three decisions, each with an oracle: `D15` (the delivery's F1
+`llama_lf_*` layer-input device store vs upstream's `embd_row`/`#31506` — expected subsumption, keep the
+delivery's host-experts guard), the state save/restore batching (delivery `state-pipe` vs upstream's new
+batched `llama_io_write_host` — `gate-state-pipe.sh` decides), and the server prompt-cache residency/parking
+vs upstream's server rework (`gate-park-idle-slots.sh` / `gate-ckpt-reuse.sh` decide).  Two of the eight
+conflicts are mechanical (both event families; the F1 hooks in `llama-graph.cpp`).
 
 ---
 
@@ -30,7 +37,7 @@ asserts it; every qwen3.8 run crawled to a halt on the first compute step withou
 | `master` in `~/llama.cpp` | the **pristine snapshot** at `a691b2345`.  Never commit to it, never rebase onto it directly. |
 | blocks re-based | **12 of 16** — blocks 00-11 = rungs R01-R12 (see the table below) |
 | blocked | none |
-| not started | R13 (block 12) … R16 (block 15 streamed KV), then R17 (the release ladder) |
+| next | **R13 = block 12 — PARKED with a survey** (`r13-survey.md`); then R14 … R16, then R17 (the release ladder) |
 | delivery repo | branch **`rebase-r236`** (main stays at the pre-re-base delivery; the switch-over is R17) |
 | historical | **`r11-resolution.patch`** in this directory — the R11 resolution as it was parked (83 files, +16987/−5484, sha256 `705b7a75f765e58a…`), applies to `5654a5f95`.  Kept as the record of the blocked state; the committed rung carries the fixes it was missing. |
 

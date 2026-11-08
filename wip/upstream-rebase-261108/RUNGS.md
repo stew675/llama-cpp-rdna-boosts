@@ -633,9 +633,17 @@ re-examined if the conflict cost per rung keeps growing (`GREEDY-PURITY.md` §84
 
 - status: **DONE (`D3` DECIDED)** · sha: `b1b0fa807`
 
-## R13 — block 12: campaign remainder (CPU wins, iface fills, DFlash, server)
+## R13 — block 12: campaign remainder (CPU wins, iface fills, DFlash, server) · **PARKED 2026-11-08 (survey in `r13-survey.md`)**
 
-* block sha `be4749a56` · 81 files · +5893 / −995 · **expected conflicts: 8**
+* block sha `be4749a56` · 81 files · +5893 / −995 · **expected conflicts: 8** — found **8 files / 24 hunks**
+* **parked, not blocked**: the cherry-pick was surveyed and rolled back (the branch is at the green R12 tip
+  `b1b0fa807`).  The rung contains **three** places where upstream and the delivery built the same thing, so it
+  needs decisions with measurements rather than a long merge: `D15` (F1 `llama_lf_*` vs upstream's
+  `embd_row`/`#31506`), the state save/restore batching (delivery `state-pipe` vs upstream's new batched
+  `llama_io_write_host`), and the server prompt-cache residency/parking vs upstream's server rework.
+  `wip/upstream-rebase-261108/r13-survey.md` is the cold-start brief: per-file conflict table, the three
+  decisions with the expected resolution and the gate that decides each, and the amended exit criteria
+  (the survey also records that `ggml-backend.cpp`'s conflict is mechanical: free BOTH event families).
 
 | conflicted path | what to expect |
 |---|---|
@@ -738,7 +746,7 @@ climb touched has a maintainer decision recorded.
 | R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
 | R11 | 10 | `ed1d36436` | 8 expected → 8 files / 22 hunks | build + 3-model coherence + `gate-norm-rows-alias.sh` PASS + MUL_MAT_ID 931/931 + every fusion arm byte-identical to the unfused chain | 2026-11-08 | unblocked: pair `ncols_max`→`ntj` (the fault), routed-compact gate on `nchannels_y` + `tile_y_j_max`→`tile_y_j_sup` (two latent delivery-code losses, +1.9 % prefill), two-copy dispatcher reconciled to one (TODO #290 closed, stale delivery duplicates incl. a non-pure conv-input fold removed) |
 | R12 | 11 | `b1b0fa807` | 7 expected → 9 files / 34 hunks | build + 4B/30B unchanged + `gate-hc-fusions.sh` PASS + `gate-qwen4exp-quant-coherence.sh` PASS | 2026-11-08 | **D3 DECIDED by measurement**: upstream has its own qwen4exp; the delivery's is bit-identical on Flash-Next 3-GPU tensor and +31 % decode (70.1 vs 53.5 t/s), neutral on 27B → keep ours; `n_pad` ctor/member dropped (#31200), `get_n_kv` requires n_tokens, `#31733`/`#31073`/`#29510` drift re-derived; quant-coherence gate's model selection fixed; dsv4 soft-arm drift recorded as `TODO` #292 |
-| R13 | 12 | | | | | |
+| R13 | 12 | — (parked) | 8 expected → 8 files / 24 hunks | — | 2026-11-08 | **surveyed and parked** at the R12 tip; three subsumption decisions need measurement (`D15` F1-vs-`embd_row`, state-pipe-vs-`llama_io_write_host`, prompt cache) — see `r13-survey.md` |
 | R14 | 13 | | | | | |
 | R15 | 14 | | | | | |
 | R16 | 15 | | | | | |
