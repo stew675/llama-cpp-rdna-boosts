@@ -470,6 +470,17 @@ in CI.  The model-level gates are manual:
    `ggml_cuda_grid_stall_pad()` or a call site of it, and every release (the site that was missing is what
    issue #277 reported: `get_rows` was unpadded from r46 to r225).
 
+22. **The one-command verdict for a re-base (r236)** — `scripts/gate-rebase-release.sh`.  A re-base has to answer
+    "did we lose performance, and are the numerics still pure?" in one place; this orchestrates the gates that own
+    the rules (build per block, prefill-logit KLD, the `MUL_MAT_ID`/`MUL_MAT` op suites, the coherence texts, the
+    interleaved performance A/B against the shipped build, and the GPU-fault scan scoped to the run's own start)
+    and prints a single PASS/FAIL with exit `0`/`1`.  It adds no thresholds of its own beyond `--tolerance`
+    (default 1.0 % per arm).  **It FAILS rather than skips**: a step that cannot run is a FAIL, so a missing build,
+    model or recorded hash cannot look like a pass.  `--quick` drops the build ladder and the KLD gate while
+    iterating; `--perf-only` is the A/B alone and is also the answer to a `#279`-class "is this still worth
+    implementing on the new base?" question (the arm it guards is the decode arm).  Run it before a tag and paste
+    its verdict into the release's `WORKLOG.md` entry.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

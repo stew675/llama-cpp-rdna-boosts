@@ -24,7 +24,7 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patches/`/`release.json` are cut at R17.
+climbed and its pre-R17 items are closed except `#287` (an upstream candidate) and R17 itself; `patches/`/`release.json` are cut at R17.
 
 ## The open list
 
@@ -41,7 +41,6 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
 | **270** | `llama-batched-bench -c 16384` segfaults on Flash-Next at `-ncmoe 48`, printing nothing | correctness (pre-existing, r215) | **OPEN** — a silent SIGSEGV is a bad failure mode; R17 must pick a context that works — §270 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
-| **279** | narrow-2 (draft compute) must prefer its `cudaMalloc` fallback over evicting arena tables | performance (delivery, re-validation) | **OPEN on r236** — closed pre-re-base as "do not implement"; the slab/arena moved, so the basis is gone — §279 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **283** | `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index | correctness (latent, default off) | **OPEN** — fix when the option is next touched — §283 |
 | **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
@@ -54,7 +53,6 @@ climbed, its remaining items are the `#279`/`#286`-`#301` rows below, and `patch
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
-| **304** | `MUL_MAT_ID` with repeated expert ids **fails for `f16` at `ncols_dst = 9`** (ERR 0.374 vs 5e-4); every other dup case passes.  Upstream keeps those cases `#if 0`, so nothing in `patches/` tests the duplicate path at all | correctness (delivery, narrow `f16`/`mmf` dispatch) | **OPEN** — found 2026-11-08 while re-cutting `#287`; the delivery is **15/16** on upstream's dup suite — §304 |
 
 ## Handle numbering
 
@@ -303,23 +301,6 @@ bisect the context, then check whether it is the compute buffer, the arena or th
 
 **OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
 
-## 279. narrow-2 (draft compute) must prefer its `cudaMalloc` fallback over evicting arena tables (r236 re-validation)
-
-**Status: OPEN on r236** — it was closed on the pre-re-base tree, and the re-base moved the measurement basis
-(see the last paragraph).  The pre-re-base result, kept for the reason it will be re-measured:
-
-Measured **CLOSED 2026-11-07 as "do not implement"** on the pre-re-base tree
-(`archive/work/host-expert-parity/PLAN.md` P1.5, `PR-267-REMAINDER.md` item 5): when the draft's narrow-2 compute
-region fits *outside* the slab, taking the `cudaMalloc` fallback instead of evicting arena tables measured no better
-than the eviction, so the branch was not taken.
-
-The re-base moved the slab and the arena (R10/R11 re-derived the arena, R13 fixed the `hc_combine_norm` pool
-ordering, R16 fixed the `mmb_glu` pool-ordering site and added `GGML_CUDA_POOL_TRACE`), so the *measurement basis*
-is gone.  **Closing it on r236 means one A/B of the branch against `GGML_CUDA_SLAB_MIN_ARENA_MIB`** on the field
-config (35B-A3B or Flash-Next, `-ncmoe`, `-sm layer`), with the arena table count / residency census in the record —
-either it still measures neutral (close it again, with the r236 number) or the re-based slab changed the answer and
-it ships.
-
 ## 282. A mid-run pinned-tier latch perturbs the logits by ~1e-5 (a path difference, not corruption)
 
 **A mid-run pinned-tier latch (`MOE_HOST_POOL_PIN_FAULT=late`) perturbs the logits by ~1e-5, which flips one near-tie token in a 32-token greedy run**: the arm declines a MIXTURE of ops (some cache-served, some stood down) and that mixture reproduces neither `ref` nor the wholesale-stand-down arms, so a box that latches mid-run (the Windows aperture case in #278) does not answer identically to one that does not
@@ -387,8 +368,9 @@ seams, the per-tile `tile_spec` read, `mul_mat_f_ids`'s store loop `continue` + 
 delivery that code is entangled with its gate+up pair fusion, so it has to be written, not lifted.  Acceptance:
 `test-backend-ops -o MUL_MAT_ID -p 'dup=1'` **16/16** on a pristine patched `a691b2345`, the full `MUL_MAT_ID`
 and `MUL_MAT` suites green, no GPU fault, and a launch census showing the duplicate columns are covered.  The
-delivery must stay green too (see `#304` for its own 15/16).  Delivery-neutral: it must not change the delivery
-tree.
+delivery must stay green too -- it is now **16/16** (`#304` closed: the compact-ids MMF kernel was dispatching a
+column tile narrower than the grid its seams were built with, see `WORKLOG.md` 261108.009; that fix is the MMF half
+of what this candidate needs).  Delivery-neutral: it must not change the delivery tree.
 
 ## 290. The dispatcher merge debt must actually LAND with r236 (resolved at R11)
 
@@ -499,32 +481,6 @@ residency/thrash hypothesis is needed.
 
 The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
 never run on RDNA3.5 before this validation.
-
-## 304. `MUL_MAT_ID` duplicate ids: `f16` at `ncols_dst = 9` is wrong (and nothing tests the path)
-
-Found 2026-11-08 while re-cutting `TODO` #287.  Upstream's `[TAG_MUL_MAT_ID_DUPLICATE_ID]` cases
-(`tests/test-backend-ops.cpp`, `test_mul_mat_id_dup`) are `#if 0` with the note *"disabled until CUDA backend
-support is added"* — in **r235 and r236 alike**, because the delivery never re-enabled them.  So the delivery's
-duplicate-id handling (block 00's foundation fix) has been shipping **untested** by its own oracle.
-
-Measured by temporarily enabling them on the r236 tree (fork `2ff384571`) and running
-`test-backend-ops -o MUL_MAT_ID -p 'dup=1'`: **15/16**.  Every `q8_0`/`q4_0` case and the wide `f16` /
-`ids_offset` cases pass; the single failure is
-
-```
-MUL_MAT_ID(type_a=f16, type_b=f32, n_mats=28, n_used=10, b=0, m=1024, n=9, k=256, m_v=0, ids_offset=0,
-           skip=0, dup=1):  ERR = 0.374 > 0.000500   FAIL
-```
-
-i.e. the narrow-`f16` shape only (the compact path there is `mmf`'s, and the delivery's `mmf` delta against
-upstream is only the two gates — so the narrow-width column handling in `mul_mat_f_ids`/the F16 tile loop is the
-suspect).  The `full MUL_MAT_ID` suite is 931/931 with the cases disabled, so nothing else is affected.
-
-**Closing it:** fix the narrow-`f16` compact path, then **enable the dup cases in the delivery's
-`tests/test-backend-ops.cpp`** so the path has a standing oracle (they are upstream's tests; enabling them is a
-test-only change and it is what makes `#287`'s upstream PR checkable against the delivery).  Gates: `dup=1`
-**16/16**, the full `MUL_MAT_ID` suite, `MUL_MAT`, same-seed greedy text on a MoE arm, `check-gpu-faults.sh`.
-The narrow-`f16` path is `mmf`'s, so run it on a box where `mmf` is selected (gfx1201, `ncols_dst <= 16`).
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 

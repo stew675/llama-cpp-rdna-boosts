@@ -1222,6 +1222,44 @@ it).
 
 - status: **DONE, no delivery change** · record: `benchmarks/2026-11-08-dense-mmq-303.md` · `WORKLOG.md` 261108.008 · session 2026-11-08
 
+## P8 — pre-R17: `TODO` #304 fixed (a wrong-answer bug with a standing oracle) and the pre-release verdict automated · **DONE 2026-11-08**
+
+`#304` was the last correctness handle on the pre-R17 list and it was **shipping untested**: upstream keeps the
+`[TAG_MUL_MAT_ID_DUPLICATE_ID]` cases `#if 0` "until CUDA backend support is added", the delivery has had that
+support since block 00, and with the cases enabled it was **15/16** — `f16` at `ncols_dst = 9` returned wrong
+numbers (ERR 0.374 vs 5e-4).
+
+**Cause: two files disagreed about the compact column-tile width.**  `mmf.cu` builds the per-expert
+seam/`tile_spec` grid and sizes `max_tiles` with a **fixed stride of 16**; `mul_mat_f_switch_cols_per_block`
+derived the kernel's `cols_per_block` from `ncols_dst` **clamped to 16**.  For `ncols_dst < 16` the kernel
+therefore processed only that many of every 16-wide tile's columns and **silently dropped the tail of each
+expert's compact range**.  With duplicate ids an expert's range is its `(token, slot)` occurrence count, which can
+be far wider than the token count — so the narrow width was the only broken one (`16/33/64` all clamp to 16) and
+the quantized cases never noticed (they take `mmq`, not `mmf`).
+
+**Fix** (fork `3b0978888`): name the contract — `MMF_IDS_COLS` is used by the seam builder and `max_tiles` in
+`mmf.cu` and by the dispatch in `mmf.cuh`, and the compact path always dispatches that width; the non-compact ids
+path and plain `MUL_MAT` still tile by `ncols_dst`.  **The duplicate cases are enabled** in
+`tests/test-backend-ops.cpp` as the standing oracle (they are what found this; no f16 MoE model exists on the box,
+so the suite is the only oracle for that path).  Verified: `dup=1` **16/16**, full `MUL_MAT_ID` **947/947**, dense
+`MUL_MAT` **2517/2517**.
+
+**`#303` got four more levers, all refuted at instruction level** (occupancy 2→1 for the Q8_0/J=128 row:
+byte-identical kernel; the J tile-width knob: J=128 already optimal, J=64 −4.3 %; the delivery's own dense MMB
+path: −0.15 %; a probe with the whole ids branch compiled out of the kernel: the dense loop still comes back in
+the slow shape).  Six levers total, six null, on a kernel that is upstream's byte for byte — so the 1.2 % dense
+arm stands as an inherited upstream cost and the fix belongs upstream.
+
+**Automation: `scripts/gate-rebase-release.sh`** turns the pre-release question into one command and one verdict —
+state (with `master` pinned at the fork point), build per block, prefill-logit KLD, the `MUL_MAT_ID`/`MUL_MAT`
+oracles, coherence texts against recorded hashes, an **interleaved** performance A/B of every arm against the
+shipped build, and the GPU-fault scan scoped to the run's own start.  It delegates every rule to the gate that
+owns it, **fails rather than skips**, and exits `0`/`1`.  First run (1 round): **dense-27B-prefill −1.20 % FAIL,
+moe-35B-prefill +0.75 % PASS, moe-35B-decode +0.02 % PASS** — `#303` is the only red arm, and the decode arm is
+also the `#279` A/B, so that handle closes on the same run.
+
+- status: **DONE** · fork `3b0978888` (block 00/08 surface: `mmf.cu`/`mmf.cuh` + the delivery's test suite) · `WORKLOG.md` 261108.009 · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1253,6 +1291,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | R17 | — | | | | | |
+| P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |
 | P6 | — | `upstream/recurrent-find-slot-rs-max/` (candidate) | #286/#287/#289/#290: two upstream candidates, one re-cut halved, one pre-check | #286 measured (5 arms), #289 `git apply --check` clean on a691b2345, #287 WIP, #290 pre-checked | 2026-11-08 | found `#304` (delivery is 15/16 on upstream's dup suite) |
 | P5 | — | `2ff384571` (fork, block 05 hunk) | #302: the FA tile loader's per-chunk `kv_rows` select (r236's port) cost 25 % of the FA kernel | fixed (inlined fast path + `__noinline__` kv_rows variant); 30B/35B parity, KLD gate PASS | 2026-11-08 | scratch 376 -> 336 B, 19.6 -> 15.7 ms; residue is the dense `mul_mat_q` (#303) |

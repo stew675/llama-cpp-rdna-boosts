@@ -1,3 +1,65 @@
+## 261108.009 (no release) -- `TODO` #304 fixed (a real wrong-answer bug, with a standing oracle), `#279` closed by the new release gate, and the pre-release verdict is now ONE command
+
+`#303` closed earlier today as an inherited cost; this entry is the other half of the pre-R17 list, plus the
+automation that keeps it from being a memory exercise.
+
+**`#304` — `MUL_MAT_ID` duplicate ids, `f16` at `ncols_dst = 9`: FIXED, wrong numbers, not slow numbers.**  Two files
+disagreed about the compact column-tile width: `mmf.cu` builds the per-expert seam/`tile_spec` grid and sizes
+`max_tiles` with a **fixed stride of 16**, while `mul_mat_f_switch_cols_per_block` derived the kernel's
+`cols_per_block` from `ncols_dst` **clamped to 16** — so for `ncols_dst < 16` the kernel processed only that many
+of every 16-wide tile's columns and **silently dropped the tail of each expert's compact range**.  With duplicate
+ids an expert's range is the number of `(token, slot)` occurrences and can be far wider than the token count,
+which is exactly why only the narrow width broke: `n = 16/33/64` all clamp to 16 and were correct, and the
+quantized cases take `mmq`, not `mmf`.  Fork `3b0978888` names the contract (`MMF_IDS_COLS`, used by the seam
+builder, `max_tiles` and the dispatch) and forces the compact path to that width; the non-compact ids path and
+plain `MUL_MAT` still tile by `ncols_dst`.  **The duplicate cases upstream keeps `#if 0` are now enabled in
+`tests/test-backend-ops.cpp`**, so the path has a standing oracle instead of shipping untested — they are what
+found this.  Verified: `dup=1` **16/16** (was 15/16), full `MUL_MAT_ID` **947/947**, dense `MUL_MAT` **2517/2517**.
+No f16 MoE model exists on the box, so the suite is the only oracle for that path — which is precisely why
+enabling it mattered more than the one-line fix.
+
+**`#303` — four more levers refuted, all at instruction level, none measured to be worth it.**  (1) `__launch_bounds__`
+occupancy 2→1 for the Q8_0/J=128 row: **byte-identical kernel** (the register cap is not binding).  (2) The J (tile
+width) knob, which is a per-shape tuning decision we own: **J=128 is already optimal — J=64 is −4.3 %** (1486 vs
+1552 t/s), and J=96/48 are not instantiated for Q8_0.  (3) The delivery's own dense path (block 06 MMB,
+`MMB_DENSE=1 MMB_DENSE_TYPES=q8_0`): **−0.15 %** — no win, which is why gfx1201 has it off and Q8_0 out of its
+RDNA4 mask.  (4) A probe with the whole ids branch compiled out of the kernel: the dense loop still comes back in
+the slow shape (62 dual-FMA + 52 dual-MUL + 4 unpaired FMA vs the old body's 64 + 54 + 0), so the ids machinery is
+not what shifts the allocation either.  With the earlier `min()` and NVFP4-gating attempts, that is **six levers
+tried, six null**, on a kernel whose code is upstream's byte for byte.  The regression therefore stands as an
+inherited, upstream-side cost; the only place it can be fixed is upstream.
+
+**Automation — `scripts/gate-rebase-release.sh` (new): the whole pre-release verdict in one command.**  A re-base
+has to answer "did we lose performance, and are the numerics still pure?" and doing that by hand is how this
+campaign shipped a wrong launch count, a single-run census and an unpinned attribution base.  The gate is a thin
+orchestrator over the gates that already own the rules — it adds no thresholds of its own beyond the per-arm
+performance tolerance — and it prints one verdict:
+
+| step | what | owned by |
+|---|---|---|
+| 1 | both repos clean, fork tip/tree, `master` **pinned at `a691b2345`**, builds present | itself |
+| 2 | clean build per block commit | `gate-per-block-build.sh --fast` |
+| 3 | prefill-logit KLD (the numerics guarantee) | `gate-prefill-logits.sh` |
+| 4 | `test-backend-ops -o MUL_MAT_ID` (incl. the duplicate-id oracle) and `-o MUL_MAT` | itself |
+| 5 | same-seed greedy text on the coherence arms against recorded hashes | itself |
+| 6 | **interleaved wall clock of every arm against the SHIPPED build**, per-arm ratio | itself |
+| 7 | GPU faults, scoped to this run's own start timestamp | `check-gpu-faults.sh --since` |
+
+It fails rather than skips: a step that cannot run is a FAIL, `WARN`/`INFO` do not fail the run, and the exit
+code is the verdict (`0` releasable, `1` not).  `--quick` drops steps 2-3 while iterating, `--perf-only` is the
+A/B alone, `--tolerance` (default 1.0 %) is the per-arm bound.  First run, `ROUNDS=1`, against r235:
+**dense-27B-prefill −1.20 % (FAIL), moe-35B-prefill +0.75 % (PASS), moe-35B-decode +0.02 % (PASS)** — i.e. the gate
+reproduces `#303` as the single red arm and nothing else.
+
+**`#279` (narrow-2 draft compute preferring `cudaMalloc` over evicting arena tables) — closed with the A/B the
+re-base owed**, which the perf step now performs every run: the arm it guards (`moe-35B-decode`) is **+0.02 %**, so
+the pre-re-base "do not implement" decision still holds on r236 and the slab/arena move did not invalidate it.
+
+**State.**  Fork `rebase-r236` = `3b0978888` (tree records the `#304` hunk), `master` = `a691b2345`, working tree
+clean, `build-rocm`/`build-rocm-r235`/`build-rocm-base` intact.  `patches/`/`release.json`/the fork's `rdna-boosts`
+untouched (cut at R17).  Open before R17: **`#287`** (the upstream candidate, whose MMF half this entry solved) and
+R17 itself; the remaining `TODO.md` entries are the standing performance backlog, not re-base items.
+
 ## 261108.008 (no release) -- `TODO` #303 closes with NO delivery change: the dense MMQ residue is the base commit, and the delivery is bit-identical to upstream in that kernel
 
 No delivery code changed.  `#303` is closed as an **inherited, understood cost**, the record that mis-diagnosed it
