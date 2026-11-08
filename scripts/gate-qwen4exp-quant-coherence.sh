@@ -78,7 +78,10 @@ echo "    logs: $KEEPOUT"
 fails=0
 warns=0
 for q in $QUANTS; do
-    model="$(ls "$MODEL_ROOT/$q"/*.gguf 2>/dev/null | grep -v -e mmproj -e mtp | head -1 || true)"
+    # the quant directory also holds draft assets that are NOT the model under test: mmproj,
+    # the mtp-* draft head and the DFlash2 drafter (which is itself a dflash-arch model and needs
+    # ctx_other, so loading it standalone fails).  Pick the quant's own shard 1.
+    model="$(ls "$MODEL_ROOT/$q"/*.gguf 2>/dev/null | grep -v -e mmproj -e /mtp- -e DFlash -e dflash | head -1 || true)"
     if [ -z "$model" ]; then
         echo "SKIP  $q: no model under $MODEL_ROOT/$q"
         continue

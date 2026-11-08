@@ -8,11 +8,15 @@ old upstream fork point onto the new one, one block per rung, pausing at every p
 and the delivery's may be the same thing.  Nothing here is delivery until R17 — `patches/`, `release.json` and
 the fork stay untouched until then.
 
-**R11 is DONE** (block 10, fork commit `ed1d36436`, tree `d8fb72ad0`): the GPU fault it was blocked on was a
-re-base defect in the MUL_MAT pair fusion, and unblocking it turned up two more latent delivery-code losses and
-a two-copy dispatcher that had to be reconciled to one.  The bisect, the three defects and the measurement traps
-are in `RUNGS.md` → R11; the doctrine they produced is `GREEDY-PURITY.md` §84 plus the `INVARIANTS.md` entries.
-**Your next job is R12** (block 11, qwen4exp) — and its decision point `D3` is the one to read first.
+**R11 and R12 are DONE.**  R11 (block 10, `ed1d36436`) was blocked on a GPU fault that turned out to be a
+re-base defect in the MUL_MAT pair fusion; unblocking it found two more latent delivery-code losses and a
+two-copy dispatcher that had to be reconciled to one (`GREEDY-PURITY.md` §84, and the `INVARIANTS.md` entries).
+R12 (block 11 qwen4exp, `b1b0fa807`) then turned out to be **`D3` in its full form**: upstream carries its own
+qwen4exp, so the rung was a measured choice between two implementations — the delivery's wins by **+31 % decode
+with byte-identical text** on the field config, so it stays.  Read `RUNGS.md` → R12 before touching that model.
+A pre-rung fix also landed: `5f412b011` releases the per-graph MMB/BF16 pool blocks in LIFO order (the VMM pool
+asserts it; every qwen3.8 run crawled to a halt on the first compute step without it).
+**Your next job is R13** (block 12, the campaign remainder — the refactor-heaviest rung, `D8`/`D15`).
 
 ---
 
@@ -24,9 +28,9 @@ are in `RUNGS.md` → R11; the doctrine they produced is `GREEDY-PURITY.md` §84
 | new fork point | **`a691b2345`** (2026-11-08 11:50 +0200) — 318 upstream commits, 947 files, +116932/−45160 |
 | working branch | **`rebase-r236`** in `~/llama.cpp`, currently **`5654a5f95`** (block 09), tree `63ca1523`, clean |
 | `master` in `~/llama.cpp` | the **pristine snapshot** at `a691b2345`.  Never commit to it, never rebase onto it directly. |
-| blocks re-based | **11 of 16** — blocks 00-10 = rungs R01-R11 (see the table below) |
+| blocks re-based | **12 of 16** — blocks 00-11 = rungs R01-R12 (see the table below) |
 | blocked | none |
-| not started | R12 (block 11 qwen4exp) … R16 (block 15 streamed KV), then R17 (the release ladder) |
+| not started | R13 (block 12) … R16 (block 15 streamed KV), then R17 (the release ladder) |
 | delivery repo | branch **`rebase-r236`** (main stays at the pre-re-base delivery; the switch-over is R17) |
 | historical | **`r11-resolution.patch`** in this directory — the R11 resolution as it was parked (83 files, +16987/−5484, sha256 `705b7a75f765e58a…`), applies to `5654a5f95`.  Kept as the record of the blocked state; the committed rung carries the fixes it was missing. |
 
@@ -43,6 +47,9 @@ af0cae2f1 block 08 fused kernels         R09  5 files / 8 h    D2 complementary;
 5654a5f95 block 09 host-resident MoE     R10  7 files / 12 h   D1 first numbers; NO_VMM finding
 ed1d36436 block 10 slab/dispatcher/ring R11  8 files / 22 h   pair ntj fault fixed; compact MoE dispatch revived (+1.9% pp);
                                                               one dispatcher (TODO #290 closed); GREEDY-PURITY §84
+5f412b011 (fix) pool LIFO release      --                    pre-R12: VMM pool assert killed every qwen3.8 run
+b1b0fa807 block 11 qwen4exp            R12  9 files / 34 h    D3 measured: ours is +31% tg on Flash-Next 3-GPU with
+                                                              identical text; upstream's qwen4exp discarded
 ```
 
 ## §0.1  The hard rules of this repo (they are not optional)

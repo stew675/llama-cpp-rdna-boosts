@@ -550,9 +550,16 @@ that only it used.  The interim `GGML_CUDA_FUSE_LEGACY` switch is gone with the 
 
 - status: **DONE** · sha: `ed1d36436` · tree `d8fb72ad0`
 
-## R12 — block 11: qwen4exp
+## R12 — block 11: qwen4exp · **DONE 2026-11-08 (`D3` DECIDED: keep the delivery's implementation, measured)**
 
-* block sha `0e1032213` · 46 files · +12091 / −433 · **expected conflicts: 7**
+* block sha `0e1032213` · 46 files · +12091 / −433 · **expected conflicts: 7** — found 9 files / 34 hunks
+  (the cascades were `llama-memory-recurrent.cpp` and `tests/CMakeLists.txt`)
+* **result: `b1b0fa807`** (tree `7baf3ba40`), build green; dense 4B `1472ebdadd46` and
+  Qwen3-Coder-30B-A3B `013d09f165a5` unchanged; `gate-hc-fusions.sh` **PASS** (5/5 hard arms
+  byte-identical, 449 chars `d62340fbf566`); `gate-qwen4exp-quant-coherence.sh` **PASS**
+  (IQ3_XXS / IQ4_NL / Q4_K_M gather on == off, no `////`)
+* **the headline: upstream already HAS a qwen4exp** (see `D3` below), so this rung was not a
+  port but a choice between two implementations of the same architecture
 
 | conflicted path | what to expect |
 |---|---|
@@ -570,7 +577,61 @@ deciding to keep both, narrow ours, or drop one.
 **Exit:** build + coherence + `scripts/gate-hc-fusions.sh <model.gguf>` (4 arms) +
 `scripts/gate-qwen4exp-quant-coherence.sh`.
 
-- status: **TODO** · sha: —
+### R12 resolution log
+
+**The rung is a fork decision, not a merge.**  `src/models/qwen4exp.cpp` already exists upstream
+(1514 lines, upstream contributors: `#30965` "build the QSA selection without the kq_mask",
+`#31243` "k-pool sparse selection independently of the kq_mask shape", `#31443`, `#30927`,
+`#31086`), with its own HC mix/combine (plain ops), QSA selection (`build_qsa_sel`, an additive
+mask) and indexer (plain ops).  The delivery's is 3197 lines: fused HC ops
+(`GGML_OP_HC_MIX`/`HC_COMBINE`, HC16 planar layout), the mask-free QSA store+top-k selection,
+`INDEXER_SCORE/TOPK/FILL`, a keys-only indexer cache, the MTP sparse draft and the managed lazy
+reader.  Per the maintainer's ruling the decision was **measured first** (`C`: resolve far enough
+to run both, then decide), not taken on the code's shape.
+
+**`D3` measurement** (same GGUFs, same build path, gfx1201, ROCm 10.1, VMM build, `-c 8192`,
+5256-token `prompts/prose-rdna-boosts.txt`, `-n 16 --seed 42 --temp 0`):
+
+| config | implementation | prefill | decode | text |
+|---|---|---|---|---|
+| Flash-Next GSQ-IQ3_XXS, 3 GPU `-sm tensor` | upstream | 1399.7 t/s | 53.5 t/s | `7a8734a9f1a6` |
+| Flash-Next GSQ-IQ3_XXS, 3 GPU `-sm tensor` | **delivery** | **1432.1 t/s** | **70.1 t/s** | `7a8734a9f1a6` (identical) |
+| Qwen3.8-27B UD-Q4_K_M, 1 GPU | upstream | 1311.1 t/s | 32.4 t/s | `b905c9763a58` |
+| Qwen3.8-27B UD-Q4_K_M, 1 GPU | **delivery** | 1303.2 t/s | 32.4 t/s | `b21e94a5b6e1` (diverges) |
+
+On the config this repo validates the delivery's implementation is **bit-identical to upstream's
+and +31 % decode / +2.3 % prefill**; on the 27B it is throughput-neutral and its greedy text
+diverges at 16 tokens, which is a *chain* difference the R17 KLD gate has to quantify, not a
+purity claim in either direction.  **Decision: keep the delivery's implementation** (`D3` →
+DECIDED).  Rationale beyond the numbers: r235's qwen4exp validation and both delivery gates stay
+meaningful, and the fused HC/indexer kernels are what the +31 % *is*.  Cost accepted: we own a
+3200-line model file that upstream keeps rewriting -- the price of the 31 % on this config, to be
+re-examined if the conflict cost per rung keeps growing (`GREEDY-PURITY.md` §84's doctrine).
+
+| site | resolution |
+|---|---|
+| `llama-kv-cache.h/.cpp` | **both indexer flags**: upstream's `is_indexer` (indexer RoPE params) and the delivery's `v_enabled` (keys-only caches).  The delivery's `n_pad` ctor parameter *and* member are dropped -- `#31200` removed them and hardcodes the 256-cell floor in the size math -- so only the derived `n_pad_prefill` (`LLAMA_KV_N_PAD_PREFILL`, `_MIN`, `_FROM`) survives.  `get_n_kv()` now *requires* `n_tokens` (a default of 0 would silently turn the prefill pad off at that call site) and `llama-kv-cache-dsv4.cpp` passes it. |
+| `llama-memory-hybrid-idx.cpp` | the keys-only indexer cache is built with upstream's post-`#31141` ctor (`no_alloc`, no `n_pad`) plus `is_indexer`/`v_enabled`; the pool body is the delivery's. |
+| `llama-memory-recurrent.cpp` | R04 wins (upstream's `rs_max`, the tracker stays dropped); the block's two real additions are kept -- the getenv-once `rs_rollback_debug()` helper (issue #273) and the `has_recr` gate that stops a qwen4exp MTP context (recurrent filter matches nothing) spamming the non-consecutive-position warning. |
+| `models.h`, `qwen4exp.cpp` | `#31733` made `model` a member of `llm_graph_context`, so both ctors lose their `const llama_model &` argument and the class its shadowing member; `#31073` turned the rotation constants into per-layer vectors (`self_k_rot[il]`); `#29510`/`#31683` replaced `get_kq_mask()` with `self_attn_mask.raw`; `build_attn_mha` grew `n_kv_max`. |
+| `ggml-cuda/indexer-score.cu` | `ggml_rope_yarn_corr_dims` gained the truncate flag (2 sites). |
+| `tests/CMakeLists.txt` | R03 had already re-placed every registration this block adds (`#30880`), so only `test-lazy-reader` is new. |
+| `tests/test-llama-archs.cpp` | upstream's `get_model`/`get_model_and_ctx` split kept; the block's `lazy_buf_size` is handed over as `LLAMA_LAZY_BUF_MB` around the load, and the qwen4exp roundtrip passes `256 << 10`. |
+| `tests/test-backend-ops.cpp` | **both** sides' Flash-Attention classes (upstream's `test_flash_attn_ext_kv_rows`, the delivery's `test_flash_attn_qsa`) and both perf-case blocks. |
+
+**Two gate findings (both fixed/recorded here, not deferred):**
+1. `gate-qwen4exp-quant-coherence.sh` picked the **DFlash2 drafter** as the model under test (its
+   `ls | grep -v -e mmproj -e mtp | head -1` predates the DFlash asset landing in the quant
+   directory), so every arm failed with "dflash requires ctx_other to be set".  Fixed: the
+   selection now excludes `mtp-*`/`DFlash`/`dflash`.  Re-run: PASS on all three quants.
+2. `gate-hc-fusions.sh`'s two REPORTED `dsv4_pre`/`dsv4_post` arms no longer agree with the chain
+   on the BF16-hc class: chain `d62340fbf566`, dsv4 arms `6a102dbc62d6` -- which is the value the
+   *chain* produced at r235.  So the HC chain itself moved with the re-base while the fused
+   pre/post ops still reproduce the old numerics; the gate reports (does not fail) them, but its
+   own header says byte-identity is expected on this class.  Recorded as `TODO` #292 for the R17
+   KLD gate (and a decision on the soft-arm expectation).
+
+- status: **DONE (`D3` DECIDED)** · sha: `b1b0fa807`
 
 ## R13 — block 12: campaign remainder (CPU wins, iface fills, DFlash, server)
 
@@ -670,7 +731,7 @@ climb touched has a maintainer decision recorded.
 | R09 | 08 | `af0cae2f1` | 5 expected → 5 files / 8 hunks | build + MUL_MAT_ID 931/931 + fused/chain byte-identical | 2026-11-08 | `D2` complementary (two template arms); `mmq_args` carries `expert_bounds` next to `tile_spec`; norm-rows gate moved to R11 |
 | R10 | 09 | `5654a5f95` | 7 expected → 7 files / 12 hunks | build + dense coherence + D1 arms (VMM build) | 2026-11-08 | **arena needs `GGML_HIP_NO_VMM=OFF`** (upstream default is ON, so the tier is inert on the stock build); D1 first numbers: upstream cache +17.6% decode |
 | R11 | 10 | `ed1d36436` | 8 expected → 8 files / 22 hunks | build + 3-model coherence + `gate-norm-rows-alias.sh` PASS + MUL_MAT_ID 931/931 + every fusion arm byte-identical to the unfused chain | 2026-11-08 | unblocked: pair `ncols_max`→`ntj` (the fault), routed-compact gate on `nchannels_y` + `tile_y_j_max`→`tile_y_j_sup` (two latent delivery-code losses, +1.9 % prefill), two-copy dispatcher reconciled to one (TODO #290 closed, stale delivery duplicates incl. a non-pure conv-input fold removed) |
-| R12 | 11 | | | | | |
+| R12 | 11 | `b1b0fa807` | 7 expected → 9 files / 34 hunks | build + 4B/30B unchanged + `gate-hc-fusions.sh` PASS + `gate-qwen4exp-quant-coherence.sh` PASS | 2026-11-08 | **D3 DECIDED by measurement**: upstream has its own qwen4exp; the delivery's is bit-identical on Flash-Next 3-GPU tensor and +31 % decode (70.1 vs 53.5 t/s), neutral on 27B → keep ours; `n_pad` ctor/member dropped (#31200), `get_n_kv` requires n_tokens, `#31733`/`#31073`/`#29510` drift re-derived; quant-coherence gate's model selection fixed; dsv4 soft-arm drift recorded as `TODO` #292 |
 | R13 | 12 | | | | | |
 | R14 | 13 | | | | | |
 | R15 | 14 | | | | | |

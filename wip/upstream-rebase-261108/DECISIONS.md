@@ -104,7 +104,20 @@ gate, and the indexer/sparse census lines, across (a) delivery fusions on, (b) `
 (the chain), (c) the derived-mask kill switch, (d) the sparse arm off.  Judge the fused arm against the
 chain, never against the default (`MANIFESTS.md` gate 3, `GREEDY-PURITY.md` §81).
 
-- status: **OPEN** · rung R12 (residue in R06/R16) · record: —
+- status: **DECIDED (R12, 2026-11-08) — keep the delivery's implementation, and it was measured,
+  not assumed.**  Upstream turns out to carry its own qwen4exp (1514 lines, `#30965`/`#31243`/`#31443`/
+  `#30927`/`#31086`) with plain-op HC mix/combine, a mask-based `build_qsa_sel` and a plain-op indexer;
+  the delivery's (3197 lines) has fused HC ops, the mask-free store+top-k selection, the indexer
+  ops and a keys-only indexer cache.  Same GGUFs, same build, `-c 8192`, 5256-token prompt:
+  Flash-Next GSQ-IQ3_XXS 3 GPU `-sm tensor` — upstream **1399.7 / 53.5** t/s (pp/tg), delivery
+  **1432.1 / 70.1**, **text byte-identical** (`7a8734a9f1a6`) → the delivery's wins by **+31 % decode**
+  with no numeric difference at all; Qwen3.8-27B UD-Q4_K_M 1 GPU — upstream 1311.1 / 32.4, delivery
+  1303.2 / 32.4 (neutral) and the greedy text diverges (`b905c9763a58` vs `b21e94a5b6e1`), which the
+  R17 KLD gate must quantify (a chain difference, not a purity claim).  So: neither "subsumed" nor a
+  preference — the delivery's implementation is the faster one exactly where this repo validates, and
+  keeping it keeps r235's qwen4exp validation and both delivery gates meaningful.  Cost accepted: the
+  3200-line model file stays ours while upstream keeps rewriting it.  Rung: `b1b0fa807`; log in
+  `RUNGS.md` → R12.
 
 ## D4 — The recurrent rollback bound: upstream enforces what we track and warn about
 
