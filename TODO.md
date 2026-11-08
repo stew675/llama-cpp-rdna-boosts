@@ -579,9 +579,22 @@ On UMA the "mirror" and the weights are the same physical memory pool, so the MA
 the `kv_pool_invalidate()` / dirty-refill protocol) is reasoning about two kinds of memory that are one here.
 It may also be the per-device counter/page-table single-instance path (`bad` varies).
 
-**Until this is fixed, block 15's pool must not be claimed for gfx1151** (`patches/README.md` block 15 records
-it).  The window and the sparse arm are unaffected.  Pre-existing: the pool shipped in r235 and was never run on
-RDNA3.5 before this validation.
+**Mitigated at r236 (`2aac85e78`): the pool now DECLINES on a shared host/device pool** (any
+`GGML_BACKEND_DEVICE_TYPE_IGPU` device) with one message naming RDNA3.5/gfx1151 and this item, and the KV takes the
+plain device buffer; `gate-kv-residency.sh` grades that decline (once per arm, no arm engaging the placement,
+`pref == pres == pfloor`) instead of grading numbers that cannot exist.  So no consumer can trip the defect by
+opting in on an APU.
+
+**Still owed: the fix.**  Prime suspect is the tier's own model: a pinned host *mirror* plus DMA fills is a
+discrete-GPU design, and on UMA the mirror and the weights are one physical pool, so the MARK/CLAIM/MAP+FILL
+ordering, `kv_pool_invalidate()` and the dirty-refill protocol are reasoning about two kinds of memory that are
+one.  The per-device counter/page-table single-instance path is the second candidate (`bad` varies run to run).
+Start from the gate's `pres` + `LLAMA_KV_POOL_VERIFY=1` arm, which reproduces in ~5 min on halo and needs no
+20-minute prefill (any `-c` works) — and from the fact that a *fully resident* pool is already wrong, so no
+residency/thrash hypothesis is needed.
+
+The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
+never run on RDNA3.5 before this validation.
 
 ## Where the current lists live
 

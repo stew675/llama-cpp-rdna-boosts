@@ -381,6 +381,28 @@ if [ "$DO_POOL" = 1 ]; then
 
     HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of pfloor)
     info "pref text: $HPRE    pres: $HPRES    pfloor: $HPFLR"
+
+    # A shared host/device memory pool (an integrated GPU, e.g. RDNA3.5 / gfx1151) REJECTS the pool: the mirror
+    # is not a separate memory tier there and the page table is not correct on such a device yet (TODO #300).
+    # That decline is the designed behaviour, so on that platform the section asserts the DECLINE plus "nothing
+    # changed", instead of the placement's residency numbers -- the same treatment a declined park gets.
+    if [ "$(count pres 'SHARED host/device pool')" -ge 1 ]; then
+        info "the pool was DECLINED on this platform (shared host/device memory pool -- an integrated GPU;"
+        info "  the window and the sparse arm are the supported placements there, TODO #300):"
+        [ "$HPRE" = "$HPRES" ] && [ "$HPRE" = "$HPFLR" ] \
+            && pass "the declined pool changed no token (pref == pres == pfloor = $HPRE)" \
+            || fail "the pool DECLINED but the text changed: '$HPRE' / '$HPRES' / '$HPFLR'"
+        [ "$(count pres 'ATTENDANCE POOL ENABLED')" = 0 ] && [ "$(count pfloor 'ATTENDANCE POOL ENABLED')" = 0 ] \
+            && pass "no pool arm engaged the placement (nothing to verify, nothing to get wrong)" \
+            || fail "an arm reported 'ATTENDANCE POOL ENABLED' while another reported the decline: the guard and the placement disagree"
+        info "-- pool section: DECLINED BY DESIGN on this platform (not a pass of the placement's numbers)"
+    else
+    [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
+        && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
+        || fail "pres != pref: '$HPRE' vs '$HPRES'"
+    [ -n "$HPRE" ] && [ "$HPRE" = "$HPFLR" ] \
+        && pass "pfloor == pref (a pool claimed out under pressure changes no token)" \
+        || fail "pfloor != pref: '$HPRE' vs '$HPFLR'"
     [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
         && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
         || fail "pres != pref: '$HPRE' vs '$HPRES'"
@@ -468,6 +490,7 @@ resident pool"
     awk -v a="$H_FLR" -v b="$H_RES" 'BEGIN { exit !(a+0 < b+0) }' \
         && pass "pfloor's hit rate is lower ($H_FLR % vs $H_RES %)" \
         || fail "the two pool arms report the same hit rate ($H_FLR % vs $H_RES %)"
+    fi   # end: placement graded (discrete GPU) | decline graded (shared host/device pool)
 
 fi
 
