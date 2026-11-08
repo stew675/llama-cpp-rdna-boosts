@@ -32,7 +32,8 @@
 #   longer matches the weights) and that is fine: the target verifies every proposed token.
 #   HARD  * every request answers in every arm (the #272 failure is a HTTP 500 on a follow-up turn)
 #   HARD  * no `inconsistent sequence positions`, no `failed to process speculative batch`, no abort in any
-#           log, and `check-gpu-faults.sh` clean is the caller's job
+#           log, and the kernel journal clean over this gate's own window (`check-gpu-faults.sh --since <the
+#           gate's start>`, issue #294; `--no-faults` skips it)
 #   HARD  * the tail arms really windowed (`every layer has a N-position window`), or the arm is vacuous
 #   HARD  * each turn really added more than the window (`prompt_n > window` on turns 2 and 3), or the reuse
 #           jump this gate exists for was never created
@@ -42,7 +43,7 @@
 #   INFO  cached tokens, draft acceptance per arm
 #
 # Usage:
-#   ./gate-spec-reuse-window.sh [--keep]
+#   ./gate-spec-reuse-window.sh [--keep] [--no-faults]
 #
 # Environment:
 #   LLAMA_SERVER  llama-server binary  (default: ~/llama.cpp/build-rocm/bin/llama-server)
@@ -75,12 +76,15 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 DERIVED="${DERIVED:-$KEEPOUT/draft-nomrope.gguf}"
 mkdir -p "$KEEPOUT"
+KEEP=0
+FAULTS=1
 
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--keep] [--no-faults]" >&2; exit 2 ;;
     esac
 done
 
@@ -95,6 +99,9 @@ if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     echo "ERROR: something is already listening on port $PORT (set PORT=...)" >&2
     exit 2
 fi
+
+# The kernel journal is shared between runs, so the fault window starts here, before the first server (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 # derive the non-M-RoPE copy of the draft: zero `dflash.rope.dimension_sections` in place (a metadata-only
 # edit of a copy).  A draft that has no sections already takes the strict path - then the copy is skipped.
@@ -306,6 +313,25 @@ for arm in strict strict0 mrope mrope0; do
     acc=$(grep "draft acceptance" "$KEEPOUT/$arm/log.txt" | sed 's/.*draft acceptance = /  /' | tr '\n' ' ')
     [ -n "$acc" ] && echo "INFO  $arm: draft acceptance$acc"
 done
+
+# the kernel journal, scoped to this gate's own window (#294: an unscoped or fixed "N min ago" window fails
+# on an earlier run's fault, which is a verdict about the journal and not about the code under test)
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    echo
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for arm in strict strict0 mrope mrope0; do
+        [ -f "$KEEPOUT/$arm/log.txt" ] && log_args+=(--log "$KEEPOUT/$arm/log.txt")
+    done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"
+        echo "$out" | sed 's/^/      /'
+        fails=$((fails + 1))
+    fi
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

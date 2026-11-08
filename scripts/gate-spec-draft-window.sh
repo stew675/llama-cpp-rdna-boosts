@@ -15,7 +15,8 @@
 #
 # WHAT IT CHECKS
 #   HARD  * every request answers on both arms (the #264 failure is a HTTP 500 on the second slot)
-#   HARD  * no `GGML_ASSERT` / abort in either log, and `check-gpu-faults` clean is the caller's job
+#   HARD  * no `GGML_ASSERT` / abort in either log, and the kernel journal clean over this gate's own window
+#           (`check-gpu-faults.sh --since <the gate's start>`, issue #294; `--no-faults` skips it)
 #   HARD  * win == win0 byte for byte on every step.  The window is drafter-only: the target verifies every
 #           proposed token, so a windowed drafter can lose acceptance and can never change the text
 #   HARD  * the win arm really windowed, and windowed PER SEQUENCE: the draft reserve line must report
@@ -26,7 +27,7 @@
 #         is not a failure; a *text* difference is)
 #
 # Usage:
-#   ./gate-spec-draft-window.sh [--keep]
+#   ./gate-spec-draft-window.sh [--keep] [--no-faults]
 #
 # Environment:
 #   LLAMA_SERVER   llama-server binary   (default: ~/llama.cpp/build-rocm/bin/llama-server)
@@ -66,6 +67,8 @@ PORT="${PORT:-18102}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
+KEEP=0
+FAULTS=1
 
 # the second slot must NOT share a prefix with the first (a shared prefix is served through seq_cp and
 # would not exercise a second sequence's own cells)
@@ -86,8 +89,9 @@ esac
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--keep] [--no-faults]" >&2; exit 2 ;;
     esac
 done
 
@@ -100,6 +104,9 @@ if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     echo "ERROR: something is already listening on port $PORT (set PORT=...)" >&2
     exit 2
 fi
+
+# The kernel journal is shared between runs, so the fault window starts here, before the first server (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 # drive one arm: start the server, run A-F, stop it.  Writes $arm/{log.txt,steps.json}.
 run_arm() {
@@ -285,6 +292,22 @@ for arm in win win0; do
     acc=$(grep "draft acceptance" "$KEEPOUT/$arm/log.txt" | sed 's/.*draft acceptance = /  /' | tr '\n' ' ')
     [ -n "$acc" ] && echo "INFO  $arm: draft acceptance$acc"
 done
+
+# the kernel journal, scoped to this gate's own window (#294: an unscoped or fixed "N min ago" window fails
+# on an earlier run's fault, which is a verdict about the journal and not about the code under test)
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    echo
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" \
+            --log "$KEEPOUT/win/log.txt" --log "$KEEPOUT/win0/log.txt" 2>&1)"; then
+        echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and both arm logs clean"
+    else
+        echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"
+        echo "$out" | sed 's/^/      /'
+        fails=$((fails + 1))
+    fi
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

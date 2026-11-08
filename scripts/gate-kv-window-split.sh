@@ -43,7 +43,7 @@
 # require both to PASS (that is the arm that caught the 2-D state copy of a windowed split).
 #
 # Usage:
-#   ./scripts/gate-kv-window-split.sh [--keep]
+#   ./scripts/gate-kv-window-split.sh [--keep] [--no-faults]
 #
 # Environment:
 #   LLAMA_CLI / LLAMA_FIT   binaries (default: ~/llama.cpp/build-rocm/bin/llama-cli / llama-fit-params)
@@ -67,14 +67,18 @@ PROMPT="${PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
 NGEN="${NGEN:-64}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 KEEP=0
+FAULTS=1
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
         *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 mkdir -p "$KEEPOUT"
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ] || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -x "$LLAMA_FIT" ] || { echo "error: no llama-fit-params at $LLAMA_FIT" >&2; exit 2; }
@@ -306,6 +310,21 @@ fit_arm fit-off 0,1 524288 LLAMA_KV_RESIDENT_CELLS=65536 LLAMA_KV_REGION=0 --
 [ "$(grep -ci 'windowed' "$KEEPOUT/fit-off.err" || true)" = 0 ] \
     && pass "fit-off (LLAMA_KV_REGION=0) says nothing about a window" \
     || fail "fit-off still reported a window"
+
+# ---------------------------------------------------------------------------------------------------------
+echo
+# the kernel journal, scoped to this gate's own window (#294)
+if [ "$FAULTS" = 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.err; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        pass "GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        fail "GPU faults:"; echo "$out" | sed 's/^/      /'
+    fi
+fi
 
 # ---------------------------------------------------------------------------------------------------------
 echo

@@ -58,7 +58,7 @@
 #   blk.0 hc_attn_* tensor types) without running anything.
 #
 # Usage:
-#   ./gate-hc-fusions.sh [MODEL.gguf]
+#   ./gate-hc-fusions.sh [--no-faults] [MODEL.gguf]
 #   ./gate-hc-fusions.sh --types MODEL.gguf
 # Environment:
 #   MODEL        GGUF path          (default: $MODEL_ROOT/GSQ-IQ3_XXS/... the BF16-hc class)
@@ -70,6 +70,7 @@
 #   EXTRA_ARGS   extra llama-cli args (e.g. "-ngl 99 -sm tensor -ncmoe 40")
 #   KEEPOUT      dir for the per-arm logs (default: mktemp -d)
 #   TIME_LIMIT   per-arm timeout, seconds (default: 3000)
+#   --no-faults  skip the kernel-journal fault check (a box with no readable kernel log)
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -162,7 +163,18 @@ if [ "${1:-}" = "--types" ]; then
     exit $?
 fi
 
-MODEL="${1:-${MODEL:-$MODEL_ROOT/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}}"
+FAULTS=1
+MODEL_ARG=""
+for a in "$@"; do
+    case "$a" in
+        --no-faults) FAULTS=0 ;;
+        -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+        -*) echo "usage: $0 [--no-faults] [MODEL.gguf]" >&2; exit 2 ;;
+        *) MODEL_ARG="$a" ;;
+    esac
+done
+
+MODEL="${MODEL_ARG:-${MODEL:-$MODEL_ROOT/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}}"
 
 [ -x "$LLAMA_CLI" ] || { echo "FAIL: llama-cli not executable: $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL" ]     || { echo "FAIL: model not found: $MODEL" >&2; exit 2; }
@@ -170,6 +182,8 @@ command -v python3 >/dev/null || { echo "FAIL: python3 required" >&2; exit 2; }
 [ -f "$REPO_DIR/scripts/extract-generated.py" ] || { echo "FAIL: extractor not found" >&2; exit 2; }
 
 mkdir -p "$KEEPOUT"
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 PROMPT_SHA="$(printf '%s' "$PROMPT" | sha256sum | awk '{print $1}')"
 
 echo "==> qwen4exp hyper-connection fusion-equivalence gate"
@@ -249,6 +263,21 @@ for arm in "${ARMS[@]}"; do
 done
 
 echo
+# the kernel journal, scoped to this gate's own window (#294)
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.log; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        echo "PASS: no GPU fault in the kernel journal (since ${GATE_SINCE_TS:-start}) or the arm logs"
+    else
+        echo "FAIL: a GPU fault was recorded during the arms (since ${GATE_SINCE_TS:-the journal start}):"
+        echo "$out" | sed 's/^/      /'
+        fails=$((fails + 1))
+    fi
+fi
+
 if [ "$fails" -ne 0 ]; then
     echo "FAIL: $fails arm(s) disagreed with the unfused chain (see $KEEPOUT)"
     exit 1

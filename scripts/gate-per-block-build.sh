@@ -46,6 +46,9 @@
 #       shared header, or once for a re-base when you want the strongest statement.
 #   Do NOT read a fast-profile pass as "every target builds in every block" — it is not that claim.
 #
+# This gate has NO kernel-journal fault check, by design: it only compiles (it never loads a model or
+# dispatches a kernel), so it cannot record a GPU fault.  The runs that can are the block gates (#294).
+#
 # Usage:
 #   ./gate-per-block-build.sh [options]
 #

@@ -31,8 +31,12 @@
 #   is kept OUT of the text arms because verbose logging interleaves statistics into the generated text
 #   (see scripts/extract-generated.py).
 #
+# The fault check (last section) reads the kernel journal through `check-gpu-faults.sh`, scoped to a timestamp
+# taken before the first arm starts (`--since`), so a fault left by an earlier run in the same session cannot
+# fail this gate -- issue #294.  `--no-faults` skips it, for a box with no readable kernel log.
+#
 # Usage:
-#   ./gate-grid-stall-pad.sh
+#   ./gate-grid-stall-pad.sh [--no-faults]
 # Environment:
 #   BUILD_DIR   llama.cpp build tree                (default: ~/llama.cpp/build-rocm)
 #   TBO         test-backend-ops                    (default: $BUILD_DIR/bin/test-backend-ops)
@@ -76,6 +80,15 @@ MOE_ARM="${MOE_ARM:-1}"
 # The four GET_ROWS launch sites the pad covers (issue #277).  Each must appear in the pad arm's census.
 GET_ROWS_SITES="get_rows_float_vec get_rows_float get_rows_q get_rows_kq"
 
+FAULTS=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-faults) FAULTS=0; shift ;;
+        -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+        *) echo "usage: $0 [--no-faults]" >&2; exit 2 ;;
+    esac
+done
+
 fails=0
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
 note() { echo "    $*"; }
@@ -84,6 +97,10 @@ echo "==> gfx1201 grid-stall pad gate (issues #273 / #277)"
 echo "    build=$BUILD_DIR"
 echo "    logs=$KEEPOUT"
 mkdir -p "$KEEPOUT"
+
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+# A fixed "N min ago" window both fails on an earlier run's fault and misses its own early arms on a long run.
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 # -----------------------------------------------------------------------------------------------------
 # A. the op oracle: every get_rows launch pads, and the padded launch matches the CPU reference
@@ -219,14 +236,20 @@ if [ "$B_ARM" -eq 1 ]; then
     if [ "$MOE_ARM" -eq 1 ]; then
         model_pair moe "$MODEL_MOE" "$GPU" "$EXTRA_MOE"
     fi
+fi
 
-    if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
-        echo
-        echo "==> GPU faults"
-        # shellcheck disable=SC2046
-        "$REPO_DIR/scripts/check-gpu-faults.sh" $(for f in "$KEEPOUT"/*.log; do printf -- '--log %s ' "$f"; done) |
-            sed 's/^/    /' || fail "a GPU fault was recorded during the arms"
-    fi
+# -----------------------------------------------------------------------------------------------------
+# the fault check: scoped to this gate's own journal window (#294)
+# -----------------------------------------------------------------------------------------------------
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    echo
+    echo "==> GPU faults (since ${GATE_SINCE_TS:-the start of the journal})"
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.log; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    "$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" |
+        sed 's/^/    /' || fail "a GPU fault was recorded during the arms"
 fi
 
 echo

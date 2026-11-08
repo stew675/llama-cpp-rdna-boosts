@@ -151,6 +151,9 @@ PORT="${PORT:-18301}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
+# the fault window starts here, before the first server (#294): a fixed "N min ago" guess reaches back into an
+# earlier run's fault and, on a gate that runs longer than the guess, misses its own first arms
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 KEEP=0
 FAULTS=1
@@ -403,9 +406,11 @@ done
 
 if [ "$FAULTS" -eq 1 ]; then
     if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+        since_args=()
+        [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
         logs=""
         for f in "$KEEPOUT"/*/log.txt; do logs="$logs --log $f"; done
-        out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --since "120 min ago" $logs 2>&1)"
+        out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" $logs 2>&1)"
         if [ $? -ne 0 ]; then
             echo "FAIL  GPU faults:"; echo "$out" | sed 's/^/      /'
             fails=$((fails + 1))

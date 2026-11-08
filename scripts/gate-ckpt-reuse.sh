@@ -27,7 +27,7 @@
 #         delta at the end (the recycled buffers are retained host memory)
 #
 # Usage:
-#   ./gate-ckpt-reuse.sh [--keep]
+#   ./gate-ckpt-reuse.sh [--keep] [--no-faults]
 #
 # Environment:
 #   LLAMA_SERVER   llama-server binary    (default: ~/llama.cpp/build-rocm/bin/llama-server)
@@ -62,6 +62,8 @@ PORT="${PORT:-18098}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
+# the fault window starts here, before the first server (#294)
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 case "$NGPU" in
   1) DEVS=0 ;;
@@ -71,11 +73,14 @@ case "$NGPU" in
   *) DEVS="$NGPU" ;;
 esac
 
+KEEP=0
+FAULTS=1
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         -h|--help) sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--keep] [--no-faults]" >&2; exit 2 ;;
     esac
 done
 
@@ -302,11 +307,15 @@ rc=$?
 [ "$rc" -ne 0 ] && fails=$((fails + 1))
 
 # the only valid GPU-fault check: the kernel journal plus the arm logs, with the echoed prompts stripped.
-# --since is required, as in gate-state-pipe.sh / gate-spec-align.sh: without it check-gpu-faults.sh reads the
-# whole boot's journal, so any fault from an EARLIER session fails a clean run (a stale page fault from the
-# previous evening failed the r164 release run while the gate's own arm logs were clean)
-if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
-    fault_out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --since "30 min ago" --log "$KEEPOUT/keep/log.txt" 2>&1)"
+# --since is required: without it check-gpu-faults.sh reads the whole boot's journal, so any fault from an
+# EARLIER session fails a clean run (a stale page fault from the previous evening failed the r164 release run
+# while the gate's own arm logs were clean).  The window is this gate's own start timestamp, not a fixed
+# "N min ago" guess: a fixed window both reaches back into an earlier run's fault and, on a gate that runs
+# longer than the guess, misses its own first arms (#294).
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    fault_out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" --log "$KEEPOUT/keep/log.txt" 2>&1)"
     fault_rc=$?
     if [ "$fault_rc" -eq 0 ]; then
         echo "PASS  no GPU fault in the kernel journal or the keep arm's log"

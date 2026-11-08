@@ -8,6 +8,13 @@ Conventions: all paths default to this repo (found relative to the script), a `r
 for any number the script needs (fork point, tip, tree, block count, hashes) so nothing is hard-coded twice,
 and every script is safe to run from any directory.
 
+**Every gate that puts work on the GPU ends with the same fault check**: `check-gpu-faults.sh` scoped to a
+timestamp taken **before the gate's first arm** (`--since`), over **every log the gate wrote**, with
+`--no-faults` as the only opt-out and a PASS line so a skipped check cannot look like a clean one.  The kernel
+journal is shared between runs, so an unscoped check (or a fixed `"N min ago"` window) fails on an earlier
+arm's fault — and a window shorter than the gate *misses* its own early arms.  `gate-per-block-build.sh` is the
+one exception: it only compiles.  See `TODO` #294's record (`WORKLOG.md` 261108.002).
+
 ## The two flows
 
 **Apply + verify (the consumer / developer path)**

@@ -91,6 +91,8 @@ PORT="${PORT:-18101}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
+# the fault window starts here, before the first server (#294)
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 case "$NGPU" in
   1) DEVS=0 ;;
@@ -246,7 +248,9 @@ done
 
 if [ "$FAULTS" -eq 1 ]; then
     if [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
-        out="$("$REPO_DIR/scripts/check-gpu-faults.sh" --since "30 min ago" \
+        since_args=()
+        [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+        out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" \
                  --log "$KEEPOUT/pipe/log.txt" --log "$KEEPOUT/copy0/log.txt" \
                  --log "$KEEPOUT/pipe1/log.txt" \
                  --log "$KEEPOUT/read1/log.txt" --log "$KEEPOUT/sync/log.txt" 2>&1)"

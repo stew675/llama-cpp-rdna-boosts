@@ -83,7 +83,7 @@
 #   (`context` MiB in this log), which the gate prints for the arm it matters on.
 #
 # Usage:
-#   ./scripts/gate-kv-residency.sh [--keep] [--window-only|--pool-only|--multi-only]
+#   ./scripts/gate-kv-residency.sh [--keep] [--no-faults] [--window-only|--pool-only|--multi-only]
 #
 # Environment:
 #   LLAMA_CLI    binary (default: ~/llama.cpp/build-rocm/bin/llama-cli)
@@ -134,12 +134,14 @@ MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 REUSE="${REUSE:-0}"
 KEEP=0
+FAULTS=1
 DO_WINDOW=1
 DO_POOL=1
 DO_MULTI=1
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         --window-only) DO_POOL=0; DO_MULTI=0 ;;
         --pool-only) DO_WINDOW=0 ;;
         --multi-only) DO_WINDOW=0; DO_POOL=0 ;;
@@ -148,6 +150,8 @@ for arg in "$@"; do
     esac
 done
 mkdir -p "$KEEPOUT"
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ]      || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL_WIN" ]      || { echo "error: no model at $MODEL_WIN" >&2; exit 2; }
@@ -584,6 +588,22 @@ if [ "$DO_POOL" = 1 ]; then
     done
     ctx=$(grep -m1 -oE 'context +[0-9]+' "$KEEPOUT/pres.err")
     [ -n "$ctx" ] && printf '  %-7s --fit sees: %s MiB of the memory table (the arena consequence)\n' "pres" "$ctx"
+fi
+
+# ---------------------------------------------------------------------------------------------------------
+echo
+# the kernel journal, scoped to this gate's own window (#294).  This gate runs 25-40 min and starts many
+# servers, so a fixed window would miss its own early arms; the start timestamp is the only correct window.
+if [ "$FAULTS" = 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.err "$KEEPOUT"/*.out; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        pass "GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        fail "GPU faults:"; echo "$out" | sed 's/^/      /'
+    fi
 fi
 
 # ---------------------------------------------------------------------------------------------------------

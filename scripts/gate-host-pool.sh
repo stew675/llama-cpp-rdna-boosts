@@ -92,7 +92,7 @@
 #   INFO  the pool's pinned size/slot count, its hit rate, the fill mode and the throughput per arm
 #
 # Usage:
-#   ./gate-host-pool.sh [--keep]
+#   ./gate-host-pool.sh [--keep] [--no-faults]
 #
 # Environment:
 #   LLAMA_CLI   llama-cli binary   (default: ~/llama.cpp/build-rocm/bin/llama-cli)
@@ -130,13 +130,17 @@ KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
 
 KEEP=0
+FAULTS=1
 for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
+        --no-faults) FAULTS=0 ;;
         -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
-        *) echo "usage: $0 [--keep]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--keep] [--no-faults]" >&2; exit 2 ;;
     esac
 done
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ] || { echo "ERROR: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL" ]     || { echo "ERROR: no model at $MODEL" >&2; exit 2; }
@@ -436,6 +440,21 @@ for a in ref dio nodisk fail late pinlate pin0; do
         ok "$a: no abort"
     fi
 done
+
+echo
+# the kernel journal, scoped to this gate's own window (#294)
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    hard
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*/err.txt; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        ok "GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        fail "GPU faults:"; echo "$out" | sed 's/^/      /'
+    fi
+fi
 
 echo
 echo "==> $((CHECKS - FAILED))/$CHECKS checks passed"

@@ -104,6 +104,9 @@
 #                                    to this gate unless the arm is `--sm tensor` on >= 2 devices.
 #   --timeout N       TIMEOUT        per-run seconds (default 1800)
 #   --keep            KEEP=1         keep the per-run logs
+#   --no-faults       FAULTS=0       skip the kernel-journal fault check (a box with no readable
+#                                    kernel log).  By default the journal is checked over this gate's
+#                                    own window, i.e. from a timestamp taken before the first run (#294)
 #   --extra "ARGS"    PPL_EXTRA      extra llama-perplexity arguments, word-split (default: none).
 #                                    Needed to gate a configuration that is not the all-GPU default --
 #                                    e.g. a host-expert arm: --extra "-ncmoe 40 --host-experts pool".
@@ -144,6 +147,7 @@ SM="${SM:-}"
 PPL_EXTRA="${PPL_EXTRA:-}"
 TIMEOUT="${TIMEOUT:-1800}"
 KEEP="${KEEP:-0}"
+FAULTS="${FAULTS:-1}"
 ALLOW_BASE_MISMATCH=0
 
 RECORD=0
@@ -179,6 +183,7 @@ while [ $# -gt 0 ]; do
         --sm)                   SM="$2"; shift 2 ;;
         --timeout)              TIMEOUT="$2"; shift 2 ;;
         --keep)                 KEEP=1; shift ;;
+        --no-faults)            FAULTS=0; shift ;;
         --allow-base-mismatch)  ALLOW_BASE_MISMATCH=1; shift ;;
         --extra)                PPL_EXTRA="$2"; shift 2 ;;
         --record)               RECORD=1; RECORD_ENV=""; shift ;;
@@ -274,6 +279,8 @@ fi
 
 LOGDIR="${LOGDIR:-$(mktemp -d)}"
 mkdir -p "$LOGDIR"
+# The kernel journal is shared between runs, so the fault window starts here, before the first run (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$LOGDIR"; }
 trap cleanup EXIT
 
@@ -561,6 +568,24 @@ if [ "$FAMILY_SWITCH" -eq 1 ]; then
         fi
     fi
     rc=$(( rc | family_rc ))
+fi
+
+echo
+# the kernel journal, scoped to this gate's own window (#294).  A prefill-logit gate that ran on a card that
+# faulted earlier in the session is a verdict about the journal, not about the logits.
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$LOGDIR"/*.log; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        echo "    GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every run log clean"
+    else
+        echo "FAIL: a GPU fault was recorded during this gate (since ${GATE_SINCE_TS:-the journal start}):" >&2
+        echo "$out" | sed 's/^/      /' >&2
+        rc=1
+        KEEP=1
+    fi
 fi
 
 echo

@@ -25,7 +25,7 @@
 #     STRICT=1 (recommended with `-sm layer`) to make it a hard failure.
 #
 # Usage:
-#   ./gate-qwen4exp-quant-coherence.sh [llama-cli]
+#   ./gate-qwen4exp-quant-coherence.sh [--no-faults] [llama-cli]
 # Environment:
 #   LLAMA_CLI    path to llama-cli      (default: ~/llama.cpp/build-rocm/bin/llama-cli)
 #   MODEL_ROOT   qwen4exp model root    (default: /llm/models/Qwen3.8/Flash-Next)
@@ -37,6 +37,7 @@
 #   NGPU         GPUs                   (default: 2 -> HIP_VISIBLE_DEVICES=0,1)
 #   STRICT       1 = a hash mismatch is a hard failure (default: 0 = warn)
 #   KEEPOUT      dir for the per-run logs (default: mktemp -d)
+#   --no-faults  skip the kernel-journal fault check (a box with no readable kernel log)
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,6 +52,19 @@ NGPU="${NGPU:-2}"
 STRICT="${STRICT:-0}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
+
+# the positional llama-cli the usage line has always documented was silently ignored; parse it (#294)
+FAULTS=1
+for a in "$@"; do
+    case "$a" in
+        --no-faults) FAULTS=0 ;;
+        -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+        -*) echo "usage: $0 [--no-faults] [llama-cli]" >&2; exit 2 ;;
+        *) LLAMA_CLI="$a" ;;
+    esac
+done
+# The kernel journal is shared between runs, so the fault window starts here, before the first arm (#294).
+GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 case "$NGPU" in
   1) DEVS=0 ;;
@@ -133,6 +147,21 @@ for q in $QUANTS; do
 done
 
 echo
+# the kernel journal, scoped to this gate's own window (#294)
+if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
+    since_args=()
+    [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
+    log_args=()
+    for f in "$KEEPOUT"/*.log "$KEEPOUT"/*.err; do [ -f "$f" ] && log_args+=(--log "$f"); done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
+        echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and every arm log clean"
+    else
+        echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"
+        echo "$out" | sed 's/^/      /'
+        fails=$((fails + 1))
+    fi
+fi
+
 if [ "$fails" -eq 0 ]; then
     echo "==> PASS: every measured qwen4exp quant produced a coherent (0 '////') gather-ON output"
     [ "$warns" -gt 0 ] && echo "    ($warns quant(s) only WARNed on transparency - see above)"
