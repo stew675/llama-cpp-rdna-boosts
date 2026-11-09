@@ -179,7 +179,24 @@ step_state() {
 step_build() {
     echo "== 2. build (clean, per block commit) ==================================="
     local log="$LOGDIR/gate-per-block-build.log"
-    if bash "$REPO/scripts/gate-per-block-build.sh" --fast > "$log" 2>&1; then
+    # `release.json.tip` is the CANONICAL re-cut commit, and it only exists in the checkout AFTER
+    # `scripts/fork-refresh.sh` has re-cut (release time).  A fold leaves the checkout on the WORKING chain,
+    # whose tip has the same tree and different ids, and that chain is the only one to walk: the plain call
+    # failed with "ERROR: tip <canonical> not in <fork>" and the whole verdict read NOT RELEASABLE although
+    # every block built (r239).  So walk the checkout's own tip when the recorded one is absent and its tree
+    # is the recorded tree; anything else stays a FAIL (a genuinely wrong set must not be talked past).
+    local tip_args=()
+    if command -v jq >/dev/null 2>&1 && [ -d "$FORK/.git" ] &&
+            ! git -C "$FORK" rev-parse --verify -q "$(jq -r '.tip // empty' "$REPO/release.json")^{commit}" >/dev/null 2>&1; then
+        local rec_tree head_tree
+        rec_tree="$(jq -r '.tree // empty' "$REPO/release.json")"
+        head_tree="$(git -C "$FORK" rev-parse -q 'HEAD^{tree}' 2>/dev/null)"
+        if [ -n "$rec_tree" ] && [ "$rec_tree" = "$head_tree" ]; then
+            tip_args=(--tip HEAD)
+            echo "    (release.json .tip is not in $FORK; walking HEAD, whose tree is the recorded one)"
+        fi
+    fi
+    if bash "$REPO/scripts/gate-per-block-build.sh" --fast "${tip_args[@]}" > "$log" 2>&1; then
         record PASS per-block-build "clean build per block commit (--fast)"
     else
         record FAIL per-block-build "see $log"

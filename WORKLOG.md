@@ -58,14 +58,18 @@ the run's own window.  `scripts/gate-fusion-alias-copy.sh` PASS (and its negativ
 `scripts/validate-set.sh`: checksums OK, strict `git am` of the 16 patches from a fresh `a691b2345` tarball,
 applied tree `7339c1bc7` == `release.json.tree`, no conflict markers, Windows portability scan 287 files clean.
 
-**The `.tip` trap, again, and one new wrinkle.**  `gate-rebase-release.sh`'s step 2 delegates to
+**The `.tip` trap, again, and the tooling fix it earned.**  `gate-rebase-release.sh`'s step 2 delegates to
 `gate-per-block-build.sh`, which walks `release.json.tip` **in the working checkout** -- and that commit only
-exists there after the re-cut.  So on a fold the ladder's build step FAILS before the re-cut ever happens
-(`ERROR: tip 2be18fc46... not in /home/stew675/llama.cpp`), and the "NOT RELEASABLE" verdict is the tip, not the
-code.  Recovered by fetching the canonical chain into the checkout
+exists there after the re-cut.  So on a fold the ladder's build step FAILED before the re-cut ever happened
+(`ERROR: tip 2be18fc46... not in /home/stew675/llama.cpp`) and the "NOT RELEASABLE" verdict was the tip, not the
+code; recovered for this run by fetching the canonical chain into the checkout
 (`git fetch <re-cut clone> rdna-boosts:refs/heads/canonical-r239`) and running
-`gate-per-block-build.sh --fast --tip <canonical tip>`: 16/16.  A later session should make step 2 pass
-`--tip "$(git -C "$FORK" rev-parse --short HEAD)"` when the working tip's tree equals `release.json.tree`.
+`gate-per-block-build.sh --fast --tip <canonical tip>`: 16/16.  **Fixed in the tooling**: step 2 now passes
+`--tip HEAD` when `release.json.tip` does not resolve in the checkout and HEAD's tree IS `release.json.tree`
+(a genuinely wrong set still fails, and no other case is talked past).  Tested both ways: with a temporarily
+bogus `.tip` the step walks HEAD and passes, with the real `.tip` it walks the recorded chain and passes.  Note
+`git rev-parse --verify -q <sha>` returns **0** for a well-formed but absent SHA (it only validates the syntax),
+so the resolvability test appends `^{commit}`.
 
 **Landing.**  The release commit `1f284c8c` carries the re-cut set, `release.json` (tip `2be18fc46`, tree
 `7339c1bc7`, all 17 hashes) and the records, and the annotated tag `v16-a691b2345-r239` names it.  Folded into
