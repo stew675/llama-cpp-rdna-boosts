@@ -4,6 +4,15 @@
 2026-11-08 r236 re-base, which replaced the 2026-10-25 `6050b467c` base), one
 `git am` commit each.
 
+> **r240: where this release's changes folded.**  GitHub issue #290 (an hc base copy per layer held to the end
+> of a `-sm layer` prefill graph, plus the two per-graph activation caches leapfrogging) -> **block 12** for the
+> base-copy ordering in `hyperconn.cu`, and **block 10** for everything else: `GGML_CUDA_POOL_STACK_CENSUS`
+> (live vs dead-but-blocked entries, per kind) in `common.cuh` + the graph-end hook in `ggml-cuda.cu`, the BF16
+> src1 cache's block reuse in `common.cuh`, and the MMB activation cache's evicted-block re-key in `mmb.cu`.
+> That fold is what `scripts/gate-per-block-build.sh` verifies block by block, the gate is
+> `scripts/gate-hc-base-copy.sh`, and the tree is the one the release numbers were measured on (`WORKLOG.md`
+> 261109.004).
+>
 > **r239: where this release's one change folded.**  GitHub issue #287 (a fused gate+up+GLU MoE overwrote the
 > host-expert scheduler copy it was still reading) -> **block 10**, which owns
 > `ggml_cuda_check_fusion_memory_ranges()` in `ggml-cuda-try-fuse.cu`: a leaf `src` (`GGML_OP_NONE`) is skipped
