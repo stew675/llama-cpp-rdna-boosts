@@ -4,6 +4,15 @@
 2026-11-08 r236 re-base, which replaced the 2026-10-25 `6050b467c` base), one
 `git am` commit each.
 
+> **r239: where this release's one change folded.**  GitHub issue #287 (a fused gate+up+GLU MoE overwrote the
+> host-expert scheduler copy it was still reading) -> **block 10**, which owns
+> `ggml_cuda_check_fusion_memory_ranges()` in `ggml-cuda-try-fuse.cu`: a leaf `src` (`GGML_OP_NONE`) is skipped
+> only when its buffer is not a COMPUTE buffer, so a scheduler copy of a host expert table is compared against
+> the fusion's out nodes like any other src.  The same rule is applied at the rope-fwht matcher's own leaf skip
+> in the same file, and `GGML_CUDA_FUSE_TRACE=1` now reports every declined alias class.  That fold is what
+> `scripts/gate-per-block-build.sh` verifies block by block, and the tree is the one the release numbers were
+> measured on (`WORKLOG.md` 261109.003).
+>
 > **r238: where this release's one change folded.**  GitHub issue #285 (a plain norm-rows match inheriting the
 > gated match's gate index) -> **block 10**, whose `ggml_cuda_norm_rows_try_fuse()` is the only caller of the two
 > matchers: `pre` is now a local in the gated matcher and is written to the struct only on success, the plain
@@ -853,6 +862,20 @@ must be **bit-identical** to what it replaces at the widths it serves.
   assert no longer names `ids`; bias/scale stay dense-only and a routed call can never reach upstream's dense
   interleaved kernel.  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` is the A/B arm: fused == unfused, byte-identical
   greedy text and prefill-logit KLD -0.000000 / 100.000 % top-p.  `GREEDY-PURITY.md` §65.
+* **A leaf `src` is not automatically a weight (r239, GitHub issue #287).**  `ggml_cuda_check_fusion_memory_ranges()`
+  (this block's file) skipped every `src->op == GGML_OP_NONE`, but a scheduler copy of a **host-resident expert
+  table** is a leaf in the COMPUTE buffer, and the allocator's last-use rule is computed on the unfused graph —
+  so the fused gate+up+GLU could write the GLU output into the gate-weight copy it was still reading (NaN
+  logits).  The leaf predicate is now
+  `t->buffer == nullptr || ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE`,
+  applied here and at the rope-fwht matcher's leaf skip; it can only decline a fusion.  On the CLI repro arm the
+  fused gate+up+GLU is bit-identical to the unfused chain, so the chain is the oracle
+  (`193 chars 3fab4da87774` vs the pre-fix `58 chars 793107d73635`), and the production text/speed do not move
+  (+0.7 % `pp512`, -0.06 % `tg128`).  `GGML_CUDA_FUSE_TRACE=1` (WARN, so `-lv 2`) prints
+  `FUSE_TRACE ALIAS <dst><-<src>/<copy|node>@<n>` per declined class.
+  [`../benchmarks/2026-11-09-issue-287-fusion-leaf-copy.md`](../benchmarks/2026-11-09-issue-287-fusion-leaf-copy.md),
+  `scripts/gate-fusion-alias-copy.sh`, `INVARIANTS.md` r239,
+  [`../upstream/fusion-range-leaf-copy/`](../upstream/fusion-range-leaf-copy/README.md).
 * `moe-weighted-reduction.cu`: the MoE weighted-down reduction (+ column-blocked band epilogue).
 * `norm-gated.cu`: the narrow-row RMS norm (`ncols <= 256`, `rows >= 4096`, 8 rows per 256-thread block)
   and its sigmoid-gated form (`RMS_NORM -> MUL(w) -> MUL_MAT -> SIGMOID -> MUL`, the qwen4exp /

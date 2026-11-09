@@ -3155,3 +3155,38 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   regression needs a **SILU**-gated hybrid (any Qwen3.x/qwen35 GGUF), where the pre-fix build declines 264 nodes
   at `-c 8192` on Qwen3.5-4B.  Section C asserts the plain form fused (`>= 1` `fused=1 gated=0`, non-vacuity),
   **declined nothing**, and byte-identical text against `GGML_CUDA_DISABLE_NORM_ROWS=1`.
+
+## r239 -- a leaf is not a weight: a fusion must not skip a src that lives in the compute buffer (GitHub issue #287)
+
+**The rule.  `ggml_cuda_check_fusion_memory_ranges()` may skip `src->op == GGML_OP_NONE` only when that leaf's
+memory cannot become a graph result; the arm that catches it is `scripts/gate-fusion-alias-copy.sh`.**
+
+- **A scheduler copy of a host weight is a leaf in the COMPUTE buffer, and the allocator's last-use rule is
+  computed on the UNFUSED graph (r239, block 10, GitHub issue #287).**  With `--ncmoe`/`--cpu-moe` the
+  scheduler copies each routed expert table into the compute buffer per ubatch
+  (`ROCm0#blk.N.ffn_gate_exps.weight#0`); the copy is `GGML_OP_NONE`, so the range check treated it as an
+  immutable weight and never compared it with a fusion's out node.  The allocator frees the copy after its
+  last **unfused** consumer (the gate `MUL_MAT_ID`) and hands the block to a later node -- for the 3-op
+  `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` fusion, the GLU output landed inside the gate-weight copy on 19 of 19
+  layers -- so the fused MMVQ kernel wrote its output while still reading the weights, and the logits went
+  **NaN** (one repeated character for the whole generation).  The fix is the leaf predicate
+  `t->buffer == nullptr || ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE`,
+  applied in both places in `ggml-cuda-try-fuse.cu` that skip leaves (the shared range check and the rope-fwht
+  matcher).  It can only **decline** a fusion, never admit one.
+- **The shape needs three things at once, and any one of them removes it (r239).**  Host-resident experts read
+  from scheduler copies (expert cache off, or a table whose fill declined), a ubatch inside the **extended
+  MMVQ MoE band** (9..16 columns on RDNA4, block 07), and that ubatch offloaded
+  (`GGML_OP_OFFLOAD_MIN_BATCH`; the report uses 9).  Measured on Qwen3.6-35B-A3B Q4_K_M, 1 R9700, greedy:
+  pre-fix `58 chars 793107d73635` (`3333...`), post-fix `193 chars 3fab4da87774` -- and that post-fix hash is
+  **byte-identical to `GGML_CUDA_DISABLE_FUSION=1`**, so at this shape the fused gate+up+GLU MMVQ kernel is
+  bit-identical to the unfused chain and the chain is the gate's oracle.  `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1`
+  (the reporter's control) is identical in both builds.
+- **What the new check declines on the delivery's own path, and what it costs (r239).**  `GGML_CUDA_FUSE_TRACE=1`
+  censuses, 1 R9700, `--n-cpu-moe 99`: cache off 39 `GLU<-NONE/copy` per 40-token run; cache **on** 238 per
+  48-token run; a ~2.8 K-token prompt 195 `MUL<-NONE/copy` (the routed-down + routing-weight fold) + 99
+  `GLU<-NONE/copy`.  Production cost, interleaved fresh processes, 3 rounds, 35B-A3B Q8_0 `-ncmoe 48`:
+  `pp512` 1204.6 -> 1213.1 t/s (**+0.7 %**, noise) and `tg128` 83.08 -> 83.03 (**-0.06 %**, noise), with the
+  production text unchanged (`193 chars 3fab4da87774`).
+- **`GGML_CUDA_FUSE_TRACE=1` logs at WARN, so a census needs `-lv 2` in `llama-cli` (r239).**  `llama-cli`
+  starts at errors-only; a trace arm run at the default level logs nothing at all, which reads exactly like
+  "the check never fired".  Text arms still pass no `-lv`, and the trace arm's text is discarded.

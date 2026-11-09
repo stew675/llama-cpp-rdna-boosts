@@ -15,7 +15,7 @@ It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp check
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r238`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r239`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -45,7 +45,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r238`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r239`**; the block
 count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
 16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in

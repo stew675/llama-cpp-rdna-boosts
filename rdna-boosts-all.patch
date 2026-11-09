@@ -30369,10 +30369,10 @@ index 000000000..d6ed08aeb
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..19688f6f7
+index 000000000..6caa201ce
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3213 @@
+@@ -0,0 +1,3251 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -31163,6 +31163,32 @@ index 000000000..19688f6f7
 +    return true;
 +}
 +
++// A leaf (GGML_OP_NONE) src that a fusion-window alias check may ignore: it is not produced inside the window, and
++// its memory cannot have been handed to a graph result.  A scheduler copy of a host weight (`--ncmoe`/`--cpu-moe`
++// plus op offload) is a leaf too, but it lives in the COMPUTE buffer, and the allocator's last-use rule is computed
++// on the UNFUSED graph: a fused window reads the copy before the later node that owns its output runs, so the
++// allocator may already have reused the copy's memory for that output (GitHub issue #287).
++static bool ggml_cuda_leaf_is_immutable(const ggml_tensor * t) {
++    return t->buffer == nullptr ||
++           ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
++}
++
++// GGML_CUDA_FUSE_TRACE=1: one line per process per (dst op <- src op, src elements, class) whose fusion was declined
++// because that src overlaps the fused output and the window does not produce it.  `copy` is the compute-buffer leaf of
++// issue #287; `node` is a graph input or an op node outside the window.
++static void fusion_alias_trace(const ggml_tensor * dst, const ggml_tensor * src) {
++    static const bool on = getenv("GGML_CUDA_FUSE_TRACE") != nullptr;
++    if (!on) {
++        return;
++    }
++    static std::map<std::string, int> seen;
++    const std::string k = std::string(ggml_op_name(dst->op)) + "<-" + ggml_op_name(src->op) +
++        (src->op == GGML_OP_NONE ? "/copy" : "/node") + "@" + std::to_string((int64_t) ggml_nelements(src));
++    if (seen.emplace(k, 1).second) {
++        GGML_LOG_WARN("FUSE_TRACE ALIAS %s\n", k.c_str());
++    }
++}
++
 +// returns whether the write (out) nodes overwrite the read nodes in operation
 +bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 +                                                 const int           node_idx,
@@ -31202,7 +31228,14 @@ index 000000000..19688f6f7
 +            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
 +                const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 +
-+                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
++                if (!src || src == logits_may_alias) {
++                    continue;
++                }
++
++                // A leaf is skipped only when it really is an immutable weight: see ggml_cuda_leaf_is_immutable
++                // (GitHub issue #287 -- the gate+up+GLU MoE fusion overwrote the host-expert scheduler copy it
++                // was still reading).
++                if (src->op == GGML_OP_NONE && ggml_cuda_leaf_is_immutable(src)) {
 +                    continue;
 +                }
 +
@@ -31217,6 +31250,7 @@ index 000000000..19688f6f7
 +                    }
 +
 +                    if (!found) {
++                        fusion_alias_trace(dst, src);
 +                        is_ok = false;
 +                        break;
 +                    }
@@ -31274,7 +31308,11 @@ index 000000000..19688f6f7
 +    for (int j = node_idx; j < node_idx + 5; ++j) {
 +        for (int k = 0; k < GGML_MAX_SRC; ++k) {
 +            const ggml_tensor * src = cgraph->nodes[j]->src[k];
-+            if (!src || src->op == GGML_OP_NONE || !overlap(mm, src)) {
++            if (!src || !overlap(mm, src)) {
++                continue;
++            }
++            // same rule as ggml_cuda_check_fusion_memory_ranges: a compute-buffer leaf may already be mm's memory
++            if (src->op == GGML_OP_NONE && ggml_cuda_leaf_is_immutable(src)) {
 +                continue;
 +            }
 +            if (j > node_idx && src == cgraph->nodes[j - 1]) {

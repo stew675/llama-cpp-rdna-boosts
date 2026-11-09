@@ -1,0 +1,25 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a49c5247a..ff7f84e23 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3628,7 +3628,19 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
+ 
+-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
++                if (!src || src == logits_may_alias) {
++                    continue;
++                }
++
++                // A leaf may only be skipped when its memory cannot have become a graph result.  A scheduler
++                // copy of a host weight (`-ncmoe`/`--cpu-moe` plus op offload) is a leaf too, but it lives in
++                // the COMPUTE buffer, and the allocator's last-use rule is computed on the UNFUSED graph: a
++                // fused window reads the copy before the later node that owns its output runs, so the copy's
++                // block may already have been reused for that output.  Reading the copy while writing the
++                // output corrupts the result (that is the repo's GitHub issue #287).
++                if (src->op == GGML_OP_NONE &&
++                    (src->buffer == nullptr ||
++                     ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+                     continue;
+                 }
+ 

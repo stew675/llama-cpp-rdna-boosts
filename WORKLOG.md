@@ -1,3 +1,78 @@
+## 261109.003 (r239, RELEASE v16-a691b2345-r239) -- a fusion may no longer skip a leaf that lives in the compute buffer (GitHub issue #287), gated 14/14 and re-cut
+
+**What shipped.**  `v16-a691b2345-r239`: the same 16 blocks on the same fork point (**`a691b2345`**), with one
+folded fix (block 10, `patches/README.md` carries the mapping).  `release.json`: `base=a691b2345`,
+`base_tree=9d7b9a02f`, `tip=2be18fc46b2acb0f7d045b473d359f5f84757d17` (the fork branch's re-cut commit; the
+working chain's tip `a7adf60b1` has the same tree and is never the recorded value),
+`tree=7339c1bc7f9d7cde4f85c0c49d5236d310c91481`, 16 blocks, all 17 artifact hashes refreshed.  Report:
+`benchmarks/2026-11-09-issue-287-fusion-leaf-copy.md`; the engineering fact is `INVARIANTS.md` r239, the
+upstream candidate is `upstream/fusion-range-leaf-copy/`.
+
+1. **The fix (GitHub issue #287, reporter @briansp2020).**  `ggml_cuda_check_fusion_memory_ranges()`
+   (`ggml-cuda-try-fuse.cu`, block 10) skipped every `src->op == GGML_OP_NONE` as "a weight".  With
+   `--ncmoe`/`--cpu-moe` the scheduler copies each routed expert table into the **compute** buffer per ubatch
+   (`ROCm0#blk.N.ffn_gate_exps.weight#0`), and that copy is a leaf too -- so the 3-op
+   `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` fusion wrote the GLU output into the gate-weight copy it was still
+   reading (the allocator's last-use rule is computed on the unfused graph).  The leaf predicate is now
+   `t->buffer == nullptr || ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE`,
+   applied there and at the rope-fwht matcher's own leaf skip; it can only decline a fusion.  The reporter's
+   diff was the same condition, and it applied unchanged (r236 did not move that code).
+2. **Reproduced before, byte-identical to the unfused chain after.**  1 R9700, Qwen3.6-35B-A3B Q4_K_M,
+   `--n-cpu-moe 99 -fa on -ub 14`, `MOE_EXPERT_CACHE_MIB=0`, `GGML_OP_OFFLOAD_MIN_BATCH=9`: **58 chars
+   `793107d73635`** (`3333...`, i.e. NaN logits) -> **193 chars `3fab4da87774`**, and that post-fix hash is
+   identical to `GGML_CUDA_DISABLE_FUSION=1` and to `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` -- so at this shape the
+   fused kernel is bit-identical to the chain and the chain is the gate's oracle.  The failed-fill route
+   (`MOE_HOST_POOL_FILL_FAULT=200`) went the same way, and the server arm reproduced the report verbatim
+   (`!!!!...`, 48 chars `b05adbd34c0c` -> 235 chars `6a75e507f1a1`).
+3. **What the check declines, and what it costs.**  `GGML_CUDA_FUSE_TRACE=1` (new: every declined alias class,
+   one line each) censuses, 1 R9700: cache off 39 `GLU<-NONE/copy` per 40-token run; cache **on** 238 per
+   48-token run; a ~2.8 K-token prompt 195 `MUL<-NONE/copy` (routed down + routing-weight fold) + 99
+   `GLU<-NONE/copy`.  On the delivery's own config nothing moves: production text `3fab4da87774` before and
+   after, `pp512` 1204.6 -> 1213.1 t/s (+0.7 %, 3 interleaved rounds) and `tg128` 83.08 -> 83.03 (-0.06 %, the
+   same shape as the reporter's "no output change, no speed change").
+4. **The gate gains the arm that reaches it.**  New `scripts/gate-fusion-alias-copy.sh`: A = the repro arm
+   (text == the unfused chain, >= 1 `FUSE_TRACE ALIAS .../copy@` line so the arm cannot be vacuous, plus the
+   MMVQ-band control), B = the failed-fill arm, C = the production arm against the recorded anchor `3fab4da87774`
+   with a decline logged (the check is not inert there), and a GPU-fault scan of its own window.
+   `GGML_CUDA_FUSE_TRACE` is documented in `ENVIRONMENT.md` (WARN, so a `llama-cli` census arm needs `-lv 2`).
+   **Negative-tested**: `BUILD_DIR=~/llama.cpp/build-rocm-r238` fails 4 checks (A's text, A's trace, B, C's
+   trace) and passes on the fixed build.
+5. **Verification also caught an unrelated, pre-existing defect (recorded, NOT fixed here).**
+   `-sm tensor` across 3 devices with an **uneven** slice, host-resident experts, the expert cache ON and a
+   ubatch inside the cache band (9..16 tokens) gives NaN logits on **r237 and r238** and is coherent on r236
+   (r237 is the release that first armed the arena under `-sm tensor`).  Controls: `-ts 2,1,1` (even slice),
+   `GGML_MOE_CACHE_MAX_TOK=8`, `MOE_EXPERT_CACHE_MIB=0`, `-sm layer` and 2 devices are all coherent, and
+   `GGML_CUDA_DISABLE_FUSION=1` does not help -- so it is the tensor-split arena registration/band read, not a
+   fusion.  The censuses differ (`tables=134` vs `120`, `takeover=3315` vs `0`, `2200 of 2200` remap offers
+   declined, 2 `identity fill failed`).  It is unrelated to #287 and untouched by this change; it needs its own
+   decision (fix, or a load-time guard, which is `TODO` #135's subject).  Full recipe in the report.
+
+**Gates.**  `scripts/gate-rebase-release.sh` against `/tmp/stage`-style `BASE_BUILD=build-rocm-r238` (the shipped
+r238 build): **14 passed, 0 failed, RELEASABLE** once the per-block ladder was re-pointed at the canonical tip
+(see the trap below) -- state clean (master pinned at `a691b2345`); per-block build **16/16** (`--fast`, 97 s);
+prefill-logit KLD PASS; ops `MUL_MAT_ID` **947/947** and `MUL_MAT` **2517/2517**; coherence `text-qwen35-4B
+1c5d32ac537d`; the multi-slot DFlash server arms **3/3** with acceptance and texts as anchored
+(`fn24`/`fn10` 0.72269/0.74359, `35b10` 0.44720/0.59124); real-text prefill **-0.04 %** (tol -3.0); perf
+dense-27B **+0.17 %**, moe-35B-prefill **+0.47 %**, moe-35B-decode **+0.06 %** (tol -1.0); GPU faults: none in
+the run's own window.  `scripts/gate-fusion-alias-copy.sh` PASS (and its negative test fails as designed).
+`scripts/validate-set.sh`: checksums OK, strict `git am` of the 16 patches from a fresh `a691b2345` tarball,
+applied tree `7339c1bc7` == `release.json.tree`, no conflict markers, Windows portability scan 287 files clean.
+
+**The `.tip` trap, again, and one new wrinkle.**  `gate-rebase-release.sh`'s step 2 delegates to
+`gate-per-block-build.sh`, which walks `release.json.tip` **in the working checkout** -- and that commit only
+exists there after the re-cut.  So on a fold the ladder's build step FAILS before the re-cut ever happens
+(`ERROR: tip 2be18fc46... not in /home/stew675/llama.cpp`), and the "NOT RELEASABLE" verdict is the tip, not the
+code.  Recovered by fetching the canonical chain into the checkout
+(`git fetch <re-cut clone> rdna-boosts:refs/heads/canonical-r239`) and running
+`gate-per-block-build.sh --fast --tip <canonical tip>`: 16/16.  A later session should make step 2 pass
+`--tip "$(git -C "$FORK" rev-parse --short HEAD)"` when the working tip's tree equals `release.json.tree`.
+
+**Landing.**  The release commit carries the re-cut set, `release.json` (tip `2be18fc46`, tree `7339c1bc7`, all 17
+hashes) and the records, and the annotated tag `v16-a691b2345-r239` names it.  Folded into block 10 by
+`git rebase -i` (`edit` at that commit, `git apply` of the change, `--amend`), and the resulting tree is
+bit-identical to the working tree the numbers above were measured on, so no measurement had to be repeated after
+the fold.
+
 ## 261109.002 (r238, RELEASE v16-a691b2345-r238) -- the plain norm-rows match no longer inherits a gate index (GitHub issue #285), gated 14/14 and re-cut
 
 **What shipped.**  `v16-a691b2345-r238`: the same 16 blocks on the same fork point (**`a691b2345`**), with one
