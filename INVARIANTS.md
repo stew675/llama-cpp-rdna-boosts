@@ -3263,3 +3263,44 @@ memory cannot become a graph result; the arm that catches it is `scripts/gate-fu
   default** (measured: identical 31-line startup logs, 7 WARNs; `-lv 4` adds 191 INFO lines), while a `llama-cli`
   arm at its ERROR default shows neither.  An arm that "looked verbose without `-lv`" was a server, and an arm that
   "did not print the census at `-lv 3`" was reading llama's INFO, not ggml's.
+
+## r242 -- a three-op prefill chain is worth folding, but only with the dep AND the range check (contributor PR #288)
+
+**The fusion. Do not re-derive; do not quote the win without its device arm.** `DSV4_HC_POST -> RMS_NORM ->
+MUL(gamma)`, the tail of every qwen4exp layer's prefill chain under a Meta (tensor-split) device, is now one launch
+(`dsv4_hc_post_rms_f32`, `norm.cu`; matcher in `ggml-cuda-try-fuse.cu`; env `GGML_CUDA_HC_POST_RMS`). The kernel
+reproduces `dsv4_hc_post_f32`'s two statements and `rms_norm_f32`'s **scalar** path (`block_size = 1024`, tid-strided
+accumulation, `scale*x*gamma` left-to-right), which is the launch the stock path picks for `ncols = 2560`, so it is
+bit-identical rather than rounding-level. Worth **+6.0 %** prefill on a 31.5k prompt and **+8.1 %** on a 101k one
+(2 R9700, `-sm tensor`, Flash-Next GSQ-RCO IQ3_S), **+6.8 %** on the delivery-style arm (attendance pool on, `-ub
+4096`, `-c 32768`); the BF16 producer half is **+2.2 %** of that. Prefill logits `-0.000000 / 100.000 %`.
+- **Reachability is structural, and it decides which arms can see it.** `DSV4_HC_POST` is emitted only when
+  `cparams.fused_dsv4_hc_post` is on, i.e. only when a **Meta device** is in play (`-sm tensor` on >= 2 devices, or
+  `LLAMA_FUSED_DSV4_HC_POST=1`), and the `rms_norm + mul` chain next to it only exists above the fused-mixer band
+  (`nt > 16`). So 1 device is **neutral** (measured: 1601.6 -> 1602.1 t/s, same text) and decode is untouched by
+  construction. A gate that runs a 1-GPU `-sm layer` arm proves nothing about this fusion; the arm that fires is
+  `-sm tensor --device 0,2` (or the forced-op env), and the census is `GGML_CUDA_HC_POST_RMS_DEBUG=1` (INFO):
+  1302 `fused=1`, **0 declined**, on one 31.5k prefill.
+- **It pre-dispatch-writes a later node, so it owes both halves of r225's rule, not one.** The kernel writes the MUL's
+  destination while it runs at the `DSV4_HC_POST` node's turn, and the allocator's last-use plan is computed on the
+  unfused graph, so `ggml_backend_cuda_graph_optimize` registers `x`/`residual`/`post -> mul` alloc deps *and* the
+  matcher byte-compares the two outputs against every source in the window (`span`, not `ggml_nbytes()`). The one
+  allowed overlap is `hc_post` with `residual` (same `(col,row,token)` read-then-write by the same thread). The shared
+  `ggml_cuda_check_fusion_memory_ranges()` cannot be used for this window: it walks `node_idx..node_idx+count` and
+  this window is **not contiguous** (view/noop nodes sit between the three op nodes), which is the same reason the
+  `hyperconn.cu` windows carry a bespoke check.
+- **The ncols bound is a shape gate, not a tuning knob:** a 1024-thread block with at most 4 elements per thread
+  means `1024 <= ncols <= 4096`. Flash-Next is `n_embd = 2560` so it fuses; a wider qwen4exp (or a narrower one)
+  silently does not, which is why "it did nothing for me" is not evidence against the fusion on this model.
+- **Arch arms: bit-identical everywhere it fires, and worth something on gfx1151 too.** A single device never emits
+  `DSV4_HC_POST`, so the arch sweep has to force the op (`LLAMA_FUSED_DSV4_HC_POST=1`): gfx1100 (1x 7900 XTX) text
+  `328 chars 133929592711` in both arms, prefill 1018.5 -> 1019.0 (neutral on one 24 GB card -- no host-expert split,
+  so the hc-wide stream is a small share), 372 `fused=1` / 0 declined; gfx1151 (8060S) text `334 chars 6d1c179497fc`
+  in both arms and, isolated on ONE build (`GGML_CUDA_HC_POST_RMS=0` as the chain), 848.8 vs 795.6 t/s over two
+  alternating pairs = **+6.7 %** -- the single stock-vs-patch pair (888.0 -> 872.4) was that box's spread, not a
+  regression.  `archive/work/hc-post-rms-bf16/SWEEP.md`.
+- **The producer half is a pattern the delivery already had.** `bf16_src1_cache` + a fused producer writing the RNE
+  BF16 copy was shipped for the hc-combine+norm window; `dsv4_hc_pre` and the new fused op join it. Two independent
+  checks that the copies are right: `GGML_CUDA_BF16_PRODUCER=2` re-converts every hit and compares (3501+ hits,
+  **0 mismatching elements**, both producers named in the log: `hc_norm-N`, `hc_mixed-N`), and the prefill-logit gate
+  reads `-0.000000`. The F32 output is still written except on the MMB BF16-only mark, where nothing reads it.

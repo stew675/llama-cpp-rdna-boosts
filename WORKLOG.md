@@ -1,3 +1,62 @@
+## 261109.007 (r242, RELEASE v16-a691b2345-r242) -- contributor PR #288: the qwen4exp prefill chain `DSV4_HC_POST -> RMS_NORM -> MUL` is one kernel, and its producers write the BF16 GEMM activations, +6.0-8.1 % prefill on a 2-device `-sm tensor` arm
+
+**Release `v16-a691b2345-r242`.**  Base `a691b2345`, 16 blocks, canonical tip
+`c2e8d67408942c20b95957ff4d8dd151dd2cd761`, tree `03a2a3e904f96761421cd3ff3b79614712882c64`.  One change, folded
+into **block 11** (qwen4exp / hyper-connections); blocks 12-15 replayed clean over it, every other block's body is
+byte-identical to r241.  `release.json` is regenerated (`scripts/make-release.sh`), `validate-set.sh` and the
+per-block build gate re-ran on it.
+
+**The contribution.**  Brian (`briansp2020`), [PR #288](https://github.com/stew675/llama-cpp-rdna-boosts/pull/288):
+a `wip/` campaign carrying one patch cut against **r235**.  Under `-sm tensor` every qwen4exp layer ends with the
+`DSV4_HC_POST` op and the next layer's `ggml_mul(rms_norm(x), gamma)` over the hc-wide stream (10240 floats for
+Flash-Next); the patch (a) fuses the three ops into `dsv4_hc_post_rms_f32` and (b) has the two prefill producers of
+BF16 GEMM activations (`dsv4_hc_post_rms`'s `xn`, `dsv4_hc_pre`'s mixed stream) write the RNE BF16 copy in the same
+pass and leave it in `bf16_src1_cache`, so the rocBLAS BF16 `hc_*_down`/`hc_*_inject` GEMMs skip their conversion.
+`GGML_CUDA_HC_POST_RMS=0`, `GGML_CUDA_BF16_PRODUCER=0|2`, census `GGML_CUDA_HC_POST_RMS_DEBUG=1`.
+
+**Its claims held, and were re-measured here** (gfx1201, 2x R9700 `0,2`, `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, the
+contributor's own host-expert settings): prefill **2334.8/2328.4/2325.9 -> 2471.9/2473.3/2463.8 t/s (+6.0 %)** on a
+31.5k prompt (claim +5.6 %) and **2404.3/2438.5 -> 2617.4/2616.1 (+8.1 %)** on a 101k one (claim +5.9 %); the
+delivery-style arm (attendance pool on, `--load-mode mmap`, `-ub 4096`, `-c 32768`) **2127.6 -> 2271.8 (+6.8 %)**.
+Each switch reproduces its share: `HC_POST_RMS=0` 2300/2295 (the fusion is the win), `BF16_PRODUCER=0` 2414/2418
+(the producer is **+2.2 %**, the contributor said +2.0-2.5 %).  Greedy text byte-identical in every arm
+(`1285a7dbe521` on the 31.5k arm; `e6ecbe2cd1c8` with `draft-mtp n3` at `-n 256`, decode 97.9 -> 99.5 t/s, noise);
+**prefill logits `-0.000000 / 100.000 %`** on `gate-prefill-logits.sh --sm tensor --device 0,2` against a base
+recorded from the r241 build — identical, not merely inside tolerance; `gate-hc-fusions.sh` PASS (5/5 hard arms
+byte-identical to the chain, both numeric arms at their anchors); `test-backend-ops -o HC_COMBINE
+-o HC_COMBINE_MIX -o HC_MIX` 30/30; `GGML_CUDA_BF16_PRODUCER=2` **0 mismatching elements over 3501+ hits**, both
+producers named (`hc_norm-N`, `hc_mixed-N`); no GPU faults.  **One device is neutral** (1601.6 -> 1602.1 t/s,
+`-sm layer` and `-sm tensor`): `DSV4_HC_POST` is only emitted when a **Meta device** is in play, so there is no
+chain to fuse — which is also why a 1-GPU `-sm layer` gate arm proves nothing here (`INVARIANTS.md` r242).
+Arch sweep (each box with `LLAMA_FUSED_DSV4_HC_POST=1`, because a single device never emits the op):
+**gfx1100** text `328 chars 133929592711` in both arms, prefill 1018.5 -> 1019.0 (neutral on one card, no host-expert
+split); **gfx1151** text `334 chars 6d1c179497fc` in both arms and **+6.7 %** with the fusion isolated on one build
+(848.8 vs 795.6 t/s over two alternating pairs -- the single stock-vs-patch pair, 888.0 -> 872.4, was that box's
+spread); the census reported **372 `fused=1` / 0 declined** on both -- `archive/work/hc-post-rms-bf16/SWEEP.md`.  Rule-5 `llama-batched-bench -npl 1,4,8` (Flash-Next, 2 GPU `-sm tensor`, q8_0 KV, `-npp 512 -ntg 32`, fused vs
+`GGML_CUDA_HC_POST_RMS=0`): prefill B1 478.54 -> 476.55 (flat), B4 1806.05 -> **1870.84**, B8 2218.38 -> **2312.78**
+t/s (+3.6 % / +4.3 % at the batched widths) and decode 56.62/166.28/244.34 -> 55.85/164.97/243.56, inside the
+single-run spread.
+
+**What was adjusted before it could ship** (`archive/work/hc-post-rms-bf16/` is the full record):
+the patch was **re-cut onto the current tree** (it was cut against r235 and the bf16-src1 lookup has been
+restructured since, `TODO` #298; the `=2` hook also needed a `(const nv_bfloat16 *)` cast to compile at all);
+the alias guard now uses the **tensor span** (`INVARIANTS.md` r225) instead of `ggml_nbytes()` and also compares the
+`gamma` operand, with the shared `ggml_cuda_check_fusion_memory_ranges()` deliberately not used (this window is not
+contiguous — the same reason `hyperconn.cu`'s windows carry a bespoke check), the one allowed overlap staying
+`hc_post` with `residual`; a **census** was added (`GGML_CUDA_HC_POST_RMS_DEBUG=1`, INFO: 1302 `fused=1` /
+**0 declined** on one 31.5k prefill) because a silent fusion makes the arm vacuous (`INVARIANTS.md` r225/r238); the
+two env reads moved to `common.cuh` so the matcher and the graph optimizer cannot disagree; and `ENVIRONMENT.md`
+rows, the `MANIFESTS.md` block-11 verification row, `INVARIANTS.md` r242 and the `patches/README.md` block-11 note
+were written.  The contributor's repo placement (a `wip/` directory with **no `wip/CAMPAIGNS.md` row**, and a stale
+copy of that file) was not adopted: the campaign was promoted in the same session, so it is recorded in
+`archive/work/` (a finished campaign does not become a stub) and the PR was answered with the outcome.
+
+**Held back, deliberately:** the `__builtin_nontemporal_*` hints the standalone hc kernels carry (worth +18.6 % in
+situ on `dsv4_hc_pre`, unmeasured in the fused kernel — `TODO` #311); a wider `ncols` band (the kernel fuses only
+`1024 <= n_embd <= 4096`, Flash-Next is 2560 — documented, not generalised on one model); and the 3-GPU `-sm tensor`
+arm, which OOMs on the **stock** build too at these settings (a pre-existing degenerate split, `TODO` #135), so the
+multi-device evidence is the 2-device shape the delivery itself validates qwen4exp on.
+
 ## 261109.006 (tooling/optional) -- issue #281 closes: its fill-source half becomes `optional/host-pool-fill-src`, `two-lane-prefill` is re-cut at r241, and `--include-optional` asks per artifact
 
 **No release.**  `release.json` is untouched: `A` (the buffered coalesced prefill read) has been in block 12

@@ -47,6 +47,7 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
+| **311** | the fused `hc_post_rms` kernel drops the hc kernels' non-temporal hints | performance (block 11, r242) | **PARKED** (2026-11-09) — value-preserving and unmeasured; worth +18.6 % in situ on `dsv4_hc_pre` by the neighbouring kernel's own record — §311 |
 
 ## Handle numbering
 
@@ -667,3 +668,17 @@ artifact instead and close this.
 - **Upstream PR candidates:** `upstream/README.md`.
 
 ---
+
+## 311. The fused `hc_post_rms` kernel uses plain loads/stores where the standalone hc kernels use non-temporal ones
+
+`dsv4_hc_post_rms_f32` (block 11, r242, from contributor PR #288) reads `x`/`residual`/`post` and writes the
+residual and `xn` with ordinary accesses.  The two standalone hc ops it replaces are deliberately streamed:
+`dsv4-hc.cu`'s own comment records `dsv4_hc_pre` 605 -> 493 us/call (**+18.6 %**) and `dsv4_hc_post` 691 -> 660 us
+from `__builtin_nontemporal_load/store` alone, measured in situ on gfx1151 pp8192, with no difference in a
+standalone microbench (so the effect is L2/MALL pressure from the surrounding GEMM weight streams, not the op).
+
+The hints are value-preserving (the same float moves), so adding them to the fused kernel cannot change a hash — it
+is purely a question of whether the fused launch keeps the win it has.  **Measure before believing:** the same
+31.5k-prompt arm the r242 record uses (2 R9700 `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, `-ub 6144`), plus a gfx1151
+arm where the in-situ effect was found.  If it is worth anything, the guard is a rebuild + the prefill-logit gate
+(`-0.000000` is the expected answer) and nothing else moves.
