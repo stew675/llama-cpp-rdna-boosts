@@ -3190,3 +3190,42 @@ memory cannot become a graph result; the arm that catches it is `scripts/gate-fu
 - **`GGML_CUDA_FUSE_TRACE=1` logs at WARN, so a census needs `-lv 2` in `llama-cli` (r239).**  `llama-cli`
   starts at errors-only; a trace arm run at the default level logs nothing at all, which reads exactly like
   "the check never fired".  Text arms still pass no `-lv`, and the trace arm's text is discarded.
+
+- **A pool block that only has to live for one statement must be the NEWEST pool allocation of that statement
+  (r240, blocks 10/12, GitHub issue #290).**  The device pool is a LIFO stack: `ggml_cuda_pool_vmm::free`
+  asserts that the block being freed is the newest one, and a block registered on the delivery's `pool_stack`
+  is only really freed when a kill finds it on top.  r236 registered the `hc_combine_norm` [repeat] matcher's
+  base copy (a kernel argument, nothing else reads it) *before* the `set_bf16*()` calls of the same window,
+  which push an mmb activation block and the BF16 src1 block -- so the copy sat under them and stayed live
+  until the **end of the graph**.  Under `-sm layer` one graph covers every layer of a device, so a prefill
+  graph held one copy per layer: measured Flash-Next GSQ-RCO-IQ3_XXS, 3 devices `-sm layer -ts 60,20,20`,
+  `-ub 2048`, `hc=31` copies / **620.0 MiB** live on device 0 at graph end (10 / 7 on the other two), and the
+  reporter's 2x R9700 `-ub 2048` shape held 26 x ~84 MiB = ~2.2 GiB, which is what ran device 0 out of memory
+  at a 259.6k-token prompt.  The copy is now made **after** the `set_bf16*()` pushes and killed right after
+  the launch, so the kill really frees it (`hc=0`, and the run's total per-graph retention at that shape
+  1854.6 -> 292.0 MiB).  r235 got the same lifetime by accident with a scoped `ggml_cuda_pool_alloc`, but that
+  order is what the VMM pool's LIFO assert rejects; the ordering, not the registration, is the fix.
+- **`GGML_CUDA_POOL_STACK_CENSUS=1` is the instrument, and `hc=0` alone is not a gate signal (r240).**  The
+  census prints, per graph per device, what the pool stack still holds -- `live=<entries> dead=<entries>/<MiB>
+  bytes=<MiB>` plus `hc`/`mmb`/`bf16` LIVE entries and bytes and how many base copies the graph **made**
+  (`made`).  `dead` is the killed-but-blocked pile (the LIFO class itself, which is why it is not folded into
+  the per-kind counts) and `bytes` is what the graph really still holds.  A shape that stops reaching the
+  matcher also prints `hc=0`, so the gate (`scripts/gate-hc-base-copy.sh`) requires `made > 0` on the devices
+  that carry layers.  It is a WARN: a `llama-cli` census arm needs `-lv 2`.
+- **The per-graph activation caches hold ONE working set per graph, not one dead block per layer (r240).**
+  They leapfrog: the BF16 src1 cache holds one block and the MMB activation cache `cache_max` (4 on RDNA4),
+  and each replaced its previous block only *after* the other had pushed a newer one above it -- so a killed
+  LIFO block never reached the top and both chains were freed only at `pool_stack_release_all`.  The reporter's
+  snapshot of that pile is `abababab…A` (41 dead / 1 live); it is their "remaining ~1.5 GiB" after their own
+  one-line fix.  Both caches now REUSE instead of replacing: `bf16_src1_cache_put` keeps its block while
+  `cap >= n` on the same stream (a capacity field independent of the key's `n`), and `mmb_cache_insert`
+  re-keys its evicted (oldest) block as the newest entry when it is big enough, killing it only when the new
+  request does not fit.  Both are what that block's free + reallocate would have produced on the same stream,
+  minus the churn.  Measured at the shape above: `dead` 59/521.8 MiB -> 1/24.0 on device 0 and the graph's
+  total retention 1854.6 -> 292.0 MiB, with byte-identical greedy text (`8447c7032117` with the defaults, with
+  `GGML_CUDA_BF16_SRC1_CACHE=0` and with `GGML_CUDA_MMB_CACHE=0`).
+- **The headroom is what the fix buys, and it is the number to quote for a memory report (r240).**  Peak VRAM
+  on the card that runs out first (`-ts 60,20,20`, the prose prefill): 28522 -> 27448 MiB at `-c 8192`, and
+  31600 -> 30526 MiB at `-c 262144` q8_0, i.e. **+1074 MiB of headroom** against a 32624 MiB card, with
+  prefill flat (1782.0 / 1783.2 vs 1788.9 / 1779.7 t/s, interleaved).  A retention census is the evidence; the
+  free-VRAM headroom is what a user with a long prompt actually needs.

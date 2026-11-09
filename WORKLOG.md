@@ -1,3 +1,69 @@
+## 261109.004 (r240, RELEASE v16-a691b2345-r240) -- a pool block that only lives for one statement is released per statement (GitHub issue #290), gated 14/14 and re-cut
+
+**What shipped.**  `v16-a691b2345-r240`: the same 16 blocks on the same fork point (**`a691b2345`**), with two
+blocks amended (10 and 12, `patches/README.md` carries the mapping).  `release.json`: `base=a691b2345`,
+`base_tree=9d7b9a02f`, `tip=a7cb0ab1887605a6890e8aeb3b9760b1bec6bec5` (the fork branch's re-cut commit; the
+working chain's tip `110f9a43a` has the same tree and is never the recorded value),
+`tree=5494e1d191c0c617b9f0d2a73e787bb82131e2f8`, 16 blocks, all 17 artifact hashes refreshed.  Report:
+`benchmarks/2026-11-09-issue-290-hc-base-copy.md`; the engineering facts are `INVARIANTS.md` r240; the gate is
+the new `scripts/gate-hc-base-copy.sh`.
+
+1. **The fix (GitHub issue #290, reporter @briansp2020).**  The `hc_combine_norm` [repeat] matcher reads the
+   narrow base from a **pool copy** when `add` or `mulg` reuses its buffer (a kernel argument, nothing else
+   reads it).  r236 registered that copy on the device `pool_stack` *before* the window's `set_bf16*()` calls,
+   which push an mmb activation block and the BF16 src1 block; the pool is LIFO, so a killed block is only
+   freed when it reaches the top, and the copy stayed live until the **end of the graph**: one per layer, i.e.
+   26 x ~84 MiB = ~2.2 GiB on the reporter's device 0, which ran it out of memory at a 259.6k-token prompt
+   (`ggml_cuda_pool_leg::alloc`).  The copy is now made as the **last** pool allocation of the window (after
+   those pushes) and killed right after the launch, so the kill really frees it.  `set_bf16*()` only *reads*
+   `block_out`, so the copy is still taken from the same, intact base, and `blk_in_bf16` is re-pointed at the
+   copy for the (default-off) `LLAMA_HC_BLK16` read.  This is the reporter's own one-line fix, made to free.
+2. **Their follow-up was right and it identified the other half.**  The remaining ~1.5 GiB is not a long-lived
+   MMB block on top: the BF16 src1 cache and the MMB activation cache **leapfrog**, each replacing its block
+   only *after* the other had pushed a newer one, so no killed block ever reached the top (their snapshot:
+   `abababab…A`, 41 dead / 1 live).  Both now **reuse** their block instead of replacing it: the BF16 src1
+   cache keeps it while `cap >= n` on the same stream (`cap` is a capacity field independent of the key's `n`),
+   and `mmb_cache_insert` re-keys its evicted (oldest) block as the newest entry when it fits, killing it only
+   when the new request does not.  Both are what that block's free + reallocate would have produced on the same
+   stream, minus the churn.
+3. **`GGML_CUDA_POOL_STACK_CENSUS`** (new, `common.cuh` + the graph-end hook in `ggml-cuda.cu`) is the
+   instrument: once per graph per device it prints `live=… dead=…/…MiB bytes=… | hc=<live>/<MiB>
+   made=<copies made> mmb=… bf16=…`.  The per-kind counts are LIVE entries, `dead` is the killed-but-blocked
+   pile, `made` is the vacuity control (a shape that stops reaching the matcher prints `hc=0` too).
+**Measured** (Flash-Next GSQ-RCO-IQ3_XXS, 3 devices, `-sm layer -ts 60,20,20 -c 8192 -ub 2048 -fa on`, the
+5246-token prose prefill, worst graph): device 0 `hc=31` live / 620.0 MiB, `dead=59/521.8`, retained
+1205.8 MiB (1854.6 MiB over the three devices) -> `hc=0`, `dead=1/24.0`, 132.0 MiB (292.0 MiB).  Peak VRAM on
+the card that runs out first: `-c 8192` 28522 -> 27448 MiB, `-c 262144` q8_0 31600 -> 30526 MiB of 32624, i.e.
+**1024 -> 2098 MiB of headroom**; prefill flat (1782.0 / 1783.2 vs 1788.9 / 1779.7 t/s, interleaved); greedy
+text byte-identical (`153 chars 8447c7032117`) against the pre-fix build and with `GGML_CUDA_BF16_SRC1_CACHE=0`
+and `GGML_CUDA_MMB_CACHE=0`.
+
+**Gates.**  `scripts/gate-rebase-release.sh` against the shipped r239 build (`build-rocm-r239ship`):
+**14 passed, 0 failed, RELEASABLE** -- state clean (master pinned at `a691b2345`, tip `110f9a43a` tree
+`5494e1d19`); per-block build **16/16** (`--fast`; block 10 and 11 each recompile all of `ggml-hip` because
+`common.cuh`/`hyperconn.cu` are in every TU, 6 min each); prefill-logit KLD PASS; ops `MUL_MAT_ID` **947/947**
+and `MUL_MAT` **2517/2517**; coherence `text-qwen35-4B 1c5d32ac537d`; the multi-slot DFlash server arms **3/3**
+with acceptance and texts as anchored (`fn24`/`fn10` 0.72269/0.74359, `35b10` 0.44720/0.59124); real-text
+prefill **-0.35 %** (tol -3.0); perf dense-27B-prefill **-0.53 %**, moe-35B-prefill **-0.09 %**,
+moe-35B-decode **+0.24 %** (tol -1.0, all inside the arm's own spread); GPU faults: none in the run's own
+window.  `scripts/gate-hc-fusions.sh` PASS (5 hard arms byte-identical to the chain, `449 chars
+d62340fbf566`; the two DSV4 numeric arms at their anchor `6a102dbc62d6`) -- re-run AFTER the cache reuses,
+because they change prefill buffer lifetimes.  `scripts/gate-hc-base-copy.sh` PASS, and **negative-tested**:
+the pre-fix build (canonical caches + the pre-r240 ordering + the census) fails it with `hc=31/620.0` live,
+`dead=59/521.8` and 1854.6 MiB retained.  `scripts/validate-set.sh`: checksums OK, strict `git am` of the 16
+patches from a fresh `a691b2345` tarball, applied tree `5494e1d19` == `release.json.tree`, no conflict markers,
+Windows portability scan 287 files clean.
+
+**Landing.**  Two folds by `git rebase -i` (`edit` at the block 10 and block 12 commits, `git apply` of the
+change, `--amend`): block 10 carries the census and the two cache reuses, block 12 the base-copy ordering.  The
+folded tree is bit-identical to the working tree the numbers above were measured on (`git diff` against it is
+empty), so no measurement had to be repeated.  `scripts/fork-refresh.sh --build --gates --push` re-cut the
+canonical chain from the regenerated patches, verified the applied tree `5494e1d19` and printed the recorded
+tip `a7cb0ab18`, then rebuilt, re-ran the coherence arm (`1c5d32ac537d`) and the prefill-logit gate
+(**0.000697**, same-top-p 98.784 %, identical to r239), and force-with-lease pushed
+`2be18fc46 -> a7cb0ab18` to the **personal fork only**.  The reporter was replied to and GitHub issue #290
+closed as completed.
+
 ## 261109.003 (r239, RELEASE v16-a691b2345-r239) -- a fusion may no longer skip a leaf that lives in the compute buffer (GitHub issue #287), gated 14/14 and re-cut
 
 **What shipped.**  `v16-a691b2345-r239`: the same 16 blocks on the same fork point (**`a691b2345`**), with one

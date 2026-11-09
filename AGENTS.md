@@ -323,6 +323,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the verify-batch alignment / a multi-slot draft width | `scripts/gate-spec-align.sh` / `scripts/gate-spec-width-band.sh` |
 | a qwen4exp hyper-connection op, chain or matcher | `scripts/gate-hc-fusions.sh MODEL.gguf` |
 | the narrow-row norm fusion (`norm-gated.cu`), its alloc-dep registration, or a new fusion that pre-dispatches a node | `scripts/gate-norm-rows-alias.sh` |
+| the hc base copy, `bf16_src1_cache_put()`, or the device `pool_stack` | `scripts/gate-hc-base-copy.sh` |
 | the fusion-window range check (`ggml_cuda_check_fusion_memory_ranges()`), a fusion's out-node set, or a host-expert scheduler copy | `scripts/gate-fusion-alias-copy.sh` |
 | a grid-stall pad call site, or `ggml_cuda_grid_stall_pad()` itself | `scripts/gate-grid-stall-pad.sh` |
 | the MTP draft KV window (block 15 Goal C) | `scripts/gate-spec-draft-window.sh` |

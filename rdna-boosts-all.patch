@@ -13845,7 +13845,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index bc83ea375..739dba2bf 100644
+index bc83ea375..c800597b5 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,44 @@
@@ -15199,7 +15199,7 @@ index bc83ea375..739dba2bf 100644
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
-@@ -1563,6 +2727,84 @@ struct ggml_backend_cuda_context {
+@@ -1563,6 +2727,145 @@ struct ggml_backend_cuda_context {
      // pool
      std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
  
@@ -15209,11 +15209,21 @@ index bc83ea375..739dba2bf 100644
 +    // frees the OLDEST block while newer ones are live).  Every such buffer is therefore registered here
 +    // at allocation and released through this stack: a kill only MARKS it dead, and it is really freed
 +    // when it reaches the top.  `release_all` drains whatever is left at the end of a graph, top first.
-+    struct pool_stack_entry { void * obj; void (*del)(void *); bool dead; };
++    //
++    // A block that only has to live for the current statement (the hc_combine_norm base copy) must be
++    // pushed as the LAST pool allocation of that statement, so its kill really frees it; pushed before a
++    // long-lived block it waits under it until the end of the graph, which is how one 84 MiB copy per layer
++    // accumulated across a `-sm layer` prefill graph (GitHub issue #290).  `size`/`kind` exist so
++    // `pool_stack_census()` can report what a graph retained.
++    enum pool_stack_kind { POOL_STACK_MMB = 0, POOL_STACK_BF16, POOL_STACK_HC, POOL_STACK_KIND_COUNT };
++    struct pool_stack_entry { void * obj; void (*del)(void *); size_t size; unsigned char kind; bool dead; };
 +    std::vector<pool_stack_entry> pool_stack;
++    // Census counter (see pool_stack_census): hc_combine_norm base copies MADE since the previous census, so
++    // `hc_live=0` can be told apart from an arm that never makes a copy at all.
++    size_t pool_stack_hc_made = 0;
 +
-+    void pool_stack_push(void * obj, void (*del)(void *)) {
-+        pool_stack.push_back({ obj, del, false });
++    void pool_stack_push(void * obj, void (*del)(void *), size_t size, pool_stack_kind kind) {
++        pool_stack.push_back({ obj, del, size, (unsigned char) kind, false });
 +    }
 +    void pool_stack_pop_dead() {
 +        while (!pool_stack.empty() && pool_stack.back().dead) {
@@ -15241,6 +15251,41 @@ index bc83ea375..739dba2bf 100644
 +    }
 +    bool pool_stack_empty() const { return pool_stack.empty(); }
 +
++    // Diagnostic (GGML_CUDA_POOL_STACK_CENSUS=1): what this graph still holds on the pool stack when it
++    // reaches its end, i.e. before the per-graph caches are yielded.  The per-kind counts are LIVE entries
++    // (still keyed and in use); `dead` is the pile of KILLED entries that could not reach the top -- the
++    // LIFO-blocked class behind issue #290 -- and `bytes` is what the graph really still holds (live + dead).
++    void pool_stack_census() {
++        static const bool on = [] {
++            const char * e = getenv("GGML_CUDA_POOL_STACK_CENSUS");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (!on) {
++            return;
++        }
++        size_t n[POOL_STACK_KIND_COUNT] = {};
++        size_t b[POOL_STACK_KIND_COUNT] = {};
++        size_t live = 0, dead = 0, bytes = 0, dead_bytes = 0;
++        for (const auto & e : pool_stack) {
++            bytes += e.size;
++            if (e.dead) {
++                dead++;
++                dead_bytes += e.size;
++                continue;
++            }
++            live++;
++            n[e.kind]++;
++            b[e.kind] += e.size;
++        }
++        GGML_LOG_WARN("POOL_STACK_CENSUS dev=%d live=%zu dead=%zu/%.1f bytes=%.1f MiB | "
++                      "hc=%zu/%.1f made=%zu mmb=%zu/%.1f bf16=%zu/%.1f\n",
++            device, live, dead, (double) dead_bytes / 1048576.0, (double) bytes / 1048576.0,
++            n[POOL_STACK_HC], (double) b[POOL_STACK_HC] / 1048576.0, pool_stack_hc_made,
++            n[POOL_STACK_MMB], (double) b[POOL_STACK_MMB] / 1048576.0,
++            n[POOL_STACK_BF16], (double) b[POOL_STACK_BF16] / 1048576.0);
++        pool_stack_hc_made = 0;
++    }
++
 +    // Per-graph cache of the BF16 copy that the cuBLAS BF16 matmul makes of an F32 src1 (multi-token graphs).
 +    // The hc mixer feeds one normalized [hc_dim, T] tensor to two BF16 GEMMs (hc_down and the 4-wide hc_inject),
 +    // which converted all of it twice; the second GEMM now reuses the first copy.  Keyed like the Q8_1 cache
@@ -15250,7 +15295,8 @@ index bc83ea375..739dba2bf 100644
 +        const ggml_tensor * src1 = nullptr;
 +        const void * data = nullptr;
 +        int stream_no = 0;
-+        int64_t n = 0;
++        int64_t n = 0;      // the key's element count (the tensor this entry was made for)
++        int64_t cap = 0;    // the block's element capacity -- the reuse test, independent of the key's n
 +        std::unique_ptr<ggml_cuda_pool_alloc<nv_bfloat16>> buf;
 +    } bf16_src1_cache;
 +
@@ -15261,6 +15307,7 @@ index bc83ea375..739dba2bf 100644
 +        pool_stack_kill(bf16_src1_cache.buf.release());
 +        bf16_src1_cache.src1 = nullptr;
 +        bf16_src1_cache.data = nullptr;
++        bf16_src1_cache.cap  = 0;
 +    }
 +
 +    // Make `root` (a view root, contiguous, n elements) the cached entry and return its BF16 buffer for the
@@ -15270,21 +15317,35 @@ index bc83ea375..739dba2bf 100644
 +        // wip/slab-transient-absorption (step 2b-2): not pinned any more -- `graph_compute` clears this cache
 +        // on scope exit, so the block never outlives the graph and the slab's wide band may serve it.
 +        // The replaced block is killed through the pool stack, never freed in place (see pool_stack above).
++        //
++        // REUSE the block while it is big enough (on the same stream): the converted tensors of a graph are a
++        // handful of sizes repeated per layer (`hc_mixed-N`, the fused xn, ...), and the cache holds ONE of them,
++        // so replacing it on every layer left a dead-but-blocked block per layer live until the end of the graph
++        // (a killed LIFO pool block cannot be freed under a newer one) -- the same class as GitHub issue #290's
++        // base copy, and what the reporter measured as the remaining ~1.5 GiB.  Reusing the block is what its
++        // free + allocate would have produced anyway, minus the churn.
++        if (c.buf != nullptr && c.stream_no == curr_stream_no && c.cap >= n) {
++            c.src1 = root;
++            c.data = root->data;
++            c.n    = n;
++            return c.buf->get();
++        }
 +        bf16_src1_cache_clear();
 +        auto * buf = new ggml_cuda_pool_alloc<nv_bfloat16>(pool(), n);
-+        pool_stack_push(buf, bf16_src1_buf_del);
++        pool_stack_push(buf, bf16_src1_buf_del, (size_t) n * sizeof(nv_bfloat16), POOL_STACK_BF16);
 +        c.buf       = std::unique_ptr<ggml_cuda_pool_alloc<nv_bfloat16>>(buf);
 +        c.src1      = root;
 +        c.data      = root->data;
 +        c.stream_no = curr_stream_no;
 +        c.n         = n;
++        c.cap       = n;
 +        return c.buf->get();
 +    }
 +
      static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(ggml_backend_cuda_context & ctx, int device, int stream_no);
  
      ggml_cuda_pool & pool(int device) {
-@@ -1577,18 +2819,70 @@ struct ggml_backend_cuda_context {
+@@ -1577,18 +2880,70 @@ struct ggml_backend_cuda_context {
      }
  };
  
@@ -15355,7 +15416,7 @@ index bc83ea375..739dba2bf 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -1596,12 +2890,58 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1596,12 +2951,58 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -15414,7 +15475,7 @@ index bc83ea375..739dba2bf 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -1728,3 +3068,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1728,3 +3129,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -35267,7 +35328,7 @@ index 000000000..7570a3b06
 +void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
 +size_t ggml_cuda_slab_seed_floor(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a49c5247a..0bbcf5a8e 100644
+index a49c5247a..abd1e5fe4 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -45489,7 +45550,7 @@ index a49c5247a..0bbcf5a8e 100644
      if (graph->instances.empty()) {
          if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
              if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
-@@ -5127,35 +7857,111 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -5127,35 +7857,113 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -45526,6 +45587,8 @@ index a49c5247a..0bbcf5a8e 100644
 +    struct per_graph_cache_yield {
 +        ggml_backend_cuda_context * c;
 +        ~per_graph_cache_yield() {
++            // diagnostic (GGML_CUDA_POOL_STACK_CENSUS): what the graph retained until its end
++            c->pool_stack_census();
 +            ggml_cuda_mmb_yield_caches(c);
 +            c->bf16_src1_cache_clear();
 +            // every per-graph pool block is now marked dead; drain the pool stack top-first (a VMM pool
@@ -45610,7 +45673,7 @@ index a49c5247a..0bbcf5a8e 100644
                  }
                  // else: properties changed or first call - execute directly (use_cuda_graph stays false)
              } else {
-@@ -5166,59 +7972,421 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5166,59 +7974,421 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      if (ggml_cuda_graph_debug_enabled()) {
                          GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                      }
@@ -46075,7 +46138,7 @@ index a49c5247a..0bbcf5a8e 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -5234,6 +8402,189 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5234,6 +8404,189 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      };
  
      if (!disable_fusion) {
@@ -46265,7 +46328,7 @@ index a49c5247a..0bbcf5a8e 100644
          // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
          // TODO: consolidate fusion paths in graph_optimize and graph_compute
          ggml_cuda_set_device(cuda_ctx->device);
-@@ -5298,8 +8649,43 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5298,8 +8651,43 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
              }
  
@@ -46311,7 +46374,7 @@ index a49c5247a..0bbcf5a8e 100644
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                  if (match.expert_scale != nullptr) {
-@@ -5368,14 +8754,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5368,14 +8756,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -46329,7 +46392,7 @@ index a49c5247a..0bbcf5a8e 100644
  
      static bool enable_graph_optimization = [] {
          const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-@@ -5386,6 +8767,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5386,6 +8769,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -46349,7 +46412,7 @@ index a49c5247a..0bbcf5a8e 100644
      ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
      stream_context.reset();
  
-@@ -5611,6 +9005,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5611,6 +9007,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -46359,7 +46422,7 @@ index a49c5247a..0bbcf5a8e 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -5627,7 +9024,24 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5627,7 +9026,24 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -46384,7 +46447,7 @@ index a49c5247a..0bbcf5a8e 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -5653,6 +9067,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -5653,6 +9069,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -46399,7 +46462,7 @@ index a49c5247a..0bbcf5a8e 100644
      return description;
  }
  
-@@ -5897,8 +9319,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -5897,8 +9321,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -46410,7 +46473,7 @@ index a49c5247a..0bbcf5a8e 100644
  }
  
  // TODO: move these functions here
-@@ -6058,6 +9480,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6058,6 +9482,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_IQ4_XS:
                          return true;
                      case GGML_TYPE_IQ4_NL:
@@ -46420,7 +46483,7 @@ index a49c5247a..0bbcf5a8e 100644
                      case GGML_TYPE_MXFP4:
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
-@@ -6147,6 +9572,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6147,6 +9574,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -46429,7 +46492,7 @@ index a49c5247a..0bbcf5a8e 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -6354,8 +9781,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6354,8 +9783,41 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -46471,7 +46534,7 @@ index a49c5247a..0bbcf5a8e 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
-@@ -6379,7 +9839,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6379,7 +9841,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -46481,7 +46544,7 @@ index a49c5247a..0bbcf5a8e 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -6400,6 +9861,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -6400,6 +9863,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -46498,7 +46561,7 @@ index a49c5247a..0bbcf5a8e 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -6434,6 +9905,247 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -6434,6 +9907,247 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -46746,7 +46809,7 @@ index a49c5247a..0bbcf5a8e 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -6450,6 +10162,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -6450,6 +10164,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -46778,7 +46841,7 @@ index a49c5247a..0bbcf5a8e 100644
  };
  
  // backend reg
-@@ -6531,8 +10268,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -6531,8 +10270,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -46852,7 +46915,7 @@ index a49c5247a..0bbcf5a8e 100644
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
          return (void *)ggml_backend_cuda_comm_init;
      }
-@@ -6634,6 +10436,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6634,6 +10438,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -48308,10 +48371,10 @@ index 000000000..457eb3e55
 +int  ggml_cuda_hc_combine_mix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
 new file mode 100644
-index 000000000..f2499963a
+index 000000000..b88443081
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hyperconn.cu
-@@ -0,0 +1,1206 @@
+@@ -0,0 +1,1226 @@
 +#include "hyperconn.cuh"
 +#include "ggml-backend-impl.h"
 +#include "mmb.cuh"
@@ -49202,30 +49265,18 @@ index 000000000..f2499963a
 +                                    // block_out is not pinned: it dies at the repeat, so add or mulg may reuse its buffer.
 +                                    // Nothing in the window runs before the fused kernel, so the base is still intact here:
 +                                    // read it from a pool copy instead of falling back to the unfused nodes.
-+                                    // The copy outlives this call (it is a kernel argument) and is made BEFORE the
-+                                    // set_bf16*() calls below, which push a block of their own onto the pool stack
-+                                    // (bf16_src1_cache_put).  A plain local would then be freed in place while that
-+                                    // block is live, and the device pool is a LIFO stack (the VMM pool asserts, the
-+                                    // non-VMM one corrupts its accounting): register the copy on the pool stack the
-+                                    // same way, so it is released top-first at the end of the graph capture.
-+                                    struct hc_base_copy_del {
-+                                        static void del(void * p) { delete (ggml_cuda_pool_alloc<char> *) p; }
-+                                    };
-+                                    ggml_cuda_pool_alloc<char> * base_copy_buf = nullptr;
-+                                    ggml_tensor base_copy;
-+                                    if (!alias_ok && alias_ok_but_base && n_tok > 1 && ggml_is_contiguous(base_root)) {
-+                                        base_copy = *base_root;
-+                                        base_copy_buf = new ggml_cuda_pool_alloc<char>(ctx.pool());
-+                                        ctx.pool_stack_push(base_copy_buf, hc_base_copy_del::del);
-+                                        base_copy.data = base_copy_buf->alloc(ggml_nbytes(base_root));
-+                                        CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
-+                                            cudaMemcpyDeviceToDevice, ctx.stream()));
-+                                        args.block_out = &base_copy;
++                                    //
++                                    // The copy is a kernel argument and nothing else reads it, so it is made as the
++                                    // LAST pool allocation of this window and killed right after the launch (below).
++                                    // That ordering is what makes the kill free it: the device pool is a LIFO stack,
++                                    // and a copy registered BEFORE the set_bf16*() blocks (bf16_src1_cache_put, the mmb
++                                    // reserve) can only reach the top at the END of the graph -- one ~84 MiB copy per
++                                    // layer stayed live for the whole prefill graph under `-sm layer` and ran device
++                                    // 0 out of memory on a 255k-token prompt (GitHub issue #290).
++                                    const bool need_base_copy = !alias_ok && alias_ok_but_base && n_tok > 1 &&
++                                        ggml_is_contiguous(base_root);
++                                    if (need_base_copy) {
 +                                        alias_ok = true;
-+                                        if (hc_cn_dbg) {
-+                                            static unsigned d3 = 0;
-+                                            if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
-+                                        }
 +                                    }
 +                                    if (!alias_ok && n_tok == 1 && hc <= 4) {
 +                                        args.single_block = true;
@@ -49253,7 +49304,39 @@ index 000000000..f2499963a
 +                                    if (alias_ok && supp && canf) {
 +                                        ggml_cuda_hc_combine_norm_set_bf16(ctx, args);
 +                                        ggml_cuda_hc_combine_norm_set_bf16_src1(ctx, args);
++                                        // The base copy is made AFTER the set_bf16*() pushes so that it is the
++                                        // newest pool block (see the note above), and killed after the launch.
++                                        // set_bf16*() only READ block_out, so the copy is taken from the same,
++                                        // still-intact base.
++                                        struct hc_base_copy_del {
++                                            static void del(void * p) { delete (ggml_cuda_pool_alloc<char> *) p; }
++                                        };
++                                        ggml_cuda_pool_alloc<char> * base_copy_buf = nullptr;
++                                        ggml_tensor base_copy;
++                                        if (need_base_copy) {
++                                            ctx.pool_stack_hc_made++;
++                                            base_copy = *base_root;
++                                            base_copy_buf = new ggml_cuda_pool_alloc<char>(ctx.pool());
++                                            ctx.pool_stack_push(base_copy_buf, hc_base_copy_del::del,
++                                                ggml_nbytes(base_root), ggml_backend_cuda_context::POOL_STACK_HC);
++                                            base_copy.data = base_copy_buf->alloc(ggml_nbytes(base_root));
++                                            CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
++                                                cudaMemcpyDeviceToDevice, ctx.stream()));
++                                            args.block_out = &base_copy;
++                                            // set_bf16*() armed the BF16 block read off the base itself; the copy
++                                            // holds the same bytes, so the read follows it.
++                                            if (args.blk_in_bf16 != nullptr) {
++                                                args.blk_in_bf16 = (const uint16_t *) base_copy.data;
++                                            }
++                                            if (hc_cn_dbg) {
++                                                static unsigned d3 = 0;
++                                                if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
++                                            }
++                                        }
 +                                        ggml_cuda_op_hc_combine_norm(ctx, args);
++                                        // read only by the kernel just queued: release it now (it is the newest
++                                        // pool block, so this frees rather than defers)
++                                        ctx.pool_stack_kill(base_copy_buf);
 +                                        return g - i;
 +                                    }
 +                                }
@@ -52055,10 +52138,10 @@ index b7939243b..b57e344b6 100644
 +}
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..742e96fdb
+index 000000000..2b720813f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,2603 @@
+@@ -0,0 +1,2626 @@
 +#include "common.cuh"
 +#include "mmb.cuh"
 +#include "unary.cuh"
@@ -53689,12 +53772,35 @@ index 000000000..742e96fdb
 +static void mmb_buf_del(void * p) { delete (ggml_cuda_pool_alloc<uint16_t> *) p; }
 +static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
 +    std::vector<mmb_cache_entry> & cache = mmb_state().cache;
-+    if (cache.size() >= mmb_cache_max()) { ctx.pool_stack_kill(cache.front().buf); cache.erase(cache.begin()); }
++    // The cache holds `cache_max` entries and a prefill graph converts one activation per layer, so the entry
++    // that is evicted here was KILLED and then sat dead-but-blocked under the newer blocks for the rest of the
++    // graph (a LIFO pool block cannot be freed under a newer one): one dead block per layer, the half of
++    // GitHub issue #290 the BF16 src1 cache's own churn used to hide.
++    //
++    // REUSE the evicted block when it is big enough, re-keyed as the newest entry: on this stream that is
++    // exactly what its free + reallocate would have produced, minus the churn.  Its previous consumer was
++    // enqueued before this conversion, so the stream order still protects it.
++    mmb_cache_entry reused;
++    bool have_reused = false;
++    if (!cache.empty() && cache.size() >= mmb_cache_max()) {
++        mmb_cache_entry & old = cache.front();
++        if (old.buf != nullptr && old.n >= n) {
++            reused = old;
++            have_reused = true;
++        } else {
++            ctx.pool_stack_kill(old.buf);
++        }
++        cache.erase(cache.begin());
++    }
++    if (have_reused) {
++        cache.push_back({mmb_root(t), t->data, n, reused.buf});
++        return cache.back().buf->get();
++    }
 +    // wip/slab-transient-absorption (step 2b-2): NOT pinned any more -- this buffer is released at the end
 +    // of the compute (`ggml_cuda_mmb_yield_caches`), so it never outlives the graph and the slab's wide band
 +    // may serve it (or, when the band is not armed, the pool, exactly as before).
 +    auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
-+    ctx.pool_stack_push(buf, mmb_buf_del);
++    ctx.pool_stack_push(buf, mmb_buf_del, (size_t) n * sizeof(uint16_t), ggml_backend_cuda_context::POOL_STACK_MMB);
 +    cache.push_back({mmb_root(t), t->data, n, buf});
 +    return buf->get();
 +}
@@ -54036,7 +54142,7 @@ index 000000000..742e96fdb
 +    if (e.buf && cap < n) { ctx.pool_stack_kill(e.buf); e.buf = nullptr; }
 +    if (!e.buf) {
 +        e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
-+        ctx.pool_stack_push(e.buf, mmb_buf_del);
++        ctx.pool_stack_push(e.buf, mmb_buf_del, (size_t) n * sizeof(uint16_t), ggml_backend_cuda_context::POOL_STACK_MMB);
 +        cap = n;
 +    }
 +    e.root = mmb_root(t); e.data = t->data; e.n = n;

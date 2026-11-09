@@ -1,4 +1,4 @@
-From 134bdf5a1a3315edbe78445e98bb88b7d2b80bde Mon Sep 17 00:00:00 2001
+From b338bb1a732be9ce6ebd8ce1df3ec1606cf84a2d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 10:06:57 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -72,7 +72,7 @@ Coherence vs the R12 tree (same session, same commands): dense 4B 1de99b7e6ee6, 
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |    3 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  251 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  175 +-
- ggml/src/ggml-cuda/hyperconn.cu               |   15 +-
+ ggml/src/ggml-cuda/hyperconn.cu               |   55 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 4438 ++++++++++++++---
  ggml/src/ggml-cuda/moe-expert-cache.h         |   51 +
  .../template-instances/generate_cu_files.py   |   46 +-
@@ -103,7 +103,7 @@ Coherence vs the R12 tree (same session, same commands): dense 4B 1de99b7e6ee6, 
  tools/server/server-task.cpp                  |  107 +-
  tools/server/server-task.h                    |   16 +-
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 51 files changed, 7774 insertions(+), 1168 deletions(-)
+ 51 files changed, 7804 insertions(+), 1178 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 2b885af17..3b02f6439 100644
@@ -2346,7 +2346,7 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1c2e6b29e..954806caf 100644
+index a7fe59aa1..b562997bf 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3686,6 +3686,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -2522,7 +2522,7 @@ index 1c2e6b29e..954806caf 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -7473,6 +7585,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7475,6 +7587,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -2531,7 +2531,7 @@ index 1c2e6b29e..954806caf 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7502,6 +7616,11 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7504,6 +7618,11 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -2543,7 +2543,7 @@ index 1c2e6b29e..954806caf 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8032,6 +8151,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8034,6 +8153,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -2552,7 +2552,7 @@ index 1c2e6b29e..954806caf 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -8419,6 +8540,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -8421,6 +8542,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -2575,7 +2575,7 @@ index 1c2e6b29e..954806caf 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -8438,6 +8575,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -8440,6 +8577,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -2587,7 +2587,7 @@ index 1c2e6b29e..954806caf 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -8461,6 +8603,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -8463,6 +8605,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -2607,7 +2607,7 @@ index 1c2e6b29e..954806caf 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -8595,11 +8750,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8597,11 +8752,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -2623,34 +2623,80 @@ index 1c2e6b29e..954806caf 100644
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
-index 985d9d091..f2499963a 100644
+index 985d9d091..b88443081 100644
 --- a/ggml/src/ggml-cuda/hyperconn.cu
 +++ b/ggml/src/ggml-cuda/hyperconn.cu
-@@ -888,11 +888,22 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
+@@ -888,19 +888,18 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
                                      // block_out is not pinned: it dies at the repeat, so add or mulg may reuse its buffer.
                                      // Nothing in the window runs before the fused kernel, so the base is still intact here:
                                      // read it from a pool copy instead of falling back to the unfused nodes.
 -                                    ggml_cuda_pool_alloc<char> base_copy_buf(ctx.pool());
-+                                    // The copy outlives this call (it is a kernel argument) and is made BEFORE the
-+                                    // set_bf16*() calls below, which push a block of their own onto the pool stack
-+                                    // (bf16_src1_cache_put).  A plain local would then be freed in place while that
-+                                    // block is live, and the device pool is a LIFO stack (the VMM pool asserts, the
-+                                    // non-VMM one corrupts its accounting): register the copy on the pool stack the
-+                                    // same way, so it is released top-first at the end of the graph capture.
-+                                    struct hc_base_copy_del {
-+                                        static void del(void * p) { delete (ggml_cuda_pool_alloc<char> *) p; }
-+                                    };
-+                                    ggml_cuda_pool_alloc<char> * base_copy_buf = nullptr;
-                                     ggml_tensor base_copy;
-                                     if (!alias_ok && alias_ok_but_base && n_tok > 1 && ggml_is_contiguous(base_root)) {
-                                         base_copy = *base_root;
+-                                    ggml_tensor base_copy;
+-                                    if (!alias_ok && alias_ok_but_base && n_tok > 1 && ggml_is_contiguous(base_root)) {
+-                                        base_copy = *base_root;
 -                                        base_copy.data = base_copy_buf.alloc(ggml_nbytes(base_root));
-+                                        base_copy_buf = new ggml_cuda_pool_alloc<char>(ctx.pool());
-+                                        ctx.pool_stack_push(base_copy_buf, hc_base_copy_del::del);
-+                                        base_copy.data = base_copy_buf->alloc(ggml_nbytes(base_root));
-                                         CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
-                                             cudaMemcpyDeviceToDevice, ctx.stream()));
-                                         args.block_out = &base_copy;
+-                                        CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
+-                                            cudaMemcpyDeviceToDevice, ctx.stream()));
+-                                        args.block_out = &base_copy;
++                                    //
++                                    // The copy is a kernel argument and nothing else reads it, so it is made as the
++                                    // LAST pool allocation of this window and killed right after the launch (below).
++                                    // That ordering is what makes the kill free it: the device pool is a LIFO stack,
++                                    // and a copy registered BEFORE the set_bf16*() blocks (bf16_src1_cache_put, the mmb
++                                    // reserve) can only reach the top at the END of the graph -- one ~84 MiB copy per
++                                    // layer stayed live for the whole prefill graph under `-sm layer` and ran device
++                                    // 0 out of memory on a 255k-token prompt (GitHub issue #290).
++                                    const bool need_base_copy = !alias_ok && alias_ok_but_base && n_tok > 1 &&
++                                        ggml_is_contiguous(base_root);
++                                    if (need_base_copy) {
+                                         alias_ok = true;
+-                                        if (hc_cn_dbg) {
+-                                            static unsigned d3 = 0;
+-                                            if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
+-                                        }
+                                     }
+                                     if (!alias_ok && n_tok == 1 && hc <= 4) {
+                                         args.single_block = true;
+@@ -928,7 +927,39 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
+                                     if (alias_ok && supp && canf) {
+                                         ggml_cuda_hc_combine_norm_set_bf16(ctx, args);
+                                         ggml_cuda_hc_combine_norm_set_bf16_src1(ctx, args);
++                                        // The base copy is made AFTER the set_bf16*() pushes so that it is the
++                                        // newest pool block (see the note above), and killed after the launch.
++                                        // set_bf16*() only READ block_out, so the copy is taken from the same,
++                                        // still-intact base.
++                                        struct hc_base_copy_del {
++                                            static void del(void * p) { delete (ggml_cuda_pool_alloc<char> *) p; }
++                                        };
++                                        ggml_cuda_pool_alloc<char> * base_copy_buf = nullptr;
++                                        ggml_tensor base_copy;
++                                        if (need_base_copy) {
++                                            ctx.pool_stack_hc_made++;
++                                            base_copy = *base_root;
++                                            base_copy_buf = new ggml_cuda_pool_alloc<char>(ctx.pool());
++                                            ctx.pool_stack_push(base_copy_buf, hc_base_copy_del::del,
++                                                ggml_nbytes(base_root), ggml_backend_cuda_context::POOL_STACK_HC);
++                                            base_copy.data = base_copy_buf->alloc(ggml_nbytes(base_root));
++                                            CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
++                                                cudaMemcpyDeviceToDevice, ctx.stream()));
++                                            args.block_out = &base_copy;
++                                            // set_bf16*() armed the BF16 block read off the base itself; the copy
++                                            // holds the same bytes, so the read follows it.
++                                            if (args.blk_in_bf16 != nullptr) {
++                                                args.blk_in_bf16 = (const uint16_t *) base_copy.data;
++                                            }
++                                            if (hc_cn_dbg) {
++                                                static unsigned d3 = 0;
++                                                if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
++                                            }
++                                        }
+                                         ggml_cuda_op_hc_combine_norm(ctx, args);
++                                        // read only by the kernel just queued: release it now (it is the newest
++                                        // pool block, so this frees rather than defers)
++                                        ctx.pool_stack_kill(base_copy_buf);
+                                         return g - i;
+                                     }
+                                 }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 index c386ee560..b3c19d267 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
