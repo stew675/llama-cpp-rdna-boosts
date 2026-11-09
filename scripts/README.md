@@ -27,6 +27,7 @@ scripts/gate-prefill-logits.sh                        # prefill-logit KLD gate (
 scripts/gate-park-idle-slots.sh                       # server idle-slot parking gate (parking changes / every release)
 scripts/gate-hc-fusions.sh MODEL.gguf                 # qwen4exp hyper-connection fusion-equivalence gate (HC changes / every release)
 scripts/gate-norm-rows-alias.sh                       # narrow-row norm fusion aliasing gate: driver + real gated GGUF + a SILU-gated hybrid (issues #276 / #285)
+scripts/gate-slot-rev-share.sh                          # slot-order sharing gate (issue #291): one rollback index chain per graph instead of one per conv layer, byte-identical text, decode not slower (block 03)
 scripts/gate-grid-stall-pad.sh                         # gfx1201 grid-stall pad gate: every covered site pads, matches the CPU reference, text identical with the pad off (issue #277)
 scripts/gate-fusion-alias-copy.sh                      # fusion-window leaf-copy gate: a compute-buffer leaf (host-expert scheduler copy) is checked, the repro arm reproduces the unfused chain, text unchanged (issue #287)
 scripts/gate-hc-base-copy.sh                           # hc base-copy pool-lifetime gate: every copy released per statement, one BF16 src1 block per graph, text unchanged (issue #290)

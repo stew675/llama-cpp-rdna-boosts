@@ -3229,3 +3229,24 @@ memory cannot become a graph result; the arm that catches it is `scripts/gate-fu
   31600 -> 30526 MiB at `-c 262144` q8_0, i.e. **+1074 MiB of headroom** against a 32624 MiB card, with
   prefill flat (1782.0 / 1783.2 vs 1788.9 / 1779.7 t/s, interleaved).  A retention census is the evidence; the
   free-VRAM headroom is what a user with a long prompt actually needs.
+
+- **The conv-state rollback index is a graph constant, and rebuilding it per layer costs launches (r241, issue #291).**
+  `build_conv_state_store()` emits the store's index as `arange` + `scale_bias` + `cast` over `K = n_rs_seq + 1 <= 8`
+  int32 values, then one `set_rows` per conv layer. Built per layer (upstream #31660's shape) that is 3 nodes and 3
+  launches per layer per graph: 144 of the 1268 nodes of the dense-27B MTP verify graph, re-created every speculative
+  round. Shared per (graph, device) it is 1 chain, and the verify graph drops to **1127** nodes. Bit-identical, text
+  `535c/3c3913603ed9` in every arm, prefill-logit KLD 0.000697 / 98.784 % (the r239/r240 value, unchanged). Worth
+  **+1.03 %** MTP decode at 10.5k depth and **+4.0 %** on a decode-dominated prompt (45.93 -> 47.76 t/s), because the
+  cost is per launch and only shows where launches are a large share of the round. The device key is load-bearing:
+  sharing across devices turns every consumer on another device into a cross-device copy of the index. Kill switch
+  `LLAMA_SHARE_SLOT_REV=0`; gate `scripts/gate-slot-rev-share.sh` (the per-layer arm is the negative control, so the
+  census cannot go vacuous). **Corollary for reports:** a per-round cost that a text hash and a kernel-timing table
+  both miss is per LAUNCH, not per kernel and not per host call, and the census to read is the dispatch-entry count,
+  not the graph's GPU time.
+- **Our GDN conv fusion and the `ssm_conv_in` epilogue decline on a multi-sequence ubatch (r241, recorded, NOT fixed).**
+  `gdn_conv_check()` requires the concat's state operand at `st->ne[2] == 1`, so with `-np 2 --kv-unified`
+  (`st->ne[2] == 2`) the direct conv never matches, and once the rollback store's window view sits between the CONCAT
+  and the conv, `ggml_cuda_ssm_conv_in_try_fuse` does not take it either: r240 dispatches `CONCAT conv_input-*` 48
+  times per verify round where r220 dispatched ~4, 0.010 ms each. Restoring it needs both matchers to accept the new
+  window view (`ne = [n_cols, Kw, C, n_seqs]` with dim-1 stride one element), which is a prefill-kernel change and was
+  not shipped on the strength of one arm. Worth ~0.5 ms of a 45 ms verify round.

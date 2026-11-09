@@ -87373,10 +87373,19 @@ index 4e096a368..14a05154a 100644
  
                  if (*pos != '}') {
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index b5d4642a2..522582787 100644
+index b5d4642a2..f67b95fae 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -29,11 +29,19 @@
+@@ -7,6 +7,8 @@
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+ 
++#include "ggml-backend.h"
++
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+@@ -29,11 +31,19 @@
  
  // dedup helpers
  
@@ -87399,7 +87408,7 @@ index b5d4642a2..522582787 100644
      const auto n_kv     = mctx->get_n_kv();
      const auto n_tokens = ubatch.n_tokens;
      const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
-@@ -41,9 +49,89 @@ static ggml_tensor * build_attn_inp_kq_mask(
+@@ -41,9 +51,89 @@ static ggml_tensor * build_attn_inp_kq_mask(
      // flash attention requires an f16 mask
      const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
  
@@ -87492,7 +87501,7 @@ index b5d4642a2..522582787 100644
  
      return res;
  }
-@@ -100,11 +188,11 @@ static bool can_reuse_attn_mask(
+@@ -100,11 +190,11 @@ static bool can_reuse_attn_mask(
  }
  
  // KQ mask over the cell lists of kv_rows, or over the whole cache if kv_rows is not used
@@ -87507,7 +87516,7 @@ index b5d4642a2..522582787 100644
      llm_attn_mask attn_mask;
  
      attn_mask.n_kv = mctx->get_n_kv();
-@@ -113,15 +201,15 @@ static llm_attn_mask build_attn_inp_attn_mask(
+@@ -113,15 +203,15 @@ static llm_attn_mask build_attn_inp_attn_mask(
  
      if (n_kv_rows == 0) {
          attn_mask.rows = nullptr;
@@ -87526,7 +87535,7 @@ index b5d4642a2..522582787 100644
          ggml_set_input(attn_mask.raw);
          ggml_set_name(attn_mask.raw, "attn_inp_kq_mask");
      }
-@@ -483,11 +571,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+@@ -483,11 +573,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
      }
  }
  
@@ -87559,7 +87568,7 @@ index b5d4642a2..522582787 100644
      if (s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
          int32_t * data = (int32_t *) s_copy->data;
-@@ -661,6 +770,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+@@ -661,6 +772,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
  void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
      mctx->set_input_k_idxs(self_k_idxs, ubatch);
  
@@ -87568,7 +87577,7 @@ index b5d4642a2..522582787 100644
      mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
  }
  
-@@ -1197,11 +1308,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1197,11 +1310,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
      mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
      mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
  
@@ -87584,7 +87593,7 @@ index b5d4642a2..522582787 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1248,6 +1362,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -1248,6 +1364,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -87593,7 +87602,7 @@ index b5d4642a2..522582787 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1305,6 +1421,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -1305,6 +1423,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -87602,7 +87611,7 @@ index b5d4642a2..522582787 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1395,8 +1513,12 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
+@@ -1395,8 +1515,12 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
  llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
      reset();
  
@@ -87617,7 +87626,7 @@ index b5d4642a2..522582787 100644
  }
  
  int64_t llm_graph_result::get_max_nodes() const {
-@@ -1589,6 +1711,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+@@ -1589,6 +1713,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
      layer_inp_dev    (params.layer_inp_dev),
      layer_inp_src    (params.layer_inp_src),
      samplers         (params.samplers),
@@ -87625,7 +87634,7 @@ index b5d4642a2..522582787 100644
      cb_func          (params.cb),
      res              (params.res),
      ctx0             (res->get_ctx()),
-@@ -3077,14 +3200,35 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3077,14 +3202,35 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              v = ggml_cast(ctx0, v, GGML_TYPE_F16);
          }
  
@@ -87662,7 +87671,7 @@ index b5d4642a2..522582787 100644
  
          ggml_flash_attn_ext_add_sinks(cur, sinks);
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-@@ -3263,12 +3407,8 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -3263,12 +3409,8 @@ ggml_tensor * llm_graph_context::build_attn(
      return cur;
  }
  
@@ -87677,7 +87686,7 @@ index b5d4642a2..522582787 100644
  
      auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
  
-@@ -3278,7 +3418,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+@@ -3278,7 +3420,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
          inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
          inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
  
@@ -87686,7 +87695,7 @@ index b5d4642a2..522582787 100644
      }
  
      inp->self_k_rot = mctx_cur->get_k_rot();
-@@ -3290,7 +3430,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+@@ -3290,7 +3432,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
  llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
      const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
  
@@ -87695,7 +87704,7 @@ index b5d4642a2..522582787 100644
  
      return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
  }
-@@ -3382,12 +3522,8 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -3382,12 +3524,8 @@ ggml_tensor * llm_graph_context::build_attn(
      return cur;
  }
  
@@ -87710,7 +87719,7 @@ index b5d4642a2..522582787 100644
  
      auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
  
-@@ -3396,7 +3532,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+@@ -3396,7 +3534,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
  
          inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
  
@@ -87719,7 +87728,7 @@ index b5d4642a2..522582787 100644
      }
  
      return inp;
-@@ -3405,7 +3541,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+@@ -3405,7 +3543,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
  llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
      const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
  
@@ -87728,7 +87737,7 @@ index b5d4642a2..522582787 100644
  
      return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
  }
-@@ -3617,16 +3753,17 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -3617,16 +3755,17 @@ ggml_tensor * llm_graph_context::build_attn(
  
      // these nodes are added to the graph together so that they are not reordered
      // by doing so, the number of splits in the graph is reduced
@@ -87750,7 +87759,7 @@ index b5d4642a2..522582787 100644
      const auto * mctx_iswa = inp->mctx;
  
      const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-@@ -3807,19 +3944,15 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -3807,19 +3946,15 @@ ggml_tensor * llm_graph_context::build_attn(
      return cur;
  }
  
@@ -87773,7 +87782,7 @@ index b5d4642a2..522582787 100644
      }
  
      {
-@@ -3829,7 +3962,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
+@@ -3829,7 +3964,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
          auto cparams_copy = cparams;
          cparams_copy.flash_attn = cparams.fused_lid;
  
@@ -87782,7 +87791,7 @@ index b5d4642a2..522582787 100644
  
          inp->self_k_rot_lid = mctx_cur->get_lid()->get_k_rot();
      }
-@@ -3840,7 +3973,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
+@@ -3840,7 +3975,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
  llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
      const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
  
@@ -87791,7 +87800,7 @@ index b5d4642a2..522582787 100644
  
      return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));
  }
-@@ -3848,14 +3981,14 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+@@ -3848,14 +3983,14 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
  llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa() const {
      const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_iswa_context *>(mctx);
  
@@ -87808,7 +87817,7 @@ index b5d4642a2..522582787 100644
  
      auto inp = std::make_unique<llm_graph_input_attn_k_dsa_iswa>(std::move(inp_dsa), std::move(inp_swa), mctx_cur);
  
-@@ -3876,7 +4009,7 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
+@@ -3876,7 +4011,7 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
          inp->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
          inp->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
  
@@ -87817,7 +87826,7 @@ index b5d4642a2..522582787 100644
      }
  
      inp->self_k_rot = mctx_base->get_k_rot();
-@@ -3901,7 +4034,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
+@@ -3901,7 +4036,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
          inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
          inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
  
@@ -87826,7 +87835,7 @@ index b5d4642a2..522582787 100644
      }
  
      {
-@@ -3910,7 +4043,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
+@@ -3910,7 +4045,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
          inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
          inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
  
@@ -87835,7 +87844,7 @@ index b5d4642a2..522582787 100644
      }
  
      inp->self_k_rot = mctx_cur->get_base()->get_k_rot();
-@@ -3930,7 +4063,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
+@@ -3930,7 +4065,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
      {
          inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
  
@@ -87844,7 +87853,7 @@ index b5d4642a2..522582787 100644
      }
  
      {
-@@ -3938,7 +4071,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
+@@ -3938,7 +4073,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
  
          inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
  
@@ -87853,7 +87862,7 @@ index b5d4642a2..522582787 100644
      }
  
      inp->self_k_rot = mctx_cur->get_base()->get_k_rot();
-@@ -4029,11 +4162,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -4029,11 +4164,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
  
      inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
      ggml_set_input(inp->s_copy);
@@ -87874,7 +87883,7 @@ index b5d4642a2..522582787 100644
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
  
-@@ -4060,9 +4202,26 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -4060,9 +4204,26 @@ ggml_tensor * llm_graph_context::build_rs(
      // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
      ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
  
@@ -87902,7 +87911,47 @@ index b5d4642a2..522582787 100644
  }
  
  void llm_graph_context::build_conv_state_store(
-@@ -4171,7 +4330,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+@@ -4101,12 +4262,33 @@ void llm_graph_context::build_conv_state_store(
+     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
+     const int64_t Kw = std::min(n, K);
+ 
+-    // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
+-    // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
+-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+-    cb(s_slot_rev, "s_slot_rev", -1);
++    // the slot order {K-1, ..., 0} is identical for EVERY conv layer of a graph and never depends on
++    // the ubatch, so it is built ONCE per (graph, device) and each layer takes its own tail
++    // {Kw-1, ..., 0} as a view of it (a view is not a graph node).  Built per layer instead -- as
++    // upstream does -- it is arange + scale_bias + cast per conv layer, i.e. 3 nodes and 3 launches
++    // per layer per graph: 144 nodes of 1268 in the dense-27B MTP verify graph, ~11 % of the graph,
++    // spent rebuilding a 4-element constant.  Measured on gfx1201 (issue #291): the verify graph's
++    // dispatch entry count and GPU time both rise with it, and the loss is per LAUNCH, so it is worst
++    // where a launch is expensive (GGML_CUDA_DISABLE_GRAPHS=1, and Windows).
++    // The device is the one the conv state itself lives on: sharing across devices would turn every
++    // consumer on another device into a cross-device copy of the index.
++    ggml_backend_buffer_type_t slot_rev_buft = s->buffer != nullptr ? ggml_backend_buffer_get_type(s->buffer) : nullptr;
++    ggml_tensor * s_slot_rev = nullptr;
++    if (share_slot_rev) {
++        auto it = s_slot_rev_cache.find(slot_rev_buft);
++        if (it != s_slot_rev_cache.end()) {
++            s_slot_rev = it->second;
++        }
++    }
++    if (s_slot_rev == nullptr) {
++        s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
++        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
++        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
++        cb(s_slot_rev, "s_slot_rev", -1);
++        if (share_slot_rev) {
++            s_slot_rev_cache[slot_rev_buft] = s_slot_rev;
++        }
++    }
+ 
+     ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+ 
+@@ -4171,7 +4353,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
      const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
  
      auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
@@ -87911,7 +87960,7 @@ index b5d4642a2..522582787 100644
  
      auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
  
-@@ -4182,7 +4341,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
+@@ -4182,7 +4364,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
      const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
  
      auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
@@ -87920,7 +87969,7 @@ index b5d4642a2..522582787 100644
  
      auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
  
-@@ -4203,14 +4362,14 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
+@@ -4203,14 +4385,14 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
          inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
          inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
  
@@ -87938,7 +87987,7 @@ index b5d4642a2..522582787 100644
  
      inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 9867c9540..701f093f7 100644
+index 9867c9540..597b32385 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -49,6 +49,7 @@ enum llm_graph_type {
@@ -88059,7 +88108,23 @@ index 9867c9540..701f093f7 100644
  struct llm_graph_context {
      const llama_model & model;
  
-@@ -1084,10 +1142,18 @@ struct llm_graph_context {
+@@ -1069,6 +1127,15 @@ struct llm_graph_context {
+ 
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+ 
++    // build_conv_state_store: the rollback slot order is a graph constant, so it is built once per
++    // (graph, device) instead of once per conv layer.  `share_slot_rev` is the kill switch
++    // (LLAMA_SHARE_SLOT_REV=0 restores the per-layer chain, for an A/B or a bisect).
++    const bool share_slot_rev = [] {
++        const char * e = getenv("LLAMA_SHARE_SLOT_REV");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    mutable std::map<ggml_backend_buffer_type_t, ggml_tensor *> s_slot_rev_cache;
++
+     const llama_adapter_cvec     * cvec;
+     const llama_adapter_loras    * loras;
+     const llama_memory_context_i * mctx;
+@@ -1084,10 +1151,18 @@ struct llm_graph_context {
  
      std::map<llama_seq_id, llama_sampler *> samplers;
  
@@ -88078,7 +88143,7 @@ index 9867c9540..701f093f7 100644
      ggml_context * ctx0 = nullptr;
      ggml_cgraph  * gf   = nullptr;
  
-@@ -1308,6 +1374,26 @@ struct llm_graph_context {
+@@ -1308,6 +1383,26 @@ struct llm_graph_context {
  
      llm_graph_input_attn_kv * build_attn_inp_kv() const;
  

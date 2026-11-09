@@ -1,4 +1,4 @@
-From 6ad4d6842ea46b36cdc1afc5d94b5f022e75b645 Mon Sep 17 00:00:00 2001
+From d60531f254ad59150a5625a20b21013e1ef6dc5f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 03/15] rdna-boosts: block 03: chunked gated-delta-net prefill
@@ -40,8 +40,8 @@ overdoingism (PR #261).  Record: archive/work/recurrent-moved-cell-snapshots/.
  ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |    2 +-
  ggml/src/ggml.c                               |    4 +-
  src/llama-context.cpp                         |    5 +
- src/llama-graph.cpp                           |   52 +-
- src/llama-graph.h                             |    7 +
+ src/llama-graph.cpp                           |   87 +-
+ src/llama-graph.h                             |   16 +
  src/llama-memory-hybrid-idx.cpp               |    3 +-
  src/llama-memory-hybrid-idx.h                 |    1 +
  src/llama-memory-hybrid-iswa.cpp              |    2 +
@@ -54,7 +54,7 @@ overdoingism (PR #261).  Record: archive/work/recurrent-moved-cell-snapshots/.
  src/models/delta-net-base.cpp                 |   16 +-
  tests/test-backend-ops.cpp                    |  132 ++-
  tests/test-recurrent-state-depth.cpp          |  178 ++-
- 25 files changed, 3324 insertions(+), 25 deletions(-)
+ 25 files changed, 3362 insertions(+), 31 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
@@ -3088,10 +3088,19 @@ index e96fa121a..9a15a7758 100644
      LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index b5d4642a2..a2336bef8 100644
+index b5d4642a2..c9b227b4d 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -483,11 +483,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+@@ -7,6 +7,8 @@
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+ 
++#include "ggml-backend.h"
++
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+@@ -483,11 +485,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
      }
  }
  
@@ -3124,7 +3133,7 @@ index b5d4642a2..a2336bef8 100644
      if (s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
          int32_t * data = (int32_t *) s_copy->data;
-@@ -1202,6 +1223,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1202,6 +1225,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3133,7 +3142,7 @@ index b5d4642a2..a2336bef8 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1248,6 +1271,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -1248,6 +1273,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3142,7 +3151,7 @@ index b5d4642a2..a2336bef8 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1305,6 +1330,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -1305,6 +1332,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3151,7 +3160,7 @@ index b5d4642a2..a2336bef8 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -4034,6 +4061,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -4034,6 +4063,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
      inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
      inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
  
@@ -3164,7 +3173,7 @@ index b5d4642a2..a2336bef8 100644
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
  
-@@ -4060,9 +4093,26 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -4060,9 +4095,26 @@ ggml_tensor * llm_graph_context::build_rs(
      // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
      ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
  
@@ -3192,8 +3201,48 @@ index b5d4642a2..a2336bef8 100644
  }
  
  void llm_graph_context::build_conv_state_store(
+@@ -4101,12 +4153,33 @@ void llm_graph_context::build_conv_state_store(
+     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
+     const int64_t Kw = std::min(n, K);
+ 
+-    // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
+-    // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
+-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+-    cb(s_slot_rev, "s_slot_rev", -1);
++    // the slot order {K-1, ..., 0} is identical for EVERY conv layer of a graph and never depends on
++    // the ubatch, so it is built ONCE per (graph, device) and each layer takes its own tail
++    // {Kw-1, ..., 0} as a view of it (a view is not a graph node).  Built per layer instead -- as
++    // upstream does -- it is arange + scale_bias + cast per conv layer, i.e. 3 nodes and 3 launches
++    // per layer per graph: 144 nodes of 1268 in the dense-27B MTP verify graph, ~11 % of the graph,
++    // spent rebuilding a 4-element constant.  Measured on gfx1201 (issue #291): the verify graph's
++    // dispatch entry count and GPU time both rise with it, and the loss is per LAUNCH, so it is worst
++    // where a launch is expensive (GGML_CUDA_DISABLE_GRAPHS=1, and Windows).
++    // The device is the one the conv state itself lives on: sharing across devices would turn every
++    // consumer on another device into a cross-device copy of the index.
++    ggml_backend_buffer_type_t slot_rev_buft = s->buffer != nullptr ? ggml_backend_buffer_get_type(s->buffer) : nullptr;
++    ggml_tensor * s_slot_rev = nullptr;
++    if (share_slot_rev) {
++        auto it = s_slot_rev_cache.find(slot_rev_buft);
++        if (it != s_slot_rev_cache.end()) {
++            s_slot_rev = it->second;
++        }
++    }
++    if (s_slot_rev == nullptr) {
++        s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
++        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
++        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
++        cb(s_slot_rev, "s_slot_rev", -1);
++        if (share_slot_rev) {
++            s_slot_rev_cache[slot_rev_buft] = s_slot_rev;
++        }
++    }
+ 
+     ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+ 
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 98ab50da4..b5fa3ca8b 100644
+index 98ab50da4..04a9d0abf 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -314,6 +314,13 @@ public:
@@ -3210,6 +3259,22 @@ index 98ab50da4..b5fa3ca8b 100644
      const llama_memory_recurrent_context * mctx;
  
      // used in view offsets, need to match for valid graph reuse
+@@ -1073,6 +1080,15 @@ struct llm_graph_context {
+ 
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+ 
++    // build_conv_state_store: the rollback slot order is a graph constant, so it is built once per
++    // (graph, device) instead of once per conv layer.  `share_slot_rev` is the kill switch
++    // (LLAMA_SHARE_SLOT_REV=0 restores the per-layer chain, for an A/B or a bisect).
++    const bool share_slot_rev = [] {
++        const char * e = getenv("LLAMA_SHARE_SLOT_REV");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    mutable std::map<ggml_backend_buffer_type_t, ggml_tensor *> s_slot_rev_cache;
++
+     const llama_adapter_cvec     * cvec;
+     const llama_adapter_loras    * loras;
+     const llama_memory_context_i * mctx;
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
 index da1747649..02d13b67d 100644
 --- a/src/llama-memory-hybrid-idx.cpp

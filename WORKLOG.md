@@ -1,3 +1,57 @@
+## 261109.005 (r241, RELEASE v16-a691b2345-r241) -- the conv-state rollback index is built once per graph, not once per layer (GitHub issue #291), gated and re-cut
+
+**What shipped.**  `v16-a691b2345-r241`: the same 16 blocks on the same fork point (**`a691b2345`**), with one
+folded fix (block 03, `patches/README.md` carries the mapping).  `release.json`: `base=a691b2345`,
+`base_tree=9d7b9a02f`, `tip=7ef43022bf7fb122dd94c6b0e79a2501aa52c526` (the fork branch's re-cut commit; the
+working chain's tip `d38cb0920` has the same tree and is never the recorded value),
+`tree=d1fee048a4d450cc2b80831298d197381b406fa4`, 16 blocks, all 17 artifact hashes refreshed.  Report:
+`benchmarks/2026-11-09-issue-291-slot-rev-share.md`; the engineering facts are `INVARIANTS.md` r241; the gate is
+the new `scripts/gate-slot-rev-share.sh`.
+
+1. **Reproduced, with a much smaller magnitude than reported (GitHub issue #291, reporter @DanoPTT).**  Their arm
+   is dense Qwen3.8-27B + `--spec-type draft-mtp` at ~100k context on Windows: decode -12.5 %, prefill -5.5 %
+   from r220 to r236, GPU kernel times flat or lower, `GGML_CUDA_DISABLE_GRAPHS=1`.  On Linux (gfx1201, one
+   R9700, their exact flags and a 99 845-token prompt) the same direction is real but small: plain decode **flat**
+   (26.77 / 26.83 / 26.82 t/s at 10.5k), MTP decode **-2.7 %** (58.99 / 59.31 -> 57.51 / 57.67 at 100k), plain
+   prefill **-1.5 %** (818.7 / 816.5 -> 806.0 / 805.0 at 100k) and MTP prefill **-4.8 %** (787.6 -> 750.7) from
+   r220 to r236.  The MTP-specific prefill penalty was **r236-only** and already gone at r240 (1078.0 -> 1132.7
+   t/s).  Acceptance and generated text are identical in every arm here.
+2. **The mechanism the reporter's own analysis named was real, and it was ours to fix.**  Upstream #31660 replaced
+   the conv-state snapshot copies with one `ggml_set_rows` per conv layer plus an `arange` + `scale_bias` + `cast`
+   index, and the index was rebuilt **per conv layer, per graph**: 3 nodes and 3 launches for the same K <= 8 int32
+   values, i.e. 144 of the 1268 nodes of the dense-27B MTP verify graph (their +96 is the same mechanism on a graph
+   that already carried `set_rows`).  The chain is now built once per (graph, device), keyed on the buffer type of
+   the recurrent state the store writes, and each layer takes its `{Kw-1, ..., 0}` tail as a view (a view is not a
+   graph node).  Verify graph **1268 -> 1127 nodes**.  `LLAMA_SHARE_SLOT_REV=0` restores the per-layer chain.
+3. **Measured on one build, A/B, same text.**  `58.37 / 58.31 -> 59.01 / 58.88 t/s` MTP decode at 10.5k depth
+   (**+1.03 %**), and **45.93 -> 47.76 t/s (+4.0 %)** on a decode-dominated short prompt, where the per-launch cost
+   is a larger share of the round; prefill 1132.7 -> 1145.2 / 1134.3 t/s.  Text byte-identical everywhere
+   (`535c/3c3913603ed9`, 535 chars).  r241 is at or above r220 on this arm (r220: 58.97 / 59.72).  Because the cost
+   removed is per **launch**, the platform that pays most is the one where a launch is expensive, which is the
+   reporter's (`GGML_CUDA_DISABLE_GRAPHS=1`, Windows).
+4. **Recorded, NOT shipped: the CONCAT the same refactor un-fused.**  `CONCAT conv_input-*` is dispatched 48 times
+   per verify round at r240 against ~4 at r220 (0.010 ms each, ~1 % of a 45 ms round).  Two matchers lost it: the
+   GDN direct conv requires `st->ne[2] == 1` so it declines on any multi-sequence ubatch (which `-np 2
+   --kv-unified` produces), and `ggml_cuda_ssm_conv_in_try_fuse` no longer reaches the concat because the store's
+   window view sits between it and the conv.  Restoring it means teaching both matchers the new window view
+   (`ne = [n_cols, Kw, C, n_seqs]`, dim-1 stride one element), a prefill-kernel change that one arm is not enough
+   to justify.  Detail and the exact shapes are in the report; the fact is `INVARIANTS.md` r241.
+
+**Gates.**  `scripts/gate-slot-rev-share.sh` PASS: one index chain per graph (census `x1` vs `x48` in the per-layer
+arm, read from `GGML_CUDA_OP_TIMING`), text identical, decode not slower, GPU faults none in its own window.
+Coherence `text-qwen35-4B 1c5d32ac537d` (the r239/r240 anchor, unchanged).  `scripts/gate-prefill-logits.sh` PASS:
+mean KLD **0.000697**, same-top-p **98.784 %**, i.e. numerically identical to the recorded r239/r240 numbers, which
+is what a bit-identical graph change must show.  `scripts/gate-per-block-build.sh --fast --tip HEAD
+--changed-from a7cb0ab18`: **2/2** (block 03 and the tip).  `scripts/validate-set.sh`: checksums OK, strict `git am`
+of the 16 patches from a fresh `a691b2345` tarball, applied tree `d1fee048a` == `release.json.tree`, no conflict
+markers, Windows portability scan 287 files clean.
+
+**Landing.**  Folded into block 03 (`git rebase -i`, `edit` at that commit, `git apply` of the delta, `--amend`),
+and the folded tree is bit-identical to the working tree the numbers above were measured on (`git diff` against it
+is empty), so no measurement had to be repeated.  `scripts/make-patches.sh` + `make-release.sh` regenerated the
+set and `release.json`; the re-cut off the regenerated patches reproduces tree `d1fee048a` and prints the recorded
+tip `7ef43022b`.
+
 ## 261109.004 (r240, RELEASE v16-a691b2345-r240) -- a pool block that only lives for one statement is released per statement (GitHub issue #290), gated 14/14 and re-cut
 
 **What shipped.**  `v16-a691b2345-r240`: the same 16 blocks on the same fork point (**`a691b2345`**), with two
