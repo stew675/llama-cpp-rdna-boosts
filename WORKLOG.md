@@ -1642,7 +1642,7 @@ blocks 00-11 and 13-15 keep identical deltas).  `release.json` tip `8650138aa`, 
 `53a43c6003307a2cf7f538767a4250aa44c596e8` (base/base-tree unchanged).  Issue
 [#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) (@DanoPTT, Windows 11, one R9700,
 Flash-Next IQ3_XXS, `--limit-host-experts 4 MOE_HOST_POOL_RAM_PCT=10`): *"forcing the direct tier for the same
-`l4` config makes prefill ~3x faster"*.  Campaign record: [`wip/host-pool-fill-transport/`](wip/host-pool-fill-transport/README.md).
+`l4` config makes prefill ~3x faster"*.  Campaign record: [`archive/work/host-pool-fill-transport/`](archive/work/host-pool-fill-transport/README.md).
 
 **1. The defect is one predicate.**  The coalesced prefill read (r224, `MOE_HOST_POOL_STAGE_SPAN`, default on)
 serves a run of >= 2 "neither tier" experts from one file read per 16-expert chunk, but both `span_geom`
@@ -1712,7 +1712,7 @@ new entry for the latch's ~1e-5 perturbation.  `patches/README.md`: the block-12
 
 **Environment.**  `soar` (3 x R9700, 91 GiB; `HIP_VISIBLE_DEVICES=0` for every arm), ROCm 10.1.0-gfx120X,
 build 11903 lineage @ `a19aab55e` + the change.  Arms: `wip/bench-56gb/arms-issue281{,b,c}.txt`, the RAM-rich
-cell in `wip/host-pool-fill-transport/warm-fill-src.sh`.  `check-gpu-faults.sh` clean over the session.  One
+cell in `archive/work/host-pool-fill-transport/warm-fill-src.sh`.  `check-gpu-faults.sh` clean over the session.  One
 rig bug fixed on the way: `runme-56gb-tier.sh` exported the literal `-`/`auto` for "default" and
 `env_int("auto", ...)` is 0, so a `DIO=auto` arm silently forced buffered and `RANK=-` forced `combined`; the
 script now *unsets* them and two arms were re-run.
@@ -1721,7 +1721,7 @@ script now *unsets* them and two arms were re-run.
 
 **No delivery change yet** (`patches/`, `release.json` and the fork branch stay `v16-6050b467c-r231`, tip
 `a19aab55e`).  A fix is built, measured and gated as a working-tree diff; the campaign record is
-[`wip/host-pool-fill-transport/`](wip/host-pool-fill-transport/README.md) and the delivery change waits on the
+[`archive/work/host-pool-fill-transport/`](archive/work/host-pool-fill-transport/README.md) and the delivery change waits on the
 maintainer's go-ahead.  Issue [#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) (@DanoPTT,
 Windows 11, Flash-Next IQ3_XXS, `--limit-host-experts 4 RAM_PCT=10`): *"forcing the direct tier makes prefill
 ~3x faster"*.
@@ -1786,7 +1786,7 @@ prefill-staging snapshot built before a rolled-back admission -- the r219 class 
 
 **Environment.**  `soar` (3 x R9700, 91 GiB; `HIP_VISIBLE_DEVICES=0` for every arm), build 11903 @ `a19aab55e`
 + the change, ROCm 10.1.0-gfx120X.  Arms: `wip/bench-56gb/arms-issue281{,b,c}.txt`, the RAM-rich cell in
-`wip/host-pool-fill-transport/warm-fill-src.sh`, logs beside them.  `scripts/check-gpu-faults.sh` clean over the
+`archive/work/host-pool-fill-transport/warm-fill-src.sh`, logs beside them.  `scripts/check-gpu-faults.sh` clean over the
 session.  One rig bug fixed on the way: `runme-56gb-tier.sh` exported the literal `-`/`auto` for "default", and
 `env_int("auto", …)` is 0 -- so a `DIO=auto` arm silently forced buffered and `RANK=-` forced `combined`; the
 script now *unsets* those, and two arms were re-run.
