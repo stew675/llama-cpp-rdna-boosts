@@ -58,8 +58,16 @@ and +98 → +68 % decode from d0 to d160K, +19/+88 % on real text, +42/+67/+54 %
 both MoE tiers, ours default-on, upstream's opt-in; coexistence costs 44 % prefill).  Records: 261108.011-.015.
 `TODO` #134 (the re-base) closes with this entry; the campaign moves to `archive/work/upstream-rebase-261108/`.
 
-**Containers** are built and pushed **off-host** by the watcher (`scripts/container-watch.sh` on `radiance`),
-which picks the tag up within ~10 minutes — nothing runs on the primary box.
+**Landing and publication.**  The release commit `884c7e5c` (and the annotated tag `v16-a691b2345-r236`, which
+points at it) is on **`main`**: `rebase-r236` was 49 commits ahead of `origin/main` and 0 behind, so the release
+was a fast-forward (`171d5463..884c7e5c`) rather than a merge — the tag therefore names a commit that `main`
+carries, which is what a consumer reading the default branch expects.  The fork's `rdna-boosts` was refreshed by
+`scripts/fork-refresh.sh --build --push` (re-cut, tree check, build, force-with-lease): `69d36099b -> 0e6daae4e`,
+which equals `release.json.tip`, and its tree equals `release.json.tree`.  CI: **`Release patch set` succeeded on
+the tag** (assets attached) and `Validate delivery set` succeeded on the tag and on both branches.  **Containers**
+are built and pushed **off-host** by the watcher (`scripts/container-watch.sh` on `radiance`, cron every 10 min):
+its 22:10 pass logged `new release v16-a691b2345-r236 (last built: v16-6050b467c-r235); building (attempt 1/3)`,
+so both ROCm lines are building there — nothing runs on the primary box.
 
 ## 261108.015 (no release) -- `TODO` #291/`D1` closed: keep both MoE tiers, ours default-on, upstream's opt-in (and D1's original inversion is stale)
 
