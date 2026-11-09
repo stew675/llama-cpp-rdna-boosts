@@ -3304,3 +3304,41 @@ bit-identical rather than rounding-level. Worth **+6.0 %** prefill on a 31.5k pr
   checks that the copies are right: `GGML_CUDA_BF16_PRODUCER=2` re-converts every hit and compares (3501+ hits,
   **0 mismatching elements**, both producers named in the log: `hc_norm-N`, `hc_mixed-N`), and the prefill-logit gate
   reads `-0.000000`. The F32 output is still written except on the MMB BF16-only mark, where nothing reads it.
+
+## r243 -- a host gather is bounded by the ubatch boundary, and ggml's threadpool cannot be borrowed (contributor PR #289)
+
+**The change. Do not re-derive the numbers from the PR text: they are 4-5x the real ones.** The qwen4exp host PLE
+gather (`llm_graph_input_ple::set_input`) now dequantizes `per_layer_token_embd`'s rows straight into `emb->data`
+when the input tensor lives in a host buffer (`LLAMA_PLE_DIRECT=0` restores scratch + `ggml_backend_tensor_set`), and
+splits the row range over one thread per 4096 rows (`LLAMA_PLE_THREADS` is the ceiling; `LLAMA_PLE_DEBUG=1` prints
+`ple gather: <rows> rows, <threads> threads, direct=<0|1>` at INFO). Worth **+1.31 %** prefill on the delivery-style
+`-ub 4096` arm and **+1.16 %** at `-ub 4096` without the attendance pool, but **+0.06 %** at `-ub 6144` on the same
+31.5k prompt (+0.32 % on a 101k one). Greedy text identical, prefill-logit KLD `-0.000000 / 100.000 %`.
+- **The per-ubatch work is a property of the model, not of the ubatch token count alone.** Flash-Next is
+  `ple_n_heads = 16`, `ple_head_dim = 160`, IQ4_NL (90 B/row): at `-ub 4096` the gather is **65 536 rows / 41.9 MB**
+  (81.9 MB of source rows), at `-ub 6144` **98 304 / 62.9 MB**. The PR's "~300k rows and a 200 MB copy" is not this
+  model (do not repeat it); it overstates the cost by ~4.6x and therefore also overstates the mechanism's importance.
+- **The saving is per ubatch boundary, so the arm has to expose it.** It is a memcpy of one ubatch's input plus one
+  thread's dequantization, i.e. a fixed cost per boundary: on 8 boundaries (31.5k at `-ub 4096`) it is ~1.3 %, at
+  `-ub 6144` (6 boundaries) the same absolute cost is *hidden* behind the host-expert fill and measures 0. A/B this
+  at `-ub 4096` or not at all -- and expect the win to shrink, not grow, at a wider ubatch.
+- **The input tensor is on the host because it is a graph input.** `ggml_backend_sched_backend_id_from_cur()` sends
+  every `GGML_TENSOR_FLAG_INPUT` leaf to `sched->n_backends - 1` (the CPU backend), so `emb->buffer` is the CPU
+  buffer, `ggml_backend_buffer_is_host()` is true, and the scheduler's own H2D copy is what reaches the GPU. The
+  shortcut therefore replaces a **host memcpy** and nothing else: the CPU buffer's `set_tensor` is a bare `memcpy`
+  (`ggml_backend_cpu_buffer_set_tensor`), so writing `emb->data` directly bypasses no bookkeeping. Resolve the
+  buffer the way `ggml_backend_tensor_set()` does (`view_src ? view_src->buffer : buffer`) so a view cannot be
+  mis-detected -- a false negative just takes the old path, which is why that rule is the safe default.
+- **ggml's threadpool cannot be borrowed, and that is a durable fact.** Its only entry point is
+  `ggml_graph_compute(cgraph, threadpool, n_threads)`; workers block and then walk the graph's node loop through
+  `ggml_barrier()`. There is no public `parallel_for`, and no *getter* either (`ggml_backend_cpu_set_threadpool()` is
+  write-only, called by `llama_context::attach_threadpool`), so a graph input cannot even reach the pool. Reusing it
+  would mean adding a second work-item protocol to `ggml-cpu.c`'s threading core -- a TU shared by every backend's CPU
+  splits -- to save ~0.3 ms of thread spawn per ubatch (~0.02 % of a 13 s prefill). Host fan-out spawns its own
+  threads here exactly as `llama_lazy_reader::gather()` and `llama_state_copy_jobs` already do; take the **width**
+  from the operator (`cparams.n_threads_batch`, i.e. `--threads`/`-tb`) and cap it by `hardware_concurrency()`.
+- **A textual-identical hunk can land in the wrong branch.** The managed-lazy and host-gather branches of
+  `build_inp_ple` had byte-identical three-line contexts, so a hand-cut diff placed the `n_threads` assignment in
+  the *lazy* branch (it compiled, ran, and only the census showed the ceiling was 8 instead of `--threads`). Anchor
+  such an edit on a unique line -- here the `std::make_unique<llm_graph_input_ple>` call site -- and prove it with
+  the census, not with the diff.

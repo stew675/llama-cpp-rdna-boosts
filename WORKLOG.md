@@ -1,3 +1,69 @@
+## 261109.008 (r243, RELEASE v16-a691b2345-r243) -- contributor PR #289: the qwen4exp host PLE gather writes the graph input in place and fans out over `--threads`, +1.3 % prefill on the `-ub 4096` arm (and neutral at `-ub 6144`)
+
+**Release `v16-a691b2345-r243`.**  Base `a691b2345`, 16 blocks, canonical tip
+`72f7753fdfbb5b4b2d72f2a326ac468a04cb3d2c`, tree `e9300f1dbd0b2f0b96c1828829d2072d73f34bca`.  One change, folded
+into **block 11** (qwen4exp); blocks 12-15 replay clean over it and every other block's body is byte-identical to
+r242 (`gate-per-block-build.sh --changed-from 9c157f421 --tip <new>`: 2/2 built, 14 skipped as unchanged).
+`release.json` was regenerated (`scripts/make-release.sh`) and `validate-set.sh` re-ran on it (checksums, fresh
+tarball at `a691b2345`, strict `git am`, tree match, Windows-portability scan of 287 added files OK).
+
+**The contribution.**  Brian (`briansp2020`), [PR #289](https://github.com/stew675/llama-cpp-rdna-boosts/pull/289):
+one patch cut against **r235** plus a README, filed under `wip/ple-gather-r235/`.  Every prompt ubatch, the main
+thread gathers `ple_n_heads` hashed rows per token out of the host `per_layer_token_embd` table, dequantizes them
+into a scratch vector and `ggml_backend_tensor_set`s that into the PLE graph input while both GPUs wait at the
+ubatch boundary.  The patch (a) dequantizes the rows **straight into `emb->data`** when the input lives in a host
+buffer and (b) splits the row range over up to 8 `std::thread`s, one per 4096 rows.  `LLAMA_PLE_DIRECT`,
+`LLAMA_PLE_THREADS`.
+
+**Its claims, checked against this box** (gfx1201, 2x R9700 `0,2`, `-sm tensor`, Flash-Next GSQ-RCO IQ3_S,
+`-ncmoe 47 -lme 47`, `--load-mode mmap`, 31.5k prompt, alternated runs):
+- **The mechanism fires, and it is reachable.**  A census build printed `buf=CPU is_host=1 direct=1` and `n_thr=8`
+  at prefill widths (`n_thr=1` for decode).  The input tensor is on the host because
+  `ggml_backend_sched_backend_id_from_cur()` sends every `GGML_TENSOR_FLAG_INPUT` leaf to the CPU backend, so the
+  shortcut replaces a host `memcpy` and bypasses no bookkeeping (the CPU buffer's `set_tensor` is a bare `memcpy`).
+- **Their `-ub 4096` numbers reproduce, slightly conservatively:** delivery shape (`-ub 4096` + attendance pool)
+  **2338.5 -> 2369.2 t/s (+1.31 %)**, 6 runs per side and **no overlap** between the arms (every PR run 2360.9-2380.5
+  above every base run 2327.1-2354.9); again +0.77 % once the ceiling followed `--threads` (`-t 7`).  Isolated on one
+  binary with both switches off as the control (2344.4): **threads +0.69 %**, **direct write +0.17 %**.
+- **Their field-shape numbers do not:** at their own `-ub 6144`/no-pool settings, 31.5k **2384.3 -> 2385.7 (+0.06 %,
+  neutral)** and 101k **2444.1 -> 2451.9 (+0.32 %)** against their +0.3 %/+0.9 %.  `-ub 4096` *without* the pool is
+  +1.16 % (2286.8 -> 2313.3), so the win is **ubatch-boundary shaped** (8 boundaries instead of 6 on the same
+  prompt): at `-ub 6144` the same absolute cost sits behind the host-expert fill and disappears.  That is now the
+  delivery's guidance for the arm (`INVARIANTS.md` r243), and the record's headline is the `-ub 4096` number.
+- **Their motivation was overstated ~4.6x:** they wrote "about 300k rows and a 200 MB copy per ubatch" at `-ub 4096`;
+  the model is `ple_n_heads = 16`, `ple_head_dim = 160`, IQ4_NL, so it is **65 536 rows / 41.9 MB** (98 304 / 62.9 MB
+  at `-ub 6144`).  The measured rows/size are in the census and in `INVARIANTS.md` so the figure cannot propagate.
+- **Purity held, and is exact:** greedy text identical in every arm -- `9de3ae5502bc` (31.5k, -n 64),
+  `e6ecbe2cd1c8` (`draft-mtp n3`, -n 256, the delivery's own MTP anchor), `0f5005a4398f` (1 device `-sm layer`),
+  `83eec5e9b4f0` (Qwen3.5-4B control, a model the change cannot reach); prefill-logit **-0.000000 / 100.000 %**
+  (`--sm tensor --device 0,2`, base recorded from the r242 build) -- the logits are *unchanged*, not merely inside
+  tolerance, which is what a host-side gather rewrite must show; no GPU faults across every run
+  (`check-gpu-faults.sh`).  Rule-5 width check `llama-batched-bench -npl 1,4,8 -npp 512 -ntg 32`: PP 592.5 -> 597.2
+  / 2226.0 -> 2242.9 / **2465.0 -> 2539.8** t/s, decode 56.0/160.3/237.1 -> 56.2/157.5/240.7 (inside the spread).
+
+**What was adjusted before it could ship** (`archive/work/ple-gather/` is the full record): the patch was re-cut
+onto the r242 tree (the touched region is byte-identical to r235, only line numbers drifted); the thread **ceiling
+now follows the operator** -- the smaller of 8, `hardware_concurrency()` and `cparams.n_threads_batch`
+(`--threads`/`-tb`), because ggml's threadpool cannot be borrowed (no parallel-for, no getter; it only runs
+`ggml_graph_compute` and it is idle here anyway) while the delivery's own host fan-outs already spawn their own
+threads (`llama_lazy_reader::gather`, `llama_state_copy_jobs`); the direct write resolves the buffer the way
+`ggml_backend_tensor_set()` does (`view_src` first) so a view cannot be mis-detected; and a census
+(`LLAMA_PLE_DEBUG=1`, INFO) was added, because a silent optimisation makes a future arm vacuous (r225/r238).  The
+contributor's `wip/` placement was not adopted (no `wip/CAMPAIGNS.md` row; a stale copy of that file) -- the
+campaign was promoted in the same session, so it is recorded under `archive/work/` and the PR was answered with the
+outcome.
+
+**Held back:** the per-ubatch thread *creation* (a persistent pool would save ~0.3 ms of spawn per boundary, i.e.
+~0.02 % -- not worth lifetime handling in the graph input); and the `MADV_WILLNEED` range merge the contributor
+mentions as a follow-up (that is `wip/ple-residency`'s territory, still parked, and the delivered loop is
+load-bearing per that campaign's own record).
+
+**Arch arms:** not re-run for this release, deliberately -- the change is host code with no kernel, no
+backend predicate and no arch branch, the 1-device arm is neutral and identical, and the 4B control shows it
+unreachable elsewhere; gfx1151 holds the whole expert set in VRAM, so its `per_layer_token_embd` is a *device*
+table and the host-gather arm is not even reached there without `--override-tensor 'per_layer_token_embd.*=CPU'`
+(`INVARIANTS.md` r243).
+
 ## 261109.007 (r242, RELEASE v16-a691b2345-r242) -- contributor PR #288: the qwen4exp prefill chain `DSV4_HC_POST -> RMS_NORM -> MUL` is one kernel, and its producers write the BF16 GEMM activations, +6.0-8.1 % prefill on a 2-device `-sm tensor` arm
 
 **Release `v16-a691b2345-r242`.**  Base `a691b2345`, 16 blocks, canonical tip

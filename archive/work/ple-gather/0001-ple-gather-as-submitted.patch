@@ -1,0 +1,114 @@
+From 9e2ed3bc9f6a184b7269ae6e0dfd8f4d529d0186 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 05:39:03 +0000
+Subject: [PATCH] qwen4exp: gather the host PLE rows on several threads,
+ straight into the input
+
+For every prompt ubatch llm_graph_input_ple::set_input gathers n_heads hashed
+rows per token from the host per_layer_token_embd table, dequantizes them on
+one thread into a scratch vector and copies that into the input tensor with
+ggml_backend_tensor_set (about 300k rows and 200 MB at -ub 4096), while both
+GPUs wait at the ubatch boundary.
+
+- The rows are split over up to 8 std::threads, one per 4096 rows, so decode
+  stays on the calling thread. Each row is dequantized on its own with the
+  same to_float, so the bytes are the same. If a worker cannot be started,
+  the calling thread takes its rows. LLAMA_PLE_THREADS=1 restores the single
+  loop.
+- When the input lives in a host buffer with exactly the gathered size, the
+  rows are written straight into emb->data instead of the scratch +
+  ggml_backend_tensor_set. Device, split and RPC buffers, and a meta buffer
+  with any non-host child, keep the old path. LLAMA_PLE_DIRECT=0 restores it.
+
+2x R9700, -sm tensor, Flash-Next IQ3_S: greedy / 4.4k prompt set / 101k
+hashes unchanged; prefill +0.3-0.9 % with the r235 host-pool settings,
++0.8-1.2 % with --host-experts mmap -ub 4096.
+---
+ src/models/qwen4exp.cpp | 62 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 59f342c09..e9f820db2 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,9 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cstdlib>
++#include <system_error>
++#include <thread>
++#include <vector>
+ #if defined(__linux__) || defined(__APPLE__)
+ #include <sys/mman.h>
+ #endif
+@@ -3041,17 +3044,58 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         llama_prefetch_rows(tab, idx.data(), idx.size());
+ #endif
+ 
+-        emb_scratch.resize(idx.size() * (size_t) dim);
+-        for (size_t k = 0; k < idx.size(); ++k) {
+-            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+-            float *      dst = emb_scratch.data() + k * (size_t) dim;
+-            if (tab->type == GGML_TYPE_F32) {
+-                memcpy(dst, src, dim * sizeof(float));
+-            } else {
+-                traits->to_float(src, dst, dim);
++        // the input sits in a host buffer: write the rows straight into it instead of copying ~200 MB per prompt ubatch
++        // from the scratch (same bytes).  LLAMA_PLE_DIRECT=0: through the scratch and ggml_backend_tensor_set.
++        static const bool direct_ok = [] { const char * e = getenv("LLAMA_PLE_DIRECT"); return e == nullptr || atoi(e) != 0; }();
++        const bool direct = direct_ok && emb->buffer != nullptr && ggml_backend_buffer_is_host(emb->buffer) &&
++                            ggml_nbytes(emb) == idx.size() * (size_t) dim * sizeof(float);
++        if (!direct) {
++            emb_scratch.resize(idx.size() * (size_t) dim);
++        }
++        float * const out = direct ? (float *) emb->data : emb_scratch.data();
++        // every row is dequantized on its own, so splitting the rows over threads gives the same bytes; a prompt ubatch
++        // of 4096 tokens has ~200k rows, ~30 ms on one thread between the GPU's ubatches.  One thread per 4096 rows, so
++        // fewer than 8192 rows (decode) stay on this thread.  LLAMA_PLE_THREADS=1: one thread.
++        static const int n_thr_max = [] {
++            const char * e = getenv("LLAMA_PLE_THREADS");
++            return e != nullptr ? std::max(1, atoi(e)) : 8;
++        }();
++        const auto gather_rows = [&](size_t k0, size_t k1) {
++            for (size_t k = k0; k < k1; ++k) {
++                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
++                float *      dst = out + k * (size_t) dim;
++                if (tab->type == GGML_TYPE_F32) {
++                    memcpy(dst, src, dim * sizeof(float));
++                } else {
++                    traits->to_float(src, dst, dim);
++                }
++            }
++        };
++        const size_t n_rows = idx.size();
++        const int    n_thr  = (int) std::min<size_t>((size_t) n_thr_max, std::max<size_t>(1, n_rows / 4096));
++        if (n_thr <= 1) {
++            gather_rows(0, n_rows);
++        } else {
++            std::vector<std::thread> workers;
++            workers.reserve(n_thr - 1);
++            const size_t chunk = (n_rows + n_thr - 1) / n_thr;
++            try {
++                for (int t = 1; t < n_thr; ++t) {
++                    const size_t k0 = std::min(n_rows, t * chunk), k1 = std::min(n_rows, k0 + chunk);
++                    workers.emplace_back(gather_rows, k0, k1);
++                }
++            } catch (const std::system_error &) {
++                // a worker could not be started: this thread also takes the rows of the ones that are missing
++            }
++            gather_rows(0, std::min(n_rows, chunk));
++            gather_rows(std::min(n_rows, (workers.size() + 1) * chunk), n_rows);
++            for (auto & w : workers) {
++                w.join();
+             }
+         }
+-        ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        if (!direct) {
++            ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        }
+     } else {
+         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+     }
+-- 
+2.53.0
+

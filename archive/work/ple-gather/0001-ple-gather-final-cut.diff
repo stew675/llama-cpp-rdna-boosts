@@ -1,0 +1,125 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 05a35a7db..fa13ef178 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,9 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cstdlib>
++#include <system_error>
++#include <thread>
++#include <vector>
+ #if defined(__linux__) || defined(__APPLE__)
+ #include <sys/mman.h>
+ #endif
+@@ -2837,7 +2840,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+ class llm_graph_input_ple : public llm_graph_input_i {
+ public:
+     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
+-                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
++                        const llama_kv_cache_context * mctx,
++                        int n_threads) : pmodel(pmodel), mctx(mctx), n_threads(n_threads) {}
+     virtual ~llm_graph_input_ple() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+@@ -2858,6 +2862,9 @@ public:
+     // the predecessor tokens live in the attention KV cells (ext.tok)
+     const llama_kv_cache_context * mctx;
+ 
++    // the host gather's thread ceiling, from cparams.n_threads_batch (--threads/-tb), see set_input()
++    const int n_threads;
++
+     // scratch, reused across set_input() calls
+     std::vector<llama_token> prev;
+     std::vector<float> emb_scratch;
+@@ -2974,17 +2981,71 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         llama_prefetch_rows(tab, idx.data(), idx.size());
+ #endif
+ 
+-        emb_scratch.resize(idx.size() * (size_t) dim);
+-        for (size_t k = 0; k < idx.size(); ++k) {
+-            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+-            float *      dst = emb_scratch.data() + k * (size_t) dim;
+-            if (tab->type == GGML_TYPE_F32) {
+-                memcpy(dst, src, dim * sizeof(float));
+-            } else {
+-                traits->to_float(src, dst, dim);
++        // the input sits in a host buffer: write the rows straight into it instead of copying the whole thing per prompt
++        // ubatch from the scratch (same bytes).  LLAMA_PLE_DIRECT=0: through the scratch and ggml_backend_tensor_set.
++        // the buffer follows ggml_backend_tensor_set()'s own rule (a view owns no buffer of its own)
++        static const bool direct_ok = [] { const char * e = getenv("LLAMA_PLE_DIRECT"); return e == nullptr || atoi(e) != 0; }();
++        const ggml_backend_buffer_t buf = emb->view_src ? emb->view_src->buffer : emb->buffer;
++        const bool direct = direct_ok && buf != nullptr && ggml_backend_buffer_is_host(buf) &&
++                            ggml_nbytes(emb) == idx.size() * (size_t) dim * sizeof(float);
++        if (!direct) {
++            emb_scratch.resize(idx.size() * (size_t) dim);
++        }
++        float * const out = direct ? (float *) emb->data : emb_scratch.data();
++        // every row is dequantized on its own, so splitting the rows over threads gives the same bytes; a prompt ubatch
++        // has ~100k rows at -ub 6144, a few ms of one thread's time between the GPU's ubatches.  One thread per 4096 rows,
++        // so fewer than 8192 rows (decode) stay on this thread.  The width is the smaller of this ceiling, the hardware
++        // and `--threads` (n_threads): the CPU graph threads are idle while the GPUs run the prefill, and ggml's
++        // threadpool only ever executes a ggml_graph_compute, so a host fan-out spawns its own -- the lazy reader's
++        // gather() and llama_state_copy_jobs do the same.  LLAMA_PLE_THREADS overrides the ceiling (_=1 for the A/B).
++        static const int n_thr_cfg = [] {
++            const char * e = getenv("LLAMA_PLE_THREADS");
++            return e != nullptr ? std::max(1, atoi(e)) : 8;
++        }();
++        static const int n_thr_hw = (int) std::min<size_t>((size_t) n_thr_cfg,
++                                                            std::max<unsigned>(1u, std::thread::hardware_concurrency()));
++        const auto gather_rows = [&](size_t k0, size_t k1) {
++            for (size_t k = k0; k < k1; ++k) {
++                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
++                float *      dst = out + k * (size_t) dim;
++                if (tab->type == GGML_TYPE_F32) {
++                    memcpy(dst, src, dim * sizeof(float));
++                } else {
++                    traits->to_float(src, dst, dim);
++                }
++            }
++        };
++        const size_t n_rows = idx.size();
++        const int    n_thr  = (int) std::min<size_t>((size_t) std::min(n_thr_hw, n_threads),
++                                                    std::max<size_t>(1, n_rows / 4096));
++        if (n_thr <= 1) {
++            gather_rows(0, n_rows);
++        } else {
++            std::vector<std::thread> workers;
++            workers.reserve(n_thr - 1);
++            const size_t chunk = (n_rows + n_thr - 1) / n_thr;
++            try {
++                for (int t = 1; t < n_thr; ++t) {
++                    const size_t k0 = std::min(n_rows, t * chunk), k1 = std::min(n_rows, k0 + chunk);
++                    workers.emplace_back(gather_rows, k0, k1);
++                }
++            } catch (const std::system_error &) {
++                // a worker could not be started: this thread also takes the rows of the ones that are missing
++            }
++            gather_rows(0, std::min(n_rows, chunk));
++            gather_rows(std::min(n_rows, (workers.size() + 1) * chunk), n_rows);
++            for (auto & w : workers) {
++                w.join();
+             }
+         }
+-        ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        // a silent optimisation makes a later arm vacuous (the r225/r238 rule), so name the split when asked
++        static const bool gather_debug = [] { const char * e = getenv("LLAMA_PLE_DEBUG"); return e != nullptr && atoi(e) != 0; }();
++        if (gather_debug) {
++            LLAMA_LOG_INFO("%s: ple gather: %zu rows, %d threads, direct=%d\n", __func__, n_rows, n_thr, (int) direct);
++        }
++        if (!direct) {
++            ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++        }
+     } else {
+         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+     }
+@@ -3055,7 +3116,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+ 
+     // the attention cells see every ubatch regardless of the layer types
+     auto ple_inp = std::make_unique<llm_graph_input_ple>(
+-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
++            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn(),
++            cparams.n_threads_batch > 0 ? (int) cparams.n_threads_batch : 8);
+ 
+     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model);
+     if (pmodel.lazy_reader) {

@@ -1,4 +1,4 @@
-From ea5f068711e12f8cf07c0d0facdd33ba500087c4 Mon Sep 17 00:00:00 2001
+From 4712d26eb303ce6b680e9925d8762549604845c5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -8576,10 +8576,10 @@ index 51fd1cfa8..cc359bcab 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index defe7de9c..7458a21b7 100644
+index 3e37cae7a..2c10acccf 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -166,6 +166,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
+@@ -169,6 +169,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
      return false;
  }
  
@@ -8614,7 +8614,7 @@ index defe7de9c..7458a21b7 100644
  // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
  // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
  // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
-@@ -755,7 +783,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -758,7 +786,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
      // tail of the collapse launch) or Q8_0 (mmvq rows on the down grid).
      // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
      // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
@@ -8623,7 +8623,7 @@ index defe7de9c..7458a21b7 100644
      // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
      const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
                              (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
-@@ -772,7 +800,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -775,7 +803,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
          const int64_t out_n = n_embd + (w_inject ? hc : 0);
          // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
          // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
@@ -8632,7 +8632,7 @@ index defe7de9c..7458a21b7 100644
          const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
          if (planar) {
              ggml_hc_mix_set_planar(dst_t);
-@@ -918,7 +946,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -921,7 +949,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
      // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
      // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
@@ -8641,7 +8641,7 @@ index defe7de9c..7458a21b7 100644
      if (pin_block_out) {
          ggml_set_output(block_out);
      }
-@@ -2371,9 +2399,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2374,9 +2402,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
      }
  
@@ -8670,7 +8670,7 @@ index defe7de9c..7458a21b7 100644
      // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
      ggml_tensor * k_raw = k;
      ggml_tensor * v_raw = v;
-@@ -2392,6 +2437,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2395,6 +2440,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
@@ -8681,7 +8681,7 @@ index defe7de9c..7458a21b7 100644
          // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
          // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
          // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
-@@ -2552,10 +2601,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -2555,10 +2604,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
          if (shortcut && n_kv <= width) {
              build_qsa_store_k(mctx_hyb, cur, il);
@@ -8696,7 +8696,7 @@ index defe7de9c..7458a21b7 100644
              build_qsa_store_k(mctx_hyb, cur, il);
          } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                     n_kv < qsa_dense_prefill_until) {
-@@ -3057,7 +3109,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -3118,7 +3170,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
          // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
          // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B
