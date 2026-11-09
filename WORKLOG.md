@@ -67,11 +67,18 @@ code.  Recovered by fetching the canonical chain into the checkout
 `gate-per-block-build.sh --fast --tip <canonical tip>`: 16/16.  A later session should make step 2 pass
 `--tip "$(git -C "$FORK" rev-parse --short HEAD)"` when the working tip's tree equals `release.json.tree`.
 
-**Landing.**  The release commit carries the re-cut set, `release.json` (tip `2be18fc46`, tree `7339c1bc7`, all 17
-hashes) and the records, and the annotated tag `v16-a691b2345-r239` names it.  Folded into block 10 by
-`git rebase -i` (`edit` at that commit, `git apply` of the change, `--amend`), and the resulting tree is
-bit-identical to the working tree the numbers above were measured on, so no measurement had to be repeated after
-the fold.
+**Landing.**  The release commit `1f284c8c` carries the re-cut set, `release.json` (tip `2be18fc46`, tree
+`7339c1bc7`, all 17 hashes) and the records, and the annotated tag `v16-a691b2345-r239` names it.  Folded into
+block 10 by `git rebase -i` (`edit` at that commit, `git apply` of the change, then `--amend`), and the resulting
+tree is bit-identical to the working tree the numbers above were measured on, so no measurement had to be repeated
+after the fold.  `scripts/fork-refresh.sh --build --gates --push` re-cut and re-verified the build + coherence
+(`193 chars 3fab4da87774`) + prefill KLD (**0.000697**, same-top-p 98.784 %) on the canonical tip, then
+force-with-lease pushed `513866c57 -> 2be18fc46` to the **personal fork only**.  Published: `main` fast-forwarded,
+the tag pushed, CI green (`Validate delivery set` and `Release patch set`, assets attached), and the ROCm images
+are the off-host worker watcher's next pass (`scripts/container-watch.sh` on `radiance`, 10-minute cron); nothing
+runs on the primary box.  The reporter was replied to and GitHub issue #287 closed as completed.  **Left open for
+the maintainer's decision:** the unrelated 3-device `-sm tensor` cache-band NaN in item 5 above, which is a
+pre-existing r237 regression and not touched by this release.
 
 ## 261109.002 (r238, RELEASE v16-a691b2345-r238) -- the plain norm-rows match no longer inherits a gate index (GitHub issue #285), gated 14/14 and re-cut
 
