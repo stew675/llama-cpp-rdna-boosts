@@ -1,0 +1,67 @@
+From 19e80ec5c1e25b076e90ef8dacf2a09117341faa Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:12:56 +0800
+Subject: [PATCH 2/3] llama-graph: the DFlash layer-input copies right after
+ each layer, not after the whole graph (LLAMA_LAYER_INP_EARLY=0: off)
+
+build_layer_inp_dev() (upstream #31506) appends the SET_ROWS that copy the extracted layer inputs into the device buffer
+after the rest of the graph, so each extracted layer input stays alive through every later layer.  On dense 27B + DFlash2
+(5 layers) at -ub 2048 the target's compute buffer stays at ~757 MiB, where F1's per-layer store had brought it to ~582 MiB
+(stock r235 / r239 startup logs, gfx1201).  Each layer's copy (its VIEW, RESHAPE and SET_ROWS) now moves to just after the
+next layer's input node, where F1 put it; only the node order changes, every node computes the same.  The move is made only
+when the next layer's input is a node of its own and the source comes before it; otherwise the copy stays at the end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f67b95fae..eeb8e7e71 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4555,6 +4555,15 @@ void llm_graph_context::build_layer_inp_dev() const {
+     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+     ggml_set_input(inp->idxs);
+ 
++    // Each copy goes right after the layer's output (the next layer's input), where F1 put its per-layer store, instead of
++    // after the whole graph: the layer input is free from there on.  Appended at the end, every extracted layer input lived
++    // through every later layer (dense 27B + DFlash2's 5 layers, -ub 2048: the target's compute buffer ~582 -> ~757 MiB).
++    // Only the order moves; every node computes the same.  LLAMA_LAYER_INP_EARLY=0: at the end, as upstream
++    static const bool early = [] {
++        const char * e = getenv("LLAMA_LAYER_INP_EARLY");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
+     int64_t col = 0;
+     for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+@@ -4566,9 +4575,25 @@ void llm_graph_context::build_layer_inp_dev() const {
+         GGML_ASSERT(src != nullptr && "layer input tensor is null");
+         GGML_ASSERT(src->ne[0] == n_embd);
+ 
++        const int n0 = ggml_graph_n_nodes(gf);
+         ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd*ggml_element_size(layer_inp_dev));
+         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_tokens), inp->idxs));
+         col++;
++
++        const int n1 = ggml_graph_n_nodes(gf);
++        ggml_tensor * next = il + 1 < res->t_layer_inp.size() ? res->t_layer_inp[il + 1] : nullptr;
++        if (early && next != nullptr && n1 > n0) {
++            ggml_tensor ** nodes = ggml_graph_nodes(gf);
++            int i_src = -1, i_next = -1;
++            for (int k = 0; k < n0; ++k) {
++                if (nodes[k] == src)  i_src  = k;
++                if (nodes[k] == next) i_next = k;
++            }
++            // src computed before (or a leaf), and the next layer's input is a node of its own: the new nodes move there
++            if (i_next >= 0 && i_src < i_next) {
++                std::rotate(nodes + i_next + 1, nodes + n0, nodes + n1);
++            }
++        }
+     }
+     GGML_ASSERT(col*n_embd == layer_inp_dev->ne[0]);
+ 
+-- 
+2.43.0
+

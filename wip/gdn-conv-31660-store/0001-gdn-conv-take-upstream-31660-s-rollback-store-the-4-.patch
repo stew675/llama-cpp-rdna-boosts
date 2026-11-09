@@ -1,0 +1,54 @@
+From 9fb3f1d4550e284f679eb4fb7b95ac83eb895003 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:12:40 +0800
+Subject: [PATCH 1/3] gdn-conv: take upstream #31660's rollback store (the 4-D
+ window view and its SET_ROWS) in gdn_conv_check
+
+build_conv_state_store() now writes the rollback snapshots with one 4-D view of Kw overlapping 3-column windows of the concat
+(ne = [3, Kw, C, n_seqs], dim-1 stride one element) and one SET_ROWS that reads it.  gdn_conv_check() rejected both, so the
+direct conv (and with it the prefill and verify fusions built on it) declined on every GDN layer, single sequence included:
+the CONCAT, SSM_CONV and the q / k norm pair ran unfused.
+
+The window view's columns join the materialized tail (gdn_concat_tail writes them); the SET_ROWS (src[0] the window view,
+src[1] the slot order, src[2] the cache slots) is accepted as a reader of that tail.  It is not folded into the direct
+kernel (snap stays off, so the state gather is not deferred either).  A multi-sequence ubatch still declines (st->ne[2] == 1),
+as INVARIANTS r241 records.  GGML_CUDA_DISABLE_CONV_FUSION=1 still turns the whole fusion off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/gdn-conv.cu | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index 88d194d34..d24e4344d 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -212,11 +212,25 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+         for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == cc || t->src[s]->view_src == cc) reads = true;
+         if (!reads) continue;
+         if (t->op == GGML_OP_VIEW) {
++            // the rollback store of build_conv_state_store (upstream #31660): one 4-D view of Kw overlapping 3-column windows
++            // of the concat, one element apart, read by a SET_ROWS below -- its columns join the materialized tail
++            if (t->ne[0] == 3 && t->ne[2] == C && t->ne[3] == 1 && t->nb[1] == sizeof(float) && t->nb[2] == cc->nb[1] &&
++                    t->view_offs % sizeof(float) == 0) {
++                const int64_t col = (int64_t) (t->view_offs / sizeof(float));
++                if (col < 0 || col + t->ne[1] + 2 > T + 3) return false;
++                tail_from = std::min(tail_from, col); continue;
++            }
+             if (t->ne[0] != 3 || t->ne[1] != C || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float)) return false;
+             const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
+             tail_from = std::min(tail_from, col); continue;
+         }
+         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) { snap_ok = false; continue; }
++        // the SET_ROWS of that store (src[0] the window view above, src[1] the slot order, src[2] the cache slots) reads the
++        // materialized tail; the direct kernel does not take its writes (no snapshot fold, so no deferred state gather either)
++        if (t->op == GGML_OP_SET_ROWS && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc &&
++                t->src[1] && t->src[1]->view_src != cc && t->src[1] != cc && t->src[2] && t->src[2] != cc && t->src[2]->view_src != cc) {
++            snap_ok = false; continue;
++        }
+         // the shared build_conv_state (qwen35moe/qwen35/qwen3next) writes the snapshot with a raw
+         // view of the concat, while qwen4exp wraps it in a cont.  Accept the snapshot cpy when its
+         // source is a 3-column view of the concat (already accounted for by tail_from above); reject
+-- 
+2.43.0
+
