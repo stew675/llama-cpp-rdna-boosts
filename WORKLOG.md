@@ -1,3 +1,49 @@
+## 261109.006 (tooling/optional) -- issue #281 closes: its fill-source half becomes `optional/host-pool-fill-src`, `two-lane-prefill` is re-cut at r241, and `--include-optional` asks per artifact
+
+**No release.**  `release.json` is untouched: `A` (the buffered coalesced prefill read) has been in block 12
+since **r232**, and what landed here is an **optional artifact** for its second half plus two pieces of tooling.
+Issue [#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) is closed after the reply — its
+reported regression is fixed and the reporter verified it on r233.
+
+1. **`optional/host-pool-fill-src/`** — `MOE_HOST_POOL_FILL_SRC`: a buffered pool *fill* reads the file (a
+   buffered `pread` through the OS page cache) instead of one `memcpy` per expert out of the model mapping.
+   Cut against the r241 tree `d1fee048a` (one file, 25/8 lines), tree `1ab8622e7`, sha256 `3652af8849…`.  It is
+   **not** a release fix and cannot be: the campaign's numbers are +38 % prefill **on top of** the span at 26 %
+   coverage (821-875 -> 1138-1146 t/s) but **−41 % on its own** and exactly neutral when the pages are cacheable,
+   so a default-on form would turn the existing `MOE_HOST_POOL_STAGE_SPAN=0` kill switch into a 41 % regression.
+   **r241 spot check** (1 × R9700, 35B-A3B Q8_0, `-sm layer -ncmoe 24 --host-experts pool -lme 4`, greedy):
+   file `10 595 storage reads` / 0 memcpys, `map` 0 reads / `10 589 mapping memcpys`, both 10.99 GiB at
+   11 257 / 11 251 MiB/s, text **`627b2ebd7792` in both arms** — the switch moves the transport and nothing else,
+   and the win needs the reporter's cold 64 GB box, not this one.  `TODO` **#306** carries the A/B and the two
+   conditions for promotion (the coupled form, and a `gate-host-pool.sh` cell varying both switches).
+2. **`optional/two-lane-prefill/` re-cut onto r241** (it was cut at r229 and no longer applied): the delivery's
+   `ggml_backend_sched_compute_splits` is now a per-split function the pair path wants, so the artifact carries
+   that structure **plus** the delivery's `sched_moe_register_tables()` pre-pass and
+   `ggml_backend_sched_prefetch_inputs()` between the copy passes; `extract_layer_inputs()` lost its `host_also`
+   argument (r241's in-graph layer-input store), so the artifact now adds only `sched_x` (lane 1 must not read
+   back through lane 0's scheduler) and keeps r241's body; `graph_reserve`'s `no_alloc` -> `split_only` and
+   `cparams.lf_layer_inp_dev` -> `embeddings_layer_inp_dev` are renames at the two arming sites; the r229 cut's
+   `lf_wait_features_consumed()` ordering call is gone (the function no longer exists).  Tree `1fcd9891db`,
+   sha256 `44b7962f3d…`.  **Measured at r241**: 3 × R9700, 35B-A3B Q8_0, `-sm layer -ts 1,1,1` +
+   `-ot 'blk\.0\.attn_q\.weight=ROCm0'`, `-b 2048 -ub 2048`, the 5 256-token prose prompt, prefill
+   **5844.7 / 5827.9 -> 6638.2 / 6614.8 t/s (+13.5 %)**; same-seed greedy text `4ac3a523160f` (the delivery's
+   own anchor for that model) in both arms, and `-sm tensor` refuses the lanes and keeps `1c5d32ac537d`.
+3. **`scripts/apply-all.sh --include-optional` is interactive** (maintainer request): it steps through
+   `optional/*/*.patch`, prints each artifact's patch subject and asks `[y/N]` — **N is the default** — then
+   applies only the accepted ones with strict `git am` and reports the tree plus a `Skipped:` line.
+   `--include-optional-all` is the non-interactive form (and is *required* headlessly: `/dev/tty` exists as a
+   path with no controlling terminal, so the guard has to open it, not test `-r`).  Verified three ways on
+   fresh `a691b2345` checkouts: `--include-optional-all` -> 16 blocks + both artifacts (tree `5410af6236`),
+   piped stdin -> refuses with the two-line explanation and adds nothing, and a pty-driven `y`,`n` -> applies
+   `host-pool-fill-src` only, `Skipped: two-lane-prefill`, tree `1ab8622e7`.
+4. **Records.**  `wip/host-pool-fill-transport/` is **archived** (closed, not stubbed):
+   `archive/work/host-pool-fill-transport/` keeps the r231-era cuts as the measurement's pre-image and its
+   README opens with what shipped where; the `wip/CAMPAIGNS.md` row is gone and its "Closed" section names both
+   halves.  `optional/README.md` gains the artifact and the interactive flag; `ENVIRONMENT.md` §18 catalogues
+   `MOE_HOST_POOL_FILL_SRC` (kill-switch class, default = file); `MANIFESTS.md`, `README.md`, `AGENTS.md` and
+   `scripts/README.md` describe the prompt instead of "applies every patch".
+
+
 ## 261109.005 (r241, RELEASE v16-a691b2345-r241) -- the conv-state rollback index is built once per graph, not once per layer (GitHub issue #291), gated and re-cut
 
 **What shipped.**  `v16-a691b2345-r241`: the same 16 blocks on the same fork point (**`a691b2345`**), with one

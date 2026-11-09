@@ -26,8 +26,9 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout a691b2345
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (16 commits)
 
-# OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .   # 16 blocks + optional/*/*.patch
+# OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
+bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
+bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every artifact, no prompt
 
 # OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + beta/*/*.patch
@@ -147,7 +148,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── beta/                  # promotion-candidate patches pending a beta test (NOT part of the delivery;
 │                          #   apply with `apply-all.sh --include-beta`; currently empty, see beta/README.md)
 ├── optional/              # opt-in features with no validated win here (NOT part of the delivery; apply with
-│                          #   `apply-all.sh --include-optional`; see optional/README.md)
+│                          #   `apply-all.sh --include-optional` and a [y/N] per artifact; see optional/README.md)
 ├── upstream/              # upstream-PR candidates: one sub-directory each (README.md + patch) + index
 └── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```

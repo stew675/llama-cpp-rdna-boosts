@@ -2,10 +2,16 @@
 # Apply the full rdna-boosts patch set (block 00 + blocks 01-N; N from release.json.n_blocks)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
-# Usage: ./apply-all.sh [--include-optional] [--include-beta] [llama.cpp-checkout] [rdna-boosts-repo]
+# Usage: ./apply-all.sh [--include-optional [--include-optional-all]] [--include-beta]
+#                      [llama.cpp-checkout] [rdna-boosts-repo]
 #   --include-optional   also apply the optional/<name>/*.patch artifacts, after the release blocks and
 #                        before the beta candidates (OPTIONAL: tracked as extra commits, and the checkout
-#                        is then NOT the release tree -- see optional/README.md)
+#                        is then NOT the release tree -- see optional/README.md).  Steps through the
+#                        artifacts one by one and asks [y/N] for each (default: N), so a consumer opts in
+#                        to the specific feature they want instead of the whole set.
+#   --include-optional-all
+#                        apply every optional artifact without asking.  This is the non-interactive form
+#                        (a scripted apply, CI, a gate); it is required when stdin is not a terminal.
 #   --include-beta       also apply the promotion candidates in beta/<name>/*.patch, after the
 #                        release blocks (BETA: tracked as extra commits, and the checkout is then
 #                        NOT the release tree -- see beta/README.md)
@@ -28,13 +34,14 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 INCLUDE_BETA=0
-INCLUDE_OPTIONAL=0
+INCLUDE_OPTIONAL=0      # 0 = no, 1 = ask per artifact, 2 = every artifact (--include-optional-all)
 POSITIONAL=()
 for arg in "$@"; do
     case "$arg" in
-        --include-optional) INCLUDE_OPTIONAL=1 ;;
-        --include-beta) INCLUDE_BETA=1 ;;
-        -h|--help)      sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --include-optional)     INCLUDE_OPTIONAL=1 ;;
+        --include-optional-all) INCLUDE_OPTIONAL=2 ;;
+        --include-beta)         INCLUDE_BETA=1 ;;
+        -h|--help)      sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)             echo "ERROR: unknown option: $arg (try --help)" >&2; exit 1 ;;
         *)              POSITIONAL+=("$arg") ;;
     esac
@@ -143,39 +150,88 @@ echo "Applied tip: $(git rev-parse --short=9 HEAD) (this is the value for releas
 # optional/ holds features that are useful on some hardware but are NOT part of the delivery: each is a
 # self-contained patch cut against this release's tree, kept because it is worth having on the layouts it
 # helps, and excluded because it is not beneficial (or not reachable) on the delivery's validated configs.
-# `--include-optional` applies them on top of the verified release tree, one commit each, so a consumer can
-# build and use them; the checkout is then NOT `release.json`'s tree, which is reported below and in the log.
+# `--include-optional` steps through them on top of the verified release tree and applies the ones the
+# consumer accepts, one commit each; `--include-optional-all` applies every artifact without asking (the
+# scripted / CI form).  The checkout is then NOT `release.json`'s tree, which is reported below and in the
+# log.
 # They are cut against the release tree, so they only apply on top of THIS release -- rebase them if the
 # delivery moves and the patch does not apply (see optional/README.md).
 # ---------------------------------------------------------------------------
 OPTIONAL_COUNT=0
-if [ "$INCLUDE_OPTIONAL" -eq 1 ]; then
+if [ "$INCLUDE_OPTIONAL" -ne 0 ]; then
     shopt -s nullglob
     OPTIONAL_PATCHES=( "$RDNA"/optional/*/*.patch )
     shopt -u nullglob
     echo
-    if [ "${#OPTIONAL_PATCHES[@]}" -eq 0 ]; then
-        echo "No optional artifacts found under $RDNA/optional/*/*.patch -- nothing to add."
-    else
-        echo "Applying ${#OPTIONAL_PATCHES[@]} OPTIONAL artifact patch(es) on top of the release tree:"
-        for p in "${OPTIONAL_PATCHES[@]}"; do
-            echo "  ${p#"$RDNA"/}"
-        done
-        # An optional artifact is cut against the verified release tree, so it must apply strictly: a
-        # 3-way merge here would silently accept a stale cut against an older delivery.
-        if ! git am "${OPTIONAL_PATCHES[@]}"; then
-            echo "ERROR: strict 'git am' of the optional artifacts failed." >&2
-            echo "       They are cut against release.json .tree; this checkout is not that tree, or the" >&2
-            echo "       artifact has not been rebased onto this release (see optional/README.md)." >&2
-            git am --abort >/dev/null 2>&1 || true
-            exit 1
+    # where the [y/N] answers come from: the caller's stdin when it is a terminal, else the controlling
+    # terminal.  /dev/tty exists as a path even with no controlling terminal, so it has to be opened to
+    # find out (a piped or CI invocation fails it).
+    OPT_TTY=""
+    if [ "$INCLUDE_OPTIONAL" -eq 1 ]; then
+        if [ -t 0 ]; then
+            OPT_TTY="stdin"
+        elif (: < /dev/tty) 2>/dev/null; then
+            OPT_TTY="/dev/tty"
         fi
-        OPTIONAL_COUNT="${#OPTIONAL_PATCHES[@]}"
-        echo
-        echo "NOTE: this checkout includes $OPTIONAL_COUNT OPTIONAL artifact(s) and is NOT the release tree."
-        echo "      release.json tree: $RELEASE_TREE"
-        echo "      applied tree:      $(git rev-parse HEAD^{tree})"
-        echo "      An optional tree is expected to differ; it is not covered by the delivery's gates."
+    fi
+    if [ "${#OPTIONAL_PATCHES[@]}" -eq 0 ]; then
+        echo "No optional artifacts found under optional/*/*.patch -- nothing to add."
+    elif [ "$INCLUDE_OPTIONAL" -eq 1 ] && [ -z "$OPT_TTY" ]; then
+        echo "ERROR: --include-optional asks [y/N] for each artifact and there is no terminal to ask on." >&2
+        echo "       Use --include-optional-all to apply every optional artifact non-interactively." >&2
+        echo "       Nothing was added; the release blocks are on branch $BRANCH as usual." >&2
+        exit 1
+    else
+        echo "OPTIONAL artifacts available (none of them is part of the delivery -- optional/README.md):"
+        SELECTED_PATCHES=()
+        SKIPPED_NAMES=()
+        for p in "${OPTIONAL_PATCHES[@]}"; do
+            name="$(basename "$(dirname "$p")")"
+            subject="$(sed -n 's/^Subject: \[PATCH\] //p' "$p" | head -1)"
+            [ -n "$subject" ] || subject="$name"
+            if [ "$INCLUDE_OPTIONAL" -eq 2 ]; then
+                answer="y"
+                echo "  [yes, --include-optional-all] optional/$name"
+            else
+                printf '  apply optional/%s ?\n    %s\n  [y/N] ' "$name" "$subject"
+                answer=""
+                # the terminal, not stdin: the script may have been started from a pipe
+                if [ "$OPT_TTY" = "stdin" ]; then read -r answer || true; else read -r answer < /dev/tty || true; fi
+                printf '\n'
+            fi
+            case "$answer" in
+                y|Y|yes|YES) SELECTED_PATCHES+=( "$p" ) ;;
+                *)           SKIPPED_NAMES+=( "$name" ) ;;
+            esac
+        done
+        if [ "${#SELECTED_PATCHES[@]}" -eq 0 ]; then
+            echo
+            echo "No optional artifact selected -- the checkout is the release tree."
+        else
+            echo
+            echo "Applying ${#SELECTED_PATCHES[@]} OPTIONAL artifact patch(es) on top of the release tree:"
+            for p in "${SELECTED_PATCHES[@]}"; do
+                echo "  ${p#"$RDNA"/}"
+            done
+            # An optional artifact is cut against the verified release tree, so it must apply strictly: a
+            # 3-way merge here would silently accept a stale cut against an older delivery.
+            if ! git am "${SELECTED_PATCHES[@]}"; then
+                echo "ERROR: strict 'git am' of the optional artifacts failed." >&2
+                echo "       They are cut against release.json .tree; this checkout is not that tree, or the" >&2
+                echo "       artifact has not been rebased onto this release (see optional/README.md)." >&2
+                git am --abort >/dev/null 2>&1 || true
+                exit 1
+            fi
+            OPTIONAL_COUNT="${#SELECTED_PATCHES[@]}"
+            echo
+            echo "NOTE: this checkout includes $OPTIONAL_COUNT OPTIONAL artifact(s) and is NOT the release tree."
+            echo "      release.json tree: $RELEASE_TREE"
+            echo "      applied tree:      $(git rev-parse HEAD^{tree})"
+            echo "      An optional tree is expected to differ; it is not covered by the delivery's gates."
+        fi
+        if [ "${#SKIPPED_NAMES[@]}" -gt 0 ]; then
+            echo "Skipped: ${SKIPPED_NAMES[*]}"
+        fi
     fi
 fi
 

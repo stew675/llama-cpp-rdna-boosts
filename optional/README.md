@@ -27,9 +27,13 @@ the hardware a supported, rebased artifact, and keeps the delivery honest about 
   release whenever the delivery moves; it is never cut against a working branch, a part-applied set or
   an older release.  If it no longer applies, that is a rebase task, not a reason to relax the strict
   apply (`apply-all.sh --include-optional` refuses a 3-way merge for exactly this reason).
-* **Nothing here is applied by default.**  `scripts/apply-all.sh --include-optional` applies every
-  `optional/*/*.patch` (sorted) on top of the verified release tree, one commit each, and reports the
-  resulting tree — which is *not* `release.json`'s tree.
+* **Nothing here is applied by default.**  `scripts/apply-all.sh --include-optional` steps through every
+  `optional/*/*.patch` (sorted) **on top of the verified release tree** and asks `[y/N]` for each one —
+  `N` is the default — applying the accepted ones with strict `git am`, one commit each, and reporting the
+  resulting tree, which is *not* `release.json`'s tree.  `--include-optional-all` applies every artifact
+  without asking; it is the non-interactive form (a scripted apply, CI, a gate) and is required when there
+  is no terminal to ask on.  The prompt names each artifact's patch subject, so a consumer opts in to the
+  specific feature they want instead of the whole directory.
 * **Not covered by the delivery's gates.**  An optional artifact is reviewed (it must build, must not
   change the default path, and must not break another backend), but its own claims are the artifact's
   responsibility, and its `README.md` must say which layouts it was measured on and which it cannot
@@ -47,4 +51,5 @@ and recorded in `WORKLOG.md`; no stubs are left behind.
 
 | artifact | what | measured | status |
 |---|---|---|---|
-| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits, plus the sub-ubatch split that makes a single wide batch pair (from PRs #268/#279, @slavap) | **+27.4 % MoE 35B-A3B pp2048, +41.0 % dense 27B pp2048, +48.3 % at pp8192/-b 8192** on 3 x R9700 gfx1201 in the `-sm layer -ot` layout (the only one it reaches); nil decode, default path bit-identical.  The gain needs both halves -- the split alone is −15 %, the pair alone nil.  Costs: a second compute-buffer set (~1.4 GiB/context), ~8 % on a second context, −3.5 % at `-npl 8`, ~4 % if armed with a draft | **optional**, r229 re-cut, 2026-11-06 |
+| `host-pool-fill-src/` | `MOE_HOST_POOL_FILL_SRC`: the host pool's **buffered fill** reads the file (a buffered `pread` through the OS page cache) instead of one `memcpy` per expert out of the model mapping — the second half of issue #281 (the first half, the coalesced span, is block 12 since r232) | **+38 % prefill on top of the coalesced span** at 26 % pool coverage (821-875 → 1138-1146 t/s) and 95 → 23.8 GiB of storage reads, **−41 % on its own** (a 0.7 MiB `pread` per fill is latency-bound at depth 1) and **exactly neutral once the pages are cacheable**.  A page-cache-headroom bet: it pays where the span pays (a sub-complement pool) and nowhere else, and `MOE_HOST_POOL_STAGE_SPAN=0` drops it into the slow arm | **optional**, r241 cut, 2026-11-09 |
+| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits, plus the sub-ubatch split that makes a single wide batch pair (from PRs #268/#279, @slavap) | **+27.4 % MoE 35B-A3B pp2048, +41.0 % dense 27B pp2048, +48.3 % at pp8192/-b 8192** on 3 x R9700 gfx1201 in the `-sm layer -ot` layout (the only one it reaches); nil decode, default path bit-identical.  The gain needs both halves -- the split alone is −15 %, the pair alone nil.  Costs: a second compute-buffer set (~1.4 GiB/context), ~8 % on a second context, −3.5 % at `-npl 8`, ~4 % if armed with a draft | **optional**, r241 re-cut (**+13.5 % prefill** on the r241 spot check), 2026-11-09 |

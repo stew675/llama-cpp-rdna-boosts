@@ -1,6 +1,13 @@
-# wip/host-pool-fill-transport — issue #281: the *buffered* host-pool prefill path is 2x slower than it has to be
+# host-pool-fill-transport (was `wip/`) — issue #281: the *buffered* host-pool prefill path is 2x slower than it has to be
 
-**Status: OPEN — measured, a fix is built and A/B'd on `soar` (2026-11-07). Nothing is in `patches/` yet.**
+**Status: CLOSED / ARCHIVED 2026-11-09.**  Both halves are delivered, and this directory is the record:
+`A` — the buffered coalesced prefill read — is a **block-12 amendment in r232** (`patches/README.md`, the r232
+amendment), and `B` — the fill source (`MOE_HOST_POOL_FILL_SRC`) — is an **optional artifact**,
+[`optional/host-pool-fill-src/`](../../optional/host-pool-fill-src/README.md), re-cut at r241 with its own
+spot check.  What is still open is the *field* measurement that would justify promoting `B`: `TODO` **#306**
+(the reporter's cold-cache Windows A/B).  The diff files here are the r231-era cuts kept as the measurement's
+pre-image; do **not** apply them (they are superseded by the artifact).
+
 Campaign for [issue #281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281) (@DanoPTT, Windows 11,
 one R9700, Flash-Next IQ3_XXS, `--limit-host-experts 4 MOE_HOST_POOL_RAM_PCT=10`): *"forcing the direct tier
 for the same `l4` config makes prefill ~3× faster"*.

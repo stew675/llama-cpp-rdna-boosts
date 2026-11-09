@@ -1,17 +1,19 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  On `r229`** (cut against `release.json` tree
-`622d017f7a1fac093b24b7bb8dc65a8e15de4cb7`).
+**Optional artifact, not part of the delivery.  On `r241`** (cut against `release.json` tree
+`d1fee048a4d450cc2b80831298d197381b406fa4`; the r229 cut and its measurements are kept below as the dated
+record).
 
 From **PR #268 then PR #279 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed and
 amended (see *What changed in the rebase* below).  The submitter's own description and measurements are in the
 PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `c451d99696aa13218147e2117db3d411804cb74a6b2a41e98c6009203e87457e`
-* applies at `release.json` tree `622d017f7a…`, produces tree `0d8d509d78bb5ba2f3797af0a39e9466fd1e6668`
-  (verified by strict `git am` on a fresh checkout of `.tip`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `44b7962f3d1021a13d5a5e4c79560be7ba760b27acfa419012ebc0e1b88c2e7b`
+* applies at `release.json` tree `d1fee048a4…`, produces tree `1fcd9891db2622394652a381c51f0beeb94d3526`
+  (verified by strict `git am` on a fresh checkout of `.tip` `7ef43022b`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
+  # --include-optional steps through the artifacts and asks [y/N] for each one
   ```
 
 ## What it does
@@ -135,7 +137,7 @@ chunks (one split batch per call) leaves +5.5 %.
 3. **No cost on the default path.**  Events are timing-enabled only when `GGML_SCHED_PAIR_DEBUG>=3`.
 4. **Docs corrected** to state the reachability table rather than implying `-sm layer -ts 1,1` works.
 
-**r229 (this re-cut, PR #279):**
+**r229 (the PR #279 re-cut):**
 
 5. **The split is gated exactly like the pair** — `!cparams.embeddings_nextn && !cparams.lf_layer_inp_dev`, the
    pair gate's own conditions.  Without it a draft workload declined the pair but was still split, i.e. it paid
@@ -146,6 +148,33 @@ chunks (one split batch per call) leaves +5.5 %.
    (`// one scheduler each switch re-splits and re-allocates the graph. …`), which had left the MTP sched2 note
    reading "… every cycle; with / scheduler, so both stay allocated".  The artifact no longer deletes delivery
    text it does not mean to.
+
+**r241 (this re-cut) — the delivery moved under it:**
+
+7. **`ggml_backend_sched_compute_splits` became a per-split function.**  The delivery now has
+   `ggml_backend_sched_compute_split(sched, split_id, st)` plus the loop wrapper (which is exactly the structure
+   the pair path needs), and since r229 the loop body also gained `sched_moe_register_tables()` before it and
+   `ggml_backend_sched_prefetch_inputs()` between the two input-copy passes.  The artifact's cut carries both
+   delivery calls, so a pool's host tables are still registered before a graph's first split and the prefetch
+   still runs between the non-weight and the weight copies.
+8. **`extract_layer_inputs()` lost its `host_also` argument** (the delivery's in-graph layer-input device store
+   removed the post-graph host fill).  The artifact now adds only `sched_x` — the scheduler that owns the graph,
+   which lane 1 must pass or its readback would query lane 0's scheduler — and keeps the r241 body and semantics
+   verbatim.
+9. **`graph_reserve()` takes `split_only` where it used to take `no_alloc`**, and `cparams.lf_layer_inp_dev`
+   became `cparams.embeddings_layer_inp_dev`.  Both are renames at the two places the artifact arms the lanes.
+10. **Removed: the `lf_wait_features_consumed()` ordering call** the r229 cut put at the end of
+    `prepare_ubatch()`.  The function does not exist on r241 (the in-graph store made it unnecessary), and
+    `prepare_ubatch` keeps r241's tail unchanged.
+
+**Spot check at r241** (3 × R9700 gfx1201, 35B-A3B Q8_0, `-sm layer -ts 1,1,1` plus
+`-ot 'blk\.0\.attn_q\.weight=ROCm0'`, `-b 2048 -ub 2048`, the 5 256-token
+`prompts/prose-rdna-boosts.txt` with `-n 0`, two interleaved reps): prefill **5844.7 / 5827.9 → 6638.2 /
+6614.8 t/s (+13.5 %)**.  Same-seed greedy text unchanged (`4ac3a523160f`, the delivery's own anchor for that
+model), and under `-sm tensor` the lanes are refused and the text is the dense anchor (`1c5d32ac537d`).  The
+number is smaller than the r229 table's +27 % because that table is `llama-bench pp2048`, one wide ubatch split
+into two halves; this arm is `llama-cli` feeding a 5 256-token prompt in `-b` chunks, where only the chunks that
+fit the split window pair.
 
 ## Known open points
 

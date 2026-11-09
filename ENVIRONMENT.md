@@ -1125,9 +1125,16 @@ cache, so growing the mirror to its destination would pin the whole context agai
 
 ## 18. Optional artifacts (`optional/`) — **not part of the delivery**
 
-These exist only in a checkout made with `scripts/apply-all.sh --include-optional`; the delivery itself
-never reads them.  They are catalogued here because a consumer who applies an optional artifact is running
-these code paths and needs the same default/class discipline (`optional/README.md`).
+These exist only in a checkout made with `scripts/apply-all.sh --include-optional` (`[y/N]` per artifact) or
+`--include-optional-all`; the delivery itself never reads them.  They are catalogued here because a consumer
+who applies an optional artifact is running these code paths and needs the same default/class discipline
+(`optional/README.md`).
+
+`optional/host-pool-fill-src` (the second half of issue #281):
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `MOE_HOST_POOL_FILL_SRC` | unset = the pool's **file** (buffered `pread`) | kill-switch (value) | `map` restores the pre-r232 fill: one `memcpy` per expert out of the read-only model mapping.  Both read the same page-cache pages, so the pool contents are identical and only the transport changes — a mapped fill on Windows is a demand fault per 4 KiB page (715 MiB/s measured) where a buffered `pread` gets the OS readahead.  **Keep `MOE_HOST_POOL_STAGE_SPAN` on:** this arm is +38 % *on top of* the coalesced span and −41 % with the span off.  Inert where the disk tier is on (an O_DIRECT fill already reads the file), where the arena serves the table, and where the pool file I/O is a stub.  `optional/host-pool-fill-src` only. |
 
 `optional/two-lane-prefill` (from PR #268/#279, @slavap):
 
