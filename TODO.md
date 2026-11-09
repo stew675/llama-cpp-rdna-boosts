@@ -18,14 +18,14 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`6050b467c`**
+**Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`a691b2345`**
 (the 2026-10-25 re-base); read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
-The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed; every re-base-derived row is closed and R17 is the live brief in
-`wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
+The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 16 blocks are climbed,
+every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
+(`v16-a691b2345-r236`).
 
 ## The open list
 
@@ -35,7 +35,6 @@ climbed; every re-base-derived row is closed and R17 is the live brief in
 | **131** | `--host-experts pool` prefill collapse under a 3+-device `-sm tensor` split: the staging-path root cause, reachable only through the kill switch | performance (block 12; pre-existing backlog) | **OPEN (residue)** — the collapse itself is fixed (r207, measured), the root cause is not — §131 |
 | **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **133** | a fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch | performance (delivery defect, default mode; backlog) | **OPEN** (2026-11-03) — 3-device prefill is slower than 1-device because of it — §133 |
-| **134** | re-base the delivery onto a newer upstream tip (its own release, not a patch) | delivery (release work) | **IN PROGRESS** — this campaign: base `a691b2345` (past #134's `6b9c0cfcb`), ladder climbed, R17 owed — §134 |
 | **135** | a `-sm tensor` split across more devices than the model divides evenly is degenerate and nothing refuses it at load | correctness / usability (a load-time refusal) | **OPEN** — the work is the guard, not a perf chase — §135 |
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill on 35B-A3B at `MOE_HOST_POOL_FRAC=50` | performance (delivery defect, default-on) | **OPEN** (2026-11-03) — needs a wider sweep before the default moves — §136 |
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04) — the bound is static per shape on purpose — §141 |
@@ -229,19 +228,6 @@ A fully-resident (identity) expert table is re-copied out of the arena on every 
 **Kind:** performance (delivery defect, default mode).
 
 **OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.2).  See §133
-
-## 134. Re-base the delivery onto upstream `6b9c0cfcb` — 207 commits, block 00 conflicts immediately
-
-**Status: open, assessed 2026-11-03 (`WORKLOG.md` 261103.003).  Deferred out of the promotion session by design: it
-is its own release.**  `6050b467c..upstream/master` = **207 commits**; `git am -3` of the delivery onto the new tip
-fails at **block 00** (`ggml/src/ggml-cuda/mmq.cu`, `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`,
-`src/llama-model.cpp`, `src/llama-vocab.cpp`).  Two upstream commits overlap this campaign's mechanisms and need a
-semantic review, not just a textual merge: **`f5222f25c` "cuda: fuse MoE (MUL_MAT_ID) gate/up and GLU in MMQ"**
-(the delivery's MoE/MUL_MAT_ID area) and **`740251a92` "cuda: gather batched tensor reads into mapped host memory"**
-(the campaign's gather / mapped-host-memory area); also `8fc037672` (Q8_1 correction sum) and `1b6935b22`
-(flash_attn_ext_rows, block 05's area).  Re-base plan: re-cut every block at the new base, per-block build ladder,
-re-record the prefill-logit base on the new base, re-measure the headline arms (a re-base is a decode *and* prefill
-change — `AGENTS.md`), then re-apply block 12's r207 amendment on top.
 
 ## 135. A `-sm tensor` split across more devices than the model divides evenly is degenerate, and nothing refuses it at load
 

@@ -1,3 +1,66 @@
+## 261108.016 (r236, RELEASE v16-a691b2345-r236) -- the re-base lands: 16 blocks re-cut onto `a691b2345`, full gate 13/14 with the one permitted red attributed, fork refreshed
+
+**The release.** `v16-a691b2345-r236` — the 16-block V2.1 set re-based from `6050b467c` (2026-10-25) onto
+**`a691b2345`** (318 upstream commits).  `release.json` carries `base=a691b2345`, `base_tree=9d7b9a02f`,
+`tip=0e6daae4e8746f049b06148bfcb1980f933baf9e`, `tree=a4093f9dadf685172889e3147a95d9fd38d09dae`, 16 blocks and
+the per-artifact sha256 of all 17 files.  `scripts/validate-set.sh` is green (checksums OK, strict `git am` of the
+16 patches from a fresh `a691b2345` tarball, applied tree `a4093f9da`, no conflict markers, Windows portability
+scan 287 files clean), and `scripts/gate-rebase-release.sh` — **nine steps now** — returns:
+
+| step | verdict |
+|---|---|
+| state | PASS (fork clean, `master` pinned at `a691b2345`, tip `0e6daae4e` tree `a4093f9da`) |
+| per-block build | **PASS 16/16** (clean build per block commit, `--fast` profile) |
+| prefill-logit KLD | PASS (within rounding tolerance of the base) |
+| ops | PASS `MUL_MAT_ID` **947/947**, `MUL_MAT` **2517/2517** |
+| coherence text | PASS 4B `1c5d32ac537d` |
+| server-arms (new, 5c) | PASS 3/3 — `fn24`/`fn10` 0.74359 / 0.72269, `35b10` 0.59124 / 0.44720, texts as anchored |
+| textprefill (new, 5b) | PASS **−0.15 %** (−0.24 / −0.15 / −0.06, spread 0.19) vs the shipped build |
+| perf (interleaved, 3 rounds, `-r 5`) | dense-27B-prefill **−1.34 %** **FAIL** (permitted, below); moe-35B-prefill +0.34 % (spread 5.10, noisy) PASS; moe-35B-decode −0.12 % PASS |
+| GPU faults | PASS (journal + every arm log, scoped to the run's own start) |
+
+**13 passed, 1 failed — the one red is `dense-27B-prefill` at −1.34 %** (−1.12 / −1.52 / −1.37, spread 0.41),
+which is `TODO` #303's **inherited upstream cost**, not a delivery loss: r236's dense `mul_mat_q` is
+instruction-for-instruction identical to unpatched `a691b2345`'s (1436 instructions, 0 diff lines, `isa-kernel-diff.py`),
+the base commit itself costs +1.31 %, r235's old body −0.36 % and the delivery on the new base +0.09 %; six levers
+were tried and all null (`benchmarks/2026-11-08-dense-mmq-303.md`).  **The maintainer's decision (2026-11-08) is to
+ship with the attribution recorded** — the gate is NOT amended to hide it (no `--tolerance` change, no allow-list):
+the verdict above is what it prints, and this entry is the attribution.  The measured spread is why the number is
+quoted from this run and not from the earlier one: a full-gate run that times the perf arms straight off the
+per-block ladder read −2.24 % (spread 1.85, round 1 −3.44 %) while the same A/B on a quiet box reads −1.28 %
+(spread 0.13), so see the two gate defects below.
+
+**How the 16 blocks were cut.** The campaign's working chain carried **11 amendment commits** on top of the blocks
+(the `#296`/`#297`/`#298`/`#301`/`#302`/`#304` fixes, the pool-order and shared-host-pool refusals, the MMB
+slot-order fix).  The delivery is a 16-patch set, so each folded into the block whose **file state matches its
+preimage** — `#302` → 05, `#304` → 08, the MMB/BF16 LIFO fix + `#298` → 10, `#297` → 11, `#296` → 12, and the
+attendance-pool refusal, the shared-host-pool expert refusal, the MMB slot order, `#301` and the VMM pool-order
+assert → 15.  The folded chain's final tree is bit-identical to the campaign's (`a4093f9da`), the per-block build
+gate proves every folded block still builds, and the mapping is recorded in `patches/README.md`'s header.  The
+re-cut is **deterministic**: two independent fresh clones at `a691b2345` + `apply-all.sh` produce the same tip
+`0e6daae4e` and tree `a4093f9da`.
+
+**Two gate defects found and fixed while running this** (both would have mis-verdicted the release):
+1. **`LOGDIR` collision.** `gate-prefill-logits.sh` uses `LOGDIR` for its own log dir and `rm -rf`s it on success,
+   so an *exported* `LOGDIR` (the only way it reaches a child) made step 3 delete the orchestrator's log directory
+   mid-run — every later step then failed on missing logs (a 9-failure run that was entirely the harness).
+   `gate-rebase-release.sh` now does `export -n LOGDIR`.
+2. **Perf timed straight off the build ladder.** The per-block ladder leaves the GPU hot/busy for minutes and the
+   dense arm sits 1 % under the shipped build, so the first timed round read −3.44 % against −1.68 / −1.59 after
+   (verdict −2.24 %, spread 1.85) — the same A/B on a quiet box is −1.31 / −1.19 / −1.32 (−1.28 %, spread 0.13).
+   The perf step now runs one **discarded warm-up round** (`WARMUP=1`).
+
+**The five pre-R17 items all closed today, each by measurement**: `#295` (the host-expert multi-slot DFlash
+detector is now gate step 5c), `#296`/`D8` (two dead CPU hunks dropped; the "prefill regression" was
+`llama-bench`'s random-token prompt, the real floor is `#273`'s transport), `#292` (the dsv4 arms never drifted —
+a stale header line — and they are sha-anchored now), `#293`/`D3` (KEEP our qwen4exp: +16.6 → +173.4 % prefill
+and +98 → +68 % decode from d0 to d160K, +19/+88 % on real text, +42/+67/+54 % at 1/2/4 slots), `#291`/`D1` (keep
+both MoE tiers, ours default-on, upstream's opt-in; coexistence costs 44 % prefill).  Records: 261108.011-.015.
+`TODO` #134 (the re-base) closes with this entry; the campaign moves to `archive/work/upstream-rebase-261108/`.
+
+**Containers** are built and pushed **off-host** by the watcher (`scripts/container-watch.sh` on `radiance`),
+which picks the tag up within ~10 minutes — nothing runs on the primary box.
+
 ## 261108.015 (no release) -- `TODO` #291/`D1` closed: keep both MoE tiers, ours default-on, upstream's opt-in (and D1's original inversion is stale)
 
 **The last measurement item before R17, taken on real text.** 1 x R9700, 35B-A3B Q8_0, `-sm layer`, `-c 8192`,
@@ -484,7 +547,7 @@ editing the dated one.
 
 **Fork change, block 10** (`ggml/src/ggml-cuda/ggml-cuda.cu`, +38/-17, fork `9b7dfb47a`, tree `801148bb3`).
 `patches/`/`release.json` untouched; the hunk lands at the R17 re-cut.  Re-base record:
-`wip/upstream-rebase-261108/RUNGS.md` → `P3`.
+`archive/work/upstream-rebase-261108/RUNGS.md` → `P3`.
 
 **The rule, restated because the pool's assert is unconditional:** a `pool_stack`-registered allocation must be
 created **before** any plain device-pool allocation in the same scope.  The pool is a strict LIFO stack
@@ -530,7 +593,7 @@ measures the cache's value is a prefill-timing one (`GGML_CUDA_BF16_SRC1_CACHE=0
 
 **Fork change, block 11** (`ggml/src/ggml-cuda/indexer-score.cu`, 23 lines, fork `08d6c343b`, tree `ccbbcf7a4`) plus
 a new section E in `scripts/gate-qwen4exp-quant-coherence.sh`.  `patches/`/`release.json` stay untouched (r235 is
-the release); the block-11 hunk lands at the R17 re-cut.  Re-base record: `wip/upstream-rebase-261108/RUNGS.md` → `P2`.
+the release); the block-11 hunk lands at the R17 re-cut.  Re-base record: `archive/work/upstream-rebase-261108/RUNGS.md` → `P2`.
 
 **The gap.**  `indexer-score.cu` called `ggml_rope_get_truncate(dst)` on a `GGML_OP_INDEXER_SCORE` node, which
 upstream's `#30206` asserts against — so every sparse QSA decode run aborted from R12 to R16 and nothing noticed,
@@ -570,7 +633,7 @@ hand-written reference for the whole fused sequence, and the chain arm is that r
 ## 261108.002 (no release) -- `TODO` #294 closes: every gate's GPU-fault verdict is scoped to the gate's own window, and the 8 gates that had none now have one
 
 **No delivery change** (`patches/`, `release.json` and the fork tree stay untouched until R17).  Scripts only: 10
-`scripts/gate-*.sh` files, `+~250/-~40`.  Re-base record: `wip/upstream-rebase-261108/RUNGS.md` → `P1`.
+`scripts/gate-*.sh` files, `+~250/-~40`.  Re-base record: `archive/work/upstream-rebase-261108/RUNGS.md` → `P1`.
 
 **The handle was right about the symptom and wrong about the scope.**  It said 9 gates end with
 `check-gpu-faults.sh` and 3 of them take no `--since`/`--no-faults`.  In the tree: 8 gates called it at all; two of
@@ -605,7 +668,7 @@ silently ignored by the code) is now parsed.
 ## 261108.001 (no release) -- the next re-base, set up as a ladder: 16 blocks from `6050b467c` onto `a691b2345`
 
 **No delivery change.**  `patches/`, `release.json` and the fork tree are untouched (r235 is the release).
-This records the setup of `wip/upstream-rebase-261108/` — the campaign for the next re-base — and the one
+This records the setup of `archive/work/upstream-rebase-261108/` — the campaign for the next re-base — and the one
 measurement behind it.  The maintainer snapshotted upstream `master` into `~/llama.cpp` on 2026-11-08; the
 target fork point is **`a691b2345`** (`webgpu : add COUNT_EQUAL support`, 2026-11-08 11:50 +0200).
 
@@ -623,7 +686,7 @@ earlier ones) leaves **75 conflicted paths** in total: block 00 has 12, blocks 0
 have 8, 09/11 have 7, 08 has 5, 02 has 4, 13 has 3, 01/03/07 have 1 each, and **blocks 04 (BF16 KV), 06
 (MMB) and 14 (`-sm relaxed-tensor`) apply clean**.  Caveat recorded in the campaign: a conflicted block
 leaves markers in the chained tree, so those counts are slightly pessimistic — "clean" is the solid result.
-The tool is kept as `wip/upstream-rebase-261108/probe-conflicts.py` so a later rung can re-run it.
+The tool is kept as `archive/work/upstream-rebase-261108/probe-conflicts.py` so a later rung can re-run it.
 
 **The shape: 17 rungs, not one rebase.**  One `git cherry-pick` per block commit on a dedicated branch
 (`rebase-r236`, created at `a691b2345` in `~/llama.cpp`; `master` there stays the pristine snapshot), each rung
@@ -635,7 +698,7 @@ upstream moved numerics on purpose (`#31854` F32 src1 on the CPU backend, `#7429
 refactor, the MoE layout linearisation), so a rung is judged by build + coherence + its own kill-switch A/B.
 
 **Two findings that need a maintainer decision before any delivery code is dropped** (register:
-`wip/upstream-rebase-261108/DECISIONS.md`, 13 items):
+`archive/work/upstream-rebase-261108/DECISIONS.md`, 13 items):
 
 1. **`D4` — upstream `#31368` is the enforcement counterpart of block 03's r91 rollback tracker.**  Upstream
    now records `rs_max` per sequence (the deepest rollback the last ubatch guarantees) and **refuses** a
@@ -655,7 +718,7 @@ redundant), `D4` (above), `D5` (FA entry restructure: whether any band kernel be
 (upstream's 256-view Meta compute floor vs the delivery's `GGML_COMPUTE_BUFFER_MARGIN_PCT`).  Each stops its
 rung with a measurement; none is resolved by this entry.
 
-Campaign: [`wip/upstream-rebase-261108/`](wip/upstream-rebase-261108/README.md) — `README.md` (method, traps,
+Campaign: [`archive/work/upstream-rebase-261108/`](archive/work/upstream-rebase-261108/README.md) — `README.md` (method, traps,
 resume), `RUNGS.md` (the 17 rungs with per-rung conflict lists and exit criteria), `DECISIONS.md` (the
 register), `CONFLICT-MAP.md` (the measurement above, per block).
 

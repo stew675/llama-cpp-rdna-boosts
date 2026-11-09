@@ -2354,7 +2354,7 @@ bit-identical to the plain path and **+1.9 %** prefill (3489 vs 3423 t/s, 5256-t
 as a whole is worth +26 % decode on the 4B (87.4 vs 69.0) and +38 % on the 35B-A3B tensor arm (80.5 vs 58.4).
 
 **Record.**  This entry; `INVARIANTS.md` (the renamed-field, ids-convention and single-dispatcher entries);
-the rung log in `../wip/upstream-rebase-261108/RUNGS.md` (R11) and, at release, `WORKLOG.md`.
+the rung log in `../archive/work/upstream-rebase-261108/RUNGS.md` (R11) and, at release, `WORKLOG.md`.
 
 
 ## 85. A re-derived call into a new API owes the *node type* that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment (r236, re-base R16)
@@ -2393,5 +2393,5 @@ post-fix `gate-kv-residency.sh` is PASS, `pref == pres == pfloor` `f260d1824ab3`
 `build_attn`, via the *fit probe* context), post-fix `1de99b7e6ee6`, and all four coherence arms match the R13
 family (`1de99b7e6ee6` / `4b4d56191368` / `86b7f9b5aa80` / `7a8734a9f1a6`).
 
-**Record.**  This entry; `INVARIANTS.md` (the ctor-order entry); `wip/upstream-rebase-261108/RUNGS.md` R16;
+**Record.**  This entry; `INVARIANTS.md` (the ctor-order entry); `archive/work/upstream-rebase-261108/RUNGS.md` R16;
 `TODO.md` #297 (the sparse arm's missing gate); `WORKLOG.md` at R17.

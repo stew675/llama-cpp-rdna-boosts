@@ -1,4 +1,4 @@
-From 670aa557d40a0f8ffa7517608017f59a9b984f1e Mon Sep 17 00:00:00 2001
+From 75f9b0da34a4be8fa0cae242b168e7146bf38ab6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 03/15] rdna-boosts: block 03: chunked gated-delta-net prefill
@@ -48,23 +48,23 @@ overdoingism (PR #261).  Record: archive/work/recurrent-moved-cell-snapshots/.
  src/llama-memory-hybrid-iswa.h                |    1 +
  src/llama-memory-hybrid.cpp                   |    2 +
  src/llama-memory-hybrid.h                     |    1 +
- src/llama-memory-recurrent.cpp                |  112 +-
- src/llama-memory-recurrent.h                  |   23 +
+ src/llama-memory-recurrent.cpp                |   42 +-
+ src/llama-memory-recurrent.h                  |    9 +
  src/llama-model.cpp                           |    5 +
- src/models/delta-net-base.cpp                 |   29 +-
+ src/models/delta-net-base.cpp                 |   16 +-
  tests/test-backend-ops.cpp                    |  132 ++-
- tests/test-recurrent-state-depth.cpp          |  151 +++
- 25 files changed, 3403 insertions(+), 16 deletions(-)
+ tests/test-recurrent-state-depth.cpp          |  178 ++-
+ 25 files changed, 3324 insertions(+), 25 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 953a58ec8..7c2c9b11a 100644
+index ca31ebc51..04ac66c16 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1816,6 +1816,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1822,6 +1822,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -75,10 +75,10 @@ index 953a58ec8..7c2c9b11a 100644
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index e22420ee0..17a1af958 100644
+index baac60ab5..ec3a13cd2 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -3131,6 +3131,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3213,6 +3213,7 @@ common_speculative_init_result::common_speculative_init_result(
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
      //       the extra memory for small models is likely negligible?
      cparams.n_rs_seq  = 0;
@@ -87,10 +87,10 @@ index e22420ee0..17a1af958 100644
  
      std::string model_path;
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d62a63104..f7f83956d 100644
+index 973aea25b..150881b3a 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -2668,6 +2668,10 @@ extern "C" {
+@@ -2692,6 +2692,10 @@ extern "C" {
      // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
      // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
      // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
@@ -101,7 +101,7 @@ index d62a63104..f7f83956d 100644
      GGML_API struct ggml_tensor * ggml_gated_delta_net(
              struct ggml_context * ctx,
              struct ggml_tensor  * q,
-@@ -2676,7 +2680,8 @@ extern "C" {
+@@ -2700,7 +2704,8 @@ extern "C" {
              struct ggml_tensor  * g,
              struct ggml_tensor  * beta,
              struct ggml_tensor  * state,
@@ -3030,10 +3030,10 @@ index 000000000..44dbf85c2
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-index 97747e866..fc65c320d 100644
+index 5fa919511..9cc0bbaf9 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-@@ -1322,7 +1322,7 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+@@ -1374,7 +1374,7 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
          } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
              tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
              src_clone[2], src_clone[3], src_clone[4], src_clone[5],
@@ -3043,10 +3043,10 @@ index 97747e866..fc65c320d 100644
              src_clone[0]->flags = tensor->src[0]->flags;
              tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..ffa557de4 100644
+index f8cf75b3a..cb1feb24b 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -6424,7 +6424,8 @@ struct ggml_tensor * ggml_gated_delta_net(
+@@ -6486,7 +6486,8 @@ struct ggml_tensor * ggml_gated_delta_net(
          struct ggml_tensor  * g,
          struct ggml_tensor  * beta,
          struct ggml_tensor  * state,
@@ -3056,7 +3056,7 @@ index ed8554b14..ffa557de4 100644
      GGML_ASSERT(ggml_is_contiguous_rows(q));
      GGML_ASSERT(ggml_is_contiguous_rows(k));
      GGML_ASSERT(ggml_is_contiguous_rows(v));
-@@ -6459,6 +6460,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+@@ -6521,6 +6522,7 @@ struct ggml_tensor * ggml_gated_delta_net(
      struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
  
      ggml_set_op_params_i32(result, 0, (int32_t) K);
@@ -3065,10 +3065,10 @@ index ed8554b14..ffa557de4 100644
      result->op     = GGML_OP_GATED_DELTA_NET;
      result->src[0] = q;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 44e8fda47..d3d5f9b34 100644
+index e96fa121a..9a15a7758 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -201,6 +201,10 @@ llama_context::llama_context(
+@@ -208,6 +208,10 @@ llama_context::llama_context(
          cparams.n_rs_seq = 0;
      }
  
@@ -3079,7 +3079,7 @@ index 44e8fda47..d3d5f9b34 100644
      cparams.n_threads               = params.n_threads;
      cparams.n_threads_batch         = params.n_threads_batch;
      cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
-@@ -413,6 +417,7 @@ llama_context::llama_context(
+@@ -450,6 +454,7 @@ llama_context::llama_context(
      LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
      LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
      LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -3088,10 +3088,10 @@ index 44e8fda47..d3d5f9b34 100644
      LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 044ab9953..c8d631fd6 100644
+index b5d4642a2..a2336bef8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -396,11 +396,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+@@ -483,11 +483,32 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
      }
  }
  
@@ -3124,7 +3124,7 @@ index 044ab9953..c8d631fd6 100644
      if (s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
          int32_t * data = (int32_t *) s_copy->data;
-@@ -1179,6 +1200,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1202,6 +1223,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3133,7 +3133,7 @@ index 044ab9953..c8d631fd6 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1222,6 +1245,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -1248,6 +1271,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3142,7 +3142,7 @@ index 044ab9953..c8d631fd6 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -1295,6 +1320,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -1305,6 +1330,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -3151,7 +3151,7 @@ index 044ab9953..c8d631fd6 100644
      if (inp_rs->s_copy) {
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
-@@ -3949,6 +3976,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -4034,6 +4061,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
      inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
      inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
  
@@ -3164,7 +3164,7 @@ index 044ab9953..c8d631fd6 100644
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
  
-@@ -3975,9 +4008,26 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -4060,9 +4093,26 @@ ggml_tensor * llm_graph_context::build_rs(
      // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
      ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
  
@@ -3191,12 +3191,12 @@ index 044ab9953..c8d631fd6 100644
 +    return output_states;
  }
  
- ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+ void llm_graph_context::build_conv_state_store(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 114dc5d92..706f9936c 100644
+index 98ab50da4..b5fa3ca8b 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -298,6 +298,13 @@ public:
+@@ -314,6 +314,13 @@ public:
      ggml_tensor * s_copy_main; // I32 [n_seqs]
      ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
  
@@ -3211,10 +3211,10 @@ index 114dc5d92..706f9936c 100644
  
      // used in view offsets, need to match for valid graph reuse
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 8113f5c21..29ecb99d3 100644
+index da1747649..02d13b67d 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -37,6 +37,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+@@ -33,6 +33,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                              /* common */
                   uint32_t   n_seq_max,
                   uint32_t   n_rs_seq,
@@ -3222,9 +3222,9 @@ index 8113f5c21..29ecb99d3 100644
                       bool   offload,
                       bool   unified,
                              /* layer filters */
-@@ -47,7 +48,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
-         model,
-         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+@@ -44,7 +45,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         no_alloc,
+         type_k, type_v, v_trans, kv_size, n_swa, swa_type,
          type_r, type_s, rs_size,
 -        n_seq_max, n_rs_seq, offload, unified,
 +        n_seq_max, n_rs_seq, n_rs_batch, offload, unified,
@@ -3232,7 +3232,7 @@ index 8113f5c21..29ecb99d3 100644
      hparams_idx(model.hparams),
      mem_idx(filter_idx == nullptr ? nullptr : [&] {
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 0ac4265df..516c7d222 100644
+index 59940dbb8..16d43ba93 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
 @@ -33,6 +33,7 @@ public:
@@ -3244,7 +3244,7 @@ index 0ac4265df..516c7d222 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
-index 06f7fd542..75b5fabb7 100644
+index 6d843c76e..e0975a961 100644
 --- a/src/llama-memory-hybrid-iswa.cpp
 +++ b/src/llama-memory-hybrid-iswa.cpp
 @@ -25,6 +25,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
@@ -3255,7 +3255,7 @@ index 06f7fd542..75b5fabb7 100644
                       bool   offload,
                       bool   unified,
                              /* layer filters */
-@@ -58,6 +59,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
+@@ -59,6 +60,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
          rs_size,
          n_seq_max,
          n_rs_seq,
@@ -3264,7 +3264,7 @@ index 06f7fd542..75b5fabb7 100644
              [&](int32_t il) { return hparams.is_recr(il); }
              : filter_recr
 diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
-index c9d3f9f57..a9852b00b 100644
+index 52c885ac9..88c5fef98 100644
 --- a/src/llama-memory-hybrid-iswa.h
 +++ b/src/llama-memory-hybrid-iswa.h
 @@ -35,6 +35,7 @@ public:
@@ -3276,7 +3276,7 @@ index c9d3f9f57..a9852b00b 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index bbd4bee0b..69f6aa5f3 100644
+index 7d3b27908..0f5c766dd 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
 @@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
@@ -3287,7 +3287,7 @@ index bbd4bee0b..69f6aa5f3 100644
                       bool   offload,
                       bool   unified,
                              /* layer filters */
-@@ -59,6 +60,7 @@ llama_memory_hybrid::llama_memory_hybrid(
+@@ -60,6 +61,7 @@ llama_memory_hybrid::llama_memory_hybrid(
          rs_size,
          n_seq_max,
          n_rs_seq,
@@ -3296,7 +3296,7 @@ index bbd4bee0b..69f6aa5f3 100644
              [&](int32_t il) { return hparams.is_recr(il); }
              : filter_recr
 diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index 484eafb74..fb8164664 100644
+index 2b4d1269c..fd77ebbc2 100644
 --- a/src/llama-memory-hybrid.h
 +++ b/src/llama-memory-hybrid.h
 @@ -35,6 +35,7 @@ public:
@@ -3308,7 +3308,7 @@ index 484eafb74..fb8164664 100644
                       bool   unified,
                              /* layer filters */
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 178d6c1b7..97e4e8a81 100644
+index f99e7b47d..479065dac 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -8,6 +8,8 @@
@@ -3320,15 +3320,15 @@ index 178d6c1b7..97e4e8a81 100644
  #include <cstring>
  #include <limits>
  #include <map>
-@@ -25,6 +27,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -26,6 +28,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                   uint32_t   mem_size,
                   uint32_t   n_seq_max,
                   uint32_t   n_rs_seq,
 +                 uint32_t   n_rs_batch,
-     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
      const int32_t n_layer = hparams.n_layer();
  
-@@ -32,8 +35,11 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -33,7 +36,8 @@ llama_memory_recurrent::llama_memory_recurrent(
      size = mem_size;
      used = 0;
  
@@ -3336,75 +3336,16 @@ index 178d6c1b7..97e4e8a81 100644
 +    this->n_rs_seq   = n_rs_seq;
 +    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
      rs_idx.assign(n_seq_max, 0);
-+    last_ubatch_nseq_tokens_by_seq.assign(n_seq_max, 0);
-+    last_ubatch_pos_last_by_seq.assign(n_seq_max, -1);
  
      cells.clear();
-     cells.resize(mem_size);
-@@ -192,6 +198,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
-     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
-     if (rm_all) {
-         set_rs_idx(seq_id, 0);
-+        // issue #131: a fully removed sequence's last-batch shape is no longer meaningful
-+        if (seq_id < 0) {
-+            std::fill(last_ubatch_nseq_tokens_by_seq.begin(), last_ubatch_nseq_tokens_by_seq.end(), 0);
-+            std::fill(last_ubatch_pos_last_by_seq.begin(), last_ubatch_pos_last_by_seq.end(), -1);
-+        } else if ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size()) {
-+            last_ubatch_nseq_tokens_by_seq[seq_id] = 0;
-+            last_ubatch_pos_last_by_seq[seq_id]    = -1;
-+        }
-     }
- 
-     // models like Mamba or RWKV can't have a state partially erased at the end
-@@ -219,7 +233,38 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
-                 const llama_pos rollback = cell.pos - (p0 - 1);
-                 // pending rollback is single-use
-                 const bool pending = rs_idx[seq_id] != 0;
-+                // The sequence's own last batch (issue #131), not the global last batch.
-+                const uint32_t  last_seq_nseq = ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size())
-+                        ? last_ubatch_nseq_tokens_by_seq[seq_id] : 0;
-+                const llama_pos last_seq_pos  = ((size_t) seq_id < last_ubatch_pos_last_by_seq.size())
-+                        ? last_ubatch_pos_last_by_seq[seq_id] : -1;
-                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-+                    if (getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr) {
-+                        LLAMA_LOG_WARN("%s: RSROLL seq=%d rollback=%d p0=%d last_global_nseq=%u last_global_pos=%d "
-+                                       "last_seq_nseq=%u last_seq_pos=%d n_rs_seq=%u n_rs_batch=%u\n",
-+                                       __func__, (int) seq_id, (int) rollback, (int) p0,
-+                                       last_ubatch_nseq_tokens, (int) last_ubatch_pos_last,
-+                                       last_seq_nseq, (int) last_seq_pos, n_rs_seq, n_rs_batch);
-+                    }
-+                    // Guard: the snapshot path assumes a rollback only removes tokens the last
-+                    // batch decoded, i.e. that only batches at or below n_rs_batch -- speculative
-+                    // verify batches -- are rolled back into.  A larger batch is not a verify
-+                    // batch, and the whole-batch chunked GDN prefill (gated_delta_net.cu,
-+                    // GDN_CHUNKED_MIN_TOKENS) writes only the newest snapshot for it, so restoring
-+                    // snapshot `rollback` would read an unwritten slot.  Warn once rather than
-+                    // corrupt silently.
-+                    if (!warned_rollback_boundary && last_seq_nseq > n_rs_batch) {
-+                        warned_rollback_boundary = true;
-+                        LLAMA_LOG_WARN("%s: rollback crossed a batch boundary: seq %d rollback=%d but "
-+                                "the sequence's last batch decoded %u tokens (last pos %d, n_rs_seq=%u, n_rs_batch=%u). The "
-+                                "recurrent snapshot path assumes only verify batches (<= n_rs_batch "
-+                                "tokens) are rolled back into; if that batch exceeded the chunked-GDN "
-+                                "threshold it wrote no usable snapshot and the restored state is "
-+                                "wrong -- set GGML_CUDA_GDN_CHUNKED=0 for the sequential kernel. "
-+                                "Please report this at github.com/stew675/llama-cpp-rdna-boosts/issues\n",
-+                                __func__, (int) seq_id, (int) rollback, last_seq_nseq,
-+                                (int) last_seq_pos, n_rs_seq, n_rs_batch);
-+                    }
-                     set_rs_idx(seq_id, (uint32_t) rollback);
-                     cell.pos = p0 - 1;
-                     return true;
-@@ -530,6 +575,63 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+@@ -509,6 +513,30 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
      used = org_used;
      head = org_head;
  
-+    // remember the shape of the batch that is about to run, for the rollback guard in seq_rm()
++    // `LLAMA_RS_ROLLBACK_DEBUG=1`: one line per prepared ubatch, so a log shows the prepare order that
++    // leads into a rollback.  The rollback bound itself is upstream's (see seq_rm(), rs_max); this is the
++    // instrument that showed a large batch can precede a small sequence's rollback in one prepare list.
 +    if (!ubatches.empty()) {
-+        // wip/rs-rollback-boundary instrumentation (`LLAMA_RS_ROLLBACK_DEBUG=1`): one line per prepared
-+        // ubatch, so a server log shows the prepare order that leads into a partial rollback.  Used to
-+        // answer open question 1 ("whose prepare is the large one, and does the MTP verify batch go
-+        // through this path at all?").
 +        const bool rs_debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
 +        if (rs_debug) {
 +            for (size_t u = 0; u < ubatches.size(); ++u) {
@@ -3423,43 +3364,23 @@ index 178d6c1b7..97e4e8a81 100644
 +                               ub.n_seqs_unq, ub.n_pos, (int) p_first, (int) p_last, (int) p_first, (int) p_1, ids);
 +            }
 +        }
-+        const llama_ubatch & ub = ubatches.back();
-+        last_ubatch_nseq_tokens = ub.n_seq_tokens;
-+        last_ubatch_pos_last    = ub.n_tokens > 0 ? ub.pos[ub.n_tokens - 1] : -1;
-+        // issue #131: per-sequence last-batch shape.  A sequence's entry is its own most recent batch, so
-+        // EVERY ubatch in this prepare list is folded in, oldest first -- not just `ubatches.back()`.
-+        // Why (wip/rs-rollback-boundary, 2026-10-19): one decode call can carry several ubatches (a
-+        // two-slot server under `--kv-unified` builds one per distinct graph shape), e.g. `[seq 1 verify
-+        // (4 tokens)] [seq 2 prefill (6136 tokens)]`.  Reading only the back ubatch left seq 1's entry at
-+        // whatever it was the last time seq 1 happened to BE the back ubatch -- typically its own prefill
-+        // chunk -- so the next rejection rollback for seq 1 was compared against a 4571-token prefill it
-+        // had already finished, and the guard warned about a batch boundary that never happened.  That is
-+        // the whole of the "large prefill as the last prepared batch before a rollback" ordering: a stale
-+        // tracker entry, not a real scheduling order.
-+        for (const llama_ubatch & u : ubatches) {
-+            for (uint32_t s = 0; s < u.n_seqs_unq; ++s) {
-+                const llama_seq_id sid = u.seq_id_unq[s];
-+                if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
-+                    last_ubatch_nseq_tokens_by_seq[sid] = 0;
-+                    last_ubatch_pos_last_by_seq[sid]    = -1;
-+                }
-+            }
-+            for (uint32_t i = 0; i < u.n_tokens; ++i) {
-+                const llama_seq_id sid = u.seq_id[i][0];
-+                if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
-+                    last_ubatch_nseq_tokens_by_seq[sid]++;
-+                    if (u.pos != nullptr) {
-+                        last_ubatch_pos_last_by_seq[sid] = u.pos[i * u.n_pos];
-+                    }
-+                }
-+            }
-+        }
 +    }
 +
      return success;
  }
  
-@@ -1380,6 +1482,14 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+@@ -646,6 +674,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+             std::swap(dst_cell.pos, src_cell.pos);
+             std::swap(dst_cell.src, src_cell.src);
+             std::swap(dst_cell.seq_id, src_cell.seq_id);
++            // the rollback bound belongs to the state, not to the cell index: a moved cell keeps the
++            // snapshots of the state that lived there (r195 moves planes 1..n_rs_seq by index), so the
++            // bound has to travel with pos/src/seq_id or a rollback after a move reads the wrong limit
++            std::swap(dst_cell.rs_max, src_cell.rs_max);
+ 
+             // swap tails
+             for (uint32_t j = 0; j < size; ++j) {
+@@ -1360,6 +1392,14 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
      return mem->p_l[il];
  }
  
@@ -3475,10 +3396,10 @@ index 178d6c1b7..97e4e8a81 100644
      const uint32_t cell_idx = i + mem->head;
      const int32_t  src0     = mem->cells[cell_idx].src0;
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 08489a4be..64b9d4782 100644
+index 6442fc1c1..e0e0cfc71 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
-@@ -24,6 +24,7 @@ public:
+@@ -25,6 +25,7 @@ public:
                       uint32_t   mem_size,
                       uint32_t   n_seq_max,
                       uint32_t   n_rs_seq,
@@ -3486,7 +3407,7 @@ index 08489a4be..64b9d4782 100644
          const layer_filter_cb & filter);
  
      ~llama_memory_recurrent() = default;
-@@ -73,9 +74,27 @@ public:
+@@ -74,6 +75,10 @@ public:
      // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
      uint32_t n_rs_seq = 0;
  
@@ -3497,24 +3418,7 @@ index 08489a4be..64b9d4782 100644
      // per-seq rollback index
      std::vector<uint32_t> rs_idx;
  
-+    // Shape of the most recently prepared ubatch, used by the rollback guard in seq_rm():
-+    // a rollback may only remove tokens the last batch decoded, and a batch that can be
-+    // rolled back into never decodes more than n_rs_batch tokens.  See the guard there.
-+    uint32_t  last_ubatch_nseq_tokens = 0;
-+    llama_pos last_ubatch_pos_last    = -1;
-+    // Per-sequence shape of the last batch each sequence ran in (issue #131): a rollback may only
-+    // read the snapshot planes its own sequence's last batch wrote, so the guard below must use the
-+    // sequence's own value, not the last batch of whichever sequence was prepared last.  Only the
-+    // sequences present in the last ubatch are updated; the others keep the count from the last
-+    // batch they ran in.
-+    std::vector<uint32_t>  last_ubatch_nseq_tokens_by_seq;
-+    std::vector<llama_pos> last_ubatch_pos_last_by_seq;
-+    bool      warned_rollback_boundary = false;
-+
-     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
- 
-     // computed before each graph build
-@@ -182,6 +201,10 @@ public:
+@@ -187,6 +192,10 @@ public:
  
      int32_t s_copy(int i) const;
  
@@ -3526,10 +3430,10 @@ index 08489a4be..64b9d4782 100644
      const llama_memory_status status;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index cbb06ceb3..defa9e6b6 100644
+index 5e53cf855..48955b01f 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2948,6 +2948,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3098,6 +3098,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                      /* n_seq_max         */ cparams.n_seq_max,
                      /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3537,7 +3441,7 @@ index cbb06ceb3..defa9e6b6 100644
                      /* offload           */ cparams.offload_kqv,
                      /* unified           */ cparams.kv_unified,
                      /* filter_attn       */ std::move(filter_attn),
-@@ -3139,6 +3140,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3290,6 +3291,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              std::max((uint32_t) 1, cparams.n_seq_max),
                              cparams.n_seq_max,
                              cparams.n_rs_seq,
@@ -3545,7 +3449,7 @@ index cbb06ceb3..defa9e6b6 100644
                              nullptr);
                  } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                      // The main difference between hybrid architectures is the
-@@ -3200,6 +3202,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3363,6 +3365,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3553,7 +3457,7 @@ index cbb06ceb3..defa9e6b6 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -3220,6 +3223,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3383,6 +3386,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3561,7 +3465,7 @@ index cbb06ceb3..defa9e6b6 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -3240,6 +3244,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
+@@ -3403,6 +3407,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3570,7 +3474,7 @@ index cbb06ceb3..defa9e6b6 100644
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index f4da85bf0..fe35efa77 100644
+index 4c0c24d6c..598b9192b 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -396,7 +396,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
@@ -3582,27 +3486,7 @@ index f4da85bf0..fe35efa77 100644
      if (n_tokens == 1) {
          res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
      } else {
-@@ -525,6 +525,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
- 
-             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-         }
-+
-+        // same as the ssm state: keep the pre-batch conv state in slot n_seq_tokens when the whole
-+        // batch can be rolled back and the slot fits
-+        if (0 < ubatch.n_seq_tokens && (int64_t) ubatch.n_seq_tokens < K) {
-+            ggml_tensor * conv_state_pre = ggml_reshape_2d(ctx0, conv_states, row_count, n_seqs);
-+            ggml_tensor * conv_state_pre_dst =
-+                ggml_view_2d(ctx0,
-+                        conv_states_all, row_count, n_seqs,
-+                        conv_states_all->nb[1],
-+                        ((size_t) ubatch.n_seq_tokens * mem_size + kv_head) * row_size);
-+
-+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_pre, conv_state_pre_dst));
-+        }
-     }
- 
-     return conv_input;
-@@ -569,8 +582,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -508,8 +508,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
      const int64_t D = S_v * S_v * H_v;
      const int64_t K = cparams.n_rs_seq + 1;
  
@@ -3625,10 +3509,10 @@ index f4da85bf0..fe35efa77 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index fe3a67c64..76c9b2fdb 100644
+index 852b62701..166b15036 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -1565,14 +1565,64 @@ struct test_case {
+@@ -1593,14 +1593,64 @@ struct test_case {
                  }
              }
  
@@ -3698,7 +3582,7 @@ index fe3a67c64..76c9b2fdb 100644
                  ud->ok = false;
              }
              return true;
-@@ -5113,6 +5163,25 @@ struct test_gated_delta_net : public test_case {
+@@ -5174,6 +5224,25 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
@@ -3724,7 +3608,7 @@ index fe3a67c64..76c9b2fdb 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -5146,7 +5215,7 @@ struct test_gated_delta_net : public test_case {
+@@ -5207,7 +5276,7 @@ struct test_gated_delta_net : public test_case {
          // q/k are L2-normalised in qwen35/kimi-linear before delta_net
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -3733,7 +3617,7 @@ index fe3a67c64..76c9b2fdb 100644
          return out;
      }
  
-@@ -5154,7 +5223,7 @@ struct test_gated_delta_net : public test_case {
+@@ -5215,7 +5284,7 @@ struct test_gated_delta_net : public test_case {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              if (ggml_is_view_op(t->op)) { continue; }
              if (strcmp(t->name, "g") == 0) {
@@ -3742,7 +3626,7 @@ index fe3a67c64..76c9b2fdb 100644
              } else if (strcmp(t->name, "beta") == 0) {
                  init_tensor_uniform(t, 0.0f, 1.0f);
              } else if (strcmp(t->name, "v") == 0) {
-@@ -5210,7 +5279,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -5271,7 +5340,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
  
@@ -3751,7 +3635,7 @@ index fe3a67c64..76c9b2fdb 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -5255,6 +5324,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -5316,6 +5385,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
      bool run_whole_graph() override { return true; }
      std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
  
@@ -3775,7 +3659,7 @@ index fe3a67c64..76c9b2fdb 100644
      uint64_t op_flops(ggml_tensor * t) override {
          GGML_UNUSED(t);
          const uint64_t S_v = head_size;
-@@ -12417,6 +12503,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12949,6 +13035,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3797,7 +3681,7 @@ index fe3a67c64..76c9b2fdb 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -12469,6 +12570,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13001,6 +13102,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
      test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
@@ -3812,7 +3696,7 @@ index fe3a67c64..76c9b2fdb 100644
  
  #if 0
      // these tests are disabled to save execution time, sbut they can be handy for debugging
-@@ -13004,6 +13113,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13585,6 +13694,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  
@@ -3827,7 +3711,7 @@ index fe3a67c64..76c9b2fdb 100644
      for (int kv : { 256, 4096, 65536 }) {
          for (int bs : { 1, 512, 2048 }) {
 diff --git a/tests/test-recurrent-state-depth.cpp b/tests/test-recurrent-state-depth.cpp
-index c35181180..71a1f19b6 100644
+index c35181180..249d83a35 100644
 --- a/tests/test-recurrent-state-depth.cpp
 +++ b/tests/test-recurrent-state-depth.cpp
 @@ -14,6 +14,7 @@
@@ -3838,7 +3722,29 @@ index c35181180..71a1f19b6 100644
  #include <cmath>
  #include <cstdio>
  #include <cstdlib>
-@@ -138,6 +139,124 @@ static double run_case(
+@@ -75,7 +76,7 @@ static double run_case(
+         const common_params & params, llama_model * model, llama_context * ctx_tok,
+         const llama_vocab * vocab,
+         uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
+-        uint32_t n_tokens, uint32_t n_rollback, bool verbose) {
++        uint32_t n_tokens, uint32_t n_rollback, bool verbose, bool * refused_out = nullptr) {
+     const int n_vocab = llama_vocab_n_tokens(vocab);
+ 
+     std::vector<llama_token> toks = make_tokens(ctx_tok, vocab, n_tokens, (uint32_t) n_vocab);
+@@ -102,7 +103,11 @@ static double run_case(
+ 
+     const bool rm = llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, (llama_pos) p0, -1);
+     if (!rm) {
+-        fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
++        if (refused_out) {
++            *refused_out = true;
++        } else {
++            fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
++        }
+         llama_free(ctx_roll); llama_free(ctx_ref);
+         return -1;
+     }
+@@ -138,6 +143,124 @@ static double run_case(
      return diff_max;
  }
  
@@ -3963,7 +3869,40 @@ index c35181180..71a1f19b6 100644
  int main(int argc, char ** argv) {
      std::setlocale(LC_NUMERIC, "C");
  
-@@ -210,6 +329,38 @@ int main(int argc, char ** argv) {
+@@ -186,10 +309,13 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "  n_rs_seq=%2u verify shape: %s\n", n_rs_seq, fail_a ? "FAIL" : "PASS");
+     }
+ 
+-    // Phase B: deeper-than-K batch still at/below the draft bound.  A batch with
+-    // n_tokens > K can be rolled back into when the speculator drafts deeply
+-    // (n_rs_batch > K).  n_tokens = n_rs_batch, rollback the full draft range.
+-    fprintf(stderr, "=== Phase B: deep draft (n_tokens = n_rs_batch > K) ===\n");
++    // Phase B: a batch deeper than K = n_rs_seq + 1.  The rollback bound is upstream's
++    // (#31368): rs_max = min(n_seq_tokens, n_rs_seq) for a ubatch of n_seq_tokens tokens, and
++    // 0 when the ubatch is longer than n_rs_seq + 1 -- a batch that long only guarantees its final
++    // state, so every rollback into it must be REFUSED.  (The delivery's own ubatch tracker used to
++    // allow a rollback up to n_rs_batch tokens, which is where the deep-draft verify batch lived;
++    // that relaxation went with the tracker -- see wip/upstream-rebase-261108, rung R04, D4.)
++    fprintf(stderr, "=== Phase B: deeper than K (n_tokens > n_rs_seq+1) refuses every rollback ===\n");
+     for (uint32_t n_rs_seq = 7; n_rs_seq <= 15; n_rs_seq += 4) {
+         const uint32_t K = n_rs_seq + 1;
+         for (uint32_t extra = 1; extra <= 16; extra += 5) {
+@@ -197,9 +323,11 @@ int main(int argc, char ** argv) {
+             const uint32_t n_tokens   = n_rs_batch;
+             int fail_b = 0;
+             for (uint32_t r = 1; r <= n_rs_seq; ++r) {
+-                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
+-                if (d < 0 || d > eps) {
+-                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u max diff=%g\n",
++                bool refused = false;
++                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32,
++                                          n_tokens, r, false, &refused);
++                if (d >= 0 || !refused) {
++                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u was NOT refused (d=%g)\n",
+                             n_rs_seq, n_rs_batch, n_tokens, r, d);
+                     ++fail_b;
+                 }
+@@ -210,6 +338,38 @@ int main(int argc, char ** argv) {
          }
      }
  

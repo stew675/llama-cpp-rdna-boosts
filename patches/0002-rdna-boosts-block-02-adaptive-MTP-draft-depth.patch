@@ -1,4 +1,4 @@
-From 470729be7518b624e13f9001b24e5c76bf245926 Mon Sep 17 00:00:00 2001
+From 8680d921f306d0bc952f7212e1daab78642b4e60 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 24 Oct 2026 09:35:46 -0500
 Subject: [PATCH 02/15] rdna-boosts: block 02: adaptive MTP draft depth
@@ -92,11 +92,11 @@ dense 27B 3 GPU 218.5 -> 249.6 (+14.2 %), and a fixed `draft-mtp` n_max 7 arm 31
 stays byte-identical, so it is a pure multi-slot change.  A host-expert config takes the arena band and is
 untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-band.sh.
 ---
- common/arg.cpp                                |  56 ++-
- common/common.cpp                             |  99 +++-
+ common/arg.cpp                                |  56 +-
+ common/common.cpp                             |  96 +++-
  common/common.h                               |  43 +-
- common/speculative-adaptive.h                 | 142 ++++++
- common/speculative.cpp                        | 464 +++++++++++++++++-
+ common/speculative-adaptive.h                 | 142 +++++
+ common/speculative.cpp                        | 484 +++++++++++++++++-
  common/speculative.h                          |   9 +
  docs/speculative.md                           |   9 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
@@ -108,7 +108,6 @@ untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-
  src/llama-ext.h                               |  12 +
  src/llama-model.cpp                           |   8 +
  src/llama-model.h                             |   3 +
- src/models/delta-net-base.cpp                 |  11 +-
  tests/CMakeLists.txt                          |  23 +
  tests/test-arg-parser.cpp                     |  17 +
  tests/test-recurrent-state-depth.cpp          | 215 ++++++++
@@ -116,16 +115,16 @@ untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  15 +-
- 24 files changed, 1378 insertions(+), 54 deletions(-)
+ 23 files changed, 1381 insertions(+), 57 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 76a0bbbb7..58504eef7 100644
+index 39beea854..e4b3054ed 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
+@@ -340,9 +340,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
      common_download_hf_plan plan_spec;
      common_download_opts opts;
  
@@ -136,7 +135,7 @@ index 76a0bbbb7..58504eef7 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -4146,12 +4144,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4123,12 +4121,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for K for the draft model\n"
              "allowed values: %s\n"
@@ -154,7 +153,7 @@ index 76a0bbbb7..58504eef7 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
      add_opt(common_arg(
-@@ -4159,12 +4158,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4136,12 +4135,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for V for the draft model\n"
              "allowed values: %s\n"
@@ -172,7 +171,7 @@ index 76a0bbbb7..58504eef7 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
      add_opt(common_arg(
-@@ -4193,11 +4193,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4170,11 +4170,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
@@ -193,7 +192,7 @@ index 76a0bbbb7..58504eef7 100644
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4218,6 +4226,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4195,6 +4203,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -225,20 +224,10 @@ index 76a0bbbb7..58504eef7 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 3237c0fa7..953a58ec8 100644
+index 75fd39665..ca31ebc51 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1257,8 +1257,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
- 
-         // the draft context is created from the same base params and follows the main context, fit both together
-         const bool has_draft = params.speculative.has_dft();
--        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
--            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-+        const bool spec_mtp  = params.speculative.has_mtp();
- 
-         common_params params_dft = common_base_params_to_speculative(params);
- 
-@@ -1378,7 +1377,30 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1383,7 +1383,30 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -269,7 +258,7 @@ index 3237c0fa7..953a58ec8 100644
      if (lctx == NULL) {
          COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
          return;
-@@ -1425,6 +1447,76 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
+@@ -1430,6 +1453,76 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -346,7 +335,7 @@ index 3237c0fa7..953a58ec8 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1712,7 +1804,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1717,7 +1810,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -357,10 +346,10 @@ index 3237c0fa7..953a58ec8 100644
      return mparams;
  }
 diff --git a/common/common.h b/common/common.h
-index 70d6a671f..38998e2dd 100644
+index 84abddc76..b0d894dd9 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -172,18 +172,19 @@ enum common_params_sampling_config : uint64_t {
+@@ -174,18 +174,19 @@ enum common_params_sampling_config : uint64_t {
  };
  
  enum common_speculative_type {
@@ -391,7 +380,7 @@ index 70d6a671f..38998e2dd 100644
  };
  
  // Grammar type enumeration
-@@ -328,6 +329,8 @@ struct common_params_model {
+@@ -330,6 +331,8 @@ struct common_params_model {
  struct common_params_speculative_draft {
      int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
      int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -400,7 +389,7 @@ index 70d6a671f..38998e2dd 100644
  
      float p_split = 0.1f; // speculative decoding split probability
      float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
-@@ -348,6 +351,12 @@ struct common_params_speculative_draft {
+@@ -350,6 +353,12 @@ struct common_params_speculative_draft {
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  
@@ -413,7 +402,7 @@ index 70d6a671f..38998e2dd 100644
      common_cpu_params cpuparams;
      common_cpu_params cpuparams_batch;
  
-@@ -394,13 +403,21 @@ struct common_params_speculative {
+@@ -396,13 +405,21 @@ struct common_params_speculative {
          return !draft.mparams.empty();
      }
  
@@ -586,7 +575,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 1e1bf94e8..e22420ee0 100644
+index aafcf2c43..baac60ab5 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -731,7 +720,7 @@ index 1e1bf94e8..e22420ee0 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -1507,6 +1610,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1546,6 +1649,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      int32_t n_mtp_layers  = 1;
      bool    is_mem_shared = false;   // gemma4
      bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
@@ -739,7 +728,7 @@ index 1e1bf94e8..e22420ee0 100644
  
      // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
      // The last h-row of one process() call needs the first token of the NEXT
-@@ -1524,8 +1628,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1563,8 +1667,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
@@ -764,7 +753,7 @@ index 1e1bf94e8..e22420ee0 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1537,6 +1655,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1576,6 +1694,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -781,7 +770,7 @@ index 1e1bf94e8..e22420ee0 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1587,7 +1715,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1623,10 +1751,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -792,13 +781,16 @@ index 1e1bf94e8..e22420ee0 100644
 +            strict_pos = rope_type != LLAMA_ROPE_TYPE_MROPE && rope_type != LLAMA_ROPE_TYPE_IMROPE;
 +        }
  
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
 +        // remember the user n_max: chain_heads caps it at the model MTP layer
 +        // count, and the adaptive range abort below must explain the cap
 +        const int32_t n_max_user = this->params.n_max;
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1598,6 +1735,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1637,6 +1774,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -833,7 +825,7 @@ index 1e1bf94e8..e22420ee0 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1626,6 +1791,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1665,6 +1830,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          // reset here rather than per round, or two identical requests differ
          common_sampler_reset(smpls[seq_id].get());
  
@@ -847,7 +839,7 @@ index 1e1bf94e8..e22420ee0 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1643,6 +1815,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1682,6 +1854,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
      }
  
@@ -896,7 +888,7 @@ index 1e1bf94e8..e22420ee0 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1652,6 +1866,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1691,6 +1905,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return true;
          }
  
@@ -914,7 +906,7 @@ index 1e1bf94e8..e22420ee0 100644
          const int32_t n_tokens = batch_in.size();
  
          // remember the first and last batch index for each sequence
-@@ -1686,11 +1911,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1725,11 +1950,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              // TODO:this is generally true, but would be nice to assert it
              const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
  
@@ -940,7 +932,7 @@ index 1e1bf94e8..e22420ee0 100644
                  // vision tokens carry an embedding instead of an id
                  const int32_t idx = t.id != LLAMA_TOKEN_NULL
                      ? batch.add(t.id, t.pos[0], seq_id, false)
-@@ -1705,8 +1944,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1744,8 +1983,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              auto * mem_dft = llama_get_memory(ctx_dft);
  
@@ -958,13 +950,28 @@ index 1e1bf94e8..e22420ee0 100644
                  if (chain_heads) {
                      // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                      for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1740,12 +1987,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1779,19 +2026,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
 -            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-+            int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-+            int32_t i_row0 = i_batch_beg[seq_id];
++            int32_t h_rows   = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
++            int32_t h_offset = i_batch_beg[seq_id];
++
++            // a shared-KV target (gemma4 assistant) reuses the target position for every draft token, so a
++            // batch whose last token is not an output needs no row at all
+             if (is_mem_shared && !batch_in.tokens[i_batch_end[seq_id]].output) {
+                 verify_h_rows[seq_id] = 0;
+                 continue;
+             }
+ 
+-            const bool all_rows_output = std::all_of(
+-                    batch_in.tokens.begin() + i_batch_beg[seq_id],
+-                    batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
+-                    [](const common_batch::token & token) { return token.output; });
+-            const int32_t h_rows = is_mem_shared && !all_rows_output ? 1 : n_rows;
+-            const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
+-
 +            // A prompt batch (still inside the prompt reported by set_prompt_end): accept() only ever follows a verify
 +            // batch, whose own process() refills verify_h, so only the last row (the next pending_h) is needed (a
 +            // 2048-row prompt ubatch copied ~84 MB here).  Verify batches, of any length, keep every row.  The prompt
@@ -975,20 +982,26 @@ index 1e1bf94e8..e22420ee0 100644
 +                ingest_from[seq_id]       = 0;   // generation reached
 +                ingest_prompt_end[seq_id] = -1;
 +                llama_set_embeddings_nextn_from(ctx_tgt, seq_id, 0);
-+            } else if (n_rows > 1 && have_end) {
-+                i_row0 += n_rows - 1;
-+                n_rows  = 1;
++            } else if (h_rows > 1 && have_end) {
++                h_offset += h_rows - 1;
++                h_rows    = 1;
 +            }
-             verify_h_rows[seq_id] = n_rows;
-             verify_h[seq_id].resize((size_t) n_rows * n_embd);
++
++            // a shared-KV target whose batch mixes output and non-output rows only needs the last one
++            if (is_mem_shared) {
++                const bool all_rows_output = std::all_of(
++                        batch_in.tokens.begin() + i_batch_beg[seq_id],
++                        batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
++                        [](const common_batch::token & token) { return token.output; });
++                if (!all_rows_output) {
++                    h_offset = i_batch_end[seq_id];
++                    h_rows   = 1;
++                }
++            }
+             verify_h_rows[seq_id] = h_rows;
+             verify_h[seq_id].resize((size_t) h_rows * n_embd);
  
-             for (int32_t i = 0; i < n_rows; ++i) {
--                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_row0 + i);
-                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-             }
- 
-@@ -1774,6 +2036,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1825,6 +2095,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              n_drafting++;
              drafting[seq_id] = true;
@@ -1007,7 +1020,7 @@ index 1e1bf94e8..e22420ee0 100644
              // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
              if (!params.probabilistic) {
                  dp.result_q = nullptr;
-@@ -1799,6 +2073,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1850,6 +2132,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -1018,7 +1031,7 @@ index 1e1bf94e8..e22420ee0 100644
          int i = 0;
  
          while (n_drafting > 0) {
-@@ -1869,7 +2147,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1920,7 +2206,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                      dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                  }
  
@@ -1027,7 +1040,7 @@ index 1e1bf94e8..e22420ee0 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1916,17 +2194,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1967,17 +2253,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -1138,9 +1151,9 @@ index 1e1bf94e8..e22420ee0 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -1936,6 +2305,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+@@ -2010,6 +2387,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
      }
 +
 +    // partial acceptance on a context that cannot roll back: the rejected draft
@@ -1156,7 +1169,7 @@ index 1e1bf94e8..e22420ee0 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2422,6 +2802,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2496,6 +2884,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -1164,7 +1177,7 @@ index 1e1bf94e8..e22420ee0 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2513,6 +2894,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2587,6 +2976,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -1172,7 +1185,7 @@ index 1e1bf94e8..e22420ee0 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2668,8 +3050,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2742,8 +3132,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
          }
      }
  
@@ -1191,7 +1204,7 @@ index 1e1bf94e8..e22420ee0 100644
      result.n_outputs_max = params.n_parallel;
      result.n_outputs_max_per_seq = 1;
  
-@@ -2715,15 +3105,24 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2789,15 +3187,24 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -1219,7 +1232,7 @@ index 1e1bf94e8..e22420ee0 100644
      }
  
      // the draft context holds as many tokens per sequence as the target context
-@@ -2809,7 +3208,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2883,7 +3290,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -1235,7 +1248,7 @@ index 1e1bf94e8..e22420ee0 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2822,12 +3228,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2896,12 +3310,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -1252,7 +1265,7 @@ index 1e1bf94e8..e22420ee0 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -2841,7 +3251,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2915,7 +3333,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -1265,7 +1278,7 @@ index 1e1bf94e8..e22420ee0 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2966,6 +3380,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -3040,6 +3462,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -1281,7 +1294,7 @@ index 1e1bf94e8..e22420ee0 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3106,6 +3529,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3180,6 +3611,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -1326,10 +1339,10 @@ index 4262327cb..605a847b0 100644
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
  void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 diff --git a/docs/speculative.md b/docs/speculative.md
-index a32842a25..543ec3d84 100644
+index d8f3bcb39..9ace5a345 100644
 --- a/docs/speculative.md
 +++ b/docs/speculative.md
-@@ -224,7 +224,7 @@ Use exactly one of these options:
+@@ -225,7 +225,7 @@ Use exactly one of these options:
  ### General Speculative Parameters
  
  ```
@@ -1338,7 +1351,7 @@ index a32842a25..543ec3d84 100644
                                          comma-separated list of types of speculative decoding to use
                                          (default: none)
                                          (env: LLAMA_ARG_SPEC_TYPE)
-@@ -250,6 +250,12 @@ Use exactly one of these options:
+@@ -251,6 +251,12 @@ Use exactly one of these options:
  --spec-draft-n-ubatch                   N
                                          physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                          (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
@@ -1351,7 +1364,7 @@ index a32842a25..543ec3d84 100644
  --spec-draft-p-split, --draft-p-split   P
                                          speculative decoding split probability (default: 0.10)
                                          (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
-@@ -370,6 +376,7 @@ Specifies a comma-separated list of speculative decoding types to use.
+@@ -371,6 +377,7 @@ Specifies a comma-separated list of speculative decoding types to use.
  | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
  | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
  | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
@@ -1375,10 +1388,10 @@ index e4a878b82..cb627129b 100644
  
              {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cf5d73f17..69e8209cb 100644
+index c7d5e90eb..6fd7fe2c2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -168,7 +168,7 @@ static bool ggml_cuda_register_host_enabled() {
+@@ -169,7 +169,7 @@ static bool ggml_cuda_register_host_enabled() {
      return enabled;
  }
  
@@ -1388,10 +1401,10 @@ index cf5d73f17..69e8209cb 100644
      return disabled;
  }
 diff --git a/include/llama.h b/include/llama.h
-index 3cbfb4487..62ccecc21 100644
+index d743c6db8..c641e5433 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -371,6 +371,7 @@ extern "C" {
+@@ -372,6 +372,7 @@ extern "C" {
          uint32_t n_ubatch;              // physical maximum batch size
          uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
          uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
@@ -1400,10 +1413,10 @@ index 3cbfb4487..62ccecc21 100644
          uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
          int32_t  n_threads;             // number of threads to use for generation
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 5efedf27e..44e8fda47 100644
+index 1279fcc5b..e96fa121a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1360,6 +1360,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+@@ -1421,6 +1421,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
      cparams.embeddings_nextn_masked = masked;
  }
  
@@ -1416,7 +1429,7 @@ index 5efedf27e..44e8fda47 100644
  void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
      LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
  
-@@ -1995,6 +2001,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2164,6 +2170,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      int64_t n_outputs_prev = 0;
      int64_t n_tokens_prev_l  = 0;
  
@@ -1432,7 +1445,7 @@ index 5efedf27e..44e8fda47 100644
      // complete the async device->host readbacks issued for one ubatch
      auto sync_readback = [&](ggml_tensor * t) {
          if (t == nullptr) {
-@@ -2150,6 +2165,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2337,6 +2352,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
          // [TAG_EXTRACT_TARGET_EMBEDDINGS]
          bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev_l, ubatch.n_tokens);
@@ -1441,7 +1454,7 @@ index 5efedf27e..44e8fda47 100644
  
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
-@@ -2157,8 +2174,34 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2344,8 +2361,34 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
              const bool masked    = cparams.embeddings_nextn_masked;
              const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
              const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev_l;
@@ -1477,7 +1490,7 @@ index 5efedf27e..44e8fda47 100644
                  ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                  GGML_ASSERT(backend_h != nullptr);
  
-@@ -2167,6 +2210,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2354,6 +2397,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
                  GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                  ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
@@ -1485,7 +1498,7 @@ index 5efedf27e..44e8fda47 100644
                  extract_all_idxs = extract_all_idxs || !masked;
              }
          }
-@@ -2208,7 +2252,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2395,7 +2439,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
          // to overwrite a layer input before its copy had read it.
          static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
@@ -1494,7 +1507,7 @@ index 5efedf27e..44e8fda47 100644
              sync_readback(t_logits);
              sync_readback(t_embd);
              sync_readback(t_h_nextn);
-@@ -4043,6 +4087,7 @@ llama_context_params llama_context_default_params() {
+@@ -4297,6 +4341,7 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -1502,7 +1515,7 @@ index 5efedf27e..44e8fda47 100644
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-@@ -4316,6 +4361,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4571,6 +4616,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -1514,18 +1527,18 @@ index 5efedf27e..44e8fda47 100644
      ctx->set_embeddings_nextn(value, masked);
  }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 6938fb103..c7a121857 100644
+index 39c5619df..e9aba31df 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -119,6 +119,7 @@ struct llama_context {
+@@ -121,6 +121,7 @@ struct llama_context {
  
      void set_embeddings (bool value);
      void set_embeddings_nextn(bool value, bool masked);
 +    void set_embeddings_nextn_from(llama_seq_id seq_id, llama_pos pos);
      void set_embeddings_layer_inp(uint32_t lid, bool enable);
-     void set_nextn_layer_offset(int32_t offset);
-     void set_causal_attn(bool value);
-@@ -320,6 +321,7 @@ private:
+     void set_embeddings_layer_inp_dev(bool value);
+ 
+@@ -331,6 +332,7 @@ private:
      // populated only when cparams.embeddings_nextn is enabled and the model graph
      // sets llm_graph_result::t_h_nextn
      buffer_view<float> embd_nextn = {nullptr, 0};
@@ -1534,7 +1547,7 @@ index 6938fb103..c7a121857 100644
      // host buffers for output layer input embeddings, per layer
      // populated when cparams.output_layer_inp[il] is true
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 0c260f7b6..e36b78ac8 100644
+index 9d5fe2b3a..be4f55166 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -14,6 +14,7 @@ struct llama_cparams {
@@ -1546,10 +1559,10 @@ index 0c260f7b6..e36b78ac8 100644
      uint32_t n_outputs_max_per_seq;
      int32_t  n_threads;       // number of threads to use for generation
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 933cb8013..5d244ecac 100644
+index b55c0c357..f5d7b5940 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -103,6 +103,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+@@ -128,6 +128,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
  // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
  LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
  
@@ -1562,7 +1575,7 @@ index 933cb8013..5d244ecac 100644
  // Select which appended NextN block the DECODER_MTP graph runs (offset past
  // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
  // chain multiple trained NextN heads. Default 0 (first head).
-@@ -152,6 +158,12 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
+@@ -190,6 +196,12 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
  // returns the number of extracted layers from target model
  LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
  
@@ -1576,10 +1589,10 @@ index 933cb8013..5d244ecac 100644
  // returns total number of elements or 0 on error
  // if out is nullptr, returns the number of tokens without writing to out
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c2a454cf9..cbb06ceb3 100644
+index 29bb822e0..5e53cf855 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3995,6 +3995,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
+@@ -4162,6 +4162,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
      }
  }
  
@@ -1595,10 +1608,10 @@ index c2a454cf9..cbb06ceb3 100644
      if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
          return 0;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 01fbda319..72188ce47 100644
+index 9c0a51f3d..126f52b00 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -836,6 +836,9 @@ struct llama_model {
+@@ -923,6 +923,9 @@ struct llama_model {
      // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
      std::vector<int32_t> target_layer_ids;
  
@@ -1608,33 +1621,11 @@ index 01fbda319..72188ce47 100644
      std::vector<llama_layer> layers;
  
      //Dense linear projections for SentenceTransformers models like embeddinggemma
-diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index 2e15777ee..f4da85bf0 100644
---- a/src/models/delta-net-base.cpp
-+++ b/src/models/delta-net-base.cpp
-@@ -498,7 +498,16 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
- 
-         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
- 
--        for (int64_t t = 1; t <= K; ++t) {
-+        // only the snapshot slots reachable by a rollback inside this batch are
-+        // useful: rollback <= n_seq_tokens - 1, so slots beyond the batch repeat
-+        // the pre-batch state and would only waste kernel launches per round
-+        // the bound is safe because the only callers that roll back remove tokens
-+        // this batch decoded: speculative verify batches start with the seq's last
-+        // committed token. the fused GDN op relies on the same bound - it writes
-+        // only the last min(n_seq_tokens, K) snapshots
-+        const int64_t t_min = std::max<int64_t>(1, K - ubatch.n_seq_tokens + 1);
-+
-+        for (int64_t t = t_min; t <= K; ++t) {
-             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-             const int64_t s_slot = K - t;
- 
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 36703127a..87121524f 100644
+index 4224a15ae..009f23fb3 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -178,6 +178,7 @@ set(LLAMA_CONTEXT_TEST_SRC
+@@ -180,6 +180,7 @@ set(LLAMA_CONTEXT_TEST_SRC
      llama-context/test-util.cpp
  )
  llama_build(${LLAMA_CONTEXT_TEST_SRC})
@@ -1642,35 +1633,35 @@ index 36703127a..87121524f 100644
  
  if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
      # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
-@@ -272,6 +273,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
-     )
+@@ -285,6 +286,27 @@ set_tests_properties(test-llama-context PROPERTIES
+     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+ )
  
-+    # snapshots for the speculative verify band: n_rs_seq 1..15 through the
-+    # full rollback range, compared against a sequential reference
-+    llama_test(
-+        test-recurrent-state-depth
-+        LABEL main
-+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
-+    )
-+    set_tests_properties(test-recurrent-state-depth PROPERTIES
-+        FIXTURES_REQUIRED generate-models
-+    )
++# snapshots for the speculative verify band: n_rs_seq 1..15 through the
++# full rollback range, compared against a sequential reference
++llama_test(
++    test-recurrent-state-depth
++    LABEL main
++    ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++)
++set_tests_properties(test-recurrent-state-depth PROPERTIES
++    FIXTURES_REQUIRED generate-models
++)
 +
-+    llama_test(
-+        test-recurrent-state-depth
-+        NAME test-recurrent-state-depth-qwen4exp
-+        LABEL main
-+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
-+    )
-+    set_tests_properties(test-recurrent-state-depth-qwen4exp PROPERTIES
-+        FIXTURES_REQUIRED generate-models
-+    )
++llama_test(
++    test-recurrent-state-depth
++    NAME test-recurrent-state-depth-qwen4exp
++    LABEL main
++    ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
++)
++set_tests_properties(test-recurrent-state-depth-qwen4exp PROPERTIES
++    FIXTURES_REQUIRED generate-models
++)
 +
-     llama_build(test-fusion.cpp)
- endif()
+ llama_build(test-fusion.cpp)
  
-@@ -321,6 +343,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
+ llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
+@@ -339,6 +361,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
@@ -2171,10 +2162,10 @@ index 000000000..a5ae0bc64
 +    return 0;
 +}
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index ad7e4b33f..23ac1aea1 100644
+index 9d140fd00..0121642c6 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
-@@ -201,6 +201,7 @@
+@@ -202,6 +202,7 @@
  | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
  | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
@@ -2182,7 +2173,7 @@ index ad7e4b33f..23ac1aea1 100644
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -210,7 +211,7 @@
+@@ -211,7 +212,7 @@
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
@@ -2192,10 +2183,10 @@ index ad7e4b33f..23ac1aea1 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 2f98106de..a37879e55 100644
+index df5fd4c58..bdf53a2ba 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
-@@ -264,6 +264,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -266,6 +266,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
  | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
@@ -2203,7 +2194,7 @@ index 2f98106de..a37879e55 100644
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -273,7 +274,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -275,7 +276,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
@@ -2213,10 +2204,10 @@ index 2f98106de..a37879e55 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a5cba1d71..0e66dfe1e 100644
+index 78c8ef149..230b4079c 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1199,9 +1199,7 @@ private:
+@@ -1217,9 +1217,7 @@ private:
  
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft();
@@ -2227,7 +2218,7 @@ index a5cba1d71..0e66dfe1e 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -3908,6 +3906,10 @@ private:
+@@ -4035,6 +4033,10 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -2238,7 +2229,7 @@ index a5cba1d71..0e66dfe1e 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4859,7 +4861,12 @@ private:
+@@ -4993,7 +4995,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  

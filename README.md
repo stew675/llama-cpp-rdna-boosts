@@ -11,11 +11,11 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point
-**`6050b467c`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
+**`a691b2345`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v16-6050b467c-r234`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r236`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -23,7 +23,7 @@ not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 6050b467c
+git checkout a691b2345
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (16 commits)
 
 # OPT-IN, not part of the delivery: an optional artifact on top (NOT the release tree)
@@ -45,7 +45,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 16 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-6050b467c-r180`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r236`**; the block
 count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
 16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
@@ -282,7 +282,7 @@ Applying the 14 patches to the fork point in [`release.json`](release.json) ther
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 6050b467c          # the base recorded in release.json
+git checkout a691b2345          # the base recorded in release.json
 bash <path-to-this-repo>/scripts/apply-all.sh .   # 15/15 strict, tree checked against release.json
 ```
 

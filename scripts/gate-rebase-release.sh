@@ -47,6 +47,8 @@
 #   ARMS          "name|model|extra llama-bench args" lines (defaults below)
 #   TEXT_PREFILL_ARMS  "name|model|llama-cli args" lines for step 5b (default below; the prompt is always
 #                 prompts/prose-rdna-boosts.txt, `-n 0`, i.e. prompt-eval only)
+#   WARMUP        discarded warm-up passes over the perf arms before timing (default 1).  The per-block
+#                 build ladder leaves the GPU hot; without this the first timed round reads 1-2 points low.
 #   TEXT_TOLERANCE  allowed regression of a real-text prefill arm, percent (default 3.0 -- a single
 #                 llama-cli run is noisier than `llama-bench -r 5`, and the arm exists to catch a
 #                 transport/arena regression, which is tens of percent, not one)
@@ -84,6 +86,12 @@ done
 
 LOGDIR="${LOGDIR:-$(mktemp -d)}"
 mkdir -p "$LOGDIR"
+# Do NOT export LOGDIR: `gate-prefill-logits.sh` uses the same variable name for its own log dir and
+# `rm -rf`s it on success (its cleanup is `[ KEEP -eq 1 ] || rm -rf "$LOGDIR"`), so an inherited value makes
+# step 3 delete THIS run's log directory mid-flight -- every later step then fails on missing logs.  Latent
+# since the two scripts were written; found at R17 (2026-11-08) because the run was launched with `env
+# LOGDIR=...`, which is the only way the value reaches a child.  `export -n` makes the value local.
+export -n LOGDIR 2>/dev/null || true
 START_EPOCH="$(date +%s)"
 START_HUMAN="$(date)"
 
@@ -333,6 +341,21 @@ bench_tps() { # bench_tps <binary> <model> <arm args...> -> t/s on stdout
 step_perf() {
     echo "== 6. perf: new build vs the SHIPPED build (interleaved, -r $REPS, $ROUNDS rounds) =="
     local name model args n b r ok=1
+    # A DISCARDED warm-up round first.  Step 2 (the per-block build ladder) leaves the GPU hot and busy for
+    # minutes, and the dense-27B arm sits 1 % under the shipped build, so the first timed round then reads
+    # 1-2 points low: measured at R17 (2026-11-08) as -3.44 % on round 1 against -1.68 / -1.59 after
+    # (spread 1.85, verdict -2.24 %) while the same A/B on a quiet box reads -1.31 / -1.19 / -1.32
+    # (spread 0.13, verdict -1.28 %).  One untimed pass over every arm absorbs it.  `WARMUP=0` disables.
+    if [ "${WARMUP:-1}" -gt 0 ]; then
+        echo "   warm-up round (discarded; WARMUP=0 disables)"
+        while IFS='|' read -r name model args; do
+            [ -z "${name:-}" ] && continue
+            case "$name" in \#*) continue ;; esac
+            [ -f "$model" ] || continue
+            bench_tps "$NEW_BUILD"  "$model" $args >/dev/null
+            bench_tps "$BASE_BUILD" "$model" $args >/dev/null
+        done <<< "$ARMS"
+    fi
     while IFS='|' read -r name model args; do
         [ -z "${name:-}" ] && continue
         if ! need_file "$model" "perf-$name"; then ok=0; continue; fi

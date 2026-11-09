@@ -3028,9 +3028,61 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   `TODO` #303).**  The whole device program is one `.hip_fatbin` section of `libggml-hip.so` holding one
   `__CLANG_OFFLOAD_BUNDLE__` per TU (`llvm-objcopy --dump-section .hip_fatbin`, then parse the bundle header — note
   the entry offsets are **bundle-relative**, not section-relative — then `llvm-objdump -d
-  --disassemble-symbols`; scripted in `wip/upstream-rebase-261108/isa-kernel-diff.py`).  Comparing the normalised instruction sequence answers in seconds what profiling cannot:
+  --disassemble-symbols`; scripted in `archive/work/upstream-rebase-261108/isa-kernel-diff.py`).  Comparing the normalised instruction sequence answers in seconds what profiling cannot:
   r236's dense MMQ came out **identical to unpatched `a691b2345`'s** (1436 instructions, 0 diff lines), which is what
   closed `#303` as an inherited cost rather than a lost delivery win — and it refuted two candidate fixes (a `min()`
   removal: 1436 → 1435 instructions; a type-gated NVFP4 prologue: byte-identical) before a single measurement was
   spent.  Check the ISA *before* benchmarking a codegen hypothesis; the same dump also gives the static instruction
   mix, which shows a "big" regression is usually four instructions and a scheduling change.
+- **`llama-bench`'s prompt has no routing locality, so it CANNOT measure the expert arena or the host-expert
+  transport (r236, `TODO` #296/#291).**  Its prompt is `std::rand() % n_vocab` (`tools/llama-bench/llama-bench.cpp`),
+  i.e. uniformly random token ids: every ubatch routes over all 256 experts of every layer.  On that shape the
+  arena is measurably **inert** — 35B-A3B Q8_0, 1 × R9700, `-ncmoe 48`, `-ub 512`, pp1450 = **414.1 / 414.5 /
+  414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto — while the same arm driven with the
+  shipped prose prompt reads **401.6 → 583.6 → 676.9 → 1063.6**.  The delivery looks −15…−18 % behind unpatched
+  upstream on the random shape and **+181 % ahead** on real text (1064 vs 379 t/s), and the arena's prefill is
+  838 t/s there against 1442 on real text.  Any A/B of the pool/arena/host transport must be driven with real
+  text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, now gate step 5b); `llama-bench` remains valid for
+  **build-vs-build** regressions (both sides see the same degenerate prompt) and for kernels whose cost does not
+  depend on routing.
+- **`llama-batched-bench`'s npl=1 prefill row is a cold-first-pass artifact (r236; same trap as
+  `archive/work/host-expert-eager-push/HANDOVER-R210.md` §3.1).**  Three identical npl=1 rows in one process read
+  ours **0.824 / 0.207 / 0.197 s** (Flash-Next GSQ, 3 devices `-sm tensor`, 512-token prefill) and upstream
+  **0.255 / 0.244 / 0.237 s**, so the first row understates the steady state by ~4× and must be discarded (a
+  one-time ~0.6 s cost on the first prefill of a process is all that is real).  The **decode** column is sound.
+- **`llama-batched-bench -c 16384` on Flash-Next at `-ncmoe 48` segfaults silently (`TODO` #270); it is a flag-set
+  landmine, not a general unreliability.**  With `-c 32768` and no `-ncmoe` (or with `-c 8192`) the same binary
+  prints complete tables and produces no assert, so the arm is usable once that shape is avoided.
+- **A "numeric arm" is the anchor, not byte-identity (r236, `TODO` #292).**  The dsv4 `DSV4_HC_PRE/_POST` ops own
+  the HC16 bf16 producer slots by design: vs their own ggml chain they read **0.013217 / 96.392 %** and
+  **0.013198 / 96.186 %** mean KLD / same-top-p on the BF16-hc class (base PPL 2.8489), and they are
+  **deterministic per class** (r235 and r236 produce the same `6a102dbc62d6`).  So they are gated by their own
+  recorded text (`SOFT_EXPECT` in `scripts/gate-hc-fusions.sh`), never by chain identity — a stale "both arms
+  agree on BF16-hc" line in that gate's header sent `#292` after a re-base drift that did not exist (r235's chain
+  reads `d62340fbf566` too).
+- **Delivery-vs-unpatched-upstream prefill-logit KLD grows with the surface the delivery replaces, and is
+  insensitive to every kill switch it ships (r236, `TODO` #293).**  Measured against a base recorded from a
+  detached `a691b2345` (wikitext 512 × 40): dense 27B Q8_0 (`qwen35`) **0.000697 / 98.784 %**, MoE 35B-A3B Q8_0
+  **0.004980 / 97.127 %** (unchanged with MMB/pair/router-topk off, with `GGML_CUDA_DISABLE_MMQ=1`, and only
+  0.004483 with `GGML_CUDA_GDN_CHUNKED=0`), qwen4exp Flash-Next **0.013426 / 96.431 %** (0.013955 with every HC
+  op/fusion off, 0.013081 with the derived mask, QSA, GDN-bf16, rms-vec and all fusions off).  It is the
+  accumulated arithmetic order of our own MoE/attention/HC implementations, **not** the qwen4exp model file — and
+  delivery-vs-delivery is still exact (r235 == r236 text on the field config, `87 ac6445f74aa2`).
+  `Qwen3.8-27B` is arch `qwen35`, so no `qwen4exp.cpp` change can affect it.
+- **On qwen4exp the delivery's advantage grows with depth, and 160 K is the decisive arm (r236, `TODO` #293).**
+  Ours vs unpatched `a691b2345`, Flash-Next GSQ-RCO-IQ3_XXS, 3 devices `-sm tensor`, device-resident (no
+  `-ncmoe`): `pp512` **+16.6 / +28.8 / +173.4 %** at d 0 / 16 384 / **163 840**, `tg128` **+98.2 / +98.9 /
+  +68.2 %**, real-text prefill **+19.1 / +88.4 %** at ~16 K / ~160 K, and aggregate concurrency **+41.6 / +67.2 /
+  +53.7 %** at 1 / 2 / 4 slots.  A shallow single-stream arm is not a basis for judging the qwen4exp/indexer
+  work.
+- **`r235` cannot run `llama-perplexity` on Flash-Next (r236 fixed it).**  The shipped build aborts in
+  `ggml-cuda.cu:1375` (`GGML_ASSERT(ptr == pool_addr + pool_used)`, the pool-order class `TODO` #298 fixed) under
+  `-sm tensor` and core-dumps under `-sm layer`, so a delivery-vs-delivery KLD arm is not available on that model
+  — compare text/throughput instead, or use r236-vs-upstream.
+- **The release gate must not time the perf arms straight after the per-block build ladder, and it must not
+  inherit `LOGDIR` (r236, found running R17).**  (1) The ladder leaves the GPU hot/busy: the dense-27B arm read
+  **−3.44 % on round 1** against −1.68 / −1.59 after (verdict −2.24 %, spread 1.85) while the same A/B on a quiet
+  box reads −1.31 / −1.19 / −1.32 (**−1.28 %, spread 0.13**), so `gate-rebase-release.sh` now runs one
+  **discarded warm-up round** (`WARMUP=1`).  (2) `gate-prefill-logits.sh` uses the variable `LOGDIR` for its own
+  log dir and `rm -rf`s it on success, so an *exported* `LOGDIR` makes step 3 delete the orchestrator's log
+  directory mid-run and every later step fails on missing logs; the orchestrator now does `export -n LOGDIR`.
