@@ -475,8 +475,15 @@ in CI.  The model-level gates are manual:
     the rules (build per block, prefill-logit KLD, the `MUL_MAT_ID`/`MUL_MAT` op suites, the coherence texts, the
     interleaved performance A/B against the shipped build, and the GPU-fault scan scoped to the run's own start)
     and prints a single PASS/FAIL with exit `0`/`1`.  It adds no thresholds of its own beyond `--tolerance`
-    (default 1.0 % per arm).  **It FAILS rather than skips**: a step that cannot run is a FAIL, so a missing build,
-    model or recorded hash cannot look like a pass.  `--quick` drops the build ladder and the KLD gate while
+    (default 1.0 % per `llama-bench` arm) and `--text-tolerance` (default 3.0 % for the real-text prefill arm).
+    **It FAILS rather than skips**: a step that cannot run is a FAIL, so a missing build,
+    model or recorded hash cannot look like a pass.  **Step 5b (`--only textprefill`) is a real-text prompt-eval
+    against the shipped build, and it is not redundant with the `llama-bench` perf arm**: `llama-bench` builds its
+    prompt from `std::rand() % n_vocab` (uniformly random token ids), so every ubatch routes over every expert and
+    the expert arena is measurably inert there (pp1450 = 414.1 / 414.5 / 414.5 / 414.5 t/s at
+    `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto) while the same arm on the shipped prose prompt reads
+    401.6 / 583.6 / 676.9 / 1063.6 t/s.  A `llama-bench`-only perf step therefore cannot see the arena or the
+    host-expert transport, which is where this repo's prefill risk lives (`TODO #273`, `#296`).  `--quick` drops the build ladder and the KLD gate while
     iterating; `--perf-only` is the A/B alone and is also the answer to a `#279`-class "is this still worth
     implementing on the new base?" question (the arm it guards is the decode arm).  Run it before a tag and paste
     its verdict into the release's `WORKLOG.md` entry.

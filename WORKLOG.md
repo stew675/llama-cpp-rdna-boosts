@@ -1,3 +1,48 @@
+## 261108.011 (no release) -- `TODO` #296/`D8` closed: the "host-expert prefill regression" is `llama-bench`'s random-token prompt, the real floor is the transport, and the gate gains a real-text arm
+
+**Two things had to be separated: a measurement artifact and a real transport cost.**  Taken the way `TODO` #296
+prescribed, the host-expert `pp`/`tg` arm said the delivery is **−15…−18 %** prefill against unpatched
+`a691b2345`.  It is the tool, not the delivery: `llama-bench` builds its prompt from `std::rand() % n_vocab`
+(`tools/llama-bench/llama-bench.cpp`), so every ubatch routes over every expert of every layer and the heat-ranked
+expert arena has no locality to exploit.  On that shape the arena is measurably **inert** — pp1450 =
+**414.1 / 414.5 / 414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto (35B-A3B Q8_0, 1 × R9700,
+`-ncmoe 48`, `-ub 512`) — while the *same arm driven with the shipped prose prompt* reads
+**401.6 → 583.6 → 676.9 → 1063.6** t/s.  Two prompt shapes, same flags: **delivery 414.5 vs base 508.3** on random
+ids, **delivery 1064 vs base 379 (+181 %)** on real text.  A real-text prefill moves only **351.7 MiB** of expert
+H2D traffic for 4 000 tokens (`hits=83.11% fills=14.74% cold=2.14%`).
+
+**The real floor (`TODO` #273's family, recorded there).**  Under no locality the delivery's host transport is
+414 vs upstream's 508 — and it is **transport-shaped**: it scales with the host fraction (`-ncmoe` 12/24/48 →
++9.3 / −5.6 / −17.8 %) and with the ubatch **count**, not its size (`pp4096` at `-ub` 512/1024/2048/4096 →
+439/877/1744/3446 t/s = exactly 1/2/4/8 × a constant per-ubatch cost).  It is not the slab, the devgather, the
+host tier, the cold path, the host buft or the CPU offload thread cap (all inside noise of 438-439), and not the
+dense path (all-GPU 3 × R9700 `-sm tensor` pp512 is +13 % over base).  Upstream wins that shape by computing the
+experts on the CPU out of local RAM and never crossing the bus.
+
+**`#296` itself, hunk by hunk (D8).**  Two of block 12's five CPU hunks were **dead and are now dropped** from the
+tree: `arch-fallback.h`'s only delivery content was a one-line `// quants.c` comment (the file is byte-identical
+to upstream's again), and `ggml-cpu.cpp`'s `static` on the `GGML_CPU_MOE_OFFLOAD_THREADS` `getenv` sits inside
+`ggml_backend_cpu_moe_offload_cap()`, which returns early from its own memoised `static int cap`, so it can never
+run twice.  Three stay, each for a measured reason: `repack.cpp`'s three `nullptr`s are what silence
+`-Wmissing-field-initializers` (compiled without them: exactly that warning, `repack.cpp:5254`), `ggml-cpu.c`'s
+`GGML_OP_ALL_GATHER` → `dup` is the cross-backend consistency fill, and `arch/x86/quants.c`'s Q2_0 dot is purity
+(85/85 on `test-backend-ops -b CPU -o MUL_MAT -p type_a=q2_0`) at a now-measured price: **0.66-0.69 TFLOPS against
+upstream `#30447`'s 1.23-1.34** (n=1: 177.74 vs 95.10 µs) on a type no delivery model uses.  The one measured CPU
+win in the block is the AVX2 top-k prefilter in `common/sampling.cpp`: **+0.54 %** decode (103.93 vs 103.37 t/s,
+3/3 rounds, 4B Q8_0, `--temp 0.8 --top-k 40`) with **byte-identical text** (`7f950c7d0f76`) — a filter, not an
+approximation (it is already `GGML_LF_FAST_TOPK`'s prefilter, so nothing new is gated).
+
+**Verification.**  Clean rebuild (a widely included header); coherence 4B `1c5d32ac537d` unchanged; the
+host-expert arm reads `pp512` 437.2 / `tg64` 80.1 against 438.2/438.3 and 76-82 before, inside its own spread.
+Fork tip `8715156da`, tree `a4093f9da`.
+
+**Gate extended.**  `scripts/gate-rebase-release.sh` gains step **5b `textprefill`** — real-text prompt-eval on a
+`-ncmoe 48` host-expert config against the shipped build, `--text-tolerance` default 3.0 %, appended to
+`MANIFESTS.md` gate 22 with the reason (a `llama-bench`-only perf step cannot see the arena or the host transport,
+which is where this repo's prefill risk lives).  First run, 3 rounds: r236 vs r235 **−0.45 %** (−0.46 / −0.45 /
+−0.45, spread 0.01) PASS.  `TODO` #296 and `DECISIONS.md` `D8` are closed by this entry; `TODO` #273 carries the
+finding and the method change.
+
 ## 261108.010 (no release) -- `TODO` #290 closed: the single fusion dispatcher is verified in the tree that R17 cuts from
 
 **`#290` (the dispatcher merge debt) — VERIFIED, not merely asserted.**  R11 reconciled the two

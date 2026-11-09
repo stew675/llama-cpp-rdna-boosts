@@ -2955,7 +2955,17 @@ had no other home.
 
 * **CPU wins**: an AVX2 block prefilter in the sampler (block max + NaN detection over 64 logits, with the
   scalar fallback preserved), and an AVX2 Q2_0 dot product that reproduces the generic two-rounding
-  arithmetic bit-for-bit.
+  arithmetic bit-for-bit.  **Measured at r236 (`TODO` #296 / `D8`), and the list is now exact**: the prefilter
+  is the win (**+0.54 %** decode, 103.93 vs 103.37 t/s, 3/3 rounds, 4B Q8_0 `--temp 0.8 --top-k 40`, text
+  byte-identical `7f950c7d0f76` — it is a filter, so it cannot move the distribution); the Q2_0 dot is **purity,
+  not speed** — `test-backend-ops -b CPU -o MUL_MAT -p type_a=q2_0` 85/85, but 0.66-0.69 TFLOPS against upstream
+  `#30447`'s non-pure body's 1.23-1.34 (n=1: 177.74 vs 95.10 µs), on a type no delivery model uses.  The three
+  non-perf hunks stay for stated reasons: `ggml-cpu.c`'s `GGML_OP_ALL_GATHER` → `dup` and its `get_n_tasks` entry
+  are the cross-backend consistency fill, `repack.cpp`'s three `nullptr`s are what silence
+  `-Wmissing-field-initializers`, and the sampler's scalar fallback preserves non-AVX2 hosts.  **Two dead hunks
+  were dropped at r236** (a one-line `// quants.c` comment in `arch-fallback.h`, and a `static` on the
+  `GGML_CPU_MOE_OFFLOAD_THREADS` `getenv` inside the already-memoised `ggml_backend_cpu_moe_offload_cap()`;
+  records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert-prefill-transport.md`).
 * **DFlash**: the F1 device-resident layer-input path made default-on with a warn-once fallback
   (`GGML_LF_DFLASH_DEV=0` disables), `GGML_LF_FAST_TOPK`, and — since **r106** — DFlash2 under
   `-sm tensor` (see the fold below; the r54 clean rejection is gone).

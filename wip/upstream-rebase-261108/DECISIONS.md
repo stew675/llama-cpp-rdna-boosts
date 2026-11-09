@@ -221,7 +221,36 @@ gains), and does anything become dead code?  Drop only what measurably no longer
 **Measurement:** CPU-side `pp`/`tg` on the host-expert config, `test-backend-ops` for the touched quant
 types, and the delivery's `-lv 4` CPU-path census.
 
-- status: **OPEN — partially addressed at R13, one measurement still owed** · record: `RUNGS.md` R13
+- status: **DECIDED (R17 pre-pass, 2026-11-08) — measured; two dead hunks DROPPED, three kept, and the win is not
+  in those five files at all.**  Numbers and arms: `benchmarks/2026-11-08-host-expert-prefill-transport.md`,
+  `WORKLOG.md` 261108.011, `RUNGS.md` `P9`.
+  * `arch-fallback.h` — the delivery's only change was a **one-line `// quants.c` comment**.  Dropped; the file is
+    byte-identical to upstream's again (blob `4e59d0ae0`).
+  * `ggml-cpu.cpp` — the delivery marked the `getenv("GGML_CPU_MOE_OFFLOAD_THREADS")` result `static`, inside
+    `ggml_backend_cpu_moe_offload_cap()`, which returns early from its own `static int cap` memoisation, so the
+    `static` can never run twice.  **A literal no-op**; dropped.
+  * `repack.cpp` — three `nullptr` entries for the new buffer-type fields.  No behavioural effect (an aggregate
+    initialiser zero-fills), but it is exactly what silences `-Wmissing-field-initializers`: compiled without them
+    (same TU flags, `-Wextra`) emits that warning on `repack.cpp:5254`.  **Kept** (the tree is warning-clean by
+    standard).
+  * `ggml-cpu.c` — `GGML_OP_ALL_GATHER` → `dup` + its `ggml_get_n_tasks` entry.  Not a perf win: it is the
+    cross-backend consistency fill that lets a CPU split carry the delivery's all-gather node (`AGENTS.md`, scope
+    policy).  **Kept**.
+  * `arch/x86/quants.c` — the AVX2 Q2_0 dot, whose *purpose* is purity (bit-identical to the generic body).
+    Functional: `test-backend-ops -b CPU -o MUL_MAT -p type_a=q2_0` **85/85**.  The price of purity is now
+    measured: delivery **0.66-0.69 TFLOPS** against upstream `#30447`'s body **1.23-1.34 TFLOPS** on the same
+    shapes (n=1: 177.74 µs vs 95.10 µs) — i.e. we carry a ~46 % slower dot than upstream on a type no delivery
+    model uses.  **Kept**, recorded; a purity-preserving fast body is a possible future item, not a D8 blocker.
+  * The one *measured CPU win* in block 12 is not one of those five files: the AVX2 top-k block prefilter in
+    `common/sampling.cpp` — **+0.54 %** decode (103.93 vs 103.37 t/s, 3/3 rounds, 4B Q8_0, `--temp 0.8 --top-k 40`)
+    with **byte-identical text** (`7f950c7d0f76`), which also proves it is a filter and not an approximation.
+    **Kept.**
+  * The "host-expert CPU path" arm D8 asked for was measured and it changed the question: on **real text** the
+    delivery is **+181 %** prefill over unpatched `a691b2345` (1064 vs 379 t/s, 35B-A3B Q8_0, `-ncmoe 48`), while
+    on `llama-bench`'s random-token prompt it is −18 % — an artifact of that prompt (the arena is inert there:
+    0.09 % across a 22 GiB arena sweep).  The residual no-locality floor is `TODO` #273's, recorded there.
+
+- record from R13 (superseded by the above, kept because it states the premise):
   *R13 (block 12, 2026-11-09): block 12's CPU hunks (`arch-fallback.h`, `arch/x86/quants.c`, `ggml-cpu.c`,
   `ggml-cpu.cpp`, `repack.cpp`) merged without conflict and `#31854`'s F32-src1 `type_traits_cpu` entry did not
   collide with ours, so **nothing was dropped** — the wins are still in the tree by construction.  The

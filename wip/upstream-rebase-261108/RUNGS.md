@@ -1260,6 +1260,49 @@ also the `#279` A/B, so that handle closes on the same run.
 
 - status: **DONE** · fork `3b0978888` (block 00/08 surface: `mmf.cu`/`mmf.cuh` + the delivery's test suite) · `WORKLOG.md` 261108.009 · session 2026-11-08
 
+## P9 — pre-R17: `TODO` #296, `D8`'s CPU-win measurement — two dead hunks dropped, and the measurement method itself was the finding · **DONE 2026-11-08**
+
+`#296` asked which of block 12's CPU hunks (`arch-fallback.h`, `arch/x86/quants.c`, `ggml-cpu.c`, `ggml-cpu.cpp`,
+`repack.cpp`) still pay after upstream's CPU-backend rewrite.  Answer: **three of the five are not perf hunks at
+all, two were literally dead, and the one measured CPU win is in a file D8's list does not name.**
+
+**Hunk by hunk (measured, not assumed).**
+* `arch-fallback.h` — the delivery's only change was a **one-line `// quants.c` comment** (blob-level diff against
+  `a691b2345`: one line added).  **Dropped**; the file is byte-identical to upstream's again.
+* `ggml-cpu.cpp` — `static const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS")`, inside
+  `ggml_backend_cpu_moe_offload_cap()`, which returns early from its own `static int cap` memoisation → the
+  `static` can never execute twice.  **Dead; dropped.**
+* `repack.cpp` — three `nullptr` entries for the new buffer-type fields.  No behaviour change, but compiled without
+  them (same TU flags, `-Wextra`) the compiler emits `-Wmissing-field-initializers` on `repack.cpp:5254`, so the
+  hunk is what keeps the tree warning-clean.  **Kept.**
+* `ggml-cpu.c` — `GGML_OP_ALL_GATHER` → `dup` + its `ggml_get_n_tasks` entry: the cross-backend consistency fill
+  (a CPU split carrying the delivery's all-gather node aborts without it).  **Kept.**
+* `arch/x86/quants.c` — the AVX2 Q2_0 dot, pure by design (bit-identical to the generic body).  `test-backend-ops
+  -b CPU -o MUL_MAT -p type_a=q2_0` **85/85**; throughput **0.66-0.69 TFLOPS** against upstream `#30447`'s body
+  **1.23-1.34 TFLOPS** (n=1: 177.74 vs 95.10 µs) — the cost of purity, on a type no delivery model uses.
+  **Kept**, recorded.
+* The measured win is block 12's **AVX2 top-k block prefilter** in `common/sampling.cpp`: **+0.54 %** decode
+  (103.93 vs 103.37 t/s, 3/3 rounds, 4B Q8_0, `--temp 0.8 --top-k 40`), text **byte-identical** (`7f950c7d0f76`)
+  — a filter, not an approximation.  **Kept.**
+
+**The bigger finding is the method.**  D8's "host-expert CPU path" `pp`/`tg` arm, taken the way the item said, said
+the delivery is −15…−18 % prefill against unpatched `a691b2345`.  It is an artifact: `llama-bench` builds its
+prompt from `std::rand() % n_vocab`, so every ubatch routes over every expert and the heat-ranked arena is inert
+(pp1450 = 414.1 / 414.5 / 414.5 / 414.5 t/s across `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto).  Driven with
+real text, the same arm is **1064 vs 379 t/s (+181 %)** and the arena sweep is 401.6 → 583.6 → 676.9 → 1063.6.  The
+residual floor under no locality (414 vs 508, flat across every knob: slab, devgather, host tier, cold path, host
+buft, CPU offload threads) belongs to `TODO` #273 and is recorded there.
+
+**Verification.**  Clean rebuild after the two drops (a widely included header); coherence 4B `1c5d32ac537d`
+unchanged; the same host-expert arm reads `pp512` 437.2 / `tg64` 80.1 against 438.2/438.3 and 76-82 before, i.e.
+inside its own spread.  **Gate extended**: new step **5b `textprefill`** in `scripts/gate-rebase-release.sh`
+(real-text prompt-eval on `-ncmoe 48`, `--text-tolerance` default 3.0 %), first run r236 vs r235 **−0.45 %**
+(−0.46 / −0.45 / −0.45, spread 0.01) PASS — so a future change to the arena or the host transport can no longer
+pass a `llama-bench`-only gate.
+
+- status: **DONE** · fork `8715156da` (tree `a4093f9da`) · `WORKLOG.md` 261108.011 ·
+  `benchmarks/2026-11-08-host-expert-prefill-transport.md` · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1290,6 +1333,7 @@ climb touched has a maintainer decision recorded.
 | R14 | 13 | `ed13a322e` | 3 expected → 4 files / 5 hunks | build + 4-arm coherence (R13-identical) + `--spec-draft-mtp-vocab` on both head paths (shared-NextN via `ctx_other`, self-headed gemma4) + inert when unset | 2026-11-09 | clean rung: no decision needed. `arch == other.arch` dropped from `can_reuse` (`#31733` moved the model into the graph context; `model == other.model` subsumes it); `common_fit_apply()` already carried the delivery's draft-reserve fold; block 13's row-range splice over a vocab-split Meta tensor is exercised by the shared-NextN arm |
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
+| P9 | — | `8715156da` (fork, `ggml-cpu`: `arch-fallback.h` + `ggml-cpu.cpp`) | #296 / `D8`: which block-12 CPU hunks survive the CPU-backend rewrite | DECIDED: two hunks were dead (a comment line, a `static` inside a memoised function) -> dropped; `repack.cpp` keeps its warning fix, `ggml-cpu.c` keeps the `ALL_GATHER` fill, `quants.c` keeps the pure Q2_0 dot (cost measured: 0.66-0.69 vs upstream's 1.23-1.34 TFLOPS); the measured CPU win (AVX2 top-k prefilter) is +0.54 % with byte-identical text | 2026-11-08 | the host-expert `pp` arm turned out to be a `llama-bench` random-token artifact (arena inert: 414.1/414.5/414.5/414.5 across MIB 0/4096/8192/auto; real text 401.6 -> 1063.6) -- new gate step 5b `textprefill`, and `#273` carries the transport floor |
 | R17 | — | | | | | |
 | P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |

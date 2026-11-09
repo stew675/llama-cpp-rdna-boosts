@@ -13,16 +13,25 @@
 #   3. numerics   the prefill-logit KLD gate                -> scripts/gate-prefill-logits.sh
 #   4. ops        tests/test-backend-ops: MUL_MAT_ID (incl. the duplicate-id oracle), MUL_MAT
 #   5. text       same-seed greedy text on the coherence arms, against recorded hashes
-#   6. perf       interleaved wall clock of every arm against the SHIPPED build, per-arm ratio
+#   5b. textprefill  REAL-TEXT prompt-eval on a host-resident-expert config, against the SHIPPED build.
+#                 `llama-bench` cannot stand in for this: its prompt is `std::rand() % n_vocab`
+#                 (tools/llama-bench/llama-bench.cpp), i.e. uniformly random token ids with NO routing
+#                 locality, and on that shape the expert arena is measurably inert (pp1450 = 414.1 /
+#                 414.5 / 414.5 / 414.5 t/s at MOE_EXPERT_CACHE_MIB 0 / 4096 / 8192 / auto).  On the same
+#                 arm with a real prompt the arena is the whole win (401.6 -> 583.6 -> 676.9 -> 1063.6),
+#                 so a `llama-bench`-only gate would pass a broken arena host transport.  Hence this step.
+#   6. perf       interleaved wall clock of every llama-bench arm against the SHIPPED build, per-arm ratio
 #   7. faults     scripts/check-gpu-faults.sh, scoped to this run's start timestamp
 #
 # USAGE
 #   scripts/gate-rebase-release.sh                       # everything
 #   scripts/gate-rebase-release.sh --quick               # skip steps 2 and 3 (the slow ones)
 #   scripts/gate-rebase-release.sh --perf-only           # just step 6 (an A/B while iterating)
-#   scripts/gate-rebase-release.sh --only text,faults    # one or more steps by name (build|logits|ops|text|perf)
+#   scripts/gate-rebase-release.sh --only text,faults    # one or more step names
+#                                                       # (build|logits|ops|text|textprefill|perf|faults);
 #                                                       # `state` is included only when named
-#   scripts/gate-rebase-release.sh --tolerance 1.0       # allowed regression per arm, percent (default 1.0)
+#   scripts/gate-rebase-release.sh --tolerance 1.0       # allowed regression per llama-bench arm, percent
+#   scripts/gate-rebase-release.sh --text-tolerance 3.0   # the same for the real-text prefill arm
 #
 # ENV (all optional)
 #   FORK          fork checkout                 (default: ~/llama.cpp)
@@ -32,6 +41,11 @@
 #   ROUNDS        A/B rounds                    (default: 3)
 #   REPS          llama-bench -r                (default: 5)
 #   ARMS          "name|model|extra llama-bench args" lines (defaults below)
+#   TEXT_PREFILL_ARMS  "name|model|llama-cli args" lines for step 5b (default below; the prompt is always
+#                 prompts/prose-rdna-boosts.txt, `-n 0`, i.e. prompt-eval only)
+#   TEXT_TOLERANCE  allowed regression of a real-text prefill arm, percent (default 3.0 -- a single
+#                 llama-cli run is noisier than `llama-bench -r 5`, and the arm exists to catch a
+#                 transport/arena regression, which is tens of percent, not one)
 #   LOGDIR        output dir                    (default: mktemp -d)
 #
 # Exit: 0 = every step passed, 1 = at least one FAILED, 2 = usage/startup error.
@@ -45,6 +59,7 @@ BASE_COMMIT="${BASE_COMMIT:-a691b2345}"
 ROUNDS="${ROUNDS:-3}"
 REPS="${REPS:-5}"
 TOLERANCE="${TOLERANCE:-1.0}"
+TEXT_TOLERANCE="${TEXT_TOLERANCE:-3.0}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 QUICK=0 PERF_ONLY=0 ONLY=""
@@ -54,6 +69,7 @@ while [ $# -gt 0 ]; do
         --perf-only) PERF_ONLY=1 ;;
         --only)      ONLY="$2"; shift ;;
         --tolerance) TOLERANCE="$2"; shift ;;
+        --text-tolerance) TEXT_TOLERANCE="$2"; shift ;;
         --rounds)    ROUNDS="$2"; shift ;;
         --reps)      REPS="$2"; shift ;;
         -h|--help)   sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -82,6 +98,14 @@ DEFAULT_TEXT_ARMS="\
 qwen35-4B|/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf|HIP_VISIBLE_DEVICES=0 -ngl 99|1c5d32ac537d
 "
 TEXT_ARMS="${TEXT_ARMS:-$DEFAULT_TEXT_ARMS}"
+
+# Step 5b: real-text prompt-eval (see the header).  `-ncmoe 48` is the host-resident-expert shape the arena
+# and the host transport live in; `-ub 512 -b 2048` is the field ubatch.  A model that is not present is a FAIL
+# (the step must not silently measure nothing).
+DEFAULT_TEXT_PREFILL_ARMS="\
+moe-35B-prefill-text|/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf|HIP_VISIBLE_DEVICES=0 -ncmoe 48 -ub 512 -b 2048
+"
+TEXT_PREFILL_ARMS="${TEXT_PREFILL_ARMS:-$DEFAULT_TEXT_PREFILL_ARMS}"
 
 results=()
 pass_n=0 fail_n=0
@@ -214,6 +238,66 @@ step_text() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# 5b. real-text prefill against the shipped build (the shape the expert arena exists for)
+# ---------------------------------------------------------------------------------------------------------------
+# `llama-bench` builds its prompt from `std::rand() % n_vocab`: uniformly random token ids, so every ubatch
+# routes over every expert of every layer and the heat-ranked arena has no signal to work with.  Measured on
+# this arm (35B-A3B Q8_0, 1 x R9700, `-ncmoe 48`, `-ub 512`, ~1450-token prompt): pp1450 = 414.1 / 414.5 /
+# 414.5 / 414.5 t/s at MOE_EXPERT_CACHE_MIB 0 / 4096 / 8192 / auto -- the arena is inert -- while the SAME arm
+# driven with the shipped prose prompt measures 401.6 / 583.6 / 676.9 / 1063.6 t/s.  A `llama-bench`-only perf
+# step is therefore blind to the arena and to the host-expert transport, which is where this repo's prefill
+# risk lives, so the release verdict carries a real-text arm of its own.
+prompt_eval_tps() { # prompt_eval_tps <build dir> <model> <arm args...> -> prompt-eval t/s on stdout
+    local bin="$1" model="$2"; shift 2
+    local out
+    split_arm "$@"
+    if ! out="$(env "${ENVS[@]}" timeout 1800 "$bin/bin/llama-cli" -m "$model" \
+                  -f "$REPO/prompts/prose-rdna-boosts.txt" -n 0 --seed 42 --temp 0 \
+                  --no-display-prompt --single-turn "${FLAGS[@]}" 2>>"$LOGDIR/textprefill.err")"; then
+        return 1
+    fi
+    # llama-cli's timing footer, at its default verbosity (a text arm takes no -lv)
+    printf '%s\n' "$out" | grep -oE '\[ Prompt: [0-9.]+ t/s' | tail -1 | grep -oE '[0-9.]+'
+}
+
+step_textprefill() {
+    echo "== 5b. real-text prefill: new build vs the SHIPPED build (interleaved, $ROUNDS rounds) =="
+    local name model args n b r ok=1
+    if ! need_file "$REPO/prompts/prose-rdna-boosts.txt" textprefill; then return 1; fi
+    while IFS='|' read -r name model args; do
+        [ -z "${name:-}" ] && continue
+        case "$name" in \#*) continue ;; esac
+        if ! need_file "$model" "textprefill-$name"; then ok=0; continue; fi
+        local ratios=()
+        for r in $(seq 1 "$ROUNDS"); do
+            n="$(prompt_eval_tps "$NEW_BUILD"  "$model" $args)"
+            b="$(prompt_eval_tps "$BASE_BUILD" "$model" $args)"
+            if [ -z "$n" ] || [ -z "$b" ] || [ "$b" = "0" ]; then
+                record FAIL "textprefill-$name" "round $r produced no prompt-eval rate (new='$n' base='$b'); see $LOGDIR/textprefill.err"
+                ok=0; break
+            fi
+            ratios+=("$(python3 -c "print('%+.3f' % (100*($n/$b-1)))")")
+        done
+        [ ${#ratios[@]} -eq 0 ] && continue
+        local verdict
+        verdict="$(python3 - "$TEXT_TOLERANCE" "${ratios[@]}" <<'PYVERDICT'
+import sys, statistics
+tol = float(sys.argv[1]); vals = [float(x) for x in sys.argv[2:]]
+mean = statistics.mean(vals)
+spread = max(vals) - min(vals)
+status = "PASS" if mean >= -tol else "FAIL"
+print(f"{status} {mean:+.2f}% (rounds: {' '.join(f'{v:+.2f}' for v in vals)}; spread {spread:.2f}; tol {-tol:+.1f})")
+PYVERDICT
+)"
+        case "$verdict" in
+            PASS*) record PASS "textprefill-$name" "${verdict#PASS }" ;;
+            *)     record FAIL "textprefill-$name" "${verdict#FAIL }"; ok=0 ;;
+        esac
+    done <<< "$TEXT_PREFILL_ARMS"
+    return $(( ok == 1 ? 0 : 1 ))
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # 6. performance A/B against the shipped build
 # ---------------------------------------------------------------------------------------------------------------
 bench_tps() { # bench_tps <binary> <model> <arm args...> -> t/s on stdout
@@ -293,6 +377,7 @@ else
     if [ "$QUICK" = 1 ]; then record WARN prefill-logits "skipped (--quick)";  else wanted logits && step_logits; fi
     wanted ops    && step_ops
     wanted text   && step_text
+    wanted textprefill && step_textprefill
     wanted perf   && step_perf
     wanted faults && step_faults
 fi

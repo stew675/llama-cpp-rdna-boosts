@@ -24,7 +24,7 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed; the remaining `#291`/`#292`/`#293`/`#295`/`#296` rows plus R17 are the live brief in
+climbed; the remaining `#291`/`#292`/`#293`/`#295` rows plus R17 are the live brief in
 `wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
 
 ## The open list
@@ -51,7 +51,6 @@ climbed; the remaining `#291`/`#292`/`#293`/`#295`/`#296` rows plus R17 are the 
 | **292** | `gate-hc-fusions.sh`'s dsv4 soft arms reproduce r235's numerics, not the unfused chain's | gate expectation / `hyperconn.cu` | **OPEN** — created at R12; quantify with the KLD gate at R17 — §292 |
 | **293** | decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support | model file (`src/models/qwen4exp.cpp`) + the fused HC/indexer kernels | **OPEN** — kept at R12 on a measured +31 % decode; the discriminating arm is Q8_0 on 2/3 devices — §293 |
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
-| **296** | `D8`'s CPU-win measurement is still owed | ladder arm (R17) | **OPEN — R17** — `pp`/`tg` on a host-expert config + `test-backend-ops` + the CPU-path census — §296 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 
 ## Handle numbering
@@ -299,6 +298,29 @@ bisect the context, then check whether it is the compute buffer, the arena or th
 
 **Kind:** architecture / delivery — a transport consolidation.
 
+**r236 (2026-11-08, `TODO` #296): the measurement method changed, and there is a floor to beat.**  Two facts that
+should steer this item:
+1. **`llama-bench` cannot measure this path.**  Its prompt is `std::rand() % n_vocab` (uniformly random token ids),
+   so every ubatch routes over every expert of every layer and the heat-ranked arena has no signal.  On that shape
+   the arena is measurably inert: 35B-A3B Q8_0, 1 x R9700, `-ncmoe 48`, `-ub 512`, pp1450 = **414.1 / 414.5 /
+   414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto.  The *same* arm driven with the shipped
+   prose prompt reads **401.6 / 583.6 / 676.9 / 1063.6** t/s -- the arena is the whole win.  Any A/B of a transport
+   must therefore be driven with real text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`), which is now
+   `scripts/gate-rebase-release.sh` step 5b (`--only textprefill`).
+2. **The random-token floor is the target.**  On the no-locality shape the delivery's host transport is
+   **414 t/s against unpatched `a691b2345`'s 508** (-18 %, and it is flat across the arena sizes above, i.e. the
+   arena is not the cost); on real text the same pair is **1064 against 379** (+181 %), and streaming-only is
+   402 against 379 (+6 %).  So the sign of the comparison depends on routing locality, and upstream *computing the
+   experts on the CPU out of local RAM* is the thing that wins when locality is absent: it reads the same bytes but
+   never crosses the bus, and a uniform 16-rows-per-expert split is its best case.  The gap is therefore
+   **transport-shaped, not policy-shaped** -- it scales with the number of host-resident layers (delivery vs base
+   prefill: `-ncmoe` 12 -> +9 %, 24 -> -5.6 %, 48 -> -18 %) and it scales with the ubatch COUNT, not its size
+   (pp4096 at `-ub` 512/1024/2048/4096 = 439/877/1744/3446 t/s = exactly 1/2/4/8 x a constant per-ubatch cost).
+   That per-ubatch constant is the resident-complement re-read; a transport that avoids it under no locality is
+   the floor this item should be measured against.  Census for a real-text prefill (4k tokens, 69 % residency):
+   `hits=83.11% fills=14.74% cold=2.14%`, **351.7 MiB of expert H2D traffic for the whole prefill**.
+   Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert-prefill-transport.md`.
+
 **OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
 
 ## 282. A mid-run pinned-tier latch perturbs the logits by ~1e-5 (a path difference, not corruption)
@@ -415,15 +437,6 @@ guarded against is **silent** (draft acceptance -> ~0 while the text stays corre
 keep one arm that would catch a regression: a host-expert (`-ncmoe`) **two-slot** server with a DFlash drafter
 and the acceptance axis read at `-lv 4`.  Add it to `RUNGS.md` R17's arm list if it is not there — the MTP
 four-axis protocol alone does not cover a `-ncmoe` multi-slot DFlash run.
-
-## 296. `D8`'s CPU-win measurement is still owed at R17
-
-The re-base kept block 12's CPU hunks untouched (`arch-fallback.h`, `arch/x86/quants.c`, `ggml-cpu.c`,
-`ggml-cpu.cpp`, `repack.cpp`; `#31854`'s F32-src1 `type_traits_cpu` entry did not collide with ours), but
-*which* of those wins still pays on the rewritten CPU backend was never measured (`DECISIONS.md` `D8`).  The
-R17 ladder should run the CPU-side `pp`/`tg` on a host-expert config, `test-backend-ops` for the touched quant
-types, and the delivery's `-lv 4` CPU-path census, then either record the surviving wins in `patches/README.md`
-or drop the dead ones.
 
 ## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
 
