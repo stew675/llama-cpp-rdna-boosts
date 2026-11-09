@@ -1340,6 +1340,46 @@ anchor valid.
 
 - status: **DONE, no delivery-code change** · `WORKLOG.md` 261108.012 · session 2026-11-08
 
+## P11 — pre-R17: `TODO` #293, keep or drop our qwen4exp — KEEP, measured at depth and concurrency · **DONE 2026-11-08**
+
+`#293` asked whether to keep carrying the delivery's own `src/models/qwen4exp.cpp` (3264 lines) or take upstream's
+(1514).  R12 kept it on a single-stream +31 % decode; the item's open half was the "field config" (Q8_0, 2/3 GPUs
+`-sm tensor`) and an unexplained 27B text divergence.  Both are now measured.
+
+**The 27B half was a category error.**  `Qwen3.8-27B-Q8_0` is arch **`qwen35`** (dense), so no `qwen4exp.cpp` swap
+can touch it; its prefill-logit KLD against unpatched `a691b2345` is **0.000697 / 98.784 %** (rounding-level, PASS).
+The R12 "greedy text diverged" observation was short-prompt noise on a near-tie, not an implementation difference.
+
+**Upstream's file cannot be swapped in anyway**: `a691b2345:src/models/qwen4exp.cpp` does not compile against the
+delivery tree (upstream's `llm_graph_input_kpool`, a `hc_mix` graph type and an 8-arg `ggml_hc_mix` were all
+re-expressed by our k-pool/HC work).  So the comparison is ours-vs-unpatched, model device-resident on 3 devices
+`-sm tensor` (no `-ncmoe`, so `TODO` #296's `llama-bench` artifact cannot enter).
+
+| arm | ours | upstream | delta |
+|---|---:|---:|---:|
+| `pp512` d0 / d16 384 / d163 840 | 2721.8 / 2327.5 / 1822.2 | 2334.6 / 1807.6 / 666.6 | **+16.6 / +28.8 / +173.4 %** |
+| `tg128` d0 / d16 384 / d163 840 | 86.4 / 82.8 / 57.7 | 43.6 / 41.6 / 34.3 | **+98.2 / +98.9 / +68.2 %** |
+| real text ~16 K / ~160 K prefill | 1927 / 2134 | 1618 / 1133 | **+19.1 / +88.4 %** |
+| batched total, 1 / 2 / 4 slots | 275.6 / 572.7 / 872.7 | 194.6 / 342.5 / 567.9 | **+41.6 / +67.2 / +53.7 %** |
+
+No cell favours upstream, so the item's "mixed bag → merge session" branch never opens and the "wins at depth"
+test passes at 160 K.  **DECIDED: keep ours.**
+
+**Two instrument traps met on the way**, both recorded so they are not re-derived: (1) `llama-batched-bench`'s
+npl=1 prefill row is a cold-first-pass artefact (ours 0.824 s first, 0.197 s warm; the same trap as
+`archive/work/host-expert-eager-push/HANDOVER-R210.md` §3.1) — the steady state is +19.0 %, not −67 %;
+(2) r235 cannot run `llama-perplexity` on this model at all (its own pool-order assert, `ggml-cuda.cu:1375`, the
+class `#298` fixed), so a delivery-vs-delivery KLD is not available — delivery-vs-delivery was instead confirmed
+byte-identical in text (87 chars `ac6445f74aa2` on both builds).
+
+**Order of the KLD ladder** (ours vs unpatched, 512 × 40): dense 27B **0.000697** → MoE 35B-A3B **0.004980** →
+qwen4exp **0.013426**, and the qwen4exp number does not move with any switch we ship (HC ops/fusions 0.013955,
+derived-mask/QSA/GDN-bf16/rms/all-fusions 0.013081).  So the divergence tracks the delivery's own MoE/attention/HC
+re-expression, not the model file — which is why keeping the file costs numerics nothing that a swap could recover.
+
+- status: **DONE** · `benchmarks/2026-11-08-qwen4exp-keep-or-drop.md` · `WORKLOG.md` 261108.013 ·
+  `DECISIONS.md` `D3` · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1372,6 +1412,7 @@ climb touched has a maintainer decision recorded.
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | P9 | — | `8715156da` (fork, `ggml-cpu`: `arch-fallback.h` + `ggml-cpu.cpp`) | #296 / `D8`: which block-12 CPU hunks survive the CPU-backend rewrite | DECIDED: two hunks were dead (a comment line, a `static` inside a memoised function) -> dropped; `repack.cpp` keeps its warning fix, `ggml-cpu.c` keeps the `ALL_GATHER` fill, `quants.c` keeps the pure Q2_0 dot (cost measured: 0.66-0.69 vs upstream's 1.23-1.34 TFLOPS); the measured CPU win (AVX2 top-k prefilter) is +0.54 % with byte-identical text | 2026-11-08 | the host-expert `pp` arm turned out to be a `llama-bench` random-token artifact (arena inert: 414.1/414.5/414.5/414.5 across MIB 0/4096/8192/auto; real text 401.6 -> 1063.6) -- new gate step 5b `textprefill`, and `#273` carries the transport floor |
 | P10 | — | (none — no delivery change; `scripts/gate-hc-fusions.sh` + docs) | #292: the dsv4 `DSV4_HC_PRE/_POST` soft arms were said to reproduce r235's numerics while the re-based chain moved | NOT DRIFT: the shipped r235 build reproduces r236's split exactly (hard `d62340fbf566`, soft `6a102dbc62d6` on both); the claim traced to a stale r156 header line. KLD vs chain measured 0.013217/96.392 % (pre) and 0.013198/96.186 % (post) at base PPL 2.8489 = the documented bf16 re-baseline. The soft arms are now sha-anchored (`SOFT_EXPECT`), so a real numeric change FAILs instead of printing `reported` | 2026-11-08 | no kernel change; `hyperconn.cu`/`dsv4-hc.cu` are correct |
+| P11 | — | (none — no delivery change) | #293: keep or drop the delivery's own qwen4exp model file (3264 vs 1514 lines) | KEEP, measured: ours vs unpatched a691b2345 on Flash-Next GSQ 3 GPU -sm tensor — prefill +16.6/+28.8/+173.4 % at d0/16k/160k, decode +98.2/+98.9/+68.2 %, real-text prefill +19.1/+88.4 % at 16k/160k, batched total +41.6/+67.2/+53.7 % at 1/2/4 slots. The 27B 'divergence' was a category error (qwen35, not qwen4exp; its KLD vs upstream is 0.000697/98.784 %), and upstream's file does not compile against our tree (kpool/hc_mix API). qwen4exp-vs-upstream KLD 0.013426/96.431 % is the MoE/attention/HC re-expression, insensitive to every switch | 2026-11-08 | two instrument traps recorded: batched-bench npl=1 cold first pass, and r235's pool-order assert on perplexity |
 | R17 | — | | | | | |
 | P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |

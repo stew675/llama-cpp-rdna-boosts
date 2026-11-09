@@ -1,3 +1,48 @@
+## 261108.013 (no release) -- `TODO` #293 closed: KEEP our qwen4exp, measured at depth and concurrency (and the 27B "divergence" was a category error)
+
+**The decision the item was waiting for, taken on depth and concurrency rather than a shallow single-stream arm.**
+Ours (`8715156da`) vs unpatched `a691b2345`, Flash-Next GSQ-RCO-IQ3_XXS (`qwen4exp`, 70.62 GiB, device-resident on
+3 devices `-sm tensor`, **no `-ncmoe`** so `#296`'s random-token/arena artifact cannot enter), interleaved 3 rounds:
+
+| arm | ours | upstream | delta |
+|---|---:|---:|---:|
+| `pp512` d0 / d16 384 / **d163 840** | 2721.8 / 2327.5 / 1822.2 | 2334.6 / 1807.6 / 666.6 | **+16.6 / +28.8 / +173.4 %** |
+| `tg128` d0 / d16 384 / **d163 840** | 86.4 / 82.8 / 57.7 | 43.6 / 41.6 / 34.3 | **+98.2 / +98.9 / +68.2 %** |
+| real-text prompt-eval ~16 K / ~160 K | 1927 / 2134 | 1618 / 1133 | **+19.1 / +88.4 %** |
+| `batched-bench` aggregate, 1 / 2 / 4 slots | 275.6 / 572.7 / 872.7 | 194.6 / 342.5 / 567.9 | **+41.6 / +67.2 / +53.7 %** |
+
+Every cell favours ours and the prefill margin **grows with depth** (+16.6 → +28.8 → +173.4 %), which is the
+indexer/sparse path doing its job at 160 K.  Per `#293`'s rule (drop only if upstream matches or beats us at all
+depths and concurrencies; a mixed bag earns a merge session; shallow parity + a depth win means keep), this is
+**keep** — and there is no mixed bag for a merge to defend, so no merge session is warranted.
+
+**The 27B half of the item was a category error.**  `Qwen3.8-27B-Q8_0` is arch **`qwen35`** (dense), so no
+`qwen4exp.cpp` swap can affect it; its prefill-logit KLD against unpatched upstream is **0.000697 / 98.784 %**
+(rounding-level, PASS).  R12's "27B greedy text diverged" was short-prompt noise on a near-tie.  And upstream's
+file cannot be swapped in at all: `a691b2345:src/models/qwen4exp.cpp` (1514 lines) does not compile against our
+tree — it needs upstream's `llm_graph_input_kpool`, a `hc_mix` graph type and an 8-arg `ggml_hc_mix`, all of which
+our k-pool/HC work re-expressed.  So the comparison is necessarily ours-vs-unpatched.
+
+**The numerics ladder, so the KLD is not mistaken for a regression later** (ours vs unpatched, wikitext 512 × 40):
+dense 27B **0.000697 / 98.784 %** → MoE 35B-A3B **0.004980 / 97.127 %** → qwen4exp **0.013426 / 96.431 %**, and the
+qwen4exp number does not move with any switch we ship (all HC ops/fusions off 0.013955; + derived-mask off, QSA
+off, GDN-bf16 off, rms-vec, all fusions off 0.013081).  It is the accumulated arithmetic order of **our own**
+MoE/attention/HC implementations, not the model file — dropping the file would leave the 0.0050 MoE term and lose
+the performance.  The historically quoted qwen4exp KLDs (`0.000000 / 100.000 %`, `5.9e-5`) are delivery-vs-delivery
+(or vs our own fallback arm) and are still exact: r235 and r236 are **text-identical** on the field config
+(87 chars `ac6445f74aa2`).
+
+**Two instrument traps recorded** (so they are not re-derived): (1) `llama-batched-bench`'s npl=1 prefill row is a
+cold-first-pass artefact — ours 0.824 s first vs 0.207/0.197 s warm, upstream 0.255/0.244/0.237 s; steady state is
+**+19.0 %**, not the −67 % the raw row suggests (same trap as `archive/work/host-expert-eager-push/HANDOVER-R210.md`
+§3.1).  The residual is a one-time ~0.6 s on the first prefill of a process, recorded in the benchmark note.
+(2) r235 cannot run `llama-perplexity` on this model at all — it aborts in its own pool-order assert
+(`ggml-cuda.cu:1375`, the class `#298` fixed) and core-dumps at `-sm layer` — which is why every KLD arm is
+r236-vs-upstream.
+
+`TODO` #293 is retired by this entry; `DECISIONS.md` `D3` carries the re-decision.  Two pre-R17 rows remain:
+`#291` and `#295` (+ R17).
+
 ## 261108.012 (no release) -- `TODO` #292 closed: the dsv4 soft arms never drifted, a stale header line sent the chase after the re-base, and they are now sha-anchored
 
 **The premise was wrong, and one command pair settles it.**  `#292` said `gate-hc-fusions.sh`'s dsv4

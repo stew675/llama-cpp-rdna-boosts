@@ -119,6 +119,20 @@ chain, never against the default (`MANIFESTS.md` gate 3, `GREEDY-PURITY.md` §81
   3200-line model file stays ours while upstream keeps rewriting it.  Rung: `b1b0fa807`; log in
   `RUNGS.md` → R12.
 
+  **Re-decided at r236 (2026-11-08, `RUNGS` `P11`) on depth and concurrency, not on a shallow single-stream arm —
+  KEEP, and no merge session is warranted.**  Ours vs unpatched `a691b2345`, Flash-Next GSQ-RCO-IQ3_XXS, 3 devices
+  `-sm tensor`, no `-ncmoe`, interleaved 3 rounds: prefill **+16.6 % / +28.8 % / +173.4 %** at d 0 / 16 384 /
+  163 840; decode **+98.2 % / +98.9 % / +68.2 %** at the same depths; real-text prompt-eval **+19.1 %** at ~16 K
+  and **+88.4 %** at ~160 K; aggregate concurrency **+41.6 % / +67.2 % / +53.7 %** at 1 / 2 / 4 slots.  There is no
+  cell where upstream matches or beats us, so `#293`'s "keep only if it wins at depth" test passes at every depth,
+  and the "mixed bag → merge" branch never opens.  The earlier 27B "text divergence" that motivated this item was
+  an artefact: the 27B is `qwen35` (dense), so no `qwen4exp.cpp` swap can affect it, and its prefill-logit KLD
+  against unpatched upstream is **0.000697 / 98.784 %** (rounding-level).  The qwen4exp-vs-upstream KLD is
+  **0.013426 / 96.431 %** and is *not* the model file: it is the accumulated arithmetic order of our own MoE /
+  attention / HC implementations (MoE alone costs 0.004980 on 35B-A3B), and it is insensitive to every switch we
+  ship.  Dropping our model file would therefore leave the 0.0050 MoE term and lose the performance.
+  `benchmarks/2026-11-08-qwen4exp-keep-or-drop.md`.
+
 ## D4 — The recurrent rollback bound: upstream enforces what we track and warn about
 
 **Upstream:** `#31368` — the recurrent memory and the DSV4 cache record the deepest rollback the *last

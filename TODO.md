@@ -24,7 +24,7 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed; the remaining `#291`/`#293`/`#295` rows plus R17 are the live brief in
+climbed; the remaining `#291`/`#295` rows plus R17 are the live brief in
 `wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
 
 ## The open list
@@ -48,7 +48,6 @@ climbed; the remaining `#291`/`#293`/`#295` rows plus R17 are the live brief in
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **291** | upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | delivery vs upstream (`D1`) | **OPEN — deferred to its own session** (maintainer, 2026-11-08) — a measurement, not a code change — §291 |
-| **293** | decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support | model file (`src/models/qwen4exp.cpp`) + the fused HC/indexer kernels | **OPEN** — kept at R12 on a measured +31 % decode; the discriminating arm is Q8_0 on 2/3 devices — §293 |
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 
@@ -410,14 +409,6 @@ code change, unless the numbers say otherwise.
 **Kind:** delivery vs upstream (`src/llama-moe-cache.cpp`, `ggml/src/ggml-cuda/moe-expert-cache.cu`).
 
 **OPEN — needs a full measuring session (maintainer's call, 2026-11-08: defer).**  Open questions: is the difference the *policy* (ClassLRU vs the arena's heat/RFU admission), the *tier* (upstream caches in a plain device buffer; ours lives in the slab, and the slab's reserve/headroom may be costing us usable arena), the *config* (one GPU `-sm layer` vs the field's 2-3 GPU `-sm tensor`), or the measurement (the arms are either/or — the coexistence the merge preserves is untested; and the run needs `GGML_HIP_NO_VMM=OFF`, which is now in `~/bin/build-llama-rocm`).  Also note `--moe-cache-cpu-share` (`#30966`) and ClassLRU (`#31233`) are capabilities ours lacks
-
-## 293. Decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support
-
-**Decide whether to keep carrying our own qwen4exp (Qwen3.8) model support.**  R12 (`D3`) kept the delivery's implementation because it is **+31 % decode with byte-identical text** on Flash-Next 3-GPU `-sm tensor`, but it is a 3200-line model file that upstream keeps rewriting (`#30965`/`#31243`/`#31443`/`#30927`/`#31086`), i.e. the largest per-rung conflict surface we own.  On **Qwen3.8-27B** (1 GPU) it was throughput-neutral and its greedy text diverged from upstream's (`b905c9763a58` vs `b21e94a5b6e1`), which is unexplained
-
-**Kind:** `src/models/qwen4exp.cpp`, `src/llama-kv-cache.*` (the keys-only indexer cache), `ggml/src/ggml-cuda/{hc-mix,hyperconn,fattn-qsa,indexer-score}.*`.
-
-**OPEN — created 2026-11-08 (maintainer's call at R12).**  Assess in a follow-up session; the **discriminating measurement is Q8_0 on 2 and 3 GPU `-sm tensor`** (the field config, where the fused HC/indexer kernels are supposed to pay off), plus the KLD gate on the 27B to explain the text divergence.  If ours does not win on Q8_0 tensor-split, drop the model file and keep upstream's (the fused kernels then need re-expressing as fusions over upstream's plain-op graph)
 
 ## 295. R17 must include a host-expert multi-slot DFlash arm (the guard's detector)
 
