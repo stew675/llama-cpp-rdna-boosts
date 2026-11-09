@@ -1,16 +1,17 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  On `r241`** (cut against `release.json` tree
-`d1fee048a4d450cc2b80831298d197381b406fa4`; the r229 cut and its measurements are kept below as the dated
-record).
+**Optional artifact, not part of the delivery.  Re-cut on `r243`** (against `release.json` tree
+`e9300f1dbd0b2f0b96c1828829d2072d73f34bca`; the r241 and r229 cuts and their measurements are kept below as the
+dated record).
 
 From **PR #268 then PR #279 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed and
 amended (see *What changed in the rebase* below).  The submitter's own description and measurements are in the
 PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `44b7962f3d1021a13d5a5e4c79560be7ba760b27acfa419012ebc0e1b88c2e7b`
-* applies at `release.json` tree `d1fee048a4…`, produces tree `1fcd9891db2622394652a381c51f0beeb94d3526`
-  (verified by strict `git am` on a fresh checkout of `.tip` `7ef43022b`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `dfba9168a1044a29a2e466c36fb8b64c78dd3e79d359aeda01fa7c3141680799`
+* applies at `release.json` tree `e9300f1dbd…`, produces tree `0db1268ea8e72cb2f0bf830583a94b85c06ba77e`
+  (verified by strict `git am` on a fresh checkout of `.tip` `72f7753fd`; both artifacts together produce
+  `74458b8bfd25575d86a31d69c21a16a3a5e837b7`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one

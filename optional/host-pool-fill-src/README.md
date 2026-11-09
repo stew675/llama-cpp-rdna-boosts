@@ -1,7 +1,7 @@
 # `host-pool-fill-src` — the host pool's buffered fill reads the file, not the model mapping
 
-**Optional artifact, not part of the delivery.  On `r241`** (cut against `release.json` tree
-`d1fee048a4d450cc2b80831298d197381b406fa4`).
+**Optional artifact, not part of the delivery.  Re-cut on `r243`** (against `release.json` tree
+`e9300f1dbd0b2f0b96c1828829d2072d73f34bca`; first cut on `r241`).
 
 The second half of **issue [#281](https://github.com/stew675/llama-cpp-rdna-boosts/issues/281)** (@DanoPTT,
 Windows 11, one R9700, 64 GB, Flash-Next IQ3_XXS, `--limit-host-experts 4 MOE_HOST_POOL_RAM_PCT=10`).
@@ -10,9 +10,10 @@ The first half shipped in **r232** as a block-12 amendment (`A`: the coalesced p
 buffered — could not coalesce at all).  This is `B`: **the pool fill reads the file too.**
 
 * `host-pool-fill-src.patch` — the artifact.  sha256
-  `3652af8849de867774e4a77977c983ec60eaa33465522b90127dceaebeef4d85`
-* applies at `release.json` tree `d1fee048a4…`, produces tree `1ab8622e758e818f7a696ab1d6574d8f8bfb4f4b`
-  (verified by strict `git am` on a checkout of `.tip` `7ef43022b`)
+  `eb1bee8257ae3e3e2abfd2c196c2dbdb697f6c0bb0406f6f51a85f008af036be`
+* applies at `release.json` tree `e9300f1dbd…`, produces tree `faa85ced24786bcd780022585b28c86a3e531a18`
+  (verified by strict `git am` on a checkout of `.tip` `72f7753fd`; both artifacts together produce
+  `74458b8bfd25575d86a31d69c21a16a3a5e837b7`)
 * one file, 25 insertions / 8 deletions: `ggml/src/ggml-cuda/moe-expert-cache.cu`
 * ```bash
   bash scripts/apply-all.sh <clean-llama.cpp-at-release.json.base>   # then accept the prompt for this one

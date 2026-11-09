@@ -58,6 +58,14 @@ outcome.
 mentions as a follow-up (that is `wip/ple-residency`'s territory, still parked, and the delivered loop is
 load-bearing per that campaign's own record).
 
+**Post-tag housekeeping (same session, `optional/` only -- no release artifact changes).**  Both optional artifacts were
+**re-cut onto this release's tree** as the policy requires (`optional/README.md`): `host-pool-fill-src` now applies at
+`e9300f1dbd…` and produces `faa85ced24…` (sha256 `eb1bee8257…`), `two-lane-prefill` produces `0db1268ea8…` (sha256
+`dfba9168a1…`), and the two together `74458b8bfd…`, verified end to end with
+`scripts/apply-all.sh --include-optional-all` on a fresh `a691b2345` checkout.  Neither needed a conflict resolution
+(both are `git am`-clean over the block-11 delta); they were regenerated rather than left pointing at the r241 blobs
+because a stale `index` line is exactly what lets a 3-way apply land a hunk in the wrong place later.
+
 **Arch arms:** not re-run for this release, deliberately -- the change is host code with no kernel, no
 backend predicate and no arch branch, the 1-device arm is neutral and identical, and the 4B control shows it
 unreachable elsewhere; gfx1151 holds the whole expert set in VRAM, so its `per_layer_token_embd` is a *device*

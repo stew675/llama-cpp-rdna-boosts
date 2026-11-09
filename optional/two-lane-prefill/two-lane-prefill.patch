@@ -1,4 +1,4 @@
-From e7d8b348a0b1718b91715b7b8f32b231af3bae6f Mon Sep 17 00:00:00 2001
+From 9cc6bceae4d6ac34ec85f5a809836e0a8e282a62 Mon Sep 17 00:00:00 2001
 From: "Slava P." <slavap@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 21:30:00 -0600
 Subject: [PATCH] rdna-boosts [optional]: two-lane prefill
@@ -925,10 +925,10 @@ index 8091607dc..bc4c8a919 100644
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index abd1e5fe4..f67880f83 100644
+index 4a0286460..0ced05aab 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -9886,7 +9886,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+@@ -9954,7 +9954,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
      ggml_cuda_set_device(dev_ctx->device);
  
      cudaEvent_t event;
@@ -950,7 +950,7 @@ index abd1e5fe4..f67880f83 100644
  
      return new ggml_backend_event {
          /* .device  = */ dev,
-@@ -9907,6 +9920,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -9975,6 +9988,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -978,7 +978,7 @@ index abd1e5fe4..f67880f83 100644
  // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
  // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
  // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
-@@ -10189,6 +10223,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10257,6 +10291,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
