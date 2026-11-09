@@ -46,6 +46,11 @@ is what a bit-identical graph change must show.  `scripts/gate-per-block-build.s
 of the 16 patches from a fresh `a691b2345` tarball, applied tree `d1fee048a` == `release.json.tree`, no conflict
 markers, Windows portability scan 287 files clean.
 
+**MTP protocol.**  `benchmarks/mtp-adaptive-methodology.md` Protocol A, canonical dense arm, run on the shipped
+build at **reduced depth** (`-c 32768 --predict 1000`, the 102400/3000 arm is ~6 min of wall clock per side and was
+not run): `draft-mtp` acceptance **0.50588** (602 / 1190, mean len 2.52) at **54.0 t/s** against **30.1 t/s** plain,
+prompt eval 1229.4 / 1270.3 t/s.  Both of the protocol's criteria hold (draft-mtp >= plain, acceptance > ~0.45).
+
 **Landing.**  Folded into block 03 (`git rebase -i`, `edit` at that commit, `git apply` of the delta, `--amend`),
 and the folded tree is bit-identical to the working tree the numbers above were measured on (`git diff` against it
 is empty), so no measurement had to be repeated.  `scripts/make-patches.sh` + `make-release.sh` regenerated the

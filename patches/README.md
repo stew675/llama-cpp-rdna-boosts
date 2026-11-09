@@ -4,6 +4,15 @@
 2026-11-08 r236 re-base, which replaced the 2026-10-25 `6050b467c` base), one
 `git am` commit each.
 
+> **r241: where this release's one change folded.**  GitHub issue #291 (the conv-state store's rollback index was
+built per conv layer, per graph: `arange` + `scale_bias` + `cast` for the same K <= 8 int32 values, 144 of the
+1268 nodes of the dense-27B MTP verify graph, every speculative round).  It is now built once per (graph,
+device) and each layer takes a view, `LLAMA_SHARE_SLOT_REV=0` the kill switch.  Folded into **block 03** (the
+rollback tracker, `build_conv_state_store`).  Gate `scripts/gate-slot-rev-share.sh`; `INVARIANTS.md` r241;
+`WORKLOG.md` 261109.005; `benchmarks/2026-11-09-issue-291-slot-rev-share.md`.  Bit-identical: coherence
+`1c5d32ac537d`, prefill-logit KLD 0.000697 / 98.784 % (both unchanged), MTP decode +1.03 % at 10.5k depth and
++4.0 % on a decode-dominated prompt.
+>
 > **r240: where this release's changes folded.**  GitHub issue #290 (an hc base copy per layer held to the end
 > of a `-sm layer` prefill graph, plus the two per-graph activation caches leapfrogging) -> **block 12** for the
 > base-copy ordering in `hyperconn.cu`, and **block 10** for everything else: `GGML_CUDA_POOL_STACK_CENSUS`
