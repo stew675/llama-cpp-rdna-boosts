@@ -42,6 +42,14 @@ reported regression is fixed and the reporter verified it on r233.
    halves.  `optional/README.md` gains the artifact and the interactive flag; `ENVIRONMENT.md` §18 catalogues
    `MOE_HOST_POOL_FILL_SRC` (kill-switch class, default = file); `MANIFESTS.md`, `README.md`, `AGENTS.md` and
    `scripts/README.md` describe the prompt instead of "applies every patch".
+5. **`-lv` corrected in `AGENTS.md`, and the fact appended to `INVARIANTS.md`.**  The table's premise ("llama.cpp's
+   own `LOG_INF` is INFO") named the wrong macro: the line that arrives at `-lv 3` is **`common/`'s** `LOG_INF`
+   (self-filtered at verbosity 3 — the per-slot statistics block in `common/sampling.cpp`), while `LLAMA_LOG_INFO`
+   goes through `llama_log_internal(GGML_LOG_LEVEL_INFO, ...)` and is mapped to **TRACE = 4**, i.e. llama's own
+   library INFO needs `-lv 4` exactly like the ggml censuses.  That is why `llama-cli` and `llama-server` "differ":
+   the server's default threshold (3) reveals only `common/`'s lines, so measured here **`-lv 3` adds nothing at all
+   over a server's default** (identical 31-line startup log, 7 WARNs; `-lv 4` adds 191 INFO lines).  No behaviour
+   changed — a documentation fix, but it is the trap that cost a run in this session.
 
 
 ## 261109.005 (r241, RELEASE v16-a691b2345-r241) -- the conv-state rollback index is built once per graph, not once per layer (GitHub issue #291), gated and re-cut

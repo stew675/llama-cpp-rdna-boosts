@@ -269,24 +269,35 @@ trap so easy to hit only on the 3-GPU arm.
 Diff against a known-good build: same-seed output must be IDENTICAL. `GGML_CUDA_ALLREDUCE=nccl` is not
 a bit-identical reference under `-sm tensor` (see `INVARIANTS.md`); treat it as a smoke comparison.
 
-**`-lv` is a threshold you pick per arm, and `llama-cli` starts at errors-only.**  One flag, two mappings:
-`common_log_get_verbosity()` sends ggml's `GGML_LOG_INFO` to **TRACE** while llama.cpp's own `LOG_INF` is
-**INFO**, and `llama-cli` sets `params.verbosity = LOG_LEVEL_ERROR` (the common default is INFO, which is why a
-`llama-server` arm differs — see below).  So:
+**`-lv` is a threshold you pick per arm, and `llama-cli` starts at errors-only.**  One flag, but there are
+**two** ways a line reaches it, and that is the usual source of confusion:
+
+1. **`common/`'s own macros self-filter.**  `LOG_TMPL` compares the macro's verbosity against the threshold, so
+   `LOG_INF` / `LOG_CNT` (verbosity `LOG_LEVEL_INFO` = **3**) appear at **`-lv 3`**.  In practice the call site
+   that matters is `common/sampling.cpp`'s **per-slot statistics block**, printed *between* streamed tokens.
+2. **Anything logged through the ggml/llama logger is mapped up one notch.**  `LLAMA_LOG_INFO`
+   (`src/llama-impl.h`) emits `GGML_LOG_LEVEL_INFO`, and `common_log_get_verbosity()` maps that level to
+   **`LOG_LEVEL_TRACE` = 4** — so llama.cpp's *library* INFO (`sched_reserve: reserving …`, `two-lane prefill
+   enabled`, the spec/`draft acceptance` lines) needs **`-lv 4`**, exactly like ggml's own `GGML_LOG_INFO`
+   censuses.  Measured 2026-11-09: `llama-server`'s default and `llama-server -lv 3` produce **identical**
+   startup logs (31 lines, 7 WARNs); only `-lv 4` adds its 191 INFO lines.
 
 | `-lv` | what it adds | use it for |
 |---|---|---|
-| **none** (the `llama-cli` default) | errors only — the banner, generic output, the generated text | **every text/hash arm**: `scripts/extract-generated.py` needs the clean stream, and the rates come from the `[ Prompt: … \| Generation: … ]` footer |
-| `2` | ggml/gate WARN: the slab line, `narrow-2 … pinned at`, the pool/sink census WARNs | a quick mechanism spot-check |
-| `3` | llama-cli's own INFO, i.e. its **per-slot statistics block**, printed *between* streamed tokens | **nothing** — it corrupts a hash and still hides every ggml INFO census |
-| `4` | ggml INFO: `MoE expert cache:`, `expert access:`, `takeover=`, `cold admission=`, `sched_reserve`, the `draft acceptance`/spec lines | **every census/mechanism arm** |
+| **none** (the `llama-cli` default, `LOG_LEVEL_ERROR`) | errors only — the banner, generic output, the generated text | **every text/hash arm**: `scripts/extract-generated.py` needs the clean stream, and the rates come from the `[ Prompt: … \| Generation: … ]` footer |
+| `2` | WARN: the slab line, `narrow-2 … pinned at`, the pool/sink census WARNs | a quick mechanism spot-check |
+| `3` | **`common/`'s** verbosity-3 INFO — in practice the per-slot statistics block, printed *between* streamed tokens | **nothing** — it corrupts a hash *and* adds no census, because llama's library INFO and every ggml census are one notch above it (see 2 above) |
+| `4` | `LLAMA_LOG_INFO` (`sched_reserve`, `MoE expert cache:`, `expert access:`, `takeover=`, `cold admission=`, `two-lane prefill enabled`, the spec lines) **and** ggml INFO | **every census/mechanism arm** |
 
 A hash and a census are therefore **two runs**: hash with no `-lv`, then repeat with `-lv 4` for the numbers
 (that is what `wip`-style arm harnesses do; `archive/work/host-expert-parity/touch-ab.sh` is an example, and its
 `VERBOSE=` is an explicit space, because `${VERBOSE:-default}` silently takes the default for an empty value).
-`llama-server` differs: its generated text comes back over **HTTP**, so `-lv 4` pollutes only the log — which is
-why `gate-ckpt-reuse.sh` hashes the API responses at `-lv 4` safely.  Every gate that hashes `llama-cli` text
-passes no `-lv` at all (`gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-kv-window-split.sh`,
+`llama-server` is **not** more verbose where it matters: its default threshold is the common one
+(`LOG_LEVEL_INFO` = 3) instead of `llama-cli`'s ERROR, so it already shows `common/`'s verbosity-3 lines — the
+slot block, which is why a server arm *looks* chattier — and still hides every census and every
+`LLAMA_LOG_INFO` until `-lv 4`.  What it does change is the hash: its generated text comes back over **HTTP**, so
+`-lv 4` pollutes only the log — which is why `gate-ckpt-reuse.sh` hashes the API responses at `-lv 4` safely.
+Every gate that hashes `llama-cli` text passes no `-lv` at all (`gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-kv-window-split.sh`,
 `gate-grid-stall-pad.sh`, `gate-norm-rows-alias.sh`, `gate-hc-fusions.sh`).  Code paths and the measured
 consequences: `INVARIANTS.md` (2026-11-07).
 

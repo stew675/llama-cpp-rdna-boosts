@@ -3250,3 +3250,16 @@ memory cannot become a graph result; the arm that catches it is `scripts/gate-fu
   times per verify round where r220 dispatched ~4, 0.010 ms each. Restoring it needs both matchers to accept the new
   window view (`ne = [n_cols, Kw, C, n_seqs]` with dim-1 stride one element), which is a prefill-kernel change and was
   not shipped on the strength of one arm. Worth ~0.5 ms of a 45 ms verify round.
+- **`-lv` has two mappings, and only one of them is `common/`'s (2026-11-09, tooling; refs `AGENTS.md`).**
+  A line reaches the threshold in one of two ways, and telling them apart is what makes the `-lv` table
+  non-obvious: (a) `common/`'s `LOG_TMPL` **self-filters** on the macro's own verbosity, so `LOG_INF`/`LOG_CNT`
+  (verbosity `LOG_LEVEL_INFO` = **3**) appear at **`-lv 3`** — in practice that is the per-slot statistics block in
+  `common/sampling.cpp`, printed between streamed tokens; (b) everything emitted through the ggml/llama logger is
+  **mapped up one notch**: `LLAMA_LOG_INFO` (`src/llama-impl.h`) passes `GGML_LOG_LEVEL_INFO` and
+  `common_log_get_verbosity()` maps that level to `LOG_LEVEL_TRACE` = **4**, so llama.cpp's own library INFO
+  (`sched_reserve: reserving …`, `two-lane prefill enabled`, the spec/`draft acceptance` lines) needs **`-lv 4`**,
+  exactly like ggml's `GGML_LOG_INFO` censuses.  Consequence for the binaries: `llama-server`'s default threshold
+  (`LOG_LEVEL_INFO`) shows (a) and hides (b) and every census, so **`-lv 3` adds literally nothing over a server's
+  default** (measured: identical 31-line startup logs, 7 WARNs; `-lv 4` adds 191 INFO lines), while a `llama-cli`
+  arm at its ERROR default shows neither.  An arm that "looked verbose without `-lv`" was a server, and an arm that
+  "did not print the census at `-lv 3`" was reading llama's INFO, not ggml's.
