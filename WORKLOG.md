@@ -1,3 +1,62 @@
+## 261109.002 (r238, RELEASE v16-a691b2345-r238) -- the plain norm-rows match no longer inherits a gate index (GitHub issue #285), gated 14/14 and re-cut
+
+**What shipped.**  `v16-a691b2345-r238`: the same 16 blocks on the same fork point (**`a691b2345`**), with one
+folded fix (block 10, `patches/README.md` carries the mapping).  `release.json`: `base=a691b2345`,
+`base_tree=9d7b9a02f`, `tip=513866c5783ed6dba6fcfa7e43a66caf51b92b24` (the fork branch's re-cut commit; the
+working chain's tip `2a430dcf5` has the same tree and is never the recorded value),
+`tree=3d7a69fa5c15e5bc2bdcb112fa07687b66eff5bd`, 16 blocks, all 17 artifact hashes refreshed.  Report: `benchmarks/2026-11-09-issue-285-norm-rows-plain-match.md`; the engineering fact and the gate
+rule are `INVARIANTS.md` r238.
+
+1. **The fix (GitHub issue #285, reporter @overdoingism).**  `ggml_cuda_norm_rows_try_fuse()` runs the GATED
+   matcher first and reuses the same `ggml_cuda_norm_gated_match` for the plain matcher.  The gated matcher
+   recorded the gate `MUL_MAT`'s node index in `m.pre` while scanning and could still `return 0` after that --
+   Qwen3.x's delta-net output norm is **SILU**-gated (`src/models/qwen35.cpp`, `build_norm_gated()`), so the
+   scan's `SIGMOID` test fails on every layer's output norm -- and the plain matcher never cleared `pre`.  The
+   shared tail therefore read a PLAIN match as the gated form: with the gate output aliasing `x` it declined the
+   fusion (`gate-out`, the lost fusion), and with a non-overlapping allocation it dispatched that `MUL_MAT` early
+   and computed it again later in graph order (a duplicated GEMM; did not occur in our runs, as the reporter also
+   found).  The reporter's one-line diff applies unchanged at r237 and is what ships, extended so the gated
+   matcher keeps `pre` in a **local** and writes the struct only when the match succeeds (no future caller can
+   inherit it) and the struct's fields are default-initialised.  Reproduced before the fix at **144
+   `declined=gate-out` + 96 plain fusions** (Qwen3.8-27B UD-Q4_K_XL, `-ub 2048 -b 2048 -fa on`, 5256-token
+   prose prompt) and **72** on Qwen3.5-4B Q8_0; after it, **240 / 120 plain fusions and 0 declines**.
+2. **What it is worth here, honestly.**  Prefill prompt-eval on the dense 27B, interleaved fresh processes:
+   **+0.57 %** at 5.2 K (1276.0 -> 1283.3 t/s, 6 runs per arm) and **+0.63 %** at 31.5 K (1167.2 -> 1174.6, 4 per
+   arm); same-seed greedy text identical in all four arms (`149 chars 6a4f4535a2d7`).  That is **less than the
+   1.3-1.9 % the reporter measured on r235 of the fork** and more than their stock-r235 follow-up (+0.0/+0.2/
+   -0.3 %): a declined norm-rows node is absorbed by the generic `RMS_NORM + MUL` fusion
+   (`ggml_cuda_op_rms_norm_fused`), so what is lost is the 8-rows-per-block kernel and not a whole launch.  Both
+   numbers are config- and revision-dependent -- neither is "the" size, and the fix is not judged by it (a plane
+   match was dispatching a node it does not own).
+3. **The gate gains the arm that catches it.**  `scripts/gate-norm-rows-alias.sh` gets **section C**: a SILU-gated
+   hybrid (Qwen3.5-4B Q8_0) where the plain form must fuse (`>= 1` `fused=1 gated=0`), decline **nothing**, and
+   reproduce the `GGML_CUDA_DISABLE_NORM_ROWS=1` text (`d2ffb97ccb76`).  Section B's Ling-3.0-tiny arm is blind
+   to this class of bug (its gate SUCCEEDS: 180/180 gated, 0 declined, before and after).  Negative-tested: the
+   pre-fix build fails section C with **264** `declined=gate-out` lines.  `ENVIRONMENT.md` now names
+   `declined=gate-out gated=0` as the #285 signature a future run must not print.
+
+**Gates.**  `scripts/gate-rebase-release.sh` (against `/tmp/stage-pre`, the shipped r237 build) --
+**14 passed, 0 failed, RELEASABLE**: state clean (master pinned at the fork point, fork tip `513866c57` tree
+`3d7a69fa5`); per-block build **16/16** (`--fast`); prefill-logit KLD **0.000697** (limit 0.005), PASS; ops
+`MUL_MAT_ID` **947/947** and `MUL_MAT` **2517/2517**; coherence `text-qwen35-4B 1c5d32ac537d`; the multi-slot
+DFlash server arms **3/3** with acceptance and texts as anchored (`fn24`/`fn10` 0.72269/0.74359, `35b10`
+0.44720/0.59124); real-text prefill **+1.42 %** (tol -3.0); perf dense-27B **+0.76 %**, moe-35B-prefill
+**+1.50 %**, moe-35B-decode **+0.11 %** (tol -1.0); GPU faults: none in the run's own window.
+`scripts/validate-set.sh`: checksums OK, strict `git am` of the 16 patches from a fresh `a691b2345` tarball,
+applied tree `3d7a69fa5` == `release.json.tree`, no conflict markers, Windows portability scan 287 files clean.
+
+**The three perf arms' positive deltas are NOT this fix, and must not be quoted as one.**  The fusion cannot act
+at `llama-bench -p 512` at all: 0 `norm-rows` decision lines with `GGML_CUDA_NORM_ROWS_DEBUG=1` on that exact
+arm (rows 512 is below the fusion's 4096-row floor), so r237 and r238 issue the same launches there.  Re-measured
+interleaved outside the gate (3 rounds, `-r 5`): 1518.75 / 1515.43 / 1512.78 t/s on the shipped build against
+1528.19 / 1524.56 / 1524.41 on this one, i.e. it reproduces and is a few added instructions moving HIP code
+objects around in the same `libggml-hip.so` (layout/alignment), not a kernel change.  The fix's own effect is the
+ubatch-2048 measurement above.
+
+**Follow-ups for the repository, not for the issue.**  The fork's `rdna-boosts` branch is refreshed and pushed on
+this release (`scripts/fork-refresh.sh --push`, tip `513866c5783ed6dba6fcfa7e43a66caf51b92b24`), the tag
+`v16-a691b2345-r238` is pushed, and the ROCm container images are built off-host by the worker watcher as usual.
+
 ## 261109.001 (r237, RELEASE v16-a691b2345-r237) -- the prefill arena arming fix + `--lazy-mode mlockr`, gated 10/10 and re-cut
 
 **What shipped.**  `v16-a691b2345-r237`: the same 16 blocks on the same fork point (**`a691b2345`**), with two

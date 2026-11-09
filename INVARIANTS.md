@@ -3123,3 +3123,35 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   `--lazy-mode off`, which keeps the table in anonymous RAM instead).  So "pin it" is the wrong default for a
   table that is only *read*: populate, then release.  (On this box a settled box is not enough to make `mlock`
   safe — the flap reproduces with 30-60 s between runs and `Dirty`/`Writeback` at 0.)
+
+## r238 -- a second matcher must not inherit the first one's state: the plain norm-rows match carried a foreign gate index (GitHub issue #285)
+
+**The bug and its cost.  Do not re-derive; the arm that catches it is section C of `scripts/gate-norm-rows-alias.sh`.**
+
+- **`ggml_cuda_norm_rows_try_fuse()` runs the GATED matcher first and reuses the same struct for the plain one,
+  so a field one matcher writes and the other does not is a live bug, not a style issue (r238, block 10, GitHub
+  issue #285).**  `ggml_cuda_norm_gated_match_at()` records the gate's `MUL_MAT` in `m.pre` while it scans, and
+  can still `return 0` *after* that (the `UNARY` is not `SIGMOID`; the shape/use checks below it fail; no sigmoid
+  gate at all).  `ggml_cuda_norm_rows_match_at()` then set `x`/`w`/`z`/`dst`/`eps` on that same struct and left
+  `pre` alone, so the shared tail read `nm.pre >= 0` as "the gated form": with the gate output aliasing `x` the
+  fusion was **declined** as `gate-out` on every such node, and with a non-overlapping allocation the gate
+  `MUL_MAT` was dispatched early *and* computed again later in graph order.  Qwen3.x's delta-net output norm is
+  **SILU**-gated (`src/models/qwen35.cpp`, `build_norm_gated()`), so it reaches exactly this path on every layer's
+  output norm, while qwen4exp/bailingmoe3's SIGMOID gate succeeds and was never affected.  `pre` is now a local
+  in the gated matcher (written to the struct only on success), the plain matcher clears it, and the struct's
+  fields are default-initialised.
+- **The measured cost is the LOST FUSION, and it is small because the generic `RMS_NORM + MUL` fusion absorbs a
+  declined node (r238).**  Qwen3.8-27B UD-Q4_K_XL (`qwen35`), `-ub 2048 -b 2048 -fa on -ctk/-ctv q8_0`, one
+  R9700, the 5256-token `prompts/prose-rdna-boosts.txt`: pre-fix **144 `declined=gate-out` + 96 plain fusions**,
+  post-fix **240 plain fusions, 0 declined**; Qwen3.5-4B Q8_0 reads 72 declines -> 0.  Prefill prompt-eval,
+  interleaved fresh processes: **+0.57 %** at 5.2 K (1276.0 -> 1283.3 t/s mean of 6 runs per arm) and **+0.63 %**
+  at 31.5 K (1167.2 -> 1174.6, 4 per arm); same-seed greedy text identical in all four arms (fix/pre x
+  fusion-on/kill-switch, `32 tok`, `6a4f4535a2d7`).  A reporter's own upstream-`r235` measurement read
+  **+0.0/+0.2/-0.3 %** and ours on `r235` read **+1.3-1.9 %**, so the size is config- and revision-dependent --
+  do not quote one of these as "the" win, and do not judge the fix by it: the defect is a plain match
+  dispatching a node it does not own.
+- **A SIGMOID-gated model cannot test this path (r238).**  Ling-3.0-tiny's gate SUCCEEDS, so section B of
+  `gate-norm-rows-alias.sh` (180/180 gated nodes fused, 0 declined) passes both before and after the fix -- the
+  regression needs a **SILU**-gated hybrid (any Qwen3.x/qwen35 GGUF), where the pre-fix build declines 264 nodes
+  at `-c 8192` on Qwen3.5-4B.  Section C asserts the plain form fused (`>= 1` `fused=1 gated=0`, non-vacuity),
+  **declined nothing**, and byte-identical text against `GGML_CUDA_DISABLE_NORM_ROWS=1`.

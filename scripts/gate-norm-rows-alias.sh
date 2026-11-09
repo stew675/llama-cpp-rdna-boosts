@@ -23,6 +23,17 @@
 #   fusion (the unfused chain computes the same text) unless the only overlap is the benign exact
 #   alias of x with dst (a read-then-write of the same address by the same thread).
 #
+#   issue #285 (r238): `ggml_cuda_norm_rows_try_fuse()` runs the GATED matcher first and, when that
+#   declines, reuses the SAME struct for the plain matcher.  The gated matcher recorded the gate's
+#   MUL_MAT in `m.pre` while scanning and could still return 0 (Qwen3.x's delta-net output norm is
+#   SILU-gated, so the UNARY is not SIGMOID), and the plain matcher never cleared `pre` -- so every
+#   such node went to the shared tail carrying a gate index it does not own: either declined as
+#   `gate-out` (the gate output aliased x, the fusion lost on every delta-net output norm) or, when
+#   it did not alias, a gate MUL_MAT dispatched early and computed twice.  `pre` is now a local in the
+#   gated matcher (written to the struct only on success) and the plain matcher clears it.  Section C
+#   below is the arm that catches it: Ling-3.0-tiny's gate is SIGMOID, so section B never reaches the
+#   failed-gated-match-then-plain-match path.
+#
 # WHAT IT CHECKS
 #   A. THE GUARD, with no scheduler in sight.  `scripts/norm-rows-alias.cpp` drives
 #      ggml_backend_graph_compute() directly (no ggml_backend_sched, therefore NO alloc deps) on the
@@ -50,7 +61,18 @@
 #          (the kernel-journal scan is scoped to this run, so an earlier fault left in the boot's
 #          journal cannot fail the gate; issue #276 follow-up).
 #
-#   `MODEL_ARM=0` runs the driver only (no model needed); `A_ARM=0` / `B_ARM=0` skip one section.
+#   C. THE PLAIN FORM ON A SILU-GATED HYBRID (issue #285).  Same two armed llama-cli runs on a
+#      Qwen3.x delta-net hybrid (qwen35, `build_norm_gated()` -> SILU), whose output norm is the shape
+#      that makes the gated matcher record `pre` and then decline.  The gate fails unless:
+#        - the plain form really fused (>= 1 `norm-rows: ... fused=1 gated=0` line) -- without the
+#          #285 fix this model's plain fusions are exactly the nodes lost to a stale `pre`;
+#        - it declined NOTHING (`declined=0`): pre-fix this arm logs 264 `declined=gate-out` lines (80
+#          plain fusions of 344 decisions) on the 5256-token prompt at the gate's default ubatch, 72 at
+#          `EXTRA_ARGS='-ngl 99 -ub 2048 -b 2048'`, and 144 on Qwen3.8-27B UD-Q4_K_XL the same way;
+#        - the fused and kill-switch arms generate byte-identical text.
+#
+#   `MODEL_ARM=0` runs the driver only (no model needed); `A_ARM=0` / `B_ARM=0` / `C_ARM=0` skip one
+#   section.
 #
 # Usage:
 #   ./gate-norm-rows-alias.sh
@@ -59,6 +81,8 @@
 #   SRC_DIR      llama.cpp source tree       (default: the build dir's parent)
 #   LLAMA_CLI    llama-cli                   (default: $BUILD_DIR/bin/llama-cli)
 #   MODEL        a GGUF that reaches the sigmoid-gated form (default: Ling-3.0-tiny IQ4_NL)
+#   SILU_MODEL   a SILU-gated hybrid GGUF     (default: Qwen3.5-4B Q8_0, qwen35 delta-net)
+#   SILU_CTX     context size for section C   (default: $CTX)
 #   PROMPT       prompt file                 (default: prompts/prose-rdna-boosts.txt, 5256 tokens)
 #   CTX          context size                (default: 8192, must exceed the prompt)
 #   NGEN         generated tokens            (default: 32)
@@ -76,6 +100,7 @@ BUILD_DIR="${BUILD_DIR:-$HOME/llama.cpp/build-rocm}"
 SRC_DIR="${SRC_DIR:-$(cd "$BUILD_DIR/.." 2>/dev/null && pwd)}"
 LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
 MODEL="${MODEL:-/llm/models/Ling/3.0-tiny/IQ4_NL/Ling-3.0-tiny-IQ4_NL.gguf}"
+SILU_MODEL="${SILU_MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}"
 PROMPT="${PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
 CTX="${CTX:-8192}"
 NGEN="${NGEN:-32}"
@@ -88,7 +113,9 @@ DRIVER_SRC="$REPO_DIR/scripts/norm-rows-alias.cpp"
 
 A_ARM="${A_ARM:-1}"
 B_ARM="${B_ARM:-1}"
+C_ARM="${C_ARM:-1}"
 MODEL_ARM="${MODEL_ARM:-1}"
+SILU_CTX="${SILU_CTX:-$CTX}"
 
 fails=0
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
@@ -180,6 +207,28 @@ if [ "$A_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
         fail "the benign exact alias (dst == x) was declined: the guard is too strict"
 fi
 
+# One armed llama-cli run.  `-v` is required for the decision lines (the fusion logs at INFO, which the
+# default level drops) and is kept OUT of the text arms: verbose logging interleaves statistics lines into
+# the generated text (scripts/extract-generated.py's own header says so), so the counters and the text come
+# from separate runs of the same shape.
+#   model_run <model> <ctx> <name> <ngen> <verbose> [extra env assignments...]
+model_run() {
+    local model="$1" ctx="$2" name="$3" ngen="$4" verbose="$5"; shift 5
+    # shellcheck disable=SC2086
+    env "$@" GGML_CUDA_NORM_ROWS_DEBUG=1 HIP_VISIBLE_DEVICES="$GPU" \
+        timeout "$TIME_LIMIT" "$LLAMA_CLI" -m "$model" -c "$ctx" $EXTRA_ARGS \
+        -f "$PROMPT" -n "$ngen" --seed 42 --temp 0 --no-display-prompt --single-turn $verbose \
+        > "$KEEPOUT/$name.log" 2>&1
+    echo "    $name: exit $?"
+}
+
+# `<n> chars sha=<h>` for a text arm, via the delivery's own extractor (a naive sed slice does not
+# reproduce the hashes).
+extract() {
+    python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1.log" 2>/dev/null |
+        sed -n 's/^\([0-9]*\) chars sha=\([0-9a-f]*\)$/\1 \2/p' | head -1
+}
+
 if [ "$B_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
     echo
     echo "==> B. the delivery path on a real GGUF (the scheduler's alloc deps must still hold)"
@@ -192,23 +241,10 @@ if [ "$B_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
     elif [ ! -f "$PROMPT" ]; then
         fail "prompt not found: $PROMPT"
     else
-        model_arm() { # <name> <ngen> <extra env assignments...>
-            local name="$1" ngen="$2" verbose="$3"; shift 3
-            # -v is required for the decision lines (the fusion logs at INFO, which the default level
-            # drops) and is kept OUT of the text arms: verbose logging interleaves statistics lines into
-            # the generated text (scripts/extract-generated.py's own header says so), so the counters and
-            # the text come from separate runs of the same shape.
-            # shellcheck disable=SC2086
-            env "$@" GGML_CUDA_NORM_ROWS_DEBUG=1 HIP_VISIBLE_DEVICES="$GPU" \
-                timeout "$TIME_LIMIT" "$LLAMA_CLI" -m "$MODEL" -c "$CTX" $EXTRA_ARGS \
-                -f "$PROMPT" -n "$ngen" --seed 42 --temp 0 --no-display-prompt --single-turn $verbose \
-                > "$KEEPOUT/$name.log" 2>&1
-            echo "    $name: exit $?"
-        }
-        model_arm fused      "$NGEN" ""
-        model_arm chain      "$NGEN" "" GGML_CUDA_DISABLE_NORM_ROWS=1
-        model_arm probe      1       -v
-        model_arm probe_off  1       -v GGML_CUDA_DISABLE_NORM_ROWS=1
+        model_run "$MODEL" "$CTX" fused      "$NGEN" ""
+        model_run "$MODEL" "$CTX" chain      "$NGEN" "" GGML_CUDA_DISABLE_NORM_ROWS=1
+        model_run "$MODEL" "$CTX" probe      1       -v
+        model_run "$MODEL" "$CTX" probe_off  1       -v GGML_CUDA_DISABLE_NORM_ROWS=1
 
         fused_lines="$(grep -c 'norm-rows: i=' "$KEEPOUT/probe.log")"
         gated_fused="$(grep -c 'norm-rows: .*fused=1 gated=1' "$KEEPOUT/probe.log")"
@@ -221,15 +257,53 @@ if [ "$B_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
         [ "${declined:-0}" -eq 0 ]     || fail "the fused arm declined $declined node(s): the scheduler's alloc deps no longer hold x/w for the fused launch"
         [ "${chain_lines:-0}" -eq 0 ]  || fail "GGML_CUDA_DISABLE_NORM_ROWS=1 still produced $chain_lines fusion lines"
 
-        read -r fc fsha < <(python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/fused.log" 2>/dev/null |
-            sed -n 's/^\([0-9]*\) chars sha=\([0-9a-f]*\)$/\1 \2/p' | head -1)
-        read -r cc csha < <(python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/chain.log" 2>/dev/null |
-            sed -n 's/^\([0-9]*\) chars sha=\([0-9a-f]*\)$/\1 \2/p' | head -1)
+        read -r fc fsha < <(extract fused)
+        read -r cc csha < <(extract chain)
         note "fused: ${fc:-0} chars sha=${fsha:-none}   chain: ${cc:-0} chars sha=${csha:-none}"
         if [ -z "${fsha:-}" ] || [ "${fsha:-}" != "${csha:-}" ] || [ "${fc:-0}" != "${cc:-0}" ]; then
             fail "fused and unfused text differ on the gated form"
         fi
 
+    fi
+fi
+
+if [ "$C_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ] && [ "$fails" -eq 0 ]; then
+    echo
+    echo "==> C. the PLAIN form on a SILU-gated hybrid (issue #285: a declined gated match must leave no"
+    echo "       gate index behind for the plain match)"
+    note "model=$SILU_MODEL"
+    note "prompt=$PROMPT ctx=$SILU_CTX ngen=$NGEN extra='$EXTRA_ARGS'"
+    if [ ! -f "$SILU_MODEL" ]; then
+        fail "model not found: $SILU_MODEL (set SILU_MODEL, or C_ARM=0 to skip this section)"
+    elif [ ! -x "$LLAMA_CLI" ]; then
+        fail "llama-cli not executable: $LLAMA_CLI"
+    elif [ ! -f "$PROMPT" ]; then
+        fail "prompt not found: $PROMPT"
+    else
+        model_run "$SILU_MODEL" "$SILU_CTX" silu_fused      "$NGEN" ""
+        model_run "$SILU_MODEL" "$SILU_CTX" silu_chain      "$NGEN" "" GGML_CUDA_DISABLE_NORM_ROWS=1
+        model_run "$SILU_MODEL" "$SILU_CTX" silu_probe      1       -v
+        model_run "$SILU_MODEL" "$SILU_CTX" silu_probe_off  1       -v GGML_CUDA_DISABLE_NORM_ROWS=1
+
+        s_lines="$(grep -c 'norm-rows: i=' "$KEEPOUT/silu_probe.log")"
+        s_gated="$(grep -c 'norm-rows: .*fused=1 gated=1' "$KEEPOUT/silu_probe.log")"
+        s_plain="$(grep -c 'norm-rows: .*fused=1 gated=0' "$KEEPOUT/silu_probe.log")"
+        s_declined="$(grep -c 'norm-rows: .*declined=' "$KEEPOUT/silu_probe.log")"
+        s_reasons="$(sed -n 's/.*norm-rows: i=[0-9]* declined=\([a-z-]*\).*/\1/p' "$KEEPOUT/silu_probe.log" | sort | uniq -c | tr '\n' ' ')"
+        s_chain_lines="$(grep -c 'norm-rows: i=' "$KEEPOUT/silu_probe_off.log")"
+        note "probe: $s_lines decisions ($s_plain plain, $s_gated gated), $s_declined declined ${s_reasons:+($s_reasons)}"
+        note "probe with the kill switch: $s_chain_lines fusion lines"
+
+        [ "${s_plain:-0}" -ge 1 ]      || fail "the SILU-gated hybrid never reached the PLAIN fused form: the arm would be vacuous"
+        [ "${s_declined:-0}" -eq 0 ]   || fail "the SILU-gated hybrid declined $s_declined node(s) ${s_reasons:+($s_reasons)}: a declined gated match left its gate index in the struct reused by the plain match (issue #285)"
+        [ "${s_chain_lines:-0}" -eq 0 ] || fail "GGML_CUDA_DISABLE_NORM_ROWS=1 still produced $s_chain_lines fusion lines"
+
+        read -r sfc sfsha < <(extract silu_fused)
+        read -r scc scsha < <(extract silu_chain)
+        note "fused: ${sfc:-0} chars sha=${sfsha:-none}   chain: ${scc:-0} chars sha=${scsha:-none}"
+        if [ -z "${sfsha:-}" ] || [ "${sfsha:-}" != "${scsha:-}" ] || [ "${sfc:-0}" != "${scc:-0}" ]; then
+            fail "fused and unfused text differ on the SILU-gated hybrid"
+        fi
     fi
 fi
 
@@ -256,6 +330,12 @@ if [ "$fails" -eq 0 ]; then
     else
         echo "      The real-GGUF section was SKIPPED (MODEL_ARM=$MODEL_ARM B_ARM=$B_ARM): the guard is proven,"
         echo "      the alloc deps are NOT.  Run it without MODEL_ARM=0 before a release."
+    fi
+    if [ "$C_ARM" -eq 1 ] && [ "$MODEL_ARM" -eq 1 ]; then
+        echo "      On the SILU-gated hybrid the PLAIN form fused with nothing declined (issue #285: no stale"
+        echo "      gate index reached it) and its text equals the kill-switch arm."
+    else
+        echo "      Section C was SKIPPED (C_ARM=$C_ARM MODEL_ARM=$MODEL_ARM): the #285 regression is NOT covered."
     fi
     exit 0
 fi

@@ -1,4 +1,4 @@
-From 2b9481f0327789c666bc6607e51de89b4f19cb08 Mon Sep 17 00:00:00 2001
+From 66ef122b997fee4ccf086f61877558c9f378d315 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -114,8 +114,8 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  ggml/src/ggml-cuda/moe-expert-cache.h         |    9 +-
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   83 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    2 +
- ggml/src/ggml-cuda/norm-gated.cu              |  104 +
- ggml/src/ggml-cuda/norm-gated.cuh             |    1 +
+ ggml/src/ggml-cuda/norm-gated.cu              |  121 +-
+ ggml/src/ggml-cuda/norm-gated.cuh             |   11 +-
  ggml/src/ggml-cuda/norm.cu                    |  166 +-
  ggml/src/ggml-cuda/norm.cuh                   |    7 +
  ggml/src/ggml-cuda/ple-conv.cu                |   36 +-
@@ -143,7 +143,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 83 files changed, 15674 insertions(+), 5503 deletions(-)
+ 83 files changed, 15691 insertions(+), 5513 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -21929,7 +21929,7 @@ index 894c4b1a3..31136cb03 100644
 +int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
-index d7d4bc9b6..d69d1288d 100644
+index d7d4bc9b6..a7bd8b0c6 100644
 --- a/ggml/src/ggml-cuda/norm-gated.cu
 +++ b/ggml/src/ggml-cuda/norm-gated.cu
 @@ -58,6 +58,66 @@ static bool norm_rows_enabled() {
@@ -21999,7 +21999,53 @@ index d7d4bc9b6..d69d1288d 100644
  static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * out) {
      if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) return false;
      if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->nb[0] != 4 || !ggml_is_contiguous(w) || !ggml_is_contiguous(out)) return false;
-@@ -126,3 +186,47 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
+@@ -70,11 +130,16 @@ int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
+     if (!norm_rows_enabled() || i + 3 >= cgraph->n_nodes) return 0;
+     const ggml_tensor * rms = cgraph->nodes[i], * mul = cgraph->nodes[i+1];
+     if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return 0;
+-    int k = i + 2; m.pre = -1;
++    // issue #285: `pre` is a LOCAL until the match succeeds.  This matcher can record the gate's
++    // MUL_MAT and still decline (the UNARY below is not SIGMOID -- Qwen3.x's delta-net output norm is
++    // SILU-gated), and ggml_cuda_norm_rows_try_fuse() then reuses the same struct for the plain match,
++    // which owns no gate at all.  Writing m.pre only on success means a declined gated match cannot
++    // leave a gate index behind for the caller, whatever the caller does next.
++    int k = i + 2, pre = -1;
+     while (k + 1 < cgraph->n_nodes && k < i + 6) {
+         const ggml_op op = cgraph->nodes[k]->op;
+         if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) { ++k; continue; }
+-        if (op == GGML_OP_MUL_MAT && m.pre < 0) { m.pre = k; ++k; continue; }
++        if (op == GGML_OP_MUL_MAT && pre < 0) { pre = k; ++k; continue; }
+         break;
+     }
+     if (k + 1 >= cgraph->n_nodes) return 0;
+@@ -85,13 +150,13 @@ int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
+     const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
+     if (!w) return 0;
+     const ggml_tensor * z = sig->src[0];
+-    if (m.pre >= 0) { const ggml_tensor * zr = z->view_src ? z->view_src : z; if (zr != cgraph->nodes[m.pre]) return 0; }
++    if (pre >= 0) { const ggml_tensor * zr = z->view_src ? z->view_src : z; if (zr != cgraph->nodes[pre]) return 0; }
+     if (!((out->src[0] == mul && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul))) return 0;
+     if (!ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i+1, 1) || !ggml_node_has_n_uses(cgraph, k, 1)) return 0;
+     if (!rows_shape_ok(x, w, out) || z->type != GGML_TYPE_F32 || !ggml_is_contiguous(z) || !ggml_is_contiguous(mul)) return 0;
+     if (!ggml_are_same_shape(z, out) || !ggml_are_same_shape(mul, out) || !ggml_are_same_shape(rms, out)) return 0;
+     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
+-    m.x = x; m.w = w; m.z = z; m.dst = out; m.eps = eps;
++    m.x = x; m.w = w; m.z = z; m.dst = out; m.eps = eps; m.pre = pre;
+     return (k + 1) - i;
+ }
+ 
+@@ -105,7 +170,9 @@ int ggml_cuda_norm_rows_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_no
+     if (!w || !ggml_node_has_n_uses(cgraph, i, 1)) return 0;
+     if (!rows_shape_ok(x, w, mul) || !ggml_are_same_shape(rms, mul)) return 0;
+     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
+-    m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps;
++    // A plain match has no gate (issue #285): clear the field explicitly, so this path cannot read or
++    // pre-dispatch a MUL_MAT even if a caller hands it a struct a failed gated match already touched.
++    m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps; m.pre = -1;
+     return 1;
+ }
+ 
+@@ -126,3 +193,47 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
              (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
      }
  }
@@ -22048,10 +22094,26 @@ index d7d4bc9b6..d69d1288d 100644
 +    return sk;
 +}
 diff --git a/ggml/src/ggml-cuda/norm-gated.cuh b/ggml/src/ggml-cuda/norm-gated.cuh
-index e8b5888dc..261e9697e 100644
+index e8b5888dc..a753d3e76 100644
 --- a/ggml/src/ggml-cuda/norm-gated.cuh
 +++ b/ggml/src/ggml-cuda/norm-gated.cuh
-@@ -18,3 +18,4 @@ struct ggml_cuda_norm_gated_match {
+@@ -7,14 +7,15 @@
+ // 256-thread block instead of the one-block-per-row rms_norm_f32<256>, which is
+ // block-scheduling bound for the model's per-head norms (~786k rows of <= 256 columns).
+ struct ggml_cuda_norm_gated_match {
+-    const ggml_tensor * x;
+-    const ggml_tensor * w;
+-    const ggml_tensor * z;
+-    ggml_tensor * dst;
+-    float eps;
++    const ggml_tensor * x   = nullptr;
++    const ggml_tensor * w   = nullptr;
++    const ggml_tensor * z   = nullptr;   // nullptr => the plain (ungated) form
++    ggml_tensor * dst       = nullptr;
++    float eps               = 0.0f;
+     int pre = -1;   // node index of the gate MUL_MAT to compute first (or -1)
+ };
+ 
  int  ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
  int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
  void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
