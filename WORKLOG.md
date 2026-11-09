@@ -74,6 +74,21 @@ no `ENVIRONMENT.md` row).  Records: `benchmarks/2026-11-08-prefill-arena-arm.md`
 (the campaign README + the pre-fold candidate patch), `INVARIANTS.md` (three entries appended), `TODO` #305
 retired.
 
+**Landing.**  The release commit `cef5ae91` carries the re-cut set, `release.json` (tip `f978dcb82`, tree
+`d41c4939d`, all 17 hashes) and the records, and the annotated tag `v16-a691b2345-r237` names it.  Folded into
+blocks 00 and 12 by `git rebase -i` (`edit` at those two commits, `git apply -3` of the two change sets, then
+`--amend`), and the resulting tree is **bit-identical to the working tree the numbers above were measured on**
+(`git diff <working TEMP> HEAD` empty) — so no measurement had to be repeated after the fold.  The
+`.tip` trap bit as predicted: the re-cut the fork branch carries (`f978dcb82`) is a different commit from the
+working-chain tip (`7193e0829`), both with tree `d41c4939d`; `scripts/fork-refresh.sh --yes` printed the value
+to record and `release.json` names it, then `gate-rebase-release.sh --only state` re-verified `fork-tip
+f978dcb82 tree d41c4939d` + `master-pinned` + a clean tree (3 passed).  Published: force-with-lease
+`0e6daae4e -> f978dcb82` on the **personal fork only**, `main` fast-forwarded to the release commit, CI green on
+the tag (`Validate delivery set` and `Release patch set`, assets attached: `rdna-boosts-all.patch`, `patches.tar.gz`,
+`release.json`, `SHA256SUMS`).  The ROCm container images are built and pushed **off-host** by the watcher
+(`scripts/container-watch.sh` on `radiance`, cron every 10 min), which picks the new tag up on its next pass —
+nothing runs on the primary box.
+
 ## 261108.017 (no release) -- the `-ncmoe` + `llama-bench` "regression" is the expert arena never arming in a prefill-only run: +173 % from a 148-line candidate (`TODO` #305)
 
 **The number that was left over from the re-base, explained.**  R17 shipped with one arm still reading badly and
