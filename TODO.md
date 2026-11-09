@@ -24,7 +24,7 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed; the remaining `#291` row plus R17 are the live brief in
+climbed; every re-base-derived row is closed and R17 is the live brief in
 `wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
 
 ## The open list
@@ -47,7 +47,6 @@ climbed; the remaining `#291` row plus R17 are the live brief in
 | **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
-| **291** | upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | delivery vs upstream (`D1`) | **OPEN — deferred to its own session** (maintainer, 2026-11-08) — a measurement, not a code change — §291 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 
 ## Handle numbering
@@ -390,24 +389,6 @@ and `MUL_MAT` suites green, no GPU fault, and a launch census showing the duplic
 delivery must stay green too -- it is now **16/16** (`#304` closed: the compact-ids MMF kernel was dispatching a
 column tile narrower than the grid its seams were built with, see `WORKLOG.md` 261108.009; that fix is the MMF half
 of what this candidate needs).  Delivery-neutral: it must not change the delivery tree.
-
-## 291. The arena vs upstream's MoE cache: finish the measurement (`D1`, MEASURING)
-
-`DECISIONS.md` `D1`.  The first numbers are in (`RUNGS.md` R10: upstream's cache +17.6 % decode on one arm) and the
-maintainer deferred the analysis to its own session; the delivery's host-expert arena and upstream's cache may be
-complementary (different tiers) or redundant.  **Closing it:** the measurement set R10 named — one model at two
-`-ncmoe` levels, `MOE_EXPERT_CACHE_MIB` arms, the `-lv 4` census (`expert access:`, `takeover=`, cold admission),
-decode **and** prefill, and an A/B of "arena only" vs "upstream cache only" vs both — then a decision recorded in
-`DECISIONS.md` (keep both, keep one, drop one).  This is the largest item on the list; it is a measurement, not a
-code change, unless the numbers say otherwise.
-
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-**Investigate properly: upstream's MoE cache vs the delivery's host-expert arena at equal MiB.**  Measured once (1 × R9700, `Qwen3.6-35B-A3B Q8_0 -ncmoe 20 -c 8192`, 16.3 GiB host experts, text identical in every arm): delivery arena 4080 MiB **547.6 / 53.5** t/s (pp/tg), upstream `--moe-cache-mib 4096` **544.2 / 62.9**, streaming **470.9 / 49.0** — i.e. upstream's ClassLRU cache is **+17.6 % decode** over ours at ~the same footprint.  The delivery's tier used to be the faster one, so the number is surprising and unexplained
-
-**Kind:** delivery vs upstream (`src/llama-moe-cache.cpp`, `ggml/src/ggml-cuda/moe-expert-cache.cu`).
-
-**OPEN — needs a full measuring session (maintainer's call, 2026-11-08: defer).**  Open questions: is the difference the *policy* (ClassLRU vs the arena's heat/RFU admission), the *tier* (upstream caches in a plain device buffer; ours lives in the slab, and the slab's reserve/headroom may be costing us usable arena), the *config* (one GPU `-sm layer` vs the field's 2-3 GPU `-sm tensor`), or the measurement (the arms are either/or — the coexistence the merge preserves is untested; and the run needs `GGML_HIP_NO_VMM=OFF`, which is now in `~/bin/build-llama-rocm`).  Also note `--moe-cache-cpu-share` (`#30966`) and ClassLRU (`#31233`) are capabilities ours lacks
 
 ## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
 

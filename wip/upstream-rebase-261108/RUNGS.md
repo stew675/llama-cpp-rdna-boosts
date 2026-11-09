@@ -1424,6 +1424,38 @@ step that owns it.
 - status: **DONE** · `scripts/gate-server-arms.sh` (new) + `scripts/gate-rebase-release.sh` step 5c ·
   `WORKLOG.md` 261108.014 · session 2026-11-08
 
+## P13 — pre-R17: `TODO` #291 / `D1`, the arena vs upstream's ClassLRU at equal MiB — keep both, ours default · **DONE 2026-11-08**
+
+The last measurement item before R17.  Real text (never `llama-bench`'s prompt, `TODO` #296), 1 x R9700,
+35B-A3B Q8_0, two `-ncmoe` levels, two interleaved rounds, **text identical in every arm** (`504 a2cdef23588f`):
+
+| arm (`-ncmoe 20`) | prefill t/s | decode t/s |
+|---|---:|---:|
+| **delivery arena (default)** | **1441.6** | **72.0** |
+| delivery, arena disabled | 757.1 | 48.7 |
+| delivery arena + upstream cache 4096 | 808.4 | 63.9 |
+| upstream ClassLRU 4096 | 782.3 | 53.3 |
+| upstream ClassLRU + `cpu-share` 0.5 / 0.95 | 778.3 / 778.4 | 55.7 / 58.3 |
+| upstream, no cache | 747.5 | 42.5 |
+
+`-ncmoe 40`: ours **1394.2 / 69.2**, arena off 371.1 / 31.8, coexist 399.0 / 34.5, upstream cache 455.8 / 32.6,
+upstream off 431.3 / 30.8.  Arena census at `-ncmoe 20`: 11 411.2 MiB of 16 320.0 (69.9 %), settling at
+10 850.2 MiB, `MoE arena = 0.8787 (27 289 hit / 31 056 reaches)`.
+
+At equal MiB the arena is **+84 % prefill / +35 % decode** (+206 % / +112 % at `-ncmoe` 40); **coexistence is a
+loss** (44 % prefill / 11 % decode) because the ClassLRU cache takes VRAM the arena sizes itself against; neither
+ClassLRU nor `cpu-share` closes the gap.  **DECISION (maintainer): keep both -- ours default-on, upstream's
+opt-in only, mostly for comparison** (it also stays the only device tier on a `GGML_HIP_NO_VMM=ON` platform,
+where the arena declines).  "Keep both" is either/or, which is already the shipped default (`--moe-cache-mib` = 0).
+
+**`D1`'s original inversion is stale, and half of it was a measurement-regime artifact.**  D1 recorded upstream
++17.6 % decode (ours 53.5 vs 62.9 at 4080 MiB).  On today's tree the same `llama-bench` arm reads ours **83.9**
+against upstream **48.0**, and the arena's prefill is regime-dependent (838 t/s on random tokens vs 1442 on real
+text) -- the `#296` effect.  No part of "upstream is faster" survives.
+
+- status: **DONE, no delivery change** · `benchmarks/2026-11-08-moe-cache-arena-vs-classlru.md` ·
+  `WORKLOG.md` 261108.015 · `DECISIONS.md` `D1` · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1458,6 +1490,7 @@ climb touched has a maintainer decision recorded.
 | P10 | — | (none — no delivery change; `scripts/gate-hc-fusions.sh` + docs) | #292: the dsv4 `DSV4_HC_PRE/_POST` soft arms were said to reproduce r235's numerics while the re-based chain moved | NOT DRIFT: the shipped r235 build reproduces r236's split exactly (hard `d62340fbf566`, soft `6a102dbc62d6` on both); the claim traced to a stale r156 header line. KLD vs chain measured 0.013217/96.392 % (pre) and 0.013198/96.186 % (post) at base PPL 2.8489 = the documented bf16 re-baseline. The soft arms are now sha-anchored (`SOFT_EXPECT`), so a real numeric change FAILs instead of printing `reported` | 2026-11-08 | no kernel change; `hyperconn.cu`/`dsv4-hc.cu` are correct |
 | P11 | — | (none — no delivery change) | #293: keep or drop the delivery's own qwen4exp model file (3264 vs 1514 lines) | KEEP, measured: ours vs unpatched a691b2345 on Flash-Next GSQ 3 GPU -sm tensor — prefill +16.6/+28.8/+173.4 % at d0/16k/160k, decode +98.2/+98.9/+68.2 %, real-text prefill +19.1/+88.4 % at 16k/160k, batched total +41.6/+67.2/+53.7 % at 1/2/4 slots. The 27B 'divergence' was a category error (qwen35, not qwen4exp; its KLD vs upstream is 0.000697/98.784 %), and upstream's file does not compile against our tree (kpool/hc_mix API). qwen4exp-vs-upstream KLD 0.013426/96.431 % is the MoE/attention/HC re-expression, insensitive to every switch | 2026-11-08 | two instrument traps recorded: batched-bench npl=1 cold first pass, and r235's pool-order assert on perplexity |
 | P12 | — | (delivery repo only: `scripts/gate-server-arms.sh`, `gate-rebase-release.sh` step 5c) | #295: the release ladder had no host-expert multi-slot DFlash arm, so R13's dropped guard has no detector | WIRED: three two-slot `-ncmoe` DFlash arms (Flash-Next GSQ + DFlash2 at -ncmoe 24 and 10, 35B-A3B Q8_0 + its DFlash2 at 10), baselines 0.74359/0.72269 and 0.59124/0.44720, bit-reproducible; HARD on both slots drafting, acceptance not collapsed (0.5x floor) and not drifted (0.10), text hashes, and a scoped fault check | 2026-11-08 | R13's own 0.53793/0.51678 etc. do not reproduce and its invocation was never recorded (the handover said RUNGS had it; it does not) -- recorded, not chased |
+| P13 | — | (none — no delivery change) | #291 / D1: upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | DECIDED (maintainer): keep both, ours default-on, upstream's opt-in only. Real-text arms, text identical in every arm: -ncmoe 20 ours 1441.6/72.0 vs upstream ClassLRU 4096 782.3/53.3 (arena off 757.1/48.7, coexist 808.4/63.9, cpu-share 0.95 778.4/58.3); -ncmoe 40 ours 1394.2/69.2 vs 455.8/32.6. Coexistence costs 44 % prefill / 11 % decode, so either/or. D1's original +17.6 % inversion is stale (now ours 83.9 vs upstream 48.0 on the same llama-bench arm) and partly the #296 regime effect | 2026-11-08 | no code change; ClassLRU and --moe-cache-cpu-share not adopted |
 | R17 | — | | | | | |
 | P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |

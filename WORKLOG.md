@@ -1,3 +1,46 @@
+## 261108.015 (no release) -- `TODO` #291/`D1` closed: keep both MoE tiers, ours default-on, upstream's opt-in (and D1's original inversion is stale)
+
+**The last measurement item before R17, taken on real text.** 1 x R9700, 35B-A3B Q8_0, `-sm layer`, `-c 8192`,
+the shipped 5 246-token prose prompt, greedy 128, two interleaved rounds, **the generated text is identical in
+every arm** (`504 chars a2cdef23588f`) — every tier is numerically neutral.
+
+| arm (`-ncmoe 20`, 16.3 GiB host experts) | prefill t/s | decode t/s |
+|---|---:|---:|
+| **delivery arena (default)** | **1441.6** | **72.0** |
+| delivery, arena disabled (`MOE_EXPERT_CACHE_MIB=0`) | 757.1 | 48.7 |
+| delivery arena + `--moe-cache-mib 4096` (coexist) | 808.4 | 63.9 |
+| upstream ClassLRU, `--moe-cache-mib 4096` | 782.3 | 53.3 |
+| upstream ClassLRU + `--moe-cache-cpu-share` 0.5 / 0.95 | 778.3 / 778.4 | 55.7 / 58.3 |
+| upstream, no cache | 747.5 | 42.5 |
+
+At `-ncmoe 40`: ours **1394.2 / 69.2**, arena off 371.1 / 31.8, coexist 399.0 / 34.5, upstream cache 455.8 / 32.6,
+upstream off 431.3 / 30.8.  Arena census at `-ncmoe 20`: 11 411.2 MiB of 16 320.0 MiB host experts (69.9 %
+residency), settling at 10 850.2 MiB after the compute-buffer drops, `MoE arena = 0.8787 (27 289 hit / 31 056
+reaches this turn)`.
+
+**What it settles.** At equal MiB the delivery's arena is **+84 % prefill / +35 % decode** (`-ncmoe 20`) and
+**+206 % / +112 %** (`-ncmoe 40`).  Upstream's cache helps its own baseline (747.5/42.5 -> 782.3/53.3) and its
+`cpu-share` recovers part of the decode gap (-> 58.3 at 0.95), but neither approaches the arena.  **Coexistence is
+a loss, not a complement**: adding `--moe-cache-mib 4096` beside the arena costs **44 % prefill and 11 % decode**,
+because the ClassLRU cache takes VRAM the arena sizes itself against — two tiers at one budget is strictly worse
+than one, so "keep both" necessarily means either/or (already the shipped state: `--moe-cache-mib` defaults to 0).
+
+**DECISION (maintainer, in `D1`): keep both tiers — ours default-on, upstream's opt-in only (mostly for
+comparison).**  No code change: the arena stays the default, upstream's cache stays shipped and dormant, and it
+remains the only device tier on a `GGML_HIP_NO_VMM=ON` platform (upstream's default), where the arena declines.
+Neither ClassLRU nor `--moe-cache-cpu-share` is adopted.
+
+**`D1`'s original premise does not reproduce.**  It recorded upstream's cache as **+17.6 % decode** over ours
+(547.6/53.5 against 544.2/62.9 at 4080 MiB).  Re-measured on today's tree at the same `-ncmoe 20`, ours reads
+**1441.6/72.0** against **782.3/53.3** on real text, and **838/83.9** against **857/48.0** under `llama-bench`.
+The arena's decode has improved since r210 (53.5 -> 83.9 on the `llama-bench` arm), so the inversion is stale; and
+the arena's *prefill* is regime-dependent exactly as `#296` established for the host-expert transport (838 t/s on
+random tokens against 1442 on real text, same arm).  Recorded so "upstream's cache is faster" is not re-derived
+from the old numbers.
+
+`TODO` #291 is retired by this entry.  With `#292`, `#293`, `#295` and `#296` closed earlier today, **no
+re-base-derived `TODO` row remains** — R17 is the only item left.
+
 ## 261108.014 (no release) -- `TODO` #295 closed: the host-expert multi-slot DFlash detector is gate step 5c (and R13's invocation was never recorded)
 
 **The hole.**  R13 dropped the F1 host-experts guard (`n_seq > 1` + `-ncmoe` -> host copies) after measuring the

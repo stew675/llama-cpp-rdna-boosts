@@ -57,6 +57,24 @@ cpu-share-style arm.  Report the three questions together.
   **Build prerequisite discovered here:** the arena requires VMM and upstream's HIP default is
   `GGML_HIP_NO_VMM=ON`, so all these arms ran on a separate `build-rocm-vmm` (`-DGGML_HIP_NO_VMM=OFF`).
 
+- status: **DECIDED (2026-11-08, `RUNGS` `P13`) -- keep both, ours default-on, upstream's opt-in only.**
+  Re-measured on real text (the `llama-bench` random-token prompt makes the arena look inert, `TODO` #296),
+  1 x R9700, 35B-A3B Q8_0, two interleaved rounds, **text identical in every arm** (`504 a2cdef23588f`):
+  `-ncmoe 20` -- delivery arena **1441.6 / 72.0** t/s (pp/tg, 69.9 % residency, 87.9 % decode hit rate),
+  arena disabled 757.1 / 48.7, delivery arena + `--moe-cache-mib 4096` 808.4 / 63.9, upstream ClassLRU 4096
+  782.3 / 53.3, upstream + `--moe-cache-cpu-share` 0.5 **/** 0.95 778.3 / 55.7 **/** 778.4 / 58.3, upstream
+  no cache 747.5 / 42.5; `-ncmoe 40` -- ours **1394.2 / 69.2** against upstream's cache 455.8 / 32.6 and no
+  cache 431.3 / 30.8.  So at equal MiB the arena is +84 % prefill / +35 % decode (+206 % / +112 % at
+  `-ncmoe` 40); **coexistence is a LOSS** (44 % prefill, 11 % decode) because the ClassLRU cache takes the
+  VRAM the arena sizes itself against -- so "keep both" means either/or, which is already the shipped state
+  (`--moe-cache-mib` defaults to 0); and neither ClassLRU nor `cpu-share` is adopted (0.95 share reaches
+  58.3 t/s against the arena's 72.0).  Upstream's cache stays shipped and dormant: it is the only device tier
+  on a `GGML_HIP_NO_VMM=ON` platform, where the arena declines.  **`D1`'s original inversion (upstream
+  +17.6 % decode) is stale and partly a `#296`-class artifact**: on today's tree ours measures 83.9 against
+  upstream's 48.0 on the `llama-bench` arm (was 53.5 against 62.9), and the arena's *prefill* is
+  regime-dependent (838 t/s on random tokens against 1442 on real text, same arm).
+  `benchmarks/2026-11-08-moe-cache-arena-vs-classlru.md`.
+
 ## D2 — Fused MoE gate/up+GLU in MMQ (and top-k MoE)
 
 **Upstream:** `#31188` fuses `MUL_MAT_ID` gate/up + GLU in MMQ, `#31288` adds a top-k MoE fusion for 384
