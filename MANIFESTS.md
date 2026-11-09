@@ -481,7 +481,8 @@ in CI.  The model-level gates are manual:
 22. **The one-command verdict for a re-base (r236)** — `scripts/gate-rebase-release.sh`.  A re-base has to answer
     "did we lose performance, and are the numerics still pure?" in one place; this orchestrates the gates that own
     the rules (build per block, prefill-logit KLD, the `MUL_MAT_ID`/`MUL_MAT` op suites, the coherence texts, the
-    interleaved performance A/B against the shipped build, and the GPU-fault scan scoped to the run's own start)
+    host-expert multi-slot DFlash acceptance arms (`scripts/gate-server-arms.sh`, below), the interleaved
+    performance A/B against the shipped build, and the GPU-fault scan scoped to the run's own start)
     and prints a single PASS/FAIL with exit `0`/`1`.  It adds no thresholds of its own beyond `--tolerance`
     (default 1.0 % per `llama-bench` arm) and `--text-tolerance` (default 3.0 % for the real-text prefill arm).
     **It FAILS rather than skips**: a step that cannot run is a FAIL, so a missing build,
@@ -495,6 +496,18 @@ in CI.  The model-level gates are manual:
     iterating; `--perf-only` is the A/B alone and is also the answer to a `#279`-class "is this still worth
     implementing on the new base?" question (the arm it guards is the decode arm).  Run it before a tag and paste
     its verdict into the release's `WORKLOG.md` entry.
+
+    **Step 5c (`--only server`) delegates to `scripts/gate-server-arms.sh`** (`TODO` #295): three two-slot
+    `llama-server` arms with a DFlash drafter on host-resident experts (`-ncmoe` 24 and 10 on Flash-Next GSQ
+    + DFlash2, 10 on 35B-A3B Q8_0 + its DFlash2), `-sm layer`, greedy, the shipped prose prompt in both slots.
+    It exists because every other step in this ladder — and the MTP four-axis protocol — runs a SINGLE
+    sequence, so a draft regression on a `-ncmoe` multi-slot run is silent (acceptance -> ~0 while the text
+    stays correct); that is the guard R13 dropped, and this is its detector.  HARD: the server comes up, both
+    slots draft, per-slot acceptance is not a collapse (`ACC_FLOOR`, default 0.5 x baseline) and has not drifted
+    past `ACC_TOL` (default 0.10), and the two generated texts match the recorded hash set.  R13's own numbers
+    (0.53793/0.51678 etc.) are **not** the criterion: its invocation was never recorded and they do not
+    reproduce, so the baselines are measured at r236 and reproduce to the digit (0.72269/0.74359 on Flash-Next
+    at both `-ncmoe` levels, 0.44720/0.59124 on 35B-A3B).
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 

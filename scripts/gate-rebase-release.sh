@@ -13,6 +13,10 @@
 #   3. numerics   the prefill-logit KLD gate                -> scripts/gate-prefill-logits.sh
 #   4. ops        tests/test-backend-ops: MUL_MAT_ID (incl. the duplicate-id oracle), MUL_MAT
 #   5. text       same-seed greedy text on the coherence arms, against recorded hashes
+#   5c. server     the host-expert MULTI-SLOT DFlash acceptance arms -> scripts/gate-server-arms.sh
+#                 (`TODO` #295).  The MTP protocol and every other step here run a SINGLE sequence, so a
+#                 `-ncmoe` two-slot draft regression (acceptance -> ~0 while the text stays correct) is
+#                 invisible to all of them; that failure mode is silent by construction.
 #   5b. textprefill  REAL-TEXT prompt-eval on a host-resident-expert config, against the SHIPPED build.
 #                 `llama-bench` cannot stand in for this: its prompt is `std::rand() % n_vocab`
 #                 (tools/llama-bench/llama-bench.cpp), i.e. uniformly random token ids with NO routing
@@ -28,7 +32,7 @@
 #   scripts/gate-rebase-release.sh --quick               # skip steps 2 and 3 (the slow ones)
 #   scripts/gate-rebase-release.sh --perf-only           # just step 6 (an A/B while iterating)
 #   scripts/gate-rebase-release.sh --only text,faults    # one or more step names
-#                                                       # (build|logits|ops|text|textprefill|perf|faults);
+#                                                       # (build|logits|ops|text|server|textprefill|perf|faults);
 #                                                       # `state` is included only when named
 #   scripts/gate-rebase-release.sh --tolerance 1.0       # allowed regression per llama-bench arm, percent
 #   scripts/gate-rebase-release.sh --text-tolerance 3.0   # the same for the real-text prefill arm
@@ -238,6 +242,23 @@ step_text() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# 5c. host-expert multi-slot DFlash acceptance (the guard R13 dropped; TODO #295)
+# ---------------------------------------------------------------------------------------------------------------
+# Delegates the rule to the gate that owns it.  It must run against the NEW build only (it is an
+# absolute-arm detector, not an A/B), and it needs a server build: a missing binary is a FAIL.
+step_server() {
+    echo "== 5c. host-expert multi-slot DFlash acceptance (TODO #295) ============"
+    if ! need_file "$NEW_BUILD/bin/llama-server" server; then return 1; fi
+    local out="$LOGDIR/server-arms.log"
+    if LLAMA_SERVER="$NEW_BUILD/bin/llama-server" KEEPOUT="$LOGDIR/server-arms" \
+            bash "$REPO/scripts/gate-server-arms.sh" --no-faults > "$out" 2>&1; then
+        record PASS server-arms "$(grep -E '^(fn24|fn10|35b10) ' "$out" | tr -s ' ' | tr '\n' ';' | cut -c1-140)"
+    else
+        record FAIL server-arms "$(grep -E 'FAIL' "$out" | head -2 | tr '\n' ' ')"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # 5b. real-text prefill against the shipped build (the shape the expert arena exists for)
 # ---------------------------------------------------------------------------------------------------------------
 # `llama-bench` builds its prompt from `std::rand() % n_vocab`: uniformly random token ids, so every ubatch
@@ -377,6 +398,7 @@ else
     if [ "$QUICK" = 1 ]; then record WARN prefill-logits "skipped (--quick)";  else wanted logits && step_logits; fi
     wanted ops    && step_ops
     wanted text   && step_text
+    wanted server && step_server
     wanted textprefill && step_textprefill
     wanted perf   && step_perf
     wanted faults && step_faults

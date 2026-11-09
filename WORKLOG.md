@@ -1,3 +1,41 @@
+## 261108.014 (no release) -- `TODO` #295 closed: the host-expert multi-slot DFlash detector is gate step 5c (and R13's invocation was never recorded)
+
+**The hole.**  R13 dropped the F1 host-experts guard (`n_seq > 1` + `-ncmoe` -> host copies) after measuring the
+device buffer and the host copies as identical.  The failure mode that guard existed for is **silent**: draft
+acceptance collapses to ~0 while the generated text stays correct.  Nothing in the ladder could see it — the MTP
+four-axis protocol, `gate-spec-align`, `gate-hc-fusions` and every coherence arm run a SINGLE sequence — so the
+release could have shipped a `-ncmoe` multi-slot draft regression invisibly.
+
+**The detector.**  New `scripts/gate-server-arms.sh`, delegated from `scripts/gate-rebase-release.sh` as **step
+5c** (`--only server`): three two-slot `llama-server` arms with a DFlash drafter, `-sm layer` on 3 devices, greedy,
+the shipped prose prompt in both slots (so both sequences verify in the same decode step), acceptance read from the
+per-slot `draft acceptance = …` line:
+
+| arm | model + drafter | `-ncmoe` | acceptance | texts |
+|---|---|---:|---|---|
+| `fn24` | Flash-Next GSQ-RCO-IQ3_XXS + DFlash2-Q8_0 | 24 | 0.74359 / 0.72269 | `b73aa781bca5` / `b337648c3ef9` |
+| `fn10` | the same | 10 | 0.74359 / 0.72269 | the same |
+| `35b10` | 35B-A3B Q8_0 + its DFlash2-Q8_0 | 10 | 0.59124 / 0.44720 | `e26a28d3f3ae` / `2cf19becd4ee` |
+
+HARD: both slots draft (`draft_n > 0`); per-slot acceptance ≥ 0.5 × baseline (the collapse detector) and within
+0.10 of it (a drift detector); the two texts match the recorded set; `check-gpu-faults.sh` scoped to the gate's own
+window.  `--record` prints replacement baselines for another config.
+
+**R13's numbers are not the criterion, and the handover's pointer was wrong.**  R13 recorded
+0.53793/0.51678, 0.55245/0.47134 and 0.63918/0.62887 for these arms but never wrote the invocation down — and the
+handover claims `RUNGS.md` R13 carries it, which it does not (its R13 section has the numbers only).  None of those
+values reproduce: n_max 3 with `-n_predict` 128 on the shipped prose prompt gives the table above, and `-ctk/-ctv
+q8_0 -fa on`, n_max 5 and the GSQ-RCO-IQ3_S quant were each tried without landing there.  Rather than chase an
+unrecorded command, the gate enforces what the item actually asks for ("not ~0, text unchanged") against baselines
+that are **bit-reproducible** (two independent runs per arm agree to the digit, text included) — and `fn24 == fn10`
+exactly, which is a free purity statement: the `-ncmoe` level does not move the numerics on this shape.
+
+**Verified**: gate PASS on the r236 tree (3/3, no GPU fault); the verdict logic exercised on all four paths offline
+(exact → ok; collapse to 0.0000/0.0003 → `collapsed`; 0.14 drift → `drifted`; wrong slot count → `slot count`);
+`MANIFESTS.md` gate 22 and `scripts/README.md` updated with the step and the reason it is not redundant.
+
+`TODO` #295 is retired by this entry.  One pre-R17 row remains: `#291` (+ R17).
+
 ## 261108.013 (no release) -- `TODO` #293 closed: KEEP our qwen4exp, measured at depth and concurrency (and the 27B "divergence" was a category error)
 
 **The decision the item was waiting for, taken on depth and concurrency rather than a shallow single-stream arm.**

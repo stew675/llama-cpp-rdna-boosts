@@ -1380,6 +1380,50 @@ re-expression, not the model file — which is why keeping the file costs numeri
 - status: **DONE** · `benchmarks/2026-11-08-qwen4exp-keep-or-drop.md` · `WORKLOG.md` 261108.013 ·
   `DECISIONS.md` `D3` · session 2026-11-08
 
+## P12 — pre-R17: `TODO` #295, the host-expert multi-slot DFlash detector — wired in as gate step 5c · **DONE 2026-11-08**
+
+`#295` asked for a ladder arm that would catch the failure mode R13's dropped guard protected: with host-resident
+experts (`-ncmoe`) and more than one sequence, draft acceptance collapsing to ~0 **while the generated text stays
+correct**.  Nothing else in the ladder can see it — the MTP four-axis protocol, `gate-spec-align`,
+`gate-hc-fusions` and the coherence arms are all single-sequence — so the resolution is a gate step, and that is
+what landed: `scripts/gate-server-arms.sh`, delegated from `scripts/gate-rebase-release.sh` as **step 5c**
+(`--only server`).
+
+**The arms** (two-slot `llama-server`, DFlash drafter, `--spec-type draft-dflash --spec-draft-n-max 3`,
+`-sm layer` 3 devices, greedy, the shipped prose prompt in both slots so the two sequences verify in the same
+decode step, `-n_predict 128`, acceptance read from the per-slot `draft acceptance = …` line at `-lv 4`):
+
+| arm | model + drafter | `-ncmoe` | acceptance | texts |
+|---|---|---:|---|---|
+| `fn24` | Flash-Next GSQ-RCO-IQ3_XXS + DFlash2-Q8_0 | 24 | 0.74359 / 0.72269 | `b73aa781bca5` / `b337648c3ef9` |
+| `fn10` | the same | 10 | 0.74359 / 0.72269 | the same |
+| `35b10` | 35B-A3B Q8_0 + its DFlash2-Q8_0 | 10 | 0.59124 / 0.44720 | `e26a28d3f3ae` / `2cf19becd4ee` |
+
+These are **bit-reproducible**: two independent runs of each arm agreed to the digit, including the text, and
+`fn24 == fn10` exactly (the `-ncmoe` level does not move the numerics on this shape).
+
+**R13's numbers are not the criterion — and the handover's claim that `RUNGS` R13 carries the invocation is
+wrong.**  R13 recorded 0.53793/0.51678, 0.55245/0.47134 and 0.63918/0.62887 for these arms but never wrote the
+command down, and none of those values reproduce under any invocation tried (n_max 3 with `-n_predict` 128 on the
+shipped prose prompt is what produces the table above; `-ctk/-ctv q8_0 -fa on`, n_max 5 and the GSQ-RCO-IQ3_S
+quant were each tried and none lands there).  The item's own criterion — *acceptance not ~0, text unchanged* — is
+what the gate enforces, with the baselines measured at r236:
+
+* **HARD** the server comes up and **both slots draft** (`draft_n > 0`);
+* **HARD** per-slot acceptance ≥ `ACC_FLOOR` (0.5) × baseline, so the collapse-to-~0 pathology fails;
+* **HARD** per-slot acceptance within `ACC_TOL` (0.10) of baseline, so a genuine drift is visible too;
+* **HARD** the two texts match the recorded sorted hash set;
+* **HARD** `check-gpu-faults.sh` over the gate's own `--since` window.
+`--record` prints replacement baseline lines for another model/config.
+
+**Verified**: the gate PASSes on the r236 tree (3/3 arms, no GPU fault); the verdict logic was exercised offline on
+the three paths (exact → ok, collapse to 0.0000/0.0003 → `collapsed`, a 0.14 drift → `drifted`, wrong slot count →
+`slot count`, i.e. a FAIL each); and it is wired into `MANIFESTS.md` gate 22 + `scripts/README.md` alongside the
+step that owns it.
+
+- status: **DONE** · `scripts/gate-server-arms.sh` (new) + `scripts/gate-rebase-release.sh` step 5c ·
+  `WORKLOG.md` 261108.014 · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1413,6 +1457,7 @@ climb touched has a maintainer decision recorded.
 | P9 | — | `8715156da` (fork, `ggml-cpu`: `arch-fallback.h` + `ggml-cpu.cpp`) | #296 / `D8`: which block-12 CPU hunks survive the CPU-backend rewrite | DECIDED: two hunks were dead (a comment line, a `static` inside a memoised function) -> dropped; `repack.cpp` keeps its warning fix, `ggml-cpu.c` keeps the `ALL_GATHER` fill, `quants.c` keeps the pure Q2_0 dot (cost measured: 0.66-0.69 vs upstream's 1.23-1.34 TFLOPS); the measured CPU win (AVX2 top-k prefilter) is +0.54 % with byte-identical text | 2026-11-08 | the host-expert `pp` arm turned out to be a `llama-bench` random-token artifact (arena inert: 414.1/414.5/414.5/414.5 across MIB 0/4096/8192/auto; real text 401.6 -> 1063.6) -- new gate step 5b `textprefill`, and `#273` carries the transport floor |
 | P10 | — | (none — no delivery change; `scripts/gate-hc-fusions.sh` + docs) | #292: the dsv4 `DSV4_HC_PRE/_POST` soft arms were said to reproduce r235's numerics while the re-based chain moved | NOT DRIFT: the shipped r235 build reproduces r236's split exactly (hard `d62340fbf566`, soft `6a102dbc62d6` on both); the claim traced to a stale r156 header line. KLD vs chain measured 0.013217/96.392 % (pre) and 0.013198/96.186 % (post) at base PPL 2.8489 = the documented bf16 re-baseline. The soft arms are now sha-anchored (`SOFT_EXPECT`), so a real numeric change FAILs instead of printing `reported` | 2026-11-08 | no kernel change; `hyperconn.cu`/`dsv4-hc.cu` are correct |
 | P11 | — | (none — no delivery change) | #293: keep or drop the delivery's own qwen4exp model file (3264 vs 1514 lines) | KEEP, measured: ours vs unpatched a691b2345 on Flash-Next GSQ 3 GPU -sm tensor — prefill +16.6/+28.8/+173.4 % at d0/16k/160k, decode +98.2/+98.9/+68.2 %, real-text prefill +19.1/+88.4 % at 16k/160k, batched total +41.6/+67.2/+53.7 % at 1/2/4 slots. The 27B 'divergence' was a category error (qwen35, not qwen4exp; its KLD vs upstream is 0.000697/98.784 %), and upstream's file does not compile against our tree (kpool/hc_mix API). qwen4exp-vs-upstream KLD 0.013426/96.431 % is the MoE/attention/HC re-expression, insensitive to every switch | 2026-11-08 | two instrument traps recorded: batched-bench npl=1 cold first pass, and r235's pool-order assert on perplexity |
+| P12 | — | (delivery repo only: `scripts/gate-server-arms.sh`, `gate-rebase-release.sh` step 5c) | #295: the release ladder had no host-expert multi-slot DFlash arm, so R13's dropped guard has no detector | WIRED: three two-slot `-ncmoe` DFlash arms (Flash-Next GSQ + DFlash2 at -ncmoe 24 and 10, 35B-A3B Q8_0 + its DFlash2 at 10), baselines 0.74359/0.72269 and 0.59124/0.44720, bit-reproducible; HARD on both slots drafting, acceptance not collapsed (0.5x floor) and not drifted (0.10), text hashes, and a scoped fault check | 2026-11-08 | R13's own 0.53793/0.51678 etc. do not reproduce and its invocation was never recorded (the handover said RUNGS had it; it does not) -- recorded, not chased |
 | R17 | — | | | | | |
 | P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |
