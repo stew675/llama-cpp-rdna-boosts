@@ -1,0 +1,358 @@
+From 5657c418a270785136918a1168e1fa3acacdb39b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 05:39:03 +0000
+Subject: [PATCH] cuda: fuse DSV4_HC_POST -> RMS_NORM -> MUL and let qwen4exp
+ producers leave the BF16 copy
+
+Under -sm tensor each qwen4exp layer ends with the DSV4_HC_POST op (the
+unfused hc chain is not correct under the Meta backend), and the next layer
+normalizes its output with RMS_NORM + MUL(gamma): two kernels and an extra
+read of the hc-wide stream. One kernel now computes the hc_post sum with the
+same statements as dsv4_hc_post_f32, stores it (the next residual), and does
+the scalar-path reduction, scale and gamma product of rms_norm_f32, so the
+output is bit-identical. The graph optimizer keeps x / residual / post alive
+until the MUL (other blocks still read them while xn is written); an overlap
+check falls back to the unfused kernels, and the fusion stands down under
+GGML_CUDA_RMS_NORM_VEC=1. GGML_CUDA_HC_POST_RMS=0 turns it off.
+
+The normalized stream (and the dsv4_hc_pre output) feed BF16 GEMMs that run
+on rocBLAS on RDNA4, each of which first converts the whole activation to
+BF16. dsv4_hc_post_rms and dsv4_hc_pre now also write the RNE BF16 copy of
+their output in the same pass and leave it in bf16_src1_cache, where
+ggml_cuda_mul_mat_cublas_impl finds it. The F32 output is always written; the
+gates match the lookup's (T >= 64, contiguous root tensor), so decode is
+untouched. GGML_CUDA_BF16_PRODUCER=0 turns this off; =2 re-converts every
+cache hit and compares (skipped inside a graph capture).
+
+2x R9700, -sm tensor, Flash-Next IQ3_S, r235 host-pool settings: prefill
+31.5k 2143 -> 2263 t/s (+5.6 %), 101k 2088 -> 2214 (+5.9 %); greedy / 4.4k
+prompt set / 101k hashes unchanged in every arm; =2 over the same prompts:
+32,501 hits, 0 mismatching elements.
+---
+ ggml/src/ggml-cuda/common.cuh            |   9 ++
+ ggml/src/ggml-cuda/dsv4-hc.cu            |   6 ++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  42 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu          |  65 +++++++++++++
+ ggml/src/ggml-cuda/norm.cu               | 113 +++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cuh              |   4 +
+ 6 files changed, 239 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 6512d3890..61dd75e88 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2773,6 +2773,15 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
+     return on;
+ }
+ 
++// Producer-written BF16 src1 (GGML_CUDA_BF16_PRODUCER, default 1; 0: off; 2: also verify every hit against the
++// conversion it replaces, debug only, slow): the qwen4exp prefill producers of the cuBLAS/rocBLAS BF16 GEMM
++// activations (dsv4_hc_post_rms's xn, dsv4_hc_pre's mixed stream) write the RNE BF16 copy in the same pass and leave
++// it in bf16_src1_cache, so the GEMM skips its F32 -> BF16 pass.  The F32 output is always written too.
++static inline int ggml_cuda_bf16_producer_mode() {
++    static const int m = [] { const char * e = getenv("GGML_CUDA_BF16_PRODUCER"); return e == nullptr ? 1 : atoi(e); }();
++    return m;
++}
++
+ // Fusion-window alias check (defined in ggml-cuda.cu): true when none of the output nodes alias
+ // an input that is not produced inside the window.  Shared by the extracted fusion helpers.
+ bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index ecb0a13f6..9c99c71dd 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -340,6 +340,12 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
+         dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+     }
++    // no MMB copy: leave the mixed stream's BF16 copy for the cuBLAS BF16 GEMMs that read it (router, indexer, beta/alpha)
++    if (dst16 == nullptr && store_f32 && ggml_cuda_bf16_producer_mode() != 0 && ggml_cuda_bf16_src1_cache_on() &&
++            dst->view_src == nullptr && ggml_is_contiguous(dst) && n_tokens >= 64 &&
++            nbd0 == sizeof(float) && nbd1 == (size_t) n_embd*sizeof(float)) {
++        dst16 = (uint16_t *) ctx.bf16_src1_cache_put(dst, ggml_nelements(dst));
++    }
+     ggml_cuda_kernel_launch(kernel, launch_params,
+             xptr, wptr, (float *) dst->data,
+             n_embd, hc, n_tokens,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 917e3c6e2..d8b524014 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -3269,6 +3269,48 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (const int n_hc_mix = ggml_cuda_hc_mix_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_hc_mix;
+     }
++    // qwen4exp under tensor split (prefill): DSV4_HC_POST -> RMS_NORM -> MUL(gamma) in one kernel (norm.cu), bit-identical
++    // to the three kernels.  The hc_post output stays an output (next layer's residual).  ggml-cuda.cu's graph
++    // optimizer keeps x / residual / post alive until the MUL; the overlap check is a tripwire.  GGML_CUDA_HC_POST_RMS=0 off.
++    if (node->op == GGML_OP_DSV4_HC_POST && node->src[3] == nullptr) {
++        static const bool hc_post_rms = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS"); return e == nullptr || atoi(e) != 0; }();
++        if (hc_post_rms) {
++            const int limit = std::min(cgraph->n_nodes, i + 16);
++            int idxs[16];
++            enum ggml_op ops[16];
++            int n = 0;
++            idxs[n] = i; ops[n++] = node->op;
++            int k = i + 1;
++            while (k < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && !ggml_is_empty(cgraph->nodes[k])) {
++                ++k;
++            }
++            ggml_tensor * rms = k < limit ? cgraph->nodes[k] : nullptr;
++            if (rms != nullptr && rms->op == GGML_OP_RMS_NORM && rms->src[0] == node) {
++                idxs[n] = k; ops[n++] = rms->op;
++                int g = k + 1;
++                while (g < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[g]) && !ggml_is_empty(cgraph->nodes[g])) {
++                    ++g;
++                }
++                ggml_tensor * mul = g < limit ? cgraph->nodes[g] : nullptr;
++                if (mul != nullptr && mul->op == GGML_OP_MUL && (mul->src[0] == rms || mul->src[1] == rms)) {
++                    idxs[n] = g; ops[n++] = mul->op;
++                    const int outs[2] = { i, g };
++                    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++                        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
++                        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
++                        return a0 < b1 && b0 < a1;
++                    };
++                    // other blocks still read x (shared by the hc rows) and residual while xn is written
++                    const bool alias = overlap(mul, node->src[0]) || overlap(mul, node->src[1]) || overlap(mul, node->src[2]) ||
++                                       overlap(node, node->src[0]) || overlap(node, node->src[2]) || overlap(mul, node);
++                    if (!alias && ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outs, 2) &&
++                        ggml_cuda_op_dsv4_hc_post_rms_fused(*cuda_ctx, node, rms, mul)) {
++                        return g - i;
++                    }
++                }
++            }
++        }
++    }
+     // qwen4exp hyper-connection combine+norm fusions (owned by hyperconn.cu).
+     if (const int n_hc_comb = ggml_cuda_hc_combine_norm_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_hc_comb;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5e250a093..98eacca03 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4951,6 +4951,43 @@ struct cuda_gc_timer {
+ 
+ // GGML_CUDA_BF16_SRC1_CACHE=0 disables the per-graph BF16 src1 reuse (bf16_src1_cache in common.cuh).
+ 
++// GGML_CUDA_BF16_PRODUCER=2 (debug): compare a cached BF16 src1 with the conversion it replaced, element by element.
++static __global__ void ggml_cuda_bf16_src1_cmp(const nv_bfloat16 * a, const nv_bfloat16 * b, int64_t n, unsigned long long * bad) {
++    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
++        if (__bfloat16_as_ushort(a[i]) != __bfloat16_as_ushort(b[i])) atomicAdd(bad, 1ull);
++    }
++}
++static void ggml_cuda_bf16_src1_verify(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const nv_bfloat16 * cached, int64_t n, cudaStream_t stream) {
++    static unsigned long long hits = 0, bad_total = 0, skipped = 0;
++#if defined(GGML_USE_HIP)
++    hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
++    CUDA_CHECK(hipStreamIsCapturing(stream, &cap));
++    const bool capturing = cap != hipStreamCaptureStatusNone;
++#else
++    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
++    const bool capturing = cap != cudaStreamCaptureStatusNone;
++#endif
++    if (capturing) {   // a graph capture cannot synchronize: those hits are not checked
++        ++skipped;
++        return;
++    }
++    ggml_cuda_pool_alloc<nv_bfloat16> ref(ctx.pool(), n);
++    ggml_get_to_bf16_cuda(GGML_TYPE_F32)(src1->data, ref.get(), n, stream);
++    ggml_cuda_pool_alloc<unsigned long long> cnt(ctx.pool(), 1);
++    unsigned long long * dbad = cnt.get();
++    CUDA_CHECK(cudaMemsetAsync(dbad, 0, sizeof(*dbad), stream));
++    ggml_cuda_bf16_src1_cmp<<<256, 256, 0, stream>>>(cached, ref.get(), n, dbad);
++    unsigned long long bad = 0;
++    CUDA_CHECK(cudaMemcpyAsync(&bad, dbad, sizeof(bad), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    ++hits; bad_total += bad;
++    if (bad != 0 || hits % 500 == 1) {
++        GGML_LOG_WARN("BF16_PRODUCER verify: %s n=%lld mismatches %llu (hits %llu, total mismatches %llu, %llu captured hits not checked)\n",
++                      src1->name, (long long) n, bad, hits, bad_total, skipped);
++    }
++}
++
+ template<ggml_type compute_type>
+ 
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -5035,6 +5072,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+             const auto & c = ctx.bf16_src1_cache;
+             if (c.buf && c.src1 == root && c.data == root->data && c.stream_no == ctx.curr_stream_no && c.n == n) {
+                 src1_ptr = (const cuda_t *) c.buf->get();
++                if (ggml_cuda_bf16_producer_mode() == 2) {
++                    ggml_cuda_bf16_src1_verify(ctx, src1, c.buf->get(), n, main_stream);
++                }
+             } else {
+                 nv_bfloat16 * buf = ctx.bf16_src1_cache_put(root, n);
+                 const auto convert_func = traits::convert(src1->type);
+@@ -8038,6 +8078,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     }
+ 
++    // DSV4_HC_POST -> RMS_NORM -> MUL(gamma) fusion (GGML_CUDA_HC_POST_RMS, ggml-cuda-try-fuse.cu): the fused kernel
++    // writes xn (the MUL dst) while other blocks of the same token still read x and residual, so keep the hc_post
++    // sources alive until the MUL; otherwise the allocator hands their freed buffers to the norm/mul outputs.
++    {
++        static const bool hc_post_rms = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS"); return e == nullptr || atoi(e) != 0; }();
++        for (int i = 0; hc_post_rms && i < cgraph->n_nodes; ++i) {
++            ggml_tensor * hp = cgraph->nodes[i];
++            if (hp->op != GGML_OP_DSV4_HC_POST || hp->src[3] != nullptr) continue;
++            int k = i + 1;
++            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && !ggml_is_empty(cgraph->nodes[k])) ++k;
++            if (k >= cgraph->n_nodes || cgraph->nodes[k]->op != GGML_OP_RMS_NORM || cgraph->nodes[k]->src[0] != hp) continue;
++            ggml_tensor * rms = cgraph->nodes[k];
++            int g = k + 1;
++            while (g < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[g]) && !ggml_is_empty(cgraph->nodes[g])) ++g;
++            if (g >= cgraph->n_nodes || cgraph->nodes[g]->op != GGML_OP_MUL ||
++                (cgraph->nodes[g]->src[0] != rms && cgraph->nodes[g]->src[1] != rms)) continue;
++            for (int j = 0; j < 3; ++j) {
++                ggml_tensor * src = hp->src[j];
++                if (src != nullptr) {
++                    params->add_alloc_dep(params->user_data, src->view_src ? src->view_src : src, cgraph->nodes[g]);
++                }
++            }
++        }
++    }
++
+     // Prefill indexer relu-sum: keep the pre-relu scores alive until the summed output, so the
+     // allocator cannot reuse that buffer for the fused destination.
+     {
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 9d29faf4a..e2add0590 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1375,3 +1375,116 @@ int ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
+     }
+     return 0;
+ }
++
++// qwen4exp under tensor split (prefill): DSV4_HC_POST (no comb, not gated) -> RMS_NORM -> MUL(gamma) in one kernel.
++// One block of `block_size` threads per (hc row, token).  Each thread computes the hc_post sum for col = tid,
++// tid + block_size, ... exactly as dsv4_hc_post_f32 does (same two statements, so the same contraction), stores it
++// (it is the next layer's residual), and accumulates the square sum in the order of rms_norm_f32's scalar path; the
++// reduction, scale and gamma product are rms_norm_f32's, so the output is bit-identical to the three-kernel chain.
++template <int block_size>
++static __global__ void dsv4_hc_post_rms_f32(
++        const float * x, const float * residual, const float * post, const float * gamma,
++        float * dst_res, float * dst_xn, uint16_t * dst16, const bool store_f32,
++        const int ncols, const int hc, const int n_tokens,
++        const int64_t sx0, const int64_t sx1,
++        const int64_t sr0, const int64_t sr1, const int64_t sr2,
++        const int64_t sp0, const int64_t sp1,
++        const int64_t sd0, const int64_t sd1, const int64_t sd2,
++        const int64_t sg1, const float eps) {
++    ggml_cuda_pdl_lc();
++    constexpr int max_per_thread = 4;
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    extern __shared__ float s_sum[];
++
++    ggml_cuda_pdl_sync();
++
++    for (int it = blockIdx.y; it < n_tokens; it += gridDim.y) {
++        const float p = post[row*sp0 + it*sp1];
++        float sv[max_per_thread];
++        float tmp = 0.0f;
++        int k = 0;
++        for (int col = tid; col < ncols; col += block_size, ++k) {
++            float sum = x[col*sx0 + it*sx1] * p;
++            sum += residual[col*sr0 + row*sr1 + it*sr2];
++            dst_res[col*sd0 + row*sd1 + it*sd2] = sum;
++            sv[k] = sum;
++            tmp += sum * sum;
++        }
++
++        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++        const float mean  = tmp / ncols;
++        const float scale = rsqrtf(mean + eps);
++
++        const int64_t   o    = ((int64_t) it*hc + row)*ncols;
++        const float   * g    = gamma + row*sg1;
++        k = 0;
++        for (int col = tid; col < ncols; col += block_size, ++k) {
++            const float v = scale * sv[k] * g[col];
++            if (store_f32) {
++                dst_xn[o + col] = v;
++            }
++            if (dst16 != nullptr) {
++                dst16[o + col] = norm_f2bf(v);
++            }
++        }
++        // s_sum is reused by the next token's block_reduce
++        __syncthreads();
++    }
++}
++
++bool ggml_cuda_op_dsv4_hc_post_rms_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
++        const ggml_tensor * rms, ggml_tensor * mul) {
++    constexpr int block_size = 1024;
++    const ggml_tensor * x        = hc_post->src[0];
++    const ggml_tensor * residual = hc_post->src[1];
++    const ggml_tensor * post     = hc_post->src[2];
++    const ggml_tensor * gamma    = mul->src[0] == rms ? mul->src[1] : mul->src[0];
++
++    const int64_t ncols    = x->ne[0];
++    const int64_t n_tokens = x->ne[1];
++    const int64_t hc       = residual->ne[1];
++    if (hc_post->src[3] != nullptr || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
++        post->type != GGML_TYPE_F32 || gamma == nullptr || gamma->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++        ncols < block_size || ncols > 4*block_size || ncols > INT32_MAX || n_tokens > INT32_MAX ||
++        gamma->ne[0] != ncols || gamma->ne[1] != hc || gamma->ne[2] != 1 || gamma->ne[3] != 1 || gamma->nb[0] != sizeof(float) ||
++        !ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, hc_post) || hc_post->ne[3] != 1) {
++        return false;
++    }
++    // GGML_CUDA_RMS_NORM_VEC=1 makes the stock rms_norm sum squares per float4, a different order than this kernel's
++    // scalar sum: leave the ops unfused then, so the result stays the one the unfused graph computes.
++    if (ggml_cuda_rms_norm_vec()) {
++        return false;
++    }
++    float eps = 0.0f;
++    memcpy(&eps, rms->op_params, sizeof(float));
++
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(mul)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul, (size_t) ggml_nelements(mul));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(mul)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul, (size_t) ggml_nelements(mul));
++    }
++    // no MMB copy: leave xn's BF16 copy for the cuBLAS BF16 hc_down GEMM that follows (same gates as its lookup)
++    if (dst16 == nullptr && store_f32 && ggml_cuda_bf16_producer_mode() != 0 && ggml_cuda_bf16_src1_cache_on() &&
++            mul->view_src == nullptr && ggml_nrows(mul) / hc >= 64) {
++        dst16 = (uint16_t *) ctx.bf16_src1_cache_put(mul, ggml_nelements(mul));
++    }
++
++    const dim3 grid_dims((unsigned) hc, (unsigned) std::min<int64_t>(n_tokens, UINT16_MAX), 1);
++    const dim3 block_dims(block_size, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params(grid_dims, block_dims, 32*sizeof(float), ctx.stream());
++    ggml_cuda_kernel_launch(dsv4_hc_post_rms_f32<block_size>, launch_params,
++            (const float *) x->data, (const float *) residual->data, (const float *) post->data, (const float *) gamma->data,
++            (float *) hc_post->data, (float *) mul->data, dst16, store_f32,
++            (int) ncols, (int) hc, (int) n_tokens,
++            (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)),
++            (int64_t) (residual->nb[0]/sizeof(float)), (int64_t) (residual->nb[1]/sizeof(float)), (int64_t) (residual->nb[2]/sizeof(float)),
++            (int64_t) (post->nb[0]/sizeof(float)), (int64_t) (post->nb[1]/sizeof(float)),
++            (int64_t) (hc_post->nb[0]/sizeof(float)), (int64_t) (hc_post->nb[1]/sizeof(float)), (int64_t) (hc_post->nb[2]/sizeof(float)),
++            (int64_t) (gamma->nb[1]/sizeof(float)), eps);
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 9fb6a3921..78773d5f4 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -8,6 +8,10 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
+ 
++// DSV4_HC_POST -> RMS_NORM -> MUL(gamma) as one kernel (tensor-split prefill); false: shape not supported, run unfused
++bool ggml_cuda_op_dsv4_hc_post_rms_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
++        const ggml_tensor * rms, ggml_tensor * mul);
++
+ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
+ 
+ void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
+-- 
+2.53.0
+
