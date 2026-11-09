@@ -1303,6 +1303,43 @@ pass a `llama-bench`-only gate.
 - status: **DONE** · fork `8715156da` (tree `a4093f9da`) · `WORKLOG.md` 261108.011 ·
   `benchmarks/2026-11-08-host-expert-prefill-transport.md` · session 2026-11-08
 
+## P10 — pre-R17: `TODO` #292, the dsv4 soft arms — no drift, a stale header line, and the anchor that closes the hole · **DONE 2026-11-08**
+
+`#292` claimed the dsv4 `LLAMA_FUSED_DSV4_HC_PRE/_POST` arms "reproduce r235's numerics, not the re-based chain's",
+i.e. that the HC chain moved with the re-base while the fused ops did not.  **It did not: the shipped r235 build
+reproduces the re-based tree's split exactly.**
+
+| arm | r236 `8715156da` | shipped r235 `69d36099b` |
+|---|---|---|
+| `chain_chain` (reference) | 449 `d62340fbf566` | 449 **`d62340fbf566`** |
+| `mixed_comb` / `mixfused_comb` / `fused_fused` / `no_cuda_fuse` | `d62340fbf566` | `d62340fbf566` |
+| `dsv4_pre_chain`, `dsv4_post_op` (soft) | 449 `6a102dbc62d6` | 449 **`6a102dbc62d6`** |
+
+(Flash-Next GSQ-IQ3_XXS, BF16-hc class, 3 devices `-sm layer`, 96 tokens, prompt sha `18147e48a7f4`.)  The
+"`6a102dbc62d6` is what the chain produced at r235" clause came from the gate's r156 header line -- and from
+`MANIFESTS.md` gate 11's r148 row, where `6a102dbc62d6` is genuinely the chain *of that date*.  The chain has
+since moved to `d62340fbf566`; the header was never updated.  So there was no re-base artefact to explain.
+
+**The numerics, quantified (`gate-prefill-logits.sh --ab`, Flash-Next, wikitext 512 x 40, 3 devices `-sm layer`,
+base PPL 2.8489):** fused pre op vs its chain **mean KLD 0.013217 / same-top-p 96.392 %**; fused post op vs its
+chain **0.013198 / 96.186 %**.  That is the documented HC16 bf16 producer-slot re-baseline (the gate's own r156
+IQ4_NL reference: 0.027936 / 96.471 % at base PPL 1.7888), and *smaller* in KLD.  Both texts stay fluent and
+diverge from the first sentence; each arm is deterministic per class across builds, which is what makes an
+anchor valid.
+
+**Resolution (no kernel change -- `hyperconn.cu`/`dsv4-hc.cu` are correct):**
+* the gate header no longer claims byte-identity on the BF16-hc class: both classes are numeric arms, with the
+  measured KLD/same-top-p stated, and the r156 IQ4_NL figure kept for scale (noted alongside `MANIFESTS.md`
+  gate 7's different IQ4_NL number, 0.021542 / 95.814 %, which is its own unnamed point -- neither is a target);
+* **`SOFT_EXPECT` anchors the two numeric arms to their own recorded text** (defaulted to the fused-mixer
+  class's `dsv4_pre_chain=dsv4_post_op=6a102dbc62d6`, 449 chars; unset for other classes so they do not inherit
+  it).  A numeric arm no longer just prints "reported": if its sha moves, the arm **FAILs**.  That is the hole
+  `#292` actually exposed -- a real change in either op used to pass silently.
+* Negative-tested: with a deliberately wrong anchor the gate names the arm and exits **1**; with the recorded
+  anchors it passes (exit 0 by construction, the final `if` block's `echo`).
+
+- status: **DONE, no delivery-code change** · `WORKLOG.md` 261108.012 · session 2026-11-08
+
 ## R17 — the release ladder
 
 See [`README.md`](README.md) §4.  Starts only when R01..R16 are DONE and every `DECISIONS.md` item that the
@@ -1334,6 +1371,7 @@ climb touched has a maintainer decision recorded.
 | R15 | 14 | `617ee7152` | 0 expected → 0 found | build + flint `-sm relaxed-tensor` == `-sm layer` text + `-sm tensor` still refused with the block's message + 4-arm coherence | 2026-11-09 | zero-conflict, zero-drift rung; the TEMPORARY block stays isolated for its `TODO` #104 removal. flint validated on the box; mellum/mistral4 still have no model |
 | R16 | 15 | `2dc4511b8` | 9 expected → 8 files / 12 hunks (`qwen4exp.cpp` auto-merged) | build + 4-arm coherence (R13-identical) + `gate-kv-residency.sh` PASS + `gate-kv-window-split.sh` PASS 38/38 + `gate-spec-draft-window.sh` PASS | 2026-11-08 | **`D12`/`D13` re-derived**: provider still binds at the buffer type (rotation constants are per-cache, not cell-indexed), `hparams.no_alloc` → the ctor's `no_alloc`, pool cells round to whole PAGES (`n_pad` gone), `memory_breakdown()` over `ctxs_bufs.bufs` + `attn_rot_bufs`, `params_l` → `params`.  **Two real defects fixed**: the hybrid ctor's positional argument shift (upstream inserted `is_indexer`; `v_enabled` got `kv_pool` → no V tensor → `cpy_v` null-deref → every GDN model segfaulted at load) and a latent R12 defect in `indexer-score.cu` (`ggml_rope_get_truncate` on a non-ROPE node — the sparse QSA arm has aborted since R12, no gate reached it; §85, `TODO` #297).  r193's draft reserve preserved by folding the `mtp_shared` branch into `common_draft_reserve_derive()`: arena 20 527.5 vs 17 977.5 MiB (+7.8 points) |
 | P9 | — | `8715156da` (fork, `ggml-cpu`: `arch-fallback.h` + `ggml-cpu.cpp`) | #296 / `D8`: which block-12 CPU hunks survive the CPU-backend rewrite | DECIDED: two hunks were dead (a comment line, a `static` inside a memoised function) -> dropped; `repack.cpp` keeps its warning fix, `ggml-cpu.c` keeps the `ALL_GATHER` fill, `quants.c` keeps the pure Q2_0 dot (cost measured: 0.66-0.69 vs upstream's 1.23-1.34 TFLOPS); the measured CPU win (AVX2 top-k prefilter) is +0.54 % with byte-identical text | 2026-11-08 | the host-expert `pp` arm turned out to be a `llama-bench` random-token artifact (arena inert: 414.1/414.5/414.5/414.5 across MIB 0/4096/8192/auto; real text 401.6 -> 1063.6) -- new gate step 5b `textprefill`, and `#273` carries the transport floor |
+| P10 | — | (none — no delivery change; `scripts/gate-hc-fusions.sh` + docs) | #292: the dsv4 `DSV4_HC_PRE/_POST` soft arms were said to reproduce r235's numerics while the re-based chain moved | NOT DRIFT: the shipped r235 build reproduces r236's split exactly (hard `d62340fbf566`, soft `6a102dbc62d6` on both); the claim traced to a stale r156 header line. KLD vs chain measured 0.013217/96.392 % (pre) and 0.013198/96.186 % (post) at base PPL 2.8489 = the documented bf16 re-baseline. The soft arms are now sha-anchored (`SOFT_EXPECT`), so a real numeric change FAILs instead of printing `reported` | 2026-11-08 | no kernel change; `hyperconn.cu`/`dsv4-hc.cu` are correct |
 | R17 | — | | | | | |
 | P8 | — | `3b0978888` (fork, block 00/08: `mmf.cu`/`mmf.cuh` + `tests/test-backend-ops.cpp`) | #304: `MUL_MAT_ID` dup ids wrong for `f16` at `ncols_dst = 9` — the compact seam grid (16) and the kernel's `cols_per_block` (ncols_dst, clamped) disagreed, so an expert's compact range was truncated but only below 16 | FIXED + oracle enabled: dup=1 16/16 (was 15/16), MUL_MAT_ID 947/947, MUL_MAT 2517/2517 | 2026-11-08 | also closed #279 via the new perf A/B, and added `scripts/gate-rebase-release.sh` (one-command verdict, fails rather than skips) |
 | P7 | — | (none — no delivery change) | #303: the dense `mul_mat_q` residue, filed as our R01/R08/R09 re-expression (VGPR 232 -> 216) | closed as INHERITED: r236's kernel ISA is identical to unpatched a691b2345 (1436 instrs, 0 diff); base commit = +1.31 %, r235's old body = -0.36 %, delivery = +0.09 %; two candidate fixes refuted at ISA level | 2026-11-08 | single-run census floor is +-1.1 % (two runs, same binary); 794 dense launches, 986 total; master was carrying a local #289 commit and is pinned at a691b2345 again |

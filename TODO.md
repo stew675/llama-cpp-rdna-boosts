@@ -24,7 +24,7 @@ truth, not this line.  Block 15 is the **streamed KV** (the resident
 window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`wip/upstream-rebase-261108/`, base `a691b2345`) is the ladder in flight: its 16 blocks are
-climbed; the remaining `#291`/`#292`/`#293`/`#295` rows plus R17 are the live brief in
+climbed; the remaining `#291`/`#293`/`#295` rows plus R17 are the live brief in
 `wip/upstream-rebase-261108/HANDOVER-R17-REMAINING.md`; `patches/`/`release.json` are cut at R17.
 
 ## The open list
@@ -48,7 +48,6 @@ climbed; the remaining `#291`/`#292`/`#293`/`#295` rows plus R17 are the live br
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **291** | upstream's ClassLRU MoE cache vs the delivery's host-expert arena at equal MiB | delivery vs upstream (`D1`) | **OPEN — deferred to its own session** (maintainer, 2026-11-08) — a measurement, not a code change — §291 |
-| **292** | `gate-hc-fusions.sh`'s dsv4 soft arms reproduce r235's numerics, not the unfused chain's | gate expectation / `hyperconn.cu` | **OPEN** — created at R12; quantify with the KLD gate at R17 — §292 |
 | **293** | decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support | model file (`src/models/qwen4exp.cpp`) + the fused HC/indexer kernels | **OPEN** — kept at R12 on a measured +31 % decode; the discriminating arm is Q8_0 on 2/3 devices — §293 |
 | **295** | R17 must include a host-expert multi-slot DFlash arm (the detector for the guard R13 dropped) | ladder arm (R17) | **OPEN — R17** — the failure mode it catches is silent — §295 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
@@ -411,14 +410,6 @@ code change, unless the numbers say otherwise.
 **Kind:** delivery vs upstream (`src/llama-moe-cache.cpp`, `ggml/src/ggml-cuda/moe-expert-cache.cu`).
 
 **OPEN — needs a full measuring session (maintainer's call, 2026-11-08: defer).**  Open questions: is the difference the *policy* (ClassLRU vs the arena's heat/RFU admission), the *tier* (upstream caches in a plain device buffer; ours lives in the slab, and the slab's reserve/headroom may be costing us usable arena), the *config* (one GPU `-sm layer` vs the field's 2-3 GPU `-sm tensor`), or the measurement (the arms are either/or — the coexistence the merge preserves is untested; and the run needs `GGML_HIP_NO_VMM=OFF`, which is now in `~/bin/build-llama-rocm`).  Also note `--moe-cache-cpu-share` (`#30966`) and ClassLRU (`#31233`) are capabilities ours lacks
-
-## 292. `gate-hc-fusions.sh`'s dsv4 soft arms reproduce r235's numerics, not the unfused chain's
-
-**`gate-hc-fusions.sh`'s two REPORTED dsv4 arms drifted away from the chain on the BF16-hc class**: chain 449 chars `d62340fbf566`, `dsv4_pre`/`dsv4_post` 449 chars `6a102dbc62d6` — and `6a102dbc62d6` is what the *chain* produced at r235, so the HC chain moved with the re-base while the fused pre/post ops still reproduce the old numerics.  The gate classifies them soft ("reported") so nothing fails, but its own header says byte-identity is expected on this class
-
-**Kind:** `scripts/gate-hc-fusions.sh`, `ggml/src/ggml-cuda/hyperconn.cu`.
-
-**OPEN — created 2026-11-08 at re-base rung R12.**  Quantify with `gate-prefill-logits.sh` at R17 (KLD + same-top-p on Flash-Next), then either update the soft-arm expectation with the measured numbers or fix the drift, and record which
 
 ## 293. Decide whether to keep carrying the delivery's own qwen4exp (Qwen3.8) model support
 

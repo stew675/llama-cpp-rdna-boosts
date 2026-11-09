@@ -38,17 +38,23 @@
 #   HARD: every arm produces the same generated text (byte-identical, same sha) as the
 #         chain+chain reference arm, and the reference arm is not degenerate (>= MIN_CHARS
 #         and no `////` run).  A mismatch names the arm.
-#   REPORTED: the DeepSeek-V4 HC pre/post op pair (which qwen4exp also builds through) is
-#         printed with its sha and divergence but does not fail the gate.  Those two ops are
-#         NOT an exact reimplementation of their ggml chain: they own the HC16 bf16 producer
-#         slots (`dsv4-hc.cu`: "a numerics change vs the F32 chain, approved as a prefill
-#         re-baseline"), so `LLAMA_FUSED_DSV4_HC_PRE`/`_POST` are numeric arms, not aliases.
-#         Baseline on the IQ4_NL class (r156, `gate-prefill-logits.sh --ab`): the fused pre op
-#         reads mean KLD 0.027936 / same-top-p 96.471 % against its own chain at base PPL
-#         1.7888, the same order the combine+norm fusion has always shown (0.0185-0.0213 /
-#         95.6 %, WORKLOG 261025.014).  A *change* in that magnitude is the regression signal;
-#         byte-identity is not expected there.  A class where they DO agree (BF16-hc) prints
-#         equal shas, so nothing is lost.
+#   NUMERIC (sha-anchored, r236): the DeepSeek-V4 HC pre/post op pair (which qwen4exp also
+#         builds through) does NOT reproduce its ggml chain and must not be required to: those
+#         two ops own the HC16 bf16 producer slots (`dsv4-hc.cu`: "a numerics change vs the F32
+#         chain, approved as a prefill re-baseline"), so `LLAMA_FUSED_DSV4_HC_PRE`/`_POST` are
+#         numeric arms, not aliases.  Measured with `gate-prefill-logits.sh --ab` on the
+#         BF16-hc class (Flash-Next GSQ-IQ3_XXS, 3 devices `-sm layer`, wikitext 512 x 40,
+#         base PPL 2.8489): pre op **0.013217 / 96.392 %** and post op **0.013198 / 96.186 %**
+#         against their own chain -- the documented re-baseline class, and *smaller* KLD than
+#         the IQ4_NL reference below.  r156's IQ4_NL point, for scale: 0.027936 / 96.471 % at
+#         base PPL 1.7888 (`MANIFESTS.md` gate 7 carries a second IQ4_NL figure, 0.021542 /
+#         95.814 %, from its own unnamed point -- both are historical, neither is a target).
+#         So byte-identity is NOT expected on any class, and the honest regression detector is
+#         the arm's OWN recorded text: each arm is deterministic per class (r235 and r236
+#         produce the same `6a102dbc62d6` on the BF16-hc class), so `SOFT_EXPECT` anchors it and
+#         a real numeric change in either op FAILS the gate instead of printing "reported".
+#         (Between r156 and r236 the CHAIN moved to `d62340fbf566`, not the ops -- the r156
+#         "both arms agree on BF16-hc" line was stale, never a re-base artefact: `TODO` #292.)
 #   The arms cover both halves independently and the CUDA-side chain fusions.
 #
 #   The hc weight TYPE decides which mixer runs, so run this once per class:
@@ -195,14 +201,13 @@ echo "    prompt sha256=$PROMPT_SHA  (extractor: scripts/extract-generated.py)"
 echo "    logs: $KEEPOUT"
 echo
 
-# The DSV4_HC_PRE/_POST ops are REPORTED arms (r156).  They are numeric re-baselines, not exact
-# reimplementations: `dsv4_hc_pre_f32`'s `wbf16`/`xbf16` arms read the HC16 bf16 producer slots
-# deliberately (see the header), so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as well
-# as the fusion.  Measured on the IQ4_NL class at r156: mean KLD 0.027936 / same-top-p 96.471 %
-# (base PPL 1.7888), i.e. the same class of difference the combine+norm fusion has always shown
-# (0.0185-0.0213 / 95.6 %, WORKLOG 261025.014) -- so it is reported, and a *change* in it is the
-# signal.  Byte-identity IS expected on the BF16-hc class, where both arms still agree (449 chars
-# `6a102dbc62d6`).
+# The DSV4_HC_PRE/_POST ops are NUMERIC arms, not exact reimplementations: `dsv4_hc_pre_f32`'s
+# `wbf16`/`xbf16` arms read the HC16 bf16 producer slots deliberately (see the header), so
+# `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as well as the fusion -- BF16-hc class,
+# measured r236: mean KLD 0.013217 / same-top-p 96.392 % (pre) and 0.013198 / 96.186 % (post)
+# against the chain.  Byte-identity is therefore NOT expected on any class.  Each arm IS
+# deterministic per class, so its text is anchored instead: SOFT_EXPECT (below) makes a real
+# numeric change FAIL rather than print "reported" -- the hole `TODO` #292 exposed.
 HARD_ARMS=(
     "chain_chain   :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0"
     "mixed_comb    :LLAMA_FUSED_HC_COMBINE=0"
@@ -215,6 +220,25 @@ SOFT_ARMS=(
     "dsv4_post_op  :LLAMA_FUSED_DSV4_HC_POST=1"
 )
 ARMS=("${HARD_ARMS[@]}" "${SOFT_ARMS[@]}")
+
+# The numeric (dsv4 pre/post) arms are anchored to their OWN recorded text, per hc-down class.
+#   SOFT_EXPECT="arm=sha arm=sha"  an explicit anchor set (other classes / a new model); an empty
+#                                  value disables anchoring for a class that has none recorded.
+# The default is the BF16-hc class's r236 measurement, applied only when the gate detects that
+# class (the fused-mixer class), so running the IQ4_NL/Q5_K classes does not inherit it and fail.
+#
+# Why this exists (`TODO` #292): the ops differ from the chain by design (bf16 producer slots), so
+# they cannot be byte-hard.  They were only *reported*, which meant a real numeric change in either
+# op passed silently -- and a stale "both arms agree" line in this header sent an earlier session
+# after a re-base drift that did not exist (r235 reproduces r236's split exactly).
+HC_TYPE="$(types_of "$MODEL" | sed -n 's/^blk\.0\.hc_attn_down\.weight[[:space:]]*//p' | head -1)"
+case "$HC_TYPE" in
+    BF16|Q8_0) SOFT_EXPECT="${SOFT_EXPECT-dsv4_pre_chain=6a102dbc62d6 dsv4_post_op=6a102dbc62d6}" ;;
+    *)         SOFT_EXPECT="${SOFT_EXPECT-}" ;;
+esac
+declare -A SOFT_EXPECT_MAP=()
+for kv in $SOFT_EXPECT; do SOFT_EXPECT_MAP["${kv%%=*}"]="${kv#*=}"; done
+[ -n "$SOFT_EXPECT" ] && echo "    numeric-arm anchors: $SOFT_EXPECT"
 
 ref_sha=""
 ref_chars=0
@@ -251,7 +275,16 @@ for arm in "${ARMS[@]}"; do
     elif [ "$sha" = "$ref_sha" ] && [ "$chars" = "$ref_chars" ]; then
         verdict="ok"
     elif [ "$soft" -eq 1 ]; then
-        verdict="reported (numeric arm, differs -- see the header)"
+        # a numeric arm: it is not expected to match the chain, but its own text is deterministic
+        # per class, so a recorded anchor turns "the op's numerics moved" into a FAIL
+        exp="${SOFT_EXPECT_MAP[$name]:-}"
+        if [ -z "$exp" ]; then
+            verdict="reported (numeric arm, differs -- no anchor recorded for this class)"
+        elif [ "$sha" = "$exp" ]; then
+            verdict="reported (numeric arm, anchor $exp)"
+        else
+            verdict="FAIL (numeric arm moved: $chars chars $sha, anchor $exp)"
+        fi
     else
         verdict="FAIL (differs from chain_chain)"
     fi
@@ -284,7 +317,7 @@ if [ "$fails" -ne 0 ]; then
 fi
 if [ "$warns" -ne 0 ]; then
     echo "PASS: all $(( ${#ARMS[@]} - warns )) hard arms are byte-identical to the unfused chain" \
-         "($ref_chars chars, sha $ref_sha); $warns reported arm(s) differ (documented numeric re-baseline)"
+         "($ref_chars chars, sha $ref_sha); $warns numeric arm(s) differ as documented and match their anchor"
 else
     echo "PASS: all ${#ARMS[@]} arms are byte-identical to the unfused chain ($ref_chars chars, sha $ref_sha)"
 fi

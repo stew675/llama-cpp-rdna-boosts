@@ -158,10 +158,18 @@ in CI.  The model-level gates are manual:
 7. **qwen4exp hyper-connection fusions** — `scripts/gate-hc-fusions.sh MODEL.gguf`: runs the **four**
    mix/combine arm combinations (`LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE`, selected independently)
    plus the CUDA-side chain fusions, and requires every hard arm to be **byte-identical to the unfused
-   chain**.  The DSV4 HC pre/post pair is **reported, not hard** (r156): those two ops own the HC16 bf16
-   producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer
-   precision as well as the fusion (IQ4_NL class: mean KLD **0.021542 / 95.814 %** against the chain at the
-   standard 40-chunk point, the same order the combine+norm fusion always showed).  Required for any change to `build_hc_mix`, `build_hc_combine`,
+   chain**.  The DSV4 HC pre/post pair are **numeric arms, sha-anchored** (r236, `TODO` #292): those two ops own
+   the HC16 bf16 producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps
+   the producer precision as well as the fusion and byte-identity is **not** expected on any class.  Measured
+   on the BF16-hc class (3 devices `-sm layer`, wikitext 512 x 40, base PPL 2.8489): pre op **0.013217 /
+   96.392 %** and post op **0.013198 / 96.186 %** against their own chain.  Because each arm is deterministic
+   per class, its own text is the anchor instead: the gate defaults `SOFT_EXPECT` to the fused-mixer class's
+   recorded shas (`dsv4_pre_chain=dsv4_post_op=6a102dbc62d6`, 449 chars) and **FAILs when one moves**, which is
+   the regression signal a "reported" arm used to swallow.  (Historical, for scale only: the IQ4_NL class read
+   0.027936 / 96.471 % at base PPL 1.7888 in the gate's own r156 record and 0.021542 / 95.814 % in gate 11's
+   r148 row -- different points, neither is a target.  The r148 row's "BF16-hc 449 chars `6a102dbc62d6`" is
+   the *chain* of that date; the chain now reads `d62340fbf566`, which is what #292 mistook for drift.)
+   Required for any change to `build_hc_mix`, `build_hc_combine`,
    `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (kernel, CPU reference or op definition) or a matcher that fuses
    either.  **Run it once per hc-down weight class** — Q8_0/BF16 `hc_attn_down` takes the fused mixer, any
    other quant takes the chain (`--types MODEL.gguf` prints the class).  The defect class it exists for only

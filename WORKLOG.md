@@ -1,3 +1,40 @@
+## 261108.012 (no release) -- `TODO` #292 closed: the dsv4 soft arms never drifted, a stale header line sent the chase after the re-base, and they are now sha-anchored
+
+**The premise was wrong, and one command pair settles it.**  `#292` said `gate-hc-fusions.sh`'s dsv4
+`LLAMA_FUSED_DSV4_HC_PRE/_POST` arms "reproduce r235's numerics, not the re-based chain's".  Run against the
+*shipped* binary as well as the re-based one (Flash-Next GSQ-IQ3_XXS, BF16-hc class, 3 devices `-sm layer`,
+96 tokens, prompt sha `18147e48a7f4`), the two builds produce the **same split**:
+
+| arm | r236 `8715156da` | shipped r235 `69d36099b` |
+|---|---|---|
+| `chain_chain` (reference) | 449 `d62340fbf566` | 449 **`d62340fbf566`** |
+| `mixed_comb` / `mixfused_comb` / `fused_fused` / `no_cuda_fuse` | `d62340fbf566` | `d62340fbf566` |
+| `dsv4_pre_chain`, `dsv4_post_op` (soft) | 449 `6a102dbc62d6` | 449 **`6a102dbc62d6`** |
+
+So nothing moved with the re-base.  The clause "`6a102dbc62d6` is what the chain produced at r235" came from the
+gate's r156 header line (`MANIFESTS.md` gate 11's r148 row has the same hash as *that date's* chain); the chain
+legitimately moved to `d62340fbf566` afterwards and the header was never updated.  A dated row read as current
+state — the same failure mode this file keeps recording.
+
+**Quantified, because the ops are a deliberate numeric re-baseline** (`gate-prefill-logits.sh --ab`, Flash-Next,
+wikitext 512 x 40, 3 devices `-sm layer`, base PPL 2.8489): fused pre op vs its own chain **mean KLD 0.013217 /
+same-top-p 96.392 %**, fused post op vs its chain **0.013198 / 96.186 %**.  The gate's r156 IQ4_NL reference for
+the same pair is 0.027936 / 96.471 % (base PPL 1.7888), i.e. the BF16-hc class sits *inside* the documented
+re-baseline band with a smaller KLD.  Both generations stay fluent and diverge from the first sentence, and each
+arm is deterministic per class across builds — which is what makes a text anchor a valid detector.
+
+**No kernel change: `hyperconn.cu` / `dsv4-hc.cu` are correct.**  What was wrong was the gate's *classification
+of the evidence*: the pair was only "reported", so a real numeric change in either op would have passed silently.
+`SOFT_EXPECT` now anchors each numeric arm to its own recorded text, per hc-down class (defaulted for the
+fused-mixer class to `dsv4_pre_chain=dsv4_post_op=6a102dbc62d6`, 449 chars; unset elsewhere so the IQ4_NL/Q5_K
+classes do not inherit it).  A numeric arm still is not byte-hard against the chain, but **if its sha moves the
+gate FAILs and names it** — negative-tested with a deliberately wrong anchor (arm named, exit **1**), and the
+recorded anchors pass.  The gate header's "byte-identity IS expected on the BF16-hc class" claim is gone, and
+`MANIFESTS.md` gate 7 now carries both classes' measured numbers, the anchor, and the two historical IQ4_NL
+figures with their provenance (they are different points; neither is a target).
+
+`TODO` #292 is retired by this entry.  Four pre-R17 rows remain: `#291`, `#293`, `#295` (+ R17).
+
 ## 261108.011 (no release) -- `TODO` #296/`D8` closed: the "host-expert prefill regression" is `llama-bench`'s random-token prompt, the real floor is the transport, and the gate gains a real-text arm
 
 **Two things had to be separated: a measurement artifact and a real transport cost.**  Taken the way `TODO` #296
