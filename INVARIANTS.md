@@ -3035,16 +3035,22 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   spent.  Check the ISA *before* benchmarking a codegen hypothesis; the same dump also gives the static instruction
   mix, which shows a "big" regression is usually four instructions and a scheduling change.
 - **`llama-bench`'s prompt has no routing locality, so it CANNOT measure the expert arena or the host-expert
-  transport (r236, `TODO` #296/#291).**  Its prompt is `std::rand() % n_vocab` (`tools/llama-bench/llama-bench.cpp`),
-  i.e. uniformly random token ids: every ubatch routes over all 256 experts of every layer.  On that shape the
-  arena is measurably **inert** — 35B-A3B Q8_0, 1 × R9700, `-ncmoe 48`, `-ub 512`, pp1450 = **414.1 / 414.5 /
-  414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto — while the same arm driven with the
-  shipped prose prompt reads **401.6 → 583.6 → 676.9 → 1063.6**.  The delivery looks −15…−18 % behind unpatched
-  upstream on the random shape and **+181 % ahead** on real text (1064 vs 379 t/s), and the arena's prefill is
-  838 t/s there against 1442 on real text.  Any A/B of the pool/arena/host transport must be driven with real
-  text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, now gate step 5b); `llama-bench` remains valid for
-  **build-vs-build** regressions (both sides see the same degenerate prompt) and for kernels whose cost does not
-  depend on routing.
+  transport (r236, `TODO` #296/#291) — and on a `-ncmoe` shape its pp arm measures NO CACHE AT ALL (r236 follow-up,
+  `TODO` #305).**  Its prompt is `std::rand() % n_vocab` (`tools/llama-bench/llama-bench.cpp`), i.e. uniformly random
+  token ids: every ubatch routes over all 256 experts of every layer.  **The `MOE_EXPERT_CACHE_MIB` sweep that was
+  read as "the arena is inert on that shape" (414.1 / 414.5 / 414.5 / 414.5 t/s at 0 / 4096 / 8192 / auto) is flat
+  because the arena never arms in a prefill-only run, not because residency cannot help:** the deferred sizing waits
+  for a `≤8`-token pass (which only a warmup provides) and the H2D staging ring stages the expert tables before the
+  host path can register them, so the run reports `tables=0`, `arena 0.0 MiB`, `prefill cache staging: nomatch=<N>`.
+  With the arena armed the same arm reads **1116-1202 t/s** against 438 unarmed and 529 for unpatched upstream
+  (`wip/prefill-arena-arm/`), and every ubatch it saves is a whole host-expert set that is not streamed
+  (`host_bytes / H2D GB/s` per ubatch — the `-ub` sweep is exactly that law).  What remains true of the original
+  entry: the random-token shape has no locality to exploit *within* one ubatch, so an A/B of the pool/arena/host
+  transport must still be driven with real text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, gate step 5b) —
+  on that shape the delivery is **+181 %** ahead of unpatched upstream (1064 vs 379 t/s) — and `llama-bench` remains
+  valid for **build-vs-build** regressions and for kernels whose cost does not depend on routing.  **Corollary for
+  any measurement:** a prefill-only tool (`llama-bench -p`, `llama-perplexity`, embeddings) must be given a narrow
+  pass first (or the `TODO` #305 candidate applied) before an arena/host-transport number from it means anything.
 - **`llama-batched-bench`'s npl=1 prefill row is a cold-first-pass artifact (r236; same trap as
   `archive/work/host-expert-eager-push/HANDOVER-R210.md` §3.1).**  Three identical npl=1 rows in one process read
   ours **0.824 / 0.207 / 0.197 s** (Flash-Next GSQ, 3 devices `-sm tensor`, 512-token prefill) and upstream
@@ -3086,3 +3092,34 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   **discarded warm-up round** (`WARMUP=1`).  (2) `gate-prefill-logits.sh` uses the variable `LOGDIR` for its own
   log dir and `rm -rf`s it on success, so an *exported* `LOGDIR` makes step 3 delete the orchestrator's log
   directory mid-run and every later step fails on missing logs; the orchestrator now does `export -n LOGDIR`.
+
+- **The expert arena must be armed from a ROUTING-FREE registration pre-pass, or a prefill-only workload never
+  has a cache at all (r237, `TODO` #305).**  Two gates used to conspire: the deferred sizing armed only on a
+  `≤8`-token pass (only a warmup provides one), and the H2D staging ring staged a host-weight split *before* the
+  input loop, so `moe_cache_update` — the only place a table registered, primed and sized — never ran.  The
+  signature is unmistakable and is now the first thing to look for: `MoE expert cache: h=0.0000 (0/0 reaches),
+  tables=0, slots=0, arena=0.0 MiB` plus `prefill cache staging: nomatch=<N>`.  Its cost is exactly the transport
+  law, not a policy loss: the whole host set per ubatch (`32 640 MiB / 28.7 GB/s = 1.11 s` on 35B-A3B Q8_0
+  `-ncmoe 48` `-ub 512`, i.e. the 438 t/s that was read as a delivery regression against upstream's 529).  The fix
+  is `moe_cache_register` (an iface hook, called for every split's routed host-expert inputs at the top of
+  `ggml_backend_sched_compute_splits` while `moe_cache_pending`) plus arming at registration; measured **438 ->
+  1209 t/s** (1 GPU), **799 -> 2457** (2 devices `-sm tensor`), with decode, real-text prefill and greedy text
+  inside noise/identical.  Feeds `TODO` #133 (the staged fill still assembles the whole table out of the arena).
+- **A `-sm tensor` table can only be discovered WITHOUT routing (r237).**  The Meta `moe_cache_update` declines
+  every `n_tok > band`, by design (reading the routing back on every prefill op is the sync the band exists to
+  avoid), so a prefill-only tensor-split run never observes its table set from the op path.  Any table-set
+  discovery must therefore be geometry-only (`moe_cache_register`, forwarded per device with that device's slice
+  geometry from the meta split state) — and the *gates* that depend on it (`moe_cache_pending`,
+  `moe_cache_stage_ready`) must be forwarded too, or the tensor split silently keeps the old behaviour.  Do NOT
+  forward a "still unarmed" query without the registration pre-pass behind it: it never clears, and it disables
+  the staging ring for the whole run (measured 356 vs 799 t/s).
+- **`mlock` a multi-GiB lazy table and let the expert arena auto-size, and the two fight for the model mapping
+  (r237).**  An unevictable 26.8 GiB PLE table leaves the mmap'd weights as the only reclaimable memory, so the
+  host-expert misses intermittently come from disk: on Flash-Next GSQ-RCO-IQ3_S, 2 devices `-sm tensor -ncmoe 48`
+  `-p 512`, `MemAvailable` bottomed at **1.0 GiB** with 76.1 GiB resident and one rep read **13 t/s** against
+  1278 for its neighbours, and the 1-device real-text prefill read 492-505 t/s.  `--lazy-mode mlockr` runs the
+  same populate and then **munlocks** (nothing is dropped; the pages are just reclaimable again): **1250-1286
+  t/s** flat on the 2-device arm, **747-781 t/s** on the 1-device real-text prefill (+54 % over `mlock`, 3.5x
+  `--lazy-mode off`, which keeps the table in anonymous RAM instead).  So "pin it" is the wrong default for a
+  table that is only *read*: populate, then release.  (On this box a settled box is not enough to make `mlock`
+  safe — the flap reproduces with 30-60 s between runs and `Dirty`/`Writeback` at 0.)

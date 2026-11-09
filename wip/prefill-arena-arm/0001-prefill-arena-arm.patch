@@ -1,0 +1,254 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 73a543b86..945d3dd25 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -330,6 +330,26 @@ extern "C" {
+         // event per copy no wait is ever re-bound.  APPENDED at the very end, so the other backends' positional
+         // initializers stay valid (NULL); a backend that does not implement it keeps `cpy_tensor_async`.
+         bool (*cpy_tensor_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_event_t ev);
++
++        // MoE expert cache: TRUE while the cache is ENABLED on this backend, host expert tables are
++        // expected on it, and the arena has not armed yet.  The scheduler keeps a routed host-expert table
++        // OFF the staging ring while this is true, so the cache gets to observe the table set (register,
++        // prime, latch the deferred sizing) instead of the ring's whole-table upload hiding it -- the ring
++        // never calls the cache, so a workload whose FIRST pass is wide (llama-bench `-p`,
++        // llama-perplexity, the embedding tools: no <=8-token warmup) otherwise never arms the arena and
++        // streams the whole host expert set over the link on every ubatch (measured 35B-A3B Q8_0,
++        // `-ncmoe 48`, 1 GPU, `-ub 512`: 438 t/s against 1116 with the arena armed).  NULL, or false for a
++        // device with no host expert tables (dense models, `-ncmoe 0`), leaves staging untouched.
++        // APPENDED at the very end, so the other backends' positional initializers stay valid (NULL).
++        bool (*moe_cache_pending)(ggml_backend_t backend);
++
++        // MoE expert cache: can the cache fill THIS routed host-expert `weight` from the arena right now
++        // (sized, and the table has slots)?  The scheduler stages a routed host-expert table only when the
++        // answer is true: a table the cache cannot serve is left to the plain whole-table upload, which is
++        // faster than a ring round-trip that gains nothing (measured 2658 vs 3446 t/s on a small mid-prefill
++        // arena at `-ub 4096`, against 1195 vs 580 at `-ub 512` with a properly sized one).  A dense host
++        // weight is never asked.  NULL = no opinion (stage as before).  APPENDED at the very end.
++        bool (*moe_cache_stage_ready)(ggml_backend_t backend, const struct ggml_tensor * weight);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 122dc3d4e..4f9d6f568 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -24,6 +24,7 @@
+ #include <string>
+ #include <vector>
+ 
++
+ // getenv() is cheap on Linux but takes a lock and rescans the environment block on Windows.  These
+ // debug / A-B gates sit on per-graph and per-split paths, so resolve each one once per call site:
+ // the static inside the immediately-invoked lambda is unique to each macro expansion.
+@@ -2954,6 +2955,27 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         sched_stage_batch_tokens(split) < sched_stage_min_tokens_for(sched, split)) {
+         return;
+     }
++    // MoE expert cache: let the cache arm itself before a routed host-expert table is staged.  The ring's
++    // whole-table upload never calls the cache, so a workload whose FIRST pass is wide (llama-bench `-p`,
++    // llama-perplexity, the embedding tools: no <=8-token warmup) never registers, primes or sizes the
++    // cache at all -- `prefill cache staging: nomatch=<N>` and `tables=0` -- and an `-ncmoe` prefill then
++    // streams the ENTIRE host expert set over the link on every ubatch (measured 35B-A3B Q8_0,
++    // `-ncmoe 48`, 1 GPU, `-ub 512`: 438 t/s, against 1116 once the arena is armed and the staging reads
++    // `1 - residency` of the bytes).  While the backend reports a not-yet-armed cache with host expert
++    // tables expected, leave these inputs on the host path: that path registers/primes them and latches
++    // the deferred sizing, and the NEXT pass stages from the arena.  A warmup-first workload (server, cli)
++    // is armed by its warmup, so this never fires there; a device with no host experts never reports it.
++    {
++        ggml_backend_t split_backend = sched->backends[split->backend_id];
++        if (split_backend->iface.moe_cache_pending != NULL && split_backend->iface.moe_cache_pending(split_backend)) {
++            for (int i = 0; i < split->n_inputs; i++) {
++                const struct ggml_tensor * in = split->inputs[i];
++                if (in != NULL && in->ne[2] >= 2 && sched_stage_is_host_weight(in)) {
++                    return;
++                }
++            }
++        }
++    }
+     // A large expert table is always gathered (see `sched_input_gatherable`), so it must not be
+     // staged above the width gate either: skip the ring/meta hand-off and let the input loop gather.
+     for (int i = 0; i < split->n_inputs; i++) {
+@@ -2988,6 +3010,20 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+     if (n_host_inputs == 0 || n_host_inputs > sched->stage_n_slots) {
+         return;
+     }
++    // MoE expert cache: stage a routed host-expert table only when the cache can actually fill it from the
++    // arena.  A ring round-trip that gains nothing still pays a slot plus the slot -> input D2D, and the
++    // plain whole-table upload straight into the input is faster (measured 3446 vs 2658 t/s on a small
++    // mid-prefill arena at `-ub 4096`).  A dense host weight is never asked, and a pool-backed table was
++    // already routed to the gather above.
++    if (backend->iface.moe_cache_stage_ready != NULL) {
++        for (int i = 0; i < split->n_inputs; i++) {
++            const struct ggml_tensor * in = split->inputs[i];
++            if (in != NULL && in->ne[2] >= 2 && sched_stage_is_host_weight(in) &&
++                !backend->iface.moe_cache_stage_ready(backend, in)) {
++                return;
++            }
++        }
++    }
+     if (backend->iface.stage_buffer == NULL) {
+         return;
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index 7623cb2d3..38aab7d60 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -242,6 +242,16 @@ bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_te
+ }
+ 
+ // B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
++bool ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const struct ggml_tensor * weight) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return moe_cache_stage_ready(weight, cuda_ctx->device);
++}
++
++bool ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return moe_cache_pending(cuda_ctx->device);
++}
++
+ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+     const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
+     return moe_cache_max_tok_dev(cuda_ctx->device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index 310a748ca..f04e945b4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -19,6 +19,8 @@ float  ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend);
+ bool   ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
+ bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy);
+ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
++bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
++bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
+ bool   ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis);
+ bool   ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only);
+ size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index dce704a0b..5d1e9b140 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9039,6 +9039,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
+     /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
+     /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
++    /* .moe_cache_pending      = */ ggml_backend_cuda_moe_cache_pending,
++    /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 8bc727c72..2aa70ecbc 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -6616,6 +6616,24 @@ bool moe_cache_has_arena() {
+ }
+ 
+ 
++// Prefill-first workloads never armed the arena: llama-bench `-p`, llama-perplexity and the embedding
++// tools have no <=8-token warmup pass, the deferred sizing is gated on one, and the staging ring takes a
++// host-expert table away from the cache entirely (the ring's whole-table upload never calls the cache, so
++// the table set is never even observed).  The scheduler asks this while deciding whether to stage a routed
++// host-expert table: TRUE means "leave it on the host path for now, the cache must register, prime and
++// size on this table set first".  It answers false for a device that expects no host expert tables (a
++// dense model, `-ncmoe 0`), so the ring is untouched there.
++bool moe_cache_pending(int device) {
++    if (!g_enabled) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !g_preflight_device_seen[device]) {
++        return false;
++    }
++    return !g_sized;
++}
++
+ // wip/slab-ring-region: has the deferred arena sizing run?  The slab's H2D-ring hole must stay ARMED
+ // through sizing (so the auto-sized arena never allocates its highest tables into the hole); a disarm
+ // before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer.
+@@ -6833,6 +6851,35 @@ bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device) {
+     return false;
+ }
+ 
++// Can the cache serve THIS routed host-expert table from the arena right now (sized + the table has slots)?
++// The scheduler picks the transport with it: a table the cache cannot serve is left to the plain
++// whole-table upload, because a ring round-trip that gains nothing still pays a ring slot + the
++// slot -> input D2D.  Measured (35B-A3B Q8_0, `-ncmoe 48`, 1 GPU, `-p 4096`): a small mid-prefill arena
++// staged 2658 t/s against 3446 for the plain upload, while a properly sized arena staged 1195 against
++// 580 at `-ub 512`.
++bool moe_cache_stage_ready(const struct ggml_tensor * weight, int device) {
++    // TRUE means "staging this table is fine" -- including the case where the cache has no opinion at all
++    // (disabled, or this device expects no host expert tables), so the ring behaves exactly as it did
++    // before this query existed.  FALSE is the only case that changes the transport: the cache IS managing
++    // host experts here and cannot fill this table from the arena, so a ring slot would buy nothing.
++    if (weight == nullptr || device < 0 || !g_enabled) {
++        return true;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (device >= GGML_CUDA_MAX_DEVICES || !g_preflight_device_seen[device]) {
++        return true;
++    }
++    if (!g_sized) {
++        return false;
++    }
++    for (const table_t & t : g_tables) {
++        if (t.device == device && t.host == (const void *) weight->data) {
++            return t.arena != nullptr && t.slots > 0;
++        }
++    }
++    return false;
++}
++
+ bool moe_cache_has_tables() {
+     if (!g_enabled) {
+         return false;
+@@ -8562,7 +8609,27 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+             // re-sights one, so the sizing check below is unreachable and the first real decode pays the
+             // whole seed.  Also evaluate the deferred sizing here; `alloc_all_locked`'s completeness gate
+             // is what prevents latching on a partial set, so this is safe to call on every priming.
+-            if (g_size_at_prime && !g_sized && n_tok <= 8) {
++            // r237: arm on the first pass that COMPLETES the table set, at ANY width.  The `n_tok <= 8`
++            // condition here was the reason a prefill-only workload (llama-bench `-p`, llama-perplexity,
++            // the embedding tools: no warmup pass) never armed the arena for its whole lifetime, so every
++            // ubatch of an `-ncmoe` prefill streamed the ENTIRE host expert set over the link (measured
++            // 35B-A3B Q8_0, `-ncmoe 48`, 1 GPU, `-ub 512`: 438 t/s against 1116 with the arena armed).
++            // A narrow first pass arms it exactly as before, so a warmup-first workload (llama-server,
++            // llama-cli) is unchanged.  The OPEN 2 boundary caveat still applies: mid-prefill the WIDE
++            // work layout is live, so the arena sizes a few GiB smaller than it would after the drop; that
++            // is printed once (it is still strictly better than no arena at all).
++            if (g_size_at_prime && !g_sized) {
++                if (n_tok > 8) {
++                    static bool warned = false;
++                    if (!warned) {
++                        warned = true;
++                        GGML_LOG_WARN("%s: arming the arena on a %lld-token pass (no narrow warmup has "
++                                      "primed the sizing): the wide prefill work layout is live, so the "
++                                      "arena sizes below its steady-state capacity.  Harmless for a "
++                                      "prefill-only workload; a server should warm up first.\n",
++                                      __func__, (long long) n_tok);
++                    }
++                }
+                 g_alloc_priming = true;
+                 alloc_all_locked();
+                 g_alloc_priming = false;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 8cddb0a91..7ed05228a 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -195,6 +195,16 @@ bool moe_cache_has_arena();
+ // tensor the fused call site would redirect (the scheduler's copy or the original).
+ bool moe_cache_table_serves(const struct ggml_tensor * op, const struct ggml_tensor * weight, int device);
+ 
++// Can THIS routed host-expert table be filled from the arena right now (the cache is sized and the table
++// has slots)?  The scheduler uses it to choose the transport for a pinned master (see the definition).
++bool moe_cache_stage_ready(const struct ggml_tensor * weight, int device);
++
++// The cache is enabled, this device expects host expert tables, and the arena has NOT armed yet: the
++// scheduler keeps a routed host-expert table on the host path (off the staging ring) while this is true, so
++// the cache can observe/register/prime its table set and latch the deferred sizing.  See the comment at the
++// definition for the measurement that makes this necessary (a prefill-only workload never warmed up).
++bool moe_cache_pending(int device);
++
+ // wip/slab-ring-region: the deferred arena sizing has run.  The slab's H2D-ring hole must stay ARMED
+ // through sizing, so the auto-sized arena never allocates its highest tables into the hole (a disarm
+ // before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer).

@@ -1,3 +1,138 @@
+## 261109.001 (r237, RELEASE v16-a691b2345-r237) -- the prefill arena arming fix + `--lazy-mode mlockr`, gated 10/10 and re-cut
+
+**What shipped.**  `v16-a691b2345-r237`: the same 16 blocks on the same fork point (**`a691b2345`**), with two
+changes folded (block 00 and block 12, `patches/README.md` carries the mapping).  `release.json`:
+`base=a691b2345`, `base_tree=9d7b9a02f`, `tip=f978dcb82325464ec323395fad792c2df88fac21` (the fork branch's re-cut commit; the working chain's tip
+`7193e0829` has the same tree and is never the recorded value),
+`tree=d41c4939d28798c4ea998082597c8410039e8f4e`, 16 blocks, all 17 artifact hashes refreshed.  This entry
+supersedes the closing paragraph of 261108.017 (which recorded the fix as a `wip/` candidate with nothing
+promoted).
+
+1. **The expert arena now arms before the first ubatch, so a prefill-only run is not uncached anymore
+   (`TODO` #305, closed).**  261108.017 found the `-ncmoe` + `llama-bench` "regression" was `tables=0`: the
+   deferred sizing waited for a `<=8`-token pass and the staging ring staged the expert tables before the host
+   path could register them.  The fix: `moe_cache_register` (geometry-only iface hook, no routing) called for
+   every split's routed host-expert inputs at the top of `ggml_backend_sched_compute_splits` while
+   `moe_cache_pending`; the arena arms the moment the expected table set is complete; and a second hook
+   `moe_cache_stage_ready` refuses to stage a table the cache cannot fill (no ring round-trip for nothing).
+   The Meta backend forwards both per device with that device's slice geometry, which is what makes
+   `-sm tensor` work — its update hook declines every prefill width by design, so a tensor split had never armed
+   the arena at all.
+2. **`--lazy-mode mlockr` (block 00).**  `mlock` pins a multi-GiB lazy table for the whole run, and a full auto
+   arena then leaves the model mapping as the only reclaimable memory.  `mlockr` runs the same populate and then
+   **munlocks**: nothing is dropped, the pages stay hot in the page cache and become reclaimable again.
+
+**What the fix is worth** (35B-A3B Q8_0, `-ncmoe 48`, `-ub 512`, 1 GPU unless stated; shipped r236 -> r237):
+
+| arm | r236 | r237 | |
+|---|---:|---:|---|
+| `llama-bench -p 512 -n 0` (`-r 5`) | 438.5 | **1198** | +173 % (upstream `a691b2345`: 529) |
+| the same with `-r 1` (no warm pass at all) | 438 | **1192** | the arena arms at registration, before ubatch 1 |
+| `-p 4096` at `-ub` 512 / 1024 / 2048 | 439 / 877 / 1742 | **1191 / 1857 / 2655** | +171 / +112 / +52 % |
+| 2 devices `-sm layer` | 454 | **1438** | +217 % |
+| 2 devices `-sm tensor` (4 runs, 30 s apart) | 798.6 | **2458 / 2455 / 2408 / 2337** | **+208 %, new capability** |
+| `MOE_EXPERT_CACHE_MIB=0` (cache-off contract) | 437.1 | 437.6 | unchanged |
+| Flash-Next GSQ-RCO-IQ3_S `-lzm mlockr`, 2 devices tensor, pp512 | 494.8 | **1245-1280** | +155 % |
+| Flash-Next `-lzm mlockr`, 1 device, real-text prefill | 492-505 (`mlock`) | **747-781** | +54 % over `mlock`; `-lzm off` is 216 |
+
+**Neutral where the delivery lives** (r237 vs r236, interleaved): `tg128` 83.58 vs 82.98; real-text prefill
+-**0.24 %** ((-0.03 / -0.28 / -0.41), the release gate's step 5b); 35B greedy text identical on `-sm layer` and
+`-sm tensor` (`139 chars e2dde701fc04`); 4B anchor `1c5d32ac537d`; dense 27B `+0.05 %`.
+
+**The `mlock` trap, measured so it is not re-derived** (261108.017 had it as "run-to-run variance"; it is not):
+Flash-Next 2 devices `-sm tensor -ncmoe 48 -p 512` with the pin **held** sampled `MemAvailable` bottoming at
+**1.0 GiB** with `VmRSS` 76.1 GiB and one rep reading **13 t/s** against 1278 for its neighbours; the 1-device
+real-text prefill read 492-505.  It reproduces with 30 s and with 60 s + `sync` between runs, `Dirty`/`Writeback`
+at 0, and `MemAvailable` ~78 GiB before each run — so it is **memory overcommit** (an unevictable 26.8 GiB PLE
+table beside a ~43.7 GiB auto arena on a 91 GiB box), not the 10-15 s the kernel takes to release mlocked pages
+after a process exits.  `mlockr` is the mode for that shape.
+
+**Gates.**  `scripts/gate-per-block-build.sh --fast`: **16/16 built, 0 failed** (541 s).  `validate-set.sh`:
+checksums OK, strict `git am` of the 16 patches from a fresh `a691b2345` tarball, applied tree `d41c4939d` = 
+`release.json.tree`, no conflict markers, Windows portability scan 287 files clean.
+`scripts/gate-rebase-release.sh` (against `build-rocm-r236`, the shipped r236 tree) — **10 passed, 0 failed,
+RELEASABLE**: prefill-logit KLD PASS; ops `MUL_MAT_ID` 947/947 and `MUL_MAT` 2517/2517; coherence text
+`1c5d32ac537d`; the multi-slot DFlash **server arms** 3/3 with acceptance and texts as anchored
+(`fn24`/`fn10` 0.74359/0.72269, `35b10` 0.59124/0.44720); real-text prefill **-0.24 %** (tol -3.0); perf
+dense-27B **+0.05 %**, moe-35B-prefill **+0.04 %**, moe-35B-decode **+0.10 %** (tol -1.0, spreads <= 0.19);
+GPU faults: none in the run's own window.  Two extra gates for paths the release gate does not cover: a
+2-device `-sm tensor -ncmoe 48` greedy run is text-identical to r236 (`e2dde701fc04`, the new registration path
+changes no numerics on a tensor split), and `scripts/gate-host-pool.sh` — **42/42 checks passed, GATE PASSED**:
+the seven pool arms keep their recorded texts (`a99ccbd97ecb` wholesale, and the documented `pinlate` WARN arm
+`b981e742aa13`), `takeover=0` under the fill faults, and the kernel-journal scan clean over the gate's own window,
+so the scheduler changes leave the pool tier exactly where it was.
+
+**Caveats carried, not hidden.**  (a) For a prefill-first workload the arena now sizes against the wide work
+layout, so it comes out a few GiB below its steady-state capacity (OPEN 2's boundary caveat).  That is strictly
+better than no arena, and a warmup-first workload (`llama-server`, `llama-cli`) is bit-for-bit unchanged because
+its 2-token warmup arms it at the narrow boundary — measured, not assumed.  A post-drop re-size is the clean
+follow-up and is not in this release.  (b) The staged fill still assembles the WHOLE table out of the arena on
+every ubatch, so the arm is ~1/3 of the physical bound at high residency: that is `TODO` #133's re-copy (serve
+resident experts in place), the next campaign, and `wip/expert-transfer-engine/`'s "one transport".  (c) Nothing
+is default-off here: the arena fix is on, `mlockr` is a mode the user selects (no new environment variable, so
+no `ENVIRONMENT.md` row).  Records: `benchmarks/2026-11-08-prefill-arena-arm.md` (§5), `wip/prefill-arena-arm/`
+(the campaign README + the pre-fold candidate patch), `INVARIANTS.md` (three entries appended), `TODO` #305
+retired.
+
+## 261108.017 (no release) -- the `-ncmoe` + `llama-bench` "regression" is the expert arena never arming in a prefill-only run: +173 % from a 148-line candidate (`TODO` #305)
+
+**The number that was left over from the re-base, explained.**  R17 shipped with one arm still reading badly and
+unattributed: `llama-bench`'s pp arm on a `-ncmoe` shape was **−15…−18 %** against unpatched upstream, and `TODO` #296
+closed it as "`llama-bench`'s prompt has no routing locality, so the arena is inert".  The arena is not inert — **it is
+never armed**, and the difference is not a policy question but a whole cache that does not exist in the process.  On
+the failing arm (`35B-A3B Q8_0`, `-ncmoe 48`, 1 × R9700, `-fa 1 -t 8`, `-ub 512`):
+
+```
+report_locked: prefill cache staging: ok=0 geom_decline=0 unusable=0 nomatch=234 unsized=0; arena=0.0 MiB host=0.0 MiB
+report_locked: MoE expert cache: h=0.0000 (0/0 reaches), tables=0, slots=0, arena=0.0 MiB total
+```
+
+`tables=0`.  Two independent gates do it: (a) the deferred sizing arms only on a **≤8-token** pass (r74's priming
+sizing, the "OPEN 2" narrow-boundary rule), and a prefill-only tool has no such pass — every `llama-server`/`llama-cli`
+run has a 2-token warmup, which is why the field path never showed this; (b) the H2D **staging ring** stages a
+host-weight split *before* the input loop, so `moe_cache_update` (the only place a table registers, primes and sizes)
+never runs, and the void-returning staging hook cannot register a table itself.  With no arena, every ubatch streams
+the whole host expert set: 32 640 MiB at the box's calibrated **28.7 GB/s** = **1.11 s per ubatch**, against the
+1.17 s/ubatch the arm actually reads.  The `-ub` sweep is that law exactly (439 / 877 / 1742 t/s at `-ub` 512/1024/2048).
+
+**Arming it is the whole win.**  Same arm, arena armed (a single 8-token row first, `-p 8,512`): **1116-1162 t/s**.
+A 148-line candidate (`wip/prefill-arena-arm/0001-prefill-arena-arm.patch`, 7 files) makes that automatic — two new
+`ggml_backend_i` queries (`moe_cache_pending`: enabled + host experts expected on this device + not armed ⇒ the
+scheduler leaves a routed host-expert table on the host path so the cache can observe its table set;
+`moe_cache_stage_ready`: sized + THIS table has slots ⇒ stage, otherwise take the plain upload instead of a pointless
+ring round-trip) plus `moe_cache_update`'s priming-time sizing no longer requiring `n_tok <= 8`.
+
+| arm (35B-A3B Q8_0, `-ncmoe 48`, 1 GPU) | shipped r236 | unpatched upstream | candidate |
+|---|---:|---:|---:|
+| `llama-bench -p 512 -n 0 -ub 512` (`-r 5`, 6 runs) | **438.5** | 529 (517-533) | **1183-1204** (+173 % / +126 %) |
+| `-p 4096`, `-ub 512` / 1024 / 2048 / 4096 | 439 / 877 / 1742 / 1742 | — | 1191 / 1857 / 2655 / 2648 |
+| `-ncmoe` 12 / 24 / 48 (pp512) | — | 1185 / 756 / 536 | 1187 / 1143 / 1192 |
+| 2 devices `-sm layer` / `-sm tensor` | 454 / 799 | — | 1350 (+197 %) / 799 (unchanged) |
+| Flash-Next GSQ-RCO-IQ3_S `-lzm mlock`, `-ub 1024`, pp512 / tg64 | 296 / 45.3 | — | 388 (+31 %) / 44.6 (−1.6 %, inside ±7-8) |
+
+**Neutral where the delivery actually lives** (the whole point of the exercise): decode `tg128` **82.94 vs 82.98**;
+real-text prefill (shipped 5256-token prose, `-ub 512`) **1428 t/s `auto` / 999 `pinned`**, against **1423 / 999**
+before; the 35B greedy text is identical on both builds and both tiers (`139 chars e2dde701fc04`); the 4B coherence
+anchor is `1c5d32ac537d`.  `MOE_EXPERT_CACHE_MIB=0` and `GGML_SCHED_STAGE=0` each restore the r236 behaviour exactly
+(the cache-off arm reads 1739 vs the shipped 1741 at `-ub 4096`).  No new environment variable.
+
+**Two traps paid for, both recorded in the campaign README §5:** forwarding the new queries through the `-sm tensor`
+Meta backend is *unsound* (its update hook declines every prefill width, so "pending" would never clear and the ring
+would stay off for the whole run — measured **356 vs 799 t/s**), and a residency-threshold gate is the wrong axis (a
+73 %-resident arena still wins 2× at `-ub 512`; the `-ub 4096` cell that motivated the threshold was a stale number
+from another invocation — the shipped binary reads 1741 there, not 3446).
+
+Records: `benchmarks/2026-11-08-prefill-arena-arm.md` (every arm, the census, and the four traps),
+`wip/prefill-arena-arm/` (the campaign README + the candidate patch), `TODO` #305, and the r236 arena entry in
+`INVARIANTS.md` corrected in place (it said "the arena is inert on the random-token prompt"; it never armed).
+
+**What this does not fix, and the next three steps** (`TODO` #305): `-sm tensor` needs registration at graph build;
+the mid-prefill sizing should be re-run after the compute-buffer drop (a warmup-less server would latch the wide-layout
+arena); and the arm is still only ~1/3 of the physical bound because the staged fill assembles the **whole** table out
+of the arena on every ubatch — `TODO` #133's re-copy, i.e. the cache-aware prefill and the "one transport" direction of
+`wip/expert-transfer-engine/`.  Nothing was promoted: `release.json`, `patches/` and the shipped tree are untouched,
+the candidate lives only in `wip/prefill-arena-arm/`.
+
 ## 261108.016 (r236, RELEASE v16-a691b2345-r236) -- the re-base lands: 16 blocks re-cut onto `a691b2345`, full gate 13/14 with the one permitted red attributed, fork refreshed
 
 **The release.** `v16-a691b2345-r236` — the 16-block V2.1 set re-based from `6050b467c` (2026-10-25) onto

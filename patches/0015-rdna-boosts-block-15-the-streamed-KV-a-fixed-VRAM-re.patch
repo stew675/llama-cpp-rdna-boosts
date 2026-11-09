@@ -1,4 +1,4 @@
-From 5922a9ebdbc04a0851a1f6859602e42286737a01 Mon Sep 17 00:00:00 2001
+From 7193e08296302221d61bb77b9266d8e46b3756fb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -922,7 +922,7 @@ index 3cc9cfd93..5815706ac 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 3c5349a5f..83b35081a 100644
+index 3a27d8b93..5def78a35 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -2708,7 +2708,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6aed8b994..dce704a0b 100644
+index 954806caf..0bbcf5a8e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,6 +30,7 @@
@@ -4385,7 +4385,7 @@ index 6aed8b994..dce704a0b 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -8378,6 +9799,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8381,6 +9802,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -4400,7 +4400,7 @@ index 6aed8b994..dce704a0b 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -8407,7 +9836,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8410,7 +9839,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -4410,7 +4410,7 @@ index 6aed8b994..dce704a0b 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -8836,8 +10266,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -8839,8 +10269,60 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -4471,7 +4471,7 @@ index 6aed8b994..dce704a0b 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -8954,6 +10436,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8957,6 +10439,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -5006,7 +5006,7 @@ index 2c32cf2f8..79a23e5fb 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 0b0524db6..8bc727c72 100644
+index b3c19d267..e2ecc287e 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -5085,7 +5085,7 @@ index 0b0524db6..8bc727c72 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -7841,7 +7862,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -7888,7 +7909,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {
@@ -6838,7 +6838,7 @@ index 37d01ed11..61f13f61b 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 21d23f80b..afc509aac 100644
+index ded951113..e138bbfa1 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,168 +53,566 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -8278,7 +8278,7 @@ index 21d23f80b..afc509aac 100644
      }
  
      if (param_overrides_p != nullptr) {
-@@ -1868,7 +1895,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1891,7 +1918,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
                  tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
                  tn.bid <  (int) hparams.n_layer()) {
@@ -8289,7 +8289,7 @@ index 21d23f80b..afc509aac 100644
                  fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
                  fflush(stderr);
              }
-@@ -1912,6 +1941,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1935,6 +1964,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                          });
                          continue;
                      }
@@ -8307,7 +8307,7 @@ index 21d23f80b..afc509aac 100644
                      if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                          // Host-resident MoE experts: a device's host buffer type carries that device, and
                          // the scheduler places the consumers of its tensors there.  Picking the device-0
-@@ -2155,7 +2195,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -2178,7 +2218,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
  // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
  // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
  static bool llama_load_release_mmap() {

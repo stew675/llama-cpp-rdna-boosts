@@ -1,4 +1,4 @@
-From da64a9635dd71a77c5e16dfb479ba9d47ee20123 Mon Sep 17 00:00:00 2001
+From d65398b40a5db46a9adcac5c8ba49e12f4564a86 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -130,7 +130,7 @@ header says byte-identity IS expected on this class -- the soft-arm expectation 
  create mode 100644 tests/test-lazy-reader.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 4ae4140a3..a10d311e5 100644
+index 11a7f31ce..2b885af17 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2747,7 +2747,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -10290,7 +10290,7 @@ index 479065dac..4048d27f5 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index ccb672c6d..59209eaf6 100644
+index 8369b51ca..137fee566 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -16,17 +16,35 @@
@@ -10362,7 +10362,7 @@ index ccb672c6d..59209eaf6 100644
  ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
      if (dev == nullptr) {
          return nullptr;
-@@ -1631,6 +1629,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
+@@ -1654,6 +1652,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
              __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
  }
  
@@ -10377,7 +10377,7 @@ index ccb672c6d..59209eaf6 100644
  // wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
  // fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
  // layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
-@@ -1758,9 +1764,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1781,9 +1787,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -10391,7 +10391,7 @@ index ccb672c6d..59209eaf6 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -2024,10 +2032,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2047,10 +2055,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -10405,7 +10405,7 @@ index ccb672c6d..59209eaf6 100644
          const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
          is_lazy = lazy.add(tn.str(), cur, w);
  
-@@ -2611,8 +2619,10 @@ bool llama_model_loader::load_all_data(
+@@ -2634,8 +2642,10 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
