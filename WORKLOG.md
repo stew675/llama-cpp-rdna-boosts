@@ -1,3 +1,52 @@
+## 261109.009 (wip) -- `wip/apu-expert-pool` opened: the host-expert / expert-arena tier is hard-gated off on UMA APUs, and the measurements say the reasons for the gate are a *sizing* defect plus an unexplained fault, not a limit
+
+**Scoping note + a completed measurement foundation, nothing implemented** (no `patches/` change, nothing
+applied to the fork, no `TODO` opened -- the open decisions are `wip/apu-expert-pool/README.md` §7).  The tree
+was pulled to r243 before writing, and every file the plan cites is unchanged by r243 (that release touched only
+`src/models/qwen4exp.cpp`).
+
+**The gate, in three places.**  `src/llama-model-loader.cpp:130` (`set_host_experts_umem`, reached from the
+`IGPU` scan in `src/llama-model.cpp`) zeroes `n_cpu_moe_from_end`, so `-ncmoe`/`-cmoe`/`-lme` and a CPU
+`*_exps.*` override are **ignored**; `ggml/src/ggml-cuda/moe-expert-cache.cu:5604`/`:5622`
+(`moe_cache_shared_pool_device`/`moe_cache_preflight`) turns the **whole cache stack** off; `common/fit.cpp`
+refuses the reserve to match.  It was put there for two real reasons: AUTO arena sizing from "free VRAM"
+over-committed a 123 GiB box (121 GiB resident + 13 GiB swap, `SLAB_INIT size(VA)=98.44 GiB`, 2026-10-19), and
+`-ncmoe 24`/`48` on gfx1151 faulted in `mul_mat_q<Q2_0,16>` at a host address.  The thesis is that the first is
+a **sizing** guard that must stay and the second has **no established root cause** -- P1.0 in the plan
+separates (a) the host-expert buft's `Portable|ReadOnly` registration without `Mapped` (`ggml-cuda.cu:9178`,
+r215 §4's documented mode), (b) a pageable pointer reaching the GPU, (c) a real unpin -- before any code
+changes, because the answer decides whether this is a campaign or a one-liner.
+
+**The measured foundation** (`halo`, gfx1151, 123 GiB, kernel 7.2.13, ROCm 10.1.0; ten probe programs, all
+re-runnable, none needs root).  gfx1151 has **no `xnack` target at all** (`hipcc --offload-arch=gfx1151:xnack+`
+-> `invalid target ID`; `gfx90a:xnack+`/`gfx942:xnack+` accepted), an unregistered page-cache mapping faults
+fatally **even when fully hot** (`Reason: Page not present or supervisor privilege`, exit 134) and `HSA_XNACK=1`
+is inert with `PageableMemoryAccess=0`.  Its "VRAM" is host RAM: `mem_info_vram_total` **2 GiB**, `gtt_total`
+**130 GB**, HIP `totalGlobalMem` **121.1 GiB**, `Memory Properties: APU`.  A **GTT allocation is host-writable**
+(host `memset` 13.5 GB/s, GPU sees it FRESH) so an eviction can move no data; fills are **31.5 GB/s cold /
+77.1 GB/s warm** over `hipMemcpy` (host `memcpy` 12.8; `O_DIRECT` into GTT is `EINVAL`); GPU reads are
+untiered (`hipMalloc` **232.6** GB/s, registered-RO page cache **230.5**) **except** that a registered
+**writable** range reads at **60.2** GB/s -- which is the arm the shipped pool is in, because it registers
+`Portable|Mapped`.  Registration pins: a control 4 GiB mapping reclaims 4096/4096 MiB, the registered one holds
+4096/4096 and keeps holding after `hipHostUnregister` while the VMA lives (46 GiB shard: 8.69 s to register,
+11.9M pages held).  Two traps recorded: `MADV_DONTNEED` on a registered region the GPU is reading returns
+**zeros with no fault** (silent weight corruption), and dirty anon pool pages cost nothing to discard
+(`pswpout=0`/`pgpgout=0` for 4 GiB in 0.26 ms) but would be swapped if the kernel's reclaim owned them.
+
+**The plan** (`wip/apu-expert-pool/IMPLEMENTATION.md`): **P0.5** read-only registration for the pool's device
+alias (`MOE_HOST_POOL_RO`, default on) -- the 60->233 GB/s fix, which the PCIe link masks on a discrete box and
+which therefore needs an A/B on both; **P1.0** root-cause the fault; **P1** enable `--host-experts pool` on
+`IGPU` -- the mechanism already ships for discrete as the `ROCm_HostMap` buft (`ggml-cuda.cu:4970`,
+`wip/host-expert-master-drop`, `TODO` #55: mapping master + bounded pinned pool, written to make a set larger
+than RAM runnable), so on UMA only the gate stops it; **P2** the UMA arena as the disk-backed cache (RAM-budget
+sizing, a slab that cannot map the machine, fills straight into the slot, **no copy-out on eviction**, optional
+soft-evict via the existing `g_prov_evict` state); **P3** one budget for pool+arena+context; **P4** optional
+policy unification.  Gate: `scripts/gate-uma-arena.sh`, 8 arms, text hashed with **no `-lv`**, censuses at
+`-lv 4`.
+
+**Records:** `wip/apu-expert-pool/` (`README.md`, `IMPLEMENTATION.md`, `MEASUREMENTS.md`, `probe/` -- ten
+HIP programs, all verified to build on ROCm 10.1) and its `wip/CAMPAIGNS.md` row.
+
 ## 261109.008 (r243, RELEASE v16-a691b2345-r243) -- contributor PR #289: the qwen4exp host PLE gather writes the graph input in place and fans out over `--threads`, +1.3 % prefill on the `-ub 4096` arm (and neutral at `-ub 6144`)
 
 **Release `v16-a691b2345-r243`.**  Base `a691b2345`, 16 blocks, canonical tip
