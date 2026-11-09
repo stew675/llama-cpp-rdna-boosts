@@ -454,10 +454,15 @@ in CI.  The model-level gates are manual:
    launch: this is the assertion that catches a dropped or renumbered dep, which is silent -- the text
    stays correct because the guard falls back), the fused and `GGML_CUDA_DISABLE_NORM_ROWS=1` arms are
    byte-identical, and neither arm aborts or faults a GPU.  `GGML_CUDA_NORM_ROWS_DEBUG=1` is the
-   diagnostic that makes the decision observable.  Required for any change to `norm-gated.cu`, to the
-   norm-rows alloc-dep registration in `ggml-cuda.cu`, or to the fusion's dispatch order; every release
-   (no other gate reaches this code, and `test-backend-ops` cannot: the fused kernel is compared against
-   a chain, not against an allocator).
+   diagnostic that makes the decision observable.  A **third** arm (r238, GitHub issue #285) drives a
+   **SILU**-gated hybrid (Qwen3.5-4B Q8_0) instead: the gated matcher records the gate `MUL_MAT` and then
+   declines there (the `UNARY` is not `SIGMOID`), so it is the only arm that exercises "a declined gated
+   match followed by the plain match", and it fails unless the PLAIN form fused, **nothing was declined**
+   and the text equals the kill-switch arm.  A sigmoid-gated model cannot stand in for it (its gated match
+   succeeds, which is why the Ling arm passed before and after that fix).  Required for any change to
+   `norm-gated.cu`, to the norm-rows alloc-dep registration in `ggml-cuda.cu`, or to the fusion's dispatch
+   order; every release (no other gate reaches this code, and `test-backend-ops` cannot: the fused kernel
+   is compared against a chain, not against an allocator).
 
 21. **gfx1201 grid-stall pad** — `scripts/gate-grid-stall-pad.sh` (r226, issue #277, extending #273): the
    pad is DEFAULT ON and is a *launch-shape* change at six sites, so two properties have to be observed
