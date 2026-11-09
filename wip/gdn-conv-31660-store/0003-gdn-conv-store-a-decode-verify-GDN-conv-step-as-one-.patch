@@ -19,8 +19,8 @@ takes it too, with r241's shared chain (LLAMA_SHARE_SLOT_REV) the chain runs as 
 keeps x and the state alive until the k norm's SCALE.  A thread per channel; it reads its three state values before it writes
 any slot (the deferred read and slot 0 may be one row).
 
-The conv keeps the direct conv's arithmetic (the same 4-tap order and silu); the q / k sums are rms_norm_scale_pair_wave_f32's
-(the 32-lane butterflies, the four wave sums as ((s0 + s2) + (s1 + s3)), no contraction, a run-time divisor), so the outputs
+The conv keeps the direct conv's arithmetic (the same 4-tap order and silu); the q / k sums are rms_norm_scale_pair_f32<256>'s
+(the warp butterflies, a head's four warp sums as ((s0 + s2) + (s1 + s3)), no contraction, a run-time divisor), so the outputs
 are bit-identical to the chain.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -44,8 +44,8 @@ index 000000000..95630f27f
 +// Per channel: the three state values (the cache row itself when the state's GET_ROWS is deferred), the four taps and the T
 +// inputs; out: the conv + silu row, the q / k rows normalized (the l2 norm pair's SCALE outputs), and the Kw snapshot windows of
 +// the concatenated input straight into the cache's rollback slots.  The conv and the norm keep the arithmetic of rdna-boosts'
-+// direct conv (gdn-conv.cu, MIT): the same 4-tap order and silu; the q / k sums are rms_norm_scale_pair_wave_f32's (norm.cu: the
-+// 32-lane butterflies, the 4 wave sums of a 128-wide head as ((s0 + s2) + (s1 + s3)), nothing contracted, a run-time divisor), so
++// direct conv (gdn-conv.cu, MIT): the same 4-tap order and silu; the q / k sums are rms_norm_scale_pair_f32<256>'s (norm.cu: the
++// warp butterflies, the 4 warp sums of a 128-wide head as ((s0 + s2) + (s1 + s3)), nothing contracted, a run-time divisor), so
 +// the outputs are bit-identical to the chain it replaces.
 +#include "gdn-conv-store.cuh"
 +#include "ggml-cuda-try-fuse.cuh"
@@ -299,7 +299,7 @@ index 000000000..95630f27f
 +        y[(size_t) t * C + c] = yv;
 +        if (qk) {
 +            // the head's 32-lane sums of squares, then its 4 wave sums in lanes 0..3 (0 elsewhere) butterflied again.  As in
-+            // rms_norm_scale_pair_wave_f32 (norm.cu): nothing contracted (0 + y*y would fuse with the first butterfly add) and a
++            // rms_norm_scale_pair_f32<256> (norm.cu): nothing contracted (0 + y*y would fuse with the first butterfly add) and a
 +            // run-time divisor (sum / 128 as a constant becomes sum * 2^-7, which would fuse with + eps)
 +#pragma clang fp contract(off)
 +            __shared__ float s_w[256/WARP_SIZE];

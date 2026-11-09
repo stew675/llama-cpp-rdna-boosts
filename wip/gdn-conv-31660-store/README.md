@@ -8,7 +8,7 @@ counts and top-5 logprobs are identical to r241 with each of them on and off.
 |---|---|---|
 | `0001-gdn-conv-take-upstream-31660-s-rollback-store-the-4-.patch` | `ggml/src/ggml-cuda/gdn-conv.cu` (+14) | `6706687edc311cba02932ba05e0ad106bf6f6a1ab14a2258cb6c0f7e67cf094f` |
 | `0002-llama-graph-the-DFlash-layer-input-copies-right-afte.patch` | `src/llama-graph.cpp` (+25) | `1bda5bc0f8337dd475a1384545c56051872ef46797861e7e64f7bfd688ad6380` |
-| `0003-gdn-conv-store-a-decode-verify-GDN-conv-step-as-one-.patch` | new `ggml/src/ggml-cuda/gdn-conv-store.cu` / `.cuh`, `ggml-cuda-try-fuse.cu` (+6), `ggml-cuda.cu` (+11) | `31f365d00500dadf1d8788240fbc3c6578e7209d6d2c22110797c4cab7e42857` |
+| `0003-gdn-conv-store-a-decode-verify-GDN-conv-step-as-one-.patch` | new `ggml/src/ggml-cuda/gdn-conv-store.cu` / `.cuh`, `ggml-cuda-try-fuse.cu` (+6), `ggml-cuda.cu` (+11) | `163d8929ecc793be20e26095c34ab4dab822dcc181a54ee81c5a587eabbaca86` |
 
 ## 0001 — `gdn_conv_check` takes the #31660 store again
 
@@ -56,10 +56,11 @@ over x / the state.  r235 had one kernel per layer.
 
 **Arithmetic.**
 - The conv is the direct conv's (the same 4-tap order and silu).
-- The q / k sums are `rms_norm_scale_pair_wave_f32`'s: the 32-lane butterflies, the four wave sums as ((s0 + s2) + (s1 + s3)),
-  no contraction, and a run-time divisor.
+- The q / k sums are `rms_norm_scale_pair_f32<256>`'s: the warp butterflies, a head's four warp sums as ((s0 + s2) + (s1 + s3)),
+  no contraction (there the square is summed in the column loop, so it does not fuse with the first butterfly add), and a
+  run-time divisor.
 - A first version that copied the direct conv's norm fold (contracted, `/ 128` as a constant) gave different logprobs.  The two
-  effects are the ones `norm.cu` describes: 0 + y·y fusing with the first butterfly add, and `sum * 2^-7` fusing with `+ eps`.
+  effects: 0 + y·y fusing with the first butterfly add, and `sum * 2^-7` fusing with `+ eps`.
   So the direct conv's own norm fold may not be bit-identical to the pair.  We did not check that further.
 
 Kill switch: `GGML_CUDA_FUSE_GDN_CONV_STORE=0`.  0003 does not need 0001, but was tested on top of it.
