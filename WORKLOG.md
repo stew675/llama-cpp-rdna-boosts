@@ -53,9 +53,19 @@ interleaved outside the gate (3 rounds, `-r 5`): 1518.75 / 1515.43 / 1512.78 t/s
 objects around in the same `libggml-hip.so` (layout/alignment), not a kernel change.  The fix's own effect is the
 ubatch-2048 measurement above.
 
-**Follow-ups for the repository, not for the issue.**  The fork's `rdna-boosts` branch is refreshed and pushed on
-this release (`scripts/fork-refresh.sh --push`, tip `513866c5783ed6dba6fcfa7e43a66caf51b92b24`), the tag
-`v16-a691b2345-r238` is pushed, and the ROCm container images are built off-host by the worker watcher as usual.
+**Landing.**  The release commit `6d0cd781` carries the re-cut set, `release.json` (tip `513866c57`, tree
+`3d7a69fa5`, all 17 hashes) and the records, and the annotated tag `v16-a691b2345-r238` names it.  Folded into
+block 10 by `git rebase -i` (`edit` at that commit, `git apply` of the change, then `--amend`), and the resulting
+tree is bit-identical to the working tree the numbers above were measured on, so no measurement had to be
+repeated after the fold.  The `.tip` trap again: the fork branch carries `513866c57` while the working chain's tip
+is `2a430dcf5`, both with tree `3d7a69fa5`; `scripts/fork-refresh.sh --build --gates --push` printed the value to
+record, re-cut and re-verified the build + coherence + prefill KLD on the re-cut, then force-with-lease pushed
+`f978dcb82 -> 513866c57` to the **personal fork only**.  Published: `main` fast-forwarded, the tag pushed, CI green
+(`Validate delivery set` and `Release patch set`, assets attached), and the release notes corrected to say the ROCm
+images are the off-host watcher's job (the workflow template had kept a "built locally" line from before the
+worker existed, fixed in `2db6f0fd`).  The worker's `v16-a691b2345-r238` image build is its normal next-pass job
+(`scripts/container-watch.sh` on `radiance`, 10-minute cron); nothing runs on the primary box.  The reporter was
+replied to and GitHub issue #285 closed as completed.
 
 ## 261109.001 (r237, RELEASE v16-a691b2345-r237) -- the prefill arena arming fix + `--lazy-mode mlockr`, gated 10/10 and re-cut
 
