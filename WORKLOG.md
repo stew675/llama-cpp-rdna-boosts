@@ -1,3 +1,99 @@
+## 261110.006 (r250, RELEASE v16-a691b2345-r250) -- four `TODO` handles close: a degenerate `-sm tensor` share is refused (#135), the staging redirect is retired (#284), the `n_rs_seq` diagnostic refuses a narrow ubatch (#315), and the `hc_post_rms` non-temporal hints measure neutral (#311)
+
+**Release `v16-a691b2345-r250`.**  Base `a691b2345`, 16 blocks, canonical re-cut tip
+`360ce99848f35bc1c3ceec4b5c48cb3fbdf08732`, tree `ce1a738d2b0f81193caf73d4371267249d641fa8`.  Three blocks
+change: **09** (`#284` + `#135`), **10** (`#315`, plus the hooks-file read of the retired variable), **11**
+untouched (`#311` added no code).  No contributor patch this time; four items closed in one release, each
+with the measurement it was decided on.
+
+**1. `TODO` #135 -- a degenerate `-sm tensor` share is REFUSED at load (block 09).**  The item's written
+diagnosis ("a `-sm tensor` split across more devices than the model divides evenly is degenerate; the third
+device halves throughput") did not survive measurement.  gfx1201, 35B-A3B UD-Q4_K_M (`n_embd` 2048, expert
+FF **512**), `llama-bench -p 128 -n 32`, `-fa on -t 12`, decode t/s:
+
+| arm | 2 devices | 3 devices |
+|---|---:|---:|
+| all-VRAM | 130.4 | **130.9** |
+| `-ncmoe 40` (Q4_K_M) | 109.7 | **20.5** |
+| `-ncmoe 40` (Q3_K_M) | 105.0 | 23.0 |
+| `-ncmoe 40` (Q8_0) | 95.7 | 90.2 |
+
+So the third device is **not** the problem (all-VRAM 3 devices is healthy, and prefill is flat at 566 vs 592
+t/s); the collapse needs **host-resident experts** *and* a **K-quant table**.  The mechanism is the loader's
+own equal-division share floored to the granularity — `lcm(blck_size,128)` for FFN tensors — which for a
+512-wide axis at three devices is **0 / 256 / 256** at a 256-element block and **128 / 128 / 256** at Q8_0's
+32; the zero-extent device is then handed the **whole** tensor (MIRRORED) by the meta split, i.e. 2x the host
+bytes and the whole expert's compute on one card.  `moe-expert-cache.cu` already printed a
+`DEGENERATE TENSOR SPLIT` line, but only when a table is created (nothing at `MOE_EXPERT_CACHE_MIB=0`) and
+only at runtime.  The new patch adds `llama_model::check_host_expert_split_shares()`, called once at the end
+of `load_tensors`: it walks the host-resident `*exps*` weights, asks the split-state callback for the
+per-device extents and **throws** naming the first offender —
+`blk.0.ffn_down_exps.weight (axis 0: 512 columns over 3 devices, granularity 256) -> device 0 holds 0`, 120
+of 120 host tables on the degenerate arm.  It is geometry-derived (no model list), conditioned on host
+placement (placement-blind, it would refuse the healthy all-VRAM arm), skips an explicit `--tensor-split`
+zero, and has the escape hatch `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1`.  Verified matrix: refuses the 3-device
+`-ncmoe 40` Q4_K_M/Q3_K_M shape; loads (unchanged) the same model at 2 devices, at 3 devices all-VRAM, in
+Q8_0, the dense 27B 3-GPU arm, the 4B 3-GPU anchor, `-sm layer`, and the degenerate shape with the escape
+hatch.  Placement note: the check runs after the data load because a host-expert tensor has **no** host
+buffer before it (measured 0 of 733 tensors), i.e. the same point `report_host_expert_placement()` uses.
+
+**2. `TODO` #284 -- the staging redirect is RETIRED, not re-timed (block 09).**  The recorded defect
+("`GGML_SCHED_STAGE_MODE=1` = abort on `-sm layer`, corrupt without it") **did not reproduce** on r249:
+staging forced with `GGML_SCHED_STAGE_MIN_TOKENS=0`, 27B Q8_0 and 35B-A3B UD-Q4_K_M `-ncmoe 40`, 2 **and** 3
+devices, `-sm layer`, gave byte-identical text in both modes (`ae7356376871`, `fde694a1ad12`), no
+`hipMemcpyAsync invalid argument`, no `////`, and mode 1 measured **+0.2-0.3 %** prefill (3432 -> 3442 t/s) —
+i.e. exactly the one D2D the mode exists to avoid.  That is the whole benefit, and the mode's correctness
+rests on the consuming graph being uncaptured: capture here is **decode-only** by construction
+(`ggml_cuda_graph_is_multi_token()` skips every multi-token graph), so the redirect is safe exactly where it
+is useless and unsafe exactly where staging is forced into the decode band — which is the unsupported
+configuration the defect was recorded on.  A restore-timing change cannot fix a captured graph, and the VMEM
+it was meant to buy (`input_cpy`, ~1 GiB on Flash-Next) needs an arena-sizing policy that does not exist, so
+the knob is **deleted** (`GGML_SCHED_STAGE_MODE`, `sched_stage_restore()`, the `orig` field, the mode-1
+free-event record, the redirect tripwire, and the two remaining env reads in `ggml-cuda.cu` and
+`ggml-cuda-moe-cache-hooks.cu`); stage-then-D2D is unconditional.  Inertness, measured: text identical to
+r249 in every host-expert arm (`fde694a1ad12` at 2 and 3 devices, `-sm layer` and `-sm tensor`; `ae7356376871`
+27B; `fc4e96e1e603` a wide `-ub 8192` arm, prefill 4041.1 vs 4067.0 t/s), prefill-logit KLD **-0.000000 /
+100.000 %**, and `llama-batched-bench -npl 1,4,8` prefill 1628.5/3871.8/4063.0 -> 1669.3/3916.6/4062.3 t/s,
+decode 97.9/322.0/534.3 -> 99.2/326.7/533.0 (inside the single-run spread).
+
+**3. `TODO` #315 -- the `n_rs_seq` diagnostic refuses a narrow ubatch (block 10).**  Reproduced first:
+`GGML_FORCE_N_RS_SEQ=3` + `--ub 4` (and `--ub 3`) aborts in `llama_batch_allocr::split_equal()`
+(`GGML_ASSERT(n_ubatch > n_keep_tail)`, exit 134), `--ub 5` and `--ub 8` run — so the bound is exactly
+`n_ubatch >= n_rs_seq + 2`.  Both the assert and `n_keep_tail` are **upstream's**, so the fix is at the point
+the delivery applies the FORCE value (`src/llama-context.cpp`): refuse with
+`GGML_FORCE_N_RS_SEQ=3 needs --ub >= 5 (one ubatch must hold the rollback tail of n_rs_seq + 1 tokens);
+refusing instead of aborting in llama_batch_allocr::split_equal()`, exit 1, no core dump.  The plain path is
+untouched (`--ub 5` under the diagnostic and an RS-unset `--ub 4` both read **PPL 4.2941**), and the r244/r249
+MANIFESTS rows keep `--ub 8`: their `--ub 4`/`--ub 1` arms are impossible at depth 3 by construction, not by
+defect.
+
+**4. `TODO` #311 -- the `hc_post_rms` non-temporal hints measure NEUTRAL, so no code was added (block 11
+untouched).**  Two builds of one 5-line delta in `norm.cu`, interleaved A/B, census first
+(`GGML_CUDA_HC_POST_RMS_DEBUG=1`: **1488 fused=1 / 0 declined** on a 31.5k gfx1201 prefill, **558 / 0** on
+gfx1151): gfx1201 2x R9700 `-sm tensor` Flash-Next GSQ-RCO IQ3_S, the r242-style host-expert arm 1657.9 vs
+**1685.3** t/s over 3 reps (+1.7 %, inside a 4 % spread; +0.0 % excluding a cold first rep) and the
+delivery-style arm (`-c 32768`, `-ub 4096`, mmap, slab headroom 1536) 1489.1 vs **1499.4** (+0.7 %, spread
+0.8 %); gfx1151 (`radiance`) all-VRAM with `LLAMA_FUSED_DSV4_HC_POST=1`, 16k prompt: **926.1 vs 920.3 t/s
+over 6 reps (-0.6 %)**.  The effect the neighbouring `dsv4_hc_pre` recorded (+18.6 % in situ, gfx1151
+pp8192) is L2/MALL pressure from the GEMM weight streams beside the op, and no arm this delivery validates
+can isolate it on gfx1201 (Flash-Next is 78 GiB, so every validated arm is host-expert-bound).  The
+measurement is the record; the item is closed **without code**.
+
+**Gates.**  `scripts/validate-set.sh` green (16/16 strict `git am` from a fresh `a691b2345` tarball, tree
+`ce1a738d`, Windows lint 289 files); `scripts/gate-per-block-build.sh --tip <chain> --changed-from 076daf709
+--fast` **4/4** (blocks 09, 10, 12, 15; 11/13/14 deltas unchanged); coherence `1c5d32ac537d` (4B Q8_0, 1 GPU
+**and** 3-GPU `-sm tensor`, the recorded anchor) plus the host-expert arms above; prefill logits **0.000000 /
+100.000 %** (27B default point) and **-0.000000 / 100.000 %** (`--extra "-ncmoe 40"`, 35B-A3B);
+`llama-batched-bench -npl 1,4,8` neutral (above); `scripts/check-gpu-faults.sh` clean on the journal window
+and every run log, on **both** boxes (gfx1201 and radiance/gfx1151).  **No MTP Protocol A**: no decode,
+fusion or speculator kernel moved (the changed code is a load-time check, an env retire on the staging path,
+and a diagnostic refusal), so the decode-band instrument has nothing to see — the batched-bench `-npl` run
+above is the decode-side neutrality check instead.  `ENVIRONMENT.md` (`GGML_SCHED_STAGE_MODE` retired,
+`GGML_TENSOR_SPLIT_ALLOW_DEGENERATE` + `GGML_FORCE_N_RS_SEQ` added), `INVARIANTS.md` r250 (5 facts),
+`MANIFESTS.md` (three r250 rows), `patches/README.md` (fold note + block 09/10 rows), `TODO.md` (four rows and
+four sections deleted), `wip/CAMPAIGNS.md` (the `#284` "next" pointer replaced), `README.md` and
+`release.json` updated.
+
 ## 261110.005 (r249, RELEASE v16-a691b2345-r249) -- contributor PR #295: the one-kernel GDN conv step also takes a multi-sequence ubatch (the `--kv-unified` verify step of a multi-slot server)
 
 **Release:** `v16-a691b2345-r249`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

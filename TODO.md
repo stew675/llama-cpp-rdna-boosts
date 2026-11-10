@@ -35,7 +35,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **131** | `--host-experts pool` prefill collapse under a 3+-device `-sm tensor` split: the staging-path root cause, reachable only through the kill switch | performance (block 12; pre-existing backlog) | **OPEN (residue)** — the collapse itself is fixed (r207, measured), the root cause is not — §131 |
 | **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **133** | a fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch | performance (delivery defect, default mode; backlog) | **OPEN** (2026-11-03) — 3-device prefill is slower than 1-device because of it — §133 |
-| **135** | a `-sm tensor` split across more devices than the model divides evenly is degenerate and nothing refuses it at load | correctness / usability (a load-time refusal) | **OPEN** — the work is the guard, not a perf chase — §135 |
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill on 35B-A3B at `MOE_HOST_POOL_FRAC=50` | performance (delivery defect, default-on) | **OPEN** (2026-11-03) — needs a wider sweep before the default moves — §136 |
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04) — the bound is static per shape on purpose — §141 |
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
@@ -43,12 +42,9 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **283** | `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index | correctness (latent, default off) | **OPEN** — fix when the option is next touched — §283 |
-| **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
-| **311** | the fused `hc_post_rms` kernel drops the hc kernels' non-temporal hints | performance (block 11, r242) | **PARKED** (2026-11-09) — value-preserving and unmeasured; worth +18.6 % in situ on `dsv4_hc_pre` by the neighbouring kernel's own record — §311 |
-| **315** | a `--ub 4`/`--ub 1` perplexity/KLD arm aborts under `GGML_FORCE_N_RS_SEQ` (`split_equal`) | diagnostics (test arm only; NOT a delivery defect) | **OPEN — small** (2026-11-10) — the r244 gate recipe's `--ub 4`/`--ub 1` arms cannot be run; use `--ub 8` until fixed — §315 |
 
 ## Handle numbering
 
@@ -231,14 +227,6 @@ A fully-resident (identity) expert table is re-copied out of the arena on every 
 
 **OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.2).  See §133
 
-## 135. A `-sm tensor` split across more devices than the model divides evenly is degenerate, and nothing refuses it at load
-
-A `-sm tensor` split across more devices than the model can divide evenly is **degenerate**, and nothing stops it at load: 35B-A3B has no even split above 2 GPUs, so a 3-device arm runs at ~20 t/s against ~55 (1 GPU) / ~52 (2 GPUs) — the third device *halves* throughput.  The item is now a **load-time guard**, not a perf investigation: detect an unsupported device count for the model and refuse it (vLLM-style) instead of silently running degenerate
-
-**Kind:** correctness / usability (delivery — a load-time refusal).
-
-**OPEN — limitation understood, the work is the GUARD** (maintainer, 2026-11-04).  The cause is **divisibility**: 35B-A3B has no even `-sm tensor` split above 2 devices, which is the same class as `gemma-4-E4B-it` + 3 devices in the accepted-limitations list (2 KV heads < 3 devices aborts in the split-state assert).  So the ~20 t/s is the *symptom* of a zero/uneven per-device share, **not** a host-expert performance bug — do not chase it as one.  What is needed: a **load-time check** that decides whether the requested device count can split this model's tensors evenly and, when it cannot, **refuses to offload that far** with a message naming the constraint and the supported counts, as vLLM's TP validation does (detect it from the model's own geometry — heads/expert counts — never a hard-coded model list).  Evidence: r209, 35B-A3B Q4_K_M `-ncmoe 40`, gfx1201 x3, `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §7 — all-VRAM on the same 3 devices gives 138 t/s, so the cliff is the split geometry, not the device count
-
 ## 136. `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill at a half-covered pool
 
 `GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement
@@ -326,19 +314,6 @@ instead of overlapping it, and a second copy stream (the parked
 nothing ships wrong today.  **Fix when the option is next touched:** give the branch streams their own index base
 (or make `copy_stream()` reserve its index), and add a `-lv 4` assertion that no concurrent branch ever runs on the
 copy stream's index.
-
-## 284. The ring's redirect restore should be deferred to `stage_free_ev` (removes the third VRAM copy)
-
-**Status: open, cheap, measured shape on a small config (`WORKLOG.md` 261107.014; `archive/docs/TENSOR-CORRUPTION.md`).**
-`GGML_SCHED_STAGE_MODE=1` points the split input at the ring slot so the bytes move once instead of twice
-(`H2D` + full-table `D2D` into `input_cpy`), but the generic ring's restore runs at the top of the next
-`sched_stage_issue` -- the "the kernels have been launched" assumption the meta path disproved -- and the record
-lists it as "mode 1 = abort, mode 0 = corrupt" on `-sm layer`.  The fix shape is written down there: **defer the
-restore to the free-event boundary** (the slots already carry `stage_free_ev` for exactly this ordering).  What it
-would buy is real VMEM, not speed on the old box: `input_cpy` is ~1.0 GiB of the 1.62 GiB work floor on Flash-Next
-at `-ncmoe 46`, i.e. +4.5 % arena once a sizing policy can claim it; the one clean A/B on the record (meta path,
-`-sm tensor`, IQ4_XS) put the D2D at **+0.3 %**, so re-measure before believing the 6 % the Flash-Next arithmetic
-suggests.  Gates: same-seed text on Flash-Next at 48 % residency, `gate-prefill-logits.sh` KLD 0.000000.
 
 ## 285. A unified expert store: one VA per device, expert-granular residency (`wip/expert-transfer-engine/` §7.6)
 
@@ -669,40 +644,3 @@ artifact instead and close this.
 - **Upstream PR candidates:** `upstream/README.md`.
 
 ---
-
-## 311. The fused `hc_post_rms` kernel uses plain loads/stores where the standalone hc kernels use non-temporal ones
-
-`dsv4_hc_post_rms_f32` (block 11, r242, from contributor PR #288) reads `x`/`residual`/`post` and writes the
-residual and `xn` with ordinary accesses.  The two standalone hc ops it replaces are deliberately streamed:
-`dsv4-hc.cu`'s own comment records `dsv4_hc_pre` 605 -> 493 us/call (**+18.6 %**) and `dsv4_hc_post` 691 -> 660 us
-from `__builtin_nontemporal_load/store` alone, measured in situ on gfx1151 pp8192, with no difference in a
-standalone microbench (so the effect is L2/MALL pressure from the surrounding GEMM weight streams, not the op).
-
-The hints are value-preserving (the same float moves), so adding them to the fused kernel cannot change a hash — it
-is purely a question of whether the fused launch keeps the win it has.  **Measure before believing:** the same
-31.5k-prompt arm the r242 record uses (2 R9700 `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, `-ub 6144`), plus a gfx1151
-arm where the in-situ effect was found.  If it is worth anything, the guard is a rebuild + the prefill-logit gate
-(`-0.000000` is the expected answer) and nothing else moves.
-
-## 315. A narrow-ubatch perplexity arm aborts under `GGML_FORCE_N_RS_SEQ` (`llama_batch_allocr::split_equal`)
-
-Found while gating PR #295 (r249).  The r244 verification row asks for the decode-band fusion arms at `--ub 4`
-and `--ub 1`, which for this kernel need a `n_rs_seq > 0` graph, i.e. `GGML_FORCE_N_RS_SEQ=3` (the store's own
-recipe).  That combination **aborts** in `llama_batch_allocr::split_equal()` (`ggml_abort` from
-`llama_memory_hybrid::init_batch`) before the first ubatch, on the **r248 build as well as** the r249 one, so it is
-pre-existing and not a delivery-code defect:
-
-```
-GGML_FORCE_N_RS_SEQ=3 ./build/bin/llama-perplexity -m 27B-Q8_0.gguf -c 512 -ub 4 ...
-  #6 llama_batch_allocr::split_equal(unsigned int, bool, unsigned int)
-  #7 llama_memory_hybrid::init_batch
-```
-
-The rollback tracker needs `n_rs_seq + 1` (here 4) tail tokens inside one ubatch, and `split_equal()` does not
-refuse an ubatch that cannot hold them — it asserts.  So the arm is *impossible*, not merely useless, and the
-r249 record runs that band at `--ub 8` instead.
-
-The work is a load-time or per-batch **refusal** (the same class as `TODO` #135: a configuration that cannot work
-should say so, not abort): either clamp/refuse `GGML_FORCE_N_RS_SEQ` against `n_ubatch` where the value is
-applied, or make `split_equal()` reject a `n_keep_tail` it cannot honour and let the caller fall back.  A
-diagnostic-only path, so no gate depends on it; `INVARIANTS.md` r249 records the trap so nobody re-derives it.

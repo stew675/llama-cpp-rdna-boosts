@@ -1,4 +1,4 @@
-From fe0f62b7a6060bb29ba18aaa3d5627d3da3ba027 Mon Sep 17 00:00:00 2001
+From e02f45706a7d0784709c8a639ba8709d14a05b27 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -5813,10 +5813,10 @@ index d864ca576..5de6c8277 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2d7a0ead1..33909aaad 100644
+index a0e0e796a..ae683dc1a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -649,6 +649,14 @@ llama_context::llama_context(
+@@ -664,6 +664,14 @@ llama_context::llama_context(
      cparams.moe_cache_size      = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
      cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -5831,7 +5831,7 @@ index 2d7a0ead1..33909aaad 100644
  
      // resolved after flash attention, see resolve_fused_ops()
      {
-@@ -800,6 +808,8 @@ llama_context::llama_context(
+@@ -815,6 +823,8 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
@@ -5840,7 +5840,7 @@ index 2d7a0ead1..33909aaad 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
-@@ -6057,6 +6067,9 @@ llama_context_params llama_context_default_params() {
+@@ -6072,6 +6082,9 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -5850,7 +5850,7 @@ index 2d7a0ead1..33909aaad 100644
      };
  
      return result;
-@@ -6838,6 +6851,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -6853,6 +6866,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
@@ -9245,7 +9245,7 @@ index 3a1dfd3d6..489a0cabe 100644
      bool host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 53779ab83..3a6258c5d 100644
+index 0e75e9034..c344e11a8 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1879,6 +1879,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -9274,7 +9274,7 @@ index 53779ab83..3a6258c5d 100644
          ml.plan_host_expert_placement((int) hparams.n_layer());
  
          // call the per-model loading function
-@@ -2754,6 +2773,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
+@@ -2760,6 +2779,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
      return max_slice;
  }
  
@@ -9292,7 +9292,7 @@ index 53779ab83..3a6258c5d 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -3253,6 +3283,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+@@ -3259,6 +3289,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
      return layers[il].rope_short;
  }
  
@@ -9378,7 +9378,7 @@ index 53779ab83..3a6258c5d 100644
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
-@@ -3759,7 +3868,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3765,7 +3874,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
@@ -9389,7 +9389,7 @@ index 53779ab83..3a6258c5d 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
-@@ -3779,7 +3890,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3785,7 +3896,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
@@ -9400,7 +9400,7 @@ index 53779ab83..3a6258c5d 100644
                      }
                  } else {
                      llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -3859,6 +3972,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3865,6 +3978,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
@@ -9470,7 +9470,7 @@ index 53779ab83..3a6258c5d 100644
                          res = new llama_kv_cache(
                                  *this,
                                  params.no_alloc,
-@@ -3868,14 +4044,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3874,14 +4050,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,
@@ -9496,7 +9496,7 @@ index 53779ab83..3a6258c5d 100644
                  }
              }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 51fd1cfa8..cc359bcab 100644
+index 73f51dd82..05be0ae10 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -1010,6 +1010,13 @@ struct llama_model {

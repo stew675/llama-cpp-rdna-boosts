@@ -3648,3 +3648,65 @@ same on the chain and family-off arms, on a repeat, at `-np 4`, on 35B-A3B, at
 probe's `P=2048/3584/4096` anchors are r244's exactly; acceptance identical to the digit.  Worth ~1.0-1.2 % per
 verify step on the two-sequence dense arm (VRAM unchanged), i.e. the win is real but small, and it is a coverage
 win rather than a retuning: **no environment variable was added and nothing changed for `S = 1`.**
+
+## r250 -- four follow-ups close: a degenerate `-sm tensor` share is refused (and it is a HOST-EXPERT phenomenon, not a device count), the staging redirect is retired, a narrow ubatch `n_rs_seq` arm refuses cleanly, and the fused `hc_post_rms` non-temporal hints measure neutral
+
+Four `TODO` items closed in one release (`#135`, `#284`, `#315`, `#311`). Facts:
+
+1. **A degenerate `-sm tensor` share is real, and it is NOT "too many devices".**  The meta split's
+   per-device share is the loader's own equal-division rule floored to the granularity -- `lcm(blck_size,
+   128)` for FFN tensors (`get_split_granularity` + the `ne_s*(j+1)/n` flooring in
+   `llama_meta_device_get_split_state`).  For 35B-A3B (`n_embd` 2048, expert FF **512**) at **three**
+   devices that is **0 / 256 / 256** for `ffn_down_exps` with a 256-element block (Q4_K/Q3_K) but
+   **128 / 128 / 256** with Q8_0's 32-element block: the zero-extent device is then handed the WHOLE
+   tensor (MIRRORED) by the meta split.  Measured (gfx1201, `llama-bench -p 128 -n 32`, `-fa on`, `-t 12`,
+   `--load-mode mmap`), decode t/s: 2 devices 109.7 / 3 devices **20.5** (Q4_K_M `-ncmoe 40`); 2/3 devices
+   **105.0 / 23.0** (Q3_K_M); **95.7 / 90.2** (Q8_0, no zero share); and **3 devices all-VRAM 130.9**
+   against 2 devices all-VRAM 130.4 -- i.e. the third device is fine, the *host-expert path* on a
+   zero-share table is what collapses (prefill is unaffected: 566 vs 592 t/s).  The 2-device Q4_K_M arm is
+   1024/1024 (both block-aligned) and fast.  So a placement-blind "device count vs geometry" refusal would
+   refuse a configuration that measures healthy, which is why the guard is conditioned on host placement.
+2. **The guard is a load-time refusal, and it is the only instrument that survives the cache being off.**
+   `llama_model::check_host_expert_split_shares()` (block 09) walks the host-resident `*exps*` weights after
+   the data load (a host-expert tensor has **no** host buffer before it: measured 0 of 733 tensors), asks
+   the split-state callback for the per-device extents and throws naming the first offender.  It fires only
+   for 2+ devices, a host-resident table and a **zero** share; an explicit `--tensor-split` zero is a
+   placement choice and is skipped, and `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` is the escape hatch.  The
+   `moe-expert-cache.cu` `DEGENERATE TENSOR SPLIT` line already existing is *runtime and cache-only*: with
+   `MOE_EXPERT_CACHE_MIB=0` there is no table and no line, and the arm just reads 20 t/s.
+3. **The staging redirect (`GGML_SCHED_STAGE_MODE=1`) is retired, not fixed.**  Its whole benefit is one
+   D2D into `input_cpy`: measured **+0.2-0.3 %** prefill on the host-expert arms (3432 -> 3442 t/s on a
+   3.7k-token prompt, 2/3-device `-sm layer`).  Its correctness rests on the consuming graph being
+   uncaptured, which the staging width gate happens to guarantee only above its floor -- and capture here
+   is **decode-only** by construction (`ggml_cuda_graph_is_multi_token()` skips the graph path for any
+   multi-token prefill), so the redirect is safe exactly where it is useless and unsafe where staging is
+   forced into the decode band.  The recorded "-sm layer: mode 1 aborts, mode 0 corrupts" (2026-10-06) does
+   **not** reproduce on r249/r250: 27B Q8_0 and 35B-A3B UD-Q4_K_M (`-ncmoe 40`), 2 and 3 devices, staging
+   forced with `GGML_SCHED_STAGE_MIN_TOKENS=0`, gave **byte-identical text** in both modes
+   (`ae7356376871`, `fde694a1ad12`).  Retired rather than "deferred to `stage_free_ev`": a restore-timing
+   change cannot help a captured graph, the VMEM it was meant to buy (`input_cpy`, ~1 GiB on Flash-Next)
+   needs an arena-sizing policy that does not exist, and the mode-0 form is capture-safe by construction
+   (its D2D lands in a graph-owned buffer).  The retirement is a no-op on the default path: text identical
+   to r249 in every host-expert arm measured (`fde694a1ad12` at 2 and 3 devices, `-sm layer` and
+   `-sm tensor`; `ae7356376871` on 27B; `fc4e96e1e603` on a wide `-ub 8192` arm), prefill-logit KLD
+   **-0.000000 / 100.000 %** against the recorded `-ncmoe 40` base.
+4. **`GGML_FORCE_N_RS_SEQ` has a hard ubatch bound: `n_ubatch >= n_rs_seq + 2`.**  The rollback tracker
+   keeps the trailing `n_rs_seq + 1` tokens of a sequence in one ubatch (`n_keep_tail` in
+   `llama_batch_allocr::split_equal`, an **upstream** assert `n_ubatch > n_keep_tail`), so at
+   `GGML_FORCE_N_RS_SEQ=3` `--ub 4` aborts and `--ub 5` runs (boundary measured on 27B Q8_0
+   `llama-perplexity -c 512 --chunks 1`, exit 134 vs a clean PPL 4.2941).  The delivery now refuses it where
+   it applies the value (block 10, `llama-context.cpp`) with a one-line message naming the minimum instead
+   of letting the splitter abort; the plain (`n_rs_seq == 0`) path is untouched and both `--ub 5` and an
+   RS-unset `--ub 4` read the *same* PPL 4.2941.  The r244 recipe's `--ub 4`/`--ub 1` arms are impossible at
+   that depth **by construction**, not by defect: `--ub 8` stays the narrow arm.
+5. **The fused `hc_post_rms` non-temporal hints are worth nothing measurable, so they were not added.**
+   `dsv4_hc_post_rms_f32` reads `x`/`residual` and writes the residual stream with plain accesses where
+   the standalone hc kernels it replaced use `__builtin_nontemporal_load/store` (worth +18.6 % in situ on
+   `dsv4_hc_pre`, gfx1151 pp8192).  Two builds, interleaved A/B: gfx1201 2x R9700 `-sm tensor`
+   Flash-Next GSQ-RCO IQ3_S -- r242-style host-expert arm **1657.9 vs 1685.3 t/s** over 3 reps (+1.7 %,
+   inside a 4 % spread, +0.0 % excluding a cold first rep) and the delivery-style arm **1489.1 vs 1499.4**
+   (+0.7 %, spread 0.8 %); gfx1151 (radiance) all-VRAM `LLAMA_FUSED_DSV4_HC_POST=1`, 16k prompt, 558
+   `fused=1` / 0 declined: **913.1 vs 922.9 t/s** over 3 reps (+1.1 %, inside a 6.4 % base spread).  Its
+   own record says the effect is L2/MALL pressure from the GEMM weight streams beside it, and neither
+   gfx1201 arm the delivery validates can isolate that (the model is 78 GiB, so every validated arm is
+   host-expert-bound).  No code was added: the measurement is the record (`TODO` #311).

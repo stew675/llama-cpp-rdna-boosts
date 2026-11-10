@@ -1,4 +1,4 @@
-From d2fa96b712f1ca4ee57239240b89200f6625a797 Mon Sep 17 00:00:00 2001
+From 4ebe38068885a44cca0276e711b46560fd4a8b53 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -52,7 +52,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  ggml/src/ggml-alloc.c                         |   85 +-
  ggml/src/ggml-backend-impl.h                  |  267 +
  ggml/src/ggml-backend-meta.cpp                | 1562 +++-
- ggml/src/ggml-backend.cpp                     | 1342 +++-
+ ggml/src/ggml-backend.cpp                     | 1296 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    7 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    7 +
  ggml/src/ggml-cpu/amx/amx.cpp                 |    3 +
@@ -62,7 +62,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2741 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2739 ++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 6607 +++++++++++++++++
@@ -97,13 +97,13 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama-mmap.h                              |    5 +
  src/llama-model-loader.cpp                    |  694 +-
  src/llama-model-loader.h                      |  118 +-
- src/llama-model.cpp                           |  163 +-
- src/llama-model.h                             |    4 +
+ src/llama-model.cpp                           |  266 +-
+ src/llama-model.h                             |   11 +
  src/llama-quant.cpp                           |    2 +-
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17421 insertions(+), 541 deletions(-)
+ 68 files changed, 17483 insertions(+), 541 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -4442,7 +4442,7 @@ index a0161dce1..2b05e22d4 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 92a53bf38..b59e3d141 100644
+index 92a53bf38..a8c6fcbe3 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,21 @@
@@ -4675,7 +4675,7 @@ index 92a53bf38..b59e3d141 100644
  struct ggml_backend_sched {
      bool is_reset; // true if the scheduler has been reset since the last graph split
      bool is_alloc;
-@@ -1237,6 +1428,28 @@ struct ggml_backend_sched {
+@@ -1237,6 +1428,26 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -4686,7 +4686,6 @@ index 92a53bf38..b59e3d141 100644
 +    int  stage_slot_next;
 +    int  stage_n_slots;
 +    int  stage_consumed_n;
-+    int  stage_mode; // 0 = stage then D2D into the split input, 1 = point the split input at the slot
 +    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
 +    // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
 +    // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
@@ -4696,7 +4695,6 @@ index 92a53bf38..b59e3d141 100644
 +        size_t size;
 +        int    slot;
 +        int    backend_id;
-+        void * orig; // dst->data to restore (redirect mode)
 +    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
 +    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
 +    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
@@ -4704,7 +4702,7 @@ index 92a53bf38..b59e3d141 100644
      int debug;
  
      // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
-@@ -1334,6 +1547,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
+@@ -1334,6 +1545,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
  #endif
  
  // returns the backend that should be used for the node based on the current locations
@@ -4724,7 +4722,7 @@ index 92a53bf38..b59e3d141 100644
  static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
      // assign pre-allocated nodes to their backend
      int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
-@@ -1384,7 +1610,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1384,7 +1608,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                  int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                  // check if a backend with higher prio wants to offload the op
                  if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
@@ -4747,7 +4745,7 @@ index 92a53bf38..b59e3d141 100644
                          if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                              SET_CAUSE(tensor, "1.off");
                              return b;
-@@ -1450,6 +1691,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1450,6 +1689,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
      }
  }
  
@@ -4766,7 +4764,7 @@ index 92a53bf38..b59e3d141 100644
  static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
      ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
      ggml_backend_buffer_type_t buft = NULL;
-@@ -1468,6 +1721,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+@@ -1468,6 +1719,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
          }
      }
  
@@ -4788,7 +4786,7 @@ index 92a53bf38..b59e3d141 100644
      return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
  }
  
-@@ -1479,6 +1747,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+@@ -1479,6 +1745,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
  }
  
  // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -4844,7 +4842,7 @@ index 92a53bf38..b59e3d141 100644
  void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      // reset splits
      sched->n_splits = 0;
-@@ -1678,6 +1995,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1678,6 +1993,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          }
      }
  
@@ -4931,7 +4929,7 @@ index 92a53bf38..b59e3d141 100644
      // pass 4: assign backends to remaining src from dst and view_src
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -1726,6 +2123,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1726,6 +2121,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          split->i_start = 0;
          split->n_inputs = 0;
          int cur_backend_id = split->backend_id;
@@ -4942,7 +4940,7 @@ index 92a53bf38..b59e3d141 100644
          for (; i < graph->n_nodes; i++) {
              struct ggml_tensor * node = graph->nodes[i];
  
-@@ -1739,6 +2140,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1739,6 +2138,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
              // check if we should start a new split based on the sources of the current node
              bool need_new_split = false;
@@ -4950,7 +4948,7 @@ index 92a53bf38..b59e3d141 100644
              if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
                      struct ggml_tensor * src = node->src[j];
-@@ -1750,7 +2152,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1750,7 +2150,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -5025,7 +5023,7 @@ index 92a53bf38..b59e3d141 100644
                              break;
                          }
                      }
-@@ -1775,6 +2244,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1775,6 +2242,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                  split->i_start = i;
                  split->n_inputs = 0;
                  cur_backend_id = node_backend_id;
@@ -5033,7 +5031,7 @@ index 92a53bf38..b59e3d141 100644
              }
  
              // find inputs that are not on the same backend
-@@ -1798,6 +2268,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1798,6 +2266,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -5042,7 +5040,7 @@ index 92a53bf38..b59e3d141 100644
                              }
                              tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                              SET_CAUSE(tensor_copy, "4.cpy");
-@@ -1807,6 +2279,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1807,6 +2277,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              ggml_backend_sched_split_inputs_grow(split);
                          }
                          split->inputs[n_inputs] = src;
@@ -5072,7 +5070,7 @@ index 92a53bf38..b59e3d141 100644
                      }
                      node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                  }
-@@ -1885,6 +2380,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1885,6 +2378,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              }
          },
          /* .user_data     = */ &alloc_deps,
@@ -5083,7 +5081,7 @@ index 92a53bf38..b59e3d141 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
-@@ -2082,13 +2581,390 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2082,13 +2579,376 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -5226,17 +5224,12 @@ index 92a53bf38..b59e3d141 100644
 +// the split's compute is enqueued.  The upload then overlaps the previous split's compute (the copy
 +// stream is independent).  The input loop below drains stage_consumed with a device-to-device copy
 +// into the actual split input after waiting on the per-slot upload event.
-+// Restore any split input a redirect-mode issue pointed at a ring slot.  The restore must happen
-+// after the previous split's graph_compute has been called -- the kernels copy the pointer value at
-+// launch -- and the top of the next issue is exactly that point.
-+static void sched_stage_restore(ggml_backend_sched_t sched) {
-+    for (int k = 0; k < sched->stage_consumed_n; k++) {
-+        if (sched->stage_consumed[k].orig != NULL) {
-+            sched->stage_consumed[k].dst->data = sched->stage_consumed[k].orig;
-+            sched->stage_consumed[k].orig       = NULL;
-+        }
-+    }
-+}
++//
++// There is deliberately NO redirect form (it used to be `GGML_SCHED_STAGE_MODE=1`): pointing the split
++// input's `data` at the ring slot saves that D2D (+0.3 % prefill, measured) but is only correct while
++// the consuming graph is not captured, i.e. only above the staging width gate -- a heuristic, not an
++// invariant, and mode 0 is the capture-safe form (its D2D lands in a graph-owned buffer).  Retired in
++// r250 (TODO #284, INVARIANTS r250); see `archive/work/h2d-staging-ring/`.
 +
 +// wip/moe-expert-cache (B1): a routed expert table (a MUL_MAT_ID src0) is uploaded far more cheaply by
 +// the device-side expert gather -- it copies only the routed experts straight from the pinned host
@@ -5290,7 +5283,6 @@ index 92a53bf38..b59e3d141 100644
 +// gather for a routed expert table (`sched_input_gatherable` in `sched_stage_issue`); the meta
 +// backend's `stage_input` path defers routed expert tables to the gather there too.
 +static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
-+    sched_stage_restore(sched);
 +    sched->stage_consumed_n = 0;
 +    sched->stage_split_ok = false;
 +    if (!sched->stage_enabled || split->n_inputs == 0) {
@@ -5399,14 +5391,6 @@ index 92a53bf38..b59e3d141 100644
 +        sched->stage_consumed[sched->stage_consumed_n].size       = size;
 +        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
 +        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
-+        sched->stage_consumed[sched->stage_consumed_n].orig       = NULL;
-+        if (sched->stage_mode == 1) {
-+            // point the consuming op at the slot directly: the slot bytes then move once (H2D) instead
-+            // of twice (H2D + D2D).  Safe because the graph never captures (prefill is multi-token) and
-+            // the pointer is restored before the next split issues.
-+            sched->stage_consumed[sched->stage_consumed_n].orig = plan[k].input_cpy->data;
-+            plan[k].input_cpy->data = buf;
-+        }
 +        sched->stage_consumed_n++;
 +    }
 +    sched->stage_slot_next = (slot_first + n_plan) % sched->stage_n_slots;
@@ -5475,7 +5459,7 @@ index 92a53bf38..b59e3d141 100644
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
      ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
-@@ -2104,7 +2980,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2104,7 +2964,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          }
      }
  
@@ -5489,7 +5473,7 @@ index 92a53bf38..b59e3d141 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -2112,31 +2993,336 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2112,31 +2977,323 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -5519,15 +5503,11 @@ index 92a53bf38..b59e3d141 100644
 +                const size_t size = sched->stage_consumed[stage_k].size;
 +                ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
 +                ggml_backend_event_wait(split_backend, done_ev);
-+                if (sched->stage_mode == 0) {
-+                    // stage-then-D2D mode: copy the slot into the real split input, then free it
-+                    ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
-+                    void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
-+                    split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
-+                    ggml_backend_event_record(free_ev, split_backend);
-+                }
-+                // redirect mode: input_cpy->data already points at the slot; the slot is freed
-+                // after the split's compute below
++                // copy the slot into the real split input, then free it (GGML_SCHED_STAGE_MODE retired)
++                ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
++                void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
++                split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
++                ggml_backend_event_record(free_ev, split_backend);
 +                return;
 +            }
 +        }
@@ -5557,15 +5537,6 @@ index 92a53bf38..b59e3d141 100644
 -        ggml_backend_synchronize(input_backend);
 -        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 -            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-+        // tripwire (issue #50 WIP): a split input that redirect mode pointed at a ring slot must
-+        // be consumed by the staged branch above, never by one of the copy paths below.  Catching
-+        // it here turns a future silent stale-slot read into an abort (reporters' suggestion,
-+        // PR #51).
-+        for (int k = 0; k < sched->stage_consumed_n; k++) {
-+            GGML_ASSERT(sched->stage_consumed[k].dst != input_cpy &&
-+                        "H2D staging: a redirected split input reached a copy path");
-+        }
-+
 +        // wait for the split backend to finish using the input before overwriting it.  exp37:
 +        // the meta backend has no event_record/event_wait, so this falls through to a FULL host
 +        // synchronize of both devices per expert upload, which keeps the host from running ahead.
@@ -5846,7 +5817,7 @@ index 92a53bf38..b59e3d141 100644
      }
  }
  
-@@ -2201,12 +3387,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2201,12 +3358,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      struct ggml_backend_sched_split * splits = sched->splits;
  
      int prev_backend_id = -1;
@@ -5862,7 +5833,7 @@ index 92a53bf38..b59e3d141 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -2221,7 +3410,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2221,7 +3381,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -5871,7 +5842,7 @@ index 92a53bf38..b59e3d141 100644
              }
          }
          // after the copies above, which may read host memory reused by the copies of the next split
-@@ -2229,7 +3418,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2229,7 +3389,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          ggml_backend_sched_prefetch_inputs(sched, split_id);
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -5880,22 +5851,7 @@ index 92a53bf38..b59e3d141 100644
              }
          }
  
-@@ -2277,6 +3466,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-         }
- 
-+        // redirect mode: the split's kernels have been launched, so the slots they read are reusable
-+        if (sched->stage_mode == 1) {
-+            for (int k = 0; k < sched->stage_consumed_n; k++) {
-+                ggml_backend_event_t free_ev = sched_stage_ev(sched, sched->stage_consumed[k].backend_id, sched->stage_consumed[k].slot, false);
-+                ggml_backend_event_record(free_ev, split_backend);
-+            }
-+        }
-+
-         prev_backend_id = split_backend_id;
-     }
- 
-@@ -2296,14 +3493,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2296,14 +3456,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -5912,7 +5868,7 @@ index 92a53bf38..b59e3d141 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2340,7 +3537,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2340,7 +3500,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -5928,7 +5884,7 @@ index 92a53bf38..b59e3d141 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2349,6 +3553,65 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2349,6 +3516,56 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -5942,15 +5898,6 @@ index 92a53bf38..b59e3d141 100644
 +        const char * stage_env = GGML_ENV_STR("GGML_SCHED_STAGE");
 +        const bool stage_forced = stage_env != NULL && atoi(stage_env) != 0;
 +        sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
-+        const char * mode_env = GGML_ENV_STR("GGML_SCHED_STAGE_MODE");
-+        // Redirect mode (1) points the split input straight at the ring slot to save one D2D copy.  It is
-+        // **default off as of 2026-10-06**: it assumes the consumer reads the tensor's `data` at launch
-+        // time, and that is false -- the meta path proved it (the stage guard restored the pointer right
-+        // after enqueuing the child graphs, and the kernels then read the restored pointer, so 0 of 24
-+        // staged slots ever reached `MUL_MAT_ID`; `stage_d2d` fixed it and measured the *same* speed, so
-+        // the copy this mode avoids is not worth anything).  `GGML_SCHED_STAGE_MODE=1` re-enables it for
-+        // A/B only; a correct redirect would have to defer the restore to the slot's free event.
-+        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 0;
 +        const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
 +        sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
 +        if (sched->stage_n_slots < 1) {
@@ -5994,7 +5941,7 @@ index 92a53bf38..b59e3d141 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2364,6 +3627,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2364,6 +3581,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
              ggml_backend_event_free(sched->events[b][c]);
          }
          ggml_backend_event_free(sched->prefetch_events[b]);
@@ -6005,7 +5952,7 @@ index 92a53bf38..b59e3d141 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2428,6 +3695,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2428,6 +3649,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -6023,7 +5970,7 @@ index 92a53bf38..b59e3d141 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2465,6 +3743,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2465,6 +3697,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -6032,7 +5979,7 @@ index 92a53bf38..b59e3d141 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2936,6 +4216,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2936,6 +4170,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -6042,7 +5989,7 @@ index 92a53bf38..b59e3d141 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2961,6 +4244,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2961,6 +4198,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -7378,7 +7325,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bb3238cfb..f9aae1dc7 100644
+index bb3238cfb..23b18c74a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -34,6 +34,7 @@
@@ -10087,7 +10034,7 @@ index bb3238cfb..f9aae1dc7 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -7031,6 +9113,186 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7031,6 +9113,184 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -10110,11 +10057,9 @@ index bb3238cfb..f9aae1dc7 100644
 +static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev) {
 +    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 +    ggml_cuda_set_device(cuda_ctx->device);
-+    // Deferred unless the scheduler's redirect mode (GGML_SCHED_STAGE_MODE=1) points the input at the slot: every
-+    // other caller (the scheduler's ring in its default mode, the meta backend's mirrored upload) copies the slot
-+    // into the input with stage_d2d, where the deferral is resolved.
-+    static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
-+    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ !redirect)) {
++    // `defer` is the scheduler ring's default (stage-then-D2D) form: the copy is resolved when the ring slot is
++    // drained into the split input with stage_d2d.  The old redirect form is retired (r250, TODO #284).
++    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ true)) {
 +        return;
 +    }
 +    cudaStream_t s = cuda_ctx->copy_stream();
@@ -10274,7 +10219,7 @@ index bb3238cfb..f9aae1dc7 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7047,7 +9309,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7047,7 +9307,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -10294,7 +10239,7 @@ index bb3238cfb..f9aae1dc7 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -7317,8 +9591,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -7317,8 +9589,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -10305,7 +10250,7 @@ index bb3238cfb..f9aae1dc7 100644
  }
  
  // TODO: move these functions here
-@@ -7823,6 +10097,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -7823,6 +10095,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -10322,7 +10267,7 @@ index bb3238cfb..f9aae1dc7 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -7857,6 +10141,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -7857,6 +10139,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -10478,7 +10423,7 @@ index bb3238cfb..f9aae1dc7 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -7873,6 +10306,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -7873,6 +10304,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -10510,7 +10455,7 @@ index bb3238cfb..f9aae1dc7 100644
  };
  
  // backend reg
-@@ -8057,6 +10515,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8057,6 +10513,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -20579,7 +20524,7 @@ index 3c7e1c11b..c94af98d8 100644
      void unmap_weight(const llama_tensor_weight & w) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 48955b01f..f46953afb 100644
+index 48955b01f..c67e3ec6e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1781,9 +1781,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -20650,17 +20595,23 @@ index 48955b01f..f46953afb 100644
          } else {
              ggml_backend_buffer_t buf;
              if (ml.no_alloc) {
-@@ -2161,6 +2195,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2161,6 +2195,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
 +    // wip/host-expert-tier: the tier census, once, after the placement is final.
 +    ml.report_host_expert_placement();
 +
++    // TODO #135: refuse a degenerate `-sm tensor` spread of the host-resident expert tables (a silent ~5x
++    // decode cliff).  It goes here, not earlier: a host-expert tensor does not have its host buffer until
++    // the loader places the tier DURING the data load (measured: 0 of 733 tensors has a host buffer before
++    // `load_all_data`), so the placement is only readable afterwards -- the same point the tier census uses.
++    check_host_expert_split_shares();
++
      return true;
  }
  
-@@ -3554,7 +3591,10 @@ llama_model_params llama_model_default_params() {
+@@ -3554,7 +3597,10 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -20671,7 +20622,7 @@ index 48955b01f..f46953afb 100644
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
-@@ -3565,6 +3605,7 @@ llama_model_params llama_model_default_params() {
+@@ -3565,6 +3611,7 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -20679,7 +20630,7 @@ index 48955b01f..f46953afb 100644
      };
  
      return result;
-@@ -4011,6 +4052,102 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -4011,6 +4058,102 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -20782,10 +20733,107 @@ index 48955b01f..f46953afb 100644
  int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
-@@ -4216,3 +4353,23 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4216,3 +4359,120 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
  
      return n_tokens * (uint32_t) tensor->ne[0];
  }
++
++// TODO #135 (r250): refuse a `-sm tensor` split whose granularity-rounded share of a HOST-RESIDENT expert
++// table leaves a device with ZERO of that table's split-axis columns.
++//
++// WHY: measured on gfx1201 with 35B-A3B (`n_embd` 2048, expert FF 512), `-ncmoe 40`, decode 109.7 t/s at 2
++// devices against 20.5 at 3 -- Q3_K_M 105.0/23.0, and Q8_0 95.7/90.2.  The share is the LOADER's own rule
++// (FFN granularity `lcm(blck_size,128)`, get_split_granularity + the `ne_s*(j+1)/n` flooring in the
++// split-state callback): Q4_K/Q3_K blocks are 256 elements, so `ffn_down_exps` (axis0 512) splits
++// 0/256/256 at three devices, while Q8_0's 32-element blocks split 128/128/256.  So this decides from the
++// model's own geometry AND the quant's block size -- never a model list -- and the predicate is
++// deliberately narrow:
++//   * host-resident experts only.  The SAME zero share exists in the all-VRAM 3-device arm (130.9 t/s) and
++//     in every 3-device `-sm tensor` arm the delivery validates (all Q8_0), so a placement-blind rule would
++//     refuse a configuration that measures healthy;
++//   * an explicit `--tensor-split` zero share is a placement choice, not a defect -- skip it;
++//   * `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` is the escape hatch (an explicit "I know what this shape is"
++//     for a measurement, not a default).
++// The failure mode it prevents is a silent 5x decode cliff (the moe cache prints one `DEGENERATE TENSOR
++// SPLIT` line to stderr when a table is created, but only when the cache is on), so a WARN would not be
++// enough (TODO #135 asks for vLLM-style TP validation).
++void llama_model::check_host_expert_split_shares() const {
++    static const bool allow_degenerate = [] {
++        const char * e = getenv("GGML_TENSOR_SPLIT_ALLOW_DEGENERATE");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (allow_degenerate) {
++        return;
++    }
++    const size_t n_devs = get_split_state_ud.n_devices;
++    if (n_devs < 2 || n_devs > GGML_BACKEND_META_MAX_DEVICES || get_split_state_ud.model == nullptr) {
++        return;
++    }
++    // An explicit 0 share means the user chose that placement (e.g. `--tensor-split 1,0,1`); do not refuse it.
++    // An all-zero vector is "no explicit split" (the proportional default), not an explicit choice.
++    const float * ts = tensor_split();
++    if (ts != nullptr) {
++        float ts_sum = 0.0f;
++        for (size_t d = 0; d < n_devs; d++) {
++            ts_sum += ts[d];
++        }
++        if (ts_sum > 0.0f) {
++            for (size_t d = 0; d < n_devs; d++) {
++                if (ts[d] == 0.0f) {
++                    return;
++                }
++            }
++        }
++    }
++    std::string worst;
++    size_t n_bad = 0;
++    size_t n_seen = 0;
++    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++        ggml_context * c = ctx.get();
++        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
++            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
++                continue;
++            }
++            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            if (std::string(t->name).find("exps") == std::string::npos) {
++                continue;
++            }
++            const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
++            if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS || ss.n_segments == 0) {
++                continue; // mirrored (or partial) -- not a split-axis table
++            }
++            n_seen++;
++            std::string zero_at;
++            for (size_t d = 0; d < n_devs; d++) {
++                int64_t extent = 0;
++                for (uint32_t s = 0; s < ss.n_segments; s++) {
++                    extent += ss.ne[s*n_devs + d] * ss.nr[s];
++                }
++                if (extent == 0) {
++                    zero_at += zero_at.empty() ? std::to_string(d) : ("," + std::to_string(d));
++                }
++            }
++            if (!zero_at.empty()) {
++                n_bad++;
++                if (worst.empty()) {
++                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity %lld) -> device %s holds 0",
++                            t->name, (int) ss.axis, (long long) t->ne[ss.axis], n_devs,
++                            (long long) std::lcm((int64_t) ggml_blck_size(t->type), (int64_t) 128), zero_at.c_str());
++                }
++            }
++        }
++    }
++    if (n_bad > 0) {
++        throw std::runtime_error(format(
++                "-sm tensor: %zu of %zu host-resident expert tables get a ZERO per-device share of their split "
++                "axis (first: %s).  This split cannot work: the host-expert path degenerates (measured 20.5 t/s "
++                "decode against 109.7 at two devices on such a shape).  Use -sm layer, fewer devices, or a quant "
++                "whose block size leaves every device a share; GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1 overrides.",
++                n_bad, n_seen, worst.c_str()));
++    }
++}
 +
 +size_t llama_model::max_host_weight_tensor_bytes() const {
 +    size_t max_bytes = 0;
@@ -20807,7 +20855,7 @@ index 48955b01f..f46953afb 100644
 +    return max_bytes;
 +}
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 126f52b00..60e22a957 100644
+index 126f52b00..4c41264d5 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -944,6 +944,9 @@ struct llama_model {
@@ -20820,11 +20868,18 @@ index 126f52b00..60e22a957 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -979,6 +982,7 @@ struct llama_model {
+@@ -979,6 +982,14 @@ struct llama_model {
  
      // total number of parameters in the model
      uint64_t n_elements() const;
 +    size_t max_host_weight_tensor_bytes() const;
++
++    // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
++    // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
++    // zero columns of that table, which measures a silent ~5x decode cliff.  Geometry-derived (the loader's
++    // own share rule + the quant's block size), so it carries no model list.  Called once at the end of
++    // `load_tensors`; `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` overrides.
++    void check_host_expert_split_shares() const;
  
      void print_info() const;
  

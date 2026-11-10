@@ -1,4 +1,4 @@
-From 8b9249bb84887cda982e60f09ccb4a436ff5853c Mon Sep 17 00:00:00 2001
+From 57c89e17becc147e4b25ba07a55d5ca6f44fdde7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -505,10 +505,10 @@ index 097661b79..5927f71d2 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 89fe4f6c7..2505a2e90 100644
+index b22dfd444..be5cbc4ff 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1644,6 +1644,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1642,6 +1642,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
      // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
      allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
  
@@ -524,7 +524,7 @@ index 89fe4f6c7..2505a2e90 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -3917,6 +3926,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -3871,6 +3880,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -9003,10 +9003,10 @@ index 6dcf34e77..ab8a48288 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6f5c6bcd3..c16927b6c 100644
+index df36af3cb..0d0fa864d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -787,6 +787,10 @@ llama_context::llama_context(
+@@ -802,6 +802,10 @@ llama_context::llama_context(
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
          };
@@ -10854,10 +10854,10 @@ index c94af98d8..74379b025 100644
          // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
          // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index db81cfe30..7c5151835 100644
+index 070c9056f..08969b8ac 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3369,10 +3369,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3375,10 +3375,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
          default:
              {
                  // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
@@ -10910,7 +10910,7 @@ index db81cfe30..7c5151835 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -4236,7 +4277,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4242,7 +4283,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -10921,10 +10921,10 @@ index db81cfe30..7c5151835 100644
  ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
      GGML_ASSERT(ml != nullptr);
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 566f078bc..0bff4864d 100644
+index ba3821e93..961beb261 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -1050,6 +1050,7 @@ struct llama_model_base : public llama_model {
+@@ -1057,6 +1057,7 @@ struct llama_model_base : public llama_model {
      const int TENSOR_SKIP_IF_VIRTUAL;
      const int TENSOR_ALLOW_RESHAPE;
      const int TENSOR_READ_LAZY;

@@ -1,4 +1,4 @@
-From a86de33b5acbc90b1e47f291f8f3b42bb1b253cc Mon Sep 17 00:00:00 2001
+From 3748c82611ff29b11866cfcbe7ec928915941f0f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: relaxed-tensor split mode
@@ -344,7 +344,7 @@ index c1b0d44dd..d864ca576 100644
  
      enum llama_load_mode {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 00d707c98..2d7a0ead1 100644
+index a18ec9fe7..a0e0e796a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -299,7 +299,7 @@ static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model)
@@ -356,7 +356,7 @@ index 00d707c98..2d7a0ead1 100644
  }
  
  // true when this build exposes the CUDA/HIP backend at all
-@@ -2287,7 +2287,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -2302,7 +2302,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
  
      LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
  
@@ -365,7 +365,7 @@ index 00d707c98..2d7a0ead1 100644
          static bool warned = false;
          if (!warned) {
              LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-@@ -6105,7 +6105,7 @@ llama_context * llama_init_from_model(
+@@ -6120,7 +6120,7 @@ llama_context * llama_init_from_model(
          params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
      }
  
@@ -401,7 +401,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3810eb650..53779ab83 100644
+index dd57134e1..0e75e9034 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -398,7 +398,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
