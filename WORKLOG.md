@@ -1,3 +1,35 @@
+## 261109.011 (r244, optional) -- PR #284 (`two-lane-prefill` re-base) reviewed and NOT taken: the MTP gate it removes is not a rebase, and the MTP draft arms a second buffer set here
+
+PR #284 (@slavap) is a re-base of `optional/two-lane-prefill` from r229 to r234 **plus one behavioural
+delta**: it removes `!cparams.embeddings_nextn` from both the split and the pair gate so an MTP *target* pairs.
+Reviewed against the r244 tree and turned down (`CHANGES_REQUESTED` on the PR) rather than ported here: the
+cut no longer applies at r244, its numbers are on a V620 + 8060S pair this box does not have, and item 2 below
+means taking it would mean fixing it first.  `optional/` is unchanged — the artifact stays at its r243 cut
+(which does still apply strictly at r244, tree `603696098c`).
+
+1. **The delta is real and it measures well.**  With the two gates relaxed on an r244 tree, 3 x R9700,
+   `-sm layer -ts 1/1/1 -ot`: MTP target (dense 27B `…-mtp`, `draft-mtp n3`, 3037-token prompt) prefill
+   **946.7/942.0 -> 1085.1/1080.6 t/s (+14.7 %; +14.9 % over the r243 cut, which armed and declined)**, decode
+   flat, same-seed greedy text (`6c4fc2de00df`) and MTP acceptance identical, default path bit-identical
+   (prefill-logit KLD 0.000000, same-top-p 100.000 % against a base recorded from the r244 delivery build),
+   `check-gpu-faults.sh` clean.  Not shipped: nothing is committed.
+2. **Blocker: the artifact arms the MTP draft, and the PR's gate removal would pair it.**  The PR says the
+   draft contexts stay single-lane because they are "pinned to one device (`n_gpu = 1`)".  They are not: the
+   draft's backends are the model's whole device list, so `n_gpu = 3` here and the arm gate passes —
+   measured, `GGML_CUDA_WORK_ALLOC_DEBUG=1` prints `is_draft=0` for the MTP draft on the r244 build (the
+   fork propagates `params.ctx_other` only for Gemma4-assistant / EAGLE3 / DFlash / qwen4exp; an MTP draft is
+   the target's own model with `ctx_type = LLAMA_CONTEXT_TYPE_MTP`).  So through r243 the draft has been
+   allocating a second scheduler + compute-buffer set (134.29 MiB device + 20.08 MiB host) it could never pair
+   on, and with `!embeddings_nextn` removed it would pair as well.  The requested change is an explicit draft
+   predicate (`ctx_other != nullptr || ctx_type == MTP`) in the arm gate — verified locally to give the target
+   pair with the draft refused (`ignored (n_gpu = 3, pipeline_parallel = 0, draft = 1)`), costing ~1 % on that
+   arm (1081 vs 1092 t/s) and saving the buffer set.
+3. **Same predicate question in the delivery, recorded here rather than as new work:** the fork's own draft
+   detection (`graph_reserve()`'s narrow-2 route, `process_ubatch()`'s `is_draft`, the narrow-2 floor re-pin in
+   `sched_reserve()`) is the same `ctx_other` test, so none of them run for a qwen3-family MTP draft.  Whether
+   that can alias the target's narrow verify buffer is unmeasured; it was **not** changed in this pass (no
+   delivery file was touched) and it is not a new item — it is the pre-existing state, noted so the next
+   session does not re-derive it.
 ## 261109.010 (r244, RELEASE v16-a691b2345-r244) -- contributor PR #292: the GDN conv takes `#31660`'s rollback store again (+0.9 % prefill), that conv step runs as one kernel (+1.2 % per verify forward), and the DFlash layer-input copies sit next to each layer (-176 MiB)
 
 **Release `v16-a691b2345-r244`.**  Base `a691b2345`, 16 blocks, canonical tip `443104a13`, tree
