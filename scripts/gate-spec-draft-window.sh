@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MTP draft-WINDOW gate (LLAMA_SPEC_DRAFT_WINDOW, block 15 Goal C; issue #264).
+# MTP draft-WINDOW gate (`--spec-draft-kv-window`, block 15 Goal C; issues #264 / #293).
 #
 # WHY THIS EXISTS
 #   The MTP draft context's KV is a sliding window instead of a `-c`-cell cache (block 15, r193).  Under
@@ -10,8 +10,15 @@
 #   `decode() failed: failed to process speculative batch` (HTTP 500) while `--kv-unified -np 2` is in use.
 #
 #   This gate drives two slots on a unified cache through the whole lifecycle and compares two arms:
-#     win   LLAMA_SPEC_DRAFT_WINDOW=$WIN   (a small window, so BOTH slots' rings wrap on a short prompt)
-#     win0  LLAMA_SPEC_DRAFT_WINDOW=0      (the reference: the full draft cache)
+#     win   --spec-draft-kv-window $WIN    (a small window, so BOTH slots' rings wrap on a short prompt)
+#     win0  --spec-draft-kv-window 0       (the reference: the full draft cache)
+#
+#   It also asserts the `auto` POLICY itself, startup-only (no requests), because r246 replaced the
+#   quarter-of-the-context sizer with `the cap or nothing` (issue #293):
+#     auto_small    CTX 8192,   2 slots -> nothing to save: no window and no message
+#     auto_decline  CTX 131072, 2 slots -> the reporter's shape: a DECLINE line instead of the 32768-cell
+#                                          quarter-of-the-context window that cost 8 % of decode (issue #293)
+#     auto_grant    CTX 67584,  1 slot  -> 65536 cells per sequence, draft cache 66 048 cells
 #
 # WHAT IT CHECKS
 #   HARD  * every request answers on both arms (the #264 failure is a HTTP 500 on the second slot)
@@ -33,7 +40,8 @@
 #   LLAMA_SERVER   llama-server binary   (default: ~/llama.cpp/build-rocm/bin/llama-server)
 #   MODEL          target GGUF with an embedded MTP head (default: the dense Qwen3.8-27B UD-IQ3_S)
 #   PROMPT, PROMPT2  the two slot prompts; both must be LONGER than WIN tokens
-#   WIN            the forced window       (default: 1024 -> wrap after ~2 batches per slot)
+#   WIN            the forced window       (default: 1024 -> wrap after ~2 batches per slot; `auto` is the
+#                                          policy, which needs CTX > 2*65536 with NPAR 2 to be granted)
 #   CTX            context per sequence    (default: 8192)
 #   NPAR           slots / n_seq_max       (default: 2)
 #   NGEN           tokens per request      (default: 32)
@@ -43,9 +51,10 @@
 #   EXTRA_ARGS     extra llama-server args
 #   KEEPOUT        dir for the per-arm logs (default: mktemp -d)
 #
-# The reporter's own shape (#264) is the AUTO policy at a large context:
-#   WIN=auto CTX=262144 PROMPT=<a >32768-token prompt> PROMPT2=<another one>
-# ... which the same code path serves with a bigger N.
+# The reporter's own shape (#264/#293) is the AUTO policy at a large context:
+#   WIN=auto CTX=262144 NPAR=2 PROMPT=<a >32768-token prompt> PROMPT2=<another one>
+# ... which the same code path serves with a bigger N.  The two `auto` policy arms below are cheap and do not
+# need long prompts, so the policy is covered by the default run.
 #
 # Exit: 0 = pass, 1 = fail, 2 = usage/startup error.
 set -uo pipefail
@@ -111,15 +120,16 @@ GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 # drive one arm: start the server, run A-F, stop it.  Writes $arm/{log.txt,steps.json}.
 run_arm() {
     local arm="$1"; shift
+    local -a arm_args=("$@")
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
     local pid
     env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
         HIP_VISIBLE_DEVICES="$DEVS" \
-        "$@" \
         "$LLAMA_SERVER" -m "$MODEL" \
         -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$CTX" -np "$NPAR" --kv-unified \
         --spec-type draft-mtp --spec-draft-n-max 3 -t 8 --poll 0 \
+        "${arm_args[@]}" \
         --host 127.0.0.1 --port "$PORT" $EXTRA_ARGS > "$dir/log.txt" 2>&1 &
     pid=$!
     SRV_PID="$pid"
@@ -190,6 +200,29 @@ stop_arm() {
     fi
 }
 
+# startup-only arm: start the server with the given context/slot counts and window args, wait for the draft
+# cache's startup lines, stop it.  Used by the `auto` policy arms, which need no requests (r246, issue #293).
+policy_arm() {   # policy_arm <arm> <ctx> <npar> <arg...>
+    local arm="$1" ctx="$2" npar="$3"; shift 3
+    local dir="$KEEPOUT/$arm"
+    mkdir -p "$dir"
+    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+        HIP_VISIBLE_DEVICES="$DEVS" \
+        "$LLAMA_SERVER" -m "$MODEL" \
+        -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$ctx" -np "$npar" --kv-unified \
+        --spec-type draft-mtp --spec-draft-n-max 3 -t 8 --poll 0 -lv 4 "$@" \
+        --host 127.0.0.1 --port "$PORT" $EXTRA_ARGS > "$dir/log.txt" 2>&1 &
+    SRV_PID=$!
+    for _ in $(seq 1 900); do
+        grep -qE "MTP draft KV window|listening on http|failed to|error:" "$dir/log.txt" 2>/dev/null && break
+        kill -0 "$SRV_PID" 2>/dev/null || break
+        sleep 1
+    done
+    sleep 1
+    stop_arm
+    return 0
+}
+
 echo "==> MTP draft-window gate (WIN $WIN, ctx $CTX, $NPAR slot(s), $SM, $NGPU GPU, $NGEN tokens/request)"
 echo "    prompts: $(basename "$PROMPT") $(wc -c < "$PROMPT") B, $(basename "$PROMPT2") $(wc -c < "$PROMPT2") B"
 if [ "$WIN" != "auto" ] && [ "$(wc -c < "$PROMPT")" -lt $((4 * WIN)) ]; then
@@ -197,8 +230,8 @@ if [ "$WIN" != "auto" ] && [ "$(wc -c < "$PROMPT")" -lt $((4 * WIN)) ]; then
     echo "          cell-count check below would exercise the sizing.  Point PROMPT/PROMPT2 at longer text."
 fi
 
-run_arm win  env LLAMA_SPEC_DRAFT_WINDOW="$WIN" || { echo "==> FAIL: the window arm did not run"; exit 1; }
-run_arm win0 env LLAMA_SPEC_DRAFT_WINDOW=0      || { echo "==> FAIL: the no-window arm did not run"; exit 1; }
+run_arm win  --spec-draft-kv-window "$WIN" || { echo "==> FAIL: the window arm did not run"; exit 1; }
+run_arm win0 --spec-draft-kv-window 0      || { echo "==> FAIL: the no-window arm did not run"; exit 1; }
 
 fails=0
 
@@ -236,7 +269,7 @@ if [ -z "$line" ]; then
     echo "      (no window was created, or the estimate did not run: check '$(basename "$MODEL")' carries an embedded MTP head)"
     fails=$((fails + 1))
 elif ! echo "$line" | grep -q "MTP draft window"; then
-    echo "FAIL  win: LLAMA_SPEC_DRAFT_WINDOW=$WIN was declined (no window: the text comparison below is vacuous)"
+    echo "FAIL  win: --spec-draft-kv-window $WIN was declined (no window: the text comparison below is vacuous)"
     echo "      $(echo "$line" | sed 's/^[^ ]* //')"
     fails=$((fails + 1))
 else
@@ -293,6 +326,48 @@ for arm in win win0; do
     [ -n "$acc" ] && echo "INFO  $arm: draft acceptance$acc"
 done
 
+# ===== the `auto` policy (r246, issue #293) ==========================================================
+# Startup-only arms: `auto` must never grant a window the drafter can outgrow.  A window below the depth the
+# drafter works over costs 7-9 % of decode (and 8 % measured at -c 131072 on BOTH a pre- and a post-re-base
+# build), so it is DECLINED instead of lowered -- while a context with a full 65536 cells of room below every
+# sequence's own window still gets one.
+echo
+echo "-- auto policy arms (startup only)"
+
+# nothing to save: at ctx 8192 x 2 slots the cap cannot fit per sequence, and the whole draft cache is smaller
+# than the cap anyway -- so there is no window AND no message (the pre-r246 behaviour, kept)
+policy_arm auto_small 8192 2 --spec-draft-kv-window auto
+if grep -q "MTP draft KV window" "$KEEPOUT/auto_small/log.txt"; then
+    echo "FAIL  auto_small: auto reported a window at ctx 8192 x 2 slots (nothing to save there):"
+    grep -m2 "MTP draft KV window" "$KEEPOUT/auto_small/log.txt" | sed 's/^/      /'
+    fails=$((fails + 1))
+else
+    echo "PASS  auto_small: no window and no message at ctx 8192 x 2 slots"
+fi
+
+# the reporter's -c 131072 x 2 slots shape: the pre-r246 policy picked 32768 there (a quarter of the context,
+# below the depth a 62k request reaches) and cost 8 % of decode; auto must now DECLINE and say so
+policy_arm auto_decline 131072 2 --spec-draft-kv-window auto
+if grep -q "MTP draft KV window: declined" "$KEEPOUT/auto_decline/log.txt" \
+        && ! grep -q "MTP draft KV window = " "$KEEPOUT/auto_decline/log.txt"; then
+    echo "PASS  auto_decline: auto granted no window at ctx 131072 x 2 slots, and said why"
+else
+    echo "FAIL  auto_decline: auto did not decline the window it cannot grant per sequence (131072 x 2 slots):"
+    grep -m2 -E "MTP draft KV window" "$KEEPOUT/auto_decline/log.txt" | sed 's/^/      /'
+    fails=$((fails + 1))
+fi
+
+# a context with a full cap of room below every sequence's own window: the cap is granted
+policy_arm auto_grant 67584 1 --spec-draft-kv-window auto
+line=$(grep -m1 "MTP draft KV window = " "$KEEPOUT/auto_grant/log.txt" || true)
+if echo "$line" | grep -q "65536 cells per sequence" && echo "$line" | grep -q "draft cache 66048 "; then
+    echo "PASS  auto_grant: auto granted the 65536-cell cap at ctx 67584 x 1 slot (draft cache 66 048)"
+else
+    echo "FAIL  auto_grant: auto did not grant the cap at ctx 67584 x 1 slot:"
+    echo "      ${line:-<no window line>}"
+    fails=$((fails + 1))
+fi
+
 # the kernel journal, scoped to this gate's own window (#294: an unscoped or fixed "N min ago" window fails
 # on an earlier run's fault, which is a verdict about the journal and not about the code under test)
 if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
@@ -300,7 +375,9 @@ if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
     since_args=()
     [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
     if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" \
-            --log "$KEEPOUT/win/log.txt" --log "$KEEPOUT/win0/log.txt" 2>&1)"; then
+            --log "$KEEPOUT/win/log.txt" --log "$KEEPOUT/win0/log.txt" \
+            --log "$KEEPOUT/auto_small/log.txt" --log "$KEEPOUT/auto_decline/log.txt" \
+            --log "$KEEPOUT/auto_grant/log.txt" 2>&1)"; then
         echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and both arm logs clean"
     else
         echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"

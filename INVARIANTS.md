@@ -33,19 +33,23 @@ change), and let `WORKLOG.md` carry the narrative.
   the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
   carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
   (r178; `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the tail in pinned system
-  RAM, one VA range, no kernel change) and the **attendance pool** (r190; `LLAMA_KV_REGION_POOL` — the
+  RAM, one VA range, no kernel change) and the **attendance pool** (r190; `--kv-region-pool` — the
   authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
   top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
   **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
+  Since **r246 both of block 15's own knobs are first-class command-line options, not environment variables**
+  (`--kv-region-pool` and `--spec-draft-kv-window`, both defaulting to `auto`; the `LLAMA_KV_REGION_POOL` /
+  `LLAMA_SPEC_DRAFT_WINDOW` env vars are gone).  Why: a KV placement that costs 8-13 % of decode does not
+  belong behind a variable nobody sets and nobody can see in `--help` (issue #293).
   A run with both knobs unset keeps the plain device buffer and its OOM.  **They are placements of the KV, so
   each declines rather than fighting another placement (r197):** the pool declines on an active window and on
   `!offload`, and the window now declines on `!offload` too — with `-nkvo` the cache is pageable host RAM end to
   end, so there is nothing to window (before r197 it announced a VRAM window and then built a plain `CPU KV
   buffer`, and `is_streaming()` took qwen4exp's sparse arm off that plan).  `is_streaming()` therefore keys on
   `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **15 also carries Goal C** (r193,
-  `LLAMA_SPEC_DRAFT_WINDOW`): the MTP draft context's KV is a *window* instead of `-c` cells, **default ON**
-  because it measures non-negative (adaptive = a quarter of the context clamped to [32768, 65536], `0` is the
-  kill switch), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
+  `--spec-draft-kv-window`): the MTP draft context's KV is a *window* instead of `-c` cells, **default `auto`**
+  because it measures non-negative where it is granted (`auto` = THE CAP OR NOTHING, see the r246 entry below;
+  `0` = a full `-c` draft cache), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
   +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
@@ -60,7 +64,7 @@ change), and let `WORKLOG.md` carry the narrative.
   under-charge the allocation.  A per-stream cache (`--no-kv-unified`) is unchanged, `n_seq_max == 1` (every
   `llama-cli`/`llama-bench` run) measures exactly what it did, and the window is DECLINED rather than lowered
   when it cannot fit per sequence.  Gate: `scripts/gate-spec-draft-window.sh` (2 slots, both rings wrapping,
-  windowed output must equal `LLAMA_SPEC_DRAFT_WINDOW=0` byte for byte).  Every `block NN`
+  windowed output must equal `--spec-draft-kv-window 0` byte for byte).  Every `block NN`
   reference elsewhere in this file that is not one of the V2.1 numbers below is the **pre-V2.1 16-block
   numbering** and is kept as a historical handle.  The V2.1 map: **01** all-reduce, **02** adaptive MTP,
   **03** chunked GDN, **04** BF16 KV, **05** FA band/native/derived, **06** MMB, **07** k-quant,
@@ -1721,7 +1725,7 @@ cost a session to learn; do not re-derive them.
 4. **The pool is not the cause of every 2-device large-context fault.**  On the reported arm (`-c 204800`, 2 devices,
    `-ncmoe 48`, mmap) prefill faults `rms_norm_f32` on GPU 1 (`HSA_STATUS_ERROR_MEMORY_FAULT` + `gfxhub page fault`)
    right after `moe_cache_evict_slab_range` discards 5.4-5.8 GiB of arena tables, and it **reproduces with
-   `LLAMA_KV_REGION_POOL=0`**; `-c 131072` (2 devices) and `-c 204800` (1 device) are clean.  Before blaming block 15 for a
+   `--kv-region-pool 0`**; `-c 131072` (2 devices) and `-c 204800` (1 device) are clean.  Before blaming block 15 for a
    multi-device fault, run the same arm with the pool off.  (**Fixed in r214**, `TODO` #143: the fault was the
    slab's narrow-2 draft-compute region being handed out with its top unmapped -- see the r214 section below.)
 
@@ -1803,7 +1807,7 @@ cost a session to learn; do not re-derive them.
 
 **Measured facts.  Do not re-derive; do not enable the pool on a prompt-heavy server.**
 
-1. **The pool's page-fill path is per DECODE step, so at PROMPT time it is pure overhead.**  `LLAMA_KV_REGION_POOL=16384`
+1. **The pool's page-fill path is per DECODE step, so at PROMPT time it is pure overhead.**  `--kv-region-pool 16384`
    against the plain device KV, one RX 7900 XTX, `-c 204800`, Qwen3.8-Flash-Next GSQ-RCO-IQ3_S (`-ncmoe 48`, q8_0
    KV): **pp32K 427.5 against 829.3 t/s**, pp8K 463 against 769, **pp113K 409.2 against 808.2**.  A prompt chunk
    writes every cell of its range, so the fill it pays is never reused; a decode step re-reads the same pages.
@@ -3008,7 +3012,7 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   assert always names sizes/offsets now (`GGML_CUDA_POOL_TRACE=1` adds the stacks); (b) the *class* is open: every
   `pool_stack_push` site still owes a check that no plain allocation precedes it in its scope (`TODO` #298).
 - **The attendance pool is a distinct-memory design and is wrong on a shared host/device pool (r236, measured on
-  gfx1151).**  `LLAMA_KV_REGION_POOL` keeps the authoritative KV in a pinned host *mirror* and fills a compact
+  gfx1151).**  `--kv-region-pool` keeps the authoritative KV in a pinned host *mirror* and fills a compact
   device pool from it by DMA, keyed by a page table with a MARK/CLAIM/MAP+FILL resolve.  On an integrated GPU the
   mirror and the weights are the same physical memory, and on gfx1151 the resolve is **wrong**: with the WHOLE
   cache resident (8192 pages) `LLAMA_KV_POOL_VERIFY=1` reports ~93 M byte mismatches (93 399 360; 95 173 888 on
@@ -3417,3 +3421,33 @@ came out of it and are worth not re-deriving:
    compare against the host master, zero mismatches and no non-finite heads), and cache-on vs cache-off
    text byte-identical.  **A mixed-arch layout is still not a validated configuration**, so this is a
    supported-but-unmeasured case, not a claim of support.
+
+## r246 -- a KV placement is an option, not an environment variable, and `auto` must never grant a window the drafter outgrows (GitHub issue #293)
+
+The delivery's two block-15 knobs were promoted out of the environment (r246):
+`LLAMA_SPEC_DRAFT_WINDOW` -> `--spec-draft-kv-window [auto|N]` and `LLAMA_KV_REGION_POOL` ->
+`--kv-region-pool [auto|N]`, both **default `auto`**, both carried in `llama_context_params`
+(`spec_draft_kv_window` / `kv_region_pool`, `-1` = auto) and no longer read from the environment.  Do not
+re-derive the reasons:
+
+1. **A knob that changes decode by 8-13 % cannot be invisible.**  Neither variable appeared in `--help`, and
+   a consumer who inherited one (or forgot one) could not tell from any log line which placement they were
+   running.  A first-class option is discoverable, per-run, and shows up in the arg dump.
+2. **`auto` for the draft window is THE CAP OR NOTHING, and the old sizer was wrong for a whole class of
+   contexts.**  r193's policy took `n_ctx_seq/4` clamped to `[32768, 65536]`, so at `-c 131072` it granted
+   32 768 cells: a quarter of the context, i.e. *below* the depth a 62 k-token request reaches.  Measured on
+   both a pre- and a post-re-base build (issue #293): 55.14 t/s at 62 857 tokens against 59.81 with the
+   window off, and identical draft acceptance at 35 881 (83/128 either way, 90/109 with the window off) --
+   the documented 7-9 % "window below the drafter's working depth" case, chosen silently by the policy.  `auto`
+   now grants `min(65536, ctx)` cells and DECLINES (logged at WARN) rather than lowering.  The trade is
+   explicit: a small context loses its window (and its VRAM saving) instead of paying decode.
+3. **`--kv-region-pool auto` has no sizer yet**, and that is stated rather than implied: the pool only pays
+   when the context does not fit without it, so `auto` does not take it and a pool-eligible cache logs one
+   INFO line saying so.  `TODO` #313 is the `--fit` pass that would decide it.
+4. **What the issue's evidence does NOT establish** (do not re-derive the wrong half): `n_kv`, the mask width
+   and the used cell count are **continuous** across the drafter's ring wrap (`get_n_kv()` is
+   `min(cells.size(), PAD(used_max_p1))`), so a step at exactly the window cannot come from the mask covering
+   the ring; and `GGML_CUDA_GCDBG`'s host figure covers only the backend's `graph_compute` per-node dispatch,
+   so it says nothing about the llama-side per-ubatch host work (the packed kq-mask fill, `find_slot` /
+   `apply_ubatch`, `seq_rm`) -- "the time is on the GPU" is not supported by it.  The Windows mechanism
+   (12-13 % past the wrap on r241+ only) is `TODO` #312.

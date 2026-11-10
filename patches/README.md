@@ -4059,7 +4059,15 @@ byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op witho
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
 
-## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`), the attendance POOL (`LLAMA_KV_REGION_POOL`) and the MTP draft WINDOW (`LLAMA_SPEC_DRAFT_WINDOW`, **default on**)
+## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`), the attendance POOL (`--kv-region-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `auto`**)
+
+> **r246 amendment (issue #293): both of this block's own knobs are now first-class options.**  `LLAMA_KV_REGION_POOL`
+> became `--kv-region-pool [auto|N]` and `LLAMA_SPEC_DRAFT_WINDOW` became `--spec-draft-kv-window [auto|N]`, both
+> defaulting to `auto`, and the two env vars are **gone** (they live on as the options' `LLAMA_ARG_*` forms).  Two
+> reasons: a KV placement that can cost 8-13 % of decode must be visible in `--help` and settable per run, and the
+> old `auto` sizers were not defensible -- the window's quarter-of-the-context policy picked 32768 at `-c 131072`,
+> i.e. a window below the depth a 62k request reaches, and cost 8 % of decode.  `auto` is now **the cap or
+> nothing** (65536 cells, or no window).  See `ENVIRONMENT.md` §17, `INVARIANTS.md` (r246).
 
 > **r222 amendment (issue #275, Windows 2-GPU `-sm tensor` access violation):** the provider used to inherit the
 > calling thread's driver context.  `ggml_backend_cuda_kv_region_buffer_type_split` -- i.e. the capability
@@ -4087,7 +4095,7 @@ Purity notes: `GREEDY-PURITY.md` §58.
 > tensor** (144-240 calls per run).  No behaviour change; the windowed/pooled arms are unchanged.
 
 > **REJECTED on gfx1151 (RDNA3.5, measured 2026-11-08, `TODO` #300):** the **attendance pool**
-> (`LLAMA_KV_REGION_POOL`, Goal B) is **incorrect** on an integrated GPU.  A *fully resident* pool (every block of
+> (`--kv-region-pool`, Goal B) is **incorrect** on an integrated GPU.  A *fully resident* pool (every block of
 > the cache has a page) still reports ~93 M byte mismatches against its own mirror under `LLAMA_KV_POOL_VERIFY=1`
 > and produces a text that differs from the sparse reference and moves run to run.  The **window** (Goal A) and
 > the sparse decode arm are unaffected and validated there (`wref == wres == wspill` `be904e86f248`).  The pool is
@@ -4187,14 +4195,14 @@ byte-identical to a build without this block, including its OOM.
   27B, −0.000000 / 99.994 % on a spilling Flash-Next (two KV caches), and every text arm byte-identical to
   its plain reference.  The state, context-checkpoint and MTP verify-width gates all pass on arms that
   provably spill (`FLIP > 0`).
-* **Not in the window's own part:** Goal C (the MTP drafter ring, `LLAMA_SPEC_DRAFT_WINDOW`) and the
+* **Not in the window's own part:** Goal C (the MTP drafter ring, `--spec-draft-kv-window`) and the
   superseded A1 two-base FA read (Goal B is the pool below).
 
 ### The attendance pool (Goal B, r190)
 
 Promoted from the `archive/work/kv-residency` campaign in **r190** (the window above is Goal A of the same campaign;
 this is Goal B).  Where the window keeps a positional tail of the KV in VRAM, the pool keeps the **whole**
-context in pinned host RAM and only the pages a decode step actually attends to in VRAM.  Opt-in: with `LLAMA_KV_REGION_POOL` unset (or
+context in pinned host RAM and only the pages a decode step actually attends to in VRAM.  Opt-in: with `--kv-region-pool` left at `auto` (or
 `0`) the attention KV takes the plain device buffer and the run is byte-identical to a build without this
 block, including its OOM.
 
@@ -4213,7 +4221,7 @@ kernel change.  `WORKLOG.md` 261105.001, `INVARIANTS.md` r216.
   every existing path — the `set_rows` writers, `state_write`/`state_read`, the rope shift behind
   `defrag`/`seq_add`, `seq_park`, `get_k`/`get_v`, the kq mask — works on it **unchanged**.  That is the
   writer rule, and it is why the state, context-checkpoint and parking gates need no pool-specific code.
-* A compact **DEVICE POOL** holds `LLAMA_KV_REGION_POOL` cells per layer as pages of **one indexer block**
+* A compact **DEVICE POOL** holds `--kv-region-pool N` cells per layer as pages of **one indexer block**
   (`compress_ratio` cells), with a page table `tbl[block] -> slot`, its inverse, a per-slot epoch mark and one
   shared counter block.  At the measured shape that is **204 MiB** against the resident KV's 816 MiB
   (`-c 65536`) / 1 632 MiB (131 072) / 2 448 MiB (196 608).
@@ -4245,7 +4253,7 @@ kernel change.  `WORKLOG.md` 261105.001, `INVARIANTS.md` r216.
    and only the **trunk** context of a qwen4exp model (the MTP draft's cache is read densely: pooling it would
    only make its reads leave VRAM).  Anything else declines with one message and the KV is unchanged.
 
-**Knobs.**  `LLAMA_KV_REGION_POOL=<cells>` (unset/`0` = off), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
+**Knobs.**  `--kv-region-pool <cells>` (`auto` = not taken yet, `0` = off; r246; the `LLAMA_KV_REGION_POOL` env var before it), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
 selected page compared byte-for-byte with the mirror at read time, 0 mismatches expected),
 `LLAMA_KV_POOL_STATS=<path>` (a **path**, appended at teardown: a line on stderr would sit inside the generated
 text).  `ENVIRONMENT.md` §18.
@@ -4346,14 +4354,15 @@ identity.
 #### r193 — Goal C: the MTP draft window, and the reserve that makes it pay
 
 The MTP draft context's KV is a sliding window instead of `-c` cells.  **This is the one knob in this block
-that is default ON**, because it measures non-negative everywhere and positive where the freed VRAM has
-somewhere to go — the delivery's own rule (a beneficial, gated feature is on; the env var only disables).
+that is on by default**, because it measures non-negative where it is granted and positive where the freed
+VRAM has somewhere to go — the delivery's own rule (a beneficial, gated feature is on; the knob only disables).
 
-* `LLAMA_SPEC_DRAFT_WINDOW`: unset or `auto` = the adaptive policy (**a quarter of the context, clamped to
-  `[32768, 65536]` cells), `0` = off (byte-identical to a build without it), `N` = that many cells **per
-  sequence** (floored at one ubatch).  The clamps are the safety rails: a window far below the context the
-  drafter uses costs 7-9 % of decode, a window at or above it is free, and at `-c <= 32768` the window is
-  dropped entirely.
+* `--spec-draft-kv-window` (r246; the `LLAMA_SPEC_DRAFT_WINDOW` env var before it): `auto` (the default) =
+  **the cap or nothing** -- `min(65536, ctx)` cells, and where that would not leave one batch of room below
+  every sequence's own context the window is **declined** (logged) rather than lowered, because a window
+  below the depth the drafter works over costs 7-9 % of decode; `0` = off (byte-identical to a build without
+  it); `N` = that many cells **per sequence** (floored at one ubatch, declined when it cannot fit).  The r193
+  sizer (a quarter of the context clamped to `[32768, 65536]`) is what r246 replaced.
 * **The ring is the shipped reclaim**, not a new allocator: `llama_kv_cache::find_slot` already reclaims a
   cell more than `n_swa` behind, and `set_input_kq_mask` reads *this cache's* `n_swa`, so `hparams` (shared
   with the target) is untouched.  The derived kq mask stays valid as well — its predicate compares each
@@ -4463,8 +4472,8 @@ mirror to the host bucket (it cannot know the run's depth).
 **r200 — the draft window is granted per sequence (issue #264).**  See the per-sequence bullet above.
 Reported on `--kv-unified -np 2` (dense 27B, `-c 262144`, `-ctk/-ctv q8_0`): after slot 0 held ~100 k tokens,
 every request on slot 1 answered HTTP 500 `decode() failed: failed to process speculative batch` with
-`W decode: failed to find a memory slot for batch of size 1024` in the log; `LLAMA_SPEC_DRAFT_WINDOW=0`
-passed.  Cause: 66 048 cells = 65 536 (sequence 0's window) + 512, and that 512-cell tail is where sequence
+`W decode: failed to find a memory slot for batch of size 1024` in the log; `--spec-draft-kv-window 0`
+(then `LLAMA_SPEC_DRAFT_WINDOW=0`) passed.  Cause: 66 048 cells = 65 536 (sequence 0's window) + 512, and that 512-cell tail is where sequence
 0's own ring writes, so sequence 1's first batch had no contiguous run — `find_slot`'s SWA reclaim frees a
 cell by its OWNER's position, so an idle sequence's cells are not reclaimable by another.  The cache is now
 132 096 cells for that config (`(65536 + 512) x 2`), still 130 048 cells short of the full `-c` mirror.
@@ -4475,7 +4484,7 @@ per-stream arm before).
 Reproduced and gated here with a forced 8192-cell window (before the fix: HTTP 500 on slot 1, draft cache
 8 704 cells) and with a 1 024-cell window in the new gate: 6 requests over 2 slots (both rings wrapping,
 prompts re-prefilled by swapping them between slots, then re-used from cache) are **byte-identical to
-`LLAMA_SPEC_DRAFT_WINDOW=0` on every step** with identical draft acceptance (17/36, 23/23 per prompt).
+`--spec-draft-kv-window 0` on every step** with identical draft acceptance (17/36, 23/23 per prompt).
 `plain == draft-mtp == draft-mtp(W=1024) == draft-mtp(W=0)` at `-c 16384` (876 chars, `sha=8c8fd395402f`).
 Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and `-np 6` at `-c 8192`
 **declines** the window (per sequence it cannot hold a batch) and runs both slots with no window.

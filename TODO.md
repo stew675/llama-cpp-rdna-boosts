@@ -46,8 +46,10 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **284** | the ring's redirect restore should be deferred to `stage_free_ev` | VMEM (delivery) | **OPEN — cheap** — re-measure before believing the 6 % arithmetic — §284 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
-| **300** | gfx1151 / RDNA3.5: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
+| **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-region-pool N`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 | **311** | the fused `hc_post_rms` kernel drops the hc kernels' non-temporal hints | performance (block 11, r242) | **PARKED** (2026-11-09) — value-preserving and unmeasured; worth +18.6 % in situ on `dsv4_hc_pre` by the neighbouring kernel's own record — §311 |
+| **312** | Windows: the MTP draft window costs 12-13 % of decode past the ring wrap on r241+ (issue #293) | performance (Windows-only; block 15) | **OPEN** — the `auto` sizer no longer grants a window the drafter outgrows (r246), but a granted 65536-cell window still costs on Windows and the mechanism is not identified — §312 |
+| **313** | `--kv-region-pool auto` has no sizer: nothing decides the pool, so `auto` does not take it | fittability (block 15) | **OPEN** — needs a `--fit` pass that measures with and without the pool; until then `auto` is "not taken" and says so — §313 |
 
 ## Handle numbering
 
@@ -377,7 +379,7 @@ delivery must stay green too -- it is now **16/16** (`#304` closed: the compact-
 column tile narrower than the grid its seams were built with, see `WORKLOG.md` 261108.009; that fix is the MMF half
 of what this candidate needs).  Delivery-neutral: it must not change the delivery tree.
 
-## 300. gfx1151: the attendance pool (`LLAMA_KV_REGION_POOL`) is INCORRECT on RDNA3.5 — do not claim it there
+## 300. gfx1151: the attendance pool (`--kv-region-pool N`) is INCORRECT on RDNA3.5 — do not claim it there
 
 Found at R16 validating on `halo` (gfx1151 Strix Halo, UMA) with `scripts/gate-kv-residency.sh`.  The **window**
 (Goal A) is fine (`wref == wres == wspill` `be904e86f248`, 16 flips / 64 MiB pinned host) and the **sparse**
@@ -682,3 +684,36 @@ is purely a question of whether the fused launch keeps the win it has.  **Measur
 31.5k-prompt arm the r242 record uses (2 R9700 `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, `-ub 6144`), plus a gfx1151
 arm where the in-situ effect was found.  If it is worth anything, the guard is a rebuild + the prefill-logit gate
 (`-0.000000` is the expected answer) and nothing else moves.
+
+## 312. Windows: a granted MTP draft window costs 12-13 % of decode past the ring wrap (issue #293)
+
+Reported by @DanoPTT on Windows 11 / ROCm 10.1, dense Qwen3.8-27B UD-Q5_K_XL, `-np 2 --kv-unified -c 262144`,
+q8_0 K/V, `draft-mtp n-max 3`, `GGML_CUDA_DISABLE_GRAPHS=1`.  r220 -> r241/r245 lose 12-13 % of MTP decode once the
+drafter's ring wraps (65 536 tokens at `-c 262144`, 32 768 at `-c 131072`); plain decode is unaffected, and
+`--spec-draft-kv-window 0` removes all of it (and then r245 is 4.7 % *faster* than r220 at 100 k).  Linux does not
+reproduce it at 71 394 tokens (window on 44.72 t/s, off 44.69).
+
+What the data already rules out: `n_kv`, the mask width and the cell count are **continuous** across the wrap
+(`get_n_kv()` is `min(cells.size(), PAD(used_max_p1))`), so "the mask covers the full ring" cannot be the trigger;
+`GGML_CUDA_GCDBG`'s host figure only covers the backend's `graph_compute` per-node dispatch, so it does not rule out
+the llama-side per-ubatch host work (the packed kq-mask fill, `find_slot`/`apply_ubatch`, `seq_rm`) either.
+
+Still owed, cheapest first: the **r235 vs r236** bisect (upstream vs ours -- the only arm that splits the 318-commit
+re-base from our own carries), `-np 1` at 68 767 tokens (drops the unified 2-slot machinery), the two mask-bitmap
+arms `GGML_CUDA_FA_MASK_SKIP=0` / `GGML_CUDA_FA_BAND_SKIP=0` (the only per-layer per-step device work we ship that
+is gated on the mask hiding cells), and a `-lv 4` node/op census of the draft and verify graphs before and after the
+wrap on both builds.  r246 already removes the *silent* half of the problem: the `auto` sizer declines a window it
+cannot grant at full depth instead of granting a small one, and the decline is logged at WARN.
+
+## 313. `--kv-region-pool auto` has no sizer
+
+r246 promoted the attendance pool from `LLAMA_KV_REGION_POOL` to `--kv-region-pool [auto|N]` with `auto` as the
+default, but nothing decides `auto`: the pool only pays when the context does **not** fit without it (it is a
+fittability feature, and on a KV that fits it costs ~48 % of pp32K, `ENVIRONMENT.md` §17.1), so `auto` currently
+resolves to "not taken" and the cache logs one INFO line saying so.
+
+The work is a `--fit` pass: measure the context with the pool off, and if it does not fit, re-run the fit with a
+pool sized from the shortfall and keep it only when it makes the context fit.  `common_params_fit` is one pass
+today, and the pool's VRAM is fixed while its pinned mirror scales with `-c` (which is why the fit already skips
+its `-c` interpolation when a pool is active), so this is a real design change, not a default flip.  `gate-kv-residency.sh`
+already has the arms (`pref` / `pres` / `pfloor`) to grade it.

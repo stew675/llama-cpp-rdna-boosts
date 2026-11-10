@@ -22,8 +22,8 @@ Block 15 is **three opt-in placements of the attention KV, one default-on draft 
 | knob | default | what it does |
 |---|---|---|
 | `LLAMA_KV_RESIDENT_CELLS` | off (`0`/unset) | the **window**: newest `W` cells in VRAM, the tail in pinned system RAM in one VA reservation (no kernel change).  `auto` = `--fit` sizes it, and only for a `-c` the user pinned (the decision `TODO` #122 records: P1, fittability only).  `-nkvo` declines it (r197); a `-sm tensor` split carries it, one region per child device (r204, `TODO` #124); a MIRRORED dsv4/HRM cache declines it |
-| `LLAMA_KV_REGION_POOL` | off (`0`/unset) | the **pool**: the authoritative KV in a pinned host mirror + a compact device pool of indexer-block pages, resolved in-graph by `GGML_OP_KV_POOL`.  qwen4exp/QSA only (it is the sparse reader's page table); declines while a window is active, on `!offload` and on a `-sm tensor` split |
-| `LLAMA_SPEC_DRAFT_WINDOW` | **on** (`auto`) | the **MTP draft window**: the embedded MTP head's draft KV is a quarter of the context clamped to [32768, 65536] cells, `0` = off.  MTP + embedded head only |
+| `--kv-region-pool` (was `LLAMA_KV_REGION_POOL`, r246) | `auto` = off | the **pool**: the authoritative KV in a pinned host mirror + a compact device pool of indexer-block pages, resolved in-graph by `GGML_OP_KV_POOL`.  qwen4exp/QSA only (it is the sparse reader's page table); declines while a window is active, on `!offload` and on a `-sm tensor` split |
+| `--spec-draft-kv-window` (was `LLAMA_SPEC_DRAFT_WINDOW`, r246) | `auto` | the **MTP draft window**: the embedded MTP head's draft KV is a window instead of `-c` cells.  Since r246 `auto` = *the cap or nothing* (65536 cells, or a logged decline), `0` = off, `N` = N cells.  MTP + embedded head only |
 | `LLAMA_KV_SPILL_RAM_PCT` / `LLAMA_KV_POOL_MIRROR_UNIT_MIB` | 85 % / 1 MiB | the pinned-RAM ceilings and the mirror's grow unit |
 
 Two facts that make the rest of this file readable: a streamed cache reports `is_streaming()` and therefore
@@ -65,7 +65,7 @@ the "cells / bytes / resident share / bookkeeping / fit consequence from the log
 the plan's P0.
 
 **Three things the plan's own arm design got wrong — do not re-derive.**
-1. **A pool cannot be made "deliberately undersized" by cells.**  `LLAMA_KV_REGION_POOL` is floored to one
+1. **A pool cannot be made "deliberately undersized" by cells.**  `--kv-region-pool N` is floored to one
 decode band (`8 x ceil(top_k / page)` pages, 4 104 pages on Flash-Next), so the plan's `512`-cell arm becomes
 exactly that floor: 204 MiB of pool, not 128 pages.  The forced-miss arm has to be expressed against the
 **working set** instead — the same pool at a depth that does not fit it (25 763 tokens = 6 441 blocks against
@@ -117,7 +117,7 @@ ship and gate.
 
 ### 2.3 A window for a *separate* draft model (`O3-DRAFTER-RING.md` §7(3); the archive's `HANDOVER-A19.md` §2)
 
-**State.**  `LLAMA_SPEC_DRAFT_WINDOW` is **MTP-only and embedded-head-only** by the r193 decision: an
+**State.**  `--spec-draft-kv-window` is **MTP-only and embedded-head-only** by the r193 decision: an
 embedded head has no GGUF of its own, which is what lets the slab reserve be derived with the window.  A
 *separate* draft GGUF keeps the full `-c` cache: Flash-Next's MTP sidecar
 (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`), DFlash2 (`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`) and the old
@@ -137,7 +137,7 @@ touched.  Size: M (measurable on one card; both models are on disk).
 
 ### 2.4 A pool-size policy above ~200k (the archive's `HANDOVER-A19.md` §2)
 
-**State.**  `LLAMA_KV_REGION_POOL` is a **fixed cell count per layer**.  A17 measured `=16416`
+**State.**  `--kv-region-pool` is a **fixed cell count per layer**.  A17 measured `=16416`
 (4 104 pages, 204 MiB) at 97.9 % hit at 5 246 tokens and 86.0 % at 102 800, and `=32768` bought 0.2 points
 and no speed.  The pool's VRAM is inside the KV buffer's size, while its mirror is pinned **host** RAM that
 `--fit` charges to the host — so a bigger pool trades device VRAM for hit rate only.
@@ -148,7 +148,7 @@ scale with `-c` / the indexer's top-k?  Nobody has asked; do not change the defa
 **Cross-arm, 2026-11-05 (`wip/bench-56gb/`, 1 x R9700, host experts on a mirror pool so the host tiers are
 not a variable, `-c 204800`, `-ub 6144`, `-lv 4`).**  New data point, and it does NOT sit on the A17 curve:
 
-* the default `LLAMA_KV_REGION_POOL=16384` (4 104 pages, 204.4 MiB of device pool, **12** full-attention
+* the measured `--kv-region-pool 16384` (4 104 pages, 204.4 MiB of device pool, **12** full-attention
   layers on this model) reports `hits 8408 (4.27 %)` of 196 896 ids at a 179.5k prompt, with
   `misses 29041 / claims 29041`, i.e. every claim missed and only 4.3 % of the ids were served from a
   resident page.  A17's 86.0 % was at 102 800.  Half the context, a 20x difference in hit rate: reconcile

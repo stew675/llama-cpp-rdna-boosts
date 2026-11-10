@@ -39,7 +39,8 @@ export HIP_VISIBLE_DEVICES=0
 # the -lme budget IS the sizing decision: never let the RAM ceiling shave an arm
 export MOE_HOST_POOL_RAM_PCT=${RAM_PCT:-0}
 # at -c 204800 the attendance pool hits 4 %, costs 2.3 GiB host + 2.3 GiB of arena VRAM: off
-export LLAMA_KV_REGION_POOL=0
+# r246: `LLAMA_KV_REGION_POOL` is gone; the pool is an option and is off unless asked for
+export LLAMA_ARG_KV_REGION_POOL=auto
 export GGML_CUDA_SLAB_HEADROOM_MIB=1536
 export MOE_EXPERT_HEATMAP=$HEATMAP
 # `''`, `-` and `auto` all mean LEAVE IT TO THE BINARY.  This matters: `env_int`/`strcmp` on the literal

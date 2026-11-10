@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # KV-RESIDENCY gate (block 15: the resident window `LLAMA_KV_RESIDENT_CELLS` and the attendance pool
-# `LLAMA_KV_REGION_POOL`; `wip/kv-residency-cleanup/README.md` §2.1, the archive plan's phase P0).
+# `--kv-region-pool`; `wip/kv-residency-cleanup/README.md` §2.1, the archive plan's phase P0).
 #
 # WHY THIS EXISTS
 #   Block 15 is the one shipped feature with no release gate of its own.  It shipped on a SUBSTITUTE: the
@@ -41,9 +41,9 @@
 #   prompt = 6 441 pages of the 4-cell indexer block, MTP depth 4):
 #     pref          no pool + the SPARSE decode arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) -- the arm the pool
 #                   replaces and therefore the text it must reproduce
-#     pres          `LLAMA_KV_REGION_POOL=32768` = the whole cache (8 192 pages): nothing can be claimed out
+#     pres          `--kv-region-pool 32768` = the whole cache (8 192 pages): nothing can be claimed out
 #                   for capacity
-#     pfloor        `LLAMA_KV_REGION_POOL=512`: FLOORED to one decode band (4 104 pages = 16 416 cells), i.e.
+#     pfloor        `--kv-region-pool 512`: FLOORED to one decode band (4 104 pages = 16 416 cells), i.e.
 #                   the smallest pool the backend will build, against a 6 441-page working set -- the forced
 #                   misses, and `LLAMA_KV_POOL_VERIFY=1` on this arm (the churn arm is where a wrong-page
 #                   resolve would show)
@@ -56,8 +56,8 @@
 #   reaches it.  Text is judged WITHIN the device count (`INVARIANTS.md`: greedy text is a per-device-count
 #   reference), so the reference is the 2-device no-pool sparse arm, not `pref`:
 #     pmref         no pool, 2 devices, the sparse decode arm -- the 2-device reference
-#     pmres         2 devices, `LLAMA_KV_REGION_POOL=$POOL_RES`
-#     pmfloor       2 devices, `LLAMA_KV_REGION_POOL=$POOL_FLOOR` (+ `LLAMA_KV_POOL_VERIFY=1`)
+#     pmres         2 devices, `--kv-region-pool $POOL_RES`
+#     pmfloor       2 devices, `--kv-region-pool $POOL_FLOOR` (+ `LLAMA_KV_POOL_VERIFY=1`)
 #   Plus the two witnesses only a multi-device arm can give: the enable line must report the layer span, and
 #   the teardown counters must report ONE counter block PER DEVICE (a single-device report on a 2-device arm
 #   means the blocks are not really per device -- the r213 defect).
@@ -287,11 +287,17 @@ run_arm wselftest0 "$MODEL_WIN" "$PROMPT_WIN" GGML_CUDA_VMM_REGION_SELFTEST=1 LL
     && pass "wselftest reported no failed check" \
     || fail "wselftest FAILED: $(grep -m3 'selftest\|FAILED:' "$KEEPOUT/wselftest.err" 2>/dev/null | tr '\n' ' ')"
 
-# the mechanism, on BOTH arms: the hazard case ran, and each arm really ran with the intended hold state
+# the mechanism, on BOTH arms: the hazard case ran, and each arm really ran with the intended hold state.
+# The PASS arm names the case in its verdict line ("the host-mapping hazard (a whole flip sequence
+# re-verified)") while a FAILING arm prints one `FAILED: hazard: ...` per device -- so the two arms word it
+# differently and the check has to accept both (r246: matching only the PASS wording failed the sensitivity
+# arm for reporting the hazard exactly the way a failure reports it).
 for arm in wselftest wselftest0; do
-    [ "$(count $arm 'the host-mapping hazard')" -ge 1 ] \
-        && pass "$arm exercised the host-mapping hazard case" \
-        || fail "$arm never reported the host-mapping hazard case: the sensitivity control has nothing to grade (the case was skipped or compiled out)"
+    if [ "$(count $arm 'the host-mapping hazard')" -ge 1 ] || [ "$(count $arm 'FAILED: hazard')" -ge 1 ]; then
+        pass "$arm exercised the host-mapping hazard case"
+    else
+        fail "$arm never reported the host-mapping hazard case: the sensitivity control has nothing to grade (the case was skipped or compiled out)"
+    fi
 done
 [ "$(count wselftest 'quarantine hold on')" -ge 1 ] \
     && pass "wselftest ran with the quarantine hold ON (the shipped configuration)" \
@@ -367,21 +373,24 @@ fi
 
 # ===== the pool ==========================================================================================
 # Both pool sections (one device, and the multi-device split) run these same arms; only the device set differs.
-pool_arm() {   # pool_arm <arm> [VAR=VAL ...]
-    local arm=$1
-    shift
+pool_arm() {   # pool_arm <arm> <pool-cells|""> [VAR=VAL ...]
+    local arm=$1 pool=$2
+    shift 2
+    local -a pool_arg=()
+    [ -n "$pool" ] && pool_arg=(--kv-region-pool "$pool")
     run_arm "$arm" "$MODEL_POOL" "$PROMPT_POOL" \
         LLAMA_KV_POOL_STATS="$KEEPOUT/$arm.stats" "$@" -- \
         -md "$DRAFT_POOL" -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off \
-        -c "$CTX_POOL" -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 4
+        -c "$CTX_POOL" -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 4 \
+        "${pool_arg[@]}"
 }
 
 # ===== the pool (one device) =============================================================================
 if [ "$DO_POOL" = 1 ]; then
     echo "-- pool arms (Flash-Next + MTP, -c $CTX_POOL q8_0 KV, -ncmoe 48, a 25 763-token prefix)"
-    pool_arm pref   LLAMA_QSA_DENSE_DECODE_UNTIL=0                        || exit 1
-    pool_arm pres   LLAMA_KV_REGION_POOL="$POOL_RES"                      || exit 1
-    pool_arm pfloor LLAMA_KV_REGION_POOL="$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1 || exit 1
+    pool_arm pref    ""            LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
+    pool_arm pres    "$POOL_RES"                                              || exit 1
+    pool_arm pfloor  "$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1                     || exit 1
 
     HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of pfloor)
     info "pref text: $HPRE    pres: $HPRES    pfloor: $HPFLR"
@@ -511,14 +520,14 @@ if [ "$DO_MULTI" = 1 ]; then
         echo "-- multi-device pool arms ($NDEVS devices '$MULTI_DEVICES', -sm layer, same model/prompt/knobs)"
         # the same arms, on the multi-device set: `RUN_DEVS` is read by run_arm, and a prefixed assignment
         # on a shell function is visible inside that call only
-        pool_arm_md() {   # pool_arm_md <arm> [VAR=VAL ...]
-            local arm=$1
-            shift
-            RUN_DEVS="$MULTI_DEVICES" pool_arm "$arm" "$@"
+        pool_arm_md() {   # pool_arm_md <arm> <pool-cells|""> [VAR=VAL ...]
+            local arm=$1 pool=$2
+            shift 2
+            RUN_DEVS="$MULTI_DEVICES" pool_arm "$arm" "$pool" "$@"
         }
-        pool_arm_md pmref   LLAMA_QSA_DENSE_DECODE_UNTIL=0                        || exit 1
-        pool_arm_md pmres   LLAMA_KV_REGION_POOL="$POOL_RES"                      || exit 1
-        pool_arm_md pmfloor LLAMA_KV_REGION_POOL="$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1 || exit 1
+        pool_arm_md pmref   ""            LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
+        pool_arm_md pmres   "$POOL_RES"                                              || exit 1
+        pool_arm_md pmfloor "$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1                     || exit 1
 
         HPMREF=$(hash_of pmref); HPMRES=$(hash_of pmres); HPMFLR=$(hash_of pmfloor)
         info "pmref text: $HPMREF    pmres: $HPMRES    pmfloor: $HPMFLR"

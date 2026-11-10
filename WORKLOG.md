@@ -1,3 +1,74 @@
+## 261110.001 (r246, RELEASE v16-a691b2345-r246) -- GitHub issue #293: the MTP draft window and the attendance pool become first-class options, and `auto` stops granting a window the drafter outgrows
+
+**Release:** `v16-a691b2345-r246`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`a9d74e39325f794da3f42347dbbf69b6023968cb` (tree `9385502ba8c83ff17371c87231b5a48e075cbfcb`), 16 blocks.
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`, applied tree == recorded
+tree, conflict-marker and Windows-portability scans).  **No block renumbered, merged or split**: everything
+folds into **block 15**.  No kernel, no graph, no numerics and no default gate threshold changed.
+
+### What the reporter's follow-up established
+
+@DanoPTT (Windows 11, ROCm 10.1, dense Qwen3.8-27B, `-np 2 --kv-unified -c 262144`, q8_0 K/V,
+`draft-mtp n-max 3`, `GGML_CUDA_DISABLE_GRAPHS=1`) bisected the r220 -> r241/r245 decode loss to
+`LLAMA_SPEC_DRAFT_WINDOW`: the step appears **exactly when the drafter's ring wraps** (65 536 tokens at
+`-c 262144`, 32 768 at `-c 131072`), costs a constant 1.3-1.6 ms/token at a 32 k window and 2.8-2.9 at 64 k,
+is unaffected by fusion or the FA staging cap, and disappears with the window off -- at which point r245 is
+4.7 % **faster** than r220 at 100 k.  Linux does not reproduce it (71 394 tokens: 44.72 with the window,
+44.69 without).  Their `-c 131072` arm also showed something that is *not* Windows-specific: with a 32 k
+window the decode loses **8 %** on both r220 and r241 (55.14 against 59.81 t/s at 62 857 tokens, identical
+draft acceptance at 35 881 with the window off at 90/109 against 83/128) -- i.e. our own documented
+"window below the depth the drafter works over" case, chosen silently by the `auto` policy.
+
+### 1. Both of block 15's own knobs are options now (the environment is gone)
+
+`LLAMA_SPEC_DRAFT_WINDOW` -> `--spec-draft-kv-window [auto|N]` and `LLAMA_KV_REGION_POOL` ->
+`--kv-region-pool [auto|N]`, both **default `auto`**, both carried in `llama_context_params`
+(`spec_draft_kv_window` / `kv_region_pool`, `-1` = auto) through `llama_cparams` into `create_memory`
+(and `llama_memory_params.kv_pool_cells` for the pool's hybrid path).  The two env vars are **no longer
+read**; each option keeps the standard `common/arg.cpp` `LLAMA_ARG_*` env form, which is the option's env
+form, not a second knob.  Why a first-class option: a placement that changes decode by 8-13 % cannot be
+invisible in `--help` and unsettable per run.
+
+* `auto` for the window is **THE CAP OR NOTHING**: `min(65536, ctx)` cells, and where that would not leave
+  one batch of room below every sequence's own context the window is **declined** (logged at WARN, so no
+  `-lv 4` is needed to see it).  The r193 sizer (`n_ctx_seq/4` clamped to `[32768, 65536]`) is gone: at
+  `-c 131072` it picked 32 768, below the depth a 62 k request reaches.  `0` and `N` keep their meaning.
+* `auto` for the pool is a **fittability decision nothing makes yet**: the pool only pays when the context
+  does not fit without it, so `auto` does not take it, and a pool-eligible cache logs one INFO line saying
+  so.  `TODO` #313 is the `--fit` pass that would decide it.  `0` and `N` are unchanged.
+
+### 2. Gates
+
+| gate | result |
+|---|---|
+| `scripts/gate-spec-draft-window.sh` | **PASS**, now with three startup-only `auto` policy arms: `auto_small` (`-c 8192` x 2 slots: no window, no message), `auto_decline` (the reporter's `-c 131072` x 2 slots: a logged decline), `auto_grant` (`-c 67584` x 1 slot: 65 536 cells per sequence, draft cache 66 048) -- plus the existing per-sequence sizing check (`(1024 + 512) x 2 = 3072`) and 6/6 requests byte-identical to the no-window arm |
+| coherence / width purity (27B UD-Q4_K_XL, 1 GPU, seed 42, 24 tokens) | `plain == draft-mtp(auto) == draft-mtp(W=0) == draft-mtp(W=1024) == draft-mtp(auto @ -c 67584)` = `d45e2221805a` |
+| MTP Protocol A (reduced: `-c 67584`, bf16 KV, `-n 512`, seed 42) | `plain` 29.9 t/s, `draft-mtp(auto)` 55.3, `draft-mtp(0)` 55.3, text `333b004203de` in all three -- the granted 65 536-cell window is neutral on Linux (the pre-r246 policy granted 32 768 at this context) |
+| `scripts/gate-kv-residency.sh --pool-only` | **PASS** (47 checks; `pref`/`pres`/`pfloor` text-identical, `bad 0`, 90.91 % / 89.87 % hit rates, `pres` 8192 pages vs `pfloor` 4104, both arms 252 resolves) **and** the 2-device `-sm layer` section -- the flag plumbing drives the same placement the env var did |
+| `scripts/gate-prefill-logits.sh` | **PASS** 0.000697 / 98.784 % against the recorded gfx1201 base (no prefill path touched; the formality every release runs) |
+| `scripts/gate-per-block-build.sh --fast --changed-from 9e0d39dd8` | 1/1 (block 15 only) |
+| `scripts/validate-set.sh` | strict 16/16, applied tree `9385502b`, checksums + Windows portability lint green |
+| `scripts/check-gpu-faults.sh` | clean, scoped per gate to the time before its first arm |
+
+### 3. Two gate defects found and fixed while running them
+
+* `gate-kv-residency.sh`'s "did the selftest exercise the host-mapping hazard" check matched only the PASS
+  arm's wording (`the host-mapping hazard`).  The sensitivity arm reports it as a failure
+  (`FAILED: hazard: every already-flipped window still holds its bytes`), so the control could never pass
+  -- a gate that grades a formality.  It now accepts either wording (and the same run then reads 47 PASS /
+  0 FAIL).
+* `gate-spec-draft-window.sh` had no arm for the `auto` policy at all, which is exactly why the r193 sizer
+  survived from r193 to r246: the gate only ever exercised an explicitly forced window.  It has three now.
+
+### 4. Not run, and why
+
+`gate-park-idle-slots.sh` (no parking path touched), `gate-state-pipe.sh` / `gate-ckpt-reuse.sh` (no state
+path touched) and the full four-axis MTP protocol (`-n 3000`, four arms) are not run: this change moves no
+kernel, no fusion, no graph and no numerics, and the reduced Protocol A above plus the draft-window gate's
+byte-identity across `auto|0|1024` cover what it *can* move (which draft cells the drafter keeps).  The
+Windows mechanism itself is still open -- `TODO` #312 lists the arms still owed (the r235/r236 bisect,
+`-np 1`, `GGML_CUDA_FA_MASK_SKIP=0` / `GGML_CUDA_FA_BAND_SKIP=0`, a node census before and after the wrap).
+
 ## 261109.012 (r245) -- GitHub issue #294 (mixed gfx1100 + gfx1201 assert): the MMB policy accessors were still process-wide, and one arena-release path skipped its device sync
 
 **Release:** `v16-a691b2345-r245`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
