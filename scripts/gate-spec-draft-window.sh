@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MTP draft-WINDOW gate (`--spec-draft-kv-window`, block 15 Goal C; issues #264 / #293).
+# MTP draft-WINDOW gate (`--spec-draft-kv-window`, block 15 Goal C; issues #264 / #293 / #297).
 #
 # WHY THIS EXISTS
 #   The MTP draft context's KV is a sliding window instead of a `-c`-cell cache (block 15, r193).  Under
@@ -9,9 +9,18 @@
 #   placed in, `find_slot` finds no contiguous run, and every request on that slot answers
 #   `decode() failed: failed to process speculative batch` (HTTP 500) while `--kv-unified -np 2` is in use.
 #
+#   The window's reclaim is by POSITION, which only works while positions advance one per token.  A
+#   multimodal (M-RoPE) image chunk puts every row on the SAME temporal position, so nothing becomes
+#   reclaimable, the `win + one batch` spare room runs out mid-chunk, and the request died with
+#   `failed to find a memory slot for batch of size N` -> `failed to process mtmd chunk` (HTTP 500), issue
+#   #297.  The drafter's cache is lossy by design, so it is now a TRUE ring (`find_slot` evicts the
+#   sequence's oldest cells when position cannot place the batch) and a draft-only failure can no longer
+#   fail a request.  The MULTIMODAL arms below are the only ones that reach that.
+#
 #   This gate drives two slots on a unified cache through the whole lifecycle and compares two arms:
 #     win   --spec-draft-kv-window $WIN    (a small window, so BOTH slots' rings wrap on a short prompt)
 #     win0  --spec-draft-kv-window 0       (the reference: the full draft cache)
+#   ... then one multimodal request on the same pair of arms (mtmd_win / mtmd_win0).
 #
 #   It also asserts the `auto` POLICY itself, startup-only (no requests), because r246 replaced the
 #   quarter-of-the-context sizer with `the cap or nothing` (issue #293):
@@ -30,11 +39,18 @@
 #           `kv cells` == PAD((WIN + draft-ubatch) * n_slots, 256).  A window the cache declined (a
 #           sequence count that cannot hold one) would make the text comparison trivially equal, and the
 #           r193 shape is exactly half this number -- which is what this gate exists to catch.
+#   HARD  * the reserve estimate and the ALLOCATED cache agree on that cell count (issue #297: they read
+#           the target's `-ub` and the draft context's MTP_DRAFT_N_UBATCH cap respectively, so they
+#           disagreed by 512 cells)
+#   HARD  * mtmd: a multimodal request whose image batch is WIDER than the draft cache's spare room answers
+#           on both arms, the window arm NEEDED the ring fallback (`ring eviction is active` in its log and
+#           not in win0's, so the arm is not vacuous), neither arm logs `failed to find a memory slot` or
+#           gave up drafting, and win == win0 byte for byte.  `--no-mtmd` skips it.
 #   INFO  draft acceptance per slot per arm (the window is an approximation, so a cost here is expected and
 #         is not a failure; a *text* difference is)
 #
 # Usage:
-#   ./gate-spec-draft-window.sh [--keep] [--no-faults]
+#   ./gate-spec-draft-window.sh [--keep] [--no-faults] [--no-mtmd]
 #
 # Environment:
 #   LLAMA_SERVER   llama-server binary   (default: ~/llama.cpp/build-rocm/bin/llama-server)
@@ -47,6 +63,13 @@
 #   NGEN           tokens per request      (default: 32)
 #   SM/NCMOE/NGPU  split mode / -ncmoe / GPUs (defaults: layer / 0 / 1)
 #   UB             the draft context's ubatch (default: 512, MTP_DRAFT_N_UBATCH's default)
+#   MMPROJ, IMAGE  the multimodal arm's projector (must pair with MODEL) and image; the arm SKIPS when
+#                  either is missing, and FAILS when the image's batch is not wider than MTMD_DUB (it then
+#                  proves nothing).  Defaults: the Qwen3.8-27B Q8_0 projector and llama.cpp's 300-token
+#                  tools/mtmd/test-1.jpeg
+#   MTMD_DUB       MTP_DRAFT_N_UBATCH for the multimodal arms (default 128, so a stock test image is wider
+#                  than the spare room; the reporter's shape is the 512 default with a ~1000-token image)
+#   MTMD_WIN/CTX   the window and the context of the multimodal arms (defaults: 1024 / 8192)
 #   PORT           server port             (default: 18102)
 #   EXTRA_ARGS     extra llama-server args
 #   KEEPOUT        dir for the per-arm logs (default: mktemp -d)
@@ -72,12 +95,22 @@ SM="${SM:-layer}"
 NCMOE="${NCMOE:-0}"
 NGPU="${NGPU:-1}"
 UB="${UB:-512}"
+# The MULTIMODAL arm (issue #297): an M-RoPE image chunk puts ~1k tokens on ONE temporal position, so the
+# window's position-based reclaim frees nothing and the `win + one batch` spare room runs out mid-chunk.
+# MMPROJ must pair with MODEL; IMAGE must be large enough that the image's batch is wider than the draft
+# cache's spare room (`MTMD_DUB` cells, checked from the log so the arm can never pass vacuously).
+MMPROJ="${MMPROJ:-/llm/models/Qwen3.8/27B/Q8_0/mmproj-F16.gguf}"
+IMAGE="${IMAGE:-$HOME/llama.cpp/tools/mtmd/test-1.jpeg}"
+MTMD_DUB="${MTMD_DUB:-128}"
+MTMD_WIN="${MTMD_WIN:-1024}"
+MTMD_CTX="${MTMD_CTX:-8192}"
 PORT="${PORT:-18102}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
 KEEP=0
 FAULTS=1
+MTMD=1
 
 # the second slot must NOT share a prefix with the first (a shared prefix is served through seq_cp and
 # would not exercise a second sequence's own cells)
@@ -99,8 +132,9 @@ for a in "$@"; do
     case "$a" in
         --keep) KEEP=1 ;;
         --no-faults) FAULTS=0 ;;
-        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $0 [--keep] [--no-faults]" >&2; exit 2 ;;
+        --no-mtmd) MTMD=0 ;;
+        -h|--help) sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "usage: $0 [--keep] [--no-faults] [--no-mtmd]" >&2; exit 2 ;;
     esac
 done
 
@@ -117,19 +151,27 @@ fi
 # The kernel journal is shared between runs, so the fault window starts here, before the first server (#294).
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
-# drive one arm: start the server, run A-F, stop it.  Writes $arm/{log.txt,steps.json}.
-run_arm() {
-    local arm="$1"; shift
-    local -a arm_args=("$@")
-    local dir="$KEEPOUT/$arm"
+# start one arm's server and wait for /health.  env vars in START_ENV are applied to the server only.
+#   start_arm <dir> [server args...]   -> 0 up, 1 not
+#
+# `-lv 4` is REQUIRED here and costs the comparison nothing: the generated text comes back over HTTP, so a
+# verbosity threshold can only pollute the LOG (the reason `gate-ckpt-reuse.sh` hashes API responses at -lv 4
+# too).  Without it, every llama/mtmd INFO line -- `create_memory: MTP draft KV window`, `decoding image
+# batch`, the ring-eviction census -- is invisible, and three checks below would grade an empty log.
+start_arm() {
+    local dir="$1"; shift
     mkdir -p "$dir"
     local pid
+    # START_CTX / START_NPAR / START_ENV / START_MODEL override the shared arm globals for one invocation
+    # (the multimodal arm needs its own context, one slot, a smaller draft ubatch and a projector)
+    local ctx="${START_CTX:-$CTX}" npar="${START_NPAR:-$NPAR}"
     env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
-        HIP_VISIBLE_DEVICES="$DEVS" \
-        "$LLAMA_SERVER" -m "$MODEL" \
-        -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$CTX" -np "$NPAR" --kv-unified \
+        HIP_VISIBLE_DEVICES="$DEVS" ${START_ENV:-} \
+        "$LLAMA_SERVER" -m "${START_MODEL:-$MODEL}" \
+        -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$ctx" -np "$npar" --kv-unified \
         --spec-type draft-mtp --spec-draft-n-max 3 -t 8 --poll 0 \
-        "${arm_args[@]}" \
+        -lv 4 \
+        "$@" \
         --host 127.0.0.1 --port "$PORT" $EXTRA_ARGS > "$dir/log.txt" 2>&1 &
     pid=$!
     SRV_PID="$pid"
@@ -141,11 +183,19 @@ run_arm() {
         sleep 1
     done
     if [ "$up" -ne 1 ]; then
-        echo "FAIL  $arm: the server did not come up (see $dir/log.txt)"
+        echo "FAIL  $(basename "$dir"): the server did not come up (see $dir/log.txt)"
         tail -5 "$dir/log.txt" | sed 's/^/      /'
         stop_arm
         return 1
     fi
+    return 0
+}
+
+# drive one arm: start the server, run A-F, stop it.  Writes $arm/{log.txt,steps.json}.
+run_arm() {
+    local arm="$1"; shift
+    local dir="$KEEPOUT/$arm"
+    start_arm "$dir" "$@" || return 1
 
     python3 - "$PORT" "$NGEN" "$PROMPT" "$PROMPT2" "$NPAR" "$dir/steps.json" <<'PY'
 import json, sys, urllib.request
@@ -183,6 +233,66 @@ for name, slot, text in steps:
         break
 
 json.dump({"steps": res, "dead": dead}, open(out_file, "w"), indent=1)
+PY
+    local rc=$?
+    stop_arm
+    sleep 2
+    return $rc
+}
+
+# The MULTIMODAL arm (issue #297): ONE chat request whose prompt is the long text followed by an image chunk,
+# so the target hands the drafter a batch of image rows.  An M-RoPE image puts every row on the same temporal
+# position, so `seq_pos_max` does not advance while the batch eats cells and the window's position-based
+# reclaim frees nothing: before the ring fallback, the 2nd sub-batch of a 1024-token image found no cell in
+# `win + 512` and the whole request answered HTTP 500 "failed to process mtmd chunk".
+#
+# `MTMD_DUB` shrinks the DRAFT context's ubatch (MTP_DRAFT_N_UBATCH) so a stock ~300-token test image is
+# wider than the spare room -- the same geometry as the reporter's 512/1024, at a third of the tokens.
+# Writes $arm/{log.txt,steps.json}.
+run_mtmd_arm() {
+    local arm="$1"; shift
+    local dir="$KEEPOUT/$arm"
+    START_CTX="$MTMD_CTX" START_NPAR=1 START_ENV="MTP_DRAFT_N_UBATCH=$MTMD_DUB" \
+        start_arm "$dir" --mmproj "$MMPROJ" "$@" || return 1
+
+    python3 - "$PORT" "$NGEN" "$PROMPT" "$IMAGE" "$dir/steps.json" <<'PY'
+import base64, json, sys, urllib.request
+
+port, ngen, prompt, image, out_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+text = open(prompt, encoding="utf-8").read()
+b64  = base64.b64encode(open(image, "rb").read()).decode()
+
+body = json.dumps({
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": text + "\n\nDescribe this image in one sentence."},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
+    ]}],
+    "max_tokens": ngen, "temperature": 0, "seed": 42, "cache_prompt": True,
+}).encode()
+
+# A: the first ingest (the text fills the window, then the image chunk arrives past it -- the #297 shape).
+# B: the same request again, so the server serves it from the prompt cache and the image chunk is NOT
+#    re-decoded: the drafter must realign to the restored positions without touching the text.
+res = {}
+for name in ("A", "B"):
+    req = urllib.request.Request("http://127.0.0.1:%s/v1/chat/completions" % port, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=7200) as r:
+            d = json.load(r)
+        msg = d["choices"][0]["message"]
+        # a thinking model puts its text in reasoning_content; hash both so neither channel is ignored
+        content = (msg.get("content") or "") + "|" + (msg.get("reasoning_content") or "")
+        res[name] = {"content": content, "error": None}
+    except Exception as e:
+        res[name] = {"content": "", "error": str(e)}
+        try:
+            res[name]["body"] = e.read().decode()[:300]
+        except Exception:
+            pass
+        break
+
+json.dump({"steps": res}, open(out_file, "w"), indent=1)
 PY
     local rc=$?
     stop_arm
@@ -288,6 +398,23 @@ else
         echo "      the window is not granted per sequence (issue #264: the r193 shape is $((cells_expect / NPAR)) cells)"
         fails=$((fails + 1))
     fi
+
+    # ... and the cache must be allocated at THAT size.  The reserve estimate above and
+    # `create_memory`'s own cell count were computed from different ubatches until issue #297: the estimate
+    # read the target's `-ub` while the draft context caps its own with MTP_DRAFT_N_UBATCH (512), so it
+    # charged 52224 cells for a 51712-cell cache (and `--fit` inherited the error).
+    cache_cells=$(sed -n 's/.*MTP draft KV window = [0-9]* cells per sequence (draft cache \([0-9]*\) of.*/\1/p' \
+        "$KEEPOUT/win/log.txt" | head -1)
+    if [ -z "$cache_cells" ]; then
+        echo "FAIL  win: no 'create_memory: MTP draft KV window' line - the cache was not sized from the window"
+        fails=$((fails + 1))
+    elif [ "$cache_cells" = "$cells" ]; then
+        echo "PASS  win: the reserve estimate and the allocated cache agree on $cells cells (issue #297)"
+    else
+        echo "FAIL  win: the reserve estimate charges $cells cells but the cache allocated $cache_cells: the two"
+        echo "      sizing paths disagree about the draft context's ubatch (MTP_DRAFT_N_UBATCH, issue #297)"
+        fails=$((fails + 1))
+    fi
 fi
 
 python3 - "$KEEPOUT" <<'PY'
@@ -324,6 +451,91 @@ for name in ("A", "B", "C", "D", "E", "F"):
 sys.exit(1 if fails else 0)
 PY
 [ $? -ne 0 ] && fails=$((fails + 1))
+
+# ===== the MULTIMODAL arm (issue #297) ===============================================================
+# The text arms above cannot reach this: with text every token advances the position by 1, so the window's
+# position-based reclaim always frees exactly one batch.  A multimodal (M-RoPE) image chunk is different --
+# every row shares one temporal position -- and that is what used to fail the whole request with
+# "failed to find a memory slot" + HTTP 500 "failed to process mtmd chunk".
+echo
+echo "-- multimodal arm (issue #297: an M-RoPE image chunk past the window)"
+if [ "$MTMD" -eq 0 ]; then
+    echo "SKIP  mtmd: --no-mtmd"
+elif [ ! -f "$MMPROJ" ]; then
+    echo "SKIP  mtmd: no projector at MMPROJ=$MMPROJ (it must pair with MODEL)"
+elif [ ! -f "$IMAGE" ]; then
+    echo "SKIP  mtmd: no image at IMAGE=$IMAGE"
+else
+    run_mtmd_arm mtmd_win  --spec-draft-kv-window "$MTMD_WIN" || { echo "FAIL  mtmd_win: the arm did not run"; fails=$((fails + 1)); }
+    run_mtmd_arm mtmd_win0 --spec-draft-kv-window 0            || { echo "FAIL  mtmd_win0: the arm did not run"; fails=$((fails + 1)); }
+
+    # the image batch must be wider than the draft cache's spare room (`MTMD_DUB` cells), or the arm proves
+    # nothing: with the window active the spare room is exactly one draft batch
+    n_img=$(sed -n 's/.*decoding image batch [0-9]*\/[0-9]*, n_tokens_batch = \([0-9]*\).*/\1/p' "$KEEPOUT/mtmd_win/log.txt" | head -1)
+    if [ -z "$n_img" ]; then
+        echo "FAIL  mtmd: the image chunk was never decoded (no 'decoding image batch' line) - is MMPROJ a projector for MODEL?"
+        fails=$((fails + 1))
+    elif [ "$n_img" -le "$MTMD_DUB" ]; then
+        echo "FAIL  mtmd: the image batch is $n_img tokens, not wider than the draft ubatch ($MTMD_DUB), so the spare"
+        echo "      room could hold it and the ring fallback was never needed.  Use a larger IMAGE or a smaller MTMD_DUB."
+        fails=$((fails + 1))
+    else
+        echo "PASS  mtmd: the image chunk is $n_img tokens, wider than the draft cache's $MTMD_DUB-cell spare room"
+    fi
+
+    if grep -q "ring eviction is active" "$KEEPOUT/mtmd_win/log.txt"; then
+        echo "PASS  mtmd: the window arm needed the ring fallback (positions did not advance) and placed the batch"
+        grep -m1 "ring eviction is active" "$KEEPOUT/mtmd_win/log.txt" | sed 's/^.*find_slot: //' | cut -c1-140 | sed 's/^/      /'
+    else
+        echo "FAIL  mtmd: the window arm placed the image batch WITHOUT the ring fallback - the arm is vacuous"
+        fails=$((fails + 1))
+    fi
+    if grep -q "ring eviction is active" "$KEEPOUT/mtmd_win0/log.txt"; then
+        echo "FAIL  mtmd_win0: the full draft cache reported a ring eviction (only a TRUNCATING window may evict)"
+        fails=$((fails + 1))
+    fi
+    for arm in mtmd_win mtmd_win0; do
+        if grep -q "failed to find a memory slot" "$KEEPOUT/$arm/log.txt"; then
+            echo "FAIL  $arm: $(grep -m1 'failed to find a memory slot' "$KEEPOUT/$arm/log.txt" | sed 's/^.*\(failed to find\)/\1/')"
+            fails=$((fails + 1))
+        fi
+        if grep -q "drafting is disabled" "$KEEPOUT/$arm/log.txt"; then
+            echo "FAIL  $arm: the drafter gave up (drafting disabled) - the ring fallback did not place the batch"
+            fails=$((fails + 1))
+        fi
+    done
+
+    python3 - "$KEEPOUT" <<'PY'
+import json, sys
+root = sys.argv[1]
+res = {}
+for a in ("mtmd_win", "mtmd_win0"):
+    try:
+        res[a] = json.load(open("%s/%s/steps.json" % (root, a)))
+    except Exception as e:
+        print("FAIL  %s: no result (%s)" % (a, e))
+        sys.exit(1)
+    for step, r in res[a]["steps"].items():
+        if r.get("error"):
+            print("FAIL  %s %s: the multimodal request failed: %s %s"
+                  % (a, step, r["error"], r.get("body", "")))
+            sys.exit(1)
+for step in ("A", "B"):
+    w, n = res["mtmd_win"]["steps"][step]["content"], res["mtmd_win0"]["steps"][step]["content"]
+    if w != n:
+        print("FAIL  mtmd %s: the windowed drafter changed the text (%d vs %d chars)" % (step, len(w), len(n)))
+        sys.exit(1)
+    if len(w) < 16:
+        print("FAIL  mtmd %s: the text is empty (%r) - nothing to compare" % (step, w[:32]))
+        sys.exit(1)
+if res["mtmd_win"]["steps"]["A"]["content"] != res["mtmd_win"]["steps"]["B"]["content"]:
+    print("FAIL  mtmd: the window arm's cached re-request (step B) differs from its first answer (step A)")
+    sys.exit(1)
+print("PASS  mtmd: win == win0 on both steps (%d chars), and the cached re-request reproduces the answer"
+      % len(res["mtmd_win"]["steps"]["A"]["content"]))
+PY
+    [ $? -ne 0 ] && fails=$((fails + 1))
+fi
 
 # acceptance is informational: the window is an approximation, so a difference here is expected
 for arm in win win0; do
@@ -418,11 +630,12 @@ if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
     echo
     since_args=()
     [ -n "$GATE_SINCE_TS" ] && since_args=(--since "$GATE_SINCE_TS")
-    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" \
-            --log "$KEEPOUT/win/log.txt" --log "$KEEPOUT/win0/log.txt" \
-            --log "$KEEPOUT/auto_small/log.txt" --log "$KEEPOUT/auto_decline/log.txt" \
-            --log "$KEEPOUT/auto_grant/log.txt" --log "$KEEPOUT/default_off/log.txt" \
-            --log "$KEEPOUT/tensor_default_off/log.txt" --log "$KEEPOUT/tensor_auto/log.txt" 2>&1)"; then
+    log_args=()
+    for f in win win0 auto_small auto_decline auto_grant default_off tensor_default_off tensor_auto \
+             mtmd_win mtmd_win0; do
+        [ -f "$KEEPOUT/$f/log.txt" ] && log_args+=(--log "$KEEPOUT/$f/log.txt")
+    done
+    if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" "${log_args[@]}" 2>&1)"; then
         echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and both arm logs clean"
     else
         echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"
@@ -435,6 +648,7 @@ echo
 if [ "$fails" -eq 0 ]; then
     echo "==> PASS: every request answered on both slots with the draft window active, and the windowed"
     echo "    drafter produced byte-identical text to the full draft cache (the target verifies every token)."
+    echo "    The multimodal arm ingested an image chunk past the window on the ring fallback (issue #297)."
     echo "    logs kept in $KEEPOUT"
     [ "${KEEP:-0}" = "1" ] || rm -rf "$KEEPOUT"
     exit 0

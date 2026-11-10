@@ -145,7 +145,7 @@ only as a rough shape.
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r227: the host pool's disk tier is real on Windows (`ReadFile`/`FILE_FLAG_NO_BUFFERING`), a refused pool allocation reports and latches, and the exit census prints from the model teardown with the pinned tier's realized bytes and, on Windows, the adapter's aperture budget; + r224: the host-expert pool campaign — a DECODE-ranked pool, an eviction demote with in-budget headroom, coalesced prefill reads, and the heat-save truncation fix; + r221: a host pool that covers its tensor has nothing to re-rank, so `pool_rerank_from_heat_locked` returns before any bookkeeping — the write-once layout the decode remap's cold map needs, TODO #269; + r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248; + r203: PR #266's `g_dr_key_to_id` reindex in `moe_cache_forget_all` and the `heat_dec` tally in the lag policy; + r209: **Windows** — the host pool and the KV spill ceiling read `GlobalMemoryStatusEx` as their available-RAM figure — PR #269; + r218: the DFlash/DSpark drafter's KV is realigned with the batch it ingests so a partially reused prompt cannot invalidate it, issue #272) (+ r237: the prefill-arena fix — the arena arms on the first complete table set, and the scheduler registers every split's host-expert tables before the first one computes, so `-sm tensor` arms too; pp512 438 -> 1209 on `-ncmoe 48`; + r240: the `hc_combine_norm` base copy is the last pool allocation of its window and is killed right after the launch, so a `-sm layer` prefill graph no longer holds one copy per layer — GitHub issue #290; + r244: PR #292's DFlash layer-input copies move to just after each layer (`build_layer_inp_dev()`, `LLAMA_LAYER_INP_EARLY`) — the target's compute buffer 756.97 → 624.99 MiB / 580.99 MiB on dense 27B + DFlash2) | +7832 / −1178 | 52 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +575 / −16 | 19 |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −18 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `LLAMA_KV_RESIDENT_CELLS=<cells>| +6446 / −763 | 39 | 32 |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297) | +7005 / −837 | 45 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -4061,6 +4061,42 @@ Purity notes: `GREEDY-PURITY.md` §58.
 
 ## Block 15 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
 
+> **r248 amendment (issue #297): the MTP draft window is a TRUE ring, a drafter failure no longer fails a request,
+> and the two sizing paths agree on the draft ubatch.**  The window reclaims a cell by its POSITION
+> (`find_slot`'s `n_swa` test), which only works while positions advance one per token.  An M-RoPE multimodal
+> chunk does not: every row of an image shares ONE temporal position, so nothing becomes reclaimable, the
+> `win + one batch` spare room is exhausted mid-chunk, and the whole request died with
+> `failed to find a memory slot for batch of size N` → `spec process: llama_process(ctx_dft) … failed rc=1` →
+> HTTP 500 `failed to process mtmd chunk` (reproduced on the stock 27B + its projector at `-c 8192` with a
+> 1024-token image past a 2048-cell window; the reporter hit it at ~51 k tokens / 1014-token image).  Three
+> parts, all inside the drafter:
+> 1. **The ring.**  `find_slot` gets a second pass for a TRUNCATING window cache only (`swa_ring`, set by
+>    `create_memory`'s MTP branch and by nothing else — a model's own sliding-window attention must never
+>    reuse a cell inside its window): when the position scan cannot place the batch, it evicts the
+>    sequence's OLDEST cells, exactly as many as the batch needs (`nth_element` on their positions, no
+>    sort, no allocation beyond the failure path).  Only cells holding a position STRICTLY BELOW every
+>    position the batch writes are eligible, so `apply_ubatch`'s purge of the overwritten range can never
+>    reach a cell the batch just wrote — which also makes it safe on a re-decode.  Text never reaches this
+>    pass (measured: zero occurrences on a 42 k-token run past an 8192-cell window); one INFO line per run
+>    (`draft window ring eviction is active`) explains the first eviction, then DEBUG.
+> 2. **The safety net.**  A draft-only failure used to return `false`, and the server turned that into HTTP
+>    500.  Now a failed draft decode drops the draft KV of the batch's sequences (a batch is always
+>    placeable in an empty cache) and retries once; a retry that still fails only disables drafting for
+>    those sequences until the next request (`dft_skip`, cleared in `begin()`).  The target decodes the
+>    tokens itself, so the text is unchanged — verified by disabling the ring and re-running the multimodal
+>    shape: the request answers 200 with the byte-identical text instead of 500.
+> 3. **The sizing disagreement.**  `common_draft_reserve_derive()` read the TARGET's `-ub` while the draft
+>    context caps its own with `MTP_DRAFT_N_UBATCH` (512), so the reserve charged 52224 cells for a
+>    51712-cell cache (the reporter's two log lines) and `--fit` inherited the error.  Both now go through
+>    `common_speculative_draft_n_ubatch()`, the one place the cap is defined.
+>
+> Gate: `scripts/gate-spec-draft-window.sh` gains **multimodal arms** (`mtmd_win`/`mtmd_win0`, skipping only
+> when a projector/image is missing) and a check that the reserve estimate and the allocated cache agree.
+> Its arms now run at `-lv 4` (the text comes over HTTP, so verbosity only pollutes the log) — without it
+> the `create_memory`, `decoding image batch` and ring lines are invisible and three checks would grade an
+> empty log.  Defaults unchanged: `--spec-draft-kv-window` stays `0` (r247's measurement stands; the ring
+> makes a window *placeable*, not cheaper), and no environment variable is added.
+
 > **r247 amendment (issue #293 follow-up): all three placements default OFF, and the pool stops being a size knob.**
 > The MTP draft window shipped from r246 with `auto` as its default and that cost MTP decode whenever the request
 > was deeper than the window: **−9.7 %** on a `-sm tensor` split at ~105 k tokens (65 536-cell `auto` window
@@ -4384,7 +4420,9 @@ non-negative only *below the window's depth*, and −9.7 % on a `-sm tensor` spl
   cell more than `n_swa` behind, and `set_input_kq_mask` reads *this cache's* `n_swa`, so `hparams` (shared
   with the target) is untouched.  The derived kq mask stays valid as well — its predicate compares each
   cell's **position**, not its index, so a recycled cell reports its new one.  (The `wip` design note listed
-  that as a hazard; it is not one.)
+  that as a hazard; it is not one.)  **Since r248 it is a true ring** as well: reclaim by position frees
+  nothing when a batch's positions do not advance (an M-RoPE image chunk), so a truncating window cache may
+  also evict the sequence's oldest cells — issue #297, and see the r248 amendment at the top of this block.
 * **MTP only, and only an embedded MTP head** (qwen3.5/3.6/3.8).  A separate MTP draft GGUF (qwen4exp /
   Flash-Next) keeps its full cache and its flat reserve — its draft model's path is not known where the
   reserve is derived, so that case is deliberately left alone.

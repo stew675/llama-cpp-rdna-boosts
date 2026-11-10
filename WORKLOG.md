@@ -1,3 +1,114 @@
+## 261110.004 (r248, RELEASE v16-a691b2345-r248) -- GitHub issue #297: a windowed draft cache is a TRUE ring, a drafter failure cannot fail a request, and the reserve now reads the draft's own ubatch
+
+**Release:** `v16-a691b2345-r248`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`12433634d259e823a66651152028715ec115cbc2` (tree `fe0e044947f44ccc78bdfa62b46afeea5b8a081c`), 16 blocks.
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`, applied tree == recorded tree,
+conflict-marker and Windows-portability scans); a clean re-cut from `patches/` at `.base` reproduces the same
+tree **and** the same tip.  **No block renumbered, merged or split**: everything folds into **block 15**.  No
+kernel, no graph, no numerics, no default and no gate threshold changed.
+
+### The bug, reproduced
+
+The MTP draft window reclaims a cell by its **position** (`find_slot`'s `n_swa` test), which is a complete ring
+for text: every token advances the position by one, so a full window always has exactly one batch of reclaimable
+cells.  It is not complete for a multimodal batch.  `mtmd_image_tokens_get_decoder_pos()` gives every row of an
+M-RoPE image the SAME temporal position (`pos.t = pos_0`), so while a ~1k-token image chunk is placed
+`seq_pos_max` does not move, nothing new becomes reclaimable, and the `win + n_ubatch` spare room is exhausted
+mid-chunk.  The drafter's `process()` then returned `false`, and the server turned that into HTTP 500.
+
+Reproduced on the maintainer's box with the stock Qwen3.8-27B IQ3_S + its own projector (`-c 8192`,
+`--spec-draft-kv-window 2048`, `-b/-ub 1024`, a 1500-token text prompt then a 1024-token image), which is the
+reporter's chain with smaller numbers:
+
+```
+I decoding image batch 1/1, n_tokens_batch = 1024
+W decode: failed to find a memory slot for batch of size 1024
+E spec      process: llama_process(ctx_dft) head=0 failed rc=1 (pos=6717)
+E post-decode callback failed
+HTTP 500  failed to process mtmd chunk
+```
+
+The reporter's shape (`-c 204800`, ~51 k-token window, a 1014-token image at `pos=56549`) is the same path.
+**r247 did not fix this** and could not have: it made the window default-OFF, which removes the *exposure* but
+leaves the failure intact for the consumer who opts in (the reporter's own workaround is exactly that opt-out).
+So the window was still broken-by-design for every multimodal request, on every MTP-head model, M-RoPE or not.
+
+### The fix (three parts, all inside the drafter)
+
+1. **The ring is real now.**  `llama_kv_cache::find_slot` gets a second pass for a **TRUNCATING** window cache
+   only -- a new `swa_ring` construction flag set by `create_memory`'s MTP branch and by **nothing else** (a
+   model's own sliding-window attention must never reuse a cell inside its window: there that cell is still
+   attended).  When the position scan cannot place the batch, the pass evicts the sequence's **OLDEST** cells,
+   exactly as many as the batch needs (`std::nth_element` on their positions -- no sort, no allocation outside
+   this rare path).  Only cells holding a position **strictly below every position the batch writes** are
+   eligible, so `apply_ubatch`'s purge of the overwritten range can never reach a cell the batch just wrote;
+   that is also what makes it safe on a re-decode.  One INFO line per run explains the first eviction
+   (`draft window ring eviction is active …`), then DEBUG.
+   *Measured inert for text*: a 42 k-token run past an 8192-cell window at `-lv 4` reports **zero** ring
+   evictions -- position reclaim alone is enough, so nothing changes on the path r247 measured.
+2. **A drafter failure can no longer fail a request** (the reporter's suggestion 2).  A failed draft decode now
+   drops the draft KV of the batch's sequences -- a batch is always placeable in an empty cache -- and retries
+   once; a retry that still fails only disables drafting for those sequences until the next request
+   (`dft_skip`, cleared in `begin()`).  The target decodes the tokens itself, so the text cannot change.
+   *Verified by disabling the ring and re-running the multimodal shape*: the request answers **200** with the
+   byte-identical text instead of 500, the log carrying `draft decode failed … dropping the draft KV and
+   retrying once`.
+3. **The two sizing paths agree** (the reporter's suggestion 3).  `common_draft_reserve_derive()` read the
+   **target's** `-ub` while the draft context caps its own with `MTP_DRAFT_N_UBATCH` (512), so the reserve --
+   and `--fit` behind it -- charged `PAD(win + 1024)` cells for a `PAD(win + 512)` cache: the reporter's
+   `kv cells 52224` against `draft cache 51712`, and 3072 against 2560 in the reproduction above.  The cap now
+   lives in one function, `common_speculative_draft_n_ubatch()`, which the draft context, the derived reserve
+   and `--fit` all call (and `n_batch` bounds it exactly as `llama_context` does).
+
+**Defaults are untouched.**  `--spec-draft-kv-window` stays `0`: this makes a window *placeable*, not cheaper,
+and r247's `−9.7 %` past the wrap is a separate, still-unexplained cost.  No environment variable is added --
+the ring is a correctness bound on a cache whose lossiness is already documented, and a caller who wants the old
+behaviour asks for a full draft cache.
+
+### Gates
+
+| gate | result |
+|---|---|
+| **the reporter's own shape, end to end** (Swift-Qwen3.8-27B Q4_K_S + its projector, `-c 131072`, `--spec-draft-kv-window auto` -> window 65 536, draft cache 66 048 of 131 072; a 69 k-token prompt then a 1024-token image) | **HTTP 200 with a real answer**, the ring firing on the image sub-batch (`evicted the oldest cells (pos <= 3239)`), and the text **byte-identical** to the same request with `--spec-draft-kv-window 0` on an identical run (the no-window arm logs no ring).  This is the arm that failed with `failed to find a memory slot` -> HTTP 500 before the fix |
+| the default draft ubatch (`MTP_DRAFT_N_UBATCH` 512) with a 1024-token image and a 2048-cell window | **PASS** -- HTTP 200, text byte-identical to the `0` arm, no `failed to find a memory slot` (this is the exact config of the reproduction above) |
+| `scripts/gate-spec-draft-window.sh` (default run) | **PASS** -- text arms 6/6 `win == win0`; `win` cache 3072 = `(1024 + 512) x 2`; **new**: the reserve estimate and the allocated cache agree on that 3072 (issue #297 part 3); the `auto` policy + default arms unchanged |
+| ... its **new multimodal arms** | **PASS** -- `mtmd_win` / `mtmd_win0` (27B IQ3_S + `mmproj-F16`, `-c 8192`, window 1024, `MTMD_DUB=128`, `tools/mtmd/test-1.jpeg` = 300 image tokens > 128-cell spare room): the image chunk really is wider than the spare room, the window arm **needed** the ring (`ring eviction is active`, absent in `mtmd_win0`), neither arm reports `failed to find a memory slot` or `drafting is disabled`, and both requests (the ingest and a prompt-cache re-request) are byte-identical across the arms |
+| ... gate self-check (ring forced OFF, rebuild) | **FAILS as designed** (`2 check(s) failed`: no ring census + `failed to find a memory slot`), so the arm is not vacuous |
+| coherence (27B UD-Q4_K_XL, 3 GPU, seed 42 / 24 tokens) | `-sm layer` `d45e2221805a` and `-sm tensor` `019844e4b185` -- **both the r247 reference hashes**, i.e. the default path is untouched |
+| MTP, reduced Protocol A (`-sm layer -c 67584`, 42 k-token request, `-n 512`, seed 42) | `plain` 27.4 t/s (r247: 27.5) and `draft-mtp` 52.7 t/s (r247: 52.8), text **identical** `1f0fbac1ea2d` |
+| windowed text at depth (`-sm layer -c 67584`, 42 k prompt, `--spec-draft-kv-window 8192`, `-lv 4`) | runs clean, window line reports 8192 of 67584 cells, **0** ring evictions (the ring is text-inert) |
+| SWA smoke (Gemma4 12B Q8_0, `n_swa` 1024) | iswa path loads both caches (`non-SWA 262144`, `SWA 1536` cells), generates text, no ring (a model's own window never rings) |
+| `scripts/gate-per-block-build.sh --fast --changed-from 4973ab6c1` | **1/1** (block 15 only, 8 s) |
+| `scripts/gate-prefill-logits.sh` | **PASS** 0.000697 / 98.784 % (no prefill path touched; the formality every release runs) |
+| `scripts/validate-set.sh` | strict 16/16, applied tree `fe0e044947`, checksums + Windows portability lint green |
+| `scripts/check-gpu-faults.sh --since "2026-11-10 09:00:00"` | clean.  (The journal does hold 37 `page fault` lines -- all from **2026-11-08 16:35**, days before this session; the default window of the script reaches back further than the session.) |
+
+### Gate defects found while writing the arms
+
+* **The gate's checks need `-lv 4` and the arms were not passing it.**  `create_memory: MTP draft KV window`,
+  `decoding image batch` and the ring census are llama/mtmd INFO lines, one notch above `common/`'s, so three of
+  the new checks graded an **empty log** on the first run.  Every arm now runs at `-lv 4`, which costs the text
+  comparison nothing because `llama-server` returns its text over HTTP (the same reason `gate-ckpt-reuse.sh`
+  hashes API responses there) -- the class of defect r246 and r247 each hit once in this same gate.
+* **Two stale rows in `patches/README.md`'s block table**: block 15's subject still named the pre-r246
+  `LLAMA_KV_RESIDENT_CELLS` env knob as its interface, and its row carried one field too many (the header has
+  `+/−` and `files`; the row had three numbers after the subject).  Both corrected with the r248 stats
+  (+7005 / −837, 45 files).
+
+### A pre-existing wart, NOT fixed
+
+A `llama_process` that fails after `n_queued_tokens += n_tokens` leaves that count for the next `synchronize()`,
+so the draft context's own perf counters absorb the failed batch.  It is draft-only, it pre-dates this change
+(any `rc != 0` did it) and the retry synchronizes immediately after, so it is a statistic, not a result.  Noted
+rather than touched: the retry path is now the only one that can reach it twice.
+
+### Records
+
+`patches/README.md` (block 15: the r248 amendment + the Goal C ring bullet), `ENVIRONMENT.md` §17.2 and the
+`MTP_DRAFT_N_UBATCH` row, `MANIFESTS.md` gate 15, `scripts/README.md` (the gate's row), `INVARIANTS.md`
+(r248: five facts and three decisions), `benchmarks/2026-11-10-mtp-draft-window-depth.md` is unchanged (the
+r247 measurement stands -- this release changes no rate).
+
 ## 261110.003 (r247, RELEASE v16-a691b2345-r247) -- the MTP draft window was costing 9.7 % of decode at depth: every block-15 placement now defaults OFF, and the pool stops being a size knob
 
 **Release:** `v16-a691b2345-r247`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

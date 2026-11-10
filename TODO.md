@@ -20,12 +20,12 @@ still means the same subject after that item is closed and removed from this fil
 
 **Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`a691b2345`**
 (the 2026-10-25 re-base); read `.release` in `release.json` for the release id -- it is the source of
-truth, not this line.  Block 15 is the **streamed KV** (the resident
-window *and* the attendance pool, both opt-in).  `release.json` is the source of truth for the
+truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
+draft window -- all three opt-in, default off).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 16 blocks are climbed,
 every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
-(`v16-a691b2345-r236`).
+(the base is unchanged since; the release id is `release.json.release`).
 
 ## The open list
 

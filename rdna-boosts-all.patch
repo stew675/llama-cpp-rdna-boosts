@@ -392,7 +392,7 @@ index 69be4a61e..faa73a2e9 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 75fd39665..e96601e86 100644
+index 75fd39665..2072e62a9 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -411,7 +411,7 @@ index 75fd39665..e96601e86 100644
      llama_context_ptr context;
  
      std::vector<llama_adapter_lora_ptr> lora;
-@@ -1235,6 +1237,54 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+@@ -1235,6 +1237,61 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
      return info;
  }
  
@@ -446,17 +446,24 @@ index 75fd39665..e96601e86 100644
 +    // The window predicate is the CACHE's own geometry function, not the bare policy: with `--kv-unified` a
 +    // window can be declined for the sequence count (issue #264), and a reserve derived from a window the
 +    // cache did not take would under-charge the draft's KV.
++    //
++    // The ubatch passed in has to be the DRAFT context's, not the target's `-ub`: `MTP_DRAFT_N_UBATCH` caps it
++    // at 512 (TODO #42), and the window keeps `win + one batch` cells -- so reading the target's `-ub` sized the
++    // estimate for 52224 cells while the cache allocated 51712 (issue #297, the reporter's `kv cells 52224`
++    // against `draft cache 51712`).  `n_batch` bounds it the same way `llama_context` does.
++    const uint32_t n_ubatch_dft = std::min<uint32_t>(params.n_batch, common_speculative_draft_n_ubatch(params.n_ubatch));
++
 +    uint32_t mtp_win = 0;
 +    const bool mtp_shared = params.speculative.has_mtp() &&
 +                            params.speculative.draft.mparams.path.empty() &&
-+                            llama_spec_draft_kv_cells(params.n_ctx, params.n_ubatch,
++                            llama_spec_draft_kv_cells(params.n_ctx, n_ubatch_dft,
 +                                                      (uint32_t) params.n_parallel, params.kv_unified,
 +                                                      params.speculative.draft.kv_window,
 +                                                      &mtp_win) != 0;
 +    return common_draft_reserve_estimate(
 +            mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
 +            params.n_ctx,
-+            params.n_ubatch,
++            mtp_shared ? n_ubatch_dft : params.n_ubatch,
 +            params.cache_type_k, params.cache_type_v,
 +            mtp_shared,
 +            (uint32_t) params.n_parallel, params.kv_unified,
@@ -466,7 +473,7 @@ index 75fd39665..e96601e86 100644
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
      if (!params.fit_params) {
          return;
-@@ -1243,17 +1293,19 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1243,17 +1300,19 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
      COM_TRC("%s", "fitting params to device memory ...\n");
      COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
  
@@ -490,7 +497,7 @@ index 75fd39665..e96601e86 100644
      }
      cparams_dft.n_rs_seq = 0;
  
-@@ -1262,6 +1314,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1262,6 +1321,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
          /*.mparams      =*/ &mparams_dft,
          /*.cparams      =*/ &cparams_dft,
          /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
@@ -498,7 +505,7 @@ index 75fd39665..e96601e86 100644
      };
  
      common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-@@ -1273,7 +1326,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1273,7 +1333,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
          params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
  }
  
@@ -507,7 +514,7 @@ index 75fd39665..e96601e86 100644
      pimpl(new impl{}) {
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -1286,7 +1339,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1286,7 +1346,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
      }
  
      pimpl->model.reset(model);
@@ -515,7 +522,7 @@ index 75fd39665..e96601e86 100644
      if (model_only) {
          return;
      }
-@@ -1383,7 +1435,153 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1383,7 +1442,153 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -669,7 +676,7 @@ index 75fd39665..e96601e86 100644
      if (lctx == NULL) {
          COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
          return;
-@@ -1391,6 +1589,28 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1391,6 +1596,28 @@ common_init_result::common_init_result(common_params & params, bool model_only)
  
      pimpl->context.reset(lctx);
  
@@ -698,7 +705,7 @@ index 75fd39665..e96601e86 100644
      set_process_priority(params.cpuparams.priority);
  
      pimpl->threadpools.init(lctx, params);
-@@ -1400,6 +1620,14 @@ llama_model * common_init_result::model() {
+@@ -1400,6 +1627,14 @@ llama_model * common_init_result::model() {
      return pimpl->model.get();
  }
  
@@ -713,7 +720,7 @@ index 75fd39665..e96601e86 100644
  llama_context * common_init_result::context() {
      return pimpl->context.get();
  }
-@@ -1429,8 +1657,109 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
+@@ -1429,8 +1664,109 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
      }
  }
  
@@ -825,7 +832,7 @@ index 75fd39665..e96601e86 100644
  
      llama_model * model = res->model();
      if (model == NULL) {
-@@ -1664,6 +1993,15 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
+@@ -1664,6 +2000,15 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
      }
  }
  
@@ -841,7 +848,7 @@ index 75fd39665..e96601e86 100644
  void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
      common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
      if (ctx_dft) {
-@@ -1695,6 +2033,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1695,6 +2040,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -861,7 +868,7 @@ index 75fd39665..e96601e86 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1717,7 +2068,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1717,7 +2075,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -871,7 +878,7 @@ index 75fd39665..e96601e86 100644
  
      return mparams;
  }
-@@ -1728,6 +2080,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1728,6 +2087,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -881,7 +888,7 @@ index 75fd39665..e96601e86 100644
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
-@@ -1754,6 +2109,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1754,6 +2116,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -3048,7 +3055,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index e6290eaad..bb2186f6e 100644
+index e6290eaad..fe0793cda 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -3340,12 +3347,17 @@ index e6290eaad..bb2186f6e 100644
  
      // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
      // The last h-row of one process() call needs the first token of the NEXT
-@@ -1563,8 +1743,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1563,8 +1743,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
 -    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
 -        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
++    // per-sequence "do not draft" latch, set when the drafter could not place a batch even into an empty
++    // cache (issue #297).  Sticky for the request so one poison chunk cannot make every later chunk pay the
++    // drop-and-retry; `begin()` clears it.  Drafting is optional, so skipping it never changes the text.
++    std::vector<bool> dft_skip;
++
 +    // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
 +    bool adaptive = false;
 +    std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
@@ -3365,7 +3377,7 @@ index e6290eaad..bb2186f6e 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1576,6 +1770,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1576,6 +1775,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -3384,7 +3396,7 @@ index e6290eaad..bb2186f6e 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1613,12 +1819,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1613,12 +1824,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -3415,7 +3427,7 @@ index e6290eaad..bb2186f6e 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1629,6 +1852,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1629,6 +1857,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -3450,10 +3462,24 @@ index e6290eaad..bb2186f6e 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1657,6 +1908,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1637,6 +1893,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++
++        dft_skip.assign(n_seq, false);
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1657,6 +1915,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          // reset here rather than per round, or two identical requests differ
          common_sampler_reset(smpls[seq_id].get());
  
++        // a new request retries drafting even if the previous one disabled it (issue #297)
++        if ((size_t) seq_id < dft_skip.size()) {
++            dft_skip[seq_id] = false;
++        }
++
 +        // new generation: the depth learned for the previous content is stale,
 +        // so the controller starts over from --spec-draft-n-start (or the default
 +        // cold start), even for an empty prompt
@@ -3464,7 +3490,7 @@ index e6290eaad..bb2186f6e 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1674,6 +1932,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1674,6 +1944,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
      }
  
@@ -3513,7 +3539,7 @@ index e6290eaad..bb2186f6e 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1683,6 +1983,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1683,6 +1995,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return true;
          }
  
@@ -3531,7 +3557,7 @@ index e6290eaad..bb2186f6e 100644
          const int32_t n_tokens = batch_in.size();
  
          // remember the first and last batch index for each sequence
-@@ -1717,11 +2028,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1717,11 +2040,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              // TODO:this is generally true, but would be nice to assert it
              const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
  
@@ -3557,10 +3583,17 @@ index e6290eaad..bb2186f6e 100644
                  // vision tokens carry an embedding instead of an id
                  const int32_t idx = t.id != LLAMA_TOKEN_NULL
                      ? batch.add(t.id, t.pos[0], seq_id, false)
-@@ -1736,8 +2061,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1736,33 +2073,76 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              auto * mem_dft = llama_get_memory(ctx_dft);
  
+-            bool ok = true;
+-            for (int head = 0; head < n_mtp_layers; ++head) {
+-                if (chain_heads) {
+-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                        if (i_batch_beg[seq_id] < 0) {
+-                            continue;
 +            // a partially reused prompt leaves the cache ending below the first row ingested here (see
 +            // spec_draft_align_cache()); a shared cache is the target's, so it is never touched
 +            if (!is_mem_shared) {
@@ -3569,13 +3602,81 @@ index e6290eaad..bb2186f6e 100644
 +                }
 +            }
 +
-             bool ok = true;
--            for (int head = 0; head < n_mtp_layers; ++head) {
-+            for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
-                 if (chain_heads) {
-                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1771,19 +2104,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
++            // The drafter's KV is LOSSY by design (a window, or a ring that evicted its oldest cells), so a
++            // batch it cannot place must cost ACCEPTANCE, never the request: a draft-only failure used to
++            // return false, and the server turned that into HTTP 500 "failed to process speculative batch" /
++            // "failed to process mtmd chunk" (issue #297).  Run the heads, and on a failure drop the draft KV
++            // of the batch's sequences -- a batch is always placeable in an empty draft cache -- then retry
++            // once.  A retry that still fails only disables drafting for those sequences until the next
++            // request (`begin()`); the target decodes the tokens itself and the output is unchanged.
++            auto run_heads = [&]() -> int32_t {
++                for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
++                    if (chain_heads) {
++                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
++                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                            if (i_batch_beg[seq_id] < 0) {
++                                continue;
++                            }
++                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                         }
+-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
++                        llama_set_nextn_layer_offset(ctx_dft, head);
++                    }
++
++                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++                    if (rc != 0) {
++                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
++                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
++                        return rc;
+                     }
+-                    llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
++                return 0;
++            };
++
++            int32_t rc = run_heads();
++
++            if (rc != 0) {
++                SPC_WRN("draft decode failed (rc=%d, pos=%d): dropping the draft KV and retrying once\n",
++                        (int) rc, (int) batch_in.tokens[0].pos[0]);
++
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (i_batch_beg[seq_id] >= 0) {
++                        llama_memory_seq_rm(mem_dft, seq_id, 0, -1);
++                    }
++                }
++
++                rc = run_heads();
+ 
+-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                 if (rc != 0) {
+-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+-                    ok = false;
+-                    break;
++                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                        if (i_batch_beg[seq_id] >= 0) {
++                            dft_skip[seq_id] = true;
++                        }
++                    }
++                    SPC_ERR("the drafter cannot place this batch even in an empty cache (rc=%d): drafting is "
++                            "disabled for the rest of this request\n", (int) rc);
+                 }
+             }
+ 
+             if (chain_heads) {
+                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+             }
+-            if (!ok) {
+-                return false;
++
++            if (rc != 0) {
++                // never fail the request for a drafter-only failure (issue #297)
++                return true;
+             }
+         }
+ 
+@@ -1771,19 +2151,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -3626,8 +3727,17 @@ index e6290eaad..bb2186f6e 100644
              verify_h_rows[seq_id] = h_rows;
              verify_h[seq_id].resize((size_t) h_rows * n_embd);
  
-@@ -1817,6 +2173,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1815,8 +2218,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 continue;
+             }
  
++            if ((size_t) seq_id < dft_skip.size() && dft_skip[seq_id]) {
++                // the drafter could not place a batch for this sequence (issue #297): decode without drafts
++                // for the rest of the request rather than retrying a poison chunk on every step
++                dp.drafting = false;
++                continue;
++            }
++
              n_drafting++;
              drafting[seq_id] = true;
 +
@@ -3645,7 +3755,7 @@ index e6290eaad..bb2186f6e 100644
              // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
              if (!params.probabilistic) {
                  dp.result_q = nullptr;
-@@ -1842,6 +2210,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1842,6 +2264,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -3656,7 +3766,7 @@ index e6290eaad..bb2186f6e 100644
          int i = 0;
  
          while (n_drafting > 0) {
-@@ -1912,7 +2284,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1912,7 +2338,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                      dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                  }
  
@@ -3665,7 +3775,7 @@ index e6290eaad..bb2186f6e 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1959,17 +2331,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1959,17 +2385,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -3776,7 +3886,7 @@ index e6290eaad..bb2186f6e 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -2002,6 +2465,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2002,6 +2519,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
      }
@@ -3794,7 +3904,7 @@ index e6290eaad..bb2186f6e 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2488,6 +2962,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2488,6 +3016,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -3802,7 +3912,7 @@ index e6290eaad..bb2186f6e 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2579,6 +3054,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2579,6 +3108,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -3810,7 +3920,23 @@ index e6290eaad..bb2186f6e 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2711,6 +3187,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2702,6 +3232,15 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
+     return spec->synth_probs;
+ }
+ 
++uint32_t common_speculative_draft_n_ubatch(uint32_t n_ubatch_tgt) {
++    const char * e = getenv("MTP_DRAFT_N_UBATCH");
++    const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
++    if (draft_ub > 0) {
++        return (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) n_ubatch_tgt));
++    }
++    return n_ubatch_tgt;
++}
++
+ common_params common_base_params_to_speculative(const common_params & params) {
+     const bool has_draft = params.speculative.has_dft();
+ 
+@@ -2711,6 +3250,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
      result.embedding    = false;
      result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
  
@@ -3821,7 +3947,7 @@ index e6290eaad..bb2186f6e 100644
      if (has_draft) {
          // default to global devices value
          if (!params_spec.devices.empty()) {
-@@ -2734,8 +3214,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2734,8 +3277,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
          }
      }
  
@@ -3840,7 +3966,7 @@ index e6290eaad..bb2186f6e 100644
      result.n_outputs_max = params.n_parallel;
      result.n_outputs_max_per_seq = 1;
  
-@@ -2746,6 +3234,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -2746,6 +3297,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
      // the MoE cache is only used by the target context
      result.moe_cache_size = 0;
  
@@ -3852,7 +3978,7 @@ index e6290eaad..bb2186f6e 100644
      // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
      // TODO: refactor such properties to be announced by the speculative types
      //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
-@@ -2775,37 +3268,95 @@ struct common_speculative_init_result::impl {
+@@ -2775,37 +3331,95 @@ struct common_speculative_init_result::impl {
      llama_context_ptr context;
  };
  
@@ -3918,12 +4044,12 @@ index e6290eaad..bb2186f6e 100644
 +    // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
 +    // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
 +    // `-ub`; a positive value overrides the 512 default.
++    //
++    // The cap is the DRAFT CACHE's `n_ubatch`, so it also decides how many spare cells its KV window keeps
++    // (`win + one batch`).  Anything that sizes that KV must ask `common_speculative_draft_n_ubatch()` and
++    // not read the target's `-ub` -- the two disagreed by 512 cells until issue #297.
 +    if (spec_mtp) {
-+        const char * e = getenv("MTP_DRAFT_N_UBATCH");
-+        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
-+        if (draft_ub > 0) {
-+            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
-+        }
++        cparams.n_ubatch = common_speculative_draft_n_ubatch(cparams.n_ubatch);
 +    }
 +
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -3956,7 +4082,7 @@ index e6290eaad..bb2186f6e 100644
          if (model_dft == NULL) {
              LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
              return;
-@@ -2833,6 +3384,15 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2833,6 +3447,15 @@ common_speculative_init_result::common_speculative_init_result(
  
          pimpl->context.reset(ctx_dft);
      }
@@ -3972,7 +4098,7 @@ index e6290eaad..bb2186f6e 100644
  }
  
  common_speculative_init_result::~common_speculative_init_result() = default;
-@@ -2845,8 +3405,9 @@ llama_context * common_speculative_init_result::context() {
+@@ -2845,8 +3468,9 @@ llama_context * common_speculative_init_result::context() {
      return pimpl->context.get();
  }
  
@@ -3984,7 +4110,7 @@ index e6290eaad..bb2186f6e 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -2875,7 +3436,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2875,7 +3499,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -4000,7 +4126,7 @@ index e6290eaad..bb2186f6e 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2888,12 +3456,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2888,12 +3519,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -4017,7 +4143,7 @@ index e6290eaad..bb2186f6e 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -2907,7 +3479,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2907,7 +3542,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -4030,7 +4156,7 @@ index e6290eaad..bb2186f6e 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -3032,6 +3608,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -3032,6 +3671,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -4046,7 +4172,7 @@ index e6290eaad..bb2186f6e 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3172,6 +3757,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3172,6 +3820,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -4064,7 +4190,7 @@ index e6290eaad..bb2186f6e 100644
  // TODO: support the case of more than one speculative implementations having a state
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
-@@ -3242,3 +3838,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3242,3 +3901,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }
@@ -4115,10 +4241,23 @@ index e6290eaad..bb2186f6e 100644
 +    return clamped;
 +}
 diff --git a/common/speculative.h b/common/speculative.h
-index 4262327cb..358ff49ce 100644
+index 4262327cb..a166fcde2 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
-@@ -89,12 +89,21 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -37,6 +37,12 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
+ 
+ common_params common_base_params_to_speculative(const common_params & params);
+ 
++// The MTP draft context's ubatch (`MTP_DRAFT_N_UBATCH`, default 512, 0 = no cap).  The draft context caps
++// `n_ubatch` here to keep its compute buffer small (TODO #42), and its KV window's "one batch of spare room"
++// is sized from it -- so anything that SIZES the draft context's KV (the slab's draft reserve, `--fit`) must
++// use this value and not the target's `-ub`, or the two disagree about the cache's geometry (issue #297).
++uint32_t common_speculative_draft_n_ubatch(uint32_t n_ubatch_tgt);
++
+ struct common_speculative_output_limits {
+     int32_t total;
+     int32_t per_seq;
+@@ -89,12 +95,21 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
  // process the batch and update the internal state of the speculative context
  bool common_speculative_process(common_speculative * spec, const common_batch & batch);
  
@@ -4140,7 +4279,7 @@ index 4262327cb..358ff49ce 100644
  // (optional) get/set internal state
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
  void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
-@@ -102,14 +111,40 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
+@@ -102,14 +117,40 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
  // print statistics about the speculative decoding
  void common_speculative_print_stats(const common_speculative * spec);
  
@@ -4182,7 +4321,7 @@ index 4262327cb..358ff49ce 100644
      ~common_speculative_init_result();
  
      llama_model   * model();
-@@ -122,4 +157,5 @@ private:
+@@ -122,4 +163,5 @@ private:
  
  using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
  
@@ -89369,7 +89508,7 @@ index ef1be94a2..c2e2dfeb9 100644
  
      return res;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a1ec67e26..a08e1dea9 100644
+index a1ec67e26..97dd30d48 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,333 @@ static bool ggml_is_power_of_2(int n) {
@@ -89736,7 +89875,7 @@ index a1ec67e26..a08e1dea9 100644
  llama_kv_cache::llama_kv_cache(
          const llama_model & model,
                       bool   no_alloc,
-@@ -79,10 +429,14 @@ llama_kv_cache::llama_kv_cache(
+@@ -79,10 +429,15 @@ llama_kv_cache::llama_kv_cache(
      const layer_filter_cb & filter,
      const  layer_reuse_cb & reuse,
      const  layer_share_cb & share,
@@ -89746,15 +89885,16 @@ index a1ec67e26..a08e1dea9 100644
 +                     bool   is_indexer,
 +                     bool   v_enabled,
 +                     bool   kv_pool_capable,
-+                    int32_t kv_pool_cells) :
++                    int32_t kv_pool_cells,
++                     bool   swa_ring) :
      model(model), hparams(hparams), v_trans(v_trans),
 -    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
 +    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max),
-+    n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), is_indexer(is_indexer),
++    n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_ring(swa_ring), is_indexer(is_indexer),
      attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
      other(static_cast<llama_kv_cache *>(mem_other)),
      v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-@@ -162,6 +516,313 @@ llama_kv_cache::llama_kv_cache(
+@@ -162,6 +517,313 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -90068,7 +90208,7 @@ index a1ec67e26..a08e1dea9 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -218,6 +879,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -218,6 +880,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -90109,7 +90249,7 @@ index a1ec67e26..a08e1dea9 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -227,11 +922,31 @@ llama_kv_cache::llama_kv_cache(
+@@ -227,11 +923,31 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -90144,7 +90284,7 @@ index a1ec67e26..a08e1dea9 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -240,13 +955,50 @@ llama_kv_cache::llama_kv_cache(
+@@ -240,13 +956,50 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -90197,7 +90337,7 @@ index a1ec67e26..a08e1dea9 100644
      }
  
      if (reuse) {
-@@ -280,6 +1032,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -280,6 +1033,29 @@ llama_kv_cache::llama_kv_cache(
          LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
      }
  
@@ -90227,7 +90367,7 @@ index a1ec67e26..a08e1dea9 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -430,10 +1205,15 @@ void llama_kv_cache::clear(bool data) {
+@@ -430,10 +1206,15 @@ void llama_kv_cache::clear(bool data) {
          v_heads[s] = 0;
      }
  
@@ -90243,7 +90383,7 @@ index a1ec67e26..a08e1dea9 100644
      }
  }
  
-@@ -460,7 +1240,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -460,7 +1241,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
          uint32_t new_head = cells.size();
  
@@ -90259,7 +90399,7 @@ index a1ec67e26..a08e1dea9 100644
              if (!cells.pos_in(i, p0, p1)) {
                  continue;
              }
-@@ -476,6 +1263,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -476,6 +1264,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
          if (new_head != cells.size() && new_head < head) {
              head = new_head;
          }
@@ -90270,7 +90410,7 @@ index a1ec67e26..a08e1dea9 100644
      } else {
          // match any sequence
          for (uint32_t s = 0; s < n_stream; ++s) {
-@@ -484,7 +1275,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -484,7 +1276,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
              uint32_t new_head = cells.size();
  
@@ -90280,7 +90420,7 @@ index a1ec67e26..a08e1dea9 100644
                  if (!cells.pos_in(i, p0, p1)) {
                      continue;
                  }
-@@ -501,6 +1293,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -501,6 +1294,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                  head = new_head;
              }
          }
@@ -90291,7 +90431,7 @@ index a1ec67e26..a08e1dea9 100644
      }
  
      return true;
-@@ -515,6 +1311,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+@@ -515,6 +1312,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
      GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
      GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
  
@@ -90302,20 +90442,24 @@ index a1ec67e26..a08e1dea9 100644
      const auto s0 = seq_to_stream[seq_id_src];
      const auto s1 = seq_to_stream[seq_id_dst];
  
-@@ -619,12 +1419,320 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+@@ -619,10 +1420,318 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
          }
      }
  
+-    // If we freed up a slot, set head to it so searching can start there.
+-    if (new_head != cells.size() && new_head < head) {
+-        head = new_head;
+-    }
 +    if (!parked.empty()) {
 +        park_refresh();
 +    }
 +
-     // If we freed up a slot, set head to it so searching can start there.
-     if (new_head != cells.size() && new_head < head) {
-         head = new_head;
-     }
- }
- 
++    // If we freed up a slot, set head to it so searching can start there.
++    if (new_head != cells.size() && new_head < head) {
++        head = new_head;
++    }
++}
++
 +// LLAMA_KV_PARK_DEBUG=1: log every park, unpark and compaction move, and why a park or an unpark is refused
 +static bool llama_kv_park_debug() {
 +    static const bool v = [] { const char * e = getenv("LLAMA_KV_PARK_DEBUG"); return e != nullptr && atoi(e) != 0; }();
@@ -90618,12 +90762,10 @@ index a1ec67e26..a08e1dea9 100644
 +    // shared cells (another cache reads them), a transposed V, or a sliding-window cache, which reuses the cells that fall
 +    // out of a sequence's window -- another sequence's included -- so it cannot keep cells off limits
 +    return n_stream == 1 && other == nullptr && v_cells_impl.use_count() == 1 && !v_trans && n_swa == 0;
-+}
-+
+ }
+ 
  void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-     if (other) {
-@@ -741,8 +1849,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
+@@ -741,8 +1850,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -90673,7 +90815,7 @@ index a1ec67e26..a08e1dea9 100644
      for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
          ret[buft] += size;
      }
-@@ -750,6 +1898,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -750,6 +1899,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -90710,7 +90852,7 @@ index a1ec67e26..a08e1dea9 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -800,6 +1978,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+@@ -800,6 +1979,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
  llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
      llama_kv_cache::slot_info_vec_t res;
  
@@ -90730,7 +90872,7 @@ index a1ec67e26..a08e1dea9 100644
      struct state_t {
          slot_info sinfo; // slot info for the ubatch
  
-@@ -1052,14 +2243,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1052,93 +2244,167 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
  
          uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
  
@@ -90753,27 +90895,202 @@ index a1ec67e26..a08e1dea9 100644
              return { };
          }
  
-@@ -1070,8 +2266,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+-        uint32_t n_tested = 0;
+-
+         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
+         // for non-continuous slots, we test the tokens one by one
          const uint32_t n_test = cont ? n_tokens : 1;
  
-         while (true) {
+-        while (true) {
 -            if (head_cur + n_test > cells.size()) {
 -                n_tested += cells.size() - head_cur;
-+            if (head_cur + n_test > n_cells) {
-+                n_tested += n_cells - head_cur;
-                 head_cur = 0;
-                 continue;
+-                head_cur = 0;
+-                continue;
++        // A TRUNCATING window cache (`swa_ring`, the MTP drafter's) can run out of position-reclaimable cells
++        // while it is NOT full: an M-RoPE image chunk puts ~1k tokens on ONE temporal position, so
++        // `seq_pos_max` barely moves while the batch eats cells, and the `win + batch` spare room runs out
++        // mid-chunk with every remaining cell still inside the window (issue #297).  The window is a lossy
++        // bound by design (the target verifies every proposal), so the second pass below makes it a TRUE
++        // ring: when position-based reclaim cannot place the batch, the sequence's OLDEST cells are evicted.
++        //
++        // Only cells holding a position strictly BELOW every position this batch writes for the sequence are
++        // evicted (`pos_first`), so `apply_ubatch`'s purge of the overwritten range can never reach a cell
++        // this batch has just written -- which is what makes the eviction safe on a re-decode as well.
++        llama_pos pos_first = -1;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            if (ubatch.n_seq_id[i] > 0 && ubatch.seq_id[i][0] == seq_id) {
++                pos_first = pos_first < 0 ? ubatch.pos[i] : std::min(pos_first, ubatch.pos[i]);
              }
-@@ -1129,7 +2325,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
-                 res.idxs[s].clear();
++        }
+ 
+-            for (uint32_t i = 0; i < n_test; i++) {
+-                const auto idx = head_cur;
+-
+-                head_cur++;
+-                n_tested++;
++        // one full scan of the ring, collecting cells for this sequence.  `evict_below` >= 0 additionally
++        // accepts a cell of THIS sequence holding a position below it (the ring fallback described above).
++        auto scan = [&](llama_pos evict_below) -> bool {
++            uint32_t n_tested_scan = 0;
+ 
+-                //const llama_pos    pos    = ubatch.pos[i];
+-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
++            while (true) {
++                if (head_cur + n_test > n_cells) {
++                    n_tested_scan += n_cells - head_cur;
++                    head_cur = 0;
++                    continue;
++                }
+ 
+-                // can we use this cell? either:
+-                //  - the cell is empty
+-                //  - the cell is occupied only by one sequence:
+-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
+-                //    - mask SWA, using current max pos for that sequence in the cache
+-                //                always insert in the cell with minimum pos
+-                bool can_use = cells.is_empty(idx);
++                for (uint32_t i = 0; i < n_test; i++) {
++                    const auto idx = head_cur;
+ 
+-                if (!can_use && cells.seq_count(idx) == 1) {
+-                    const llama_pos pos_cell = cells.pos_get(idx);
++                    head_cur++;
++                    n_tested_scan++;
+ 
+-                    // (disabled) causal mask
+-                    // note: it's better to purge any "future" tokens beforehand
+-                    //if (cells.seq_has(idx, seq_id)) {
+-                    //    can_use = pos_cell >= pos;
+-                    //}
++                    // can we use this cell? either:
++                    //  - the cell is empty
++                    //  - the cell is occupied only by one sequence:
++                    //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
++                    //    - mask SWA, using current max pos for that sequence in the cache
++                    //                always insert in the cell with minimum pos
++                    bool can_use = cells.is_empty(idx);
+ 
+-                    if (!can_use) {
++                    if (!can_use && cells.seq_count(idx) == 1) {
++                        const llama_pos    pos_cell    = cells.pos_get(idx);
+                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
+ 
++                        // (disabled) causal mask
++                        // note: it's better to purge any "future" tokens beforehand
++                        //if (cells.seq_has(idx, seq_id)) {
++                        //    can_use = pos_cell >= pos;
++                        //}
++
+                         // SWA mask
+                         if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                             can_use = true;
+                         }
++
++                        // the truncating window's ring fallback (issue #297): the sequence's own oldest cells
++                        if (!can_use && evict_below >= 0 && seq_id_cell == seq_id && pos_cell < evict_below) {
++                            can_use = true;
++                        }
+                     }
+-                }
+ 
+-                if (can_use) {
+-                    res.idxs[s].push_back(idx);
+-                } else {
+-                    if (cont) {
+-                        break;
++                    if (can_use) {
++                        res.idxs[s].push_back(idx);
++                    } else {
++                        if (cont) {
++                            break;
++                        }
+                     }
+                 }
+-            }
+ 
+-            if (res.idxs[s].size() == n_tokens) {
+-                break;
++                if (res.idxs[s].size() == n_tokens) {
++                    break;
++                }
++
++                if (cont) {
++                    res.idxs[s].clear();
++                }
++
++                if (n_tested_scan >= n_cells) {
++                    //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
++                    return false;
++                }
+             }
+ 
+-            if (cont) {
+-                res.idxs[s].clear();
++            return true;
++        };
++
++        if (!scan(-1)) {
++            res.idxs[s].clear();
++
++            // the ring fallback: evict the sequence's oldest cells, but only as many as the batch needs and
++            // only from below `pos_first`.  `nth_element` finds the age threshold the batch needs without
++            // sorting the cache; cells sharing the threshold position are all eligible, which can evict a
++            // few cells more than strictly needed (harmless: they are the oldest ones either way).
++            bool ok = false;
++
++            if (swa_ring && pos_first > 0) {
++                std::vector<llama_pos> cand;
++                cand.reserve(n_tokens + 256);
++
++                for (uint32_t i = 0; i < n_cells; ++i) {
++                    if (!cells.is_empty(i) && cells.seq_count(i) == 1 && cells.seq_get(i) == seq_id) {
++                        const llama_pos p = cells.pos_get(i);
++                        if (p < pos_first) {
++                            cand.push_back(p);
++                        }
++                    }
++                }
++
++                if (cand.size() >= n_tokens) {
++                    std::nth_element(cand.begin(), cand.begin() + (n_tokens - 1), cand.end());
++                    const llama_pos thr = cand[n_tokens - 1];
++
++                    if (!swa_ring_reported) {
++                        swa_ring_reported = true;
++                        LLAMA_LOG_INFO("%s: draft window ring eviction is active: the position window could "
++                                "not place a %u-token batch of seq %d (compressed / non-advancing positions, "
++                                "e.g. an M-RoPE image chunk), so its oldest cells (pos <= %d) were evicted.  "
++                                "The drafter's cache is lossy by design; the target verifies every token.\n",
++                                __func__, n_tokens, (int) seq_id, (int) thr);
++                    } else {
++                        LLAMA_LOG_DEBUG("%s: stream[%d], seq %d: ring fallback evicts cells with pos <= %d "
++                                "(%zu candidates, %u needed)\n", __func__, seq_to_stream[seq_id], (int) seq_id,
++                                (int) thr, cand.size(), n_tokens);
++                    }
++
++                    head_cur = 0;
++                    ok = scan(thr + 1);
++                    if (!ok) {
++                        res.idxs[s].clear();
++                    }
++                }
              }
  
 -            if (n_tested >= cells.size()) {
-+            if (n_tested >= n_cells) {
-                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+-                //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
++            if (!ok) {
                  return { };
              }
-@@ -1248,6 +2444,164 @@ bool llama_kv_cache::get_can_shift() const {
+         }
+-
+-        // we didn't find a suitable slot - return empty result
+-        if (res.idxs[s].size() < n_tokens) {
+-            return { };
+-        }
+     }
+ 
+     assert(res.s1 >= res.s0);
+@@ -1248,6 +2514,164 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -90938,7 +91255,7 @@ index a1ec67e26..a08e1dea9 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1309,17 +2663,63 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1309,17 +2733,63 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -91004,7 +91321,7 @@ index a1ec67e26..a08e1dea9 100644
      }
  
      return result;
-@@ -1655,6 +3055,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1655,6 +3125,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -91014,7 +91331,7 @@ index a1ec67e26..a08e1dea9 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -1968,6 +3371,271 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const
+@@ -1968,6 +3441,271 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const
      }
  }
  
@@ -91286,7 +91603,7 @@ index a1ec67e26..a08e1dea9 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2835,6 +4503,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2835,6 +4573,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -91296,7 +91613,7 @@ index a1ec67e26..a08e1dea9 100644
      return true;
  }
  
-@@ -3009,9 +4680,14 @@ bool llama_kv_cache_context::apply() {
+@@ -3009,9 +4750,14 @@ bool llama_kv_cache_context::apply() {
      }
  
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -91312,7 +91629,7 @@ index a1ec67e26..a08e1dea9 100644
      return true;
  }
  
-@@ -3089,6 +4765,16 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
+@@ -3089,6 +4835,16 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
      kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
  }
  
@@ -91330,7 +91647,7 @@ index a1ec67e26..a08e1dea9 100644
      kv->set_input_pos_bucket(dst, ubatch);
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 5aafbebb3..e93ba6ccd 100644
+index 5aafbebb3..b92a5695b 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -5,6 +5,7 @@
@@ -91341,7 +91658,7 @@ index 5aafbebb3..e93ba6ccd 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -116,9 +117,20 @@ public:
+@@ -116,9 +117,26 @@ public:
          // a model can hold more than one cache, so the tensor names have to stay unique
                   const char *   name_tag = "",
          // lightning indexer keys are rotated with the indexer RoPE parameters
@@ -91359,13 +91676,19 @@ index 5aafbebb3..e93ba6ccd 100644
 +        // ...and the pool's size request in CELLS per layer (-1 = auto, 0 = off, N = N cells).  A number
 +        // is `--kv-attendance-pool` (on/off); the pool is sized below from the model's indexer geometry
 +        // it yet, so `auto` does not take the pool -- it says so once at startup).
-+                        int32_t kv_pool_cells = -1);
++                        int32_t kv_pool_cells = -1,
++        // the cache is a TRUNCATING window (the MTP drafter's, see llama-ext.h): `n_swa` is a lossy bound on
++        // what the drafter may keep, not a mask the model depends on, so `find_slot` may make it a TRUE ring
++        // by evicting the sequence's oldest cells when position-based reclaim cannot place the batch
++        // (issue #297).  false for every other cache, INCLUDING a model's own sliding-window attention,
++        // where a cell inside the window must never be reused.
++                         bool   swa_ring = false);
 +
 +    ~llama_kv_cache();
  
      //
      // llama_memory_i
-@@ -137,9 +149,28 @@ public:
+@@ -137,9 +155,28 @@ public:
  
      void clear(bool data) override;
  
@@ -91394,7 +91717,7 @@ index 5aafbebb3..e93ba6ccd 100644
      void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
      void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
  
-@@ -148,6 +179,9 @@ public:
+@@ -148,6 +185,9 @@ public:
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
  
@@ -91404,7 +91727,7 @@ index 5aafbebb3..e93ba6ccd 100644
      // state write/load
  
      void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
-@@ -161,6 +195,35 @@ public:
+@@ -161,6 +201,35 @@ public:
      uint32_t get_n_seq_max() const;
      uint32_t get_n_stream() const;
  
@@ -91440,7 +91763,7 @@ index 5aafbebb3..e93ba6ccd 100644
      bool get_has_shift() const;
  
      ggml_type type_k() const;
-@@ -192,7 +255,7 @@ public:
+@@ -192,7 +261,7 @@ public:
      // graph_build API
      //
  
@@ -91449,7 +91772,7 @@ index 5aafbebb3..e93ba6ccd 100644
  
      // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
      // the ubatch splits into n_slices groups of tokens with one sequence each
-@@ -247,6 +310,23 @@ public:
+@@ -247,6 +316,23 @@ public:
      void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
  
@@ -91473,7 +91796,7 @@ index 5aafbebb3..e93ba6ccd 100644
      // true if llama_kv_cell_ext holds information that has to survive a state save/restore
      bool has_cell_ext() const;
  
-@@ -282,6 +362,10 @@ private:
+@@ -282,9 +368,22 @@ private:
      const uint32_t n_seq_max = 1;
      const uint32_t n_stream  = 1;
  
@@ -91484,7 +91807,19 @@ index 5aafbebb3..e93ba6ccd 100644
      // SWA
      const uint32_t n_swa = 0;
  
-@@ -313,6 +397,45 @@ private:
++    // is `n_swa` a lossy bound of a truncating window cache (`find_slot` may evict the oldest cells)?
++    // false for a model's own sliding-window attention: there a cell inside the window is still attended
++    const bool swa_ring = false;
++
++    // the ring eviction above is reported ONCE (INFO, then DEBUG): it explains why a draft batch evicted
++    // cells the position window still held, which is the issue #297 shape, and it must be visible without
++    // `-lv 4` the first time it happens to a run
++    mutable bool swa_ring_reported = false;
++
+     const bool is_indexer = false;
+ 
+     // env: LLAMA_ATTN_ROT_DISABLE
+@@ -313,6 +412,45 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      llama_memory_bufs ctxs_bufs;
  
@@ -91530,7 +91865,7 @@ index 5aafbebb3..e93ba6ccd 100644
      // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
-@@ -332,6 +455,22 @@ private:
+@@ -332,6 +470,22 @@ private:
  
      std::vector<kv_layer> layers;
  
@@ -91553,7 +91888,7 @@ index 5aafbebb3..e93ba6ccd 100644
      // model layer id -> KV cache layer id
      std::unordered_map<int32_t, int32_t> map_layer_ids;
  
-@@ -413,6 +552,20 @@ public:
+@@ -413,6 +567,20 @@ public:
      uint32_t get_n_kv() const;
      uint32_t get_n_kv_rows() const;
  
@@ -91574,7 +91909,7 @@ index 5aafbebb3..e93ba6ccd 100644
      ggml_type type_k() const;
      ggml_type type_v() const;
  
-@@ -445,6 +598,12 @@ public:
+@@ -445,6 +613,12 @@ public:
      void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
  
@@ -95556,7 +95891,7 @@ index ed59079a4..489a0cabe 100644
      void unmap_weight(const llama_tensor_weight & w) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 7e845bc30..53d142a19 100644
+index 7e845bc30..3a6258c5d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -23,6 +23,7 @@
@@ -96243,21 +96578,23 @@ index 7e845bc30..53d142a19 100644
                      }
                  } else {
                      llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -3471,6 +3972,60 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3471,6 +3972,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
 +                        // The MTP drafter's KV window (llama-ext.h).  The draft context is created AFTER the
 +                        // target, so this is the only place its cell count exists.
 +                        //
-+                        // A sliding window, not a ring allocator: `find_slot` already reclaims a cell whose
++                        // A sliding window, backed by a ring: `find_slot` already reclaims a cell whose
 +                        // position is more than `n_swa` behind the newest one for its sequence, which IS the
-+                        // ring, and `set_input_kq_mask` reads THIS cache's `n_swa`, so the packed mask windows
-+                        // consistently and `hparams` (shared with the target) is untouched.  The derived mask
-+                        // stays valid as well -- its predicate is `tok_lo <= cell_pos <= tok_hi` over the
-+                        // per-cell POSITION, so a recycled cell reports its new position (a position range, not
-+                        // a cell-index range).  Only the drafter loses the tokens older than the window, and
-+                        // the target verifies every token it proposes.
++                        // ring while positions advance, and it evicts the sequence's oldest cells when they
++                        // do not (a multimodal / M-RoPE chunk, issue #297 -- `swa_ring` below).  Both read
++                        // THIS cache's `n_swa`, so the packed mask windows consistently and `hparams` (shared
++                        // with the target) is untouched.  The derived mask stays valid as well -- its
++                        // predicate is `tok_lo <= cell_pos <= tok_hi` over the per-cell POSITION, so a recycled
++                        // cell reports its new position (a position range, not a cell-index range).  Only the
++                        // drafter loses the tokens older than the window, and the target verifies every token
++                        // it proposes.
 +                        //
 +                        // The window is per SEQUENCE: under `--kv-unified` this cache holds every sequence in
 +                        // one stream, so `llama_spec_draft_kv_cells()` multiplies the cell count by
@@ -96266,6 +96603,12 @@ index 7e845bc30..53d142a19 100644
 +                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
 +                        uint32_t mtp_n_swa   = hparams.n_swa;
 +                        llama_swa_type mtp_swa_type = hparams.swa_type;
++                        // `n_swa` of a windowed draft cache is a LOSSY bound, not a mask the model depends on,
++                        // so the cache may make it a true ring (evict the sequence's oldest cells) when a
++                        // batch cannot be placed by position alone -- an M-RoPE image chunk puts ~1k tokens
++                        // on one temporal position, and `win + batch` spare cells then run out mid-chunk
++                        // (issue #297).  A model's OWN sliding window never sets this.
++                        bool mtp_ring = false;
 +                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
 +                            uint32_t win = 0;
 +                            const uint32_t cells = llama_spec_draft_kv_cells(cparams.n_ctx_seq, cparams.n_ubatch,
@@ -96276,6 +96619,7 @@ index 7e845bc30..53d142a19 100644
 +                                mtp_kv_size  = cells;
 +                                mtp_n_swa    = win;
 +                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
++                                mtp_ring     = true;
 +                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells per sequence (draft cache %u "
 +                                               "of %u cells per stream, n_seq_max %u, %s; --spec-draft-kv-window "
 +                                               "%s -- the target still verifies every token)\n",
@@ -96304,7 +96648,7 @@ index 7e845bc30..53d142a19 100644
                          res = new llama_kv_cache(
                                  *this,
                                  params.no_alloc,
-@@ -3480,10 +4035,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3480,14 +4044,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,
@@ -96318,7 +96662,18 @@ index 7e845bc30..53d142a19 100644
                                  nullptr,
                                  filter,
                                  nullptr,
-@@ -3534,7 +4089,10 @@ llama_model_params llama_model_default_params() {
+-                                nullptr);
++                                nullptr,
++                                "",
++                                false,
++                                true,
++                                false,
++                                -1,
++                                /*.swa_ring    =*/ mtp_ring);
+                     }
+                 }
+             }
+@@ -3534,7 +4104,10 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -96329,7 +96684,7 @@ index 7e845bc30..53d142a19 100644
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
-@@ -3545,6 +4103,7 @@ llama_model_params llama_model_default_params() {
+@@ -3545,6 +4118,7 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -96337,7 +96692,7 @@ index 7e845bc30..53d142a19 100644
      };
  
      return result;
-@@ -3559,6 +4118,12 @@ void llama_free_model(llama_model * model) {
+@@ -3559,6 +4133,12 @@ void llama_free_model(llama_model * model) {
  }
  
  void llama_model_free(llama_model * model) {
@@ -96350,7 +96705,7 @@ index 7e845bc30..53d142a19 100644
      delete model;
  }
  
-@@ -3607,6 +4172,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
+@@ -3607,6 +4187,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
      return model->hparams.n_swa;
  }
  
@@ -96368,7 +96723,7 @@ index 7e845bc30..53d142a19 100644
  
  uint32_t llama_model_n_cls_out(const struct llama_model * model) {
      return model->hparams.n_cls_out;
-@@ -3991,6 +4567,115 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -3991,6 +4582,115 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -96484,7 +96839,7 @@ index 7e845bc30..53d142a19 100644
  int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
-@@ -4020,7 +4705,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4020,7 +4720,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -96494,7 +96849,7 @@ index 7e845bc30..53d142a19 100644
  
  ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
      GGML_ASSERT(ml != nullptr);
-@@ -4147,6 +4833,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
+@@ -4147,6 +4848,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
      }
  }
  
@@ -96509,7 +96864,7 @@ index 7e845bc30..53d142a19 100644
  uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
      if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
          return 0;
-@@ -4188,3 +4882,4 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4188,3 +4897,4 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
  
      return n_tokens * (uint32_t) tensor->ne[0];
  }

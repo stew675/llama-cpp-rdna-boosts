@@ -3549,3 +3549,53 @@ Do not re-derive the decisions:
    unmeasured.  It now asserts the default itself (`default_off`, `tensor_default_off`, and `tensor_auto` as
    the non-vacuous control) -- and its ready-wait had to stop matching the benign `--fit` WARN "failed to fit
    params ... n_gpu_layers already set", which killed the server ~1 s into a load and graded an empty log.
+
+## r248 -- a window that reclaims by POSITION cannot place a batch whose positions do not advance, and a drafter failure is not a request failure (GitHub issue #297)
+
+The MTP draft window's reclaim is `find_slot`'s SWA test: a cell is reusable once its **position** is
+`>= n_swa` behind its sequence's newest one.  That is a ring in position space, and it is complete for text --
+every token advances the position by one, so a full window always has exactly one batch's worth of cells to
+reclaim.  It is **not** complete for a multimodal batch: `mtmd_image_tokens_get_decoder_pos()` gives every row
+of an M-RoPE image the SAME temporal position (`pos.t = pos_0`), so while a 1014-token image chunk is placed
+`seq_pos_max` does not move, nothing new becomes reclaimable, and the `win + n_ubatch` spare room is exhausted
+mid-chunk.  The request then died, because the MTP speculator's `process()` returned `false` and the server
+turned that into HTTP 500.
+
+Reproduced exactly on the maintainer's box (stock Qwen3.8-27B IQ3_S + its projector, `-c 8192`,
+`--spec-draft-kv-window 1024`, `-b/-ub 1024`, a 1500-token text prompt then `tools/mtmd/test-1.jpeg`):
+`W decode: failed to find a memory slot for batch of size 300` -> `E spec process: llama_process(ctx_dft) head=0
+failed rc=1` -> `E post-decode callback failed` -> HTTP 500 `failed to process mtmd chunk`.  The reporter's own
+shape (~51 k tokens, a 1014-token image, `-c 204800`) is the same path with bigger numbers.
+
+Facts:
+
+1. **A truncating window may evict by age; a model's own sliding window may not.**  The window cache's `n_swa`
+   is a lossy bound on what the DRAFTER may keep (the target verifies every token), so the cache can also drop
+   its oldest cells when position cannot place a batch (`swa_ring`, set only by `create_memory`'s MTP branch).
+   A model's sliding-window attention is the opposite: a cell inside its window is still attended, so reusing
+   it would be a wrong answer.  Never let the two share a predicate.
+2. **Evict only cells strictly below every position the batch writes.**  `apply_ubatch` purges the sequence's
+   positions up to the highest one it overwrote, to keep `[pos_min, pos_max]` contiguous; a cell evicted at or
+   above the batch's own positions would be purged right after being written.  That guard is also what makes
+   the fallback safe on a re-decode.
+3. **A drafter-only failure must cost acceptance, never the request.**  A draft decode that fails drops the
+   draft KV and retries once (an empty cache can always place a batch), and a retry that still fails disables
+   drafting for that sequence until the next request.  Anything else makes a lossy optimisation authoritative
+   over the user's answer.
+4. **Two code paths that size the same cache must read the same ubatch.**  `common_draft_reserve_derive()` read
+   the target's `-ub` while the draft context caps its own with `MTP_DRAFT_N_UBATCH` (512), so the reserve and
+   `--fit` charged `PAD(win + 1024)` for a `PAD(win + 512)` cache (the reporter's `kv cells 52224` against
+   `draft cache 51712`).  One function, `common_speculative_draft_n_ubatch()`, now defines the cap.
+5. **A gate's log threshold is part of the gate.**  Three of the new checks (the allocated cache's cell count,
+   `decoding image batch`, the ring census) are llama/mtmd INFO lines, which need `-lv 4`; without it they
+   graded an empty log.  The arms may run at `-lv 4` freely because the server returns its text over HTTP --
+   the same reason `gate-ckpt-reuse.sh` hashes API responses there.
+
+Do not re-derive the decisions:
+
+* **The default stays `0`.**  This fix makes a window *placeable*, not cheaper: r247's -9.7 % past the wrap is a
+  separate, still-unexplained cost, so a windowed run remains a conscious opt-in.
+* **No new environment variable.**  The ring has no knob: it is a correctness bound on a cache whose lossiness
+  is already documented, and a caller who wants the old behaviour asks for a full draft cache (`0`).
+* **The window's spare room stays `one draft batch`.**  Sizing it to "one batch plus the widest image" would
+  guess at a tokenizer's image budget; the ring makes the bound exact instead.
