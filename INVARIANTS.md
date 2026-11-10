@@ -2844,10 +2844,17 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   **+32 %** end-to-end on a 35B pool mirror at 43 % arena).  Concurrency is legitimate only across independent
   resources: copy engine vs compute engine, or one stream per device over its own link (`-sm tensor`'s
   `stage_input`).  `copy_stream()` is `stream(device, 1)` and that is load-bearing, not incidental.
-- **`GGML_CUDA_GRAPH_OPT=1`'s branch streams collide with the staging copy stream's index.**  The fork/join mapping
-  is `stream_mapping[n] = branch_idx + 1`, i.e. branch 0 lands on `stream(device, 1)` -- the same stream
-  `copy_stream()` returns -- so enabling it queues the staging fills behind branch compute instead of beside it.
-  Dormant (the option is default-off); recorded so it is fixed before anyone enables it (`TODO` #283).
+- **`GGML_CUDA_GRAPH_OPT=1`'s branch streams live in their OWN range (r251, `TODO` #283).**  The fork/join mapping
+  used to be `stream_mapping[n] = branch_idx + 1`, i.e. branch 0 landed on `stream(device, 1)` -- the same stream
+  `copy_stream()` returns -- so enabling it queued the staging fills behind branch compute.  Since r251 `common.cuh`
+  reserves **1..4 for copy streams** (`copy_stream()` stays index 1; 2..4 are the parked second-copy-stream
+  reservation) and bases the branch streams at **5** (`5..7` for Q/K/V), with a `static_assert` that both ranges fit
+  `GGML_CUDA_MAX_STREAMS` (8) and `ggml_cuda_is_copy_stream_index()` asserted at the mapping and at the
+  `curr_stream_no` selection site; the mapping is census-printed at INFO (`-lv 4`).  `is_valid()` also indexed
+  `write_ranges[stream - 1]` against an `n_streams` vector, an out-of-bounds read for any base but 1 -- now
+  base-relative.  The measured timing effect is **inside noise** (+0.4 % decode, -0.1 % MTP verify, 35B-A3B
+  `-ncmoe 40`, ~10.4 k fills/run) because staging is issued at MoE nodes, **outside** the Q/K/V fork window; the
+  value is the layout contract (and the parked second copy stream), not a rate.
 - **A synchronous copy is not a benchmark for the async path, and one host allocation kind is a trap.**
   `hipMemcpy` out of a `hipHostMalloc` buffer measures **40.7 GB/s** against the **55.8 GB/s** the same buffer does
   asynchronously (registered mmap / write-combined / pageable are full speed both ways).  `stage_h2d_gbps()`
@@ -3066,9 +3073,19 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   ours **0.824 / 0.207 / 0.197 s** (Flash-Next GSQ, 3 devices `-sm tensor`, 512-token prefill) and upstream
   **0.255 / 0.244 / 0.237 s**, so the first row understates the steady state by ~4× and must be discarded (a
   one-time ~0.6 s cost on the first prefill of a process is all that is real).  The **decode** column is sound.
-- **`llama-batched-bench -c 16384` on Flash-Next at `-ncmoe 48` segfaults silently (`TODO` #270); it is a flag-set
-  landmine, not a general unreliability.**  With `-c 32768` and no `-ncmoe` (or with `-c 8192`) the same binary
-  prints complete tables and produces no assert, so the arm is usable once that shape is avoided.
+- **`llama-batched-bench -c 16384` on Flash-Next at `-ncmoe 48` does NOT segfault (r251, `TODO` #270 closed).**  The
+  r215 report (silent SIGSEGV, no output, `-c 16384` only) does not reproduce on r250/r251 in **17 arms**: 1/2/3
+  devices, `-c` 8192..1048576, `-npp` 16/64/512/16384, `-npl` 1/8, `--fit off`, `MOE_EXPERT_CACHE_MIB=0`,
+  `GGML_CUDA_SLAB_HEADROOM_MIB=256/12000`, `-ncmoe` 44/46/48 and the r214 pool path (`MOE_HOST_POOL_ALLOC=portable
+  MOE_HOST_POOL_BULK=0`).  The census names why: the slab yields the arena to the compute buffer and re-takes it
+  (`moe_cache_evict_slab_range: evicted 5.3-5.5 GiB ... 29-52 tables stood down` then `moe_cache_rearm: re-armed
+  30-54 ... after a compute-buffer drop`), and `slab_init_locked` shrinks the slab as `-c` grows (26.12 GiB at
+  `-c 16384` -> 23.38 GiB at 196608) with the arena re-sized around it.  A genuine over-subscription now **refuses
+  in one line naming the terms** (work buffer / cache floor / H2D-ring hole) and falls back to streaming, and a
+  context that cannot allocate OOMs with `ggml_cuda_oom_warn` + `failed to create the llama_context` (exit 1), so
+  the tool's `NULL` checks cover it.  A silent startup SIGSEGV with no message is the **stale-tool** trap (a
+  `llama-batched-bench` binary older than a `llama_model_params` change), not a model/flag shape; that trap is a
+  durable fact here rather than only in an archived handover.
 - **A "numeric arm" is the anchor, not byte-identity (r236, `TODO` #292).**  The dsv4 `DSV4_HC_PRE/_POST` ops own
   the HC16 bf16 producer slots by design: vs their own ggml chain they read **0.013217 / 96.392 %** and
   **0.013198 / 96.186 %** mean KLD / same-top-p on the BF16-hc class (base PPL 2.8489), and they are
@@ -3710,3 +3727,38 @@ Four `TODO` items closed in one release (`#135`, `#284`, `#315`, `#311`). Facts:
    own record says the effect is L2/MALL pressure from the GEMM weight streams beside it, and neither
    gfx1201 arm the delivery validates can isolate that (the model is 78 GiB, so every validated arm is
    host-expert-bound).  No code was added: the measurement is the record (`TODO` #311).
+
+## r251 -- `TODO` #283 closed: the `GGML_CUDA_GRAPH_OPT` branch streams get their own range; #270 closes as verified-obsolete
+
+Two `TODO` handles closed in one release (`#283`, `#270`). Facts:
+
+1. **The stream-number layout is now a contract, not an accident.**  `0` compute, `1..4` copy streams
+   (`copy_stream()` = **1**, unchanged -- load-bearing for every staging fill, `stage_gather` and the pool
+   fill; 2..4 are the parked second-copy-stream reservation), `5..7` `GGML_CUDA_GRAPH_OPT`'s concurrent
+   fork/join branches, with `static_assert(1 + 4 + 3 <= GGML_CUDA_MAX_STREAMS)`.  The old mapping
+   (`branch_idx + 1`) put branch 0 on the copy stream, so the join event recorded on that stream waited for
+   the fill chain; a second copy stream (the parked `wip/expert-transfer-engine/0002`, index 2) collided the
+   same way.  A branch on a copy index is impossible by construction now, asserted at the mapping and at the
+   `curr_stream_no` selection site, and a `-lv 4` census prints both ranges.
+2. **`write_ranges[stream - 1]` in `ggml_cuda_concurrent_event::is_valid()` was an out-of-bounds read for any
+   branch base other than 1** (the vector is sized `n_streams`).  It is base-relative now.  Not a shipped
+   defect -- the base *was* 1 -- but it is why this is a correctness change and not a renumbering.
+3. **The measured timing effect of #283 is zero/in-noise, and that is the honest result.**  35B-A3B Q4_K_M,
+   1 device, `-ncmoe 40`, arena capped at 4096 MiB (so ~10.4 k fills per run), graph opt on, old vs new
+   mapping, interleaved reps: decode **55.2 vs 55.4 t/s** (means 55.17 / 55.37, +0.4 % inside a 1.6 % spread)
+   and an MTP verify graph (4 tokens, wider) **85.1 vs 85.05 t/s**; text byte-identical (`fa8b35c9e780`) and
+   acceptance identical (0.92079) in every arm.  Why: the concurrent region is the `attn_norm`->Q/K/V fork and
+   **staging fills are issued at MoE nodes, outside it** -- the only interaction is a copy already queued
+   ahead of a branch kernel/join event, and Q/K/V is not the critical path.  The item's "whole-table uploads
+   queue behind branch compute" premise needs a fill issued *inside* the fork window, which the scheduler
+   never does, so the deliverable is the layout contract (and the parked second copy stream), not a rate.
+4. **Flash-Next (qwen4exp) never creates a concurrent event at all** (`GGML_CUDA_GRAPH_OPT=1 --fit off
+   -lv 4`: no census line in any arm), so the field model is vacuous for this path; and on every model the
+   arm needs `--fit off` -- with the default `--fit on`, `common_fit_params` consumes the graph and the
+   fork/join path does not engage either.  `scripts/gate-graph-opt-streams.sh` FAILS on an empty census
+   instead of passing vacuously.
+5. **The two asserts that actually fire are the mapping one and `is_valid()`'s; the `curr_stream_no` one is
+   belt-and-braces.**  The node loop that selects a branch stream is the capture loop, and no arm measured
+   reaches it (`Setting stream no to` appears in no log at `-lv 5`).  Proven non-vacuous by reintroducing
+   `branch_idx + 1`: the mapping assert fires (`GGML_ASSERT(!ggml_cuda_is_copy_stream_index(branch_stream))
+   failed`, exit 134) and `is_valid()`'s range assert fires on a model whose events pass the overlap check.

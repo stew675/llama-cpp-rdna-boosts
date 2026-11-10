@@ -389,6 +389,13 @@ slab is fine; *backing* outside the movable boundary is not.
 2. The arena-sizing policy question (§6.1) — now with the number: ~4-5 GiB of transport footprint that only a
    policy change can turn into residency.
 3. Only if a config with a dispatch-bound fill matters: the scoped stream change (`0002` minus the global knob).
+   **Re-cut onto the r251 tree (r251)**: `0002-stage-copy-streams.patch` is regenerated against
+   `release.json` tree `5fbe6aff5` (`git apply --check` clean) and its numbering is unchanged — its copy streams
+   are index 1 and 2, inside the copy range r251 reserves (`copy_stream()` = 1, streams 1..4 reserved, concurrent
+   branch streams based at 5), so it can no longer collide with `GGML_CUDA_GRAPH_OPT`'s branches.  Its
+   `MOE_STAGE_COPY_STREAMS` clamp of 4 is exactly that reservation; raising it would need the layout constant
+   changed in `common.cuh` too.  One hunk adapted to r250's staging-redirect retirement
+   (`/*defer =*/ !redirect` -> `true`).  Reviewed, never applied.
 4. Do **not** re-enter the contiguous static tier (§2g) — 7.4's run-layout analysis prices it at 7-14 points of
    decode mass (see `heat-run-layout.py`; §2's "one bulk DMA from the contiguous complement" needs a resident set
    whose heat-weighted mass survives being made contiguous, and it does not).

@@ -1,3 +1,84 @@
+## 261110.007 (r251, RELEASE v16-a691b2345-r251) -- two `TODO` handles close: the `GGML_CUDA_GRAPH_OPT` branch streams get a reserved range above the copy streams (#283), and the r215 silent `llama-batched-bench` SIGSEGV is VERIFIED-OBSOLETE (#270, no code)
+
+**Delivery change: `patches/0000`-`0015` (16 blocks, block 10 AMENDED), release `v16-a691b2345-r251`, base
+`a691b2345`, tip `342248b7c`, tree `5fbe6aff5`.**  `#270` touched no block.
+
+### 1. #283 — the layout, not a rate
+
+`GGML_CUDA_GRAPH_OPT=1`'s fork/join scheduler mapped branch `b` to `stream(device, b + 1)`, so **branch 0 ran on
+`copy_stream()`** (index 1: every staging fill, `stage_gather`, pool fill) and a second copy stream (the parked
+`wip/expert-transfer-engine/0002`) would have landed on branch 1 at index 2.  Now: `0` compute; **1..4 copy**
+(`copy_stream()` still 1; 2..4 reserved for that parked work); **5..7 branches**; `static_assert(1 + 4 + 3 <=
+GGML_CUDA_MAX_STREAMS)`; `ggml_cuda_is_copy_stream_index()` asserted at the mapping and at the `curr_stream_no`
+selection site; a `-lv 4` census prints both ranges.  Found while reading: `is_valid()` indexed
+`write_ranges[stream - 1]` against an `n_streams` vector -- an **out-of-bounds read for any base other than 1** --
+now base-relative.
+
+**Non-vacuity (each proof a rebuild, reverted after):** with the old mapping the construction assert fires
+(`GGML_ASSERT(!ggml_cuda_is_copy_stream_index(branch_stream)) failed`, one line, exit 134), and `is_valid()`'s
+branch-range assert fires on an arm whose concurrent events pass the overlap check.  The `curr_stream_no` assert is
+belt-and-braces: no arm reaches that loop (`Setting stream no to` appears in no log at `-lv 5`).
+
+**Measured** (gfx1201, 35B-A3B Q4_K_M, 1 device, `-ncmoe 40`, arena capped 4096 MiB, `GGML_CUDA_GRAPH_OPT=1`,
+`-c 8192`, `--fit off`, `ROCBLAS_USE_HIPBLASLT=0`, interleaved reps, binaries identical except the mapping):
+
+| arm | r250 mapping | r251 | delta |
+|---|---|---|---|
+| decode `-n 128` (3 reps) | 55.5 / 54.6 / 55.4 (55.17) | 55.2 / 55.5 / 55.4 (55.37) | **+0.4 %** (spread 1.6 %) |
+| MTP verify, 4-token graph (2 reps) | 85.1 / 85.1 | 85.0 / 85.1 | **-0.1 %** |
+
+Text byte-identical (`fa8b35c9e780`), acceptance identical (0.92079), ~10.4 k fills per run (so staging really
+happened).  **The overlap win the item predicted is NOT measurable and this record does not claim one**: the
+concurrent region is the `attn_norm`->Q/K/V fork and staging is issued at MoE nodes, outside it, so the only
+interaction is a copy already queued ahead of a branch kernel/join event on the same stream.  Two further findings:
+with the default `--fit on` the fork/join path does not engage at all (`common_fit_params` consumes the graph), so
+the arm needs `--fit off`; and Flash-Next (qwen4exp) **never creates a concurrent event**, so the field model is
+vacuous for this path.  The deliverable is the layout contract; `scripts/gate-graph-opt-streams.sh` (new) fails on
+an empty census instead of passing.
+
+**Parked artifact:** `wip/expert-transfer-engine/0002-stage-copy-streams.patch` is re-cut onto the r251 tree
+(`git apply --check` clean) and keeps its numbering -- copy streams 1 and 2 sit inside the reserved 1..4 range, and
+its `MOE_STAGE_COPY_STREAMS` clamp of 4 is exactly that reservation.  One hunk adapted to r250's
+staging-redirect retirement (`/*defer =*/ !redirect` -> `true`).  Reviewed, never applied.
+
+### 2. #270 — measured first: it does not reproduce, and the refusal side already works
+
+`llama-batched-bench -c 16384` on Flash-Next GSQ-RCO IQ3_S at `-ncmoe 48` (the reported arm) exits 0 on r250/r251
+in **17 arms**: 1/2/3 devices, `-c` 8192/16384/24576/32768/65536/131072/196608/1048576, `-npp` 16/64/512/16384,
+`-npl` 1/8, `--fit off`, `MOE_EXPERT_CACHE_MIB=0`, `GGML_CUDA_SLAB_HEADROOM_MIB` 256/12000, `-ncmoe` 44/46/48, and
+the r214 pool path (`MOE_HOST_POOL_ALLOC=portable MOE_HOST_POOL_BULK=0`).  There is no core, so no backtrace exists
+to show -- that **is** the finding.  The census names the mechanism: the slab yields the arena to the compute
+buffer and re-takes it (`evicted 5304-5484 MiB ... re-armed 30-54 tables after a compute-buffer drop`) and
+`slab_init_locked` shrinks the slab as `-c` grows (26.12 GiB at 16384 -> 23.38 GiB at 196608) with the arena
+re-sized around it.  At a genuine over-subscription it refuses in one line naming the terms -- `-ub 16384`:
+*"the movable-boundary slab does NOT fit ... work buffer (17664 MiB) plus a 2048 MiB cache floor plus the H2D-ring
+hole (8192 MiB), but only 26752 MiB ... the experts will STREAM"*, then runs at 72 t/s; `-ncmoe 0`:
+`ggml_cuda_oom_warn` + `unable to load model`, exit 1; and a context that cannot allocate prints `failed to create
+the llama_context`, so the tool's NULL checks cover it (the "no banner" part of the report is not a NULL deref).
+A silent startup SIGSEGV with no output at all is the archive's **stale-`llama-batched-bench`** trap (a tool binary
+older than a `llama_model_params` change), now a durable fact in `INVARIANTS.md` instead of only a handover.
+
+**Decision (maintainer-approved): close as VERIFIED-OBSOLETE, no code.**  A `-c` guard in the tool would refuse
+shapes that measurably work, and there is no failing allocation to size.  The reported shape is recorded as a manual
+release arm in `MANIFESTS.md` / `INVARIANTS.md` (it needs a model load, so it cannot be a CI gate).
+
+### 3. Gates (all green)
+
+`validate-set.sh` **16/16 strict, tree `5fbe6aff5`**; per-block ladder `--changed-from 360ce99848 --fast` **2/2**
+(block 10 + tip); coherence **`1c5d32ac537d`** 4B at 1 GPU and 3-GPU `-sm tensor`; prefill-logit **0.000000 /
+100.000 %** against the recorded base (unchanged, recorded from the r248 `12433634d` build -- r250 also passed
+against it); `scripts/gate-graph-opt-streams.sh` **PASS** (`147 chars sha=b065f37593b3` on both arms, census
+`branch 5..7 / copy 1..4`); reduced MTP Protocol A (35B-A3B prose `-n 300`: plain 93.9 vs draft-mtp **199.6 t/s**,
+acceptance **0.75547**, text `97b7412c3bd9` identical -- reduced because only the default-off option's stream
+numbers moved and the default decode path is byte-identical); `llama-batched-bench -npl 1,4,8` **93.3 / 296.1 /
+415.9 tg** (no collapse); `check-gpu-faults.sh --since` clean on the journal window and **176 run logs**.
+
+### 4. Not done, deliberately
+
+No `GGML_CUDA_GRAPH_OPT` default change (a noise-level effect is not a win); no fix for qwen4exp's inert fork/join
+path (its own property, and outside this item); no `-c`/VRAM pre-flight guard (nothing fails, and the slab refusal
+already names its terms); the parked `0002` patch is re-cut and reviewed, never applied.
+
 ## 261110.006 (r250, RELEASE v16-a691b2345-r250) -- four `TODO` handles close: a degenerate `-sm tensor` share is refused (#135), the staging redirect is retired (#284), the `n_rs_seq` diagnostic refuses a narrow ubatch (#315), and the `hc_post_rms` non-temporal hints measure neutral (#311)
 
 **Shipped.**  `main` `c6258f8c`, tag `v16-a691b2345-r250`, fork `rdna-boosts` refreshed to

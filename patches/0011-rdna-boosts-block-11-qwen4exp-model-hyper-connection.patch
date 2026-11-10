@@ -1,4 +1,4 @@
-From 57c89e17becc147e4b25ba07a55d5ca6f44fdde7 Mon Sep 17 00:00:00 2001
+From 157ac1ca31c1a4e1b4f33191bc973e92573ae7c2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: qwen4exp (model,
@@ -1255,10 +1255,10 @@ index 00a2ea7dc..ae93e6848 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index c800597b5..638cbfb4d 100644
+index 9c32acb55..2e77ae8d2 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -2893,6 +2893,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
+@@ -2922,6 +2922,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
      return on;
  }
  
@@ -3210,7 +3210,7 @@ index e4538702d..2d93591e8 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a14b0b36a..7fcf227a3 100644
+index 0e6a25529..7cc6ba3c3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -28,6 +28,9 @@
@@ -3321,7 +3321,7 @@ index a14b0b36a..7fcf227a3 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -6716,12 +6782,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6719,12 +6785,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -3474,7 +3474,7 @@ index a14b0b36a..7fcf227a3 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -8114,8 +8320,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8141,8 +8347,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;

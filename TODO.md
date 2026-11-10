@@ -38,10 +38,8 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill on 35B-A3B at `MOE_HOST_POOL_FRAC=50` | performance (delivery defect, default-on) | **OPEN** (2026-11-03) — needs a wider sweep before the default moves — §136 |
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04) — the bound is static per shape on purpose — §141 |
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
-| **270** | `llama-batched-bench -c 16384` segfaults on Flash-Next at `-ncmoe 48`, printing nothing | correctness (pre-existing, r215) | **OPEN** — a silent SIGSEGV is a bad failure mode; R17 must pick a context that works — §270 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **283** | `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index | correctness (latent, default off) | **OPEN** — fix when the option is next touched — §283 |
 | **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
@@ -251,19 +249,6 @@ The pool tier's **first** prefill pays ~3 s: `llama-batched-bench -npp 512 -npl 
 
 **OPEN -- pre-existing (r210), not a r211 regression** (2026-11-04, `WORKLOG.md` 261104.002 §4).  `MOE_HOST_POOL_PREWARM=0` does not move it (122 vs 130), so it is the build/first-touch, not the prewarm order.  The lead from `archive/work/host-expert-eager-push/P6-POOL-REGION.md` §7d is to move the population into the preflight (before the first timed batch) -- it was scoped as worth only ~0.09 s at `-n 300`, but this row is the arm where it is worth 3 s
 
-## 270. `llama-batched-bench -c 16384` segfaults on Flash-Next at `-ncmoe 48` (both arms, no output)
-
-**Status: open, found 2026-11-04 (r215).  Pre-existing, not that change — recorded so it is not re-discovered as one.**
-`llama-batched-bench` on Qwen3.8-Flash-Next GSQ-RCO-IQ3_S (`-ngl 999 -ncmoe 48 -sm tensor -fa 1 -ctk/ctv q8_0
--ot 'per_layer_token_embd.*=CPU' -lm mmap`) exits with SIGSEGV (139) and **prints nothing at all** — not even the
-model-load banner — for `-c 16384` at `-npp 512 -ntg 128 -npl 1` (and `-npl 2/4/8`, and `-npp 64 -ntg 64 -npl 8`).
-`-c 8192` runs those same shapes normally (`-npp 16 -ntg 32 -npl 1,4,8` and `-npp 16 -ntg 32 -npl 8` both produce
-the table).  Reproduced with `MOE_HOST_POOL_ALLOC=portable MOE_HOST_POOL_BULK=0`, i.e. the r214 code path, so it is
-the workload shape / VRAM cliff on this model, not the r215 pool change.  Worth chasing only because a silent
-SIGSEGV with no message is a bad failure mode (the archive's warning that this instrument has been unreliable
-before applies: `archive/work/host-expert-eager-push/HANDOVER-R210.md` §3).  Start from `-c 16384 -npp 16` and
-bisect the context, then check whether it is the compute buffer, the arena or the `-npp 512` prefill shape.
-
 ## 273. Three prefill transports where one should do
 
 **Three prefill transports where one should do**: a host-resident expert table's prefill is served by the device gather, the staged fill or the scheduler's bulk upload, selected by `GGML_SCHED_DEVGATHER` x `GGML_MOE_CACHE_STAGE` and a tier test — each wins somewhere, so no single default is right.  Measured on r234: bulk wins at ≤ 67 % arena residency (+16 % at 44 %, +6 % at 67 %, 1 and 2 devices, both box phases), the staged fill wins at ≥ 83 % (up to +10 %; at 99 % it sends 0.0 % of the bytes over PCIe), on the pool tier the staged fill is mandatory (the alternative is the per-expert pinned bounce, 5-10x slower), and the gather is the pool default that wins at `-ub` ≤ 4096.  The trade is **bytes saved vs transactions issued**, and the resident set is scattered so the complement cannot be coalesced
@@ -302,18 +287,6 @@ should steer this item:
 **Kind:** purity (delivery — `gate-host-pool.sh` `pinlate` arm; NOT corruption).
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie
-
-## 283. `GGML_CUDA_GRAPH_OPT`'s branch streams collide with the staging copy stream's index
-
-**Status: open, latent (found 2026-11-07 while auditing transfer concurrency; `WORKLOG.md` 261107.014).**  The
-fork/join scheduler maps a concurrent branch to `stream(device, branch_idx + 1)`, so **branch 0 lands on
-`stream(device, 1)` -- exactly `copy_stream()`**, the stream every staging fill, `stage_gather` and the pool fill
-use.  With `GGML_CUDA_GRAPH_OPT=1` a split's whole-table uploads would therefore queue *behind* branch compute
-instead of overlapping it, and a second copy stream (the parked
-`wip/expert-transfer-engine/0002-stage-copy-streams.patch`) would collide at index 2 the same way.  Default-off, so
-nothing ships wrong today.  **Fix when the option is next touched:** give the branch streams their own index base
-(or make `copy_stream()` reserve its index), and add a `-lv 4` assertion that no concurrent branch ever runs on the
-copy stream's index.
 
 ## 285. A unified expert store: one VA per device, expert-granular residency (`wip/expert-transfer-engine/` §7.6)
 

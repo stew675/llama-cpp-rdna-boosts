@@ -15,7 +15,7 @@ It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp check
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r250`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v16-a691b2345-r251`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,

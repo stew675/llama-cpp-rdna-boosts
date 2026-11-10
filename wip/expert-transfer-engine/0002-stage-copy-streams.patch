@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 7623cb2d3..858a1f736 100644
+index c4e797c0b..8dcb8a98e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 @@ -10,6 +10,40 @@
@@ -52,8 +52,8 @@ index 7623cb2d3..858a1f736 100644
      if (!moe_cache_stage_table(dev, src, offset, width, stride_src, n_copies, dst,
                                 cuda_ctx->stream(), s, order_ev[dev])) {
          return false;
-@@ -59,7 +93,7 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
-     if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ !redirect)) {
+@@ -57,7 +91,7 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
+     if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ true)) {
          return;
      }
 -    cudaStream_t s = cuda_ctx->copy_stream();
@@ -61,7 +61,7 @@ index 7623cb2d3..858a1f736 100644
      // wip/host-expert-master-drop (TODO #55): a POOL-BACKED host expert master is PAGEABLE, and a pageable
      // `cudaMemcpyAsync` is staged through a shared internal bounce (back-to-back copies tear -- measured as
      // nondeterministic greedy text).  Stage it through the pool / the per-table pinned bounce instead.
-@@ -106,7 +140,7 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
+@@ -104,7 +138,7 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
      if (ggml_backend_cuda_stage_from_cache(cuda_ctx, src, offset, width, stride_src, n_copies, dst, ev, /*defer =*/ true)) {
          return true;
      }
@@ -70,7 +70,7 @@ index 7623cb2d3..858a1f736 100644
      // WIP r42 (stage-1 item 2): a pinned source lets the compacted slice be copied straight with one
      // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
      // was the pathological ROCm case (the campaign's `hipMemcpy2DAsync` fault); this is the pinned
-@@ -154,7 +188,17 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
+@@ -152,7 +186,17 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
  void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_cuda_set_device(cuda_ctx->device);
