@@ -109,6 +109,18 @@ rather than touched: the retry path is now the only one that can reach it twice.
 (r248: five facts and three decisions), `benchmarks/2026-11-10-mtp-draft-window-depth.md` is unchanged (the
 r247 measurement stands -- this release changes no rate).
 
+### Release mechanics (done)
+
+`scripts/fork-refresh.sh --build --gates --push`: re-cut at `a691b2345` reproduced tip `12433634d` / tree
+`fe0e044947` (so the deterministic ids hold across this amend), built, the coherence and prefill-logit gates
+re-ran green inside the refresh, and the branch was force-with-lease pushed to the personal fork only
+(`4973ab6c1 -> 12433634d`).  `main` and the annotated tag `v16-a691b2345-r248` are pushed; the tag's
+`Release patch set` workflow published the assets and both `Validate delivery set` runs went green.  GitHub
+issue #297 is answered (reproduction, the three parts, why the default stays `0`) and closed.  Container
+images: the `radiance` worker watcher picked the tag up on its own and is running
+`build-containers.sh --rocm 7.14.1 10.1 --push --prune --force`, per the policy nothing runs on the primary
+box.
+
 ## 261110.003 (r247, RELEASE v16-a691b2345-r247) -- the MTP draft window was costing 9.7 % of decode at depth: every block-15 placement now defaults OFF, and the pool stops being a size knob
 
 **Release:** `v16-a691b2345-r247`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
