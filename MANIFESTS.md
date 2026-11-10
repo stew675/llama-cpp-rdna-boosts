@@ -36,7 +36,7 @@ reorder, never insert.
 | 12 | `0012-…-block-12-campaign-remainder-…` | campaign remainder | CPU wins, backend iface fills, DFlash (incl. the r130 prompt-ingest tail, the r162 draft-reserve split (issue #239) and the r163 in-graph layer-input store (issue #240)), FA build grouping, mmap reclaim, batched state restore, server prompt-cache residency, idle-slot parking (r136), and the backend-sampling compute-buffer reserve keyed on the chain's node count (r169, PR #245) |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-…` | MTP draft vocabulary subset | **opt-in** (`--spec-draft-mtp-vocab N`), default off; draft-only |
 | 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | `-sm relaxed-tensor` (TEMPORARY) | a local relaxation of upstream #31081: tensor split with a per-device MoE amax scalar, for `flint`/`mellum`/`mistral4`.  **Not a supported feature**; delete this patch to return to the r136 tree |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | windowed KV (**opt-in**, `LLAMA_KV_RESIDENT_CELLS=<cells>\|auto`) | the KV's VRAM cost is a resident window of the newest `W` cells, the rest in pinned system RAM in ONE VA reservation (no kernel or op change); the window slides in whole map units and `--fit` sizes it; **since r204 it also runs on a tensor split** (one region PER CHILD device, all children at the same `W` cells, the grow fanned out to every child; `--fit` charges the physical `W x cell_bytes` against the split's per-device budget; a MIRRORED dsv4/HRM cache declines it) -- before r204 `-sm tensor` declined it (r181); `LLAMA_KV_SPILL_RAM_PCT` caps the pinned spill; + r190: a cache that is **streaming** at the depth it reads takes the **sparse** QSA decode arm (`LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm)  **+ r190: the ATTENDANCE POOL** (`--kv-region-pool <cells>`, `auto` by default = not taken) — the KV's authoritative copy in a pinned host **mirror** plus a compact **device pool** of indexer-block pages and a page table, resolved by `GGML_OP_KV_POOL` (mark / claim / map+fill) with the QSA reader taking a second id list; `--fit` books the mirror as host RAM (only the pool is VRAM) and does not interpolate `-c` while the pool is active.  A fittability feature like the window: **default off**, unset = byte-identical including the OOM, and mutually exclusive with the window.  **+ r193: the MTP DRAFT WINDOW** (`--spec-draft-kv-window`, **default `auto`** since r246 = *the cap or nothing*: 65536 cells, or no window when that would not leave a batch of room below every sequence's own context; `0` = off, `N` = cells; the r193 sizer was a quarter of the context clamped to [32768, 65536]) — the draft context's KV is a window instead of `-c` cells, and an embedded MTP head's slab draft reserve is derived with the window (aux 3.50 -> 0.76 GiB, arena +2.8 GiB); MTP only and embedded-head only (a separate MTP draft GGUF keeps its full cache) |
+| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | windowed KV (**opt-in**, `--kv-window <cells>\|auto`; `LLAMA_KV_RESIDENT_CELLS` = deprecated alias) | the KV's VRAM cost is a resident window of the newest `W` cells, the rest in pinned system RAM in ONE VA reservation (no kernel or op change); the window slides in whole map units and `--fit` sizes it; **since r204 it also runs on a tensor split** (one region PER CHILD device, all children at the same `W` cells, the grow fanned out to every child; `--fit` charges the physical `W x cell_bytes` against the split's per-device budget; a MIRRORED dsv4/HRM cache declines it) -- before r204 `-sm tensor` declined it (r181); `LLAMA_KV_SPILL_RAM_PCT` caps the pinned spill; + r190: a cache that is **streaming** at the depth it reads takes the **sparse** QSA decode arm (`LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm)  **+ r190: the ATTENDANCE POOL** (`--kv-attendance-pool [on|off]`, alias `--kv-region-pool`; **off by default**, and **since r247 not a size knob**: the pool is derived from the model, one decode band of the indexer working set, and a legacy numeric value is accepted-and-ignored) — the KV's authoritative copy in a pinned host **mirror** plus a compact **device pool** of indexer-block pages and a page table, resolved by `GGML_OP_KV_POOL` (mark / claim / map+fill) with the QSA reader taking a second id list; `--fit` books the mirror as host RAM (only the pool is VRAM) and does not interpolate `-c` while the pool is active.  A fittability feature like the window: **default off**, unset = byte-identical including the OOM, and mutually exclusive with the window.  **+ r193: the MTP DRAFT WINDOW** (`--spec-draft-kv-window`, **default `0` since r247** — a window the request outgrows cost −9.7 % of MTP decode on a `-sm tensor` split at ~105k tokens, `benchmarks/2026-11-10-mtp-draft-window-depth.md`; `auto` = *the cap or nothing*: 65536 cells, or no window when that would not leave a batch of room below every sequence's own context; `N` = cells; the r193 sizer was a quarter of the context clamped to [32768, 65536]) — the draft context's KV is a window instead of `-c` cells, and an embedded MTP head's slab draft reserve is derived with the window (aux 3.50 -> 0.76 GiB, arena +2.8 GiB); MTP only and embedded-head only (a separate MTP draft GGUF keeps its full cache) |
 
 `rdna-boosts-all.patch` (repo root) is the entire net as ONE patch.  It is a convenience for a one-off
 build at the fork point; it is **not** the reviewable increment and not a substitute for the per-block
@@ -310,7 +310,7 @@ in CI.  The model-level gates are manual:
    matcher it rides on, or `gdn_conv_enabled()`/`ple_conv_enabled()`; every release.
 
 15. **MTP draft window** — `scripts/gate-spec-draft-window.sh` (r200, issue #264; r246, issue #293): the MTP
-   draft context's KV is a sliding window (`--spec-draft-kv-window`, default `auto`), and under `--kv-unified` the one draft cache
+   draft context's KV is a sliding window (`--spec-draft-kv-window`, default `0` since r247), and under `--kv-unified` the one draft cache
    holds every sequence, so it must be sized per sequence — `(win + one batch) x n_seq_max` — by
    `llama_spec_draft_kv_cells()`, which is also what the slab's draft reserve and `common`'s "is a window
    active" test call.  The gate drives 2 slots through 6 requests (the first slot fills its window, the second
@@ -322,7 +322,13 @@ in CI.  The model-level gates are manual:
    `--spec-draft-kv-window 0` on **every** step.  Since **r246** the gate also asserts the `auto` POLICY, startup-only: no
    window and no message at `-c 8192` x 2 slots (nothing to save), a logged **decline** at the reporter's
    `-c 131072` x 2 slots (the shape where the old quarter-of-the-context sizer granted 32768 and cost 8 % of
-   decode), and a granted 65536-cell cap at `-c 67584` x 1 slot.  **No other gate reaches this code**: the coherence,
+   decode), and a granted 65536-cell cap at `-c 67584` x 1 slot.  Since **r247** it also pins the DEFAULT
+   itself (the regression that shipped: nothing in the ladder could see it), startup-only: `default_off` (no
+   knob at `-c 131072` → **no** window line and no decline), `tensor_default_off` (the same under `-sm tensor`,
+   the layout the loss was measured in) and `tensor_auto` (an explicit `auto` still grants the cap there, so
+   the two default arms are not vacuous).  That gate's ready-wait also had to stop matching a benign `--fit`
+   WARN ("failed to fit params … n_gpu_layers already set"), which killed the server ~1 s in and graded an
+   empty log -- found while adding the `-sm tensor` arms.  **No other gate reaches this code**: the coherence,
    prefill-logit and MTP protocols run one sequence, where the geometry is unchanged (and identical to
    r198's), and the park/ckpt/state gates drive one slot at a time.  Required for any change to the draft
    window's sizing, `llama_spec_draft_kv_cells()`, `create_memory`'s MTP branch or the derived draft reserve;
@@ -361,11 +367,12 @@ in CI.  The model-level gates are manual:
    **must** never flip a mapping nor map a host byte) and `wspill` (`W=2048`: **must** do both, `FLIP device 0`
    > 0 and `of which host` > 0), text byte-identical on all three.  Pool arms (Flash-Next GSQ-IQ3_XXS + its MTP
    sidecar, 1 GPU, `-ncmoe 48`, q8_0, `-c 32768`, 25 763-token prefix, MTP depth 4): `pref` (no pool, the
-   SPARSE arm the pool replaces), `pres` (`--kv-region-pool 32768` = the whole cache, 8 192 pages) and
-   `pfloor` (`--kv-region-pool 512`, **floored** to one decode band = 4 104 pages, with `LLAMA_KV_POOL_VERIFY=1`); text and
-   `draft_n`/`draft_n_accepted` identical across all three, `bad 0`, claims/resolves/hits non-zero, `pres`
-   holding exactly `-c/4` pages, and on the SAME resolve count `pfloor` claiming more per resolve and hitting
-   less.  `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
+   SPARSE arm the pool replaces), `pres` (`--kv-attendance-pool on`, **system-sized**: one decode band =
+   4 104 pages against a 6 441-page working set) and `plegacy` (`--kv-region-pool 32768`, the r246 spelling:
+   accepted and **ignored**, with `LLAMA_KV_POOL_VERIFY=1`); text and `draft_n`/`draft_n_accepted` identical
+   across all three, `bad 0`, claims/resolves/hits non-zero, the derived pool **smaller** than the cache (so
+   the claim pressure is real), `plegacy` reporting the compatibility WARN and holding the SAME page count as
+   `pres` (the size is not a knob since r247), and a per-id hit rate inside (0, 100).  `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
    log (cells, bytes, the buffer the placement got, host-backed MiB, pool geometry, the counters line).
    **r217: the pool section also asserts the PROMPT RATE** -- `pres` must keep `PREFILL_MIN_PCT` (default
    40 %) of `pref`'s `prompt eval` tokens/s, both read from the arms' own logs, so a placement that is

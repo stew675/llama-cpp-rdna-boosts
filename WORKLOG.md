@@ -1,3 +1,129 @@
+## 261110.003 (r247, RELEASE v16-a691b2345-r247) -- the MTP draft window was costing 9.7 % of decode at depth: every block-15 placement now defaults OFF, and the pool stops being a size knob
+
+**Release:** `v16-a691b2345-r247`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`2cf1af51d980612eba22ddb4ae5515fb834bd6a3` (tree `ebb1d2a8d4812a97af412f632b81cd5c35562c67`), 16 blocks.
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`, applied tree == recorded tree,
+conflict-marker and Windows-portability scans); `scripts/fork-refresh.sh` re-cut reproduces the same tree/tip.
+**No block renumbered, merged or split**: everything folds into **block 15**.  No kernel, no graph, no numerics
+and no gate threshold changed — only defaults, one option's shape, one option's name, and the docs that
+described them wrongly.
+
+### What happened (the honest version)
+
+r246 gave block 15 two options whose `auto` meant **opposite things**: `--spec-draft-kv-window auto` was **on**
+(the 65 536-cell cap), and `--kv-region-pool auto` was **off** ("nothing sizes it yet").  That is a trap, and it
+caught the maintainer: the `auto is the cap or nothing` line was read against the *pool*.  Chasing that
+confusion produced the question that matters — **does the draft window cost MTP decode at depth?** — and the
+answer was yes, in a layout the delivery validates.
+
+r246's premise for the default was `ENVIRONMENT.md` §17.2's "it measures non-negative everywhere and positive
+where it pays".  **That premise was wrong**, and it shipped a regression: a window the request outgrows costs
+decode, and `auto` grants a window at any context above 65 536 cells (including the reporter's `-c 262144`).
+
+### The measurement (27B UD-Q4_K_XL, embedded MTP head, 3 x R9700, `-c 131072`, 104 940-token request)
+
+| split | `0` (the new default) | `auto` = 65 536 cells | |
+|---|---|---|---|
+| `-sm tensor` | **80.5 / 80.4 t/s** | **72.7 / 72.7 / 72.6 t/s** | **-9.7 %**, reproducible across 3 runs at the head of the queue and 2 behind |
+| `-sm layer` | 36.0 / 35.9 | 36.8 / 36.8 | +2.2 % — **neutral**: that arm's *prefill* moved with it (+1.8 %), so it is an allocation offset, not a window effect |
+| `-sm tensor`, 41 976-token request | 92.6 | 91.5 | -1.2 % (below the window: neutral) |
+| `-sm tensor`, `N = 104960` (also wraps) | — | 67.8 | the cost **grows with the window**, so lowering the cap is not a fix |
+
+Text is byte-identical within each split (`ab4b11912e3b` layer, `c4faf464ee52` tensor), so nothing was ever
+mis-computed — it is throughput only.  Mechanism, from `-lv 4` (`-n 128`, 69.0 vs 77.7 t/s): **acceptance
+0.50000 (76/152) → 0.45342 (73/161)** plus a **per-step cost past the ring wrap** (+1.33 ms/step at the 65 536
+cap; the Windows report in `TODO` #312 measured 1.3-1.6 ms at 32 k and 2.8-2.9 at 64 k — the same shape, so
+**#312 was never Windows-specific**).  Why a wrapped window costs per step is still unidentified; it no longer
+needs to be.  Arms and hashes: `benchmarks/2026-11-10-mtp-draft-window-depth.md`.
+
+### The corrected shape: three placements, all default OFF, consistent semantics
+
+The maintainer's call, and it is the design rule now: **default = off (full speed, more memory), `auto` = the
+system picks the size, `N` = explicit.**  A placement that costs 10 % of decode in a validated layout cannot be
+a default, and a default run must carry no placement decision at all.
+
+| option | default | what it is |
+|---|---|---|
+| `--spec-draft-kv-window [auto\|N]` | **`0`** (was `auto`) | **truncates** the MTP drafter's own cache (lossy) |
+| `--kv-window [auto\|N]` | **`0`** | the **lossless resident window**, promoted from `LLAMA_KV_RESIDENT_CELLS` (env var kept as a deprecated alias, and it now warns) |
+| `--kv-attendance-pool [on\|off]` | **`off`** | the **host-mirror + device page-cache** placement, renamed from `--kv-region-pool` (kept as an alias) |
+
+Both `common_params` and `llama_context_params` carry the new defaults, so a library consumer inherits them too.
+
+**The pool's size stopped being a knob** (this closes `TODO` #313): its floor was *already* derived from the
+model (`QSA_DECODE_BAND 8 x ceil((indexer_top_k + page - 1) / page)`, clamped to the cache), and a numeric
+request could only *raise* it — for a measured +1 point of per-id hit rate at 2x the VRAM (whole cache 8 192
+pages: 90.91 %; the derived 4 104 pages: 89.87 %).  It is now `on|off` with the derived size, and a legacy
+numeric value or `auto` is accepted-and-**ignored**, with a WARN saying so — so nothing breaks for a consumer
+who inherited one.  That also removes the last thing `--fit` had to decide about the pool, which is why the
+`auto` question disappears rather than getting an implementation.
+
+**`--fit` still follows the user's choice**: `common_draft_reserve_derive()` charges the small derived draft
+reserve only when a window is actually *active*, so with the new default an embedded MTP head charges the flat
+3 584 MiB again.  That is the accepted cost of the opt-in — a config that only fits with the window must ask for
+it and then owns the caveat.  `TODO` #314 is the follow-up: `--fit` should **say** which placement would make a
+config fit, never take one.
+
+### Gates
+
+| gate | result |
+|---|---|
+| `scripts/gate-spec-draft-window.sh` | **PASS** — the existing 6/6 byte-identity sequence and the r246 `auto` policy arms, plus **three new startup arms**: `default_off` (no knob at `-c 131072`: no window line, no decline), `tensor_default_off` (the same under `-sm tensor`, the layout the loss was measured in) and `tensor_auto` (an explicit `auto` still grants the cap there, so the two are not vacuous) |
+| `scripts/gate-kv-residency.sh --pool-only` | **PASS** (47 checks) with the arms reshaped: `pres` (`--kv-attendance-pool on`, system-sized 4 104 pages) and `plegacy` (`--kv-region-pool 32768`, ignored + the verify oracle), text byte-identical across `pref`/`pres`/`plegacy`, `bad 0`, derived pool smaller than the cache (claim pressure real), `plegacy` holding the *same* page count as `pres`, and the 2-device `-sm layer` section still proving the per-device counter blocks |
+| `scripts/gate-per-block-build.sh --fast --changed-from a9d74e393` | 1/1 (block 15 only; every other block's delta unchanged) |
+| `scripts/gate-prefill-logits.sh` | **PASS** 0.000697 / 98.784 % (no prefill path touched; the formality every release runs) |
+| `scripts/validate-set.sh` | strict 16/16, applied tree `ebb1d2a8d4`, checksums + Windows portability lint green |
+| `scripts/check-gpu-faults.sh` | clean, scoped per gate to the time before its first arm |
+
+**A gate defect found while adding the tensor arms:** `gate-spec-draft-window.sh`'s `policy_arm` ready-wait
+matched a bare `failed to`, which also matches the **benign** `--fit` WARN "failed to fit params to free device
+memory: n_gpu_layers already set by user to 999".  The loop therefore stopped ~1 s in, killed the server
+mid-load and graded an **empty log** — it only surfaced because the new `-sm tensor` arms load slower.  The wait
+now matches the window line, `listening on http`, or a real failure only.  (r246 fixed two gate defects in this
+same gate; that is now three, and the lesson is the same: a ready condition is a parser too.)
+
+### Records
+
+`ENVIRONMENT.md` §17 (rewritten: the three placements, why they are confused, which to use for a dense vs a
+sparse reader, and the measured costs), §17.0/§17.1/§17.2 + the §13 retired rows; `MANIFESTS.md` block-15 row,
+gate 15 and the pool gate's arms; `patches/README.md` block 15 (r247 amendment + knobs); `AGENTS.md`'s patch
+table; `INVARIANTS.md` (the r246 entry corrected in place, and an **r247** entry with the measurement, the
+default rule, the "boolean beats a derived size knob" rule, the "window vs pool are alternatives" rule, the
+`--fit` consequence, and the gate lesson); `TODO` **#312 and #313 closed** (as *resolved by an opt-in feature
+with a measured caveat* and *solved by removing the knob*, not as fixed bugs — the per-step mechanism is still
+unidentified and recorded as such) with **#314** opened for the `--fit` diagnostic; `scripts/README.md` for both
+gates; `benchmarks/2026-11-10-mtp-draft-window-depth.md` for the arms.
+
+### Not run, and why
+
+`gate-host-pool.sh`, `gate-park-idle-slots.sh`, `gate-state-pipe.sh`, `gate-ckpt-reuse.sh`,
+`gate-hc-fusions.sh`, `gate-spec-width-band.sh` and the full four-axis MTP protocol: this change moves no
+kernel, no fusion, no graph, no numerics and no state path.  The draft-window gate covers what it *can* move
+(which draft cells exist), and the two decode-rate arms above are the record for the default.  `gate-kv-window-split.sh`
+was not rerun: `--kv-window` is the same placement with a new spelling plus a legacy-env fallback, and
+`gate-kv-residency.sh`'s window section exercises exactly that path (`wref`/`wres`/`wspill`, all green at r246
+and unchanged in code).
+
+### Owed at tag time (not done here)
+
+`optional/two-lane-prefill/` is cut against the r246 tree and no longer applies to `release.json.tree`; it must
+be re-cut onto `ebb1d2a8d4` when the release is actually tagged and pushed (it is an optional artifact, not part
+of the delivery, so the tree is consistent without it — but a consumer who tries it today gets a reject).
+Also owed then: `fork-refresh.sh --build --gates --push` and the worker container rebuild, per the Pushing policy.
+
+### Release notes (the short version for consumers)
+
+> **r247 changes three defaults and one option's shape, because r246 shipped a decode regression.**
+> The MTP draft window (`--spec-draft-kv-window`) defaulted to `auto` and could cost **~10 % of MTP decode**
+> once your request was deeper than the window (measured on a 3-GPU tensor split at 105k tokens).  It now
+> defaults to **`0`** (a full `-c` draft cache).  All three block-15 placements are now **off by default** with
+> the same semantics — `auto` = the system picks the size, `N` = explicit — and the attendance pool, renamed
+> `--kv-attendance-pool` (`--kv-region-pool` still accepted), **no longer takes a size**: it is derived from the
+> model, and a numeric value is accepted and ignored.  The resident window is now a real option, `--kv-window`
+> (`LLAMA_KV_RESIDENT_CELLS` still works, and warns).  If you were relying on a window for VRAM, opt in
+> explicitly and read `ENVIRONMENT.md` §17.2 for the depth caveat.  Nothing else changes: the default path is
+> byte-identical, no kernel or numerics were touched, and the prefill-logit gate reads 0.000697 / 98.784 %.
+
 ## 261110.002 (r246, optional) -- PR #296 (`two-lane-prefill` re-cut) TAKEN: the MTP target pairs, the MTP draft is refused at the arm gate, and the artifact now carries the r244 review's predicate
 
 PR #296 (@slavap) is the re-cut PR #284 should have been: it re-pins the artifact to the release tree, keeps the

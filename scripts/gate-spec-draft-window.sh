@@ -213,8 +213,13 @@ policy_arm() {   # policy_arm <arm> <ctx> <npar> <arg...>
         --spec-type draft-mtp --spec-draft-n-max 3 -t 8 --poll 0 -lv 4 "$@" \
         --host 127.0.0.1 --port "$PORT" $EXTRA_ARGS > "$dir/log.txt" 2>&1 &
     SRV_PID=$!
+    # The ready condition must not match a BENIGN failure line: a bare "failed to" also matches the `--fit`
+    # WARN ("failed to fit params to free device memory: n_gpu_layers already set by user to 999"), which an
+    # `-ngl 999` arm emits during the fit -- the loop then stopped ~1 s in, killed the server mid-load and
+    # graded an empty log (found 2026-11-10 while adding the `-sm tensor` policy arms, which load slower).
     for _ in $(seq 1 900); do
-        grep -qE "MTP draft KV window|listening on http|failed to|error:" "$dir/log.txt" 2>/dev/null && break
+        grep -qE "MTP draft KV window|listening on http|error: |failed to load|failed to initialize|main: exiting" \
+            "$dir/log.txt" 2>/dev/null && break
         kill -0 "$SRV_PID" 2>/dev/null || break
         sleep 1
     done
@@ -326,7 +331,7 @@ for arm in win win0; do
     [ -n "$acc" ] && echo "INFO  $arm: draft acceptance$acc"
 done
 
-# ===== the `auto` policy (r246, issue #293) ==========================================================
+# ===== the `auto` policy (r246, issue #293) and the DEFAULT (r247) =====================================
 # Startup-only arms: `auto` must never grant a window the drafter can outgrow.  A window below the depth the
 # drafter works over costs 7-9 % of decode (and 8 % measured at -c 131072 on BOTH a pre- and a post-re-base
 # build), so it is DECLINED instead of lowered -- while a context with a full 65536 cells of room below every
@@ -368,6 +373,45 @@ else
     fails=$((fails + 1))
 fi
 
+
+# the DEFAULT is 0 (a full `-c` draft cache) since r247: the window cost MTP decode whenever the request is
+# deeper than it, measured at -9.7 % on a `-sm tensor` split at ~105k tokens (benchmarks/mtp-draft-window-depth.md).
+# Nothing in this gate could see that before -- the `auto` arms all pass the flag explicitly and every text arm
+# forced a small window -- so the default itself is asserted here: with no knob, NO window line at all, and no
+# decline either (there is nothing to decline).
+policy_arm default_off 131072 1
+if grep -q "MTP draft KV window" "$KEEPOUT/default_off/log.txt"; then
+    echo "FAIL  default_off: the default granted/reported a draft window (the default must be 0):"
+    grep -m2 "MTP draft KV window" "$KEEPOUT/default_off/log.txt" | sed 's/^/      /'
+    fails=$((fails + 1))
+else
+    echo "PASS  default_off: no draft window at ctx 131072 with no knob (the default is a full draft cache)"
+fi
+
+# ... and the same on a `-sm tensor` split, which is the layout the cost was MEASURED in (the measurement used
+# 3 GPUs, `DEVS=0,1,2`; the policy itself is not device-count dependent, which is what these startup arms
+# assert).  It must not be split-dependent: nothing about a tensor split changes the window's geometry.
+SM=tensor policy_arm tensor_default_off 131072 1
+if grep -q "MTP draft KV window" "$KEEPOUT/tensor_default_off/log.txt"; then
+    echo "FAIL  tensor_default_off: the default granted/reported a draft window under -sm tensor:"
+    grep -m2 "MTP draft KV window" "$KEEPOUT/tensor_default_off/log.txt" | sed 's/^/      /'
+    fails=$((fails + 1))
+else
+    echo "PASS  tensor_default_off: no draft window under -sm tensor with no knob (the default is 0 there too)"
+fi
+
+# ... and an EXPLICIT `auto` still grants the cap on that split, so `tensor_default_off` is not vacuous (a
+# split where the window could not be taken at all would pass it for the wrong reason)
+SM=tensor policy_arm tensor_auto 67584 1 --spec-draft-kv-window auto
+tline=$(grep -m1 "MTP draft KV window = " "$KEEPOUT/tensor_auto/log.txt" || true)
+if echo "$tline" | grep -q "65536 cells per sequence"; then
+    echo "PASS  tensor_auto: an explicit auto still grants the 65536-cell cap under -sm tensor"
+else
+    echo "FAIL  tensor_auto: explicit auto did not grant the cap under -sm tensor (tensor_default_off is vacuous):"
+    echo "      ${tline:-<no window line>}"
+    fails=$((fails + 1))
+fi
+
 # the kernel journal, scoped to this gate's own window (#294: an unscoped or fixed "N min ago" window fails
 # on an earlier run's fault, which is a verdict about the journal and not about the code under test)
 if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
@@ -377,7 +421,8 @@ if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
     if out="$("$REPO_DIR/scripts/check-gpu-faults.sh" "${since_args[@]}" \
             --log "$KEEPOUT/win/log.txt" --log "$KEEPOUT/win0/log.txt" \
             --log "$KEEPOUT/auto_small/log.txt" --log "$KEEPOUT/auto_decline/log.txt" \
-            --log "$KEEPOUT/auto_grant/log.txt" 2>&1)"; then
+            --log "$KEEPOUT/auto_grant/log.txt" --log "$KEEPOUT/default_off/log.txt" \
+            --log "$KEEPOUT/tensor_default_off/log.txt" --log "$KEEPOUT/tensor_auto/log.txt" 2>&1)"; then
         echo "PASS  GPU faults: kernel journal (since ${GATE_SINCE_TS:-start}) and both arm logs clean"
     else
         echo "FAIL  GPU faults (since ${GATE_SINCE_TS:-the journal start}):"

@@ -41,14 +41,16 @@
 #   prompt = 6 441 pages of the 4-cell indexer block, MTP depth 4):
 #     pref          no pool + the SPARSE decode arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) -- the arm the pool
 #                   replaces and therefore the text it must reproduce
-#     pres          `--kv-region-pool 32768` = the whole cache (8 192 pages): nothing can be claimed out
-#                   for capacity
-#     pfloor        `--kv-region-pool 512`: FLOORED to one decode band (4 104 pages = 16 416 cells), i.e.
-#                   the smallest pool the backend will build, against a 6 441-page working set -- the forced
-#                   misses, and `LLAMA_KV_POOL_VERIFY=1` on this arm (the churn arm is where a wrong-page
-#                   resolve would show)
+#     pres          `--kv-attendance-pool on`: the pool, SIZED BY THE SYSTEM to one decode band of the indexer
+#                   working set against a 6 441-page working set, so the forced misses are built in and this
+#                   IS the churn arm.  Since r247 the size is not a knob -- a numeric request only ever bought
+#                   ~1 point of hit rate for 2x the VRAM (and `auto` had no sizer, TODO #313 closed), so the
+#                   backend derives it (`QSA_DECODE_BAND x ceil(top_k / page)`).
+#     plegacy       the r246 spelling `--kv-region-pool 32768` (the whole cache): accepted for compatibility
+#                   and IGNORED, so it must build the SAME pool as `pres` and say so; it carries
+#                   `LLAMA_KV_POOL_VERIFY=1` (the oracle arm is where a wrong-page resolve would show)
 #     and one assertion beyond residency (r217): `pres` must keep >= `PREFILL_MIN_PCT` (40 %) of `pref`'s
-#     PROMPT rate.  `pfloor` runs with the verify oracle and is not a timing arm.
+#     PROMPT rate.  `plegacy` runs with the verify oracle and is not a timing arm.
 #   Pool, MULTI-DEVICE (`-sm layer`, the same model/prompt/knobs on `MULTI_DEVICES`, default `0,1`): the pool
 #   is per layer AND per device (one mirror buffer type, device pool, page table and counter block per
 #   device), so a multi-device arm is a distinct placement, not a rerun: r213 shipped a fix for exactly the
@@ -56,8 +58,8 @@
 #   reaches it.  Text is judged WITHIN the device count (`INVARIANTS.md`: greedy text is a per-device-count
 #   reference), so the reference is the 2-device no-pool sparse arm, not `pref`:
 #     pmref         no pool, 2 devices, the sparse decode arm -- the 2-device reference
-#     pmres         2 devices, `--kv-region-pool $POOL_RES`
-#     pmfloor       2 devices, `--kv-region-pool $POOL_FLOOR` (+ `LLAMA_KV_POOL_VERIFY=1`)
+#     pmres         2 devices, `--kv-attendance-pool on`
+#     pmlegacy      2 devices, `--kv-region-pool $POOL_LEGACY` (+ `LLAMA_KV_POOL_VERIFY=1`)
 #   Plus the two witnesses only a multi-device arm can give: the enable line must report the layer span, and
 #   the teardown counters must report ONE counter block PER DEVICE (a single-device report on a 2-device arm
 #   means the blocks are not really per device -- the r213 defect).
@@ -72,10 +74,12 @@
 #       counts as neither hit nor miss, so it can never read 100 %.
 #     * A "resident" pool does NOT reach ~0 misses: the round-robin claim cursor hands out the next slot
 #       whether or not the block is resident, and a decode step's top-k selection MOVES, so every step pulls
-#       in blocks it did not read before.  At `-c 32768`, depth 25 763, 8 192 pages: 144 claims/resolve.
-#     * What DOES separate the two arms is claim pressure per resolve and the hit rate: 4 104 pages vs the
-#       same working set reads 218 claims/resolve and a full point less of `hits %`.  Those two, plus the
-#       text, are this gate's pool assertions -- never an absolute miss count.
+#       in blocks it did not read before.  At `-c 32768`, depth 25 763, the derived pool (4 104 pages):
+#       218 claims/resolve.
+#     * What this gate asserts instead of an absolute miss count: the pool really resolves (claims and
+#       resolves > 0), its hit rate is below 100 % (it cannot reach it -- see above), the derived size is
+#       SMALLER than the cache (so the claim pressure is real), a legacy numeric request builds the SAME
+#       size, and the text is byte-identical to the sparse arm.
 #
 #   The KV-ACCOUNTING section prints, per cache and from the log only (never from arithmetic on the knobs):
 #   cells, logical MiB, device MiB and its share, host/pinned MiB, and the buffer each placement really got.
@@ -93,8 +97,10 @@
 #   PROMPT_WIN   default: prompts/prose-rdna-boosts.txt   (5 246 tokens: must stay BELOW W=8192)
 #   PROMPT_POOL  default: prompts/kld-corpus-35b-in-domain.txt (25 763 tokens: must stay ABOVE the floor)
 #   NGEN         generated tokens per arm (default 64; the counter arms need enough steps to separate)
-#   CTX_WIN / CTX_POOL / POOL_RES / POOL_FLOOR   the arm's `-c` and pool sizes (defaults 16384 / 32768 /
-#                32768 / 512 -- POOL_FLOOR is meant to be floored, see the arm table)
+#   CTX_WIN / CTX_POOL   the window and pool arms' `-c` (defaults 16384 / 32768)
+#   POOL_LEGACY  the numeric size the COMPATIBILITY arm passes to the r246 spelling `--kv-region-pool`
+#                (default 32768).  It must be IGNORED -- the arm asserts `plegacy` builds the same pool as
+#                `pres`; it exists so the accepted-and-ignored path stays covered.
 #   MULTI_DEVICES  the devices the multi-device pool arms use (default `0,1`; needs two real GPUs and the
 #                `-sm layer` split, which is the default -- a tensor split declines the pool by design and
 #                would make those arms vacuous).  `MULTI_DEVICES=0` disables the section (1 GPU box).
@@ -127,8 +133,7 @@ PROMPT_POOL="${PROMPT_POOL:-$REPO_DIR/prompts/kld-corpus-35b-in-domain.txt}"
 NGEN="${NGEN:-64}"
 CTX_WIN="${CTX_WIN:-16384}"
 CTX_POOL="${CTX_POOL:-32768}"
-POOL_RES="${POOL_RES:-32768}"
-POOL_FLOOR="${POOL_FLOOR:-512}"
+POOL_LEGACY="${POOL_LEGACY:-32768}"
 PREFILL_MIN_PCT="${PREFILL_MIN_PCT:-40}"
 MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
@@ -373,11 +378,16 @@ fi
 
 # ===== the pool ==========================================================================================
 # Both pool sections (one device, and the multi-device split) run these same arms; only the device set differs.
-pool_arm() {   # pool_arm <arm> <pool-cells|""> [VAR=VAL ...]
+pool_arm() {   # pool_arm <arm> <""|on|legacy> [VAR=VAL ...]
     local arm=$1 pool=$2
     shift 2
     local -a pool_arg=()
-    [ -n "$pool" ] && pool_arg=(--kv-region-pool "$pool")
+    case "$pool" in
+        "")     pool_arg=()                                                        ;;
+        on)     pool_arg=(--kv-attendance-pool on)                                 ;;
+        legacy) pool_arg=(--kv-region-pool "$POOL_LEGACY")                         ;;
+        *)      echo "gate-kv-residency: unknown pool mode '$pool'" >&2; exit 2    ;;
+    esac
     run_arm "$arm" "$MODEL_POOL" "$PROMPT_POOL" \
         LLAMA_KV_POOL_STATS="$KEEPOUT/$arm.stats" "$@" -- \
         -md "$DRAFT_POOL" -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off \
@@ -388,12 +398,12 @@ pool_arm() {   # pool_arm <arm> <pool-cells|""> [VAR=VAL ...]
 # ===== the pool (one device) =============================================================================
 if [ "$DO_POOL" = 1 ]; then
     echo "-- pool arms (Flash-Next + MTP, -c $CTX_POOL q8_0 KV, -ncmoe 48, a 25 763-token prefix)"
-    pool_arm pref    ""            LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
-    pool_arm pres    "$POOL_RES"                                              || exit 1
-    pool_arm pfloor  "$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1                     || exit 1
+    pool_arm pref    ""       LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
+    pool_arm pres    on                                                   || exit 1
+    pool_arm plegacy legacy   LLAMA_KV_POOL_VERIFY=1                     || exit 1
 
-    HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of pfloor)
-    info "pref text: $HPRE    pres: $HPRES    pfloor: $HPFLR"
+    HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of plegacy)
+    info "pref text: $HPRE    pres: $HPRES    plegacy: $HPFLR"
 
     # A shared host/device memory pool (an integrated GPU, e.g. RDNA3.5 / gfx1151) REJECTS the pool: the mirror
     # is not a separate memory tier there and the page table is not correct on such a device yet (TODO #300).
@@ -403,9 +413,9 @@ if [ "$DO_POOL" = 1 ]; then
         info "the pool was DECLINED on this platform (shared host/device memory pool -- an integrated GPU;"
         info "  the window and the sparse arm are the supported placements there, TODO #300):"
         [ "$HPRE" = "$HPRES" ] && [ "$HPRE" = "$HPFLR" ] \
-            && pass "the declined pool changed no token (pref == pres == pfloor = $HPRE)" \
+            && pass "the declined pool changed no token (pref == pres == plegacy = $HPRE)" \
             || fail "the pool DECLINED but the text changed: '$HPRE' / '$HPRES' / '$HPFLR'"
-        [ "$(count pres 'ATTENDANCE POOL ENABLED')" = 0 ] && [ "$(count pfloor 'ATTENDANCE POOL ENABLED')" = 0 ] \
+        [ "$(count pres 'ATTENDANCE POOL ENABLED')" = 0 ] && [ "$(count plegacy 'ATTENDANCE POOL ENABLED')" = 0 ] \
             && pass "no pool arm engaged the placement (nothing to verify, nothing to get wrong)" \
             || fail "an arm reported 'ATTENDANCE POOL ENABLED' while another reported the decline: the guard and the placement disagree"
         info "-- pool section: DECLINED BY DESIGN on this platform (not a pass of the placement's numbers)"
@@ -414,20 +424,14 @@ if [ "$DO_POOL" = 1 ]; then
         && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
         || fail "pres != pref: '$HPRE' vs '$HPRES'"
     [ -n "$HPRE" ] && [ "$HPRE" = "$HPFLR" ] \
-        && pass "pfloor == pref (a pool claimed out under pressure changes no token)" \
-        || fail "pfloor != pref: '$HPRE' vs '$HPFLR'"
-    [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
-        && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
-        || fail "pres != pref: '$HPRE' vs '$HPRES'"
-    [ -n "$HPRE" ] && [ "$HPRE" = "$HPFLR" ] \
-        && pass "pfloor == pref (a pool claimed out under pressure changes no token)" \
-        || fail "pfloor != pref: '$HPRE' vs '$HPFLR'"
+        && pass "plegacy == pref (the accepted-and-ignored numeric spelling changes no token)" \
+        || fail "plegacy != pref: '$HPRE' vs '$HPFLR'"
 
     # ... and the PLACEMENT may not cost the PROMPT (r217).  The pool's page-fill path runs per DECODE step;
     # a prompt chunk writes every cell of its range and reuses nothing, so the fill is work the no-pool arm
     # does not do.  Measured 427.5 t/s against 829.3 at pp32K on one RX 7900 XTX (-48 %, WORKLOG 261105.001)
     # while every residency assertion above passed.  These two arms share the prompt, the binary and the
-    # device, so the rates are comparable by construction; pfloor carries the verify oracle and is not a
+    # device, so the rates are comparable by construction; plegacy carries the verify oracle and is not a
     # timing arm, so it is not asserted.  Both rates must be PRESENT: an unparsed rate would make this
     # vacuous, which is the one failure mode this gate exists to refuse.
     #
@@ -453,12 +457,12 @@ if [ "$DO_POOL" = 1 ]; then
 
     # acceptance is a second, independent witness: the drafter proposes from the same resolved KV
     acc() { grep -oE '"draft_n":[0-9]+,"draft_n_accepted":[0-9]+' "$KEEPOUT/$1.err" 2>/dev/null | tail -1; }
-    ARES=$(acc pres); AFLR=$(acc pfloor)
+    ARES=$(acc pres); AFLR=$(acc plegacy)
     [ -n "$ARES" ] && [ "$ARES" = "$AFLR" ] \
-        && pass "pres/pfloor draft acceptance identical ($AFLR)" \
+        && pass "pres/plegacy draft acceptance identical ($AFLR)" \
         || fail "draft acceptance differs: '$ARES' vs '$AFLR'"
 
-    for a in pres pfloor; do
+    for a in pres plegacy; do
         [ "$(count $a 'ATTENDANCE POOL ENABLED')" = 1 ] && pass "$a placed the attendance pool (once)" \
             || fail "$a 'ATTENDANCE POOL ENABLED' count = $(count $a 'ATTENDANCE POOL ENABLED') (want 1)"
         [ -s "$KEEPOUT/$a.stats" ] && pass "$a wrote its pool counters" \
@@ -476,33 +480,34 @@ if [ "$DO_POOL" = 1 ]; then
             && pass "$a reported $N_HITS per-id hits ($(pool_hit $a) %)" \
             || fail "$a reported no per-id hits"
     done
-    # the floor: an undersized request must be RAISED to one decode band, never honoured as-is
-    [ "$(count pfloor 'floored to one decode band')" = 1 ] \
-        && pass "pfloor's $POOL_FLOOR-cell request was floored to one decode band" \
-        || fail "pfloor did not report the decode-band floor ($(grep -m1 -o 'ATTENDANCE POOL ENABLED[^.]*' \
-                "$KEEPOUT/pfloor.err"))"
-    PAGES_RES=$(pool_pages pres); PAGES_FLR=$(pool_pages pfloor)
-    [ "${PAGES_RES:-0}" -gt "${PAGES_FLR:-0}" ] 2>/dev/null \
-        && pass "pres holds the whole cache ($PAGES_RES pages) and pfloor does not ($PAGES_FLR)" \
-        || fail "the two pool arms hold the same number of pages ($PAGES_RES vs $PAGES_FLR): the residency \
-difference is not real"
-    [ "$PAGES_RES" = $(( CTX_POOL / 4 )) ] \
-        && pass "pres holds the cache exactly ($PAGES_RES x 4 cells = -c $CTX_POOL)" \
-        || fail "pres holds $PAGES_RES pages, want -c/4 = $(( CTX_POOL / 4 ))"
-    # ... and the residency numbers must actually MOVE: same decode steps, more claim pressure, fewer hits
-    R_RES=$(pool_field pres resolves); R_FLR=$(pool_field pfloor resolves)
-    [ -n "$R_RES" ] && [ "$R_RES" = "$R_FLR" ] \
-        && pass "both arms ran the same $R_RES resolves (the comparison is fair)" \
-        || fail "the arms ran different resolve counts ('$R_RES' vs '$R_FLR')"
-    C_RES=$(claims_per_resolve pres); C_FLR=$(claims_per_resolve pfloor)
-    [ "$(claims_x100 pfloor)" -gt "$(claims_x100 pres)" ] 2>/dev/null \
-        && pass "pfloor claims more per resolve ($C_FLR vs $C_RES)" \
-        || fail "the two pool arms claim the same per resolve ($C_FLR vs $C_RES) -- the gate cannot leave the \
-resident pool"
-    H_RES=$(pool_hit pres); H_FLR=$(pool_hit pfloor)
-    awk -v a="$H_FLR" -v b="$H_RES" 'BEGIN { exit !(a+0 < b+0) }' \
-        && pass "pfloor's hit rate is lower ($H_FLR % vs $H_RES %)" \
-        || fail "the two pool arms report the same hit rate ($H_FLR % vs $H_RES %)"
+    # the SIZE is the system's now: one decode band of the indexer working set, and a legacy numeric request
+    # must build the SAME pool (accepted for compatibility, ignored -- r247)
+    [ "$(count pres 'sized by the system to one decode band')" = 1 ] \
+        && pass "pres reports a system-derived pool size (one decode band of the indexer working set)" \
+        || fail "pres did not report a derived size ($(grep -m1 -o 'ATTENDANCE POOL ENABLED[^.]*' \
+                "$KEEPOUT/pres.err"))"
+    [ "$(count plegacy 'accepted for compatibility and IGNORED')" = 1 ] \
+        && pass "plegacy says its numeric size is accepted and ignored" \
+        || fail "plegacy did not report the compatibility path ($(grep -m1 -o 'accepted for compatibility[^.]*' \
+                "$KEEPOUT/plegacy.err"))"
+    PAGES_RES=$(pool_pages pres); PAGES_FLR=$(pool_pages plegacy)
+    [ -n "$PAGES_RES" ] && [ "$PAGES_RES" = "$PAGES_FLR" ] \
+        && pass "pres and plegacy hold the same derived pool ($PAGES_RES pages): the numeric request was ignored" \
+        || fail "the pool size is still driven by the numeric request ($PAGES_RES vs $PAGES_FLR pages)"
+    [ "${PAGES_RES:-0}" -gt 0 ] 2>/dev/null && [ "$PAGES_RES" -lt $(( CTX_POOL / 4 )) ] \
+        && pass "the derived pool ($PAGES_RES pages) is smaller than the cache ($(( CTX_POOL / 4 )) pages): the \
+claim pressure is real" \
+        || fail "the derived pool holds '$PAGES_RES' of $(( CTX_POOL / 4 )) pages -- it must be a small cache, \
+not the whole context"
+    # ... and the residency numbers must actually MOVE under that pressure
+    C_RES=$(claims_per_resolve pres)
+    [ "$(claims_x100 pres)" -gt 0 ] 2>/dev/null \
+        && pass "pres claims pages per resolve ($C_RES) -- it is not a resident pool" \
+        || fail "pres claims nothing per resolve ($C_RES): the pool never leaves the resident placement"
+    H_RES=$(pool_hit pres)
+    awk -v a="$H_RES" 'BEGIN { exit !(a+0 > 0 && a+0 < 100) }' \
+        && pass "pres's per-id hit rate is $H_RES % (below 100 by construction, above 0)" \
+        || fail "pres's hit rate '$H_RES %' is outside (0,100): the counters are not a probe rate"
     fi   # end: placement graded (discrete GPU) | decline graded (shared host/device pool)
 
 fi
@@ -525,20 +530,20 @@ if [ "$DO_MULTI" = 1 ]; then
             shift 2
             RUN_DEVS="$MULTI_DEVICES" pool_arm "$arm" "$pool" "$@"
         }
-        pool_arm_md pmref   ""            LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
-        pool_arm_md pmres   "$POOL_RES"                                              || exit 1
-        pool_arm_md pmfloor "$POOL_FLOOR" LLAMA_KV_POOL_VERIFY=1                     || exit 1
+        pool_arm_md pmref   ""       LLAMA_QSA_DENSE_DECODE_UNTIL=0             || exit 1
+        pool_arm_md pmres   on                                                   || exit 1
+        pool_arm_md pmlegacy legacy LLAMA_KV_POOL_VERIFY=1                     || exit 1
 
-        HPMREF=$(hash_of pmref); HPMRES=$(hash_of pmres); HPMFLR=$(hash_of pmfloor)
-        info "pmref text: $HPMREF    pmres: $HPMRES    pmfloor: $HPMFLR"
+        HPMREF=$(hash_of pmref); HPMRES=$(hash_of pmres); HPMFLR=$(hash_of pmlegacy)
+        info "pmref text: $HPMREF    pmres: $HPMRES    pmlegacy: $HPMFLR"
         [ -n "$HPMREF" ] && [ "$HPMREF" = "$HPMRES" ] \
             && pass "pmres == pmref (a per-device pool is byte-identical to the 2-device sparse arm)" \
             || fail "pmres != pmref: '$HPMRES' vs '$HPMREF'"
         [ -n "$HPMREF" ] && [ "$HPMREF" = "$HPMFLR" ] \
-            && pass "pmfloor == pmref (forced misses across a device split change no token)" \
-            || fail "pmfloor != pmref: '$HPMFLR' vs '$HPMREF'"
+            && pass "pmlegacy == pmref (the ignored numeric spelling changes no token across a device split)" \
+            || fail "pmlegacy != pmref: '$HPMFLR' vs '$HPMREF'"
 
-        for a in pmres pmfloor; do
+        for a in pmres pmlegacy; do
             [ "$(count $a 'ATTENDANCE POOL ENABLED')" = 1 ] && pass "$a placed the attendance pool (once)" \
                 || fail "$a 'ATTENDANCE POOL ENABLED' count = $(count $a 'ATTENDANCE POOL ENABLED') (want 1)"
             [ "$(count $a "devices: each keeps its own mirror")" = 1 ] \
@@ -554,19 +559,22 @@ if [ "$DO_MULTI" = 1 ]; then
                 && pass "$a ran $MRES pool resolves" \
                 || fail "$a ran no pool resolve at all"
         done
-        # the residency numbers must move here too, or the two multi arms are the same placement
-        M_RES=$(claims_per_resolve pmres); M_FLR=$(claims_per_resolve pmfloor)
-        [ "$(claims_x100 pmfloor)" -gt "$(claims_x100 pmres)" ] 2>/dev/null \
-            && pass "pmfloor claims more per resolve ($M_FLR vs $M_RES)" \
-            || fail "the two multi-device arms claim the same per resolve ($M_FLR vs $M_RES)"
-        MH_RES=$(pool_hit pmres); MH_FLR=$(pool_hit pmfloor)
-        awk -v a="$MH_FLR" -v b="$MH_RES" 'BEGIN { exit !(a+0 < b+0) }' \
-            && pass "pmfloor's hit rate is lower ($MH_FLR % vs $MH_RES %)" \
-            || fail "the two multi-device arms report the same hit rate ($MH_FLR % vs $MH_RES %)"
-        PAGES_MRES=$(pool_pages pmres); PAGES_MFLR=$(pool_pages pmfloor)
-        [ "${PAGES_MRES:-0}" -gt "${PAGES_MFLR:-0}" ] 2>/dev/null \
-            && pass "pmres holds the whole cache ($PAGES_MRES pages) and pmfloor does not ($PAGES_MFLR)" \
-            || fail "the two multi-device arms hold the same number of pages ($PAGES_MRES vs $PAGES_MFLR)"
+        # the SIZE is the system's here too, and the counter blocks are already proven per device above
+        M_RES=$(claims_per_resolve pmres)
+        [ "$(claims_x100 pmres)" -gt 0 ] 2>/dev/null \
+            && pass "pmres claims pages per resolve ($M_RES) -- it is not a resident pool" \
+            || fail "pmres claims nothing per resolve ($M_RES): the pool never leaves the resident placement"
+        MH_RES=$(pool_hit pmres)
+        awk -v a="$MH_RES" 'BEGIN { exit !(a+0 > 0 && a+0 < 100) }' \
+            && pass "pmres's per-id hit rate is $MH_RES % (below 100 by construction)" \
+            || fail "pmres's hit rate '$MH_RES %' is outside (0,100): the counters are not a probe rate"
+        PAGES_MRES=$(pool_pages pmres); PAGES_MFLR=$(pool_pages pmlegacy)
+        [ -n "$PAGES_MRES" ] && [ "$PAGES_MRES" = "$PAGES_MFLR" ] \
+            && pass "pmres and pmlegacy hold the same derived pool ($PAGES_MRES pages)" \
+            || fail "the multi-device pool size still follows the numeric request ($PAGES_MRES vs $PAGES_MFLR)"
+        [ "${PAGES_MRES:-0}" -gt 0 ] 2>/dev/null && [ "$PAGES_MRES" -lt $(( CTX_POOL / 4 )) ] \
+            && pass "the derived multi-device pool ($PAGES_MRES pages) is smaller than the cache" \
+            || fail "the derived multi-device pool holds '$PAGES_MRES' of $(( CTX_POOL / 4 )) pages"
     fi
 fi
 
@@ -584,7 +592,7 @@ if [ "$DO_WINDOW" = 1 ]; then
     done
 fi
 if [ "$DO_POOL" = 1 ]; then
-    for a in pref pres pfloor pmref pmres pmfloor; do
+    for a in pref pres plegacy pmref pmres pmlegacy; do
         [ -s "$KEEPOUT/$a.err" ] || continue
         line=$(grep -m1 -E 'llama_kv_cache: size = ' "$KEEPOUT/$a.err" | sed -E 's/^.*size = +//')
         pool=$(grep -m1 -oE 'attendance pool: [0-9.]+ MiB of device pool, [0-9.]+ MiB of pinned host mirror, [0-9]+ pages of [0-9]+ cells' \

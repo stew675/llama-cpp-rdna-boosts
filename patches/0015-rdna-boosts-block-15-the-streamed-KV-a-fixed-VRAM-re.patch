@@ -1,4 +1,4 @@
-From a9d74e39325f794da3f42347dbbf69b6023968cb Mon Sep 17 00:00:00 2001
+From 8ac7efbd6c75695496c43804fc5323ec3f2e5e54 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -80,13 +80,35 @@ Gates:
   3072 cells ((win + 512) x 2)" and all six requests across both slots are byte-identical to win 0,
   acceptance identical (0.47222 / 17-36, 1.0 / 23-23).
 * check-gpu-faults.sh --since the session start: clean.
+
+r247 (issue #293 follow-up): all three placements default OFF, and the pool stops being a size knob.
+
+The MTP draft window shipped with `auto` as its default from r246 and that cost MTP decode whenever the
+request was deeper than the window: measured -9.7 % on a `-sm tensor` split at ~105k tokens (65 536-cell
+`auto` window 72.7 t/s against 80.5 off; text byte-identical; benchmarks/mtp-draft-window-depth.md).
+`--spec-draft-kv-window` now defaults to 0 in BOTH `common_params` and `llama_context_params`, and `auto`
+(cap or nothing) / `N` stay exactly as r246 defined them, as a conscious opt-in.
+
+The three placements now read the same way -- default off, `auto` = the system picks, `N` = explicit:
+  * `--spec-draft-kv-window [auto|N]`  (default 0)  truncates the DRAFTER's cache; lossy, measured caveat
+  * `--kv-window [auto|N]`             (default 0)  the LOSSLESS resident window, promoted from the
+    LLAMA_KV_RESIDENT_CELLS env var, which stays as the option's deprecated alias (the fit path and every
+    shipped script keep working).  New `llama_context_params.kv_resident_cells`
+  * `--kv-attendance-pool [on|off]`    (default off) the host-mirror + device page cache, renamed from
+    `--kv-region-pool` (kept as an alias).  Its SIZE is no longer a knob: it is derived from the model
+    (one decode band of the indexer working set, `QSA_DECODE_BAND x ceil(top_k / page)`), because a numeric
+    request only ever bought ~1 point of hit rate for 2x the VRAM and `auto` had nothing to size it
+    (TODO #313, closed).  A legacy numeric size or `auto` is accepted and IGNORED, with a WARN saying so.
+
+Default-OFF is what makes the window's cost a documented caveat instead of a shipped regression, and it
+also means no default run carries a placement decision at all.
 ---
- common/arg.cpp                             |   51 +
- common/common.cpp                          |   31 +-
- common/common.h                            |   10 +
+ common/arg.cpp                             |   94 ++
+ common/common.cpp                          |   32 +-
+ common/common.h                            |   25 +
  common/draft-reserve.cpp                   |   57 +-
  common/draft-reserve.h                     |   12 +-
- common/fit.cpp                             |  434 +++++-
+ common/fit.cpp                             |  439 +++++-
  common/speculative.cpp                     |    5 +
  ggml/include/ggml-backend.h                |   20 +
  ggml/include/ggml-rpc.h                    |    4 +-
@@ -108,58 +130,98 @@ Gates:
  ggml/src/ggml-cuda/moe-expert-cache.cu     |   43 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
  ggml/src/ggml.c                            |   83 +-
- include/llama.h                            |   11 +
- src/llama-context.cpp                      |   23 +
+ include/llama.h                            |   23 +
+ src/llama-context.cpp                      |   29 +
  src/llama-context.h                        |    3 +
- src/llama-cparams.h                        |    6 +
- src/llama-ext.h                            |   73 +
- src/llama-kv-cache.cpp                     | 1037 ++++++++++++-
+ src/llama-cparams.h                        |    9 +
+ src/llama-ext.h                            |   83 ++
+ src/llama-kv-cache.cpp                     | 1067 +++++++++++++-
  src/llama-kv-cache.h                       |  105 +-
  src/llama-memory-hybrid-idx.cpp            |   10 +-
  src/llama-memory-hybrid-idx.h              |    5 +-
  src/llama-memory-hybrid.cpp                |   15 +-
  src/llama-memory-hybrid.h                  |    8 +-
- src/llama-memory.h                         |   18 +
+ src/llama-memory.h                         |   19 +
  src/llama-model-loader.cpp                 | 1372 ++++++++---------
  src/llama-model-loader.h                   |   13 +
  src/llama-model.cpp                        |  177 ++-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   66 +-
- 44 files changed, 6580 insertions(+), 763 deletions(-)
+ 44 files changed, 6706 insertions(+), 763 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 4c58f91b8..61c1d7030 100644
+index 4c58f91b8..faa73a2e9 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1697,6 +1697,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1697,6 +1697,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.kv_unified = value;
          }
      ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
 +    add_opt(common_arg(
-+        {"--kv-region-pool"}, "[auto|N]",
-+        string_format("attendance pool for the attention KV, in cells per layer: 'auto', '0' (off), or N cells "
-+                      "(default: %s).  The pool is a compact device pool of pages plus an AUTHORITATIVE pinned host "
-+                      "mirror; a decode step resolves its top-k selection through the page table and fills the pages "
-+                      "it missed from the mirror.  It only serves the sparse QSA decode arm (a qwen4exp trunk: a "
-+                      "uniform indexer-block geometry, one stream, device-offloaded K/V), it declines everywhere else, "
-+                      "and it costs prompt throughput on a KV that fits.  'auto' does not take the pool yet -- nothing "
-+                      "sizes it -- and says so once at startup.  Formerly the LLAMA_KV_REGION_POOL env var",
-+                      params.kv_region_pool < 0 ? "auto" : std::to_string(params.kv_region_pool).c_str()),
++        {"--kv-window"}, "[auto|N]",
++        string_format("the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N "
++                      "cells (default: %s).  The newest N cells stay in VRAM and everything older moves to pinned "
++                      "system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  "
++                      "LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe "
++                      "link, which costs 11-26 %% of decode once your request is deeper than the window.  'auto' "
++                      "is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a "
++                      "placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device "
++                      "CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the "
++                      "drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias",
++                      params.kv_resident_cells < 0 ? "auto" : std::to_string(params.kv_resident_cells).c_str()),
 +        [](common_params & params, const std::string & value) {
 +            if (is_autoy(value)) {
++                params.kv_resident_cells = -1;
++            } else if (is_falsey(value)) {
++                params.kv_resident_cells = 0;
++            } else {
++                try {
++                    const int v = std::stoi(value);
++                    if (v < 0) {
++                        throw std::invalid_argument("negative");
++                    }
++                    params.kv_resident_cells = v;
++                } catch (...) {
++                    throw std::invalid_argument(
++                        string_format("error: unknown value for --kv-window: '%s'\n", value.c_str()));
++                }
++            }
++        }
++    ).set_env("LLAMA_ARG_KV_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--kv-attendance-pool", "--kv-region-pool"}, "[on|off]",
++        string_format("take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: %s).  The KV's "
++                      "AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of "
++                      "indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is "
++                      "one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block "
++                      "geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated "
++                      "GPU, and while the resident window is active -- the two are ALTERNATIVES for the same "
++                      "bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool "
++                      "instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 %% of "
++                      "pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from "
++                      "the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is "
++                      "accepted for compatibility and IGNORED",
++                      params.kv_region_pool != 0 ? "on" : "off"),
++        [](common_params & params, const std::string & value) {
++            if (is_autoy(value)) {
++                // the r246 spelling for "the system's size": still ON, and the cache says the value is ignored
 +                params.kv_region_pool = -1;
++            } else if (common_arg_utils::is_truthy(value)) {
++                params.kv_region_pool = 1;
 +            } else if (is_falsey(value)) {
 +                params.kv_region_pool = 0;
 +            } else {
 +                try {
-+                    params.kv_region_pool = std::max(0, std::stoi(value));
++                    // a legacy numeric size (r246): accepted, and IGNORED by the cache -- it stays non-zero so
++                    // the cache can SEE that a size was asked for and say it is not a knob any more
++                    params.kv_region_pool = std::stoi(value);
 +                } catch (...) {
-+                    throw std::invalid_argument(
-+                        string_format("error: unknown value for --kv-region-pool: '%s'\n", value.c_str()));
++                    throw std::invalid_argument(string_format(
++                        "error: unknown value for --kv-attendance-pool: '%s'\n", value.c_str()));
 +                }
 +            }
 +        }
@@ -167,20 +229,23 @@ index 4c58f91b8..61c1d7030 100644
      add_opt(common_arg(
          {"--cache-idle-slots"},
          {"--no-cache-idle-slots"},
-@@ -4300,6 +4325,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4300,6 +4365,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
 +    add_opt(common_arg(
 +        {"--spec-draft-kv-window"}, "[auto|N]",
 +        string_format("MTP only: the draft context's own KV window, in cells per sequence -- 'auto', '0' (a full "
-+                      "`-c` draft cache), or N cells (default: %s).  The draft context carries a KV of its own, sized "
-+                      "`-c` (one draft layer: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144`), although the "
-+                      "drafter only reads its recent prefix; a window makes it a ring instead.  This is an "
-+                      "APPROXIMATION the target verifies: a truncated draft is a slower run, never a wrong answer.  "
-+                      "'auto' is THE CAP OR NOTHING -- 65536 cells, or no window at all when 65536 would not leave a "
-+                      "batch of room below every sequence's own context -- because a window below the depth the "
-+                      "drafter works over costs 7-9 %% of decode.  Formerly the LLAMA_SPEC_DRAFT_WINDOW env var",
++                      "`-c` draft cache, the DEFAULT), or N cells (default: %s).  The draft context carries a KV of "
++                      "its own, sized `-c` (one draft layer: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144`), "
++                      "although the drafter only reads its recent prefix; a window makes it a ring instead.  This is "
++                      "an APPROXIMATION the target verifies: a truncated draft is a slower run, never a wrong "
++                      "answer.  'auto' is THE CAP OR NOTHING -- 65536 cells, or no window at all when 65536 would "
++                      "not leave a batch of room below every sequence's own context.  OFF by default since r247: "
++                      "a window the request outgrows costs draft acceptance AND a per-step cost past the ring wrap "
++                      "(measured -9.7 %% of MTP decode on a tensor split at 105k tokens; "
++                      "benchmarks/mtp-draft-window-depth.md), so 'auto' and N are a conscious opt-in.  "
++                      "Formerly the LLAMA_SPEC_DRAFT_WINDOW env var",
 +                      params.speculative.draft.kv_window < 0 ? "auto" : std::to_string(params.speculative.draft.kv_window).c_str()),
 +        [](common_params & params, const std::string & value) {
 +            if (is_autoy(value)) {
@@ -201,7 +266,7 @@ index 4c58f91b8..61c1d7030 100644
          {"--spec-draft-n-min-adaptive"}, "N",
          string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
 diff --git a/common/common.cpp b/common/common.cpp
-index 33e3c24b8..f7717567b 100644
+index 33e3c24b8..e96601e86 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1254,11 +1254,35 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
@@ -242,40 +307,56 @@ index 33e3c24b8..f7717567b 100644
  }
  
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-@@ -2086,6 +2110,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -2086,6 +2110,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
-+    // the delivery's two KV-placement options (formerly LLAMA_SPEC_DRAFT_WINDOW / LLAMA_KV_REGION_POOL)
++    // the delivery's KV-placement options (block 15; all three default off since r247)
 +    cparams.spec_draft_kv_window = params.speculative.draft.kv_window;
 +    cparams.kv_region_pool       = params.kv_region_pool;
++    cparams.kv_resident_cells    = params.kv_resident_cells;
  
      // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
      // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
 diff --git a/common/common.h b/common/common.h
-index bcf7e828a..9f89b30e8 100644
+index bcf7e828a..0384a6ca6 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -365,6 +365,11 @@ struct common_params_speculative_draft {
+@@ -365,6 +365,14 @@ struct common_params_speculative_draft {
      // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
      int32_t mtp_vocab = 0;
  
 +    // MTP only (`--spec-draft-kv-window`): the draft context's KV window in CELLS per sequence.
 +    // -1 = `auto` (the cap or nothing), 0 = a full `-c` draft cache, N = N cells.  The delivery's own option
 +    // (formerly the LLAMA_SPEC_DRAFT_WINDOW env var, which r246 removed).
-+    int32_t kv_window = -1;
++    // DEFAULT 0 since r247: a window below the depth the request reaches costs decode (measured -9.7 % of
++    // MTP decode on a tensor split at 105k tokens), and the default path must not carry a placement
++    // decision.  `auto` and `N` are a conscious opt-in; see benchmarks/mtp-draft-window-depth.md.
++    int32_t kv_window = 0;
 +
      common_cpu_params cpuparams;
      common_cpu_params cpuparams_batch;
  
-@@ -667,6 +672,11 @@ struct common_params {
+@@ -667,6 +675,23 @@ struct common_params {
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  
-+    // `--kv-region-pool`: the ATTENDANCE POOL, in CELLS per layer of the attention KV.  -1 = `auto`, 0 = off,
-+    // N = N cells.  Only a qwen4exp trunk cache can take it (its decode read is the sparse QSA arm).  The
-+    // delivery's own option (formerly the LLAMA_KV_REGION_POOL env var, which r246 removed).
-+    int32_t kv_region_pool = -1;
++    // `--kv-attendance-pool` (the `--kv-region-pool` spelling is kept as an alias): the ATTENDANCE POOL --
++    // the attention KV as an AUTHORITATIVE pinned host MIRROR plus a compact device pool of indexer pages
++    // that the sparse QSA decode arm resolves through.  0 = off, non-zero = on.  Only a qwen4exp trunk cache
++    // can take it (its decode read is the sparse QSA arm).  The pool's SIZE is derived from the model (one
++    // decode band of the indexer working set, `indexer_top_k x QSA_DECODE_BAND`), so a legacy numeric value
++    // is accepted for compatibility and ignored -- the size is not a user knob (TODO #313, closed r247).
++    int32_t kv_region_pool = 0;
++
++    // `--kv-window`: the RESIDENT WINDOW (block 15 Goal A) -- how much of the attention KV stays in VRAM, in
++    // CELLS.  -1 = `auto` (`--fit` sizes it; without `--fit` the cache declines and says so), 0 = off (fully
++    // resident), N = the newest N cells.  Model-agnostic and LOSSLESS: the older cells live in pinned system
++    // RAM inside the same VA reservation, and every read of one goes over the PCIe link.  Not the same thing
++    // as the pool (which keeps a device CACHE of a host-authoritative copy) and not the draft window (which
++    // TRUNCATES the drafter's cache).  The legacy env var `LLAMA_KV_RESIDENT_CELLS` is still honoured as the
++    // option's deprecated alias.
++    int32_t kv_resident_cells = 0;
 +
      size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
      float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
@@ -413,7 +494,7 @@ index 8e65564b6..20a42f3b2 100644
 +                                                   bool kv_unified = false,
 +                                                   int32_t draft_kv_window = -1);
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 3f1c82251..a9dbae626 100644
+index 3f1c82251..165a7eb28 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -133,6 +133,76 @@ struct common_fit_cache_reserve {
@@ -542,7 +623,19 @@ index 3f1c82251..a9dbae626 100644
                  break;
              }
          }
-@@ -503,13 +599,30 @@ static void common_params_fit_impl(
+@@ -389,6 +485,11 @@ static void common_params_fit_impl(
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+     constexpr int64_t MiB = 1024*1024;
++
++    // the resident window's REQUEST (`--kv-window`, or its deprecated LLAMA_KV_RESIDENT_CELLS alias) reaches
++    // the library through the context params; hand it over before the sizing below asks for it.
++    llama_kv_region_set_window_request(cparams->kv_resident_cells);
++
+     typedef std::vector<llama_device_memory_data> dmds_t;
+     const llama_model_params default_mparams = llama_model_default_params();
+ 
+@@ -503,13 +604,30 @@ static void common_params_fit_impl(
          }
      };
  
@@ -574,7 +667,7 @@ index 3f1c82251..a9dbae626 100644
  
      // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
      const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-@@ -521,11 +634,27 @@ static void common_params_fit_impl(
+@@ -521,11 +639,27 @@ static void common_params_fit_impl(
          if (n_streams > 1) {
              LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                  __func__, n_ctx_max, n_streams);
@@ -594,7 +687,7 @@ index 3f1c82251..a9dbae626 100644
 +    // charges it to the host bucket, so it is absent from the device tier) and only the compact device pool
 +    // is VRAM -- and, unlike every other KV, that VRAM does NOT grow with `-c`.
 +    if (kv_pool_vram != 0 || kv_pool_ram != 0) {
-+        LOG_WRN("%s: the ATTENDANCE POOL is active (--kv-region-pool): the KV's device tier is the compact "
++        LOG_WRN("%s: the ATTENDANCE POOL is active (--kv-attendance-pool): the KV's device tier is the compact "
 +                "pool (%.1f MiB of VRAM) and its %.1f MiB authoritative mirror is pinned host RAM, which the "
 +                "device budget does not carry.  The pool's VRAM is fixed; only the mirror grows with -c.\n",
 +                __func__, (double) kv_pool_vram / MiB, (double) kv_pool_ram / MiB);
@@ -603,7 +696,7 @@ index 3f1c82251..a9dbae626 100644
      const size_t nd = devs.size(); // number of devices
  
      std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
-@@ -534,7 +663,18 @@ static void common_params_fit_impl(
+@@ -534,7 +668,18 @@ static void common_params_fit_impl(
          margins.push_back(margins_s[0]);
      } else {
          for (size_t id = 0; id < nd; id++) {
@@ -623,7 +716,7 @@ index 3f1c82251..a9dbae626 100644
          }
      }
  
-@@ -766,6 +906,152 @@ static void common_params_fit_impl(
+@@ -766,6 +911,152 @@ static void common_params_fit_impl(
                  __func__, ntd, used_total/MiB, budget/MiB);
          }
  
@@ -644,7 +737,7 @@ index 3f1c82251..a9dbae626 100644
 +        // but a window whose charge still scaled with `ntd x -c` could never let a pinned context fit, so the
 +        // window is sized against the PHYSICAL KV term: the resident `W x cell_bytes` while it is active, the
 +        // whole logical `kv_bytes` when it is not.  This correction is applied ONLY where a window was asked
-+        // for; a run without `LLAMA_KV_RESIDENT_CELLS` keeps the branch's arithmetic exactly.
++        // for; a run without `--kv-window` keeps the branch's arithmetic exactly.
 +        //
 +        // Per-device feasibility (the note's `min over devices`): the loader shards the KV along the KV-head
 +        // axis by the same `tensor_split` ratio it shards the weights by, so device `i` holds `ratio_i x W x
@@ -667,7 +760,7 @@ index 3f1c82251..a9dbae626 100644
 +                            "split's KV is not one (the backend, or one of the devices behind the Meta wrapper, does "
 +                            "not provide the region buffer type); the window is left as configured\n", __func__);
 +                } else if (kv_auto && n_ctx_auto) {
-+                    LOG_WRN("%s: LLAMA_KV_RESIDENT_CELLS=auto only spills a context the user pinned; with -c unset "
++                    LOG_WRN("%s: --kv-window auto only spills a context the user pinned; with -c unset "
 +                            "the fit sizes a fully resident context instead (%" PRIu32 " cells).  Pass `-c <cells>` "
 +                            "next to `auto` to keep a bigger context and spill the tail.\n", __func__, n_ctx_max);
 +                } else {
@@ -722,7 +815,7 @@ index 3f1c82251..a9dbae626 100644
 +                        // a zero-width spill saves nothing.  Nothing to hand down: the KV stays fully resident.
 +                        if (kv_auto) {
 +                            llama_kv_region_set_resident_cells(0);
-+                            LOG_WRN("%s: LLAMA_KV_RESIDENT_CELLS=auto: no window is needed -- the %" PRIu32
++                            LOG_WRN("%s: --kv-window auto: no window is needed -- the %" PRIu32
 +                                    "-cell KV (%.1f MiB, %.1f MiB of it on each of %zu devices) fits fully resident "
 +                                    "(%.1f MiB of VRAM left over the %" PRId64 " MiB target)\n",
 +                                    __func__, kv_cells, (double) kv_bytes / MiB, (double) kv_bytes / MiB / (double) ntd,
@@ -749,7 +842,7 @@ index 3f1c82251..a9dbae626 100644
 +                                "so a token at the full context reads %.1f MiB = about %.1f ms at %s, and nothing "
 +                                "spills below depth %zu.  The tightest per-device target is %zu MiB, which is what "
 +                                "makes each device able to hold its proportional slice; unset "
-+                                "LLAMA_KV_RESIDENT_CELLS to keep the KV fully resident.\n",
++                                "--kv-window 0 to keep the KV fully resident.\n",
 +                                __func__, (double) (kv_bytes - res_bytes) / MiB, (double) projected / MiB,
 +                                budget / MiB, (double) proj_free / MiB, (double) cell_bytes / 1024.0,
 +                                gbps > 0.0f ? (std::to_string((int) (gbps + 0.5f)) + " GB/s, calibrated").c_str()
@@ -776,7 +869,7 @@ index 3f1c82251..a9dbae626 100644
          if (used_total <= budget) {
              LOG_TRC("%s: tensor split: no changes needed\n", __func__);
              return;
-@@ -821,6 +1107,136 @@ static void common_params_fit_impl(
+@@ -821,6 +1112,136 @@ static void common_params_fit_impl(
          return;
      }
  
@@ -793,7 +886,7 @@ index 3f1c82251..a9dbae626 100644
 +    //   `(depth - W) x cell_bytes` of per-token spill -- i.e. when `-c` is much larger than the depth you run
 +    //   at.  At `-c` ~1.4x the depth it is a measured loss (Flash-Next: 0.39 GiB freed, -14.6 % decode), at
 +    //   `-c` ~4x it is a measured win (3.63 GiB freed, +13.1 % prefill, 0 % decode -- nothing spills at the
-+    //   run's depth).  So `LLAMA_KV_RESIDENT_CELLS=<cells>` states the window and `=auto` lets this function
++    //   run's depth).  So `--kv-window N` states the window and `--kv-window auto` lets this function
 +    //   size it; `-c` close to what fits should keep the cache fully resident.
 +    //
 +    // Only one device is sized here: the multi-device (tensor/layer split) paths decide layer placement in
@@ -811,7 +904,7 @@ index 3f1c82251..a9dbae626 100644
 +            } else if (kv_auto && n_ctx_auto) {
 +                // `-c` is ours to choose: prefer a context that fits FULLY RESIDENT (no per-token cost) and say
 +                // how to get the bigger one, rather than silently trading decode speed for context length.
-+                LOG_WRN("%s: LLAMA_KV_RESIDENT_CELLS=auto only spills a context the user pinned; with -c unset "
++                LOG_WRN("%s: --kv-window auto only spills a context the user pinned; with -c unset "
 +                        "the fit will size a fully resident context instead (%" PRIu32 " cells).  Pass `-c <cells>` "
 +                        "next to `auto` to keep a bigger context and spill the tail.\n", __func__, n_ctx_max);
 +            } else {
@@ -871,7 +964,7 @@ index 3f1c82251..a9dbae626 100644
 +                    // it does not fit at all, and today's fit-or-fail is then the honest answer
 +                    if (kv_auto) {
 +                        llama_kv_region_set_resident_cells(0);
-+                        LOG_WRN("%s: LLAMA_KV_RESIDENT_CELLS=auto: no window is needed -- the %" PRIu32
++                        LOG_WRN("%s: --kv-window auto: no window is needed -- the %" PRIu32
 +                                "-cell KV (%.1f MiB) fits fully resident (%.1f MiB of VRAM left over the %" PRId64
 +                                " MiB target)\n", __func__, kv_cells, (double) kv_bytes / MiB,
 +                                (double) budget_kv / MiB, margins[0] / MiB);
@@ -913,7 +1006,7 @@ index 3f1c82251..a9dbae626 100644
      std::vector<std::string> dev_names;
      {
          dev_names.reserve(nd);
-@@ -921,7 +1337,15 @@ static void common_params_fit_impl(
+@@ -921,7 +1342,15 @@ static void common_params_fit_impl(
                      "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                      __func__, -global_surplus/MiB);
              }
@@ -925,7 +1018,7 @@ index 3f1c82251..a9dbae626 100644
 +                // pinned mirror could then OOM the host.  Skip it and let the layer reduction below decide.
 +                LOG_WRN("%s: cannot buy device memory back by reducing the context: the attendance pool's VRAM "
 +                        "is fixed and only its pinned host mirror scales with -c.  Pin -c, lower -ngl, or unset "
-+                        "--kv-region-pool 0 to fit the context instead.\n", __func__);
++                        "--kv-attendance-pool off to fit the context instead.\n", __func__);
 +            } else if (n_ctx_auto) {
                  if (n_ctx_max > n_ctx_min_total) {
                      int64_t sum_used_target = sum_free;
@@ -5386,42 +5479,59 @@ index 74250c6ed..b67a53bf3 100644
  
  struct ggml_tensor * ggml_indexer_top_k(
 diff --git a/include/llama.h b/include/llama.h
-index d864ca576..f1e3ee795 100644
+index d864ca576..5de6c8277 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -494,6 +494,17 @@ extern "C" {
+@@ -494,6 +494,29 @@ extern "C" {
          // a source/target/parent context
          // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
          struct llama_context * ctx_other;
 +
-+        // --- the delivery's two KV-placement options (both are also command-line flags; the env vars that
-+        // used to drive them are gone, r246) ---
-+        int32_t spec_draft_kv_window;  // MTP draft context only: its KV window in CELLS per sequence
-+                                       // (-1 = auto policy, 0 = a full `n_ctx` cache, N = N cells).  A window
-+                                       // drops the drafter's oldest cells; the target verifies every drafted
-+                                       // token, so a truncated draft can only be slower, never wrong
++        // --- the delivery's KV-placement options (block 15; all three are also command-line flags, and all
++        // three DEFAULT TO OFF: a placement that changes decode cannot be a default) ---
++        int32_t spec_draft_kv_window;  // MTP draft context only (`--spec-draft-kv-window`): its KV window in
++                                       // CELLS per sequence (-1 = auto policy, 0 = a full `n_ctx` cache,
++                                       // N = N cells; DEFAULT 0 since r247).  A window DROPS the drafter's
++                                       // oldest cells; the target verifies every drafted token, so a truncated
++                                       // draft can only be slower, never wrong.  Measured: -9.7 % of MTP
++                                       // decode on a tensor split at 105k tokens past a 65536-cell window
 +                                       // [EXPERIMENTAL]
-+        int32_t kv_region_pool;        // ATTENDANCE POOL size in CELLS per layer for the attention KV
-+                                       // (-1 = auto, 0 = off, N = N cells).  Only a qwen4exp trunk cache can
-+                                       // take it (its decode read is the sparse QSA arm) [EXPERIMENTAL]
++        int32_t kv_region_pool;        // the ATTENDANCE POOL (`--kv-attendance-pool`, alias
++                                       // `--kv-region-pool`): 0 = off (default), non-zero = on.  The
++                                       // attention KV becomes an authoritative pinned host MIRROR plus a
++                                       // compact device pool of indexer pages the sparse QSA decode resolves
++                                       // through.  Only a qwen4exp trunk cache can take it, and it is the
++                                       // alternative to the resident window, never a layer on top of it.  The
++                                       // pool's SIZE is derived from the model and is not a knob [EXPERIMENTAL]
++        int32_t kv_resident_cells;     // `--kv-window`: the RESIDENT WINDOW, the newest N CELLS of the
++                                       // attention KV that stay in VRAM with the older ones spilled to pinned
++                                       // host RAM (lossless; a model-agnostic placement).  -1 = auto (`--fit`
++                                       // sizes it), 0 = off (default), N = N cells.  The legacy env var
++                                       // `LLAMA_KV_RESIDENT_CELLS` is honoured as this option's deprecated alias
++                                       // [EXPERIMENTAL]
      };
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2d7a0ead1..9fe7e3be1 100644
+index 2d7a0ead1..33909aaad 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -649,6 +649,9 @@ llama_context::llama_context(
+@@ -649,6 +649,14 @@ llama_context::llama_context(
      cparams.moe_cache_size      = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
      cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
-+    // the delivery's two KV-placement options (formerly LLAMA_SPEC_DRAFT_WINDOW / LLAMA_KV_REGION_POOL)
++    // --- the delivery's KV-placement options (block 15; all three DEFAULT OFF since r247) ---
 +    cparams.spec_draft_kv_window = params.spec_draft_kv_window;
 +    cparams.kv_region_pool       = params.kv_region_pool;
++    cparams.kv_resident_cells    = params.kv_resident_cells;
++    // hand the resident-window REQUEST to the library before any cache exists (a library consumer sets it
++    // through `llama_context_params`; `common_params_fit` sets the same thing, and its own decision arrives
++    // through `llama_kv_region_set_resident_cells`).
++    llama_kv_region_set_window_request(params.kv_resident_cells);
  
      // resolved after flash attention, see resolve_fused_ops()
      {
-@@ -800,6 +803,8 @@ llama_context::llama_context(
+@@ -800,6 +808,8 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
@@ -5430,16 +5540,17 @@ index 2d7a0ead1..9fe7e3be1 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
-@@ -6057,6 +6062,8 @@ llama_context_params llama_context_default_params() {
+@@ -6057,6 +6067,9 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
-+        /*.spec_draft_kv_window        =*/ -1,
-+        /*.kv_region_pool              =*/ -1,
++        /*.spec_draft_kv_window        =*/ 0,
++        /*.kv_region_pool              =*/ 0,
++        /*.kv_resident_cells           =*/ 0,
      };
  
      return result;
-@@ -6838,6 +6845,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -6838,6 +6851,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
@@ -5477,24 +5588,27 @@ index 3e66d5518..3641e2017 100644
      // training
      //
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index f1f723f9e..3983780d2 100644
+index f1f723f9e..dc477167b 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -24,6 +24,12 @@ struct llama_cparams {
+@@ -24,6 +24,15 @@ struct llama_cparams {
  
      int32_t  mtp_draft_vocab = 0; // MTP draft vocabulary subset in use by this context (0 = full vocabulary)
  
-+    // The delivery's two KV-placement options, from `llama_context_params` (first-class since r246):
-+    //   spec_draft_kv_window  the MTP draft cache's window in CELLS per sequence (-1 = auto, 0 = off, N = N)
-+    //   kv_region_pool        the attendance pool in CELLS per layer         (-1 = auto, 0 = off, N = N)
-+    int32_t  spec_draft_kv_window = -1;
-+    int32_t  kv_region_pool       = -1;
++    // The delivery's KV-placement options, from `llama_context_params` (first-class since r246, default OFF
++    // since r247):
++    //   spec_draft_kv_window  the MTP draft cache's TRUNCATING window (-1 = auto, 0 = off, N = N cells)
++    //   kv_region_pool        the attendance pool: 0 = off, non-zero = on (size is derived, not a knob)
++    //   kv_resident_cells     the LOSSLESS resident window: -1 = auto (fit), 0 = off, N = N cells
++    int32_t  spec_draft_kv_window = 0;
++    int32_t  kv_region_pool       = 0;
++    int32_t  kv_resident_cells    = 0;
 +
      float rope_freq_base;
      float rope_freq_scale;
  
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 7811dc049..77b4e39e6 100644
+index 7811dc049..e07fd2057 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -127,6 +127,11 @@ LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model,
@@ -5509,7 +5623,7 @@ index 7811dc049..77b4e39e6 100644
  // the backend buffers that a state write of this memory would touch - empty caches report none
  LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
  
-@@ -244,3 +249,71 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+@@ -244,3 +249,81 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
  
  // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
  LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
@@ -5517,18 +5631,24 @@ index 7811dc049..77b4e39e6 100644
 +//
 +// The windowed KV cache.
 +//
-+// `LLAMA_KV_RESIDENT_CELLS=<cells>` keeps the newest <cells> cells of the KV in VRAM and puts everything
-+// older in pinned system RAM; `=auto` leaves the number to `--fit`, which sizes it against the device memory
-+// it has left after the expert arena's reserve and the pinned-RAM ceiling on the spill.  Unset (or 0) = no
-+// window: the KV takes the plain device buffer and the run is byte-identical to a build without this
-+// feature, including its OOM.
++// `--kv-window N` keeps the newest N cells of the KV in VRAM and puts everything older in pinned system RAM;
++// `--kv-window auto` leaves the number to `--fit`, which sizes it against the device memory it has left after
++// the expert arena's reserve and the pinned-RAM ceiling on the spill.  Off (the default, since r247) = no
++// window: the KV takes the plain device buffer and the run is byte-identical to a build without this feature,
++// including its OOM.  The legacy `LLAMA_KV_RESIDENT_CELLS` env var is honoured as the option's alias.
 +//
 +// Is the KV region provider available (a device that offers VMM, and `LLAMA_KV_REGION=0` not given)?
 +LLAMA_API bool llama_kv_region_is_enabled(void);
 +
 +// The window the cache would use: 0 = none, UINT32_MAX = `auto` (fit decides), else the cell count.
-+// Reads the fit decision first, then the environment.
++// Precedence: the fit's decision, then the `--kv-window` request (a library consumer sets it through
++// `llama_context_params.kv_resident_cells`), then the deprecated `LLAMA_KV_RESIDENT_CELLS` env alias.
 +LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
++
++// The `--kv-window` REQUEST in cells: 0 = nothing asked, -1 = `auto` (fit decides), N = N cells.  Set from
++// `llama_context_params.kv_resident_cells` at context creation and by `common_params_fit` before any context
++// exists; the fit's own DECISION still goes through `llama_kv_region_set_resident_cells`.
++LLAMA_API void llama_kv_region_set_window_request(int32_t req);
 +
 +// For `--fit`'s measurement context only: take a region buffer even with no window, so the fit can identify
 +// the KV's bytes.  No batch ever runs on such a context.
@@ -5547,15 +5667,19 @@ index 7811dc049..77b4e39e6 100644
 +// (a wrong draft is a slower run, never a wrong answer).  `req` is the request as `llama_context_params`
 +// carries it:
 +//
-+//   `auto` (default, -1)  THE CAP OR NOTHING: 65536 cells -- or no window at all when 65536 would not leave a
-+//                         batch of room below every sequence's own context.  A window at or above the context
-+//                         the drafter actually works over changes no draft; every cell below it that it masks
-+//                         is a decode cost (7-9 % when the request is deeper than the window, 8 % at `-c 131072`
-+//                         with the pre-r246 quarter-of-the-context policy -- issue #293).  A window that has to
-+//                         be smaller than the cap saves at most one batch of cells per sequence and buys that
-+//                         decode cost, so it is declined instead of granted
-+//   `0`                   no window: a full `-c` draft cache, byte-identical to a pre-window build
++//   `0` (DEFAULT, r247)   no window: a full `-c` draft cache, byte-identical to a pre-window build.  The
++//                         default because a window the request outgrows costs decode: measured -9.7 % of MTP
++//                         decode on a `-sm tensor` split at ~105k tokens (65 536-cell `auto` window against
++//                         off), through BOTH a lower draft acceptance (0.500 -> 0.453) and a per-step cost
++//                         past the ring wrap that grows with the window (`benchmarks/mtp-draft-window-depth.md`)
++//   `auto` (-1)           THE CAP OR NOTHING: 65536 cells -- or no window at all when 65536 would not leave a
++//                         batch of room below every sequence's own context.  Every cell below the cap that the
++//                         window masks is a decode cost once the request is deeper than it, so a window that
++//                         has to be smaller than the cap is declined instead of granted (issue #293)
 +//   `N`                   N cells per sequence (floored at one ubatch, and declined where it would not fit)
++//
++// `auto` and `N` are a conscious opt-in: they are a fittability feature (the freed VRAM reaches the expert
++// arena), and the cost above is the documented price of using one past its depth.
 +//
 +// Returns the PER-SEQUENCE window in cells, or 0 for "no window" (nothing to save at this context, or
 +// disabled).  MTP only: a DFlash2/`-md` draft keeps its own `-c` cache.  This is the policy; the cache's cell
@@ -5582,10 +5706,10 @@ index 7811dc049..77b4e39e6 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index e938d95c0..e50f4d187 100644
+index e938d95c0..a08e1dea9 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -18,6 +18,306 @@ static bool ggml_is_power_of_2(int n) {
+@@ -18,6 +18,333 @@ static bool ggml_is_power_of_2(int n) {
      return (n & (n - 1)) == 0;
  }
  
@@ -5607,7 +5731,7 @@ index e938d95c0..e50f4d187 100644
 +typedef int (*llama_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
 +
 +// Is the region PROVIDER usable at all?  Default yes: the buffer type is only ever taken when a window is
-+// actually asked for (`LLAMA_KV_RESIDENT_CELLS`), so the default path is the plain device buffer and this
++// actually asked for (`--kv-window`, or its `LLAMA_KV_RESIDENT_CELLS` alias), so the default path is the plain device buffer and this
 +// switch exists for A/B testing and bisection.  `LLAMA_KV_REGION=0` disables the provider outright.
 +static bool llama_kv_region_enabled() {
 +    static const bool on = [] {
@@ -5709,7 +5833,7 @@ index e938d95c0..e50f4d187 100644
 +    return fn != nullptr ? fn(dev) : nullptr;
 +}
 +
-+// `--kv-region-pool N`: the attendance pool's size, in CELLS per layer (0 = off).  Page = one
++// `--kv-attendance-pool` (alias `--kv-region-pool`): the attendance pool ON/OFF (0 = off).  Page = one
 +// indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots.
 +// The request arrives as an int32: -1 = `auto`, 0 = off, N = N cells.  `auto` is a FITTABILITY decision --
 +// the pool only pays when the context does not fit without it -- and nothing sizes it yet, so `auto` does
@@ -5736,7 +5860,10 @@ index e938d95c0..e50f4d187 100644
 +}
 +
 +static uint32_t kv_pool_cells_request(int32_t req) {
-+    return req > 0 ? (uint32_t) req : 0u;
++    // 0 = off; anything else = ON.  The pool's SIZE is derived from the model below (one decode band of the
++    // indexer working set) and is deliberately not a user knob: a numeric request only ever made the cache
++    // bigger for a measured +1 point of hit rate, and `auto` had nothing to size it (TODO #313, closed r247).
++    return req != 0 ? 1u : 0u;
 +}
 +
 +// wip/kv-residency (TODO #118): the windowed KV's resident window, in CELLS.  0/unset = off.
@@ -5747,10 +5874,28 @@ index e938d95c0..e50f4d187 100644
 +//   - `auto`           -> `--fit` sizes it (`llama_kv_region_set_resident_cells` below).  Without `--fit`
 +//                         there is nobody to decide, so the cache declines the window and says so;
 +//   - unset / 0        -> no window (today's fully resident cache, today's OOM).
++// `--kv-window N` / `LLAMA_KV_RESIDENT_CELLS` (the option's deprecated alias): the REQUEST, in cells.
++// 0 = nothing asked (the env alias may still speak), -1 = `auto` (fit decides), N = N cells.  A process
++// global, like the fit's decision below and for the same reason: `common_params_fit` runs before any context
++// exists, and one W covers every KV cache the process creates.
++static int32_t  g_kv_resident_cells_request = 0;
++
++void llama_kv_region_set_window_request(int32_t req) {
++    g_kv_resident_cells_request = req;
++}
++
++// The legacy `LLAMA_KV_RESIDENT_CELLS` env var, still honoured as `--kv-window`'s deprecated alias (it is
++// named in shipped scripts and gate invocations).  `auto` = fit sizes it.
 +static uint32_t kv_split_resident_cells_env() {
 +    const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
 +    if (e == nullptr || e[0] == '\0') {
 +        return 0u;
++    }
++    static bool warned = false;
++    if (!warned) {
++        warned = true;
++        LLAMA_LOG_WARN("%s: LLAMA_KV_RESIDENT_CELLS is the deprecated alias of --kv-window; prefer "
++                       "--kv-window %s\n", __func__, strcmp(e, "auto") == 0 ? "auto" : e);
 +    }
 +    if (strcmp(e, "auto") == 0) {
 +        return UINT32_MAX;
@@ -5758,7 +5903,7 @@ index e938d95c0..e50f4d187 100644
 +    return (uint32_t) strtoul(e, nullptr, 10);
 +}
 +
-+// The fit-produced window (`--fit` with `LLAMA_KV_RESIDENT_CELLS=auto`), 0 = none decided.  A process
++// The fit-produced window (`--fit` with `--kv-window auto`), 0 = none decided.  A process
 +// global on purpose: `common_params_fit` runs before the contexts exist and hands the decision down here,
 +// and one W covers every KV cache the process creates (the A2 rule: one window for every tensor and
 +// cache).
@@ -5798,7 +5943,13 @@ index e938d95c0..e50f4d187 100644
 +    if (g_kv_resident_cells_override != 0) {
 +        return g_kv_resident_cells_override;
 +    }
-+    return kv_split_resident_cells_env();
++    if (g_kv_resident_cells_request < 0) {
++        return UINT32_MAX;   // `--kv-window auto`: fit owns the number
++    }
++    if (g_kv_resident_cells_request > 0) {
++        return (uint32_t) g_kv_resident_cells_request;
++    }
++    return kv_split_resident_cells_env();   // default 0 = off; the legacy alias may still speak
 +}
 +
 +// How much pinned host RAM the spill may take (bytes), 0 = no ceiling / unknown.  The backend owns the
@@ -5892,7 +6043,7 @@ index e938d95c0..e50f4d187 100644
  // orthonormal Walsh-Hadamard rotation matrix
  // note: res^2 == I
  static void ggml_gen_hadamard(ggml_tensor * tensor) {
-@@ -104,7 +404,9 @@ llama_kv_cache::llama_kv_cache(
+@@ -104,7 +431,9 @@ llama_kv_cache::llama_kv_cache(
      const  layer_share_cb & share,
               const char *   name_tag,
                       bool   is_indexer,
@@ -5903,7 +6054,7 @@ index e938d95c0..e50f4d187 100644
      model(model), hparams(hparams), v_trans(v_trans),
      n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max),
      n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), is_indexer(is_indexer),
-@@ -187,6 +489,310 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +516,313 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -6071,11 +6222,14 @@ index e938d95c0..e50f4d187 100644
 +    // and a device that answers for the mirror buffer type.  Anything else keeps today's cache.
 +    {
 +        const uint32_t req = kv_pool_capable ? kv_pool_cells_request(kv_pool_cells) : 0u;
-+        if (kv_pool_capable && kv_pool_cells < 0 && hparams.indexer_head_size > 0) {
-+            // only a cache that IS pool-eligible can have anything to say here (a qwen4exp/glm5-next trunk;
-+            // every other model has no indexer geometry and never reaches the eligibility checks below)
-+            LLAMA_LOG_INFO("%s: attendance pool: --kv-region-pool auto, not taken (nothing sizes it yet; "
-+                           "--kv-region-pool N takes a pool of N cells per layer)\n", __func__);
++        if (kv_pool_capable && req != 0 && hparams.indexer_head_size > 0 && kv_pool_cells != 1) {
++            // only a cache that IS pool-eligible has anything to say here (a qwen4exp/glm5-next trunk; every
++            // other model has no indexer geometry and never reaches the eligibility checks below).  The legacy
++            // spellings (`auto`, a numeric size) are accepted, but the size is the system's now -- say so.
++            LLAMA_LOG_WARN("%s: attendance pool: %s is accepted for compatibility and IGNORED -- the pool is "
++                           "sized by the system (one decode band of the indexer working set).  Use "
++                           "--kv-attendance-pool / --no-kv-attendance-pool\n", __func__,
++                           kv_pool_cells < 0 ? "'auto'" : "a numeric size");
 +        }
 +        if (req != 0) {
 +            // one page == one indexer block
@@ -6152,7 +6306,7 @@ index e938d95c0..e50f4d187 100644
 +            if (why == nullptr) {
 +                const size_t budget = llama_kv_region_spill_budget(model.dev_layer(0));
 +                if (budget != SIZE_MAX && mirror_worst > budget) {
-+                    LLAMA_LOG_ERROR("%s: --kv-region-pool needs a %.2f MiB pinned host mirror at full context, "
++                    LLAMA_LOG_ERROR("%s: --kv-attendance-pool needs a %.2f MiB pinned host mirror at full context, "
 +                                    "but only %.2f MiB is available (the LLAMA_KV_SPILL_RAM_PCT ceiling on pinned, "
 +                                    "non-swappable RAM).  The pool is disabled and the KV stays as it is.\n",
 +                                    __func__, (double) mirror_worst / 1048576.0, (double) budget / 1048576.0);
@@ -6163,8 +6317,8 @@ index e938d95c0..e50f4d187 100644
 +            }
 +
 +            if (why != nullptr) {
-+                LLAMA_LOG_WARN("%s: --kv-region-pool=%u was declined: %s.  The KV cache is unchanged.\n",
-+                        __func__, req, why);
++                LLAMA_LOG_WARN("%s: --kv-attendance-pool was declined: %s.  The KV cache is unchanged.\n",
++                        __func__, why);
 +            } else {
 +                // A resolve must never evict a page it claimed in the same launch (a verify batch resolves
 +                // several selections at once), so the pool is floored at one full decode band's worth of
@@ -6196,14 +6350,14 @@ index e938d95c0..e50f4d187 100644
 +                          "node runs entirely on its own device."
 +                        : "";
 +                LLAMA_LOG_WARN("%s: ATTENDANCE POOL ENABLED for the attention KV: a %.1f MiB device pool of %u pages "
-+                               "x %u cells per layer (--kv-region-pool %u%s), with the authoritative copy in a "
++                               "x %u cells per layer (--kv-attendance-pool, sized by the system to one decode band of "
++                               "the indexer working set), with the authoritative copy in a "
 +                               "pinned host mirror (up to %.2f MiB at full context).  A decode step resolves its "
 +                               "top-k selection through the page table and fills the pages it missed from the "
 +                               "mirror (~%.2f MiB/token at a 90%% hit rate); prefill reads the mirror over the "
-+                               "PCIe link.%s  `--kv-region-pool 0` keeps the KV fully in VRAM.\n",
++                               "PCIe link.%s  `--kv-attendance-pool off` keeps the KV fully in VRAM.\n",
 +                               __func__,
-+                               (double) n_pages*page*cell*n_tens / 1048576.0, n_pages, page, req,
-+                               n_pages*page != req ? ", floored to one decode band" : "",
++                               (double) n_pages*page*cell*n_tens / 1048576.0, n_pages, page,
 +                               (double) mirror_worst / 1048576.0,
 +                               (double) (width*cell*n_tens*0.10) / 1048576.0,
 +                               dev_note.c_str());
@@ -6214,7 +6368,7 @@ index e938d95c0..e50f4d187 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +849,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +879,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -6255,7 +6409,7 @@ index e938d95c0..e50f4d187 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -252,11 +892,31 @@ llama_kv_cache::llama_kv_cache(
+@@ -252,11 +922,31 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -6289,7 +6443,7 @@ index e938d95c0..e50f4d187 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -265,13 +925,50 @@ llama_kv_cache::llama_kv_cache(
+@@ -265,13 +955,50 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -6342,7 +6496,7 @@ index e938d95c0..e50f4d187 100644
      }
  
      if (reuse) {
-@@ -305,6 +1002,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -305,6 +1032,29 @@ llama_kv_cache::llama_kv_cache(
          LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
      }
  
@@ -6372,7 +6526,7 @@ index e938d95c0..e50f4d187 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -461,6 +1181,9 @@ void llama_kv_cache::clear(bool data) {
+@@ -461,6 +1211,9 @@ void llama_kv_cache::clear(bool data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
@@ -6382,7 +6536,7 @@ index e938d95c0..e50f4d187 100644
      }
  }
  
-@@ -784,6 +1507,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -784,6 +1537,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -6393,7 +6547,7 @@ index e938d95c0..e50f4d187 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -839,6 +1566,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -839,6 +1596,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -6422,7 +6576,7 @@ index e938d95c0..e50f4d187 100644
 +        if (!warned) {
 +            warned = true;
 +            LLAMA_LOG_WARN("%s: the KV is a growable/windowed REGION (LLAMA_KV_REGION) or an attendance POOL whose "
-+                    "mirror is grown on demand (--kv-region-pool): a park moves cells to the TOP of the cache, "
++                    "mirror is grown on demand (--kv-attendance-pool): a park moves cells to the TOP of the cache, "
 +                    "which would map (and pin) the whole context, so idle slots are saved to the prompt cache and "
 +                    "cleared instead of parked (one state copy per idle transition)\n",
 +                    __func__);
@@ -6432,7 +6586,7 @@ index e938d95c0..e50f4d187 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1060,8 +1819,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
+@@ -1060,8 +1849,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -6482,7 +6636,7 @@ index e938d95c0..e50f4d187 100644
      for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
          ret[buft] += size;
      }
-@@ -1069,6 +1868,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1069,6 +1898,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -6519,7 +6673,7 @@ index e938d95c0..e50f4d187 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1585,6 +2414,164 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1585,6 +2444,164 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -6684,7 +6838,7 @@ index e938d95c0..e50f4d187 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1646,6 +2633,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1646,6 +2663,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -6710,7 +6864,7 @@ index e938d95c0..e50f4d187 100644
 +            // already logged the numbers; refuse loudly instead of hanging the card.
 +            GGML_ABORT("%s: the KV region/mirror cannot be grown to %u cells and a batch that needs more than the "
 +                       "mapped extent would fault the GPU.  Lower -c, raise LLAMA_KV_REGION_MAP_MAX_MIB or "
-+                       "LLAMA_KV_SPILL_RAM_PCT, or `--kv-region-pool 0` / `--kv-region 0`.\n", __func__, n_kv);
++                       "LLAMA_KV_SPILL_RAM_PCT, or `--kv-attendance-pool off` / `--kv-region 0`.\n", __func__, n_kv);
 +        }
 +    }
 +}
@@ -6718,7 +6872,7 @@ index e938d95c0..e50f4d187 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -2011,6 +3025,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -2011,6 +3055,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -6728,7 +6882,7 @@ index e938d95c0..e50f4d187 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3456,6 +4473,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3456,6 +4503,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -6738,7 +6892,7 @@ index e938d95c0..e50f4d187 100644
      return true;
  }
  
-@@ -3633,6 +4653,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3633,6 +4683,11 @@ bool llama_kv_cache_context::apply() {
      n_kv      = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
      n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
  
@@ -6751,7 +6905,7 @@ index e938d95c0..e50f4d187 100644
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 053f80219..1c4233bba 100644
+index 053f80219..e93ba6ccd 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -120,9 +120,17 @@ public:
@@ -6767,7 +6921,7 @@ index 053f80219..1c4233bba 100644
 +        // the MTP draft's attention is dense, so the draft cache must not take it.
 +                         bool   kv_pool_capable = false,
 +        // ...and the pool's size request in CELLS per layer (-1 = auto, 0 = off, N = N cells).  A number
-+        // is a `--kv-region-pool N`; `auto` reaches the cache as -1 and it decides below (nothing sizes
++        // is `--kv-attendance-pool` (on/off); the pool is sized below from the model's indexer geometry
 +        // it yet, so `auto` does not take the pool -- it says so once at startup).
 +                        int32_t kv_pool_cells = -1);
 +
@@ -6936,7 +7090,7 @@ index bbbf5b3da..9a3c32d12 100644
                  (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
                  (long long) limits.front(), (long long) limits.back());
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 9d9592843..458bf2bd0 100644
+index 9d9592843..561393967 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
 @@ -40,7 +40,10 @@ public:
@@ -6947,7 +7101,7 @@ index 9d9592843..458bf2bd0 100644
 +    const layer_filter_cb & filter_idx,
 +                            /* wip/kv-residency B-A: the attention cache may take the attendance pool */
 +                     bool   kv_pool = false,
-+                     int32_t kv_pool_cells = -1);
++                     int32_t kv_pool_cells = 0);
  
      // Defined out of line because kpool_layout is incomplete here.
      ~llama_memory_hybrid_idx();
@@ -6992,7 +7146,7 @@ index 0f5c766dd..2080fb76f 100644
      mem_attn->state_write(io, seq_id, flags);
      mem_recr->state_write(io, seq_id, flags);
 diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index fd77ebbc2..0001217c8 100644
+index fd77ebbc2..ddc7c64a0 100644
 --- a/src/llama-memory-hybrid.h
 +++ b/src/llama-memory-hybrid.h
 @@ -40,7 +40,10 @@ public:
@@ -7003,7 +7157,7 @@ index fd77ebbc2..0001217c8 100644
 +    const layer_filter_cb & filter_recr = nullptr,
 +    // wip/kv-residency (TODO #118) B-A: the attention cache may take the attendance pool
 +                     bool   kv_pool     = false,
-+                     int32_t kv_pool_cells = -1);
++                     int32_t kv_pool_cells = 0);
  
      ~llama_memory_hybrid() = default;
  
@@ -7018,25 +7172,26 @@ index fd77ebbc2..0001217c8 100644
  
      void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
 diff --git a/src/llama-memory.h b/src/llama-memory.h
-index 37d01ed11..b4da0adb0 100644
+index 37d01ed11..fd5a50cb1 100644
 --- a/src/llama-memory.h
 +++ b/src/llama-memory.h
-@@ -29,6 +29,14 @@ struct llama_memory_params {
+@@ -29,6 +29,15 @@ struct llama_memory_params {
  
      // only simulate the memory allocations
      bool no_alloc;
 +
 +    // wip/kv-residency (TODO #118) B-A: may this memory's ATTENTION cache take the attendance pool
-+    // (`--kv-region-pool`)?  Only the trunk's: the MTP draft's cache is read densely, so pooling it
-+    // would only make its reads leave VRAM.
++    // (`--kv-attendance-pool`, alias `--kv-region-pool`)?  Only the trunk's: the MTP draft's cache is read
++    // densely, so pooling it would only make its reads leave VRAM.
 +    bool kv_pool;
 +
-+    // ...and the pool's size request, in CELLS per layer (-1 = auto, 0 = off, N = N cells).
++    // ...and whether the pool was ASKED for: 0 = off (default), non-zero = on.  The size is derived from the
++    // model (one decode band of the indexer working set), so a legacy numeric request is ignored (r247).
 +    int32_t kv_pool_cells;
  };
  
  // the tensor contexts and backend buffers of a memory instance
-@@ -150,6 +158,16 @@ struct llama_memory_i {
+@@ -150,6 +159,16 @@ struct llama_memory_i {
  
      virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
  
@@ -8813,7 +8968,7 @@ index 51fd1cfa8..cc359bcab 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 3e37cae7a..2c10acccf 100644
+index 3e37cae7a..ff1073286 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -169,6 +169,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
@@ -8822,7 +8977,7 @@ index 3e37cae7a..2c10acccf 100644
  
 +// wip/kv-residency (TODO #118) B2: does the ATTENTION cache stream at this extent?
 +//
-+// A windowed KV (block 15, `LLAMA_KV_RESIDENT_CELLS`) keeps only its newest W cells in VRAM and the older
++// A windowed KV (block 15, `--kv-window`) keeps only its newest W cells in VRAM and the older
 +// tail in pinned host RAM.  When the used extent has passed W, every read of a spilled cell comes over the
 +// PCIe link instead of VRAM, so the DENSE decode arm -- which reads the whole used extent every step -- pays
 +// `bytes/55.7 GB/s` where the sparse arm reads ~top_k cells.  Measured on Flash-Next IQ3_XXS (`-ncmoe 48`,

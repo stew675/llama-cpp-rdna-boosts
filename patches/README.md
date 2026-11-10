@@ -4059,7 +4059,21 @@ byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op witho
 `ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
 Purity notes: `GREEDY-PURITY.md` §58.
 
-## Block 15 — the streamed KV: the resident WINDOW (`LLAMA_KV_RESIDENT_CELLS`), the attendance POOL (`--kv-region-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `auto`**)
+## Block 15 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
+
+> **r247 amendment (issue #293 follow-up): all three placements default OFF, and the pool stops being a size knob.**
+> The MTP draft window shipped from r246 with `auto` as its default and that cost MTP decode whenever the request
+> was deeper than the window: **−9.7 %** on a `-sm tensor` split at ~105 k tokens (65 536-cell `auto` window
+> 72.7 t/s against 80.5 off, text byte-identical), through both a lower draft acceptance (0.500 → 0.453) and a
+> per-step cost past the ring wrap that grows with the window.  `--spec-draft-kv-window` now defaults to `0` in
+> both `common_params` and `llama_context_params`; `auto` (cap or nothing) and `N` are unchanged, as a conscious
+> opt-in.  The three now read the same way — **default off / `auto` = the system picks / `N` = explicit**:
+> `--spec-draft-kv-window` (truncates the DRAFTER's cache), `--kv-window` (the LOSSLESS resident window, promoted
+> from `LLAMA_KV_RESIDENT_CELLS`, which stays as its deprecated alias and now warns), and `--kv-attendance-pool`
+> (renamed from `--kv-region-pool`, kept as an alias) whose SIZE is now derived from the model — one decode band
+> of the indexer working set — because a numeric request only ever bought ~1 point of hit rate for 2x the VRAM
+> and `auto` had nothing to size it (`TODO` #313, closed).  `auto`/a legacy number is accepted and IGNORED, with a
+> WARN.  Measurements and arms: `benchmarks/2026-11-10-mtp-draft-window-depth.md`.
 
 > **r246 amendment (issue #293): both of this block's own knobs are now first-class options.**  `LLAMA_KV_REGION_POOL`
 > became `--kv-region-pool [auto|N]` and `LLAMA_SPEC_DRAFT_WINDOW` became `--spec-draft-kv-window [auto|N]`, both
@@ -4221,7 +4235,7 @@ kernel change.  `WORKLOG.md` 261105.001, `INVARIANTS.md` r216.
   every existing path — the `set_rows` writers, `state_write`/`state_read`, the rope shift behind
   `defrag`/`seq_add`, `seq_park`, `get_k`/`get_v`, the kq mask — works on it **unchanged**.  That is the
   writer rule, and it is why the state, context-checkpoint and parking gates need no pool-specific code.
-* A compact **DEVICE POOL** holds `--kv-region-pool N` cells per layer as pages of **one indexer block**
+* A compact **DEVICE POOL** holds `--kv-attendance-pool` cells per layer as pages of **one indexer block**
   (`compress_ratio` cells), with a page table `tbl[block] -> slot`, its inverse, a per-slot epoch mark and one
   shared counter block.  At the measured shape that is **204 MiB** against the resident KV's 816 MiB
   (`-c 65536`) / 1 632 MiB (131 072) / 2 448 MiB (196 608).
@@ -4253,7 +4267,7 @@ kernel change.  `WORKLOG.md` 261105.001, `INVARIANTS.md` r216.
    and only the **trunk** context of a qwen4exp model (the MTP draft's cache is read densely: pooling it would
    only make its reads leave VRAM).  Anything else declines with one message and the KV is unchanged.
 
-**Knobs.**  `--kv-region-pool <cells>` (`auto` = not taken yet, `0` = off; r246; the `LLAMA_KV_REGION_POOL` env var before it), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
+**Knobs.**  `--kv-attendance-pool [on|off]` (alias `--kv-region-pool`; env form `LLAMA_KV_REGION_POOL`; **off** by default, and its SIZE is derived from the model — one decode band of the indexer working set — so `auto`/a legacy numeric value is accepted and ignored, r247), `LLAMA_KV_POOL_VERIFY=1` (the oracle: every
 selected page compared byte-for-byte with the mirror at read time, 0 mismatches expected),
 `LLAMA_KV_POOL_STATS=<path>` (a **path**, appended at teardown: a line on stderr would sit inside the generated
 text).  `ENVIRONMENT.md` §18.
@@ -4353,16 +4367,19 @@ identity.
 
 #### r193 — Goal C: the MTP draft window, and the reserve that makes it pay
 
-The MTP draft context's KV is a sliding window instead of `-c` cells.  **This is the one knob in this block
-that is on by default**, because it measures non-negative where it is granted and positive where the freed
-VRAM has somewhere to go — the delivery's own rule (a beneficial, gated feature is on; the knob only disables).
+The MTP draft context's KV is a sliding window instead of `-c` cells.  r193 made it **the one knob in this block
+that was on by default**, on the premise that it "measures non-negative where it is granted".  **r247 refuted
+that premise and turned it off by default** (see the r247 amendment at the top of this block): it measures
+non-negative only *below the window's depth*, and −9.7 % on a `-sm tensor` split past it.
 
-* `--spec-draft-kv-window` (r246; the `LLAMA_SPEC_DRAFT_WINDOW` env var before it): `auto` (the default) =
-  **the cap or nothing** -- `min(65536, ctx)` cells, and where that would not leave one batch of room below
-  every sequence's own context the window is **declined** (logged) rather than lowered, because a window
-  below the depth the drafter works over costs 7-9 % of decode; `0` = off (byte-identical to a build without
-  it); `N` = that many cells **per sequence** (floored at one ubatch, declined when it cannot fit).  The r193
-  sizer (a quarter of the context clamped to `[32768, 65536]`) is what r246 replaced.
+* `--spec-draft-kv-window` (r246; the `LLAMA_SPEC_DRAFT_WINDOW` env var before it): **`0` is the default since
+  r247** (a full `-c` draft cache, byte-identical to a build without the feature) — a window the request
+  outgrows costs MTP decode: **−9.7 %** measured on a `-sm tensor` split at ~105 k tokens
+  (`benchmarks/2026-11-10-mtp-draft-window-depth.md`).  `auto` = **the cap or nothing** -- `min(65536, ctx)`
+  cells, and where that would not leave one batch of room below every sequence's own context the window is
+  **declined** (logged) rather than lowered; `N` = that many cells **per sequence** (floored at one ubatch,
+  declined when it cannot fit).  `auto` and `N` are a conscious opt-in.  The r193 sizer (a quarter of the
+  context clamped to `[32768, 65536]`) is what r246 replaced.
 * **The ring is the shipped reclaim**, not a new allocator: `llama_kv_cache::find_slot` already reclaims a
   cell more than `n_swa` behind, and `set_input_kq_mask` reads *this cache's* `n_swa`, so `hparams` (shared
   with the target) is untouched.  The derived kq mask stays valid as well — its predicate compares each

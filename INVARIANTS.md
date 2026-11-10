@@ -32,25 +32,31 @@ change), and let `WORKLOG.md` carry the narrative.
   A and B of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor` block, see `patches/README.md`;
   the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
   carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
-  (r178; `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the tail in pinned system
-  RAM, one VA range, no kernel change) and the **attendance pool** (r190; `--kv-region-pool` — the
+  (r178; `--kv-window`, formerly `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the
+  tail in pinned system RAM, one VA range, no kernel change) and the **attendance pool** (r190;
+  `--kv-attendance-pool`, formerly `--kv-region-pool` — the
   authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
   top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
   **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
-  Since **r246 both of block 15's own knobs are first-class command-line options, not environment variables**
-  (`--kv-region-pool` and `--spec-draft-kv-window`, both defaulting to `auto`; the `LLAMA_KV_REGION_POOL` /
-  `LLAMA_SPEC_DRAFT_WINDOW` env vars are gone).  Why: a KV placement that costs 8-13 % of decode does not
-  belong behind a variable nobody sets and nobody can see in `--help` (issue #293).
+  Since **r246 block 15's own knobs are first-class command-line options, not environment variables**; since
+  **r247 all three placements default to OFF** with the same semantics (`auto` = the system picks the size,
+  `N` = explicit, default = neither): `--kv-window [auto|N]` (the resident window, promoted from
+  `LLAMA_KV_RESIDENT_CELLS`, which remains as its deprecated alias), `--kv-attendance-pool [on|off]` (renamed
+  from `--kv-region-pool`, alias kept; its SIZE is derived from the model, not a knob) and
+  `--spec-draft-kv-window [auto|N]`.  The `LLAMA_KV_REGION_POOL` / `LLAMA_SPEC_DRAFT_WINDOW` env vars are gone.
+  Why: a KV placement that costs 8-13 % of decode does not belong behind a variable nobody sets and nobody can
+  see in `--help` (issue #293) — and, since r247, nor may it be a **default**, because one of them measured
+  -9.7 % of MTP decode past its depth in a validated layout (`benchmarks/2026-11-10-mtp-draft-window-depth.md`).
   A run with both knobs unset keeps the plain device buffer and its OOM.  **They are placements of the KV, so
   each declines rather than fighting another placement (r197):** the pool declines on an active window and on
   `!offload`, and the window now declines on `!offload` too — with `-nkvo` the cache is pageable host RAM end to
   end, so there is nothing to window (before r197 it announced a VRAM window and then built a plain `CPU KV
   buffer`, and `is_streaming()` took qwen4exp's sparse arm off that plan).  `is_streaming()` therefore keys on
   `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **15 also carries Goal C** (r193,
-  `--spec-draft-kv-window`): the MTP draft context's KV is a *window* instead of `-c` cells, **default `auto`**
-  because it measures non-negative where it is granted (`auto` = THE CAP OR NOTHING, see the r246 entry below;
-  `0` = a full `-c` draft cache), and an embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena
-  +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
+  `--spec-draft-kv-window`): the MTP draft context's KV is a *window* instead of `-c` cells, **default `0`**
+  since r247 (a full `-c` draft cache; `auto` = THE CAP OR NOTHING and `N` = cells are a conscious opt-in — the
+  earlier "measures non-negative" claim is corrected by the r247 entry below), and **when a window is active** an
+  embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
 - **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r200,
@@ -3426,7 +3432,9 @@ came out of it and are worth not re-deriving:
 
 The delivery's two block-15 knobs were promoted out of the environment (r246):
 `LLAMA_SPEC_DRAFT_WINDOW` -> `--spec-draft-kv-window [auto|N]` and `LLAMA_KV_REGION_POOL` ->
-`--kv-region-pool [auto|N]`, both **default `auto`**, both carried in `llama_context_params`
+`--kv-region-pool [auto|N]`, both defaulting to `auto` **at r246 only -- r247 moved every block-15 placement
+to a default of OFF and renamed/reshaped the pool; see the r247 entry below, which supersedes the defaults,
+the pool's name and its sizing**, both carried in `llama_context_params`
 (`spec_draft_kv_window` / `kv_region_pool`, `-1` = auto) and no longer read from the environment.  Do not
 re-derive the reasons:
 
@@ -3483,3 +3491,58 @@ the arm gate to a draft context at the same time.  The trap is a predicate the f
    (the same 1152 + 896 boundaries, run serially) reads **exactly the same two numbers**.  Judge the artifact
    on that equality, not on greedy text: text identity is the greedy path's luck.  The default path stays
    bit-identical to the delivery (prefill-logit gate `0.000697` / `98.784 %`, the release's own reading).
+
+## r247 -- a default that can cost 10 % of decode is not a default, and a pool's size is not a user knob (issue #293 follow-up)
+
+Measured, then decided.  The MTP draft window shipped from r246 with `auto` as its **default**, on r193's claim
+that it "measures non-negative everywhere".  That claim is false, and this is the measurement that settles it
+(27B UD-Q4_K_XL with its embedded MTP head, 3 x R9700 gfx1201, `-c 131072`, a 104 940-token request,
+`--spec-type draft-mtp --spec-draft-n-max 3`, seed 42 / temp 0, one arm per process,
+`ROCBLAS_USE_HIPBLASLT=0`; `benchmarks/2026-11-10-mtp-draft-window-depth.md` has the arms):
+
+| split | window `0` (the new default) | window `auto` = 65 536 cells | |
+|---|---|---|---|
+| `-sm tensor` | 80.5 / 80.4 t/s | 72.7 / 72.7 / 72.6 t/s | **-9.7 %** |
+| `-sm layer` | 36.0 / 35.9 | 36.8 / 36.8 | +2.2 % (neutral: the arm's *prefill* moved with it, so it is an allocation offset) |
+| `-sm tensor`, 41 976-token request | 92.6 | 91.5 | -1.2 % (neutral -- below the window) |
+
+Text is byte-identical within each split.  The mechanism has two components (from `-lv 4`, `-n 128`): the
+drafter's **acceptance drops** (0.50000, 76/152 → 0.45342, 73/161, i.e. more verify rounds for the same
+output), and a **per-step cost past the ring wrap** that *scales with the window*: `N = 104960` (which also
+wraps at that depth) reads **67.8 t/s**, slower than the 65 536 cap.  At 80.5 t/s a step is 12.42 ms, so the
+cap adds +1.33 ms/step; the Windows report in `TODO` #312 measured 1.3-1.6 ms at a 32 k window and 2.8-2.9 at
+64 k -- the same shape, so **#312 was never Windows-specific** (it needs a request deeper than the window).
+Why a wrapped window costs per step at all is still unidentified, and does not need to be: the feature is now
+opt-in, with a measured caveat (`#312` closed as *resolved by policy*, not as *fixed*).
+
+Do not re-derive the decisions:
+
+1. **Defaults are OFF for all three placements, in both `common_params` and `llama_context_params`.**  A
+   placement that costs 10 % of decode in a layout the delivery validates cannot be a default, and it must not
+   be reachable by a leftover env var either (that is what r246 established for env vars; r247 applies the same
+   rule to defaults).  `auto` (where it survives) = *the system picks the size*, `N` = explicit, default =
+   neither.
+2. **A plain boolean beats a size knob whose value is derived.**  The attendance pool's floor is a function of
+   the model (`QSA_DECODE_BAND x ceil((indexer_top_k + page - 1) / page)`, clamped to the cache's cells), so
+   `--kv-attendance-pool` is on/off and the derived size IS the pool: at the gate's shape 4 104 pages,
+   **89.87-90.05 %** per-id hits against **90.91 %** for the old whole-cache 8 192-page request -- ~1 point of
+   hit rate for 2x the VRAM.  A numeric request or `auto` is accepted for r246 compatibility and IGNORED with a
+   WARN (`TODO` #313 closed: the pool needs no sizer, so `--fit` has nothing to decide).
+3. **The three names now mean three different things, and the docs say so in one sentence each.**  `--kv-window`
+   = the LOSSLESS resident window (one copy, tiered by address; the older cells are pinned host pages in the
+   same reservation, read over PCIe every step).  `--kv-attendance-pool` = the host-authoritative copy plus a
+   device **cache** of indexer pages (a miss is one DMA fill, then it hits).  `--spec-draft-kv-window` =
+   **truncation** of the drafter's own cache (lossy; the only one that can change what the drafter proposes).
+   The window and the pool are **alternatives** for the same bytes, never layers: recency is the right
+   predictor for a dense reader and the wrong one for a sparse reader, and the code declines one when the
+   other is active.
+4. **`--fit` follows the window the user asked for, not a default.**  `common_draft_reserve_derive()` charges
+   the small derived draft reserve only when a window is actually active (`llama_spec_draft_kv_cells() != 0`),
+   so with the new default an embedded MTP head charges the flat 3 584 MiB again.  That is the accepted cost of
+   the opt-in: a config that fits only with the window must ask for it (`--spec-draft-kv-window auto`), and it
+   pays the caveat above past 65 536 tokens of depth.
+5. **A gate that only ever passes its knob explicitly cannot see a default regress.**  The draft-window gate's
+   text arms all forced a window and its `auto` arms all passed the flag, so the r246 default shipped
+   unmeasured.  It now asserts the default itself (`default_off`, `tensor_default_off`, and `tensor_auto` as
+   the non-vacuous control) -- and its ready-wait had to stop matching the benign `--fit` WARN "failed to fit
+   params ... n_gpu_layers already set", which killed the server ~1 s into a load and graded an empty log.
