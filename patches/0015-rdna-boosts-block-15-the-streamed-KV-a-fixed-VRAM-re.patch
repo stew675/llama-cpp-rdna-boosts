@@ -1,4 +1,4 @@
-From 7195e78802a4339996f89d5a7b3d79e89ba6680d Mon Sep 17 00:00:00 2001
+From c4ef4e4002a5fb2ba012bf63252c81a41ee43e34 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 31 Oct 2026 14:53:57 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -4898,10 +4898,10 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 4670a4aa0..2b720813f 100644
+index aa01fa3e6..916d368c0 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -2555,6 +2555,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2601,6 +2601,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
      const int n_rows_x = ne11 * T, n_rows = n_used * T;
      constexpr int BN = 128;
      const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
@@ -4917,7 +4917,7 @@ index 4670a4aa0..2b720813f 100644
      ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
      ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
      ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
-@@ -2571,8 +2580,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2617,8 +2626,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
      ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
      ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
      mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
@@ -5006,7 +5006,7 @@ index 2c32cf2f8..79a23e5fb 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index b3c19d267..e2ecc287e 100644
+index f4e0fb120..440580086 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -5085,7 +5085,7 @@ index b3c19d267..e2ecc287e 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -7888,7 +7909,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -7897,7 +7918,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {

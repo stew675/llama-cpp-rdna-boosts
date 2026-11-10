@@ -1,4 +1,4 @@
-From 4e5b57e646b8967cc95fec95930ae3659cf8e5f9 Mon Sep 17 00:00:00 2001
+From 45ffa36a63d15d71a2948face838b26fb3f016ea Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -65,7 +65,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  ggml/src/ggml-cuda/ggml-cuda.cu               | 2741 ++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 6598 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 6607 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  347 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -103,7 +103,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17412 insertions(+), 541 deletions(-)
+ 68 files changed, 17421 insertions(+), 541 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -10845,10 +10845,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..c2d8f89c0
+index 000000000..acc55466e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6598 @@
+@@ -0,0 +1,6607 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -14885,6 +14885,13 @@ index 000000000..c2d8f89c0
 +    });
 +    size_t freed = 0;
 +    size_t n_freed = 0;
++    // The fused MoE kernels receive the ARENA ADDRESS AS A KERNEL ARGUMENT and the compute is
++    // asynchronous, so nothing may be freed while a kernel that reads it is still in flight -- the
++    // same hazard `stand_down_table_locked` and `moe_cache_release_arena` both pay a sync for.  This
++    // path is currently unreferenced, which is exactly why it must not be the one that forgets it:
++    // a future caller would get a device use-after-free (the measured shape is
++    // `mul_mat_vec_q_moe` faulting on an address inside a just-freed table arena).
++    moe_cache_sync_devices_locked();
 +    for (int i : order) {
 +        if (freed >= target) {
 +            break;
@@ -14901,6 +14908,7 @@ index 000000000..c2d8f89c0
 +        }
 +        t.arena = nullptr;
 +        t.slots = 0;
++        t.identity = false;
 +        t.slot_expert.clear();
 +        t.slot_prov.clear();
 +        t.expert_slot.clear();
@@ -14955,6 +14963,7 @@ index 000000000..c2d8f89c0
 +            t.arena = nullptr;
 +        }
 +        t.slots = 0;
++        t.identity = false;
 +        t.slot_expert.clear();
 +        t.expert_slot.clear();
 +        t.slot_dirty = true;

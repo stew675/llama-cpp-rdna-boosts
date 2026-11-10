@@ -3379,3 +3379,41 @@ splits the row range over one thread per 4096 rows (`LLAMA_PLE_THREADS` is the c
   the *lazy* branch (it compiled, ran, and only the census showed the ceiling was 8 instead of `--threads`). Anchor
   such an edit on a unique line -- here the `std::make_unique<llm_graph_input_ple>` call site -- and prove it with
   the census, not with the diff.
+
+## r245 -- a per-arch policy is only per-arch once the CACHE around it is, and every arena release path must sync
+
+`TODO`-free hardening cut from the GitHub issue #294 report (a mixed gfx1100 + gfx1201 pair asserting in
+`llama_sampler_dist_apply`); the issue itself is **not** closed by this, because the fault does not
+reproduce on gfx1201 hardware (the reply asks the reporter for the one-round diagnostic set).  Two facts
+came out of it and are worth not re-deriving:
+
+1. **`mmb_cfg()` being per-device (r132) did not make MMB's policy per-device.**  The 23 accessors around it
+   (`mmb_cache_max`, `mmb_shadow_mode/cap`, `mmb_min_t`, `mmb_f32split_mode/min_k/min_m`,
+   `mmb_tiny_m_f32_ok/tt`, `mmb_bf16w`, `mmb_hc16`, `mmb_tall_mode`, `mmb_gatemix_flag`,
+   `mmb_down16_flag`, `mmb_glu`, `mmb_routed_flag`, `mmb_glu_thresh`, `mmb_routed_thresh`,
+   `mmb_iq3xxs_glu`, `ggml_cuda_mmb_blk16/res16`) cached `mmb_cfg()` in a **process-wide** `static const`,
+   so the first device to touch one decided it for every later device.  On a gfx1100 + gfx1201 pair the
+   leaked rows are the discriminating ones (`f32split_mode` 0 vs 1, `gatemix` 0 vs 1, `tiny_m` RDNA4-only,
+   `routed` 0 on RDNA4, `dense_geom` `R4_256x128` vs the gfx1151 128x256 tile that spills to scratch on
+   gfx1100), and which device won depended on graph order.  They now resolve per device
+   (`mmb_cfg_for_device()` under a device guard + `mmb_policy<T>()`, one instantiation per call site), and
+   `mmb_cfg_dump_once()` prints once per device.  **The general rule: a cached policy value is part of the
+   policy.**  A homogeneous box is bit-identical by construction, which is the only thing that can be
+   verified here: `1c5d32ac537d` (4B Q8_0, 1 GPU and 3-GPU `-sm tensor`) and prefill-logit KLD
+   **0.000000** against a base recorded from the r244 build.
+2. **Three ways to release an expert-cache arena, one of them without the sync.**  `stand_down_table_locked()`
+   and `moe_cache_release_arena()` both call `moe_cache_sync_devices_locked()` first, because the fused MoE
+   kernels carry the arena address in their launch parameters and HIP does not wait for in-flight work on
+   free (this file records the measured consequence: `mul_mat_vec_q_moe` faulting on an address inside a
+   just-freed arena).  `moe_cache_shrink_arena()` did not — and it is currently unreferenced, which is
+   precisely the state in which the omission survives to the day someone calls it.  It syncs now, and the
+   two bulk paths also clear `t.identity` on every table they stand down.
+3. **The negative result is part of the record.**  On 2 x R9700 the reporter's layout reproduces exactly
+   (the same 14.8 GiB / 1.8 GiB device split for `-ts 24,16 -ncmoe 34`), and the fault does not: eight
+   arena sizes from 11 % to 99 % residency, symmetric and asymmetric (`hog`-forced) per-device arenas,
+   pinned and forced-pageable masters (`GGML_CUDA_NO_PINNED=1`, i.e. their pin-fallback state), `-sm tensor`
+   and `-sm layer`, `-lm none`, 10.1 and 7.14.1, short and 551-token prompts (the 551-token arm reaches
+   r243's threaded PLE gather and the prefill band), `MOE_EXPERT_CACHE_VALIDATE=1` and `=3` (per-slot byte
+   compare against the host master, zero mismatches and no non-finite heads), and cache-on vs cache-off
+   text byte-identical.  **A mixed-arch layout is still not a validated configuration**, so this is a
+   supported-but-unmeasured case, not a claim of support.

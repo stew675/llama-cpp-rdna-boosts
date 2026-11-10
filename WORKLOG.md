@@ -1,3 +1,92 @@
+## 261109.012 (r245) -- GitHub issue #294 (mixed gfx1100 + gfx1201 assert): the MMB policy accessors were still process-wide, and one arena-release path skipped its device sync
+
+**Release:** `v16-a691b2345-r245`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip `c4ef4e400`,
+tree `0d10efd84f`, 16 blocks.  `scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16
+`git am`, applied tree == recorded tree, Windows portability lint).  **No block renumbered, merged or
+split**: two folds, **block 06** (`mmb.cu`) and **block 09** (`moe-expert-cache.cu`).  No kernel arithmetic
+changed, no default moved, no environment variable added or repurposed.  Braces stay on their own line (the
+r244 tree's style).
+
+### What the report says, and what could not be reproduced
+
+@kapitalmouse (7900 XTX / gfx1100 + 9070 XT / gfx1201, 64 GiB, r244, HIP 7.14.1, Qwen3.8-Flash-Next GSQ-RCO
+IQ3_S, `-ts 24,16 -dev ROCm0,ROCm1 -lm none -ngl 99 -b 1024 -ub 512 -ctk q8_0 -ctv q8_0 -ncmoe 34 --fit off
+-c 65536`) loads the model, then the first prompt dies in
+`llama_sampler_dist_apply`: `Assertion 'found' failed` — i.e. a non-finite (or `+inf`/`-inf`-collapsed)
+logit vector reaching the sampler.  `MOE_EXPERT_CACHE_MIB=0` makes it run.
+
+The **layout** reproduces exactly here (2 x R9700, same flags: 14 839 MiB of weights on device 0 and
+1 794 MiB on device 1, host experts 16 822 + 18 812 MiB — the same 69 % / 17 % VRAM shape they report), so
+the flags are read identically.  The **fault** does not: 8 arena sizes from 11 % to 99 % residency
+(`MOE_EXPERT_CACHE_MIB` 2048/3072/4096/6144/8192 and auto), symmetric and `hog`-forced asymmetric per-device
+arenas (68 %, 57 %, and a state where individual table arenas fail to allocate), pinned and
+forced-pageable masters (`GGML_CUDA_NO_PINNED=1`, their "5 GiB free, pin failed" state), `-lme auto` fitting
+and not fitting (`MOE_HOST_LIMIT_FRAC=1`), `-sm tensor -ts 24,16` and `-sm layer`, `-lm none`, ROCm 10.1.0
+**and** 7.14.1 (rebuilt at the tip), short prompts and `prompts/recall.txt` (551 tokens, which crosses the
+prefill band and reaches r243's threaded PLE gather: `ple gather: 8192 rows, 2 threads, direct=1`),
+`MOE_EXPERT_CACHE_VALIDATE=1` (structure) and `=3` (per-slot byte compare against the host master, under
+churn: 0 mismatches, 0 non-finite heads), and cache-on vs cache-off same-seed text byte-identical
+(`d80ffbb6d77e`).  `scripts/check-gpu-faults.sh` clean throughout.
+
+So the discriminator is the one thing this box cannot have: **two architectures in one split**.  A
+device-heterogeneous layout is explicitly not a validated configuration (`INVARIANTS.md` r229, `optional/`
+README), which is why r245 is a hardening cut plus a diagnostic ask, not a "fixed, closed".
+
+### Fold 1 (block 06) -- a per-arch policy is only per-arch once the CACHE around it is
+
+r132 (PR #218) keyed `mmb_cfg()` on the running device after a mixed-arch box "zeroed its output projection
+logits (PPL == vocab)" — the same symptom class as this report.  But the 23 accessors around it
+(`mmb_cache_max`, `mmb_shadow_mode/cap`, `mmb_min_t`, `mmb_f32split_mode/min_k/min_m`,
+`mmb_tiny_m_f32_ok/tt`, `mmb_bf16w`, `mmb_hc16`, `mmb_tall_mode`, `mmb_gatemix_flag`, `mmb_down16_flag`,
+`mmb_glu`, `mmb_routed_flag`, `mmb_glu_thresh`, `mmb_routed_thresh`, `mmb_iq3xxs_glu`,
+`ggml_cuda_mmb_blk16/res16`) still held their value in a **process-wide** `static const`, so the first device
+to touch one decided it for every later device.  The rows that actually differ between gfx1100 and gfx1201
+are exactly the leaked ones: `f32split_mode` 0 vs 1, `gatemix` 0 vs 1, `tiny_m` (RDNA4 only), `routed`
+(0 on RDNA4) and `dense_geom` (`R4_256x128` vs the gfx1151 128x256 tile that spills to scratch on gfx1100).
+Which device won was graph-order dependent — the wrong property for a policy table to have.
+
+They now resolve through `mmb_cfg_for_device()` (resolved with that device current) into a
+one-slot-per-device cache (`mmb_policy<T>()`, one template instantiation per call site, so the env-override
+latch stays per device too), and `mmb_cfg_dump_once()` prints **once per device** with a `device=` field.
+`GGML_CUDA_MMB` itself and `GGML_CUDA_MMB_DENSE` (whose default is arch-independent by design) stay
+process-wide env latches.
+
+### Fold 2 (block 09) -- the third arena-release path forgot the sync
+
+`stand_down_table_locked()` and `moe_cache_release_arena()` both call `moe_cache_sync_devices_locked()`
+before touching an arena, because the fused MoE kernels carry the arena address in their launch parameters
+and HIP does not wait for in-flight work on free (block 09's own comment records the measured consequence:
+`mul_mat_vec_q_moe` faulting on an address inside a just-freed arena).  `moe_cache_shrink_arena()` is the
+third release path and did not.  It has no callers today, which is exactly why the omission had survived —
+a future caller would have inherited the fault — so it syncs now.  Both bulk paths also clear
+`t.identity` on every table they stand down (every consumer already re-checks `t.arena`/`t.slots`, so this
+is defence in depth, not a behaviour change).
+
+### Verification (gfx1201, ROCm 10.1.0)
+
+| arm | result |
+|---|---|
+| coherence, 4B Q8_0, 1 GPU and 3 GPU `-sm tensor` (`-n 20 --seed 42 --temp 0`) | `1c5d32ac537d` both = the anchor the set has recorded since r152 |
+| prefill-logit KLD against a base **recorded from the r244 build** (27B Q8_0, `--record` on the r244 tree first) | **mean KLD 0.000000**, same-top-p 100.000 %, PASS |
+| the reporter's own arm (Flash-Next GSQ-RCO-IQ3_S, `-ts 24,16 -ncmoe 34 -lm none -c 65536 -ctk/-ctv q8_0`, `prompts/recall.txt`, `-n 64`) | `776 chars sha=d80ffbb6d77e`, byte-identical to the **r244 binary** (lib swap A/B in one build dir) |
+| `GGML_CUDA_MMB_CFG=1` on 3 devices | one `MMB_CFG device=N …` line per device (0/1/2): the per-device resolver and the per-device dump both fire |
+| `gate-per-block-build.sh --fast --base a691b2345 --tip c4ef4e400 --changed-from 443104a13` | 4/4 built (blocks 06, 09, 10, 15 — the blocks whose delta moved — plus the tip), 125 s |
+| `validate-set.sh` | strict 16/16, applied tree `0d10efd84f` == `release.json.tree`, Windows lint clean |
+| `check-gpu-faults.sh` | clean (kernel journal over the whole session) |
+
+The r244 prefill-logit base is kept at `~/.cache/rdna-boosts/gates-r244/` on this box: it is the only
+instrument that could separate "r245 is inert" from "r243/r244 moved the prefill logits", and the default
+recorded base predates both (`2026-11-08`, against 0.000697 mean KLD for either).
+
+### Left open on purpose
+
+* **Issue #294 stays open.**  The reply asks for `-lv 4` on a failing run, `MOE_EXPERT_CACHE_VALIDATE=3`,
+  `GGML_CUDA_MMB_CFG=1` (which directly tests the fold above on their pair), the `GGML_MOE_DEVREMAP=0` /
+  `GGML_CUDA_MMB=0` / `MOE_EXPERT_CACHE_MIB=4096` bisect arms, a `-ncmoe 34` arm on each card **alone**
+  (mixed pair vs gfx1100 vs gfx1201), a release bisect, and `-sm layer` rather than `-sm tensor` on
+  cards of different sizes.  Closing it needs their confirmation, not our optimism.
+* No `TODO` item was opened: the two folds are the whole change and the diagnostic ask lives in the issue.
+
 ## 261109.011 (r244, optional) -- PR #284 (`two-lane-prefill` re-base) reviewed and NOT taken: the MTP gate it removes is not a rebase, and the MTP draft arms a second buffer set here
 
 PR #284 (@slavap) is a re-base of `optional/two-lane-prefill` from r229 to r234 **plus one behavioural

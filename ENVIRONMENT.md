@@ -917,7 +917,10 @@ The per-arch policy above (`GGML_CUDA_MMB_*` defaults, the weight-type sets, the
 **per device** from the cc of the device the kernel runs on, not from `devices[0]` (r132), and
 `graph_optimize` selects its own context's device before consulting it.  That is what makes a mixed-arch
 box (an RDNA2 card beside an RDNA3/RDNA4 one) behave: MMB stays off on the RDNA2 device.  There is no knob
-— on a single-arch box the two spellings are the same cc (`GREEDY-PURITY.md` §56).
+— on a single-arch box the two spellings are the same cc (`GREEDY-PURITY.md` §56).  **Since r245 every one
+of those accessors is per DEVICE too** (they used to cache the first caller's value process-wide, so the
+first device decided the whole box); `GGML_CUDA_MMB_CFG=1` now prints one `MMB_CFG device=<n> …` line per
+device at `-lv`-independent WARN level, which is how a mixed box's two rows are read off.
 
 ### 10.1 `GGML_CUDA_MMF32` -- the F32 skinny prefill GEMM (block 06)
 

@@ -1,4 +1,4 @@
-From c99ea643586ece13a23a80be8cb974b85e0e41f6 Mon Sep 17 00:00:00 2001
+From e1882af44e60eaa80f405e145a227deae89d7826 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -100,7 +100,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6182 ++++++-----------
- ggml/src/ggml-cuda/mmb.cu                     |  375 +-
+ ggml/src/ggml-cuda/mmb.cu                     |  333 +-
  ggml/src/ggml-cuda/mmb.cuh                    |   24 +
  ggml/src/ggml-cuda/mmq.cu                     |  206 +-
  ggml/src/ggml-cuda/mmq.cuh                    |   28 +-
@@ -145,7 +145,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 85 files changed, 16271 insertions(+), 5512 deletions(-)
+ 85 files changed, 16250 insertions(+), 5491 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -17770,7 +17770,7 @@ index f9aae1dc7..a14b0b36a 100644
          return (void *)ggml_backend_cuda_comm_init;
      }
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index ee8bd9667..4670a4aa0 100644
+index 594802cf5..aa01fa3e6 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -1280,7 +1280,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
@@ -17900,9 +17900,9 @@ index ee8bd9667..4670a4aa0 100644
          // The 128x256 dense tile spills to scratch on gfx1100 for most weight types (Q6_K 148 B,
          // Q5_K 104, Q3_K 56, BF16 48 per thread; Q4_K does not), and under WSL a spilling MMB prefill
          // kernel together with the spilling head-256 WMMA FA kernel faults the queue with
-@@ -1530,14 +1590,25 @@ static const mmb_arch_cfg & mmb_cfg() {
-     return c;
+@@ -1579,6 +1639,14 @@ static T mmb_policy(F resolve) {
  }
+ 
  
 +// Diagnostics gate for the "first N hits" prints below: off unless GGML_CUDA_MMB_LOG is set (the file's
 +// long-standing gate; 2 prints more).  They used to be unconditional, which put them on stderr in every
@@ -17915,9 +17915,10 @@ index ee8bd9667..4670a4aa0 100644
  // Print the resolved per-arch config + every env override exactly once (GGML_CUDA_MMB_CFG=1, or
  // GGML_CUDA_MMB_LOG=1), so a profiler run records what was actually used.
  static void mmb_cfg_dump_once() {
-     static bool done = false;
-     if (done) return;
-     done = true;
+@@ -1588,8 +1656,11 @@ static void mmb_cfg_dump_once() {
+     const int   device = ggml_cuda_get_device();
+     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || done[device]) return;
+     done[device] = true;
 -    const bool on = (getenv("GGML_CUDA_MMB_CFG") && atoi(getenv("GGML_CUDA_MMB_CFG")) != 0) ||
 -                    (getenv("GGML_CUDA_MMB_LOG") && atoi(getenv("GGML_CUDA_MMB_LOG")) != 0);
 +    const bool on = [] {
@@ -17926,14 +17927,11 @@ index ee8bd9667..4670a4aa0 100644
 +        return (cfg != nullptr && atoi(cfg) != 0) || (log != nullptr && atoi(log) != 0);
 +    }();
      if (!on) return;
-     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-     const mmb_arch_cfg & c = mmb_cfg();
-@@ -1550,21 +1621,52 @@ static void mmb_cfg_dump_once() {
-             c.glu, c.bf16w, c.iq3xxs_glu, c.routed, c.big_q4k_only);
- }
+     const int cc = ggml_cuda_info().devices[device].cc;
+     const mmb_arch_cfg & c = mmb_cfg_for_device(device);
+@@ -1604,19 +1675,50 @@ static void mmb_cfg_dump_once() {
  
--static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
-+static size_t mmb_cache_max() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_CACHE"); return e ? atoi(e) : mmb_cfg().cache_max; }(); return (size_t) v; }
+ static size_t mmb_cache_max() { return (size_t) mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_CACHE"); return e ? atoi(e) : mmb_cfg_for_device(d).cache_max; }); }
  static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 +// The pool is a stack (see ggml_backend_cuda_context::pool_stack): these buffers are evicted, grown and
 +// replaced in an order the pool cannot accept, so they are registered and killed through that stack.
@@ -17988,20 +17986,7 @@ index ee8bd9667..4670a4aa0 100644
      mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
      return buf;
  }
-@@ -1615,10 +1717,10 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
- static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
- static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
- static size_t g_mmb_shadow_bytes = 0;
--int    mmb_shadow_mode(){ static const int v = getenv("GGML_CUDA_MMB_SHADOW") ? atoi(getenv("GGML_CUDA_MMB_SHADOW")) : mmb_cfg().shadow_mode; return v; }
-+int    mmb_shadow_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_SHADOW"); return e ? atoi(e) : mmb_cfg().shadow_mode; }(); return v; }
- bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
- bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
--size_t mmb_shadow_cap(){ static const long v = getenv("GGML_CUDA_MMB_SHADOW_MB") ? atol(getenv("GGML_CUDA_MMB_SHADOW_MB")) : mmb_cfg().shadow_cap_mb; return (size_t) v << 20; }
-+size_t mmb_shadow_cap(){ static const long v = [] { const char * e = getenv("GGML_CUDA_MMB_SHADOW_MB"); return e ? atol(e) : mmb_cfg().shadow_cap_mb; }(); return (size_t) v << 20; }
- static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
- static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
- static bool mmb_is_row_concat(const ggml_tensor * w) {
-@@ -1639,7 +1741,7 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
+@@ -1691,7 +1793,7 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
  bool mmb_enabled() {
      // DEFAULT ON (maintainer policy 2026-09-21: a beneficial feature is on by default; the env var
      // exists only to disable it for A/B or debugging).  GGML_CUDA_MMB=0 turns the whole campaign off.
@@ -18010,7 +17995,7 @@ index ee8bd9667..4670a4aa0 100644
      if (v == 0) return false;
      // The kernels select the WMMA builtin + fragment layout at compile time: gfx11 uses the first-gen
      // `..._bf16_w32` builtin and the 16-half row fragment, gfx12 `..._bf16_w32_gfx12` and the 8-half
-@@ -1647,11 +1749,11 @@ bool mmb_enabled() {
+@@ -1699,7 +1801,7 @@ bool mmb_enabled() {
      // RDNA4 (gfx1200/gfx1201) and RDNA3_0 (gfx1100/1101/1102, validated by the gfx1100 port) are on;
      // GGML_CUDA_MMB_RDNA3=0 disables the RDNA3_0 arm.
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -18019,55 +18004,7 @@ index ee8bd9667..4670a4aa0 100644
      if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || (allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc))) { mmb_cfg_dump_once(); return true; }
      return false;
  }
--int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : mmb_cfg().min_t; return v; }
-+int  mmb_min_t()   { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_MIN_T"); return e ? atoi(e) : mmb_cfg().min_t; }(); return v; }
- // F32 dense weights: historically DEFAULT OFF (the 2026-09-19 session-4 note); SUPERSEDED by the
- // shape-aware default below.  Kept only for the measured history: a 16x256 small-M tile was tried
- // and is worse (870/847 vs 895/885 t/s -- BN=256 halves the block count).
-@@ -1677,31 +1779,31 @@ int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(g
- //
- // Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
- // pre-2026-09-19 behaviour, kept for A/B).
--int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : mmb_cfg().f32split_mode; return v; }
-+int  mmb_f32split_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT"); return e ? atoi(e) : mmb_cfg().f32split_mode; }(); return v; }
- bool mmb_f32split() { return mmb_f32split_mode() != 0; }
- // Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
- // long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
--int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : mmb_cfg().f32split_min_k; return v; }
--int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : mmb_cfg().f32split_min_m; return v; }
-+int  mmb_f32split_min_k(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K"); return e ? atoi(e) : mmb_cfg().f32split_min_k; }(); return v; }
-+int  mmb_f32split_min_m(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M"); return e ? atoi(e) : mmb_cfg().f32split_min_m; }(); return v; }
- // tiny-M F32 (the hc *_inject pair): M=hc=4, K=10240.  Neither tile suits it (see
- // mmb_tiny_m_f32_kernel), so it gets its own warp-per-token kernel.  This has to be part of the
- // *gate* as well as the launcher -- an M-based rule that only admits M >= 128 would reject the
- // shape here and rocBLAS would run, silently, with the kernel never reached.
- bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
--    static const int v = getenv("GGML_CUDA_MMB_TINY_M") ? atoi(getenv("GGML_CUDA_MMB_TINY_M")) : mmb_cfg().tiny_m;
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TINY_M"); return e ? atoi(e) : mmb_cfg().tiny_m; }();
-     return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
- }
- int mmb_tiny_m_f32_tt() {
--    static const int v = getenv("GGML_CUDA_MMB_TINY_TT") ? atoi(getenv("GGML_CUDA_MMB_TINY_TT")) : mmb_cfg().tiny_tt;
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg().tiny_tt; }();
-     return v;
- }
--bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : mmb_cfg().bf16w; return v != 0; }
--bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : mmb_cfg().hc16; return v != 0; }
--int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : mmb_cfg().tall_mode; return v; }
-+bool mmb_bf16w()    { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_BF16W"); return e ? atoi(e) : mmb_cfg().bf16w; }(); return v != 0; }
-+bool mmb_hc16()    { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : mmb_cfg().hc16; }(); return v != 0; }
-+int  mmb_tall_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TALL"); return e ? atoi(e) : mmb_cfg().tall_mode; }(); return v; }
- bool mmb_tall()    { return mmb_tall_mode() != 0; }
--bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : mmb_cfg().gatemix; return v != 0; }
--bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : mmb_cfg().down16; return v != 0; }
--bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : mmb_cfg().glu; return v != 0; }
-+bool mmb_gatemix_flag() { static const int v = [] { const char * e = getenv("LLAMA_HC_GATEMIX"); return e ? atoi(e) : mmb_cfg().gatemix; }(); return v != 0; }
-+bool mmb_down16_flag() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_DOWN16"); return e ? atoi(e) : mmb_cfg().down16; }(); return v != 0; }
-+bool mmb_glu()     { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_GLU"); return e ? atoi(e) : mmb_cfg().glu; }(); return v != 0; }
- // Path policy for the generic *quantized* dense tile GEMM (a plain MUL_MAT -- attention qkv/o and
- // the dense MLP), as opposed to the routed MoE expert path and the qwen4exp HC paths (tall-M /
- // tiny-M / gate-mix), which have their own knobs below.  Off by default on RDNA4: the measurements
-@@ -1709,7 +1811,7 @@ bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(get
+@@ -1758,7 +1860,7 @@ bool mmb_glu() { return mmb_policy<int>([](int d) { const char * e = getenv("GGM
  // dense big-M shapes on the losing side, so the two are separable and are kept separate here.
  // GGML_CUDA_MMB_DENSE forces it on/off for either arch for A/B.
  bool mmb_dense_flag() {
@@ -18076,29 +18013,7 @@ index ee8bd9667..4670a4aa0 100644
      if (v >= 0) return v != 0;
      return !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
  }
-@@ -1721,17 +1823,17 @@ bool mmb_dense_flag() {
- // costs nothing (the graph's fusion stand-down goes through this predicate).  Measured on RDNA4:
- // `35B-A3B UD-Q3_K_M` routed-ON -1.4 %, routed-OFF +-0.0 % (two interleaved rounds).
- bool mmb_routed_flag() {
--    static const int v = getenv("GGML_CUDA_MMB_ROUTED") ? atoi(getenv("GGML_CUDA_MMB_ROUTED")) : mmb_cfg().routed;
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_ROUTED"); return e ? atoi(e) : mmb_cfg().routed; }();
-     return v != 0;
- }
--int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : mmb_cfg().glu_thresh; return v; }
--int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : mmb_cfg().routed_thresh; return v; }
-+int mmb_glu_thresh() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_GLU_THRESH"); return e ? atoi(e) : mmb_cfg().glu_thresh; }(); return v; }
-+int mmb_routed_thresh() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_ROUTED_THRESH"); return e ? atoi(e) : mmb_cfg().routed_thresh; }(); return v; }
- // IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
- // win, but the MMB *fused GLU* path is a NET LOSS on the UD-Q3_K_M workload (the fused kernel's
- // dequant/loop shape costs more than the bf16-WMMA gain): full-on 1921 vs routed-only 2121 t/s
- // pp8192 (both vs 1942 off).  So the fused GLU arm is default-off; GGML_CUDA_MMB_IQ3XXS=1 enables it
- // for re-measurement/tuning.
--bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? atoi(getenv("GGML_CUDA_MMB_IQ3XXS")) : mmb_cfg().iq3xxs_glu; return v != 0; }
-+bool mmb_iq3xxs_glu() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_IQ3XXS"); return e ? atoi(e) : mmb_cfg().iq3xxs_glu; }(); return v != 0; }
- 
- // ---------------------------------------------------------------------------------------------
- // Weight-type policy.  MMB's per-type kernels do NOT transfer between arches: on RDNA4 (gfx12)
-@@ -1762,7 +1864,9 @@ static uint64_t mmb_wtype_mask() {
+@@ -1808,7 +1910,9 @@ static uint64_t mmb_wtype_mask() {
                                 (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
      const uint64_t Q4Q5      = (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_MXFP4) | (1ull << GGML_TYPE_NVFP4);
      const uint64_t IQ2       = (1ull << GGML_TYPE_IQ2_S) | (1ull << GGML_TYPE_IQ2_XS) | (1ull << GGML_TYPE_IQ2_XXS);
@@ -18109,7 +18024,7 @@ index ee8bd9667..4670a4aa0 100644
      if (e && *e) {
          static uint64_t mask = 0;
          static bool init = false;
-@@ -1881,31 +1985,114 @@ static bool mmb_wtype_ok_glu(const ggml_type t) { return mmb_wtype_ok(t) && (t !
+@@ -1927,31 +2031,114 @@ static bool mmb_wtype_ok_glu(const ggml_type t) { return mmb_wtype_ok(t) && (t !
  
  const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
      const ggml_tensor * root = mmb_root(t);
@@ -18238,7 +18153,7 @@ index ee8bd9667..4670a4aa0 100644
      g_mmb_shadow.clear();
      g_mmb_shadow_pair.clear();
      g_mmb_shadow_bytes = 0;
-@@ -1960,6 +2147,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+@@ -2006,6 +2193,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
      return ggml_nrows(dst) == T;
  }
  
@@ -18256,7 +18171,7 @@ index ee8bd9667..4670a4aa0 100644
  bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
      if (!mmb_enabled() || !mmb_routed_flag() || !src0 || !src1 || !ids || !dst) return false;
      const bool wtype = mmb_wtype_ok(src0->type);
-@@ -1981,7 +2179,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2027,7 +2225,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
      cudaStream_t stream = ctx.stream();
      const int K = (int) src0->ne[0], M = (int) src0->ne[1];
      const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
@@ -18265,7 +18180,7 @@ index ee8bd9667..4670a4aa0 100644
        if (lg) { static unsigned cnt = 0; if (cnt++ < 80) fprintf(stderr, "MMB_DENSE %s type=%s M=%d K=%d T=%d\n", src0->name, ggml_type_name(src0->type), M, K, T); } }
      if (src0->type == GGML_TYPE_F32) {
          // tiny-M (the hc *_inject pair, M=hc=4): a warp-per-token kernel beats both tiles by a
-@@ -1994,16 +2192,31 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2040,16 +2238,31 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
              const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
              dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
              const float * Wf = (const float *) src0->data;
@@ -18303,7 +18218,7 @@ index ee8bd9667..4670a4aa0 100644
          if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
          else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
          CUDA_CHECK(cudaGetLastError()); return;
-@@ -2020,18 +2233,23 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2066,18 +2279,23 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
          if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
          else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
          CUDA_CHECK(cudaGetLastError());
@@ -18331,14 +18246,8 @@ index ee8bd9667..4670a4aa0 100644
      }
      dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
      const uint16_t * shadow = shadow_pre;
-@@ -2128,15 +2346,27 @@ bool ggml_cuda_mmb_active() { return mmb_enabled(); }
- // worse, disagrees with the graph optimizer's BF16-only activation marking, which may leave a
- // preempted reader's F32 buffer unwritten.
- bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
--bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : mmb_cfg().blk16; return v != 0; }
--bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : mmb_cfg().res16; return v != 0; }
-+bool ggml_cuda_mmb_blk16() { static const int v = [] { const char * e = getenv("LLAMA_HC_BLK16"); return e ? atoi(e) : mmb_cfg().blk16; }(); return v != 0; }
-+bool ggml_cuda_mmb_res16()  { static const int v = [] { const char * e = getenv("LLAMA_HC_RES16"); return e ? atoi(e) : mmb_cfg().res16; }(); return v != 0; }
+@@ -2178,11 +2396,23 @@ bool ggml_cuda_mmb_blk16() { return mmb_policy<int>([](int d) { const char * e =
+ bool ggml_cuda_mmb_res16() { return mmb_policy<int>([](int d) { const char * e = getenv("LLAMA_HC_RES16"); return e ? atoi(e) : mmb_cfg_for_device(d).res16; }) != 0; }
  bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
          const int hc, const float scale, const float bias) {
 -    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
@@ -18364,7 +18273,7 @@ index ee8bd9667..4670a4aa0 100644
      cudaStream_t stream = ctx.stream();
      const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
      uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
-@@ -2144,7 +2374,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2190,7 +2420,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor *
      dim3 grid(E / 32, (T + 127) / 128);
      hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
      CUDA_CHECK(cudaGetLastError());
@@ -18372,7 +18281,7 @@ index ee8bd9667..4670a4aa0 100644
      return true;
  }
  
-@@ -2238,7 +2467,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2284,7 +2513,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
      const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
      uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(dst)) ? (uint16_t *) dst->data : nullptr;
      const bool store_f32 = Dh == nullptr;
@@ -18381,7 +18290,7 @@ index ee8bd9667..4670a4aa0 100644
      dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
      mmb_routed_kernel_dispatch(src0, gbig, gsmall, stream, W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
      CUDA_CHECK(cudaGetLastError());
-@@ -2344,7 +2573,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2390,7 +2619,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
      mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
      uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
      const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
@@ -18390,7 +18299,7 @@ index ee8bd9667..4670a4aa0 100644
      const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
      dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
      mmb_routed_glu_kernel_dispatch(gw, gbig, gsmall, stream, Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
-@@ -2386,5 +2615,5 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2432,5 +2661,5 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
      }
      CUDA_CHECK(cudaGetLastError());
      g_mmb_shadow_bytes += bytes;
@@ -22094,7 +22003,7 @@ index 35f625eaa..ea7ce5ad9 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index c2d8f89c0..c386ee560 100644
+index acc55466e..47c664885 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1825,6 +1825,40 @@ static void pool_rank_from_prefill_locked() {
@@ -22259,7 +22168,7 @@ index c2d8f89c0..c386ee560 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -4746,7 +4821,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -4755,7 +4830,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -22269,7 +22178,7 @@ index c2d8f89c0..c386ee560 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -4764,6 +4840,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4773,6 +4849,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -22283,7 +22192,7 @@ index c2d8f89c0..c386ee560 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -4793,6 +4876,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -4802,6 +4885,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -22295,7 +22204,7 @@ index c2d8f89c0..c386ee560 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -4861,7 +4949,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -4870,7 +4958,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -22304,7 +22213,7 @@ index c2d8f89c0..c386ee560 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -5135,6 +5223,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
+@@ -5144,6 +5232,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
      return span <= host_bytes - src_off;
  }
  
@@ -22332,7 +22241,7 @@ index c2d8f89c0..c386ee560 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5382,7 +5491,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5391,7 +5500,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -22342,7 +22251,7 @@ index c2d8f89c0..c386ee560 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -5425,7 +5535,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5434,7 +5544,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -22368,7 +22277,7 @@ index c2d8f89c0..c386ee560 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5442,7 +5569,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5451,7 +5578,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -22378,7 +22287,7 @@ index c2d8f89c0..c386ee560 100644
      if (table < 0) {
          return false;
      }
-@@ -5494,7 +5622,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5503,7 +5631,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -22387,7 +22296,7 @@ index c2d8f89c0..c386ee560 100644
          g_decline_all++;
          return false;
      }
-@@ -5849,7 +5977,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
+@@ -5858,7 +5986,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
@@ -22396,7 +22305,7 @@ index c2d8f89c0..c386ee560 100644
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -6100,7 +6228,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6109,7 +6237,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }

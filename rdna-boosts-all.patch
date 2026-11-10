@@ -52790,10 +52790,10 @@ index b7939243b..b57e344b6 100644
 +}
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..2b720813f
+index 000000000..916d368c0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,2626 @@
+@@ -0,0 +1,2672 @@
 +#include "common.cuh"
 +#include "mmb.cuh"
 +#include "unary.cuh"
@@ -54386,6 +54386,55 @@ index 000000000..2b720813f
 +    return c;
 +}
 +
++// The config for ONE device, resolved with that device current (mmb_cfg() reads
++// `ggml_cuda_get_device()`).  `device < 0` resolves for whatever is current, uncached.
++static const mmb_arch_cfg & mmb_cfg_for_device(int device) {
++    static mmb_arch_cfg cfg[GGML_CUDA_MAX_DEVICES];
++    static bool         init[GGML_CUDA_MAX_DEVICES] = {};
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return mmb_cfg();
++    }
++    if (!init[device]) {
++        int prev = -1;
++        const bool changed = cudaGetDevice(&prev) == cudaSuccess && prev != device && cudaSetDevice(device) == cudaSuccess;
++        cfg[device] = mmb_cfg();
++        if (changed) {
++            (void) cudaSetDevice(prev);
++        }
++        init[device] = true;
++    }
++    return cfg[device];
++}
++
++// A lazily-resolved, per-DEVICE copy of one policy value: an env override if it is set,
++// otherwise `mmb_cfg_for_device()`.  Every call site is its own template instantiation (a
++// distinct lambda type), i.e. its own one-slot-per-device cache.
++//
++// WHY THIS EXISTS (r245): these used to be `static const T v = [] { ... mmb_cfg() ... }();`,
++// i.e. a PROCESS-WIDE cache.  `mmb_cfg()` became per-arch in r132, but the FIRST device to
++// touch one of these accessors still decided its value for every later device, so on a
++// mixed-arch box (gfx1100 + gfx1201, say) the RDNA3_0-only and RDNA4-only rows leaked across
++// the pair: `f32split_mode` 0 vs 1, `gatemix` 0 vs 1, `tiny_m` RDNA4-only, `routed` 0 on
++// RDNA4, and `dense_geom` R4_256x128 vs the gfx1151 128x256 tile that spills to scratch on
++// gfx1100.  Which device won depended on graph order, i.e. the tree's behaviour was
++// order-dependent by construction.  A homogeneous box is unaffected: every device resolves
++// the same row.
++template <typename T, typename F>
++static T mmb_policy(F resolve) {
++    static T    val[GGML_CUDA_MAX_DEVICES];
++    static bool init[GGML_CUDA_MAX_DEVICES] = {};
++    const int device = ggml_cuda_get_device();
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return resolve(device);
++    }
++    if (!init[device]) {
++        val[device]  = resolve(device);
++        init[device] = true;
++    }
++    return val[device];
++}
++
++
 +// Diagnostics gate for the "first N hits" prints below: off unless GGML_CUDA_MMB_LOG is set (the file's
 +// long-standing gate; 2 prints more).  They used to be unconditional, which put them on stderr in every
 +// server log.
@@ -54397,27 +54446,30 @@ index 000000000..2b720813f
 +// Print the resolved per-arch config + every env override exactly once (GGML_CUDA_MMB_CFG=1, or
 +// GGML_CUDA_MMB_LOG=1), so a profiler run records what was actually used.
 +static void mmb_cfg_dump_once() {
-+    static bool done = false;
-+    if (done) return;
-+    done = true;
++    // Once per DEVICE: on a mixed-arch box the config differs per device, and printing only
++    // the first one would hide exactly the leak this dump exists to make visible (r245).
++    static bool done[GGML_CUDA_MAX_DEVICES] = {};
++    const int   device = ggml_cuda_get_device();
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || done[device]) return;
++    done[device] = true;
 +    const bool on = [] {
 +        const char * cfg = getenv("GGML_CUDA_MMB_CFG");
 +        const char * log = getenv("GGML_CUDA_MMB_LOG");
 +        return (cfg != nullptr && atoi(cfg) != 0) || (log != nullptr && atoi(log) != 0);
 +    }();
 +    if (!on) return;
-+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+    const mmb_arch_cfg & c = mmb_cfg();
-+    fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
++    const int cc = ggml_cuda_info().devices[device].cc;
++    const mmb_arch_cfg & c = mmb_cfg_for_device(device);
++    fprintf(stderr, "MMB_CFG device=%d cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
 +                    "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
 +                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d routed=%d big_q4k_only=%d\n",
-+            cc, c.dense_geom, c.min_t, c.glu_thresh, c.routed_thresh, c.tall_mode,
++            device, cc, c.dense_geom, c.min_t, c.glu_thresh, c.routed_thresh, c.tall_mode,
 +            c.tiny_m, c.tiny_tt, c.f32split_mode, c.f32split_min_m, c.f32split_min_k, c.cache_max,
 +            c.shadow_mode, c.shadow_cap_mb, c.hc16, c.down16, c.gatemix, c.blk16, c.res16,
 +            c.glu, c.bf16w, c.iq3xxs_glu, c.routed, c.big_q4k_only);
 +}
 +
-+static size_t mmb_cache_max() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_CACHE"); return e ? atoi(e) : mmb_cfg().cache_max; }(); return (size_t) v; }
++static size_t mmb_cache_max() { return (size_t) mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_CACHE"); return e ? atoi(e) : mmb_cfg_for_device(d).cache_max; }); }
 +static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 +// The pool is a stack (see ggml_backend_cuda_context::pool_stack): these buffers are evicted, grown and
 +// replaced in an order the pool cannot accept, so they are registered and killed through that stack.
@@ -54513,10 +54565,10 @@ index 000000000..2b720813f
 +static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 +static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 +static size_t g_mmb_shadow_bytes = 0;
-+int    mmb_shadow_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_SHADOW"); return e ? atoi(e) : mmb_cfg().shadow_mode; }(); return v; }
++int mmb_shadow_mode() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_SHADOW"); return e ? atoi(e) : mmb_cfg_for_device(d).shadow_mode; }); }
 +bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 +bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
-+size_t mmb_shadow_cap(){ static const long v = [] { const char * e = getenv("GGML_CUDA_MMB_SHADOW_MB"); return e ? atol(e) : mmb_cfg().shadow_cap_mb; }(); return (size_t) v << 20; }
++size_t mmb_shadow_cap(){ return (size_t) mmb_policy<long>([](int d) { const char * e = getenv("GGML_CUDA_MMB_SHADOW_MB"); return e ? atol(e) : (long) mmb_cfg_for_device(d).shadow_cap_mb; }) << 20; }
 +static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
 +static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 +static bool mmb_is_row_concat(const ggml_tensor * w) {
@@ -54549,7 +54601,7 @@ index 000000000..2b720813f
 +    if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || (allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc))) { mmb_cfg_dump_once(); return true; }
 +    return false;
 +}
-+int  mmb_min_t()   { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_MIN_T"); return e ? atoi(e) : mmb_cfg().min_t; }(); return v; }
++int mmb_min_t() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_MIN_T"); return e ? atoi(e) : mmb_cfg_for_device(d).min_t; }); }
 +// F32 dense weights: historically DEFAULT OFF (the 2026-09-19 session-4 note); SUPERSEDED by the
 +// shape-aware default below.  Kept only for the measured history: a 16x256 small-M tile was tried
 +// and is worse (870/847 vs 895/885 t/s -- BN=256 halves the block count).
@@ -54575,31 +54627,28 @@ index 000000000..2b720813f
 +//
 +// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
 +// pre-2026-09-19 behaviour, kept for A/B).
-+int  mmb_f32split_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT"); return e ? atoi(e) : mmb_cfg().f32split_mode; }(); return v; }
++int mmb_f32split_mode() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT"); return e ? atoi(e) : mmb_cfg_for_device(d).f32split_mode; }); }
 +bool mmb_f32split() { return mmb_f32split_mode() != 0; }
 +// Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
 +// long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
-+int  mmb_f32split_min_k(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K"); return e ? atoi(e) : mmb_cfg().f32split_min_k; }(); return v; }
-+int  mmb_f32split_min_m(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M"); return e ? atoi(e) : mmb_cfg().f32split_min_m; }(); return v; }
++int mmb_f32split_min_k() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K"); return e ? atoi(e) : mmb_cfg_for_device(d).f32split_min_k; }); }
++int mmb_f32split_min_m() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M"); return e ? atoi(e) : mmb_cfg_for_device(d).f32split_min_m; }); }
 +// tiny-M F32 (the hc *_inject pair): M=hc=4, K=10240.  Neither tile suits it (see
 +// mmb_tiny_m_f32_kernel), so it gets its own warp-per-token kernel.  This has to be part of the
 +// *gate* as well as the launcher -- an M-based rule that only admits M >= 128 would reject the
 +// shape here and rocBLAS would run, silently, with the kernel never reached.
 +bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TINY_M"); return e ? atoi(e) : mmb_cfg().tiny_m; }();
++    const int v = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_M"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_m; });
 +    return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
 +}
-+int mmb_tiny_m_f32_tt() {
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg().tiny_tt; }();
-+    return v;
-+}
-+bool mmb_bf16w()    { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_BF16W"); return e ? atoi(e) : mmb_cfg().bf16w; }(); return v != 0; }
-+bool mmb_hc16()    { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : mmb_cfg().hc16; }(); return v != 0; }
-+int  mmb_tall_mode(){ static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_TALL"); return e ? atoi(e) : mmb_cfg().tall_mode; }(); return v; }
++int mmb_tiny_m_f32_tt() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_tt; }); }
++bool mmb_bf16w() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16W"); return e ? atoi(e) : mmb_cfg_for_device(d).bf16w; }) != 0; }
++bool mmb_hc16() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : mmb_cfg_for_device(d).hc16; }) != 0; }
++int mmb_tall_mode() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TALL"); return e ? atoi(e) : mmb_cfg_for_device(d).tall_mode; }); }
 +bool mmb_tall()    { return mmb_tall_mode() != 0; }
-+bool mmb_gatemix_flag() { static const int v = [] { const char * e = getenv("LLAMA_HC_GATEMIX"); return e ? atoi(e) : mmb_cfg().gatemix; }(); return v != 0; }
-+bool mmb_down16_flag() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_DOWN16"); return e ? atoi(e) : mmb_cfg().down16; }(); return v != 0; }
-+bool mmb_glu()     { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_GLU"); return e ? atoi(e) : mmb_cfg().glu; }(); return v != 0; }
++bool mmb_gatemix_flag() { return mmb_policy<int>([](int d) { const char * e = getenv("LLAMA_HC_GATEMIX"); return e ? atoi(e) : mmb_cfg_for_device(d).gatemix; }) != 0; }
++bool mmb_down16_flag() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_DOWN16"); return e ? atoi(e) : mmb_cfg_for_device(d).down16; }) != 0; }
++bool mmb_glu() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_GLU"); return e ? atoi(e) : mmb_cfg_for_device(d).glu; }) != 0; }
 +// Path policy for the generic *quantized* dense tile GEMM (a plain MUL_MAT -- attention qkv/o and
 +// the dense MLP), as opposed to the routed MoE expert path and the qwen4exp HC paths (tall-M /
 +// tiny-M / gate-mix), which have their own knobs below.  Off by default on RDNA4: the measurements
@@ -54618,18 +54667,15 @@ index 000000000..2b720813f
 +// OFF makes every routed op keep the delivery's `mul_mat_q_routed_compact` / `mul_mat_q` path and
 +// costs nothing (the graph's fusion stand-down goes through this predicate).  Measured on RDNA4:
 +// `35B-A3B UD-Q3_K_M` routed-ON -1.4 %, routed-OFF +-0.0 % (two interleaved rounds).
-+bool mmb_routed_flag() {
-+    static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_ROUTED"); return e ? atoi(e) : mmb_cfg().routed; }();
-+    return v != 0;
-+}
-+int mmb_glu_thresh() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_GLU_THRESH"); return e ? atoi(e) : mmb_cfg().glu_thresh; }(); return v; }
-+int mmb_routed_thresh() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_ROUTED_THRESH"); return e ? atoi(e) : mmb_cfg().routed_thresh; }(); return v; }
++bool mmb_routed_flag() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_ROUTED"); return e ? atoi(e) : mmb_cfg_for_device(d).routed; }) != 0; }
++int mmb_glu_thresh() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_GLU_THRESH"); return e ? atoi(e) : mmb_cfg_for_device(d).glu_thresh; }); }
++int mmb_routed_thresh() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_ROUTED_THRESH"); return e ? atoi(e) : mmb_cfg_for_device(d).routed_thresh; }); }
 +// IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
 +// win, but the MMB *fused GLU* path is a NET LOSS on the UD-Q3_K_M workload (the fused kernel's
 +// dequant/loop shape costs more than the bf16-WMMA gain): full-on 1921 vs routed-only 2121 t/s
 +// pp8192 (both vs 1942 off).  So the fused GLU arm is default-off; GGML_CUDA_MMB_IQ3XXS=1 enables it
 +// for re-measurement/tuning.
-+bool mmb_iq3xxs_glu() { static const int v = [] { const char * e = getenv("GGML_CUDA_MMB_IQ3XXS"); return e ? atoi(e) : mmb_cfg().iq3xxs_glu; }(); return v != 0; }
++bool mmb_iq3xxs_glu() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_IQ3XXS"); return e ? atoi(e) : mmb_cfg_for_device(d).iq3xxs_glu; }) != 0; }
 +
 +// ---------------------------------------------------------------------------------------------
 +// Weight-type policy.  MMB's per-type kernels do NOT transfer between arches: on RDNA4 (gfx12)
@@ -55142,8 +55188,8 @@ index 000000000..2b720813f
 +// worse, disagrees with the graph optimizer's BF16-only activation marking, which may leave a
 +// preempted reader's F32 buffer unwritten.
 +bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
-+bool ggml_cuda_mmb_blk16() { static const int v = [] { const char * e = getenv("LLAMA_HC_BLK16"); return e ? atoi(e) : mmb_cfg().blk16; }(); return v != 0; }
-+bool ggml_cuda_mmb_res16()  { static const int v = [] { const char * e = getenv("LLAMA_HC_RES16"); return e ? atoi(e) : mmb_cfg().res16; }(); return v != 0; }
++bool ggml_cuda_mmb_blk16() { return mmb_policy<int>([](int d) { const char * e = getenv("LLAMA_HC_BLK16"); return e ? atoi(e) : mmb_cfg_for_device(d).blk16; }) != 0; }
++bool ggml_cuda_mmb_res16() { return mmb_policy<int>([](int d) { const char * e = getenv("LLAMA_HC_RES16"); return e ? atoi(e) : mmb_cfg_for_device(d).res16; }) != 0; }
 +bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
 +        const int hc, const float scale, const float bias) {
 +    static const int gdbg = [] { const char * e = getenv("LLAMA_HC_GATEMIX_DEBUG"); return e ? atoi(e) : 0; }();
@@ -63201,10 +63247,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..e2ecc287e
+index 000000000..440580086
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9949 @@
+@@ -0,0 +1,9958 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -69174,6 +69220,13 @@ index 000000000..e2ecc287e
 +    });
 +    size_t freed = 0;
 +    size_t n_freed = 0;
++    // The fused MoE kernels receive the ARENA ADDRESS AS A KERNEL ARGUMENT and the compute is
++    // asynchronous, so nothing may be freed while a kernel that reads it is still in flight -- the
++    // same hazard `stand_down_table_locked` and `moe_cache_release_arena` both pay a sync for.  This
++    // path is currently unreferenced, which is exactly why it must not be the one that forgets it:
++    // a future caller would get a device use-after-free (the measured shape is
++    // `mul_mat_vec_q_moe` faulting on an address inside a just-freed table arena).
++    moe_cache_sync_devices_locked();
 +    for (int i : order) {
 +        if (freed >= target) {
 +            break;
@@ -69190,6 +69243,7 @@ index 000000000..e2ecc287e
 +        }
 +        t.arena = nullptr;
 +        t.slots = 0;
++        t.identity = false;
 +        t.slot_expert.clear();
 +        t.slot_prov.clear();
 +        t.expert_slot.clear();
@@ -69244,6 +69298,7 @@ index 000000000..e2ecc287e
 +            t.arena = nullptr;
 +        }
 +        t.slots = 0;
++        t.identity = false;
 +        t.slot_expert.clear();
 +        t.expert_slot.clear();
 +        t.slot_dirty = true;
