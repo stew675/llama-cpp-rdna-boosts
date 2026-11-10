@@ -143,9 +143,14 @@ produces `17f51fb30c` (sha256 `f5702697ea…`), verified with a plain `git am` o
 mechanical — this release moved block-15 defaults and options only, so nothing in that artifact's code or
 numbers moves, and its own measurements are kept as the dated record.
 
-The rest of the release mechanics: `fork-refresh.sh --build --gates --push` (the personal fork's `rdna-boosts`
-branch must carry tip `4973ab6c1`), the tag, and the off-host worker container build that the tag triggers
-(`CONTAINERS.md` — never on the primary box).
+The rest of the release mechanics, done at tag time: `fork-refresh.sh` (no flags) verified the re-cut —
+`Applied tree matches release.json`, `Applied tip: 4973ab6c1`; the gates above ran against that same tree on the
+long-lived build; the personal fork's `rdna-boosts` was then published with `git push --force-with-lease origin
+rdna-boosts` (`a9d74e393...4973ab6c1`, the only permitted target), and the delivery tag
+`v16-a691b2345-r247` was pushed with `main`.  (`fork-refresh.sh --build --gates --push` is the one-command
+equivalent; the split was used here so the gates ran before anything was published.)  Still pending by design:
+the **off-host worker container build**, which the tag triggers on `radiance` (`CONTAINERS.md` — never on the
+primary box).
 
 ### Release notes (the short version for consumers)
 
