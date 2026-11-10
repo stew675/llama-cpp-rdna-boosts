@@ -3243,13 +3243,50 @@ memory cannot become a graph result; the arm that catches it is `scripts/gate-fu
   census cannot go vacuous). **Corollary for reports:** a per-round cost that a text hash and a kernel-timing table
   both miss is per LAUNCH, not per kernel and not per host call, and the census to read is the dispatch-entry count,
   not the graph's GPU time.
-- **Our GDN conv fusion and the `ssm_conv_in` epilogue decline on a multi-sequence ubatch (r241, recorded, NOT fixed).**
-  `gdn_conv_check()` requires the concat's state operand at `st->ne[2] == 1`, so with `-np 2 --kv-unified`
-  (`st->ne[2] == 2`) the direct conv never matches, and once the rollback store's window view sits between the CONCAT
-  and the conv, `ggml_cuda_ssm_conv_in_try_fuse` does not take it either: r240 dispatches `CONCAT conv_input-*` 48
-  times per verify round where r220 dispatched ~4, 0.010 ms each. Restoring it needs both matchers to accept the new
-  window view (`ne = [n_cols, Kw, C, n_seqs]` with dim-1 stride one element), which is a prefill-kernel change and was
-  not shipped on the strength of one arm. Worth ~0.5 ms of a 45 ms verify round.
+- **The GDN conv fusion and the `ssm_conv_in` epilogue declined on EVERY `#31660`-store graph, not only on a
+  multi-sequence ubatch (r241, corrected in r244 -- the r241 text said "multi-sequence" and that was wrong).**
+  `build_conv_state_store()` writes its rollback snapshots with one 4-D window view of the concat
+  (`ne = [n_cols, Kw, C, n_seqs]`, dim-1 stride one element) and one `SET_ROWS` that reads it. `gdn_conv_check()`
+  knew only the old one-CPY shape (a `[3, C]` view) and rejected an unknown reader of the concat, so from the r236
+  re-base until r244 the direct conv declined on **every** GDN layer of any graph with `n_rs_seq > 0` -- i.e. every
+  MTP/DFlash verify AND every prompt prefill of a draft-armed context -- with `n_seqs == 1` included. The multi-
+  sequence `st->ne[2] == 1` requirement is a *second*, independent limitation; on its own it never decided an arm.
+  Measured at r243 (dense 27B, `draft-mtp n3`, one sequence): `GGML_CUDA_CONV_DEBUG` prints no `GDN_CONV_DIRECT`
+  at all and a 32-token run dispatches `CONCAT` 456 times (`GGML_CUDA_OP_TIMING`), against 24 at r244. r220's ~4
+  per verify round was the pre-#31660 shape. Fixed in r244 (the 4-D window view's columns join the materialized
+  tail and the `SET_ROWS` is accepted as a reader of it); the multi-sequence limitation remains, and
+  `ggml_cuda_ssm_conv_in_try_fuse` still does not take the store graph.
+- **A GDN conv replacement must stand down with `GGML_CUDA_DISABLE_CONV_FUSION`, or the "chain" arm is not the
+  chain (r244).** The new one-kernel decode/verify conv step (block 10, `GGML_CUDA_FUSE_GDN_CONV_STORE`) replaced
+  the same step as the direct conv and at first honoured only its own switch. With `GGML_CUDA_DISABLE_CONV_FUSION=1`
+  the kernel still ran and the half-off state was **numerically wrong**: `test-logits-width-probe` at `P=3584`
+  (dense 27B, `GGML_FORCE_N_RS_SEQ=3`) read `W=1 maxdiff_vs_W8 = 5.88239`, `width_purity=FAIL`, where the previous
+  release, the default arm and the both-switches-off arm all read maxdiff 0 and the same W8/row-0 hashes. This is
+  §81/r202's class in the mirror: a switch that covers part of a path measures nothing, and here it also produced
+  wrong logits. The matcher's `gdn_store_enabled()` now reads both switches, and the family switch is the arm gate
+  10's width probe uses. **Rule:** a new fusion that replaces a step an existing switch already covers must honour
+  that switch, and the gate must run the family-off arm, not only the new feature's own.
+- **The GDN conv restore and the one-kernel conv step are bit-identical to the chain, and worth ~1 % each (r244,
+  contributor PR #292).** With the store accepted by `gdn_conv_check()` the verify/prefill conv is fused again:
+  prefill **+0.87 %** (dense 27B + DFlash2, 5246 tokens, 1260.4 -> 1271.4 t/s) and **+1.0 %** (MTP), a server arm
+  +0.94 %; the one-kernel step is **-1.22 %** of the per-verify-forward time (`predicted_ms / (predicted_n -
+  draft_n_accepted)`, 6 interleaved server arms) and +1.3 % end-to-end generation. Launch census per 32-token MTP
+  run: `CONCAT` 456 -> 24 (the conv restore), `SET_ROWS` 432 -> 48 and the deferred state `GET_ROWS` 568 -> 184
+  (the one-kernel step). Bit-identity: prefill-logit KLD -0.000000 / same-top-p 99.990 % in the store path, and
+  width-probe `P=2048/3584/4096` on 27B and 35B-A3B, 1 GPU and 3-GPU `-sm tensor` / `-sm layer` identical to the
+  r243 build. Both are RDNA4-only in the step (`GGML_CUDA_CC_IS_RDNA4`): gfx1100/gfx1151 get the conv restore and
+  the layer-input copies, not the one-kernel step. The step also keeps `#pragma clang fp contract(off)` (clang/HIP
+  only -- an NVRTC/nvcc build would ignore it, which is why the kernel's reachability is gated on the AMD cc).
+- **An extracted layer input's copy position is a VRAM decision, and upstream's order is the expensive one (r244).**
+  Upstream #31506's `build_layer_inp_dev()` appends each layer's `SET_ROWS` after the whole graph, so every
+  extracted layer input lives until the end. Moving the copy's nodes to just after the next layer's input node
+  (`LLAMA_LAYER_INP_EARLY`, the shape r163's `set_layer_inp()` store already had) takes the dense-27B + DFlash2
+  target's compute buffer from **756.97 to 624.99 MiB** (`-np 1`) / **580.99 MiB** (server `-np 2 --kv-unified`) at
+  `-ub 2048`, i.e. **-185 MB** of steady-state VRAM, with identical text and draft counts. The move is a node-order
+  rotation with an explicit dependency check (the copy's source must be recorded before the next layer's input, and
+  the next input must be a node of its own); `ggml_cgraph`'s `use_counts` are hash-keyed, so a rotation does not
+  invalidate them, and `grads` (index-keyed) is unused on an inference graph. Do not "simplify" it by moving the
+  copy unconditionally: a source recorded after the target would then be read before it is written.
 - **`-lv` has two mappings, and only one of them is `common/`'s (2026-11-09, tooling; refs `AGENTS.md`).**
   A line reaches the threshold in one of two ways, and telling them apart is what makes the `-lv` table
   non-obvious: (a) `common/`'s `LOG_TMPL` **self-filters** on the macro's own verbosity, so `LOG_INF`/`LOG_CNT`

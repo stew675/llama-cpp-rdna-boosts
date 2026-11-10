@@ -1,4 +1,4 @@
-From 954eabfc61260ee6b13e490910a536a2feb39fa3 Mon Sep 17 00:00:00 2001
+From b018152d1d88be363e76b3223272b5dc0623f4c4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 10:06:57 -0600
 Subject: [PATCH 12/15] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -86,6 +86,7 @@ Coherence vs the R12 tree (same session, same commands): dense 4B 1de99b7e6ee6, 
  src/llama-context.h                           |   63 +-
  src/llama-cparams.h                           |    5 -
  src/llama-ext.h                               |   29 +-
+ src/llama-graph.cpp                           |   28 +
  src/llama-graph.h                             |    5 -
  src/llama-kv-cache.cpp                        |  332 +-
  src/llama-kv-cache.h                          |   30 +
@@ -103,7 +104,7 @@ Coherence vs the R12 tree (same session, same commands): dense 4B 1de99b7e6ee6, 
  tools/server/server-task.cpp                  |  107 +-
  tools/server/server-task.h                    |   16 +-
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 51 files changed, 7804 insertions(+), 1178 deletions(-)
+ 52 files changed, 7832 insertions(+), 1178 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 2b885af17..3b02f6439 100644
@@ -2346,10 +2347,10 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a72b752b5..8dad11d5e 100644
+index 7fcf227a3..da6cfad59 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3686,6 +3686,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -3687,6 +3687,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -2427,7 +2428,7 @@ index a72b752b5..8dad11d5e 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -4880,6 +4951,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -4881,6 +4952,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -2438,7 +2439,7 @@ index a72b752b5..8dad11d5e 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -5279,6 +5354,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -5280,6 +5355,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -2463,7 +2464,7 @@ index a72b752b5..8dad11d5e 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -5476,7 +5569,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -5477,7 +5570,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -2473,7 +2474,7 @@ index a72b752b5..8dad11d5e 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -5530,16 +5624,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -5531,16 +5625,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -2506,7 +2507,7 @@ index a72b752b5..8dad11d5e 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -5547,6 +5650,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -5548,6 +5651,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -2522,7 +2523,7 @@ index a72b752b5..8dad11d5e 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -7543,6 +7655,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7554,6 +7666,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -2531,7 +2532,7 @@ index a72b752b5..8dad11d5e 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7572,6 +7686,11 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7583,6 +7697,11 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -2543,7 +2544,7 @@ index a72b752b5..8dad11d5e 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8102,6 +8221,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8113,6 +8232,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -2552,7 +2553,7 @@ index a72b752b5..8dad11d5e 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -8489,6 +8610,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -8500,6 +8621,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -2575,7 +2576,7 @@ index a72b752b5..8dad11d5e 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -8508,6 +8645,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -8519,6 +8656,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -2587,7 +2588,7 @@ index a72b752b5..8dad11d5e 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -8531,6 +8673,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -8542,6 +8684,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -2607,7 +2608,7 @@ index a72b752b5..8dad11d5e 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -8665,11 +8820,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8676,11 +8831,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -10440,6 +10441,55 @@ index d71608749..7811dc049 100644
  // returns pointer to the target-model layer indices
  LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
  // returns the number of extracted layers from target model
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1678215ff..2d2e6fca3 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4550,6 +4550,18 @@ void llm_graph_context::build_layer_inp_dev() const {
+     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+     ggml_set_input(inp->idxs);
+ 
++    // Each copy goes right after the layer's output (the next layer's input), where F1's per-layer store put it, instead of
++    // after the whole graph: the layer input is free from there on.  Appended at the end (upstream #31506's order), every
++    // extracted layer input lives through every later layer: measured on dense 27B + DFlash2's 5 layers at -ub 2048, the
++    // target's compute buffer took 756.97 MiB and now takes 624.99 MiB (llama-cli, -np 1) / 580.99 MiB (server, -np 2
++    // --kv-unified), and steady-state VRAM on the card fell 185 MB.  Only the node order moves; every node computes the
++    // same.  The move needs the next layer's input to be a node of its own, taken after the copy's source; otherwise the
++    // copy stays where upstream appended it.  LLAMA_LAYER_INP_EARLY=0: at the end, as upstream.
++    static const bool early = [] {
++        const char * e = getenv("LLAMA_LAYER_INP_EARLY");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
+     int64_t col = 0;
+     for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+@@ -4561,9 +4573,25 @@ void llm_graph_context::build_layer_inp_dev() const {
+         GGML_ASSERT(src != nullptr && "layer input tensor is null");
+         GGML_ASSERT(src->ne[0] == n_embd);
+ 
++        const int n0 = ggml_graph_n_nodes(gf);
+         ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd*ggml_element_size(layer_inp_dev));
+         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_tokens), inp->idxs));
+         col++;
++
++        const int n1 = ggml_graph_n_nodes(gf);
++        ggml_tensor * next = il + 1 < res->t_layer_inp.size() ? res->t_layer_inp[il + 1] : nullptr;
++        if (early && next != nullptr && n1 > n0) {
++            ggml_tensor ** nodes = ggml_graph_nodes(gf);
++            int i_src = -1, i_next = -1;
++            for (int k = 0; k < n0; ++k) {
++                if (nodes[k] == src)  i_src  = k;
++                if (nodes[k] == next) i_next = k;
++            }
++            // src computed before (or a leaf), and the next layer's input is a node of its own: the new nodes move there
++            if (i_next >= 0 && i_src < i_next) {
++                std::rotate(nodes + i_next + 1, nodes + n0, nodes + n1);
++            }
++        }
+     }
+     GGML_ASSERT(col*n_embd == layer_inp_dev->ne[0]);
+ 
 diff --git a/src/llama-graph.h b/src/llama-graph.h
 index 195f54efb..7728eff51 100644
 --- a/src/llama-graph.h

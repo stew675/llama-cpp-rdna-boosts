@@ -1,3 +1,63 @@
+## 261109.010 (r244, RELEASE v16-a691b2345-r244) -- contributor PR #292: the GDN conv takes `#31660`'s rollback store again (+0.9 % prefill), that conv step runs as one kernel (+1.2 % per verify forward), and the DFlash layer-input copies sit next to each layer (-176 MiB)
+
+**Release `v16-a691b2345-r244`.**  Base `a691b2345`, 16 blocks, canonical tip `443104a13`, tree
+`5cd5d6a4665409060ad6c78f6ace32f6feffd34b`, all 17 artifact hashes refreshed.  Two blocks amended: **10** (the
+conv restore and the one-kernel conv step) and **12** (the layer-input copy order).  Record:
+[`archive/work/gdn-conv-store/`](archive/work/gdn-conv-store/README.md); the engineering facts are
+`INVARIANTS.md` r244; the variable rows are `ENVIRONMENT.md` §4/§7.1/§9; the verification contract is
+`MANIFESTS.md` blocks 10 and 12.
+
+1. **The PR, and the first thing it exposed.**  Three `git am` commits from `overdoingism`, each with its own
+   kill switch, cut against r241 and applying cleanly to r243: `gdn_conv_check()` takes upstream #31660's
+   rollback store again (`GGML_CUDA_DISABLE_CONV_FUSION`), the decode/verify GDN conv step runs as one kernel on
+   that store (`GGML_CUDA_FUSE_GDN_CONV_STORE`), and the DFlash layer-input copies move to just after each layer
+   (`LLAMA_LAYER_INP_EARLY`).  Its central claim -- "since r236 the direct conv declined on every GDN layer,
+   single-sequence ubatches included" -- is **true**, and it means the **r241 entry understated the r236 re-base
+   regression**: `INVARIANTS.md` r241 recorded it as a multi-sequence-ubatch limitation, but `#31660`'s 4-D
+   window view breaks the matcher on every `n_rs_seq > 0` graph, i.e. every MTP/DFlash verify *and* every prompt
+   prefill of a draft-armed context.  Measured at r243 (dense 27B, `draft-mtp n3`, one sequence): no
+   `GDN_CONV_DIRECT` at all, `CONCAT` dispatched 456 times per 32-token run; with the restore, 24.  The r241
+   entry is corrected in place.
+2. **The defect we found and fixed before taking it (the one thing that would have blocked the PR).**  The new
+   conv-step kernel replaced the same step as the direct conv but honoured only its own switch, so
+   `GGML_CUDA_DISABLE_CONV_FUSION=1` -- the documented A/B/bisect arm, and the reference arm of gate 10's width
+   probe -- left it running.  That half-off state was **numerically wrong**: `test-logits-width-probe P=3584`
+   (dense 27B, `GGML_FORCE_N_RS_SEQ=3`) read **`W=1 maxdiff_vs_W8 5.88239`, `width_purity=FAIL`**, where r243, the
+   default arm and the both-switches-off arm all read maxdiff 0 and the same W8/row-0 hashes.  This is
+   §81/r202's rule ("a switch that covers only part of the path measures nothing") in the mirror image, and it is
+   why the fix is in the delivery rather than in a follow-up: `gdn_store_enabled()` now reads both switches.  We
+   also added a census -- `GGML_CUDA_CONV_DEBUG=1` prints `GDN_CONV_STORE C=.. T=.. Kw=..` once per process, the
+   direct conv's `GDN_CONV_DIRECT` equivalent -- because without it a run of this path cannot be told from the
+   chain, i.e. the gate would be vacuous.
+3. **Bit-identity, in the store path this time.**  The plain coherence arms are **blind** to both changes (the
+   store only exists at `n_rs_seq > 0`), so the gate was run with `GGML_FORCE_N_RS_SEQ=3`: prefill-logit KLD
+   **−0.000000 / same-top-p 99.990 %** against a base recorded from the r243 build under the same override, for
+   the default arm, `GGML_CUDA_FUSE_GDN_CONV_STORE=0` and `GGML_CUDA_DISABLE_CONV_FUSION=1`; width probe
+   `P=2048/3584/4096` on dense 27B and 35B-A3B, 1 GPU and 3-GPU `-sm tensor`/`-sm layer`, identical to r243 and
+   `width_purity PASS` everywhere, including the family-off arm after the fix.  Greedy text and draft counts are
+   identical in every arm (plain `d45e2221805a`, 27B MTP `5ba44647188f`, 27B DFlash2 `d8b90a3da3f4`, 3-GPU
+   tensor `829eede953a8`, 3-GPU layer `c437759e06e3`, server DFlash2 `42750151a957`), acceptance identical
+   (MTP 0.61654 = 82/133, DFlash2 0.60510 = 95/157), and Protocol A acceptance identical to r243 on both the
+   dense (**0.50588**, 602/1190) and the MoE (**0.73899**, 688/931) model.
+4. **What it is worth** (1 × R9700, `ROCBLAS_USE_HIPBLASLT=0`): prefill **+0.87 %** (DFlash2, 5246-token prompt,
+   1260.4 -> 1271.4 t/s) and **+1.0 %** (MTP), server arm **+0.94 %**; the one-kernel step is **−1.22 %** of the
+   per-verify-forward time (`predicted_ms / (predicted_n − draft_n_accepted)`, six interleaved server arms) and
+   +1.3 % end-to-end generation; the layer-input order takes the dense-27B + DFlash2 target's compute buffer from
+   **756.99 to 580.99 MiB** (server, `-np 2 --kv-unified`) and **756.97 to 624.99 MiB** (`llama-cli -np 1`), i.e.
+   **−185 MB (−176 MiB)** of steady-state VRAM -- the PR's "~582 MiB / −176 MiB" reproduce for the config it measured, and a
+   `-np 1` CLI graph settles 43 MiB higher.  Two claims of the PR are documented as limitations rather than
+   shipped: the step is **RDNA4-only** (gfx1100/gfx1151 get the conv restore and the copies only) and a
+   multi-sequence ubatch still declines.
+5. **Gates.**  `scripts/validate-set.sh` GREEN (checksums, strict 16/16 `git am` from a fresh `a691b2345`
+   tarball, tree `5cd5d6a46`, Windows portability 289 files clean); `scripts/gate-per-block-build.sh --fast
+   --changed-from 72f7753fd` **4/4** (blocks 10, 11, 12, 15; 405 s, block 12's `llama-graph.cpp` rebuild
+   dominating); `scripts/gate-prefill-logits.sh` PASS on all three arms; the width probe matrix above; Protocol A
+   on dense + MoE; rule-5 `llama-batched-bench -npp 2048 -ntg 128 -npl 1,4,8` PP 1373.9/1375.4/1374.3 against
+   r243's 1375.9/1390.2/1381.0 t/s and TG 30.6/101.7/151.7 against 30.6/102.0/152.0 -- **vacuous for this change
+   by construction** (no draft means `n_rs_seq = 0`, so neither the store nor the layer-input path exists) and
+   inside the box's spread; `scripts/check-gpu-faults.sh` clean over every arm.  `scripts/fork-refresh.sh`
+   re-cut to tip `443104a13` with the tree matching before the tip was recorded.
+
 ## 261109.009 (wip) -- `wip/apu-expert-pool` opened: the host-expert / expert-arena tier is hard-gated off on UMA APUs, and the measurements say the reasons for the gate are a *sizing* defect plus an unexplained fault, not a limit
 
 **Scoping note + a completed measurement foundation, nothing implemented** (no `patches/` change, nothing
