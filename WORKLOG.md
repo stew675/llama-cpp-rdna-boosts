@@ -84,7 +84,11 @@ delivery-style arm (`-c 32768`, `-ub 4096`, mmap, slab headroom 1536) 1489.1 vs 
 over 6 reps (-0.6 %)**.  The effect the neighbouring `dsv4_hc_pre` recorded (+18.6 % in situ, gfx1151
 pp8192) is L2/MALL pressure from the GEMM weight streams beside the op, and no arm this delivery validates
 can isolate it on gfx1201 (Flash-Next is 78 GiB, so every validated arm is host-expert-bound).  The
-measurement is the record; the item is closed **without code**.
+measurement is the record; the item is closed **without code**.  **One instrument note for the next reader:**
+the r242 record's absolute prefill (**2334.8-2471.9 t/s**) does not reproduce on this box today — my r242-style
+arm (same flags, `-c 262144`, 130 kB of delivery docs as the prompt) reads **1692** t/s on the r249 build and
+1484 t/s on the delivery-style arm, so the r242 prompt (not committed) and some later default both differ;
+that is why the #311 verdict rests on an interleaved same-build A/B and not on matching an old absolute.
 
 **Gates.**  `scripts/validate-set.sh` green (16/16 strict `git am` from a fresh `a691b2345` tarball, tree
 `ce1a738d`, Windows lint 289 files); `scripts/gate-per-block-build.sh --tip <chain> --changed-from 076daf709
