@@ -1,7 +1,8 @@
 ## 261109.012 (r245) -- GitHub issue #294 (mixed gfx1100 + gfx1201 assert): the MMB policy accessors were still process-wide, and one arena-release path skipped its device sync
 
-**Release:** `v16-a691b2345-r245`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip `c4ef4e400`,
-tree `0d10efd84f`, 16 blocks.  `scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16
+**Release:** `v16-a691b2345-r245`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`9e0d39dd8` (the `fork-refresh.sh` re-cut; the working chain's own tip `c4ef4e400` carries the same tree
+`0d10efd84f` and is **not** the value to record), 16 blocks.  `scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16
 `git am`, applied tree == recorded tree, Windows portability lint).  **No block renumbered, merged or
 split**: two folds, **block 06** (`mmb.cu`) and **block 09** (`moe-expert-cache.cu`).  No kernel arithmetic
 changed, no default moved, no environment variable added or repurposed.  Braces stay on their own line (the
