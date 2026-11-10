@@ -1,0 +1,281 @@
+From 7fe1ed000f08ea960450382039d8b25e1e31cb78 Mon Sep 17 00:00:00 2001
+From: Marvin Johanning <email@marvinjohanning.de>
+Date: Tue, 10 Nov 2026 20:15:31 +0100
+Subject: [PATCH] rdna-boosts [optional]: an 8-bit (q8_0) wire for the
+ copy-engine all-reduce (GGML_CUDA_AR_CE_WIRE)
+
+For a two-GPU tensor split on a slow inter-GPU link, the copy-engine all-reduce
+(GGML_CUDA_ALLREDUCE=ce) can send the partial sums as q8_0 blocks (32 values,
+one fp16 scale: 53 % of the bf16 bytes) instead of bf16. Opt-in:
+
+  GGML_CUDA_AR_CE_WIRE=bf16 (default) | q8 | q8h
+
+q8h first multiplies each 32-value block by the normalized Walsh-Hadamard
+matrix (orthogonal and its own inverse), so a single outlier is spread over the
+block instead of setting a coarse scale for the other 31. The ranks reduce in
+the rotated domain.
+
+The four phases mirror the bf16 path (same scratch, events and ordering); each
+rank dequantizes its own reduced half too, so both ranks hold identical values.
+Only two ranks, ne divisible by 64, and wave32 devices take the 8-bit path;
+anything else, and the default, keeps the bf16 wire unchanged. Decode-sized
+tensors stay on the internal pipeline and are not touched.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 234 ++++++++++++++++++++++++++++++++
+ 1 file changed, 234 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 68d6b33f0..b9a3f06fc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3839,6 +3839,125 @@ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+ // of NCCL's SM-driven kernels.  Rationale (measured): copy-engine transfers
+ // hide completely behind a WMMA-saturating GEMM while SM-driven transfers steal ~84-95% of the
+ // compute; the store here is therefore the prerequisite for any overlapped all-reduce.  2 ranks only.
++// ---------------------------------------------------------------------------------------------
++// Opt-in 8-bit wire for the copy-engine all-reduce (GGML_CUDA_AR_CE_WIRE=q8; default: bf16, unchanged).
++//
++// For hosts where one GPU sits on a slow link (e.g. a chipset PCIe 3.0 x4 slot), the large-tensor
++// all-reduce is bandwidth-bound and the cards stall on it.  This path sends q8_0 blocks (int8 + one
++// fp16 scale per 32 values, 34 B / 32 values = 53 % of the bf16 bytes) instead of bf16.
++//
++// Same 2-rank reduce-scatter + all-gather shape as the bf16 path:
++//   phase 0   each rank quantizes its fp32 contribution to q8_0 (whole tensor)
++//   phase 1a  rank i ships q8 chunk c to rank c
++//   phase 1b  rank i: own fp32 chunk + dequant(peer chunk) -> re-quantize into its q8 buffer
++//   phase 2a  rank i ships its reduced q8 chunk to the peer
++//   phase 2b  every rank dequantizes BOTH chunks from q8 (its own reduced chunk too), so all ranks
++//             hold bit-identical results, as the bf16 path guarantees.
++// Lossy by design (two q8_0 roundings per all-reduce); decode-sized tensors never reach this path
++// (they stay on the internal pipeline), so the decode/verify band is untouched.
++
++#define GGML_CUDA_CE_Q8_GROUPS 8   // 32-lane groups per 256-thread workgroup, one q8_0 block each
++
++// `q8h`: rotate each 32-value block with a normalized Walsh-Hadamard transform before quantizing and rotate
++// back after dequantizing.  The transform is orthogonal and linear, so the two ranks can add their
++// contributions in the rotated domain, and it spreads a single outlier over the whole block instead of
++// flushing the block's 31 small values to zero (the dominant q8 error on LLM activations).
++template <int m>
++static __device__ __forceinline__ float ggml_cuda_ce_xor(float v) {
++#if defined(GGML_CUDA_DPP_XOR)
++    return ggml_cuda_xor_lane<m>(v);
++#else
++    return __shfl_xor_sync(0xffffffff, v, m, 32);
++#endif
++}
++template <int m>
++static __device__ __forceinline__ float ggml_cuda_ce_fwht_step(float v, int lane) {
++    const float o = ggml_cuda_ce_xor<m>(v);
++    return (lane & m) ? (o - v) : (v + o);
++}
++static __device__ __forceinline__ float ggml_cuda_ce_fwht32(float v, int lane) {
++    v = ggml_cuda_ce_fwht_step<1>(v, lane);
++    v = ggml_cuda_ce_fwht_step<2>(v, lane);
++    v = ggml_cuda_ce_fwht_step<4>(v, lane);
++    v = ggml_cuda_ce_fwht_step<8>(v, lane);
++    v = ggml_cuda_ce_fwht_step<16>(v, lane);
++    return v * 0.17677669529663687f; // 1/sqrt(32)
++}
++
++static __device__ __forceinline__ void ggml_cuda_ce_q8_store(float v, block_q8_0 * __restrict__ dst, int lane) {
++    const float amax = warp_reduce_max<32>(fabsf(v));
++    // round the scale to fp16 FIRST so quantize and dequantize use the same value
++    const half  dh = __float2half(amax / 127.0f);
++    const float d  = __half2float(dh);
++    const int   q  = d > 0.0f ? max(-127, min(127, __float2int_rn(v / d))) : 0;
++    dst->qs[lane] = (int8_t) q;
++    if (lane == 0) {
++        dst->d = dh;
++    }
++}
++
++// phase 0: fp32 -> q8_0
++static __global__ void ggml_cuda_ce_q8_quant(const float * __restrict__ x, block_q8_0 * __restrict__ y, int64_t nblocks, int rot) {
++    const int lane = threadIdx.x % 32;
++    for (int64_t b = (int64_t) blockIdx.x * GGML_CUDA_CE_Q8_GROUPS + threadIdx.x / 32; b < nblocks;
++         b += (int64_t) gridDim.x * GGML_CUDA_CE_Q8_GROUPS) {
++        float v = x[b * QK8_0 + lane];
++        if (rot) {
++            v = ggml_cuda_ce_fwht32(v, lane);
++        }
++        ggml_cuda_ce_q8_store(v, &y[b], lane);
++    }
++}
++
++// phase 1b: (own fp32, may be null = zero contribution) + dequant(peer q8) -> q8
++static __global__ void ggml_cuda_ce_q8_sum_requant(const float * __restrict__ own, const block_q8_0 * __restrict__ peer,
++                                                   block_q8_0 * __restrict__ dst, int64_t nblocks, int rot) {
++    const int lane = threadIdx.x % 32;
++    for (int64_t b = (int64_t) blockIdx.x * GGML_CUDA_CE_Q8_GROUPS + threadIdx.x / 32; b < nblocks;
++         b += (int64_t) gridDim.x * GGML_CUDA_CE_Q8_GROUPS) {
++        float v = __half2float(peer[b].d) * (float) peer[b].qs[lane];   // already rotated when rot
++        if (own != nullptr) {
++            float o = own[b * QK8_0 + lane];
++            if (rot) {
++                o = ggml_cuda_ce_fwht32(o, lane);
++            }
++            v += o;
++        }
++        ggml_cuda_ce_q8_store(v, &dst[b], lane);
++    }
++}
++
++// phase 2b: q8_0 -> fp32
++static __global__ void ggml_cuda_ce_q8_dequant(const block_q8_0 * __restrict__ x, float * __restrict__ y, int64_t nblocks, int rot) {
++    const int lane = threadIdx.x % 32;
++    for (int64_t b = (int64_t) blockIdx.x * GGML_CUDA_CE_Q8_GROUPS + threadIdx.x / 32; b < nblocks;
++         b += (int64_t) gridDim.x * GGML_CUDA_CE_Q8_GROUPS) {
++        float v = __half2float(x[b].d) * (float) x[b].qs[lane];
++        if (rot) {
++            v = ggml_cuda_ce_fwht32(v, lane);
++        }
++        y[b * QK8_0 + lane] = v;
++    }
++}
++
++static inline unsigned ggml_cuda_ce_q8_grid(int64_t nblocks) {
++    const int64_t g = (nblocks + GGML_CUDA_CE_Q8_GROUPS - 1) / GGML_CUDA_CE_Q8_GROUPS;
++    return (unsigned) std::max<int64_t>(1, std::min<int64_t>(g, 4096));
++}
++
++// 0 = bf16 (default), 1 = q8 (q8_0 blocks), 2 = q8h (q8_0 blocks of Hadamard-rotated values)
++static int ggml_cuda_ce_wire_q8_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_CUDA_AR_CE_WIRE");
++        const int v = e == nullptr ? 0 : strcmp(e, "q8") == 0 ? 1 : strcmp(e, "q8h") == 0 ? 2 : 0;
++        if (v) {
++            GGML_LOG_INFO("%s: copy-engine all-reduce: 8-bit wire enabled (GGML_CUDA_AR_CE_WIRE=%s)\n", __func__, e);
++        }
++        return v;
++    }();
++    return mode;
++}
++
+ static __global__ void ggml_cuda_ce_add_bf16(const nv_bfloat16 * __restrict__ a,
+                                              const nv_bfloat16 * __restrict__ b,
+                                              nv_bfloat16 * __restrict__ o, long n) {
+@@ -3955,6 +4074,121 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+     auto ctmp2 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp2[i]; };
+     const size_t esz = sizeof(nv_bfloat16);
+ 
++
++    // Opt-in 8-bit wire (see ggml_cuda_ce_q8_* above).  2 ranks, and every chunk boundary on a q8_0
++    // block (ne divisible by n * 32); anything else keeps the bf16 path below.  The scratch above is
++    // sized for bf16 (2 B/value), so the q8 data (1.0625 B/value) always fits in the same regions.
++    // The kernels map one lane to each value of a 32-value q8_0 block (one 32-lane group per block) and
++    // use 32-wide lane exchanges.  That is one wave on wave32 devices (RDNA, NVIDIA), the only ones it has
++    // been measured on; anything else keeps the bf16 wire.
++    static const bool ce_q8_wave32 = [comm_ctx] {
++        for (const int dev : comm_ctx->dev_ids) {
++            if (ggml_cuda_info().devices[dev].warp_size != 32) {
++                if (ggml_cuda_ce_wire_q8_mode() != 0) {
++                    GGML_LOG_WARN("%s: GGML_CUDA_AR_CE_WIRE needs wave32 devices (device %d has warp size %d); "
++                                  "using the bf16 wire\n", __func__, dev, ggml_cuda_info().devices[dev].warp_size);
++                }
++                return false;
++            }
++        }
++        return true;
++    }();
++    if (n == 2 && ggml_cuda_ce_wire_q8_mode() != 0 && ce_q8_wave32 && ne % ((int64_t) QK8_0 * n) == 0) {
++        const int rot = ggml_cuda_ce_wire_q8_mode() == 2;
++        const size_t qb = sizeof(block_q8_0);
++        auto qoff  = [&](int c) -> size_t { return (size_t) (off[c] / QK8_0) * qb; };         // byte offset of chunk c
++        auto qlen  = [&](int c) -> size_t { return (size_t) ((off[c + 1] - off[c]) / QK8_0) * qb; };
++        auto qnblk = [&](int c) -> int64_t { return (off[c + 1] - off[c]) / QK8_0; };
++        auto treg  = [&](int sender) -> size_t { return (size_t) sender * chunk_max * esz; };  // receive region
++
++        // phase 0: quantize each rank's whole contribution
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
++                ggml_cuda_ce_q8_quant<<<ggml_cuda_ce_q8_grid(ne / QK8_0), 256, 0, s>>>(
++                    (const float *) tensors[i]->data, (block_q8_0 *) cbuf(i), ne / QK8_0, rot);
++                CUDA_CHECK(cudaGetLastError());
++            } else {
++                CUDA_CHECK(cudaMemsetAsync(comm_ctx->ce_buf[i], 0, need, s));
++            }
++        }
++
++        // phase 1a: rank i ships q8 chunk c to rank c (same cross-call guard as the bf16 path)
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int c = 0; c < n; ++c) {
++                if (c != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_done[c], 0));
++                }
++            }
++            for (int c = 0; c < n; ++c) {
++                if (c == i) {
++                    continue;
++                }
++                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp1(c) + treg(i), cdev(c), cbuf(i) + qoff(c), cdev(i), qlen(c), s));
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_send[i], s));
++        }
++
++        // phase 1b: own fp32 chunk + dequant(peer slice) -> re-quantized into the own q8 chunk
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int c = 0; c < n; ++c) {
++                if (c != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_send[c], 0));
++                }
++            }
++            const int peer = 1 - i;
++            const float * own = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE)
++                                    ? (const float *) tensors[i]->data + off[i] : nullptr;
++            ggml_cuda_ce_q8_sum_requant<<<ggml_cuda_ce_q8_grid(qnblk(i)), 256, 0, s>>>(
++                own, (const block_q8_0 *) (ctmp1(i) + treg(peer)), (block_q8_0 *) (cbuf(i) + qoff(i)), qnblk(i), rot);
++            CUDA_CHECK(cudaGetLastError());
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_done[i], s));
++        }
++
++        // phase 2a: all-gather -- rank i ships its reduced q8 chunk to the peer
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int c = 0; c < n; ++c) {
++                if (c != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_out[c], 0));
++                }
++            }
++            for (int p = 0; p < n; ++p) {
++                if (p == i) {
++                    continue;
++                }
++                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp2(p) + treg(i), cdev(p), cbuf(i) + qoff(i), cdev(i), qlen(i), s));
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_recv[i], s));
++        }
++
++        // phase 2b: dequantize the own reduced chunk AND the peer's, so both ranks hold identical values
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int c = 0; c < n; ++c) {
++                if (c != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_recv[c], 0));
++                }
++            }
++            const int peer = 1 - i;
++            ggml_cuda_ce_q8_dequant<<<ggml_cuda_ce_q8_grid(qnblk(i)), 256, 0, s>>>(
++                (const block_q8_0 *) (cbuf(i) + qoff(i)), (float *) tensors[i]->data + off[i], qnblk(i), rot);
++            ggml_cuda_ce_q8_dequant<<<ggml_cuda_ce_q8_grid(qnblk(peer)), 256, 0, s>>>(
++                (const block_q8_0 *) (ctmp2(i) + treg(peer)), (float *) tensors[i]->data + off[peer], qnblk(peer), rot);
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[i], s));
++            CUDA_CHECK(cudaGetLastError());
++        }
++
++        return true;
++    }
++
+     // phase 0: stage each rank's contribution as bf16
+     for (int i = 0; i < n; ++i) {
+         ggml_cuda_set_device(cctx(i)->device);
+-- 
+2.56.0
+

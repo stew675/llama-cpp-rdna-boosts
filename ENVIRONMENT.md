@@ -1195,6 +1195,12 @@ who applies an optional artifact is running these code paths and needs the same 
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
+`optional/ce-q8-wire` (an 8-bit wire for the copy-engine all-reduce):
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_AR_CE_WIRE` | unset = `bf16` (the delivery's wire) | opt-in (value) | `q8` sends the copy-engine all-reduce's partial sums as q8_0 blocks (32 values, one fp16 scale: 53 % of the bf16 bytes); `q8h` first applies a normalized 32-point Walsh-Hadamard rotation to each block (spreads an outlier over the block; the ranks reduce in the rotated domain).  **Lossy**, so opt-in: it pays only on a slow inter-GPU link (measured: an RX 9070 on CPU lanes + an RX 7900 GRE on a chipset PCIe 3.0 x4 link, +17-21 % prefill).  Engages only on `GGML_CUDA_ALLREDUCE=ce` (or the auto chain's CE arm), exactly 2 ranks, wave32 devices and `ne` divisible by 64; anything else, and every decode-sized tensor (the internal pipeline), keeps the bf16 wire unchanged.  Unset is bit-identical to the delivery (`gate-prefill-logits.sh`: mean KLD 0.000000).  `optional/ce-q8-wire` only. |
+
 ## Maintaining this file
 
 The tables were derived from the code, so re-derive rather than trust them after a block change:
