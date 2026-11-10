@@ -71,6 +71,18 @@ blocks 11-15; the folded tip's tree is **identical** to the tree every measureme
 `archive/work/gdn-conv-store-multiseq/` (the submitted patch, the delivery's form, and the submitter's README
 kept verbatim as `README-as-submitted.md`).
 
+### Release mechanics (done)
+
+`scripts/fork-refresh.sh --build` then `--gates --push`: the re-cut at `a691b2345` reproduced tip `076daf709` /
+tree `262b72c37b` (the deterministic ids hold across the amend), built green, and the coherence + prefill-logit
+gates re-ran green inside the refresh; the branch was force-with-lease pushed to the personal fork only
+(`12433634d -> 076daf709`).  `main` and the annotated tag `v16-a691b2345-r249` are pushed; the tag's `Release
+patch set` workflow published the assets and both `Validate delivery set` runs (tag and `main`) went green.
+PR #295 is answered (what reproduced, the two record corrections, the pre-existing `--ub` trap) and closed, with
+the campaign archived rather than merged.  `TODO` #315 filed for that trap.  Container images: the `radiance`
+worker watcher picks the tag up on its own (`build-containers.sh --rocm 7.14.1 10.1 --push --prune`), per the
+policy nothing runs on the primary box.
+
 ## 261110.004 (r248, RELEASE v16-a691b2345-r248) -- GitHub issue #297: a windowed draft cache is a TRUE ring, a drafter failure cannot fail a request, and the reserve now reads the draft's own ubatch
 
 **Release:** `v16-a691b2345-r248`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
