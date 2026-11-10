@@ -1,3 +1,76 @@
+## 261110.005 (r249, RELEASE v16-a691b2345-r249) -- contributor PR #295: the one-kernel GDN conv step also takes a multi-sequence ubatch (the `--kv-unified` verify step of a multi-slot server)
+
+**Release:** `v16-a691b2345-r249`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`076daf709782c011a9ce49649dc917a49f97bf22` (tree `262b72c37b55c4dde7bcccbf765d6251fc384abc`), 16 blocks.
+`scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`, applied tree == recorded tree,
+conflict-marker and Windows-portability scans); a clean re-cut from `patches/` at `.base` reproduces the same tree
+**and** the same tip.  **No block renumbered, merged or split**: everything folds into **block 10** (the GDN conv
+store's owner).  No default, no gate threshold and no environment variable changed -- the patch adds no knob.
+
+### What shipped
+
+`GGML_CUDA_FUSE_GDN_CONV_STORE` (r244) replaced a speculative graph's whole GDN conv chain with one kernel, but
+only for **one** sequence (`st->ne[2] == 1`).  A `--kv-unified` `llama-server` whose verify ubatch carries two or
+more sequences therefore ran the chain on every GDN layer -- the limitation r244 records under "Not taken".  The
+step now takes **1..8 sequences, one block row a sequence** (`grid = dim3(C/256, S)`), reads `T`/`C`/`S` from the
+transposed view (its root is the in-projection's 2-D `[C, T*S]`), checks every per-sequence stride it relies on,
+and keeps the state as the `GET_ROWS` **copy** when `S > 1` (the gather is deferred for one sequence only, since
+one sequence's cache rows may be another's source).  `GGML_CUDA_CONV_DEBUG=1` prints its census line once **per
+sequence count** and it carries `S=`.
+
+### Assessment (the PR's claims, checked)
+
+The submitter's patch was one `git am` file cut against r244, and it applies cleanly to r248 as it stands
+(`gdn-conv-store.cu`/`.cuh` were untouched in between); its recorded sha256 reproduces exactly.  **It needed no
+code adjustment** -- the arithmetic, the stride checks, the deferral rule and the kill switches are as claimed:
+
+| arm (dense 27B, `-np 2 --kv-unified`, DFlash2 n5, q8_0 KV, `-c 16384`) | fingerprint (2 texts + 256 logprobs each) |
+|---|---|
+| r248 | `ba595285c0e555e2` |
+| r249 (store on) | `ba595285c0e555e2` |
+| r249 `GGML_CUDA_FUSE_GDN_CONV_STORE=0` (the chain) | `ba595285c0e555e2` |
+| r249 `GGML_CUDA_DISABLE_CONV_FUSION=1` (the family chain) | `ba595285c0e555e2` |
+| r249 repeat | `ba595285c0e555e2` |
+
+Byte-identical to r248 also at `-np 4` (S=4, `7ff4b91512e7ae57`), on 35B-A3B (`89f2ea4785d5c0b2`), with
+`GGML_CUDA_DISABLE_GRAPHS=1` (`74d9a48d81e22934`), on a 2-device `-sm tensor` split (`0edf500bb27cbdde`) and
+with `draft-mtp` (`d96d2182b1224e4b`) -- the four shapes the submitter listed as "not validated".  The census
+shows the path really fired and that r248 declined it: r248 prints only `GDN_CONV_STORE C=10240 T=2 …`, r249 also
+prints `… T=4 S=2 Kw=4 …` (and `T=4 S=4`, `T=6 S=2` at `-np 4`).
+
+**Numbers.**  Per verify step, two sequences decoding together: **7011.9 / 6995.7 ms** against **7082.9 ms** on
+r248, i.e. ~1.0-1.2 % faster (the submitter measured 1.6-1.8 % on their box, same direction); draft acceptance
+identical to the digit (0.41646 / 0.64667) and VRAM identical (19614 MiB both).  So the win is real, small, and
+it is a **coverage** win: a multi-slot server gets the kernel it was supposed to have.
+
+**Gates.**  Prefill logits: **-0.000000 / 99.990 %** under `GGML_FORCE_N_RS_SEQ=3` against a base re-recorded from
+r248 (store-off, family-off and `--ub 8` arms identical) and **0.000000 / 100.000 %** at the plain point (PPL
+5.9325).  Width probe `P=2048/3584/4096`, `RS=0` and `RS=3`, plus the family-off arm: `maxdiff 0`,
+`width_purity PASS`, and r244's anchors exactly (`9d22f1cfc9d5511d`, `946b1435ffc6a107`, `b4b493442fa8e46d` /
+`f6d04c9117b6af98`).  Protocol A (reduced, `-c 32768 -n 1000`): dense text `c4cec4370cadee92` identical,
+acceptance **0.89545** (728/813) identical, plain 29.66 -> 29.71 t/s and MTP 77.04 -> 77.30; MoE (`35B-A3B
+UD-Q4_K_M`) text `dc3a06849475dfda` identical, acceptance **0.92920** (735/791) identical; MTP >= plain on both.
+`test-backend-ops -o GATED_DELTA_NET` 55/55; `llama-batched-bench -npl 1,4,8` neutral (PP 1368.1/1365.0 vs
+1369.6/1372.5, TG 102.5/155.1 vs 102.7/155.6); `gate-per-block-build.sh --fast --tip <chain> --changed-from
+12433634d`: **2/2** (block 10 and the tip); `check-gpu-faults.sh` clean on the kernel journal and every run log.
+
+**Two things recorded rather than fixed.**  (1) `GGML_FORCE_N_RS_SEQ=3` with `--ub 4`/`--ub 1` aborts in
+`llama_batch_allocr::split_equal` -- **on r248 too**, so it is pre-existing and not this patch's; the r244 row's
+`--ub 4` arm was never reachable and this release runs that band at `--ub 8`.  Filed as **`TODO` #315**.
+(2) Re-recording the prefill-logit base with `--ab` overwrites `$BASE_DIR`'s file for the default point; the base
+was re-recorded from the r248 build (`build=12433634d`, `base_ppl=5.9325`) afterwards, so the cache carries the
+release reference again.
+
+### Landing
+
+`git apply` of the submitted file at block 10 in the working chain, `--amend`, then `git rebase --onto` across
+blocks 11-15; the folded tip's tree is **identical** to the tree every measurement above was taken on (an empty
+`git diff` against the `git am` arm), so no run had to be repeated.  `scripts/make-patches.sh` +
+`make-release.sh` regenerated the set and `release.json`; the re-cut off the regenerated patches reproduces tree
+`262b72c37` and prints the recorded tip `076daf709`.  The campaign moves to
+`archive/work/gdn-conv-store-multiseq/` (the submitted patch, the delivery's form, and the submitter's README
+kept verbatim as `README-as-submitted.md`).
+
 ## 261110.004 (r248, RELEASE v16-a691b2345-r248) -- GitHub issue #297: a windowed draft cache is a TRUE ring, a drafter failure cannot fail a request, and the reserve now reads the draft's own ubatch
 
 **Release:** `v16-a691b2345-r248`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

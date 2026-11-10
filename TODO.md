@@ -48,6 +48,7 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 | **311** | the fused `hc_post_rms` kernel drops the hc kernels' non-temporal hints | performance (block 11, r242) | **PARKED** (2026-11-09) — value-preserving and unmeasured; worth +18.6 % in situ on `dsv4_hc_pre` by the neighbouring kernel's own record — §311 |
+| **315** | a `--ub 4`/`--ub 1` perplexity/KLD arm aborts under `GGML_FORCE_N_RS_SEQ` (`split_equal`) | diagnostics (test arm only; NOT a delivery defect) | **OPEN — small** (2026-11-10) — the r244 gate recipe's `--ub 4`/`--ub 1` arms cannot be run; use `--ub 8` until fixed — §315 |
 
 ## Handle numbering
 
@@ -682,3 +683,26 @@ is purely a question of whether the fused launch keeps the win it has.  **Measur
 31.5k-prompt arm the r242 record uses (2 R9700 `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, `-ub 6144`), plus a gfx1151
 arm where the in-situ effect was found.  If it is worth anything, the guard is a rebuild + the prefill-logit gate
 (`-0.000000` is the expected answer) and nothing else moves.
+
+## 315. A narrow-ubatch perplexity arm aborts under `GGML_FORCE_N_RS_SEQ` (`llama_batch_allocr::split_equal`)
+
+Found while gating PR #295 (r249).  The r244 verification row asks for the decode-band fusion arms at `--ub 4`
+and `--ub 1`, which for this kernel need a `n_rs_seq > 0` graph, i.e. `GGML_FORCE_N_RS_SEQ=3` (the store's own
+recipe).  That combination **aborts** in `llama_batch_allocr::split_equal()` (`ggml_abort` from
+`llama_memory_hybrid::init_batch`) before the first ubatch, on the **r248 build as well as** the r249 one, so it is
+pre-existing and not a delivery-code defect:
+
+```
+GGML_FORCE_N_RS_SEQ=3 ./build/bin/llama-perplexity -m 27B-Q8_0.gguf -c 512 -ub 4 ...
+  #6 llama_batch_allocr::split_equal(unsigned int, bool, unsigned int)
+  #7 llama_memory_hybrid::init_batch
+```
+
+The rollback tracker needs `n_rs_seq + 1` (here 4) tail tokens inside one ubatch, and `split_equal()` does not
+refuse an ubatch that cannot hold them — it asserts.  So the arm is *impossible*, not merely useless, and the
+r249 record runs that band at `--ub 8` instead.
+
+The work is a load-time or per-batch **refusal** (the same class as `TODO` #135: a configuration that cannot work
+should say so, not abort): either clamp/refuse `GGML_FORCE_N_RS_SEQ` against `n_ubatch` where the value is
+applied, or make `split_equal()` reject a `n_keep_tail` it cannot honour and let the caller fall back.  A
+diagnostic-only path, so no gate depends on it; `INVARIANTS.md` r249 records the trap so nobody re-derives it.

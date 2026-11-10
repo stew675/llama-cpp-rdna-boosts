@@ -3599,3 +3599,52 @@ Do not re-derive the decisions:
   is already documented, and a caller who wants the old behaviour asks for a full draft cache (`0`).
 * **The window's spare room stays `one draft batch`.**  Sizing it to "one batch plus the widest image" would
   guess at a tokenizer's image budget; the ring makes the bound exact instead.
+
+## r249 -- a verify ubatch is not one sequence: an S=1-only fusion silently hands a multi-slot server back to the chain (contributor PR #295)
+
+r244's GDN conv step (`GGML_CUDA_FUSE_GDN_CONV_STORE`, block 10) is RDNA4-gated, replaces the whole
+`GET_ROWS`/`CONCAT`/window/`SET_ROWS`/`SSM_CONV`/`SILU`/q-k-norm chain of a speculative graph, and shipped
+accepting **exactly one sequence** (`st->ne[2] == 1`).  A `--kv-unified` `llama-server` with two or more slots
+verifying in the same ubatch produces a graph with **S > 1**, and those graphs were never reached: the store
+declined and every GDN layer ran the chain, invisibly, because nothing in the delivery's ladder runs a
+multi-sequence *verify* batch.
+
+Facts:
+
+1. **A verify ubatch carries one sequence per slot that verifies in that step.**  Observed shapes on the dense
+   27B (DFlash2 n5, `-np 2 --kv-unified`, `-c 16384`, q8_0 KV): `T=2 S=1` on a single-slot step, `T=4 S=2`
+   when both slots verify, and with `-np 4` also `T=4 S=4` and `T=6 S=2` (acceptance differs per slot, so the
+   batch composes per step).  `T`, `C`, `S` must be read from the **transposed view** (`tr->ne[0..2]`): its
+   `view_src` is the in-projection's output *reshape view* (`[C, T, S]`), whose own root is the 2-D
+   `MUL_MAT` result `[C, T*S]`, so `x->ne[2]` alone does not carry `S`.
+2. **The state stays the `GET_ROWS` copy when `S > 1`.**  Deferring the gather means reading the cache row the
+   store writes back, which is safe for one sequence only -- one sequence's cache rows may be *another's*
+   source (`ggml_cuda_gdn_store_gather_deferrable()` refuses `m.S != 1`).  The gather is therefore a real
+   launch for multi-sequence steps and the kernel indexes the copy at `s * 3 * C`.
+3. **Per-sequence offsets are not the state's shape.**  The slots view's sequence stride is `nb[3]`, which is
+   the state cache's **row** size (`s->nb[1]`), not `3 * C * sizeof(float)`; `y`, the q/k norm outputs and
+   `x` are contiguous per-sequence slices.  Mixing the two strides is a silent wrong answer, so the matcher
+   checks each one it relies on.
+4. **Debug censuses must be able to show a new shape, or the gate is vacuous.**  `GGML_CUDA_CONV_DEBUG` now
+   prints its `GDN_CONV_STORE` line once **per sequence count** and carries `S=`; with the old once-per-process
+   line, a run that only ever printed its first shape cannot prove the multi-sequence path fired (the same
+   class as `GREEDY-PURITY.md` §11's "an arm that cannot fire measures nothing").
+5. **A helper that only the multi-sequence path needs cannot be gated from `llama-perplexity`/`llama-cli`.**
+   `GGML_FORCE_N_RS_SEQ` reaches the store's *single*-sequence path; the multi-sequence path needs a real
+   `-np N --kv-unified` **server**.  The gate is the fingerprint of both texts *and* every per-token logprob,
+   against the previous release **and** against the chain (`GGML_CUDA_FUSE_GDN_CONV_STORE=0`,
+   `GGML_CUDA_DISABLE_CONV_FUSION=1`): a text-only diff on this box cannot separate a numerics change from a
+   batch-composition change, and the chain arm is what proves *this* kernel.
+6. **The `n_rs_seq` diagnostic cannot be combined with a narrow ubatch.**  `GGML_FORCE_N_RS_SEQ=3` with
+   `--ub 4`/`--ub 1` aborts in `llama_batch_allocr::split_equal` (the rollback tracker's `n_rs_seq + 1` tail
+   tokens do not fit), on r248 as well as r249 -- pre-existing, filed as `TODO` #315.  Use `--ub 8` for that
+   band; the r244 verification row's `--ub 4` arm was never reachable.
+
+Measured (gfx1201, ROCm 10.1.0, 1 x R9700 unless noted, `ROCBLAS_USE_HIPBLASLT=0` in every fresh-process
+arm): bit-identical to r248 on both texts **and** all 256 per-token logprobs of a two-sequence run, and the
+same on the chain and family-off arms, on a repeat, at `-np 4`, on 35B-A3B, at
+`GGML_CUDA_DISABLE_GRAPHS=1`, on a 2-device `-sm tensor` split and with `draft-mtp`; prefill-logit KLD
+-0.000000 / 99.990 % under `GGML_FORCE_N_RS_SEQ=3` and 0.000000 / 100.000 % at the plain point; the width
+probe's `P=2048/3584/4096` anchors are r244's exactly; acceptance identical to the digit.  Worth ~1.0-1.2 % per
+verify step on the two-sequence dense arm (VRAM unchanged), i.e. the win is real but small, and it is a coverage
+win rather than a retuning: **no environment variable was added and nothing changed for `S = 1`.**
