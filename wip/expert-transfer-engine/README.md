@@ -358,7 +358,7 @@ transport footprint **strands** VRAM instead of converting it into residency (th
 never re-derives it), and the ring's VRAM is buying prefill, not idle.  Converting freed VRAM into arena needs the
 arena *sizing policy* (the §6.1 question), not a structural merge.
 
-### 7.6 A unified expert store — design direction, not a campaign (`TODO` #285)
+### 7.6 A unified expert store — DECLINED at r252 (`TODO` #285, retired; kept as the arithmetic)
 
 Representing **every** expert is cheap: 138 x 512 = 70 656 experts, 4 B residency id each = **276 KiB**; with
 {VA offset, host offset} per expert, **1.08 MiB**; VMM range entries per expert, the same; the ids remap
@@ -381,6 +381,14 @@ beat is the current fallback, which is **free** (r234: 1826 t/s declined vs 1824
 **Constraint that kills the naive form:** it must stay *yieldable*.  A raw `cudaMalloc` outside the slab is the
 pre-slab crash mode (`INVARIANTS.md`, issue #136): a wide prefill's transient work needs that VRAM.  VA outside the
 slab is fine; *backing* outside the movable boundary is not.
+
+**Resolution (r252, `WORKLOG.md` 261110.008): declined, not scheduled.**  Re-measured what a stand-down still
+costs on the delivery's own arms (r251 build, `-c 32768`, `-ub 8192`, a 16 k-token prompt): it fires **only** on
+the high-residency arm (Flash-Next GSQ-RCO IQ3_S, 1 GPU, `-ncmoe 48`: 47.87 % resident, 32 + 1 tables for
+5 926 MiB in the prefill, `re-armed 33` at the compute-buffer drop), never on 35B-A3B `-ncmoe 40` (100 %),
+`MOE_EXPERT_CACHE_MIB=8000` (56.5 %) or the 2-device tensor split (100 %) — and the fallback it replaces is
+free (r234).  So the store is robustness for a state that is transient, prefill-only and re-armed, at the price
+of a rewrite that must stay yieldable; the reopen conditions are in `INVARIANTS.md` r252 / that WORKLOG entry.
 
 ### 7.7 Next state
 

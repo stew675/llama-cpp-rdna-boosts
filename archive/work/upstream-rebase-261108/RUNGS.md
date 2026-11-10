@@ -1158,7 +1158,7 @@ fine with the margin at 0.
 `upstream/README.md`.
 
 **`#287` (re-cut the mul-mat-id-dup candidate) — HALF DONE, parked as WIP.**  See
-[`../upstream-pr-mul-mat-id-dup-recut/README.md`](../upstream-pr-mul-mat-id-dup-recut/README.md): the
+[`../upstream-mul-mat-id-dup-recut/README.md`](../upstream-mul-mat-id-dup-recut/README.md): the
 per-occurrence compaction is ported onto upstream's `tile_spec` writer, both `mmf` gates are removed (the
 delivery's own 6-line delta) and the `#if 0` dup cases are enabled — and it still fails (`f16` numerically at
 every width, `q8_0` at `n=9` page-faults in `mul_mat_q<(ggml_type)8, 16, …>`).  The missing piece is the MMQ/MMF

@@ -40,8 +40,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **285** | a unified expert store: one VA per device, expert-granular residency | design direction (not scheduled) | **OPEN** — not a prefill speed-up; six hard constraints recorded — §285 |
-| **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 
 ## Handle numbering
@@ -287,44 +285,6 @@ should steer this item:
 **Kind:** purity (delivery — `gate-host-pool.sh` `pinlate` arm; NOT corruption).
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie
-
-## 285. A unified expert store: one VA per device, expert-granular residency (`wip/expert-transfer-engine/` §7.6)
-
-**Status: open design direction, not scheduled (scoped 2026-11-07; `WORKLOG.md` 261107.014).**  Today a
-host-resident table is represented by three allocations (arena slots, ring slot, `input_cpy`) with three sizing
-rules and three reclamation semantics, and a slab chunk reclamation stands a whole table down
-(`arena == nullptr && slots == 0`, `TODO` #271).  A single store -- one VA reservation per device, an
-expert-granular page table (**~1.5 MiB for all 70 656 Flash-Next experts**), residency by policy, fills landing in
-the table's own VA, the op reading `table + e*stride` with **no ids remap** -- would make a stand-down a host-backed
-page instead of an unusable table, and collapse the three allocations and three rules into one.  It is **not** a
-prefill speed-up: every prefill ubatch routes essentially the whole table (~15.5 GB of used experts), so there is no
-cross-ubatch reuse, and a host-backed page read in place is 33 GB/s serialised against the copy engine's 55.8 GB/s
-overlapped.  The baseline to beat is the current bulk fallback, which is **free** (r234: 1826 declined vs 1824
-staged).  **Two constraints:** it must stay *yieldable* (a raw `cudaMalloc` outside the slab is the pre-slab crash
-mode, issue #136), and block 15's VMM region maps in whole units and refuses an idle-slot park on a region-backed
-cache -- read `ggml-cuda-vmm-region.cu` and `wip/kv-residency-cleanup/` before designing the page table.
-
-## 287. Re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` onto `#31047`'s `tile_spec` grid
-
-**Status: HALF DONE (2026-11-08) — the work is in [`wip/upstream-pr-mul-mat-id-dup-recut/`](wip/upstream-pr-mul-mat-id-dup-recut/README.md)
-and it does NOT pass.**  The old patch was cut against `097cf33d9` and `git apply --check` fails on `a691b2345`
-(`mmq.cuh:995`), because upstream's `#31047` rewrote the same `MUL_MAT_ID` tile scheduling.
-
-Done in `candidate-does-not-pass.patch` (sha256 `2e39b670…`): `mmid.cu`'s helper rewritten for **per-occurrence**
-compaction on upstream's `tile_spec` writer (and the `mm_ids_helper_store` staging buffer dropped), `mmf.cu`'s
-build-the-compact-map gate and `mmf.cuh`'s select-the-compact-kernel gate both removed for **every** `MUL_MAT_ID`
-(this is exactly the delivery's own 6-line delta), and upstream's `#if 0` `[TAG_MUL_MAT_ID_DUPLICATE_ID]` cases
-re-enabled.  It still fails: `f16` dup cases are numerically wrong at every width and `q8_0` at `n = 9`
-**page-faults** in `mul_mat_q<(ggml_type)8, 16, …>(…, ggml_cuda_mm_id_tile_spec const *, …)`.
-
-**Closing it:** the remaining piece is the **MMQ/MMF ids kernel** work (the column tile iterating `tile_spec`
-seams, the per-tile `tile_spec` read, `mul_mat_f_ids`'s store loop `continue` + per-tile C re-zero).  In the
-delivery that code is entangled with its gate+up pair fusion, so it has to be written, not lifted.  Acceptance:
-`test-backend-ops -o MUL_MAT_ID -p 'dup=1'` **16/16** on a pristine patched `a691b2345`, the full `MUL_MAT_ID`
-and `MUL_MAT` suites green, no GPU fault, and a launch census showing the duplicate columns are covered.  The
-delivery must stay green too -- it is now **16/16** (`#304` closed: the compact-ids MMF kernel was dispatching a
-column tile narrower than the grid its seams were built with, see `WORKLOG.md` 261108.009; that fix is the MMF half
-of what this candidate needs).  Delivery-neutral: it must not change the delivery tree.
 
 ## 300. gfx1151: the attendance pool (`--kv-attendance-pool`, alias `--kv-region-pool`) is INCORRECT on RDNA3.5 — do not claim it there
 

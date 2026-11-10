@@ -73,7 +73,7 @@ must be closed **on r236**, which is a different thing.
 | **#291** | the arena-vs-upstream-MoE-cache measurement (`D1`, MEASURING) | its own session — **the largest item**; a measurement, not a code change |
 | **#303** | the dense `mul_mat_q` is 1.4 % slower than r235 at identical geometry (the last prefill gap) | its own session: [`HANDOVER-303.md`](HANDOVER-303.md) |
 | **#304** | `MUL_MAT_ID` dup: `f16` at `ncols_dst = 9` is wrong (and nothing tests the path) | before R17 |
-| **#287** | (halved) the mul-mat-id-dup re-cut is WIP: [`../upstream-pr-mul-mat-id-dup-recut/`](../upstream-pr-mul-mat-id-dup-recut/README.md) | its own session |
+| **#287** | (halved) the mul-mat-id-dup re-cut is WIP: [`../upstream-mul-mat-id-dup-recut/`](../upstream-mul-mat-id-dup-recut/README.md) | its own session |
 | **#295** | R17 must include a host-expert **two-slot DFlash** arm | **during R17** (a ladder arm, not a fix) |
 | **#296** | `D8`'s CPU-win measurement | **during R17** (a ladder arm, not a fix) |
 | #300 | gfx1151 attendance pool | **parked** (mitigated: the knob declines there), not a blocker |

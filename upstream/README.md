@@ -33,12 +33,6 @@ delivery then carries only the fork-local remainder.
 
 | directory | what | in the delivery | status |
 |---|---|---|---|
-> **`mul-mat-id-dup/` is being re-cut for `a691b2345`** (`TODO` #287): the old patch no longer applies (upstream's
-> `#31047` rewrote the `MUL_MAT_ID` tile grid), and the partial re-cut — compaction ported, both `mmf` gates
-> removed, dup cases enabled, the MMQ/MMF ids kernels still missing — lives in
-> [`../wip/upstream-pr-mul-mat-id-dup-recut/`](../wip/upstream-pr-mul-mat-id-dup-recut/README.md).  Do not use the
-> directory's patch against the current base.
-
 | [`fa-kv-split-width/`](fa-kv-split-width/README.md) | ggml-cuda: make the FA KV-split (`parallel_blocks`) heuristic query-width independent for small batches, so decode and every spec-verify width reduce identically | **block 00** | validated (gfx1201, issue #25), applies clean to its base |
 | [`fa-decode-verify-kernel-family/`](fa-decode-verify-kernel-family/README.md) | ggml-cuda: keep the decode/verify band on one FA kernel family (a quantized K/V cache took VEC for `n_q <= 2`, TILE from 3) | **block 05** | validated (3x gfx1201) |
 | [`fa-512-rdna-head-cap/`](fa-512-rdna-head-cap/README.md) | ggml-cuda: let RDNA4 use the WMMA FA kernel for head 512 (prefill-only), instead of always falling to the tile kernel | **block 05** (r92, issue #188) | builds and runs on `097cf33d9`; `FLASH_ATTN_EXT` 3993/3993 |
@@ -48,7 +42,7 @@ delivery then carries only the fork-local remainder.
 | [`moe-router-tie-break/`](moe-router-tie-break/README.md) | ggml-cuda: make the fused MoE router bit-identical to the generic chain (softmax order, division, stable argsort tie-break) | **block 08** | validated on gfx1201 |
 | [`q1-0-amd-perm/`](q1-0-amd-perm/README.md) | ggml-cuda: port the Q1_0 table lookups off HIP's private-memory `__byte_perm` to `__builtin_amdgcn_perm` | **block 07** | bit-identical (16.7M cases); no speed claim |
 | [`ggml-alloc-unused-view/`](ggml-alloc-unused-view/README.md) | ggml-alloc: release view sources whose views are never consumed (a real leak; repro included) | **block 00** | repro + `test-alloc`/`test-batch-alloc` verified on master |
-| [`mul-mat-id-dup/`](mul-mat-id-dup/README.md) | ggml-cuda: handle repeated expert ids in `MUL_MAT_ID` (per-occurrence compact rows, expanded column grids, no first-match `break`) | **block 00** (since r66) | dup cases 16/16 (base 0/16), full suites green |
+| [`mul-mat-id-dup/`](mul-mat-id-dup/README.md) | ggml-cuda: handle repeated expert ids in `MUL_MAT_ID` (per-occurrence compact rows, the compact map/kernel for every batch width, a compact column tile that matches its seam grid, no first-match `break`) | **block 00** (since r66) + the compact-MMF tile width in **block 08** (`#304`, closed) | **re-cut against `a691b2345`** (r252): `git apply --check` clean on a pristine base, validated there — dup cases **16/16**, `MUL_MAT_ID` 947/947, `MUL_MAT` 2517/2517, no GPU fault, duplicate columns shown covered by a `tile_spec` census. Patch sha256 `00b43499…`. Not filed |
 | [`meta-offload-op/`](meta-offload-op/README.md) | ggml-backend-meta: let the tensor split op-offload host weights, and let a `MIRRORED` tensor serve an arbitrary byte range | **block 09** | measured standalone on pristine master (505 → 1690 t/s) |
 | [`meta-split-unalloc-alias-and-alloc-fail/`](meta-split-unalloc-alias-and-alloc-fail/README.md) | ggml-backend-meta: resolve an alias through its view chain when the allocator never initialised it, and fail an allocation with NULL instead of asserting | **block 00** (+ the `offload_op` gate in **block 09**) | builds on `097cf33d9`; validated at 24 GiB-card parity |
 | [`per-device-host-buffers/`](per-device-host-buffers/README.md) | ggml-cuda + llama + ggml-backend: per-device host buffer types and host-expert offload placement | **block 09** | validated on 2x / 3x R9700 |

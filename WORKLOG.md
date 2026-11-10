@@ -1,3 +1,102 @@
+## 261110.008 (r252, docs/artifact only -- NO delivery change) -- two `TODO` handles close: the `MUL_MAT_ID` duplicate-id upstream candidate is re-cut and PASSES (`TODO` #287), and the unified expert store is DECLINED with the numbers (`TODO` #285)
+
+**No delivery change:** `patches/`, `release.json` and the gates are untouched; the release stays
+`v16-a691b2345-r251` (base `a691b2345`, tip `342248b7c`, tree **`5fbe6aff5`**, 16 blocks).  `r252` is the
+record's revision tag so `INVARIANTS.md` entries have something to point at; nothing is tagged or published.
+`patches/` is byte-identical (`scripts/validate-set.sh` green).
+
+### 1. `TODO` #287 — the candidate was a *helper* bug, not a missing ids kernel
+
+The WIP campaign's diagnosis ("the MMQ/MMF ids kernels are still missing") was **wrong**.  Upstream `#31047`
+had already rewritten `MUL_MAT_ID` as a `tile_spec` stream and its rewritten kernels already handle a compact
+column list of arbitrary width (`ntj = ceil(n_tokens*n_expert_used/J) + n_experts`, `tile_spec[jt]` read per
+tile, `ids_dst` through shared memory, a `tile_spec`-aware stream-k fixup), and `mul_mat_f_ids` is one block per
+`tile_spec` entry, so its store loop's `return` is correct.  **No `mmq.*` change was needed at all.**  What was
+actually broken:
+
+* `mm_ids_helper` computed the compact offsets from `nex_prev` **before** it was warp-reduced (and re-reduced
+  `it_compact`, which is already warp-uniform), so every expert wrote at a lane-local offset — `f16` wrong at
+  every width, `q8_0` n=9 page-faulting once a tile read a garbage `tile_spec`.  The fault was a symptom,
+  exactly as the original `quantize_mmq_q8_1` fault was a symptom of the dedup.
+* the compact-MMF column tile: `mmf.cu` builds the seam grid with a 16-column stride, `ncols_dst` (9/16) was
+  dispatched as `cols_per_block`, and both `mmf` gates still required `ncols_dst > 16` — so the narrow path
+  silently dropped the tail of every expert's compact range.  That is the **delivery's `#304`** (closed in
+  block 08) and it is a *base* bug the old gate made unreachable.
+
+**Artifact:** [`upstream/mul-mat-id-dup/`](upstream/mul-mat-id-dup/README.md),
+`UPSTREAM-PR-mul-mat-id-dup.patch` sha256 **`a8060ef10de1c297e1c70571ee2d8e7d7740f540fd23b9841f0bb61462751850`**,
+re-cut against `a691b2345` (`git apply --check` clean), 5 files (+95/−83).  **Not filed upstream** — that is
+the maintainer's call and has never been made.
+
+**Validated on a pristine `a691b2345` + the patch** (gfx1201, ROCm 10.1.0, 1 x R9700, `~/llama-scratch`, not
+the delivery tree):
+
+| gate | result |
+|---|---|
+| `test-backend-ops -o MUL_MAT_ID -p 'dup=1'` | **16/16** (before the fix: `f16` n = 9/16/33/64 numeric FAILs, then a GPU page fault in `mul_mat_q<Q8_0,16,…>` at n = 9) |
+| `test-backend-ops -o MUL_MAT_ID` | **947/947** |
+| `test-backend-ops -o MUL_MAT` | **2517/2517** |
+| `-o MUL_MAT_ID -p 'dup=1'` with the dup cases re-parameterised to `n_used` **3 / 5 / 12** (a temporary local test edit, not in the patch: those widths take the generic non-templated helper path) | **52/52** |
+| `scripts/check-gpu-faults.sh --since 2026-11-10 15:14:00 --log …` | clean over the journal and all four logs (the 15:09:01 reproduction fault is before the window, `pasid` 24738) |
+| launch census (temporary `tile_spec` read-back, not in the patch) | duplicate columns **covered**; both the MMQ and the MMF launch reach it |
+
+Census (`-o MUL_MAT_ID -p 'dup=1'`, expected/covered compact columns, tiles, widest expert range vs token
+count): 9 tokens **90/90** 34 tiles (23) **60** vs 9; 16 tokens **160/160** 38 (29) **116** vs 16; 33 tokens
+**330/330** 49 (40) **237** vs 33; 64 tokens **640/640** 48 (42) **475** vs 64; 33 tokens / 1025 and 2050
+experts **330/330**, ranges 248 / 237.  One expert owning more columns than there are tokens is only possible
+with a repeated id, so the arm that passes is the arm that covers the duplicates.
+
+**Delivery neutrality:** the delivery tree is unchanged and re-verified **16/16** at tree `5fbe6aff5` (its dup
+cases have been enabled since block 08, so the release already carries the oracle).  The campaign record moved
+to [`archive/work/upstream-mul-mat-id-dup-recut/`](archive/work/upstream-mul-mat-id-dup-recut/README.md) with
+**no stub** in `wip/`, `wip/CAMPAIGNS.md` lost its row, `upstream/README.md`'s row is rewritten and its
+"being re-cut" callout is gone.
+
+### 2. `TODO` #285 — declined: robustness for a fallback that measures free, at the price of a yieldability-risky rewrite
+
+The item's throughput motivation was already refuted at r234 (declined 1826 vs staged 1824 t/s, ±0.1 %; the
+pinned tier's staging kernel −10 %), so the store is a **complexity/robustness** proposal.  Re-measured what a
+stand-down costs today (r251 build, `-c 32768`, `-ub 8192`, 16 k-token prompt, `-lv 4`, gfx1201):
+
+| arm | arena / tables / residency | stand-down | prefill | decode |
+|---|---|---|---|---|
+| Flash-Next GSQ-RCO IQ3_S, 1 GPU, `-ncmoe 48` | 23 992.5 MiB / 144 / **47.87 %** | **yes** — `evicted 5698.0 + 228.0 MiB ... 32 + 1 table(s) stood down`, `re-armed 33` at the compute-buffer drop | **901.5 t/s** | **42.1 t/s** |
+| 35B-A3B Q4_K_M, 1 GPU, `-ncmoe 40` | 18 600 MiB / 120 / **100 %** | none | **4310.5** | **106.9** |
+| same, `MOE_EXPERT_CACHE_MIB=8000` | 7992.2 MiB / 120 / 56.5 % | none | **2783.6** | **63.0** |
+| same, 2 devices `-sm tensor -ncmoe 48` | 2 x 9300 MiB / 100 % | none | **5387.3** | **84.2** |
+
+So the stand-down is a **high-residency, prefill-only** phenomenon (it fires only where the arena is squeezed
+against a wide prefill's compute buffer), it is re-armed before decode, and its fallback is the free bulk copy.
+The store would replace that with expert-granular pages — and the bytes do not change (every prefill ubatch
+routes essentially the whole table; a host-backed page read in place is 33 GB/s serialised against the copy
+engine's 55.8 GB/s overlapped).  What is left is collapsing three representations (arena slots, ring slot,
+`input_cpy`) and three sizing rules into one, in a path that must stay **yieldable** (backing outside the
+movable boundary is the pre-slab crash mode, issue #136) and that cannot be built on block 15's VMM region
+(whole-unit mapping; it refuses an idle-slot park on a region-backed cache).  That is a large rewrite for a
+robustness win with a free baseline, so the decision is **decline-and-close**.
+
+**What would reopen it** (any one, with the measurement that shows it): a stood-down table that is *not*
+re-armed for the rest of the run (a decode-band census with `arena == nullptr && slots == 0` after the drop);
+a measured prefill loss the bulk fallback cannot explain (a same-arena A/B, not a residency comparison); or a
+new consumer that needs expert-granular residency to survive a prefill without re-filling (the static-hot-tier
+direction in `TODO` #273 would be such a consumer, and it is unbuilt).
+
+Also recorded this session (nothing owed): 35B-A3B Q4_K_M at **3 devices** `-sm tensor` is refused at load by
+the r250 degenerate-share guard (`512` experts over 3 devices at a 256-element granularity gives device 0
+**0** columns) — the 2-device arm above is the multi-device measurement for that reason, and `-sm layer` is the
+3-device shape.
+
+### 3. Housekeeping
+
+* `TODO` #287 and `TODO` #285 are **deleted** (row and section), never renumbered; `#NN` numbering continues.
+* `INVARIANTS.md` gains an `r252` section (the `tile_spec` grid already covers arbitrary compact widths; the
+  `nex_prev` reduction rule and its two failure signatures; the seam-grid column-tile rule; the stand-down
+  census numbers above; the `TODO` #285 decline).
+* `upstream/README.md` row updated; `archive/work/upstream-rebase-261108/`'s two references to the moved
+  campaign now point at `archive/work/upstream-mul-mat-id-dup-recut/`.
+* `scripts/validate-set.sh` green; `release.json` tree still `5fbe6aff5`; no container image or tag is
+  involved (this is not a release).
+
 ## 261110.007 (r251, RELEASE v16-a691b2345-r251) -- two `TODO` handles close: the `GGML_CUDA_GRAPH_OPT` branch streams get a reserved range above the copy streams (#283), and the r215 silent `llama-batched-bench` SIGSEGV is VERIFIED-OBSOLETE (#270, no code)
 
 **Delivery change: `patches/0000`-`0015` (16 blocks, block 10 AMENDED), release `v16-a691b2345-r251`, base
@@ -1968,7 +2067,8 @@ passes all three phases after it) and the note that upstream's own `rollback_bou
 Row added to `upstream/README.md`.
 
 **`#287` (re-cut `UPSTREAM-PR-mul-mat-id-dup.patch`) — half done, and it is WIP now.**
-`wip/upstream-pr-mul-mat-id-dup-recut/` (`candidate-does-not-pass.patch`, sha256 `2e39b670…`) ports the
+`archive/work/upstream-mul-mat-id-dup-recut/` (formerly `wip/upstream-pr-mul-mat-id-dup-recut/`;
+`candidate-does-not-pass.patch`, sha256 `2e39b670…`; resolved at r252, `WORKLOG.md` 261110.008) ports the
 **per-occurrence compaction** onto upstream's `tile_spec` writer, removes **both** `mmf` gates (`mmf.cu` builds the
 compact map for every `MUL_MAT_ID`, `mmf.cuh` selects the compact kernel for every `MUL_MAT_ID` — which is
 *exactly* the delivery's own 6-line delta), and re-enables upstream's `#if 0`'d dup cases.  It still fails:
@@ -2311,7 +2411,7 @@ ring sub-region `ring_req` 4-6 GiB, `input_cpy` ~1.0 GiB inside the 1.62 GiB nar
 than converting it into residency (the arena is sized once and `--fit off` never re-derives it), and the ring's
 VRAM is buying prefill.  Turning freed VRAM into arena is the §6.1 arena-sizing-policy question, not a merge.
 
-**Design direction recorded, not scheduled** (`TODO` #285): representing **all** experts costs ~**1.5 MiB** (70 656
+**Design direction recorded, not scheduled** (`TODO` #285 -- **declined at r252**, `WORKLOG.md` 261110.008): representing **all** experts costs ~**1.5 MiB** (70 656
 experts x 4 B residency id = 276 KiB; + {VA, host} offsets = 1.08 MiB; the ids remap 276 KiB) -- negligible -- so a
 unified store is a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
 granularity).  It would fix `TODO` #271 *structurally* (a stand-down becomes a host-backed page instead of

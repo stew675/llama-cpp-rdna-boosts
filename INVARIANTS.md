@@ -2870,7 +2870,8 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   **276 KiB** as int32 residency ids and **~1.5 MiB** with per-expert {VA, host} offsets and the ids remap.  A
   unified store is therefore a VA reservation with VRAM backing for a resident subset (block 15's pattern at expert
   granularity) -- and it must stay **yieldable**: a raw `cudaMalloc` outside the slab is the pre-slab crash mode
-  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285).
+  (issue #136), because a wide prefill's transient work needs that VRAM (`TODO` #285, **declined at r252**: see the
+  r252 section below for the stand-down census and the reopen conditions).
 - **`--load-mode none` silently disables the `--host-experts pool`** (`a pool needs a mapped load`), so a
   `runme` built on it runs the bulk/pageable path its own comments do not describe.  Read
   `report_host_expert_placement` before attributing anything to the pool.
@@ -3762,3 +3763,59 @@ Two `TODO` handles closed in one release (`#283`, `#270`). Facts:
    reaches it (`Setting stream no to` appears in no log at `-lv 5`).  Proven non-vacuous by reintroducing
    `branch_idx + 1`: the mapping assert fires (`GGML_ASSERT(!ggml_cuda_is_copy_stream_index(branch_stream))
    failed`, exit 134) and `is_valid()`'s range assert fires on a model whose events pass the overlap check.
+
+## r252 -- `TODO` #287 closes (the `MUL_MAT_ID` duplicate-id candidate was a *helper* bug, not a kernel gap) and #285 closes as declined (the unified expert store is robustness for a free baseline)
+
+Docs/artifact only: the delivery tree is unchanged. Facts:
+
+1. **Upstream `#31047`'s `tile_spec` grid already supports a compact `MUL_MAT_ID` column list of *arbitrary*
+   width, so a duplicate-id re-cut needs no `mmq.*` change at all.**  `mmq.cu` already launches
+   `ntj = ceil(n_tokens*n_expert_used / J) + n_experts` blocks and passes `J` as the seam width to the helper;
+   `mmq.cuh` reads `tile_spec[jt]` per tile, reads `ids_dst` through shared memory and has a `tile_spec`-aware
+   stream-k fixup.  `mul_mat_f_ids` is **one block per `tile_spec` entry** (`blockIdx.y` is the tile), so its
+   store loop's `return` is correct there -- the `continue`/per-tile-`C` rule belongs to the pre-`#31047`
+   kernel.  The old campaign's "the MMQ/MMF ids kernels are still missing" was a **wrong diagnosis**: the
+   candidate failed because of (2), and the recorded page fault was a symptom, exactly as the original
+   `quantize_mmq_q8_1` fault was a symptom of the helper's dedup.
+2. **A per-occurrence ids compaction is only correct if `nex_prev` is warp-reduced *before* the write pass, and
+   `it_compact` is never reduced afterwards** (it is accumulated from already-warp-wide counts, so it is
+   warp-uniform by construction).  Get it wrong and every expert writes at a lane-local offset: the F16/MMF
+   cases are wrong at *every* width (ERR 0.4-1.8 against 5e-4) and the quantized/MMQ case page-faults inside
+   `mul_mat_q<…>` once a tile reads a garbage `tile_spec`/`ids_dst`.  The 2026-11-08 candidate had exactly this
+   bug and it is what the "missing kernel" was blamed for.
+3. **Removing the compact-MMF width gate requires pinning the column tile to the seam-grid width and
+   re-zeroing/re-storing per tile -- otherwise the narrow path silently drops the tail of every expert's
+   range.**  That is the delivery's `#304` signature (`f16`, `ncols_dst` 9: ERR 0.374, no fault): `mmf.cu`
+   builds the `tile_spec` grid with a 16-column stride while `mul_mat_f_switch_cols_per_block` picks
+   `cols_per_block = ncols_dst` (1..16), so one block processes only that many of its tile's 16 columns.  It is
+   a **base** bug that the old `> 16` gate happened to make unreachable; a patch that compacts every width must
+   carry the fix.  Upstream candidate: `upstream/mul-mat-id-dup/` (sha256 `a8060ef1…`), validated on a pristine
+   `a691b2345`: `dup=1` **16/16**, `MUL_MAT_ID` 947/947, `MUL_MAT` 2517/2517, no GPU fault, and a `tile_spec`
+   census proving coverage (launched tiles cover exactly `n_tokens*n_expert_used` compact columns, and one
+   expert's range is wider than the token count -- 60 columns for 9 tokens, 475 for 64 -- which only a repeated
+   id can produce).  The delivery already reads 16/16 at tree `5fbe6aff5` (its cases are enabled in block 08).
+4. **The transient expert-table stand-down still exists and is a *high-residency, prefill-only* phenomenon, not
+   a general prefill cost.**  Measured 2026-11-10 (gfx1201, r251 build, `-c 32768`, `-ub 8192`, a 16 k-token
+   prompt, `-lv 4`):
+   * Flash-Next GSQ-RCO IQ3_S, 1 GPU, `-ncmoe 48`: arena 23 992.5 MiB, 144 tables, **47.87 %** of the routed mass
+     resident -> `evicted 5698.0 + 228.0 MiB of arena tables ... 32 + 1 table(s) stood down`, then
+     `re-armed 33 ... after a compute-buffer drop`; prefill **901.5 t/s**, decode **42.1 t/s**.
+   * 35B-A3B Q4_K_M, 1 GPU, `-ncmoe 40`: arena 18 600 MiB, **100 %** coverage -> **no stand-down**; prefill
+     **4310.5**, decode **106.9**.  Same model, `MOE_EXPERT_CACHE_MIB=8000` (56.5 %): **no stand-down**;
+     prefill **2783.6**, decode **63.0** (lower for the residency reason, not the stand-down).  2 devices
+     `-sm tensor -ncmoe 48` (2 x 9300 MiB, 100 %): **no stand-down**; prefill **5387.3**, decode **84.2**.
+   So the stand-down fires only where the arena is squeezed against a wide prefill's compute buffer, it is
+   re-armed at the compute-buffer drop before decode, and r234 measured its fallback **free** (1826 t/s
+   declined vs 1824 staged, +-0.1 %; the pinned tier's staging kernel is -10 %).  A verdict on a stand-down
+   that reads rates without the `evicted/re-armed` lines is measuring residency, not the fallback.
+5. **`TODO` #285 (a unified expert store: one VA per device, expert-granular residency) is DECLINED, not
+   deferred for a rate.**  Its structural motivation is (4), and (4) is transient, prefill-only, re-armed and
+   free at the fallback; its byte claim is nil (every prefill ubatch routes essentially the whole table, and a
+   host-backed page read in place is 33 GB/s serialised against the copy engine's 55.8 GB/s overlapped).  What
+   is left is collapsing three representations (arena slots, ring slot, `input_cpy`) and three sizing rules
+   into one -- a large rewrite that must stay **yieldable** (backing outside the movable boundary is the
+   pre-slab crash mode, issue #136) and that must not be built on block 15's VMM region (whole-unit mapping,
+   refuses an idle-slot park on a region-backed cache).  Reopen conditions are in `WORKLOG.md`
+   261110.008: a stood-down table that is *not* re-armed for the rest of a run, a measured
+   prefill loss the bulk fallback cannot explain, or a new consumer that needs expert-granular residency to
+   survive a prefill without re-filling.
