@@ -1,0 +1,247 @@
+From 6d27ebaef63c0ea2cacf13d3ab4901d5e7fe6475 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 08:32:05 +0800
+Subject: [PATCH] gdn-conv-store: the one-kernel GDN conv step also takes a
+ multi-sequence ubatch (two slots verifying in one batch)
+
+With --kv-unified and several slots, a verify ubatch holds S sequences of T tokens: the state [3, C, S], x^T [T, C, S] (a view of
+the in-projection's output [C, T*S]), the window view [3, Kw, C, S] and the slots [3, K, C, S] (the sequences' cells, nb[3]
+apart).  The store took S = 1 only, so such a step ran the whole chain on every GDN layer -- GET_ROWS, CONCAT, SET_ROWS,
+SSM_CONV, SILU, the norm pair -- the limitation r244 records ("a multi-sequence ubatch still declines").
+
+Now 1..8 sequences, one block row a sequence; T, C and S come from the transposed view (its root is 2-D).  With S > 1 the state
+stays the GET_ROWS copy: the gather is deferred for one sequence only, since one sequence's cache rows may be another's
+source.  GGML_CUDA_CONV_DEBUG=1: the GDN_CONV_STORE line gains S= and is printed once for each S, so a multi-sequence step
+shows up next to the single-sequence ones.  Kill switches unchanged: GGML_CUDA_FUSE_GDN_CONV_STORE=0, or
+GGML_CUDA_DISABLE_CONV_FUSION=1 for the whole conv family.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/gdn-conv-store.cu  | 75 +++++++++++++++++----------
+ ggml/src/ggml-cuda/gdn-conv-store.cuh | 14 ++---
+ 2 files changed, 54 insertions(+), 35 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv-store.cu b/ggml/src/ggml-cuda/gdn-conv-store.cu
+index 96f290677..e06484c12 100644
+--- a/ggml/src/ggml-cuda/gdn-conv-store.cu
++++ b/ggml/src/ggml-cuda/gdn-conv-store.cu
+@@ -1,11 +1,13 @@
+ // The Gated DeltaNet conv of a decode / verify step as one kernel on the graph of upstream #31660 (see gdn-conv-store.cuh).
+ //
+-// Per channel: the three state values (the cache row itself when the state's GET_ROWS is deferred), the four taps and the T
++// Per channel and sequence: the three state values (the cache row itself when the state's GET_ROWS is deferred), the four taps and the T
+ // inputs; out: the conv + silu row, the q / k rows normalized (the l2 norm pair's SCALE outputs), and the Kw snapshot windows of
+ // the concatenated input straight into the cache's rollback slots.  The conv and the norm keep the arithmetic of rdna-boosts'
+ // direct conv (gdn-conv.cu, MIT): the same 4-tap order and silu; the q / k sums are rms_norm_scale_pair_f32<256>'s (norm.cu: the
+ // warp butterflies, the 4 warp sums of a 128-wide head as ((s0 + s2) + (s1 + s3)), nothing contracted, a run-time divisor), so
+ // the outputs are bit-identical to the chain it replaces.
++// Several sequences (a verify step of two slots in one batch, --kv-unified): one block row per sequence; their state is the
++// GET_ROWS copy (not deferred: one sequence's cache rows may be another's source), the slots are the sequences' cells.
+ #include "gdn-conv-store.cuh"
+ #include "ggml-cuda-try-fuse.cuh"
+ #include "unary.cuh"
+@@ -67,7 +69,7 @@ static bool gdn_store_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+ }
+ 
+ // RMS_NORM + SCALE (scale only) over the 128-wide head view of y that starts at channel ch0
+-static bool gdn_store_norm_one(const ggml_cgraph * cgraph, int j, const ggml_tensor * y, int64_t C, int64_t T, int64_t ch0,
++static bool gdn_store_norm_one(const ggml_cgraph * cgraph, int j, const ggml_tensor * y, int64_t C, int64_t T, int64_t S, int64_t ch0,
+                                int64_t nk, float & eps, float & scale) {
+     if (j + 1 >= cgraph->n_nodes) return false;
+     const ggml_tensor * rn = cgraph->nodes[j];
+@@ -76,9 +78,10 @@ static bool gdn_store_norm_one(const ggml_cgraph * cgraph, int j, const ggml_ten
+             sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc)) return false;
+     const ggml_tensor * v = rn->src[0];
+     if (v == nullptr || v->op != GGML_OP_VIEW || v->view_src != y || v->type != GGML_TYPE_F32) return false;
+-    if (v->ne[0] != 128 || v->ne[1] != nk || v->ne[2] != T || v->ne[3] != 1 || v->nb[0] != sizeof(float) ||
++    if (v->ne[0] != 128 || v->ne[1] != nk || v->ne[2] != T || v->ne[3] != S || (S > 1 && v->nb[3] != (size_t) (T*C)*sizeof(float)) ||
++            v->nb[0] != sizeof(float) ||
+             v->nb[1] != 128*sizeof(float) || v->nb[2] != (size_t) C*sizeof(float) || v->view_offs != (size_t) ch0*sizeof(float)) return false;
+-    if (sc->ne[0] != 128 || sc->ne[1] != nk || sc->ne[2] != T || sc->ne[3] != 1) return false;
++    if (sc->ne[0] != 128 || sc->ne[1] != nk || sc->ne[2] != T || sc->ne[3] != S) return false;
+     eps   = gdn_store_param_f(rn, 0);
+     scale = gdn_store_param_f(sc, 0);
+     return gdn_store_param_f(sc, 1) == 0.0f && eps >= 0.0f;
+@@ -90,24 +93,27 @@ bool ggml_cuda_gdn_store_match_at_concat(const ggml_cgraph * cgraph, int i, ggml
+     const ggml_tensor * cc = cgraph->nodes[i];
+     if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return false;
+ 
+-    // CONCAT(state [3, C], x^T [T, C]): one sequence
++    // CONCAT(state [3, C, S], x^T [T, C, S]): S sequences of T tokens
+     const ggml_tensor * st = cc->src[0];
+     const ggml_tensor * tr = cc->src[1];
+     if (st == nullptr || tr == nullptr || tr->op != GGML_OP_TRANSPOSE || tr->view_src == nullptr) return false;
++    // x^T is a view of the in-projection's output, the root of its views: [C, T*S] (or [C, T, S]) contiguous, so the shape is
++    // the transposed view's own [T, C, S]
+     const ggml_tensor * x = tr->view_src;
+-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) return false;
+-    const int64_t C = x->ne[0], T = x->ne[1];
+-    if (T < 1 || T > 16 || C % 256 != 0) return false;
+-    if (st->type != GGML_TYPE_F32 || !ggml_is_contiguous(st) || st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1) return false;
+-    if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+-    if (!ggml_is_contiguous(cc) || cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1) return false;
++    const int64_t T = tr->ne[0], C = tr->ne[1], S = tr->ne[2];
++    if (T < 1 || T > 16 || C % 256 != 0 || S < 1 || S > 8 || tr->ne[3] != 1 || tr->view_offs != 0) return false;
++    if (tr->nb[0] != (size_t) C*sizeof(float) || tr->nb[1] != sizeof(float) || (S > 1 && tr->nb[2] != (size_t) (T*C)*sizeof(float))) return false;
++    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != C || ggml_nelements(x) != C*T*S) return false;
++    if (st->type != GGML_TYPE_F32 || !ggml_is_contiguous(st) || st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1) return false;
++    if (!ggml_is_contiguous(cc) || cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != S || cc->ne[3] != 1) return false;
+ 
+     // build_conv_state_store: the window view right after the CONCAT, then the slot order {Kw-1, ..., 0} (a view of
+     // ARANGE -> SCALE -> CAST over K; built per layer, or once per graph and device with r241's LLAMA_SHARE_SLOT_REV), the
+     // slots and the SET_ROWS
+     const ggml_tensor * win = cgraph->nodes[i + 1];
+     if (win->op != GGML_OP_VIEW || win->view_src != cc || win->type != GGML_TYPE_F32 || win->ne[0] != 3 || win->ne[2] != C ||
+-            win->ne[3] != 1 || win->nb[1] != sizeof(float) || win->nb[2] != cc->nb[1] || win->view_offs % sizeof(float) != 0) return false;
++            win->ne[3] != S || win->nb[1] != sizeof(float) || win->nb[2] != cc->nb[1] || (S > 1 && win->nb[3] != cc->nb[2]) ||
++            win->view_offs % sizeof(float) != 0) return false;
+     const int64_t Kw = win->ne[1], col0 = (int64_t) (win->view_offs / sizeof(float));
+     if (Kw < 1 || col0 < 0 || col0 + Kw + 1 != T + 2) return false;   // the last window ends at the last column
+     int i_sr = -1;
+@@ -130,7 +136,7 @@ bool ggml_cuda_gdn_store_match_at_concat(const ggml_cgraph * cgraph, int i, ggml
+     if (so->type != GGML_TYPE_I32 || so->ne[0] != Kw || so->ne[1] != 1 || so->view_offs != (size_t) (K - Kw) * sizeof(int32_t)) return false;
+     const ggml_tensor * cache = gdn_store_root(sl);
+     if (sl == nullptr || sl->op != GGML_OP_VIEW || cache == nullptr || cache->op != GGML_OP_NONE || sl->type != GGML_TYPE_F32 || sl->ne[0] != 3 ||
+-            sl->ne[1] != K || sl->ne[2] != C || sl->ne[3] != 1 || sl->nb[0] != sizeof(float) || sl->nb[2] != 3*sizeof(float)) return false;
++            sl->ne[1] != K || sl->ne[2] != C || sl->ne[3] != S || sl->nb[0] != sizeof(float) || sl->nb[2] != 3*sizeof(float)) return false;
+     // between the window view and the SET_ROWS only the store's own nodes; the slot order chain is the layer's own (all three
+     // in there, each read once) or a shared one, which is left to run for the later layers
+     int n_chain = 0;
+@@ -166,7 +172,7 @@ bool ggml_cuda_gdn_store_match_at_concat(const ggml_cgraph * cgraph, int i, ggml
+     if (conv < 0 || conv + 1 >= cgraph->n_nodes) return false;
+     const ggml_tensor * cv = cgraph->nodes[conv];
+     const ggml_tensor * w  = cv->src[1];
+-    if (cv->type != GGML_TYPE_F32 || !ggml_is_contiguous(cv) || cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != 1) return false;
++    if (cv->type != GGML_TYPE_F32 || !ggml_is_contiguous(cv) || cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != S) return false;
+     if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 4 || w->ne[1] != C) return false;
+     ggml_tensor * y = cgraph->nodes[conv + 1];
+     if (y->op != GGML_OP_UNARY || ggml_get_unary_op(y) != GGML_UNARY_OP_SILU || y->src[0] != cv || y->type != GGML_TYPE_F32 ||
+@@ -179,10 +185,10 @@ bool ggml_cuda_gdn_store_match_at_concat(const ggml_cgraph * cgraph, int i, ggml
+     const int64_t nk = cgraph->nodes[j]->src[0]->ne[1];
+     if (nk < 1 || 2*nk*128 > C) return false;
+     float eps0, sc0, eps1, sc1;
+-    if (!gdn_store_norm_one(cgraph, j, y, C, T, 0, nk, eps0, sc0)) return false;
++    if (!gdn_store_norm_one(cgraph, j, y, C, T, S, 0, nk, eps0, sc0)) return false;
+     int j2 = j + 2;
+     while (j2 < cgraph->n_nodes && gdn_store_noop(cgraph->nodes[j2])) ++j2;
+-    if (!gdn_store_norm_one(cgraph, j2, y, C, T, nk*128, nk, eps1, sc1) || eps0 != eps1 || sc0 != sc1) return false;
++    if (!gdn_store_norm_one(cgraph, j2, y, C, T, S, nk*128, nk, eps1, sc1) || eps0 != eps1 || sc0 != sc1) return false;
+     // the conv output is read by the SILU only, the RMS_NORM outputs by their SCALEs only
+     for (int n = conv + 2; n < cgraph->n_nodes; ++n) {
+         const ggml_tensor * t = cgraph->nodes[n];
+@@ -222,23 +228,32 @@ bool ggml_cuda_gdn_store_match_at_concat(const ggml_cgraph * cgraph, int i, ggml
+     m.concat = i; m.set_rows = i_sr; m.conv = conv; m.last = j2 + 1; m.private_chain = private_chain;
+     m.gather = gather; m.state = st; m.x = x; m.w = w; m.y = y;
+     m.q_out = cgraph->nodes[j + 1]; m.k_out = cgraph->nodes[j2 + 1]; m.slots = sl;
+-    m.C = C; m.T = T; m.K = K; m.Kw = Kw; m.col0 = col0;
++    m.C = C; m.T = T; m.S = S; m.K = K; m.Kw = Kw; m.col0 = col0;
+     m.nk = (int) nk; m.eps = eps0; m.scale = sc0;
+     return true;
+ }
+ 
+-// One thread a channel, 256 a block; the q / k blocks (channels below 2 nk 128, a multiple of 256) hold two whole heads.
++// One thread a channel, 256 a block, one block row a sequence; the q / k blocks (channels below 2 nk 128, a multiple of 256)
++// hold two whole heads.
+ // state and slots may be one row (the deferred gather reads the cache row that slot 0 writes back): no __restrict__ on them,
+ // and each thread reads its three state values before it writes any slot.
+ static __global__ void __launch_bounds__(256) gdn_conv_store_kernel(
+         const float * state, const int32_t * __restrict__ state_ids, const int64_t state_row,
+         const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
+-        float * __restrict__ q_out, float * __restrict__ k_out, char * slots, const int64_t slot_nb1,
++        float * __restrict__ q_out, float * __restrict__ k_out, char * slots, const int64_t slot_nb1, const int64_t slot_nb3,
+         const int Kw, const int col0, const int C, const int T, const int nk, const int ncols, const float eps, const float scale_out) {
+     const int c = blockIdx.x * 256 + threadIdx.x;
++    const int s = blockIdx.y;   // the sequence: its state row, its T tokens, its cell's slots
+     if (state_ids != nullptr) {
+-        state += (int64_t) state_ids[0] * state_row;
++        state += (int64_t) state_ids[0] * state_row;   // deferred gather: one sequence only
++    } else {
++        state += (int64_t) s * 3 * C;
+     }
++    x     += (size_t) s * T * C;
++    y     += (size_t) s * T * C;
++    q_out += (size_t) s * T * nk * 128;
++    k_out += (size_t) s * T * nk * 128;
++    slots += (int64_t) s * slot_nb3;
+     const float s0 = state[c * 3 + 0], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
+     const auto col = [&](const int jp) -> float {
+         return jp == 0 ? s0 : (jp == 1 ? s1 : (jp == 2 ? s2 : x[(size_t) (jp - 3) * C + c]));
+@@ -303,11 +318,13 @@ static __global__ void __launch_bounds__(256) gdn_conv_store_kernel(
+ }
+ 
+ static void gdn_store_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_store_match & m) {
+-    // GGML_CUDA_CONV_DEBUG: one line per process, the same switch and shape as the direct conv's GDN_CONV_DIRECT
+-    // (gdn-conv.cu).  Without it a run of this path cannot be told from the chain, i.e. the gate would be vacuous.
+-    static bool dbg = getenv("GGML_CUDA_CONV_DEBUG") != nullptr;
+-    if (dbg) { fprintf(stderr, "GDN_CONV_STORE C=%lld T=%lld Kw=%lld col0=%lld K=%lld private_chain=%d\n",
+-        (long long) m.C, (long long) m.T, (long long) m.Kw, (long long) m.col0, (long long) m.K, (int) m.private_chain); dbg = false; }
++    // GGML_CUDA_CONV_DEBUG: one line per process for each sequence count S, the same switch and shape as the direct
++    // conv's GDN_CONV_DIRECT (gdn-conv.cu).  Without it a run of this path cannot be told from the chain, i.e. the gate
++    // would be vacuous; per S, so that a multi-sequence ubatch shows up next to the single-sequence steps.
++    static const bool dbg = getenv("GGML_CUDA_CONV_DEBUG") != nullptr;
++    static bool seen[9] = {};
++    if (dbg && !seen[m.S]) { fprintf(stderr, "GDN_CONV_STORE C=%lld T=%lld S=%lld Kw=%lld col0=%lld K=%lld private_chain=%d\n",
++        (long long) m.C, (long long) m.T, (long long) m.S, (long long) m.Kw, (long long) m.col0, (long long) m.K, (int) m.private_chain); seen[m.S] = true; }
+     const float *   state     = (const float *) m.state->data;
+     const int32_t * state_ids = nullptr;
+     int64_t         state_row = 0;
+@@ -318,9 +335,10 @@ static void gdn_store_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_gd
+         state_ids = (const int32_t *) m.gather->src[1]->data;
+         state_row = (int64_t) (m.gather->src[0]->nb[1] / sizeof(float));
+     }
+-    gdn_conv_store_kernel<<<(unsigned) (m.C / 256), 256, 0, ctx.stream()>>>(state, state_ids, state_row,
++    GGML_ASSERT(state_ids == nullptr || m.S == 1);
++    gdn_conv_store_kernel<<<dim3((unsigned) (m.C / 256), (unsigned) m.S), 256, 0, ctx.stream()>>>(state, state_ids, state_row,
+         (const float *) m.x->data, (const float *) m.w->data, (float *) m.y->data, (float *) m.q_out->data, (float *) m.k_out->data,
+-        (char *) m.slots->data, (int64_t) m.slots->nb[1], (int) m.Kw, (int) m.col0, (int) m.C, (int) m.T, m.nk, 128, m.eps, m.scale);
++        (char *) m.slots->data, (int64_t) m.slots->nb[1], (int64_t) m.slots->nb[3], (int) m.Kw, (int) m.col0, (int) m.C, (int) m.T, m.nk, 128, m.eps, m.scale);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -373,7 +391,8 @@ bool ggml_cuda_gdn_store_gather_deferrable(const ggml_cgraph * cgraph, int node_
+         return false;
+     }
+     ggml_cuda_gdn_store_match m;
+-    if (!ggml_cuda_gdn_store_match_at_concat(cgraph, g->second.concat, m, true) || m.gather != gr || m.state->data != gr->data ||
++    // one sequence only: with several, one sequence's cache rows may be the source of another's state
++    if (!ggml_cuda_gdn_store_match_at_concat(cgraph, g->second.concat, m, true) || m.S != 1 || m.gather != gr || m.state->data != gr->data ||
+             ggml_nelements(gr) != 3 * m.C || ggml_nrows(gr) != 1 || gr->src[1] == nullptr || gr->src[1]->ne[0] != 1) {
+         return false;
+     }
+diff --git a/ggml/src/ggml-cuda/gdn-conv-store.cuh b/ggml/src/ggml-cuda/gdn-conv-store.cuh
+index 8a771f509..d5721bf6f 100644
+--- a/ggml/src/ggml-cuda/gdn-conv-store.cuh
++++ b/ggml/src/ggml-cuda/gdn-conv-store.cuh
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "common.cuh"
+ 
+-// The Gated DeltaNet conv of a decode / verify step (1..16 tokens, one sequence, RDNA4) as one kernel, on the graph that stores
++// The Gated DeltaNet conv of a decode / verify step (1..16 tokens a sequence, 1..8 sequences, RDNA4) as one kernel, on the graph that stores
+ // the rollback snapshots with one SET_ROWS (upstream #31660, build_conv_state_store):
+ //
+ //   GET_ROWS (state) -> CONCAT(state, x^T) -> VIEW (windows) + VIEW (slot order, of an ARANGE/SCALE/CAST chain built per layer
+@@ -15,14 +15,14 @@
+ struct ggml_cuda_gdn_store_match {
+     int concat = -1, set_rows = -1, conv = -1, last = -1;   // node indices; last = the k norm's SCALE
+     const ggml_tensor * gather = nullptr;   // the GET_ROWS the state roots at (nullptr: none)
+-    const ggml_tensor * state  = nullptr;   // [3, C] F32 contiguous
+-    const ggml_tensor * x      = nullptr;   // [C, T] F32 contiguous
++    const ggml_tensor * state  = nullptr;   // [3, C, S] F32 contiguous
++    const ggml_tensor * x      = nullptr;   // [C, T, S] F32 contiguous
+     const ggml_tensor * w      = nullptr;   // [4, C] F32 contiguous
+-    ggml_tensor *       y      = nullptr;   // the SILU output [C, T]
+-    ggml_tensor *       q_out  = nullptr;   // the q norm's SCALE [128, nk, T]
++    ggml_tensor *       y      = nullptr;   // the SILU output [C, T, S]
++    ggml_tensor *       q_out  = nullptr;   // the q norm's SCALE [128, nk, T, S]
+     ggml_tensor *       k_out  = nullptr;   // the k norm's SCALE
+-    const ggml_tensor * slots  = nullptr;   // the SET_ROWS destination [3, K, C, 1]: slot planes nb[1] apart
+-    int64_t C = 0, T = 0, K = 0, Kw = 0, col0 = 0;
++    const ggml_tensor * slots  = nullptr;   // the SET_ROWS destination [3, K, C, S]: slot planes nb[1] apart, cells nb[3]
++    int64_t C = 0, T = 0, S = 1, K = 0, Kw = 0, col0 = 0;
+     int     nk = 0;
+     float   eps = 0.0f, scale = 0.0f;
+     bool    private_chain = false;   // the slot order chain is this layer's own (taken with the CONCAT) or shared
+-- 
+2.43.0
+
