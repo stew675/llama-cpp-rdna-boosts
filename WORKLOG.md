@@ -1,3 +1,51 @@
+## 261110.002 (r246, optional) -- PR #296 (`two-lane-prefill` re-cut) TAKEN: the MTP target pairs, the MTP draft is refused at the arm gate, and the artifact now carries the r244 review's predicate
+
+PR #296 (@slavap) is the re-cut PR #284 should have been: it re-pins the artifact to the release tree, keeps the
+`embeddings_nextn` removal on the split and pair gates (the +14.7 % MTP-target win measured at r244), and adds
+the predicate the r244 review asked for -- `ctx_type == LLAMA_CONTEXT_TYPE_MTP` at the arm gate, because an MTP
+draft is the target's own model with `ctx_other` **nullptr**.  Reviewed and **taken**, with two amendments, into
+`optional/two-lane-prefill/` (no delivery block, no `patches/` change, no `release.json` change, so **no new
+release**).  `scripts/apply-all.sh --include-optional-all` on a fresh `a691b2345` checkout: strict `git am`, r246
+tree `9385502b` + this artifact = `e4e8be30`, sha256 `acc5adb0edafd172022377235937934f166ffc0e0d28373ba48859c9d5d6a16d`;
+with `host-pool-fill-src` too, `db5ed504`.
+
+1. **What the PR got right.**  The delta versus the r243 cut is exactly the three gate edits it claims (verified
+   by diffing the two patches' added lines: no smuggled change), it applies **strictly at r246** despite being
+   pinned to r245, and its reasoning about the draft is the right one.  Its two hard numbers that this box can
+   check are accurate: the draft's second buffer set is the r244-measured 134 MiB device + 20 MiB host, and the
+   "+14.7 % on the reviewer's 3 x R9700" is this repo's own r244 arm.  The V620 gfx1030 + 8060S gfx1151 arm
+   (+47.1 %) is the submitter's hardware and is recorded as such in the artifact README.
+2. **Amendment 1 (observability): the WARN lost the field that explains the refusal.**  The submitted cut kept
+   the two conditions inline and left the line at `ignored (n_gpu = %d, pipeline_parallel = %d)`, so a refused
+   MTP draft logs a WARN whose two printed conditions **both pass** -- the reader cannot see the new predicate
+   fire, which is precisely the trap the r244 review documented.  Restored as one `is_draft_ctx` boolean with
+   `… , draft = %d` (measured: `ignored (n_gpu = 3, pipeline_parallel = 0, draft = 1)` once per draft context,
+   `draft = 0` under `-sm tensor` / plain `-sm layer`), plus the `ctx_other`-vs-`ctx_type` explanation above the
+   gate.
+3. **Amendment 2 (prose): a claim that does not exist in this tree.**  The commit message justified the ratio as
+   "(halo parity: `!model.hparams.mtp_only`)".  There is no `hparams.mtp_only` here; `mtp_only` is a local
+   `const bool` in `src/models/xing4-0.cpp:85` used only to pick load flags.  Dropped, and the message rewritten
+   around this repo's measurements.  The same message also said the gates were "restored" by item 3, which is
+   the r229 change, not this one -- corrected.
+4. **Verified here (3 x R9700 gfx1201, `-sm layer -ts 1/1/1 -ot`, 5 298-token `prompts/prose-rdna-boosts.txt`,
+   `-ub 2048 -b 2048`, ABBA).**  MTP target 1047.7/1044.3 -> 1361.1/1351.1 t/s (**+29.9 %**), decode 63.4 ->
+   63.2, greedy text `a4a403d64c40` and draft acceptance `0.62500 (20/32)` identical; same model `--spec-type
+   none` 1086.5 -> 1436.3 (**+32.2 %**); MoE 35B-A3B Q8_0 `llama-bench pp2048` 6695.8/6751.0 -> 8288.2/8322.9
+   (**+23.8 %**); 35B-A3B + DFlash2 draft 5308/5346/5340/5300 -> 5273/5287/5260/5280 (**-0.9 %**, text
+   identical, so the r229 -13.9 % case stays fixed); `llama-batched-bench -npl 1,4,8` +20.3 / -1.5 / **-6.1 %**,
+   TG flat.  Default path **bit-identical**: `gate-prefill-logits.sh` 0.000697 / 98.784 % (the release's own
+   reading), `check-gpu-faults.sh` clean.  The pair adds no approximation: lanes=2 versus the lanes-unset base
+   reads mean KLD 0.001394 / 99.101 %, and a plain `-ub 1152` arm reads **exactly** the same two numbers.
+5. **Two of the PR's own numbers are weaker than they look, and the artifact README now says why.**  Its decode
+   arm reports acceptance 0.742 -> 0.677 and calls it variance: that arm leaves the MTP depth adaptive, so
+   acceptance follows the speedup.  With `--spec-draft-n-max 3` fixed, acceptance is **identical** (0.62500 both
+   ways) -- the check that can actually fail.  Its "+47.1 %" also reads 821.6 -> 1208.0 on a **median** of an
+   unknown arm count; the artifact states the layout and hardware instead of adopting the number.
+6. **Carried, not fixed:** the pair-failure path double-applies lane 1's ubatch to the memory module (error path
+   only), `llama_n_prefill_lanes()` in `include/llama.h`, the ~8 % second-context penalty (r229 observation, not
+   re-measured) and the now -6.1 % 8-sequence regression.  The fork's own `ctx_other`-only draft detection is
+   still `ctx_other`-only -- pre-existing, recorded at r244, untouched.
+
 ## 261110.001 (r246, RELEASE v16-a691b2345-r246) -- GitHub issue #293: the MTP draft window and the attendance pool become first-class options, and `auto` stops granting a window the drafter outgrows
 
 **Release:** `v16-a691b2345-r246`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

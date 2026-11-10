@@ -3451,3 +3451,35 @@ re-derive the reasons:
    so it says nothing about the llama-side per-ubatch host work (the packed kq-mask fill, `find_slot` /
    `apply_ubatch`, `seq_rm`) -- "the time is on the GPU" is not supported by it.  The Windows mechanism
    (12-13 % past the wrap on r241+ only) is `TODO` #312.
+
+## r246 (optional) -- the MTP *target* may pair and the MTP *draft* may not: `ctx_type` is a predicate `ctx_other` cannot express
+
+`optional/two-lane-prefill` (PR #296, @slavap) re-opens two-lane prefill to a `nextn` workload and has to close
+the arm gate to a draft context at the same time.  The trap is a predicate the fork uses everywhere else:
+
+1. **`ctx_other` is NOT how an MTP draft is identified.**  The context constructor propagates `ctx_other` only
+   for Gemma4-assistant / EAGLE3 / DFlash / qwen4exp; an MTP draft is the *target's own model* with
+   `ctx_type = LLAMA_CONTEXT_TYPE_MTP` (`common/speculative.cpp`), so `ctx_other` is nullptr and its `n_gpu` is
+   the model's whole device list (2-3, not 1).  A gate written as `ctx_other == nullptr` therefore **admits** an
+   MTP draft: it allocates a second scheduler + compute-buffer set (134 MiB device + 20 MiB host at `-ub 512`
+   on 3 x R9700) for a context whose ubatches are 0-output nextn reads and can never pair.  The predicate is
+   `ctx_other != nullptr || ctx_type == MTP`, and the refusal must be *visible*: the WARN reports
+   `ignored (n_gpu = %d, pipeline_parallel = %d, draft = %d)`, because a line that prints only the two
+   conditions which pass tells the reader nothing about why it was refused.  (The fork's own draft detection --
+   `graph_reserve()`'s narrow-2 route, `process_ubatch()`'s `is_draft`, `sched_reserve()`'s narrow-2 re-pin --
+   still tests `ctx_other` alone, so it does not fire for an MTP draft either; that is pre-existing delivery
+   state, recorded since r244 and not changed by the artifact.)
+2. **An MTP target pairs safely because an unmasked nextn row is per token.**  Its prefill runs on 0-output
+   `nextn` ubatches; with `embeddings_nextn_masked == 0` (`nextn_shared_target_tensors` / a separate MTP head)
+   the host rows are per token and the offsets the lane split changes are the ubatch's own, so per-lane
+   readback is enough.  Measured (3 x R9700, 27B GSQ-RCO-IQ3_S-mtp, `draft-mtp --spec-draft-n-max 3`, 5 298
+   tokens, `-ub 2048 -b 2048`, `-sm layer -ot`): prefill 1047.7/1044.3 -> 1361.1/1351.1 t/s (**+29.9 %**),
+   decode 63.4 -> 63.2, greedy text `a4a403d64c40` and draft acceptance `0.62500 (20/32)` identical.
+   **Fix the depth** (`--spec-draft-n-max`) in that comparison: with adaptive MTP the acceptance follows the
+   speedup (the submitter's arm read 0.742 -> 0.677), which looks like a correctness signal and is not one.
+3. **The interleave adds no approximation; the split's divergence IS the ubatch change** (re-verified at r246
+   at a second point).  `llama-perplexity --kl-divergence` at `-c 2048 --chunks 20 -ub 2048 -b 2048`, base from
+   the lanes-unset arm: lanes=2 reads mean KLD `0.001394` / same-top-p `99.101 %`, and a plain `-ub 1152` arm
+   (the same 1152 + 896 boundaries, run serially) reads **exactly the same two numbers**.  Judge the artifact
+   on that equality, not on greedy text: text identity is the greedy path's luck.  The default path stays
+   bit-identical to the delivery (prefill-logit gate `0.000697` / `98.784 %`, the release's own reading).

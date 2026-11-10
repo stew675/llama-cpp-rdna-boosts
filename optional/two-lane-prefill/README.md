@@ -1,17 +1,17 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r243`** (against `release.json` tree
-`e9300f1dbd0b2f0b96c1828829d2072d73f34bca`; the r241 and r229 cuts and their measurements are kept below as the
-dated record).
+**Optional artifact, not part of the delivery.  Re-cut on `r246`** (against `release.json` tree
+`9385502ba8c83ff17371c87231b5a48e075cbfcb`; the r243, r241 and r229 cuts and their measurements are kept below
+as the dated record).
 
-From **PR #268 then PR #279 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed and
-amended (see *What changed in the rebase* below).  The submitter's own description and measurements are in the
-PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
+From **PR #268, #279, #284 then #296 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
+reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
+are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `dfba9168a1044a29a2e466c36fb8b64c78dd3e79d359aeda01fa7c3141680799`
-* applies at `release.json` tree `e9300f1dbd…`, produces tree `0db1268ea8e72cb2f0bf830583a94b85c06ba77e`
-  (verified by strict `git am` on a fresh checkout of `.tip` `72f7753fd`; both artifacts together produce
-  `74458b8bfd25575d86a31d69c21a16a3a5e837b7`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `acc5adb0edafd172022377235937934f166ffc0e0d28373ba48859c9d5d6a16d`
+* applies at `release.json` tree `9385502ba8…` (r246), produces tree `e4e8be30110e4f24673cd98c3d21dc391eafa061`
+  (verified by strict `git am` on a fresh checkout of `.base`; with `host-pool-fill-src` applied first the two
+  together produce `db5ed504b5e28216ebb57fcb36449474af663c44`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one
@@ -33,11 +33,16 @@ Since the r229 cut there are two halves, and **both are needed** (the numbers be
    cut only *whole* ubatches paired, so a prompt batch of fewer than two ubatches never paired at all.
 2. **Output-aware pairing.**  The pair gate no longer requires both ubatches to be output-free: the outputs are
    extracted per lane after compute, on the scheduler of each lane (`extract_outputs`, with a sched-aware
-   readback sync).  MTP (`nextn`) and F1 layer-input readback stay single-lane.
+   readback sync).  F1 layer-input readback stays single-lane.
+
+Since the **r246 cut** an **MTP (nextn) target pairs too**: its prefill runs on 0-output nextn ubatches, and an
+unmasked nextn row is per token, so the host offsets the lane split changes are the ubatch's own.  A **draft
+context never arms** — `ctx_other` for Gemma4-assistant / EAGLE3 / DFlash / qwen4exp, and `ctx_type == MTP` for
+an MTP draft, which the fork does *not* mark with `ctx_other` (it is the target's own model).
 
 It degrades to the existing single-lane path when `< 2` non-CPU **backends**, pipeline parallelism, `no_alloc`,
-or a draft context is present, and a workload that reads `nextn` / F1 layer-input rows declines the pair **and
-now also declines the split** (see amendment 1).
+or a draft context is present, and a workload that reads **F1** layer-input rows declines the pair **and also
+declines the split** (see amendment 11).
 
 A pair is admitted only when both lanes have the same split structure and the cache-hazard analysis finds no
 cross-backend hazard (`GGML_SCHED_PAIR_HAZARD=0` keeps the name guard alone; `GGML_SCHED_PAIR_DEBUG` logs the
@@ -49,9 +54,10 @@ This matters more than the knob does, so it is measured, not assumed (3× R9700,
 
 | layout | result |
 |---|---|
-| `-sm tensor` (any device count) | **never engages.**  This tree's tensor split is ONE backend (a Meta device wrapping N GPUs) so the `n_gpu >= 2` gate sees 1: `sched_reserve: LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0)` |
-| plain `-sm layer`, all layers on GPU | **never engages.**  The scheduler's own pipeline parallelism is enabled in exactly that configuration: `ignored (n_gpu = 3, pipeline_parallel = 1)` |
+| `-sm tensor` (any device count) | **never engages.**  This tree's tensor split is ONE backend (a Meta device wrapping N GPUs) so the `n_gpu >= 2` gate sees 1: `sched_reserve: LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0, draft = 0)` |
+| plain `-sm layer`, all layers on GPU | **never engages.**  The scheduler's own pipeline parallelism is enabled in exactly that configuration: `ignored (n_gpu = 3, pipeline_parallel = 1, draft = 0)` |
 | `-sm layer` + any `--override-tensor` (`-ot`) | **engages** — a tensor override disables pipeline parallelism (`pair decided: splits a=4 b=4, interleaved=1`).  **This is the only reachable layout on ROCm.** |
+| any layout, with a draft (`-md draft-dflash` / `-eagle3`, or `--spec-type draft-mtp`) | **never engages** — the draft context declines at the arm gate: `ignored (n_gpu = 3, pipeline_parallel = 0, draft = 1)`, and allocates no second buffer set |
 | `-sm row` | **not usable at all on ROCm**: `llama_model_load: device ROCm0 does not support split buffers` (the r220 cut listed this as a reachable layout — it is an inference, not a measurement, and it is wrong for this backend) |
 | `-sm none` | one GPU backend, i.e. the `-sm tensor` case |
 
@@ -61,9 +67,45 @@ so the +13.3 % PR #268 reported for it was not measured with this patch on this 
 ## What it measures here
 
 `-sm layer -ts 1/1/1 -ot 'blk\.0\.attn_q\.weight=ROCm0'` (a placement-neutral override: it only turns pipeline
-parallelism off), `-ub 2048`, `-t 16`, `-r 5`, two rounds in ABBA order unless noted.  Same binary, env-gated.
+parallelism off) and `-ub 2048 -b 2048` throughout; the `llama-bench` arms add `-t 16 -r 3`, the `llama-cli` arms
+run the tool's default thread count (one arm per line, A B B A order).  Same binary, env-gated.
 
-### The gain needs both halves (MoE 35B-A3B Q8_0, pp2048)
+### The r246 cut (PR #296) — the MTP target pairs
+
+3× R9700 gfx1201, `prompts/prose-rdna-boosts.txt` (5 298 tokens), `-ub 2048 -b 2048`, A B B A:
+
+| arm | 1 lane | 2 lanes | |
+|---|---|---|---|
+| dense 27B `GSQ-RCO-IQ3_S-mtp`, `--spec-type draft-mtp --spec-draft-n-max 3` — prefill | 1047.7 / 1044.3 | **1361.1 / 1351.1** | **+29.9 %** |
+| the same, decode (`-n 32`) | 63.4 | 63.2 | nil |
+| the same model, `--spec-type none` — prefill | 1086.5 | **1436.3** | **+32.2 %** |
+| MoE 35B-A3B Q8_0, `llama-bench pp2048` (`-t 16 -r 3`) | 6695.8 / 6751.0 | **8288.2 / 8322.9** | **+23.8 %** |
+| MoE 35B-A3B Q8_0 + DFlash2 draft (`--spec-type draft-dflash`) — prefill | 5308 / 5346 / 5340 / 5300 | 5273 / 5287 / 5260 / 5280 | −0.9 % |
+| `llama-batched-bench -npp 2048 -ntg 128 -npl 1,4,8` (PP/S) | 6214.6 / 8381.7 / 8822.9 | 7475.8 / 8258.2 / 8284.8 | +20.3 % / −1.5 % / **−6.1 %** |
+
+`GGML_SCHED_PAIR_DEBUG=1`: `pair decided: splits a=4 b=4, interleaved=1`, once per batch — 5 298 tokens at
+`-b 2048` is 3 batches, each split into 1152 + 896 (or 1152 + 50) and paired, so 3 pairs per prompt (a 15 k-token
+prompt pairs several batches' worth).  The draft contexts log
+`LLAMA_PREFILL_LANES ignored (n_gpu = 3, pipeline_parallel = 0, draft = 1)` (one WARN each — two draft
+contexts) and allocate no lane-2 buffer set; the target logs `two-lane prefill enabled`.  An MTP draft has
+`n_gpu = 2..3`, not 1: its backends are the model's whole device list, which is why the `ctx_type` predicate
+is needed at all.
+
+**The pair adds no approximation** (r246, 27B Q8_0, `-c 2048 --chunks 20 -ub 2048 -b 2048` + `-ot`,
+`llama-perplexity --kl-divergence-base` recorded from the lanes-unset arm): lanes=2 reads mean KLD
+**0.001394 / same-top-p 99.101 %**, and a plain `-ub 1152` arm (the same 1152 + 896 boundaries, run serially)
+reads *exactly the same two numbers*.  So the divergence is the ubatch change, to every printed digit.
+
+**The default path is bit-identical** to the r246 delivery build: `scripts/gate-prefill-logits.sh` mean KLD
+**0.000697** / same-top-p **98.784 %** — the release's own reading — and `check-gpu-faults.sh` clean.
+
+**Greedy text and MTP acceptance are unchanged**: `-n 32 --temp 0 --seed 42`, lanes=1 == lanes=2 ==
+`--spec-type none`, sha `a4a403d64c40`; DFlash2 arm sha `e2dde701fc04` both ways; draft acceptance **0.62500
+(20 / 32)** in both MTP arms (the submitter's arm shows 0.742 → 0.677 across the lanes — that arm leaves the
+depth adaptive, so acceptance follows the speedup; a fixed `--spec-draft-n-max` is what makes the comparison
+exact).
+
+### The r243/r229 cuts (dated record): the gain needs both halves (MoE 35B-A3B Q8_0, pp2048)
 
 | arm | t/s | vs lanes unset |
 |---|---|---|
@@ -97,31 +139,39 @@ chunks (one split batch per call) leaves +5.5 %.
 
 ### Correctness
 
-* **The default path is bit-identical.**  `scripts/gate-prefill-logits.sh` against a base recorded from the
-  delivery build: mean KLD **0.000000**, same-top-p **100.000 %**; pp2048 6604–6628 vs 6618–6636 t/s (ABBA).
-* **The pair is bit-exact.**  lanes=2 vs lanes unset at the same ubatching measures **exactly** the divergence
-  of a plain `-ub 1152` vs `-ub 2048` change on the same build — mean KLD `0.004088`, same-top-p `97.898 %`,
-  identical to six digits (this is the §46 "benign reordering" scale — a smaller ubatch, nothing more).  So the
-  interleave adds no approximation; the split's divergence *is* the ubatch change, which is why greedy text
-  staying identical is luck of the greedy path and not identity.
-* Same-seed greedy text (`-n 32 --temp 0 --seed 42`, `/tmp` 2145-token slice of
-  `prompts/prose-rdna-boosts.txt`): lanes=2 == lanes unset, sha `f61214fad249` on the MoE and `8c1c642fc7cd` on
-  the dense 27B, before and after amendment 1, and with a DFlash2 draft after amendment 1.
+* **The default path is bit-identical** (r246): `scripts/gate-prefill-logits.sh` mean KLD **0.000697** /
+  same-top-p **98.784 %** against the base recorded from the r246 delivery build — the release's own reading.
+* **The pair is bit-exact** (r246): lanes=2 vs lanes unset at the same ubatching measures **exactly** the
+  divergence of a plain `-ub 1152` vs `-ub 2048` change on the same build — mean KLD `0.001394`, same-top-p
+  `99.101 %`, identical to every printed digit (the r229 point read `0.004088 / 97.898 %`; this is the §46
+  "benign reordering" scale — a smaller ubatch, nothing more).  So the interleave adds no approximation; the
+  split's divergence *is* the ubatch change, which is why greedy text staying identical is luck of the greedy
+  path and not identity.
+* Same-seed greedy text (`-n 32 --temp 0 --seed 42`, the 5 298-token `prompts/prose-rdna-boosts.txt`): lanes=2 ==
+  lanes unset == `--spec-type none`, sha `a4a403d64c40`; a DFlash2 draft arm sha `e2dde701fc04` both ways.  MTP
+  draft acceptance identical, `0.62500 (20 / 32)` in both arms (r229 record: `f61214fad249` on the MoE and
+  `8c1c642fc7cd` on the dense 27B).
 * Perplexity (`--ctx 2048 --chunks 8 --ub 2048`, every token an output row, i.e. **both** lanes carry outputs)
-  restores the split's exact single-lane value — `llama-perplexity` output identical to the `-ub 1152` arm.
+  restores the split's exact single-lane value — `llama-perplexity` output identical to the `-ub 1152` arm (r229).
 
 ### What it costs (all measured, all documented rather than tuned away)
 
-* **A second compute-buffer set per armed context**: ~1.4–1.5 GiB at `-ub 2048` (`ROCm0 441 + ROCm1 430 +
-  ROCm2 430 + host 65` MiB, logged once as `compute buffer size = … (prefill lane 2)`).
-* **A second context in the same process runs ~8 % slower with the lanes armed** (pp8192: 7976 → 7347 on the
-  2nd context, while lanes unset is flat at 7513–7519 across three contexts).  Unexplained; the extra buffer
-  set is the obvious suspect.
-* **Multi-sequence prefill regresses**: `llama-batched-bench -npp 2048 -ntg 128 -npl 1,4,8` → PP/S_TG
-  6289→8101 (+28.8 %), 8363→8437 (+0.9 %), **8776→8467 (−3.5 %)**; TG 92.98→92.96, 243.2→246.4, 322.7→322.9.
-  Server workloads with many concurrent long prompts therefore do not want this.
-* **Arming the lanes on a draft context costs ~4 % prefill / ~2 % decode** even though the pair declines
-  (35B-A3B + DFlash2 pp2048: 4042/4026 vs 3894/3867).  Leave `LLAMA_PREFILL_LANES` unset for draft workloads.
+* **A second compute-buffer set per armed context**: ~1.4–1.5 GiB at `-ub 2048` (the r229 record: `ROCm0 441 +
+  ROCm1 430 + ROCm2 430 + host 65` MiB, logged once as `compute buffer size = … (prefill lane 2)`).  A **draft**
+  context no longer pays it (r246): the two MTP draft contexts on the 27B arm show only their own 134 MiB device /
+  20 MiB host set, no `(prefill lane 2)` lines.
+* **A second context in the same process runs ~8 % slower with the lanes armed** (r229 observation, *not*
+  re-measured on this cut; pp8192: 7976 → 7347 on the 2nd context, while lanes unset is flat at 7513–7519 across
+  three contexts).  Unexplained; the extra buffer set is the obvious suspect.
+* **Multi-sequence prefill regresses**, and more so than at r243: `llama-batched-bench -npp 2048 -ntg 128 -npl
+  1,4,8` → PP/S_TG 6214.6→7475.8 (+20.3 %), 8381.7→8258.2 (−1.5 %), **8822.9→8284.8 (−6.1 %)**; TG
+  92.28→92.56, 242.2→239.1, 320.7→320.9 (r243 record: +28.8 / +0.9 / −3.5 %).  Server workloads with many
+  concurrent long prompts therefore do not want this.
+* **A draft workload's target still pays the arming cost** even though nothing pairs — `embeddings_layer_inp_dev`
+  is a *decode-time* gate, not an arm-gate one.  Measured on this cut (35B-A3B Q8_0 + DFlash2, 5 298-token
+  prompt): **−0.9 %** prefill, text identical (the r229 arm measured ~4 % prefill / ~2 % decode on a
+  `llama-bench pp2048` arm; the difference is the shape, not a change in the mechanism).  An MTP workload no
+  longer pays it at all (the draft is refused at the arm gate).
 
 ## What changed in the rebase
 
@@ -150,7 +200,7 @@ chunks (one split batch per call) leaves +5.5 %.
    reading "… every cycle; with / scheduler, so both stay allocated".  The artifact no longer deletes delivery
    text it does not mean to.
 
-**r241 (this re-cut) — the delivery moved under it:**
+**r241 (the re-cut after the delivery moved under it):**
 
 7. **`ggml_backend_sched_compute_splits` became a per-split function.**  The delivery now has
    `ggml_backend_sched_compute_split(sched, split_id, st)` plus the loop wrapper (which is exactly the structure
@@ -177,19 +227,50 @@ number is smaller than the r229 table's +27 % because that table is `llama-bench
 into two halves; this arm is `llama-cli` feeding a 5 256-token prompt in `-b` chunks, where only the chunks that
 fit the split window pair.
 
+**r243 (the re-cut after the r241 delivery moved again):** no behavioural delta and no conflict resolution —
+the artifact was re-cut only so its index lines name the r243 blobs instead of r241's (a stale blob line is what
+lets a 3-way apply land a hunk in the wrong place; `WORKLOG.md` 261109.008).  Its numbers are the `+13.5 %` spot
+check above, carried over.  `release.json` was not touched.
+
+**r244-r245 (PR #284 reviewed, NOT taken):** PR #284 re-cut the artifact onto r234 and, on top of the re-base,
+removed `!cparams.embeddings_nextn` from the split and pair gates so an **MTP target** pairs.  It was turned
+down with `CHANGES_REQUESTED` (`WORKLOG.md` 261109.011): the delta measures (+14.7 %, 946.7/942.0 →
+1085.1/1080.6 t/s on 3 × R9700) but it would also *pair the MTP draft*, which the artifact's arm gate let arm
+— an MTP draft is the target's own model with `ctx_type = MTP`, so `ctx_other` is nullptr, `n_gpu` is the
+model's whole device list, and the draft was allocating a second scheduler it could never pair on.  The
+requested change was the explicit predicate `ctx_other != nullptr || ctx_type == MTP` plus a re-cut on the
+current tree with the gate delta and the layout/hardware stated.
+
+**r246 (this re-cut, PR #296):**
+
+11. **The MTP target pairs; the MTP draft is refused at the arm gate** (`ctx_type == MTP` added).  The split and
+    pair gates keep only `!embeddings_layer_inp_dev`, so they agree with each other and with what actually
+    pairs.  Measured on this cut: target prefill **+29.9 %** (27B MTP, 5 298-token prompt), MoE **+23.8 %**,
+    dense **+32.2 %**; MTP greedy text and draft acceptance unchanged; the pair measures the plain-`-ub 1152`
+    KLD exactly (all in *What it measures here*).
+12. **The draft predicate is one boolean and it is logged.**  The submitted cut left the two conditions inline
+    and the WARN at `ignored (n_gpu = %d, pipeline_parallel = %d)`, so a refused MTP draft printed a line whose
+    two conditions both pass — the reader cannot see that the new predicate fired.  It reports
+    `… draft = %d` again, and the `ctx_other`-vs-`ctx_type` explanation sits above the gate where the next
+    reader will look (`ggml_backend_sched_graph_compute_async_pair`'s WARN is the other half of that story).
+
 ## Known open points
 
 * On the pair-failure path (`graph_compute_pair != SUCCESS`) lane 1's ubatch has already been applied to the
   memory module by `prepare_ubatch`, and the loop then processes it again in the single-lane path.  Error path
   only; a double `mctx->apply()` for the same positions is not obviously idempotent for every memory type.
 * `include/llama.h` gains `llama_n_prefill_lanes()`, a public accessor for an internal feature.
-* The ~8 % second-context penalty and the −3.5 % 8-sequence regression above are observed, not explained.
+* The ~8 % second-context penalty and the −6.1 % 8-sequence regression above are observed, not explained.
+* The delivery's own draft detection (`graph_reserve()`'s narrow-2 route, `process_ubatch()`'s `is_draft`, the
+  narrow-2 floor re-pin in `sched_reserve()`) still tests `ctx_other` alone, so none of it fires for a
+  qwen3-family MTP draft.  That is pre-existing delivery behaviour (`WORKLOG.md` 261109.011 item 3), not this
+  artifact's; the artifact only had to stop letting the draft arm.
 
 ## Env knobs (see `ENVIRONMENT.md` for the class of each)
 
 | variable | default | what |
 |---|---|---|
-| `LLAMA_PREFILL_LANES` | `1` | `2` enables the pair.  Anything else (or a layout the table above refuses) logs one WARN and stays single-lane |
+| `LLAMA_PREFILL_LANES` | `1` | `2` enables the pair.  Anything else (or a layout the table above refuses, or a draft context) logs one WARN and stays single-lane |
 | `LLAMA_LANES_SPLIT_MIN` | `1024` | minimum batch size (tokens) for the sub-ubatch split; `0` = whole-ubatch pairing only (the r220 behaviour) |
 | `LLAMA_LANES_SPLIT_FRAC` | `0.55` | fraction the first sub-ubatch takes (clamped to [0.1, 0.9], rounded up to 64) |
 | `GGML_SCHED_PAIR_DEBUG` | `0` | `1`: log each pair decision; `>= 2`: also run the hazard self-test; `>= 3`: per-lane/per-backend GPU event spans (creates timing events) |
@@ -197,13 +278,14 @@ fit the split window pair.
 
 ## Why this is not a block
 
-Promotion needs a **validated win on one of the delivery's own configurations**, and this cut now has one
-(gfx1201, +27 %/+41 % prefill in the `-ot` layout) — but it also has three open regressions (a draft context
-armed and declined, a second context, 8-sequence batched prefill) and it is **inert in both splits the delivery
-actually validates** (`-sm tensor` is one backend; plain `-sm layer` has pipeline parallelism on).  Reaching it
-costs a second compute-buffer set and a hand-written `-ot` override.  So it stays an artifact: a consumer with
-an `-ot` layout gets a large prefill win for a knob and a documented set of costs.
+Promotion needs a **validated win on one of the delivery's own configurations**, and this cut now has several
+(gfx1201, +23.8 % MoE `pp2048`, +32.2 % dense prefill, **+29.9 % on an MTP target**, all in the `-ot` layout) —
+but it still carries open regressions (a second context, −6.1 % at 8 sequences, −0.9 % on a layer-input draft's
+target) and it is **inert in both splits the delivery actually validates** (`-sm tensor` is one backend; plain
+`-sm layer` has pipeline parallelism on).  Reaching it costs a second compute-buffer set and a hand-written
+`-ot` override, and it reaches a *draft* workload only through its target.  So it stays an artifact: a consumer
+with an `-ot` layout gets a large prefill win for a knob and a documented set of costs.
 
 It becomes a promotion candidate when it reaches `-sm tensor` (pairing inside the Meta device, or a tensor-split
 hazard analysis), when plain `-sm layer` can use it (the pair needs to coexist with, or replace, the scheduler's
-pipeline parallelism), or when the three regressions above are gone.
+pipeline parallelism), or when the regressions above are gone.
