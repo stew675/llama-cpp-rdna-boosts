@@ -1,5 +1,12 @@
 ## 261110.006 (r250, RELEASE v16-a691b2345-r250) -- four `TODO` handles close: a degenerate `-sm tensor` share is refused (#135), the staging redirect is retired (#284), the `n_rs_seq` diagnostic refuses a narrow ubatch (#315), and the `hc_post_rms` non-temporal hints measure neutral (#311)
 
+**Shipped.**  `main` `c6258f8c`, tag `v16-a691b2345-r250`, fork `rdna-boosts` refreshed to
+`360ce99848f35bc1c3ceec4b5c48cb3fbdf08732` (`fork-refresh.sh --build --gates --push`: tree assert green, its
+own coherence + prefill-logit PASS on the re-cut build).  CI green on the `main` push (29 s) and on the tag
+(`Validate delivery set` 1m22s, `Release patch set` 16 s).  The **images** are being built and pushed
+off-host by the worker watcher on `radiance` (`rdna-container-watch.sh` picked the tag up at 13:30 local,
+attempt 1/3, `--rocm "7.14.1 10.1" --push --prune`) — nothing was built on the primary box.
+
 **Release `v16-a691b2345-r250`.**  Base `a691b2345`, 16 blocks, canonical re-cut tip
 `360ce99848f35bc1c3ceec4b5c48cb3fbdf08732`, tree `ce1a738d2b0f81193caf73d4371267249d641fa8`.  Three blocks
 change: **09** (`#284` + `#135`), **10** (`#315`, plus the hooks-file read of the retired variable), **11**
