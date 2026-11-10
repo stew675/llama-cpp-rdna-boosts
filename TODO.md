@@ -48,7 +48,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **287** | re-cut `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` against `#31047`'s `tile_spec` grid | upstream candidate, not delivery | **OPEN — half done** (`wip/upstream-pr-mul-mat-id-dup-recut/`): the compaction is ported and both `mmf` gates are removed, but the MMQ/MMF **ids kernels** still fault → it is WIP, not a candidate — §287 |
 | **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 | **311** | the fused `hc_post_rms` kernel drops the hc kernels' non-temporal hints | performance (block 11, r242) | **PARKED** (2026-11-09) — value-preserving and unmeasured; worth +18.6 % in situ on `dsv4_hc_pre` by the neighbouring kernel's own record — §311 |
-| **314** | `--fit` does not tell a user whose KV does not fit which placement would fix it | fittability (block 15) | **OPEN** — all three placements default off (r247), so a config that no longer fits needs to be told its options: `--kv-window N` (recency, lossless, any model) or `--kv-attendance-pool` (sparse qwen4exp only, costs prompt throughput).  A MESSAGE, never a decision — nothing may be taken on the user's behalf — §314 |
 
 ## Handle numbering
 
@@ -683,24 +682,3 @@ is purely a question of whether the fused launch keeps the win it has.  **Measur
 31.5k-prompt arm the r242 record uses (2 R9700 `-sm tensor`, Flash-Next GSQ-RCO IQ3_S, `-ub 6144`), plus a gfx1151
 arm where the in-situ effect was found.  If it is worth anything, the guard is a rebuild + the prefill-logit gate
 (`-0.000000` is the expected answer) and nothing else moves.
-
-## 314. `--fit` does not name the placements that would make a KV fit
-
-Since r247 every block-15 placement defaults to **off**, which is the right default (a placement that costs
-10 % of decode cannot be one) but leaves a config that does **not** fit with no hint: the fit reports the
-shortfall and shrinks `-c`, and the user has to know that `--kv-window N` (recency, lossless, any model) or
-`--kv-attendance-pool` (host mirror + device page cache, sparse qwen4exp only, costs prompt throughput) exist,
-and that they are alternatives.
-
-The work is a **message**, not a decision: when the fit cannot make the context fit at the requested `-c`, print
-the two options with the measured cost of each (`ENVIRONMENT.md` §17) and the fact that they are alternatives.
-Do **not** let the fit take one on the user's behalf — a placement chosen for the user, at a cost the user never
-asked for, is exactly what produced the r246 → r247 regression.  The `--fit` pass is one pass today, and the
-pool's mirror scales with `-c` while its device pool does not, so a *decision* would be a design change; a
-message is not.
-
-Closed in the same area (do not reopen without a measurement): **#312** — the MTP draft window's cost past the
-ring wrap is now a documented caveat of an opt-in feature, measured `-9.7 %` on a `-sm tensor` split at ~105k
-tokens (`benchmarks/2026-11-10-mtp-draft-window-depth.md`); the per-step mechanism itself is still unidentified
-and no longer needs to be.  **#313** — `--kv-region-pool auto` had no sizer, solved by *removing* the size knob:
-the pool is derived from the indexer geometry, so there is nothing left to size.

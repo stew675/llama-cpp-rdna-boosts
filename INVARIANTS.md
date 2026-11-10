@@ -3540,7 +3540,10 @@ Do not re-derive the decisions:
    the small derived draft reserve only when a window is actually active (`llama_spec_draft_kv_cells() != 0`),
    so with the new default an embedded MTP head charges the flat 3 584 MiB again.  That is the accepted cost of
    the opt-in: a config that fits only with the window must ask for it (`--spec-draft-kv-window auto`), and it
-   pays the caveat above past 65 536 tokens of depth.
+   pays the caveat above past 65 536 tokens of depth.  **`--fit` SAYS so and takes nothing** (the r247 follow-up):
+   when the pinned `-c` does not fit, its ERROR block lists `--kv-window N` and `--kv-attendance-pool` with their
+   measured costs and their mutual exclusivity, and skips whichever is already active.  A message, never a
+   decision — that is the whole lesson of r246 → r247.
 5. **A gate that only ever passes its knob explicitly cannot see a default regress.**  The draft-window gate's
    text arms all forced a window and its `auto` arms all passed the flag, so the r246 default shipped
    unmeasured.  It now asserts the default itself (`default_off`, `tensor_default_off`, and `tensor_auto` as

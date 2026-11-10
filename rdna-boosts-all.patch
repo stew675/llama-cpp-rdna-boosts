@@ -1495,7 +1495,7 @@ index 000000000..20a42f3b2
 +                                                   bool kv_unified = false,
 +                                                   int32_t draft_kv_window = -1);
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 10d57f956..165a7eb28 100644
+index 10d57f956..7ac20fb56 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -55,6 +55,154 @@ private:
@@ -1733,7 +1733,7 @@ index 10d57f956..165a7eb28 100644
      common_memory_breakdown_print(ctx);
  
      llama_free(ctx);
-@@ -261,14 +459,37 @@ common_device_memory_data_vec common_get_device_memory_data(
+@@ -261,14 +459,80 @@ common_device_memory_data_vec common_get_device_memory_data(
      return ret;
  }
  
@@ -1758,6 +1758,49 @@ index 10d57f956..165a7eb28 100644
 +    return (int64_t) extra->reserve_bytes + (int64_t) (n_dev - 1) * per_dev;
 +}
 +
++
++// wip/kv-residency (TODO #314, r247): `--fit` can only ever REDUCE -- shrink the context or offload fewer
++// layers.  It cannot move the KV, and the two placements that would buy the KV back are the user's decision:
++// a placement chosen for the user, at a cost the user never asked for, is exactly the r246 -> r247 regression
++// (the MTP draft window shipped on by default and cost ~10 % of decode past its depth).  So when the context
++// the user asked for does not fit, SAY what exists -- with its measured cost and the fact that the two are
++// alternatives -- and take nothing.  Printed once per fit.
++static bool g_fit_placement_hint_printed = false;
++
++static void fit_placement_hint(const llama_context_params * cparams, enum ggml_log_level level, const char * fn) {
++    if (g_fit_placement_hint_printed) {
++        return;
++    }
++    g_fit_placement_hint_printed = true;
++    const bool win_on  = cparams->kv_resident_cells != 0;
++    const bool pool_on = cparams->kv_region_pool != 0;
++    if (win_on && pool_on) {
++        return;   // cannot happen (they decline each other), but never print advice for what is already on
++    }
++    common_log_add(common_log_main(), level,
++            "%s:   two placements can buy the KV back -- --fit will not take either on your behalf:\n", fn);
++    if (!win_on) {
++        common_log_add(common_log_main(), level,
++                "%s:     --kv-window N          keep the newest N cells of the attention KV in VRAM and the\n"
++                "%s:                         older ones in pinned system RAM (ONE copy, LOSSLESS, any model).\n"
++                "%s:                         Costs 11-26 %% of decode once the request is deeper than N;\n"
++                "%s:                         `--kv-window auto` lets this fit choose N for the -c you pinned.\n",
++                fn, fn, fn, fn);
++    }
++    if (!pool_on) {
++        common_log_add(common_log_main(), level,
++                "%s:     --kv-attendance-pool   keep the whole KV in a pinned host mirror and cache only the\n"
++                "%s:                         pages the sparse reader selects in VRAM (a SECOND copy; qwen4exp/\n"
++                "%s:                         Flash-Next trunks only, sized by the system).  Costs prompt\n"
++                "%s:                         throughput (~-48 %% at pp32K) and buys the arena back for decode.\n",
++                fn, fn, fn, fn);
++    }
++    common_log_add(common_log_main(), level,
++            "%s:   they are ALTERNATIVES, not layers: the pool declines while a window is active, and neither\n"
++            "%s:   changes a token (ENVIRONMENT.md 17).  Lowering -c, -ngl or the quant also fits, and always\n"
++            "%s:   ends in a clean refusal rather than an allocator abort.\n", fn, fn, fn);
++}
++
  static void common_params_fit_impl(
          const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
          float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -1774,7 +1817,7 @@ index 10d57f956..165a7eb28 100644
      typedef std::vector<llama_device_memory_data> dmds_t;
      const llama_model_params default_mparams = llama_model_default_params();
  
-@@ -310,10 +531,48 @@ static void common_params_fit_impl(
+@@ -310,10 +574,48 @@ static void common_params_fit_impl(
                  measured = common_get_device_memory_data_impl(
                      extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
              } catch (const std::runtime_error & e) {
@@ -1825,7 +1868,7 @@ index 10d57f956..165a7eb28 100644
                  return;
              }
  
-@@ -345,10 +604,30 @@ static void common_params_fit_impl(
+@@ -345,10 +647,30 @@ static void common_params_fit_impl(
          }
      };
  
@@ -1857,7 +1900,7 @@ index 10d57f956..165a7eb28 100644
  
      // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
      const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-@@ -360,11 +639,27 @@ static void common_params_fit_impl(
+@@ -360,11 +682,27 @@ static void common_params_fit_impl(
          if (n_streams > 1) {
              LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                  __func__, n_ctx_max, n_streams);
@@ -1886,7 +1929,7 @@ index 10d57f956..165a7eb28 100644
      const size_t nd = devs.size(); // number of devices
  
      std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
-@@ -373,7 +668,577 @@ static void common_params_fit_impl(
+@@ -373,7 +711,577 @@ static void common_params_fit_impl(
          margins.push_back(margins_s[0]);
      } else {
          for (size_t id = 0; id < nd; id++) {
@@ -2465,7 +2508,7 @@ index 10d57f956..165a7eb28 100644
          }
      }
  
-@@ -477,7 +1342,15 @@ static void common_params_fit_impl(
+@@ -477,7 +1385,15 @@ static void common_params_fit_impl(
                      "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                      __func__, -global_surplus/MiB);
              }
@@ -2482,7 +2525,7 @@ index 10d57f956..165a7eb28 100644
                  if (n_ctx_max > n_ctx_min_total) {
                      int64_t sum_used_target = sum_free;
                      if (nd == 0) {
-@@ -540,6 +1413,49 @@ static void common_params_fit_impl(
+@@ -540,6 +1456,53 @@ static void common_params_fit_impl(
                  }
              } else {
                  LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
@@ -2508,20 +2551,23 @@ index 10d57f956..165a7eb28 100644
 +                    }
 +                }
 +                const int64_t shortfall   = -global_surplus;
-+                const int64_t mib_per_1k  = cparams->n_ctx > 0 ? ctx_mib * 1024 / cparams->n_ctx : 0;
++                // `ctx_mib` is a BYTE count (the memory breakdown's `mb.context`); keep the per-1k figure in
++                // bytes so the token estimate below stays right, and divide by MiB only when printing it.
++                // Before 2026-11-10 (r247) this printed the byte figure as "MiB per 1024 tokens" (67.7 M).
++                const int64_t bytes_per_1k = cparams->n_ctx > 0 ? ctx_mib * 1024 / cparams->n_ctx : 0;
 +                LOG_ERR("%s: the requested configuration does NOT fit in device memory\n", __func__);
 +                LOG_ERR("%s:   projected %" PRId64 " MiB used vs. %" PRId64 " MiB free, target margin %" PRId64
 +                        " MiB -> over budget by %" PRId64 " MiB\n",
 +                        __func__, sum_projected_used/MiB, sum_free/MiB, sum_margin/MiB, shortfall/MiB);
 +                LOG_ERR("%s:   the context is fixed at %" PRIu32 " by the user (%" PRId64 " MiB, about %" PRId64
 +                        " MiB per 1024 tokens), so --fit will not reduce it\n",
-+                        __func__, (uint32_t) cparams->n_ctx, ctx_mib/MiB, mib_per_1k);
++                        __func__, (uint32_t) cparams->n_ctx, ctx_mib/MiB, bytes_per_1k/MiB);
 +                if (shortfall < ctx_mib) {
 +                    LOG_ERR("%s:   about %" PRId64 " fewer context tokens would fit; lower -c, lower -ngl, or\n"
 +                            "%s:   unset -c/-ngl so --fit can choose.  Running over budget ends in an\n"
 +                            "%s:   allocator out-of-memory abort, and on Windows/WDDM a paged device\n"
 +                            "%s:   allocation can fault the GPU instead of failing cleanly\n",
-+                            __func__, shortfall * 1024 / std::max<int64_t>(1, mib_per_1k), __func__, __func__, __func__);
++                            __func__, shortfall * 1024 / std::max<int64_t>(1, bytes_per_1k), __func__, __func__, __func__);
 +                } else {
 +                    LOG_ERR("%s:   even the smallest context cannot make this fit: lower -ngl (offload fewer\n"
 +                            "%s:   layers) or use a smaller quant.  Running over budget ends in an\n"
@@ -2529,9 +2575,24 @@ index 10d57f956..165a7eb28 100644
 +                            "%s:   allocation can fault the GPU instead of failing cleanly\n",
 +                            __func__, __func__, __func__, __func__);
 +                }
++                fit_placement_hint(cparams, GGML_LOG_LEVEL_ERROR, __func__);
              }
          }
      }
+@@ -989,11 +1952,13 @@ enum common_params_fit_status common_fit_params(
+         ggml_log_level log_level) {
+     const int64_t t0_us = llama_time_us();
+     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
++    g_fit_placement_hint_printed = false;
+     try {
+         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+     } catch (const common_params_fit_exception & e) {
+         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
++        fit_placement_hint(cparams, GGML_LOG_LEVEL_WARN, __func__);
+         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+     } catch (const std::runtime_error & e) {
+         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
 diff --git a/common/fit.h b/common/fit.h
 index b2be5e4aa..befc7755d 100644
 --- a/common/fit.h

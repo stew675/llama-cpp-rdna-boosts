@@ -1076,6 +1076,12 @@ they are that option's env form, not a second knob.
   `sparse` decode arm), but it pays a PCIe read **every step** instead of a fill per page.
 * neither is a default, and enabling one declines the other, with a message naming it.
 
+**`--fit` names them, and takes neither (r247).**  When the context you asked for does not fit, the fit's ERROR
+block lists `--kv-window N` and `--kv-attendance-pool` with their measured costs, says they are alternatives, and
+stops there — it will not take one on your behalf (a placement chosen for the user, at a cost the user never
+asked for, is what produced the r246 → r247 regression).  When one of them is already active it is left out of
+the advice.
+
 
 ### 17.0 The resident window (`--kv-window`, `LLAMA_KV_RESIDENT_CELLS` = deprecated alias)
 

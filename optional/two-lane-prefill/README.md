@@ -1,17 +1,19 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r246`** (against `release.json` tree
-`9385502ba8c83ff17371c87231b5a48e075cbfcb`; the r243, r241 and r229 cuts and their measurements are kept below
-as the dated record).
+**Optional artifact, not part of the delivery.  Re-cut on `r247`** (against `release.json` tree
+`8f99d2dc6dbe8648b44268b8b82394d11f12f573`; the r246, r243, r241 and r229 cuts and their measurements are kept
+below as the dated record).  The r247 cut is a mechanical rebase — the delivery changed only block-15 defaults
+and options (`ENVIRONMENT.md` §17), so nothing in this artifact's code or numbers moves.
 
 From **PR #268, #279, #284 then #296 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
 reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `acc5adb0edafd172022377235937934f166ffc0e0d28373ba48859c9d5d6a16d`
-* applies at `release.json` tree `9385502ba8…` (r246), produces tree `e4e8be30110e4f24673cd98c3d21dc391eafa061`
-  (verified by strict `git am` on a fresh checkout of `.base`; with `host-pool-fill-src` applied first the two
-  together produce `db5ed504b5e28216ebb57fcb36449474af663c44`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `f5702697eacdb3051dfa787b258dd405c4ab7e47b7f9a814754469944f6983d2`
+* applies at `release.json` tree `8f99d2dc6d…` (r247), produces tree `17f51fb30c39a16db280d0864a0feee784f1010b`
+  (verified by strict `git am` on a fresh checkout of the r247 `rdna-boosts` branch; the r246 cut produced
+  `e4e8be3011…`, and with the retired `host-pool-fill-src` artifact applied first the two produced
+  `db5ed504b5…`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one

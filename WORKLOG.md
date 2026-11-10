@@ -1,7 +1,7 @@
 ## 261110.003 (r247, RELEASE v16-a691b2345-r247) -- the MTP draft window was costing 9.7 % of decode at depth: every block-15 placement now defaults OFF, and the pool stops being a size knob
 
 **Release:** `v16-a691b2345-r247`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
-`2cf1af51d980612eba22ddb4ae5515fb834bd6a3` (tree `ebb1d2a8d4812a97af412f632b81cd5c35562c67`), 16 blocks.
+`4973ab6c1c5b4d7ebc8fb5a935767ef77f20156e` (tree `8f99d2dc6dbe8648b44268b8b82394d11f12f573`), 16 blocks.
 `scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`, applied tree == recorded tree,
 conflict-marker and Windows-portability scans); `scripts/fork-refresh.sh` re-cut reproduces the same tree/tip.
 **No block renumbered, merged or split**: everything folds into **block 15**.  No kernel, no graph, no numerics
@@ -61,8 +61,37 @@ who inherited one.  That also removes the last thing `--fit` had to decide about
 **`--fit` still follows the user's choice**: `common_draft_reserve_derive()` charges the small derived draft
 reserve only when a window is actually *active*, so with the new default an embedded MTP head charges the flat
 3 584 MiB again.  That is the accepted cost of the opt-in — a config that only fits with the window must ask for
-it and then owns the caveat.  `TODO` #314 is the follow-up: `--fit` should **say** which placement would make a
-config fit, never take one.
+it and then owns the caveat.
+
+**And `--fit` now SAYS so (`TODO` #314, closed here).**  Since every placement is off by default, a config that
+no longer fits had no hint.  The fit's "does NOT fit" ERROR block now lists both placements with their measured
+costs and their mutual exclusivity, skips whichever one is already active, and **takes nothing** — a message,
+never a decision:
+
+```
+E common_params_fit_impl: the requested configuration does NOT fit in device memory
+E common_params_fit_impl:   projected 32395 MiB used vs. 32408 MiB free, target margin 1024 MiB -> over budget by 1011 MiB
+E common_params_fit_impl:   the context is fixed at 262144 by the user (16533 MiB, about 64 MiB per 1024 tokens), so --fit will not reduce it
+E common_params_fit_impl:   about 16031 fewer context tokens would fit; lower -c, lower -ngl, or
+E common_params_fit_impl:   two placements can buy the KV back -- --fit will not take either on your behalf:
+E common_params_fit_impl:     --kv-window N          keep the newest N cells of the attention KV in VRAM and the
+E common_params_fit_impl:                         older ones in pinned system RAM (ONE copy, LOSSLESS, any model).
+E common_params_fit_impl:                         Costs 11-26 % of decode once the request is deeper than N;
+E common_params_fit_impl:                         `--kv-window auto` lets this fit choose N for the -c you pinned.
+E common_params_fit_impl:     --kv-attendance-pool   keep the whole KV in a pinned host mirror and cache only the
+E common_params_fit_impl:                         pages the sparse reader selects in VRAM (a SECOND copy; qwen4exp/
+E common_params_fit_impl:                         Flash-Next trunks only, sized by the system).  Costs prompt
+E common_params_fit_impl:                         throughput (~-48 % at pp32K) and buys the arena back for decode.
+E common_params_fit_impl:   they are ALTERNATIVES, not layers: the pool declines while a window is active, and neither
+E common_params_fit_impl:   changes a token (ENVIRONMENT.md 17).  Lowering -c, -ngl or the quant also fits, and always
+E common_params_fit_impl:   ends in a clean refusal rather than an allocator abort.
+```
+
+It also fires from the fit's exception path (as a WARN), so the "nothing fits at any context" abort is covered
+too, once per fit.  **A pre-existing units bug was found while writing it**: the line above it printed the
+*byte* figure as "MiB per 1024 tokens" (`67721728 MiB`); `ctx_mib` is bytes, so the per-1k figure is now computed
+in bytes and divided by MiB only for display (`64 MiB per 1024 tokens`).  The token estimate was already right
+(the units cancelled), and it is unchanged.
 
 ### Gates
 
@@ -72,7 +101,10 @@ config fit, never take one.
 | `scripts/gate-kv-residency.sh --pool-only` | **PASS** (47 checks) with the arms reshaped: `pres` (`--kv-attendance-pool on`, system-sized 4 104 pages) and `plegacy` (`--kv-region-pool 32768`, ignored + the verify oracle), text byte-identical across `pref`/`pres`/`plegacy`, `bad 0`, derived pool smaller than the cache (claim pressure real), `plegacy` holding the *same* page count as `pres`, and the 2-device `-sm layer` section still proving the per-device counter blocks |
 | `scripts/gate-per-block-build.sh --fast --changed-from a9d74e393` | 1/1 (block 15 only; every other block's delta unchanged) |
 | `scripts/gate-prefill-logits.sh` | **PASS** 0.000697 / 98.784 % (no prefill path touched; the formality every release runs) |
-| `scripts/validate-set.sh` | strict 16/16, applied tree `ebb1d2a8d4`, checksums + Windows portability lint green |
+| coherence (27B UD-Q4_K_XL, 3 GPU, seed 42 / 24 tokens) | `-sm layer` `d45e2221805a` — **the r246 reference text**, i.e. the default path is unchanged by the new defaults; `-sm tensor` `019844e4b185` |
+| MTP, reduced Protocol A (`-sm layer -c 67584`, 42k-token request, `-n 512`, seed 42) | `plain` 27.5 t/s and `draft-mtp` (the **new** default, no flag) 52.8 t/s, text **identical** (`1f0fbac1ea2d`) |
+| `TODO` #314 diagnostic (1 GPU, 27B, `-c 262144` pinned) | fires as designed (block quoted below) and is **absent** on a config that fits (`-c 8192`: 0 hits); the pre-existing "MiB per 1024 tokens" units bug it sits above now reads 64 instead of 67721728 |
+| `scripts/validate-set.sh` | strict 16/16, applied tree `8f99d2dc6d`, checksums + Windows portability lint green |
 | `scripts/check-gpu-faults.sh` | clean, scoped per gate to the time before its first arm |
 
 **A gate defect found while adding the tensor arms:** `gate-spec-draft-window.sh`'s `policy_arm` ready-wait
@@ -89,9 +121,9 @@ sparse reader, and the measured costs), §17.0/§17.1/§17.2 + the §13 retired 
 gate 15 and the pool gate's arms; `patches/README.md` block 15 (r247 amendment + knobs); `AGENTS.md`'s patch
 table; `INVARIANTS.md` (the r246 entry corrected in place, and an **r247** entry with the measurement, the
 default rule, the "boolean beats a derived size knob" rule, the "window vs pool are alternatives" rule, the
-`--fit` consequence, and the gate lesson); `TODO` **#312 and #313 closed** (as *resolved by an opt-in feature
-with a measured caveat* and *solved by removing the knob*, not as fixed bugs — the per-step mechanism is still
-unidentified and recorded as such) with **#314** opened for the `--fit` diagnostic; `scripts/README.md` for both
+`--fit` consequence, and the gate lesson); `TODO` **#312, #313 and #314 all closed** (#312 as *resolved by an opt-in feature with a measured caveat* — the
+per-step mechanism is still unidentified and recorded as such; #313 as *solved by removing the knob*; #314 as
+*implemented*, the `--fit` message above, which was the follow-up #313 would otherwise have been); `scripts/README.md` for both
 gates; `benchmarks/2026-11-10-mtp-draft-window-depth.md` for the arms.
 
 ### Not run, and why
@@ -104,12 +136,16 @@ was not rerun: `--kv-window` is the same placement with a new spelling plus a le
 `gate-kv-residency.sh`'s window section exercises exactly that path (`wref`/`wres`/`wspill`, all green at r246
 and unchanged in code).
 
-### Owed at tag time (not done here)
+### Release mechanics at tag time
 
-`optional/two-lane-prefill/` is cut against the r246 tree and no longer applies to `release.json.tree`; it must
-be re-cut onto `ebb1d2a8d4` when the release is actually tagged and pushed (it is an optional artifact, not part
-of the delivery, so the tree is consistent without it — but a consumer who tries it today gets a reject).
-Also owed then: `fork-refresh.sh --build --gates --push` and the worker container rebuild, per the Pushing policy.
+`optional/two-lane-prefill/` is re-cut onto this release: it now applies **strictly** at tree `8f99d2dc6d` and
+produces `17f51fb30c` (sha256 `f5702697ea…`), verified with a plain `git am` on a fresh checkout.  The cut is
+mechanical — this release moved block-15 defaults and options only, so nothing in that artifact's code or
+numbers moves, and its own measurements are kept as the dated record.
+
+The rest of the release mechanics: `fork-refresh.sh --build --gates --push` (the personal fork's `rdna-boosts`
+branch must carry tip `4973ab6c1`), the tag, and the off-host worker container build that the tag triggers
+(`CONTAINERS.md` — never on the primary box).
 
 ### Release notes (the short version for consumers)
 
