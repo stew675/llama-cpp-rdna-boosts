@@ -1,17 +1,19 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r243`** (against `release.json` tree
-`e9300f1dbd0b2f0b96c1828829d2072d73f34bca`; the r241 and r229 cuts and their measurements are kept below as the
-dated record).
+**Optional artifact, not part of the delivery.  Re-cut on `r245`** (against `release.json` tree
+`0d10efd84fa34521f3eb716f4f808c9346db715f`; the r244, r243, r241 and r229 cuts and their measurements are kept
+below as the dated record).
 
-From **PR #268 then PR #279 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed and
-amended (see *What changed in the rebase* below).  The submitter's own description and measurements are in the
-PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
+From **PR #268 then PR #279 then PR #284 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
+reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
+are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `dfba9168a1044a29a2e466c36fb8b64c78dd3e79d359aeda01fa7c3141680799`
-* applies at `release.json` tree `e9300f1dbd…`, produces tree `0db1268ea8e72cb2f0bf830583a94b85c06ba77e`
-  (verified by strict `git am` on a fresh checkout of `.tip` `72f7753fd`; both artifacts together produce
-  `74458b8bfd25575d86a31d69c21a16a3a5e837b7`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `0a4217b4174cf3f2c69207297803087c45af9d0a32a07b91e066d6d12850246b`
+* cut against the R244 tree `5cd5d6a466…` (where it produces `0d07d2fadb852e02f29c88a943f3e83a1eb6069a`), strictly
+  re-pinned to the r245 tree: applies at `release.json` tree `0d10efd84f…`, produces tree
+  `55fff3f4b5759efb56e57007e30be3fa43a8cde1` (verified by strict `git am` on a fresh checkout of `9e0d39dd8`; the
+  r244 → r245 applied-tree delta is `ggml/src/ggml-cuda/mmb.cu` + `moe-expert-cache.cu` only — neither touched by
+  this artifact, so the R244 measurements carry over)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one
@@ -33,11 +35,14 @@ Since the r229 cut there are two halves, and **both are needed** (the numbers be
    cut only *whole* ubatches paired, so a prompt batch of fewer than two ubatches never paired at all.
 2. **Output-aware pairing.**  The pair gate no longer requires both ubatches to be output-free: the outputs are
    extracted per lane after compute, on the scheduler of each lane (`extract_outputs`, with a sched-aware
-   readback sync).  MTP (`nextn`) and F1 layer-input readback stay single-lane.
+   readback sync).  Since the r244 cut the MTP (`nextn`) **target** pairs as well (halo parity, `!mtp_only`);
+   only the F1 layer-input readback stays single-lane.
 
 It degrades to the existing single-lane path when `< 2` non-CPU **backends**, pipeline parallelism, `no_alloc`,
-or a draft context is present, and a workload that reads `nextn` / F1 layer-input rows declines the pair **and
-now also declines the split** (see amendment 1).
+or a draft context is present.  The MTP **draft** is declined at arming by
+`cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP` (it carries the target's whole device list and would otherwise arm
+a second scheduler for 0-output ubatches); the MTP **target** arms and pairs.  A workload that reads F1
+layer-input rows declines the pair **and also declines the split** (see amendments 5 and 13).
 
 A pair is admitted only when both lanes have the same split structure and the cache-hazard analysis finds no
 cross-backend hazard (`GGML_SCHED_PAIR_HAZARD=0` keeps the name guard alone; `GGML_SCHED_PAIR_DEBUG` logs the
@@ -52,6 +57,7 @@ This matters more than the knob does, so it is measured, not assumed (3× R9700,
 | `-sm tensor` (any device count) | **never engages.**  This tree's tensor split is ONE backend (a Meta device wrapping N GPUs) so the `n_gpu >= 2` gate sees 1: `sched_reserve: LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0)` |
 | plain `-sm layer`, all layers on GPU | **never engages.**  The scheduler's own pipeline parallelism is enabled in exactly that configuration: `ignored (n_gpu = 3, pipeline_parallel = 1)` |
 | `-sm layer` + any `--override-tensor` (`-ot`) | **engages** — a tensor override disables pipeline parallelism (`pair decided: splits a=4 b=4, interleaved=1`).  **This is the only reachable layout on ROCm.** |
+| production APU-hybrid layout (`-ts 1,0` + `-ot '...exps=ROCm1'`, MTP `-md`) on V620 gfx1030 + 8060S gfx1151 | **engages on R244** — the target context sees both devices and `-ot` disables auto-PP; the two DRAFT contexts decline via amendment 12 (`LLAMA_PREFILL_LANES ignored` WARN).  Prefill +47.1 % (see *The r244 cut measured*) |
 | `-sm row` | **not usable at all on ROCm**: `llama_model_load: device ROCm0 does not support split buffers` (the r220 cut listed this as a reachable layout — it is an inference, not a measurement, and it is wrong for this backend) |
 | `-sm none` | one GPU backend, i.e. the `-sm tensor` case |
 
@@ -121,7 +127,30 @@ chunks (one split batch per call) leaves +5.5 %.
   6289→8101 (+28.8 %), 8363→8437 (+0.9 %), **8776→8467 (−3.5 %)**; TG 92.98→92.96, 243.2→246.4, 322.7→322.9.
   Server workloads with many concurrent long prompts therefore do not want this.
 * **Arming the lanes on a draft context costs ~4 % prefill / ~2 % decode** even though the pair declines
-  (35B-A3B + DFlash2 pp2048: 4042/4026 vs 3894/3867).  Leave `LLAMA_PREFILL_LANES` unset for draft workloads.
+  (35B-A3B + DFlash2 pp2048: 4042/4026 vs 3894/3867).  Since the r244 cut the MTP **draft** is declined at
+  arming (amendment 12), so the remaining case is DFlash/EAGLE3 — leave `LLAMA_PREFILL_LANES` unset there.
+
+### The r244 cut measured (MTP target pairing, V620 gfx1030 + 8060S gfx1151)
+
+Qwen3.8-Flash-Next UD-Q6_K_XL (~164 GB) + `mtp-…-shared-Q8_0.gguf` draft, the user's production server layout:
+`-dev ROCm0,ROCm1 -devd ROCm0 -ts 1,0 --fit off
+-ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' --load-mode dio --lazy-mode on --no-host
+--no-repack`, `-b 5120 -ub 2560 --ctx-size 32768 --spec-type draft-mtp-adaptive,ngram-mod`, 15,010-token
+pangram prompt, ABBA (lanes env-gated, same binary):
+
+| arm | median prompt t/s | runs |
+|---|---|---|
+| `LLAMA_PREFILL_LANES=1` | 821.6 | 821.48 / 821.78 / 823.05 / 818.33 |
+| `LLAMA_PREFILL_LANES=2` | 1208.0 | 1207.99 / 1199.80 / 1212.06 |
+
+**+47.1 %** (821.6 → 1208.0 median).  `GGML_SCHED_PAIR_DEBUG=1` shows `pair decided: splits a=100 b=100,
+interleaved=1` (4 pairs per prompt) and one `LLAMA_PREFILL_LANES ignored` WARN per DRAFT context — the MTP
+draft is refused by exactly the new `ctx_type` condition (it sees both devices: `n_gpu = 2`), the BLOCKER
+scenario the review caught.  Decode (32 tokens, MTP): 40.09 → 36.91 t/s, within the draft-acceptance variance
+of a 32-token sample (0.742 → 0.677 acceptance).
+
+Reviewer reference, 3× R9700 with the draft gate fixed, MTP target `-sm layer -ts 1/1/1 -ot`:
+946.7/942.0 → 1085.1/1080.6 t/s (+14.7 %).
 
 ## What changed in the rebase
 
@@ -176,6 +205,27 @@ model), and under `-sm tensor` the lanes are refused and the text is the dense a
 number is smaller than the r229 table's +27 % because that table is `llama-bench pp2048`, one wide ubatch split
 into two halves; this arm is `llama-cli` feeding a 5 256-token prompt in `-b` chunks, where only the chunks that
 fit the split window pair.
+
+**r244 (this re-cut) — per the PR #284 review:**
+
+11. **MTP-target pairing.**  The split and pair gates no longer test `!cparams.embeddings_nextn`: the MTP
+    target's prefill runs on 0-output nextn ubatches and now pairs (halo-hybrid parity, `!mtp_only`).  F1
+    layer-input reads stay excluded.
+12. **Arm-gate MTP-draft exclusion.**  The arm gate now also requires
+    `cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP`.  The MTP **draft** context carries the target's whole device
+    list (`ctx_other` is nullptr, `ctx_type` is MTP, set at `common/speculative.cpp`) and would otherwise arm a
+    second scheduler and pair — wasting a full second compute-buffer set (~134+20 MiB measured on 3× R9700)
+    for a context whose ubatches are 0-output nextn reads.  The MTP **target** is `ctx_type` DEFAULT, so it
+    still arms; DFlash/EAGLE3 drafts (`ctx_type` DRAFT) were already declined via `ctx_other != nullptr`.
+13. **The split gate agrees with the pair gate** — `!cparams.lf_layer_inp_dev` only, nextn removed — so a batch
+    is only split when its two halves will actually be paired.
+
+**r245 (re-pin, per the `optional/README.md` convention — "rebased onto a new release whenever the delivery moves"):**
+
+14. **Strict re-pin to the r245 tree.**  The r244 → r245 applied-tree delta is `ggml/src/ggml-cuda/mmb.cu` and
+    `ggml/src/ggml-cuda/moe-expert-cache.cu` only (the block 06/09/10/12/15 re-cut); neither file is touched by
+    this artifact, `git apply --check` is clean, and strict `git am` reproduces the commit — so the R244
+    measurements above carry over unchanged.
 
 ## Known open points
 

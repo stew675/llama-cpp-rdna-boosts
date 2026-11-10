@@ -1,11 +1,11 @@
-From 9cc6bceae4d6ac34ec85f5a809836e0a8e282a62 Mon Sep 17 00:00:00 2001
-From: "Slava P." <slavap@users.noreply.github.com>
+From 4fc743b0234e04a57135c088fdf9a905837c5662 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 6 Nov 2026 21:30:00 -0600
 Subject: [PATCH] rdna-boosts [optional]: two-lane prefill
  (LLAMA_PREFILL_LANES) -- consecutive-ubatch overlap
 
-The `two-lane-prefill` artifact, re-cut against r229 (release.json tree 622d017f7a) from
-PR #279 by @slavap.  NOT part of the delivery: nothing here is in `patches/`, `release.json`
+The `two-lane-prefill` artifact, re-cut against R244 (release.json tree 5cd5d6a46654) per the
+PR #284 review.  NOT part of the delivery: nothing here is in `patches/`, `release.json`
 or `rdna-boosts-all.patch`, and only `scripts/apply-all.sh --include-optional` picks it up.
 
 What it does
@@ -18,37 +18,53 @@ into two wide sub-ubatches (LLAMA_LANES_SPLIT_FRAC, default 0.55, rounded up to 
 chunked-GDN chunk) and the batch's output row lands in the second one; either partner may carry
 outputs, extracted per lane on that lane's scheduler.  It degrades to the single-lane path with
 < 2 non-CPU backends, pipeline parallelism, no_alloc, a draft context, or a workload that reads
-nextn/F1 rows.  Requires a layout where pipeline parallelism is already off: `-sm layer` plus
-any `--override-tensor`.
+F1 rows.  Requires a layout where pipeline parallelism is already off: `-sm layer` plus any
+`--override-tensor`.
 
-Measured here (3 x R9700 / gfx1201, `-sm layer -ts 1/1/1 -ot`, ABBA): MoE 35B-A3B Q8_0 pp2048
-6621 -> 8436 t/s (+27.4 %), pp4096 6486 -> 8245 (+27.1 %), pp8192 with `-b 8192` (one decode
-call) 6240 -> 9251 (+48.3 %); dense 27B Q6_K_XL pp2048 1293 -> 1823 (+41.0 %), pp8192
-1488 -> 1745 (+17.3 %); decode unchanged.  The gain needs BOTH halves: the split alone is a
-loss (-17 % MoE, -3.6 % dense) and the pair alone (LLAMA_LANES_SPLIT_MIN=0) is nil, which is
-why the r220 cut -- which could only pair whole ubatches -- measured nothing.  The pair itself
-is bit-exact: lanes=2 versus lanes unset at the same ubatching has exactly the divergence of a
-plain `-ub 1152` vs `-ub 2048` change (KLD 0.004088, same-top-p 97.898 %), and the default path
-is bit-identical to the delivery build (KLD 0.000000).
+Patch delta versus the PR #284 cut (per the review)
+---------------------------------------------------
+1. MTP-TARGET pairing. The split and pair gates no longer test `!cparams.embeddings_nextn`:
+   the MTP target's prefill runs on 0-output nextn ubatches and now pairs (halo-hybrid parity,
+   `!mtp_only`).  The F1 layer-input path stays excluded.
+2. Arm-gate MTP-DRAFT exclusion. The arm gate (sched_reserve) now also requires
+   `cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP`.  The MTP DRAFT context carries the target's
+   whole device list (ctx_other is nullptr, ctx_type is MTP, set at common/speculative.cpp)
+   and would otherwise arm a second scheduler and pair -- wasting a full second compute-buffer
+   set (~134+20 MiB measured on 3x R9700) for a context whose ubatches are 0-output nextn
+   reads.  The MTP TARGET is ctx_type DEFAULT, so it still arms.  DFlash/EAGLE3 drafts
+   (ctx_type DRAFT) were already declined via ctx_other != nullptr.  (halo parity:
+   `!model.hparams.mtp_only`.)
+3. The sub-ubatch split is gated exactly like the pair -- `!cparams.lf_layer_inp_dev` only,
+   embeddings_nextn removed -- so a batch is only split when its two halves will actually be
+   paired.  A workload that declines the pair (F1) and was split anyway paid a narrower
+   ubatch for nothing (the earlier 35B-A3B Q8_0 + DFlash2 pp2048 3981.8 -> 3427.4 t/s,
+   -13.9 %, came from exactly this disagreement; both are restored).
 
-Amendments in this re-cut (on top of the submitter's r229 delta)
----------------------------------------------------------------
-1. The sub-ubatch split is gated exactly like the pair -- `!cparams.embeddings_nextn &&
-   !cparams.lf_layer_inp_dev` -- so a batch is only split when its two halves will actually be
-   paired.  A draft workload (MTP / DFlash) declines the pair but was still being split, i.e. it
-   paid a narrower ubatch for nothing: 35B-A3B Q8_0 + DFlash2 pp2048 measured 3981.8 -> 3427.4
-   t/s (-13.9 %) and its greedy text diverged.  Both are restored (3993 vs 4042/4026 t/s for
-   lanes unset, same-seed text sha f61214fad249).  Arming the lanes on a draft context still
-   costs ~4 % prefill / ~2 % decode (a second compute-buffer set plus one drain per ubatch);
-   leave the variable unset there.
-2. Restored the delivery's `src/llama-context.h` comment line that the r220 cut dropped
-   ("// one scheduler each switch re-splits and re-allocates the graph. ..."), which had left
-   the MTP sched2 note reading "... every cycle; with / scheduler, so both stay allocated".
+Measured here (V620 gfx1030 32 GiB + 8060S gfx1151 124 GiB, Qwen3.8-Flash-Next UD-Q6_K_XL,
+MTP `-md`, production layout `-dev ROCm0,ROCm1 -devd ROCm0 -ts 1,0`
+`-ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1'`, 15,010-token prompt, ABBA):
+- MTP target prefill: 821.6 -> 1208.0 t/s median (+47.1 %).  The two DRAFT contexts
+  correctly decline (one WARN each); with n_gpu = 2 for the drafts, the new ctx_type
+  condition is what refuses the MTP draft -- the BLOCKER scenario, caught.
+- GGML_SCHED_PAIR_DEBUG=1: `pair decided: splits a=100 b=100, interleaved=1`, 4 pairs per
+  prompt; probe prefill 1212.4 t/s.
+- Reviewer reference, 3x R9700 with the draft gate fixed, MTP target `-sm layer -ts 1/1/1
+  -ot`: 946.7/942.0 -> 1085.1/1080.6 t/s (+14.7 %).
 
-Known open points (unchanged from the PR): the pair-failure path double-applies lane 1's ubatch
-to the memory module; a second context in one process is ~8 % slower with the lanes armed than
-the first; 8-sequence batched prefill regresses ~3.5 %.  Numbers, the reachability table and
-the layouts this cannot reach are in `optional/two-lane-prefill/README.md`.
+Measured earlier (3 x R9700 / gfx1201, no MTP, `-sm layer -ts 1/1/1 -ot`, ABBA): MoE 35B-A3B
+Q8_0 pp2048 6621 -> 8436 t/s (+27.4 %), pp4096 6486 -> 8245 (+27.1 %), pp8192 with `-b 8192`
+(one decode call) 6240 -> 9251 (+48.3 %); dense 27B Q6_K_XL pp2048 1293 -> 1823 (+41.0 %),
+pp8192 1488 -> 1745 (+17.3 %); decode unchanged.  The gain needs BOTH halves: the split alone
+is a loss (-17 % MoE, -3.6 % dense) and the pair alone (LLAMA_LANES_SPLIT_MIN=0) is nil,
+which is why the r220 cut -- which could only pair whole ubatches -- measured nothing.  The
+pair itself is bit-exact: lanes=2 versus lanes unset at the same ubatching has exactly the
+divergence of a plain `-ub 1152` vs `-ub 2048` change (KLD 0.004088, same-top-p 97.898 %),
+and the default path is bit-identical to the delivery build (KLD 0.000000).
+
+Known open points (unchanged from the PR): the pair-failure path double-applies lane 1's
+ubatch to the memory module; a second context in one process is ~8 % slower with the lanes
+armed than the first; 8-sequence batched prefill regresses ~3.5 %.  Numbers, the
+reachability table and the layouts this cannot reach are in `optional/two-lane-prefill/README.md`.
 ---
  ggml/include/ggml-backend.h     |  20 ++
  ggml/include/ggml-cuda.h        |   1 +
@@ -925,10 +941,10 @@ index 8091607dc..bc4c8a919 100644
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4a0286460..0ced05aab 100644
+index 68d6b33f0..5aaf875e1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -9954,7 +9954,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+@@ -9965,7 +9965,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
      ggml_cuda_set_device(dev_ctx->device);
  
      cudaEvent_t event;
@@ -950,7 +966,7 @@ index 4a0286460..0ced05aab 100644
  
      return new ggml_backend_event {
          /* .device  = */ dev,
-@@ -9975,6 +9988,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -9986,6 +9999,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -978,7 +994,7 @@ index 4a0286460..0ced05aab 100644
  // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
  // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
  // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
-@@ -10257,6 +10291,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10268,6 +10302,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -1000,7 +1016,7 @@ index d864ca576..4ebd18819 100644
      DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
      DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9fc700e75..33b52ba52 100644
+index 9fc700e75..fad883ca2 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1573,6 +1573,59 @@ void llama_context::sched_reserve() {
@@ -1010,7 +1026,7 @@ index 9fc700e75..33b52ba52 100644
 +    // halo-hybrid: two-lane prefill. Consecutive prefill ubatches are built on two schedulers and their splits are
 +    // submitted alternately (ggml_backend_sched_graph_compute_async_pair), so one device's experts overlap the
 +    // other's attention. Costs a second set of compute buffers. Needs >= 2 non-CPU backends, no pipeline
-+    // parallelism, and a target context (the draft's second scheduler would collide with this one).
++    // parallelism, and a non-MTP context (the MTP draft is excluded by ctx_type, not by ctx_other).
 +    cparams.prefill_lanes = 1;
 +    {
 +        int64_t lanes_req = 1;
@@ -1025,7 +1041,7 @@ index 9fc700e75..33b52ba52 100644
 +            }
 +        }
 +        if (lanes_req >= 2 && n_gpu >= 2 && !cparams.pipeline_parallel && !model.no_alloc() &&
-+                cparams.ctx_other == nullptr) {
++                cparams.ctx_other == nullptr && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
 +            cparams.prefill_lanes = 2;
 +
 +            gf_res_prev_lane.reset(new llm_graph_result(max_nodes));
@@ -1187,12 +1203,12 @@ index 9fc700e75..33b52ba52 100644
 +    // LLAMA_LANES_SPLIT_MIN tokens (default 1024); LLAMA_LANES_SPLIT_MIN=0 disables. Batches above 2 x n_ubatch keep
 +    // the plain split.
 +    // The gate MIRRORS the pair gate below, field for field: a batch is only split when its two halves will actually
-+    // be paired.  A workload that declines the pair (a draft context's nextn embeddings or the F1 layer-input path)
++    // be paired.  A workload that declines the pair (the F1 layer-input path)
 +    // and is split anyway pays a narrower ubatch and gains nothing -- measured on 35B-A3B Q8_0 + DFlash2, pp2048:
 +    // 3981.8 -> 3427.4 t/s (-13.9 %) before the two gates agreed.
 +    uint32_t n_ubatch_eff = cparams.n_ubatch;
 +    if (cparams.prefill_lanes >= 2 && sched_lane != nullptr && cparams.cb_eval == nullptr &&
-+            !cparams.embeddings_nextn && !cparams.embeddings_layer_inp_dev) {
++            !cparams.embeddings_layer_inp_dev) {
 +        static const uint32_t split_min  = (uint32_t) (getenv("LLAMA_LANES_SPLIT_MIN")  ? atoi(getenv("LLAMA_LANES_SPLIT_MIN"))  : 1024);
 +        static const double   split_frac = std::clamp(getenv("LLAMA_LANES_SPLIT_FRAC") ? atof(getenv("LLAMA_LANES_SPLIT_FRAC")) : 0.55, 0.1, 0.9);
 +        const uint32_t n = n_tokens_all;
@@ -1536,10 +1552,10 @@ index 9fc700e75..33b52ba52 100644
 +        // next ubatch is also wide, on lane 1; the two are computed with interleaved splits
 +        // (ggml_backend_sched_graph_compute_async_pair) so the two devices overlap. Either partner may carry the
 +        // batch's outputs (the sub-ubatch split above puts them on the second ubatch): the outputs are extracted per
-+        // lane after compute, so the single-lane path below is left untouched.  The nextn (MTP) and F1 layer-input
-+        // reads are the exception: they run on 0-output ubatches, so those workloads stay on the single-lane path.
++        // lane after compute, so the single-lane path below is left untouched.  The F1 layer-input
++        // reads are the exception: they run on 0-output ubatches, so that workload stays on the single-lane path.
 +        if (cparams.prefill_lanes >= 2 && sched_lane != nullptr && cparams.cb_eval == nullptr &&
-+                !cparams.embeddings_nextn && !cparams.embeddings_layer_inp_dev &&
++                !cparams.embeddings_layer_inp_dev &&
 +                ubatch.n_tokens > 1) {
 +            const auto gtype_lane = ctx_type_to_graph_type(cparams.ctx_type);
 +            const int32_t n_outputs_a = n_outputs;
@@ -1929,5 +1945,5 @@ index f1f723f9e..ac28f4db7 100644
  
      size_t moe_cache_size;
 -- 
-2.56.0
+2.43.0
 
