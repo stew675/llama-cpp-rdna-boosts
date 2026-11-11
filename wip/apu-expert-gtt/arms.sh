@@ -28,6 +28,14 @@ ROCM="${ROCM:-/opt/rocm-10.1.0-gfx1151}"
 export LD_LIBRARY_PATH="$ROCM/lib:${LD_LIBRARY_PATH:-}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 
+# MEASUREMENT HYGIENE (2026-11-11, MEASUREMENTS.md §23): the persisted heat-map prior is an INPUT, and by default
+# every run WRITES it back with its own tally merged in -- so arms contaminate each other, run order becomes part
+# of the result, and a comparison can silently invert (measured: the `auto` ladder's latch rate looked like 4/5
+# with a drifting prior and is 0/5 with a frozen one).  `load` loads and seeds from the prior but never writes it.
+# This is what the delivery's own gates do (`scripts/gate-host-pool.sh` defaults to `load` for every arm).  An
+# arm that deliberately studies the prior sets HEATMAP=1.
+export MOE_EXPERT_HEATMAP="${HEATMAP:-load}"
+
 M35=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf
 MBIG=/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf   # 123.4 GiB of weights: cannot fit
 MFN=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
@@ -77,6 +85,10 @@ census_arm() {
     fi
     printf '\n--- %s (%s)\n' "$tag" "$log"
     grep -E "GTT expert store|plan_gtt_expert_store|gtt_store" "$log" | sed 's/^/    /'
+    # §23: prove the arm ran with a frozen prior (or say which way the prior was configured)
+    grep -qE "is read-only; loading and seeding|heat map .* not updating" "$log" \
+        && echo "    heat-map prior: FROZEN (MOE_EXPERT_HEATMAP=${MOE_EXPERT_HEATMAP})" \
+        || echo "    heat-map prior: $( [ "${MOE_EXPERT_HEATMAP}" = "0" ] && echo OFF || echo 'WRITABLE -- an arm that writes the prior is not comparable with the next one' )"
 }
 
 case "$WHAT" in

@@ -325,7 +325,10 @@ evictions > 0 and unregisters == 0.
 > tier-specific start arm when the direct fill is available, or a direct-aware probe (the sample served into the
 > slot, so the comparison is the end-to-end one).
 
-> **What remains of P4 is the overlap experiment (P4e).**
+| **P4e** (DONE 2026-11-11, PM) | the overlap experiment: is there GPU work in flight when a demand fill is issued (i.e. would a fill worker pay)? | `MEASUREMENTS.md` §22: **NO** -- the drain in front of a direct fill is the in-flight work by construction, and it is **<= 263 us, never >= 1 ms**, across 22-36 k fills; the arm that *overlaps* the H2D is slower than the one that does not (§21.2); and +49 % decode from `-lme 4` to `8` proves the fill is on the critical path, not hidden. **Do not build a fill worker**; `IMPLEMENTATION.md` §7 arm 9 asserts this answer.  Prefill is P5's question |
+
+> **P4 is now COMPLETE.**  Its answer, in one line: the fills are on the critical path, so make them
+> fewer/cheaper (residency, the direct fill, coalescing) -- never a pipeline.
 
 `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) is the seam.  Two arms, chosen by the page cache, not by a
 knob (README §3.1):

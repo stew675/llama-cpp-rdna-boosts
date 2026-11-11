@@ -1094,3 +1094,178 @@ Neither is implemented; documented so the choice is visible (`IMPLEMENTATION.md`
   is not the MTP four-axis protocol, and there is still **no throughput claim** for the tier as a whole — this is
   the first *decode* number the campaign has, on one box, and it is reported as such.
 * The discrete-side effect of nothing here: the direct fill is `g_gtt_arena`-only.
+
+## 22. 2026-11-11 — P4e, the overlap experiment: there is **nothing to hide a fill behind**.  Drop the worker.  (And what the ladder's latch rate means for the start-arm question)
+
+IMPLEMENTATION.md P4e set the rule: *reproduce the question before building anything* — is there GPU work in flight
+when a demand fill is issued?  r261 had refuted the premise for the discrete pool (the exact within-layer
+lookahead measured ±1.5 %, `archive/work/host-pool-demand-overlap/`).  This is the measurement for this tier, and
+the answer is the same one, for a different reason.
+
+### 22.1 The measurement is the drain, and the mechanism says why
+
+A fill has work to hide behind only if the stream it must order behind is busy.  P4b's direct fill already
+drains that stream before writing the slot (§21.1), so **the drain IS the instrument**: it is the in-flight work,
+by construction, per fill.  P4b also showed the drain is tiny (0.005-0.01 ms/fill), which was the first hint.
+
+The mechanism, from the code: on the decode band the fills are issued from `devremap_prep_locked()`, the one-call-late
+policy of the sync-free device remap, and that path only waits for the **previous call's remap kernel** to publish
+its lag (`__threadfence_system` + a flag, or an event).  It never drains the previous token's MoE compute for the
+fill.  The previous graph's compute has nonetheless completed by the time the policy runs — the measurement below
+is the proof, and it matches r261's finding (the host materialises a split's host-weight inputs, synchronize
+included, before dispatching it).
+
+### 22.2 The drain distribution (35B-A3B, buffered + direct fills, `-n 96`)
+
+| arm | fills | longest drain | fills that waited >= 100 us | >= 1 ms | >= 5 ms |
+|---|---|---|---|---|---|
+| `-lme 4`, cold page cache | 35 962 | **263 us** | 120 | **0** | **0** |
+| `-lme 4`, warm | 35 966 | **173 us** | 26 | **0** | **0** |
+| `-lme 8` / `12` / `24`, warm | 22 608-22 630 | **187-199 us** | 13-24 | **0** | **0** |
+
+So at the instant a fill is issued there is **at most ~0.2 ms** of GPU work queued, and never a millisecond.  A
+fill costs 30-200 us.  The maximum a worker could hide is therefore ~0.2 ms per token, against a 23-36 ms token:
+**<= 0.9 %**, and that upper bound assumes the worker is free and perfectly timed.
+
+### 22.3 The cross-check: the fill is ON the critical path, not hidden by it
+
+If the fills were overlapped, spending more residency would buy little; if they are serialized, it buys their
+whole cost.  Residency sweep, buffered + direct, warm, `-n 96`:
+
+| `-lme` | decode | fills | host read |
+|---|---|---|---|
+| 4 | **28.7 t/s** | 35 966 | 1 454 ms |
+| 8 | **42.9 t/s** (+49 %) | 22 608 | 889 ms |
+| 12 | 43.0 t/s | 22 628 | 885 ms |
+| 24 | 43.0 t/s | 22 630 | 874 ms |
+
++49 % from 4 GiB to 8 GiB, then flat: the fills are exactly the cost being removed, i.e. **on the critical path**
+(~44 % of the wall clock at `-lme 4`: 35 966 fills at 40 us against 96 tokens at 34.8 ms).  And the flat tail
+says the plateau beyond ~44 % residency is the compute bound, not the fill bound.
+
+Together with §21.2 (*the arm that overlaps the H2D is slower than the one that does not*), the answer is not
+ambiguous:
+
+> **There is no overlap to be had on the demand/decode path.  Do not build a fill worker** (`copy_stream` /
+> `order_event`).  The fill is on the critical path; the levers are FEWER and CHEAPER fills -- residency (`-lme`),
+> the direct fill (P4b, +15 %), and read coalescing -- not a pipeline.  `IMPLEMENTATION.md` §7 arm 9 must assert
+> THIS answer (no pipeline), which is what P4e asked for.
+
+Prefill is a different band and stays P5's question: there the GPU *is* busy, the reads are bulk, and the tier has
+no staged prefill path yet.
+
+### 22.4 The ladder's latch rate, measured (this prices the start-arm options)
+
+`--load-mode auto` starts on `map` and falls to `file` on a probe win or a stall.  With the direct fill, `file` is
+the better arm **warm** as well, so how often does `auto` actually get there?  Same seed/prompt, 8 runs total on a
+warm cache, `-n 96`:
+
+| batch | runs that latched `file` | decode | runs stuck on `map` | decode |
+|---|---|---|---|---|
+| first (3 reps, right after a rebuild) | 1 | 28.2 t/s | 2 | 25.1 / 25.3 t/s |
+| second (5 reps, warm cache) | **4** | 28.8 t/s | 1 | 25.6 t/s |
+
+> **SUPERSEDED by §23.2/§23.3**: the drift these runs measured was the HEAT MAP warming between them, not
+> cache state.  With the prior frozen, `auto` latched `file` **0 of 5** times, i.e. the gap is systematic.
+> The "~80 %" below is an artifact; kept for the record.
+
+So ~80 % of runs reach the winning arm and ~20 % stay on `map` and lose **~11 %** decode.  The probe needs 3
+consecutive 1.5x wins at a 1/128 cadence, and on a warm box the two transports are nearly level (§20.2: 16 776
+against 22 211 MiB/s into the bounce entry), so whether it latches depends on the cache state it happens to see.
+Expected loss over the mix: ~0.6 t/s (**~2.4 %**).
+
+### 22.5 The start-arm options, with the numbers behind them
+
+| | what it is | pros | cons |
+|---|---|---|---|
+| **Option 1** -- tier-specific start arm | when the direct fill is available, start the ladder on `file` instead of `map` | one line; **deterministic** (every run gets 28.8, not 28.8-or-25.6); trivial to gate | forks an r262 decision (`map` is the optimistic start *by design*) on evidence from **one box**; wrong-shaped if the direct fill is off (`FILL_DIRECT=0`) or inapplicable (fused/strided tables keep the bounce path) -- though measured neutral there (24.5 vs 25.1-25.3); a slow-NVMe APU would want `map` |
+| **Option 2** -- direct-aware probe | when the direct fill is available, serve the probe's *sample* into the slot too, so the probe compares end-to-end (map+bounce+H2D against file+direct) | keeps r262's **one policy, evidence-driven, one-way** design; self-adapting per box (slow storage stays `map`); no new knob; the probe is a real fill, so no extra I/O | changes what the probe *means* (r262's is deliberately transport-only, shared with the pool) -- a future reader must know the tier's sample includes the destination; **delays the win** (still needs 3 wins at 1/128 cadence, so short runs may never latch); more coupling between the ladder and the store |
+| **Option 3** -- leave it | `auto` as it is; `--load-mode buffered` for the win on demand | **zero risk**, r262's policy untouched, nothing to explain later; under memory pressure `auto` latches `file` anyway (that is when the mapping stalls), i.e. a *fittability* tier gets the win exactly where it matters | a warm box loses ~11 % on ~20 % of runs (~2.4 % expected); the fastest configuration needs a flag the user has to know about |
+
+> **SUPERSEDED by §23.3** (frozen-prior measurement): the latch rate is 0/5, so "leave it" is not adequate, and
+> Option 2 turns out to need end-to-end fill timing *and* a re-calibrated threshold to work at all.  The revised
+> recommendation is **Option 1**.
+
+**Recommendation: Option 3 now, Option 2 at promotion if the tier ever ships default-on** — Option 2 is the only
+one that does not fork r262's decision, and the cost of it (a win that arrives after a few hundred fills) is the
+price a *fittability* tier can pay; Option 1 is the cheapest deterministic fix and is worth it only if the 1-in-5
+variance on a warm box turns out to matter in practice.  Nothing is implemented.
+
+### 22.6 Not measured
+
+* Multi-device, and prefill (`P5`): the overlap answer above is the **demand/decode** path only.
+* The drain was instrumented on the direct fill because that is where a drain exists; the bounce path has no drain
+  to measure (its copy is stream-ordered), so "the stream is idle at fill time" is inferred for it from the arm
+  comparison (§21.2) rather than measured directly.
+* The latch rate is 8 runs on one box and one prompt; it is reported as a rate, not as a stable property.
+
+## 23. 2026-11-11 — the heat-map prior was WARMING during my arms: two numbers corrected, one trap for the campaign, and what the corrected latch rate means for the start-arm question
+
+Maintainer's question: *"Is the `moe-heatmap` file marked as read-only?  Is it adapting to the tests being run?"*
+Answer: **no, and yes** — and that invalidated one of my own conclusions (§22.4) until it was re-measured.
+
+### 23.1 The facts
+
+* The sidecars are `0644`, owner-writable: `Qwen3.6-35B-A3B-Q4_K_M.moe-heatmap`, `...Flash-Next...moe-heatmap`,
+  `...122B-A10B...moe-heatmap`.  **Every arm I ran wrote its own**, atomically (`<path>.tmp.<pid>` -> `fsync` ->
+  `rename`) at teardown: the 35B file's mtime was 30 s old when this was asked.
+* **It adapts, cumulatively**: `heat_merge_into_loaded_locked()` adds this session's per-expert tally into the
+  loaded prior and saves it, and the next run seeds the arena's residency from it
+  (`heat-seeded 56/56 slots from the persisted map`).  Measured drift: the census's `heat (R2): total=` grew by
+  **exactly 98 760 per run** across nine consecutive arms (10 443 912 -> 11 233 992).
+* **The delivery already supports freezing it, and its own gates use that**: `MOE_EXPERT_HEATMAP=load` (aliases
+  `ro`, `read-only`) loads and seeds but never writes, and a **read-only file is the freeze signal**
+  (`heat_map_open_locked`: *"is read-only; loading and seeding from it, not updating it"*, latched in
+  `g_heat_frozen`, and re-checked at every save).  `ENVIRONMENT.md` documents all of it, and
+  `scripts/gate-host-pool.sh` defaults **every arm** to `MOE_EXPERT_HEATMAP=load` with the reason written down:
+  *"the persisted prior is an INPUT"*.
+* **So the campaign's arms were the ones out of contract**, not the delivery: `/tmp/p3/guard.sh` and my ad-hoc
+  invocations never set it.  `wip/apu-expert-gtt/arms.sh` is being fixed (§23.4).
+
+### 23.2 What it invalidated, and what it did not (all re-measured with the prior FROZEN)
+
+Frozen with `chmod a-w` on the sidecar, verified by the "read-only; loading and seeding" line and an unchanged
+`md5sum` afterwards (the file was restored to `0644` and byte-identical).
+
+| number | drifting prior (§21/§22) | **frozen prior** | verdict |
+|---|---|---|---|
+| P4b direct vs bounce, warm, `-n 96`, alternating 3+3 | 25.8/28.2/28.2 vs 24.4/24.5/24.5 (+13 %) | **28.7/28.8/28.8 vs 24.8/24.9/25.1 (+15.6 %)** | **confirmed**, and tighter -- the earlier spread was prior noise |
+| residency sweep, `-lme 4/8/12/24` | 28.7 / 42.9 / 43.0 / 43.0 | **28.8 / 43.2 / 43.1 / 43.0** | **confirmed** (+50 %, then flat); the prior's *ranking* had already converged, only its counts drifted |
+| `auto` latch rate, 5 reps warm | **4 of 5 latched `file`** (28.8 t/s) | **0 of 5** (all 25.3-25.5, all on `map`) | **CORRECTED -- the earlier "~80 % latch" was an artifact of the drifting map** |
+| text identity (all §21/§22 arms) | `627b2ebd7792` | `627b2ebd7792` | **immune by construction**: the prior changes *which* experts are resident, never the bytes (`ENVIRONMENT.md`: "bit-identical"), and the hashes agree in ~40 arms |
+
+New datum while the switch was in hand: **`MOE_EXPERT_HEATMAP=0` (cold start), buffered+direct, `-lme 4` = 28.8 t/s**
+-- the same as the warm prior with the direct fill.  On this tier the prior is **neutral at `-lme 4`**: it decides
+*which* experts are resident, and `-lme` decides *how many*, and it is the coverage that carries decode (consistent
+with the campaign's own "`-lme` coverage carries the design").
+
+### 23.3 The corrected conclusion for the start-arm question (§22.4/§22.5 superseded)
+
+With a **stable** prior, `--load-mode auto` never reaches `file` on this box: 0 of 5 runs, all 25.4 t/s, against
+28.8 achievable.  So the gap is **systematic (~11 %), not 1-in-5**, and the earlier "≈2.4 % expected loss" is
+wrong.
+
+That also kills the "Option 3 is adequate" recommendation, and it weakens **Option 2** more than §22.5 admitted:
+
+* r262's probe needs `probe_us * 1.5 < cur_us` on **per-read times into the bounce entry**.  A direct-aware sample
+  would still compare *reads*: the tier's win comes from the **deleted H2D**, which no read timer sees.  Served into
+  the slot, the sample would measure ~1.15x against a 1.5x threshold -> **it would still not latch**.  A real
+  Option 2 therefore needs an *end-to-end* measurement (time the fill until the slot's bytes are usable, i.e. an
+  event after the copy), plus a tier-specific threshold -- i.e. a much bigger change to a shared mechanism than
+  "serve the sample into the slot".
+* **Option 1** (start the ladder on `file` when the direct fill is available) is therefore the proportionate fix:
+  one line, deterministic, and structurally safe because it is **neutral on the bounce path** (`file`+bounce
+  24.8-25.1 t/s against `map`+bounce 24.4-25.3), so a box whose direct fill is off or inapplicable loses nothing.
+
+**Recommendation (revised): Option 1**, documented as a deliberate, tier-scoped exception to r262's optimistic
+`map` start, with `MOE_HOST_POOL_TRANSPORT` still able to pin either arm for an A/B.  Not implemented -- it is a
+policy change to an r262 decision and needs the maintainer's nod.
+
+### 23.4 The trap, and the fix in the campaign's own tooling
+
+**Every measurement arm must freeze the prior** (`MOE_EXPERT_HEATMAP=load`, or a read-only sidecar, or a frozen
+`MOE_EXPERT_HEATMAP_DIR` copy as `benchmarks/2026-10-26-graph-replay-keys.md` shows).  Otherwise arms contaminate
+each other, **run order becomes part of the result**, and a comparison can silently invert -- which is exactly what
+happened to the latch rate above.  `arms.sh` now exports `MOE_EXPERT_HEATMAP=load` for every arm it runs, and the
+campaign README carries it as a trap; the eventual `gate-uma-experts.sh` must do the same per arm (the delivery's
+`gate-host-pool.sh` already does).

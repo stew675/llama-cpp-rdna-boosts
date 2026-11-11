@@ -16,10 +16,11 @@ current artifact** (older `WORKLOG` entries quote the value that was current the
 |---|---|
 | [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15 % decode warm, +12 % cold) | `70ffbc7efa42157a5491b3d77c450d118c6a41dff58c15208a4f6c268bb38052` |
 
-**What is left of P4: the overlap experiment (P4e) only -- plus one OPEN QUESTION for the maintainer: the direct
-fill makes `file` beat `map` warm as well, but r262's ladder starts optimistically on `map` and its probe compares
-transports only, so a warm box rarely latches `file` (`MEASUREMENTS.md` §21.3).  Then P5 (prefill streaming) and P6
-(gate + promotion).**  P3's own limits are named
+**P4 is COMPLETE (P4a/P4b/P4e).  One OPEN QUESTION for the maintainer remains**: the direct fill makes `file` beat
+`map` warm as well, but r262's ladder starts optimistically on `map`, and with a **frozen** prior it never latches
+`file` on this box (0/5 runs, ~11 % slower than achievable) -- the earlier "usually latches" was heat-map drift
+(`MEASUREMENTS.md` §23.3).  The recommendation there is Option 1 (a tier-scoped start arm), not implemented.  Then
+P5 (prefill streaming) and P6 (gate + promotion).  P3's own limits are named
 in `MEASUREMENTS.md` §16.6, §17.4, §18.5, §20.4 and §21.4: there is **no throughput claim** for the tier as a whole
 (§21.2 is the first decode number it has -- one box, `-n 96`, three reps, reported as such) (and none for the
 head's pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path
@@ -430,6 +431,12 @@ measurement.
   (`MEASUREMENTS.md` §20.1).  Both are fixed; keep them fixed.
 * **Do not read the transport numbers as decode numbers.**  They are per-read rates into the bounce entry; the H2D
   and the op's own cost sit on top, and P4 has no throughput claim (`MEASUREMENTS.md` §20.4).
+* **Do not run a measurement arm without freezing the heat-map prior** (2026-11-11, `MEASUREMENTS.md` §23).
+  The sidecar is `0644` and every run adds its own tally to it and rewrites it, so arms contaminate each other and
+  **run order becomes part of the result** -- measured: the `auto` ladder's latch rate looked like 4/5 with a
+  drifting prior and is **0/5** with a frozen one, which inverted a conclusion.  Set `MOE_EXPERT_HEATMAP=load`
+  (or `chmod a-w` the sidecar -- the file's mode IS the freeze signal, latched and logged); the delivery's own
+  gates already default to `load` because "the persisted prior is an INPUT".  `arms.sh` does it for every arm.
 * **Do not judge this tier by text alone, and never by a `-lv` run's text.**  The `tables=0` census produced
   byte-identical text with the mechanism completely inert (`MEASUREMENTS.md` §16.1), and a `-lv 4` census of the
   122B gave two different hashes on the same seed.  Text arm: no `-lv`; the mechanism is proved by the census.

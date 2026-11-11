@@ -1,3 +1,61 @@
+## 261111.023 (wip, NO delivery change) -- the heat-map prior was WARMING during my arms: one conclusion of mine inverted, a trap for every future arm, and P4e's answer (no fill worker)
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact
+unchanged by this entry (docs + the campaign's arms script); the patch is still
+`70ffbc7ef…` / tree `1ad2695c…` against the r262 tree.  Records:
+[`MEASUREMENTS.md` §22](wip/apu-expert-gtt/MEASUREMENTS.md) (P4e) and **§23 (the correction)**.
+
+**The maintainer's question**: *is the `moe-heatmap` file read-only, and is it adapting to the tests?*  **No, and
+yes.**  The sidecars are `0644` and owner-writable; `heat_merge_into_loaded_locked()` adds each session's tally
+into the loaded prior and rewrites the file atomically at teardown, and the next run seeds residency from it.
+Measured drift: the census's `heat (R2): total=` grew by **exactly 98 760 per run** across nine consecutive arms.
+The 35B sidecar's mtime was 30 seconds old when the question was asked.
+
+**The delivery already had the answer, and its gates already use it**: `MOE_EXPERT_HEATMAP=load` (aliases `ro`,
+`read-only`) loads and seeds but never writes, a **read-only file is the freeze signal** (latched in
+`g_heat_frozen`, re-checked at every save, logged), and `scripts/gate-host-pool.sh` defaults **every arm** to
+`load` with the reason written down: *"the persisted prior is an INPUT"*.  `benchmarks/2026-10-26-graph-replay-keys.md`
+shows the same recipe.  **The campaign's arms were the ones out of contract** -- `arms.sh` and my ad-hoc runs never
+set it.
+
+**What it invalidated, all re-measured with the prior FROZEN** (`chmod a-w`, verified by the "read-only; loading
+and seeding" line and an unchanged md5; the file was restored to `0644`, byte-identical):
+
+| number | drifting prior | **frozen prior** | verdict |
+|---|---|---|---|
+| P4b direct vs bounce, warm, `-n 96` | 25.8/28.2/28.2 vs 24.4/24.5/24.5 (+13 %) | **28.7/28.8/28.8 vs 24.8/24.9/25.1 (+15.6 %)** | confirmed, and tighter -- the spread was prior noise |
+| residency sweep `-lme 4/8/12/24` | 28.7 / 42.9 / 43.0 / 43.0 | **28.8 / 43.2 / 43.1 / 43.0** | confirmed (+50 %, then flat) |
+| `auto` latch rate, 5 reps warm | **4 of 5 latched `file`** | **0 of 5** (all `map`, 25.4 t/s) | **CORRECTED -- my "~80 % latch" was heat-map drift** |
+| text identity, all arms | `627b2ebd7792` | `627b2ebd7792` | immune by construction (a placement prior; the bytes are unchanged) |
+
+Bonus datum: `MOE_EXPERT_HEATMAP=0` (cold start), buffered+direct, `-lme 4` = **28.8 t/s**, the same as the warm
+prior -- on this tier the prior decides *which* experts are resident and `-lme` decides *how many*, and it is the
+coverage that carries decode.
+
+**P4e, the overlap experiment (MEASUREMENTS §22): there is nothing to hide a fill behind.**
+* The drain in front of a direct fill **is** the in-flight work, by construction: longest **263 us**, 13-26 of
+  22-36 k fills waited >= 100 us, **0 ever >= 1 ms**.
+* The arm that *overlaps* the H2D (bounce) is **slower** than the one that fully serializes (direct): 24.8-25.1
+  against 28.7-28.8 t/s.
+* And the fill is on the critical path, not hidden by it: `-lme 4` -> `8` is **+50 %** decode (28.8 -> 43.2) because
+  the fills are exactly what is removed, then flat (the compute bound).
+* **So: do not build a fill worker** (`copy_stream`/`order_event`).  The levers are fewer/cheaper fills --
+  residency, the direct fill, coalescing.  `IMPLEMENTATION.md` §7 arm 9 must assert this answer.  Prefill stays
+  P5's question (there the GPU *is* busy and the reads are bulk).
+
+**The start-arm question, now measured properly (§23.3).**  With a stable prior the `auto` ladder **never** reaches
+`file` on this box (0/5), so the ~11 % gap is systematic, not 1-in-5 -- which kills my earlier "leave it" (Option 3)
+and weakens Option 2 more than I had said: r262's probe needs a **1.5x win on per-read times**, while the tier's win
+comes from the *deleted H2D*, which no read timer sees -- a direct-aware sample would measure ~1.15x and **still not
+latch**.  A real Option 2 needs end-to-end fill timing (an event after the copy) *and* a tier-specific threshold.
+**Revised recommendation: Option 1** -- start the ladder on `file` when the direct fill is available, one line,
+deterministic, and structurally safe because it is neutral on the bounce path (24.8-25.1 against `map`'s 24.4-25.3).
+Not implemented: it is a policy change to an r262 decision.
+
+**Fixed so it cannot recur:** `arms.sh` exports `MOE_EXPERT_HEATMAP=load` for every arm and its census arm prints
+whether the prior was FROZEN/off/WRITABLE; the campaign README carries it as a trap; `gate-uma-experts.sh` (P6) must
+do the same per arm, as `gate-host-pool.sh` already does.
+
 ## 261111.022 (wip, NO delivery change) -- P4b: the buffered arm fills straight into the arena slot (no bounce, no H2D) -- the campaign's FIRST decode win, +15 % warm / +12 % cold
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
