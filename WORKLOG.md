@@ -1,3 +1,55 @@
+## 261110.012 (r256, measurement + docs -- NO delivery change) -- `TODO` #136 retires: the pool prefill gather is a COVERAGE crossover, and its own cell no longer exists
+
+**No code, no `patches/`, no `release.json` change** -- the release stays `v16-a691b2345-r254` and the fork is
+untouched.  The row asked for "a wider sweep (model x FRAC x ubatch) before touching the default"; the sweep was
+run on the r254 tree (`b12221-1606bdaff`) and the answer is that **the default does not move**: it is the best
+arm in every configuration the delivery validates, and the ~10 % it costs in a sub-complement pool is the
+*uncovered fill*, not the gather.  Full record, with the CENSUS and the method:
+[`benchmarks/2026-11-10-devgather-coverage.md`](benchmarks/2026-11-10-devgather-coverage.md).
+
+**Three things killed the row as written.**  (1) Its cell is **refused at load** by `#135`'s r250 guard:
+35B-A3B Q4_K_M, `-ncmoe 40`, 3 devices, `-sm tensor` -> `blk.0.ffn_down_exps.weight (axis 0: 512 columns over 3
+devices, granularity 256) -> device 0 holds 0`, 120 of 120 host tables.  (2) With
+`GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` the recorded 33 % **does not reproduce** -- gather default 303.5 / 362.6
+against `GGML_SCHED_DEVGATHER=0` 242.3 / 393.2, overlapping and inverting between reps.  (3) Its command line no
+longer selects a half-covered pool: since r210 `--host-experts pool` **is** `-lme auto`, which mirrors the whole
+set when it fits and **does not read `MOE_HOST_POOL_FRAC`** -- FRAC 30/50/95 measured 1233.6 / 1240.9 / 1234.5
+t/s with every one of the 120 tables at 256/256 slots.  `ENVIRONMENT.md`'s `MOE_HOST_POOL_FRAC` row now says so
+(the knob belongs to the not-fitting band).
+
+**What replaces it, measured** (2 reps `A B B A` per arm, `MOE_EXPERT_CACHE_MIB=2048`, `prompts/prose-rdna-boosts.txt`,
+`-n 1`, so the number is a 5246-token prefill):
+
+| layout | gather default | `=0` | delta |
+|---|---:|---:|---:|
+| 1 GPU | 857.4 / 858.0 | 612.1 / 611.3 | **+40 %** |
+| 2 GPU `-sm tensor`, `-ub 4096` | 2679.7 / 2681.5 | 2465.6 / 2466.2 | **+8.7 %** |
+| 3 GPU `-sm layer` | 878.5 / 877.9 | 637.3 / 636.8 | **+38 %** |
+| 3 GPU `-sm tensor`, Q8_0 | 563.8 / 570.1 | 172.2 / 259.9 | **+2.2-2.3x** |
+| 3 GPU `-sm layer`, `-lme 9` | 665.0 / 663.2 | 571.7 / 570.6 | **+16.3 %** |
+| 2 GPU `-sm tensor`, `-lme 9` (~70 % covered) | 696.1 / 696.7 | 762.6 / 764.9 | **-8.8 %** |
+| 2 GPU `-sm tensor`, `-lme 4` (~43 %) | 456.1 / 457.3 | 507.7 / 507.7 | **-10.1 %** |
+
+The crossover sits between ~70 % and ~86 % of (arena + pool) coverage: `-lme 12` is +9 %, `-lme 14`/`17`/mirror
+are +24.5/+25.1/+25.4 %.  **The mechanism is not the gather**: at `-lme 9` the census shows the same 2574 gather
+calls as the mirror, but **191 279 routed experts copied from the bounce/pool-fill path ("neither tier")** --
+the gather fills those one at a time where `0` hands the same bytes to one whole-table copy, i.e. the
+multi-device mapping-fill family from the `push` campaign
+(`archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §3a).  That is also why the loss is
+**tensor-split-only**: the 3-device layer split at the same budget is +16.3 %.  Text is byte-identical in the
+losing band (`461ca8cd0e88`, both arms, 110 chars), as a transport switch must be.
+
+**Retired to the accepted-limitations list** with the numbers and one re-entry condition: a **coverage-gated
+gather** for the not-fitting band (the predicate already exists as the eager take-over's covering-pool test,
+`INVARIANTS.md` r221), which needs that band measured -- every arm here is this 91 GiB box, where `auto`
+mirrors -- the crossover edge located, and `#273`'s transport question settled.  `#131`'s new bullet was updated
+so it no longer points at `#136` as "the open item that could move the default".  Untouched: `#132`, `#133`,
+`#141`, `#142`, `#273`, `#282`, `#300`.
+
+Gates: none is a delivery gate (nothing changed); the purity claim above is the switch's own -- r207 recorded
+prefill logits bit-identical for it (KLD -0.000000 / same-top-p 100.000 %), and the text hash here re-confirms
+it on the current tree.  `scripts/check-gpu-faults.sh` clean on the session's journal window.
+
 ## 261110.011 (r255, docs only -- NO delivery change) -- two `TODO` rows retire to the accepted-limitations list: the pool staging residue (`#131`) and the 35B-A3B 3-device host-resident share (`#135`)
 
 **No code, no `patches/`, no `release.json` change** -- the release stays `v16-a691b2345-r254` and the fork is

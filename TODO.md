@@ -34,7 +34,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **133** | a fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch | performance (delivery defect, default mode; backlog) | **OPEN** (2026-11-03) — 3-device prefill is slower than 1-device because of it — §133 |
-| **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill on 35B-A3B at `MOE_HOST_POOL_FRAC=50` | performance (delivery defect, default-on) | **OPEN** (2026-11-03) — needs a wider sweep before the default moves — §136 |
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04) — the bound is static per shape on purpose — §141 |
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
@@ -181,14 +180,6 @@ A fully-resident (identity) expert table is re-copied out of the arena on every 
 **Kind:** performance (delivery defect, default mode).
 
 **OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.2).  See §133
-
-## 136. `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill at a half-covered pool
-
-`GGML_SCHED_DEVGATHER`'s prefill-band default **costs 33 % prefill** on 35B-A3B at `MOE_HOST_POOL_FRAC=50` (422 -> 282 t/s at 3 devices, 5246-token prompt, two reps within 1 %), where r207 chose that default from a 122B/FRAC-95 measurement
-
-**Kind:** performance (delivery defect, default-on).
-
-**OPEN** (2026-11-03, `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §4).  Needs a wider sweep (model x FRAC x ubatch) before touching the default — and note the same switch must be `0` for any prefill A/B of the expert fill path, because the gather serves the routed table itself
 
 ## 141. A sub-complement host-expert budget declines the eager take-over at wide decode
 
@@ -529,8 +520,8 @@ artifact instead and close this.
   the prefill band by default (`GGML_SCHED_DEVGATHER` unset, r207, prefill logits bit-identical
   −0.000000 / 100.000 %), `0` is a kill switch whose transport is the worst of the three at every width
   measured (−10 to −20 %), and `1`/`force` is an A/B arm that costs a `pinned` master 16-47 % prefill.
-  **Re-entry:** only if the gather default is ever moved (`#136` is the open item that could move it, and it
-  needs `GGML_SCHED_DEVGATHER=0` for its own prefill A/Bs), or if `#133`'s in-place identity read changes
+  **Re-entry:** only if the gather default is ever moved (r256 retired `#136` **without** moving it — the
+  coverage crossover it really describes is recorded there), or if `#133`'s in-place identity read changes
   `moe_cache_stage_table`'s shape.  Record: `WORKLOG.md` 261110.011, `ENVIRONMENT.md` (`GGML_SCHED_DEVGATHER`).
 
 - **35B-A3B cannot be spread over 3 devices while its experts are host-resident unless the quant's block size
@@ -547,6 +538,29 @@ artifact instead and close this.
   measurement only.  Nothing is left to fix: the usable answers are `-sm layer`, 2 devices, or a finer-block
   quant, which is what the refusal says.  Records: `WORKLOG.md` 261110.006 §1, `INVARIANTS.md` r250,
   `MANIFESTS.md` gate 09, `ENVIRONMENT.md` (`GGML_TENSOR_SPLIT_ALLOW_DEGENERATE`).
+
+- **The pool-prefill gather (`GGML_SCHED_DEVGATHER` unset) costs ~10 % prefill in a SUB-COMPLEMENT host pool —
+  a coverage crossover, so the default does not move** (`#136`, retired r256;
+  `benchmarks/2026-11-10-devgather-coverage.md`).  Measured on the r254 tree, 35B-A3B `-ncmoe 40`, 5246-token
+  prose prompt, `MOE_EXPERT_CACHE_MIB=2048` (a 2 GiB/device arena), two reps `A B B A` per arm, 2 devices
+  `-sm tensor`: gather **+25.4 %** with the pool full, **+9 %** at ~86 % coverage, and **−8.8 % / −10.1 %** at
+  ~70 % / ~43 % — the sub-complement band, reachable only through an explicit `-lme N` (or a box whose host set
+  does not fit).  The mechanism is the **uncovered fill**, not the gather: at `-lme 9` the census shows the same
+  2574 gather calls as the mirror but **191 279 routed experts copied from the bounce/pool-fill path**, where
+  `GGML_SCHED_DEVGATHER=0` amortises those bytes into one whole-table copy — the multi-device mapping-fill
+  family in `archive/work/host-expert-eager-push/P3-MULTIGPU-RESULTS.md` §3a, which is why the loss is
+  tensor-split-only (3-device `-sm layer` at the same budget is **+16.3 %**).  Text is byte-identical
+  (`461ca8cd0e88` both arms).  Everywhere the delivery validates, the default wins: **+40 %** 1 GPU, **+25 %**
+  2-device tensor, **+38 %** 3-device layer, **+2.2-2.3x** 3-device tensor Q8_0, **+8.7 %** at `-ub 4096`.  **The
+  old row's own cell is gone**: 35B-A3B Q4_K_M at 3 devices `-sm tensor` is refused at load by the `#135` guard,
+  its 33 % does not reproduce even with `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` (both arms 242-393 t/s,
+  overlapping), and `--host-experts pool` + `MOE_HOST_POOL_FRAC` no longer selects a half-covered pool at all —
+  since r210 that spelling is `-lme auto`, which mirrors the set and does not read the percentage (FRAC
+  30/50/95 measured 1233.6 / 1240.9 / 1234.5 t/s with every table at 256/256 slots).  **Re-entry:** a
+  coverage-gated gather for the not-fitting band (the predicate already exists as the eager take-over's
+  covering-pool test) — it needs that band measured (every number here is a 91 GiB box where `auto` mirrors),
+  the crossover edge located between 70 % and 86 %, and `#273`'s transport question settled.  Record:
+  `WORKLOG.md` 261110.012.
 
 ## Where the current lists live
 
