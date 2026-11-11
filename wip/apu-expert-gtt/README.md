@@ -9,17 +9,19 @@ is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the **r262** `release.json` tree `891d4acb…` and
-applied with `git am`; it produces tree `c8cdb5da…`.  Its sha256 advances as the campaign does — **the value below is always the
+applied with `git am`; it produces tree `1ad2695c…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) | `40be4cb7a0a9a9be8edaf086ce7ec7e190545fc9e2b20deb36e31148163dea6e` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15 % decode warm, +12 % cold) | `70ffbc7efa42157a5491b3d77c450d118c6a41dff58c15208a4f6c268bb38052` |
 
-**What is left of P4: the DESTINATION side (P4b -- read straight into the arena slot for the `file`/`dio` arms,
-which r262's transport now makes reachable, and the ordering argument for a direct `memcpy` on the `map` arm) and
-the overlap experiment (P4e), then P5 (prefill streaming) and P6 (gate + promotion).**  P3's own limits are named
-in `MEASUREMENTS.md` §16.6, §17.4, §18.5 and §20.4: there is **no throughput claim** for the arena tier (and none for the
+**What is left of P4: the overlap experiment (P4e) only -- plus one OPEN QUESTION for the maintainer: the direct
+fill makes `file` beat `map` warm as well, but r262's ladder starts optimistically on `map` and its probe compares
+transports only, so a warm box rarely latches `file` (`MEASUREMENTS.md` §21.3).  Then P5 (prefill streaming) and P6
+(gate + promotion).**  P3's own limits are named
+in `MEASUREMENTS.md` §16.6, §17.4, §18.5, §20.4 and §21.4: there is **no throughput claim** for the tier as a whole
+(§21.2 is the first decode number it has -- one box, `-n 96`, three reps, reported as such) (and none for the
 head's pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path
 is still the delivery's pinned bounce ring.  One sizing item is open by design: a **separate** drafter's head
 cannot be placed in the store, because the target sizes the region before the drafter loads -- if that trade is

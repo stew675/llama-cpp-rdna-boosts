@@ -1018,3 +1018,79 @@ Regressions on the same build: 35B-A3B store-off / `auto` / `-lme 6` / arena `-l
   `scripts/gate-host-pool.sh` is the gate, and the change is inert unless a transport arm is pinned — the pool's
   own path already registered its sources); multi-device (one GPU); and any throughput claim (the numbers above are
   per-read rates, not decode).
+
+## 21. 2026-11-11 — P4b: the buffered arm fills **straight into the arena slot** (no bounce entry, no H2D) — the campaign's first decode win
+
+The premise P3.0 wrote down and P4a made reachable: the arena **is** registered host memory (one address,
+`iommu=off`), so a per-expert read can land in it instead of going `pread` -> pinned bounce entry -> H2D.  Probe
+`12` had already measured that as legal *and* coherent (`pread` into the registered region, GPU read, including
+the reuse arm).
+
+### 21.1 The rule, and the two arms that keep the bounce path
+
+| arm | direct fill? | why |
+|---|---|---|
+| `file` (buffered `pread`) | **YES** | no alignment constraint, so the read is exactly `expert_bytes` from `src_offs + e*host_bytes + src_off` into `dst` — no delta, no tail |
+| `dio` (`O_DIRECT`) | no | `O_DIRECT` needs 4096-aligned offset *and* length: the round-out makes the report overrun the slot's end by up to 4095 bytes into the **next** slot's head, which holds a resident expert.  A safe version needs a tail splice; `dio` measured 11x slower than the mapping here (§20.2), so it is not worth it yet |
+| `map` (the mapping `memcpy`) | no | the source is host memory anyway, so the copy would have to be a host `memcpy` into the slot, and *that* needs the ordering drain with no transfer to hide behind — strictly worse than the stream-ordered copy it replaces |
+
+Guards: `g_gtt_arena` (the destination must be registered host memory — the same helper on the discrete pool path
+would be handed a device pointer), a known source, one contiguous run (`n_slices == 0`, not a strided axis-0 split),
+`src_off + expert_bytes <= host_bytes`, and **a stream that is not capturing** (a `cudaStreamSynchronize` is illegal
+inside a capture; those fills take the bounce path and the census counts them).  `MOE_EXPERT_GTT_FILL_DIRECT=0` is
+the A/B arm and the kill switch.  The same read serves the **sizing** fills (heat seed, identity, prefill seed),
+which pass stream 0 before any graph exists — so they need no drain at all.
+
+**The ordering drain**: a host write must follow any in-flight read of the slot (the fused MoE kernels take the
+arena address as a launch parameter, so the previous ubatch may still be reading the slot being refilled).  The
+bounce path gets that for free from the stream-ordered copy; the direct path drains the stream and **counts the
+drain separately**, because that cost is the whole question.  Measured: **0.005 ms/fill** (122-131 ms across
+26 536 fills), i.e. noise.
+
+### 21.2 Measured (`halo`, 35B-A3B, arena `-lme 4`, buffered arm, `-n 96`, 3 reps warm / 2 cold)
+
+| arm | warm page cache | cold page cache |
+|---|---|---|
+| bounce (`FILL_DIRECT=0`) | **24.5 / 24.5 / 24.4** t/s | **19.1 / 19.1** t/s |
+| **direct (`FILL_DIRECT=1`)** | **25.8 / 28.2 / 28.2** t/s (**+15 %**, median 28.2 vs 24.5) | **21.3 / 21.6** t/s (**+12 %**) |
+
+Text identical in every arm (`627b2ebd7792`): direct on/off, warm and cold, and in the **fill-fault** arm
+(`MOE_HOST_POOL_FILL_FAULT=late` with direct on) — the fault arm still declines and still answers correctly.
+
+Why it wins: the read rate *alone* looks worse (10 988 MiB/s direct against 18 010 through the bounce on a warm
+cache — the bounce entry is one hot 0.61 MiB buffer while a direct fill writes a different slot spread across the
+4 GiB arena, so it pays TLB/cache misses), but the bounce path also moves the **same bytes again** as an H2D
+(16 GiB per 96-token arm) on the compute stream, and that transfer is what the direct fill deletes.  End to end
+the deletion is worth more than the read-rate loss: +15 % warm, +12 % cold.
+
+### 21.3 What this says about the ladder's start arm (a finding, not yet a change)
+
+With `--load-mode auto` (the default) the ladder starts on `map` and only falls to `file` on a probe or a stall.
+On this tier that start arm is now the *wrong* one:
+
+| default (`auto`), warm, 3 reps | arm it settled on | t/s |
+|---|---|---|
+| rep 1 | `map` (bounce) | 25.1 |
+| rep 2 | `map` (bounce) | 25.3 |
+| rep 3 | `file` (escalated on a probe) -> **direct** | **28.2** |
+
+So `auto` leaves ~12 % on the table until the probe happens to latch `file`, and the probe rarely does on a warm
+box: it compares the *transport* only (both samples land in the bounce entry), where the mapping and a buffered
+read are near-equal once the pages are cached (`§20.2`: 16 776 against 22 211 MiB/s, and the probe needs a 1.5x
+win, 3 times running).  Two candidate fixes, both of which are **policy decisions for the maintainer** because
+r262 chose the optimistic-map start deliberately:
+
+1. a tier-specific start arm (`file` when the direct fill is available), or
+2. a direct-aware probe on this tier — the sample served into the slot, so the comparison is the end-to-end one
+   (map+bounce+H2D against file+direct).
+
+Neither is implemented; documented so the choice is visible (`IMPLEMENTATION.md` P4b).
+
+### 21.4 Not measured
+
+* **Multi-device** (one GPU); the guard is per table and per device, untested on a split.
+* **`dio`'s direct path**: not implemented (the tail splice), and `dio` is 11x slower here anyway.
+* **A long arm**: `-n 96` at ~25-28 t/s is ~3.5 s of decode; the percentages are consistent across reps but this
+  is not the MTP four-axis protocol, and there is still **no throughput claim** for the tier as a whole — this is
+  the first *decode* number the campaign has, on one box, and it is reported as such.
+* The discrete-side effect of nothing here: the direct fill is `g_gtt_arena`-only.

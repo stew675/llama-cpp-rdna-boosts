@@ -1,3 +1,61 @@
+## 261111.022 (wip, NO delivery change) -- P4b: the buffered arm fills straight into the arena slot (no bounce, no H2D) -- the campaign's FIRST decode win, +15 % warm / +12 % cold
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`70ffbc7efa42157a5491b3d77c450d118c6a41dff58c15208a4f6c268bb38052`, cut against the r262 `release.json` tree
+`891d4acb…`, produces tree `1ad2695c…` (verified by `git am` onto the r262 tip).  Record:
+[`MEASUREMENTS.md` §21](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**The premise P3.0 wrote down, now implemented**: the arena IS registered host memory, so a per-expert read can
+land in it instead of going `pread` -> pinned bounce entry -> H2D (probe `12` measured `pread` into the
+registered region as legal *and* coherent).  P4a made it reachable (the source is registered, the arm is real);
+this does it.
+
+**Which arm, and why not the others.**  The **buffered** arm has no alignment constraint, so the read is exactly
+`expert_bytes` from `src_offs + e*host_bytes + src_off` into the slot -- no delta, no tail.  `dio` keeps the
+bounce path: `O_DIRECT` needs 4096-aligned offset *and* length, the round-out makes the report overrun into the
+**next** slot's head (which holds a resident expert), and a safe version needs a tail splice -- for an arm measured
+11x slower than the mapping here.  `map` keeps it too: the source is host memory anyway, so it would be a host
+`memcpy` into the slot needing the ordering drain with **no transfer to hide behind** -- strictly worse than the
+stream-ordered copy it replaces.  Guards: `g_gtt_arena` (the destination must be registered host memory; on the
+discrete pool path the same helper would get a device pointer), a known source, one contiguous run,
+`src_off + expert_bytes <= host_bytes`, and **a stream that is not capturing** (a `cudaStreamSynchronize` is
+illegal inside a capture; those fills take the bounce path and the census counts them).
+`MOE_EXPERT_GTT_FILL_DIRECT=0` is the A/B and the kill switch.  The sizing fills (heat seed, identity, prefill
+seed) get the same read with **no drain at all** -- stream 0, no graph exists yet.
+
+**The ordering drain, measured**: a host write must follow any in-flight read of the slot, so the direct path
+drains the stream (counted separately): **0.005 ms/fill** (122-131 ms over 26 536 fills) -- noise.
+
+**Measured (`MEASUREMENTS.md` §21.2), 35B-A3B arena `-lme 4`, buffered arm, `-n 96`, 3 reps warm / 2 cold:**
+
+| arm | warm | cold page cache |
+|---|---|---|
+| bounce (`FILL_DIRECT=0`) | 24.5 / 24.5 / 24.4 t/s | 19.1 / 19.1 t/s |
+| **direct (`FILL_DIRECT=1`)** | **25.8 / 28.2 / 28.2 t/s (+15 %)** | **21.3 / 21.6 t/s (+12 %)** |
+
+Text identical everywhere (`627b2ebd7792`): direct on/off, warm and cold, and the fill-fault arm
+(`MOE_HOST_POOL_FILL_FAULT=late` with direct on).  Full regression set unchanged: 35B five arms, Flash-Next +
+separate drafter `f586785d7183`, 122B `-lme 60` `9ccf62ed39c3`; `check-gpu-faults.sh` clean.
+
+**Why it wins, and the honest read-rate caveat.**  The read *rate* alone is worse (10 988 MiB/s direct against
+18 010 through the bounce, warm): the bounce entry is one hot 0.61 MiB buffer while a direct fill writes a
+different slot spread over the 4 GiB arena, so it pays TLB/cache misses.  But the bounce path also moves the same
+bytes **again** as an H2D on the compute stream (16 GiB per arm), and deleting that transfer is worth more than
+the read-rate loss -- end to end, +15 % / +12 %.
+
+**A finding for the maintainer (§21.3), not a change:** `--load-mode auto` starts on `map` and only falls to
+`file` on a probe/stall, and on this tier a warm box rarely latches `file` (the probe compares transports only --
+both samples land in the bounce entry -- where the two arms are near-equal once cached).  With the direct fill,
+`map`+bounce is 25.1-25.3 t/s and `file`+direct is **28.2**, so `auto` leaves ~12 % on the table until the probe
+happens to win: measured, one of three reps escalated and it was the fastest.  Two candidate fixes, both policy
+changes to an r262 decision and **neither implemented**: a tier-specific start arm when the direct fill is
+available, or a direct-aware probe (the sample served into the slot, so the comparison is the end-to-end one).
+
+**Not measured (§21.4):** multi-device (one GPU); `dio`'s direct path (not implemented); and there is still **no
+throughput claim** for the tier as a whole -- §21.2 is the first decode number it has, on one box, `-n 96`, three
+reps, and it is reported that way.
+
 ## 261111.021 (wip, NO delivery change) -- P4a: the tier's fills run on r262's adaptive read transport (`map`/`file`/`dio`), after two fixes that made the ladder reachable at all
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:

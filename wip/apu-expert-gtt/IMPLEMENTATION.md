@@ -310,7 +310,22 @@ evictions > 0 and unregisters == 0.
 > **+24 %** even warm, `dio` is 11x slower (hence the 3x guard), `auto` latches `file` on the probe, and the text is
 > identical in all three arms, in all four `--load-mode` values, and in an arm where **every fill fails**.
 >
-> **What remains of P4 is the destination side (P4b) and the overlap experiment (P4e).**
+> **P4b DONE 2026-11-11** -- the destination side: on the `file` (buffered) arm a fill reads **straight into the
+> arena slot**, no bounce entry and no H2D (`MOE_EXPERT_GTT_FILL_DIRECT=0` is the A/B and the kill switch;
+> `dio` keeps the bounce path because `O_DIRECT` needs the 4096 round-out plus a tail splice, `map` because a host
+> `memcpy` would need the ordering drain with no transfer to hide behind; a capturing stream declines).
+
+| **P4b** (DONE 2026-11-11, PM) | the buffered arm reads into the slot: one `pread`, no bounce, no H2D; the host write drained behind the slot's previous consumer (counted: 0.005 ms/fill); the sizing fills get the same read with no drain at all | `MEASUREMENTS.md` §21.2: **+15 % decode warm** (28.2 vs 24.5 t/s, 3 reps each at `-n 96`) and **+12 % cold** (21.3/21.6 vs 19.1/19.1), text `627b2ebd7792` in every arm including the fill-fault one |
+| **P4e** (TODO) | the overlap experiment: reproduce "does the fill ever have work to hide behind" before any worker (r261 measured ±1.5 % for the exact within-layer lookahead) | unaffected by P4a/P4b; still the last P4 item |
+
+> **OPEN QUESTION for the maintainer (§21.3):** with the direct fill, `file` beats `map` **warm** as well
+> (28.2 against 25.1-25.3 t/s), but r262's ladder starts optimistically on `map` and only falls on a probe or a
+> stall -- and on this tier the probe compares transports only (both samples land in the bounce entry), so a warm
+> box rarely latches `file`.  Two candidate fixes, both policy changes to an r262 decision, neither implemented: a
+> tier-specific start arm when the direct fill is available, or a direct-aware probe (the sample served into the
+> slot, so the comparison is the end-to-end one).
+
+> **What remains of P4 is the overlap experiment (P4e).**
 
 `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) is the seam.  Two arms, chosen by the page cache, not by a
 knob (README §3.1):
