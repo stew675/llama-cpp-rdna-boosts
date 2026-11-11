@@ -1,4 +1,8 @@
-# IMPLEMENTATION — `wip/apu-expert-gtt`
+# IMPLEMENTATION — `archive/work/apu-expert-gtt`
+
+> **PROMOTED as block 16 of the delivery in r263 (`v17-a691b2345-r263`).**  This document is the dated
+> campaign record; the shipping code is `patches/0016-…`, the knobs `ENVIRONMENT.md` §20, the rules
+> `INVARIANTS.md` ("Block 16"), and the gate `scripts/gate-uma-experts.sh`.
 
 Phased plan for the UMA-only heat-mapped **GTT expert store** (no host pool).  Read [`README.md`](README.md)
 first — §0 is the shape, §2 the measured foundation (P1.0 is now answered), §3.2 the cost model, §6 the traps.

@@ -30,21 +30,21 @@ cmake --build build-rocm --target llama-cli -j 16 -- -k      # ~10 s incremental
 Read, in this order, and trust them over any summary here:
 
 1. `AGENTS.md` -- policy: apply/verify rules, the `-lv` table, "report findings before shipping", the WIP rules.
-2. `wip/apu-expert-gtt/README.md` -- §0 the shape, §5 sizing, §5.2 the lock policy, **§6 the traps (read all of
+2. `archive/work/apu-expert-gtt/README.md` -- §0 the shape, §5 sizing, §5.2 the lock policy, **§6 the traps (read all of
    it; it is the accumulated "do not do that again" list)**, §7 open questions, §8 promotion criteria.
-3. `wip/apu-expert-gtt/IMPLEMENTATION.md` -- the stage table (P0-P4f) and **the P5/P6 sections at the end**.
-4. `wip/apu-expert-gtt/MEASUREMENTS.md` -- the numbers.  The sections that matter for P5/P6: §16 (the arena tier
+3. `archive/work/apu-expert-gtt/IMPLEMENTATION.md` -- the stage table (P0-P4f) and **the P5/P6 sections at the end**.
+4. `archive/work/apu-expert-gtt/MEASUREMENTS.md` -- the numbers.  The sections that matter for P5/P6: §16 (the arena tier
    serves), §17 (the head pinned), §19 (never evicted), §20-§21 (the read transport + the direct fill), §22 (the
    overlap experiment: NO worker), **§23 (the heat-map trap -- read it before running anything)**, §24 (the
    RDNA3_5 UMA start arm).
 5. `WORKLOG.md` entries **261111.012 ... 261111.024** (newest first; 024 is the handover of the current state).
-6. `wip/apu-expert-gtt/arms.sh`, `guard.sh`, `cold-cache.py` -- the re-runnable tools (see §4 below).
+6. `archive/work/apu-expert-gtt/arms.sh`, `guard.sh`, `cold-cache.py` -- the re-runnable tools (see §4 below).
 
 # 1. What exists, and what has been measured (do not re-litigate)
 
 The campaign's whole output is ONE cumulative patch:
 
-* `wip/apu-expert-gtt/gtt-expert-store.patch` -- sha256 starts **`851e1871b2a59263…`**, tree `3bc7adf4…`, cut
+* `archive/work/apu-expert-gtt/gtt-expert-store.patch` -- sha256 starts **`851e1871b2a59263…`**, tree `3bc7adf4…`, cut
   against the **r262** `release.json` tree `891d4acb…` (base `a691b2345`, tip `d65b0e889`), applies with `git am`
   onto the r262 tip and produces that tree.  Re-cut it after every change (`git -C ~/llama-scratch commit --amend`,
   `format-patch -1`, copy over), verify by `git am` in a throwaway worktree, and update the sha256 in the README
@@ -190,7 +190,7 @@ the all-resident arm.
    cd ~/llama-scratch && export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx1151/lib:$LD_LIBRARY_PATH HIP_VISIBLE_DEVICES=0
    M35=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf
    MOE_EXPERT_HEATMAP=load MOE_EXPERT_GTT_ARENA=1 AS_KB=100663296 LOCK_KB=8388608 \
-     ~/llama-cpp-rdna-boosts/wip/apu-expert-gtt/guard.sh /tmp/gtt-arms/ref-text.log \
+     ~/llama-cpp-rdna-boosts/archive/work/apu-expert-gtt/guard.sh /tmp/gtt-arms/ref-text.log \
      ./build-rocm/bin/llama-cli -m $M35 -ngl 99 -p "The capital of France is" -n 20 --seed 42 --temp 0 \
        --no-display-prompt --single-turn -lme 4 --fit off      # expect sha=627b2ebd7792
    # the same arm at -lv 4 shows the census, including `GTT arena tier: ... read transport file (RDNA3_5 UMA start...)`

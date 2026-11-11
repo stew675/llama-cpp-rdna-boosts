@@ -15,13 +15,13 @@ Read, in this order, and trust them over any memory of a previous session:
 
 1. `AGENTS.md` — the policy layer (apply/verify rules, WIP rules, the `-lv` table, "report findings before
    shipping").  Follow it.
-2. `wip/apu-expert-gtt/README.md` — the design.  §0 is the shape, §2 the measured foundation, §3.2 the cost
+2. `archive/work/apu-expert-gtt/README.md` — the design.  §0 is the shape, §2 the measured foundation, §3.2 the cost
    model, §5 the `-lme` sizing, §5.1 the transient band, §6 the traps, §7 the open questions.
-3. `wip/apu-expert-gtt/IMPLEMENTATION.md` — the phases.  **Your session is P1.1 + P1.2 + P2** (§7 below says what
+3. `archive/work/apu-expert-gtt/IMPLEMENTATION.md` — the phases.  **Your session is P1.1 + P1.2 + P2** (§7 below says what
    is explicitly later).
-4. `wip/apu-expert-gtt/MEASUREMENTS.md` §13 only — the four P1.0 probes that settled the memory.  §§0-12 are the
+4. `archive/work/apu-expert-gtt/MEASUREMENTS.md` §13 only — the four P1.0 probes that settled the memory.  §§0-12 are the
    earlier (2026-11-09) record and are context, not instructions.
-5. `wip/apu-expert-gtt/probe/README.md` — probes 11-14 and the two helpers, all re-runnable.
+5. `archive/work/apu-expert-gtt/probe/README.md` — probes 11-14 and the two helpers, all re-runnable.
 
 ## 1. The design in six lines (do not re-litigate it)
 
@@ -78,7 +78,7 @@ rather than pretending.
   `./scripts/scratch-tree.sh --rocm /opt/rocm-10.1.0-gfx1151 --gpu-target gfx1151 init` once, then
   `arm <patch>` / `state` / `tip` inside it.  One long-lived source path — ccache keys on it.
 * Nothing goes into `patches/`, `release.json` or the fork.  The output of this campaign is a patch cut against
-  the **current `release.json` tree**, living under `wip/apu-expert-gtt/`, plus the dated records.
+  the **current `release.json` tree**, living under `archive/work/apu-expert-gtt/`, plus the dated records.
 * Text is hashed with **no `-lv`** (`scripts/extract-generated.py`); censuses are read at **`-lv 4`**.  Two runs
   per arm, never one.
 * Model: `/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/…-00001-of-00002.gguf` + its `mtp-…` sidecar is the field
@@ -129,7 +129,7 @@ no retry, no XNACK); do not port a tensor-split slice-read (single device: the s
 
 A previous campaign line on this subject was **deleted on purpose, not archived** (`WORKLOG.md` 261111.008): its
 design rested on a premise that is rejected, so its findings must not be ported.  Everything this campaign needs
-is in `wip/apu-expert-gtt/` and must be **re-derived from its own probes**, not inherited from anywhere else.  If
+is in `archive/work/apu-expert-gtt/` and must be **re-derived from its own probes**, not inherited from anywhere else.  If
 you find a `WORKLOG` path pointing at `wip/apu-expert-pool/` or `wip/uma-static-window/`, it is a historical
 record of a rename, not a file to read.
 
@@ -137,5 +137,5 @@ record of a rename, not a file to read.
 
 1. `git checkout apu-expert-gtt && git log --oneline -3` — confirm you are on the branch and at the campaign head.
 2. `./scripts/scratch-tree.sh --rocm /opt/rocm-10.1.0-gfx1151 --gpu-target gfx1151 init` — build the baseline.
-3. Run probe 12 (`wip/apu-expert-gtt/probe/12-pread-registered`) once on this box to confirm the keystone still
+3. Run probe 12 (`archive/work/apu-expert-gtt/probe/12-pread-registered`) once on this box to confirm the keystone still
    holds on today's driver before you design anything on it.  Then start P1.1.

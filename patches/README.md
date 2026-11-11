@@ -4703,6 +4703,66 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 `validate-set.sh` 16/16 (tree `c6c2f03d`), the re-cut tip is `2ed3997f5`, prefill-logit **0.000000 / 100.000 %**
 (build `2ed3997f5`); record `benchmarks/2026-11-01-spec-draft-window-264.md`.
 
+## Block 16 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
+
+**What it is.**  On an integrated GPU there is no host-expert tier (r236 refuses `-ncmoe`/`--host-experts` there)
+and upstream disables the expert cache outright, so a MoE model whose expert set exceeds RAM cannot run.  Block 16
+adds the tier that can: ONE anonymous region (`mmap` + `MADV_HUGEPAGE`, `hipHostRegister(Mapped|ReadOnly)` once,
+`mlock`'ed, sliced per `(tensor, expert)`) that the GPU reads in place at 230-233 GB/s.  **`-lme N|auto` sizes it** --
+the same flag, units and heat ranking as the discrete host-expert budget, i.e. the one command line that carries
+across -- and the **shape follows the budget**: a budget that covers the whole expert set **places** it (static, no
+eviction); a budget below it takes the **arena** (the store is the cache's slot storage, the expert tensors stay as
+holes in the read-only model mapping, LFRU residency serves every read, a miss is one buffered `pread` into the
+vacated slot).  `-lme` is also the opt-in for **streaming**: a >RAM model runs on whatever `RLIMIT_MEMLOCK` allows,
+and one whose weights do not fit RAM is **refused at load** (0.2 s, with the fix) rather than left to swap.
+
+**What it contains, in order:** the region + its device buffer type + the load-time fill (`gtt-store.cuh`-backed
+`gtt_store_*` in `moe-expert-cache.cu`); `plan_gtt_expert_store()` in `src/llama-model-loader.cpp` (size from `-lme`,
+the lock policy, the shape decision, the MTP head pinned outside the budget, the one-store-many-loads rule); the
+arena seam (`try_arena()`, `alloc_table_locked`, `free_arena_backing`) with the expert tensors as mapping holes and a
+forced mapped load; the fills on block 12's adaptive host-read transport, with the buffered arm reading straight into
+the arena slot (`fill_slot_from_host`); the RDNA3_5 UMA transport start arm; and the prefill stream
+(`moe_cache_prefill_stream` + the `ggml_backend_i` hook + the scheduler call site) that fills only what is not
+resident, coalesced and read in parallel.
+
+**Knobs and defaults:** `-lme` is the size and the streaming opt-in.  Kill switches: `MOE_EXPERT_GTT` (`0` = no store,
+the previous behaviour byte for byte), `MOE_EXPERT_GTT_RO`, `MOE_EXPERT_GTT_MLOCK`, `MOE_EXPERT_GTT_PREFILL`,
+`MOE_EXPERT_GTT_FILL_DIRECT`; override: `MOE_EXPERT_GTT_ARENA` (tri-state, unset = the budget decides); tuning:
+`MOE_EXPERT_GTT_PREFILL_READERS` (8); diagnostics: `_GTT_PREFILL_VERIFY`, `_GTT_PREFILL_FAULT`, `_GTT_PREFILL_DEBUG`.
+`ENVIRONMENT.md` §20 is the catalogue.  **`MOE_EXPERT_CACHE_TOUCH` is a documented no-op on this tier** (every miss
+fills -- the pageable mapping is not a GPU-readable cold source), asserted by the gate rather than assumed.
+
+**Purity / correctness.**  The store changes *where* the bytes are, never *which*: same-seed greedy text is identical
+in every arm across six models (`627b2ebd7792`, `f586785d7183`, `9ccf62ed39c3`, `ee95c45231c3`, `347f9f6f715f`,
+`9b259759672f`), the prefill-logit gate reads mean KLD **-0.000000** / same-top-p **99.990 %**, and the coalesced
+spans are byte-compared against the model mapping (`MOE_EXPERT_GTT_PREFILL_VERIFY=1`) on both models.  The MTP/nextn
+head is pinned at full residency and never evicted (the census asserts 0 head evictions), for the embedded head and a
+separate drafter.
+
+**Measured (r263, `halo` gfx1151 unless stated):** a **123.45 GiB model runs on a 123 GiB box**; registration
+26 ms/GiB at a 19 GiB extent with 100 % huge pages; `-lme 6` == 6 144.0 MiB and `auto` == the whole set (0 evictions);
+the buffered fill straight into the slot **+15.6 % decode warm** and the RDNA3_5 UMA start arm **+13.7 % warm /
++56-67 % on a >RAM model**; prefill streaming **+63-67 %** on a >RAM model (41.3 % of the used bytes read, 58.7 %
+served from the store) and neutral on a fitting one.  **Discrete side (3x R9700 gfx1201): inert by measurement** --
+zero GTT census lines with the envs forced on, `-lme` still the host-expert budget, `scripts/gate-host-pool.sh`
+**42/42**, pool throughput within noise.
+
+**Gates.**  `scripts/gate-uma-experts.sh` (16 arms, 40 checks: text identity across the arena/placement/fault/lock/
+cold/no-host-buffer arms, the arena non-vacuity census, both shape directions, the `-lme`-absent refusal, the
+prefill read-byte fall and the "no fill worker" answer), `scripts/gate-prefill-logits.sh` (a prefill-path change),
+`scripts/gate-host-pool.sh` on a discrete box, `scripts/check-gpu-faults.sh`, `scripts/gate-per-block-build.sh`,
+`scripts/validate-set.sh`.
+
+**Scope and limits (recorded, not implied).**  Linux only, integrated GPUs; on a discrete GPU the code is
+unreachable by `prop.integrated` (measured).  **Multi-device is untested** on both sides (the APU box has one GPU;
+the discrete check is `GPU=0`), and the **MTP four-axis protocol** is still owed for the decode-affecting stages.
+The store's sizing for a *separate* drafter's head is parked (a `common`/`--fit` term, `TODO` #104's area, not a
+loader change).  The lock policy still refuses a >RAM model on a clamp that covers the RAM shortfall but cannot fund
+one slot per table -- relaxing that is a separate change with its own arms.
+
+**Record:** `archive/work/apu-expert-gtt/` (README §0 the shape, §5 sizing, §6 the trap list, IMPLEMENTATION P0-P6,
+MEASUREMENTS §13-§27, the probes, and the campaign's own gate).
+
 ## Dated history
 
 [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) — every amendment note

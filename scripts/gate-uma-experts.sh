@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UMA GTT expert-store gate (`wip/apu-expert-gtt`, P6): the tier that serves a MoE expert set WHICH DOES NOT FIT
+# UMA GTT expert-store gate (`archive/work/apu-expert-gtt`, P6): the tier that serves a MoE expert set WHICH DOES NOT FIT
 # out of one registered, mlocked host region on an APU.
 #
 # WHY THIS EXISTS
@@ -202,7 +202,7 @@ pf_declined(){ grep -oE 'declined [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | sed 
 pf_failed() { grep -oE 'failed [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/failed //'; }
 # the P4e answer, asserted: a demand fill never has a millisecond of GPU work to hide behind
 drain_1ms() { grep -oE 'longest drain [0-9]+ us, [0-9]+ fill\(s\) waited >= 100 us, [0-9]+ >= 1 ms' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9]*\) >= 1 ms/\1/'; }
-guard() { if [ -x "$REPO_DIR/wip/apu-expert-gtt/guard.sh" ]; then echo "$REPO_DIR/wip/apu-expert-gtt/guard.sh"; fi; }
+guard() { if [ -x "$REPO_DIR/archive/work/apu-expert-gtt/guard.sh" ]; then echo "$REPO_DIR/archive/work/apu-expert-gtt/guard.sh"; fi; }
 
 # --- arms ------------------------------------------------------------------------------------------------
 # The tier is opted in per arm (`MOE_EXPERT_GTT_ARENA=1`): it is a fittability tier and stays opt-in (README §8).
@@ -233,7 +233,7 @@ if [ "$QUICK" = 0 ]; then
     run_arm pfverify "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL_VERIFY=1
     run_arm nohb "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" GGML_FORCE_NO_INTEGRATED=1
     # the cold-page-cache arm: drop the GGUF's cache, then re-run `ref`
-    python3 "$REPO_DIR/wip/apu-expert-gtt/cold-cache.py" "$MODEL" >/dev/null 2>&1 || true
+    python3 "$REPO_DIR/archive/work/apu-expert-gtt/cold-cache.py" "$MODEL" >/dev/null 2>&1 || true
     run_arm cold "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}"
 else
     run_arm fault "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" \

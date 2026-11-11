@@ -18,14 +18,36 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **16-block V2.1 set** (block 00 + blocks 01-15) at fork point **`a691b2345`**
+**Current state:** the **17-block V2.1 set** (block 00 + blocks 01-16) at fork point **`a691b2345`**
 (the 2026-10-25 re-base); read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
 draft window -- all three opt-in, default off).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
-The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 16 blocks are climbed,
+The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 17 blocks are climbed,
 every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
 (the base is unchanged since; the release id is `release.json.release`).
+
+### Block 16 (r263, the UMA GTT expert store) — carried forward
+
+* **The MTP four-axis protocol is OWED for block 16's decode-affecting stages** (`benchmarks/mtp-adaptive-methodology.md`).
+  The campaign's own P3c/P4 arms only ever showed draft acceptance 1.0 on 2-token arms, which is not the protocol;
+  the block's claim is "the store changes WHERE the bytes are, never WHICH", proven by same-seed text and the
+  prefill-logit gate, and that is what shipped.  Run the four axes before the next release that touches this code.
+* **Multi-device is untested on this tier** (one GPU on the APU box; the discrete cross-check was `GPU=0`).  The
+  per-device budget, the per-device head subtraction and the free-bytes query have never seen a `-sm tensor` /
+  `-sm layer` split across APUs, and the prefill-stream hook declines by geometry on a slice (by construction, not by
+  measurement).
+* **The lock policy still refuses a >RAM model on a clamp that covers the RAM shortfall but cannot fund one slot
+  per expert table** (`gtt_store_can_stream` is `-lme`, but the clamp branch also requires `honour >= arena_min`).
+  Relaxing it needs its own arms: the dangerous combination is a clamp that covers the shortfall yet is below one
+  slot per table, where the arena would decline and placement would over-commit.
+* **Probe 15 (the per-session touch distance) is still owed.**  It was going to set the admission default `N`; the
+  admission knob turned out to be a documented no-op on this tier (every miss fills), so nothing is blocked on it --
+  and the campaign's policy simulator already predicts the delivered Nth-touch admission would be *worse* here.
+* **Sizing the store for a separate drafter's head is PARKED** (maintainer): the target sizes the region before the
+  drafter loads, so it would be a `common`/`--fit` term, not a loader change.
+* **Windows**: the tier declines there (the single-address premise does not hold on WDDM) and the run keeps the
+  previous behaviour.  Nothing forecloses an arm later: the platform part is one `mmap`+`register` function.
 
 ## The open list
 

@@ -29,21 +29,21 @@ cmake --build build-rocm --target all -j 16 -- -k        # incremental; ~10 s fo
 Read, in this order, and trust them over any summary here:
 
 1. `AGENTS.md` — policy: apply/verify rules, the `-lv` table, "report findings before shipping".
-2. `wip/apu-expert-gtt/README.md` — §0 the shape, §2/P1.1+P2 the measured foundation, **§5.2 the mlock/refuse
+2. `archive/work/apu-expert-gtt/README.md` — §0 the shape, §2/P1.1+P2 the measured foundation, **§5.2 the mlock/refuse
    policy**, §6 traps, §7 open questions.
-3. `wip/apu-expert-gtt/IMPLEMENTATION.md` — **P3.0 "the seams"** (four findings that define the tier) and its
+3. `archive/work/apu-expert-gtt/IMPLEMENTATION.md` — **P3.0 "the seams"** (four findings that define the tier) and its
    **stage table, which contains an OPEN BUG box**.  That box is the state of the world you are inheriting.
-4. `wip/apu-expert-gtt/MEASUREMENTS.md` **§14 and §15** (the store's numbers, probe 16, and §15.3 the lock policy).
-5. `wip/apu-expert-gtt/WORKLOG`-equivalent: `WORKLOG.md` entries **261111.009 … 261111.013** (newest first).
+4. `archive/work/apu-expert-gtt/MEASUREMENTS.md` **§14 and §15** (the store's numbers, probe 16, and §15.3 the lock policy).
+5. `archive/work/apu-expert-gtt/WORKLOG`-equivalent: `WORKLOG.md` entries **261111.009 … 261111.013** (newest first).
    **261111.013 is the handover of the current state** — read it before you run anything.
-6. `wip/apu-expert-gtt/arms.sh` — the re-runnable arms (`text`, `census`, `rate`, `limit`).
+6. `archive/work/apu-expert-gtt/arms.sh` — the re-runnable arms (`text`, `census`, `rate`, `limit`).
 
 # 1. What already works (do not re-litigate, do not rebuild)
 
 The delivery is unaffected: nothing in `patches/`, `release.json` untouched, nothing applied to the fork.  The
 campaign's whole output is ONE cumulative patch:
 
-* `wip/apu-expert-gtt/gtt-expert-store.patch` — sha256 starts **`e38a3f15f57a39c3…`**, tree `f0991921…`, cut
+* `archive/work/apu-expert-gtt/gtt-expert-store.patch` — sha256 starts **`e38a3f15f57a39c3…`**, tree `f0991921…`, cut
   against the `release.json` tree `86389e4a…`, applies with `git am`.  Re-cut it after every change
   (`git -C ~/llama-scratch commit --amend`, `format-patch -1`, copy over) and update the sha256 in the README
   status header + the new WORKLOG entry.
@@ -55,7 +55,7 @@ What that patch contains and has **measured** (all on `halo`, all in `MEASUREMEN
 | the GTT store: ONE anonymous region (`mmap` + `MADV_HUGEPAGE`), registered once `cudaHostRegister(Mapped\|ReadOnly)` **and `mlock`ed**, sliced per (tensor, expert) | **works**: 26 ms/GiB to create+register, 100 % huge pages after the load, `mlock` free (26.3 vs 25.8-26.0 ms/GiB) |
 | `-lme` sizes it (N GiB exactly, or `auto` = `MOE_HOST_LIMIT_FRAC` of `MemAvailable`, capped at the set) | **works**: `-lme 6` realises exactly 6 144.0 MiB; `auto` on a fitting set is the whole set, zero evictions |
 | the store as a whole-tensor **placement** (`MUL_MAT_ID` reads the store in place) | **works**: text identical to `MOE_EXPERT_GTT=0` and to the pre-P2 build on 35B-A3B (`627b2ebd7792`) and Flash-Next (`f586785d7183`); pp512 within noise of the plain device buffer for the READ-ONLY arm, −5.9/−6.2 % registered writable |
-| the **lock policy**: extent clamped to `RLIMIT_MEMLOCK`; a fitting model **declines** with the fix; a model that cannot fit **refuses** (0.76 s on the 122B) | **works**, arms `./wip/apu-expert-gtt/arms.sh limit` |
+| the **lock policy**: extent clamped to `RLIMIT_MEMLOCK`; a fitting model **declines** with the fix; a model that cannot fit **refuses** (0.76 s on the 122B) | **works**, arms `./archive/work/apu-expert-gtt/arms.sh limit` |
 | kill switches `MOE_EXPERT_GTT=0`, `MOE_EXPERT_GTT_RO=0`, `MOE_EXPERT_GTT_MLOCK=0` | **work**; `GTT=0` reproduces the pre-P2 log byte for byte |
 | the store as a real **allocator** (first-fit, coalesced free list, `reserve`/`release`/`largest_free`) | **works**, verified as a no-op for the placement mode |
 | the store as the cache's **ARENA** (P3) | **WIRED BUT NOT WORKING — this is your job** (`MOE_EXPERT_GTT_ARENA=1`, default OFF, only for a set that does not fit) |

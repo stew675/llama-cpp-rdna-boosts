@@ -1216,6 +1216,46 @@ scope -- where the buffered arm holds **12.8-12.9** and `auto` reaches it on the
 `MOE_HOST_POOL_STAGE_SPAN=0` **refuses** the buffered arm (it falls back to the mapping) and the ladder steps over
 `file` to `dio`.  Nothing an operator can type lands in that pair.
 
+## 20. The UMA GTT expert store (block 16) — an APU's MoE expert set in one registered region
+
+On an **integrated GPU** "VRAM" and host RAM are one pool, so r236 refuses the host-expert tier there
+(`-ncmoe`/`--host-experts` are inert) and upstream's answer is to disable the expert cache outright: a MoE model
+whose expert set exceeds RAM simply cannot run.  Block 16 adds the tier that can: **ONE anonymous region**
+(`mmap` + `MADV_HUGEPAGE`, `hipHostRegister(Mapped|ReadOnly)` once, `mlock`'ed, sliced per `(tensor, expert)`) that
+the GPU reads in place at 230-233 GB/s.  **`-lme N|auto` sizes it** — the same flag, units and heat ranking as the
+discrete host-expert budget — and the shape follows that budget: a budget that covers the whole set **places** it
+(static, no eviction); one below it takes the **arena** (the store is the cache's slot storage, the expert tensors
+stay as holes in the read-only model mapping, LFRU residency serves every read, a miss is one buffered `pread` into
+the vacated slot).  The variables below are the tier's knobs; **`-lme` is the size and it is also the opt-in for
+streaming** (without it a model whose weights do not fit RAM is refused at load with the fix rather than placed and
+left to swap).  Everything here is inert on a discrete GPU, measured: zero census lines with the env forced on, and
+`scripts/gate-host-pool.sh` 42/42 with the same build.
+
+| variable | default | class | meaning |
+|---|---|---|---|
+| `MOE_EXPERT_GTT` | `1` | **kill-switch** | `0` = no GTT store at all: the delivery's previous behaviour and log, byte for byte |
+| `MOE_EXPERT_GTT_RO` | `1` | **kill-switch** | `0` = register the region writable instead of `ReadOnly` (the measured 232 -> 60 GB/s A/B) |
+| `MOE_EXPERT_GTT_MLOCK` | `1` | **kill-switch** | `0` = do not `mlock`.  A registered-only region is RECLAIMABLE: under pressure the kernel splits its huge pages and swaps parts of it out, and the next GPU read stalls 12-37x while the driver faults them back (measured). Diagnostic/bisection only |
+| `MOE_EXPERT_GTT_ARENA` | unset = the budget decides | **override (tri-state)** | `1` = force the arena, `0` = force placement, unset = **arena iff the store cannot hold the whole expert set**.  The default is the budget because `-lme` caps NON-SWAPPABLE memory: only the arena keeps that promise (the excess streams from the reclaimable page cache).  Note the old parse was presence-only, so `=0` used to ENABLE it |
+| `MOE_EXPERT_GTT_PREFILL` | `1` | **kill-switch** | `0` = the per-expert used-expert copy for the prefill band (block 16's streaming read is the default) |
+| `MOE_EXPERT_GTT_FILL_DIRECT` | `1` | **kill-switch** | `0` = the buffered fill goes through the per-table bounce ring instead of straight into the arena slot (no bounce, no H2D on the direct arm) |
+| `MOE_EXPERT_GTT_PREFILL_READERS` | `8` | tuning | reader-pool width for the coalesced prefill spans.  `1` reads inline on the caller (the parallel-transport A/B).  Contends with `-t` for CPU |
+| `MOE_EXPERT_GTT_PREFILL_VERIFY` | unset | **diagnostic** | byte-compare every coalesced span against the pageable model mapping and log the first mismatch (a shard-relative offset or an `O_DIRECT` slip shows up here and nowhere else) |
+| `MOE_EXPERT_GTT_PREFILL_FAULT` | unset | **diagnostic** | make every span read fail, so every window takes the per-expert source (the gate's fault arm) |
+| `MOE_EXPERT_GTT_PREFILL_DEBUG` | unset | **diagnostic** | one line per (table, ubatch): used / resident / read / arena / fallback |
+| `MOE_HOST_LIMIT_FRAC` | `80` | tuning | the `auto` ceiling as a % of `MemAvailable`, shared with the discrete arm (measured: `-lme auto` is the only arm that sizes to the whole set on a fitting model) |
+
+**The store is sized by `-lme`, never by a variable.**  The extent is clamped to `RLIMIT_MEMLOCK`, a model that fits
+in RAM *declines* the store when the limit buys nothing useful, and a model that cannot fit is **refused** at load
+(fast, before a byte is read) when the store cannot be locked.  `MOE_EXPERT_CACHE_TOUCH` is a **documented no-op on
+this tier** (every miss fills: the pageable mapping is not a GPU-readable cold source), and
+`MOE_EXPERT_CACHE_MIB` / the movable-boundary slab / the pinned host pool do not apply — the census says so once.
+
+**Measured (r263).**  A **123.45 GiB model runs on a 123 GiB box**; the buffered fill straight into the slot is
++15.6 % decode warm and the RDNA3_5 UMA start arm +13.7 % warm / +56-67 % on a >RAM model; prefill streaming is
++63-67 % on a >RAM model with the logits unmoved (mean KLD -0.000000, same-top-p 99.990 %).  Gate:
+`scripts/gate-uma-experts.sh` (16 arms, 40 checks).
+
 ## 18. Optional artifacts (`optional/`) — **not part of the delivery**
 
 These exist only in a checkout made with `scripts/apply-all.sh --include-optional` (`[y/N]` per artifact) or

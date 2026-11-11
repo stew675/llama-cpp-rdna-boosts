@@ -4019,3 +4019,52 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   keyed by model + shape + ubatch, not by the arm, so re-recording the `xncmoe-48-ub2048` point with a new `--ab`
   destroys the previous arm's base (r261 did this to the r258 `MOE_EXPERT_PREFILL_IN_PLACE=0` base).  Re-record
   before quoting that arm again.
+
+## Block 16 — the UMA GTT expert store (`archive/work/apu-expert-gtt`, promoted as r263)
+
+* **gfx1151 has no `xnack` target at all** (`gfx1151:xnack+` -> `invalid target ID`), `PageableMemoryAccess = 0`
+  and `HSA_XNACK=1` is inert, so there is **no fault-and-retry**: an unregistered page is not in the GPU's page
+  tables and a kernel read of it is a fatal `HSA_STATUS_ERROR_MEMORY_FAULT` + coredump, hot or cold.  Every byte
+  the GPU reads must be registered, and a pageable mapping may be a fill **source** and never a read target.
+* **An APU's "VRAM" IS the host pool** (`totalGlobalMem` reports the machine's memory: 124000 MiB on a 128 GiB
+  box), so `-lme` on an integrated device sizes a *registered host region*, not a separate VRAM budget, and
+  "spill" means the page cache.
+* **A registered READ-ONLY range reads at 230-233 GB/s; the same range registered writable at 60.**  A
+  `PROT_WRITE` buffer can be registered `ReadOnly` *after* it is filled, which is the shape the store uses
+  (`MOE_EXPERT_GTT_RO=0` is the 232-vs-60 A/B).
+* **`hipHostRegister` on an `mmap` region does NOT pin it — `mlock` does**, and `Unevictable` is the only thing
+  that reports the difference (`VmPin`/`VmLck` read 0; use `mincore()`).  A registered-only region loses 0-436 MiB
+  per 2 GiB under real pressure plus its huge pages, and the next GPU read stalls 12-37x.  Hence the extent is
+  clamped to `RLIMIT_MEMLOCK` and "cannot lock" is a startup decision (decline when the model fits, **refuse**
+  when it does not).
+* **`pread` into a registered region is legal and coherent** (buffered 15.7 GB/s, `O_DIRECT` 4.75 GB/s, and the GPU
+  sees the fresh bytes on the reuse/eviction arm too) — that is why the store is **anonymous**: `pread(O_DIRECT)`
+  into a `hipMalloc` GTT buffer is `EINVAL`, and choosing anon is what deletes the staging ring.
+* **A GGUF tensor offset is 32-byte aligned, not 4096**, so an `O_DIRECT` fill must round the read out and carry a
+  per-fill delta.  An unaligned `O_DIRECT` read copies **0 bytes**.
+* **`MADV_DONTNEED` on a registered region the GPU is reading is a silent zero-fill**, and `hipHostUnregister` does
+  not release the pinned pages while the VMA lives (with `iommu=off` the registration *is* the GPU's mapping, so
+  unregistering turns a read into a fatal fault).  Eviction is therefore a **table** operation only.
+* **The store's extent cannot be exceeded** — `ggml_cuda_gtt_store_reserve()` refuses — and a failed carve is
+  **FATAL** to the load (`unable to allocate ROCmGTTStore0 buffer`), not the fail-soft decline the code once
+  claimed.  A second model in the process must size against the store's FREE bytes and never takes the arena tier.
+* **The heat-map prior is an INPUT.**  `MOE_EXPERT_HEATMAP=load` (or a read-only sidecar — the file's mode IS the
+  freeze signal) loads and seeds but never writes; a writable prior is rewritten by every run, so arms contaminate
+  each other and run order becomes part of the result.  Measured: the `auto` transport ladder's latch rate looked
+  like 4/5 with a drifting prior and is **0/5** with a frozen one, which inverted a conclusion.  Every gate freezes
+  it per arm.
+* **A prefill fill is a bulk fill and the coalescing is a call-count win, not a byte win.**  One H2D per span
+  instead of one per expert is the dominant saving (12 031 -> 4 605 calls for the same bytes); the span ring must
+  be marked busy **at acquisition**, not at H2D issue (`span_buf_acquire` only refuses drained buffers, so the
+  latter hands every window in a call the SAME pinned buffer — measured as corrupt greedy text with a
+  verify-clean file read).
+* **A backend hook must take the scheduler's used-expert BITSET, never re-read the routing ids**: the ids buffer
+  the scheduler reads back is reused by the graph allocator, and a later read of it serves a stale routing.
+* **On an APU, `-lme` is a cap on NON-SWAPPABLE memory, and only the arena honours it.**  Placement keeps the
+  excess as anonymous device memory (measured: lowest `MemAvailable` 92 489 MiB at `-lme 4` on a 35B); the arena
+  keeps it as reclaimable page cache (106 064 MiB) — 13.6 GiB less non-reclaimable, at 2x the decode cost.  So the
+  shape follows the budget, and `-lme` is also the opt-in for **streaming** (a >RAM model without it is refused at
+  load, in 0.2 s, with the fix).
+* **The tier is inert on a discrete GPU, measured** (3x R9700 gfx1201): with `MOE_EXPERT_GTT_ARENA=1` forced on,
+  zero GTT census lines, `-lme` still means the host-expert budget, `gate-host-pool.sh` 42/42 with the same build,
+  and the pool path's throughput within noise.  Record: `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.

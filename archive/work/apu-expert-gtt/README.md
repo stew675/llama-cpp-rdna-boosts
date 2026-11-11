@@ -1,4 +1,13 @@
-# wip/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
+# archive/work/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
+
+> **PROMOTED as block 16 in r263 (`v17-a691b2345-r263`).**  This directory is now the campaign's *record*
+> (design, probes, every measurement, the trap list) — the code it describes ships in
+> [`patches/0016-rdna-boosts-block-16-the-UMA-GTT-expert-store-an-APU.patch`](../../patches/), its knobs are in
+> [`ENVIRONMENT.md` §20](../../ENVIRONMENT.md), its block note in [`patches/README.md`](../../patches/README.md),
+> its rules in [`INVARIANTS.md`](../../INVARIANTS.md) ("Block 16"), and its gate is
+> [`scripts/gate-uma-experts.sh`](../../scripts/gate-uma-experts.sh).  `gtt-expert-store.patch` here is the
+> pre-promotion artifact, kept for provenance; do not apply it — apply the delivery set.
+> Status below is the campaign's own, as written while it was WIP.
 
 **Status: P0-P5 COMPLETE and measured; P6 (gate + docs) DONE except the promotion itself, which waits on the
 maintainer's two decisions (README §8).**  Nothing in `patches/`, nothing applied to the fork, nothing pushed.

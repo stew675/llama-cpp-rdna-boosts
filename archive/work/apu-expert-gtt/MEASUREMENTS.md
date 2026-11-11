@@ -1,8 +1,12 @@
 # MEASUREMENTS — `wip/apu-expert-pool`
 
+> **PROMOTED as block 16 of the delivery in r263 (`v17-a691b2345-r263`).**  This document is the dated
+> campaign record; the shipping code is `patches/0016-…`, the knobs `ENVIRONMENT.md` §20, the rules
+> `INVARIANTS.md` ("Block 16"), and the gate `scripts/gate-uma-experts.sh`.
+
 Every number in [`README.md`](README.md) and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) comes from here.
 (This file was written under the campaign's opening name `wip/apu-expert-pool/`; the campaign was renamed
-`wip/apu-expert-gtt/` on 2026-11-11 and its design replaced -- see `README.md` §1 and §13 below.)  Nothing
+`archive/work/apu-expert-gtt/` on 2026-11-11 and its design replaced -- see `README.md` §1 and §13 below.)  Nothing
 below changed the fork or the delivery: all probes are standalone HIP/C programs under
 [`probe/`](probe/README.md), run as ordinary users.
 
@@ -1220,7 +1224,7 @@ Answer: **no, and yes** — and that invalidated one of my own conclusions (§22
   `scripts/gate-host-pool.sh` defaults **every arm** to `MOE_EXPERT_HEATMAP=load` with the reason written down:
   *"the persisted prior is an INPUT"*.
 * **So the campaign's arms were the ones out of contract**, not the delivery: `/tmp/p3/guard.sh` and my ad-hoc
-  invocations never set it.  `wip/apu-expert-gtt/arms.sh` is being fixed (§23.4).
+  invocations never set it.  `archive/work/apu-expert-gtt/arms.sh` is being fixed (§23.4).
 
 ### 23.2 What it invalidated, and what it did not (all re-measured with the prior FROZEN)
 
