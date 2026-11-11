@@ -116,6 +116,13 @@ mapping") that the pinned arms disproved on this hardware — see `RESULTS.md` �
 
 ## 6. Owed before this ships
 
+0. **The probe's gain threshold** (`TR_PROBE_GAIN`, currently 1.5) is NOT set from measurement yet, and the
+   interleaved A/B shows why it matters: under starvation the probe measured `dio` 1.68x faster on the read
+   while `file` was **12 % better end to end** (the buffered arm's page-cache population is what a single-read
+   latency cannot see).  The threshold must be measured the way `RESULTS.md` §5 describes — interleaved, ballast
+   held, cache dropped per arm, `file` preferred on a tie.  The first cut of that matrix also caught a real bug
+   (the probe cadence counter was incremented only by the path the probe bypasses, so every fill became a
+   probe), which is fixed: probes are 1 in 128 and `auto` is neutral when it does not latch.
 1. **The gate.** A `gate-host-pool.sh` arm at a cache-starved cgroup that must log a transition with N > 0
    reads on each arm (proving the ladder is not vacuous), the three pinned arms for text identity, and TODO
    #306's original condition — a cell varying the transport **and** `MOE_HOST_POOL_STAGE_SPAN` together, since a
@@ -123,8 +130,10 @@ mapping") that the pinned arms disproved on this hardware — see `RESULTS.md` �
    mapping).
 2. **The interleaved two-direction A/B** (ABBA, 44G/32G, transport × span) to set `TR_PROBE_*` from measurement
    rather than reasoning; the 44G band is ±25 %, so single-pass arms cannot set them.
-3. **The decode ladder** (`benchmarks/mtp-adaptive-methodology.md`, `llama-batched-bench -npl 1,4,8`): this
-   touches the decode path of every pool user.
+3. **The decode ladder.**  `llama-batched-bench -npl 1,4,8` is **run** (`RESULTS.md` §5): `auto` stays on `map`
+   and is within noise at every width on the cacheable 35B-A3B, a pinned `file` costs ~4 % at `npl 1` and
+   nothing at `npl 8`.  The **MTP four-axis protocol** is still owed before a promotion — the change is
+   host-side with no kernel or numerics, but that is the contract for a decode-path change.
 4. **Windows.** The buffered arm there is `ReadFile`, the direct arm `FILE_FLAG_NO_BUFFERING`; the reporter
    measured them within ~15 % (616-1 114 vs 638 MiB/s), and the capacity test uses `GlobalMemoryStatusEx` (no
    cgroup). `--load-mode` pins it, but neither arm has been measured in this form.

@@ -115,3 +115,71 @@ The gate's first two runs (22/24, then 24/24) are the reason its convergence che
 asserted "a RAM-rich box must stay on the mapping", which was an **assumption of mine**, and the pinned arms
 disproved it on this hardware. The check now derives the expected arm from the same run's own pinned
 measurements, so it is box-independent.
+
+## 5. The interleaved (ABBA) A/B and the decode ladder, 2026-11-11
+
+`abba-transport.sh <44G|32G>`: four arms in the order map / file / dio / auto, then auto / dio / file / map, so a
+monotone drift cancels in the average. **The page cache is dropped before every arm** (the rig's hygiene rule —
+without it the previous arm's warm cache hides the transport entirely, which is how the first cut of this matrix
+measured 32G as if it were unpressured). Never parallel.
+
+**First, a bug the matrix caught in the probe itself.** The probe's cadence was gated on
+`g_pool_tr_reads % N`, and that counter is incremented by the observe path that a probe **returns before** — so
+once a probe succeeded the counter stopped moving, `0 % N == 0` stayed true, and **every fill became a probe**
+(measured: 42 746 probes serving 42 746 fills, 3 106 ms of host read time; and once the ladder had reached
+`file` every probe was a `dio` read, which cost **67 ms/token against 39**). Fixed with a counter incremented on
+the wrapper line itself (`g_pool_tr_fill_calls`); probes are now 1 in 128 and cost 15-66 ms per run. With that
+fix `auto` is **neutral** when it does not latch.
+
+### Shape A — unpressured (44G cgroup, warm cache, cache dropped per arm)
+
+| arm | fills | bounce | prefill t/s | decode t/s |
+|---|---:|---:|---:|---:|
+| map (a / b) | 27 544 / 27 530 | 16 020 / 16 275 | 1 336 / 1 350 | 25.95 / 26.19 |
+| file (a / b) | 27 601 / 27 593 | 14 697 / 15 090 | 1 347 / 1 360 | 25.97 / 26.09 |
+| dio (a / b) | 2 313 / 2 312 | 2 329 / 2 356 | 564 / 566 | 11.15 / 11.20 |
+| **auto** (a / b) | 27 491 / 27 604 | 16 269 / 16 363 | 1 347 / 1 352 | 26.04 / 25.87 |
+
+`auto` stays on `map` (332-333 probes, no latch) and is indistinguishable from the pinned arms. **No regression**
+where the cache holds the set; `dio` is 2.3x worse, which is why it is terminal-only.
+
+### Shape B — starving (32G cgroup + 21 GiB mlocked ballast outside it, cache dropped per arm)
+
+| arm | fills | bounce | prefill t/s | decode t/s |
+|---|---:|---:|---:|---:|
+| map (a / b) | **1 628 / 1 537** | 2 287 / 2 328 | 487 / 497 | **6.25 / 5.49** |
+| file (a / b) | 2 129 / 2 128 | 2 186 / 2 179 | 463 / 461 | **12.84 / 12.92** |
+| dio (a / b) | 2 311 / 2 311 | 2 352 / 2 313 | 560 / 556 | 11.26 / 11.28 |
+| auto (a / b) | 2 133 / 2 133 | 2 265 / — | 551 / 565 | 11.28 / 11.19 |
+
+The mapping collapses (fills 1 537-1 628 MiB/s, decode **5.5-6.3 t/s**) and both disk arms are ~2x better. `auto`
+reached `file` **on the stall detector** at 6.5 s (`stall: 4 consecutive reads over 4.0x this arm's own 498 us`),
+then stepped to `dio` on a probe (`dio served the same read in 272 us against this arm's 456 us`).
+
+### The knob question this exposed (NOT yet settled — recorded as owed)
+
+On the read level `dio` won that probe 1.68x, yet **end-to-end `file` was 12 % better** (12.8 against 11.3 t/s):
+the buffered arm populates the page cache that other paths then re-read, which no single-read latency can see. So
+`TR_PROBE_GAIN=1.5` can step off a better arm, and the threshold needs to be measured, not reasoned. The
+one-off `gain=1.5/2.0/3.0` runs that followed were **inconclusive because the box drifted** (the same pinned
+`file` arm read 12.8-12.9 t/s in the interleaved matrix and 11.3-11.7 in the one-offs 10 minutes later), so the
+threshold is left at 1.5 and the measurement is owed: interleaved, ballast held, cache dropped per arm, and
+`file` preferred on a tie.
+
+### The decode ladder — `llama-batched-bench -npl 1,4,8`
+
+35B-A3B Q8_0 (fits in RAM: the cacheable case), `-ngl 99 -sm layer --n-cpu-moe 24 --limit-host-experts 8`,
+`-npp 512 -ntg 128`, cache dropped per arm:
+
+| arm | npl 1 | npl 4 | npl 8 |
+|---|---:|---:|---:|
+| map | **63.72** | **186.52** | 276.84 |
+| file | 61.30 (**-3.8 %**) | 183.93 (-1.4 %) | 276.72 (-0.04 %) |
+| auto | 62.21 | 185.24 | 276.00 (stays `map`) |
+
+`auto` never latches on a cacheable set and is within noise of the pinned mapping arm at every width; a *pinned*
+`file` costs ~4 % at `npl 1` and nothing at `npl 8`.
+
+**Not run: the MTP four-axis protocol.** The change is host-side (no kernel, no numerics) and the four-axis gate
+is the contract for decode-kernel/speculator changes; it stays owed before a promotion, together with the
+interleaved threshold measurement above.
