@@ -1,3 +1,49 @@
+## 261111.009 (wip, NO delivery change) -- the per-expert host read transport is a CROSSOVER, not a preference: the mapping is the fastest arm while the page cache holds the set and collapses to ~600 MiB/s when it cannot (TODO #306, widened)
+
+**Campaign only** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  `TODO` #306's
+question was widened at the maintainer's direction: not "should the pool FILL read the file" but "which
+TRANSPORT should every per-expert host read use", because at r261 the coalesced prefill span reads the FILE in
+both modes (r232) while the pool fill and the demand/bounce read take the file arm **only** under
+`MOE_HOST_POOL_DIO=1` -- in buffered mode they are mapping-`memcpy` only.  Campaign:
+[`wip/host-read-transport/`](wip/host-read-transport/README.md) (instrument patch, the microbenchmark, the rig
+arms, `RESULTS.md`).
+
+**1. The instrument** (`0001-per-expert-host-read-transport.patch`, r261 tree, INERT by default):
+`MOE_HOST_POOL_FILL_SRC=file` (the fill) and `MOE_HOST_POOL_DEMAND_SRC=file` (the bounce/demand read) read the
+file with a buffered `pread`; a `per-expert mapping reads (bounce)` census line so a map arm has a counter at
+all; a WARN on the file+`STAGE_SPAN=0` pair (the measured -41 %).  **Text identity proven first**: four arms,
+`144 chars sha=de81b28cab7d` in all of them (greedy, no `-lv`).
+
+**2. The crossover (`transport-ab.py`, real GGUF, RANDOM 640 KiB chunks, reader in a memory cgroup).**  MiB/s
+cold/warm, mmap vs buffered `pread` vs O_DIRECT:
+
+| cache budget | holds the working set | mmap | pread | O_DIRECT | pread/mmap |
+|---|---|---|---|---|---|
+| 40G (4 GiB) | yes | 3 040 / 17 102 | 2 491 / 7 068 | 2 177 / 2 177 | 0.82x / 0.41x |
+| 4G (8 GiB) | no | 1 050 / 1 132 | 2 240 / 2 580 | 2 125 / 2 127 | **2.13x / 2.28x** |
+| 1G (8 GiB) | no | **593 / 596** | 1 737 / 1 720 | 2 127 / 2 126 | **2.93x / 2.89x** |
+
+Sequential is the WRONG test (fault-around makes the mapping tie cold and win warm: 6 764 vs 6 808 cold,
+39 818 vs 35 902 warm) -- the routing-driven random shape is what collapses.  So the maintainer's
+"<100 MB/s mmap fill under pressure" reproduces as a mechanism: ~600 MiB/s at a 1 GiB cache budget and falling.
+
+**3. End to end (56 GiB rig, `-lme 12` = 131/512 slots, `DIO=0`, page cache dropped per arm).**  `56G`: map
+2 160 / 9 512 MiB/s, 55-59 t/s decode.  `44G`: not separable (mapping arms spanned 1 599-2 160 fills and
+4 656-9 512 bounce across repeats -- a +/-25 % band wider than the delta; file helps fills, the mapping helps
+the bounce).  **`32G`: the set is not cacheable and the mapping collapses (898 / 1 913 MiB/s) while
+file/file holds 2 047 / 2 923 and is +96 / +69 / +74 % on the three decode passes** (21.6/43.2/55.8 ->
+28.7/36.6/38.9 t/s); prefill +9 / -4 %, because the span already reads the file in both arms.
+
+**4. What it means for the delivery.**  A blanket switch to buffered reads REGRESSES the RAM-rich box (the
+mapping is 2.4x faster on the random shape when the cache holds the set), so `TODO` #306's "promote `file`"
+becomes a **three-arm policy**: cache holds the set -> mapping; it does not -> buffered `pread` (or O_DIRECT,
+which is best under hard pressure on Linux).  The real weak link is the FIT TEST, not the transport:
+`pool_decide_dio_locked` already picks buffered-vs-O_DIRECT from `MemAvailable` vs pool+set, but
+`MemAvailable` is **cgroup-unaware** and read **once** (`wip/host-expert-coverage/`), so a box whose cache
+cannot actually hold the set is silently left in the mapping arm -- which is the collapse.  **Owed before
+promotion** (all in the campaign README): the interleaved two-direction A/B per shape, a `gate-host-pool.sh`
+cell varying transport AND span together, the decode ladder, and the fit-test fix.
+
 ## 261111.008 (wip, NO delivery change) -- the `apu-expert-pool` dead-end branch and its work are DELETED, deliberately not archived; and the campaign's "registration pins" claim is narrowed to what probe 09 actually measured
 
 **Two things, both campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).

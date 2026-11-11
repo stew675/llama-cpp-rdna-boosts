@@ -10,11 +10,11 @@ set -uo pipefail
 LIST=${1:?usage: ./parity-matrix.sh <armlist> [logfile]}
 LOG=${2:-$PWD/matrix-$(date +%m%d-%H%M).log}
 echo "=== matrix start $(date -Is) list=$LIST log=$LOG ===" >> "$LOG"
-while read -r TAG LME SINK DIO SPAN RANK SERVER FILLSRC; do
+while read -r TAG LME SINK DIO SPAN RANK SERVER FILLSRC DEMANDSRC; do
   [ -z "${TAG:-}" ] && continue
   case "$TAG" in \#*) continue ;; esac
   echo "### $(date -Is) arm $TAG LME=${LME:-} SINK=${SINK:-} DIO=${DIO:-} SPAN=${SPAN:-} RANK=${RANK:-} SERVER=${SERVER:-default}" >> "$LOG"
-  LME=${LME:-} SINK=${SINK:-} DIO=${DIO:-} SPAN=${SPAN:-} RANK=${RANK:-} SERVER=${SERVER:-} FILLSRC=${FILLSRC:-} \
+  LME=${LME:-} SINK=${SINK:-} DIO=${DIO:-} SPAN=${SPAN:-} RANK=${RANK:-} SERVER=${SERVER:-} FILLSRC=${FILLSRC:-} DEMANDSRC=${DEMANDSRC:-} \
     timeout 2400 ./parity-arm.sh "$TAG" >> "$LOG" 2>&1
   echo "### rc=$? $(date -Is) arm $TAG" >> "$LOG"
 done < "$LIST"

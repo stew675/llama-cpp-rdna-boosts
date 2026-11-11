@@ -4,7 +4,7 @@
 # A parameterised sibling of `runme-56gb-mirror.sh`: the ONLY differences are the tier knobs, so every arm of
 # the parity matrix is otherwise the field config used by `RESULTS.md` (draft head attached, greedy requests).
 #
-#   usage: ./runme-56gb-tier.sh [LME] [SINK] [DIO] [SPAN] [RANK] [HEATMAP] [SERVER] [FILLSRC]
+#   usage: ./runme-56gb-tier.sh [LME] [SINK] [DIO] [SPAN] [RANK] [HEATMAP] [SERVER] [FILLSRC] [DEMANDSRC]
 #   LME=47|auto|N      -lme (default 47 = a mirror: the whole 46.84 GiB host expert set)
 #   SINK=0|1           MOE_HOST_POOL_SINK: 0 is the pre-r224 (no demote) control, unset = the binary default
 #   DIO=auto|0|1       MOE_HOST_POOL_DIO: `auto` mirrors --load-mode (mmap -> buffered fills), 1 = O_DIRECT
@@ -13,7 +13,9 @@
 #   HEATMAP=load|0|1   the persisted prior.  NEVER `1` for a measurement arm: a writable map learns the
 #                      benchmark prompt (`INVARIANTS.md`, r224).  The arms default to `load`.
 #   SERVER=...         override the binary (arg 7)
-#   FILLSRC=map|file   MOE_HOST_POOL_FILL_SRC: the buffered fill SOURCE (arg 8; `file` is the r232 default)
+#   FILLSRC=map|file   MOE_HOST_POOL_FILL_SRC: the buffered POOL FILL's source (arg 8)
+#   DEMANDSRC=map|file MOE_HOST_POOL_DEMAND_SRC: the buffered BOUNCE/demand read's source (arg 9) -- the
+#                      wip/host-read-transport instrument only; the delivered binary ignores it
 set -euo pipefail
 
 # The knobs are POSITIONAL ARGUMENTS first and environment variables second, and the order matters: run.sh
@@ -29,6 +31,8 @@ RANK=${5:-${RANK:-}}
 HEATMAP=${6:-${HEATMAP:-load}}
 # issue #281: which SOURCE a buffered fill reads (see ENVIRONMENT.md MOE_HOST_POOL_FILL_SRC)
 FILLSRC=${8:-${FILLSRC:-}}
+# wip/host-read-transport: which source the buffered BOUNCE/demand read uses (the instrument build only)
+DEMANDSRC=${9:-${DEMANDSRC:-}}
 # the binary as ARG 7 too, for the same reason: an A/B against a second build needs SERVER to cross the scope
 SERVER_ARG=${7:-}
 cd /llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S
@@ -52,6 +56,7 @@ dflt "${DIO:-}"   || [ "$DIO" = auto ] || export MOE_HOST_POOL_DIO=$DIO
 dflt "${SPAN:-}"  || export MOE_HOST_POOL_STAGE_SPAN=$SPAN
 dflt "${RANK:-}"  || export MOE_HOST_POOL_RANK=$RANK
 dflt "${FILLSRC:-}" || export MOE_HOST_POOL_FILL_SRC=$FILLSRC
+dflt "${DEMANDSRC:-}" || export MOE_HOST_POOL_DEMAND_SRC=$DEMANDSRC
 [ "${SERVER_ARG:-}" = "-" ] && SERVER_ARG=
 
 # run.sh starts this inside `systemd-run --scope` as ROOT, where $HOME is /root: resolve the build from the

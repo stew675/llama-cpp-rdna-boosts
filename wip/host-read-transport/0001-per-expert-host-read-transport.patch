@@ -1,0 +1,155 @@
+From 2faf2699f4ac70a9be1c9cf23ff1de699f8ac029 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Wed, 11 Nov 2026 07:25:22 -0600
+Subject: [PATCH] wip(host-read-transport): the two per-expert host reads get a
+ buffered FILE transport, inert by default
+
+TODO #306 widened (maintainer direction, 2026-11-11): the question is not the pool FILL's
+source, it is the TRANSPORT of every per-expert host read.  At r261 a mapped (buffered) load
+copies out of the model mapping -- a demand fault per 4 KiB page -- for two paths:
+
+  * pool_fill_slot_locked()  (the pool fill)
+  * expert_host_src()        (the bounce / demand read; r261 measured it at 54 % of a decode step)
+
+while the coalesced prefill span next to them already reads the FILE in both modes (r232).  Both
+of these take the file arm ONLY under MOE_HOST_POOL_DIO=1, so in buffered mode they are
+mapping-only.  A buffered pread reads the same page-cache pages with one syscall per expert and
+gets readahead; the mapping pays a trap per page and collapses under pressure (273 MiB/s Linux,
+~250 MiB/s Windows, <100 MiB/s under reclaim).
+
+Two independent knobs, so an arm can isolate the paths:
+  MOE_HOST_POOL_FILL_SRC=file     the pool FILL reads the file
+  MOE_HOST_POOL_DEMAND_SRC=file   the bounce/demand read reads the file
+BOTH DEFAULT TO THE MAPPING (the delivered arm) -- this is an instrument, not a promotion.
+
+Also: a mapping-read counter for the bounce path (the map arm otherwise has no counter at all,
+so an A/B cannot prove which transport an arm took), and a WARN for the coupled bad pair
+(file transport + MOE_HOST_POOL_STAGE_SPAN=0, the measured -41 % arm).
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 60 +++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index a7cd3fbaa..b89194383 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -395,6 +395,16 @@ int64_t g_pool_ram_used    = 0;      // bytes pinned by the pools built so far
+ double  g_pool_ram_scale   = -1.0;
+ int64_t g_preflight_host_bytes = 0;  // Σ host expert bytes over host-expert devices (the AUTO basis)
+ bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
++// wip/host-read-transport (TODO #306, widened): WHICH SOURCE a BUFFERED per-expert host read uses.  The
++// delivered code copies out of the read-only model mapping -- one demand fault per 4 KiB page -- and only
++// takes the file when O_DIRECT is on.  A mapping fault pays a kernel trap per page (~150 per expert) and
++// collapses under memory pressure (measured 273 MiB/s on Linux, ~250 MiB/s on Windows, and <100 MiB/s once
++// the page cache is being reclaimed); a buffered `pread` is one syscall per expert and gets readahead.  Both
++// arms read the SAME page-cache pages, so the bytes and the output are identical -- only the transport moves.
++// `=file` on either knob is the A/B arm; BOTH DEFAULT TO THE DELIVERED MAPPING ARM, so this patch is inert
++// unless asked (`file` is a candidate default for the promotion, not this instrument).
++bool    g_pool_fill_src_file   = false;  // MOE_HOST_POOL_FILL_SRC=file:   the pool FILL reads the file
++bool    g_pool_demand_src_file = false;  // MOE_HOST_POOL_DEMAND_SRC=file: the bounce/demand read does
+ // TODO #87 (1): `MOE_HOST_POOL_DIO` is AUTO by default -- decided once, at the first pool build, from
+ // MemAvailable vs the host expert set (the same measurement `MOE_HOST_POOL_RAM_PCT` takes).  Buffered fills
+ // (DIO=0) let the page cache act as an L3, which is worth +90 % decode / +155 % prefill when the set fits;
+@@ -627,6 +637,12 @@ int64_t                             g_stage_span_wait_us  = 0;   // time waiting
+ int64_t                             g_bounce_read_calls = 0;
+ int64_t                             g_bounce_read_us    = 0;
+ int64_t                             g_bounce_read_bytes = 0;
++// wip/host-read-transport: the SAME read served out of the model mapping instead (the delivered arm, and the
++// control).  Without it the map arm has no bounce counter at all, so an A/B cannot prove which transport an
++// arm actually took (`pool fills:` covers the pool fill, not this one).
++int64_t                             g_bounce_map_calls  = 0;
++int64_t                             g_bounce_map_us     = 0;
++int64_t                             g_bounce_map_bytes  = 0;
+ int64_t                             g_prs_rebuilds     = 0;   // immutable snapshot refreshes (churn indicator)
+ int64_t                             g_cold_reaches    = 0;
+ // Phase 1b fill-vs-cold admission policy (only consulted when a cold read is available):
+@@ -1130,6 +1146,14 @@ void parse_env() {
+         g_pool_ram_pct = 100;
+     }
+     g_pool_prewarm     = env_int("MOE_HOST_POOL_PREWARM", 1) != 0;
++    {
++        // wip/host-read-transport: the two per-expert transports, independently (so an arm can isolate the
++        // pool fill from the demand read).  Unset/anything else = the delivered mapping arm.
++        const char * fs = getenv("MOE_HOST_POOL_FILL_SRC");
++        const char * ds = getenv("MOE_HOST_POOL_DEMAND_SRC");
++        g_pool_fill_src_file   = fs != nullptr && strcmp(fs, "file") == 0;
++        g_pool_demand_src_file = ds != nullptr && strcmp(ds, "file") == 0;
++    }
+     // TODO #87 (1): AUTO by default (see `g_pool_dio_req`).  An explicit `MOE_HOST_POOL_DIO=0|1` wins and is
+     // decided here, so an A/B never depends on the machine.
+     g_pool_dio_req     = env_int("MOE_HOST_POOL_DIO", -1);
+@@ -1148,6 +1172,15 @@ void parse_env() {
+     if (g_pool_stage_span_n < 1) {
+         g_pool_stage_span_n = 1;
+     }
++    // wip/host-read-transport: the COUPLING, stated where an operator will see it.  A per-expert buffered
++    // read at depth 1 is latency-bound where the mapping gets fault-around prefetch, so the file transport
++    // is measured at -41 % with the coalesced span OFF.  The promotion makes one decision pick both; the
++    // instrument only refuses to let an arm land in the bad pair silently.
++    if ((g_pool_fill_src_file || g_pool_demand_src_file) && !g_pool_stage_span) {
++        GGML_LOG_WARN("%s: MOE_HOST_POOL_{FILL,DEMAND}_SRC=file with MOE_HOST_POOL_STAGE_SPAN=0 is the "
++                      "LATENCY-BOUND arm (measured -41 %): a per-expert buffered read without the coalesced "
++                      "span.  Leave the span on, or drop back to the mapping transport.\n", __func__);
++    }
+     if (g_pool_stage_span_n > 64) {
+         g_pool_stage_span_n = 64;   // 64 experts is ~43 MiB: past that the pinned ring is the cost, not the read
+     }
+@@ -2377,7 +2410,10 @@ static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
+     const int64_t t0 = ggml_time_us();
+     const size_t rel = (size_t) expert * p.host_bytes;
+     const bool   use_disk = g_pool_dio && pool_file_io_available();
+-    if (!use_disk && p.src_host != nullptr) {
++    // wip/host-read-transport: a buffered fill may read the FILE (`MOE_HOST_POOL_FILL_SRC=file`) instead of
++    // copying out of the model mapping.  Inert by default (the delivered arm is the mapping memcpy).
++    const bool   use_file = use_disk || g_pool_fill_src_file;
++    if (!use_file && p.src_host != nullptr) {
+         memcpy(dst, (const char *) p.src_host + rel, p.host_bytes);
+         g_fill_memcpy_calls++;
+         g_fill_memcpy_us += ggml_time_us() - t0;
+@@ -3362,7 +3398,11 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+     const size_t rd_off = trim ? t.src_off       : 0;
+     char * const rd_dst = buf + rd_off;
+     bool   filled = false;
+-    if (g_pool_dio && pool_file_io_available() && t.src_known && !t.src_path.empty()) {
++    // wip/host-read-transport: the file arm is reachable in BUFFERED mode too (`MOE_HOST_POOL_DEMAND_SRC=
++    // file`) -- a buffered `pread` of the same bytes, one syscall per expert instead of a fault storm.
++    // Inert by default: the delivered arm only takes the file when O_DIRECT is on.
++    if ((g_pool_dio || g_pool_demand_src_file) && pool_file_io_available() && t.src_known &&
++        !t.src_path.empty()) {
+         // DISK TIER (`MOE_HOST_POOL_DIO=1`): read the expert with O_DIRECT so the page cache is not
+         // populated -- the whole point of the mode, and it must hold for STAGING too (a whole-table prefill
+         // staging copy would otherwise fault the entire expert set into the page cache).
+@@ -3394,7 +3434,11 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+                           "expert bytes through the model mapping instead.  The bytes are identical -- only "
+                           "the page cache is populated.\n", __func__, t.layer, t.role.c_str());
+         }
++        const int64_t tm = ggml_time_us();
+         memcpy(rd_dst, (const char *) t.host + (size_t) expert * t.host_bytes + rd_off, rd_len);
++        g_bounce_map_calls++;
++        g_bounce_map_us    += ggml_time_us() - tm;
++        g_bounce_map_bytes += (int64_t) rd_len;
+         filled = true;
+     }
+     if (!filled) {
+@@ -9905,6 +9949,18 @@ static void report_locked() {
+                           ? (double) g_bounce_read_bytes / 1048576.0 / ((double) g_bounce_read_us / 1e6) : 0.0,
+                       (double) g_bounce_read_bytes / 1048576.0 / (double) g_bounce_read_calls);
+     }
++    if (g_bounce_map_calls > 0) {
++        // wip/host-read-transport: the same reads served by the MODEL MAPPING.  Print it beside the storage
++        // line so the two arms of an A/B are both visible (a map arm has zero storage reads and would
++        // otherwise report nothing for the demand path at all).
++        GGML_LOG_INFO("%s: per-expert mapping reads (bounce): %lld reads, %.1f MiB, %.0f ms, %.1f MiB/s, "
++                      "%.2f MiB/read\n",
++                      __func__, (long long) g_bounce_map_calls,
++                      (double) g_bounce_map_bytes / (1024 * 1024), g_bounce_map_us / 1000.0,
++                      g_bounce_map_us > 0
++                          ? (double) g_bounce_map_bytes / 1048576.0 / ((double) g_bounce_map_us / 1e6) : 0.0,
++                      (double) g_bounce_map_bytes / 1048576.0 / (double) g_bounce_map_calls);
++    }
+     GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
+     if (g_fill_fail > 0) {
+-- 
+2.56.0
+
