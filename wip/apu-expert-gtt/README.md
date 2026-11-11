@@ -7,15 +7,15 @@ GTT store itself, built and measured) are DONE; nothing in `patches/`, nothing a
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `29418b02…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `f0991921…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `fca915ce92f22b485126a357e6d2cb4917f75b514224b4fab750d4e950ab33c5` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `e38a3f15f57a39c33bcbe5a1f0313dfeef68fcf5f40bacb5ce02edb20595b214` |
 
-**What is left: P3 (residency/eviction -- OPENED 2026-11-11: the store is now a real allocator and the plan is
-staged in `IMPLEMENTATION.md` P3.0), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
+**What is left: P3 (residency/eviction -- OPENED 2026-11-11: the store is a real allocator, the arena arm is wired but
+**not yet serving** and has an open unbounded-allocation bug; see `IMPLEMENTATION.md` P3.0), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
 (gate + promotion)**, plus the two owed probes (`15` touch distance, `16` reclamation under pressure).  A run in
 this phase is an **ALL-RESIDENT arm or a static hot subset**; the census says so, every time.
 

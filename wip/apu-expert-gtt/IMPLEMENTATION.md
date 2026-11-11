@@ -216,8 +216,21 @@ path's own vocabulary that is `--host-experts pool` with the pool replaced by th
 | stage | what | verify |
 |---|---|---|
 | **P3a-1** (DONE 2026-11-11) | the GTT store becomes a real allocator: first-fit over a sorted, coalesced free list (`reserve`/`release`/`largest_free`), replacing the bump pointer; the all-resident carve keeps working | P2's arms unchanged: text `627b2ebd7792` / `f586785d7183`, same carves, no faults |
-| **P3a-2** | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (bypassing the slab requirement, which this tier does not use) | a fitting model runs with **the arena in the GTT store**: same text, and `arena=` in the census equals the resident bytes |
-| **P3a-3** | the loader places the expert tensors as **holes in the model mapping** in this mode (a device-carrying buft that allocates nothing, i.e. `ROCm_HostMap` extended to the APU), and registers their file source, so the cache serves every read | same text again, and the model mapping is the only backing for the non-resident experts |
+| **P3a-2** ⚠ | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (no slab) -- **all LANDED 2026-11-11, but the tier registers no tables yet** (`tables=0`), so the arena is not yet serving anything | ✗ a fitting model runs with the arena: **the text arm passes but proves nothing** (the ops still read their own buffer). Required: the census's `tables=`/`arena=` are non-zero |
+| **P3a-3** ⚠ | the loader places the expert tensors as **holes in the model mapping** (`ROCm_HostMap` on the APU when the arena tier is on -- `host_master_mapped` in `llama-model.cpp` does the placement) -- **LANDED** | ✗ unverified for the same reason; and see the memory explosion below |
+
+> **OPEN BUG (2026-11-11): arena mode can allocate without bound.**  One arm took this 123 GiB box to
+> full-memory + swap twice.  The first was the full-set forced arm, and it is now prevented by construction (the
+> identity-mirror guard: on this tier the master is pageable, so mirroring a whole table into the arena is
+> `n_experts` pageable H2Ds -- and the fitting band does not need the arena at all).  The second happened in a
+> `-lv 4` census arm with a **partial** arena (`-lme 4`), *inside* a `MemoryMax=48G` cgroup, so the cause is not
+> cgroup-charged anon alone.  Suspects, in order: the pageable-master fill path's runtime staging, the prefill
+> staging ring (`span_buf_ensure`), and the heat/ghost mirrors.  **`MOE_EXPERT_GTT_ARENA` is therefore default-OFF
+> and the modal arena branch is only reachable for a set that does not fit**; a text arm alone must not be used to
+> argue the tier works.  Containment recipe for the next session: run every arena arm under
+> `systemd-run --user --scope -p MemoryMax=32G -p MemorySwapMax=4G` and watch `free -g` -- a cgroup bounded the
+> *earlier* probe-16 work fine, so an uncatchable explosion points at memory that is not charged to the scope.
+
 | **P3b** | `-lme` smaller than the set: evictions, fills, the hit-rate census, and the transient band only if the measured admission policy wants it | a **>RAM model runs**: census shows evictions > 0, unregisters == 0, byte-identical text against the fitting arm |
 | **P3c** | the nextn tables pinned outside `-lme` | the head's 3 tables are resident in every arm, and `-lme N` arithmetic excludes them |
 
