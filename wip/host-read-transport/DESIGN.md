@@ -1,4 +1,4 @@
-# DESIGN — an adaptive host-read transport (`MOE_HOST_POOL_TRANSPORT=auto`)
+# DESIGN — an adaptive host-read transport (`--load-mode`, `MOE_HOST_POOL_TRANSPORT`)
 
 **Status: designed + prototyped (2026-11-11), WIP. `0002-adaptive-host-read-transport.patch`, built and
 exercised; nothing in `patches/`, no gate run.**
@@ -13,117 +13,104 @@ The campaign measured a **crossover**, not a winner (`README.md` §Experiment 1,
 | no (4G cgroup, 8 GiB set) | 1 050 / 1 132 | 2 240 / 2 580 | 2 125 |
 | no (1G cgroup) | **593 / 596** | 1 737 / 1 720 | **2 127** |
 
-And today the arm is a **guess**: `pool_decide_dio_locked` reads `MemAvailable` once, at the first pool build,
-and compares it with pool + host set. `MemAvailable` is **host-wide** — inside a memory cgroup it answers about
-RAM the process cannot use (`wip/host-expert-coverage/`) — and the state it predicts can change under a long
-run. When the guess says "fits" and the cache cannot hold the set, the buffered arm is the mapping, which is
-the sub-100-MB/s collapse the maintainer hit.
+Today the arm is a **guess**: `pool_decide_dio_locked` reads `MemAvailable` once, at the first pool build, and
+compares it with pool + host set. `MemAvailable` is host-wide (wrong inside a cgroup) and the state it predicts
+changes during a long run. When the guess says "fits" and the cache cannot hold the set, the buffered arm is the
+mapping — the sub-100-MB/s collapse the maintainer hit.
 
-**Replace the guess with a capacity measurement, and keep measuring while the run goes.**
+The safety property that lets us switch **during** a run: all three transports read the same page-cache pages into
+the same buffer, and greedy text is byte-identical on every arm (`de81b28cab7d`). A transport change can only
+change timing. That must stay true: no arm may change the bytes, the length or the destination offset of a read.
 
-## The safety property that makes a LIVE switch acceptable
+## The load modes and the transport
 
-All three transports read the same page-cache pages into the same buffer, and the campaign proves byte-identical
-text for every combination (`de81b28cab7d`, 144 chars — re-verified on the adaptive build, including a run that
-switches). A transport change therefore **cannot change output**, only timing. Without that, a mid-run switch
-would be unacceptable; with it, the transport is a scheduling decision like a cache policy. This must stay true:
-no transport may change the bytes, the length, or the destination offset of a read (the r261 slice read already
-fixed the per-arm length semantics).
+`--load-mode` is the operator's caching decision, so it now names the transport too. `buffered` is **new**: a
+mapped master whose host reads are buffered `pread`s — the combination that used to be unrepresentable, because
+r212 welded the fill transport to `--load-mode` so only `dio` ever got a non-mapping read.
 
-## State and switch mechanics
+| `--load-mode` | master | host-read transport | adaptive? |
+|---|---|---|---|
+| `auto` (default) | mmap | **adaptive** (starts on the mapping) | **yes** |
+| `mmap` | mmap | mapping (`memcpy` out of the page cache) | locked |
+| `buffered` **(new)** | mmap | buffered `pread` per expert | locked |
+| `dio` | O_DIRECT | O_DIRECT | locked |
+| `mmap+mlock` / `mlock` / `none` | as today | mapping (out of a resident master) | locked |
 
-```
-transport ∈ { MAP, FILE, DIO }
-g_pool_dio                    = (transport == DIO)
-g_pool_{fill,demand}_src_file = (transport >= FILE)
-```
+Explicit modes **lock** the transport; only `auto` falls back. `MOE_HOST_POOL_TRANSPORT=map|file|dio` and the
+legacy `MOE_HOST_POOL_DIO=0|1` still override (an A/B or a bisect must be the arm it names), and a library
+consumer that never calls the loader's transport hook keeps the delivered heuristic.
 
-The existing branches (`stage_span_fill`, the staging path, `pool_mirror_bulk_fill_locked`, `expert_host_src`,
-`pool_fill_slot_locked`) already select on those globals, so a switch is one assignment — plus the part that
-bites: **the `O_DIRECT` bit lives in the open flags** (`pool_open_file(path, dio)`), so a switch must close the
-pool's fd and every `table_t::src_fd` first (`pool_transport_reopen_locked`). Everything runs under `g_mutex`,
-and every host read is synchronous, so no read can straddle a switch.
+## 1. Start optimistically
 
-## 1. The initial arm: a CAPACITY test, not a rate
+`auto` always starts on the **mapping**: it is the fastest arm whenever the page cache holds the set (17 GiB/s
+random warm against 7 for a buffered read), it is what every delivered run does today, and being wrong costs one
+probe cadence (128 fills). No capacity prior selects the arm.
 
-`pool_available_ram_bytes()` becomes **cgroup-aware** (Linux): take the smaller of `/proc/meminfo`'s
-`MemAvailable` and the process's own cgroup (`/proc/self/cgroup` → `memory.max − memory.current`). Then the
-delivered test (`planned pool + host set > available`) finally means what it says inside a container or a
-systemd scope:
+The cgroup-aware `pool_available_ram_bytes()` (`min(MemAvailable, cgroup memory.max − memory.current)`) stays, but
+as the **root-cause fix for the pinned-pool RAM ceiling**, which had the same host-wide bug — not as a transport
+selector.
 
-* **fits** → `MAP` (the fast arm when warm: 17 GiB/s random against 7 for a buffered read)
-* **tight** → `FILE` (the general-purpose baseline: it degrades gracefully, 2.6 → 1.7 GB/s, where the mapping
-  falls 3.0 → 0.6 GB/s)
-* the monitor may escalate from either of them (`>= FILE` → `DIO`).
+## 2. Two relative triggers — no MiB/s, no ms, nothing box-specific
 
-### Why the arm is NOT chosen by a probe rate (measured, not assumed)
+**Stall detection.** A read that took `TR_STALL_K` times this arm's own running mean, `TR_STALL_N` times running,
+escalates at once. This is the "the fill blocked on a fault storm while its neighbours were fine" case, and it
+fires inside one ubatch.
 
-A cold probe is impossible in-process: `posix_fadvise(DONTNEED)` **skips pages the process has mapped** (the
-probe then reported 32 452 MiB/s, i.e. straight out of the page cache), and `madvise(MADV_DONTNEED)` drops the
-PTEs but not the page-cache pages. A *warm* probe measures the cache, not the transport. And even a honest cold
-ranking is the wrong question: the mapping's advantage is the warm case, so a cold-rate ranking picks O_DIRECT on
-every box, RAM-rich ones included. **Capacity decides MAP-vs-disk; runtime evidence decides everything after.**
+**The probe-fill A/B.** Every `TR_PROBE_FILLS` fills, the **next arm serves that fill instead**. The bytes are
+identical, so the pool contents are identical either way, and the sample costs **no extra I/O** — it is a fill
+that had to happen. That makes it an exact A/B: two latencies for the same bytes, on the same box, in the same
+cache state, at the same moment. `TR_PROBE_N` consecutive wins by `TR_PROBE_GAIN` latch the next step of the
+ladder (`map → file → dio`). The probe runs on the demand/bounce path too, because on a `-sm tensor` split that
+read is 54 % of a decode step (r261).
 
-## 2. The runtime monitor: escalation on evidence
+Why a probe rather than an ahead-of-time calibration: a cold probe **cannot** be made honest in-process —
+`posix_fadvise(DONTNEED)` skips pages the process has mapped (the probe then read 32 452 MiB/s, i.e. straight out
+of the cache) and `madvise(MADV_DONTNEED)` drops the PTEs but not the page cache. And a cold-rate ranking is the
+wrong question anyway: the mapping's advantage is the warm case, so it would pick O_DIRECT on every box.
 
-Every host read reports `(bytes, µs)` — the pool fill (through a wrapper around `pool_fill_slot_locked`) and the
-bounce/demand read (the dominant host cost on a tensor split: r261 measured 54 % of a decode step). Two triggers:
+## 3. One way, deliberately
 
-1. **A slow-read guard.** `N` consecutive reads (default 8) longer than `MOE_HOST_POOL_TR_SLOW_MS` (default
-   40 ms ≈ 15 MiB/s for a 0.6 MiB expert) escalate immediately — the maintainer's "the fill took far too long"
-   case, inside one ubatch.
-2. **An epoch rate check.** Every `MOE_HOST_POOL_TR_EPOCH_MIB` (default 64 MiB) of reads, compare this arm's
-   throughput with **the best rate this arm itself achieved in this run**. Below `MOE_HOST_POOL_TR_RATIO`
-   (default 0.50) for **two consecutive epochs** → escalate.
+Escalation never reverses inside a run. This is a **decision**, not a gap: a box that fell short once is likely to
+again, and the page cache a reverse switch would go on to rebuild may itself be what caused the shortfall — so a
+slower consistent point beats a flapping optimum. A reverse direction is a possible later **opt-in**; it needs a
+window measured in minutes and a hysteresis argument that does not exist yet.
 
-The reference is *relative on purpose*: a slow box and a fast box both work, and a merely cold start never fires
-it. Two consecutive epochs is not caution theatre — measured: a warm map arm dipped 16 444 → 9 624 MiB/s for one
-epoch and a single-epoch rule switched a RAM-rich box off the mapping, which is the arm it wants.
-
-Escalation is one way (`MAP → FILE → DIO`), with two epochs of warm-up after a switch, one INFO line per
-transition (arm, observed rate, reference, trigger), and `DIO` as the terminal safe baseline (it does not depend
-on the page cache at all, and on Linux it was the fastest arm under the hardest pressure).
-
-**Owed: de-escalation.** A cache that frees up again (a job finishes) currently keeps the escalated arm. It needs
-a much longer window (minutes) than escalation and it is what makes `auto` symmetric; it is not in `0002`.
-
-## 3. Controls (pinning, never enabling)
+## 4. Controls (pinning, never enabling)
 
 | knob | class | meaning |
 |---|---|---|
-| `MOE_HOST_POOL_TRANSPORT=auto` | the proposed default (after gating) | capacity prior + runtime monitor |
-| `MOE_HOST_POOL_TRANSPORT=map\|file\|dio` | diagnostic / A/B | pin one arm (no monitoring) |
-| `MOE_HOST_POOL_DIO=0\|1` | legacy, kept | the delivered knob; still honoured when TRANSPORT is unset |
-| `MOE_HOST_POOL_{FILL,DEMAND}_SRC` | campaign instrument (`0001`) | the static two-way split; not proposed |
-| `MOE_HOST_POOL_TR_{EPOCH_MIB,RATIO,SLOW_MS,SLOW_N}` | tuning | thresholds above |
-| `MOE_HOST_POOL_TR_START` | **campaign only** | start on a named arm (the only way to stage an escalation test) |
+| `--load-mode auto` | the adaptive arm (default) | optimistic start + stall/probe monitor |
+| `--load-mode mmap\|buffered\|dio` | pin | lock the transport |
+| `MOE_HOST_POOL_TRANSPORT=map\|file\|dio\|auto` | override / A/B | wins over `--load-mode` |
+| `MOE_HOST_POOL_DIO=0\|1` | legacy override | still honoured; maps onto `file`/`dio` |
+| `MOE_HOST_POOL_TR_{STALL_K,STALL_N,PROBE_FILLS,PROBE_GAIN,PROBE_N}` | tuning | dimensionless thresholds only |
+| `MOE_HOST_POOL_TR_START` | **campaign only** | start on a named arm (staging an escalation test) |
 
-## 4. What the prototype established (2026-11-11, `0002`)
+## 5. What the prototype established
 
 | check | result |
 |---|---|
-| text across `map` / `file` / `dio` / `auto` | **identical**, `144 chars sha=de81b28cab7d` |
-| text across a run that SWITCHES | identical (the escalation run hashes the same) |
-| 32G cgroup, `auto` | starts on **`file`** (`capacity prior: the set cannot be cached (cgroup-aware …)`) |
-| plain run (91 GiB host), `auto` | starts on **`map`** and stays there |
-| escalation | `map -> file (epoch rate 9252 MiB/s < 0.50x this arm's own 21185 MiB/s for 2 epochs)`, fds reopened, no fault |
-| cold probe | **not possible in-process** (above) — so no rate-based selection |
+| text, `mmap` / `buffered` / `auto` / `dio`, and the static four-way instrument | **identical**, `144 chars sha=de81b28cab7d` |
+| `--load-mode buffered` | `host read transport -> file (pinned by --load-mode)` |
+| `--load-mode mmap` | `-> map (pinned by --load-mode)` |
+| `--load-mode auto` | `-> map (optimistic start …)` |
+| `--load-mode dio` + a pool | unchanged: `NOT APPLIED: a pool needs a mapped load` |
+| probe A/B inside a 32G scope | latched on evidence: `map -> file (probe fill: file served the same read in 33 us against this arm's 50 us, 3 samples running)` |
+| the removed absolute floor / epoch-rate rule | both fired wrongly (a warm box switched off the mapping after one 16 444 → 9 624 MiB/s epoch), which is why they are gone |
 
-## 5. Still owed before this ships
+## 6. Owed before this ships
 
-1. **De-escalation** (above) — otherwise `auto` is one-way.
-2. **Threshold calibration from the interleaved A/B.** 0.50 and two epochs are *reasoned*, not tuned: the
-   interleaved two-direction arm matrix (44G/32G, transport × span) is what should set them.
-3. **A gate that proves the ladder is not vacuous**: a `gate-host-pool.sh` arm at a cache-starved cgroup that
-   must log a transition, with N > 0 reads on each arm, plus the pinned arms for text identity. TODO #306's
-   original second condition — "a cell that varies the transport and `STAGE_SPAN` together" — is still unmet and
-   must stay: a `FILE` transport with `MOE_HOST_POOL_STAGE_SPAN=0` is the measured −41 % pair, so `auto` must
-   refuse that combination (force the span on, or fall back to `MAP`).
-4. **The decode ladder** (`benchmarks/mtp-adaptive-methodology.md`, `llama-batched-bench -npl 1,4,8`): this
+1. **The gate.** A `gate-host-pool.sh` arm at a cache-starved cgroup that must log a transition with N > 0
+   reads on each arm (proving the ladder is not vacuous), the three pinned arms for text identity, and TODO
+   #306's original condition — a cell varying the transport **and** `MOE_HOST_POOL_STAGE_SPAN` together, since a
+   `FILE` transport with the span off is the measured −41 % pair (`auto` must force the span on, or drop to the
+   mapping).
+2. **The interleaved two-direction A/B** (ABBA, 44G/32G, transport × span) to set `TR_PROBE_*` from measurement
+   rather than reasoning; the 44G band is ±25 %, so single-pass arms cannot set them.
+3. **The decode ladder** (`benchmarks/mtp-adaptive-methodology.md`, `llama-batched-bench -npl 1,4,8`): this
    touches the decode path of every pool user.
-5. **Windows.** The buffered arm there is `ReadFile`; the direct arm is `FILE_FLAG_NO_BUFFERING`. The reporter
-   measured them within ~15 % (616-1 114 vs 638 MiB/s), so the ladder mostly does not matter there — but the
-   WDDM/aperture behaviour (issue #278) means `DIO` must not be assumed safe until measured, and the Windows
-   capacity test already uses `GlobalMemoryStatusEx` (no cgroup equivalent). `MOE_HOST_POOL_TRANSPORT` pins it.
-6. **Attribution.** A benchmark that escalates mid-run is not a reproducible number. Every transition is logged
-   for that reason; a measurement arm must pin the transport.
+4. **Windows.** The buffered arm there is `ReadFile`, the direct arm `FILE_FLAG_NO_BUFFERING`; the reporter
+   measured them within ~15 % (616-1 114 vs 638 MiB/s), and the capacity test uses `GlobalMemoryStatusEx` (no
+   cgroup). `--load-mode` pins it, but neither arm has been measured in this form.
+5. **Attribution.** A benchmark that latches mid-run is not reproducible; every transition is logged for that
+   reason, and a measurement arm must pin the transport.

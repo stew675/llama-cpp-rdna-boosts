@@ -107,14 +107,24 @@ is the pressure knob.
 
 ## The adaptive arm (`0002`, `DESIGN.md`)
 
-`MOE_HOST_POOL_TRANSPORT=auto` replaces the `MemAvailable` guess with a **cgroup-aware capacity prior**
-(`min(MemAvailable, cgroup memory.max - memory.current)`): the set fits → `map`; it does not → `file`. A runtime
-monitor then escalates `file → dio` (or `map → file → dio`) on evidence: a slow-read guard, or two consecutive
-epochs below 0.50x the best rate that same arm achieved in the run. **Text is identical across all four arms and
-across a run that switches** (`de81b28cab7d`). Prototyped and exercised on this box; a 32G scope starts on
-`file`, a plain run starts on `map`, and an escalation fired live. A cold calibration probe is **impossible
-in-process** (measured: `fadvise` skips mapped pages, `madvise` drops the PTEs but not the cache), which is why
-capacity — not a probe rate — picks the map-vs-disk arm.
+`--load-mode` now names the transport as well as the master: `mmap` / `buffered` (**new**) / `dio` **lock** the
+arm, and `auto` (the default) **starts optimistically on the mapping** and falls down the ladder on evidence.
+Two triggers, both dimensionless — **no MiB/s and no millisecond anywhere**:
+
+* **stall**: a read over `TR_STALL_K` (4x) this arm's own running mean, `TR_STALL_N` times running;
+* **probe-fill A/B**: every `TR_PROBE_FILLS` (128) fills, the **next** arm serves that fill instead. Same bytes,
+  so it costs no extra I/O — it is a fill that had to happen — and it compares two latencies for the same bytes
+  in the same cache state at the same moment. Three consecutive wins by 1.5x latch the next step.
+
+**One way is the decision**, not a gap: a box that fell short once is likely to again, and rebuilding the page
+cache may itself be what shortens it, so a slower consistent point beats a flapping optimum. A reverse direction
+is a possible later opt-in. The cgroup-aware `pool_available_ram_bytes()` stays as the root-cause fix for the
+pinned-pool RAM ceiling, not as a transport selector.
+
+Measured: text `de81b28cab7d` for `mmap` / `buffered` / `auto` and the static four-way instrument; `buffered` logs
+`-> file (pinned by --load-mode)`, `mmap` logs `-> map`, `auto` logs `-> map (optimistic start)`; inside a 32G
+scope `auto` latches with `map -> file (probe fill: file served the same read in 33 us against this arm's 50 us,
+3 samples running)`.
 
 ## Owed before anything is promoted
 
