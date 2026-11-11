@@ -7,14 +7,15 @@ GTT store itself, built and measured) are DONE; nothing in `patches/`, nothing a
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `0738f3f3…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `29418b02…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `4057bef77e4ac57178bd09ca4e2d0153a011f3cbd9d9162c85d94bf7ee12b47b` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `fca915ce92f22b485126a357e6d2cb4917f75b514224b4fab750d4e950ab33c5` |
 
-**What is left: P3 (residency/eviction), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
+**What is left: P3 (residency/eviction -- OPENED 2026-11-11: the store is now a real allocator and the plan is
+staged in `IMPLEMENTATION.md` P3.0), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
 (gate + promotion)**, plus the two owed probes (`15` touch distance, `16` reclamation under pressure).  A run in
 this phase is an **ALL-RESIDENT arm or a static hot subset**; the census says so, every time.
 
@@ -142,7 +143,7 @@ Two probes are still owed, and neither blocks the design's memory:
 
 ### P1.1 + P2 -- the GTT store exists and is measured (BUILT 2026-11-11; `MEASUREMENTS.md` §14)
 
-The patch is [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) (sha256 in the status header above).  What
+The patch is [`gtt-expert-store.patch`](gtt-expert-store.patch) (sha256 in the status header above).  What
 landed, and the number that says it works:
 
 | what | where | measured |
@@ -244,7 +245,7 @@ slot/remap indirection (`g_dr_key_to_id`, `moe_cache_remap`), the per-layer acce
   in place with no new dispatch and no new op;
 * the fill: `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) retargeted to the two arms of §3.1.
 
-**What P1.1 + P2 actually landed (2026-11-11, `p2-gtt-expert-store.patch`), so a later reader does not have to
+**What P1.1 + P2 actually landed (2026-11-11, `gtt-expert-store.patch`), so a later reader does not have to
 re-derive the shape from the plan above:**
 
 | file | what is in it |
@@ -503,7 +504,7 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 | `README.md` | this file: the shape, what it replaced, the measured foundation, the step/prefill protocol, the code map, the traps |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | the phased plan: P1.0 keystone probes, the GTT store, residency/eviction, the fills, prefill streaming, preflight/fit, the gate spec, docs, effort, rollback |
 | [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration, §14 the same-day P1.1+P2 record (keystone re-run, registration cost at real extent, the fill rates, the `-lme` arms, the read-rate A/B) |
-| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 as ONE patch cut against the `release.json` tree `86389e4a…` (`git am`; sha256 in the status header) |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 as ONE patch cut against the `release.json` tree `86389e4a…` (`git am`; sha256 in the status header) |
 | [`arms.sh`](arms.sh) | the P1.1+P2 arms: `text` (same-seed greedy, no `-lv`), `census` (`-lv 4`), `rate` (`llama-bench`, the ReadOnly/writable/absent A/B), plus the GPU-fault scan.  `TREE=~/llama-scratch ./arms.sh all` |
 | [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); probes 15 (touch distance) and 16 (reclamation under pressure) still owed |
 | [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md) | the cold-start prompt that drove the P1.1/P2 session (what it is, the numbers not to contradict, the definition of done).  It is now a **record**, not the current prompt: the next session starts from `IMPLEMENTATION.md` P3 |

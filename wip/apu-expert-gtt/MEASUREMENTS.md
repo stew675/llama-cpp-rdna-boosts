@@ -319,7 +319,7 @@ on disk for free.
 ## 14. 2026-11-11 — the GTT store EXISTS (P1.1 + P2): the keystone re-run, and what the registered region costs and reads at real scale
 
 The design's memory was answered in §13.  This section is the same box measuring the **implemented** GTT store
-(`p2-gtt-expert-store.patch`, `README.md` §2.1): the keystone re-run first (because a design premise that no
+(`gtt-expert-store.patch`, `README.md` §2.1): the keystone re-run first (because a design premise that no
 longer holds changes everything), then the numbers only an implementation can give — the registration cost of a
 real 19-41 GiB region, the load-time fill rate, and the model-level read-rate A/B the flag exists for.
 

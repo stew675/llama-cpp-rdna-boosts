@@ -57,7 +57,7 @@ region's pages under real memory pressure.  Probe `09` only shows that a *user-i
 
 ## P1 — preflight, detection and **`-lme`** sizing (the gate becomes a policy)
 
-> **STATUS 2026-11-11: P1.1 and P1.2 are BUILT** (`p2-gtt-expert-store.patch`, `MEASUREMENTS.md` §14).  What the
+> **STATUS 2026-11-11: P1.1 and P1.2 are BUILT** (`gtt-expert-store.patch`, `MEASUREMENTS.md` §14).  What the
 > accept criteria measured: `MOE_EXPERT_GTT=0` reproduces today's log byte for byte and the same text;
 > `-lme 6` realises **exactly 6 144.0 MiB** and the census names the source; `auto` in the fitting band is the
 > whole set with zero evictions (and says so) and with `MOE_HOST_LIMIT_FRAC=5` it is a bounded hot subset
@@ -178,6 +178,48 @@ the same model; no fault.
 > **The nextn (MTP) head's tables are pinned in the GTT store and are NOT counted against `-lme N`** (same decision):
 > the head is metadata overhead, read every draft step.  P2 still counts them (README §7 Q10); P3 is where the
 > accounting moves, because that is where "pinned" first means something.
+
+### P3.0 — the seams, read before writing anything (2026-11-11)
+
+Four findings from reading `moe-expert-cache.cu` against the store.  They fix the shape of P3, and three of them
+**simplify** the plan:
+
+1. **The device-path interception already exists.**  `ggml_cuda_mul_mat_id()` (`ggml-cuda.cu:6471`) asks
+   `moe_cache_get_table(dst, src0, ...)` at its entry and, on a hit, re-dispatches with `src0c.data = arena` and
+   the slot-remapped ids.  So a table whose arena is the GTT store needs **no new op, no dispatch change and no
+   copy**: the redirect is base-pointer-only.  Its lookup even has a semantic fallback
+   (`(layer, role, device)`), which is what lets a table be found when the scheduler never aliased it -- the exact
+   situation on an APU, where the expert weight is not a host-buft input.
+2. **`access_locked()` is the whole residency policy and it is reusable as-is.**  Hit → `arena + slot*stride`;
+   free slot → take it; full → **LFRU victim** (smallest decaying count, tie → oldest use) with the optional
+   `admit=value|touch` doorkeeper.  It is exactly the design's §3 step, already written and measured on the
+   discrete boxes.
+3. **The transient band is NOT needed for the core loop** (and §5.1's rationale does not survive here).
+   `access_locked` only *rejects* a miss when a cold path exists (`cold_ok`, i.e. `MOE_EXPERT_CACHE_COLD_UVA` +
+   a UVA-dereferenceable master); with no cold path it says so in as many words -- "every mode fills and the
+   policy is a no-op".  On an APU the in-place cold read of a pageable mapping **is** the fault (no
+   `PageableMemoryAccess`, no XNACK), so `g_cold_uva` must be false for this tier and every miss evicts+fills.
+   That is P3a; the band (and with it Nth-touch admission) becomes a P3b refinement, priced against a measured
+   hit-rate loss rather than assumed.
+4. **The source of truth on an APU is the model mapping, not a pinned master.**  `fill_slot_from_host()` →
+   `expert_host_src()` resolves a `table_t` master with `t.host`/`host_bytes`/`src_off`; a pageable master is
+   copied with `cudaMemcpyAsync(H2D)`, which is the delivery's known-bad path on RDNA.  So the APU arm must fill
+   from the **mapping with a plain host `memcpy` into the registered slot** (the measured warm arm, 12.8 GB/s;
+   a cold page faults the mapping in, which is the §3.1 "cold" arm).  That is the whole fill change.
+
+So P3 is: **the store is the arena, the model mapping is the master, the cache is the policy.**  In the discrete
+path's own vocabulary that is `--host-experts pool` with the pool replaced by the GTT store and no pinned master
+-- which is precisely what this campaign set out to be.
+
+**Stages, each independently verifiable:**
+
+| stage | what | verify |
+|---|---|---|
+| **P3a-1** (DONE 2026-11-11) | the GTT store becomes a real allocator: first-fit over a sorted, coalesced free list (`reserve`/`release`/`largest_free`), replacing the bump pointer; the all-resident carve keeps working | P2's arms unchanged: text `627b2ebd7792` / `f586785d7183`, same carves, no faults |
+| **P3a-2** | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (bypassing the slab requirement, which this tier does not use) | a fitting model runs with **the arena in the GTT store**: same text, and `arena=` in the census equals the resident bytes |
+| **P3a-3** | the loader places the expert tensors as **holes in the model mapping** in this mode (a device-carrying buft that allocates nothing, i.e. `ROCm_HostMap` extended to the APU), and registers their file source, so the cache serves every read | same text again, and the model mapping is the only backing for the non-resident experts |
+| **P3b** | `-lme` smaller than the set: evictions, fills, the hit-rate census, and the transient band only if the measured admission policy wants it | a **>RAM model runs**: census shows evictions > 0, unregisters == 0, byte-identical text against the fitting arm |
+| **P3c** | the nextn tables pinned outside `-lme` | the head's 3 tables are resident in every arm, and `-lme N` arithmetic excludes them |
 
 Reuse, do not rebuild: the heat table and its MHT2 prior (`apply_heat_seed_locked`), the slot/remap
 indirection (`g_dr_key_to_id`, `moe_cache_remap`), and `access_locked()` (`moe-expert-cache.cu:3495`) as the

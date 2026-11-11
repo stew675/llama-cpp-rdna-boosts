@@ -1,4 +1,4 @@
-From 1ed262a3fde7a8e30f1695a364ed5d98399139b3 Mon Sep 17 00:00:00 2001
+From e1811d8e5349093ebf96ae12f4a67e8147c62232 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 -- a mlocked GTT expert store
@@ -42,14 +42,14 @@ four arms pass under ulimit -l 8192 (decline, refuse, kill switch); check-gpu-fa
 ---
  common/arg.cpp                          |  30 +-
  ggml/include/ggml-backend.h             |  16 +
- ggml/src/ggml-backend-impl.h            |  24 ++
- ggml/src/ggml-backend.cpp               |  22 ++
- ggml/src/ggml-cuda/ggml-cuda.cu         | 205 ++++++++++
- ggml/src/ggml-cuda/gtt-expert-store.cu  | 493 ++++++++++++++++++++++++
- ggml/src/ggml-cuda/gtt-expert-store.cuh |  74 ++++
- src/llama-model-loader.cpp              | 381 +++++++++++++++++-
- src/llama-model-loader.h                |  23 ++
- 9 files changed, 1252 insertions(+), 16 deletions(-)
+ ggml/src/ggml-backend-impl.h            |  24 +
+ ggml/src/ggml-backend.cpp               |  22 +
+ ggml/src/ggml-cuda/ggml-cuda.cu         | 205 ++++++++
+ ggml/src/ggml-cuda/gtt-expert-store.cu  | 595 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/gtt-expert-store.cuh |  85 ++++
+ src/llama-model-loader.cpp              | 381 ++++++++++++++-
+ src/llama-model-loader.h                |  23 +
+ 9 files changed, 1365 insertions(+), 16 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -449,10 +449,10 @@ index bf574ecf9..6eb2177e8 100644
  // backend reg
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cu b/ggml/src/ggml-cuda/gtt-expert-store.cu
 new file mode 100644
-index 000000000..5f49f3f62
+index 000000000..685d27d09
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cu
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,595 @@
 +// wip/apu-expert-gtt P2: the GTT expert store's region.  See `gtt-expert-store.cuh` for the design and the
 +// measurements it rests on; the buffer type that carves tensors out of this region lives in `ggml-cuda.cu`.
 +//
@@ -475,6 +475,7 @@ index 000000000..5f49f3f62
 +#include <cstring>
 +#include <ctime>
 +#include <mutex>
++#include <vector>
 +
 +#if !defined(_WIN32)
 +#include <sys/mman.h>
@@ -482,6 +483,11 @@ index 000000000..5f49f3f62
 +#include <unistd.h>
 +#include <cerrno>
 +#endif
++
++struct gtt_block_t {
++    size_t off;
++    size_t len;
++};
 +
 +// One GTT store per device.  A `-sm tensor` split over several APUs would open one per device; gfx1151 is one
 +// device here, and the plan only ever asks the device it found.
@@ -492,7 +498,11 @@ index 000000000..5f49f3f62
 +    void *   base      = nullptr; // the region: host VA == device VA (asserted)
 +    size_t   created   = 0;       // the extent actually mapped and registered
 +    bool     ro        = false;   // registered ReadOnly
-+    size_t   used      = 0;       // bump watermark
++    size_t   used      = 0;       // bytes currently reserved (sum of live allocations)
++    // The free list: sorted, coalesced byte ranges of the region nobody holds.  Created as one range when the
++    // region is made; a reserve splits it, a release merges back.  The expert cache makes ~n_tables allocations
++    // of 100-450 MiB each, so a first-fit linear scan over a handful of ranges is the whole data structure.
++    std::vector<gtt_block_t> free_ranges;
 +    size_t   carve_min = 0;
 +    size_t   carve_max = 0;
 +    double   create_ms = 0.0;     // mmap + MADV_HUGEPAGE + the ONE registration + the mlock
@@ -653,6 +663,7 @@ index 000000000..5f49f3f62
 +    s.created = 0;
 +    s.used    = 0;
 +    s.locked  = 0;
++    s.free_ranges.clear();
 +    s.opened  = false;
 +}
 +
@@ -766,6 +777,8 @@ index 000000000..5f49f3f62
 +    s.base    = p;
 +    s.created = extent;
 +    s.used    = 0;
++    s.free_ranges.clear();
++    s.free_ranges.push_back(gtt_block_t{0, extent});
 +    static std::once_flag once_exit;
 +    std::call_once(once_exit, [] {
 +        // The registration is a HOLD (probe 09) and the hold outlives `cudaHostUnregister` while the VMA
@@ -807,6 +820,7 @@ index 000000000..5f49f3f62
 +    s.carve_min = 0;
 +    s.carve_max = 0;
 +    s.n_carves  = 0;
++    s.free_ranges.clear();
 +    snprintf(s.source, sizeof(s.source), "%s", source != nullptr ? source : "");
 +    // The region is created HERE, before a single expert tensor is placed, so a refusal is a clean decline
 +    // (the loader keeps today's placement) instead of a half-placed model.  A `--fit` / `--no-alloc` probe
@@ -823,7 +837,39 @@ index 000000000..5f49f3f62
 +// the bump allocator
 +// ---------------------------------------------------------------------------------------------------------
 +
-+void * ggml_cuda_gtt_store_carve(int device, size_t size) {
++// First fit over the free list.  `align` is a page: a GGUF expert slab is 0.45-0.92 MiB, so the padding costs
++// well under 1 %.  Caller holds the lock.
++static void * gtt_store_reserve_locked(gtt_store_t & s, size_t size, size_t align) {
++    if (size == 0 || s.base == nullptr) {
++        return nullptr;
++    }
++    for (size_t i = 0; i < s.free_ranges.size(); i++) {
++        const gtt_block_t r = s.free_ranges[i];
++        const size_t off = (r.off + align - 1) & ~(align - 1);
++        const size_t pad = off - r.off;
++        if (r.len < pad || size > r.len - pad) {
++            continue;
++        }
++        // Take [off, off + size): the head (if any) stays free, the tail (if any) stays free.
++        gtt_block_t head{r.off, pad};
++        gtt_block_t tail{off + size, r.len - pad - size};
++        s.free_ranges.erase(s.free_ranges.begin() + (long) i);
++        if (tail.len > 0) {
++            s.free_ranges.insert(s.free_ranges.begin() + (long) i, tail);
++        }
++        if (head.len > 0) {
++            s.free_ranges.insert(s.free_ranges.begin() + (long) i, head);
++        }
++        s.used += size;
++        s.carve_min = s.carve_min == 0 ? size : (size < s.carve_min ? size : s.carve_min);
++        s.carve_max = size > s.carve_max ? size : s.carve_max;
++        s.n_carves += 1;
++        return (char *) s.base + off;
++    }
++    return nullptr;
++}
++
++void * ggml_cuda_gtt_store_reserve(int device, size_t size) {
 +    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || size == 0) {
 +        return nullptr;
 +    }
@@ -832,20 +878,76 @@ index 000000000..5f49f3f62
 +    if (!s.opened || s.base == nullptr) {
 +        return nullptr;
 +    }
-+    const size_t align = 4096;   // a page: one GGUF expert slab is 0.45-0.92 MiB, so this costs < 1 %
-+    const size_t off   = (s.used + align - 1) & ~(align - 1);
-+    if (size > s.created || off > s.created - size) {
-+        GGML_LOG_ERROR("%s: device %d: a %.2f MiB carve does not fit the %.2f MiB GTT expert store (%.2f MiB used)\n",
-+                __func__, device, (double) size / 1048576.0, (double) s.created / 1048576.0,
-+                (double) s.used / 1048576.0);
-+        return nullptr;
++    void * p = gtt_store_reserve_locked(s, size, 4096);
++    if (p == nullptr && s.base != nullptr) {
++        size_t best = 0;   // NOT `ggml_cuda_gtt_store_largest_free()`: that takes this same lock
++        for (const auto & r : s.free_ranges) {
++            best = r.len > best ? r.len : best;
++        }
++        GGML_LOG_ERROR("%s: device %d: a %.2f MiB reserve does not fit the %.2f MiB GTT store (%.2f MiB held, "
++                       "largest free run %.2f MiB)\n", __func__, device, (double) size / 1048576.0,
++                       (double) s.created / 1048576.0, (double) s.used / 1048576.0, (double) best / 1048576.0);
 +    }
-+    void * p = (char *) s.base + off;
-+    s.used   = off + size;
-+    s.carve_min = s.carve_min == 0 ? size : (size < s.carve_min ? size : s.carve_min);
-+    s.carve_max = size > s.carve_max ? size : s.carve_max;
-+    s.n_carves += 1;
 +    return p;
++}
++
++void ggml_cuda_gtt_store_release(int device, void * p, size_t size) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || p == nullptr || size == 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_store_mutex);
++    gtt_store_t & s = g_stores[device];
++    if (!s.opened || s.base == nullptr) {
++        return;
++    }
++    const size_t off = (size_t) ((char *) p - (char *) s.base);
++    if (off >= s.created || size > s.created - off) {
++        GGML_LOG_ERROR("%s: device %d: release of %p + %.2f MiB is outside the GTT store\n", __func__, device,
++                       p, (double) size / 1048576.0);
++        return;
++    }
++    // Insert in offset order and coalesce with both neighbours (the list is sorted and disjoint by invariant).
++    size_t i = 0;
++    while (i < s.free_ranges.size() && s.free_ranges[i].off < off) {
++        i++;
++    }
++    // a double release would corrupt the list: refuse an overlap instead of coalescing garbage.
++    const bool overlaps = (i < s.free_ranges.size() && off + size > s.free_ranges[i].off) ||
++                          (i > 0 && s.free_ranges[i - 1].off + s.free_ranges[i - 1].len > off);
++    if (overlaps) {
++        GGML_LOG_ERROR("%s: device %d: release of %p + %.2f MiB overlaps a free range (double release?)\n",
++                       __func__, device, p, (double) size / 1048576.0);
++        return;
++    }
++    s.free_ranges.insert(s.free_ranges.begin() + (long) i, gtt_block_t{off, size});
++    s.used = s.used >= size ? s.used - size : 0;
++    i = 0;
++    while (i + 1 < s.free_ranges.size()) {
++        if (s.free_ranges[i].off + s.free_ranges[i].len == s.free_ranges[i + 1].off) {
++            s.free_ranges[i].len += s.free_ranges[i + 1].len;
++            s.free_ranges.erase(s.free_ranges.begin() + (long) (i + 1));
++        } else {
++            i++;
++        }
++    }
++}
++
++size_t ggml_cuda_gtt_store_largest_free(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return 0;
++    }
++    std::lock_guard<std::mutex> lock(g_store_mutex);
++    const gtt_store_t & s = g_stores[device];
++    size_t best = 0;
++    for (const auto & r : s.free_ranges) {
++        best = r.len > best ? r.len : best;
++    }
++    return best;
++}
++
++void * ggml_cuda_gtt_store_carve(int device, size_t size) {
++    // The ALL-RESIDENT placement arm: one allocation per load, never released.
++    return ggml_cuda_gtt_store_reserve(device, size);
 +}
 +
 +// ---------------------------------------------------------------------------------------------------------
@@ -948,10 +1050,10 @@ index 000000000..5f49f3f62
 +}
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cuh b/ggml/src/ggml-cuda/gtt-expert-store.cuh
 new file mode 100644
-index 000000000..9362af565
+index 000000000..1778bf18f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cuh
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,85 @@
 +// wip/apu-expert-gtt P2: the UMA **GTT expert store** -- one registered anonymous region that holds the
 +// resident MoE expert set, read in place by `MUL_MAT_ID`.
 +//
@@ -1015,9 +1117,20 @@ index 000000000..9362af565
 +// the platform cannot give it the one address the design needs.
 +bool ggml_cuda_gtt_store_open(int device, size_t extent_bytes, const char * source, char * err, size_t errn);
 +
-+// Carve `size` bytes out of the GTT store (bump allocator; page-aligned, monotonic).  NULL when the GTT store is not
-+// open or the request does not fit -- the caller then declines the tensor rather than over-committing.
++// Carve `size` bytes out of the GTT store (first fit; page-aligned; never released).  NULL when the GTT store is
++// not open or the request does not fit -- the caller then declines the tensor rather than over-committing.
++// This is the ALL-RESIDENT placement arm (P2): one carve per load, holding whole expert tensors.
++//
++// `reserve`/`release` are the ARENA arm (P3): the expert cache allocates a table's slot storage here at sizing
++// time and gives it back when the table stands down or its arena is evicted, so the region is a real allocator
++// and not a bump pointer.  Both arms share the one region, so a mode switch never needs a second reservation.
 +void * ggml_cuda_gtt_store_carve(int device, size_t size);
++void * ggml_cuda_gtt_store_reserve(int device, size_t size);
++void   ggml_cuda_gtt_store_release(int device, void * p, size_t size);
++
++// The largest single run still free (0 when the store is not open).  The cache's arena sizing asks this to
++// avoid a failed allocation, and the census prints it.
++size_t ggml_cuda_gtt_store_largest_free(int device);
 +
 +// The one `-lv 4` census line: extent requested vs realised, the budget source, the registration mode, the
 +// huge-page granularity, the slots and the bytes the loader read from the GGUF into the GTT store.
