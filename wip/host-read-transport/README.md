@@ -154,3 +154,39 @@ own measurement of the same run rather than against an assumption (`RESULTS.md` 
 | `transport-ab.py` | experiment 1: the transport in isolation, under a cgroup-shaped page-cache budget |
 | `text-ab.sh` | the four-arm text-identity check (greedy, hashed with `scripts/extract-generated.py`) |
 | `RESULTS.md` | the raw tables and the run directory names under `wip/bench-56gb/runs/` |
+
+## Close-out / handover (2026-11-11) — DONE AS WIP, awaiting a promote-or-park decision
+
+**Where it stands.** Everything below is proven on `soar`; nothing is in `patches/` and nothing is applied to the
+fork. `0001` (static instrument, inert by default) + `0002` (adaptive transport + `--load-mode buffered`) apply
+strictly to the r261 tip. Gate **24/24**. Greedy text identical on every arm (`de81b28cab7d`).
+
+**What the data says, in one paragraph.** On an unpressured box the three transports are *equal* end to end
+(decode 25.9-26.2 t/s; `dio` 11.2), so `auto` staying on the mapping costs nothing. Under starvation the mapping
+collapses (fills 1.5-1.6 GiB/s, decode **5.5-6.3 t/s**) while a buffered read holds **12.8-12.9 t/s** and
+O_DIRECT 11.3 — that is the maintainer's `<100 MB/s` complaint, reproduced and quantified. On width
+(`batched-bench npl 1/4/8`) a pinned `file` costs ~4 % at npl 1 and nothing at npl 8, and `auto` is neutral
+because it never latches there. So the change is **a win exactly where the page cache cannot hold the set and
+neutral everywhere else**, which is the shape a default-on change should have.
+
+**If you promote it (my recommendation):**
+1. Fold `0001` + `0002` into block 12 as one amendment (the fill/demand transport + `--load-mode buffered` +
+   the cgroup-aware ceiling), default `auto`.
+2. `ENVIRONMENT.md`: the six `MOE_HOST_POOL_TR_*` knobs and the load-mode table; `patches/README.md`: a block-12
+   note; `MANIFESTS.md`: `gate-host-read-transport.sh` into the per-block table.
+3. Move `gate-host-read-transport.sh` to `scripts/` (it is written against `wip/bench-56gb/ballast` for its
+   starving arms, so that path needs a home or the gate needs an in-gate ballast).
+4. Gates still owed by the contract: the **MTP four-axis** protocol and a **Windows-form** measurement. The
+   four-axis is the one I would not skip silently; it is ~30 min of runs on the 27B/35B and does not need new
+   hardware.
+5. Then the usual: `make-patches.sh`, `make-release.sh`, `validate-set.sh`, `fork-refresh.sh --build --gates`,
+   WORKLOG entry.
+
+**If you park it:** the campaign is self-contained — instrument, gate, both A/Bs, the mechanism record and the one
+bug the matrix caught. Nothing rots except the `optional/host-pool-fill-src/` artifact it supersedes (re-cut at
+r243, still applies, stale output tree recorded).
+
+**Not worth chasing now.** The probe's `TR_PROBE_GAIN` (1.5) / `TR_PROBE_GAIN_DIO` (3.0) are *reasoned*: the
+one-off runs meant to tune them were inconclusive because the box drifted (the same pinned arm read 12.8 t/s in
+the interleaved matrix and 11.3 ten minutes later). They are env knobs, they are documented, and the gate grades
+the outcome (decode within 5 % of the best pinned arm) rather than the thresholds — so this is tuning, not risk.

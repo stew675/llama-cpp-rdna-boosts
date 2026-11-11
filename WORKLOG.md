@@ -1,3 +1,43 @@
+## 261111.010 (wip, NO delivery change) -- `host-read-transport` closes as WIP: the adaptive transport is built and gated 24/24, `--load-mode buffered` exists, and the data says "win under pressure, neutral otherwise"
+
+**Campaign only** (no `patches/`, no `release.json`, nothing applied to the fork, no release gate owed).
+`TODO` #306's question was widened to "which transport serves a per-expert host read", built out, and stopped at
+the promote-or-park line: [`wip/host-read-transport/`](wip/host-read-transport/README.md) (README with the
+close-out, `DESIGN.md`, `RESULTS.md`, `gate-host-read-transport.sh`, the two patches, the ABBA script and the
+instrumented measurement tools).
+
+**What was built.** `--load-mode buffered` (a MAPPED master whose host reads are buffered `pread`s -- the
+combination r212 made unrepresentable, touching `include/llama.h`, `common/arg.cpp`, `src/llama.cpp`, the
+loader's `use_mmap` and transport hook, and llama-bench); an **adaptive `auto`** that starts optimistically on the
+mapping and falls down `map -> file -> dio` on two DIMENSIONLESS triggers (a stall at K x this arm's own running
+mean, and a probe-fill A/B where every Nth fill is served by the next arm -- same bytes, no extra I/O); a
+cgroup-aware `pool_available_ram_bytes()` (the root-cause fix for the pinned-pool ceiling, which had the same
+host-wide `MemAvailable` bug); and the span coupling ENFORCED (with `MOE_HOST_POOL_STAGE_SPAN=0` the buffered arm
+is refused and the ladder steps over it, so the measured -41 % pair is unreachable).  One way by decision: a box
+that fell short once is likely to again, and the page cache a reverse switch would rebuild may itself be the
+cause, so a slower consistent point beats a flapping optimum.
+
+**The numbers that decide it.** Gate **24/24** (7 text arms hashed with no `-lv`, 7 census arms at `-lv 4`, every
+arm proving its own transport through its own counters, the ladder proven to move under a starving cgroup, `auto`
+graded on decode throughput against the best pinned arm).  Text identical everywhere: `de81b28cab7d`.  Unpressured
+44G: map / file / auto all **25.9-26.2 t/s** decode, `dio` 11.2 -- so `auto` staying on the mapping costs
+nothing.  Starving 32G + ballast: mapping **5.5-6.3 t/s** with fills at 1.5-1.6 GiB/s, buffered **12.8-12.9**,
+`dio` 11.3, and `auto` reached `file` on the **stall** detector at 6.5 s.  `batched-bench -npl 1,4,8` on the
+cacheable 35B-A3B: map 63.72/186.52/276.84, file 61.30/183.93/276.72 (-3.8 % at npl 1, nothing at npl 8), `auto`
+neutral and never latching.
+
+**The bug the matrix caught** (the reason to run a real gate): the probe's cadence was gated on a counter
+incremented by the observe path a probe returns BEFORE, so once a probe succeeded every fill became a probe --
+42 746 probes serving 42 746 fills, and after the ladder reached `file` every probe was a `dio` read: 67 ms/token
+against 39.  Fixed by counting the cadence on the wrapper line itself; probes are 1 in 128 and cost 15-66 ms.
+
+**Owed, and deliberately NOT chased** (the maintainer's "pragmatic" call, same session): the probe thresholds are
+reasoned rather than tuned (the one-off runs were inconclusive because the box drifted -- the same pinned arm read
+12.8 t/s in the matrix and 11.3 ten minutes later; they are env knobs and the gate grades the outcome, so this is
+tuning, not risk), the MTP four-axis protocol has not been run (host-side change, no kernel or numerics), and no
+Windows-form measurement exists.  Promote-or-park is the maintainer's decision; the close-out section of the
+campaign README carries the checklist for both.
+
 ## 261111.009 (wip, NO delivery change) -- the per-expert host read transport is a CROSSOVER, not a preference: the mapping is the fastest arm while the page cache holds the set and collapses to ~600 MiB/s when it cannot (TODO #306, widened)
 
 **Campaign only** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  `TODO` #306's
