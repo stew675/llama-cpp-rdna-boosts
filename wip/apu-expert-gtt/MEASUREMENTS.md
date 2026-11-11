@@ -1,6 +1,8 @@
 # MEASUREMENTS — `wip/apu-expert-pool`
 
-Every number in [`README.md`](README.md) and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) comes from here.  Nothing
+Every number in [`README.md`](README.md) and [`IMPLEMENTATION.md`](IMPLEMENTATION.md) comes from here.
+(This file was written under the campaign's opening name `wip/apu-expert-pool/`; the campaign was renamed
+`wip/apu-expert-gtt/` on 2026-11-11 and its design replaced -- see `README.md` §1 and §13 below.)  Nothing
 below changed the fork or the delivery: all probes are standalone HIP/C programs under
 [`probe/`](probe/README.md), run as ordinary users.
 
@@ -191,3 +193,123 @@ So "fill in place, no flush" holds for both modes — which is what makes a host
 * The kernel *has* HMM (`hmm_range_fault` appears in the journal, reached from
   `amdgpu_amdkfd_restore_userptr_worker`) — that is the driver re-validating pinned userptr, **not** a GPU
   fault-retry path.
+
+---
+
+## 13. 2026-11-11 — the P1.0 probes (11-14) for the GTT expert store, and the expert-traffic concentration
+
+The 2026-11-09 sections above were written for the campaign's **first** design (a host pool + arena).  The
+design was replaced on 2026-11-11 (`README.md` §1) by a single registered anonymous **expert store**, and that
+design rests on four assumptions the ten probes above did not measure.  This section answers them.  Records are
+appended, not rewritten: §§0-12 stand as measured.
+
+Same box, same build line (`/opt/rocm-10.1.0-gfx1151`, HIP 7.16.26385, gfx1151, `iommu=off`).  Sources:
+`probe/11-thp-register.cpp`, `12-pread-registered.cpp`, `13-dma-from-mapped-file.cpp`,
+`14-expert-cost.cpp`; helpers `probe/gguf-expert-geom.py`, `probe/moe-heatmap-read.py`.
+
+### 13.1 Do THPs survive registration?  (`11-thp-register`, 1 GiB) — **YES**
+
+| step | AnonHugePages | Rss | Private_Dirty |
+|---|---|---|---|
+| anon `mmap` + `MADV_HUGEPAGE`, faulted in, not registered | **1024.0 MiB of 1024** | 1024.0 | 1024.0 |
+| `hipHostRegister(Mapped\|ReadOnly)` | **1024.0 MiB** (unchanged) | 1024.0 | 1024.0 |
+| after `hipHostUnregister` | 1024.0 MiB (unchanged) | 1024.0 | 1024.0 |
+
+* registration of a **pre-faulted** region: **17.4 ms/GiB** (61.7 GB/s); of an **untouched** region: 30.5 ms/GiB
+  (the later fault then still lands as huge pages: 1024.0 MiB).
+* GPU read of the registered region: **232.1 GB/s** (pre-faulted) / **227.3 GB/s** (registered then faulted).
+
+So the tier really is a huge-page tier, registration does **not** split it, and a 40 GiB store costs ~0.7 s of
+registration at load — not the 8.69 s §9 measured for registering a 46 GiB **file** mapping (that number
+included faulting the file in).
+
+### 13.2 `pread(O_DIRECT)` into a registered region, then a GPU read (`12-pread-registered`, 256 MiB) — **YES**, with one rule
+
+| arm | result |
+|---|---|
+| registered `Mapped\|ReadOnly`, pre-filled `0xAA` | CPU sum == GPU sum (45 634 027 520) |
+| `pread(O_DIRECT)` **into** the registered region | **accepted** (not `EINVAL`) — 4.75 GB/s first, 6.37 / 6.39 GB/s after |
+| GPU read after each pread | CPU sum == GPU sum **every round**, including rounds that overwrite the previous round's bytes (the eviction/reuse case) |
+| buffered `pread` into the same region | **15.68 GB/s** (page-cache source), sums match |
+
+**Rule (measured separately, `dd` on the same file): a GGUF tensor offset is 32-byte aligned, not 4096-byte
+aligned.**  An `O_DIRECT` read at a real expert offset copies **0 bytes**; at `align_down(off, 4096)` it works,
+and the expert's bytes then land at `slot + (off - align_down(off, 4096))` (2 688 bytes for the layer measured
+below).  So an `O_DIRECT` fill needs a per-fill delta and a slot head-pad of one block.
+
+Also worth recording: the buffered arm is **faster** than `O_DIRECT` for a single slab on this box, and it
+leaves the source in the page cache (which is the warm arm's source).  "Zero-copy" and "`O_DIRECT`" are not the
+same decision.
+
+### 13.3 The copy-engine pull from a registered file mapping (`13-dma-from-mapped-file`, Flash-Next GSQ-IQ3_XXS)
+
+`hipHostRegister(Mapped|ReadOnly)` on a `MAP_SHARED` file mapping: **OK** (as §3 measured for read bandwidth).
+
+| transfer | first | warm | bytes verified | host `memcpy` reference |
+|---|---|---|---|---|
+| one expert slab, 0.680 MiB | 0.083 ms = **8.55 GB/s** | 0.012 ms = **60.91 GB/s** | match | 0.017 ms = 41.01 GB/s |
+| layer span, 16 MiB | 0.903 ms = **18.57 GB/s** | 0.570 ms = **29.42 GB/s** | match | 0.369 ms = 45.45 GB/s |
+
+So the warm arm is real, and at expert granularity the copy engine beats a host `memcpy` into the same region
+(0.012 vs 0.017 ms).  This is the arm that makes the load part of the same submit as the `MUL_MAT_ID`.
+
+### 13.4 Per-fill cost at the real granularity (`14-expert-cost`, Flash-Next `blk.2.ffn_down_exps`)
+
+Geometry (from `gguf-expert-geom.py`): 48 layers with `*_exps` tensors, **512 experts**, per-expert slab
+0.452-0.921 MiB per tensor, **1.782 MiB per expert across the three tensors** of one layer; the whole expert set
+is **≈40 GiB** (33.37 GiB counted over known quants).  The delivery's cache keys each tensor separately
+(144 heat tables = 48 layers × gate/up/down), so a slot is one *(tensor, expert)* slab.
+
+| arm (slab 0.879 MiB, at a real 32-byte-aligned offset) | min | median | mean | max |
+|---|---|---|---|---|
+| COLD one slab, `O_DIRECT` (rounded out) | 0.380 ms | 0.413 ms | 4.752 ms | **34.885 ms** |
+| COLD one slab, buffered | 0.480 ms | 0.567 ms | 0.623 ms | 0.892 ms |
+| warm one slab, `O_DIRECT` | 0.155 ms | 0.381 ms | 0.375 ms | 0.488 ms |
+| warm one slab, buffered | 0.068 ms | **0.069 ms** | 0.070 ms | 0.079 ms |
+| COLD 16-slab span, `O_DIRECT` | — | 2.563 ms = **5.75 GB/s** (14.1 MiB) | | |
+| warm 16-slab span, `O_DIRECT` | — | 2.370 ms = **6.22 GB/s** | | |
+| `pread` -> launch -> `hipStreamSynchronize` floor | 0.407 ms | **0.420 ms** | 0.489 ms | 0.984 ms |
+
+Three consequences:
+
+1. **A cold single-slab read is ~0.4-0.6 ms, with a 35 ms first-read-after-idle tail.**  (The `ple-residency`
+   record's 4.7 ms first-cold-read figure is the same phenomenon on the same drive, at a different idle gap.)
+2. **Bulk is fine, scatter is not**: 14.1 MiB sequential = 5.75 GB/s; one 0.879 MiB slab = 0.4 ms (~2.1 GB/s).
+   Prefill's span shape is cheap; decode's scattered single-slab shape is latency-bound.
+3. **The fill is on the critical path per layer.**  A decode step touches top-k × 3 tensors × 48 layers =
+   **1 440 slots**.  At the 0.42 ms floor: every slot missing = **~0.6 s/step**; 90 % hit rate = ~60 ms/step;
+   98 % = ~12 ms/step.  **The store only pays at a very high hit rate, or with the next layer's fills pipelined
+   behind the current layer's compute** (`TODO` #132 is the same defect on the discrete pool: "the pool's pair
+   decode deficit is the synchronous demand read").
+
+### 13.5 How concentrated is expert traffic?  (`moe-heatmap-read.py` on the delivery's own persisted heat maps)
+
+This is the input to "how big must the store be" and to the admission policy.  MHT2 has two bands: `all` and
+`dec` (decode only).  Coverage is over *slots* = (tensor, expert) pairs.
+
+| model | slots | traffic | never touched | 90 % coverage | 95 % | 99 % |
+|---|---|---|---|---|---|---|
+| **35B-A3B Q4_K_M** (120 tables, 18.22 GiB) | 30 720 | 7 522 320 accesses | **21.0 %** | 10 891 slots (35.5 %) = **6.46 GiB** | 44.2 % = 8.05 GiB | 57.7 % = 10.52 GiB |
+| … its `dec` band (93 % of its accesses) | | 6 998 160 | 32.1 % | 32.2 % = 5.87 GiB | 40.1 % = 7.31 GiB | 52.2 % = 9.51 GiB |
+| **Flash-Next GSQ-IQ3_XXS** (144 tables, 39.97 GiB) | 73 728 | 278 250 accesses | **75.1 %** | 9 648 slots (13.1 %) = **5.23 GiB** | 18.0 % = 7.18 GiB | 23.0 % = 9.19 GiB |
+| … its `dec` band (36.2 % of its accesses) | | 100 590 | 97.2 % | 0.3 % = 0.11 GiB | 0.3 % = 0.14 GiB | 1.5 % = 0.58 GiB |
+
+**The concentration depends on how long the history is, and the second row is the honest one.**  The 35B-A3B map
+has 27x the accesses of the Flash-Next map, and its 90 % coverage needs **35 % of the slots**, not 13 % — the
+Flash-Next figure is largely *undersampling* (278 k accesses over 73 728 slots).  Plan on the long-history
+number: **a resident store of ~6-8 GiB covers 90-95 % of expert traffic on an 18-22 GiB expert set, and ~20-25 %
+of the slots are never touched at all** — that never-touched mass is what an Nth-touch admission policy leaves
+on disk for free.
+
+### 13.6 What this changes in the plan
+
+* P1.0 assumptions **all hold**; the store's memory is confirmed (registered anon THP) and the two fill arms are
+  both real.  `IMPLEMENTATION.md` P1.0 is closed by this section.
+* **The fills must be pipelined**, not synchronous per layer, or the design cannot decode at a 90 % hit rate
+  (§13.4).  This becomes a P4 requirement, not an optimisation.
+* **Admission is measurable now**: a promotion costs one cold read (0.4-0.6 ms) and saves that read on every
+  later use, so a 2nd-touch promotion pays for itself at two uses in a session.  The *per-session touch
+  distance* is still unmeasured (the heat map is a long-horizon counter, not a session sequence) — that is the
+  one probe still owed (`probe/README.md`, 15).
+* `O_DIRECT` at a real GGUF offset needs an alignment round-out and a per-fill delta (§13.2); the buffered arm
+  is a legitimate (and here faster) alternative and should stay an arm, not be dropped.

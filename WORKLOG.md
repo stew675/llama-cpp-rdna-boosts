@@ -1,3 +1,165 @@
+## 261111.006 (wip, NO delivery change) -- `wip/apu-expert-gtt`: `-lme N` is the store's size, the one command line that carries across from discrete mode; and the 2-vs-3 admission answer already exists
+
+**Campaign docs only** (design decision recorded; no `patches/`, no `release.json`, nothing applied to the fork,
+no gate owed).
+
+**Decision (maintainer, 2026-11-11).**  On an APU, **`-lme N` means the size of the registered GTT expert store**
+managed by the heat-map residency table -- *the* one command-line entry that carries over from discrete GPU mode.
+That is a policy branch, not a new flag, because `--limit-host-experts auto|N` (`common/arg.cpp:2767`) already
+means "cap the NON-SWAPPABLE memory used by host-resident MoE experts, N GiB, spent in descending hotness from the
+persisted heat map", and in the not-fitting band the discrete path *already* spends it as a **per-expert** pool
+(`plan_host_expert_placement()`, `src/llama-model-loader.cpp:277-310`, logs "a pinned per-EXPERT pool of X MiB of
+Y MiB ... ranked by the heat prior").  On UMA: `auto` = the whole set when it fits `MOE_HOST_LIMIT_FRAC` (80 %) of
+`MemAvailable`, otherwise a bounded hot-subset store; `N` = exactly N GiB, spent one **(tensor, expert) slot** at a
+time in descending heat order (finer than the discrete fit case, so `-lme 6` means 6 GiB used); unset = `auto`
+(default-on policy), and `MOE_EXPERT_GTT=0` is the kill switch.  **No sizing environment variable** -- the size is
+`-lme`, and the ranking is the code that already exists.
+
+**Three things that differ on the APU arm, recorded so they are not lost.**  (a) **The ceiling**: `MemAvailable`
+minus KV, compute and an OS reserve, read once -- *not* the GTT pool (`amdgpu.gttsize` 121 GiB), because the store
+is registered *host* memory (a 46 GiB userptr registration is measured to work, `MEASUREMENTS.md` §9).  (b) **`-lme`
+must engage the store without `-ncmoe`**: on a discrete box host experts exist only because `-ncmoe` put them
+there, so `-lme` caps someone else's placement; on an APU there is no host tier (`-ncmoe` is refused, r236), so
+`-lme` becomes the only expert-residency knob and its help text needs the UMA branch ("N GiB, spent on the hottest
+slots, the rest stays on storage").  (c) **Only the not-fitting band is a win**: a set that already fits is read at
+232.6 GB/s from plain GTT against 232.1 from the registered store (`MEASUREMENTS.md` §13.1), so `auto` engages the
+store only where the alternative is a mapping read through the page cache, and an explicit `-lme N` is the middle
+ground and the A/B lever.
+
+**The second/third-touch question was already measured, and 2 won** -- so no new variable.  `MOE_EXPERT_CACHE_TOUCH`
+(default **2**, `admit=touch`) has a 2026-11-07 A/B on the discrete path (Flash-Next + MTP, `-lme 36`/44, 3+3
+interleaved reps, `archive/work/host-expert-parity/RESULTS-2026-11-07-touch.md`): `3` damps churn exactly as
+intended (demotions -17.3/-18.3 %, sink uses -27 %) and buys **nothing measurable** (decode +1.3 to +2.2 %, inside
+the box's spread, prefill flat) while giving up 0.78/0.81 pt of hit rate and serving +35 % more misses cold.  What
+changes on UMA is the *price* of "served cold" -- a mapped in-place read there, a **0.4-0.6 ms storage read** here
+(`MEASUREMENTS.md` §13.4) -- so `3` is the candidate to re-test on this box, with `2` as the starting default.
+
+**One design element fell out and is now required:** a non-admitted read must land *somewhere* GPU-readable, and an
+APU has no in-place mapped master, so the store needs a small **transient band** (one or two registered slots per
+table, ~130 MiB on Flash-Next's 144 tables) that is filled by the cold/warm arm, read by the `MUL_MAT_ID` and reused
+in place.  Without it, touch-count admission degenerates into first-touch admission.  It is counted in the budget
+and its size (1 vs 2 slots per table) is a P3 measurement.
+
+**Plan state** (`wip/apu-expert-gtt/IMPLEMENTATION.md`): P1 is now **P1.1 the `-lme` policy/sizing** (reusing
+`plan_host_expert_placement()`'s budget and heat order) and **P1.2 the two ceilings**; P3 reuses `admit=touch` plus
+the transient band; the gate gains arm **6c** (`-lme 6` / `12` / `auto`, extent +-1 slot, budget source named, zero
+evictions in the fitting band) and 6b is re-labelled onto the existing `MOE_EXPERT_CACHE_TOUCH`.  The env surface
+shrinks to three switches (`MOE_EXPERT_GTT`, `_RO`, `_FILL_FAULT`) -- no sizing variable.  Nothing implemented.
+
+## 261111.005 (wip, NO delivery change) -- `wip/apu-expert-gtt` (renamed from `-pool`): P1.0 answered -- all four assumptions of the GTT expert store hold, and the delivery's own heat maps say the hot set is ~35 % of the slots
+
+**Campaign only** (docs + four new probe programs under `wip/apu-expert-gtt/probe/`).  No `patches/`, no
+`release.json`, nothing applied to the fork, no gate owed.  Renamed `wip/apu-expert-pool/` ->
+`wip/apu-expert-gtt/` (the design has no pool); the rename is a `git mv`, `wip/CAMPAIGNS.md`'s row and links
+follow it, and the two older entries above keep the path that was correct when they were written
+(`AGENTS.md` -> the records rule).  `MEASUREMENTS.md` §13 is the new dated record; §§0-12 stand as measured.
+
+**The four keystone probes P1.0 asked for were written and run on `halo`.  All four assumptions hold, so the
+store's memory is settled:**
+
+* **THPs survive registration** (`11-thp-register`): `AnonHugePages` **1024.0 MiB of 1024 before and after**
+  `hipHostRegister(Mapped|ReadOnly)`, in both fault orders; **17.4 ms/GiB** to register a pre-faulted region
+  (the 8.69 s / 46 GiB figure in §9 was a *file* registration, i.e. it included faulting the file in); GPU read
+  **232.1 GB/s**.  The tier really is a huge-page tier.
+* **`pread` into the registered region is legal and coherent** (`12-pread-registered`): `O_DIRECT` accepted
+  (**not** `EINVAL`, which is what it is into `hipMalloc`), **4.75 GB/s** cold; the GPU reads exactly those
+  bytes on every round, **including rounds that overwrite a previous expert's bytes** -- the eviction/reuse case
+  a fresh zeroed region would have hidden.  Buffered `pread` is **15.7 GB/s**.
+* **The copy-engine pull is real** (`13-dma-from-mapped-file`): `hipHostRegister(Mapped|ReadOnly)` on a
+  `MAP_SHARED` GGUF mapping, then `hipMemcpyAsync` on the compute stream into the registered slot -- 0.68 MiB
+  slab: **0.012 ms warm (60.9 GB/s)**, 0.083 ms first; 16 MiB span: 0.570 ms (**29.4 GB/s**); bytes verified.
+  At slab granularity it beats a host `memcpy` (0.017 ms) into the same region, which is what makes the load
+  part of the same submit as the `MUL_MAT_ID` that needs it.
+* **The per-fill cost, measured at real GGUF offsets** (`14-expert-cost` + the new `gguf-expert-geom.py`):
+  Flash-Next GSQ-IQ3_XXS is 48 layers x 512 experts x 3 tensors, **1.782 MiB per expert per layer**, ~40 GiB of
+  experts.  Cold one 0.879 MiB slab: **0.413 ms** median (`O_DIRECT`) / 0.567 ms (buffered) / **34.9 ms** worst
+  first-read-after-idle; warm: **0.069 ms** buffered; `pread -> launch -> sync`: **0.420 ms**; a 14.1 MiB span
+  streams at **5.75 GB/s**.
+
+**Two rules fell out of the probes and are now requirements, not notes.**  (a) **A GGUF tensor offset is 32-byte
+aligned, not 4096** -- an `O_DIRECT` read there copies **0 bytes** (verified with `dd`), so the cold arm needs a
+round-out to the block size plus a per-fill delta into the slot, and the buffered arm is the zero-delta
+alternative (and faster at slab granularity here).  (b) **Fills cannot be synchronous per layer**: a decode step
+touches top-k x 3 tensors x 48 layers = **1 440 slots**, so at the 0.42 ms floor every miss = ~0.6 s/step,
+90 % hit rate = ~60 ms/step, 98 % = ~12 ms.  Pipelining the next layer's fills behind the current layer's
+compute is therefore a requirement -- `TODO` #132 is the same defect measured on the discrete pool.
+
+**The hot set, from the delivery's own persisted heat maps** (`moe-heatmap-read.py`, the new helper).
+35B-A3B Q4_K_M (18.22 GiB of experts, 7.5 M accumulated accesses): **21.0 %** of the *(tensor, expert)* slots
+were **never touched**, and 90 % of traffic is covered by **35.5 %** of the slots = **6.46 GiB** (95 %: 8.05 GiB).
+Flash-Next GSQ-IQ3_XXS looks far more concentrated (13.1 % at 90 % = 5.23 GiB) but has 27x less history, so it is
+undersampled -- the long-history figure is the one to plan on.  That retires two of the campaign's open questions:
+the store holds the **hot subset** (not the whole set), and a resident store of ~6-8 GiB covers 90-95 % of an
+18-22 GiB expert set.  **LFRU stays the eviction policy** (maintainer, 2026-11-11), and admission becomes a
+**touch-count threshold** `MOE_EXPERT_GTT_ADMIT=N` whose default the cost model sets at **2** (a promotion costs
+one cold read and saves it on every later use; `N = 3` is a footprint lever for a tight budget).  The one probe
+still owed is the **per-session touch distance** that tunes `N` -- a workload measurement, nothing blocked on it.
+
+**Granularity question answered** (`README.md` §7.1, with the pros/cons the maintainer asked for): the slot is
+**per (tensor, expert)** -- the heat map's own unit, 0.45-0.92 MiB -- while the **I/O is a coalesced span over
+the layer's used set** (the discrete `MOE_HOST_POOL_STAGE_SPAN` shape).  A per-layer bank (~450 MiB here) is
+rejected: one cold expert would stream the whole bank to use 2 % of it, and it destroys the heat locality the
+small store depends on.
+
+**Plan state** (`wip/apu-expert-gtt/IMPLEMENTATION.md`): P1.0 **closed**; P1 (preflight becomes a policy, budget
+from `MemAvailable`, `MOE_EXPERT_GTT=0` restore) -> P2 (the store + a device-carrying buft on the KV-region
+pattern, in-place `MUL_MAT_ID`) -> P3 (residency: LFRU + Nth-touch admission, table-only eviction) -> P4 (the two
+fill arms, **aligned and pipelined**, with a fill-fault decline arm) -> P5 (prefill span streaming of only the
+non-resident experts) -> P6 (`scripts/gate-uma-experts.sh`, now with an admission arm).  Nothing implemented yet.
+
+## 261111.004 (wip, NO delivery change) -- `wip/apu-expert-pool` design REVISED: a UMA-only heat-mapped GTT expert store with **no host pool**, and the campaign's own numbers say why the old pool/arena plan was the wrong shape
+
+**Docs only** (the campaign's `README.md` + `IMPLEMENTATION.md`, the `wip/CAMPAIGNS.md` row, and an "owed
+probes" section in `probe/README.md`).  No `patches/`, no `release.json`, no `TODO` handle, nothing applied to
+the fork, and no gate is owed -- `MEASUREMENTS.md` and the ten probes are a dated record and are untouched.
+The design is the maintainer's directive (2026-11-11); the campaign opened 2026-11-09 with a different plan
+(`WORKLOG.md` 261109.009), which is now recorded as **superseded** in `wip/CAMPAIGNS.md`.
+
+**The new shape.**  The resident expert set is ONE anonymous region -- `mmap` + `MADV_HUGEPAGE`,
+`hipHostRegister(Mapped|ReadOnly)`, sliced into per-expert slots -- with **no pinned master, no host pool, no
+arena and no slab**.  Residency is the delivery's existing heat table + slot map; a miss drops the coldest entry
+(a **table** operation) and loads straight into the vacated bytes, then continues; prefill streams per layer only
+the experts that are not already resident.  The delivered host-expert tier (`-ncmoe`/`--host-experts`) stays
+refused on UMA exactly as r236 left it -- this is not that tier.
+
+**What killed the old plan is in its own probe log.**  The 2026-11-09 plan had to keep a staging/bounce ring for
+every disk fill, because `pread(O_DIRECT)` into a `hipMalloc` GTT buffer is **`EINVAL`**
+(`MEASUREMENTS.md` §7) -- so its headline "an eviction moves no data" only ever applied to the host tier, and
+the disk tier stayed a copy.  `pread(O_DIRECT)` into an **anonymous** buffer is **3.6 GB/s** (§4).  An anonymous
+registered region is therefore the only backing on which a *zero-copy load into the vacated slot* is possible at
+all, and choosing it deletes the pool, the staging ring and the arena from the UMA path in one move.  The old
+plan's **P1** (enable `--host-experts pool` / `-lme auto` on `IGPU` via the `ROCm_HostMap` mapping master) is
+**dropped outright**; its **P0.5** survives as `MOE_EXPERT_GTT_RO` (the store is registered read-only from
+creation, 230-233 GB/s against 60 writable); its **P2** survives in shape but not in memory (registered anon THP
+instead of an arena slot + slab).
+
+**Four assumptions are still unmeasured, and two of them can reshape the design** -- so `IMPLEMENTATION.md` P1.0
+owes four probes before any code: (1) whether `MADV_HUGEPAGE` THPs survive `hipHostRegister` (the design is "a
+mass of registered THPs"; the P0 probes counted base pages, not huge pages); (2) **`pread(O_DIRECT)` into a
+registered RO region followed by a GPU read of exactly those bytes** -- the keystone, since the three halves are
+measured separately and never in one program; (3) the copy-engine pull from a registered RO `MAP_SHARED` file
+mapping into the registered slot (warm arm); (4) per-expert cost at the real 0.65 MiB granularity.  If (1) fails
+the tier is 4 KiB pages (recorded, not fatal); if (2) fails the cold fill is not zero-copy and the design must be
+re-costed before anything is built.
+
+**Plan** (`wip/apu-expert-pool/IMPLEMENTATION.md`): **P1.0** the four probes; **P1** the integrated branch of
+`moe_cache_preflight()` (`moe-expert-cache.cu:5641`) becomes a policy that *selects* the store instead of
+disabling the whole cache, with the budget from `MemAvailable` (never "free VRAM": the 2026-10-19 over-commit
+stays guarded) and `MOE_EXPERT_GTT=0` as the verbatim-restore kill switch; **P2** the store's allocation plus a
+device-carrying **buffer type** on the delivery's KV-region pattern (`ggml-cuda.cu:10697`), so `MUL_MAT_ID` reads
+it **in place** -- no new op, no per-layer copy; **P3** residency/eviction wired to `access_locked()`
+(`:3495`), skipping the arena->pool hand-over, with **no `madvise` and no unregister on the hot path** (the P0
+traps: `MADV_DONTNEED` on a registered region the GPU reads is a *silent zero*, and the pin survives
+`hipHostUnregister` anyway while, with `iommu=off`, the registration *is* the GPU's mapping -- so an unregister
+would turn a fill into a fatal fault, not a retry); **P4** the two fill arms (cold zero-copy `pread`, warm
+copy-engine pull) with a fill-fault arm that must decline; **P5** prefill streaming on the existing span logic;
+**P6** `scripts/gate-uma-experts.sh` (10 arms, text hashed with no `-lv`, censuses at `-lv 4`) + docs.
+
+**Open for the maintainer** (`README.md` §7): slot granularity (per expert vs per layer-bank), whether the store
+holds the hot subset or the whole expert set, LFRU vs the free "evicted but intact" second chance UMA allows,
+whether a Windows carve-out APU folds into the same detection, gfx1150, and whether the directory should be
+renamed to `wip/apu-expert-gtt/` now that the pool is gone (left as a decision: a rename touches
+`CAMPAIGNS.md` and this record's own cross-links).
 ## 261111.003 (r261) -- `TODO` #132 retires: the demand read's OVERLAP premise is refuted, and the read was pulling twice the bytes a `-sm tensor` device needs
 
 **Change:** block 12, `ggml/src/ggml-cuda/moe-expert-cache.cu` only (+30/-5): `expert_host_src`'s fallback
