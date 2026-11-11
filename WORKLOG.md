@@ -1,9 +1,20 @@
-## 261111.001 (r259, RELEASE v17-a691b2345-r259) -- contributor PR #298: an 8-bit wire for the copy-engine all-reduce, as `GGML_CUDA_ALLREDUCE=q8ce`
+## 261111.001 (r259, RELEASE v16-a691b2345-r259) -- contributor PR #298: an 8-bit wire for the copy-engine all-reduce, as `GGML_CUDA_ALLREDUCE=q8ce`
 
-**Shipped:** `v17-a691b2345-r259` (block **01** amended, +317/−3 in `ggml/src/ggml-cuda/ggml-cuda.cu`), base
-`a691b2345`, tip `f7d40dab4ffbfe1f5edc22a421872ad4ae257135`, tree
-`dc225b37947d256a024e5a858210f6ccbc9eae54`, 16 blocks, all 17 artifact hashes refreshed.  Co-authored-by on
+**Shipped:** `v16-a691b2345-r259` (block **01** amended, +317/−3 in `ggml/src/ggml-cuda/ggml-cuda.cu`), base
+`a691b2345`, tip `c80fa8bda90107f145013795f0e8dcf4a103c0fa`, tree
+`7995db440ff79d805b4e1ad946ebfae605a56616`, 16 blocks, all 17 artifact hashes refreshed.  Co-authored-by on
 the block commit credits @mjohanning99 (`3389797+mjohanning99@users.noreply.github.com`).
+
+> **Correction (2026-11-11, r260).**  This entry was first written as `v17-a691b2345-r259`, tip
+> `f7d40dab4ffbfe1f5edc22a421872ad4ae257135`, tree `dc225b37947d256a024e5a858210f6ccbc9eae54`.  Those are not
+> the release: the release name was amended to `v16` and `scripts/apply-all.sh` from `patches/` reproduces
+> `c80fa8bda` / `7995db44` (which is what `release.json` records and what the tag `v16-a691b2345-r259` carries).
+> `f7d40dab4` / `dc225b37` is a chain whose only difference from the release is 25+/13− in
+> `ggml/src/ggml-cuda/ggml-cuda.cu` — a `rot` parameterisation of the `q8ce` kernels that is **not** in the
+> delivery set.  It is a no-op refactor (`rot` is the constant 1 at every call site, so both chains take the
+> rotated path), which is why the release kept the simpler form; but the *tree* it names is not the delivery's,
+> and a tree is what `release.json` records.  `release.json` is the single source of truth; the values above are it, and the numbers in the
+> rest of this entry were measured on that tree.
 
 1. **Accepted, on the concept, not on the cut.**  PR #298 (`optional/ce-q8-wire/`, `GGML_CUDA_AR_CE_WIRE=q8|q8h`)
    creates a thread: the copy-engine all-reduce's partial sums, sent as q8_0 blocks (34 B per 32 values, 53 % of
