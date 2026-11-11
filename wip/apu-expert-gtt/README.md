@@ -129,16 +129,22 @@ A decode step touches top-k × 3 tensors × n_layer slots.  On Flash-Next (10 ×
 slots**; at the measured **0.42 ms** fill round trip, *every* slot missing would cost **~0.6 s per step**, 90 %
 hit rate **~60 ms**, 98 % **~12 ms**.  Three consequences, and they are the design:
 
-1. **The hit rate must be very high** — or the fills must be pipelined.  Pipelining the next layer's fills behind
-   the current layer's compute is the only way to decode at a merely-good hit rate; it is a P4 requirement, not
-   an optimisation (`TODO` #132 is the same defect on the discrete pool: "the pool's pair decode deficit is the
-   synchronous demand read").
+1. **The hit rate is the lever, and overlap is NOT a given.**  The obvious escape — issue the next layer's fills
+   behind the current layer's compute — was **built and measured on the discrete pool and it is a wash** (r261,
+   `archive/work/host-pool-demand-overlap/`, `benchmarks/2026-11-11-host-pool-slice-read.md`): the exact
+   within-layer lookahead measured **±1.5 %** (noise), because the host copies each split's host-weight inputs —
+   beginning with a synchronize — *before* it dispatches that split, so at the instant the routing (and the miss
+   set) is known the device has nothing in flight; and the pool's own placing fill (0.131 ms) is cheaper and
+   earlier than any prefetch.  `TODO` #132 retired on that finding.  **Our fill is 3.2x that round trip (0.420
+   ms) because the source is storage**, so the trade is not settled here — but P4 must *test* whether any
+   overlap is reachable on this path and must not assume it.  Until it is shown, plan on the hit rate:
+   `-lme`/coverage (§5) and admission (§5.1, §7 Q1) are the only knobs that move the cost.
 2. **Admission costs one read and saves it on every later use**, so a 2nd-touch promotion pays for itself at two
    uses in a session, and a 3rd-touch policy only wins while the resident budget is the binding constraint
    (i.e. it is a *footprint* lever, not a cost lever).  Hence `N` is a knob with a measured default, and the
    per-session touch distance is the one probe still owed.
 3. **Prefill is cheap and decode is not**: a layer span streams at 5.75 GB/s, a scattered 0.88 MiB slab is
-   latency-bound — so prefill streams spans (P5) and decode must pipeline.
+   latency-bound — so prefill streams spans (P5), and decode lives or dies on the hit rate (item 1).
 
 **How big must the store be?**  From the delivery's own persisted heat maps (MHT2, `moe-heatmap-read.py`), over
 *(tensor, expert)* slots: on **35B-A3B Q4_K_M** (18.22 GiB of experts, 7.5 M accumulated accesses) **21 %** of
@@ -239,6 +245,10 @@ measurement.
 * **Do not `O_DIRECT` a GGUF offset directly.**  Tensor offsets are aligned to `general.alignment` (32 bytes),
   so an `O_DIRECT` fill must round the read out to the block size and carry a per-fill delta into the slot — or
   be buffered.  Measured: an unaligned `O_DIRECT` read copies **0 bytes**.
+* **Do not port the tensor-split slice-read logic** (r261's `MOE_HOST_POOL_SLICE_READ`: on a `-sm tensor` split
+  each device owns a contiguous slice, and reading the whole expert doubled the bytes).  The store is
+  single-device, so the device's slice IS the expert -- r261 measured the flag inert at 1 GPU "as the
+  geometry predicts".  The class only returns if the store is ever split across devices.
 * **Do not use `VmPin`/`VmLck` to detect the registration hold** — both read 0; use `mincore()`.
 * **Do not touch the `integrated` host-buffer (zero-copy UMA weights) path.**  It has its own history and its
   own guard (`ggml_backend_sched_buffer_supported()`); `GGML_FORCE_NO_INTEGRATED=1` is the A/B that proves the
@@ -262,9 +272,11 @@ measurement.
 3. **Eviction policy**: LFRU is confirmed.  The remaining question is whether to extend
    `g_prov_evict` (`MOE_EXPERT_CACHE_PROVISIONAL`, `moe-expert-cache.cu:722`) to "evicted but intact" — on UMA
    the bytes are already in DRAM, so a second chance is free in a way a discrete card cannot have.
-4. **How much pipelining is enough?**  Fills must be issued behind the previous layer's compute (§3.2); the
-   open question is whether one-layer lookahead is enough or the plan needs a two-layer ring, which is a
-   measurement (P4 arm), not a preference.
+4. **Is *any* fill overlap reachable on this path?**  r261 refuted the premise for the discrete pool and measured
+   the exact lookahead at ±1.5 % (§3.2); the structural obstacle — the host builds a split's host-weight inputs
+   before dispatching it — is the same shape here.  Our fill is 3.2x more expensive (storage, 0.420 ms), so the
+   question is open, and it is the first thing P4 should settle: either an overlap exists and the hit-rate
+   requirement relaxes, or it does not and `-lme` coverage carries the whole design.
 5. **Does this become one placement for both APU shapes** (Linux gfx1151: 2 GiB carve-out / 130 GB GTT) and a
    Windows APU with a fixed VRAM partition, or does the carve-out keep `MOE_EXPERT_CACHE_UNIFIED`?  Different
    detections, measured on one box so far.

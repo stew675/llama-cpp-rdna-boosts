@@ -1,3 +1,33 @@
+## 261111.007 (wip, NO delivery change) -- `wip/apu-expert-gtt` reconciled with r261: `TODO` #132 retired, so the campaign's "decode must pipeline" is corrected to an experiment -- the exact lookahead was built on the discrete pool and measured ±1.5 %
+
+**Campaign docs only** (the entry above was rebased onto r261 and renumbered; no `patches/`, no `release.json`,
+nothing applied to the fork, no gate owed).  Two corrections, both because r261 closed the item the campaign had
+been citing as its justification:
+
+1. **`TODO` #132 is retired, and the overlap premise with it.**  r261 (`archive/work/host-pool-demand-overlap/`,
+   `benchmarks/2026-11-11-host-pool-slice-read.md`) **built the exact within-layer lookahead** -- the six
+   host-weight visits of a layer carry the same routing ids, so staging the other five tables' misses needs no
+   prediction -- and measured it at **±1.5 % (noise)**: 0.9 % of the 1 315 ids/token are in neither tier, so 5.7
+   staged and 3.2 consumed against 44.5 fallback reads.  The bound is structural: the host copies each split's
+   host-weight inputs (a synchronize first) *before* dispatching that split, so nothing is in flight when the
+   miss set is known, and the pool's own placing fill (**0.131 ms**) is cheaper and earlier than any prefetch.
+   What survives of #132 is coverage (`#141`), the devremap's cold source, and a cross-role prefetch + lock-free
+   fill worker that is a *scheduler* change (recorded in the campaign, not opened as an item).
+2. **So the campaign's "decode must pipeline" is corrected.**  `README.md` §3.2 item 1 and §7 Q4 now say: the
+   **hit rate is the lever**, overlap is an **experiment** (the store's fill is 0.420 ms, **3.2x** the pool's
+   0.131 ms, so the trade is not settled here), and `IMPLEMENTATION.md` P4 must first establish whether this path
+   ever has work a fill can hide behind -- and, if not, say so and drop the requirement rather than build a
+   worker.  The gate's arm 9 asserts whichever answer is recorded, not a pipeline.
+3. **One lesson that does *not* transfer, recorded so it is not re-derived:** r261's other half is
+   `MOE_HOST_POOL_SLICE_READ` -- on a `-sm tensor` split each device owns a contiguous slice, so the old read
+   pulled twice the bytes.  The store is single-device, where the device's slice *is* the expert, and r261
+   measured the flag **inert at 1 GPU**; the class only returns if the store is ever split across devices
+   (`README.md` §6).
+
+Rebase state: this entry and the three above it were renumbered (`261111.003/.004/.005` -> `.004/.005/.006`) so
+the sequence stays monotone above r261's own `261111.003`; `MEASUREMENTS.md` §§0-12 and `probe/01-10` are
+untouched records.  Nothing else in the campaign moved.
+
 ## 261111.006 (wip, NO delivery change) -- `wip/apu-expert-gtt`: `-lme N` is the store's size, the one command line that carries across from discrete mode; and the 2-vs-3 admission answer already exists
 
 **Campaign docs only** (design decision recorded; no `patches/`, no `release.json`, nothing applied to the fork,

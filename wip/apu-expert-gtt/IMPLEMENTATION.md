@@ -166,12 +166,16 @@ knob (README §3.1):
   4096))`; the slot carries a per-fill delta.  An unaligned `O_DIRECT` read copies 0 bytes.  The **buffered**
   arm is the simpler zero-delta path and is *faster* at slab granularity on `halo` (0.567 vs 0.413 ms median,
   and no 35 ms idle-wake tail) -- keep both, and choose per arm by measurement, not by principle.
-* **Pipelining is a requirement (README §3.2):** a step touches ~1 440 slots at 0.42 ms each, so a synchronous
-  per-layer fill only decodes at a ~98 % hit rate.  Issue the next layer's fills on the copy stream behind the
-  current layer's compute, with the compute stream waiting on an event -- the discrete path's `copy_stream` /
-  `order_event` machinery (`moe-expert-cache.cu:8406`) is the shape to copy, and `TODO` #132 is the same defect
-  measured on the pool.  The gate's arm 9 asserts the overlap actually happened (census: fills issued before
-  their layer's wait).
+* **Overlap is an experiment, not an assumption (README §3.2).**  A step touches ~1 440 slots at 0.42 ms each, so
+  a synchronous per-layer fill only decodes at a ~98 % hit rate -- which is why the escape matters.  But r261
+  **built the exact within-layer lookahead on the discrete pool and measured ±1.5 %**, because the host
+  materialises a split's host-weight inputs (synchronize included) before dispatching it, so nothing is in
+  flight when the miss set is known, and the pool's placing fill (0.131 ms) is cheaper and earlier than a
+  prefetch (`archive/work/host-pool-demand-overlap/`; `TODO` #132 retired on it).  So: **first reproduce the
+  question here** -- does this path ever have work the fill can hide behind, given the store's fill is 3.2x the
+  pool's -- and only then build a worker (`copy_stream` / `order_event`, `moe-expert-cache.cu:8406` is the
+  shape).  If it does not, say so and drop the requirement: `-lme` coverage and admission carry the design.
+  The gate's arm 9 asserts whichever answer is recorded, not a pipeline.
 * Do **not** reuse the discrete staging ring (`bounce_acquire()`, `:3082`) or the coalesced-span staging
   (`moe_cache_stage_table()`, `:8134`) for the decode fills: both exist to serve a *pool*.  The span logic is
   reused for **prefill** (P5) and for the coalescing of a layer's used set (P3/P4), where it is the right shape.
