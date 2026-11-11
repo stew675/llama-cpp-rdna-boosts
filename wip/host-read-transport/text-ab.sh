@@ -33,7 +33,7 @@ run_arm() {   # tag fillsrc demandsrc
     [ "$ds" = map  ] || e+=("MOE_HOST_POOL_DEMAND_SRC=$ds")
     echo "--- $tag (FILL_SRC=${fs} DEMAND_SRC=${ds}) ---"
     timeout 900 env "${e[@]}" MOE_HOST_POOL_DIO=0 \
-        "$BIN" -m "$M" -ngl all --n-cpu-moe 48 --limit-host-experts "$NLIB" --host-experts pool \
+        "$BIN" -m "$M" -ngl all --n-cpu-moe 48 --limit-host-experts "$NLIB" \
         -c "$NCONTEXT" -b 2048 -ub 2048 --load-mode mmap --lazy-mode on \
         --spec-type none --seed 42 --temp 0 -n "$NGEN" -p "$(cat "$PROMPT")" \
         --no-display-prompt --single-turn > "$log" 2>&1

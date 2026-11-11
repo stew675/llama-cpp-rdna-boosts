@@ -1,0 +1,420 @@
+From f25d6dce2a7649cb44eca94bbe9044d952fb11e2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Wed, 11 Nov 2026 08:21:25 -0600
+Subject: [PATCH] wip(host-read-transport): an ADAPTIVE transport --
+ cgroup-aware capacity prior + a monitored ladder (map -> file -> dio)
+
+DESIGN.md made real.  MOE_HOST_POOL_TRANSPORT=auto:
+
+  * INITIAL ARM from a CAPACITY test, not a rate: pool + host set against the available RAM, where
+    pool_available_ram_bytes() is now CGROUP-AWARE (min of /proc/meminfo MemAvailable and the process's
+    own cgroup memory.max - memory.current).  That is TODO #306 option 3, and it is the bug behind the
+    collapse: inside a 32G scope the host reported ~57 GiB available, the prior said the set fit, the run
+    lived in the mapping arm, and the mapping read 898 MiB/s.
+        fits  -> map   (the fast arm when warm: 17 GiB/s random vs 7 for a buffered read)
+        tight -> file  (the general-purpose baseline the maintainer asked for)
+  * ESCALATION: map -> file -> dio, one way, on evidence only.  Two triggers: a slow-read guard
+    (N consecutive expert reads over TR_SLOW_MS) and an epoch rate check (2 CONSECUTIVE epochs below
+    TR_RATIO x the best rate this arm itself achieved).  A switch closes every open fd first, because the
+    O_DIRECT bit lives in the OPEN FLAGS.
+
+WHAT THE PROTOTYPE PROVED (live, this box):
+  * text byte-identical across map / file / dio / auto: 144 chars sha=de81b28cab7d, and the switch itself
+    does not move it.
+  * the prior lands correctly in both directions: a 32G scope starts on "file"; a plain run starts on
+    "map" and -- after the false-positive fix below -- does not leave it.
+  * escalation fires for real: "map -> file (epoch rate 9252 MiB/s < 0.50x this arm's own 21185 MiB/s for
+    2 epochs)" while a warm run was being squeezed.
+  * NOT doable in-process: a cold calibration probe.  posix_fadvise skips pages the process has MAPPED
+    (the probe read 32 452 MiB/s, i.e. out of the cache) and madvise(MADV_DONTNEED) drops the PTEs but
+    not the page cache.  So the transport is never chosen by a rate -- only by capacity plus runtime
+    evidence.
+  * a ONE-EPOCH collapse is a blip: measured a warm map arm at 16 444 -> 9 624 MiB/s for one epoch, which
+    switched a RAM-rich box off the mapping.  Hence two consecutive epochs.
+
+Still owed: de-escalation (a recovered cache currently keeps the escalated arm), the threshold
+calibration from the interleaved A/B, the gate, and the Windows form.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 316 ++++++++++++++++++++++++-
+ 1 file changed, 314 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index b89194383..6243514dd 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -405,6 +405,32 @@ bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool s
+ // unless asked (`file` is a candidate default for the promotion, not this instrument).
+ bool    g_pool_fill_src_file   = false;  // MOE_HOST_POOL_FILL_SRC=file:   the pool FILL reads the file
+ bool    g_pool_demand_src_file = false;  // MOE_HOST_POOL_DEMAND_SRC=file: the bounce/demand read does
++// wip/host-read-transport DESIGN.md: the ADAPTIVE transport.  `MOE_HOST_POOL_TRANSPORT=auto` replaces the
++// `MemAvailable` fit test (cgroup-unaware, read once -- wip/host-expert-coverage) with a MEASUREMENT of this
++// box/file/cache at the first pool build, and keeps measuring: when a read's rate falls below the next arm's
++// calibrated rate it escalates one step (map -> buffered file -> O_DIRECT).  The bytes are identical on every
++// arm (proven: greedy text `de81b28cab7d` in all four combinations), so a switch can only change TIMING.
++// UNSET leaves the delivered logic (`pool_decide_dio_locked`) untouched.
++enum { POOL_TR_MAP = 0, POOL_TR_FILE = 1, POOL_TR_DIO = 2, POOL_TR_N = 3 };
++static int     g_pool_tr_mode     = -1;    // -1 unset, 0|1|2 pin, 3 auto
++static int     g_pool_transport   = POOL_TR_MAP;
++static double  g_pool_tr_cal[POOL_TR_N] = { 0.0, 0.0, 0.0 };   // calibrated MiB/s per arm (0 = unavailable)
++// The escalation REFERENCE is the rate THIS arm achieved in this run once it was warm
++// (`g_pool_tr_ref`), not an absolute number: a warm-cache calibration measures the warm rate and would
++// make every cold read look like a collapse (measured: a warm calibration reported map 15 219 MiB/s
++// against a 1 599 MiB/s run).  A collapse = the arm falling to half of what it itself achieved before.
++static double  g_pool_tr_ref      = 0.0;
++static int     g_pool_tr_ref_epochs = 0;   // warm-up epochs after a switch before the rules may fire
++static int     g_pool_tr_low_epochs = 0;   // consecutive collapsing epochs (blip vs collapse)
++static bool    g_pool_tr_calibrated = false;
++static int64_t g_pool_tr_bytes    = 0;     // the CURRENT arm's accumulator
++static int64_t g_pool_tr_us       = 0;
++static int     g_pool_tr_slow_run = 0;     // consecutive slow reads
++static int     g_pool_tr_switches = 0;
++static int64_t g_pool_tr_epoch_bytes = 64ll << 20;   // MOE_HOST_POOL_TR_EPOCH_MIB
++static double  g_pool_tr_ratio    = 0.50;           // MOE_HOST_POOL_TR_RATIO
++static int64_t g_pool_tr_slow_us  = 40000;          // MOE_HOST_POOL_TR_SLOW_MS
++static int     g_pool_tr_slow_n   = 8;
+ // TODO #87 (1): `MOE_HOST_POOL_DIO` is AUTO by default -- decided once, at the first pool build, from
+ // MemAvailable vs the host expert set (the same measurement `MOE_HOST_POOL_RAM_PCT` takes).  Buffered fills
+ // (DIO=0) let the page cache act as an L3, which is worth +90 % decode / +155 % prefill when the set fits;
+@@ -1153,6 +1179,27 @@ void parse_env() {
+         const char * ds = getenv("MOE_HOST_POOL_DEMAND_SRC");
+         g_pool_fill_src_file   = fs != nullptr && strcmp(fs, "file") == 0;
+         g_pool_demand_src_file = ds != nullptr && strcmp(ds, "file") == 0;
++        // wip/host-read-transport: the adaptive transport.  A numeric env keeps every existing recipe valid
++        // (`MOE_HOST_POOL_DIO=0|1` is still honoured by the delivered logic when TRANSPORT is unset).
++        const char * tr = getenv("MOE_HOST_POOL_TRANSPORT");
++        if (tr != nullptr) {
++            if      (strcmp(tr, "auto") == 0) g_pool_tr_mode = 3;
++            else if (strcmp(tr, "map")  == 0) g_pool_tr_mode = POOL_TR_MAP;
++            else if (strcmp(tr, "file") == 0) g_pool_tr_mode = POOL_TR_FILE;
++            else if (strcmp(tr, "dio")  == 0) g_pool_tr_mode = POOL_TR_DIO;
++            else {
++                GGML_LOG_WARN("%s: MOE_HOST_POOL_TRANSPORT=%s is not one of auto|map|file|dio; ignoring\n",
++                              __func__, tr);
++                g_pool_tr_mode = -1;
++            }
++        }
++        g_pool_tr_epoch_bytes = (int64_t) env_int("MOE_HOST_POOL_TR_EPOCH_MIB", 64) << 20;
++        if (g_pool_tr_epoch_bytes < (8ll << 20)) g_pool_tr_epoch_bytes = 8ll << 20;
++        const int ratio_pct = env_int("MOE_HOST_POOL_TR_RATIO", 50);
++        g_pool_tr_ratio = (double) (ratio_pct > 0 ? ratio_pct : 50) / 100.0;
++        g_pool_tr_slow_us = (int64_t) env_int("MOE_HOST_POOL_TR_SLOW_MS", 40) * 1000;
++        g_pool_tr_slow_n  = env_int("MOE_HOST_POOL_TR_SLOW_N", 8);
++        if (g_pool_tr_slow_n < 1) g_pool_tr_slow_n = 1;
+     }
+     // TODO #87 (1): AUTO by default (see `g_pool_dio_req`).  An explicit `MOE_HOST_POOL_DIO=0|1` wins and is
+     // decided here, so an A/B never depends on the machine.
+@@ -1643,7 +1690,57 @@ static int64_t pool_available_ram_bytes() {
+         }
+     }
+     fclose(f);
+-    return kb > 0 ? kb * 1024 : -1;
++    int64_t avail = kb > 0 ? kb * 1024 : -1;
++    // wip/host-read-transport (TODO #306 option 3): `MemAvailable` is HOST-WIDE, so inside a memory cgroup
++    // (container, systemd scope) the fit test asks about RAM this process may not use -- it answers "the set
++    // fits", the run lives in the mapping arm, and the mapping collapses (measured: 898 MiB/s of mapping
++    // fills in a 32G scope whose host reported ~57 GiB available).  Take the smaller of the two.
++    {
++        // The process's OWN cgroup, not the root: `/sys/fs/cgroup/memory.max` is the host's limit ("max"),
++        // and reading it is what made the first version of this report "the set fits" inside a 32G scope.
++        char path[512] = "";
++        FILE * cg = fopen("/proc/self/cgroup", "r");
++        if (cg != nullptr) {
++            char line[512];
++            while (fgets(line, sizeof(line), cg) != nullptr) {
++                if (strncmp(line, "0::", 3) == 0) {              // cgroup v2: "0::<path>"
++                    char * nl = strchr(line, '\n');
++                    if (nl != nullptr) {
++                        *nl = '\0';
++                    }
++                    snprintf(path, sizeof(path), "/sys/fs/cgroup%s", line + 3);
++                    break;
++                }
++            }
++            fclose(cg);
++        }
++        char fmax[600], fcur[600];
++        snprintf(fmax, sizeof(fmax), "%s/memory.max", path[0] != '\0' ? path : "/sys/fs/cgroup");
++        snprintf(fcur, sizeof(fcur), "%s/memory.current", path[0] != '\0' ? path : "/sys/fs/cgroup");
++        char line[256];
++        int64_t lim = -1, cur = -1;
++        FILE * g = fopen(fmax, "r");       // cgroup v2
++        if (g != nullptr) {
++            if (fgets(line, sizeof(line), g) != nullptr && strncmp(line, "max", 3) != 0) {
++                lim = atoll(line);
++            }
++            fclose(g);
++        }
++        g = fopen(fcur, "r");
++        if (g != nullptr) {
++            if (fgets(line, sizeof(line), g) != nullptr) {
++                cur = atoll(line);
++            }
++            fclose(g);
++        }
++        if (lim > 0 && cur >= 0) {
++            const int64_t room = lim - cur;
++            if (room > 0 && (avail < 0 || room < avail)) {
++                avail = room;
++            }
++        }
++    }
++    return avail;
+ #elif defined(GGML_USE_HIP) && defined(_WIN32)
+     return ggml_hip_win_available_ram_bytes();
+ #else
+@@ -1912,6 +2009,193 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
+                   g_pool_dio ? "the set does not fit beside the pool" : "the set fits beside the pool");
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------
++// wip/host-read-transport: the ADAPTIVE transport (see `wip/host-read-transport/DESIGN.md`).  Caller holds
++// `g_mutex` for every function here.
++
++static const char * pool_transport_name(int a) {
++    return a == POOL_TR_FILE ? "file" : (a == POOL_TR_DIO ? "dio" : "map");
++}
++
++// A transport switch MUST close every open file handle: the O_DIRECT bit lives in the OPEN FLAGS
++// (`pool_open_file(path, dio)`), so a cached fd keeps serving the old transport.  Caller holds `g_mutex`.
++static void pool_transport_reopen_locked() {
++    for (auto & kv : g_host_pools) {
++        if (kv.second.fd >= 0) {
++            pool_close_file(kv.second.fd);
++            kv.second.fd = -1;
++        }
++    }
++    for (table_t & t : g_tables) {
++        if (t.src_fd >= 0) {
++            pool_close_file(t.src_fd);
++            t.src_fd = -1;
++        }
++    }
++}
++
++static void pool_transport_apply_locked(int next, const char * why) {
++    if (next < 0 || next >= POOL_TR_N) {
++        return;
++    }
++    const int prev = g_pool_transport;
++    if (next == prev && g_pool_tr_calibrated) {
++        return;   // already applied (the fields below are set on every apply, see the pin path)
++    }
++    pool_transport_reopen_locked();
++    g_pool_transport        = next;
++    g_pool_dio              = next == POOL_TR_DIO;
++    g_pool_fill_src_file    = next >= POOL_TR_FILE;
++    g_pool_demand_src_file  = next >= POOL_TR_FILE;
++    g_pool_tr_bytes         = 0;
++    g_pool_tr_us            = 0;
++    g_pool_tr_slow_run      = 0;
++    g_pool_tr_ref           = 0.0;
++    g_pool_tr_ref_epochs    = 2;
++    g_pool_tr_low_epochs    = 0;   // two epochs of warm-up before the rules may fire on the new arm
++    if (next != prev) {
++        g_pool_tr_switches++;
++    }
++    GGML_LOG_INFO("%s: host read transport -> %s (%s)\n", __func__, pool_transport_name(next), why);
++}
++
++// Decide the transport ONCE, at the first pool build.  The capacity question is the only one that decides
++// MAP-vs-disk, and it is a CAPACITY question -- a rate cannot answer it (the mapping's advantage is the WARM
++// case, 17 GiB/s, which no in-process probe can see: `posix_fadvise` skips mapped pages and
++// `madvise(MADV_DONTNEED)` drops the PTEs but not the page cache, both measured).  So:
++//   * the set fits the cache (cgroup-aware `pool_available_ram_bytes`)  -> MAP   (the fast arm, warm)
++//   * it does not                                                       -> FILE  (the general-purpose baseline;
++//                                                                                  the monitor may escalate to DIO)
++// A wrong prior is corrected by the runtime monitor, in one direction (see `pool_transport_observe_locked`).
++static void pool_transport_init_locked(const table_t & t, int64_t planned_pool) {
++    (void) t;
++    if (g_pool_tr_calibrated || g_pool_tr_mode < 0) {
++        return;
++    }
++    g_pool_tr_calibrated = true;
++    if (g_pool_tr_mode < 3) {
++        // a PIN: no monitoring (an A/B arm must be the arm it names)
++        g_pool_transport = -1;
++        pool_transport_apply_locked(g_pool_tr_mode, "pinned by MOE_HOST_POOL_TRANSPORT");
++        return;
++    }
++    // CAMPAIGN INSTRUMENT: start on a named arm (the only way to exercise escalation on demand).
++    {
++        const char * st = getenv("MOE_HOST_POOL_TR_START");
++        if (st != nullptr) {
++            int forced = -1;
++            if      (strcmp(st, "map")  == 0) forced = POOL_TR_MAP;
++            else if (strcmp(st, "file") == 0) forced = POOL_TR_FILE;
++            else if (strcmp(st, "dio")  == 0) forced = POOL_TR_DIO;
++            if (forced >= 0) {
++                g_pool_transport = -1;
++                pool_transport_apply_locked(forced, "MOE_HOST_POOL_TR_START (campaign instrument)");
++                return;
++            }
++        }
++    }
++    const int64_t avail = pool_available_ram_bytes();
++    const int64_t set   = g_preflight_host_bytes > 0 ? g_preflight_host_bytes : 0;
++    const bool    tight = avail > 0 && set > 0 && planned_pool + set > avail;
++    int start_map = tight ? POOL_TR_FILE : POOL_TR_MAP;
++    if (start_map == POOL_TR_FILE && !pool_file_io_available()) {
++        start_map = POOL_TR_MAP;   // no file tier on this platform: the mapping is all there is
++    }
++    g_pool_transport = -1;
++    pool_transport_apply_locked(start_map,
++        tight ? "capacity prior: the set cannot be cached (cgroup-aware MemAvailable vs pool + set)"
++              : "capacity prior: the set fits the cache, and the mapping is the fast arm");
++}
++
++// The next arm in the ladder (map -> file -> dio) that this platform can serve (-1 = none).  Caller holds
++// `g_mutex`.
++static int pool_transport_next_arm_locked() {
++    for (int a = g_pool_transport + 1; a < POOL_TR_N; a++) {
++        if (a == POOL_TR_MAP || pool_file_io_available()) {
++            return a;
++        }
++    }
++    return -1;
++}
++
++// Move to the best MEASURED arm once the current one collapses (never back, never to a worse arm).  The
++// ladder is map -> file -> dio in escalation ORDER, but the destination is the arm the calibration measured
++// as fastest, so a hard-pressure box goes straight to dio instead of spending an epoch on `file` first.
++// Caller holds `g_mutex`.
++static void pool_transport_escalate_locked(const char * why) {
++    const int next = pool_transport_next_arm_locked();
++    g_pool_tr_bytes    = 0;
++    g_pool_tr_us       = 0;
++    g_pool_tr_slow_run = 0;
++    if (next >= 0) {
++        pool_transport_apply_locked(next, why);
++    }
++}
++
++// Observe ONE read (bytes, wall time) and escalate on evidence.  Called from the fill and the bounce path.
++static void pool_transport_observe_locked(int64_t bytes, int64_t us) {
++    if (g_pool_tr_mode != 3 || g_pool_transport >= POOL_TR_DIO || bytes <= 0 || us < 0) {
++        return;
++    }
++    g_pool_tr_bytes += bytes;
++    g_pool_tr_us    += us;
++    // (1) the slow-read guard: a single expert read slower than the floor, N times running.  This is the
++    //     maintainer's "the fill took far too long" case and it fires inside one ubatch.
++    if (us > g_pool_tr_slow_us) {
++        if (++g_pool_tr_slow_run >= g_pool_tr_slow_n) {
++            char why[160];
++            snprintf(why, sizeof(why), "slow-read guard: %d reads over %lld ms each", g_pool_tr_slow_run,
++                     (long long) (g_pool_tr_slow_us / 1000));
++            pool_transport_escalate_locked(why);
++            return;
++        }
++    } else {
++        g_pool_tr_slow_run = 0;
++    }
++    // (2) the epoch rate check: the arm's throughput against WHAT IT ITSELF achieved once warm.  This is
++    //     the graceful case (the page cache stops holding the set over a long run) and it needs no absolute
++    //     reference, so a slow box and a fast box both work, and a merely cold start never fires it.
++    if (g_pool_tr_bytes < g_pool_tr_epoch_bytes || g_pool_tr_us <= 0) {
++        return;
++    }
++    const double rate = (double) g_pool_tr_bytes / 1048576.0 / ((double) g_pool_tr_us / 1e6);
++    g_pool_tr_bytes = 0;
++    g_pool_tr_us    = 0;
++    if (g_pool_transport == POOL_TR_MAP) {
++        // the band a mapping arm lives in is wide (593 MiB/s under pressure, 17 GiB/s warm), so the
++        // reference is the BEST epoch seen, and a collapse is falling to `ratio` of it
++        if (rate > g_pool_tr_ref) {
++            if (g_pool_tr_ref_epochs > 0) {
++                g_pool_tr_ref_epochs--;
++            } else {
++                g_pool_tr_ref = rate;
++            }
++            return;
++        }
++        if (g_pool_tr_ref_epochs > 0) {
++            g_pool_tr_ref_epochs--;
++            return;
++        }
++    }
++    if (g_pool_tr_ref <= 0.0) {
++        g_pool_tr_ref = rate;
++        return;
++    }
++    if (rate < g_pool_tr_ratio * g_pool_tr_ref) {
++        // SUSTAINED: one low epoch is a blip (a cold first pass, another process's burst).  Two in a row is a
++        // collapse.  Measured false positive without this: a warm map arm dipped 16 444 -> 9 624 MiB/s for one
++        // epoch and switched a RAM-rich box off the mapping, which is the arm it wants.
++        if (++g_pool_tr_low_epochs >= 2) {
++            char why[160];
++            snprintf(why, sizeof(why), "epoch rate %.0f MiB/s < %.2fx this arm's own %.0f MiB/s for %d epochs",
++                     rate, g_pool_tr_ratio, g_pool_tr_ref, g_pool_tr_low_epochs);
++            pool_transport_escalate_locked(why);
++        }
++        return;
++    }
++    g_pool_tr_low_epochs = 0;
++}
++
+ // Cap this table's `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.
+ // Caller holds `g_mutex` (it updates the process-wide running total).
+ //
+@@ -2202,7 +2486,13 @@ static host_pool_t * table_pool_locked(table_t & t) {
+     int64_t planned_pool = g_pool_total_bytes > 0 ? g_pool_total_bytes
+                                                  : (host_total * g_pool_frac) / 100;
+     // TODO #87 (1): decide the fill mode before ANY read happens, from the process-wide numbers.
+-    pool_decide_dio_locked(host_total, planned_pool);
++    // wip/host-read-transport: `MOE_HOST_POOL_TRANSPORT` (pin or `auto`) OWNS the decision when set --
++    // `auto` measures instead of guessing; unset keeps the delivered `MemAvailable` heuristic untouched.
++    if (g_pool_tr_mode >= 0) {
++        pool_transport_init_locked(t, planned_pool);
++    } else {
++        pool_decide_dio_locked(host_total, planned_pool);
++    }
+     if (g_pool_total_bytes > 0) {
+         // explicit process-wide budget, split proportionally to each tensor's share of the host set
+         if (host_total > 0) {
+@@ -2403,7 +2693,20 @@ static void pool_reap_locked(host_pool_t & p) {
+ // when it is unavailable (a platform whose pool file I/O is a stub, a file that cannot be opened) the fill
+ // falls back to the mapping instead of failing, because failing here marks the whole pool dead (issue #274).
+ // Caller holds `g_mutex`.
++// wip/host-read-transport: the monitor's view of a fill.  `pool_transport_observe_locked` is cheap (one
++// early return unless `auto` is on) and it must see the WALL time of the whole fill, which is what a slow
++// mapping fill (a fault storm) costs the run.
++static bool pool_fill_slot_locked_impl(host_pool_t & p, int expert, char * dst);
+ static bool pool_fill_slot_locked(host_pool_t & p, int expert, char * dst) {
++    const int64_t t_all = ggml_time_us();
++    const bool    ok    = pool_fill_slot_locked_impl(p, expert, dst);
++    if (ok) {
++        pool_transport_observe_locked((int64_t) p.host_bytes, ggml_time_us() - t_all);
++    }
++    return ok;
++}
++
++static bool pool_fill_slot_locked_impl(host_pool_t & p, int expert, char * dst) {
+     // wip/host-pool-speed: the fill's WALL TIME, by source.  A demand fill is synchronous (the host thread
+     // blocks on it), so this is the number that decides whether an overlapped/coalesced fill is worth
+     // building at all (README §16).  Two clock reads per fill: fills are ~1 per miss, so this is free.
+@@ -3440,6 +3743,9 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+         g_bounce_map_us    += ggml_time_us() - tm;
+         g_bounce_map_bytes += (int64_t) rd_len;
+         filled = true;
++        // wip/host-read-transport: the demand read is the DOMINANT host cost on a tensor split (r261:
++        // 54 % of a decode step), so the transport monitor has to see it, not only the pool fill.
++        pool_transport_observe_locked((int64_t) rd_len, ggml_time_us() - tm);
+     }
+     if (!filled) {
+         return false;
+@@ -9690,6 +9996,12 @@ static void report_locked() {
+     }
+     if (g_fill_read_calls + g_fill_memcpy_calls > 0) {
+         const double tb = (double) g_fill_total_bytes / (1024.0 * 1024.0 * 1024.0);
++        if (g_pool_tr_mode >= 0) {
++            GGML_LOG_INFO("%s: host read transport: %s, %s, %d switch(es) this run\n", __func__,
++                          pool_transport_name(g_pool_transport),
++                          g_pool_tr_mode == 3 ? "auto (capacity prior + runtime monitor)" : "PINNED",
++                          g_pool_tr_switches);
++        }
+         GGML_LOG_INFO("%s: pool fills: %lld storage reads %.0f ms, %lld mapping memcpys %.0f ms, %.2f GiB total "
+                       "(%.1f MiB/fill, %.0f MiB/s effective)\n",
+                       __func__, (long long) g_fill_read_calls, g_fill_read_us / 1000.0,
+-- 
+2.56.0
+

@@ -105,6 +105,17 @@ is the pressure knob.
    holds the set, keep O_DIRECT as the tight arm, and make the whole thing one decision (the coupling with
    `MOE_HOST_POOL_STAGE_SPAN` stays mandatory — a file transport without the span is the measured −41 %).
 
+## The adaptive arm (`0002`, `DESIGN.md`)
+
+`MOE_HOST_POOL_TRANSPORT=auto` replaces the `MemAvailable` guess with a **cgroup-aware capacity prior**
+(`min(MemAvailable, cgroup memory.max - memory.current)`): the set fits → `map`; it does not → `file`. A runtime
+monitor then escalates `file → dio` (or `map → file → dio`) on evidence: a slow-read guard, or two consecutive
+epochs below 0.50x the best rate that same arm achieved in the run. **Text is identical across all four arms and
+across a run that switches** (`de81b28cab7d`). Prototyped and exercised on this box; a 32G scope starts on
+`file`, a plain run starts on `map`, and an escalation fired live. A cold calibration probe is **impossible
+in-process** (measured: `fadvise` skips mapped pages, `madvise` drops the PTEs but not the cache), which is why
+capacity — not a probe rate — picks the map-vs-disk arm.
+
 ## Owed before anything is promoted
 
 * **A two-direction A/B per shape, interleaved**, on the 56G/44G/32G ladder (this campaign ran one arm per
@@ -120,7 +131,10 @@ is the pressure knob.
 
 | file | what |
 |---|---|
-| `0001-per-expert-host-read-transport.patch` | the instrument (inert by default) |
+| `0001-per-expert-host-read-transport.patch` | the static two-way instrument (inert by default) |
+| `0002-adaptive-host-read-transport.patch` | the **adaptive** layer on top of `0001`: cgroup-aware capacity prior + monitored ladder, `MOE_HOST_POOL_TRANSPORT=auto` |
+| `DESIGN.md` | the adaptive design, what the prototype proved, and what it still owes |
+| `test-adaptive.sh` | the prototype's checks (`text`, `escalate`, `slowguard`) |
 | `transport-ab.py` | experiment 1: the transport in isolation, under a cgroup-shaped page-cache budget |
 | `text-ab.sh` | the four-arm text-identity check (greedy, hashed with `scripts/extract-generated.py`) |
 | `RESULTS.md` | the raw tables and the run directory names under `wip/bench-56gb/runs/` |
