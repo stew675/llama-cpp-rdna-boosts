@@ -542,3 +542,150 @@ model fits in RAM anyway, refuse when it does not.  Four arms, all on `halo`:
 Two notes for the record.  **The refusal is the point**: the same 122B load without it goes to the 2026-10-19
 over-commit (121 GiB resident + 13 GiB swap on this 123 GiB box).  And **the decline is not silent**: a fitting
 model still gets its GTT store when the limit allows it, and is told exactly why it did not when it does not.
+
+## 16. 2026-11-11 — P3: the GTT store SERVES as the expert ARENA.  `tables=120`, `evictions>0`, and a 123.45 GiB model runs on a 123 GiB box
+
+The P3 session answered the two open bugs `IMPLEMENTATION.md` P3.0 recorded (a `tables=0` census, and an
+unbounded allocation) and then measured the tier.  Box unchanged (`halo`, gfx1151, 123 GiB, 123 GiB RAM + 175 GiB
+swap, kernel 7.2.13, ROCm 10.1.0, `iommu=off`, `RLIMIT_MEMLOCK` unlimited).  Every arm below is a guarded run
+(`/tmp/p3/guard.sh`: `ulimit -v 96 GiB`, `ulimit -l 8 GiB`, plus a 1 s monitor that kills the run the moment
+`SwapFree` starts dropping — see §16.4 for which barrier fired and on what).
+
+Models: `M35` = Qwen3.6-35B-A3B Q4_K_M (18.22 GiB of experts, 120 tables), `MFN` = Qwen3.8 Flash-Next GSQ-IQ3_XXS
+(40.9 GiB of experts, 144 tables), `MBIG` = Qwen3.5-122B-A10B Q8_0 (119.9 GiB of experts, 144 tables, 126.4 GiB of
+weights: it cannot fit in 123 GiB of RAM).
+
+### 16.1 Why `tables=0` — three defects, all in the seam between the loader and the cache
+
+Instrumented with a temporary `MOE_EXPERT_GTT_DEBUG=1` one-shot `fprintf` at each declining seam (removed before
+the patch was re-cut).  The first census with the tier on registered **no tables at all**, and these are the three
+causes, each independently fatal:
+
+1. **`moe_cache_preflight()` returned above the per-device byte recording.**  The arena tier's early `return true`
+   sat *before* the `g_preflight_device_seen` / `g_preflight_device_bytes` block, so on an APU the cache recorded
+   "0 host-expert bytes expected".  Consequences, all silent: `moe_cache_tables_complete_locked()` answered
+   **complete on the first registered table** (measured: `registered=144.0 MiB expected=0.0 MiB tables=1`, then
+   `g_sized=1`), and the two transport queries answered "no opinion" — `moe_cache_pending()` false (so the
+   scheduler's registration pre-pass never ran) and `moe_cache_stage_ready()` true.  The fix is to record, THEN
+   return: the tier's expected total is the whole host-expert set (18 662 MiB on `M35`), so the arena sizes once,
+   on the complete set.
+2. **`alloc_all_locked()` clamped the tier's budget against free VRAM / the slab.**  `g_budget` is the store's
+   extent on this tier, but the clamp below it subtracted `cudaMemGetInfo` free or the slab's arena capacity — and
+   on an APU the slab's arena capacity is **0** (the slab is armed but has no work region), so the budget came out
+   0 and every table got `layer 0 cannot hold a uniform arena above 0 slots (requested 0)`.  The clamp is
+   meaningless here: the store's extent is already bounded by `-lme` and by `MOE_HOST_LIMIT_FRAC`, and every slot
+   comes from `ggml_cuda_gtt_store_reserve()`, which cannot exceed the region.  Skipped for the tier.
+3. **The load was not MAPPED.**  `ggml_backend_cuda_device_get_props` reports `mmap_support = false` for an IGPU
+   device (upstream's rule), so the AUTO load mode resolves to `none` and the expert master became a **pageable
+   copy of the whole set**: `ROCm_HostMap model buffer size = 18 662.00 MiB` of `ggml_aligned_malloc` on `M35`,
+   with a one-time WARN.  For a set that does not fit that is the entire memory the tier exists to avoid.  The
+   arena arm now forces `use_mmap` (one WARN, `--load-mode mmap` silences it) — after which the same buffers are
+   `ROCm_HostMap` ranges over the file mapping and the anonymous copy is gone (`MemAvailable` after the load:
+   **93 GiB before, 106 GiB after** on `M35`, i.e. the 18.6 GiB copy).
+
+Also found and fixed while there: the tier was *arming the movable-boundary slab* (through
+`ggml_backend_cuda_device_moe_cache_preflight`, which arms on `on == true`), whose size is `free VRAM - reserve` —
+on a shared pool that is the whole machine (`SLAB_INIT size(VA)=98.44 GiB` is the recorded over-commit).  The tier
+disarms it, and the "cache enabled but the slab is not armed" WARN now excludes the tier (it is correct there).
+
+### 16.2 The tier serves: three arms, three models
+
+Census = `-lv 4` (mechanism); text = a separate run with **no `-lv`** at all, hashed by
+`scripts/extract-generated.py` (correctness only — §16.1's `tables=0` is the proof that identical text alone is
+not evidence).
+
+| arm | extent | resident | residency | census |
+|---|---|---|---|---|
+| `M35`, `-lme 4` | 4 096.0 MiB, **80 % evicting** | **120 tables / 6 720 slots / 4 082.3 MiB** | 56 of 256 experts per table | `h=0.5901 (6161/10440 reaches), fills=10 999, evictions=4 279, arena releases=0` |
+| `MFN`, `-lme 8` | 8 192.0 MiB | **144 tables / 14 688 slots / 8 153.0 MiB** | 102 of 144 experts per table | `h=0.9447 (14823/15690), fills=15 555, evictions=867, arena releases=0` |
+| `MBIG`, `-lme 60` | 61 440.0 MiB | **144 tables / 19 152 slots / 61 047.0 MiB** | 133 of 256 experts per table | `h=0.8786 (11028/12552), fills=20 676, evictions=1 524, arena releases=0` |
+
+`arena=` is the resident bytes by construction (slots × expert_bytes) and sits inside the extent in every arm
+(4 082.3 ≤ 4 096, 8 153.0 ≤ 8 192, 61 047.0 ≤ 61 440); the 1.25× cap added to `alloc_all_locked` never fired.  The
+tier's own census line prints the two acceptance numbers (`GTT arena tier: N table(s) resident, 0 arena
+release(s)`), and `arena alloc failures=0` in every arm.
+
+### 16.3 Text: the eviction path changes *where* the bytes are, never *which*
+
+Same-seed greedy (`--seed 42 --temp 0 -n 20 --no-display-prompt --single-turn`), hashes from
+`scripts/extract-generated.py`:
+
+| model | arm | hash |
+|---|---|---|
+| `M35` | `MOE_EXPERT_GTT=0` (no store) | `627b2ebd7792` |
+| `M35` | store `auto` (P2 placement) | `627b2ebd7792` |
+| `M35` | `-lme 6` (P2 placement) | `627b2ebd7792` |
+| `M35` | **arena `-lme 4`** (80 % evicting) | **`627b2ebd7792`** |
+| `M35` | **arena `-lme 6`** | **`627b2ebd7792`** |
+| `MFN` | `MOE_EXPERT_GTT=0` / store `auto` | `f586785d7183` |
+| `MFN` | **arena `-lme 8`** | **`f586785d7183`** |
+| `MBIG` | arena `-lme 60`, two runs | `9ccf62ed39c3`, `9ccf62ed39c3` |
+| `MBIG` | arena `-lme 20` (**one third** the residency: 44 slots/table, not 133) | **`9ccf62ed39c3`** |
+
+So the tier's text is identical to the store-off reference on both fitting models, and on `MBIG` a 3× change of
+the resident set (`-lme 20` = **44 slots/table**, `h=0.5975`, `evictions=5 052`, against `-lme 60` = **133
+slots/table**, `h=0.8786`, `evictions=1 524`) changes no token — which is the eviction invariant (`IMPLEMENTATION.md`
+P3 accept) measured directly.  A `-lv 4` census arm of the same model does **not**
+reproduce a hash (4663 vs 4797 chars across two `MBIG` censuses): the stream is polluted, as `AGENTS.md` says, so
+every hash above comes from its own no-`-lv` run.
+
+### 16.4 The unbounded-allocation bug does NOT reproduce, and the two barriers say why it was not the arena
+
+The pre-fix arms are gone, so this is stated as what was measured on the fixed build, not as a root cause.
+
+* **The literal case-2 configuration now completes**: `M35`, arena `-lme 4`, `-lv 4`, default `-c 262144`, inside
+  `systemd-run --user --scope -p MemoryMax=48G -p MemorySwapMax=4G`, under `ulimit -v 96 GiB` — exit 0, 21.9 t/s
+  decode, `SwapFree` **unchanged at 179 958 MiB for the whole run**, and the same with `-c 4096`.  No OOM, no
+  cgroup kill, no swap movement.
+* **`--fit off` was not the trigger**: the default `--fit on` arm is clean too (fit projected 25 864 of 122 773 MiB
+  and changed nothing).  The maintainer's `--fit` hypothesis is recorded as **not confirmed**: the fit probe is
+  skipped for `no_alloc` and the tier's own budget never consults it.
+* **Barrier 1 (`ulimit -v 96 GiB`) fired on ONE arm, on an allocation the tier has nothing to do with**: `MFN`
+  needs `per_layer_token_embd.weight` (27 465 MiB, `add_resident`, `--lazy-mode off`) as a plain CPU buffer, and
+  41 GiB of file mapping + ROCm's VA + the 8 GiB store exhausted the cap (`ggml_aligned_malloc: insufficient
+  memory (attempted to allocate 27465.95 MB)`).  At `AS_KB=0` the same arm runs (22.6 t/s census, 13.6 t/s text,
+  `f586785d7183`).  So the 96 GiB cap is **not** usable on the Flash-Next class of model, and the `-v` barrier's
+  "anonymous growth" reading must not be attached to the store.
+* **Barrier 2 (the cgroup) never fired** in any fixed-build arm, and the `SwapFree` monitor never had to kill a run.
+* **What the original allocation most plausibly was, and what is now true instead**: with `tables=0` the whole
+  18.6 GiB expert set was re-uploaded per op through the scheduler's pageable-master bounce path (measured on the
+  pre-fix arm: `scheduler pageable-master fallback: 414 ranges, 520.2 MiB served through the per-table bounce;
+  pinned bounce ring total 157.8 MiB`) *and* the load held the pageable 18.6 GiB copy *and* the slab was armed.
+  All three are now gone for this tier (the copy by forcing the mapped load, the slab by disarming it, the
+  per-op bounce by the tables actually registering).  If it recurs, the suspects in `IMPLEMENTATION.md` P3.0
+  still stand, but the observation to collect first is the `GTT arena tier:` panic line and `/proc/<pid>/smaps_rollup`
+  per mapping — the store's extent cannot be exceeded (`ggml_cuda_gtt_store_reserve` refuses), so an explosion is
+  never the arena.
+
+### 16.5 `MBIG`: a 123.45 GiB model on a 123 GiB box (the design's whole point)
+
+`MBIG` is 126 403 MiB of weights against ~115 GiB of `MemAvailable`: it cannot be loaded resident.  With
+`MOE_EXPERT_GTT_ARENA=1` and a mapped load, the expert tensors are mapping holes, the store holds the hot subset,
+and the rest is read from the page cache / NVMe on demand:
+
+| arm | arena | decode | prompt | result |
+|---|---|---|---|---|
+| `-lme 60 --fit off -c 4096` | 61 047.0 MiB | **3.5 t/s** | 1.3 t/s | runs to completion, `h=0.8786`, text `9ccf62ed39c3` (×2) |
+| `-lme 20 --fit off -c 4096` | **20 196.0 MiB** (144 tables / 6 336 slots) | 3.0 t/s | 2.9 t/s | runs to completion, `h=0.5975`, `evictions=5 052`, **same text** |
+| `-lme 60`, `ulimit -l 8 GiB` (the §15.3 clamp path) | — | — | — | would **REFUSE** (a >RAM model needs a locked store); these arms ran at `ulimit -l 96 GiB` |
+
+These are 4-20-token arms on a cold page cache, **not benchmarks**: the 3.5 vs 3.0 t/s difference is the
+direction the design predicts (more residency, fewer disk fills) and nothing more.  What they establish is the
+qualitative claim the campaign exists for: **a model that cannot fit in RAM runs, and the resident subset is what
+carries it.**
+
+### 16.6 What is NOT measured, and is named as such
+
+* **No throughput claim of any kind.**  The tier is opt-in and every arm above is short; the fill path is still
+  the scheduler's pinned-bounce H2D (`expert_host_src` → bounce → `copy_slot_from_src`), **not** the plain host
+  `memcpy` into the registered slot that P3.0 finding 4 calls for — that needs the ordering argument (a host
+  write must follow the previous consumer's reads on the same slot) and belongs to P4 with the measured 12.8 GB/s
+  warm arm.
+* **P3c (the nextn/MTP head's tables pinned outside the `-lme` arithmetic) is not done.**  Every arm above is a
+  plain `llama-cli` run, no MTP drafter, so the accounting question never came up.
+* **Multi-device is untested**: this box has one GPU.  The tier reserves per device from that device's store and
+  the cap is per device, but a `-sm tensor` split over two APUs has not been run.
+* **No eviction *rate* study**: `evictions=4 279` on the `M35` arm is the counter, not a hit-rate-vs-budget curve;
+  `MOE_EXPERT_CACHE_TOUCH` is a no-op on this tier by construction (every miss fills), so admission is not tuned.
+* **The mlock arm at MBIG's 61 GiB** is a real reservation under §15.3's model, but its own pressure behaviour
+  (a 61 GiB `mlock`ed region) was not probe-tested.

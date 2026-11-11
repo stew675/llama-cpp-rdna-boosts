@@ -205,7 +205,12 @@ Four findings from reading `moe-expert-cache.cu` against the store.  They fix th
    `expert_host_src()` resolves a `table_t` master with `t.host`/`host_bytes`/`src_off`; a pageable master is
    copied with `cudaMemcpyAsync(H2D)`, which is the delivery's known-bad path on RDNA.  So the APU arm must fill
    from the **mapping with a plain host `memcpy` into the registered slot** (the measured warm arm, 12.8 GB/s;
-   a cold page faults the mapping in, which is the §3.1 "cold" arm).  That is the whole fill change.
+   a cold page faults the mapping in, which is the §3.1 "cold" arm).  That is the fill change -- and it is
+   **NOT in yet**: the P3 arms run their fills through the delivery's existing pinned bounce ring
+   (`expert_host_src` -> `memcpy` into a pinned entry -> H2D), which is correct and ordered but pays a second
+   copy.  The direct `memcpy` needs an ordering argument first (a host write must follow the previous consumer's
+   reads of the same slot, which the stream-ordered copy gets for free), so it travels with P4's fill work and
+   its 12.8 GB/s warm arm (`MEASUREMENTS.md` §16.6).
 
 So P3 is: **the store is the arena, the model mapping is the master, the cache is the policy.**  In the discrete
 path's own vocabulary that is `--host-experts pool` with the pool replaced by the GTT store and no pinned master
@@ -216,23 +221,35 @@ path's own vocabulary that is `--host-experts pool` with the pool replaced by th
 | stage | what | verify |
 |---|---|---|
 | **P3a-1** (DONE 2026-11-11) | the GTT store becomes a real allocator: first-fit over a sorted, coalesced free list (`reserve`/`release`/`largest_free`), replacing the bump pointer; the all-resident carve keeps working | P2's arms unchanged: text `627b2ebd7792` / `f586785d7183`, same carves, no faults |
-| **P3a-2** ⚠ | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (no slab) -- **all LANDED 2026-11-11, but the tier registers no tables yet** (`tables=0`), so the arena is not yet serving anything | ✗ a fitting model runs with the arena: **the text arm passes but proves nothing** (the ops still read their own buffer). Required: the census's `tables=`/`arena=` are non-zero |
-| **P3a-3** ⚠ | the loader places the expert tensors as **holes in the model mapping** (`ROCm_HostMap` on the APU when the arena tier is on -- `host_master_mapped` in `llama-model.cpp` does the placement) -- **LANDED** | ✗ unverified for the same reason; and see the memory explosion below |
+| **P3a-2** (DONE 2026-11-11, PM) | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (no slab).  **It serves**: the 3 defects that made the census read `tables=0` are fixed (see the box below) | `MEASUREMENTS.md` §16.2: `M35 -lme 4` -> **120 tables / 6 720 slots / 4 082.3 MiB of a 4 096 MiB extent**, `h=0.5901`, `evictions=4 279`, `arena releases=0`; `MFN -lme 8` -> 144 / 14 688 / 8 153.0 MiB |
+| **P3a-3** (DONE 2026-11-11, PM) | the loader places the expert tensors as **holes in the read-only model MAPPING** (`ROCm_HostMap` when the arena tier is on -- `host_master_mapped` in `llama-model.cpp` does the placement), and the arena arm now FORCES a mapped load (an iGPU reports no `mmap_support`, so AUTO resolved to `none` and the master was a pageable 18.6 GiB COPY) | `MEASUREMENTS.md` §16.1 (3): the `ROCm_HostMap 18 662.00 MiB` anonymous copy is gone, `MemAvailable` after the load 93 -> 106 GiB on `M35` |
 
-> **OPEN BUG (2026-11-11): arena mode can allocate without bound.**  One arm took this 123 GiB box to
-> full-memory + swap twice.  The first was the full-set forced arm, and it is now prevented by construction (the
-> identity-mirror guard: on this tier the master is pageable, so mirroring a whole table into the arena is
-> `n_experts` pageable H2Ds -- and the fitting band does not need the arena at all).  The second happened in a
-> `-lv 4` census arm with a **partial** arena (`-lme 4`), *inside* a `MemoryMax=48G` cgroup, so the cause is not
-> cgroup-charged anon alone.  Suspects, in order: the pageable-master fill path's runtime staging, the prefill
-> staging ring (`span_buf_ensure`), and the heat/ghost mirrors.  **`MOE_EXPERT_GTT_ARENA` is therefore default-OFF
-> and the modal arena branch is only reachable for a set that does not fit**; a text arm alone must not be used to
-> argue the tier works.  Containment recipe for the next session: run every arena arm under
-> `systemd-run --user --scope -p MemoryMax=32G -p MemorySwapMax=4G` and watch `free -g` -- a cgroup bounded the
-> *earlier* probe-16 work fine, so an uncatchable explosion points at memory that is not charged to the scope.
+> **OPEN BUGS, both CLOSED (2026-11-11, PM).  The `tables=0` census was three seams, not one** -- full numbers in
+> `MEASUREMENTS.md` §16.1:
+>
+> 1. `moe_cache_preflight()` returned **above** the per-device host-expert byte recording, so the completeness
+>    gate saw `expected=0` (complete on the FIRST table), and both transport queries answered "no opinion"
+>    (`moe_cache_pending` false, `moe_cache_stage_ready` true).  Record, then return.
+> 2. `alloc_all_locked()` **clamped the tier's budget** against free VRAM / the slab's arena capacity, which on an
+>    APU is 0 -> `layer 0 cannot hold a uniform arena above 0 slots (requested 0)`.  The store's extent already IS
+>    the bound; the clamp is skipped for the tier.
+> 3. The load was **not MAPPED** (`mmap_support` is false for an IGPU device), so the "holes" were a pageable full
+>    copy of the expert set.  The arena arm forces the mapped load now (one WARN).
+>
+> Plus: the tier no longer arms the movable-boundary slab (it armed it through the preflight wrapper, and on a
+> shared pool the slab sizes itself as the whole machine).
+>
+> **The unbounded allocation did NOT reproduce on the fixed build**, including the literal case-2 configuration
+> (`-lme 4`, `-lv 4`, default ctx, `MemoryMax=48G`): exit 0, `SwapFree` unchanged for the whole run, no cgroup
+> kill (`MEASUREMENTS.md` §16.4).  The `--fit` hypothesis is **not confirmed** (`--fit on` is clean too).  Barrier
+> 1 (`ulimit -v 96 GiB`) did fire, on ONE arm and on an allocation the tier has nothing to do with: Flash-Next's
+> 27 465 MiB resident `per_layer_token_embd.weight` CPU buffer, on top of a 41 GiB file mapping.  The store's
+> extent cannot be exceeded (`ggml_cuda_gtt_store_reserve` refuses), so an explosion is never the arena; if it
+> recurs, collect `/proc/<pid>/smaps_rollup` per mapping first.  `MOE_EXPERT_GTT_ARENA` stays **default-OFF**
+> (it is a fittability tier, not a speed tier, and it costs decode on a config whose KV/experts fit).
 
-| **P3b** | `-lme` smaller than the set: evictions, fills, the hit-rate census, and the transient band only if the measured admission policy wants it | a **>RAM model runs**: census shows evictions > 0, unregisters == 0, byte-identical text against the fitting arm |
-| **P3c** | the nextn tables pinned outside `-lme` | the head's 3 tables are resident in every arm, and `-lme N` arithmetic excludes them |
+| **P3b** (DONE 2026-11-11, PM) | `-lme` smaller than the set: evictions, fills, the hit-rate census, the transient band only if the measured admission policy wants it (it does not: every miss fills by construction, so touch admission stays a no-op here) | `MEASUREMENTS.md` §16.3/§16.5: **a >RAM model runs** -- 123.45 GiB on this 123 GiB box at `-lme 60` (3.5 t/s) and `-lme 20` (3.0 t/s), `evictions > 0`, `arena releases == 0`, and the text is identical across a 3x residency change and to the store-off arm on both fitting models |
+| **P3c** (TODO) | the nextn tables pinned outside `-lme` | the head's 3 tables are resident in every arm, and `-lme N` arithmetic excludes them -- **not touched**: every P3 arm so far is a plain `llama-cli` run with no drafter |
 
 Reuse, do not rebuild: the heat table and its MHT2 prior (`apply_heat_seed_locked`), the slot/remap
 indirection (`g_dr_key_to_id`, `moe_cache_remap`), and `access_locked()` (`moe-expert-cache.cu:3495`) as the

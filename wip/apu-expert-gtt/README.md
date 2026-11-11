@@ -1,23 +1,26 @@
 # wip/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
 
-**Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, and P1.1 + P2 (the
-GTT store itself, built and measured) are DONE; nothing in `patches/`, nothing applied to the fork.**  The plan is
-[`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
+**Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, P1.1 + P2 (the GTT
+store itself) and **P3a/P3b (the store as the expert cache's ARENA: it serves, it evicts, and a 123.45 GiB model
+runs on this 123 GiB box)** are DONE and measured; nothing in `patches/`, nothing applied to the fork.**  The plan
+is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `f0991921…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `79fbbc97…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `e38a3f15f57a39c33bcbe5a1f0313dfeef68fcf5f40bacb5ce02edb20595b214` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) | `1643cc9de8c7d8fbc8213424395d5f472876c7c79a5688cdb4c84f491b022c54` |
 
-**What is left: P3 (residency/eviction -- OPENED 2026-11-11: the store is a real allocator, the arena arm is wired but
-**not yet serving** and has an open unbounded-allocation bug; see `IMPLEMENTATION.md` P3.0), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
-(gate + promotion)**, plus the two owed probes (`15` touch distance, `16` reclamation under pressure).  A run in
-this phase is an **ALL-RESIDENT arm or a static hot subset**; the census says so, every time.
+**What is left: P3c (the nextn/MTP head's tables pinned outside the `-lme` arithmetic), P4 (the streaming fill arms
++ overlap -- including the direct host `memcpy` into the registered slot that the arena tier still lacks), P5
+(prefill streaming), P6 (gate + promotion).**  P3's own limits are named in `MEASUREMENTS.md` §16.6: there is **no
+throughput claim** for the arena tier, multi-device is untested, and the fill path is still the delivery's pinned
+bounce ring.  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
+config whose experts fit), and nothing about it has been measured beyond this one APU.
 
 **The campaign's environment variables** (not in `ENVIRONMENT.md`: nothing here is in `patches/` yet, so these
 are documented here and will move there on promotion — per AGENTS.md rule 9, with their class):
@@ -27,6 +30,7 @@ are documented here and will move there on promotion — per AGENTS.md rule 9, w
 | `MOE_EXPERT_GTT` | `1` | **kill switch** | `0` = no GTT store, i.e. today's behaviour and log, byte for byte |
 | `MOE_EXPERT_GTT_RO` | `1` | **kill switch** | `0` = register the region writable instead of ReadOnly (the measured 232 → 60 GB/s A/B) |
 | `MOE_EXPERT_GTT_MLOCK` | `1` | **kill switch** | `0` = do not `mlock`: the tier is then reclaimable by design (diagnostic / bisection) |
+| `MOE_EXPERT_GTT_ARENA` | **unset (OFF)** | **opt-in** | `1` = use the GTT store as the expert cache's ARENA for a set that does not fit (P3).  Opt-in deliberately: it is a fittability tier, not a speed tier, and it forces a mapped load |
 | `MOE_HOST_LIMIT_FRAC` | `80` | tuning (existing) | the `auto` ceiling as a % of `MemAvailable`, shared with the discrete arm |
 | `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning (existing) | the admission threshold, reused unchanged in P3 |
 
@@ -393,6 +397,18 @@ measurement.
   page-fault-capable mapping is not in the GPU's page tables, hot or cold (measured fatal).  A pageable mapping
   is a *source* (a `pread` target or, registered, a copy-engine source); never a read target.
 * **Do not size the GTT store from "free VRAM".**  Measured over-commit; the guard stays.
+* **Do not clamp the ARENA tier's budget against free VRAM or the slab either** (2026-11-11, `MEASUREMENTS.md`
+  §16.1): `alloc_all_locked`'s clamp is meaningless once every slot comes from the store, and on an APU the slab's
+  arena capacity is 0, so it sized the arena to **zero slots** (`layer 0 cannot hold a uniform arena above 0
+  slots (requested 0)`) with the store wide open behind it.  The extent is the bound; a 1.25x cap is asserted.
+* **Do not arm the movable-boundary slab on the arena tier.**  The backend's preflight wrapper arms it whenever
+  the cache is on, and a UMA slab sizes itself as `free VRAM - reserve` = the whole machine.
+* **Do not let the arena tier run on an unmapped load.**  An IGPU device reports `mmap_support = false`, so AUTO
+  resolves to `--load-mode none` and the "mapping holes" become a **pageable full copy of the expert set**
+  (measured 18 662 MiB on 35B-A3B) -- the exact memory the tier exists to avoid.  The arm forces `use_mmap`.
+* **Do not judge this tier by text alone, and never by a `-lv` run's text.**  The `tables=0` census produced
+  byte-identical text with the mechanism completely inert (`MEASUREMENTS.md` §16.1), and a `-lv 4` census of the
+  122B gave two different hashes on the same seed.  Text arm: no `-lv`; the mechanism is proved by the census.
 * **Do not `O_DIRECT` a GGUF offset directly.**  Tensor offsets are aligned to `general.alignment` (32 bytes),
   so an `O_DIRECT` fill must round the read out to the block size and carry a per-fill delta into the slot — or
   be buffered.  Measured: an unaligned `O_DIRECT` read copies **0 bytes**.
