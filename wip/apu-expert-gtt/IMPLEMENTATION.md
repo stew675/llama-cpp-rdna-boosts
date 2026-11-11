@@ -420,8 +420,9 @@ repeated-prompt arm; pp rate reported against the all-resident arm.
 > Two assertions had to be corrected against what this tier actually reports (`MOE_EXPERT_GTT=0` is "cache on,
 > registers nothing", not "cache OFF"; `takeover=` counts the decode take-overs here, not `gate-host-pool.sh`'s
 > identity hand-off) -- copying either over from the discrete gate would have failed a correct arm.
-> **Both decisions are TAKEN (2026-11-11):** the SHAPE is chosen by the fit -- arena when the weights would spill
-> out of RAM, placement when they fit -- with `MOE_EXPERT_GTT_ARENA` demoted to a tri-state override (`=1` force
+> **Both decisions are TAKEN (2026-11-11):** the SHAPE follows `-lme`'s promise -- a budget below the set takes the
+> arena (the excess streams from the reclaimable page cache, which is what "cap the NON-SWAPPABLE memory" means),
+> a budget that covers the set takes placement -- with `MOE_EXPERT_GTT_ARENA` as a tri-state override (`=1` force
 > arena, `=0` force placement, unset = auto), implemented and asserted by the gate's `shapefit` / `ram` arms; and
 > the transient band stays DROPPED, because the campaign's own policy simulator predicts the Nth-touch admission is
 > *worse* on this tier at every slot count (0.708 against LFRU's 0.727 at S=56, 0.880 against 0.918 at S=133) and

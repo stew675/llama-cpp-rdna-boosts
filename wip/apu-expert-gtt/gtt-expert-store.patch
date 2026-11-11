@@ -1,4 +1,4 @@
-From 516d479835daea035e5b533bf461038d4715e075 Mon Sep 17 00:00:00 2001
+From 701dae7cd29b11c5cd64a6d409dfb284b33aa83f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b/P3c + P4a/P4b/P4f +
@@ -42,9 +42,9 @@ table, so nothing survives a pass (113 owner changes over 117 calls).
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 ++
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 1208 ++++++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   26 +
- src/llama-model-loader.cpp                    |  646 ++++++++-
+ src/llama-model-loader.cpp                    |  650 ++++++++-
  src/llama-model-loader.h                      |   35 +
- 13 files changed, 3046 insertions(+), 55 deletions(-)
+ 13 files changed, 3050 insertions(+), 55 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -2978,7 +2978,7 @@ index 3c5469637..6c252fa88 100644
  // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
  // `arena` holds `n_slots` experts of `expert_bytes`, and `remap_dev` holds the slot-remapped ids for
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 80de01396..9a9f7e863 100644
+index 80de01396..f48efd4df 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -3028,7 +3028,7 @@ index 80de01396..9a9f7e863 100644
          return;
      }
  
-@@ -419,7 +437,569 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +437,573 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -3177,11 +3177,10 @@ index 80de01396..9a9f7e863 100644
 +        }
 +    }
 +    const size_t fit_cap_now = avail > 0 ? avail - avail / 10 : 0;
-+    const bool   spills      = fit_cap_now > 0 && weights_total > fit_cap_now;
 +    const char * arena_env   = getenv("MOE_EXPERT_GTT_ARENA");
-+    // Tri-state (maintainer decision, 2026-11-11): unset = the FIT decides, `=1` forces the arena, `=0` forces
-+    // placement.  A fixed A/B arm must pin it -- this default is a property of the model's fit, not of the build.
-+    const bool   arena_wanted = arena_env != nullptr ? atoi(arena_env) != 0 : spills;
++    // Tri-state (maintainer decision, 2026-11-11): unset = the SHAPE FOLLOWS THE BUDGET, `=1` forces the arena,
++    // `=0` forces placement.  A fixed A/B arm must pin it -- the default depends on the model and on `-lme`.
++    const bool   arena_wanted = arena_env != nullptr ? atoi(arena_env) != 0 : true;
 +
 +    // --- 2b. the lock: a clamp when it is an optimisation, a refusal when it is the difference between
 +    //         running and not running ----------------------------------------------------------------
@@ -3226,6 +3225,10 @@ index 80de01396..9a9f7e863 100644
 +        // need their layer's device buffer and the load over-commits -- measured precedent: 121 GiB resident +
 +        // 13 GiB swap on a 123 GiB box (2026-10-19).  So a model that cannot fit is refused rather than left to
 +        // thrash.  P3/P4 flip this to true, and the clamp branch below becomes reachable.
++        // P3/P4/P5 have landed, so a LOCKED store can now stream -- but relaxing this branch is a separate
++        // decision with its own failure mode (a clamp that covers the shortfall yet is still below one slot per
++        // table would decline the arena and then over-commit by placement).  Left where the campaign found it and
++        // recorded as an open item, not changed in passing.
 +        const bool gtt_store_can_stream = false;
 +        const bool clamps_but_cannot_stream = clamp_useful && honour >= shortfall && !gtt_store_can_stream;
 +        const char * advice =
@@ -3291,22 +3294,27 @@ index 80de01396..9a9f7e863 100644
 +        return;
 +    }
 +
-+    // --- 2c. The SHAPE: RESIDENCY when the weights spill, PLACEMENT when they do not -------------------
++    // --- 2c. The SHAPE: RESIDENCY when the budget cannot hold the set, PLACEMENT when it can ------------
 +    //
-+    // A set that fits is placed whole (P2): no cache, no fills, no risk, and the census says "the WHOLE set".
-+    // A set that does NOT fit is a different machine: the GTT store becomes the expert cache's ARENA -- its slot
-+    // storage -- the expert tensors stay in the read-only model mapping (nothing allocated, nothing pinned), and
-+    // every read is served from the arena with LFRU residency.  That is the configuration this campaign exists
-+    // for: on UMA the bytes are already in DRAM, so residency is the whole policy.
++    // `-lme` means what its own help text says: *cap the NON-SWAPPABLE memory spent on MoE experts*.  On an APU
++    // that promise decides the shape:
++    //   * the store CAN hold the whole expert set -> PLACEMENT: every expert is placed in the registered region,
++    //     nothing is evicted, nothing is read from the file.  This is the low-risk arm and the fastest one.
++    //   * it CANNOT (the ordinary case for `-lme N` below the set) -> the excess has to live somewhere else, and
++    //     the only place on this box is the FILE-BACKED PAGE CACHE -- which is reclaimable, i.e. it honours the
++    //     "non-swappable" cap.  That is the ARENA: the store is the cache's slot storage, the expert tensors
++    //     stay as holes in the read-only model mapping, and LFRU residency serves every read.
 +    //
-+    // THE DEFAULT IS THE FIT, not a flag (maintainer decision, 2026-11-11): "arena if the weights would spill onto
-+    // disk, otherwise placement, and if `MOE_EXPERT_GTT_ARENA` is set, honour the user's choice".  On an APU the
-+    // only thing below RAM is the page cache, so "spills" is exactly "the weights do not fit in MemAvailable
-+    // minus the same 10 % reserve the `-lme` argv check applies".  Placement is then the low-risk arm for every
-+    // model this box can hold (a static placement: no eviction, no fills, no forced mapped load), and RESIDENCY is
-+    // reserved for the loads that would otherwise thrash.  `MOE_EXPERT_GTT_ARENA=1` still forces the arena and
-+    // `=0` still forces placement, so an operator can override either way -- and a fixed arm must pin it, because
-+    // this default is a property of the model's fit, not of the build.
++    // MEASURED, and it is why the rule is keyed on the budget rather than on the model's fit (2026-11-11): with
++    // `-lme 4` on a 35B-A3B (an 18.2 GiB expert set, a model that FITS this box), placement leaves 34 GiB of
++    // anonymous, non-reclaimable memory in use (lowest MemAvailable 92 489 MiB) while the arena leaves 20.4 GiB
++    // (106 064 MiB) -- a 13.6 GiB difference, because the arena's unplaced experts are reclaimable page cache.
++    // The price of the cap is real too: 1453 -> 382 t/s prefill and 62.5 -> 31.6 t/s decode, from a 25.5 % miss
++    // rate (25 212 fills per 96 tokens).  `-lme auto` (the default) asks for no cap, so a set that fits the store
++    // is PLACED and runs at full speed; an explicit small `-lme` asks for a cap and gets the arena, as documented.
++    //
++    // `MOE_EXPERT_GTT_ARENA=1` forces the arena and `=0` forces placement, so an operator can override either
++    // way; the arena can only engage where there is something to stream (the condition below).
 +    //
 +    // NOTE the old form was `getenv(...) != nullptr`, i.e. `MOE_EXPERT_GTT_ARENA=0` ENABLED the tier.  A tri-state
 +    // that cannot spell "off" is not a switch, so it is parsed now.
@@ -3431,14 +3439,10 @@ index 80de01396..9a9f7e863 100644
 +                source += arena_env != nullptr
 +                              ? format(" [MOE_EXPERT_GTT_ARENA=%s: the operator forced %s]", arena_env,
 +                                       arena_wanted ? "the arena" : "placement")
-+                              : format(" [auto: %s]", spills
-+                                       ? format("the weights spill out of RAM (%.1f MiB against a %.1f MiB "
-+                                                "ceiling), so residency, not placement, is what makes this model "
-+                                                "runnable", (double) weights_total / mib, (double) fit_cap_now / mib)
-+                                             .c_str()
-+                                       : format("the weights fit in RAM (%.1f MiB against a %.1f MiB ceiling), so "
-+                                                "nothing needs to be evicted", (double) weights_total / mib,
-+                                                (double) fit_cap_now / mib).c_str());
++                              : format(" [auto: -lme asks for a %.1f MiB cap on non-swappable expert memory "
++                                       "against a %.1f MiB set, so the excess streams from the file-backed page "
++                                       "cache (reclaimable) instead of becoming anonymous memory]",
++                                       (double) extent_trunk / mib, (double) padded_total / mib);
 +                host_experts_policy = format(
 +                    "%s -> the GTT store is the MoE ARENA: %.1f MiB of slots for a %.1f MiB expert set, the expert "
 +                    "tensors stay in the read-only MODEL MAPPING (nothing allocated, nothing pinned) and every read "
@@ -3598,7 +3602,7 @@ index 80de01396..9a9f7e863 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2055,6 +2635,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2055,6 +2639,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -3639,7 +3643,7 @@ index 80de01396..9a9f7e863 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2576,7 +3190,18 @@ bool llama_model_loader::load_all_data(
+@@ -2576,7 +3194,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -3659,7 +3663,7 @@ index 80de01396..9a9f7e863 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2637,9 +3262,12 @@ bool llama_model_loader::load_all_data(
+@@ -2637,9 +3266,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

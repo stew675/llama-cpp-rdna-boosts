@@ -1459,31 +1459,58 @@ disk, otherwise placement.  If `MOE_EXPERT_GTT_ARENA` is set, then honour the us
 the `MOE_EXPERT_CACHE_TOUCH=N` for now … don't we have a policy simulator already written somewhere for exactly
 this?"*
 
-### 26.1 The shape default: implemented, and it logs its own reason
+### 26.1 The shape default: `-lme` is a CAP, so the shape follows the budget (and the first implementation was wrong)
 
-`plan_gtt_expert_store()` now decides the shape from the FIT instead of from a flag:
+**What the flag promises.**  `-lme`'s own help text: *"cap the NON-SWAPPABLE memory spent on MoE experts"*.  On an
+APU that promise decides the shape, and the campaign's first attempt keyed it on the wrong thing -- the *model's
+fit in RAM* rather than the *budget*.  The maintainer caught it with a one-line counter-example: `-lme 4` against a
+21 GiB model is a 4 GiB cap, so the excess has to go somewhere, and "somewhere" is the arena.
 
-    arena  iff  the model's weights exceed 90 % of MemAvailable   (they would spill onto the page cache -- on an
-                                                                  APU that is the only thing below RAM)
-    placement otherwise                                             (a static placement: no eviction, no fills,
-                                                                     no forced mapped load)
+**The measurement that settles it** (35B-A3B, `-lme 4`, one 1 s `MemAvailable` monitor per run, same prompt):
 
-`MOE_EXPERT_GTT_ARENA` is a tri-state override: `=1` forces the arena, `=0` forces placement, unset = the fit
-decides.  This also fixes an older defect: the variable used to be read with `getenv(...) != nullptr`, so
-`MOE_EXPERT_GTT_ARENA=0` *enabled* the tier -- a switch that cannot spell "off" is not a switch.
+| shape | lowest `MemAvailable` during the run | non-reclaimable expert memory | pp | decode |
+|---|---|---|---|---|
+| placement | **92 489 MiB** (126 482 MiB total) | 18.66 GiB, **anonymous / device** | 1453 / 1435 t/s | 62.5 / 62.6 t/s |
+| arena | **106 064 MiB** | ~4 GiB in the store, the rest **file-backed page cache (reclaimable)** | 382.6 / 375.1 t/s | 31.6 / 31.6 t/s |
 
-Verified on the box (the reason is in the census, not inferred):
+So the arena really does hold **13.6 GiB less non-reclaimable memory** -- `MemAvailable` counts reclaimable page
+cache as available, and that is exactly what "non-swappable" means.  The first implementation's claim that "it is
+the same RAM either way" was wrong in the way that matters: the same DRAM is *touched*, but only one shape makes
+the excess reclaimable.  The price of the cap is real and is the churn: placement does no fills at all, the arena
+misses 25.5 % (`hits=73548 fills=25212` over 96 tokens).
+
+**The implemented rule** (`plan_gtt_expert_store()`), which is also what the flag documents:
+
+    the store CAN hold the whole expert set   -> PLACEMENT   (nothing to stream, nothing evicted, fastest)
+    it CANNOT (a `-lme N` below the set)      -> ARENA       (the store is the cache's slot storage, the expert
+                                                             tensors are holes in the read-only model mapping, LFRU
+                                                             residency serves every read -- the excess is
+                                                             reclaimable page cache, i.e. the cap is honoured)
+    `-lme auto` (the default) asks for NO cap: on a fitting model it sizes to the whole set, so it lands on
+    placement; on a >RAM model MemAvailable's ceiling is below the set, so it lands on the arena.
+
+`MOE_EXPERT_GTT_ARENA` is the override: `=1` forces the arena (where there is something to stream), `=0` forces
+placement.  It is no longer read as `getenv(...) != nullptr`, which meant `MOE_EXPERT_GTT_ARENA=0` *enabled* the
+tier -- a switch that cannot spell "off" is not a switch.
+
+Verified on the box, with the reason in the census:
 
 | model | `-lme` | env | census |
 |---|---|---|---|
-| 35B-A3B (21.1 GiB of weights) | 4 | unset | `-lme 4 -> … 24 tables / 6144 slots (4066.1 MiB) resident … a hot subset. Everything else keeps its layer's device buffer` -- **placement** |
-| 35B-A3B | 4 | `=1` | `-> the GTT store is the MoE ARENA: 4096.0 MiB of slots for a 18662.5 MiB expert set` -- **arena** |
-| 35B-A3B | 4 | `=0` | placement (same line as unset) |
-| 122B-A10B (123.4 GiB of weights on a 123 GiB box) | 60 | unset | `-lme 60 [auto: the weights spill out of RAM (126403.0 MiB against a 106739.9 MiB ceiling), so residency, not placement, is what makes this model runnable] -> the GTT store is the MoE ARENA` -- **arena, automatically** |
+| 35B-A3B (18.2 GiB set) | 4 | unset | `[auto: -lme asks for a 4096.0 MiB cap on non-swappable expert memory against a 18662.5 MiB set, so the excess streams from the file-backed page cache (reclaimable) instead of becoming anonymous memory] -> the GTT store is the MoE ARENA` |
+| 35B-A3B | auto (95 584.6 MiB cap) | unset | `a registered GTT expert store of 18662.5 MiB of a 18662.0 MiB expert set: 120 tables / 30720 slots (18662.5 MiB) resident … the WHOLE set` -- **placement** |
+| 35B-A3B | 4 | `=0` | placement |
+| 122B-A10B (117.5 GiB set) | 60 | unset | `[auto: -lme asks for a 61440.0 MiB cap …] -> the MoE ARENA` |
 
-The gate asserts both directions (`shapefit`: a fitting model with a small `-lme` must get placement; `ram`: the
->RAM model with the env UNSET must get the arena and must say why), and every other arm pins the shape so its
-meaning does not drift with the model's fit.
+The gate asserts both directions: `shapefit` (a cap below the set and the env UNSET must take the arena and name
+the cap) and `resident` (a budget that covers the whole set must land on placement).  `ram` runs with the env UNSET.
+
+**Recorded as an open item, NOT changed in passing:** `plan_gtt_expert_store()` still hard-codes
+`gtt_store_can_stream = false` in its lock-policy branch, whose comment says "P3/P4 flip this to true".  Relaxing it
+would let a >RAM model run on a CLAMPED (smaller) locked store instead of being refused -- but it needs its own
+arms, because the dangerous combination is a clamp that covers the RAM shortfall yet is still below one slot per
+table: the arena would decline and placement would over-commit.  That is a separate change with its own failure
+mode.
 
 ### 26.2 Admission: the campaign's own simulator predicts that NOTHING should change
 

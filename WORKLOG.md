@@ -1,3 +1,52 @@
+## 261111.028 (wip, NO delivery change) -- the shape rule CORRECTED: `-lme` is a CAP, so a budget below the set takes the ARENA (the maintainer was right; my first rule keyed on the model's fit and was wrong)
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`0049156434112f49133b791ddc30a0852f99b338b3e898c7ee3b5c0f468105a0`, tree `5b74fa1b…`, verified by `git am` onto a
+fresh `d65b0e889`.  Record: [`MEASUREMENTS.md` §26.1](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**What I got wrong.**  I read "arena if the weights would spill onto disk" as *the model's fit in RAM* and
+implemented `arena iff the weights exceed 90 % of MemAvailable`.  The maintainer's counter-example is the right
+reading: `-lme 4` against a 21 GiB model is a **4 GiB cap**, so the excess has to go somewhere, and the only
+"somewhere" on an APU is the file-backed page cache -- the arena.  My defence ("it is the same RAM either way") was
+incomplete, and one measurement shows why:
+
+| 35B-A3B, `-lme 4`, one 1 s `MemAvailable` monitor per run | lowest `MemAvailable` | what the excess is | pp | decode |
+|---|---|---|---|---|
+| placement | **92 489 MiB** | 18.66 GiB **anonymous / device** memory | 1453 / 1435 t/s | 62.5 / 62.6 t/s |
+| arena | **106 064 MiB** | `-lme` in the store + the rest **reclaimable page cache** | 382.6 / 375.1 t/s | 31.6 / 31.6 t/s |
+
+`MemAvailable` counts reclaimable page cache as available, so the arena holds **13.6 GiB less non-reclaimable
+memory** -- which is exactly what `-lme`'s own help text promises ("cap the NON-SWAPPABLE memory spent on MoE
+experts").  The same DRAM is touched in both shapes; only one makes the excess reclaimable.  The cap costs the
+churn it costs (placement: no fills at all; arena: 25.5 % misses, 25 212 fills per 96 tokens), and that is what a
+cap is *for*.  `-lme auto` -- the default -- asks for no cap, so a fitting model sizes to the whole set and lands on
+placement at full speed.
+
+**Implemented:** `arena iff the store cannot hold the whole expert set` (`extent_trunk < padded_total`), i.e. a
+`-lme N` below the set; placement otherwise; `-lme auto` resolves to placement on a fitting model and to the arena
+on a >RAM one.  `MOE_EXPERT_GTT_ARENA` stays the override (`=1` force arena where there is something to stream,
+`=0` force placement) and is no longer parsed as `getenv(...) != nullptr` -- that made `=0` *enable* the tier.  The
+census names the reason in both directions:
+
+    -lme 4 [auto: -lme asks for a 4096.0 MiB cap on non-swappable expert memory against a 18662.5 MiB set, so the
+             excess streams from the file-backed page cache (reclaimable) instead of becoming anonymous memory]
+            -> the GTT store is the MoE ARENA
+    auto: 80% of MemAvailable -> a 95584.6 MiB cap -> ... 120 tables / 30720 slots (18662.5 MiB) resident ...
+            the WHOLE set                                        (placement)
+
+**Gate updated to the new semantics** (both directions, because the old arms' premises flipped): `shapefit` -- a cap
+below the set with the env UNSET must take the arena *and* name the cap; `resident` -- a budget that covers the
+whole set must land on placement (it used to be "the arena, fully resident", which the new rule forbids because
+there is nothing to stream); `ram` runs with the env unset.  **39 checks, green** (the one FAIL in the first run was
+my own stale grep for the old reason string, fixed).
+
+**Recorded as an open item, deliberately NOT changed in passing:** `plan_gtt_expert_store()`'s lock-policy branch
+still hard-codes `gtt_store_can_stream = false`, and its comment says "P3/P4 flip this to true".  Now that P3-P5
+have landed, relaxing it would let a >RAM model run on a CLAMPED locked store instead of being refused -- but the
+dangerous combination is a clamp that covers the RAM shortfall yet is still below one slot per table (the arena then
+declines and placement over-commits), so it needs its own arms.  Separate change, separate failure mode.
+
 ## 261111.027 (wip, NO delivery change) -- the two promotion decisions, TAKEN: the SHAPE is chosen by the fit, and admission needs nothing (the campaign's own policy simulator says so)
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:

@@ -221,8 +221,9 @@ else
     run_arm pfverify "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL_VERIFY=1
 fi
 LME_FLAG="-lme $LME"
-# The DEFAULT SHAPE on a model that fits: `MOE_EXPERT_GTT_ARENA` unset must mean PLACEMENT (a static placement:
-# no eviction, no fills, no forced mapped load), not the arena.
+# The DEFAULT SHAPE with the env unset follows the BUDGET, not the model's fit: `-lme 4` against an 18.2 GiB set
+# asks for a 4 GiB cap on non-swappable expert memory, so the excess must stream from the file-backed page cache
+# (reclaimable) -- i.e. the ARENA.  `resident` below is the other direction (a budget that covers the whole set).
 run_arm shapefit "$MODEL" "$LME" "$AS_KB" "$LOCK_KB"
 LME_FLAG="-lme $LME"
 run_arm pfoff "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL=0
@@ -355,23 +356,32 @@ else
     ok "(skipped: --quick)"
 fi
 
-note "the DEFAULT SHAPE: arena iff the weights spill, otherwise placement (maintainer decision)"
+note "the DEFAULT SHAPE follows -lme: a cap below the set -> arena; a budget that covers it -> placement"
 if [ -f "$KEEPOUT/shapefit/err.txt" ]; then
     hard
-    if ! grep -q 'GTT arena tier' "$KEEPOUT/shapefit/err.txt" && \
-       grep -q 'resident, ranked by the persisted heat prior' "$KEEPOUT/shapefit/err.txt"; then
-        ok "shapefit: a model that FITS RAM and a small -lme -> placement (no arena, no eviction, no forced mmap)"
+    if grep -q 'GTT arena tier' "$KEEPOUT/shapefit/err.txt" && \
+       grep -q 'cap on non-swappable expert memory' "$KEEPOUT/shapefit/err.txt"; then
+        ok "shapefit: -lme $LME against $(awk "BEGIN{print $(arena_mib shapefit)}") MiB of store -> the ARENA, and the census names the cap"
     else
-        fail "shapefit: a fitting model with -lme $LME and no MOE_EXPERT_GTT_ARENA took the ARENA tier"
+        fail "shapefit: -lme $LME below the expert set did not take the arena (or did not say why)"
     fi
 else
     ok "(skipped: --quick)"
 fi
+if [ -f "$KEEPOUT/resident/err.txt" ]; then
+    hard
+    if grep -q 'the WHOLE set' "$KEEPOUT/resident/err.txt" && \
+       ! grep -q 'GTT arena tier' "$KEEPOUT/resident/err.txt"; then
+        ok "resident: -lme $LME_BIG covers the whole set -> PLACEMENT (nothing to stream, nothing evicted)"
+    else
+        fail "resident: a budget that covers the whole set did not land on placement"
+    fi
+fi
 if [ -f "$KEEPOUT/ram/err.txt" ]; then
     hard
-    if grep -q 'auto: the weights spill out of RAM' "$KEEPOUT/ram/err.txt" && \
+    if grep -q 'auto: -lme asks for a' "$KEEPOUT/ram/err.txt" && \
        grep -q 'GTT arena tier' "$KEEPOUT/ram/err.txt"; then
-        ok "ram: a model whose weights SPILL gets the arena automatically, and the census says why"
+        ok "ram: a >RAM model gets the arena with the env UNSET, and the census names the cap it asked for"
     else
         fail "ram: a >RAM model with the shape left to the fit did not report the auto arena"
     fi
