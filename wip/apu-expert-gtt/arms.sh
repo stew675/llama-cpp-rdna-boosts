@@ -29,6 +29,7 @@ export LD_LIBRARY_PATH="$ROCM/lib:${LD_LIBRARY_PATH:-}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 
 M35=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf
+MBIG=/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf   # 123.4 GiB of weights: cannot fit
 MFN=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 
 PROMPT="${PROMPT:-The capital of France is}"
@@ -37,7 +38,7 @@ QUICK=0
 WHAT="all"
 for arg in "$@"; do
     case "$arg" in
-        text|census|rate|all) WHAT="$arg" ;;
+        text|census|rate|limit|all) WHAT="$arg" ;;
         --quick) QUICK=1 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -117,6 +118,38 @@ rate)
     bench 35b-store-ro  "MOE_EXPERT_GTT=1 MOE_EXPERT_GTT_RO=1"
     bench 35b-store-rw  "MOE_EXPERT_GTT=1 MOE_EXPERT_GTT_RO=0"
     ;;
+limit)
+    note "LOCK POLICY under RLIMIT_MEMLOCK=8 MiB (a stock systemd default)"
+    # text first, with NO `-lv` (a decline must not change a byte of output)
+    limit_text() {
+        local tag="$1" model="$2" envs="$3"; shift 3
+        local log="$OUT/limit-$tag.log"
+        bash -c "ulimit -l 8192; exec env $envs timeout 900 '$BIN/llama-cli' -m '$model' -ngl 99 \
+            -p '$PROMPT' -n '$NGEN' --seed 42 --temp 0 --no-display-prompt --single-turn $*" > "$log" 2>&1
+        if [ $? -ne 0 ]; then
+            printf '  %-28s FAILED (%s)\n' "$tag" "$log"
+            fail=1
+            return
+        fi
+        printf '  %-28s %s\n' "$tag" "$(python3 "$REPO/scripts/extract-generated.py" "$log" 2>&1)"
+    }
+    limit_text 35b-decline     "$M35" "" -lme 6
+    limit_text 35b-mlock-off   "$M35" "MOE_EXPERT_GTT_MLOCK=0" -lme 6
+    printf '\n  (the decline/refusal messages are at WARN: re-run the same arm with -lv 2 and grep for GTT expert store)\n'
+    # the REFUSAL arm: this must exit non-zero, fast, and print the shortfall
+    note "LOCK POLICY -- a model that cannot fit must be REFUSED"
+    blog="$OUT/limit-122b-refusal.log"
+    bash -c "ulimit -l 8192; exec timeout 900 '$BIN/llama-cli' -m '$MBIG' -ngl 99 -lme 80 -p hi -n 4 --single-turn" \
+        > "$blog" 2>&1
+    if [ $? -eq 0 ]; then
+        printf '  %-28s NOT REFUSED (%s)\n' "122b-lme80" "$blog"
+        fail=1
+    else
+        printf '  %-28s refused, as it must:\n' "122b-lme80"
+        grep -E "weights|shortfall|RLIMIT_MEMLOCK|could honour" "$blog" | sed 's/^/      /'
+    fi
+    ;;
+
 esac
 
 note "GPU FAULTS"

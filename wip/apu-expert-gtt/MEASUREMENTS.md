@@ -525,3 +525,20 @@ Four things, in order of how much they change the design:
 * **Unmeasured, and named as such:** whether a large (`-lme auto`, 19-41 GiB) `mlock`ed region behaves like the
   2 GiB one; whether `mlock` + registration changes the fill rate (the fill writes already-resident pages, so it
   should not); and what `mlock`'s interaction with `hipHostUnregister` is at teardown.
+
+### 15.3 The fix, implemented and measured (same day, P2 follow-up)
+
+`mlock()` the region (`MOE_EXPERT_GTT_MLOCK`, default 1), clamp the extent to `RLIMIT_MEMLOCK`, decline when the
+model fits in RAM anyway, refuse when it does not.  Four arms, all on `halo`:
+
+| arm | result |
+|---|---|
+| unlimited limit (this box), `-lme 6` / `auto` / 41 GiB Flash-Next | **`mlocked 6144.0 / 19 126.5 / 40 925.6 MiB` — a real reservation**, and the census prints the limit it was measured against |
+| `mlock`'s cost at creation | **free**: 26.3 ms/GiB at 19 GiB against 25.8-26.0 before it (and 26.0 vs 25.9 at 41 GiB) — the registration has already faulted every page in, so this is a bookkeeping pass over the VMA |
+| `ulimit -l 8192` (8 MiB), fitting model, `-lme 6` and `-lme auto` | **declined**, one WARN with the numbers and the five ways to raise the limit; the run continues all-resident and the greedy text is **identical** (`627b2ebd7792`) |
+| `ulimit -l 8192` and `33554432` (32 GiB), `Qwen3.5-122B-A10B-Q8_0 -lme 80` | **REFUSED in 0.76 s**, before any byte is read: weights 126 403 MiB, `MemAvailable` 114 656 MiB, shortfall 23 212 MiB, limit 8 MiB / 32 GiB, and (at 32 GiB, where the clamp *would* cover it) the extra line that even a locked store would not make it runnable until P3/P4 |
+| `MOE_EXPERT_GTT_MLOCK=1` vs `0` at an 8 MiB limit | `0` skips the whole policy and the census says `NOT locked … RECLAIMABLE under pressure` — the old behaviour, deliberately |
+
+Two notes for the record.  **The refusal is the point**: the same 122B load without it goes to the 2026-10-19
+over-commit (121 GiB resident + 13 GiB swap on this 123 GiB box).  And **the decline is not silent**: a fitting
+model still gets its GTT store when the limit allows it, and is told exactly why it did not when it does not.

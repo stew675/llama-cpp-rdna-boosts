@@ -6,16 +6,30 @@ GTT store itself, built and measured) are DONE; nothing in `patches/`, nothing a
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
-The implementation so far is ONE patch, **cut against the `release.json` tree
-`86389e4a…` and applied with `git am`** (it produces tree `65aa9208…`):
+The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
+`git am`; it produces tree `0738f3f3…`.  Its sha256 advances as the campaign does — **the value below is always the
+current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the census, the kill switch) | `31ef8d1b55a765c1468bbb9561d7ffb15b84019df31a8d4a28fef80b720b8466` |
+| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) | `4057bef77e4ac57178bd09ca4e2d0153a011f3cbd9d9162c85d94bf7ee12b47b` |
 
 **What is left: P3 (residency/eviction), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
 (gate + promotion)**, plus the two owed probes (`15` touch distance, `16` reclamation under pressure).  A run in
 this phase is an **ALL-RESIDENT arm or a static hot subset**; the census says so, every time.
+
+**The campaign's environment variables** (not in `ENVIRONMENT.md`: nothing here is in `patches/` yet, so these
+are documented here and will move there on promotion — per AGENTS.md rule 9, with their class):
+
+| variable | default | class | what |
+|---|---|---|---|
+| `MOE_EXPERT_GTT` | `1` | **kill switch** | `0` = no GTT store, i.e. today's behaviour and log, byte for byte |
+| `MOE_EXPERT_GTT_RO` | `1` | **kill switch** | `0` = register the region writable instead of ReadOnly (the measured 232 → 60 GB/s A/B) |
+| `MOE_EXPERT_GTT_MLOCK` | `1` | **kill switch** | `0` = do not `mlock`: the tier is then reclaimable by design (diagnostic / bisection) |
+| `MOE_HOST_LIMIT_FRAC` | `80` | tuning (existing) | the `auto` ceiling as a % of `MemAvailable`, shared with the discrete arm |
+| `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning (existing) | the admission threshold, reused unchanged in P3 |
+
+The store's **size is not a variable**: it is `-lme`.  Nothing is added for `-fit`, the reach limit, or admission.
 
 **Naming rule (maintainer, 2026-11-11): never write a bare "store".**  It is always a **GTT store** (or
 "GTT expert store"), so it can never be read as disk/SSD storage, and so it is never confused with the
@@ -320,12 +334,38 @@ GPU read paying a **one-off 12-37x** stall (524 ms and 2 191 ms against 42-59 ms
 never faults and never corrupts — the driver re-faults the pages in — and **`Unevictable` reports 0 the whole
 time**, so the tier is reclaimable *and invisible* to a memory monitor.
 
-**`mlock()` is the answer and it is a decision, not a detail:** an `mlock`ed region kept **all** its pages and
-**all** its huge pages in every run (4 of 4), read at the same 26-28 ms, and is the only arm the accounting
-reports (`Unevictable`/`Mlocked` = 2 048 MiB).  It costs `RLIMIT_MEMLOCK` — unlimited on `halo`, but a stock
-desktop ships 8 MiB, so a real GTT store would be refused there.  **P2 does not mlock** (open decision, §7
-Q11): until it does, `-lme` is a *sizing* intent, not a guarantee, and a >RAM run can stall on the first touch of
-a swapped-out slot.
+**`mlock()` is the answer, and it is now IMPLEMENTED (2026-11-11, `MOE_EXPERT_GTT_MLOCK`, default 1).**  An
+`mlock`ed region kept **all** its pages and **all** its huge pages in every probe run (4 of 4), read at the same
+26-28 ms, and is the only arm the accounting reports (`Unevictable`/`Mlocked` = 2 048 MiB).  It costs
+`RLIMIT_MEMLOCK` — unlimited on `halo` (its `/etc/security/limits.conf` raises it), **8 MiB** on a stock systemd
+box (`#DefaultLimitMEMLOCK=8M`), 64 KiB for an unraised non-root process.  So the extent is clamped to the limit
+and a model that only fits *because* of the GTT store is **refused** rather than silently degraded (§5.2, §7 Q11).
+
+**mlock is free at creation**: 26.3 ms/GiB for a 19 GiB store against 25.8-26.0 before it, and 26.0 vs 25.9 for
+the 41 GiB one — the registration has already faulted every page in, so the `mlock` is a bookkeeping pass over an
+existing VMA, not a second walk of DRAM.
+
+### 5.2 The lock, and what happens when it cannot be honoured (implemented 2026-11-11)
+
+The GTT store is registered **and `mlock`ed**; that is what makes `-lme` a reservation (probe 16, §15).  The lock
+limit is `RLIMIT_MEMLOCK`, and the extent is resolved against it **before any tensor is placed or any byte is
+read**, in `plan_gtt_expert_store()`:
+
+| | |
+|---|---|
+| `extent <= lockable` | honour it.  The census reports `mlocked X MiB (RLIMIT_MEMLOCK …): a real reservation` |
+| `extent > lockable`, the **model fits in RAM without the store** (`weights <= 90 % of MemAvailable`) | **decline the store** (or clamp it to the limit, when the clamp still holds one expert table), WARN once with the numbers and the fix, and carry on with today's behaviour.  It is an optimisation here, not a lifeline |
+| `extent > lockable`, the **model cannot fit in RAM** | **REFUSE**, with the shortfall, the limit, and the fix.  Measured on `Qwen3.5-122B-A10B-Q8_0` (weights 126 403 MiB against 114 656 MiB available): **0.76 s** and one message, instead of the 2026-10-19 over-commit (121 GiB resident + 13 GiB swap) |
+| `MOE_EXPERT_GTT_MLOCK=0` | no lock, no policy: the tier is reclaimable by design, the census says `NOT locked … RECLAIMABLE under pressure`.  The kill switch for A/B and bisection |
+
+The refusal is gated on a capability flag (`gtt_store_can_stream`, `false` until P3/P4) so that a clamp which
+*would* cover the shortfall still refuses today: without eviction and streaming fills the experts that did not fit
+would take their layer's device buffer anyway, and the load would over-commit.  The message says so explicitly
+rather than promising that raising the limit is enough.
+
+`weights` is every tensor in the loader's index (`ggml_nbytes` summed), and the 90 % is the same reserve the
+`-lme` argv check already applies — one constant, not two.  It is a *lower bound* check, deliberately not a second
+`--fit` (which sizes the context against free device memory — a different question).
 
 ### 5.1 The transient band (what makes `N > 1` implementable)
 
@@ -420,16 +460,12 @@ measurement.
    `-lme N` can rank a head table out of the GTT store; it then keeps its layer's device buffer, so it stays readable
    and the text does not change.
 
-11. **Should the GTT store `mlock` its region?**  Probe `16` (§15) says the tier is reclaimable without it: the
-   kernel swaps parts of a *registered* region out under pressure, and the first read that touches them stalls
-   12-37x while the driver faults them back.  `mlock` fixed it completely in every run (0 pages taken, huge pages
-   preserved, `Unevictable` reports the truth) -- at the cost of `RLIMIT_MEMLOCK`, which is **unlimited here** and
-   **8 MiB on a stock desktop**.  Three ways to go: (a) `mlock` and refuse the GTT store when the limit is too low
-   (a real reservation, and the census can say which arm it got); (b) `mlock` best-effort, and let the census
-   report `mlocked MiB / extent` so a partially protected tier is visible; (c) don't, and document that the budget
-   is a sizing intent with a stall under pressure.  Recommendation is (b): the only one that is honest on both a
-   laptop and this box, and it costs one `mlock()` plus one census field.  **Not implemented; P2 ships without
-   it** -- this is a decision to take before a >RAM run leans on the budget.
+11. **Should the GTT store `mlock` its region? -- RESOLVED (maintainer, 2026-11-11): yes, and it is
+   user-actionable.**  Implemented as: `mlock` by default (`MOE_EXPERT_GTT_MLOCK=0` is the kill switch), the
+   extent clamped to `RLIMIT_MEMLOCK`, a **decline** when the model fits in RAM anyway, and a **refusal** (with
+   the fix) when the model cannot run without the store and the store cannot be locked.  So "cannot lock" is a
+   startup-time, documented, actionable condition rather than a silent stall — §5.2 for the table, §15 for the
+   measurement behind it.
 
 ### 7.1 Slot granularity — the pros and cons (asked 2026-11-11; the answer is "per expert, coalesced I/O")
 

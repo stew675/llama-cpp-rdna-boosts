@@ -1,47 +1,60 @@
-From 3dd51294fb88f32873c94dd4eea58f60fd525e4d Mon Sep 17 00:00:00 2001
+From 1ed262a3fde7a8e30f1695a364ed5d98399139b3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Wed, 11 Nov 2026 07:40:40 -0600
-Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 -- a registered GTT expert
- store sized by -lme
+Date: Wed, 11 Nov 2026 08:35:47 -0600
+Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 -- a mlocked GTT expert store
+ sized by -lme
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-A UMA-only resident expert tier: ONE anonymous region (mmap + MADV_HUGEPAGE, registered
-ONE cudaHostRegister(Mapped|ReadOnly)) that the hottest MoE expert tables are placed in and
-that MUL_MAT_ID reads in place, with no host pool, no arena and no slab below it.
+A UMA-only resident expert tier: ONE anonymous region (mmap + MADV_HUGEPAGE), registered ONCE
+with cudaHostRegister(Mapped|ReadOnly) and mlocked, that the hottest MoE expert tables are placed
+in and that MUL_MAT_ID reads in place -- with no host pool and no slab arena below it.
 
-- the store's region + bump allocator + census live in ggml/src/ggml-cuda/gtt-expert-store.{cu,cuh};
-  the buffer type is in ggml-cuda.cu, following the KV-region pattern (a DEVICE buft with the plain
-  device type's vtable contract and a per-device unique name), and two device hooks let the model
-  loader open it and print its census.
-- -lme sizes it (P1.1): N GiB exactly, or auto = MOE_HOST_LIMIT_FRAC of MemAvailable, capped at the
-  set; the SAME budget and the SAME heat ranking as the discrete arm, decided before any tensor is
-  placed.  It engages without -ncmoe, and common/arg.cpp gains the UMA branch of the help text.
+- the region + bump allocator + census live in ggml/src/ggml-cuda/gtt-expert-store.{cu,cuh}; the
+  buffer type is in ggml-cuda.cu on the KV-region pattern (a DEVICE buft with the plain device
+  type's vtable contract and a per-device unique name), and three device hooks let the model
+  loader open it, ask what it may lock, and print its census.
+- -lme sizes it (P1.1): N GiB exactly, or auto = MOE_HOST_LIMIT_FRAC of MemAvailable, capped at
+  the set and at RLIMIT_MEMLOCK; the SAME budget and the SAME heat ranking as the discrete arm,
+  decided before any tensor is placed.  It engages without -ncmoe, and common/arg.cpp gains the
+  UMA branch of the help text.
 - the fill is the buffered pread arm, straight from the GGUF into the slot (no alignment round-out).
-- MOE_EXPERT_GTT=0 (kill switch) reproduces today's behaviour byte for byte; MOE_EXPERT_GTT_RO=0
-  registers the region writable, which is the A/B that proves the read-rate claim on this region.
+- mlock is what makes it a RESERVATION: probe 16 (MEASUREMENTS.md §15) measured that a
+  registered-only region is RECLAIMABLE under pressure -- the kernel splits its huge pages, swaps
+  0-436 MiB per 2 GiB out, the next GPU read stalls a one-off 12-37x, and Unevictable reports 0
+  throughout.  So: mlock by default (MOE_EXPERT_GTT_MLOCK=0 is the kill switch), the extent
+  clamped to RLIMIT_MEMLOCK, a DECLINE with the fix when the model fits in RAM anyway, and a
+  REFUSAL with the shortfall when the model cannot run without the store and it cannot be locked
+  (0.76 s on a 123 GiB model instead of the 2026-10-19 over-commit).  mlock is free at creation
+  (26.3 vs 25.8-26.0 ms/GiB): the registration already faulted the pages in.
+- MOE_EXPERT_GTT=0 (kill switch) reproduces today's behaviour and log byte for byte;
+  MOE_EXPERT_GTT_RO=0 registers the region writable, the A/B that proves the read-rate claim.
 - ALL-RESIDENT arm only: no eviction (P3), no streaming/pipelined fill (P4), no prefill streaming
   (P5).  Whatever did not fit the budget keeps its layer's device buffer, and the census says so.
 
 Verified on halo (gfx1151, 123 GiB, ROCm 10.1.0): same-seed greedy text identical on 35B-A3B and
-Flash-Next for store-off / store-auto / -lme 6; -lme 6 realises exactly 6144.0 MiB; auto on a
-fitting set is the whole set (123 or 144 tables) with zero evictions; 100 % huge pages; pp512
-within noise of the plain device buffer with the registered READ-ONLY arm (-0.4 / -1.25 %) and
--5.9 / -6.2 % with it registered writable; check-gpu-faults.sh clean.
+Flash-Next for store-off / auto / -lme 6 / RO=0 and against the pre-P2 build; -lme 6 realises
+exactly 6144.0 MiB; auto on a fitting set is the whole set (123 or 144 tables) with zero evictions
+and 100 % huge pages; registration 26 ms/GiB; pp512 within noise of the plain device buffer for the
+registered READ-ONLY arm (-0.4 / -1.25 %) and -5.9 / -6.2 % registered writable; the lock policy's
+four arms pass under ulimit -l 8192 (decline, refuse, kill switch); check-gpu-faults.sh clean.
 ---
- common/arg.cpp                          |  25 +-
- ggml/include/ggml-backend.h             |  12 +
- ggml/src/ggml-backend-impl.h            |  14 +
- ggml/src/ggml-backend.cpp               |  15 +
- ggml/src/ggml-cuda/ggml-cuda.cu         | 196 +++++++++++
- ggml/src/ggml-cuda/gtt-expert-store.cu  | 414 ++++++++++++++++++++++++
- ggml/src/ggml-cuda/gtt-expert-store.cuh |  60 ++++
- src/llama-model-loader.cpp              | 272 +++++++++++++++-
+ common/arg.cpp                          |  30 +-
+ ggml/include/ggml-backend.h             |  16 +
+ ggml/src/ggml-backend-impl.h            |  24 ++
+ ggml/src/ggml-backend.cpp               |  22 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu         | 205 ++++++++++
+ ggml/src/ggml-cuda/gtt-expert-store.cu  | 493 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/gtt-expert-store.cuh |  74 ++++
+ src/llama-model-loader.cpp              | 381 +++++++++++++++++-
  src/llama-model-loader.h                |  23 ++
- 9 files changed, 1015 insertions(+), 16 deletions(-)
+ 9 files changed, 1252 insertions(+), 16 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index faa73a2e9..0964822e5 100644
+index faa73a2e9..5575b0e86 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2765,7 +2765,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -54,7 +67,7 @@ index faa73a2e9..0964822e5 100644
          "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
          "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
          "        bounded pinned pool (MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC) serves the reads.  It is decided at\n"
-@@ -2774,9 +2775,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2774,9 +2775,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
          "        The rest stays in the model mapping.  N above 90% of the available memory is refused, because\n"
          "        that memory cannot be swapped out.\n"
@@ -70,12 +83,17 @@ index faa73a2e9..0964822e5 100644
 +        "        evicted), otherwise that ceiling as a bounded hot subset.\n"
 +        "- N:    exactly N GiB of registered GTT store (capped at the set).  N above 90% of the available memory is\n"
 +        "        refused for the same reason as above.\n"
-+        "MOE_EXPERT_GTT=0 disables the GTT store on an APU.  (--host-experts pinned|pool are deprecated shorthands\n"
++        "The store must be LOCKED to be a reservation: a registered-but-unlocked region is reclaimable under\n"
++        "memory pressure (pages swapped, huge pages split, the next read 12-37x slower -- measured).  So the\n"
++        "extent is clamped to RLIMIT_MEMLOCK (`ulimit -l`), and a model that only fits because of the store is\n"
++        "REFUSED when it cannot be locked at all, rather than silently degrading.  `-lme auto` sizes to whatever\n"
++        "the limit allows.  MOE_EXPERT_GTT=0 disables the store on an APU; MOE_EXPERT_GTT_MLOCK=0 leaves it\n"
++        "unlocked (diagnostic: reclaimable by design).  (--host-experts pinned|pool are deprecated shorthands\n"
 +        "for the same budget.)",
          [](common_params & params, const std::string & value) {
              if (value == "auto") {
                  params.host_experts_limit_gib = 0;
-@@ -2791,9 +2800,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2791,9 +2805,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.host_experts_limit_gib = (int64_t) n;
              params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
              if (n > 0) {
@@ -91,10 +109,10 @@ index faa73a2e9..0964822e5 100644
                  long long avail_mib = -1;
                  if (mi != nullptr) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..a8485d64f 100644
+index d72bb88d7..ddf1667fc 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -90,6 +90,18 @@ extern "C" {
+@@ -90,6 +90,22 @@ extern "C" {
      // r212: tell the host pool how the model was loaded (1 = O_DIRECT) so its fills can mirror it.
      GGML_API void                  ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct);
  
@@ -109,15 +127,19 @@ index d72bb88d7..a8485d64f 100644
 +    // without a GTT store.
 +    GGML_API ggml_backend_buffer_type_t ggml_backend_dev_gtt_store_open(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
 +    GGML_API void                  ggml_backend_dev_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
++    // How many bytes the GTT store may lock (`RLIMIT_MEMLOCK`), or SIZE_MAX for unlimited / no lock.  The
++    // loader clamps the store's extent to it and refuses a model that only fits because of the store when it
++    // cannot be locked.  SIZE_MAX for a backend without a store.
++    GGML_API size_t                ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev);
 +
      // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
      // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
      // No-op for a backend without a slab or with no ring hole.
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 87c8164ec..a506b034b 100644
+index 87c8164ec..9b1fd0827 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -577,6 +577,20 @@ extern "C" {
+@@ -577,6 +577,30 @@ extern "C" {
          // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
          // that never answers leaves the pool on its own default).
          void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
@@ -135,14 +157,24 @@ index 87c8164ec..a506b034b 100644
 +        // never answers and the loader keeps today's placement.
 +        ggml_backend_buffer_type_t (*gtt_store_open)(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
 +        void (*gtt_store_report)(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
++
++        // (optional) how many bytes the GTT store may LOCK in this process (`RLIMIT_MEMLOCK`), or SIZE_MAX for
++        // unlimited.  Locking is what makes the tier a reservation: probe 16 (`wip/apu-expert-gtt`) measured
++        // that a merely-registered region is reclaimable under memory pressure.  The model loader clamps the
++        // store's extent to this, and REFUSES a model that only fits because of the store when it cannot be
++        // locked at all -- so a system configuration that cannot lock returns a small number and the loader
++        // decides, never this backend.  SIZE_MAX also means "the store does not lock", which is what the
++        // `MOE_EXPERT_GTT_MLOCK=0` kill switch must look like to the policy.  APPENDED at the very end for
++        // the positional-initializer reason above; zero-initialized means "no answer" -> SIZE_MAX below.
++        size_t (*gtt_store_lockable)(ggml_backend_dev_t dev);
      };
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 474166cef..45b69eb53 100644
+index 474166cef..6afa2a989 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -329,6 +329,21 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
+@@ -329,6 +329,28 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
      dev->iface.moe_cache_set_host_fill_mode(dev, direct);
  }
  
@@ -161,11 +193,18 @@ index 474166cef..45b69eb53 100644
 +    dev->iface.gtt_store_report(dev, filled_bytes, n_tables, n_slots);
 +}
 +
++size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
++    if (dev == nullptr || dev->iface.gtt_store_lockable == nullptr) {
++        return SIZE_MAX;
++    }
++    return dev->iface.gtt_store_lockable(dev);
++}
++
  bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bf574ecf9..b5e23cdc9 100644
+index bf574ecf9..6eb2177e8 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -124,6 +124,7 @@
@@ -347,7 +386,7 @@ index bf574ecf9..b5e23cdc9 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -10457,6 +10615,42 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(
+@@ -10457,6 +10615,50 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(
      return ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device);
  }
  
@@ -378,6 +417,14 @@ index bf574ecf9..b5e23cdc9 100644
 +    return ggml_backend_cuda_gtt_store_buffer_type(dev_ctx->device);
 +}
 +
++static size_t ggml_backend_cuda_device_gtt_store_lockable(ggml_backend_dev_t dev) {
++    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
++    if (dev_ctx == nullptr) {
++        return SIZE_MAX;
++    }
++    return ggml_cuda_gtt_store_lockable();
++}
++
 +static void ggml_backend_cuda_device_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes,
 +        int n_tables, int64_t n_slots) {
 +    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
@@ -390,21 +437,22 @@ index bf574ecf9..b5e23cdc9 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -10598,6 +10792,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10598,6 +10800,9 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
 +    /* .gtt_store_open            = */ ggml_backend_cuda_device_gtt_store_open,
 +    /* .gtt_store_report          = */ ggml_backend_cuda_device_gtt_store_report,
++    /* .gtt_store_lockable        = */ ggml_backend_cuda_device_gtt_store_lockable,
  };
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cu b/ggml/src/ggml-cuda/gtt-expert-store.cu
 new file mode 100644
-index 000000000..e4ca85663
+index 000000000..5f49f3f62
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cu
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,493 @@
 +// wip/apu-expert-gtt P2: the GTT expert store's region.  See `gtt-expert-store.cuh` for the design and the
 +// measurements it rests on; the buffer type that carves tensors out of this region lives in `ggml-cuda.cu`.
 +//
@@ -430,6 +478,7 @@ index 000000000..e4ca85663
 +
 +#if !defined(_WIN32)
 +#include <sys/mman.h>
++#include <sys/resource.h>
 +#include <unistd.h>
 +#include <cerrno>
 +#endif
@@ -446,7 +495,9 @@ index 000000000..e4ca85663
 +    size_t   used      = 0;       // bump watermark
 +    size_t   carve_min = 0;
 +    size_t   carve_max = 0;
-+    double   create_ms = 0.0;     // mmap + MADV_HUGEPAGE + the ONE registration
++    double   create_ms = 0.0;     // mmap + MADV_HUGEPAGE + the ONE registration + the mlock
++    bool     want_lock = false;   // MOE_EXPERT_GTT_MLOCK
++    size_t   locked    = 0;       // bytes mlock() actually took (0 = reclaimable tier)
 +    int      n_carves  = 0;
 +    size_t   fill      = 0;       // bytes the loader read from the GGUF into the GTT store
 +    int      n_tables  = 0;
@@ -475,6 +526,34 @@ index 000000000..e4ca85663
 +        return e == nullptr || atoi(e) != 0;
 +    }();
 +    return ro;
++}
++
++bool ggml_cuda_gtt_store_wants_lock() {
++    static const bool on = [] {
++        const char * e = getenv("MOE_EXPERT_GTT_MLOCK");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++// `RLIMIT_MEMLOCK` in bytes, or SIZE_MAX when unlimited (and SIZE_MAX too when locking is disabled, so the
++// caller's policy is exactly what it was before locking existed).
++size_t ggml_cuda_gtt_store_lockable() {
++    if (!ggml_cuda_gtt_store_wants_lock()) {
++        return SIZE_MAX;
++    }
++#if defined(_WIN32)
++    return SIZE_MAX;   // no RLIMIT_MEMLOCK; the GTT store declines on Windows anyway
++#else
++    struct rlimit rl;
++    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
++        return SIZE_MAX;
++    }
++    if (rl.rlim_cur == RLIM_INFINITY) {
++        return SIZE_MAX;
++    }
++    return (size_t) rl.rlim_cur;
++#endif
 +}
 +
 +// ---------------------------------------------------------------------------------------------------------
@@ -561,6 +640,9 @@ index 000000000..e4ca85663
 +            GGML_LOG_WARN("%s: device %d: cudaHostUnregister of the %.2f GiB GTT expert store failed: %s\n", __func__,
 +                    s.device, (double) s.created / 1073741824.0, cudaGetErrorString(err));
 +        }
++        if (s.locked != 0) {
++            (void) munlock(s.base, s.created);
++        }
 +        if (munmap(s.base, s.created) != 0) {
 +            GGML_LOG_WARN("%s: device %d: munmap of the GTT expert store failed: %s\n", __func__, s.device,
 +                    strerror(errno));
@@ -570,6 +652,7 @@ index 000000000..e4ca85663
 +    s.base    = nullptr;
 +    s.created = 0;
 +    s.used    = 0;
++    s.locked  = 0;
 +    s.opened  = false;
 +}
 +
@@ -657,6 +740,26 @@ index 000000000..e4ca85663
 +        return false;
 +    }
 +
++    // `mlock` is what makes the tier a RESERVATION, and it is the only thing that makes it visible to the
++    // memory accounting (probe 16: `Unevictable`/`Mlocked` report 0 for a merely-registered region, which is
++    // reclaimable all the same).  The pages are already resident -- the registration faulted them in -- so
++    // this is a bookkeeping pass over the VMA, not a second walk of DRAM.  The model loader has already
++    // clamped the extent to `RLIMIT_MEMLOCK`, so a failure here means something else took the limit between
++    // the check and this call: lock what we can, keep going, and let the census say the true number.
++    s.locked = 0;
++    if (s.want_lock) {
++        if (mlock(p, extent) == 0) {
++            s.locked = extent;
++        } else {
++            // Partial locking is possible (mlock fails on the page it cannot charge), so report the truth
++            // rather than a boolean: the tier is then partly a reservation and partly reclaimable.
++            GGML_LOG_WARN("%s: device %d: mlock of the %.2f GiB GTT store failed: %s -- the tier is "
++                          "RECLAIMABLE and will stall under memory pressure (raise RLIMIT_MEMLOCK; "
++                          "`ulimit -l` shows it)\n", __func__, s.device, (double) extent / 1073741824.0,
++                          strerror(errno));
++        }
++    }
++
 +    clock_gettime(CLOCK_MONOTONIC, &t1);
 +    s.create_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 + (double) (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
 +
@@ -696,6 +799,8 @@ index 000000000..e4ca85663
 +    s.opened  = true;
 +    s.extent  = extent_bytes;
 +    s.ro      = ggml_cuda_gtt_store_ro();
++    s.want_lock = ggml_cuda_gtt_store_wants_lock();
++    s.locked  = 0;
 +    s.fill    = 0;
 +    s.n_tables = 0;
 +    s.n_slots  = 0;
@@ -758,6 +863,9 @@ index 000000000..e4ca85663
 +    size_t extent = 0, created = 0, used = 0, carve_min = 0, carve_max = 0;
 +    int    n_carves = 0;
 +    double create_ms = 0.0;
++    bool   locked_any = false;
++    size_t locked = 0;
++    size_t lockable = ggml_cuda_gtt_store_lockable();
 +    bool ro = false;
 +    char source[192] = {0};
 +    void * base = nullptr;
@@ -774,6 +882,8 @@ index 000000000..e4ca85663
 +        carve_max = s.carve_max;
 +        n_carves  = s.n_carves;
 +        create_ms = s.create_ms;
++        locked     = s.locked;
++        locked_any = s.want_lock;
 +        ro        = s.ro;
 +        base      = s.base;
 +        snprintf(source, sizeof(source), "%s", s.source);
@@ -793,18 +903,35 @@ index 000000000..e4ca85663
 +    const size_t avail_kib = gtt_meminfo_kib("MemAvailable");
 +    const size_t total_kib = gtt_meminfo_kib("MemTotal");
 +    const double thp = created > 0 ? 100.0 * (double) huge_kib / ((double) created / 1024.0) : 0.0;
++    // The reservation's own line: what we asked to lock, what we got, and the limit that decides it.
++    char lim[32];
++    if (lockable == SIZE_MAX) {
++        snprintf(lim, sizeof(lim), "unlimited");
++    } else {
++        snprintf(lim, sizeof(lim), "%.1f MiB", (double) lockable / mib);
++    }
++    char lock_note[224];
++    if (!locked_any) {
++        snprintf(lock_note, sizeof(lock_note), "NOT locked (MOE_EXPERT_GTT_MLOCK=0): RECLAIMABLE under pressure");
++    } else if (locked == created) {
++        snprintf(lock_note, sizeof(lock_note), "mlocked %.1f MiB (RLIMIT_MEMLOCK %s): a real reservation",
++                 (double) locked / mib, lim);
++    } else {
++        snprintf(lock_note, sizeof(lock_note), "mlocked only %.1f of %.1f MiB (RLIMIT_MEMLOCK %s): the rest is "
++                 "RECLAIMABLE under pressure", (double) locked / mib, (double) created / mib, lim);
++    }
 +
 +    GGML_LOG_INFO("%s: device %d: GTT expert store %.1f MiB realised of %.1f MiB requested (%s), registered %s, "
 +                  "%.1f%% huge pages (%.1f MiB AnonHugePages, %.1f MiB Rss), region created+registered in %.0f ms "
 +                  "(%.1f ms/GiB), carved %.1f MiB in %d tables / %lld "
-+                  "expert slots, in %d buffer carve%s of %.1f-%.1f MiB; %.1f MiB read from the GGUF into it; MemAvailable %.1f "
-+                  "MiB of %.1f MiB total after the load\n",
++                  "expert slots, in %d buffer carve%s of %.1f-%.1f MiB; %.1f MiB read from the GGUF into it; "
++                  "%s; MemAvailable %.1f MiB of %.1f MiB total after the load\n",
 +                  __func__, device, (double) created / mib, (double) extent / mib, source,
 +                  ro ? "ReadOnly" : "WRITABLE", thp, (double) huge_kib / 1024.0, (double) rss_kib / 1024.0,
 +                  create_ms, created > 0 ? create_ms / ((double) created / 1073741824.0) : 0.0,
 +                  (double) used / mib, n_tables, (long long) n_slots,
-+                  n_carves, n_carves == 1 ? "" : "s", (double) carve_min / mib, (double) carve_max / mib, (double) filled_bytes / mib,
-+                  (double) avail_kib / 1024.0, (double) total_kib / 1024.0);
++                  n_carves, n_carves == 1 ? "" : "s", (double) carve_min / mib, (double) carve_max / mib,
++                  (double) filled_bytes / mib, lock_note, (double) avail_kib / 1024.0, (double) total_kib / 1024.0);
 +
 +    // The resident set this session can serve.  Say so out loud rather than implying the >RAM case works.
 +    GGML_LOG_INFO("%s: device %d: GTT expert store scope: ALL-RESIDENT arm only.  The GTT store holds the hottest "
@@ -821,10 +948,10 @@ index 000000000..e4ca85663
 +}
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cuh b/ggml/src/ggml-cuda/gtt-expert-store.cuh
 new file mode 100644
-index 000000000..27eb37ffd
+index 000000000..9362af565
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cuh
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,74 @@
 +// wip/apu-expert-gtt P2: the UMA **GTT expert store** -- one registered anonymous region that holds the
 +// resident MoE expert set, read in place by `MUL_MAT_ID`.
 +//
@@ -867,6 +994,20 @@ index 000000000..27eb37ffd
 +// writable (the measured 60 GB/s arm) -- the A/B that proves the flag does something on THIS region.
 +bool ggml_cuda_gtt_store_ro();
 +
++// `MOE_EXPERT_GTT_MLOCK` (default 1): `mlock()` the region, which is what makes it a RESERVATION.  Probe 16
++// (`wip/apu-expert-gtt/MEASUREMENTS.md` §15) measured that `cudaHostRegister` alone does NOT pin an `mmap`
++// region: under memory pressure the kernel splits its huge pages and swaps 0-436 MiB per 2 GiB out, and the
++// next GPU read pays a one-off 12-37x stall for the driver's re-fault.  `mlock` is also the only thing that
++// makes the tier visible to the memory accounting (`Unevictable`/`Mlocked`, 0 without it).  0 = do not lock:
++// the tier is then reclaimable by design, which is the kill switch for A/B and bisection.
++bool ggml_cuda_gtt_store_wants_lock();
++
++// How many bytes this process may lock (`RLIMIT_MEMLOCK`), or SIZE_MAX when unlimited.  Returns SIZE_MAX too
++// when locking is disabled, because the caller's budget policy must then behave exactly as it did before
++// locking existed.  The GTT store's own extent is CLAMPED to this by the model loader, and a model that only
++// fits because of the store is refused when it cannot be locked at all.
++size_t ggml_cuda_gtt_store_lockable();
++
 +// Open the GTT store on `device` with `extent_bytes` of capacity and record the budget's source string (the
 +// census prints it verbatim).  Does NOT allocate or register yet: `--fit` loads with `no_alloc`, and a probe
 +// load must not reserve 40 GiB of non-swappable RAM.  The region is created at the first real carve.
@@ -886,7 +1027,7 @@ index 000000000..27eb37ffd
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e138bbfa1..aa15be20f 100644
+index e138bbfa1..0dbf0e50e 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -936,7 +1077,7 @@ index e138bbfa1..aa15be20f 100644
          return;
      }
  
-@@ -419,7 +437,217 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +437,326 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -1030,16 +1171,125 @@ index e138bbfa1..aa15be20f 100644
 +        budget = padded_total;
 +        source = "auto: MemAvailable unknown -> the whole expert set";
 +    }
-+    // The GTT store is REGISTERED, non-swappable host memory, so the ceiling is the machine's own memory, read
-+    // once.  `-lme N` above 90%% of it is already refused by the arg parser; this is the same rule applied to
-+    // the `auto` arm and to a host whose memory changed since the parse.
++    // The GTT store is registered, RESERVED host memory, so two ceilings apply, both read once:
++    //   1. the machine's own memory -- `-lme N` above 90%% of it is already refused by the arg parser, and this is
++    //      the same rule applied to the `auto` arm and to a host whose memory changed since the parse;
++    //   2. RLIMIT_MEMLOCK, because `cudaHostRegister` alone does NOT pin an `mmap` region (probe 16,
++    //      MEASUREMENTS.md §15): without `mlock` the kernel splits its huge pages and swaps 0-436 MiB per 2 GiB
++    //      out under pressure, and the next GPU read pays a one-off 12-37x stall for the driver's re-fault.
++    //      `MOE_EXPERT_GTT_MLOCK=0` turns locking off, and the backend then reports SIZE_MAX so this policy is
++    //      exactly what it was before locking existed.
 +    if (avail > 0 && budget > avail / 10 * 9) {
 +        budget = avail / 10 * 9;
 +        source += format(", clamped to 90%% of MemAvailable (%.1f MiB)", (double) budget / mib);
 +    }
++
++    // --- 2b. the lock: a clamp when it is an optimisation, a refusal when it is the difference between
++    //         running and not running ----------------------------------------------------------------
++    // Only an integrated device can offer a GTT store, so only its limit is asked for.
++    size_t lockable = SIZE_MAX;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;
++        }
++        lockable = std::min(lockable, ggml_backend_dev_gtt_store_lockable(d));
++    }
++    // NB: SIZE_MAX means "no lock policy applies" -- either the limit is unlimited, or `MOE_EXPERT_GTT_MLOCK=0`
++    // turned locking off.  The loader cannot tell those apart and must not try: the GTT store's own census
++    // reports the truth (`mlocked X of Y` / `NOT locked ... RECLAIMABLE`), and all this function needs is the
++    // number the policy is clamped to.
++
 +    // `-lme` is a CAP, not a floor: never register space no expert can occupy.
 +    size_t extent = std::min(budget, padded_total);
++
++    if (extent > lockable) {
++        // The store cannot be locked as asked.  Two questions decide what happens, and the second is the one that
++        // matters: **can this model run without a locked store at all?**  Weights may occupy at most 90 % of
++        // MemAvailable (the same 10 % reserve the `-lme` argv check applies); whatever exceeds that is the
++        // minimum the GTT store has to hold, because on an APU there is nowhere else for it to live.
++        size_t weights = 0;
++        for (const auto & kv : weights_map) {
++            if (kv.second.tensor != nullptr) {
++                weights += ggml_nbytes(kv.second.tensor);
++            }
++        }
++        const size_t fit_cap   = avail > 0 ? avail - avail / 10 : 0;
++        const size_t shortfall = weights > fit_cap ? weights - fit_cap : 0;
++        const size_t honour    = std::min(lockable, padded_total);   // what the limit still lets us lock+place
++        // A clamp smaller than the smallest candidate table buys nothing at all -- do not register (and lock) a
++        // region no expert can occupy, go straight to the decline/refuse branch.
++        size_t smallest = padded_total;
++        for (const auto & c : cands) {
++            smallest = std::min(smallest, GGML_PAD(c.nbytes + 4096, 4096));
++        }
++        const bool clamp_useful = honour >= smallest;
++        const std::string lim  = lockable == SIZE_MAX ? "unlimited" : format("%.1f MiB", (double) lockable / mib);
++        // Whether a store that fits can make a >RAM model RUNNABLE.  Today it cannot: the GTT store is a static
++        // placement with no eviction (P3) and no streaming fill (P4/P5), so the experts that do not fit still
++        // need their layer's device buffer and the load over-commits -- measured precedent: 121 GiB resident +
++        // 13 GiB swap on a 123 GiB box (2026-10-19).  So a model that cannot fit is refused rather than left to
++        // thrash.  P3/P4 flip this to true, and the clamp branch below becomes reachable.
++        const bool gtt_store_can_stream = false;
++        const bool clamps_but_cannot_stream = clamp_useful && honour >= shortfall && !gtt_store_can_stream;
++        const char * advice =
++            "Raise RLIMIT_MEMLOCK (`ulimit -l` shows it): `LimitMEMLOCK=infinity` in the systemd unit, "
++            "`DefaultLimitMEMLOCK=infinity` in /etc/systemd/system.conf, `* - memlock unlimited` in "
++            "/etc/security/limits.conf, or run with CAP_IPC_LOCK.  `-lme auto` sizes the GTT store to whatever "
++            "the limit allows.";
++
++        if (shortfall == 0 && !clamp_useful) {
++            // (a) the model fits without the store, and the limit is too small to buy a useful one: this is an
++            // optimisation, not a lifeline -- decline it and keep today's behaviour.
++            LLAMA_LOG_WARN("%s: no GTT expert store: %s resolves to %.1f MiB and RLIMIT_MEMLOCK is %s.  This model "
++                           "fits in RAM without it (weights %.1f MiB of %.1f MiB MemAvailable), so the expert "
++                           "weights keep their layer's device buffer.  %s\n", __func__, source.c_str(),
++                           (double) extent / mib, lim.c_str(), (double) weights / mib, (double) avail / mib, advice);
++            return;
++        }
++        if (shortfall == 0) {
++            // (a') same model, but the limit still buys a real (smaller) store: take the clamp, loudly.
++            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
++                           "MiB (this model fits in RAM anyway, so this is an optimisation).  %s\n", __func__,
++                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib, advice);
++            extent = honour;
++            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
++        } else if (clamp_useful && honour >= shortfall && gtt_store_can_stream) {
++            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
++            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
++                           "MiB, which still covers the %.1f MiB this model cannot fit in RAM.  %s\n", __func__,
++                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib,
++                           (double) shortfall / mib, advice);
++            extent = honour;
++            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
++        } else {
++            // (c) it cannot be honoured and the model cannot run without it: REFUSE, before a byte is read.
++            // 2026-10-19 is why: an unchecked APU load went to 121 GiB resident + 13 GiB swap.
++            throw std::runtime_error(format(
++                "GTT expert store: this model cannot run with an unlocked store, and the store cannot be "
++                "locked.\n"
++                "  weights             %.1f MiB\n"
++                "  MemAvailable        %.1f MiB  (90%% of it is %.1f MiB: the ceiling the weights may occupy)\n"
++                "  shortfall           %.1f MiB  must live in the GTT store for this model to run at all\n"
++                "  asked for           %.1f MiB  (%s)\n"
++                "  RLIMIT_MEMLOCK      %s\n"
++                "  could honour        %.1f MiB\n"
++                "A registered-only GTT store is RECLAIMABLE under memory pressure -- the kernel swaps parts of it "
++                "and the next GPU read stalls 12-37x while the driver faults them back (measured, "
++                "wip/apu-expert-gtt/MEASUREMENTS.md §15) -- so it cannot be what makes this model fit.%s  %s",
++                (double) weights / mib, (double) avail / mib, (double) fit_cap / mib, (double) shortfall / mib,
++                (double) extent / mib, source.c_str(), lim.c_str(), (double) honour / mib,
++                clamps_but_cannot_stream
++                    ? "\n  And even a LOCKED store of that size would not make it runnable in this build: it has no "
++                      "eviction (P3) or streaming fill (P4), so the experts that do not fit would still take their "
++                      "layer's device buffer and the load would over-commit."
++                    : "",
++                advice));
++        }
++    }
 +    if (extent < 4096) {
++        LLAMA_LOG_WARN("%s: no GTT expert store: the %.1f MiB budget (from %s) is smaller than a page\n",
++                       __func__, (double) extent / mib, source.c_str());
 +        return;
 +    }
 +
@@ -1154,7 +1404,7 @@ index e138bbfa1..aa15be20f 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2036,6 +2264,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2036,6 +2373,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -1173,7 +1423,7 @@ index e138bbfa1..aa15be20f 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2557,7 +2797,18 @@ bool llama_model_loader::load_all_data(
+@@ -2557,7 +2906,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -1193,7 +1443,7 @@ index e138bbfa1..aa15be20f 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2618,9 +2869,12 @@ bool llama_model_loader::load_all_data(
+@@ -2618,9 +2978,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

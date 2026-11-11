@@ -109,6 +109,11 @@ branch, not a new flag:
 > read stalls 12-37x while the driver faults the pages back, and `Unevictable` reports 0 throughout.  **`mlock`
 > is the difference between a reservation and a sizing intent** (README §7 Q11, an open decision).  Nothing else
 > in this section changes: `MemAvailable` is charged the same either way.
+>
+> **NOW IMPLEMENTED (same day):** the store is `mlock`ed (`MOE_EXPERT_GTT_MLOCK`, default 1), the extent is clamped
+> to `RLIMIT_MEMLOCK`, a fitting model **declines** the store with the fix in the message, and a model that cannot
+> fit **refuses** at load with the shortfall and the fix.  `mlock` is free at creation (26.3 vs 25.8-26.0 ms/GiB --
+> the registration already faulted the pages in).  README §5.2 is the table; `MEASUREMENTS.md` §15.3 the arms.
 
 * `MemAvailable - KV - compute - OS reserve`, read **once**, floored, and **asserted** in the census
   (`GTT store + KV + compute < MemTotal`).  `MemAvailable` is not cgroup-aware in either call site —
