@@ -330,4 +330,5 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 | `README.md` | this file: the shape, what it replaced, the measured foundation, the step/prefill protocol, the code map, the traps |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | the phased plan: P1.0 keystone probes, the store, residency/eviction, the fills, prefill streaming, preflight/fit, the gate spec, docs, effort, rollback |
 | [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration |
-| [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); one workload probe still owed (15) |
+| [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); probes 15 (touch distance) and 16 (reclamation under pressure) still owed |
+| [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md) | the cold-start prompt for the implementation session: what P1.1/P2 is, the numbers not to contradict, the definition of done |
