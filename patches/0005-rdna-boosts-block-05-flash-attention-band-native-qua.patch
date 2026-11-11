@@ -1,4 +1,4 @@
-From cb4df6aae0e388dc78581c00f6f2dd48f38ab81c Mon Sep 17 00:00:00 2001
+From 482420ba74e7e2b5d93661df4d8cf73b8c737a9d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 05/15] rdna-boosts: block 05: flash-attention band, native
@@ -317,7 +317,7 @@ enabled"); derived vs LLAMA_KQ_MASK_DERIVED=0 byte-identical at a 4096-ctx prefi
  ggml/src/ggml-hip/CMakeLists.txt              |   11 +
  ggml/src/ggml.c                               |   41 +
  include/llama.h                               |    6 +
- src/llama-context.cpp                         |  366 ++++-
+ src/llama-context.cpp                         |  368 ++++-
  src/llama-context.h                           |   28 +-
  src/llama-cparams.h                           |    4 +
  src/llama-graph.cpp                           |  200 ++-
@@ -326,7 +326,7 @@ enabled"); derived vs LLAMA_KQ_MASK_DERIVED=0 byte-identical at a 4096-ctx prefi
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  170 ++-
- 295 files changed, 5600 insertions(+), 627 deletions(-)
+ 295 files changed, 5602 insertions(+), 627 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -8766,7 +8766,7 @@ index bb3474065..cf580c3cb 100644
          // [EXPERIMENTAL]
          // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9a15a7758..559873dff 100644
+index 9a15a7758..182341832 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,9 @@
@@ -9071,7 +9071,7 @@ index 9a15a7758..559873dff 100644
          } else {
              enabled = true;
              LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-@@ -727,6 +953,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -727,6 +953,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fkvr = false;
      }
  
@@ -9079,14 +9079,16 @@ index 9a15a7758..559873dff 100644
 +    if (cparams.auto_kq_mask_derived) {
 +        // The derived form needs a single KV stream: llama_kv_cache::kq_mask_derivable() rejects a
 +        // multi-stream cache.  That is `n_seq_max > 1` without kv_unified for the plain cache, and
-+        // always `n_seq_max > 1` for deepseek4, which keeps per-sequence streams even in unified
-+        // mode (llama_kv_cache_dsv4 pins unified_raw/unified_compressed to false).  Do not run the
-+        // probe there - it forces a single-sequence graph, and on a multi-stream cache that is a
-+        // shape the cache-layout-driven attention builders reject (deepseek4's lightning indexer
-+        // ties its query stream count to the cache K's ne[3] while its mask uses the plan's stream
-+        // count, so mask->ne[1] != q->ne[2] and ggml_lightning_indexer asserts).  Derived is dead
-+        // in that configuration anyway, so skipping the probe loses nothing.
-+        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified || model.arch == LLM_ARCH_DEEPSEEK4);
++        // always `n_seq_max > 1` for the dsv4 caches (deepseek4 and deepseek41), which keep
++        // per-sequence streams even in unified mode (llama_kv_cache_dsv4 pins
++        // unified_raw/unified_compressed to false).  Do not run the probe there - it forces a
++        // single-sequence graph, and on a multi-stream cache that is a shape the cache-layout-driven
++        // attention builders reject (dsv4's lightning indexer ties its query stream count to the
++        // cache K's ne[3] while its mask uses the plan's stream count, so mask->ne[1] != q->ne[2]
++        // and ggml_lightning_indexer asserts; V4.1's indexer asserts the same way, issue #300).
++        // Derived is dead in that configuration anyway, so skipping the probe loses nothing.
++        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified ||
++                model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41);
 +
 +        if (multi_stream) {
 +            LLAMA_LOG_INFO("%s: derived kq mask disabled (multi-stream KV cache)\n", func);
@@ -9101,7 +9103,7 @@ index 9a15a7758..559873dff 100644
      if (cparams.auto_fgdn) {
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-@@ -794,6 +1043,61 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -794,6 +1045,61 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
  }
  
@@ -9163,7 +9165,7 @@ index 9a15a7758..559873dff 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -810,6 +1114,10 @@ void llama_context::sched_reserve() {
+@@ -810,6 +1116,10 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -9174,7 +9176,7 @@ index 9a15a7758..559873dff 100644
      const size_t max_nodes = this->graph_max_nodes(n_tokens);
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
-@@ -854,13 +1162,14 @@ void llama_context::sched_reserve() {
+@@ -854,13 +1164,14 @@ void llama_context::sched_reserve() {
      // reserve pp (prompt processing) graph first so that buffers are only allocated once
      {
          auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -9191,7 +9193,7 @@ index 9a15a7758..559873dff 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -881,7 +1190,7 @@ void llama_context::sched_reserve() {
+@@ -881,7 +1192,7 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -9200,7 +9202,7 @@ index 9a15a7758..559873dff 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -903,10 +1212,10 @@ void llama_context::sched_reserve() {
+@@ -903,10 +1214,10 @@ void llama_context::sched_reserve() {
                  // [TAG_RESERVE_DIAG_DECAY]
                  // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                  // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
@@ -9213,7 +9215,7 @@ index 9a15a7758..559873dff 100644
          };
  
          if (!gf) {
-@@ -1079,7 +1388,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1079,7 +1390,7 @@ bool llama_context::memory_update(bool optimize) {
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
  
@@ -9222,7 +9224,7 @@ index 9a15a7758..559873dff 100644
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
          }
-@@ -2109,6 +2418,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2109,6 +2420,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -9249,7 +9251,7 @@ index 9a15a7758..559873dff 100644
      sched_reserve();
  
      bool did_optimize = false;
-@@ -2936,7 +3265,8 @@ static void ubatch_prepare_reserve(
+@@ -2936,7 +3267,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -9259,7 +9261,7 @@ index 9a15a7758..559873dff 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
      GGML_ASSERT(n_outputs_l >= 1);
  
-@@ -2968,7 +3298,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2968,7 +3300,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -9283,7 +9285,7 @@ index 9a15a7758..559873dff 100644
  
      res->reset();
  
-@@ -4378,6 +4723,7 @@ llama_context_params llama_context_default_params() {
+@@ -4378,6 +4725,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,

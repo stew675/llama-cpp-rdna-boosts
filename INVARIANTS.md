@@ -3847,3 +3847,43 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   (Flash-Next GSQ-RCO IQ3_S, 2 devices, `-ts 24,16 -ncmoe 34 -lm none -c 65536`, `prompts/recall.txt`,
   `-n 64`) `776 chars sha=d80ffbb6d77e` — byte-identical in `-sm tensor` **and** `-sm layer`, and identical
   to the r245 record.
+
+## r254 — a DSV4 synthetic reserve probe needs a FULL-cache context, and a 2-D copy into a slab view is refused (GitHub issue #300)
+
+* **A dsv4 reserve probe must not be built against the live memory context.**  `llama_kv_cache_dsv4_raw_context`
+  sizes its write indices from its own applied ubatch (`build_input_k_idxs`: `ubatches_write[i_next].n_tokens`),
+  while both synthetic probes in `process_ubatch` reserve a `n_verify`-token graph.  Against the live context
+  those differ by construction (the live write ubatch is the pass in flight), so `k_cur->ne[2] != k_idxs->ne[0]`
+  and `cpy_k` takes its multi-stream branch with a one-stream `sinfo` and aborts
+  (`GGML_ASSERT(sinfo.n_stream() > 1)`).  `memory->init_full()` has no write ubatch (its `k_idxs` follows the
+  reserve) and its stream layout is the cache's persistent one -- `n_seq_max` for dsv4, whose caches pin unified
+  to false -- which is the shape `sched_reserve()` reserves with.  Probe with that context and
+  `cparams.n_seq_max`; every other arch keeps the live context and `ubatch.n_seqs_unq`.
+* **The probe is not arch-specific: `deepseek4` aborts on it too** (a real DeepSeek-V4-Flash Q8_K_XL at
+  `-sm layer -ot exps=CPU`, r253 tree).  The issue's second assert needed no new arch list to reproduce, only a
+  host-expert placement; what `LLM_ARCH_DEEPSEEK41` *does* need is to be in `dsv4_cache` so V4.1 takes the same
+  probe (and `cparams.n_seq_max`), and in `resolve_fused_ops`' `multi_stream` so the derived-kq-mask probe is
+  skipped on its always-per-sequence cache.
+* **The `multi_stream` arch entry only matters in unified mode.**  With the default `kv_unified = false`,
+  `!cparams.kv_unified` already makes every arch multi-stream, so an arm without `--kv-unified` cannot see the
+  missing `LLM_ARCH_DEEPSEEK41` entry at all.  The repro that does: `llama-server -np 4 --kv-unified` on the
+  `test-llama-archs -a deepseek41 -o <dir>` fixture → `deepseek41.cpp:552 GGML_ASSERT(ci.kq_mask->ne[1] == n_tok)`.
+* **A `cudaMemcpy2DAsync` into a movable-boundary-slab range is refused by the driver, asynchronously.**  The
+  refusal is the one `ggml_cuda_cpy_as_memcpy_2d` already guards the CPY path against, and it is not about the
+  pointers: `hipPointerGetAttributes` reports the current device and type-device for both, 1-D copies into the
+  same bytes succeed, and a 2-D copy `dst -> dst` fails.  It surfaces at the *next* `CUDA_CHECK` as
+  `ROCm error: invalid argument` naming whatever line checks first, which is how it was first misread as a
+  top-k sharding bug.  `top_k_argsort_cuda` was the second call site (`deepseek32` reproduces it on r253, so it
+  predates the probe fix); it now gathers with a kernel (`top_k_gather_rows`), which is bit-identical and
+  removes the driver dependency for every arch that builds `GGML_OP_TOP_K`.
+* **The `kv_lid` cache has no layers for V4.1, so the Hadamard list is inert for it.**  `filter_lid` is
+  `!is_v41 && filter_csa`, and V4.1's index K lives inside the compressed row
+  (`hparams_csa.n_embd_head_k_full = n_embd_head_k + indexer_head_size`), so the "always create rotation
+  tensors" condition (`n_embd_head_k_full == indexer_head_size`) cannot be true for any V4.1 cache; its
+  rotation comes from the generic quantized-KV rule.  Adding `LLM_ARCH_DEEPSEEK41` there would create tensors
+  in an empty cache -- do not.
+* **`test-llama-archs` needs one host-expert arch per process.**  A `Host experts` row arms the
+  movable-boundary slab, and a slab holds its VRAM for the rest of the process (ROCm cannot unmap a sub-range):
+  after `-a deepseek2`'s rows only ~1.2 GiB is free outside it, which is why r253 + `-a 'deepseek2|deepseek4'`
+  loads the (then tiny) deepseek4 fixture and the now 1.6-2.4 GiB dsv4 fixtures do not.  Pre-existing, not
+  caused by the hosting rows themselves; run `-a deepseek2`, `-a deepseek4`, `-a deepseek41` separately.

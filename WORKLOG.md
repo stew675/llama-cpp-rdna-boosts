@@ -1,3 +1,134 @@
+## 261110.010 (r254, RELEASE v16-a691b2345-r254) -- GitHub issue #300: the dsv4 synthetic reserve probes ran against the live (wrong-shaped) memory context and on a cache that the arch list did not name, plus the top-k gather's 2-D copy that the slab refuses
+
+**Release:** `v16-a691b2345-r254`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`1606bdaff` (the `fork-refresh.sh` re-cut), 16 blocks.  `scripts/validate-set.sh` green (checksums,
+fresh-tarball strict 16/16 `git am`, applied tree `3f2cad2a0`, Windows portability lint, 289 files),
+`gate-per-block-build --fast --changed-from 2f8d454b3` **4/4** (blocks 05, 10, 12 and the tip).  **No block
+renumbered, merged or split**: three folds, **block 05** (`src/llama-context.cpp`: `multi_stream`), **block 10**
+(`src/llama-context.cpp`: `dsv4_cache` + the probe helper + `top-k.cu`) and **block 12**
+(`src/llama-context.cpp`: the early narrow-floor probe, `tests/test-llama-archs.cpp`).  No kernel arithmetic
+changed, no default moved, no environment variable added or repurposed.
+
+### What the reporter found
+
+The issue names two aborts on a real DeepSeek-V4.1 (`deepseek41`) load: `src/models/deepseek41.cpp:552`
+`GGML_ASSERT(ci.kq_mask->ne[1] == n_tok)` during `resolve_fused_ops`, and
+`src/llama-kv-cache-dsv4.cpp:2059` `GGML_ASSERT(sinfo.n_stream() > 1)` in the first `process_ubatch`.  Their
+diagnosis was right on all three points (the `multi_stream` arch list, the `dsv4_cache` arch list, and that
+adding V4.1 to those alone does not fix the second abort), and their patch is the shape of the fix; what
+changed here is the reasoning, the placement and the coverage.
+
+### Reproduction (this box, not taken on trust)
+
+Neither abort needs a V4.1 checkpoint, and that matters because the delivery has no way to hold 233 GiB of
+`IQ1_S` here.  Both were reproduced on gfx1201 (3 x R9700, ROCm 10.1.0):
+
+1. **The `cpy_k` assert is arch-independent: a real DeepSeek-V4-Flash (deepseek4) aborts on it.**
+   `/llm/models/DeepSeek/V4-Flash-0731/Q8_K_XL` (161 GiB, `deepseek4`), `-c 2048 -ngl 99 -sm layer
+   -ot exps=CPU` aborts in the first ubatch with `GGML_ASSERT(sinfo.n_stream() > 1)`.  The trigger is the
+   host-expert slab/narrow-floor probe, not the arch: `deepseek4` is already in every list the issue says
+   `deepseek41` is missing from.
+2. **`tests/test-llama-archs` covers it.**  `deepseek41` **is** in the test set (its fixture is a window-only
+   Engram/ratio-2/ratio-1 shape, 6 layers), and adding the dsv4 arches to `host_experts_test()` puts the exact
+   assert in front of the same probe: `-a deepseek4` and `-a deepseek41` both abort in the `Host experts` row
+   before the fix (`-b ROCm0`).  That row is now the regression test.
+3. **The `kq_mask` assert needs `--kv-unified`.**  With the default non-unified cache, `!cparams.kv_unified`
+   already makes `multi_stream` true for *every* arch, so the arch list only matters in unified mode (and for
+   any dsv4 cache, which pins unified to false).  `test-llama-archs -a deepseek41 -o <dir>` writes the fixture,
+   and `llama-server -m deepseek41-moe.gguf -np 4 --kv-unified -c 512` aborts at context creation with
+   `deepseek41.cpp:552`; with the fix the server starts and answers `/health`.
+
+### The defect, and why the reporter's third hunk is the right fix
+
+The dsv4 raw cache sizes its write indices from the **applied ubatch** of its own memory context
+(`build_input_k_idxs`: `ubatches_write[i_next].n_tokens`), while both synthetic reserve probes in
+`process_ubatch` ask `graph_reserve` for a `n_verify`-token graph.  Against the **live** context those two
+numbers are different by construction (the live write ubatch is this pass), so `k_cur->ne[2] != k_idxs->ne[0]`
+and `cpy_k` takes its multi-stream branch with a one-stream `sinfo` and asserts.  A full-cache context
+(`memory->init_full()`) has **no** write ubatch, so its `k_idxs` follows the reserve, and its stream layout is
+the cache's persistent one -- `n_seq_max` for dsv4, whose caches pin unified to false.  That is the shape
+`sched_reserve()` already reserves the widest graph with, so the probe also measures what the run will issue.
+
+The cut:
+
+1. **Block 05 -- the derived-kq-mask probe knows V4.1 is multi-stream.**  `multi_stream` gains
+   `LLM_ARCH_DEEPSEEK41` (issue #300 part 1).
+2. **Block 10 -- `dsv4_cache` names V4.1, and `probe_mctx()`/`probe_n_rs_seqs()` own the shape.**  The drop
+   path's size-only probe and its real re-reserve take the full-cache context and `cparams.n_seq_max` for a
+   dsv4 cache (issue #300 part 2); every other arch keeps `mctx`/`n_seqs_unq` untouched.
+3. **Block 12 -- the early narrow-floor probe uses the same helper**, and `tests/test-llama-archs.cpp` gains
+   `DEEPSEEK4`/`DEEPSEEK41` in `host_experts_test()` plus a `moe_cache_test()` split, because the tinier
+   device-cache rows (1 536 KiB) cannot hold one token of the 64-expert dsv4 fixture (192 MiB) and
+   `llama_init_from_model` refuses the context.
+
+**Not taken: `LLAMA_DSV4_PROBE_FULL`.**  The reporter offered the kill switch for their own A/B and it is
+dropped: the "old" arm is the abort, so there is nothing to opt back into.
+
+### The Hadamard condition the reporter flagged is inert -- no change
+
+`llama-kv-cache.cpp`'s "always create Hadamard rotation tensors for DeepSeek lightning indexers" list names
+`LLM_ARCH_DEEPSEEK4` but not `LLM_ARCH_DEEPSEEK41`, and the reply says why it stays that way.  V4.1 does not
+use the `kv_lid` cache at all (`filter_lid` is `!is_v41 && filter_csa`, i.e. **no layers**), and its index K
+lives *inside* the compressed row (`hparams_csa.n_embd_head_k_full = n_embd_head_k + indexer_head_size`,
+`llama-kv-cache-dsv4.cpp`), so the condition's `n_embd_head_k_full == indexer_head_size` test cannot be true
+for any V4.1 cache.  The rotation V4.1 does need comes from the generic quantized-KV rule on the CSA/HCA
+caches (`n_embd_head_k_all > 0`, quantized, `% 64 == 0`), which those head sizes satisfy.  Adding the arch
+would create rotation tensors in an empty cache: an inert line pretending to be a fix.
+
+### Found on the way: the top-k gather used a 2-D copy the slab refuses (pre-existing, fixed here)
+
+Unblocking the probe exposed the next abort, and it is **not** the dsv4 probe's: the same failure happens on
+`deepseek32` (no dsv4 cache, no probe change) on the **r253 tree**, so it is a delivery defect that the
+`cpy_k` assert had been hiding.
+
+`top_k_argsort_cuda` copied the sorted indices out with `cudaMemcpy2DAsync(dst, k*4, tmp, ncols*4, k*4, nrows)`.
+`dst` is a graph tensor view, and with host experts the compute buffer is a **view of the movable-boundary
+slab**; a padded 2-D copy into that range is refused by the driver -- asynchronously, so the error surfaces at
+the next `CUDA_CHECK` as `ROCm error: invalid argument` with a *valid* destination (helpers print `hipPointerGetAttributes`
+device = the current device, type = device memory, both 1-D copies into the same bytes succeed, `hipMemcpy2D`
+even for `dst->dst` fails).  It is the same refusal block 10's CPY guard already documents
+(`ggml_cuda_cpy_as_memcpy_2d`), reached through a second call site.  Measured, on one process each:
+`GGML_CUDA_SLAB=0` clean, `MOE_EXPERT_CACHE_MIB=0` clean, 2 devices clean, 3 devices + `-ot exps=CPU` aborts on
+the *second* top-k, and the r253 tree behaves identically on `deepseek32`.
+
+**Fix (block 10): the copy is a strided row gather, in a kernel.**  One int per thread, the row from the grid
+with a stride loop (no per-element division, no grid-height limit), replacing the 2-D copy for every arch that
+builds `GGML_OP_TOP_K`.  It is a pure index copy, so bit-identity is the expectation and it was measured:
+`test-llama-archs -a deepseek32|deepseek4|deepseek41 -s 42` result rows are **identical** to a build without
+the change (device and `Host experts` rows), the Qwen3.5-4B **top-k sampler** arm (`--temp 0.8 --top-k 40
+-n 100`) hashes `1c87c32e9fc4` both ways, and the 161 GiB V4-Flash arm prints the same 16-token text on 1 GPU.
+
+### Verification (gfx1201, ROCm 10.1.0)
+
+| arm | before | after |
+|---|---|---|
+| coherence, 4B Q8_0, 1 GPU (`--seed 42 --temp 0 -n 20`) | `1c5d32ac537d` | `1c5d32ac537d` |
+| coherence, 4B Q8_0, 3 GPU `-sm tensor` | `1c5d32ac537d` | `1c5d32ac537d` |
+| top-k sampler, 4B Q8_0, 3 GPU `-sm tensor` (`--temp 0.8 --top-k 40 -n 100`) | `1c87c32e9fc4` | `1c87c32e9fc4` |
+| DeepSeek-V4-Flash-0731 Q8_K_XL, 1 GPU, `-ot exps=CPU`, 16 tokens | coherent | **byte-identical text** |
+| DeepSeek-V4-Flash-0731 Q8_K_XL, **3 GPU `-sm layer`**, `-ot exps=CPU` | `GGML_ASSERT(sinfo.n_stream() > 1)` | coherent ("... 17*23 = 17*(20+3)=340+"), no faults |
+| `test-llama-archs -a deepseek4 -b ROCm0` | `Host experts` row aborts (assert) | **2/2** (device 7.13e-08, Host experts 7.13e-08) |
+| `test-llama-archs -a deepseek41 -b ROCm0` | `Host experts` row aborts (assert) | **2/2** (device 5.37e-08, Host experts 5.37e-08) |
+| `test-llama-archs -a deepseek32 -b ROCm0` (control, no probe change) | 1/1 | 1/1 (3.49e-10) |
+| `llama-server -m deepseek41-moe.gguf -np 4 --kv-unified -c 512` | `deepseek41.cpp:552` assert | starts, `/health` `{"status":"ok"}` |
+| 3-device `-ot exps=CPU -sm layer` on the deepseek32/4/41 fixtures | `ROCm error: invalid argument` (top-k) | all exit 0 |
+| `scripts/gate-prefill-logits.sh` (27B Q8_0, 40 chunks) | -- | mean KLD **0.000000**, same-top-p **100.000 %** |
+| `scripts/check-gpu-faults.sh` over 10 session logs | -- | clean |
+| `scripts/validate-set.sh` | -- | green, 16/16 strict, tree `3f2cad2a0` |
+| `scripts/gate-per-block-build.sh --fast --changed-from 2f8d454b3` | -- | **4/4** (05, 10, 12, tip) |
+
+No MTP Protocol A: no decode kernel, fusion or speculator moved and no default changed.  What the two code
+paths do is choose the *shape* of a synthetic reserve (whose product is a buffer size) and copy integers; the
+four text arms above are byte-identical and the prefill-logit gate is at rounding zero, which is the r250/r253
+precedent for this shape of change.
+
+**One process, one host-expert arch.**  A `Host experts` row arms the movable-boundary slab, and a slab holds
+its VRAM for the rest of the process (ROCm will not unmap a sub-range), so a *later* arch's model only has the
+slab headroom to load into.  That is pre-existing (r253 with `-a 'deepseek2|deepseek4'` leaves ~1.2 GiB free
+after deepseek2's rows) and the delivery has always run this test per arch (`-a deepseek4`, `-a deepseek41`);
+with the dsv4 fixtures now 1.6-2.4 GiB it is visible if two host-expert arches are swept in one process, so the
+test source says so next to `host_experts_test()`.
+
 ## 261110.009 (r253, RELEASE v16-a691b2345-r253) -- GitHub issue #294 follow-up: the expert cache's device-sensitive hooks never made their own device current, which is inactive on one device and active on every multi-device box
 
 **Release:** `v16-a691b2345-r253`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

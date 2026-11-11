@@ -1,4 +1,4 @@
-From 6c73b138312fa9b43578b565e644cc488e79e908 Mon Sep 17 00:00:00 2001
+From 94b25976cda225c649f6e19aab14a0dc581b1200 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -129,12 +129,13 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  ggml/src/ggml-cuda/set-rows.cuh               |  132 +
  ggml/src/ggml-cuda/ssm-scan.cu                |   93 +
  ggml/src/ggml-cuda/ssm-scan.cuh               |    3 +
+ ggml/src/ggml-cuda/top-k.cu                   |   35 +-
  ggml/src/ggml-cuda/topk-moe.cu                |  218 +-
  ggml/src/ggml-cuda/topk-moe.cuh               |   11 +
  ggml/src/ggml-cuda/unary.cu                   |  319 +-
  ggml/src/ggml-cuda/unary.cuh                  |    6 +-
  ggml/src/ggml.c                               |   13 +
- src/llama-context.cpp                         |  435 +-
+ src/llama-context.cpp                         |  465 +-
  src/llama-context.h                           |   21 +
  src/llama-ext.h                               |   11 +
  src/llama-graph.cpp                           |   12 +-
@@ -145,7 +146,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 85 files changed, 16344 insertions(+), 5490 deletions(-)
+ 86 files changed, 16405 insertions(+), 5494 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -24129,6 +24130,59 @@ index 407a4c712..d5b4312c2 100644
 +int ggml_cuda_ssm_scan_cache_cpy_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +
 +int ggml_cuda_try_ssm_scan_cache_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy);
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index b0f609990..96e851ea5 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -250,6 +250,38 @@ static void top_k_radix_cuda(
+     }
+ }
+ 
++// The sorted indices live in a `ncols`-pitch temporary and only the first k columns of each row are wanted,
++// so getting them out is a strided row copy.  `cudaMemcpy2DAsync` is NOT usable for it: a padded 2-D copy
++// into a graph tensor view fails with "invalid argument" when the destination sits in the movable-boundary
++// slab -- the same driver refusal the CPY path guards against (see `ggml_cuda_cpy_as_memcpy_2d`: there the
++// identical copy succeeds on device 0, is refused on another device of the split, and the run is clean with
++// `GGML_CUDA_SLAB=0`).  Measured here on the dsv4 indexer's top-k, a DeepSeek-V4-Flash shape and the small
++// synthetic `deepseek32` fixture with `-ot exps=CPU -sm layer` on 3 devices: the 1-D copies into the very
++// same buffer succeed, the 2-D one is refused, and both `GGML_CUDA_SLAB=0` and `MOE_EXPERT_CACHE_MIB=0`
++// make it go away.  One int per thread, the row taken from the grid with a stride loop, so there is no
++// per-element division and no grid-height limit.
++static __global__ void top_k_gather_rows(const int * GGML_CUDA_RESTRICT src, int * GGML_CUDA_RESTRICT dst,
++        const int64_t ncols, const int64_t k, const int64_t nrows) {
++    const int64_t col = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++
++    if (col >= k) {
++        return;
++    }
++
++    for (int64_t row = blockIdx.y; row < nrows; row += gridDim.y) {
++        dst[row*k     + col] = src[row*ncols + col];
++    }
++}
++
++static void top_k_gather_cuda(const int * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++
++    // gridDim.y is bounded (65535); the kernel strides over the rows above that
++    const dim3 grid((k + BLOCK_SIZE - 1) / BLOCK_SIZE, (unsigned) std::min<int64_t>(nrows, 65535));
++
++    top_k_gather_rows<<<grid, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k, nrows);
++}
++
+ static void top_k_argsort_cuda(
+         ggml_cuda_pool & pool,
+         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
+@@ -270,8 +302,7 @@ static void top_k_argsort_cuda(
+         } else {
+             argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+         }
+-        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+-                                     cudaMemcpyDeviceToDevice, stream));
++        top_k_gather_cuda(tmp, dst, ncols, iter_nrows, k, stream);
+ 
+         src += (size_t) ncols * iter_nrows;
+         dst += (size_t) k     * iter_nrows;
 diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
 index dd331e61d..25afa3aa1 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cu
@@ -25064,7 +25118,7 @@ index e2d2fcece..51b34395a 100644
              }
              view_src = view_src->view_src;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2e9e1532c..df36af3cb 100644
+index c46f99c66..3e05d419e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -25196,7 +25250,7 @@ index 2e9e1532c..df36af3cb 100644
              } else {
                  LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
                      __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-@@ -1036,6 +1111,46 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -1038,6 +1113,46 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -25243,7 +25297,7 @@ index 2e9e1532c..df36af3cb 100644
  void llama_context::sched_new(size_t max_nodes, bool parallel) {
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
-@@ -1286,6 +1401,24 @@ void llama_context::sched_reserve() {
+@@ -1288,6 +1403,24 @@ void llama_context::sched_reserve() {
          }
      }
  
@@ -25268,7 +25322,7 @@ index 2e9e1532c..df36af3cb 100644
      {
          const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
                            n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
-@@ -2062,12 +2195,12 @@ bool llama_context::set_adapter_cvec(
+@@ -2064,12 +2197,12 @@ bool llama_context::set_adapter_cvec(
      return res;
  }
  
@@ -25287,30 +25341,72 @@ index 2e9e1532c..df36af3cb 100644
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
      if (mctx && !mctx->apply()) {
-@@ -2098,6 +2231,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2100,6 +2233,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
      // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
      // reclaiming the wide layout is exactly what used to abort.
-+    // The dsv4 compressed cache builds its raw attention from the per-stream index fanout, so its
-+    // synthetic reserve probe has always used ubatch.n_seqs (a multi-stream shape) and must keep
-+    // doing so: a one-stream reserve left the next real decode reading a one-stream sinfo and
-+    // aborting in cpy_k.  Every other arch uses the real sequence count below, because the 4-D kq
-+    // mask derives its stream dim from it and must agree with the single-stream query tensor.
-+    const bool dsv4_cache = model.arch == LLM_ARCH_DEEPSEEK4 ||
++    // The reserve probe below is synthetic: it asks for a `n_verify`-token graph, which is not this pass's
++    // shape.  Two things have to agree with it.
++    //
++    // (1) The sequence count.  A dsv4 cache builds its raw attention from the per-stream index fanout, so its
++    // probe has always used a multi-stream shape and must keep doing so: a one-stream reserve left the next
++    // real decode reading a one-stream sinfo and aborting in cpy_k.  Every other arch uses the real sequence
++    // count, because the 4-D kq mask derives its stream dim from it and must agree with the single-stream
++    // query tensor.
++    //
++    // (2) The memory context (issue #300).  A dsv4 cache sizes its write indices (`k_idxs`) from the
++    // context's own write ubatch, so probing `n_verify` tokens against the LIVE context (whose write ubatch
++    // is THIS pass) disagreed with `k_cur`; `cpy_k` then took its multi-stream branch with a one-stream
++    // `sinfo` and aborted (`GGML_ASSERT(sinfo.n_stream() > 1)`).  Probe those caches against a full-cache
++    // context instead: `init_full()` has no write ubatch (its `k_idxs` follows the reserve) and its stream
++    // layout is the cache's persistent one, which is `n_seq_max` for dsv4 (whose caches pin unified to
++    // false).  That is exactly the shape `sched_reserve()` reserves the widest graph with, so the probe also
++    // measures what the run will really issue.
++    const bool dsv4_cache = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
 +            (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0);
++    llama_memory_context_ptr dsv4_probe_owned;
++    const auto probe_mctx = [&]() -> llama_memory_context_i * {
++        if (!dsv4_cache || !memory) {
++            return mctx;
++        }
++        if (!dsv4_probe_owned) {
++            dsv4_probe_owned = memory->init_full();
++        }
++        return dsv4_probe_owned ? dsv4_probe_owned.get() : mctx;
++    };
++    const auto probe_n_rs_seqs = [&]() -> uint32_t {
++        return std::max<uint32_t>(1, dsv4_cache ? cparams.n_seq_max : ubatch.n_seqs_unq);
++    };
      bool drop_now = false;
      // The work region actually observed before the drop.  The reference must be at least this: the narrow
      // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
-@@ -2157,7 +2297,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2159,13 +2324,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
          // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
          // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
 -        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
-+        const uint32_t n_rs_seqs = std::max<uint32_t>(1, dsv4_cache ? ubatch.n_seqs : ubatch.n_seqs_unq);
++        // A dsv4 cache is probed against the full-cache context instead -- see `probe_mctx()` above.
++        const uint32_t n_rs_seqs = probe_n_rs_seqs();
          // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
          // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
          // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
-@@ -2299,7 +2439,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         {
+             size_t narrow_sizes[16] = {0};
+-            if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, /*split_only=*/true,
++            if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, probe_mctx(), /*split_only=*/true,
+                               narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
+                 size_t narrow_bytes = 0;
+                 for (int i = 0; i < 16; i++) {
+@@ -2185,7 +2351,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+                 }
+             }
+         }
+-        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, false) != nullptr;
++        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, probe_mctx(), false) != nullptr;
+         if (!narrow_ok) {
+             LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
+                     " growth may not fit next to the MoE expert cache arena\n", __func__);
+@@ -2301,7 +2467,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -25337,7 +25433,7 @@ index 2e9e1532c..df36af3cb 100644
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
              return nullptr;
-@@ -2325,6 +2483,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2327,6 +2511,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -25345,7 +25441,7 @@ index 2e9e1532c..df36af3cb 100644
      ret = GGML_STATUS_SUCCESS;
  
      return res;
-@@ -2689,6 +2848,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2691,6 +2876,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      output_swaps.clear();
      embd_batch_idxs.clear();
@@ -25353,7 +25449,7 @@ index 2e9e1532c..df36af3cb 100644
  
      // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
      // covers the packed kq mask for such a batch only when the caller declared it at context creation.
-@@ -3063,6 +3223,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3065,6 +3251,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
      } while (true);
  
@@ -25376,7 +25472,7 @@ index 2e9e1532c..df36af3cb 100644
      if (layer_inp_dev && ev_layer_inp_written) {
          ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
      }
-@@ -3306,7 +3482,128 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3308,7 +3510,128 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
      return n_outputs_max;
  }
  
@@ -25505,7 +25601,7 @@ index 2e9e1532c..df36af3cb 100644
      bool extracted = false;
      if (cparams.embeddings_layer_inp_dev) {
          return extracted;
-@@ -3411,7 +3708,8 @@ void llama_context::output_reorder() {
+@@ -3413,7 +3736,8 @@ void llama_context::output_reorder() {
                  }
              }
              for (auto & layer : embd_layer_inp) {
@@ -25515,7 +25611,7 @@ index 2e9e1532c..df36af3cb 100644
                      for (size_t k = 0; k < n_embd; ++k) {
                          std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                      }
-@@ -3617,10 +3915,34 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3619,10 +3943,34 @@ ggml_cgraph * llama_context::graph_reserve(
          } else {
              ggml_backend_sched_split_graph(sched.get(), gf);
          }
@@ -25554,7 +25650,7 @@ index 2e9e1532c..df36af3cb 100644
      }
  
      return gf;
-@@ -5005,6 +5327,26 @@ llama_context_params llama_context_default_params() {
+@@ -5007,6 +5355,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -25581,7 +25677,7 @@ index 2e9e1532c..df36af3cb 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -5040,10 +5382,49 @@ llama_context * llama_init_from_model(
+@@ -5042,10 +5410,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -25633,7 +25729,7 @@ index 2e9e1532c..df36af3cb 100644
          return nullptr;
      }
  
-@@ -5284,6 +5665,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -5286,6 +5693,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  
