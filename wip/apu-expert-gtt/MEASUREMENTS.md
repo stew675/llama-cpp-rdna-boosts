@@ -1351,3 +1351,103 @@ the fitting-model arms are all `627b2ebd7792`.
   but the cache was not explicitly dropped before them.
 * **The cold-for-fitting trade is a decision, not a measurement**: the maintainer's steer is recorded above so a
   later reader sees *why* the cold arm loses.
+
+## 25. 2026-11-11 — P5: PREFILL STREAMING. The fill only what is not resident, coalesced and parallel: **+63-67 % on the >RAM model**, neutral on a fitting one, and the logits do not move
+
+The plan's P5: *per layer, subtract the resident set and stream the difference coalesced*, never re-fetching a
+bank the previous chunk holds.  What was actually wrong, measured first (`-lv 4`, 35B-A3B, `-lme 4`, a 533-token
+prompt): the prefill does **not** go through `moe_cache_stage_table` at all on this tier -- the scheduler's
+used-expert pruning issues one `set_tensor_async` per run of consecutive used experts, and on a pageable master
+that is `moe_cache_upload_pageable`: a memcpy out of the model mapping into the per-table pinned bounce in
+`host_bytes` (0.6 MiB) chunks, then one pinned H2D per chunk.
+
+    scheduler pageable-master fallback: 3984 ranges, 11608.1 MiB served through the per-table bounce
+    [ Prompt: 356.8 t/s ]   (the delivery's prefill on this tier)
+
+### 25.1 What P5 is (and what it is not)
+
+A new backend hook, `moe_cache_prefill_stream`, called where the scheduler's own copy would run, one call per
+(table, ubatch), **prefill band only**.  It fills the split-input copy itself and returns true, so the caller
+skips its copy:
+
+| the used expert is... | what happens |
+|---|---|
+| **resident in the GTT store** | one **D2D** out of its slot (232 GB/s, no storage read) -- this is the residency subtraction |
+| not resident | one **coalesced span read** per maximal run of missing used experts, `MOE_HOST_POOL_STAGE_SPAN_EXPERTS` (16) experts max, on the tier's own buffered transport, into a pinned span ring -- and **one H2D per span**, because a run is contiguous in the FILE and in the DESTINATION |
+| read came up short | the delivery's per-expert source serves it (`fallback`) |
+
+* the used set is the scheduler's **own bitset**, not the routing buffer: the ids buffer the scheduler read is
+  reused by the graph allocator, and re-reading it in the backend served a STALE routing (see §25.5);
+* the reads run **in parallel** (`MOE_EXPERT_GTT_PREFILL_READERS`, default 8) and overlap the previous batch's
+  H2Ds;
+* the MMQ finite-head guard is laid down first, one zero per used run's successor slot;
+* a failed or partial fill returns **false** and the caller's copy overwrites the destination, so the path can
+  only ever be slower, never wrong.
+
+### 25.2 The fitting model (35B-A3B Q4_K_M, arena `-lme 4`, prior FROZEN, alternating 3+3)
+
+| arm | pp | reads |
+|---|---|---|
+| `MOE_EXPERT_GTT_PREFILL=0` (the delivery's copy) | 352.1 / 352.9 t/s | 11608.1 MiB (every used expert) |
+| **P5 (default)** | **359.7 t/s** | **9451.6 MiB of 12809.2 used (73.8 %)**, in 4605 spans of 2.05 MiB; 3357.6 MiB served from the arena by D2D; 0 fallback |
+
+**+2 %** -- inside the box's spread.  26.2 % of the used bytes are never read, but on a *fitting* model the reads
+come out of the page cache and the copy-issue cost is what it is, so the byte saving does not convert into
+throughput.  That is the honest result and it is why the tier's real workload is measured separately.
+
+### 25.3 The tier's ACTUAL workload (>RAM model, MBIG 122B-A10B Q8_0, `-lme 60`, alternating 2+2)
+
+| arm | pp (533-token prompt) |
+|---|---|
+| `MOE_EXPERT_GTT_PREFILL=0` | **9.8 / 10.6 t/s** |
+| **P5 (default)** | **16.5 / 17.6 t/s** |
+
+**+63 % / +66 %.**  Census: `used 89418.9 MiB`, `read 36949.5 MiB (41.3 %)` in 8673 spans of 4.26 MiB,
+`arena D2D 52469.4 MiB (58.7 %)` -- the store's residents are more than half of what the delivery re-read on every
+ubatch, and the reads that are left are parallel, which is what a disk-bound arm wants.  Text identical in all
+four runs (`9b259759672f`, no `-lv`).
+
+### 25.4 Correctness
+
+* **Text**: identical in every arm, both models: `347f9f6f715f` (35B, 522 chars) and `9b259759672f` (MBIG).  The
+  arms include `PREFILL=0` (the exact pre-P5 behaviour), `MOE_EXPERT_GTT=0` (no store at all), the prefill
+  fault arm, the cold-cache arm, and the whole gate.
+* **Prefill logits**: `scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_GTT_PREFILL=0"` (40 chunks, ctx 512,
+  `--extra "-lme 4 --fit off"`): **mean KLD -0.000000** (limit 0.005), **same-top-p 99.990 %** (floor 98 %), GPU
+  journal clean.  Base PPL 5.8238 -- the same number for the fallback arm and for P5.
+* **The file read equals the model mapping**: `MOE_EXPERT_GTT_PREFILL_VERIFY=1` byte-compares every coalesced
+  span against the pageable mapping (a shard-relative offset in a multi-part GGUF, or an `O_DIRECT` alignment
+  slip, shows up there and nowhere else).  No mismatch on either model.
+* **A failed coalesced read is a slowdown, not an answer**: `MOE_EXPERT_GTT_PREFILL_FAULT=1` fails every span
+  read; all 117 prefill fills then decline and the per-expert source serves them.  Same text, no GPU fault.
+
+### 25.5 Two traps found the hard way (both are now in the gate)
+
+1. **The split-input copy is ONE buffer per copy id for every table, not one per table.**  The graph allocator
+   gives a prefill graph one `input_cpy` for tables whose lifetimes do not overlap, so a table's destination in
+   ubatch 2 holds the previous ubatch's LAST table -- measured: 113 owner changes over 117 calls, i.e. nothing
+   survives a pass.  **The plan's "do not re-fetch a bank the previous chunk already holds" therefore cannot be
+   served by the destination**; the residency that survives is the store's, which is what P5 subtracts.  The
+   design was built, measured, and dropped.
+2. **`span_buf_acquire` only refuses a buffer whose copies have drained** -- so a ring slot must be marked busy AT
+   ACQUISITION, not when its H2D is issued.  With the mark in the wrong place every window in a call got the SAME
+   pinned buffer: the last read won, every H2D copied it, and the greedy text came out 509 chars instead of 522.
+   The file read verified clean and the *used set* looked degenerate (8 experts per table) -- because the model
+   had already degenerated, so its later routings really were "experts 0..7".  One root cause, three symptoms; it
+   cost the session an afternoon and it is why the gate asserts `verify` + text + the read/used ratio together.
+
+The second one also retro-explains the "stale routing" red herring: a bad destination corrupts the hidden states,
+and the routing that follows is genuinely degenerate.  The hook still takes the scheduler's bitset rather than the
+ids buffer -- it is cheaper, it cannot disagree with the copy it replaces, and it is the same set under every arm.
+
+### 25.6 Not measured
+
+* **A cold page cache on a fitting model**: one cold P5 sample read 88 t/s against ~360 warm, but the baseline
+  was not measured cold in the same series, so no ratio is claimed (P4f already owns the cold trade: `file`
+  starts the ladder and costs -11.5 % cold, +13.7 % warm).
+* **Reader width**: 1/4/8 readers measured 9.7/15.2/18.2 GiB/s of *in-run* read rate (much flatter than a bare
+  `pread`, which is 25 GiB/s at one thread and 60 at eight, because the reads contend with the GPU prefill for
+  DRAM).  8 is the default and 1 is the A/B.
+* **Multi-device**: untested, as everywhere in this campaign.
+* **A `-sm tensor` slice or a fused table**: the hook declines by geometry (no single run per expert) and the
+  delivery's copy serves it -- by construction, not by measurement.

@@ -1,3 +1,141 @@
+## 261111.026 (wip, NO delivery change) -- P6: the tier gets its gate (`scripts/gate-uma-experts.sh`, 35 checks), and the promotion package is ready for the maintainer's two decisions
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed by the delivery).
+Artifact: `wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`c3cbfd1398498b2caf139ce11eb2c5e3f3aa0a464493dff456e7827e947e3244`, cut against the r262 `release.json` tree
+(`base` `a691b2345`, tip `d65b0e889`), produces tree `a1a3c9f8e3d67359a6f3b237a71ef355a976a742` -- verified by
+`git am` onto a fresh checkout of `d65b0e889` (the tree matches to the character; `git archive` is NOT a valid
+base for this check, it honours `export-ignore` and drops three tracked files).
+
+**`scripts/gate-uma-experts.sh`** is the deliverable: 16 arms, 35 checks, green on `halo` in ~9 minutes
+(`--quick` drops the four long arms; `--no-ram` drops the >RAM arm; `--kld` runs `gate-prefill-logits.sh` inside
+it).  It follows `gate-host-pool.sh`'s shape -- one `llama-cli -v` run per arm with stdout/stderr split so ONE run
+gives both the clean text hash and the census, every arm with the heat-map prior FROZEN
+(`MOE_EXPERT_HEATMAP=load`; a writable sidecar is rewritten per run and inverts conclusions, MEASUREMENTS §23).
+
+What it asserts, in the plan's arm order, and what each arm taught:
+
+| arm | assertion | what it caught |
+|---|---|---|
+| `off` | `MOE_EXPERT_GTT=0`: no GTT census, `tables=0`, the delivery's host-expert refusal, same text | the delivery's behaviour here is "cache on, registers nothing", not "cache OFF on device" -- the IMPLEMENTATION wording was wrong and is corrected |
+| `ref` | 120 tables resident, **0 arena releases**, 6648 evictions, extent 4096 MiB | the tier is not vacuous: `tables=0` produces identical text too |
+| `resident` | `-lme 20` (with `LOCK_KB=unlimited`): **0 evictions** | an 8 GiB `RLIMIT_MEMLOCK` silently CLAMPED it to an 8192 MiB arena with 2911 evictions -- the lock policy is real, so this arm relaxes the barrier and arm `lock` proves the clamp |
+| `budget` | `-lme 6` realises 6144.0 MiB | |
+| `lock` | `-lme 6` under `RLIMIT_MEMLOCK=1 GiB` CLAMPS and says so | |
+| `lmeauto` | `auto` in the fitting band: 0 evictions | ditto the clamp: `auto` must be able to lock what it asks for |
+| `touch1/2/3` | `MOE_EXPERT_CACHE_TOUCH=1/2/3` are IDENTICAL (6648 evictions each) | the tier's documented no-op admission, asserted instead of assumed |
+| `fault` | `MOE_HOST_POOL_FILL_FAULT=1` + `MOE_EXPERT_GTT_PREFILL_FAULT=1`: 117 prefill fills decline, the per-expert source serves them, same text, `takeover` **not** asserted | `takeover` counts the DECODE take-overs the arena serves on this tier, not the identity copy hand-off `gate-host-pool.sh` asserts -- copying that assertion over would have failed a correct arm |
+| `prefill` | `read 9451.6 MiB of 12809.2 MiB used (73.8 %)`, 4605 spans, and **no demand fill waited >= 1 ms** | this is the plan's "read bytes below fetch every used expert" AND P4e's answer, both from one arm |
+| `pfoff` | the fallback arm: 11608.1 MiB per-expert vs the streaming arm's 9451.6 | |
+| `pfverify` | every span byte-compared against the model mapping | |
+| `cold` | the GGUF's cache dropped, then `ref`: same text | |
+| `nohb` | `GGML_FORCE_NO_INTEGRATED=1`: same text | |
+| `ram` | MBIG `-lme 60`: 89418.9 MiB used, 2886 evictions, completes | |
+
+**The P5 numbers are in [`MEASUREMENTS.md` §25](wip/apu-expert-gtt/MEASUREMENTS.md):** neutral on a fitting model
+(+2 %, 359.7 against 352.5 t/s pp) and **+63-67 % on the >RAM model** (16.5/17.6 against 9.8/10.6 t/s), where
+58.7 % of the used experts come out of the store by D2D and only 41.3 % are read at all.  Text identical
+everywhere; `gate-prefill-logits.sh --ab "MOE_EXPERT_GTT_PREFILL=0"` reads **mean KLD -0.000000, same-top-p
+99.990 %** (40 chunks).
+
+**Two decisions the maintainer owes, and they gate promotion** (asked, not taken):
+
+1. **`MOE_EXPERT_GTT_ARENA`'s default.**  AGENTS.md says a beneficial feature ships ON with a kill switch.  The
+   campaign has kept the ARENA tier opt-in because it is a *fittability* tier: on a config whose experts fit (any
+   model that fits this box's RAM) it costs decode against the plain device buffers, and it is the only tier that
+   FORCES a mapped load.  Recommendation: keep it opt-in and record the exception -- it is not a speed tier, it is
+   "a 123.45 GiB model runs on a 123 GiB box".  The alternative (default on, `=0` to exit) is a one-line change.
+2. **The transient band** (README §5.1) is still dropped by design: every miss fills, so
+   `MOE_EXPERT_CACHE_TOUCH` is a no-op on this tier -- now *asserted* by the `touch1/2/3` arm rather than claimed.
+   Reviving the band is the only thing that would make admission a real policy here, and nothing measured says it
+   is needed.
+
+**Promotion package, ready but NOT applied** (nothing in `patches/`, `release.json` untouched, no push):
+`ENVIRONMENT.md` gains `MOE_EXPERT_GTT` / `_GTT_RO` / `_GTT_MLOCK` / `_GTT_FILL_DIRECT` (kill switches, default
+1), `MOE_EXPERT_GTT_ARENA` (opt-in, per decision 1), `MOE_EXPERT_GTT_PREFILL` (kill switch, default 1),
+`MOE_EXPERT_GTT_PREFILL_READERS` (tuning, default 8), and the diagnostics `_GTT_PREFILL_VERIFY/_FAULT/_DEBUG`;
+`INVARIANTS.md` gains the campaign's measured facts (no `xnack` target on gfx1151; an APU's "VRAM" is the host
+pool; a registered RO range reads 230-233 GB/s against 60 writable; `hipHostRegister` on an mmap does NOT pin --
+`mlock` does, and it is the only thing the accounting reports; a pageable mapping may be a fill SOURCE and never a
+read target; `pread` into a registered range is legal and coherent; `O_DIRECT` needs the 4096 round-out; the store's
+extent cannot be exceeded; a failed carve is FATAL; the heat-map prior is an INPUT).  The block note goes in
+`patches/README.md` (block 09/12 own this code) and `scripts/make-release.sh` regenerates `release.json`.
+
+**Measurement debt carried into the promotion note, not silently dropped:** multi-device is untested (one GPU
+here: the per-device budget, the per-device head subtraction and the free-bytes query have never seen a
+`-sm tensor`/`-sm layer` split across APUs); the MTP four-axis protocol is owed for any decode-affecting change
+and P4/P4b/P4f are exactly that (the P3c/P4 arms so far show draft acceptance 1.0 on 2-token arms, which is not
+it); the discrete host pool cannot be gated here (the campaign's changes are inert there by `g_gtt_arena` /
+`prop.integrated`, but that is a claim, not a measurement); and there is still no throughput claim for the tier as
+a whole beyond the P4 A/B pairs and P5's pp pairs.
+
+## 261111.025 (wip, NO delivery change) -- P5: PREFILL STREAMING -- the tier reads only what is not resident, coalesced and in parallel: **+63-67 %** on the >RAM model, neutral on a fitting one, logits unmoved
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no delivery gate owed).
+Artifact: `wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`c3cbfd1398498b2caf139ce11eb2c5e3f3aa0a464493dff456e7827e947e3244`, tree `a1a3c9f8…`, cut against the r262
+`release.json` tree and verified by `git am` onto a fresh `d65b0e889` checkout.  Record:
+[`MEASUREMENTS.md` §25](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**What was actually wrong first.**  The prefill on this tier does not go through `moe_cache_stage_table` at all:
+the scheduler's used-expert pruning issues one `set_tensor_async` per run of consecutive used experts, and with a
+pageable master that is `moe_cache_upload_pageable` -- a memcpy out of the model mapping into the per-table pinned
+bounce in `host_bytes` (0.6 MiB) chunks, then one pinned H2D per chunk.  Measured: `3984 ranges, 11608.1 MiB
+served through the per-table bounce`, pp 356.8 t/s.  EVERY used expert, EVERY ubatch, including the ones the store
+already holds.
+
+**Implemented** (one new backend hook, `moe_cache_prefill_stream`, called where the scheduler's copy would run,
+prefill band only; it fills the split-input copy and returns true so the caller skips its copy):
+
+* a used expert **resident in the GTT store** is one **D2D** out of its slot (232 GB/s, no storage read);
+* every maximal run of the rest is ONE **coalesced span read** (`MOE_HOST_POOL_STAGE_SPAN_EXPERTS` = 16 experts
+  max) on the tier's own buffered transport into a pinned span ring, and ONE **H2D per span** -- a run is
+  contiguous in the FILE and in the DESTINATION, so the two-tier byte cost is unchanged and the call count drops
+  by the run length;
+* the reads run **in parallel** (`MOE_EXPERT_GTT_PREFILL_READERS`, default 8) and overlap the previous batch's
+  H2Ds;
+* the used set is the scheduler's **own bitset**, never a re-read of the routing buffer;
+* a short read falls back to the delivery's per-expert source; a failed or partial fill returns false and the
+  caller's copy overwrites the destination -- so the path can only ever be slower, never wrong;
+* the MMQ finite-head guard is laid down first, one zero per used run's successor slot.
+
+**Measured** (prior FROZEN, alternating 3+3 / 2+2, `prompts/code-python.txt` = 533 tokens, `-n 4`, no `-lv`):
+
+| arm | 35B-A3B `-lme 4` (fitting) | MBIG 122B `-lme 60` (>RAM) |
+|---|---|---|
+| `MOE_EXPERT_GTT_PREFILL=0` (delivery copy) | 352.1 / 352.9 t/s | 9.8 / 10.6 t/s |
+| **P5 (default)** | **359.7 t/s** (+2 %) | **16.5 / 17.6 t/s** (**+63 % / +66 %**) |
+
+Census on MBIG: `used 89418.9 MiB | read 36949.5 MiB (41.3 %) in 8673 spans of 4.26 MiB | arena D2D 52469.4 MiB
+(58.7 %)`.  On the fitting model: `read 9451.6 of 12809.2 MiB used (73.8 %), 3357.6 MiB by D2D`.  Text identical in
+every arm (`347f9f6f715f`, `9b259759672f`); `gate-prefill-logits.sh --ab "MOE_EXPERT_GTT_PREFILL=0"` = **mean KLD
+-0.000000, same-top-p 99.990 %** (40 chunks); `MOE_EXPERT_GTT_PREFILL_VERIFY=1` reports no span that differs from
+the model mapping on either model.
+
+**What the plan asked for and what the data said instead** (both recorded, neither quietly dropped):
+
+1. **"Do not re-fetch a bank the previous chunk already holds" cannot be served by the destination buffer.**  The
+   graph allocator gives a prefill graph ONE `input_cpy` per copy id for every table (their lifetimes do not
+   overlap), so a table's destination in ubatch 2 holds the previous ubatch's LAST table -- measured 113 owner
+   changes over 117 calls, i.e. nothing survives a pass.  The design was built and dropped; the residency that
+   survives is the store's, which is what P5 subtracts.  So the per-pass read histogram is FLAT (the plan expected
+   it to fall): `9452/12809` on the only pass this arm has, and the fall is against "fetch every used expert",
+   which is 11608 MiB on the same config.
+2. **The coalescing is the biggest single win, and it is a call-count win.**  `stage_span_fill`'s per-expert H2D
+   out of the pinned chunk (12 031 H2Ds for 7 293 MiB) was the dominant cost; one H2D per span is the same bytes
+   in 4 605 calls.
+
+**A correctness trap that cost the session an afternoon, recorded so it cannot recur:** a pinned span-ring slot
+must be marked busy AT ACQUISITION, not when its H2D is issued -- `span_buf_acquire` only refuses a buffer whose
+copies have drained, so with the mark in the wrong place every window in a call got the SAME buffer, the last read
+won and the greedy text came out 509 chars instead of 522.  Three symptoms, one cause: the file read verified
+clean, and the *used set* looked degenerate (8 experts/table) only because the model had already degenerated and
+its later routings really were experts 0..7.  `MEASUREMENTS.md` §25.5.
+
+**Not measured:** a cold page cache on a fitting model (one cold sample read 88 t/s but with no cold baseline in
+the same series, so no ratio is claimed -- P4f already owns the cold trade); a `-sm tensor` slice or a fused
+table (the hook declines by geometry, so the delivery's copy serves them); multi-device, as everywhere here.
+
 ## 261111.024 (wip, NO delivery change) -- P4f: on RDNA3_5 UMA the ladder starts on the buffered arm (maintainer's Option 1) -- +13.7 % warm, and **+56-67 % on a >RAM model**
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:

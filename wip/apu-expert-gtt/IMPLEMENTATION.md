@@ -377,7 +377,26 @@ knob (README §3.1):
 the warm arm; both arms' census counters move as expected; `check-gpu-faults.sh` clean; the fill-fault arm
 declines and does not corrupt.
 
-## P5 — prefill: stream only what is not resident
+## P5 — prefill: stream only what is not resident  (DONE 2026-11-11, `MEASUREMENTS.md` §25)
+
+> **DONE, and it is the second-biggest win of the campaign: +63-67 % prefill on a >RAM model, neutral on a fitting
+> one, with the prefill logits unmoved (mean KLD -0.000000, same-top-p 99.990 %).**  One new backend hook
+> (`moe_cache_prefill_stream`) fills the scheduler's split-input copy where the delivery's used-expert copy would
+> run: a **D2D** for every used expert the store holds, ONE **coalesced span read + ONE H2D** per maximal run of
+> the rest (a run is contiguous in the file AND in the destination), the reads **in parallel** (8 readers) and
+> overlapping the previous batch's H2Ds, and the delivery's per-expert source for anything a span could not serve.
+> The used set is the scheduler's own **bitset**, never a re-read of the routing.
+>
+> Two plan assumptions did not survive contact with the code, and both are recorded rather than papered over:
+> (a) **the destination buffer cannot carry residency between chunks** -- the graph allocator gives a prefill graph
+> ONE `input_cpy` per copy id for every table, so nothing survives a pass (113 owner changes over 117 calls), and
+> the "do not re-fetch a bank the previous chunk holds" clause is served by the STORE's residents instead; (b)
+> **the coalescing is a call-count win, not a byte win** -- `stage_span_fill`'s per-expert H2D out of the pinned
+> chunk was the dominant cost (12 031 H2Ds for 7 293 MiB) and one H2D per span is the same bytes in 4 605 calls.
+> `stage_span_fill` itself is NOT reused (its pool admission, its `MOE_STAGE_SPAN_MIN` skip and its per-expert
+> copy are all wrong for this tier); its SHAPE is, and the discrete pool's body is untouched.
+> Gate: `scripts/gate-uma-experts.sh` arms `prefill` / `pfoff` / `pfverify` / `fault`.
+
 
 * Per layer: compute the chunk's used-expert set (the existing per-layer access plan already does this), subtract
   the resident set, and stream the difference coalesced — this is exactly
@@ -393,7 +412,19 @@ declines and does not corrupt.
 prefill-path change); text identical; read bytes strictly below "fetch every used expert" on the
 repeated-prompt arm; pp rate reported against the all-resident arm.
 
-## P6 — gate, docs, promotion
+## P6 — gate, docs, promotion  (gate + docs DONE 2026-11-11; the PROMOTION waits on the maintainer)
+
+> **`scripts/gate-uma-experts.sh` is written and green: 16 arms, 35 checks** (`WORKLOG.md` 261111.026).  Every arm
+> freezes the heat-map prior, hashes the text from a `llama-cli -v` run with stdout/stderr split (one run per arm),
+> and the prefill arm asserts BOTH P5's read-byte fall and P4e's "no fill worker" answer from the drain census.
+> Two assertions had to be corrected against what this tier actually reports (`MOE_EXPERT_GTT=0` is "cache on,
+> registers nothing", not "cache OFF"; `takeover=` counts the decode take-overs here, not `gate-host-pool.sh`'s
+> identity hand-off) -- copying either over from the discrete gate would have failed a correct arm.
+> **What is left is the promotion itself, and it is blocked on the two maintainer decisions** (the ARENA tier's
+> default, and whether to revive the transient band).  The docs are staged: the env table is in `README.md` with
+> each variable's class, the measured facts are in §6/`MEASUREMENTS.md`, and the `ENVIRONMENT.md` /
+> `INVARIANTS.md` / `patches/README.md` texts are written out in the newest `WORKLOG.md` entry.
+
 
 * `scripts/gate-uma-experts.sh` (§7 below), `check-gpu-faults.sh`, `gate-prefill-logits.sh`,
   `gate-host-pool.sh` (the discrete path must be untouched) and `validate-set.sh` if anything regenerated.

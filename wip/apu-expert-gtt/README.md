@@ -1,37 +1,35 @@
 # wip/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
 
-**Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, P1.1 + P2 (the GTT
-store itself), **P3a/P3b (the store as the expert cache's ARENA: it serves, it evicts, and a 123.45 GiB model
-runs on this 123 GiB box)** and **P3c (the MTP/nextn head pinned at full residency outside `-lme`, for the embedded
-head AND the separate drafter model)** are DONE and measured; nothing in `patches/`, nothing applied to the fork.**  The plan
-is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
-[`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
-re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
+**Status: P0-P5 COMPLETE and measured; P6 (gate + docs) DONE except the promotion itself, which waits on the
+maintainer's two decisions (README §8).**  Nothing in `patches/`, nothing applied to the fork, nothing pushed.
+`halo`, gfx1151.  DONE: P0 (the ten probes), the P1.0 keystone probes, P1.1 + P2 (the GTT store itself),
+P3a/P3b (the store as the expert cache's ARENA -- it serves, it evicts, and a 123.45 GiB model runs on this
+123 GiB box), P3c (the MTP/nextn head pinned at full residency outside `-lme`), P4a/P4b/P4e/P4f (the fills on
+r262's adaptive transport, the direct fill, the "no fill worker" answer, and the RDNA3_5 UMA start arm) and
+**P5 (prefill streaming: only what is not resident, coalesced and read in parallel)**.  The plan is
+[`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
+[`MEASUREMENTS.md`](MEASUREMENTS.md) (§25 is P5); the probe sources are [`probe/`](probe/README.md); the arms are
+[`arms.sh`](arms.sh); the gate is [`../../scripts/gate-uma-experts.sh`](../../scripts/gate-uma-experts.sh).
 
-The implementation is ONE **cumulative** patch, cut against the **r262** `release.json` tree `891d4acb…` and
-applied with `git am`; it produces tree `3bc7adf4…`.  Its sha256 advances as the campaign does — **the value below is always the
-current artifact** (older `WORKLOG` entries quote the value that was current then):
+The implementation is ONE **cumulative** patch, cut against the **r262** `release.json` tree (`base` `a691b2345`,
+tip `d65b0e889`) and applied with `git am`; it produces tree `a1a3c9f8…`.  Its sha256 advances as the campaign
+does — **the value below is always the current artifact** (older `WORKLOG` entries quote the value that was
+current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15.6 % decode warm) + P4f (on RDNA3_5 UMA the ladder starts on the buffered arm: +13.7 % warm on a fitting model, +56-67 % on a >RAM model) | `851e1871b2a59263e9209cb1b93bfc279b8805947a30f8d049eb7d2a529532af` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15.6 % decode warm) + P4f (on RDNA3_5 UMA the ladder starts on the buffered arm: +13.7 % warm, +56-67 % on a >RAM model) + **P5 (prefill streaming: the residents by D2D, the rest coalesced and parallel -- neutral on a fitting model, +63-67 % on a >RAM model, logits unmoved)** | `c3cbfd1398498b2caf139ce11eb2c5e3f3aa0a464493dff456e7827e947e3244` |
 
-> **Next session: [`NEXT-SESSION-PROMPT-P5-P6.md`](NEXT-SESSION-PROMPT-P5-P6.md)** -- the cold-start handover for
-> the last two stages (P5 prefill streaming, P6 gate + promotion) and the two decisions the maintainer owes.  The
-> re-runnable tools it names are [`arms.sh`](arms.sh), [`guard.sh`](guard.sh) and [`cold-cache.py`](cold-cache.py).
+> **Next session: [`NEXT-SESSION-PROMPT-P5-P6.md`](NEXT-SESSION-PROMPT-P5-P6.md)** is now a RECORD (it drove this
+> session); what is left is the promotion decision (§8) and the measurement debt named at the end of the newest
+> `WORKLOG.md` entry.  The re-runnable tools are [`arms.sh`](arms.sh), [`guard.sh`](guard.sh),
+> [`cold-cache.py`](cold-cache.py) and [`../../scripts/gate-uma-experts.sh`](../../scripts/gate-uma-experts.sh).
 
-**P4 is COMPLETE (P4a/P4b/P4e/P4f)**, and P4f is its biggest win: on **RDNA3_5 with the arena tier and the direct
-fill available** the ladder now starts on the buffered arm (+13.7 % warm on a fitting model, +56-67 % on a >RAM
-model), with three gates keeping it off every other configuration (`MEASUREMENTS.md` §24).  The one paid cost is a
-fitting model's first run on a cold cache (-11.5 %), accepted on the maintainer's steer: *cold happens once at the
-start, so tune for warm*.  Next: **P5** (prefill streaming) and **P6** (gate + promotion).  P3's own limits are named
-in `MEASUREMENTS.md` §16.6, §17.4, §18.5, §20.4 and §21.4: there is **no throughput claim** for the tier as a whole
-(§21.2 is the first decode number it has -- one box, `-n 96`, three reps, reported as such) (and none for the
-head's pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path
-is still the delivery's pinned bounce ring.  One sizing item is open by design: a **separate** drafter's head
-cannot be placed in the store, because the target sizes the region before the drafter loads -- if that trade is
-ever wanted (RAM-bound box), it is a `common`/`--fit` sizing term, not a loader change (`MEASUREMENTS.md` §18.4).  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
-config whose experts fit), and nothing about it has been measured beyond this one APU.
+**Where the wins are, in one line each:** the store itself is a *fittability* tier (a 123.45 GiB model on a 123 GiB
+box); the decode wins are P4b (+15.6 %) and P4f (+13.7 % warm, +56-67 % on a >RAM model); the prefill win is P5
+(+63-67 % on a >RAM model, neutral on a fitting one).  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a
+fittability feature (it costs decode on a config whose experts fit and it forces a mapped load), and that is the
+one recorded exception to the default-on policy, pending the maintainer's decision (§8).
 
 **The campaign's environment variables** (not in `ENVIRONMENT.md`: nothing here is in `patches/` yet, so these
 are documented here and will move there on promotion — per AGENTS.md rule 9, with their class):
@@ -42,8 +40,15 @@ are documented here and will move there on promotion — per AGENTS.md rule 9, w
 | `MOE_EXPERT_GTT_RO` | `1` | **kill switch** | `0` = register the region writable instead of ReadOnly (the measured 232 → 60 GB/s A/B) |
 | `MOE_EXPERT_GTT_MLOCK` | `1` | **kill switch** | `0` = do not `mlock`: the tier is then reclaimable by design (diagnostic / bisection) |
 | `MOE_EXPERT_GTT_ARENA` | **unset (OFF)** | **opt-in** | `1` = use the GTT store as the expert cache's ARENA for a set that does not fit (P3).  Opt-in deliberately: it is a fittability tier, not a speed tier, and it forces a mapped load |
+| `MOE_EXPERT_GTT_FILL_DIRECT` | `1` | **kill switch** | `0` = the buffered arm fills through the bounce ring instead of straight into the arena slot (P4b's A/B) |
+| `MOE_EXPERT_GTT_PREFILL` | `1` | **kill switch** | `0` = the delivery's per-expert used-expert copy for the prefill band (P5's A/B) |
+| `MOE_EXPERT_GTT_PREFILL_READERS` | `8` | tuning | the P5 reader-pool width; `1` reads inline on the caller (the parallel-transport A/B) |
+| `MOE_EXPERT_GTT_PREFILL_VERIFY` | unset | diagnostic | compare every coalesced span against the model mapping and log the first mismatch |
+| `MOE_EXPERT_GTT_PREFILL_FAULT` | unset | diagnostic | make every span read fail, so every window takes the per-expert source (the gate's fault arm) |
+| `MOE_EXPERT_GTT_PREFILL_DEBUG` | unset | diagnostic | one line per (table, ubatch): used / resident / read / arena / fallback |
 | `MOE_HOST_LIMIT_FRAC` | `80` | tuning (existing) | the `auto` ceiling as a % of `MemAvailable`, shared with the discrete arm |
-| `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning (existing) | the admission threshold, reused unchanged in P3 |
+| `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning (existing) | the admission threshold — a **documented no-op on this tier** (every miss fills; asserted by the gate's `touch1/2/3` arm) |
+| `MOE_HOST_POOL_STAGE_SPAN(_EXPERTS)` | `1` (16) | tuning (existing) | the coalesced-read shape P5 reuses; `=0` turns it off and the tier's `file` transport is then refused by design |
 
 The store's **size is not a variable**: it is `-lme`.  Nothing is added for `-fit`, the reach limit, or admission.
 
@@ -62,8 +67,7 @@ buffer type a host/device alias pair or drop the "one address" assertion with a 
 
 Renamed from `wip/apu-expert-pool/` on 2026-11-11: **there is no pool in this design any more** (§1), and the
 thing the tier holds is a GTT store of resident experts, not a cache tier under a host pool.  Cut against the
-**r262** tree (`release.json` tree `891d4acb…`, tip `d65b0e889…`); file:line references are that tree unless they
-name an older one.
+**r262** tree unless a file:line reference names an older one.
 
 ## 0. The shape, in the maintainer's words (2026-11-11)
 
@@ -441,6 +445,20 @@ measurement.
   drifting prior and is **0/5** with a frozen one, which inverted a conclusion.  Set `MOE_EXPERT_HEATMAP=load`
   (or `chmod a-w` the sidecar -- the file's mode IS the freeze signal, latched and logged); the delivery's own
   gates already default to `load` because "the persisted prior is an INPUT".  `arms.sh` does it for every arm.
+* **Do not mark a span-ring buffer busy when its H2D is issued -- mark it at ACQUISITION** (2026-11-11, P5,
+  `MEASUREMENTS.md` §25.5).  `span_buf_acquire` only refuses a buffer whose copies have drained, so a ring slot
+  claimed for a prefill window and marked busy later is handed out AGAIN to the next window in the same call: the
+  last read wins, every H2D copies it, and the greedy text comes out short (509 vs 522 chars).  Three symptoms
+  from one cause -- the file read verifies clean, and the *used set* looks degenerate (8 experts/table) only
+  because the model has already degenerated, so its later routings really are experts 0..7.  The gate asserts
+  `PREFILL_VERIFY` + text + the read/used ratio together for exactly this reason.
+* **Do not read the routing ids again in a backend hook.**  Take the scheduler's used-expert BITSET.  The ids
+  buffer the scheduler read is reused by the graph allocator, and a later read of it served a stale routing (P5's
+  first implementation did exactly that; the bitset is also cheaper and cannot disagree with the copy it replaces).
+* **Do not expect the split-input copy to hold anything between ubatches.**  The graph allocator gives a prefill
+  graph ONE `input_cpy` per copy id for every table (their lifetimes do not overlap), so "do not re-fetch a bank
+  the previous chunk already holds" cannot be served there -- measured 113 owner changes over 117 calls.  The
+  residency that survives is the GTT store's (P5 subtracts that).
 * **Do not judge this tier by text alone, and never by a `-lv` run's text.**  The `tables=0` census produced
   byte-identical text with the mechanism completely inert (`MEASUREMENTS.md` §16.1), and a `-lv 4` census of the
   122B gave two different hashes on the same seed.  Text arm: no `-lv`; the mechanism is proved by the census.
@@ -539,10 +557,17 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 
 * A model whose expert set **exceeds RAM** runs on `halo`, same-seed byte-identical text against the best
   fitting arm, with the census showing real fills (cold and warm counted separately) and real evictions.
-* Prefill streams only non-resident experts: the census's per-layer read bytes fall when a bank is already
-  resident, on a repeated-prompt arm.
+* Prefill streams only non-resident experts: **DONE (P5)** -- `read` is strictly below "fetch every used expert"
+  (73.8 % on a fitting model, 41.3 % on a >RAM model), measured on a prefill-band arm with the prior frozen.  The
+  reading of "a bank the previous chunk already holds" that the plan assumed (the DESTINATION buffer) is
+  impossible by construction, and the one that works (the STORE's residents) is what P5 subtracts -- see
+  `MEASUREMENTS.md` §25.5.
 * `scripts/gate-uma-experts.sh` (spec in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §7) green, including the
-  cold-page-cache arm, and `check-gpu-faults.sh` clean.
+  cold-page-cache arm, and `check-gpu-faults.sh` clean.  **WRITTEN AND GREEN: 35 checks, 16 arms**
+  (`WORKLOG.md` 261111.026).  The prefill-logit KLD gate is owed as well (a prefill-path change) and reads mean
+  KLD -0.000000 / same-top-p 99.990 % on `--ab MOE_EXPERT_GTT_PREFILL=0`.
+* **The two maintainer decisions are taken** (the arena tier's default, and whether to revive the transient
+  band): they are the only thing between this set and `patches/`.
 * No regression on the discrete boxes (the GTT store is unreachable there; the pool/arena path must be unchanged
   bit for bit).
 * Every new variable in `ENVIRONMENT.md` with its class; beneficial features **on by default** with a kill
