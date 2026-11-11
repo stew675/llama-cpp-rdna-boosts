@@ -1,0 +1,737 @@
+warning: --host-experts is deprecated; use --limit-host-experts [auto|N] (-lme) instead
+
+
+Loading model... |0.00.019.241 I cmn  common_param: common_params_print_info: build 12221 (c80fa8bda) with Clang 24.0.0 for Linux x86_64
+0.00.019.242 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.019.243 I cmn  common_param: device_info:
+0.00.019.263 I cmn  common_param:   - ROCm0   : AMD Radeon AI PRO R9700 (gfx1201) (32624 MiB, 32552 MiB free)
+0.00.019.268 I cmn  common_param:   - ROCm1   : AMD Radeon AI PRO R9700 (gfx1201) (32624 MiB, 32552 MiB free)
+0.00.019.272 I cmn  common_param:   - CPU     : AMD Ryzen 9 9950X3D2 16-Core Processor (93639 MiB, 93639 MiB free)
+0.00.019.322 I cmn  common_param: system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : FA_QUANTS = q4_0-q4_0,q4_1-q4_1,q5_0-q5_0,q5_1-q5_1,q8_0-q8_0,bf16-bf16,f16-f16,iq4_nl-iq4_nl | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.019.355 I srv  init_listene: running without SSL
+0.00.019.533 I srv          init: using 31 threads for HTTP server
+0.00.019.568 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.021.290 I srv    load_model: loading model '/llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf'
+0.00.021.291 I srv    load_model: local path '/llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf'
+0.00.021.301 I cmn  common_fit_a: fitting params to device memory ...
+0.00.021.302 I cmn  common_fit_a: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.021.329 I common_params_fit_impl: getting device memory data for initial parameters:
+-\|/-0.00.548.049 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.00.548.051 I common_memory_breakdown_print: |   - Meta() (Meta())    | 65248 = 64488 + ( 7325 =  5607 +     254 +    1464) +       -6565 |
+0.00.548.051 I common_memory_breakdown_print: |   - Host               |                  67979 = 67882 +       0 +      96                |
+\|/-\0.01.033.756 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.01.033.758 W common_fit_params:   two placements can buy the KV back -- --fit will not take either on your behalf:
+0.01.033.759 W common_fit_params:     --kv-window N          keep the newest N cells of the attention KV in VRAM and the
+common_fit_params:                         older ones in pinned system RAM (ONE copy, LOSSLESS, any model).
+common_fit_params:                         Costs 11-26 % of decode once the request is deeper than N;
+common_fit_params:                         `--kv-window auto` lets this fit choose N for the -c you pinned.
+0.01.033.760 W common_fit_params:     --kv-attendance-pool   keep the whole KV in a pinned host mirror and cache only the
+common_fit_params:                         pages the sparse reader selects in VRAM (a SECOND copy; qwen4exp/
+common_fit_params:                         Flash-Next trunks only, sized by the system).  Costs prompt
+common_fit_params:                         throughput (~-48 % at pp32K) and buys the arena back for decode.
+0.01.033.761 W common_fit_params:   they are ALTERNATIVES, not layers: the pool declines while a window is active, and neither
+common_fit_params:   changes a token (ENVIRONMENT.md 17).  Lowering -c, -ngl or the quant also fits, and always
+common_fit_params:   ends in a clean refusal rather than an allocator abort.
+0.01.033.765 I common_fit_params: fitting params to free memory took 1.01 seconds
+0.01.059.280 I llama_model_loader: additional 2 GGUFs metadata loaded.
+0.01.059.282 I llama_model_loader: loaded meta data with 57 key-value pairs and 899 tensors from /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf (version GGUF V3 (latest))
+0.01.059.298 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.01.059.301 I llama_model_loader: - kv   0:                       general.architecture str              = qwen35moe
+0.01.059.301 I llama_model_loader: - kv   1:                               general.type str              = model
+0.01.059.302 I llama_model_loader: - kv   2:                     general.sampling.top_k i32              = 20
+0.01.059.305 I llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 0.950000
+0.01.059.306 I llama_model_loader: - kv   4:                      general.sampling.temp f32              = 0.600000
+0.01.059.306 I llama_model_loader: - kv   5:                               general.name str              = Qwen3.5-122B-A10B
+0.01.059.307 I llama_model_loader: - kv   6:                           general.basename str              = Qwen3.5-122B-A10B
+0.01.059.307 I llama_model_loader: - kv   7:                       general.quantized_by str              = Unsloth
+0.01.059.307 I llama_model_loader: - kv   8:                         general.size_label str              = 122B-A10B
+0.01.059.307 I llama_model_loader: - kv   9:                            general.license str              = apache-2.0
+0.01.059.308 I llama_model_loader: - kv  10:                       general.license.link str              = https://huggingface.co/Qwen/Qwen3.5-1...
+0.01.059.309 I llama_model_loader: - kv  11:                           general.repo_url str              = https://huggingface.co/unsloth
+0.01.059.309 I llama_model_loader: - kv  12:                   general.base_model.count u32              = 1
+0.01.059.309 I llama_model_loader: - kv  13:                  general.base_model.0.name str              = Qwen3.5 122B A10B
+0.01.059.309 I llama_model_loader: - kv  14:          general.base_model.0.organization str              = Qwen
+0.01.059.310 I llama_model_loader: - kv  15:              general.base_model.0.repo_url str              = https://huggingface.co/Qwen/Qwen3.5-1...
+0.01.059.311 I llama_model_loader: - kv  16:                               general.tags arr[str,2]       = ["unsloth", "image-text-to-text"]
+0.01.059.312 I llama_model_loader: - kv  17:                      qwen35moe.block_count u32              = 49
+0.01.059.312 I llama_model_loader: - kv  18:                   qwen35moe.context_length u32              = 262144
+0.01.059.312 I llama_model_loader: - kv  19:                 qwen35moe.embedding_length u32              = 3072
+0.01.059.312 I llama_model_loader: - kv  20:             qwen35moe.attention.head_count u32              = 32
+0.01.059.312 I llama_model_loader: - kv  21:          qwen35moe.attention.head_count_kv u32              = 2
+0.01.059.313 I llama_model_loader: - kv  22:          qwen35moe.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+0.01.059.314 I llama_model_loader: - kv  23:                   qwen35moe.rope.freq_base f32              = 10000000.000000
+0.01.059.315 I llama_model_loader: - kv  24: qwen35moe.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.01.059.315 I llama_model_loader: - kv  25:                     qwen35moe.expert_count u32              = 256
+0.01.059.315 I llama_model_loader: - kv  26:                qwen35moe.expert_used_count u32              = 8
+0.01.059.316 I llama_model_loader: - kv  27:             qwen35moe.attention.key_length u32              = 256
+0.01.059.316 I llama_model_loader: - kv  28:           qwen35moe.attention.value_length u32              = 256
+0.01.059.316 I llama_model_loader: - kv  29:       qwen35moe.expert_feed_forward_length u32              = 1024
+0.01.059.316 I llama_model_loader: - kv  30: qwen35moe.expert_shared_feed_forward_length u32              = 1024
+0.01.059.316 I llama_model_loader: - kv  31:                  qwen35moe.ssm.conv_kernel u32              = 4
+0.01.059.317 I llama_model_loader: - kv  32:                   qwen35moe.ssm.state_size u32              = 128
+0.01.059.317 I llama_model_loader: - kv  33:                  qwen35moe.ssm.group_count u32              = 16
+0.01.059.317 I llama_model_loader: - kv  34:               qwen35moe.ssm.time_step_rank u32              = 64
+0.01.059.317 I llama_model_loader: - kv  35:                   qwen35moe.ssm.inner_size u32              = 8192
+0.01.059.317 I llama_model_loader: - kv  36:          qwen35moe.full_attention_interval u32              = 4
+0.01.059.317 I llama_model_loader: - kv  37:             qwen35moe.rope.dimension_count u32              = 64
+0.01.059.318 I llama_model_loader: - kv  38:             qwen35moe.nextn_predict_layers u32              = 1
+0.01.059.318 I llama_model_loader: - kv  39:                       tokenizer.ggml.model str              = gpt2
+0.01.059.318 I llama_model_loader: - kv  40:                         tokenizer.ggml.pre str              = qwen35
+0.01.059.319 I llama_model_loader: - kv  41:                      tokenizer.ggml.tokens arr[str,248320]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+0.01.059.320 I llama_model_loader: - kv  42:                  tokenizer.ggml.token_type arr[i32,248320]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.01.059.321 I llama_model_loader: - kv  43:                      tokenizer.ggml.merges arr[str,247587]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+0.01.059.321 I llama_model_loader: - kv  44:                tokenizer.ggml.eos_token_id u32              = 248046
+0.01.059.321 I llama_model_loader: - kv  45:            tokenizer.ggml.padding_token_id u32              = 248055
+0.01.059.322 I llama_model_loader: - kv  46:               tokenizer.ggml.add_bos_token bool             = false
+0.01.059.322 I llama_model_loader: - kv  47:                    tokenizer.chat_template str              = {%- set image_count = namespace(value...
+0.01.059.323 I llama_model_loader: - kv  48:               general.quantization_version u32              = 2
+0.01.059.323 I llama_model_loader: - kv  49:                          general.file_type u32              = 15
+0.01.059.323 I llama_model_loader: - kv  50:                      quantize.imatrix.file str              = Qwen3.5-122B-A10B-GGUF/imatrix_unslot...
+0.01.059.324 I llama_model_loader: - kv  51:                   quantize.imatrix.dataset str              = unsloth_calibration_Qwen3.5-122B-A10B...
+0.01.059.324 I llama_model_loader: - kv  52:             quantize.imatrix.entries_count u32              = 612
+0.01.059.324 I llama_model_loader: - kv  53:              quantize.imatrix.chunks_count u32              = 77
+0.01.059.325 I llama_model_loader: - kv  54:                                   split.no u16              = 0
+0.01.059.325 I llama_model_loader: - kv  55:                        split.tensors.count i32              = 899
+0.01.059.325 I llama_model_loader: - kv  56:                                split.count u16              = 3
+0.01.059.326 I llama_model_loader: - type  f32:  440 tensors
+0.01.059.326 I llama_model_loader: - type q8_0:  310 tensors
+0.01.059.326 I llama_model_loader: - type q4_K:   96 tensors
+0.01.059.326 I llama_model_loader: - type q5_K:   50 tensors
+0.01.059.326 I llama_model_loader: - type q6_K:    1 tensors
+0.01.059.326 I llama_model_loader: - type bf16:    2 tensors
+0.01.059.328 I print_info: file format = GGUF V3 (latest)
+0.01.059.329 I print_info: file type   = Q4_K - Medium
+0.01.059.330 I print_info: file size   = 73.23 GiB (5.05 BPW) 
+0.01.059.336 I llama_prepare_model_devices: skipping CPU (AMD Ryzen 9 9950X3D2 16-Core Processor) for tensor parallelism
+0.01.059.336 I llama_prepare_model_devices: creating a Meta device for tensor parallelism from 2 devices:
+0.01.059.337 I llama_prepare_model_devices: - device 0: ROCm0 (AMD Radeon AI PRO R9700 (gfx1201))
+0.01.059.337 I llama_prepare_model_devices: - device 1: ROCm1 (AMD Radeon AI PRO R9700 (gfx1201))
+0.01.059.348 I llama_prepare_model_devices: using device Meta() (Meta()) (unknown id) - 64564 MiB free
+0.01.097.742 I load: 0 unused tokens
+0.01.110.356 I load: printing all EOG tokens:
+0.01.110.357 I load:   - 248044 ('<|endoftext|>')
+0.01.110.357 I load:   - 248046 ('<|im_end|>')
+0.01.110.358 I load:   - 248063 ('<|fim_pad|>')
+0.01.110.358 I load:   - 248064 ('<|repo_name|>')
+0.01.110.358 I load:   - 248065 ('<|file_sep|>')
+0.01.110.424 I load: special tokens cache size = 33
+|0.01.124.870 I load: token to piece cache size = 1.7581 MB
+0.01.124.878 I print_info: arch                  = qwen35moe
+0.01.124.878 I print_info: vocab_only            = 0
+0.01.124.878 I print_info: no_alloc              = 0
+0.01.124.878 I print_info: n_ctx_train           = 262144
+0.01.124.879 I print_info: n_embd_inp            = 3072
+0.01.124.879 I print_info: n_embd                = 3072
+0.01.124.879 I print_info: n_embd_out            = 3072
+0.01.124.880 I print_info: n_layer               = 48
+0.01.124.880 I print_info: n_layer_all           = 49
+0.01.124.886 I print_info: n_head                = 32
+0.01.124.887 I print_info: n_head_kv             = 2
+0.01.124.887 I print_info: n_rot                 = 64
+0.01.124.887 I print_info: n_swa                 = 0
+0.01.124.888 I print_info: is_swa_any            = 0
+0.01.124.888 I print_info: non_causal_type       = 0
+0.01.124.888 I print_info: n_embd_head_k         = 256
+0.01.124.888 I print_info: n_embd_head_v         = 256
+0.01.124.889 I print_info: n_gqa                 = 16
+0.01.124.890 I print_info: n_embd_k_gqa          = 512
+0.01.124.890 I print_info: n_embd_v_gqa          = 512
+0.01.124.891 I print_info: f_norm_eps            = 0.0e+00
+0.01.124.892 I print_info: f_norm_rms_eps        = 1.0e-06
+0.01.124.892 I print_info: f_clamp_kqv           = 0.0e+00
+0.01.124.892 I print_info: f_max_alibi_bias      = 0.0e+00
+0.01.124.892 I print_info: f_logit_scale         = 0.0e+00
+0.01.124.893 I print_info: f_attn_scale          = 0.0e+00
+0.01.124.893 I print_info: f_attn_value_scale    = 0.0000
+0.01.124.893 I print_info: n_ff                  = 0
+0.01.124.894 I print_info: n_expert              = 256
+0.01.124.894 I print_info: n_expert_used         = 8
+0.01.124.894 I print_info: n_expert_groups       = 0
+0.01.124.894 I print_info: n_group_used          = 0
+0.01.124.894 I print_info: causal attn           = 1
+0.01.124.895 I print_info: pooling type          = -1
+0.01.124.895 I print_info: rope type             = 40
+0.01.124.895 I print_info: rope scaling          = linear
+0.01.124.896 I print_info: freq_base_train       = 10000000.0
+0.01.124.897 I print_info: freq_scale_train      = 1
+0.01.124.897 I print_info: n_ctx_orig_yarn       = 262144
+0.01.124.897 I print_info: rope_yarn_log_mul     = 0.0000
+0.01.124.898 I print_info: rope_finetuned        = unknown
+0.01.124.898 I print_info: mrope sections        = [11, 11, 10, 0]
+0.01.124.898 I print_info: ssm_d_conv            = 4
+0.01.124.899 I print_info: ssm_d_inner           = 8192
+0.01.124.899 I print_info: ssm_d_state           = 128
+0.01.124.900 I print_info: ssm_dt_rank           = 64
+0.01.124.900 I print_info: ssm_n_group           = 16
+0.01.124.900 I print_info: ssm_dt_b_c_rms        = 0
+0.01.124.901 I print_info: model type            = 122B.A10B
+0.01.124.901 I print_info: model params          = 124.64 B
+0.01.124.901 I print_info: general.name          = Qwen3.5-122B-A10B
+0.01.124.902 I print_info: vocab type            = BPE
+0.01.124.902 I print_info: n_vocab               = 248320
+0.01.124.903 I print_info: n_merges              = 247587
+0.01.124.903 I print_info: BOS token             = 11 ','
+0.01.124.903 I print_info: EOS token             = 248046 '<|im_end|>'
+0.01.124.903 I print_info: EOT token             = 248046 '<|im_end|>'
+0.01.124.903 I print_info: PAD token             = 248055 '<|vision_pad|>'
+0.01.124.904 I print_info: LF token              = 198 'Ċ'
+0.01.124.904 I print_info: FIM PRE token         = 248060 '<|fim_prefix|>'
+0.01.124.904 I print_info: FIM SUF token         = 248062 '<|fim_suffix|>'
+0.01.124.904 I print_info: FIM MID token         = 248061 '<|fim_middle|>'
+0.01.124.904 I print_info: FIM PAD token         = 248063 '<|fim_pad|>'
+0.01.124.904 I print_info: FIM REP token         = 248064 '<|repo_name|>'
+0.01.124.904 I print_info: FIM SEP token         = 248065 '<|file_sep|>'
+0.01.124.905 I print_info: EOG token             = 248044 '<|endoftext|>'
+0.01.124.905 I print_info: EOG token             = 248046 '<|im_end|>'
+0.01.124.905 I print_info: EOG token             = 248063 '<|fim_pad|>'
+0.01.124.905 I print_info: EOG token             = 248064 '<|repo_name|>'
+0.01.124.905 I print_info: EOG token             = 248065 '<|file_sep|>'
+0.01.124.906 I print_info: max token length      = 256
+0.01.124.922 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.01.125.118 I plan_host_expert_placement: host experts: host_experts_mode=PINNED -> the whole host expert set: 67110.0 of 67110.0 MiB pinned (144 of 144 tensors, descending hotness); 0.0 MiB pageable (per-table bounce ring)
+0.01.126.305 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.01.184.791 W model has unused tensor blk.48.attn_norm.weight (size = 12288 bytes) -- ignoring
+0.01.184.794 W model has unused tensor blk.48.post_attention_norm.weight (size = 12288 bytes) -- ignoring
+0.01.184.797 W model has unused tensor blk.48.attn_q.weight (size = 53477376 bytes) -- ignoring
+0.01.184.799 W model has unused tensor blk.48.attn_k.weight (size = 1671168 bytes) -- ignoring
+0.01.184.800 W model has unused tensor blk.48.attn_v.weight (size = 1671168 bytes) -- ignoring
+0.01.184.805 W model has unused tensor blk.48.attn_output.weight (size = 26738688 bytes) -- ignoring
+0.01.184.806 W model has unused tensor blk.48.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.01.184.808 W model has unused tensor blk.48.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.01.184.809 W model has unused tensor blk.48.ffn_gate_inp.weight (size = 1572864 bytes) -- ignoring
+0.01.184.811 W model has unused tensor blk.48.ffn_down_exps.weight (size = 553648128 bytes) -- ignoring
+0.01.184.813 W model has unused tensor blk.48.ffn_gate_exps.weight (size = 452984832 bytes) -- ignoring
+0.01.184.815 W model has unused tensor blk.48.ffn_up_exps.weight (size = 452984832 bytes) -- ignoring
+0.01.184.816 W model has unused tensor blk.48.ffn_gate_inp_shexp.weight (size = 6144 bytes) -- ignoring
+0.01.184.818 W model has unused tensor blk.48.ffn_gate_shexp.weight (size = 3342336 bytes) -- ignoring
+0.01.184.819 W model has unused tensor blk.48.ffn_up_shexp.weight (size = 3342336 bytes) -- ignoring
+0.01.184.820 W model has unused tensor blk.48.ffn_down_shexp.weight (size = 3342336 bytes) -- ignoring
+0.01.184.823 W model has unused tensor blk.48.nextn.eh_proj.weight (size = 20054016 bytes) -- ignoring
+0.01.184.825 W model has unused tensor blk.48.nextn.enorm.weight (size = 12288 bytes) -- ignoring
+0.01.184.827 W model has unused tensor blk.48.nextn.hnorm.weight (size = 12288 bytes) -- ignoring
+0.01.184.831 W model has unused tensor blk.48.nextn.shared_head_norm.weight (size = 12288 bytes) -- ignoring
+/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-0.08.947.191 I load_tensors: offloading output layer to GPU
+0.08.947.194 I load_tensors: offloading 48 repeating layers to GPU
+0.08.947.194 I load_tensors: offloaded 50/50 layers to GPU
+0.08.947.199 I load_tensors:   CPU_Mapped model buffer size =   772.97 MiB
+0.08.947.200 I load_tensors:       Meta() model buffer size =  3106.23 MiB
+0.08.957.456 I load_tensors:    ROCm_Host model buffer size = 67110.00 MiB
+\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-0.34.949.467 W report_host_expert_placement: host experts: pinned 67110.0 MiB of 67110.0 MiB (cap none (the whole set)), pageable 0.0 MiB; host_experts_mode=PINNED -> the whole host expert set: 67110.0 of 67110.0 MiB pinned (144 of 144 tensors, descending hotness); 0.0 MiB pageable (per-table bounce ring)
+0.34.992.284 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.34.992.286 I cmn  common_init_: added <|im_end|> logit bias = -inf
+0.34.992.286 I cmn  common_init_: added <|fim_pad|> logit bias = -inf
+0.34.992.286 I cmn  common_init_: added <|repo_name|> logit bias = -inf
+0.34.992.288 I cmn  common_init_: added <|file_sep|> logit bias = -inf
+0.34.998.422 I llama_init_from_model: enabling flash_attn since it is required for SPLIT_MODE_TENSOR
+0.34.998.447 I llama_context: constructing llama_context
+0.35.001.840 I llama_context: n_seq_max             = 1
+0.35.001.841 I llama_context: n_ctx                 = 8192
+0.35.001.841 I llama_context: n_ctx_seq             = 8192
+0.35.001.841 I llama_context: n_batch               = 2048
+0.35.001.842 I llama_context: n_ubatch              = 2048
+0.35.001.842 I llama_context: causal_attn           = 1
+0.35.001.842 I llama_context: flash_attn            = enabled
+0.35.001.842 I llama_context: kv_unified            = false
+0.35.001.844 I llama_context: freq_base             = 10000000.0
+0.35.001.845 I llama_context: freq_scale            = 1
+0.35.001.845 I llama_context: n_rs_seq              = 0
+0.35.001.845 I llama_context: n_rs_batch            = 1
+0.35.001.845 I llama_context: n_outputs_max         = 1
+0.35.001.847 I llama_context: n_outputs_max_per_seq = 1
+0.35.001.847 I llama_context: n_ctx_seq (8192) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.35.020.906 I ggml_cuda_ar_pipeline_init: initialized HIP AllReduce pipeline: 2 GPUs, 1024 KB chunked kernel staging + 32 MB copy-engine staging per GPU
+\|0.35.142.941 I llama_context:  ROCm_Host  output buffer size =     0.95 MiB
+0.35.148.883 I llama_kv_cache:     Meta() KV buffer size =    51.01 MiB
+0.35.148.887 I llama_kv_cache: size =  102.00 MiB (  8192 cells,  12 layers,  1/1 seqs), K (q8_0):   51.00 MiB, V (q8_0):   51.00 MiB
+0.35.148.887 I llama_kv_cache: n_rot_k = 256, n_embd_head_k_all = 256
+0.35.148.888 I llama_kv_cache: n_rot_v = 64, n_embd_head_k_all = 256
+0.35.149.076 I init_rotation:     Meta() rotation buffer size =     3.19 MiB
+0.35.154.372 I llama_memory_recurrent:     Meta() RS buffer size =    74.53 MiB
+0.35.154.377 I llama_memory_recurrent: size =  149.06 MiB (     1 cells,  48 layers,  1 seqs  0 rs_seq), R (f32):    5.06 MiB, S (f32):  144.00 MiB, P (f32):    0.00 MiB
+0.35.155.488 I sched_reserve: reserving ...
+0.35.166.747 I resolve_fused_ops: resolving derived kq mask support:
+0.35.171.309 I resolve_fused_ops: derived kq mask flash attention enabled
+0.35.171.311 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.35.172.326 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.35.173.263 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.35.174.184 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.35.220.314 W SLAB_INIT dev=0 free=28.32 GiB reserve=1.38 GiB headroom=1.38 GiB aux=0.00 GiB size(VA)=26.94 GiB mapped=26.94 GiB boundary=1.62 GiB va_spare=0.00 GiB chunk=64.0 MiB ring_req=2.46 GiB
+0.35.220.318 W ggml_cuda_slab_init_locked: device 0: slab 26.94 GiB (chunk 64.0 MiB): work 1.62 GiB + arena 25.31 GiB (1.38 GiB reserve, 0.00 GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+0.35.220.321 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1610.42 MiB from the slab work region (boundary 1664.00 MiB) on device 0
+0.35.233.335 W SLAB_INIT dev=1 free=28.32 GiB reserve=1.38 GiB headroom=1.38 GiB aux=0.00 GiB size(VA)=26.94 GiB mapped=26.94 GiB boundary=1.62 GiB va_spare=0.00 GiB chunk=64.0 MiB ring_req=2.46 GiB
+0.35.233.338 W ggml_cuda_slab_init_locked: device 1: slab 26.94 GiB (chunk 64.0 MiB): work 1.62 GiB + arena 25.31 GiB (1.38 GiB reserve, 0.00 GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+0.35.233.339 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1610.42 MiB from the slab work region (boundary 1664.00 MiB) on device 1
+0.35.235.148 I ggml_gallocr_reserve_n_impl: reallocating Meta() buffer from size 1610.42 MiB to 2022.05 MiB
+0.35.235.214 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2304.00 MiB from the slab work region (boundary 2304.00 MiB) on device 0
+0.35.235.216 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2304.00 MiB from the slab work region (boundary 2304.00 MiB) on device 1
+0.35.236.699 I sched_reserve:     Meta() compute buffer size =  2304.00 MiB
+0.35.236.701 I sched_reserve:        CPU compute buffer size =    96.14 MiB
+0.35.236.710 I sched_reserve: graph (pp bs=2048, tg bs=1): nodes = 4725 / 4725, splits = 144 / 50, input objects = 5 / 4, input tensors = 9 / 10
+0.35.236.710 I sched_reserve: reserve took 81.22 ms, sched copies = 1
+/0.35.239.480 I cmn          init: llama threadpool init, n_threads = 16
+0.35.239.504 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.35.246.700 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 1, n_diff = 0
+0.35.273.732 I moe_cache_register_host: the host-expert table set is complete at registration (288 tables); arming the arena before the first ubatch of this pass
+0.35.273.739 W alloc_all_locked: MoE expert cache (auto): arena 49808.2 MiB of 67110.0 MiB host experts (74.2% residency).  MOE_EXPERT_CACHE_MIB=0 disables the cache; set a positive value to size it explicitly.
+0.35.286.104 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.300.434 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.310.161 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.318.148 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.326.124 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.334.147 I apply_heat_seed_locked: layer=44 role=blk.44.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.35.344.276 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.354.390 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.362.133 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.370.107 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.378.096 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.385.862 I apply_heat_seed_locked: layer=25 role=blk.25.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.396.229 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.406.363 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.414.108 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.422.085 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.429.884 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+\0.35.437.687 I apply_heat_seed_locked: layer=37 role=blk.37.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.447.830 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.457.955 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.465.724 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.473.477 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.481.249 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.489.053 I apply_heat_seed_locked: layer=2 role=blk.2.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.499.199 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.509.542 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.517.292 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.525.282 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.533.286 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.35.541.092 I apply_heat_seed_locked: layer=32 role=blk.32.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.551.468 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.561.592 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.569.331 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.577.312 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.585.337 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.593.151 I apply_heat_seed_locked: layer=38 role=blk.38.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.603.506 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.613.869 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.621.618 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.629.587 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.35.637.376 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.645.198 I apply_heat_seed_locked: layer=29 role=blk.29.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.655.571 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.665.679 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.673.434 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.681.430 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.689.227 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.697.032 I apply_heat_seed_locked: layer=35 role=blk.35.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.707.383 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.717.504 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.725.236 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.733.195 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.35.741.177 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.749.188 I apply_heat_seed_locked: layer=26 role=blk.26.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.759.549 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.769.683 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.777.418 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.785.399 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.793.203 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.801.245 I apply_heat_seed_locked: layer=30 role=blk.30.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.811.619 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.821.736 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.829.481 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+\0.35.837.224 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.845.235 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.853.035 I apply_heat_seed_locked: layer=33 role=blk.33.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.863.419 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.873.554 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.881.302 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.889.288 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.897.090 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.904.898 I apply_heat_seed_locked: layer=36 role=blk.36.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.915.252 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.925.604 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.933.351 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.35.941.338 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.949.119 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.956.907 I apply_heat_seed_locked: layer=28 role=blk.28.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.967.287 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.977.416 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.985.165 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.35.992.915 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.000.912 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.008.713 I apply_heat_seed_locked: layer=39 role=blk.39.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.019.089 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.029.454 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.36.037.210 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.045.186 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.053.209 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.061.259 I apply_heat_seed_locked: layer=43 role=blk.43.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.071.603 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.081.707 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.089.446 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.097.412 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.105.170 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.113.168 I apply_heat_seed_locked: layer=23 role=blk.23.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.123.529 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.133.868 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.36.141.630 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.149.402 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.157.173 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.164.956 I apply_heat_seed_locked: layer=47 role=blk.47.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.175.314 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.185.669 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.193.619 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.201.366 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.209.158 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.216.931 I apply_heat_seed_locked: layer=24 role=blk.24.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.229.388 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+\0.36.243.342 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.254.978 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.266.124 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.275.362 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.284.816 I apply_heat_seed_locked: layer=46 role=blk.46.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.295.152 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.305.508 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.313.280 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.321.270 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.329.050 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.336.832 I apply_heat_seed_locked: layer=0 role=blk.0.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.36.346.948 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.357.055 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.365.025 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.372.765 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.380.761 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.388.529 I apply_heat_seed_locked: layer=22 role=blk.22.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.398.638 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.408.999 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.416.756 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.424.506 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.432.306 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.36.440.109 I apply_heat_seed_locked: layer=40 role=blk.40.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.450.482 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.460.623 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.468.363 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.476.337 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.484.134 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.491.929 I apply_heat_seed_locked: layer=41 role=blk.41.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.502.286 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.512.420 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.520.160 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.527.911 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.535.906 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.36.543.679 I apply_heat_seed_locked: layer=21 role=blk.21.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.554.033 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.564.151 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.572.114 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.579.864 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.587.881 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.595.661 I apply_heat_seed_locked: layer=16 role=blk.16.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.605.752 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.615.865 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.623.608 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.631.356 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+\0.36.639.362 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.647.165 I apply_heat_seed_locked: layer=13 role=blk.13.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.657.514 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.667.641 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.675.376 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.683.346 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.691.124 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.698.913 I apply_heat_seed_locked: layer=14 role=blk.14.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.709.266 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.719.634 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.727.382 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.735.375 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.36.743.147 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.750.949 I apply_heat_seed_locked: layer=9 role=blk.9.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.761.310 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.771.439 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.779.182 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.787.162 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.794.956 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.802.744 I apply_heat_seed_locked: layer=8 role=blk.8.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.813.095 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.823.442 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.831.184 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.36.839.152 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.847.166 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.854.961 I apply_heat_seed_locked: layer=12 role=blk.12.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.865.088 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.875.422 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.883.161 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.891.146 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.899.145 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.907.174 I apply_heat_seed_locked: layer=10 role=blk.10.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.917.532 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.927.634 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.935.367 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.36.943.347 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.951.117 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.959.122 I apply_heat_seed_locked: layer=19 role=blk.19.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.969.476 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.979.580 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.987.312 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.36.995.293 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.003.280 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.011.054 I apply_heat_seed_locked: layer=27 role=blk.27.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.021.418 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.031.782 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+\0.37.039.528 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.047.289 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.055.095 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.062.899 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.073.268 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.083.396 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.091.165 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.098.915 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.106.900 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.114.679 I apply_heat_seed_locked: layer=45 role=blk.45.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.124.777 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.134.900 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+|0.37.142.639 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.150.390 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.158.143 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.166.155 I apply_heat_seed_locked: layer=17 role=blk.17.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.176.280 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.186.644 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.194.393 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.202.381 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.210.155 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.218.171 I apply_heat_seed_locked: layer=42 role=blk.42.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.228.325 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+/0.37.238.688 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.246.449 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.254.431 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.262.200 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.270.213 I apply_heat_seed_locked: layer=3 role=blk.3.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.280.587 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.290.716 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.298.459 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.306.442 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_gate_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.314.225 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.322.248 I apply_heat_seed_locked: layer=7 role=blk.7.ffn_up_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.332.567 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+-0.37.342.708 I apply_heat_seed_locked: layer=15 role=blk.15.ffn_down_exps.weight heat-seeded 190/190 slots from the persisted map (256 experts, ranked by the DECODE band)
+0.37.369.940 I alloc_all_locked: device 0: sized 190 slots/table from 144 tables / 131.1 MiB per expert (budget auto MiB/device)
+0.37.369.942 I alloc_all_locked: device 1: sized 190 slots/table from 144 tables / 131.1 MiB per expert (budget auto MiB/device)
+0.37.369.942 I alloc_all_locked: per-device sizing: 2 device(s), arena total 49808.2 MiB
+0.37.410.335 I ggml_cuda_async_input_arm_locked: device ring: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=0 disables)
+0.37.410.341 I ggml_cuda_async_input_set: device 0: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)
+0.37.412.456 I ggml_cuda_async_input_arm_locked: device ring: batched graph-input uploads on (GGML_CUDA_ASYNC_INPUT_BATCH=0 disables)
+0.37.412.459 I ggml_cuda_async_input_set: device 1: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1 enables)
+\|/-\|0.37.959.898 I ggml_backend_cuda_stage_h2d_gbps: H2D bandwidth calibration: 28.6 GB/s (512 MiB x3 in 56.24 ms, from cudaMalloc)
+/0.38.118.796 I ggml_backend_cuda_stage_h2d_gbps: H2D bandwidth calibration: 28.6 GB/s (512 MiB x3 in 56.24 ms, from cudaMalloc)
+0.38.129.437 I sched_stage_min_tokens: H2D staging calibration: 28.6 GB/s -> min_tokens=64
+-\0.38.263.674 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2048.00 MiB from the slab work region (boundary 2048.00 MiB) on device 0
+0.38.263.677 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2048.00 MiB from the slab work region (boundary 2048.00 MiB) on device 1
+0.38.264.710 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 2, n_diff = 0
+0.38.265.758 I ggml_gallocr_reserve_n_impl: reallocating CPU buffer from size 0.05 MiB to 0.09 MiB
+0.38.317.051 I cmn  common_conte: the context does not support partial sequence removal
+0.38.318.671 I srv    load_model: speculative decoding will use checkpoints
+0.38.318.673 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 8192, kv_unified = 'false'
+0.38.318.882 I spec common_specu: no implementations specified for speculative decoding
+0.38.318.887 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 8192
+0.38.318.902 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.38.318.903 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.38.318.903 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.38.318.903 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.38.318.950 I srv          init: idle slots will be saved to prompt cache upon starting a new task
+0.38.321.717 I srv          init: init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+'
+0.38.321.985 I srv          init: init: chat template, thinking = 0
+0.38.322.001 I srv          init: preserve_reasoning kwarg: not supported by template
+0.38.322.306 I srv  server_run_i: model loaded
+0.38.322.308 I srv  server_on_li: listening on http://127.0.0.1:36729
+0.38.322.348 I srv  update_slots: all slots are idle
+| 0.38.423.320 I srv  server_strea: conv_id= (empty=1)
+0.38.443.906 I slot get_availabl: id  0 | task -1 |  - skipping, slot is empty
+0.38.443.914 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+0.38.443.914 I srv  get_availabl: updating prompt cache
+0.38.443.919 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.38.443.920 I srv          find:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000
+0.38.443.924 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 8192 tokens, 8589934592 est)
+0.38.443.925 I srv  get_availabl: prompt cache update took 0.01 ms
+0.38.443.967 I slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.38.443.974 I slot launch_slot_: id  0 | task -1 | sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.38.443.976 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.38.443.989 I slot   operator(): id  0 | task 0 | new prompt, n_ctx_slot = 8192, n_keep = 0, task.n_tokens = 5258
+0.38.443.999 I slot   operator(): id  0 | task 0 | cached n_tokens = 0, memory_seq_rm [0, end)
+0.38.448.823 W moe_cache_evict_slab_range: evicted 4160.0 MiB of arena tables from the taken slab chunks (arena now 45675.7 MiB; 24 table(s) stood down until the compute-buffer drop re-arms them)
+0.38.448.826 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1792.00 MiB from the slab work region (boundary 6656.00 MiB) on device 0
+0.38.448.847 W moe_cache_evict_slab_range: evicted 4160.0 MiB of arena tables from the taken slab chunks (arena now 41543.2 MiB; 24 table(s) stood down until the compute-buffer drop re-arms them)
+0.38.448.848 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 1792.00 MiB from the slab work region (boundary 6656.00 MiB) on device 1
+0.38.586.040 I ggml_cuda_op_gated_delta_net_impl: chunked GDN prefill n=2048 K=1 n_seqs=1 (chunked 2032 + sequential tail 16, snapshots written; GGML_CUDA_GDN_TAIL=0 restores whole-batch chunking)
+0.38.597.256 I all-reduce: host-resident experts -- large tensors use the RCCL ring (GGML_CUDA_ALLREDUCE=ce forces the copy-engine arm)
+0.38.733.997 W moe_cache_evict_slab_range: evicted 162.0 MiB of arena tables from the taken slab chunks (arena now 41382.9 MiB; 1 table(s) stood down until the compute-buffer drop re-arms them)
+0.38.748.620 W moe_cache_evict_slab_range: evicted 162.0 MiB of arena tables from the taken slab chunks (arena now 41222.6 MiB; 1 table(s) stood down until the compute-buffer drop re-arms them)
+0.39.693.915 I slot   operator(): id  0 | task 0 | cached n_tokens = 2048, memory_seq_rm [2048, end)
+0.39.695.902 I sched_graph_realloc: graph reallocation: nodes = 5216 (changed = 0), splits = 144, n_same = 3, n_diff = 0
+0.40.492.261 I slot   operator(): id  0 | task 0 | cached n_tokens = 3210, memory_seq_rm [3210, end)
+0.40.575.343 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 3209, pos_max = 3209, n_tokens = 3210, size = 149.063 MiB)
+0.40.578.097 I sched_graph_realloc: graph reallocation: nodes = 5216 (changed = 0), splits = 144, n_same = 4, n_diff = 0
+0.41.614.892 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   5254, progress = 1.00, t =   3.17 s / 1656.95 tokens per second
+0.41.614.894 I slot   operator(): id  0 | task 0 | cached n_tokens = 5254, memory_seq_rm [5254, end)
+0.41.615.294 I slot init_sampler: id  0 | task 0 | init sampler, took 0.39 ms, tokens: text = 5258, total = 5258
+0.41.667.216 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 5253, pos_max = 5253, n_tokens = 5254, size = 149.063 MiB)
+0.41.678.548 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2304.00 MiB from the slab work region (boundary 2304.00 MiB) on device 0
+0.41.678.551 I ggml_backend_cuda_buffer_type_alloc_buffer_usage: compute buffer 2304.00 MiB from the slab work region (boundary 2304.00 MiB) on device 1
+0.41.678.583 W ggml_cuda_slab_set_narrow_floor: device 0: narrow floor raise to 2560.0 MiB ignored (ring in use: 2560.0 MiB of 2560.0 MiB, floor 2304.0 MiB); the band is learned from the next idle-ring narrow view instead
+0.41.678.585 W ggml_cuda_slab_set_narrow_floor: device 1: narrow floor raise to 2560.0 MiB ignored (ring in use: 2560.0 MiB of 2560.0 MiB, floor 2304.0 MiB); the band is learned from the next idle-ring narrow view instead
+0.41.711.199 W moe_cache_rearm: re-armed 54 stood-down expert-cache tables after a compute-buffer drop (0 stood down: the arena could not hold the layer uniformly) (arena now 49808.2 MiB)
+0.41.712.323 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 5, n_diff = 0
+0.41.713.367 I ggml_gallocr_reserve_n_impl: reallocating CPU buffer from size 0.06 MiB to 0.23 MiB
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b12221-c80fa8bda
+model      : /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> # llama-cpp-rdna-boosts A patch collection that brings **AMD RDNA-specific performance work** to [llama.cpp](https://github.com/ggml-org/llama.cpp): MTP decode, chunked gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next) support, and an attention-memory campaign that frees several GiB of VRAM. It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point **`790cf5 ... (truncated)
+Based0.41.801.846 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 6, n_diff = 0
+ on the detailed README and changelog you provided, here is a structured summary of the **llama-cpp-rdna-boosts** patch collection. This project is a specialized optimization suite for **llama.cpp** targeting **AMD RDNA** GPUs (specifically RDNA3, 3.5, and 4), delivering significant performance gains, memory savings, and new model support.
+
+### 🚀 Core Value Proposition
+This is a **16-patch collection** (Block 00 + Blocks 01–150.44.812.608 I slot print_timing: id  0 | task 0 | n_gen =    114, tg =  37.52 t/s, tg_3s =  37.85 t/s
+) designed to be applied on0.44.925.085 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 7, n_diff = 0
+ top of the `llama.cpp` fork point **`790cf51aa`**. It introduces:
+*   **Performance:** RDNA-specific kernels (WMMA Flash Attention, Gated-Delta-Net), fused MoE operations, and k-quant decode paths.
+*   **Memory Efficiency:** An "attention-memory campaign" (Block 15) freeing ~3.4 GiB VRAM on large models (e.g., Qwen4exp) and ~800 MiB on dense models.
+*   **New Features:** Support for **Qwen4exp (0.47.827.435 I slot print_timing: id  0 | task 0 | n_gen =    245, tg =  40.49 t/s, tg_3s =  43.45 t/s
+Qwen3.8-Flash-Next)**, MTP (Multi-Token Prediction) decode, and hybrid all-reduce for multi-GPU setups.
+*   **Architecture Support:** Optimized for **RDNA4** (`gfx120x`) with back-ported optimizations for **RDNA3** (`gfx1100`) and **RDNA3.5** (`gfx115x`).
+
+---
+
+### 📦 The 16 Blocks (Summary)
+
+| Block | Key Feature | Details |
+| :--- | :--- | :--- |
+| **00** | **Structural Fixes0.50.757.795 I sched_graph_realloc: graph reallocation: nodes = 5213 (changed = 0), splits = 50, n_same = 8, n_diff = 0
+** |0.50.843.127 I slot print_timing: id  0 | task 0 | n_gen =    378, tg =  41.69 t/s, tg_3s =  44.10 t/s
+ Fixes FA small-batch KV-split width invariance and Vulkan masked-V/freed-cell issues. The foundation0.51.345.487 I slot print_timing: id  0 | task 0 | prompt eval time =    3356.77 ms /  5258 tokens (    0.64 ms per token,  1566.39 tokens per second)
+0.51.345.499 I slot print_timing: id  0 | task 0 |        eval time =    9544.72 ms /   400 tokens (   23.92 ms per token,    41.80 tokens per second)
+0.51.345.500 I slot print_timing: id  0 | task 0 |       total time =   12901.49 ms /  5658 tokens
+0.51.345.502 I slot print_timing: id  0 | task 0 |    graphs reused =        396
+0.51.345.503 I slot print_timing: id  0 | task 0 |   graph reallocs =          8    /     0        (same size) / (changed size)
+0.51.345.510 I slot print_timing: id  0 | task 0 |   MoE arena = 0.9409 (870178 hit / 924848 reaches this turn), arena 49808.2 MiB
+ for0.51.347.230 I slot      release: id  0 | task 0 | stop processing: n_tokens = 5657, truncated = 0
+0.51.347.235 I srv  update_slots: all slots are idle
+
+0.51.348.745 I srv    operator(): operator(): cleaning up before exit...
+0.51.349.115 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+0.51.349.116 I common_memory_breakdown_print: |   - Meta() (Meta())    | 65248 =  697 + ( 5538 =  3106 +     128 +    2304) +       59012 |
+0.51.349.116 I common_memory_breakdown_print: |   - Host               |                 67883 = 67882 +       0 +       0                |
+0.51.349.211 W ~llama_context:        CPU compute buffer size of   0.2288 MiB, does not match expectation of   0.0574 MiB
+0.51.679.264 I report_locked: MoE expert cache: h=0.9409 (870178/924848 reaches), fills=70050 evictions=14438, tables=288, slots=54720, arena=49808.2 MiB total (budget auto MiB/device)
+0.51.679.266 I report_locked: device remap: 115488 tables served, 0 of 115488 offers declined
+0.51.679.271 W report_locked: sink (MOE_HOST_POOL_SINK): 0 demoted, 0.0 MiB | declined: 0 no-free-slot, 0 geometry (structural), 0 copy-error | 0 promoter slots retired (spare=4)
+0.51.679.271 W report_locked: sink reclaimed 0 saturated slots (evict duplicate/LRU instead of declining)
+0.51.679.271 W report_locked: sink headroom: 0 prefill fills took the exchange slots (a prefill never honours the reserve; TODO #281)
+0.51.679.272 W report_locked: sink reuse: 0 uses against 0 demotions (0.0 % used; W1 break-even ~3 % on NVMe, ~0.2 % on slow storage)
+0.51.679.272 W report_locked: sink mirror tables (full coverage -> exchange INERT, spare=0): 0
+0.51.679.272 I report_locked: takeover=115776 decline_all=0 get_ok=2592 cold=uva cold_reaches=0
+0.51.679.273 I report_locked: cold admission=touch, admission-rejected (served cold)=29460
+0.51.679.273 I report_locked: device 0: tables=144 slots/table(sum)=27360 arena=24904.1 MiB (budget auto MiB/device)
+0.51.679.274 I report_locked: device 1: tables=144 slots/table(sum)=27360 arena=24904.1 MiB (budget auto MiB/device)
+0.51.696.287 I report_locked: heat coverage (this session): the resident set holds 92.68% of the routed mass; a global top-54720 placement of the same slots would hold 98.47% (static bound); resident 54526 of 73728 expert-slots (summed over tables/devices)
+0.51.704.360 I heat_map_save_locked: saved 144 heat entries to /llm/models/Qwen3.5/122B-A10B/Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL.moe-heatmap
+0.51.704.399 I report_locked: heat (R2): total=3215776192 (persisted prior + this session), nonzero=70634/73728 experts over 288 tables
+0.51.704.401 I report_locked: heat top: layer=23 role=blk.23.ffn_gate_exps.weight expert=164 count=1038821
+0.51.704.401 I report_locked: heat top: layer=23 role=blk.23.ffn_gate_exps.weight expert=164 count=1038821
+0.51.704.402 I report_locked: heat top: layer=23 role=blk.23.ffn_up_exps.weight expert=164 count=1038821
+0.51.704.402 I report_locked: heat top: layer=23 role=blk.23.ffn_up_exps.weight expert=164 count=1038821
+0.51.704.409 I report_locked: heat top: layer=23 role=blk.23.ffn_down_exps.weight expert=164 count=1038821
+0.51.704.422 W report_locked: prefill staging declined 50 of 288 host table(s): it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down.  Affected: 1/blk.1.ffn_gate_exps.weight, 1/blk.1.ffn_up_exps.weight, 1/blk.1.ffn_down_exps.weight, 4/blk.4.ffn_gate_exps.weight, 4/blk.4.ffn_up_exps.weight, 4/blk.4.ffn_down_exps.weight, 5/blk.5.ffn_gate_exps.weight, 5/blk.5.ffn_up_exps.weight, 5/blk.5.ffn_down_exps.weight, 6/blk.6.ffn_gate_exps.weight, 6/blk.6.ffn_up_exps.weight, 6/blk.6.ffn_down_exps.weight, +13 more (see the per-table lines below).  They are served by the scheduler's own whole-table upload instead (not staged, so their bytes are missing from the staging census above); a stood-down one is re-armed at the compute-buffer drop, so this is a prefill-only state
+0.51.704.423 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.423 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.423 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.424 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.424 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.424 I report_locked: prefill staging declined: layer=1 role=blk.1.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.424 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.425 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.429 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.430 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.430 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.431 I report_locked: prefill staging declined: layer=4 role=blk.4.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.431 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.435 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.436 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.436 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.437 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.437 I report_locked: prefill staging declined: layer=5 role=blk.5.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.437 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.437 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.438 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.438 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.438 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.438 I report_locked: prefill staging declined: layer=6 role=blk.6.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.439 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.439 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.439 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.440 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.442 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.442 I report_locked: prefill staging declined: layer=11 role=blk.11.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.443 I report_locked: prefill staging declined: layer=15 role=blk.15.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.443 I report_locked: prefill staging declined: layer=15 role=blk.15.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.443 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.444 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.444 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.444 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.444 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.445 I report_locked: prefill staging declined: layer=18 role=blk.18.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.445 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.445 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.445 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.446 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.446 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.449 I report_locked: prefill staging declined: layer=20 role=blk.20.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.449 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_gate_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.450 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_gate_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.450 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_up_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.450 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_up_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.451 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_down_exps.weight dev=0: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.451 I report_locked: prefill staging declined: layer=34 role=blk.34.ffn_down_exps.weight dev=1: it is stood down (0 slots, no arena) -- a slab chunk reclamation or a layer stand-down
+0.51.704.454 I report_locked: prefill cache staging: ok=696 geom_decline=0 unusable=150 nomatch=0 unsized=0 (the priming pass); arena=119672.3 MiB host=42777.7 MiB (H2D 26.3% of staged); PRS rebuilds=696
+0.51.704.455 I report_locked: VRAM budget: requested=auto MiB/device, free-clamped=2, arena alloc failures=0 (fail-soft)
+0.51.704.456 I report_locked: expert access: hits=870178 fills=25210 colds=29460 (hit=94.09% fill=2.73% cold=3.19%)
+0.51.704.458 I report_locked: expert H2D traffic: fills=22926.5 MiB cold-reads=26757.8 MiB total=49684.2 MiB over ~6 tokens = 8280.71 MiB/token
+0.51.704.459 I report_locked: expert traffic per token: 8280.7 MiB/token = 8479444 KiB/token (fills 3912788, cold 4566656)
+0.51.765.303 W moe_cache_forget_all: model teardown: dropped 144 expert-cache table(s) (24904.1 MiB of arena) on device 0 and un-sized the cache, so the next model sizes on its own first band pass
+0.51.825.493 W moe_cache_forget_all: model teardown: dropped 144 expert-cache table(s) (24904.1 MiB of arena) on device 1 and un-sized the cache, so the next model sizes on its own first band pass
+
+[ Prompt: 1566.4 t/s | Generation: 41.8 t/s ]
+
+
+Exiting...

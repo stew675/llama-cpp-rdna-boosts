@@ -3975,3 +3975,39 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   3x R9700 `pp4096` 2130 -> 2404 t/s (+12.9 %) and 35B-A3B Q8_0 4400 -> 4819 (+9.5 %), against +2.5 %
   on the 2-device x8 pair.  Decode is flat on every arm: the internal pipeline serves the decode/verify band
   and never enters the wire.
+
+## r261 — the demand read is BYTES, not latency (and the host is never ahead of the device on the decode band)
+
+* **A demand-fill "overlap worker" has nothing to overlap with on the decode band.**  A decode graph is one split
+  per layer (50 on the 122B), and the scheduler copies a split's host-weight inputs — starting with
+  `ggml_backend_synchronize(input_backend)` + an ids readback + `ggml_backend_synchronize(ids_backend)`, a full
+  meta-backend synchronize — *before* it dispatches that split.  So at the instant the routing (and the miss set)
+  is known, the device has nothing in flight: measured 2026-11-11 on the 122B pair at `-lme 54` `DIO=1`
+  (58.6 ms/step), the readback is **24.0 ms/token** (48 calls, 0.499 ms each) and that time *is* the device's
+  compute, while `moe_cache_update_host` adds **33.2 ms/token** (145 calls, 0.229 ms) of strict device idle.  Of
+  that, the decode-band demand source is 31.7 ms (96 calls: 44.6 fallback reads at 0.531 ms plus ~60 pool fill
+  attempts).  Any "run the fills beside the previous ubatch's compute" design needs a host that runs ahead of the
+  device; this path does not have one, and the hook's single global `g_mutex` means a worker would have to read
+  outside the lock to run at all.  Do not re-derive this — read `benchmarks/2026-11-11-host-pool-slice-read.md` §1.
+* **On a `-sm tensor` split a fill is worth exactly ONE device's slice.**  Each device owns a slice of every host
+  expert and for `gate`/`up` it is contiguous (`CACHE_GEOM`: `expert_bytes 884736 host_bytes 1769472 src_off 0
+  host_pitch 0 split_axis 1`); the whole-expert read the fallback fill used to issue is 2x the bytes for 2 of the
+  3 roles.  `MOE_HOST_POOL_SLICE_READ` (r261) reads the slice and is worth **+6.0 % decode / +8.6 % prefill on
+  the pair, +24.8 % prefill at 3 GPUs**, identical at 1 GPU because there `expert_bytes == host_bytes`.  A
+  **strided** slice (`host_pitch > 0`) must keep the whole-expert read: `rows` strided preads are worse than one
+  sequential read.
+* **The cold tail has no reuse, so a small shared ring buys nothing.**  An expert that neither the arena nor the
+  pool holds was routed again within a 4-entry per-host-tensor ring window **0.5 % of the time** (20 860 reads,
+  96 hits, 122B pair), and a tensor split's two devices do **not** both miss the same expert in the same window
+  (the pool is one object per host tensor and already dedupes the policy path).  A "small extra tier for the
+  cold tail" is therefore a byte-for-byte re-read: do not build one without a trace that says otherwise.
+* **The read is bandwidth-bound at single-queue depth, with ~1.8x available at depth 4.**  64 random 1.77 MiB
+  `O_DIRECT` reads of the real shard: depth 1 **3.3 GiB/s** (0.50 ms, matching the measured 0.531 ms fallback
+  fill), depth 2 4.9, depth 4 **5.8**, depth 8 6.0.  So a faster demand path exists in principle, but a depth
+  needs several misses known at once and the only *exact* lookahead is within one layer (gate/up/down share the
+  routing ids), which bounds it at ~2.  That is a scheduler change (cross-role prefetch + a lock-free fill
+  worker), recorded in `archive/work/host-pool-demand-overlap/`, not a pool knob.
+* **`gate-prefill-logits.sh --record` overwrites a base that a different `--ab` arm recorded.**  The base file is
+  keyed by model + shape + ubatch, not by the arm, so re-recording the `xncmoe-48-ub2048` point with a new `--ab`
+  destroys the previous arm's base (r261 did this to the r258 `MOE_EXPERT_PREFILL_IN_PLACE=0` base).  Re-record
+  before quoting that arm again.

@@ -1,0 +1,199 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 474166cef..377b49248 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -3147,6 +3147,32 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+ 
+ // Per-scheduler state for the copy helper below (the ids readback cache: consecutive
+ // expert inputs of one split, e.g. a merged gate/up pair, share the routing ids).
++
++// ---- TODO #132 probe (NOT FOR SHIPPING): decompose the host-side cost of a host-expert input copy ----
++struct probe132_stats {
++    int64_t n_upd = 0, upd_us = 0;          // inside moe_cache_update (fills + copies)
++    int64_t n_sync_in = 0, sync_in_us = 0;  // ggml_backend_synchronize(input_backend)
++    int64_t n_rb = 0, rb_us = 0;            // ids readback + its synchronize
++    int64_t n_copy = 0, copy_us = 0;        // the whole host-weight input copy case
++};
++static probe132_stats g_probe132;
++static bool probe132_on() { static const bool on = getenv("MOE_PROBE_132") != nullptr; return on; }
++static void probe132_report() {
++    if (!probe132_on()) { return; }
++    fprintf(stderr, "PROBE132 update: %lld calls %.1f ms total (%.3f ms/call)\n",
++            (long long) g_probe132.n_upd, g_probe132.upd_us / 1000.0,
++            g_probe132.n_upd ? (double) g_probe132.upd_us / 1000.0 / (double) g_probe132.n_upd : 0.0);
++    fprintf(stderr, "PROBE132 sync_in: %lld calls %.1f ms total (%.3f ms/call)\n",
++            (long long) g_probe132.n_sync_in, g_probe132.sync_in_us / 1000.0,
++            g_probe132.n_sync_in ? (double) g_probe132.sync_in_us / 1000.0 / (double) g_probe132.n_sync_in : 0.0);
++    fprintf(stderr, "PROBE132 readback: %lld calls %.1f ms total (%.3f ms/call)\n",
++            (long long) g_probe132.n_rb, g_probe132.rb_us / 1000.0,
++            g_probe132.n_rb ? (double) g_probe132.rb_us / 1000.0 / (double) g_probe132.n_rb : 0.0);
++    fprintf(stderr, "PROBE132 copycase: %lld calls %.1f ms total\n",
++            (long long) g_probe132.n_copy, g_probe132.copy_us / 1000.0);
++}
++static struct probe132_reg { probe132_reg() { atexit(probe132_report); } } g_probe132_reg;
++
+ struct ggml_backend_sched_copy_state {
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+@@ -3195,6 +3221,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     auto & prev_ids_tensor = st.prev_ids_tensor;
+     auto & ids             = st.ids;
+     auto & used_ids        = st.used_ids;
++    const bool probe_host_weight = ggml_backend_sched_is_host_weight(input);
++    const int64_t probe_tcase = (probe_host_weight && probe132_on()) ? ggml_time_us() : 0;
++    struct probe132_case { bool on; int64_t t0; const char * f; ~probe132_case() {
++        if (on) { g_probe132.n_copy++; g_probe132.copy_us += ggml_time_us() - t0; } } } probe_case{probe_host_weight && probe132_on(), probe_tcase, __func__};
+ 
+     if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+         (sched_sync_graph_inputs() && ggml_backend_sched_graph_input(input) != nullptr)) {
+@@ -3388,11 +3418,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             // The input backend sync is deferred to here so the gather (which reads the static
+             // host master, not the device `input_cpy`) does not pay it: on `-sm tensor` that
+             // sync is a full meta synchronize (~1.5 ms/op when the pipeline is not drained).
++            const int64_t probe_t0 = probe132_on() ? ggml_time_us() : 0;
+             ggml_backend_synchronize(input_backend);
++            if (probe132_on()) { g_probe132.n_sync_in++; g_probe132.sync_in_us += ggml_time_us() - probe_t0; }
++            const int64_t probe_t1 = probe132_on() ? ggml_time_us() : 0;
+             if (ids_tensor != prev_ids_tensor) {
+                 ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                 ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                 ggml_backend_synchronize(ids_backend);
++                if (probe132_on()) { g_probe132.n_rb++; g_probe132.rb_us += ggml_time_us() - probe_t1; }
+ 
+                 // find the used experts
+                 used_ids.clear();
+@@ -3413,10 +3447,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             // comment in ggml-backend-impl.h).  Inert unless the backend implements it and
+             // MOE_EXPERT_CACHE_MIB is set.
+             if (split_backend->iface.moe_cache_update != NULL) {
++                const int64_t probe_t2 = probe132_on() ? ggml_time_us() : 0;
+                 const bool took = split_backend->iface.moe_cache_update(
+                         split_backend, input, input_cpy, ids.data(),
+                         ids_tensor->ne[0], ids_tensor->ne[1],
+                         ids_tensor->nb[0], ids_tensor->nb[1], 0, -1, nullptr, 0);
++                if (probe132_on()) { g_probe132.n_upd++; g_probe132.upd_us += ggml_time_us() - probe_t2; }
+                 if (took) {
+                     // the cache filled its compact slots and staged the slot-remapped ids; the
+                     // consuming op reads the arena (see `moe_cache_get_table`), so the whole
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 230b94301..56d9b8175 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -3247,12 +3247,54 @@ static bool pool_sink_fault() {
+     return on;
+ }
+ 
++
++// ---- TODO #132 probe (NOT FOR SHIPPING): the DEMAND fill's wall time, split by source ----
++struct probe132_fill_stats {
++    int64_t n_poolfill = 0, poolfill_us = 0;   // pool_fill_empty_locked from the demand path
++    int64_t n_bounce = 0, bounce_us = 0;       // the bounce-ring path (acquire + read/memcpy)
++    int64_t n_src = 0, src_us = 0;             // the whole expert_host_src call
++    int64_t n_src_d = 0, src_d_us = 0;         // the same, reached from a DECODE-band hook
++    int64_t n_poolfill_d = 0, poolfill_d_us = 0;
++    int64_t n_bounce_d = 0, bounce_d_us = 0;
++};
++static probe132_fill_stats g_probe132f;
++int g_probe132_in_update = 0;   // >0 while a DECODE-band moe_cache_update_host is running
++static bool probe132f_on() { static const bool on = getenv("MOE_PROBE_132") != nullptr; return on; }
++static void probe132f_report() {
++    if (!probe132f_on()) { return; }
++    fprintf(stderr, "PROBE132 demand-band expert_host_src: %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_src_d, g_probe132f.src_d_us / 1000.0,
++            g_probe132f.n_src_d ? (double) g_probe132f.src_d_us / 1000.0 / (double) g_probe132f.n_src_d : 0.0);
++    fprintf(stderr, "PROBE132 demand-band   pool fill: %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_poolfill_d, g_probe132f.poolfill_d_us / 1000.0,
++            g_probe132f.n_poolfill_d ? (double) g_probe132f.poolfill_d_us / 1000.0 / (double) g_probe132f.n_poolfill_d : 0.0);
++    fprintf(stderr, "PROBE132 demand-band   bounce:    %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_bounce_d, g_probe132f.bounce_d_us / 1000.0,
++            g_probe132f.n_bounce_d ? (double) g_probe132f.bounce_d_us / 1000.0 / (double) g_probe132f.n_bounce_d : 0.0);
++    fprintf(stderr, "PROBE132 ALL expert_host_src: %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_src, g_probe132f.src_us / 1000.0,
++            g_probe132f.n_src ? (double) g_probe132f.src_us / 1000.0 / (double) g_probe132f.n_src : 0.0);
++    fprintf(stderr, "PROBE132   pool fill: %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_poolfill, g_probe132f.poolfill_us / 1000.0,
++            g_probe132f.n_poolfill ? (double) g_probe132f.poolfill_us / 1000.0 / (double) g_probe132f.n_poolfill : 0.0);
++    fprintf(stderr, "PROBE132   bounce:    %lld calls %.1f ms (%.3f ms/call)\n",
++            (long long) g_probe132f.n_bounce, g_probe132f.bounce_us / 1000.0,
++            g_probe132f.n_bounce ? (double) g_probe132f.bounce_us / 1000.0 / (double) g_probe132f.n_bounce : 0.0);
++}
++static struct probe132f_reg { probe132f_reg() { atexit(probe132f_report); } } g_probe132f_reg;
++
+ // TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
+ // the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
+ // Caller holds `g_mutex`.
+ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, bool allow_empty_fill,
+                             expert_src_t * out, const char ** why = nullptr, bool prefill = false) {
+     *out = expert_src_t{};
++    const int64_t pf_t0 = probe132f_on() ? ggml_time_us() : 0;
++    const bool pf_demand = probe132f_on() && g_probe132_in_update > 0;
++    struct probe132f_case { bool on; bool d; int64_t t0; ~probe132f_case() {
++        if (on) { const int64_t dt = ggml_time_us() - t0;
++                  g_probe132f.n_src++; g_probe132f.src_us += dt;
++                  if (d) { g_probe132f.n_src_d++; g_probe132f.src_d_us += dt; } } } } pf_case{probe132f_on(), pf_demand, pf_t0};
+     if (why != nullptr) {
+         *why = nullptr;
+     }
+@@ -3295,7 +3337,13 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+             return true;
+         }
+         if (allow_empty_fill) {
++            const int64_t pf_t1 = probe132f_on() ? ggml_time_us() : 0;
+             p = pool_fill_empty_locked(*pool, expert, &s, prefill);
++            if (probe132f_on()) {
++                const int64_t dt = ggml_time_us() - pf_t1;
++                g_probe132f.n_poolfill++; g_probe132f.poolfill_us += dt;
++                if (pf_demand) { g_probe132f.n_poolfill_d++; g_probe132f.poolfill_d_us += dt; }
++            }
+             if (p != nullptr && s >= 0) {
+                 out->base      = pool_h2d ? (const char *) pool->base + (size_t) s * pool->host_bytes
+                                           : (const char *) pool->base_dev + (size_t) s * pool->host_bytes;
+@@ -3318,6 +3366,7 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+     // copied out of the model mapping instead -- the same bytes, only with the page cache populated.  A hard
+     // failure here is a WRONG ANSWER, not a slow one: the demand path cannot serve the expert at all, and it
+     // used to record the slot as resident anyway (`access_locked`).
++    const int64_t pf_t2 = probe132f_on() ? ggml_time_us() : 0;
+     const int idx = bounce_acquire(t);
+     if (idx < 0) {
+         static bool warned_ring = false;
+@@ -3378,6 +3427,11 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+     out->base    = buf;
+     out->kind    = cudaMemcpyHostToDevice;
+     out->bounce  = idx;
++    if (probe132f_on()) {
++        const int64_t dt = ggml_time_us() - pf_t2;
++        g_probe132f.n_bounce++; g_probe132f.bounce_us += dt;
++        if (pf_demand) { g_probe132f.n_bounce_d++; g_probe132f.bounce_d_us += dt; }
++    }
+     return true;
+ }
+ 
+@@ -8565,6 +8619,14 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     }
+     std::lock_guard<std::mutex> lock(g_mutex);
+     table_t & t = g_tables[table];
++    if (probe132f_on()) {
++        static std::set<int> seen;
++        if (seen.insert(table * 0 + (int) t.layer * 8 + (int) (t.role[0]=='f' ? (t.role.size()>8 && t.role[8]=='d' ? 2 : (t.role.find("gate")!=std::string::npos?0:1)) : 3)).second) {
++            fprintf(stderr, "PROBE132 GEOM layer=%d dev=%d role=%s n_experts=%d expert_bytes=%zu host_bytes=%zu src_off=%zu host_pitch=%zu split_axis=%d n_slices=%d host_pinned=%d\n",
++                    t.layer, t.device, t.role.c_str(), t.n_experts, t.expert_bytes, t.host_bytes, t.src_off,
++                    t.host_pitch, t.split_axis, t.n_slices, (int) t.host_pinned);
++        }
++    }
+     // issue #294: this is the one path that issues DEVICE copies from a scheduler callback, so it owns the
+     // device the copies run on.  `cudaMemcpyAsync`/`cudaMemcpy2DAsync` -- and the `cudaHostAlloc` bounce
+     // allocation a pageable master needs -- resolve against the CURRENT device, while the table, its arena
+@@ -8627,6 +8689,13 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         return false;   // decode/verify band only
+     }
+ 
++    // TODO #132 probe (NOT FOR SHIPPING): from here on this call is a DECODE-band demand pass.
++    struct probe132_demand_guard {
++        bool on;
++        explicit probe132_demand_guard(bool o) : on(o) { if (on) { g_probe132_in_update++; } }
++        ~probe132_demand_guard() { if (on) { g_probe132_in_update--; } }
++    } probe132_guard(probe132f_on());
++
+     // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
+     // in full.  Re-derive the host pool's warm order from it once (the staged prefill never feeds
+     // `prefill_count`, and the device tally is the only record of that routing).  Gated on

@@ -32,7 +32,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
-| **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
@@ -117,30 +116,6 @@ native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style
 **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116
 
 The index row also recorded the r209-era kernel trace split: `mul_mat_fp8_wmma` **71.9 %**, `fp8_repack_weights` **7.3 %**, staging **3.3 %**, FA **1.3 %**.
-
-## 132. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
-
-**Status: open, measured 2026-11-03 (`archive/work/host-pool-speed/` README §18.4).**  On the 2-GPU x8 pair at `FRAC 80` the
-pool decodes 26.08 against `pinned`'s 39.72 (-34 %), and the fill accounting says **86 % of that gap is one
-synchronous `O_DIRECT` read per uncovered expert per decode step**: 20.7 demand fills/token at ~0.55 ms = ~11.3 ms
-of a 38.3 ms step (29 %), against 5.1 fills/token = ~5.2 ms of a 56 ms step (9 %) on one GPU — which is why §16.3
-correctly declined an overlap worker at a ~6 % ceiling there.  On a multi-device split the miss set is per device
-and the fill stays on one host thread, so the ceiling is ~25-30 % (and ~0 at full coverage / the 3-GPU shape where
-the arena holds the whole set: 49.48-51.03 vs 51.97-52.04, i.e. **-1.8 %**, inside PR #267's own envelope).  The
-tensor-split remap that this note used to rank against landed in r221 (`#269`, +16.1 % / +28.4 % at 2 / 3 devices),
-so the demand read is what is left of the pair's decode deficit -- and it is a different cost (a fill, not a sync),
-so the two do not overlap.  Protocol: re-screen with
-`scripts/moe-trace-replay.py` first (`archive/work/host-pool-speed/README.md` §9.6 — an overlap does not change placement, so the
-model cannot score it directly; use it to size the residual demand), then build the worker behind a kill switch and
-gate it on the pair at `-ncmoe 48`, `FRAC` 80, with text + MTP acceptance + faults.
-
-**The index row's detail (kept here so the table can stay a dashboard):**
-
-The pool's pair decode deficit is the synchronous demand read (~11.3 ms/token = 29 % of the step); re-open the overlap worker the 1-GPU ~6 % ceiling declined (`archive/work/host-pool-speed/README.md` §16.3)
-
-**Kind:** performance.
-
-**OPEN** (2026-11-03, `archive/work/host-pool-speed/README.md` §18.4).  See §132
 
 ## 141. A sub-complement host-expert budget declines the eager take-over at wide decode
 

@@ -1,3 +1,62 @@
+## 261111.003 (r261) -- `TODO` #132 retires: the demand read's OVERLAP premise is refuted, and the read was pulling twice the bytes a `-sm tensor` device needs
+
+**Change:** block 12, `ggml/src/ggml-cuda/moe-expert-cache.cu` only (+30/-5): `expert_host_src`'s fallback
+fill reads **this device's contiguous slice** of the host expert instead of the whole expert, under
+`MOE_HOST_POOL_SLICE_READ` (default on, `=0` = the old whole-expert read).  Re-cut: base `a691b2345`, 16
+blocks, tree `86389e4a…`, tip `030c8997d…`, release `v16-a691b2345-r261`.  Campaign (closed, archived):
+[`archive/work/host-pool-demand-overlap/`](archive/work/host-pool-demand-overlap/README.md); numbers and
+protocol: [`benchmarks/2026-11-11-host-pool-slice-read.md`](benchmarks/2026-11-11-host-pool-slice-read.md).
+
+1. **The item's mechanism is refuted by a decomposition, not by opinion.**  A temporary probe (kept in the
+   campaign as `probe-132.patch`, **not shipped**) timed a decode step on the arm the item was opened on
+   (122B-A10B Q4_K_XL, `-ncmoe 48`, `-lme 54`, 2-GPU x8 pair, `-sm tensor`, `DIO=1`, 58.6 ms/step): **the ids
+   readback + its full meta-backend synchronize is 24.0 ms/token (48 calls) and that IS the device's compute;
+   `moe_cache_update_host` is a further 33.2 ms/token (145 calls) during which the device is idle**, of which
+   the decode-band demand source is 31.7 ms (96 calls: 44.6 bounce reads at 0.531 ms = 23.7 ms, plus ~60 pool
+   fill attempts).  A decode graph is 50 splits (one per layer) and the host copies each split's host-weight
+   inputs — beginning with a synchronize — *before* dispatching that split, so at the instant the routing (and
+   the miss set) is known the device has nothing in flight.  "Overlap the current ubatch's misses with the
+   previous ubatch's compute" needs a host that runs ahead of the device; this path structurally does not have
+   one, and the hook's single global mutex means a worker would have to read outside the lock to run at all.
+2. **What the read was doing wrong: reading the peer's half.**  On a tensor split each device owns a slice, and
+   for `gate`/`up` it is CONTIGUOUS (`CACHE_GEOM`: `expert_bytes 884736 host_bytes 1769472 src_off 0
+   host_pitch 0 split_axis 1`); the consumer copies exactly that run, but the fill read all 1 769 472 B, so
+   every cold expert cost double.  The fix reads `expert_bytes` at `off + src_off` into the entry at `src_off`,
+   which leaves `copy_slot_from_src` (and its four consumers: the bounce, `fill_slot_from_host`, the prefill
+   gather, the staging fill) untouched.  A strided slice (`host_pitch > 0`, axis-0 `down_exps`) or a fused
+   table keeps the whole-expert read: one sequential read beats `rows` strided ones.
+3. **Measured** (`-n 1000`, same binary, `MOE_HOST_POOL_SLICE_READ=0` is the arm): pair **18.98 -> 20.12 t/s
+   decode (+6.0 %), 844.9 -> 917.8 prefill (+8.6 %), 193 221 -> 173 354 MiB disk (-10 %)**; 3 GPUs **48.96 ->
+   49.33 decode (flat, that arena is 99.6 % resident), 1126.9 -> 1406.8 prefill (+24.8 %), 102 998 -> 86 487 MiB
+   (-16 %)**; 1 GPU **20.44 -> 20.45 / 569.9 -> 580.7 (inert, as the geometry predicts: one device owns the
+   whole expert)**.  The `pinned` control on the same session is 43.55 / 1617.9, so the pair's pool deficit is
+   still -54 % -- this buys a sixth of it, and the residue is the coverage (`#141`) and devremap class, named in
+   the campaign.
+4. **A shared demand ring across the two devices was built and REFUTED.**  Hypothesis: both devices miss the
+   same cold expert microseconds apart, so a reusable per-host-tensor ring of whole experts would halve the
+   reads.  Implemented (4 entries/table, LRU, `slots + i` in the pool's own allocation, reusing its
+   per-(entry, device) drain events, 1 188 MiB pinned) and measured: **20 860 ring reads against 96 hits =
+   0.5 %**, decode 16.95 against 17.06 t/s, disk unchanged.  The cold tail is genuinely cold and the devices do
+   not duplicate.  Reverted; nothing of it is in `patches/`.
+5. **Gates.**  Text byte-identical everywhere: pair host-expert `-n 128` **`fa20f8883726`** across slice/whole
+   **and the r259 binary**; dense 4B 1 GPU `51daef9ef546` (old and new binary); `gate-host-pool.sh` with the
+   new build **42/42 checks passed**, every arm `a99ccbd97ecb` except the known `pinlate` mixture (`#282`);
+   `gate-prefill-logits.sh --record --ab "MOE_HOST_POOL_SLICE_READ=0"` (35B-A3B Q8_0, 3 devices `-sm tensor`,
+   `-ncmoe 48`, `-ub 2048`) **mean KLD -0.000000 / same-top-p 100.000 %**, i.e. the two read geometries produce
+   the same logits; `gate-per-block-build.sh --changed-from c80fa8bda… --fast` **2/2 built** (block 12's delta
+   + the tip, 24 s); `validate-set.sh` green on a fresh tarball (tree `86389e4a…`); `check-gpu-faults.sh` clean.
+   MTP is not owed (a read-geometry change cannot move acceptance, and the target's token stream is identical),
+   and no prefill *kernel* is touched.  Note for the next session: the `--record` above **overwrote** the
+   `xncmoe-48-ub2048` base file, which previously carried the r258 `MOE_EXPERT_PREFILL_IN_PLACE=0` arm — that
+   A/B's base must be re-recorded before it is quoted again (the base file is keyed by model+shape, not by arm).
+6. **`TODO` #132 is retired** (the item, its index row and its detail section are gone; `#NN` is never reused).
+   What it pointed at that is still real: (a) **coverage** on a sub-complement budget (`#141`), (b) the
+   **devremap** needs a cold source the device can resolve, which is what keeps the per-layer synchronize — and
+   therefore the host/device serialisation — in place, and (c) a **cross-role prefetch + lock-free fill worker**
+   (gate/up/down share the routing ids, so the depth bound is ~2; ~1.8x on the read wall is available at depth 4
+   from the queue-depth probe), which is a scheduler change, not a pool one, and is recorded in the campaign
+   rather than opened as an item.
+
 ## 261111.002 (r260, docs + artifact, NO delivery change) -- optional/two-lane-prefill: PR #301 taken as an r259 re-cut, and the host-expert abort it was hiding
 
 **Change:** `optional/two-lane-prefill/` only -- `two-lane-prefill.patch` re-cut onto the r259 tree
