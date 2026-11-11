@@ -1,3 +1,78 @@
+## 261111.001 (r259, RELEASE v17-a691b2345-r259) -- contributor PR #298: an 8-bit wire for the copy-engine all-reduce, as `GGML_CUDA_ALLREDUCE=q8ce`
+
+**Shipped:** `v17-a691b2345-r259` (block **01** amended, +317/−3 in `ggml/src/ggml-cuda/ggml-cuda.cu`), base
+`a691b2345`, tip `f7d40dab4ffbfe1f5edc22a421872ad4ae257135`, tree
+`dc225b37947d256a024e5a858210f6ccbc9eae54`, 16 blocks, all 17 artifact hashes refreshed.  Co-authored-by on
+the block commit credits @mjohanning99 (`3389797+mjohanning99@users.noreply.github.com`).
+
+1. **Accepted, on the concept, not on the cut.**  PR #298 (`optional/ce-q8-wire/`, `GGML_CUDA_AR_CE_WIRE=q8|q8h`)
+   creates a thread: the copy-engine all-reduce's partial sums, sent as q8_0 blocks (34 B per 32 values, 53 % of
+   the bf16 bytes) of Walsh-Hadamard-rotated values, so one outlier cannot set a block's scale.  The concept is
+   sound and the numbers reproduce; the *cut* is not shippable as delivered.  r259 reworks it onto the existing
+   copy-engine chain as an **algorithm of its own** — `GGML_CUDA_ALLREDUCE=q8ce`, no new environment variable, the
+   wire fixed by the chain at init — and fixes four things the contributed artifact got wrong or could not reach
+   on this box: it required **exactly two ranks** (so it was unreachable on the delivery's own 3-device
+   configuration, which is where it is worth the most), it split the tensor at **element** boundaries (`ne/n`)
+   rather than whole q8_0 blocks (a block straddling two chunks is rotated over different data on the two sides
+   and the reduced sum is meaningless — the `ne % 64 == 0` gate is block-aligned for two ranks and not for
+   three), it sized the q8 receive regions only by inspection ("the scratch is sized for bf16, so the q8 data
+   always fits"), and it offered `q8` beside `q8h` when the two measure the same error and `q8h` is better on
+   every other quality axis.
+2. **The default arm did not move, and that is the release gate for this change.**  `gate-prefill-logits.sh`
+   against a base recorded from the r258 build: mean KLD **0.000000 / 100.000 %** on 2 devices (f16 KV), on 2
+   devices (q8_0 KV) and on 3 devices.  Nothing except the `q8ce` value can set the wire, so nothing in the
+   default path is reachable.
+3. **The selected arm is an approximation that happens to pass the gate.**  `--candidate-env
+   "GGML_CUDA_ALLREDUCE=q8ce"` reads **0.000697 / 98.667 %** (2 devices, f16 KV), **0.000681 / 98.833 %** (2
+   devices, q8_0 KV) and **0.000781 / 98.824 %** (3 devices) — inside the 0.005 / 98.0 % limits, so it is quoted
+   as a passing approximation and **not** as rounding level, which is why it is never default and why `auto`
+   cannot select it.  The q8_0 KV cache adds nothing on top, i.e. the wire dominates.  The contributor's gate run
+   read 0.003321 / 97.706 % and failed on top-p; that is the measurement point (a q8_0 KV on a heterogeneous
+   pair, a different model), not the mechanism — both numbers are recorded with their points.
+4. **It is worth more here than the contributed writeup expected.**  The submission attributes the gain to a
+   chipset PCIe 3.0 x4 slot; the halved payload also pays on this all-x8/x16 box, and more at three devices than
+   at two: 3x R9700 27B Q8_0 `pp4096` **2130 -> 2404 t/s (+12.9 %)**, 35B-A3B Q8_0 **4400 -> 4819 (+9.5 %)**,
+   2-device x8 pair **+2.5 %** (two interleaved rounds each).  Decode is flat on the 3-device arms and
+   **-0.4/-0.9 % at `tg128` on the 2-device pair**, where a 64/128-token all-reduce is above the CE crossover and
+   so pays the wire's extra quantize/dequantize on a transfer too small to benefit -- recorded as the arm's cost,
+   not smoothed over.  The contributor
+   measured +17-21 % on a bandwidth-starved pair and a reporter (@kapitalmouse) reproduced +18-21 % on a
+   bifurcated PCIe 5.0 x8/x8 pair.
+
+**MTP (Protocol A, four axes, `-sm tensor` 2 GPUs `0,2`, 27B Q8_0, f16 KV, `-n 3000`, seed 42, temp 0,
+`--reasoning` per axis).**  Acceptance is healthy on every arm (`K` 0.99200, `C` 0.91041 -> 0.89967, `P`
+0.82635 -> 0.82982, `R` 0.59628 -> 0.59333), MTP beats plain decode on every axis and both wires (R 2.1x,
+P 2.6x, C 2.8-2.9x, K 3.0x), and `q8ce` is **MTP-neutral**: plain 32.8-33.9 vs 32.8-33.6 t/s, `draft-mtp`
+69.7-99.8 vs 69.9-100.1 t/s, all inside the run-to-run spread.  The one visible move is the **code axis
+acceptance, -1.2 %** (0.91041 -> 0.89967) -- the wire shifts the verify logits slightly, so a near-tie can
+flip a draft token in a thousand; the draft/verify band is not on the wire at all (a verify batch is
+decode-sized and goes to the internal pipeline), which is why acceptance barely moves.  Rule 5
+(`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, 27B Q4_K_M, q8_0 KV, 2 rounds): within noise at B=1
+(pp 308.6/314.2 vs 322.6/320.2, tg 46.04/46.07 vs 46.03/46.41) and no worse at B=4/B=8.  **The first pass of
+this gate was run without `-sm tensor`** (a layer split has no all-reduce): all 16 `ce`/`q8ce` numbers came
+back identical to the decimal, which is the negative control that proves the arm is genuinely inert without a
+comm layer -- kept in the record, because "the wire fired" measured on a layer split is a 0-launch arm.
+
+**Text purity** (`none` vs `draft-mtp n3` vs `n7`, `-n 64`, no `-lv`, `-sm tensor` 2 GPUs): all nine arms
+(`auto`/`ce`/`q8ce`) hold 266 chars and `33ae8d598e7e`.  So the wire's loss is small enough that 64 greedy
+tokens do not flip on this prompt; it takes a longer run to see it, which is why the logits instrument
+(the gate above), not a short text hash, is what judges this arm.
+
+**Greedy text.**  temp 0, seed 42, no `-lv`, `extract-generated.py`: `auto` == `ce` == `q8ce` at 32 tokens
+(`1ed53a5c6070`), and at 200 tokens `ce` `8b11d62be12a` (915 chars) vs `q8ce` `21adce75f18e` (910 chars) — a
+coherent, near-identical continuation, which is the shape a small per-element approximation should have.  A
+`-lv 4` prefill run printed no `cannot use the 8-bit wire` line, so no large all-reduce declined.
+
+**Arms that are inert by construction, and were run anyway.**  1 device (`GGML_CUDA_ALLREDUCE=q8ce`, no comm
+layer) and `-sm layer` (no all-reduce) both generate normally; a split of more than 17 ranks and a tensor that is
+not a multiple of 32 fall back to the bf16 wire with one WARN — a downgrade, never an abort.
+
+**Also:** `scripts/validate-set.sh` strict 16/16; the per-block build gate over the amended block; the
+prefill-logit gate is the one above (its own kernel-journal fault check clean on every run).  The superseded
+artifact is **not** placed under `optional/` — the delivery now carries the feature, so a second copy would be a
+stub by another name.  Bench record: `benchmarks/2026-11-11-allreduce-q8ce-wire.md`; facts:
+`INVARIANTS.md` (r259); knobs: `ENVIRONMENT.md` (`GGML_CUDA_ALLREDUCE`).
+
 ## 261110.014 (r258, delivery) -- `TODO` #133 retires: an identity expert table is served IN PLACE in the prefill band (+171 % on the pinned tier), and `TODO` #142 is measured fixed
 
 **Shipped:** `v16-a691b2345-r258` (block **12** amended, +220/−34 across 9 files), base `a691b2345`,

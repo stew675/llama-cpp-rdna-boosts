@@ -3938,3 +3938,40 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   repeated) the pool pays ~0.12-0.15 s, a pinned master ~0.29 s and `MOE_EXPERT_CACHE_MIB=0` ~0.88 s, and
   `MOE_HOST_POOL_PREWARM=0` moves it by ~0.03 s.  Re-check that ladder, not the pool, if a large box reports a
   multi-second first prefill again.
+
+## r259 — a lossy all-reduce wire is an ALGORITHM, and its chunk boundaries must be whole quant blocks (contributor PR #298)
+
+* **A lossy wire cannot be a knob on a bit-identical arm.**  `GGML_CUDA_ALLREDUCE=q8ce` (the copy-engine chain
+  whose large-tensor payload is q8_0 blocks of Walsh-Hadamard-rotated values) reads mean KLD **0.000697 /
+  same-top-p 98.667 %** against the bf16 wire on the delivery's own 2-device `-sm tensor` point (27B Q8_0,
+  f16 KV, 40 chunks) and **0.000781 / 98.824 %** on 3 devices.  That *passes* the prefill-logit gate's limits,
+  and it is still not rounding level: the delivery's default arm must stay at 0.000000, so the wire is
+  selected only by its own algorithm name and **nothing else — not `auto` — sets it**.  The same reasoning
+  applies to any future 8-bit/4-bit payload on a delivery path: prove the default arm at 0.000000 first, then
+  quote the selected arm's own number (the contributor's run read 0.003321 / 97.706 % at a *different* point —
+  a q8_0 KV on a heterogeneous pair — which is why a lossy arm's number is only meaningful with its point).
+* **A per-block rotation forces block-aligned chunk boundaries.**  The rotation is a 32-point transform of a
+  q8_0 block, so a chunk that starts or ends mid-block would be rotated over *different* data on the two sides
+  and the reduced sum would be meaningless.  The contributed cut divided the element count by the rank count
+  (`off[c] = c*ne/n + min(c, ne%n)`) and gated on `ne % 64 == 0`, which happens to be block-aligned for two
+  ranks and is not for three; r259 distributes **whole q8_0 blocks** (`qblk[c] = nblk/n + (c < nblk%n)`) and
+  needs only `ne % 32 == 0`.
+* **"n == 2 only" is what made the feature unreachable here, not a hardware limit.**  The contributed cut
+  required exactly two ranks, so on this delivery's 3-device box it could not engage at all — and the 3-device
+  arm is where it pays most (+13.4 % prefill on 27B Q8_0, against +1.7 % on the 2-device x8 pair).  The
+  reduce-scatter/all-gather is rank-count agnostic; phase 1b sums `n-1` dequantized peer slices through one
+  pointer struct, which is the only change a third rank needs.
+* **The wire is MTP-neutral, and a layer-split arm measures nothing.**  Protocol A at a 2-GPU `-sm tensor`
+  split reads acceptance 0.99200 / 0.91041 -> 0.89967 / 0.82635 -> 0.82982 / 0.59628 -> 0.59333 and
+  `draft-mtp n3` 69.7-99.8 t/s against `ce`'s 100.1-69.9, i.e. inside the run-to-run spread apart from a
+  -1.2 % acceptance move on the code axis (a near-tie flipping one draft token in a thousand).  The
+  draft/verify band never enters the wire: a verify batch is decode-sized, so the dispatcher sends it to the
+  internal pipeline.  The same gate run by accident on the **default `layer` split** returned all 16
+  `ce`/`q8ce` numbers **identical to the decimal** — a layer split has no comm layer at all, so an all-reduce
+  arm judged on one measures a 0-launch path.  Always name the split.
+* **The wire's benefit is NOT confined to a slow link.**  The contributed writeup attributes the gain to a
+  chipset PCIe 3.0 x4 slot, and that is where the largest numbers came from (+17-21 %), but the halved payload
+  also pays on an all-x8 box at a 3-device split, because the exchange is a larger fraction of a prefill there:
+  3x R9700 `pp4096` 2130 -> 2404 t/s (+12.9 %) and 35B-A3B Q8_0 4400 -> 4819 (+9.5 %), against +2.5 %
+  on the 2-device x8 pair.  Decode is flat on every arm: the internal pipeline serves the decode/verify band
+  and never enters the wire.

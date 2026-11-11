@@ -209,7 +209,7 @@ only as a rough shape.
 | # | patch | subject | +/− | files |
 |---|---|---|---|---|
 | 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator (+ r237: `--lazy-mode mlockr`, i.e. populate then **release** the lazy table's pin — see the block section) | +986 / −352 | 34 |
-| 01 | `0001-…-block-01-hybrid-HIP-all-reduce-RDNA4-gat` | hybrid HIP all-reduce | +2532 / −48 | 4 |
+| 01 | `0001-…-block-01-hybrid-HIP-all-reduce-RDNA4-gat` | hybrid HIP all-reduce (+ r259: `GGML_CUDA_ALLREDUCE=q8ce` — the copy-engine chain with a **lossy, opt-in** 8-bit wire: q8_0 blocks of Walsh-Hadamard-rotated values, any rank count, +8-13 % prefill on the delivery's own 3-device box; the concept is contributor PR #298) | +2846 / −46 | 4 |
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth (+ r218: `spec_draft_align_cache()` realigns the drafter's KV with the batch it ingests, issue #272) | +1381 / −62 | 23 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker (+ r241: the conv-state store's rollback index is built once per graph per device instead of once per conv layer, `LLAMA_SHARE_SLOT_REV=0` the kill switch — GitHub issue #291) | +3362 / −31 | 25 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +602 / −193 | 8 |
@@ -359,8 +359,39 @@ gated at **mean KLD 0.001448 / same-top-p 98.676 %** against the RCCL arm on 3 d
 (`scripts/gate-prefill-logits.sh --sm tensor --device 0,1,2`, `GREEDY-PURITY.md` §67).  Numbers and the
 isolation: `benchmarks/2026-10-28-allreduce-peer-access.md`; `WORKLOG.md` 261028.007.
 
+**r259 -- `GGML_CUDA_ALLREDUCE=q8ce`: the copy-engine chain with an 8-bit wire (PR #298's concept).**  On a
+bandwidth-constrained inter-GPU link the large-tensor exchange is what a prefill waits on, so this arm sends
+34 B per 32 values instead of 64: each rank stages its contribution as **q8_0 blocks of
+Walsh-Hadamard-rotated values** (H/sqrt(32); orthogonal, linear and its own inverse, so the ranks add in the
+rotated domain and the receiving rank rotates back).  The rotation is what makes the format usable -- a single
+outlier sets the whole block's scale otherwise, and LLM activations are full of them.  Phases, scratch,
+events and ordering are the bf16 path unchanged; phase 1b reduces the rank's own chunk in fp32 against the
+dequantized peer slices and re-quantizes, and phase 2b dequantizes **both** halves of the reduced data so
+every rank still holds bit-identical values.  Two things had to be fixed relative to the contributed cut:
+the chunk boundaries are **whole q8_0 blocks** (a block straddling two chunks would be rotated over
+different data on the two sides and the sum would be meaningless), and the reduce is **n ranks**, not
+exactly 2 (the contributor's gate required `n == 2`, which is unreachable on this delivery's 3-device box --
+that restriction was worth the whole feature).  **It is lossy, so it is an algorithm of its own and not a
+knob on `ce`:** nothing else -- not `auto` -- ever sets the wire, which is why the default arm stays
+bit-identical (mean KLD **0.000000** against the previous release on 2 and 3 devices).  Selected, it reads
+mean KLD **0.000697 / same-top-p 98.667 %** (27B Q8_0, f16 KV, 2 devices) and **0.000781 / 98.824 %** (3
+devices), i.e. it *passes* the gate but is an approximation; the contributor's own run read 0.003321 /
+97.706 % at a different point (a q8_0 KV on a heterogeneous pair).  Worth **+12.9 % prefill** on 3x R9700
+(27B Q8_0 `pp4096` 2127.9/2132.6 -> 2393.1/2415.6 t/s, two rounds), **+9.5 %** on 35B-A3B Q8_0
+(4321.6/4477.7 -> 4836.7/4801.4), **+2.5 %** on the 2-device x8 pair, and +17-21 % on a bandwidth-starved pair;
+decode is flat on 3 devices and -0.4/-0.9 % `tg128` on the 2-device pair (a 64-token all-reduce there is above
+the CE crossover, so the wire's extra quantize/dequantize runs).  It declines -- one WARN, then the bf16 wire, never an abort -- on a tensor whose element count
+is not a multiple of 32 and on a split of more than 17 ranks.
+MTP is **neutral**: Protocol A's four axes at `-sm tensor` 2 GPUs read acceptance 0.992 / 0.89967 / 0.82982 /
+0.59333 and `draft-mtp n3` 99.8 / 92.6 / 87.1 / 69.7 t/s against `ce`'s 0.992 / 0.91041 / 0.82635 / 0.59628
+and 100.1 / 93.4 / 86.5 / 69.9 (the code axis's acceptance moves -1.2 %, a near-tie flipping one draft token,
+because the wire shifts the verify logits); `llama-batched-bench -npl 1,4,8` is within noise at B=1 and no
+worse at B=4/B=8; and `none` == `draft-mtp n3` == `n7` byte-identically on every wire, because the
+draft/verify band is not on the wire at all.
+`benchmarks/2026-11-11-allreduce-q8ce-wire.md`; `WORKLOG.md` 261111.001.
+
 **Knobs.**  `GGML_CUDA_ALLREDUCE` (`auto` default on Linux/HIP since r165, `hybrid`, `nccl`, `internal`,
-`ce`, `meta`), `GGML_CUDA_AR_CE_PEER`, `GGML_CUDA_AR_P2P*`,
+`ce`, `q8ce`, `meta`), `GGML_CUDA_AR_CE_PEER`, `GGML_CUDA_AR_P2P*`,
 `GGML_CUDA_AR_CE_SCRATCH_MIB`, `GGML_CUDA_AR_SPIN_TIMEOUT_MS` / `_HARD_MS`,
 `GGML_CUDA_AR_SMALL_BLOCKS` / `_SMALL_BYTES`, `GGML_CUDA_AR_KER_EVENTS`, `GGML_CUDA_AR_PROFILE`.
 
