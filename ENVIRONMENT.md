@@ -1177,6 +1177,45 @@ Parking on a pooled cache **declines** to the server's save-and-clear fallback: 
 cache, so growing the mirror to its destination would pin the whole context again.
 
 
+## 19. Host-read transport (block 12, `TODO` #306, r262)
+
+Which TRANSPORT serves a per-expert host read (`--host-experts pool`): the model **mapping** (a `memcpy` out of
+the page cache), a **buffered `pread`** through the page cache, or **`O_DIRECT`**.  All three read the same bytes,
+so the choice can only change timing -- proven: greedy text `sha=de81b28cab7d` on every arm, and the MTP
+four-axis acceptance is identical to five decimal places across the arms.
+
+`--load-mode` names the transport as well: **`buffered` is new** (a *mapped* master whose host reads are buffered
+`pread`s -- the combination that used to be unrepresentable).  `mmap` / `buffered` / `dio` **lock** the arm;
+`auto` (the default) is the adaptive one; `none` / `mlock` / `mmap+mlock` keep their meaning.
+
+| variable | default | class | meaning |
+|---|---|---|---|
+| `MOE_HOST_POOL_TRANSPORT` | `auto` via `--load-mode` | pin / A/B | `map`, `file`, `dio` lock one transport; `auto` is the ladder below.  Wins over `--load-mode`. |
+| `MOE_HOST_POOL_TR_STALL_K` | `400` (= 4.0x) | tuning | a **stall** is a read that took K times this arm's own running mean, so nothing here is a latency or a rate in absolute units |
+| `MOE_HOST_POOL_TR_STALL_N` | `4` | tuning | consecutive stalls before the ladder moves |
+| `MOE_HOST_POOL_TR_PROBE_FILLS` | `128` | tuning | every Nth **fill is served by the next arm** instead (the probe-fill A/B: same bytes, no extra I/O) |
+| `MOE_HOST_POOL_TR_PROBE_GAIN` | `150` (= 1.5x) | tuning | the next arm must win by this much, `PROBE_N` samples running |
+| `MOE_HOST_POOL_TR_PROBE_GAIN_DIO` | `300` (= 3.0x) | tuning | entering `O_DIRECT` needs a bigger win: it bypasses the page cache, so a single-read win can be a mirage |
+| `MOE_HOST_POOL_TR_PROBE_N` | `3` | tuning | consecutive probe wins that latch the next step |
+| `MOE_HOST_POOL_FILL_SRC` / `_DEMAND_SRC` | unset | **diagnostic** | `file` moves only the pool fill / only the bounce read.  The static split the campaign measured with; the shipping control is `MOE_HOST_POOL_TRANSPORT` |
+| `MOE_HOST_POOL_TR_START` | unset | **diagnostic** | start on a named arm (`map`/`file`/`dio`) while still monitoring -- the only way to stage an escalation test |
+
+**`auto` is one way.**  It starts optimistically on the **mapping** (the arm whose advantage is cache-dependent,
+so it should be sampled rather than predicted) and falls `map -> file -> dio`, never back: a box that fell short
+once is likely to again, and the page cache a reverse switch would rebuild may be the thing that caused the
+shortfall, so a slower consistent point beats a flapping optimum.  Every transition is logged with its evidence
+(`stall: ...` / `probe fill: ...`), and the exit census reports the arm, the switch count and the probe/fill split
+-- a benchmark arm that moves is NOT reproducible, so pin the transport when measuring.
+
+**Measured (r262).**  Unpressured, the three arms are equal end to end (decode 25.9-26.2 t/s on the 56 GiB rig;
+O_DIRECT 11.2).  Under pressure the mapping collapses -- fills **1.5-1.6 GiB/s, decode 5.5-6.3 t/s** in a 32G
+scope -- where the buffered arm holds **12.8-12.9** and `auto` reaches it on the stall detector.  `batched-bench
+-npl 1,4,8` is neutral at width.  Gate: `scripts/gate-host-read-transport.sh`.
+
+**The coupling.**  A per-expert buffered read without the coalesced prefill span is the measured **-41 %** pair, so
+`MOE_HOST_POOL_STAGE_SPAN=0` **refuses** the buffered arm (it falls back to the mapping) and the ladder steps over
+`file` to `dio`.  Nothing an operator can type lands in that pair.
+
 ## 18. Optional artifacts (`optional/`) — **not part of the delivery**
 
 These exist only in a checkout made with `scripts/apply-all.sh --include-optional` (`[y/N]` per artifact) or
@@ -1188,7 +1227,7 @@ who applies an optional artifact is running these code paths and needs the same 
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `MOE_HOST_POOL_FILL_SRC` | unset = the pool's **file** (buffered `pread`) | kill-switch (value) | `map` restores the pre-r232 fill: one `memcpy` per expert out of the read-only model mapping.  Both read the same page-cache pages, so the pool contents are identical and only the transport changes — a mapped fill on Windows is a demand fault per 4 KiB page (715 MiB/s measured) where a buffered `pread` gets the OS readahead.  **Keep `MOE_HOST_POOL_STAGE_SPAN` on:** this arm is +38 % *on top of* the coalesced span and −41 % with the span off.  Inert where the disk tier is on (an O_DIRECT fill already reads the file), where the arena serves the table, and where the pool file I/O is a stub.  `optional/host-pool-fill-src` only. |
+| `MOE_HOST_POOL_FILL_SRC` | unset = the pool's **file** (buffered `pread`) | kill-switch (value) | (**SUPERSEDED in r262 by the delivery's `MOE_HOST_POOL_TRANSPORT` / `--load-mode buffered`** -- §19.  Kept because the artifact still applies to older trees.) `map` restores the pre-r232 fill: one `memcpy` per expert out of the read-only model mapping.  Both read the same page-cache pages, so the pool contents are identical and only the transport changes — a mapped fill on Windows is a demand fault per 4 KiB page (715 MiB/s measured) where a buffered `pread` gets the OS readahead.  **Keep `MOE_HOST_POOL_STAGE_SPAN` on:** this arm is +38 % *on top of* the coalesced span and −41 % with the span off.  Inert where the disk tier is on (an O_DIRECT fill already reads the file), where the arena serves the table, and where the pool file I/O is a stub.  `optional/host-pool-fill-src` only. |
 
 `optional/two-lane-prefill` (from PR #268/#279/#296, @slavap):
 

@@ -4708,3 +4708,13 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) — every amendment note
 from `r1` to `r93`, including the pre-V2.0 block-by-block notes, kept verbatim because `WORKLOG.md` and the
 campaign records cite it.
+
+**r262 amendment to block 12 -- the host-read transport (`TODO` #306).**  A third per-expert read transport
+(`--load-mode buffered`: a *mapped* master whose host reads are buffered `pread`s) and an adaptive `--load-mode
+auto` that starts on the mapping and falls `map -> file -> dio` on a stall or a probe-fill A/B, one way by
+decision.  `pool_available_ram_bytes()` became cgroup-aware (the pinned-pool ceiling was sizing against host RAM
+inside a container), and the coalesced-span coupling is enforced: with `MOE_HOST_POOL_STAGE_SPAN=0` the buffered
+arm is refused.  All three transports read the same bytes (greedy text `de81b28cab7d`; MTP acceptance identical to
+five decimal places across arms).  Gate: `scripts/gate-host-read-transport.sh`; record:
+`archive/work/host-read-transport/` + `benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`.
+

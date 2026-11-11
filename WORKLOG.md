@@ -1,3 +1,51 @@
+## 261111.011 (r262, release) -- `TODO` #306 retires: the host-read transport is adaptive, `--load-mode buffered` exists, and the mapping is no longer the only arm a spilling set can read
+
+**Release `v16-a691b2345-r262`, 16 blocks, tree `891d4acb44335687ade6eb3a3f6a37c6f836ade6`, canonical tip
+`d65b0e889f4a6b409ac90ccd2e376b2550ab9ced`.**  Campaign and all its numbers:
+[`archive/work/host-read-transport/`](archive/work/host-read-transport/README.md);
+gate record [`benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`](benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md).
+
+**What shipped (block 12 amendment).**  `--load-mode buffered` -- a MAPPED master whose per-expert host reads are
+buffered `pread`s, the combination r212 made unrepresentable -- plus an ADAPTIVE `--load-mode auto` that starts
+optimistically on the mapping and falls `map -> file -> dio` on two DIMENSIONLESS triggers: a stall (K x this
+arm's own running mean) and a probe-fill A/B (every Nth fill is served by the next arm; same bytes, so no extra
+I/O).  Entering `O_DIRECT` needs 3x or a stall because it bypasses the page cache.  **One way by decision**: a box
+that fell short once is likely to again, and the page cache a reverse switch would rebuild may be the cause, so a
+slower consistent point beats a flapping optimum.  `mmap` / `buffered` / `dio` LOCK the arm; `MOE_HOST_POOL_TRANSPORT`
+pins one for an A/B; `MOE_HOST_POOL_DIO` still works.  Also: `pool_available_ram_bytes()` is **cgroup-aware** (the
+pinned-pool RAM ceiling was sizing against host RAM inside a container), and the coalesced-span coupling is
+**enforced** -- with `MOE_HOST_POOL_STAGE_SPAN=0` the buffered arm is refused, so the measured -41 % pair is
+unreachable.
+
+**Why it retires #306.**  The item asked whether the pool FILL should read the file, held at an optional artifact
+because the win needed the reporter's cold box.  The widened question -- which transport serves a per-expert read --
+is now answered with a default that adapts, measured on this hardware: unpressured the three arms are **equal end to
+end** (decode 25.9-26.2 t/s; `O_DIRECT` 11.2), and under pressure the mapping **collapses** (fills 1.5-1.6 GiB/s,
+decode **5.5-6.3 t/s** in a 32G scope) where the buffered arm holds **12.8-12.9** and `auto` reaches it on the
+stall detector at 6.5 s.  The optional artifact `optional/host-pool-fill-src/` is superseded (left in place for
+older trees, marked so in `ENVIRONMENT.md` §18).  If the reporter sees a regression, it is a fresh issue.
+
+**Gates run for this release** (all on `soar`, ROCm 10.1.0, gfx1201):
+* **Coherence** -- dense 3-GPU `-sm tensor` `sha=1c5d32ac537d` and the MoE host-expert config `sha=627b2ebd7792`,
+  **identical to the pre-change build** (`bin-pre306` vs `bin-post306`, the documented anchors).
+* **Prefill logits** -- base recorded from the pre-change build, candidate the new one (35B-A3B Q8_0,
+  `--n-cpu-moe 24 -lme 8 --load-mode mmap`): mean KLD **0.000000**, same top-p **99.990 %**.
+* **MTP four-axis** (Protocol A, `-n 3000`, MoE arm so the pool is engaged): acceptance **identical to five
+  decimal places across all three transports on all four axes** (0.75118 / 0.75379 / 0.87798 / 0.98667), MTP above
+  plain everywhere (+65 / +71 / +73 / +112 %), `none` == `draft-mtp n3` **byte-identical** across transports, and
+  adaptive n12 at 85.7-144.1 t/s -- the one latch (recall) picked an arm measuring 146.22 against the pin's 146.21.
+* **`llama-batched-bench -npl 1,4,8`** -- cacheable 35B-A3B: map 63.72/186.52/276.84, file 61.30/183.93/276.72,
+  `auto` (stays map) 62.21/185.24/276.00.  No regression at width.
+* **`gate-host-read-transport.sh`** -- new, in `scripts/`: seven text arms + seven census arms proving every arm
+  took the transport it names via its own counters, the span coupling refused, and `auto` within 10 % of the best
+  pinned arm on a 1000-token story decode.
+* `validate-set.sh` green at tree `891d4acb443...`; `fork-refresh.sh` re-cut the fork branch and matched the tree.
+
+**Release mechanics:** `make-patches.sh` regenerated all 16 patches from the amended chain, `make-release.sh`
+refreshed `release.json`, `fork-refresh.sh` verified the applied tree, the fork's `rdna-boosts` was force-pushed
+(personal fork only), and the tag `v16-a691b2345-r262` was pushed.  The container images are the worker's job
+(`scripts/container-watch.sh` on `radiance`).
+
 ## 261111.010 (wip, NO delivery change) -- `host-read-transport` closes as WIP: the adaptive transport is built and gated 24/24, `--load-mode buffered` exists, and the data says "win under pressure, neutral otherwise"
 
 **Campaign only** (no `patches/`, no `release.json`, nothing applied to the fork, no release gate owed).

@@ -1,4 +1,4 @@
-From a5c393f93c031debb52c7633336ca7add83d15f0 Mon Sep 17 00:00:00 2001
+From eef4f95a4bc8ea9fdc6da13f1e4b91d6a6a4bd0c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -166,7 +166,7 @@ is unchanged) and divided by MiB only for display.
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 4c58f91b8..faa73a2e9 100644
+index c808237f8..a3a39142c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -1697,6 +1697,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -241,7 +241,7 @@ index 4c58f91b8..faa73a2e9 100644
      add_opt(common_arg(
          {"--cache-idle-slots"},
          {"--no-cache-idle-slots"},
-@@ -4300,6 +4365,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4303,6 +4368,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -5532,7 +5532,7 @@ index 2c32cf2f8..79a23e5fb 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 98997b3f5..a7cd3fbaa 100644
+index a160fe936..524cc11db 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -5546,7 +5546,7 @@ index 98997b3f5..a7cd3fbaa 100644
  namespace {
  
  // A pool file descriptor: an `int` on POSIX and a pointer-sized `HANDLE` on Windows, where `int` is 32-bit
-@@ -2240,7 +2236,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
+@@ -2658,7 +2654,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
          // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
          // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
          // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
@@ -5555,7 +5555,7 @@ index 98997b3f5..a7cd3fbaa 100644
          const size_t pool_bytes = (size_t) slots * t.host_bytes;
          cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
          /**/ if (strcmp(pool_alloc, "thp") == 0) {
-@@ -2901,7 +2897,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
+@@ -3365,7 +3361,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
  }
  
  static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
@@ -5564,7 +5564,7 @@ index 98997b3f5..a7cd3fbaa 100644
      if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
          return;
      }
-@@ -3495,7 +3491,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+@@ -3990,7 +3986,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return k_no_host_source;
      }
      const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -5595,7 +5595,7 @@ index 98997b3f5..a7cd3fbaa 100644
      return err;
  }
  
-@@ -5742,9 +5760,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6237,9 +6255,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -5611,7 +5611,7 @@ index 98997b3f5..a7cd3fbaa 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -7941,7 +7962,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -8450,7 +8471,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {
@@ -5779,10 +5779,10 @@ index 74250c6ed..b67a53bf3 100644
  
  struct ggml_tensor * ggml_indexer_top_k(
 diff --git a/include/llama.h b/include/llama.h
-index d864ca576..5de6c8277 100644
+index 6e334e34b..e1fe25b84 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -494,6 +494,29 @@ extern "C" {
+@@ -499,6 +499,29 @@ extern "C" {
          // a source/target/parent context
          // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
          struct llama_context * ctx_other;
@@ -7735,7 +7735,7 @@ index 37d01ed11..fd5a50cb1 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index ded951113..e138bbfa1 100644
+index 6b434d7ed..80de01396 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,168 +53,566 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -9175,7 +9175,7 @@ index ded951113..e138bbfa1 100644
      }
  
      if (param_overrides_p != nullptr) {
-@@ -1891,7 +1918,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1910,7 +1937,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
                  tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
                  tn.bid <  (int) hparams.n_layer()) {
@@ -9186,7 +9186,7 @@ index ded951113..e138bbfa1 100644
                  fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
                  fflush(stderr);
              }
-@@ -1935,6 +1964,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1954,6 +1983,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                          });
                          continue;
                      }
@@ -9204,7 +9204,7 @@ index ded951113..e138bbfa1 100644
                      if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                          // Host-resident MoE experts: a device's host buffer type carries that device, and
                          // the scheduler places the consumers of its tensors there.  Picking the device-0
-@@ -2178,7 +2218,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -2197,7 +2237,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
  // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
  // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
  static bool llama_load_release_mmap() {

@@ -229,26 +229,6 @@ residency/thrash hypothesis is needed.
 The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
 never run on RDNA3.5 before this validation.
 
-## 306. The host-pool **fill source** artifact waits on a cold-cache A/B (issue #281, second half)
-
-**`MOE_HOST_POOL_FILL_SRC` (the buffered pool fill reading the file instead of the model mapping) is delivered as
-an optional artifact and is not promoted, because the win only exists when the pages are NOT cacheable**:
-+38 % prefill on top of the coalesced span at 26 % pool coverage (821-875 -> 1138-1146 t/s, 95 -> 23.8 GiB of
-storage reads) but **-41 % on its own** (latency-bound per-expert `pread`) and **exactly neutral** once the pages
-are warm (measured at r241 on this box: 11 257 vs 11 251 MiB/s fill, text `627b2ebd7792` both arms).
-
-**Kind:** delivery candidate / optional artifact — promotion decision, no code owed here.
-
-**OPEN — waiting on the reporter's box (2026-11-09).**  The decisive cell is the one only a 64 GB machine with a
-70 GB model can produce: `--host-experts pool` at `-lme 4`, `pool fills:` after a run that has *evicted* the
-expert pages (a `MOE_HOST_POOL_DIO=1` or `--lazy-mode mlock` arm first), file vs `MOE_HOST_POOL_FILL_SRC=map`.
-The artifact + the arm list are in `optional/host-pool-fill-src/README.md`; the campaign's numbers and rig are in
-`archive/work/host-pool-fill-transport/` (the 56 GiB cgroup rig is `wip/bench-56gb/`, which cannot reproduce the
-cold case at its default page cache).  **Promote only with both**: the coupled form (the fill source must follow
-the span, so `MOE_HOST_POOL_STAGE_SPAN=0` cannot drop an operator into the -41 % arm) and a `gate-host-pool.sh`
-cell that varies the two switches together.  If the A/B shows `map` is equal or better on his box, archive the
-artifact instead and close this.
-
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
 - **A prefill-dominated multi-slot mix (`-npl 4`, `-npl 8`) is slower with `MOE_HOST_POOL_RANK=decode`** (r224,
