@@ -9,12 +9,12 @@ is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `7b40c405…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `a1c8dc86…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme`; and the SEPARATE drafter model sharing the one store safely) | `a5f41c0dc3ebc914495b6416321c28d15d91719a200f288efd56895ac36373d6` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; and the SEPARATE drafter model sharing the one store safely) | `6bac2dd19e5f7b2c21d624f1a1c11773ebee809850a6e9bef8fb8555bf46b69d` |
 
 **What is left: P4 (the streaming fill arms + overlap -- including the direct host `memcpy` into the registered
 slot that the arena tier still lacks), P5 (prefill streaming), P6 (gate + promotion).**  P3's own limits are named
@@ -417,6 +417,10 @@ measurement.
 * **Do not treat a failed carve as a soft decline.**  `alloc_buffer` returning null **fails the model load**
   (`unable to allocate ROCmGTTStore0 buffer`); the old comment claimed otherwise and a `-lme 1` + separate-drafter
   arm died on it.  Size against the free bytes, and treat a null carve as the fatal sizing bug it is.
+* **Do not let anything evict the draft weights** (maintainer, 2026-11-11).  The embedded head is pinned at one
+  slot per expert, so the policy cannot evict it, and the three out-of-policy paths (pressure stand-down, partial
+  shrink, post-drop re-arm) must skip it.  The census line `MTP/nextn head residency: … X eviction(s)` must read
+  0 and `slots == experts`; measured at 7 670 trunk evictions against 0 on the head (`MEASUREMENTS.md` §19).
 * **Do not judge this tier by text alone, and never by a `-lv` run's text.**  The `tables=0` census produced
   byte-identical text with the mechanism completely inert (`MEASUREMENTS.md` §16.1), and a `-lv 4` census of the
   122B gave two different hashes on the same seed.  Text arm: no `-lv`; the mechanism is proved by the census.

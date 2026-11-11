@@ -225,6 +225,13 @@ path's own vocabulary that is `--host-experts pool` with the pool replaced by th
 | **P3a-2** (DONE 2026-11-11, PM) | `try_arena()` gains the store as a third arm (and the free path returns the range), `g_cold_uva = false` for the tier, and a preflight entry that enables the cache on an IGPU with the store's extent as its budget (no slab).  **It serves**: the 3 defects that made the census read `tables=0` are fixed (see the box below) | `MEASUREMENTS.md` §16.2: `M35 -lme 4` -> **120 tables / 6 720 slots / 4 082.3 MiB of a 4 096 MiB extent**, `h=0.5901`, `evictions=4 279`, `arena releases=0`; `MFN -lme 8` -> 144 / 14 688 / 8 153.0 MiB |
 | **P3a-3** (DONE 2026-11-11, PM) | the loader places the expert tensors as **holes in the read-only model MAPPING** (`ROCm_HostMap` when the arena tier is on -- `host_master_mapped` in `llama-model.cpp` does the placement), and the arena arm now FORCES a mapped load (an iGPU reports no `mmap_support`, so AUTO resolved to `none` and the master was a pageable 18.6 GiB COPY) | `MEASUREMENTS.md` §16.1 (3): the `ROCm_HostMap 18 662.00 MiB` anonymous copy is gone, `MemAvailable` after the load 93 -> 106 GiB on `M35` |
 
+> **THE DRAFT-SIDE INVARIANT (maintainer, 2026-11-11): the draft weights, embedded or a separate file, are never
+> evicted** (`MEASUREMENTS.md` §19).  The embedded head holds one slot per expert, so the policy itself can never
+> evict it; the three paths that take a table down outside the policy -- the pressure stand-down, the partial
+> shrink and the post-drop re-arm -- now skip it explicitly, and the census asserts the result
+> (`MTP/nextn head residency: N table(s), S/E slots resident, X eviction(s)`, ERROR if `X != 0` or `S != E`).
+> A separate drafter's tables are a whole-set device allocation, not cache tables, so nothing can evict them.
+>
 > **TWO MORE, found while testing the SEPARATE MTP drafter (2026-11-11, PM, `MEASUREMENTS.md` §18) and both
 > CLOSED**: (i) `ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer` returning null **fails the model load** --
 > its comment claimed the loader fell back to the device buffer, and it does not (`unable to allocate

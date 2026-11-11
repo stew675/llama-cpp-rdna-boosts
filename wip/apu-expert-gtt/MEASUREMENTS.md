@@ -860,3 +860,69 @@ draft context, `common_draft_reserve_estimate`), not a loader change.  Recorded 
   takes the minimum over the IGPU devices.
 * The adoption path's *failure* arm (a second model whose set does not fit the live store) is covered only by the
   Flash-Next drafter declines above, not by a synthetic two-large-models arm.
+
+## 19. 2026-11-11 — the draft weights are never evicted (the invariant, and the census that asserts it)
+
+Maintainer's rule (2026-11-11): **"the draft weights (whether embedded or a separate file) are not subject to
+being evicted."**  This is how that is enforced and what proves it.
+
+### 19.1 Why the embedded head cannot be evicted, and the three paths that had to be told
+
+The head is sized at `slots = n_experts` (§17.2), i.e. **one slot per expert**.  `access_locked()` evicts only when
+a table has no free slot, and a table with one slot per expert always has a free slot for an expert it does not
+hold — so *the policy itself can never evict a head entry*.  What needed explicit work is everything that takes a
+table down **outside** the policy, and there were three:
+
+| path | what it does | now |
+|---|---|---|
+| `moe_cache_shrink_step()` | stands down the LARGEST table arena to satisfy a failed compute allocation (on the APU that is a host-memory "arena", so it buys nothing anyway) | skips pinned head tables: the trunk gives up its bytes instead, and a head layer is a whole layer, so standing one table down would also break slot-uniformity |
+| `moe_cache_shrink_arena()` | releases the largest table arenas until `need_bytes` is free | the candidate order excludes pinned head tables |
+| `moe_cache_rearm()` | re-arms stood-down tables after a compute-buffer drop | head tables are excluded explicitly (not merely implied by `slots == 0`), so no future path can re-arm one at a lower count |
+
+Plus the two already in place: the identity-aware drop pass (`MEASUREMENTS.md` §17.2) and the budget arithmetic
+(the head's bytes are outside `-lme`, so the trunk's shortfall never falls on the head).
+
+### 19.2 The census asserts it
+
+A new line, printed with the arena tier's census (`-lv 4`), and an ERROR on either violation:
+
+```
+report_locked: MTP/nextn head residency: 3 table(s), 768/768 (tensor, expert) slots resident, 0 eviction(s)
+               (MUST be 0: the draft weights are pinned and never evicted)
+```
+
+* `slots == experts` — every expert of every head table is resident (0 churn on the draft path);
+* `evictions == 0` — the rule the maintainer asked for, asserted rather than assumed;
+* an `ERROR` line if either fails, naming the config, so a gate (or a reader) can grep for it.
+
+### 19.3 Measured under trunk pressure (the point of the exercise)
+
+Same-seed arms at a deliberately starved trunk, so the policy is churning hard while the head must not move:
+
+| arm | trunk | head |
+|---|---|---|
+| 35B-A3B, arena `-lme 2`, `--spec-type draft-mtp`, 32 tokens | 123 tables / 4 128 slots / 2 505.2 MiB, `h=0.7945`, **508 evictions** | **3 tables, 768/768, 0 evictions** |
+| 35B-A3B, arena `-lme 4`, `--spec-type draft-mtp`, 32 tokens | 123 tables / 7 488 slots / 4 546.3 MiB, `h=0.7929`, **7 670 evictions** | **3 tables, 768/768, 0 evictions** |
+| 122B-A10B, arena `-lme 20`, `--spec-type draft-mtp`, 8 tokens | 147 tables / 7 104 slots / 22 644.0 MiB, `h=0.7683`, **3 036 evictions** | **3 tables, 768/768, 0 evictions** (the head is 2 448 MiB here) |
+
+7 670 trunk evictions against 0 on the head, and the same at the 2.4 GiB head size, is the invariant holding under
+exactly the condition it exists for.  Text unchanged (`627b2ebd7792` for 35B-A3B in the store-off / arena `-lme 4`
+/ arena `-lme 2` + MTP arms re-run after this change); `check-gpu-faults.sh` clean.
+
+### 19.4 The separate file
+
+A separate drafter's tables are a whole-set **device** allocation and are **not cache tables at all** (§18.4), so
+no cache path can evict them — the census correctly reports `MTP/nextn head residency: 0 table(s)` for that shape,
+and the loader's decline message says so in as many words ("it is already fully resident, and it is NOT a cache
+table -- so these draft weights cannot be evicted").
+
+### 19.5 What is NOT measured
+
+* The three pressure paths are **guarded but not force-tested**: `moe_cache_shrink_step` and
+  `moe_cache_shrink_arena` need a failed compute allocation on this 123 GiB APU, and the re-arm needs a
+  compute-buffer drop.  What is tested is the *policy* path (which is the one that runs every step) and the
+  code-level reason the three others can no longer select a head table.
+* `moe_cache_release_arena()` — the last-resort whole-arena release — still takes **every** table, head included,
+  and disables the cache.  It is unchanged and out of scope here (it is the "the crate is on fire" path); on the
+  arena tier it would also break the mapping holes generally, which is a pre-existing property of the tier and not
+  specific to the draft side.
