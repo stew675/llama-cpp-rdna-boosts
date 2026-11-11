@@ -1,4 +1,4 @@
-From 701dae7cd29b11c5cd64a6d409dfb284b33aa83f Mon Sep 17 00:00:00 2001
+From b7b79ac7880c68a39376d82123d3d5b3202d0940 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b/P3c + P4a/P4b/P4f +
@@ -42,9 +42,9 @@ table, so nothing survives a pass (113 owner changes over 117 calls).
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 ++
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 1208 ++++++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   26 +
- src/llama-model-loader.cpp                    |  650 ++++++++-
+ src/llama-model-loader.cpp                    |  696 +++++++++-
  src/llama-model-loader.h                      |   35 +
- 13 files changed, 3050 insertions(+), 55 deletions(-)
+ 13 files changed, 3096 insertions(+), 55 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -2978,7 +2978,7 @@ index 3c5469637..6c252fa88 100644
  // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
  // `arena` holds `n_slots` experts of `expert_bytes`, and `remap_dev` holds the slot-remapped ids for
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 80de01396..f48efd4df 100644
+index 80de01396..ffb00c836 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -3028,7 +3028,7 @@ index 80de01396..f48efd4df 100644
          return;
      }
  
-@@ -419,7 +437,573 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +437,619 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -3056,6 +3056,18 @@ index 80de01396..f48efd4df 100644
 +    if (no_alloc) {
 +        return;
 +    }
++
++    // `-lme` IS THE OPT-IN (maintainer decision, 2026-11-11): *"-lme turns on the arena, to allow for the
++    // possibility to stream models that don't fit from disk for the portions that don't fit in the GTT store."*
++    // `host_experts_limit_gib` is -1 when the flag was never given (`0` = `-lme auto`, `>0` = N GiB), so this is
++    // the difference between "the operator asked for an expert residency budget" and "nobody did".  Without it:
++    //   * the store is still sized from MemAvailable and PLACEMENT may engage (a fitting model keeps its hot
++    //     subset registered -- measured neutral-to-positive, and it is the delivery's default-on behaviour);
++    //   * but the ARENA never engages, and therefore nothing may be streamed: a model whose weights do not fit in
++    //     RAM is REFUSED with the fix (pass `-lme`) instead of being made to run by a tier the operator did not
++    //     ask for.  That is the `gtt_store_can_stream` flag below, and it is what keeps the arena an explicit
++    //     contract rather than something a load silently falls into.
++    const bool lme_given = host_experts_limit_gib >= 0;
 +
 +    // --- 1. the candidate set: every resident expert bank ------------------------------------------
 +    // Unlike the discrete arm there is no `-ncmoe` selection to honour (it is refused on this device), so the
@@ -3124,6 +3136,18 @@ index 80de01396..f48efd4df 100644
 +    host_experts_store_head_bytes = head_padded;
 +    if (cands.empty()) {
 +        return;
++    }
++
++    // The arena needs at least ONE slot per expert table: a table the store cannot hold a slot for would have to be
++    // served from the pageable model mapping, which is a fatal GPU fault on this hardware (no XNANCH, no
++    // page-fault retry), not a slow path.  Computed once here because both the lock policy (a clamp that cannot
++    // fund this is not a streaming tier) and the shape decision below need it.
++    size_t arena_min = 0;
++    for (const auto & c : cands) {
++        arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
++    }
++    for (const auto & c : head_cands) {
++        arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
 +    }
 +
 +    // --- 2. the budget: `-lme N`, or `auto` = MOE_HOST_LIMIT_FRAC of MemAvailable --------------------
@@ -3225,11 +3249,12 @@ index 80de01396..f48efd4df 100644
 +        // need their layer's device buffer and the load over-commits -- measured precedent: 121 GiB resident +
 +        // 13 GiB swap on a 123 GiB box (2026-10-19).  So a model that cannot fit is refused rather than left to
 +        // thrash.  P3/P4 flip this to true, and the clamp branch below becomes reachable.
-+        // P3/P4/P5 have landed, so a LOCKED store can now stream -- but relaxing this branch is a separate
-+        // decision with its own failure mode (a clamp that covers the shortfall yet is still below one slot per
-+        // table would decline the arena and then over-commit by placement).  Left where the campaign found it and
-+        // recorded as an open item, not changed in passing.
-+        const bool gtt_store_can_stream = false;
++        // P3/P4/P5 have landed, so a LOCKED store CAN stream -- and that is what makes a set larger than RAM
++        // runnable.  It is gated on `-lme` (maintainer decision, 2026-11-11): an operator who asked for a budget
++        // gets the streaming tier, and one who did not gets the pre-campaign behaviour (decline/refuse) instead of
++        // a tier they never asked for.  The clamp must still cover one slot per expert table, or the arena could
++        // not serve a single table and placement would over-commit -- that is checked below with `arena_min`.
++        const bool gtt_store_can_stream = lme_given;
 +        const bool clamps_but_cannot_stream = clamp_useful && honour >= shortfall && !gtt_store_can_stream;
 +        const char * advice =
 +            "Raise RLIMIT_MEMLOCK (`ulimit -l` shows it): `LimitMEMLOCK=infinity` in the systemd unit, "
@@ -3254,7 +3279,7 @@ index 80de01396..f48efd4df 100644
 +            extent = honour;
 +            extent_trunk = honour > head_padded ? honour - head_padded : 0;
 +            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
-+        } else if (clamp_useful && honour >= shortfall && gtt_store_can_stream) {
++        } else if (clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream) {
 +            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
 +            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
 +                           "MiB, which still covers the %.1f MiB this model cannot fit in RAM.  %s\n", __func__,
@@ -3380,17 +3405,10 @@ index 80de01396..f48efd4df 100644
 +
 +    // The test is the TRUNK: `extent` already carries the head's bytes on top of the budget (P3c), so comparing
 +    // the total against the trunk's own padded size would never engage the arena on a model with a head.
-+    if (arena_wanted && !store_live && extent_trunk < padded_total) {
++    if (arena_wanted && lme_given && !store_live && extent_trunk < padded_total) {
 +        // Every table must be able to hold at least one slot, or the cache would serve some op from the
 +        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
 +        // per table before enabling the tier at all.
-+        size_t arena_min = 0;
-+        for (const auto & c : cands) {
-+            arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
-+        }
-+        for (const auto & c : head_cands) {
-+            arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
-+        }
 +        if (extent < arena_min) {
 +            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB one slot per expert table "
 +                           "needs; falling back to whole-tensor placement\n", __func__,
@@ -3460,6 +3478,34 @@ index 80de01396..f48efd4df 100644
 +            LLAMA_LOG_WARN("%s: the GTT arena was declined at %.1f MiB; falling back to whole-tensor placement\n",
 +                           __func__, (double) extent / mib);
 +        }
++    }
++
++    // Placement keeps every expert the store does not hold as its layer's DEVICE allocation, so it cannot serve a
++    // model whose weights do not fit in RAM at all -- the load would over-commit and the box would swap (measured
++    // precedent, 2026-10-19: 121 GiB resident + 13 GiB swap on a 123 GiB box, then a thrashing run).  Reaching this
++    // point with such a model means streaming is not available, for one of exactly four reasons, and the fix differs
++    // per reason -- so say which and refuse, before a byte is read.
++    if (fit_cap_now == 0 || weights_total > fit_cap_now) {
++        const char * why =
++            !lme_given              ? "`-lme` was not given, and the GTT arena -- the tier that streams the part of "
++                                      "the expert set that does not fit -- is opted in BY `-lme`"
++          : store_live              ? "a GTT expert store is already live in this process (a second model), and it "
++                                      "is not this load's to size"
++          : extent < arena_min      ? "the budget is smaller than one slot per expert table, which is the minimum "
++                                      "the arena needs to serve a table at all"
++          : arena_env != nullptr    ? "MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream"
++          :                           "the arena is unavailable on this device";
++        throw std::runtime_error(format(
++            "GTT expert store: this model's weights (%.1f MiB) do not fit in RAM (%.1f MiB available, "
++            "%.1f MiB is the ceiling they may occupy), so the part that does not fit has to be streamed -- and "
++            "streaming is not available here:\n"
++            "  %s\n"
++            "  asked for           %s\n"
++            "Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena, which "
++            "streams the remainder from the file-backed page cache; `-lme auto` sizes it to whatever RAM and "
++            "RLIMIT_MEMLOCK allow.  Without a budget this load would place the unplaced experts as device "
++            "allocations, over-commit, and swap.",
++            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why, source.c_str()));
 +    }
 +
 +    // --- 3. open the GTT store, once, before any tensor is placed ---------------------------------------
@@ -3602,7 +3648,7 @@ index 80de01396..f48efd4df 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2055,6 +2639,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2055,6 +2685,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -3643,7 +3689,7 @@ index 80de01396..f48efd4df 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2576,7 +3194,18 @@ bool llama_model_loader::load_all_data(
+@@ -2576,7 +3240,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -3663,7 +3709,7 @@ index 80de01396..f48efd4df 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2637,9 +3266,12 @@ bool llama_model_loader::load_all_data(
+@@ -2637,9 +3312,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

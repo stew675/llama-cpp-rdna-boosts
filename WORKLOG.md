@@ -1,3 +1,54 @@
+## 261111.029 (wip, NO delivery change) -- `-lme` is the opt-in for STREAMING: with it the arena may stream a set larger than RAM, without it the load refuses (0.2 s, with the fix) instead of over-committing
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`69b8b0a724f3664820c3c824ab51c10469e89051c8012f3d9e259cd5925614e9`, tree `9e972b50…`, verified by `git am` onto a
+fresh `d65b0e889`.  Record: [`MEASUREMENTS.md` §26.1a](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**Decision (maintainer, 2026-11-11):** *"if `-lme [N|auto]` is set, then the `gtt_store_can_stream` should be true,
+as this then allows for a memory > RAM to be served via the arena.  If `-lme` is not set, then it should decline
+(i.e. the current non-lme behaviour).  The whole idea is that `-lme` turns on the arena."*
+
+**Implemented** as three linked facts (`host_experts_limit_gib` is -1 when the flag was never given, 0 for `auto`,
+>0 for N GiB):
+
+1. **`gtt_store_can_stream = -lme was given.**  This is the flag the LOCK policy reads, so a >RAM model under an
+   `RLIMIT_MEMLOCK` too small for the request but big enough for the RAM shortfall is now clamped and **runs**.
+   Measured (new path, first time reachable): 122B-A10B `-lme 60` with `RLIMIT_MEMLOCK=20 GiB` ->
+   `20480.0 MiB of slots for a 117504.6 MiB expert set … the MoE ARENA`, 144 tables resident, 4032 evictions, runs.
+   The clamp must still fund one slot per expert table (`honour >= arena_min`), or the arena could not serve a
+   single table and placement would over-commit -- that guard is in the same branch.
+2. **The ARENA requires `-lme`**, not merely a budget that resolves below the set.  Without the flag the store is
+   still sized from `MemAvailable` and PLACEMENT may engage (a fitting model keeps its hot subset registered --
+   neutral-to-positive, and the delivery's default-on behaviour), but nothing is streamed.
+3. **A model whose weights do not fit RAM is REFUSED when streaming is unavailable**, instead of being placed and
+   left to swap (2026-10-19 precedent: 121 GiB resident + 13 GiB swap on a 123 GiB box).  Measured: the 122B with no
+   `-lme` fails in **0.2 s, before a byte of weights is read**, with the reason and the fix:
+
+       GTT expert store: this model's weights (126403.0 MiB) do not fit in RAM (118113.2 MiB available,
+       106301.9 MiB is the ceiling they may occupy), so the part that does not fit has to be streamed --
+       and streaming is not available here:
+         `-lme` was not given, and the GTT arena -- the tier that streams the part of the expert set that
+         does not fit -- is opted in BY `-lme`
+         asked for           auto: 80% of MemAvailable -> a 95321.3 MiB cap
+       Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena, …
+
+   Three other paths reach the same refusal, each with its own sentence: a GTT store already live in the process
+   (a second model / the separate MTP drafter), a budget below one slot per table, and `MOE_EXPERT_GTT_ARENA=0`
+   (an explicit request for placement).  A *fitting* model never refuses -- its weights are under the ceiling, so
+   placement is fine.
+
+**Also corrected in the same pass:** my §26.1 rule keyed the shape on the model's *fit in RAM*; it now follows the
+**budget**, because `-lme` is a CAP on non-swappable expert memory (maintainer's counter-example: `-lme 4` against a
+21 GiB model is a 4 GiB cap, so the excess must stream).  Measured: the arena holds 13.6 GiB less non-reclaimable
+memory than placement at `-lme 4` on a 35B (lowest `MemAvailable` 106 064 vs 92 489 MiB -- `MemAvailable` counts
+reclaimable page cache as available), at 382 vs 1453 t/s prefill and 31.6 vs 62.5 t/s decode.  `-lme auto` (no cap)
+is the default, so a fitting model still lands on placement at full speed.
+
+**Gate:** `nolme` arm added -- the >RAM model with NO `-lme` must fail, and the message must name the reason and the
+fix; `shapefit` (arena), `resident` (placement) and `ram` (arena with the env unset) cover the other three corners.
+**40 checks, green** (`--quick` 34, which includes the refusal arm because it costs 0.2 s).
+
 ## 261111.028 (wip, NO delivery change) -- the shape rule CORRECTED: `-lme` is a CAP, so a budget below the set takes the ARENA (the maintainer was right; my first rule keyed on the model's fit and was wrong)
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:

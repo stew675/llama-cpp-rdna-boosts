@@ -41,6 +41,8 @@
 #                                                   here and nowhere else
 #     cold     (ref after dropping the GGUF's cache) the cold counters move and the text does not
 #     nohb     GGML_FORCE_NO_INTEGRATED=1           the tier does not depend on the zero-copy UMA weights path
+#     nolme    a >RAM model with NO `-lme`         must REFUSE at load (0.2 s) with the actionable fix: streaming is
+#                                                   opted in BY `-lme`, and placement would over-commit
 #     ram      a >RAM model (MBIG, `-lme 60`)       completes, real fills + evictions, no GPU fault.  Slow (~3 min
 #                                                   of model load); SKIP_RAM=1 for a quick pass
 #
@@ -155,6 +157,24 @@ run_arm() {
     return 0
 }
 
+# An arm that must FAIL: same barriers, but a non-zero exit is the expected result and the log is the evidence.
+run_arm_nofail() {
+    local arm="$1"; local model="$2"; local lme="$3"; local as_kb="$4"; local lock_kb="$5"; shift 5
+    local dir="$KEEPOUT/$arm"
+    mkdir -p "$dir"
+    echo "==> arm $arm (expected to REFUSE)"
+    local lim="ulimit -l $lock_kb;"
+    [ "$as_kb" != "0" ] && lim="$lim ulimit -v $as_kb;"
+    env "$@" HIP_VISIBLE_DEVICES="$GPU" MOE_EXPERT_HEATMAP=load \
+        timeout 3600 bash -c "$lim exec \"\$@\"" _ "$LLAMA_CLI" -v -m "$model" -ngl 99 --fit off \
+        -f "$PROMPT_FILE" -n 2 --temp 0 --seed 42 --single-turn --no-display-prompt $lme > "$dir/out.txt" 2> "$dir/err.txt"
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        fail "$arm: llama-cli SUCCEEDED with no -lme on a model whose weights do not fit RAM"
+    fi
+    return 0
+}
+
 text_hash() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1/out.txt" 2>&1; }
 census()    { grep -E "$2" "$KEEPOUT/$1/err.txt" | tail -1; }
 num()       { grep -oE "$2" "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*[=: ]\([0-9][0-9.~ ]*\)$/\1/'; }
@@ -228,6 +248,11 @@ run_arm shapefit "$MODEL" "$LME" "$AS_KB" "$LOCK_KB"
 LME_FLAG="-lme $LME"
 run_arm pfoff "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL=0
 if [ "$SKIP_RAM" = 0 ]; then
+    # `-lme` is the opt-in for STREAMING: without it, a model whose weights do not fit RAM must be refused at load
+    # (fast, with the fix) instead of being placed and left to swap.
+    LME_FLAG=""
+    run_arm_nofail nolme "$MODEL_RAM" "" 0 unlimited
+    LME_FLAG="-lme $LME"
     # a >RAM model: 123.4 GiB of weights on a 123 GiB box.  The address space cap cannot hold the mapping, and
     # the store must be lockable, so both barriers are relaxed for this arm only (guard.sh documents why).
     LME_FLAG="-lme 60"
@@ -385,6 +410,19 @@ if [ -f "$KEEPOUT/ram/err.txt" ]; then
     else
         fail "ram: a >RAM model with the shape left to the fit did not report the auto arena"
     fi
+fi
+# `-lme` is what turns streaming on: without it a model that cannot fit must be REFUSED, early and with the fix.
+if [ -f "$KEEPOUT/nolme/err.txt" ]; then
+    hard
+    if grep -qF "do not fit in RAM" "$KEEPOUT/nolme/err.txt" && \
+       grep -qF "is opted in BY \`-lme\`" "$KEEPOUT/nolme/err.txt" && \
+       grep -qF "Pass \`-lme N\` (N GiB of non-swappable expert memory) or \`-lme auto\`" "$KEEPOUT/nolme/err.txt"; then
+        ok "nolme: a >RAM model with no -lme is REFUSED at load, and the message says streaming is opted in by -lme"
+    else
+        fail "nolme: a >RAM model with no -lme was not refused with the actionable message"
+    fi
+else
+    ok "(skipped: --quick)"
 fi
 
 note "the >RAM arm (arm 'ram')"

@@ -50,7 +50,11 @@ are documented here and will move there on promotion — per AGENTS.md rule 9, w
 | `MOE_EXPERT_CACHE_TOUCH` | `2` | tuning (existing) | the admission threshold — a **documented no-op on this tier** (every miss fills; asserted by the gate's `touch1/2/3` arm) |
 | `MOE_HOST_POOL_STAGE_SPAN(_EXPERTS)` | `1` (16) | tuning (existing) | the coalesced-read shape P5 reuses; `=0` turns it off and the tier's `file` transport is then refused by design |
 
-The store's **size is not a variable**: it is `-lme`.  Nothing is added for `-fit`, the reach limit, or admission.
+The store's **size is not a variable**: it is `-lme`.  **`-lme` is also the opt-in for STREAMING** (maintainer
+decision, 2026-11-11): with it the store may become the arena and stream the part of a set larger than RAM from the
+file-backed page cache; without it the store is only a *placement* (a fitting model's hot subset registered, which
+is the delivery's default-on behaviour) and a model whose weights do not fit RAM is **refused at load, in 0.2 s,
+with the fix** -- never placed and left to swap.  `MEASUREMENTS.md` §26.1a.  Nothing is added for `-fit`, the reach limit, or admission.
 
 **Naming rule (maintainer, 2026-11-11): never write a bare "store".**  It is always a **GTT store** (or
 "GTT expert store"), so it can never be read as disk/SSD storage, and so it is never confused with the

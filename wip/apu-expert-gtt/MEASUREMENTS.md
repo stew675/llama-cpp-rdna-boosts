@@ -1505,6 +1505,43 @@ Verified on the box, with the reason in the census:
 The gate asserts both directions: `shapefit` (a cap below the set and the env UNSET must take the arena and name
 the cap) and `resident` (a budget that covers the whole set must land on placement).  `ram` runs with the env UNSET.
 
+### 26.1a `-lme` is the opt-in for STREAMING (maintainer, 2026-11-11)
+
+*"if `-lme [N|auto]` is set, then `gtt_store_can_stream` should be true, as this then allows for a memory > RAM to
+be served via the arena.  If `-lme` is not set, then it should decline (i.e. the current non-lme behaviour).  The
+whole idea is that `-lme` turns on the arena."*
+
+Implemented as three linked facts, because `-lme` is what distinguishes "the operator asked for an expert residency
+budget" from "nobody did" (`host_experts_limit_gib`: -1 = never given, 0 = `auto`, >0 = N GiB):
+
+1. **`gtt_store_can_stream = -lme was given.**  That is the flag the LOCK policy reads, so a >RAM model under a
+   `RLIMIT_MEMLOCK` too small for the request but big enough for the RAM shortfall is now CLAMPED AND RUN instead of
+   refused -- which is the whole point of the tier.  Measured: 122B-A10B, `-lme 60`, `RLIMIT_MEMLOCK=20 GiB` ->
+   `20480.0 MiB of slots for a 117504.6 MiB expert set … the MoE ARENA`, 144 tables resident, 4032 evictions,
+   runs.  (The clamp must still fund one slot per expert table -- `honour >= arena_min` -- or the arena could not
+   serve a single table and placement would over-commit.)
+2. **The ARENA also requires `-lme`**, not just a budget that resolves below the set.  Without the flag the store
+   is still sized from MemAvailable and PLACEMENT may engage (a fitting model keeps its hot subset registered --
+   neutral-to-positive, and it is the delivery's default-on behaviour), but nothing is streamed.
+3. **A model whose weights do not fit in RAM is REFUSED when streaming is unavailable**, instead of being placed
+   and left to swap (the 2026-10-19 precedent: 121 GiB resident + 13 GiB swap on a 123 GiB box).  Measured:
+   122B-A10B with no `-lme` fails in **0.2 s, before a byte of weights is read**, with the reason and the fix:
+
+       GTT expert store: this model's weights (126403.0 MiB) do not fit in RAM (118113.2 MiB available,
+       106301.9 MiB is the ceiling they may occupy), so the part that does not fit has to be streamed --
+       and streaming is not available here:
+         `-lme` was not given, and the GTT arena -- the tier that streams the part of the expert set that
+         does not fit -- is opted in BY `-lme`
+         asked for           auto: 80% of MemAvailable -> a 95321.3 MiB cap
+       Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena …
+
+   Three other paths reach the same refusal, each with its own sentence: a GTT store already live in the process
+   (a second model), a budget below one slot per table, and `MOE_EXPERT_GTT_ARENA=0` (an explicit request for
+   placement).  A *fitting* model never refuses: its weights are under the ceiling, so placement is fine.
+
+The gate asserts all three: `shapefit` (arena), `resident` (placement), `ram` (arena with the env unset) and
+`nolme` (the refusal, its reason, and its fix).  **40 checks, green.**
+
 **Recorded as an open item, NOT changed in passing:** `plan_gtt_expert_store()` still hard-codes
 `gtt_store_can_stream = false` in its lock-policy branch, whose comment says "P3/P4 flip this to true".  Relaxing it
 would let a >RAM model run on a CLAMPED (smaller) locked store instead of being refused -- but it needs its own

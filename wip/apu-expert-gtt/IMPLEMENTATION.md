@@ -84,7 +84,7 @@ branch, not a new flag:
 |---|---|
 | `auto` | the set fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable` -> the whole set is resident (mirror, zero evictions); otherwise that same ceiling becomes a **bounded hot-subset** GTT store with evictions on |
 | `N` (GiB) | exactly N GiB of GTT store, spent at one **(tensor, expert) slot** at a time in descending heat order — finer than the discrete fit case, so `-lme 6` means 6 GiB used |
-| (unset) | = `auto` (default-on policy: nothing to opt into).  `MOE_EXPERT_GTT=0` is the kill switch and restores today's behaviour verbatim |
+| (unset) | **PLACEMENT ONLY**: the store is still sized from `MemAvailable`, so a fitting model's hot subset is registered (neutral-to-positive, the delivery's default-on behaviour), but the **arena never engages and nothing is streamed** -- `-lme` is the streaming opt-in (maintainer decision, 2026-11-11).  A model whose weights do not fit RAM is **refused at load (0.2 s) with the fix**, not placed and left to swap.  `MOE_EXPERT_GTT=0` is the kill switch and restores today's behaviour verbatim.  See `MEASUREMENTS.md` §26.1a |
 
 * **Reuse the ranking, do not write one.**  `plan_host_expert_placement()` (`src/llama-model-loader.cpp:277-310`)
   already turns `-lme` into a byte budget and ranks tensors by the persisted heat prior; the APU GTT store needs the
