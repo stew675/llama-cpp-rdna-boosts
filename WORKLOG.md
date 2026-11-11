@@ -1,3 +1,32 @@
+## 261111.032 (r263, release) -- `v17-a691b2345-r263` is PUBLISHED: delivery repo pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip, and the ROCm images building off-host
+
+**Release:** `v17-a691b2345-r263` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`d32696128`**, tree **`9e972b50`**.  Annotated tag on `main`.
+
+**Published:**
+* delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `f8bb8bf4..b2438394`, tag
+  `v17-a691b2345-r263` (`^{}` = `b2438394`).
+* personal fork `git@github.com:stew675/llama.cpp.git`: `rdna-boosts` `d65b0e889..d32696128`, verified by
+  `git ls-remote` -- the remote branch now carries exactly `release.json.tip`.  `scripts/fork-refresh.sh` re-cut it
+  from `patches/` at the base and asserted the tree first (`Applied tree matches release.json (9e972b50…)`); its own
+  `--push` did not complete inside the wrapper's timeout, so the `--force-with-lease` push was re-run directly and
+  verified (same target, same commit -- nothing pushed twice).
+* ROCm container images: the worker watcher on `radiance` picked the tag up and is running
+  `scripts/build-containers.sh --rocm 7.14.1 10.1 --push --prune --force` off-host, as the policy requires (never on
+  the primary box during a release).
+
+**Gate ledger** (the same set recorded in the promotion entry, all green): `validate-set.sh` (17 hashes, fresh-tarball
+strict `git am`, tree match, Windows lint), deterministic re-cut (two independent runs, same tip/tree),
+`gate-per-block-build.sh` 1/1, `gate-uma-experts.sh` 40/40, `gate-prefill-logits.sh` KLD **-0.000000 / 99.990 %**,
+`gate-host-pool.sh` **42/42** on the discrete box, **MTP four-axis PASS with bit-identical acceptance in every arm**,
+`check-gpu-faults.sh` clean on both boxes.
+
+**One harness finding, recorded as a `TODO`:** `fork-refresh.sh --gates` stops at `gate-prefill-logits.sh` on this
+box, because that gate auto-selects a model from "the biggest single card" and an APU reports its **2 GiB carve-out**
+rather than the machine's pool (`ERROR: no auto model found (set MODEL); biggest single card = 2 GiB`).  The gate
+itself is fine and was run green by hand with its proper arm (`--ab MOE_EXPERT_GTT_PREFILL=0 --extra "-lme 4 --fit
+off"`); what needs fixing is the auto-selection (or `fork-refresh.sh` passing `MODEL` through).  `TODO` #316.
+
 ## 261111.031 (r263) -- PROMOTION: `apu-expert-gtt` is **block 16**; `v17-a691b2345-r263` is prepared, and the MTP four-axis gate is the one outstanding item before tagging
 
 **Release:** `v17-a691b2345-r263` -- base `a691b2345` (unchanged), **17 blocks** (block 00 + blocks 01-16), canonical

@@ -29,6 +29,14 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 
 ### Block 16 (r263, the UMA GTT expert store) — carried forward
 
+* **`fork-refresh.sh --gates` cannot run the prefill-logit gate on an APU as written** (`TODO` #316):
+  `gate-prefill-logits.sh` auto-selects a model from "the biggest single card", and an integrated GPU reports
+  its VRAM **carve-out** (2 GiB) rather than the machine pool, so the release flow stops with `ERROR: no auto
+  model found (set MODEL); biggest single card = 2 GiB`.  The gate is correct -- run by hand with its proper
+  arm (`--ab MOE_EXPERT_GTT_PREFILL=0 --extra "-lme 4 --fit off"`) it reads KLD -0.000000 / 99.990 %.  Fix the
+  auto-selection (a pool-aware probe, i.e. `prop.integrated` -> `totalGlobalMem`) or pass `MODEL` through from
+  `fork-refresh.sh`, which invokes the gate with no arguments today.
+
 * ~~The MTP four-axis protocol is OWED for block 16's decode-affecting stages~~ -- **DONE in r263**: run on
   `halo` at the promotion, acceptance **bit-identical** in every arm (0.72082 / 0.75659 / 0.88057 / 0.99462,
   identical accepted/generated counts) across the store-OFF, ARENA and PLACEMENT configurations
