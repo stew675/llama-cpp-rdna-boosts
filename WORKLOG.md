@@ -1,3 +1,27 @@
+## 261111.008 (wip, NO delivery change) -- the `apu-expert-pool` dead-end branch and its work are DELETED, deliberately not archived; and the campaign's "registration pins" claim is narrowed to what probe 09 actually measured
+
+**Two things, both campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).
+
+**1. `apu-expert-pool` is gone -- local and `origin` (`45a21cca`), deleted at the maintainer's direction, and
+deliberately NOT archived.**  It carried a second campaign (23 commits, 281 files, ~59.7 k lines) plus a verified
+11-patch backup.  The maintainer's call, recorded so a later reader does not "recover" it: **its design rests on a
+premise that is rejected, so its findings are not to be ported across** -- anything it touched must be re-derived
+from `wip/apu-expert-gtt/`'s own probes, not inherited.  The only untracked leftover in this tree
+(`wip/uma-static-window/p0/regprobe`, a build artifact) is deleted too.  The refs that remain are the historical
+`WORKLOG` paths (`261109.009`, `261111.004`), which stay as written under the records rule.
+
+**2. `README.md` §5 now states only what probe `09` measured.**  It said "a resident slot is **not** reclaimable
+while registered", but `09` measured something narrower: a registered range keeps 1 048 576 of 1 048 576 pages
+after `fadvise(DONTNEED)` **and** `madvise(DONTNEED)` where the unregistered control releases all of them, and the
+hold outlives `hipHostUnregister` while the VMA lives.  That is "not *discardable by the usual means*" -- a
+**user-initiated discard**, not the kernel's reclaim under memory pressure.  The section and the §6 trap now say
+exactly that, and **probe `16` (reclamation under pressure) is added to the owed list** beside `15` (the
+per-session touch distance): `16` is what would turn "the budget is a reservation" from an inference into a
+measurement, and it is owed **before** a >RAM model is allowed to lean on the budget.  `IMPLEMENTATION.md` P1.0
+and `probe/README.md` carry the same two-probe status; neither blocks P2.
+
+No new numbers, no new claims: this entry narrows a claim and removes a branch.
+
 ## 261111.007 (wip, NO delivery change) -- `wip/apu-expert-gtt` reconciled with r261: `TODO` #132 retired, so the campaign's "decode must pipeline" is corrected to an experiment -- the exact lookahead was built on the discrete pool and measured ±1.5 %
 
 **Campaign docs only** (the entry above was rebased onto r261 and renumbered; no `patches/`, no `release.json`,

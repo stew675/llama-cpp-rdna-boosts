@@ -49,8 +49,11 @@ falsified:
    `halo`, so both arms stay.
 2. **A fill cannot be synchronous per layer** — see the cost model (README §3.2).  P4 owns pipelining.
 
-**Still owed: probe 15, the per-session touch distance** (a workload measurement, not a mechanism one).  It sets
-the admission default `N`; nothing is blocked on it, because the cost model says `N = 2` already pays for itself.
+**Still owed, two probes:** `15`, the per-session touch distance (a workload measurement) -- it sets the
+admission default `N`, and nothing is blocked on it because the cost model says `N = 2` already pays for
+itself; and `16`, **reclamation under pressure** -- whether the kernel's reclaim can take a registered
+region's pages under real memory pressure.  Probe `09` only shows that a *user-initiated* `fadvise` +
+`madvise` cannot, so P1.2's "the budget is a real reservation" needs `16` before a >RAM model leans on it.
 
 ## P1 — preflight, detection and **`-lme`** sizing (the gate becomes a policy)
 

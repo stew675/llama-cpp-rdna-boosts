@@ -74,15 +74,14 @@ Two helpers feed them and are re-runnable on their own:
 | `gguf-expert-geom.py` | reads a GGUF's tensor table (a minimal GGUF parser) and prints each layer's `*_exps` offsets, the contiguous per-expert slab size and the whole-set footprint.  `--layer N --shell` prints `OFFSET SLAB COUNT` for probe 14 |
 | `moe-heatmap-read.py` | reads the delivery's persisted `MHT2` heat map and prints the traffic concentration (coverage curve, never-touched share, resident-set footprint at 50/80/90/95/99 %) per band |
 
-## Owed: probe 15 — the per-session touch distance
+## Owed: probes 15 and 16
 
-The one thing still unmeasured, and it is a *workload* measurement rather than a mechanism one: how often an
-expert is used **1x / 2x / 3x within one session**, which is what sets the admission threshold `N`
-(`../README.md` §3.2, §7).  The persisted heat map is a long-horizon counter, so it gives concentration but not
-session sequences.  Two candidate sources: the delivery's own `heat`/`ghost` census on a discrete box (it
-prints per-table hit/eviction tallies), or a routing trace from a CPU-only run (`-ngl 0`) replayed offline.
-Nothing is blocked on it: the cost model says `N = 2` already pays for itself, so it tunes a default rather
-than deciding the design.
+| # | probe | question |
+|---|---|---|
+| 15 | the per-session touch distance | how often an expert is used 1x/2x/3x **within one session** -- the input to the admission threshold `N` (`../README.md` §3.2, §7).  A *workload* measurement: the persisted heat map is a long-horizon counter, so it gives concentration but not session sequences.  Candidate sources: the delivery's own `heat`/`ghost` census on a discrete box, or a routing trace from a CPU-only run (`-ngl 0`) replayed offline |
+| 16 | reclamation under pressure | whether the kernel's reclaim can take a **registered** region's pages under real memory pressure (`09` only shows that a user-initiated `fadvise`+`madvise` cannot), and what `mincore`, `Unevictable` and `MemAvailable` report while it tries.  `../README.md` §5 calls the budget a reservation on the strength of `09`, so this has to exist before a >RAM model trusts it |
+
+Neither blocks the design's memory (P1.0 answered that): 15 tunes a default, 16 hardens a claim.
 
 ## What these do not cover
 

@@ -89,9 +89,15 @@ One rule fell out of it: **a GGUF tensor offset is 32-byte aligned, not 4096-byt
 fill needs a round-out to the block size plus a per-fill delta into the slot (2 688 bytes on the layer measured),
 or the fill must be buffered.  See §6.
 
-The one probe still owed is a **workload** one: the **per-session touch distance** (how often an expert is used
-1x, 2x, 3x in one session), which is what sets the admission threshold `N`.  The persisted heat map gives the
-long-horizon concentration (§3.2) but not a session sequence.
+Two probes are still owed, and neither blocks the design's memory:
+
+* **`15` -- the per-session touch distance** (how often an expert is used 1x, 2x, 3x in one session), which
+  sets the admission threshold `N`.  The persisted heat map gives the long-horizon concentration (§3.2) but
+  not a session sequence.
+* **`16` -- reclamation under pressure.**  Probe `09` shows a registered range ignores `fadvise`/`madvise`;
+  whether the kernel's reclaim can still take those pages under real memory pressure -- and what
+  `Unevictable` / `MemAvailable` / `mincore` each report while it does -- is **unmeasured**.  §5's "the budget
+  is a reservation" rests on that, so measure it before a >RAM model trusts the budget.
 
 ## 3. How a step and a prefill run
 
@@ -213,9 +219,13 @@ Three things the APU arm has to decide differently, and they are P1's work:
 Whatever the budget leaves is the page cache, which is where the warm fill arm's source comes from -- so the
 number implicitly decides the cold:warm ratio, which is why the census must print both counters.
 
-A resident slot is **not** reclaimable while registered (§2, `09`), which is what makes the budget
-load-bearing rather than advisory, and the reason `MADV_DONTNEED` is only ever reached *after*
-`hipHostUnregister` -- and never while a launch can address the region.
+**A resident slot is not *discardable* by the usual means** -- probe `09` measured a registered range keeping
+1 048 576 of 1 048 576 pages after `fadvise(DONTNEED)` **and** `madvise(DONTNEED)`, where the unregistered
+control released all of them, and the hold outlives `hipHostUnregister` while the VMA lives.  That is what
+makes the budget a real reservation, and the reason the only discard is `hipHostUnregister` **then**
+`madvise`, never while a launch can address the region.  **What probe 09 does not test is the kernel's own
+reclaim under pressure** -- a user-initiated discard is not a memory-pressure eviction -- so "the budget
+cannot be taken away from us" is an inference, not yet a measurement: owed as probe `16`.
 
 ### 5.1 The transient band (what makes `N > 1` implementable)
 
@@ -249,7 +259,9 @@ measurement.
   each device owns a contiguous slice, and reading the whole expert doubled the bytes).  The store is
   single-device, so the device's slice IS the expert -- r261 measured the flag inert at 1 GPU "as the
   geometry predicts".  The class only returns if the store is ever split across devices.
-* **Do not use `VmPin`/`VmLck` to detect the registration hold** — both read 0; use `mincore()`.
+* **Do not use `VmPin`/`VmLck` to detect the registration hold** -- both read 0 (measured, `09`); use
+  `mincore()`, and do not confuse "a registered range ignores `fadvise`/`madvise`" (measured) with "the kernel
+  cannot reclaim it under pressure" (probe `16`, owed).
 * **Do not touch the `integrated` host-buffer (zero-copy UMA weights) path.**  It has its own history and its
   own guard (`ggml_backend_sched_buffer_supported()`); `GGML_FORCE_NO_INTEGRATED=1` is the A/B that proves the
   store does not depend on it.
