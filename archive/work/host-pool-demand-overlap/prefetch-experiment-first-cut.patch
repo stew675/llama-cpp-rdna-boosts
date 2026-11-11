@@ -1,0 +1,378 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 230b94301..f7e9cb3b9 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <cerrno>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -33,6 +34,7 @@
+ #include <set>
+ #include <mutex>
+ #include <string>
++#include <thread>
+ #include <tuple>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -96,6 +98,13 @@ struct bounce_t {
+     cudaEvent_t ev   = nullptr;
+     bool        busy = false;
+     uint64_t    seq  = 0;   // acquisition order (the bounded ring waits on the oldest entry)
++    // TODO #132: >= 0 = this entry is RESERVED by the layer prefetch and holds `pf_expert`'s slice, staged
++    // ahead of the visit that will want it (`pf_job` = the read's job).  `bounce_acquire` never hands out a
++    // reserved entry, and the consumer clears both fields the moment it takes the bytes over -- so a
++    // prefetched entry becomes an ordinary bounce entry exactly when it is used, and is reclaimed by
++    // `bounce_acquire` if it never is.
++    int32_t     pf_expert = -1;
++    int         pf_job    = -1;
+ };
+ 
+ struct table_t {
+@@ -3081,6 +3090,17 @@ static void pool_rank_from_prefill_locked() {
+ // the incoming copy is about to overwrite and its destination is the pool slot that copy is reading.
+ static int bounce_acquire(table_t & t) {
+     for (int i = 0; i < (int) t.bounce.size(); i++) {
++        if (t.bounce[(size_t) i].pf_expert >= 0) {
++            // TODO #132: reserved by the layer prefetch.  Reclaim it only once its read has FINISHED (a
++            // running job still writes into that buffer) and the visit that wanted it did not take it.
++            const int pj = t.bounce[(size_t) i].pf_job;
++            if (pj >= 0 && pj < PF_JOBS && g_pf_jobs[pj].state.load(std::memory_order_acquire) != 2) {
++                continue;
++            }
++            t.bounce[(size_t) i].pf_expert = -1;
++            t.bounce[(size_t) i].pf_job    = -1;
++            g_pf_reclaimed++;
++        }
+         if (t.bounce[(size_t) i].busy) {
+             // issue #294: only `NotReady` means "still copying".  A query that FAILS (a handle from another
+             // device's context, a sticky error from an earlier swallowed call) used to fall through as
+@@ -3247,6 +3267,262 @@ static bool pool_sink_fault() {
+     return on;
+ }
+ 
++// ---------------------------------------------------------------------------------------------------
++// TODO #132: THE LAYER PREFETCH.  A layer's SIX host-weight visits (gate/up/down on each device) are
++// consecutive and share ONE routing -- measured 2026-11-11: `gate dev0, gate dev1, up dev0, up dev1, down
++// dev0, down dev1` for every layer -- so the ids the first visit reads back are an EXACT lookahead for the
++// other five.  That matters because the demand read is otherwise serial on the host thread while the device
++// is idle (measured: 44.6 fallback reads/token at 0.531 ms = 23.7 ms of a 58.6 ms step on a 2-device
++// 122B split).  The prefetch stages ONE expert per sibling table into that table's EXISTING pinned bounce
++// entry, on one worker thread, so its read runs beside the host's own demand work instead of after it.
++//
++// Deliberately minimal: no new buffer and no new tier (the entry is the one the fallback path already owns),
++// no eviction (a reserved entry is never handed to `bounce_acquire`), no expiry sweep (an unconsumed entry is
++// reclaimed by `bounce_acquire` once its read has finished), and no locking in the worker -- it is handed a
++// destination pointer, a file offset and (buffered mode) a mapping pointer, and it touches NO cache state, so
++// it cannot deadlock against the host's `g_mutex`.  `MOE_HOST_POOL_LAYER_PREFETCH=0` turns it off.
++//
++// SAFETY: the worker's destination is a `cudaHostAlloc`'d bounce buffer that only the model teardown frees,
++// and `moe_cache_forget_all` quiesces (joins) the worker before it frees any of them.
++#define PF_JOBS 4
++struct pf_job_t {
++    std::atomic<int> state{0};   // 0 = free, 1 = queued/running, 2 = done (the only state the host reads)
++    bool         ok      = false;
++    pool_fd_t    fd      = -1;
++    size_t       off     = 0;
++    size_t       len     = 0;
++    char *       dst     = nullptr;
++    const char * map     = nullptr;   // buffered mode: copy out of the model mapping instead of the file
++    size_t       align   = 4096;
++};
++static pf_job_t                     g_pf_jobs[PF_JOBS];
++static std::mutex                   g_pf_mu;
++static std::condition_variable      g_pf_cv;
++static std::vector<int>             g_pf_queue;
++static std::vector<std::thread>     g_pf_threads;
++static bool                         g_pf_stop = false;
++static int64_t                      g_pf_issued = 0, g_pf_used = 0, g_pf_notready = 0, g_pf_reclaimed = 0;
++static int                          g_pf_layer = -1;   // the layer whose prefetch pass has already run
++static bool g_layer_prefetch = [] {
++    const char * e = getenv("MOE_HOST_POOL_LAYER_PREFETCH");
++    return e == nullptr || atoi(e) != 0;
++}();
++
++static void pf_worker_main() {
++    for (;;) {
++        int idx = -1;
++        {
++            std::unique_lock<std::mutex> lk(g_pf_mu);
++            g_pf_cv.wait(lk, [] { return g_pf_stop || !g_pf_queue.empty(); });
++            if (g_pf_queue.empty()) {
++                if (g_pf_stop) { return; }
++                continue;
++            }
++            idx = g_pf_queue.back();
++            g_pf_queue.pop_back();
++        }
++        pf_job_t & j = g_pf_jobs[idx];
++        bool ok = false;
++        if (j.dst != nullptr && j.len > 0) {
++            if (j.fd >= 0) {
++                // The disk tier's own entry point, so the alignment handling is the fill path's, not a copy.
++                // `pool_dio_read`'s alignment bounce is thread-local, so a worker thread is safe here.
++                ok = pool_dio_read(j.fd, j.dst, j.len, j.off, j.align);
++            } else if (j.map != nullptr) {
++                memcpy(j.dst, j.map, j.len);   // buffered: the page cache IS the source, exactly as on the host
++                ok = true;
++            }
++        }
++        j.ok = ok;
++        j.state.store(2, std::memory_order_release);
++    }
++}
++
++// Start the workers on demand (a pool-backed run only) and quiesce them before any bounce entry is freed.
++static void pf_ensure_started_locked() {
++    if (!g_pf_threads.empty() || g_pf_stop) {
++        return;
++    }
++    // Two workers over four job slots: the measured knee is depth 4 (5.8 GiB/s against 3.3 at depth 1), and a
++    // layer stages at most one expert per sibling (five), so two in flight covers the realistic depth without
++    // parking an idle thread per slot on a process that may never use them.
++    for (int i = 0; i < 2; i++) {
++        g_pf_threads.emplace_back(pf_worker_main);
++    }
++}
++
++// Join every worker and forget the queue.  Called from `moe_cache_forget_all` while it holds `g_mutex`, so it
++// must take only `g_pf_mu`; the workers never take `g_mutex`, so this cannot deadlock.
++static void pf_quiesce_locked() {
++    if (g_pf_threads.empty()) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lk(g_pf_mu);
++        g_pf_stop = true;
++        g_pf_queue.clear();
++    }
++    g_pf_cv.notify_all();
++    for (std::thread & th : g_pf_threads) {
++        if (th.joinable()) {
++            th.join();
++        }
++    }
++    g_pf_threads.clear();
++    {
++        std::lock_guard<std::mutex> lk(g_pf_mu);
++        g_pf_stop = false;   // a later model load in the same process may prefetch again
++    }
++    for (int i = 0; i < PF_JOBS; i++) {
++        g_pf_jobs[i].state.store(0, std::memory_order_release);
++        g_pf_jobs[i].ok = false;
++    }
++}
++
++// Where an expert's bytes for THIS table come from, and how much of them: the single place that decides the
++// slice geometry, shared by the fallback fill and the prefetch so they can never disagree.
++struct src_read_t {
++    size_t       off;   // file offset
++    size_t       len;   // bytes to read
++    char *       dst;   // where in the pinned entry the bytes belong
++    const char * map;   // the mapping address of the same run (buffered mode)
++};
++static src_read_t table_expert_read(const table_t & t, int expert, char * buf) {
++    const bool   trim   = table_slice_readable(t);
++    const size_t rd_off = trim ? t.src_off : 0;
++    src_read_t   r;
++    r.off = t.src_offs + (size_t) expert * t.host_bytes + rd_off;
++    r.len = trim ? t.expert_bytes : t.host_bytes;
++    r.dst = buf + rd_off;
++    r.map = t.host != nullptr ? (const char *) t.host + (size_t) expert * t.host_bytes + rd_off : nullptr;
++    return r;
++}
++
++// Issue ONE prefetch read into bounce entry `pf_expert` of `t`.  Caller holds `g_mutex`.
++static void pf_issue_locked(table_t & t, int expert, int bounce, size_t align) {
++    pf_ensure_started_locked();
++    int idx = -1;
++    for (int i = 0; i < PF_JOBS; i++) {
++        if (g_pf_jobs[i].state.load(std::memory_order_acquire) == 0) {
++            idx = i;
++            break;
++        }
++    }
++    if (idx < 0) {
++        return;   // every job is busy: this layer simply does not prefetch
++    }
++    const char * base = t.bounce[(size_t) bounce].host;
++    if (base == nullptr) {
++        return;
++    }
++    const src_read_t r = table_expert_read(t, expert, (char *) base);
++    pf_job_t & j = g_pf_jobs[idx];
++    j.ok    = false;
++    j.fd    = -1;
++    j.map   = nullptr;
++    j.off   = r.off;
++    j.len   = r.len;
++    j.dst   = r.dst;
++    j.align = align != 0 ? align : 4096;
++    if (g_pool_dio && pool_file_io_available() && t.src_known && !t.src_path.empty()) {
++        if (t.src_fd < 0) {
++            t.src_fd = pool_open_file(t.src_path.c_str(), g_pool_dio);
++            if (t.src_fd >= 0) {
++                pool_fd_align(t.src_fd, &t.src_align);
++            }
++        }
++        j.fd = t.src_fd;   // drained by `pf_quiesce_locked` before any teardown closes it
++    }
++    if (j.fd < 0) {
++        j.map = r.map;     // buffered (or a platform with no pool file I/O): the mapping is the source
++        if (j.map == nullptr) {
++            return;
++        }
++    }
++    t.bounce[(size_t) bounce].pf_expert = expert;
++    t.bounce[(size_t) bounce].pf_job    = idx;
++    g_pf_issued++;
++    j.state.store(1, std::memory_order_release);
++    {
++        std::lock_guard<std::mutex> lk(g_pf_mu);
++        g_pf_queue.push_back(idx);
++    }
++    g_pf_cv.notify_one();
++}
++
++// Wait for a prefetch job, bounded: a read that has not landed in this long is abandoned (the caller reads
++// the expert itself, which is the pre-prefetch behaviour, so a stalled device costs latency and nothing else).
++static bool pf_wait(int idx, int64_t max_us) {
++    if (idx < 0 || idx >= PF_JOBS) {
++        return false;
++    }
++    const int64_t t0 = ggml_time_us();
++    while (g_pf_jobs[idx].state.load(std::memory_order_acquire) != 2) {
++        if (ggml_time_us() - t0 > max_us) {
++            return false;
++        }
++        std::this_thread::yield();
++    }
++    return g_pf_jobs[idx].ok;
++}
++
++// The prefetch pass: once per LAYER, on the first of its six visits, for every sibling host-weight table of
++// the same layer.  ONE expert per sibling -- the first routed expert that neither tier holds -- because the
++// measured demand set is 0.5-1 miss per table visit and a single staged expert covers it.  Caller holds
++// `g_mutex`.
++static void layer_prefetch_locked(table_t & cur, const int32_t * ids, size_t nb0, size_t nb1,
++                                  int64_t n_used, int64_t n_tok) {
++    if (!g_layer_prefetch || !g_pool_enabled || !table_master_pageable(cur)) {
++        return;   // a pinned master never bounces, so it has nothing to stage
++    }
++    if (g_pf_layer == cur.layer) {
++        return;   // this layer has already staged its siblings
++    }
++    g_pf_layer = cur.layer;
++    for (table_t & u : g_tables) {
++        if (u.layer != cur.layer || &u == &cur || u.host == nullptr || u.host_bytes == 0 ||
++            u.n_experts <= 0 || u.host_pinned || !u.src_known || u.expert_bytes == 0) {
++            continue;
++        }
++        host_pool_t * pool = table_pool_peek_locked(u);
++        // first routed expert that neither the arena nor the pool holds
++        int32_t want = -1;
++        for (int64_t tok = 0; tok < n_tok && want < 0; tok++) {
++            for (int64_t j2 = 0; j2 < n_used && want < 0; j2++) {
++                const int32_t e = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j2 * nb0);
++                if (e < 0 || e >= u.n_experts) {
++                    continue;
++                }
++                if (u.expert_slot.find(e) != u.expert_slot.end()) {
++                    continue;   // arena-resident
++                }
++                if (pool != nullptr && pool_resident_locked(*pool, e)) {
++                    continue;   // pool-resident
++                }
++                want = e;
++            }
++        }
++        if (want < 0) {
++            continue;
++        }
++        int bounce = -1;
++        for (int i = 0; i < (int) u.bounce.size(); i++) {
++            if (u.bounce[(size_t) i].pf_expert < 0 && !u.bounce[(size_t) i].busy) {
++                bounce = i;
++                break;
++            }
++        }
++        if (bounce < 0) {
++            // no free entry: grow the ring exactly as the fallback path would (one entry per table prefetch)
++            bounce = bounce_acquire(u);
++            if (bounce < 0) {
++                continue;
++            }
++        }
++        pf_issue_locked(u, want, bounce, u.src_align);
++    }
++}
++
+ // TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
+ // the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
+ // Caller holds `g_mutex`.
+@@ -3318,6 +3594,28 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+     // copied out of the model mapping instead -- the same bytes, only with the page cache populated.  A hard
+     // failure here is a WRONG ANSWER, not a slow one: the demand path cannot serve the expert at all, and it
+     // used to record the slot as resident anyway (`access_locked`).
++    // TODO #132: a sibling's staged expert is already here (or in flight) -- take it.  The entry's contract is
++    // the ordinary bounce one from this point on: `expert_src_done` records its drain event and `busy` blocks
++    // reuse until the copy is finished.
++    if (g_layer_prefetch && allow_empty_fill) {
++        for (int i = 0; i < (int) t.bounce.size(); i++) {
++            bounce_t & b = t.bounce[(size_t) i];
++            if (b.pf_expert != expert || b.pf_job < 0 || b.busy) {
++                continue;
++            }
++            if (!pf_wait(b.pf_job, 4000)) {
++                g_pf_notready++;   // not landed yet (or failed): leave it reserved and read it the normal way
++                continue;
++            }
++            b.pf_expert = -1;
++            b.pf_job    = -1;
++            g_pf_used++;
++            out->base   = b.host;
++            out->kind   = cudaMemcpyHostToDevice;
++            out->bounce = i;
++            return true;
++        }
++    }
+     const int idx = bounce_acquire(t);
+     if (idx < 0) {
+         static bool warned_ring = false;
+@@ -6181,6 +6479,9 @@ void moe_cache_forget_all(int device) {
+     // Same hazard as the arena release: the fused MoE kernels carry the arena address in their launch
+     // parameters, so nothing may be freed while one is still in flight.
+     moe_cache_sync_devices_locked();
++    // TODO #132: the layer prefetch's workers hold pointers INTO bounce entries (`host`) and into the model
++    // mapping, and may read their fd -- join them before anything below frees or closes either.
++    pf_quiesce_locked();
+ 
+     int64_t freed_b = 0;
+     std::set<const void *> dead_hosts;
+@@ -8638,6 +8939,10 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         pool_rank_from_prefill_locked();
+     }
+ 
++    // TODO #132: the layer prefetch.  This is the first of the layer's six host-weight visits, so the routing
++    // is an exact lookahead for the other five (see `layer_prefetch_locked`).
++    layer_prefetch_locked(t, ids, ids_nb0, ids_nb1, n_used, n_tok);
++
+     // A pageable axis-0 slice (a `-sm tensor` `down_exps` split) has no device mapping and its only
+     // cache fill would be a strided 2-D H2D -- the pageable `cudaMemcpy2DAsync` that faults on ROCm 7.14
+     // (issue #116's copy-side twin).  wip/host-expert-master-drop (TODO #55): a POOL-BACKED master is no
+@@ -9639,6 +9944,12 @@ static void report_locked() {
+                       "destination from the bounce/pool-fill path (neither tier)\n",
+                       __func__, (long long) g_gather_calls, (long long) g_gather_pool, (long long) g_gather_fills);
+     }
++    if (g_pf_issued > 0) {
++        GGML_LOG_INFO("%s: layer prefetch: %lld staged, %lld consumed by their visit, %lld not ready, "
++                      "%lld reclaimed unused (MOE_HOST_POOL_LAYER_PREFETCH, TODO #132)\n", __func__,
++                      (long long) g_pf_issued, (long long) g_pf_used, (long long) g_pf_notready,
++                      (long long) g_pf_reclaimed);
++    }
+     if (g_pool_enabled) {
+         const int64_t p_slots  = g_report_snap.p_slots;
+         const int64_t p_hits   = g_report_snap.p_hits;

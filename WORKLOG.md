@@ -49,7 +49,23 @@ protocol: [`benchmarks/2026-11-11-host-pool-slice-read.md`](benchmarks/2026-11-1
    and no prefill *kernel* is touched.  Note for the next session: the `--record` above **overwrote** the
    `xncmoe-48-ub2048` base file, which previously carried the r258 `MOE_EXPERT_PREFILL_IN_PLACE=0` arm — that
    A/B's base must be re-recorded before it is quoted again (the base file is keyed by model+shape, not by arm).
-6. **`TODO` #132 is retired** (the item, its index row and its detail section are gone; `#NN` is never reused).
+6. **The `(c)` step was then built too, and it is a wash — recorded so it is not rebuilt.**  The one *exact*
+   lookahead in the design is within a layer: its six host-weight visits carry the SAME routing ids (verified:
+   `gate dev0/dev1, up dev0/dev1, down dev0/down dev1` print identical ids), so staging the other five tables'
+   misses on a worker needs no prediction.  Built the simple way (one worker over a small job table, the
+   destination is the sibling's EXISTING pinned bounce entry -- no new buffer, no new tier, no eviction),
+   debugged through two real defects (a job slot that latched at "done" and retired the whole feature after 4
+   reads; and no expiry, so unused entries were never reclaimed), and measured: 48 passes/token, 240 sibling
+   tests, **only 0.9 % of the 1 315 ids/token tested are in neither tier** (92.8 % arena, 6.3 % pool) against
+   44.5 fallback reads/token, so 5.7 staged/token and 3.2 consumed; end to end **18.35/18.26 (off) against
+   18.63/18.56/18.32 (on) = ±1.5 %, noise**.  The bound is the POOL, not the worker: the demand path tries an
+   empty policy slot before it falls back, and that 0.131 ms placing fill is both better (the expert stays
+   resident) and earlier than any prefetch.  Targeting policy slots instead needs a "filling" slot state --
+   the background-fill machine `TODO` #87 removed and r113 measured as a 2x loss.  Corrected composition on
+   the shipping tree (54.0 ms/step): fallback reads **20.0 ms/token** (44.5 @ 0.449 ms), pool-fill attempts
+   **7.6 ms** (58 @ 0.131 ms), whole demand pass **27.6 ms**.  The code is kept as
+   `archive/work/host-pool-demand-overlap/prefetch-experiment-first-cut.patch`; nothing of it ships.
+7. **`TODO` #132 is retired** (the item, its index row and its detail section are gone; `#NN` is never reused).
    What it pointed at that is still real: (a) **coverage** on a sub-complement budget (`#141`), (b) the
    **devremap** needs a cold source the device can resolve, which is what keeps the per-layer synchronize — and
    therefore the host/device serialisation — in place, and (c) a **cross-role prefetch + lock-free fill worker**

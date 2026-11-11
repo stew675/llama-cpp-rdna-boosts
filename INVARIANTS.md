@@ -4001,6 +4001,14 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   96 hits, 122B pair), and a tensor split's two devices do **not** both miss the same expert in the same window
   (the pool is one object per host tensor and already dedupes the policy path).  A "small extra tier for the
   cold tail" is therefore a byte-for-byte re-read: do not build one without a trace that says otherwise.
+* **The one exact lookahead on the decode band is within a layer, and it is not worth using.**  A layer's six
+  host-weight visits (gate/up/down x each device) are consecutive and carry the SAME routing ids (measured
+  2026-11-11), so a prefetch needs no prediction -- but only **0.9 %** of the ids a sibling will route are in
+  neither the arena nor the pool (92.8 % arena, 6.3 % pool, 1 315 ids/token), and of what a prefetch stages
+  the pool's inline empty-slot fill claims most of it (0.131 ms against the fallback's 0.449 ms, and the
+  expert stays resident).  Built and measured end to end: **±1.5 %, noise**.  Do not rebuild it; if the
+  fallback reads are to be attacked, the lever is fewer of them (`TODO` #141) or a device-resolvable cold
+  source, not moving them earlier.  Record: `benchmarks/2026-11-11-host-pool-slice-read.md` §2b.
 * **The read is bandwidth-bound at single-queue depth, with ~1.8x available at depth 4.**  64 random 1.77 MiB
   `O_DIRECT` reads of the real shard: depth 1 **3.3 GiB/s** (0.50 ms, matching the measured 0.531 ms fallback
   fill), depth 2 4.9, depth 4 **5.8**, depth 8 6.0.  So a faster demand path exists in principle, but a depth

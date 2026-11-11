@@ -97,6 +97,57 @@ Same-seed greedy text is byte-identical across the arms, the pre-change binary a
 The gate-host-pool and text rows matter more than the throughput ones: this is a **read-geometry** change, so
 its failure mode is wrong bytes in a slot, and both gates compare generated text.
 
+## 2b. The cross-role prefetch: built, exact, and still not worth it (measured)
+
+The one *exact* lookahead the design has is **within a layer**: a layer's six host-weight visits are
+consecutive and carry the SAME routing —
+
+```
+IDS132 call=0 layer=0 role=blk.0.ffn_gate_exps.weight dev=0 ids=[138 85 242 117 196 10 101 206 246 206 61 103 41 196 29 186]
+IDS132 call=1 layer=0 role=blk.0.ffn_gate_exps.weight dev=1 ids=[... identical ...]
+IDS132 call=2 layer=0 role=blk.0.ffn_up_exps.weight   dev=0 ids=[... identical ...]
+...                                                    down dev=1 ids=[... identical ...]
+```
+
+so a prefetch issued on the first visit needs no prediction at all.  It was built the simple way (one worker
+thread over a small job table, the destination is the sibling's **existing** pinned bounce entry, no new
+buffer or tier, no eviction, release-on-consume with a lazy reclaim; first cut kept as
+`prefetch-experiment-first-cut.patch` in the campaign, plus the two fixes it needed: free the job slot on
+consume/reclaim — without it four slots latch at "done" and the whole run stages 4 reads — and expire a
+sibling's unused entry on the next pass).  It ran, and it is **not worth shipping**:
+
+| | count | per token |
+|---|---|---|
+| prefetch passes (one per layer per token) | 14 496 | 48 |
+| sibling tables tested | 72 480 | 240 |
+| ids tested for "is this expert in neither tier" | 397 240 | 1 315 |
+| … arena-resident | 368 676 (92.8 %) | |
+| … pool-resident | 25 009 (6.3 %) | |
+| … **neither tier** (the only thing a prefetch can help) | **3 555 (0.9 %)** | **17.6** |
+| staged / consumed by their visit / reclaimed unused (best run) | 1 719 / 968 / 748 | 5.7 / 3.2 / 2.5 |
+
+and end to end on the arm: **18.35 / 18.26 t/s (`MOE_HOST_POOL_LAYER_PREFETCH=0`) against 18.63 / 18.56 /
+18.32 t/s (on)** — i.e. **±1.5 %, noise**, for ~150 lines of worker, a new lifecycle and a teardown join.
+
+**Why it cannot do better, which is the part worth keeping:** the bound is not the worker, it is the pool.
+The demand path tries an *empty policy slot* before it falls back to the bounce (`pool_fill_empty_locked`),
+so most of the misses a prefetch would stage are served by a placing fill anyway — that is a **better**
+outcome (the expert stays resident) and it costs 0.131 ms against the fallback's 0.449 ms.  Of the misses the
+fallback actually sees, each is a first-request latency the consumer must wait for regardless: moving the
+read one visit earlier only helps if the *consumer's own* wait disappears, and it does not, because the
+consumer is the one that discovers the placement decision.  A prefetch that targeted **pool slots** instead
+would attack the right thing but needs a "filling" slot state, i.e. exactly the background-fill/eviction
+machine `TODO` #87 removed and r113 measured as a 2x loss.
+
+The composition this leaves for anyone tempted to try again (shipping tree, 300 tokens, 54.0 ms/step):
+
+| term | calls/token | wall/token | share of the step |
+|---|---|---|---|
+| ids readback + meta synchronize (the device's compute) | 48 | 24.0 ms | the device is *working* here |
+| demand service: fallback reads | 44.5 @ 0.449 ms | **20.0 ms** | 37 % |
+| demand service: pool-slot fill attempts | 58 @ 0.131 ms | 7.6 ms | 14 % |
+| whole demand pass (`expert_host_src`, decode band) | 95 | **27.6 ms** | 51 % |
+
 ## 3. Why an overlap worker cannot be the answer even in principle (the queue-depth probe)
 
 If the read is bandwidth-bound, the only remaining lever is more in-flight reads.  64 random 1 769 472-byte
@@ -113,8 +164,8 @@ So ~1.8x is on the table at depth 4 — but a depth needs *several misses known 
 there are none: the host learns one layer's routing at a time, and it is the only reader.  The one exact
 lookahead that exists is **within a layer** (gate/up/down share the routing ids, and `prev_ids_tensor` already
 relies on it), which bounds the depth at ~2 (the measured demand set is 0.5-1 miss per table, ~2 per layer).
-That is a +14-20 % estimate on this arm for a cross-table prefetch plus a lock-free fill worker, and it is
-recorded as the next step rather than shipped: the hook's global mutex and the per-table staging make it a
+That is a +14-20 % estimate on this arm for a cross-table prefetch plus a lock-free fill worker — **and it
+was built and measured at ±1.5 %, see §2b** — so it is recorded, not shipped: the hook's global mutex and the per-table staging make it a
 scheduler change, not a pool one, and `TODO` #141 (a sub-complement budget's static bound) and the devremap
 (a cold source the device can resolve) both attack the same bytes with less machinery.
 

@@ -22,6 +22,7 @@ be applied to a checkout (`AGENTS.md`, WIP and promotion rules).
 | `ab-261111.sh` | the whole A/B matrix (pair / 1 GPU / 3 GPUs x slice-read on|off, plus text arms), sequential |
 | `probe-132.patch` | the **temporary** decomposition probe (**not shipped**): per-call timers around the ids readback, `moe_cache_update_host`, and the pool/bounce fill in the decode band, printed at `exit` under `MOE_PROBE_132` |
 | `readprobe.py` | the queue-depth probe: 64 random 1.77 MiB `O_DIRECT` reads of the real shard at depth 1/2/4/8 |
+| `prefetch-experiment-first-cut.patch` | the **cross-role layer prefetch** that was built and measured (`MOE_HOST_POOL_LAYER_PREFETCH`, 2026-11-11): a worker over a small job table, the destination is the sibling's existing pinned bounce entry.  First cut — the shape that ran also needed the two fixes it names in the record (`pf_release` on consume/reclaim, the next-pass expiry) and `PF_JOBS 12`; **do not ship it**: it measures ±1.5 %, see `benchmarks/2026-11-11-host-pool-slice-read.md` §2b |
 | `runs/` | every raw log + `summary.tsv` per verdict (`261111-probe` = the decomposition, `261111-ring` = the refuted shared ring, `261111-ab` = the shipped A/B, `261111-coh` = coherence) |
 
 ## What was tried and dropped (so it is not re-proposed)
@@ -31,6 +32,15 @@ be applied to a checkout (`AGENTS.md`, WIP and promotion rules).
   devices miss the same cold experts microseconds apart, so one read could serve both.  Measured: **20 860
   ring reads against 96 hits (0.5 %)**, decode a tie (16.95 against 17.06 t/s), disk unchanged.  The cold tail
   is genuinely cold and the devices do not duplicate.  Reverted; nothing shipped.
+* **The cross-role layer prefetch — BUILT, EXACT, AND STILL A WASH.**  A layer's six host-weight visits carry
+  the same routing ids (measured), so staging the other five tables' misses on a worker needs no prediction.
+  Built the simple way (existing bounce entries, no new buffer or tier) and measured: 48 passes/token, 240
+  sibling tests, and **only 0.9 % of the 1 315 ids tested per token are in neither tier** (92.8 % arena,
+  6.3 % pool) — so a prefetch can address ~18 reads/token out of the 44.5 that actually fall back, and of the
+  5.7/token it stages only 3.2 are consumed (the pool's inline empty-slot fill, 0.131 ms, beats it to the
+  rest — and that is the *better* answer, because the expert stays resident).  End to end: **±1.5 %**.  A
+  prefetch that targeted policy slots instead would need a "filling" slot state, i.e. the background-fill
+  machine `TODO` #87 removed and r113 measured as a 2x loss.
 * **A demand-fill worker / overlap.**  Blocked by the structure, not by effort: 48 full meta-backend
   synchronizes per token (one per routed op, for the ids readback) put the host exactly where the device has
   nothing queued, so the 33.2 ms of demand service per step overlaps with nothing; and the hook holds one
