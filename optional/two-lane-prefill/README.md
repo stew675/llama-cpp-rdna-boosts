@@ -1,19 +1,20 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r247`** (against `release.json` tree
-`8f99d2dc6dbe8648b44268b8b82394d11f12f573`; the r246, r243, r241 and r229 cuts and their measurements are kept
-below as the dated record).  The r247 cut is a mechanical rebase — the delivery changed only block-15 defaults
-and options (`ENVIRONMENT.md` §17), so nothing in this artifact's code or numbers moves.
+**Optional artifact, not part of the delivery.  Re-cut on `r254`** (against `release.json` tree
+`3f2cad2a0438f9a1ec52957c3722af7fa37de6d4`; the r247, r246, r243, r241 and r229 cuts and their measurements are
+kept below as the dated record).  The r254 cut is a mechanical rebase — the delivery moved from r247 to r254
+(blocks 12-15: the streamed-KV reserve, the MTP-draft-window ring, and the relaxed-tensor-split option), the
+two-lane code lands in unchanged lines, and no number moves.
 
-From **PR #268, #279, #284 then #296 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
-reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
-are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
+From **PR #268, #279, #284, #296 by [@slavap](https://github.com/slavap)**, rebased onto the delivery, reviewed
+and amended (see *What changed in the rebase* below).  The submitter's own description and measurements are in
+the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `f5702697eacdb3051dfa787b258dd405c4ab7e47b7f9a814754469944f6983d2`
-* applies at `release.json` tree `8f99d2dc6d…` (r247), produces tree `17f51fb30c39a16db280d0864a0feee784f1010b`
-  (verified by strict `git am` on a fresh checkout of the r247 `rdna-boosts` branch; the r246 cut produced
-  `e4e8be3011…`, and with the retired `host-pool-fill-src` artifact applied first the two produced
-  `db5ed504b5…`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `bf6f8f394bde5f0d14cb0995ee52e8d68b0744cfcfe3305233ca42af69baedbc`
+* applies at `release.json` tree `3f2cad2a0438…` (r254), produces tree `896446c422b58c67027d782b611b5bce08688d42`
+  (verified by strict `git am` on a fresh checkout of the r254 `rdna-boosts` branch tip `1606bdaff`; the r247 cut
+  produced `17f51fb30c…`, and with the `host-pool-fill-src` artifact applied first the two produced
+  `d087dbed73845cc8185b7e6b6d8d63212e88b9da`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one
