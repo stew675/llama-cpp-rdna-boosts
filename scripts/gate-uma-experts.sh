@@ -221,12 +221,18 @@ else
     run_arm pfverify "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL_VERIFY=1
 fi
 LME_FLAG="-lme $LME"
+# The DEFAULT SHAPE on a model that fits: `MOE_EXPERT_GTT_ARENA` unset must mean PLACEMENT (a static placement:
+# no eviction, no fills, no forced mapped load), not the arena.
+run_arm shapefit "$MODEL" "$LME" "$AS_KB" "$LOCK_KB"
+LME_FLAG="-lme $LME"
 run_arm pfoff "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL=0
 if [ "$SKIP_RAM" = 0 ]; then
     # a >RAM model: 123.4 GiB of weights on a 123 GiB box.  The address space cap cannot hold the mapping, and
     # the store must be lockable, so both barriers are relaxed for this arm only (guard.sh documents why).
     LME_FLAG="-lme 60"
-    run_arm ram "$MODEL_RAM" 60 0 unlimited "${BASE_ENV[@]}"
+    # NO `MOE_EXPERT_GTT_ARENA` here: this arm proves the DEFAULT SHAPE, i.e. that a model whose weights spill out
+    # of RAM gets the arena automatically (maintainer decision, 2026-11-11).
+    run_arm ram "$MODEL_RAM" 60 0 unlimited
     LME_FLAG="-lme $LME"
 fi
 
@@ -235,7 +241,7 @@ note "text identity (every arm must match the delivery's own behaviour, arm 'off
 REF="$(text_hash off)"
 echo "    off      $REF"
 [ -n "$REF" ] && ok "the reference arm produced a hash" || fail "off: no text hash (see $KEEPOUT/off/out.txt)"
-for arm in ref resident budget lmeauto pfoff cold fault nohb lock; do
+for arm in ref resident budget lmeauto lock pfoff shapefit cold fault nohb; do
     [ -f "$KEEPOUT/$arm/out.txt" ] || continue
     hard
     H="$(text_hash "$arm")"
@@ -347,6 +353,28 @@ if [ -f "$KEEPOUT/touch1/err.txt" ]; then
     fi
 else
     ok "(skipped: --quick)"
+fi
+
+note "the DEFAULT SHAPE: arena iff the weights spill, otherwise placement (maintainer decision)"
+if [ -f "$KEEPOUT/shapefit/err.txt" ]; then
+    hard
+    if ! grep -q 'GTT arena tier' "$KEEPOUT/shapefit/err.txt" && \
+       grep -q 'resident, ranked by the persisted heat prior' "$KEEPOUT/shapefit/err.txt"; then
+        ok "shapefit: a model that FITS RAM and a small -lme -> placement (no arena, no eviction, no forced mmap)"
+    else
+        fail "shapefit: a fitting model with -lme $LME and no MOE_EXPERT_GTT_ARENA took the ARENA tier"
+    fi
+else
+    ok "(skipped: --quick)"
+fi
+if [ -f "$KEEPOUT/ram/err.txt" ]; then
+    hard
+    if grep -q 'auto: the weights spill out of RAM' "$KEEPOUT/ram/err.txt" && \
+       grep -q 'GTT arena tier' "$KEEPOUT/ram/err.txt"; then
+        ok "ram: a model whose weights SPILL gets the arena automatically, and the census says why"
+    else
+        fail "ram: a >RAM model with the shape left to the fit did not report the auto arena"
+    fi
 fi
 
 note "the >RAM arm (arm 'ram')"

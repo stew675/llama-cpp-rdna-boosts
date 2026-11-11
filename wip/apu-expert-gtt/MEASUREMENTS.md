@@ -1451,3 +1451,86 @@ ids buffer -- it is cheaper, it cannot disagree with the copy it replaces, and i
 * **Multi-device**: untested, as everywhere in this campaign.
 * **A `-sm tensor` slice or a fused table**: the hook declines by geometry (no single run per expert) and the
   delivery's copy serves it -- by construction, not by measurement.
+
+## 26. 2026-11-11 — the two promotion decisions: the SHAPE is chosen by the fit, and admission needs nothing (the campagne's own policy simulator says so)
+
+Maintainer, 2026-11-11: *"MOE_EXPERT_GTT_ARENA's default shape should be arena if the weights would spill onto
+disk, otherwise placement.  If `MOE_EXPERT_GTT_ARENA` is set, then honour the user's choice"* and *"we can drop
+the `MOE_EXPERT_CACHE_TOUCH=N` for now … don't we have a policy simulator already written somewhere for exactly
+this?"*
+
+### 26.1 The shape default: implemented, and it logs its own reason
+
+`plan_gtt_expert_store()` now decides the shape from the FIT instead of from a flag:
+
+    arena  iff  the model's weights exceed 90 % of MemAvailable   (they would spill onto the page cache -- on an
+                                                                  APU that is the only thing below RAM)
+    placement otherwise                                             (a static placement: no eviction, no fills,
+                                                                     no forced mapped load)
+
+`MOE_EXPERT_GTT_ARENA` is a tri-state override: `=1` forces the arena, `=0` forces placement, unset = the fit
+decides.  This also fixes an older defect: the variable used to be read with `getenv(...) != nullptr`, so
+`MOE_EXPERT_GTT_ARENA=0` *enabled* the tier -- a switch that cannot spell "off" is not a switch.
+
+Verified on the box (the reason is in the census, not inferred):
+
+| model | `-lme` | env | census |
+|---|---|---|---|
+| 35B-A3B (21.1 GiB of weights) | 4 | unset | `-lme 4 -> … 24 tables / 6144 slots (4066.1 MiB) resident … a hot subset. Everything else keeps its layer's device buffer` -- **placement** |
+| 35B-A3B | 4 | `=1` | `-> the GTT store is the MoE ARENA: 4096.0 MiB of slots for a 18662.5 MiB expert set` -- **arena** |
+| 35B-A3B | 4 | `=0` | placement (same line as unset) |
+| 122B-A10B (123.4 GiB of weights on a 123 GiB box) | 60 | unset | `-lme 60 [auto: the weights spill out of RAM (126403.0 MiB against a 106739.9 MiB ceiling), so residency, not placement, is what makes this model runnable] -> the GTT store is the MoE ARENA` -- **arena, automatically** |
+
+The gate asserts both directions (`shapefit`: a fitting model with a small `-lme` must get placement; `ram`: the
+>RAM model with the env UNSET must get the arena and must say why), and every other arm pins the shape so its
+meaning does not drift with the model's fit.
+
+### 26.2 Admission: the campaign's own simulator predicts that NOTHING should change
+
+`archive/work/moe-expert-cache/policy_sim.py` (the `moe-expert-cache` campaign's admission/replacement simulator)
+replays a token-indexed routing trace under each candidate policy and reports the steady-state hit rate per S.
+It was re-used here, unchanged, with a fresh trace from THIS tier: `MOE_EXPERT_TRACE=/tmp/moe35b.trace`, 35B-A3B,
+arena `-lme 4`, a 407-token greedy decode over 120 tables, converted to the simulator's
+`route,tok,table,expert` form (one "table" = one (layer, role), i.e. the arena's own unit; the converter is 30
+lines and is recorded in the WORKLOG entry).
+
+**h_steady (last 200 tokens), the arena's real slots/table in brackets:**
+
+| policy | S=56 (`-lme 4`) | S=133 (MBIG `-lme 60`) | S=192 |
+|---|---|---|---|
+| `static` top-S (no adaptation) | 0.398 | 0.510 | 0.512 |
+| **`lru` / the tier's LFRU** | **0.727** | **0.918** | **0.938** |
+| `second_touch` (the delivered `TOUCH=2`) | **0.708** | **0.880** | **0.891** |
+| `second_touch_fill` | 0.719 | 0.917 | 0.938 |
+| `lfru_decay:64` | 0.738 | 0.919 | 0.938 |
+| `slru:0.5` | 0.745 | 0.918 | 0.938 |
+| `lru_window:32` (a recency admission filter) | 0.541 | -- | -- |
+
+Three things fall out, and they settle the question:
+
+1. **The Nth-touch admission the delivery ships is predicted WORSE here**, at every slot count (-1.9 pts at S=56,
+   -3.8 at S=133).  The reason is structural: on this tier a non-admitted miss cannot be *served* cold (there is
+   no in-place GPU-readable source), so it still costs a full read AND it declines the slot -- the churn it saves
+   is worth less than the hit rate it gives up.  That is the maintainer's intuition, now with numbers:
+   **we would rather fill it.**
+2. **The tier already implements the predicted-best policy.**  `access_locked()`'s eviction is min-count with an
+   LRU tie-break and a decay period -- `LfruDecay` -- which is the best or tied-best row at every S (0.738 /
+   0.919 / 0.938 against plain LRU's 0.727 / 0.918 / 0.938).
+3. **SLRU is the only policy that beats it**, by +1.8 pts at S=56 and ~0 at S>=128: it trades a protected/probation
+   split, which is a new mechanism for a gain that disappears in the range the tier actually runs at.  Not worth
+   building on this evidence.
+
+**So the transient band stays dropped, and `MOE_EXPERT_CACHE_TOUCH` stays a no-op** -- now on a prediction as well
+as on the gate's `touch1/2/3` identical-residency assertion.  If a future workload makes admission worth
+revisiting, the simulator is the first stop, and the trace capture is one env var.
+
+**Calibration check:** the simulator predicts a 0.727 steady-state hit rate at S=56; the box's own whole-run
+census at `-lme 4` reads `h=0.60-0.63` over a short run, which includes the cold start.  Consistent in direction
+and magnitude -- the simulator is not obviously mis-modelling this tier.
+
+### 26.3 Not measured
+
+* **MBIG's own decode trace**: the trace above is the 35B's, replayed at MBIG's slot count (S=133).  A trace from
+  the 122B would be a better bound on its own workload; the *ranking* of the policies is what the question asked
+  for, and it is unchanged across S.
+* **SLRU / decay-period tuning**: the +1.8 pt is one trace, three prompts, one box.

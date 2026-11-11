@@ -1,3 +1,71 @@
+## 261111.027 (wip, NO delivery change) -- the two promotion decisions, TAKEN: the SHAPE is chosen by the fit, and admission needs nothing (the campaign's own policy simulator says so)
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`e15c4d2cd2983f477a5dd3d94aec8608a416ab3c502f7f2d8bc08a4c28e77880`, tree `d7dcb4f9…`, verified by `git am` onto a
+fresh `d65b0e889` checkout.  Records: [`MEASUREMENTS.md` §26](wip/apu-expert-gtt/MEASUREMENTS.md) (the shape arms
+and the simulator table).
+
+**Decision 1 (maintainer, 2026-11-11):** *"MOE_EXPERT_GTT_ARENA's default shape should be arena if the weights would
+spill onto disk, otherwise placement.  If `MOE_EXPERT_GTT_ARENA` is set, then honour the user's choice."*
+**Implemented** in `plan_gtt_expert_store()`: `arena iff the model's weights exceed 90 % of MemAvailable`, placement
+otherwise -- on an APU the only thing below RAM is the page cache, so "spills" IS that test -- with the variable now
+a tri-state (`1` force arena, `0` force placement, unset = auto).  That also fixes an older defect: it was parsed
+with `getenv(...) != nullptr`, so `MOE_EXPERT_GTT_ARENA=0` **enabled** the tier.  Verified both ways on the box, and
+the census names the reason:
+
+| model | `-lme` | env | result |
+|---|---|---|---|
+| 35B-A3B (21.1 GiB of weights) | 4 | unset | `24 tables / 6144 slots (4066.1 MiB) resident … a hot subset. Everything else keeps its layer's device buffer` -- **placement** |
+| 35B-A3B | 4 | `=1` | `-> the GTT store is the MoE ARENA` -- **forced arena** |
+| 35B-A3B | 4 | `=0` | placement |
+| 122B-A10B (123.4 GiB on a 123 GiB box) | 60 | unset | `[auto: the weights spill out of RAM (126403.0 MiB against a 106739.9 MiB ceiling), so residency, not placement, is what makes this model runnable] -> the MoE ARENA` -- **arena, automatically** |
+
+The gate grew two arms for it: `shapefit` (a fitting model with a small `-lme` and the env UNSET must get placement
+-- no arena, no eviction, no forced mmap) and `ram` (now run with the env unset, and the census must say why the
+arena was chosen).  Every other arm pins the shape so its meaning cannot drift with the model's fit.  **38 checks,
+green.**
+
+**Decision 2 (maintainer, 2026-11-11):** *"We can drop the `MOE_EXPERT_CACHE_TOUCH=N` for now.  I suspect that
+because the fill is much slower than it is for the discrete GPU scenario that we'd really prefer to fill it anyway.
+However, don't we have a policy simulator already written somewhere for exactly this?"*  **Yes --
+`archive/work/moe-expert-cache/policy_sim.py`**, and it settles the question in the direction the intuition had:
+
+* traced this tier (`MOE_EXPERT_TRACE`, 35B-A3B, arena `-lme 4`, a 407-token greedy decode over 120 tables) and
+  converted it to the simulator's `route,tok,table,expert` form -- one "table" = one (layer, role), the arena's own
+  unit, so `S` is *slots per table* (56 at `-lme 4` on the 35B, 133 on the 122B at `-lme 60`);
+* the number that matters is `h_steady`, at the arena's real S:
+
+| policy | S=56 | S=133 | S=192 |
+|---|---|---|---|
+| `static` top-S | 0.398 | 0.510 | 0.512 |
+| **`lru` / the tier's LFRU** | **0.727** | **0.918** | **0.938** |
+| `second_touch` (the delivered `TOUCH=2`) | **0.708** | **0.880** | **0.891** |
+| `lfru_decay:64` | 0.738 | 0.919 | 0.938 |
+| `slru:0.5` | 0.745 | 0.918 | 0.938 |
+| `lru_window:32` | 0.541 | -- | -- |
+
+So: **the Nth-touch admission the delivery ships is predicted WORSE here at every slot count** (-1.9 pts at S=56,
+-3.8 at S=133) -- a non-admitted miss still costs a full read on this tier (there is no cold serve) *and* declines
+the slot, so the churn it saves is worth less than the hit rate it gives up.  **We would rather fill it**, exactly
+as suspected.  The tier's existing `access_locked()` eviction is already the predicted-best policy (`LfruDecay`:
+min count, LRU tie-break, 32-step decay -- best or tied-best at every S), and the only thing that beats it is SLRU
+by +1.8 pts at S=56 and ~0 at S>=128, which is not a mechanism worth building for a gain that vanishes in the range
+the tier runs at.  **The transient band stays dropped; the no-op is now predicted as well as asserted** (the gate's
+`touch1/2/3` identical-residency arm), and the simulator + a one-env-var trace capture is the first stop if a future
+workload makes it worth revisiting.
+
+**Calibration note:** the simulator predicts a 0.727 steady-state hit rate at S=56 and the box's own whole-run
+census reads `h=0.60-0.63` over a short run including its cold start -- consistent in direction and magnitude, so
+the model is not obviously mis-fitting this tier.  What is NOT measured: a decode trace from the 122B itself (the
+35B's was replayed at MBIG's slot count; the policy *ranking* is what the question asked for and it is unchanged
+across S), and any SLRU/decay-period tuning (one trace, three prompts, one box).
+
+**Promotion is now unblocked on the decisions and still not done:** `patches/`, `release.json`, `ENVIRONMENT.md`,
+`INVARIANTS.md` and `patches/README.md` are untouched, nothing has been pushed, and the go-ahead for the block is
+still the maintainer's.  The measurement debt in the previous entry stands unchanged (multi-device, the MTP
+four-axis protocol, the discrete pool, probe 15).
+
 ## 261111.026 (wip, NO delivery change) -- P6: the tier gets its gate (`scripts/gate-uma-experts.sh`, 35 checks), and the promotion package is ready for the maintainer's two decisions
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed by the delivery).
