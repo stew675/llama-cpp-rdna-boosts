@@ -29,10 +29,11 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 
 ### Block 16 (r263, the UMA GTT expert store) — carried forward
 
-* **The MTP four-axis protocol is OWED for block 16's decode-affecting stages** (`benchmarks/mtp-adaptive-methodology.md`).
-  The campaign's own P3c/P4 arms only ever showed draft acceptance 1.0 on 2-token arms, which is not the protocol;
-  the block's claim is "the store changes WHERE the bytes are, never WHICH", proven by same-seed text and the
-  prefill-logit gate, and that is what shipped.  Run the four axes before the next release that touches this code.
+* ~~The MTP four-axis protocol is OWED for block 16's decode-affecting stages~~ -- **DONE in r263**: run on
+  `halo` at the promotion, acceptance **bit-identical** in every arm (0.72082 / 0.75659 / 0.88057 / 0.99462,
+  identical accepted/generated counts) across the store-OFF, ARENA and PLACEMENT configurations
+  (`archive/work/apu-expert-gtt/MEASUREMENTS.md` §28).  The `llama-batched-bench -npl 1,4,8` width arm was
+  inconclusive on that box (no data rows in either arm) and is still owed on the 3x R9700 box.
 * **Multi-device is untested on this tier** (one GPU on the APU box; the discrete cross-check was `GPU=0`).  The
   per-device budget, the per-device head subtraction and the free-bytes query have never seen a `-sm tensor` /
   `-sm layer` split across APUs, and the prefill-stream hook declines by geometry on a slice (by construction, not by

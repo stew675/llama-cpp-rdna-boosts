@@ -1684,3 +1684,46 @@ claim is made beyond that: the point is that the discrete host-expert path is no
   side too -- see §25.6/§26.3).
 * **A long-running arm**: the gate's arms are 32-token greedy runs; a throughput/acceptance comparison over the
   MTP four-axis protocol is still the campaign's outstanding debt on any box.
+
+## 28. 2026-11-11 — the MTP four-axis gate for block 16 (the release gate that was owed): acceptance is BIT-IDENTICAL in every arm
+
+`benchmarks/mtp-adaptive-methodology.md` Protocol A, on `halo` (gfx1151), Qwen3.6-35B-A3B Q4_K_M (its embedded
+nextn head, no `-md`), `-n 3000` (2000 floor), `--reasoning on` for R and `off` for P/C/K, seed 42, temp 0, bf16 KV,
+`-c 16384`, `-t 8`, the versioned prompts (`reasoning.txt`, `prose-rdna-boosts.txt`, `code-python.txt`,
+`recall.txt`), prior frozen.  Three arms per axis:
+
+* **OFF** = `MOE_EXPERT_GTT=0` -- the delivery's previous behaviour, the reference;
+* **ARENA** = `MOE_EXPERT_GTT_ARENA=1 -lme 4` -- the store as the cache's arena, ~25 % miss churn: the stressing arm;
+* **PLACEMENT** = `-lme auto` with `RLIMIT_MEMLOCK=unlimited` -- the **fitting-model default a consumer gets** (the
+  store holds the whole set, nothing is evicted), measured on P and K;
+* plus a **plain** (`--spec-type none`, `-n 1000`) arm per axis on the ARENA configuration, to show MTP still
+  accelerates.
+
+| axis | OFF (t/s) | ARENA (t/s) | PLACEMENT (t/s) | plain, ARENA (t/s) | **acceptance (all arms)** | mean len |
+|---|---|---|---|---|---|---|
+| R reasoning | 91.72 | 38.49 | -- | 30.44 | **0.72082** (2050 / 2844) | 3.16 |
+| P prose | 92.85 | 39.06 | 93.13 | 28.22 | **0.75659** (1321 / 1746) | 3.27 |
+| C code | 104.69 | 42.18 | -- | 28.47 | **0.88057** (2175 / 2470) | 3.64 |
+| K recall | 112.54 | 46.23 | 112.03 | 29.18 | **0.99462** (370 / 372) | 3.98 |
+
+**The acceptance is bit-identical on every axis -- not "within noise": the accepted/generated counts are the same
+integers** (2050/2844, 1321/1746, 2175/2470, 370/372) and so is the mean accepted length.  That is the strongest
+possible statement for this block: the store changes WHERE the bytes are, never WHICH, so the draft-vs-verify
+numerics relationship is untouched.  It is also on the right side of the protocol's threshold (acceptance > ~0.45
+everywhere) and **MTP still accelerates in every arm** -- +27 % to +58 % over plain on the arena arm, and the
+placement arm is level with the store OFF (P 93.13 against 92.85, K 112.03 against 112.54).
+
+The ARENA arm's throughput (38-46 t/s against 91-112) is the **price of a 4 GiB cap on an 18.7 GiB set**, not a
+block-16 regression: the same configuration's *plain* decode is 28-30 t/s, i.e. the tier is still a large win over
+no tier at all, and the default (`-lme auto`, placement) is level with the previous behaviour.
+
+**Two things this gate run also showed, both already documented and both real:**
+
+* `llama-batched-bench -npl 1,4,8` produces **no data rows on this box in either arm** (rc=0, header only) -- on the
+  block-16 build *and* on the other build in the checkout, so it is the tool/host, not the block.  The width arm is
+  therefore **inconclusive here** and no comparison is claimed; `llama-batch`/`llama-bench` arms were used instead
+  (`MEASUREMENTS` §25.2/§25.3).  The 3x R9700 box is where that arm has always been run.
+* **`-lme auto` under an 8 GiB `RLIMIT_MEMLOCK` is an ARENA, not placement**: the clamp branch takes the limit when
+  the model fits ("this model fits in RAM anyway, so this is an optimisation"), the extent lands at 8 GiB, and
+  `extent_trunk < padded_total` therefore engages the arena -- loudly, with the clamp WARN.  The placement arm above
+  needs `LOCK_KB=unlimited`, and the gate's `resident`/`shapefit` arms already assert both directions.
