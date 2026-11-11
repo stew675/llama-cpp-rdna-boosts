@@ -16,6 +16,10 @@ current artifact** (older `WORKLOG` entries quote the value that was current the
 |---|---|
 | [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15.6 % decode warm) + P4f (on RDNA3_5 UMA the ladder starts on the buffered arm: +13.7 % warm on a fitting model, +56-67 % on a >RAM model) | `851e1871b2a59263e9209cb1b93bfc279b8805947a30f8d049eb7d2a529532af` |
 
+> **Next session: [`NEXT-SESSION-PROMPT-P5-P6.md`](NEXT-SESSION-PROMPT-P5-P6.md)** -- the cold-start handover for
+> the last two stages (P5 prefill streaming, P6 gate + promotion) and the two decisions the maintainer owes.  The
+> re-runnable tools it names are [`arms.sh`](arms.sh), [`guard.sh`](guard.sh) and [`cold-cache.py`](cold-cache.py).
+
 **P4 is COMPLETE (P4a/P4b/P4e/P4f)**, and P4f is its biggest win: on **RDNA3_5 with the arena tier and the direct
 fill available** the ladder now starts on the buffered arm (+13.7 % warm on a fitting model, +56-67 % on a >RAM
 model), with three gates keeping it off every other configuration (`MEASUREMENTS.md` §24).  The one paid cost is a
@@ -551,6 +555,9 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 | `README.md` | this file: the shape, what it replaced, the measured foundation, the step/prefill protocol, the code map, the traps |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | the phased plan: P1.0 keystone probes, the GTT store, residency/eviction, the fills, prefill streaming, preflight/fit, the gate spec, docs, effort, rollback |
 | [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration, §14 the same-day P1.1+P2 record (keystone re-run, registration cost at real extent, the fill rates, the `-lme` arms, the read-rate A/B) |
+| [`guard.sh`](guard.sh) | run ONE arm under the campaign's barriers (address space, `RLIMIT_MEMLOCK`, a `SwapFree` monitor that kills the run on the first drop) -- every arm from P3 on used it |
+| [`cold-cache.py`](cold-cache.py) | drop a GGUF's page cache (no root) for a cold arm, with the caveat that a fitting model's long arm is really "cold first touch, warm repeats" |
+| [`NEXT-SESSION-PROMPT-P5-P6.md`](NEXT-SESSION-PROMPT-P5-P6.md) | the cold-start handover for P5/P6 |
 | [`gtt-expert-store.patch`](gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 + P3a/P3b/P3c as ONE patch cut against the r262 `release.json` tree `891d4acb…` (`git am`; sha256 in the status header) |
 | [`arms.sh`](arms.sh) | the P1.1+P2 arms: `text` (same-seed greedy, no `-lv`), `census` (`-lv 4`), `rate` (`llama-bench`, the ReadOnly/writable/absent A/B), plus the GPU-fault scan.  `TREE=~/llama-scratch ./arms.sh all` |
 | [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); probes 15 (touch distance) and 16 (reclamation under pressure) still owed |
