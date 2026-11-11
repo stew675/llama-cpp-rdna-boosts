@@ -1,4 +1,4 @@
-From 1ea4ebb4940f85ddb88e6a29ad5c62e210451404 Mon Sep 17 00:00:00 2001
+From a5c393f93c031debb52c7633336ca7add83d15f0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/15] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -5532,7 +5532,7 @@ index 2c32cf2f8..79a23e5fb 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 29e68ef28..230b94301 100644
+index 98997b3f5..a7cd3fbaa 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -5564,7 +5564,7 @@ index 29e68ef28..230b94301 100644
      if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
          return;
      }
-@@ -3470,7 +3466,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+@@ -3495,7 +3491,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
          return k_no_host_source;
      }
      const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
@@ -5595,7 +5595,7 @@ index 29e68ef28..230b94301 100644
      return err;
  }
  
-@@ -5717,9 +5735,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -5742,9 +5760,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      }
      // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
      // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
@@ -5611,7 +5611,7 @@ index 29e68ef28..230b94301 100644
      }
      g_preflight_done = true;
      g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
-@@ -7916,7 +7937,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -7941,7 +7962,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
      // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
      if (head_pad > 0 && weight_cpy->data != nullptr) {

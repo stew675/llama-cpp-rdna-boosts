@@ -3159,6 +3159,34 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > `pinlate` arm included), coherence `1c5d32ac537d` at 1 GPU and 3 GPU `-sm tensor`, MTP four-axis at `-n 3000`
 > on the dense 27B, `validate-set.sh` green, per-block build 2/2.  Record: `WORKLOG.md` 261106.020.
 
+> **r261 amendment (`TODO` #132 retired): a `-sm tensor` fill reads only THIS device's slice.**
+> Each device owns a slice of every host expert, and for `ffn_gate_exps`/`ffn_up_exps` that slice is
+> **contiguous** inside the expert (`CACHE_GEOM`: `expert_bytes 884736 host_bytes 1769472 src_off 0 host_pitch 0
+> split_axis 1`), while the consumer copies exactly that run (`copy_slot_from_src` -> `base + src_off`, 1-D).
+> `expert_host_src`'s fallback fill read the **whole** expert anyway, so every cold expert was read from storage
+> at double size on a multi-device split.  `MOE_HOST_POOL_SLICE_READ` (default on) now reads `expert_bytes` at
+> `file_off + expert*host_bytes + src_off` into the pinned entry **at `src_off`**, which leaves
+> `copy_slot_from_src` and its four consumers (the bounce, `fill_slot_from_host`, the prefill gather, the staging
+> fill) untouched; a **strided** slice (`host_pitch > 0`, an axis-0 `down_exps` split) or a **fused** table
+> (`n_slices > 0`) keeps the whole-expert read, because its slice is not one run and one sequential read beats
+> `rows` strided ones.  Measured (122B-A10B UD-Q4_K_XL, `-ncmoe 48 -lme 54`, `MOE_HOST_POOL_DIO=1`, `-n 1000`,
+> same binary, `MOE_HOST_POOL_SLICE_READ=0` is the A/B arm): 2-GPU x8 pair **18.98 -> 20.12 t/s decode (+6.0 %),
+> 844.9 -> 917.8 prefill (+8.6 %), 193 221 -> 173 354 MiB of disk (-10 %)**; 3 GPUs **+0.8 % decode, 1126.9 ->
+> 1406.8 prefill (+24.8 %), -16 % disk**; **inert at 1 GPU**, which is what the geometry predicts (there
+> `expert_bytes == host_bytes`).  Gates: greedy text byte-identical across the arms *and* against the pre-r261
+> binary (pair host-expert `fa20f8883726`, dense 4B `51daef9ef546`), `gate-prefill-logits.sh --record
+> --ab "MOE_HOST_POOL_SLICE_READ=0"` mean KLD **-0.000000 / 100.000 %**, `gate-host-pool.sh` **42/42**,
+> `validate-set.sh` green, per-block build 2/2.
+>
+> **The item's own mechanism was refuted, and it is worth knowing why** (`benchmarks/2026-11-11-host-pool-slice-read.md`
+> §1): a decode graph is one split per layer, and the scheduler copies a split's host-weight inputs — beginning
+> with a full meta-backend **synchronize** for the routing ids — *before* dispatching it, so when a miss is
+> discovered the device has nothing in flight.  Measured on that arm (58.6 ms/step): the readback is 24.0
+> ms/token and *is* the device's compute, and `moe_cache_update_host` adds 33.2 ms/token of strict device idle,
+> of which the demand source is 31.7 ms.  A demand-fill "overlap worker" therefore has nothing to overlap with;
+> a shared per-host-tensor ring across the two devices (built, 4 entries, 1 188 MiB) hit **0.5 %** and was
+> dropped.  The residue is a *coverage* question (`TODO` #141) and the devremap's cold source, not a pool knob.
+
 > **r231 amendment: the pool's re-layout fills are issued in FILE order, not heat order.**
 > `TODO` #280's crossover pass (`archive/work/host-expert-parity/RESULTS-2026-11-07-radix.md`) found that the biggest
 > single term in a non-mirror tier's field prefill is not bandwidth but the **band-transition tail**:

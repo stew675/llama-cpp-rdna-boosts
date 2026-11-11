@@ -64099,10 +64099,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..230b94301
+index 000000000..a7cd3fbaa
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,10063 @@
+@@ -0,0 +1,10088 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -67352,6 +67352,24 @@ index 000000000..230b94301
 +    return on;
 +}
 +
++// TODO #132: on a `-sm tensor` split a device owns a SLICE of every host expert, and that slice is usually
++// CONTIGUOUS inside the expert (`host_pitch == 0`: the split landed on a whole block axis, so this device's
++// bytes are `src_off .. src_off + expert_bytes`).  The consumer copies exactly that run (`copy_slot_from_src`
++// -> `src.base + t.src_off`, 1-D), so reading the WHOLE expert to serve it doubles the bytes of every cold
++// expert this device needs -- measured 2026-11-11 on the 2-device 122B pair, where the demand read was 75 %
++// of the decode step's host time and the two x8 devices each read the peer's half.  A slice that is strided
++// (`host_pitch > 0`, an axis-0 `down_exps` split) or fused (`n_slices > 0`) keeps the whole-expert read: its
++// slice is not one run, and one sequential read beats `rows` strided ones.
++// `MOE_HOST_POOL_SLICE_READ=0` restores the whole-expert read (the A/B arm, and the bisect).
++static bool table_slice_readable(const table_t & t) {
++    static const bool on = [] {
++        const char * e = getenv("MOE_HOST_POOL_SLICE_READ");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on && t.n_slices == 0 && t.host_pitch == 0 && t.expert_bytes > 0 &&
++           t.src_off + t.expert_bytes <= t.host_bytes;
++}
++
 +// TODO #87: `allow_empty_fill` lets the demand path take an EMPTY pool slot for a miss (and then keep it --
 +// the pool is the other tier, not a bounce buffer).  It never evicts: a full pool misses through the bounce.
 +// Caller holds `g_mutex`.
@@ -67441,6 +67459,13 @@ index 000000000..230b94301
 +        return false;
 +    }
 +    char * buf = t.bounce[(size_t) idx].host;
++    // TODO #132: read only THIS device's contiguous slice when the geometry allows it.  The entry stays
++    // `host_bytes` long and the slice lands at its own `src_off`, so `copy_slot_from_src`'s `base + src_off`
++    // is still the right address and no new field is needed.
++    const bool   trim   = table_slice_readable(t);
++    const size_t rd_len = trim ? t.expert_bytes : t.host_bytes;
++    const size_t rd_off = trim ? t.src_off       : 0;
++    char * const rd_dst = buf + rd_off;
 +    bool   filled = false;
 +    if (g_pool_dio && pool_file_io_available() && t.src_known && !t.src_path.empty()) {
 +        // DISK TIER (`MOE_HOST_POOL_DIO=1`): read the expert with O_DIRECT so the page cache is not
@@ -67454,14 +67479,14 @@ index 000000000..230b94301
 +            }
 +        }
 +        if (t.src_fd >= 0) {
-+            const size_t off = t.src_offs + (size_t) expert * t.host_bytes;
++            const size_t off = t.src_offs + (size_t) expert * t.host_bytes + rd_off;
 +            const int64_t tr0 = ggml_time_us();
-+            filled = g_pool_dio ? pool_dio_read(t.src_fd, buf, t.host_bytes, off, t.src_align)
-+                                : (pool_pread(t.src_fd, buf, t.host_bytes, off) == (pool_ssize_t) t.host_bytes);
++            filled = g_pool_dio ? pool_dio_read(t.src_fd, rd_dst, rd_len, off, t.src_align)
++                                : (pool_pread(t.src_fd, rd_dst, rd_len, off) == (pool_ssize_t) rd_len);
 +            if (filled) {
 +                g_bounce_read_calls++;
 +                g_bounce_read_us    += ggml_time_us() - tr0;
-+                g_bounce_read_bytes += (int64_t) t.host_bytes;
++                g_bounce_read_bytes += (int64_t) rd_len;
 +            }
 +        }
 +    }
@@ -67474,7 +67499,7 @@ index 000000000..230b94301
 +                          "expert bytes through the model mapping instead.  The bytes are identical -- only "
 +                          "the page cache is populated.\n", __func__, t.layer, t.role.c_str());
 +        }
-+        memcpy(buf, (const char *) t.host + (size_t) expert * t.host_bytes, t.host_bytes);
++        memcpy(rd_dst, (const char *) t.host + (size_t) expert * t.host_bytes + rd_off, rd_len);
 +        filled = true;
 +    }
 +    if (!filled) {
