@@ -329,6 +329,18 @@ evictions > 0 and unregisters == 0.
 
 > **P4 is now COMPLETE.**  Its answer, in one line: the fills are on the critical path, so make them
 > fewer/cheaper (residency, the direct fill, coalescing) -- never a pipeline.
+>
+> **P4f (the start arm, DONE 2026-11-11, maintainer's Option 1)** -- and it is the campaign's biggest win: on
+> **RDNA3_5 with the GTT arena tier and the direct fill available**, the transport ladder now **starts on the
+> buffered arm** instead of r262's optimistic `map`.  Three gates (`g_gtt_arena`, `GGML_CUDA_CC_IS_RDNA3_5`, the
+> direct fill being available) keep it off every other configuration, and an explicit
+> `MOE_HOST_POOL_TRANSPORT`/`--load-mode` still wins.  Measured (`MEASUREMENTS.md` §24): **+13.7 % warm** on a
+> fitting model (29.0 against 25.5 t/s, deterministic -- before it the ladder latched `file` 0 of 5 times), and
+> **+56-67 %** on a >RAM model (MBIG 7.5/7.8 against 4.5/5.0 t/s), where the set can never be cached.  The cost is
+> the **first** run of a *fitting* model on a cold cache (-11.5 %), accepted on the maintainer's steer: *"the cold
+> condition only happens once at the start; better to tune for warm"*.
+
+| **P4f** (DONE 2026-11-11, PM) | the RDNA3_5 UMA start arm: `file` when the direct fill is available | `MEASUREMENTS.md` §24.2/§24.3: +13.7 % warm, +56-67 % on the >RAM model, text identical in every arm, every gate verified (env pin, `--load-mode`, direct-fill switch, placement mode) |
 
 `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) is the seam.  Two arms, chosen by the page cache, not by a
 knob (README §3.1):

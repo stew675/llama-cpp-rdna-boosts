@@ -1269,3 +1269,85 @@ each other, **run order becomes part of the result**, and a comparison can silen
 happened to the latch rate above.  `arms.sh` now exports `MOE_EXPERT_HEATMAP=load` for every arm it runs, and the
 campaign README carries it as a trap; the eventual `gate-uma-experts.sh` must do the same per arm (the delivery's
 `gate-host-pool.sh` already does).
+
+## 24. 2026-11-11 — Option 1 landed: on **RDNA3_5 UMA** the transport ladder STARTS on the buffered arm, and for a >RAM model it is +56-67 %
+
+Maintainer decision (2026-11-11): *"Option 1, but gate it specific to RDNA3.5 because it's more of a UMA specific
+optimization"*, and *"always remember that the cold condition only happens once at the start; better to tune for
+warm"*.
+
+### 24.1 What is implemented, and the three gates
+
+`pool_transport_init_locked()` no longer always applies r262's optimistic `map` start.  One deviation, deliberately
+narrow:
+
+| gate | why |
+|---|---|
+| `g_gtt_arena` (the GTT arena tier) | the **discrete host pool keeps r262's `map` start exactly** -- nothing about a discrete box changes |
+| `GGML_CUDA_CC_IS_RDNA3_5(cc)` on the table's device | the maintainer's call: this is a UMA-shaped optimisation and gfx1151 is the APU this campaign measures.  A future APU on another family keeps the delivered start until it is measured |
+| `direct_fill_wanted() && table_direct_readable(t)` | the win being chased **is** the direct fill (P4b).  With it off the two arms are level on the bounce path, so a `file` start would be a fork of r262's decision with no evidence behind it |
+
+Applied, it logs its own reason: `host read transport -> file (RDNA3_5 UMA start: the buffered arm fills straight
+into the arena slot (no bounce, no H2D), which the probe cannot see and the one-way ladder would otherwise never
+reach)`.  An explicit arm still wins over the deviation -- `MOE_HOST_POOL_TRANSPORT=map|file|dio` and
+`--load-mode mmap|buffered|dio` are pins by definition (verified below).
+
+### 24.2 Measured (35B-A3B, arena `-lme 4`, `-n 96`, prior FROZEN, alternating 3+3, and MBIG in both orders)
+
+**A fitting model, warm page cache — the steady state (the maintainer's "tune for warm"):**
+
+| arm | reps | median |
+|---|---|---|
+| **default (`auto` -> RDNA3_5 UMA start -> `file` + direct)** | 29.0 / 28.8 / 29.0 t/s | **29.0** |
+| pinned `map` (r262's start) | 25.5 / 25.5 / 25.4 t/s | 25.5 |
+
+**+13.7 %**, and now deterministic: before the deviation the same configuration latched `file` **0 of 5** times
+(§23.3).
+
+**A fitting model, cold page cache — paid once per model load, by decision:**
+
+| arm | reps | median |
+|---|---|---|
+| default (`file` + direct) | 21.5 / 21.6 / 21.6 t/s | 21.6 |
+| pinned `map` | 24.4 / 24.4 / 24.6 t/s | 24.4 |
+
+**-11.5 %**, and because the ladder is one-way (an r262 decision: "a box that fell short once is likely to again")
+there is no path back to `map` -- this is a commitment, not an oscillation.  Accepted on the maintainer's steer:
+the cold state exists only at the start of a session, the warm state is every token after it, and the deviation
+also *warms* the set faster (a buffered read populates the page cache the mapping then reads).
+
+**The tier's actual workload -- a >RAM model, where the set can never be cached (MBIG `-lme 60`, `-n 16`):**
+
+| order | `file` + direct | pinned `map` |
+|---|---|---|
+| default first, then `map` | **7.5 t/s** (direct pread 4 221 MiB/s) | 4.5 t/s (24 442 ms of mapping reads) |
+| `map` first, then default | **7.8 t/s** | 5.0 t/s |
+
+**+56 % / +67 %.**  With the page cache unable to hold the set, the mapping pays a fault path per read where a
+`pread` of the same bytes does not, so the deviation is not a warm-only trick: on the model this tier exists for it
+is the largest single win the campaign has measured.  Text identical in both orders (`ee95c45231c3`, no-`-lv` runs);
+the fitting-model arms are all `627b2ebd7792`.
+
+### 24.3 The gates, verified on the box
+
+| arm | result |
+|---|---|
+| `MOE_EXPERT_GTT_FILL_DIRECT=0` | starts on **`map`** -- the deviation requires the direct fill (and the ladder may still escalate to `file`, which then uses the bounce path: 23.9 t/s) |
+| `MOE_HOST_POOL_TRANSPORT=map` | `map` (25.5 t/s) -- an explicit pin wins |
+| `MOE_HOST_POOL_TRANSPORT=dio` | `dio` (7.1 t/s -- `O_DIRECT` is 11x slower here, as §20.2 measured) |
+| `--load-mode mmap` | `map` (26.2 t/s) -- `--load-mode` is a pin too |
+| placement mode (`-lme 6`, no arena tier) | no transport applied at all -- inert |
+| text, all of the above | `627b2ebd7792` |
+
+`check-gpu-faults.sh` clean.
+
+### 24.4 Not measured
+
+* **A non-RDNA3_5 device**: none on this box.  That is precisely what the arch gate is for -- the deviation cannot
+  reach a family nobody measured it on.
+* **The discrete host pool**: `g_gtt_arena` is false there, so the code path is unreachable and r262's start is
+  untouched; `scripts/gate-host-pool.sh` (which cannot run here -- no discrete GPU) is the gate.
+* **A truly cold >RAM model**: MBIG's runs are inherently disk-bound, which is why they are the representative arm,
+  but the cache was not explicitly dropped before them.
+* **The cold-for-fitting trade is a decision, not a measurement**: the maintainer's steer is recorded above so a
+  later reader sees *why* the cold arm loses.

@@ -9,18 +9,18 @@ is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the **r262** `release.json` tree `891d4acb…` and
-applied with `git am`; it produces tree `1ad2695c…`.  Its sha256 advances as the campaign does — **the value below is always the
+applied with `git am`; it produces tree `3bc7adf4…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15 % decode warm, +12 % cold) | `70ffbc7efa42157a5491b3d77c450d118c6a41dff58c15208a4f6c268bb38052` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; the SEPARATE drafter model sharing the one store safely) + P4a (the fills run on r262's adaptive `map`/`file`/`dio` host-read transport) + P4b (the buffered arm reads straight into the arena slot: +15.6 % decode warm) + P4f (on RDNA3_5 UMA the ladder starts on the buffered arm: +13.7 % warm on a fitting model, +56-67 % on a >RAM model) | `851e1871b2a59263e9209cb1b93bfc279b8805947a30f8d049eb7d2a529532af` |
 
-**P4 is COMPLETE (P4a/P4b/P4e).  One OPEN QUESTION for the maintainer remains**: the direct fill makes `file` beat
-`map` warm as well, but r262's ladder starts optimistically on `map`, and with a **frozen** prior it never latches
-`file` on this box (0/5 runs, ~11 % slower than achievable) -- the earlier "usually latches" was heat-map drift
-(`MEASUREMENTS.md` §23.3).  The recommendation there is Option 1 (a tier-scoped start arm), not implemented.  Then
-P5 (prefill streaming) and P6 (gate + promotion).  P3's own limits are named
+**P4 is COMPLETE (P4a/P4b/P4e/P4f)**, and P4f is its biggest win: on **RDNA3_5 with the arena tier and the direct
+fill available** the ladder now starts on the buffered arm (+13.7 % warm on a fitting model, +56-67 % on a >RAM
+model), with three gates keeping it off every other configuration (`MEASUREMENTS.md` §24).  The one paid cost is a
+fitting model's first run on a cold cache (-11.5 %), accepted on the maintainer's steer: *cold happens once at the
+start, so tune for warm*.  Next: **P5** (prefill streaming) and **P6** (gate + promotion).  P3's own limits are named
 in `MEASUREMENTS.md` §16.6, §17.4, §18.5, §20.4 and §21.4: there is **no throughput claim** for the tier as a whole
 (§21.2 is the first decode number it has -- one box, `-n 96`, three reps, reported as such) (and none for the
 head's pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path

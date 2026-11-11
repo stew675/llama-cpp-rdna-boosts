@@ -1,3 +1,52 @@
+## 261111.024 (wip, NO delivery change) -- P4f: on RDNA3_5 UMA the ladder starts on the buffered arm (maintainer's Option 1) -- +13.7 % warm, and **+56-67 % on a >RAM model**
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`851e1871b2a59263e9209cb1b93bfc279b8805947a30f8d049eb7d2a529532af`, cut against the r262 `release.json` tree
+`891d4acb…`, produces tree `3bc7adf4…` (verified by `git am` onto the r262 tip).  Record:
+[`MEASUREMENTS.md` §24](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**Decision** (maintainer, 2026-11-11): *Option 1, gated to RDNA3.5 because it is more of a UMA-specific
+optimisation*, and *"the cold condition only happens once at the start; better to tune for warm"*.
+
+**Implemented**: `pool_transport_init_locked()` no longer always applies r262's optimistic `map` start.  One
+deviation, three gates:
+
+| gate | why |
+|---|---|
+| `g_gtt_arena` | the **discrete host pool keeps r262's `map` start exactly** -- nothing about a discrete box changes |
+| `GGML_CUDA_CC_IS_RDNA3_5(cc)` (the table's device) | the maintainer's call; gfx1151 is the APU this campaign measures, and a future APU on another family keeps the delivered start until someone measures it |
+| `direct_fill_wanted() && table_direct_readable(t)` | the win being chased **is** the direct fill (P4b).  With it off the arms are level on the bounce path, so a `file` start would be a fork with no evidence behind it |
+
+It logs its own reason (`RDNA3_5 UMA start: the buffered arm fills straight into the arena slot (no bounce, no
+H2D), which the probe cannot see and the one-way ladder would otherwise never reach`), and an explicit
+`MOE_HOST_POOL_TRANSPORT` / `--load-mode` still wins -- both verified.
+
+**Measured (§24.2), prior FROZEN, alternating 3+3 (`-n 96`):**
+
+| condition | `file` + direct (the new default) | pinned `map` (r262's start) |
+|---|---|---|
+| fitting model, **warm** (the steady state) | **29.0 / 28.8 / 29.0 t/s** | 25.5 / 25.5 / 25.4 t/s |
+| fitting model, **cold** (once per model load) | 21.5 / 21.6 / 21.6 t/s | 24.4 / 24.4 / 24.6 t/s |
+| **>RAM model (MBIG, both orders)** | **7.5 / 7.8 t/s** | 4.5 / 5.0 t/s |
+
+* **Warm: +13.7 %**, and now *deterministic* -- before the deviation the same configuration latched `file` **0 of
+  5** times (§23.3; the "usually latches" I reported earlier was heat-map drift).
+* **Cold: -11.5 %**, paid once per model load, and the one-way ladder (an r262 decision) means it is a commitment,
+  not an oscillation -- accepted on the maintainer's steer.  It also *warms* the set faster, since a buffered read
+  populates the page cache the mapping then reads.
+* **The tier's actual workload is the headline: +56-67 %** on the 123 GiB model whose set can never be cached
+  (direct pread 4 221 MiB/s where the mapping pays a fault path per read).  On the model this tier exists for, the
+  deviation is the largest single win the campaign has measured.
+
+Text identical in every arm and both orders (`627b2ebd7792` on 35B, `ee95c45231c3` on MBIG, no-`-lv` runs);
+every gate verified (`FILL_DIRECT=0` -> `map`; `MOE_HOST_POOL_TRANSPORT=map` -> `map` 25.5; `=dio` -> `dio` 7.1;
+`--load-mode mmap` -> `map` 26.2; placement mode -> no transport at all); `check-gpu-faults.sh` clean.
+
+**Not measured (§24.4):** a non-RDNA3_5 device (none here -- which is what the arch gate exists for), the discrete
+host pool (unreachable: `g_gtt_arena` false; `gate-host-pool.sh` is its gate), and a deliberately cold >RAM arm
+(MBIG is inherently disk-bound, which is why it is the representative one).
+
 ## 261111.023 (wip, NO delivery change) -- the heat-map prior was WARMING during my arms: one conclusion of mine inverted, a trap for every future arm, and P4e's answer (no fill worker)
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact
