@@ -150,3 +150,27 @@ Identical, as r207 recorded for the whole switch (prefill logits KLD -0.000000 /
   a census is the line above (`gather … N routed experts … from the bounce/pool-fill path`): N > 0 means the
   cell is in the losing band.  Not implemented: it would need the not-fitting box, `gate-host-pool.sh`, the
   prefill-logit gate and `#273`'s transport question settled first.
+
+## 8. The decode side of the same band (`TODO` #141), re-verified while the rig was warm
+
+`#136` and `#141` are the two faces of one configuration — a **sub-complement host-expert budget** — in different
+bands: `#136` was the prefill transport, `#141` is the eager take-over declining at wide decode.  Both were
+measured in this session, so the `#141` row is re-verified rather than carried:
+
+`llama-batched-bench -npp 512 -ntg 128 -npl 1,8`, 2 devices, 35B-A3B Q4_K_M `-ncmoe 40`,
+`MOE_EXPERT_CACHE_MIB=2048`, `-sm layer`, `-fa on`, `-t 12`:
+
+| arm | pp (npl 8) | tg (npl 8) | tg (npl 1) |
+|---|---:|---:|---:|
+| `-lme auto` (mirror, covering) | 1261.4 | **176.6** | 59.0 |
+| **`-lme 8` (≈65 % covered, sub-complement)** | 825.0 | **48.0** | 42.9 |
+| `MOE_EXPERT_CACHE_MIB=0` (cache off) | 745.5 | 109.6 | 37.1 |
+
+The sub-complement budget is **below the cache being switched off** (48.0 against 109.6) and ~3.7x below a
+covering pool — the r211 shape reproduces exactly.  Its absolutes do not, and are not comparable: the r211 record
+reads 50.4 / 270.3 / 129.2 on a different rig (that table predates `-fa on` and this tree), which is why the
+`TODO` row now carries both the shape and its own rig line.
+
+One consequence for `#141`'s candidate list: the prefill's `191 279` neither-tier experts (§5) are the *same*
+population the decode take-over declines, so candidate (b) there — a bounce ring legal as a cold source *inside*
+the take-over — would serve both bands, and that is now a two-datum candidate rather than a decode-only one.

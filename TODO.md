@@ -34,7 +34,7 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **133** | a fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch | performance (delivery defect, default mode; backlog) | **OPEN** (2026-11-03) — 3-device prefill is slower than 1-device because of it — §133 |
-| **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04) — the bound is static per shape on purpose — §141 |
+| **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **142** | the pool tier's first prefill pays ~3 s (it is built and sized lazily) | performance (block 09/12; pre-existing r210) | **OPEN** — the lead is to move the population into the preflight — §142 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
@@ -183,11 +183,28 @@ A fully-resident (identity) expert table is re-copied out of the arena on every 
 
 ## 141. A sub-complement host-expert budget declines the eager take-over at wide decode
 
-A **genuine sub-complement** host-expert budget (`-lme 8` = 43 % of the set, or any `MOE_HOST_POOL_FRAC` below 100) declines the eager take-over at wide decode: `llama-batched-bench -npl 8` gives **50.4 tg**, i.e. worse than the cache being off (129.2), because `slots + pool coverage < n_used * n_tok` cannot guarantee a complete remap and the run falls back to the pageable mapping
+A **genuine sub-complement** host-expert budget (`-lme N` well below the host expert set — 43 % of it at `-lme 8` — or a `MOE_HOST_POOL_FRAC` below 100 **in the not-fitting band only**, see the r256 note) declines the eager take-over at wide decode: `llama-batched-bench -npp 512 -ntg 128 -npl 8` gives **48.0 tg** on the r254 tree, i.e. worse than the cache being off (109.6), because `slots + pool coverage < n_used * n_tok` cannot guarantee a complete remap and the run falls back to the pageable mapping
 
 **Kind:** performance (block 09, the pool tier).
 
-**OPEN -- measured limit** (2026-11-04, `WORKLOG.md` 261104.002 §4).  The bound is static per shape on purpose (a per-token decision cannot be baked into a captured graph), so the honest answers are a bigger arena, the pinned tier, or the retired `MOE_HOST_POOL_SIZING`/coverage work.  Candidates worth scoring offline with `scripts/moe-trace-replay.py` before any code: (a) require the arena to hold `n_used * band` slots for a pool-backed table (size it, do not decline it), (b) serve a neither-tier expert from the bounce ring *inside* the take-over instead of declining the table (needs the ring to be a legal cold source for one token), (c) accept the variance and let the graph re-capture.  Nothing is in flight; the r211 fix covers only the covering case
+**OPEN -- measured limit** (2026-11-04, `WORKLOG.md` 261104.002 §4; re-verified on r254 in r256).  The bound is static per shape on purpose (a per-token decision cannot be baked into a captured graph), so the honest answers are a bigger arena, the pinned tier, or the retired `MOE_HOST_POOL_SIZING`/coverage work.  Candidates worth scoring offline with `scripts/moe-trace-replay.py` before any code: (a) require the arena to hold `n_used * band` slots for a pool-backed table (size it, do not decline it), (b) serve a neither-tier expert from the bounce ring *inside* the take-over instead of declining the table (needs the ring to be a legal cold source for one token), (c) accept the variance and let the graph re-capture.  Nothing is in flight; the r211 fix covers only the covering case
+
+**r256: this is the DECODE half of the band `#136` retired from, and the `#136` sweep corrects two things in the
+paragraph above** (`benchmarks/2026-11-10-devgather-coverage.md`, `WORKLOG.md` 261110.013).  (1) **`MOE_HOST_POOL_FRAC` is
+not a second way into this band**: when `-lme auto` fits the whole set under `MOE_HOST_LIMIT_FRAC` the pool is a
+**mirror** and the percentage is not read at all — FRAC 30/50/95 measured 1233.6 / 1240.9 / 1234.5 t/s prefill
+with every one of the 120 tables at 256/256 slots — so "any FRAC below 100" holds only in the *not-fitting* band
+(where the knob lives).  (2) **The band costs prefill as well as decode**, and the census names the shared cause:
+at `-lme 9` on 2 devices the gather issues the same 2574 calls as the mirror, but **191 279 routed experts are
+copied from the bounce/pool-fill path ("neither tier")** — the prefill face of exactly the "a neither-tier expert
+has no cold id" problem this item is about.  There the gather default costs **−8.8 % / −10.1 %** at ~70 % / ~43 %
+coverage on a 2-device tensor split, while the same budget on 3-device `-sm layer` is **+16.3 %** (the uncovered
+fill is a per-expert serialisation the layer split does not pay).  That is a second datum for candidate **(b)**:
+a bounce ring legal as a cold source *inside* the take-over would serve the decode band and the prefill gather at
+once.  **Re-verified r256** (2 devices, 35B-A3B Q4_K_M `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048`, `-sm layer`,
+`-fa on`, `-npl 1,8`): `-lme 8` **tg 48.0 / pp 825.0**, `-lme auto` (mirror) **tg 176.6 / pp 1261.4**, `MIB=0`
+(cache off) **tg 109.6 / pp 745.5** — the r211 record's absolutes (50.4 / 270.3 / 129.2) are a different rig; the
+*shape* (sub-complement below cache-off, ~3.7x below a covering pool) is what reproduces.
 
 ## 142. The pool tier's **first** prefill pays ~3 s before an arena exists
 

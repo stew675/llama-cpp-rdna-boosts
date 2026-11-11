@@ -1,3 +1,36 @@
+## 261110.013 (r257, docs + one measurement follow-up -- NO delivery change) -- `TODO` #141 is the decode side of the `#136` band, so its description is corrected and re-verified
+
+**No code, no `patches/`, no `release.json` change.**  Prompted by the obvious question after r256: `#141` is
+"a sub-complement host-expert budget declines the eager take-over at wide decode", i.e. **the same configuration**
+`#136` turned out to be about, in the other band.  Two of its statements had aged, and the rig was still warm, so
+it is corrected rather than swept up.
+
+**1. `MOE_HOST_POOL_FRAC` is not a second way into the band.**  The row said "`-lme 8` = 43 %, **or any
+`MOE_HOST_POOL_FRAC` below 100**", which was true of the r209-era tier and is false since r210: when `-lme auto`
+fits the whole set under `MOE_HOST_LIMIT_FRAC` the pool is a **mirror** and the percentage is never read (r256's
+census: FRAC 30/50/95 all fill every one of the 120 tables to 256/256 slots and measure 1233.6 / 1240.9 / 1234.5
+t/s prefill).  The knob is the *not-fitting* band's, which is where a sub-complement pool is a default rather than
+an experiment, so the row now scopes it that way (and so does `ENVIRONMENT.md`, r256).
+
+**2. The band costs prefill too, for the same reason.**  r256's census names the shared population: at `-lme 9` on
+2 devices the gather issues the same 2574 calls as the mirror, but **191 279 routed experts are copied from the
+bounce/pool-fill path ("neither tier")** — the prefill face of "a neither-tier expert has no cold id", which is
+exactly what the wide-decode take-over declines over.  The two faces have opposite transports: the gather default
+costs -8.8 %/-10.1 % at ~70 %/~43 % coverage on a **tensor split**, and is +16.3 % on `-sm layer` at the same
+budget, because the uncovered fill is a per-expert serialisation only the tensor split pays.
+
+**3. Re-verified on r254** (`llama-batched-bench -npp 512 -ntg 128 -npl 1,8`, 2 devices, 35B-A3B Q4_K_M
+`-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048`, `-sm layer`, `-fa on`): `-lme 8` **tg 48.0 / pp 825.0**, `-lme auto`
+(mirror) **176.6 / 1261.4**, `MIB=0` (cache off) **109.6 / 745.5** — the sub-complement budget is still *below the
+cache being switched off* and ~3.7x below a covering pool.  The r211 absolutes (50.4 / 270.3 / 129.2) are a
+different rig and are not comparable; the row now carries its own rig line, and the table is
+[`benchmarks/2026-11-10-devgather-coverage.md`](benchmarks/2026-11-10-devgather-coverage.md) §8.
+
+**Why it stays OPEN (not retired).**  Unlike `#136` this one has a live mechanism and an owed answer: candidate
+**(b)** (a bounce ring legal as a cold source *inside* the take-over) now has a datum from **both** bands, since
+the 191 279 neither-tier experts are the same population the decode take-over declines.  The index row's status
+gains "re-verified on r254 in r256".  Nothing else moved: `#132`, `#133`, `#142`, `#273`, `#282`, `#300` untouched.
+
 ## 261110.012 (r256, measurement + docs -- NO delivery change) -- `TODO` #136 retires: the pool prefill gather is a COVERAGE crossover, and its own cell no longer exists
 
 **No code, no `patches/`, no `release.json` change** -- the release stays `v16-a691b2345-r254` and the fork is
