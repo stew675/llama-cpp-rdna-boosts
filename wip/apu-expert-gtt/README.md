@@ -8,13 +8,13 @@ is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
-The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `a1c8dc86…`.  Its sha256 advances as the campaign does — **the value below is always the
+The implementation is ONE **cumulative** patch, cut against the **r262** `release.json` tree `891d4acb…` and
+applied with `git am`; it produces tree `44a020b8…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; and the SEPARATE drafter model sharing the one store safely) | `6bac2dd19e5f7b2c21d624f1a1c11773ebee809850a6e9bef8fb8555bf46b69d` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme` and never evicted; and the SEPARATE drafter model sharing the one store safely) | `429bf0e03ec63f07d1e3f722e77eec97bfc71e4ac04c19cb58652c65d7e48c26` |
 
 **What is left: P4 (the streaming fill arms + overlap -- including the direct host `memcpy` into the registered
 slot that the arena tier still lacks), P5 (prefill streaming), P6 (gate + promotion).**  P3's own limits are named
@@ -54,7 +54,7 @@ buffer type a host/device alias pair or drop the "one address" assertion with a 
 
 Renamed from `wip/apu-expert-pool/` on 2026-11-11: **there is no pool in this design any more** (§1), and the
 thing the tier holds is a GTT store of resident experts, not a cache tier under a host pool.  Cut against the
-**r261** tree (`release.json` tree `86389e4a…`, tip `030c8997…`); file:line references are that tree unless they
+**r262** tree (`release.json` tree `891d4acb…`, tip `d65b0e889…`); file:line references are that tree unless they
 name an older one.
 
 ## 0. The shape, in the maintainer's words (2026-11-11)
@@ -535,7 +535,7 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 | `README.md` | this file: the shape, what it replaced, the measured foundation, the step/prefill protocol, the code map, the traps |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | the phased plan: P1.0 keystone probes, the GTT store, residency/eviction, the fills, prefill streaming, preflight/fit, the gate spec, docs, effort, rollback |
 | [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration, §14 the same-day P1.1+P2 record (keystone re-run, registration cost at real extent, the fill rates, the `-lme` arms, the read-rate A/B) |
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 as ONE patch cut against the `release.json` tree `86389e4a…` (`git am`; sha256 in the status header) |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 + P3a/P3b/P3c as ONE patch cut against the r262 `release.json` tree `891d4acb…` (`git am`; sha256 in the status header) |
 | [`arms.sh`](arms.sh) | the P1.1+P2 arms: `text` (same-seed greedy, no `-lv`), `census` (`-lv 4`), `rate` (`llama-bench`, the ReadOnly/writable/absent A/B), plus the GPU-fault scan.  `TREE=~/llama-scratch ./arms.sh all` |
 | [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); probes 15 (touch distance) and 16 (reclamation under pressure) still owed |
 | [`NEXT-SESSION-PROMPT-P3.md`](NEXT-SESSION-PROMPT-P3.md) | **the cold-start prompt for the P3 session** (the one to paste): where the branch is, the two open blockers, the barrier safety protocol, and the definition of done |

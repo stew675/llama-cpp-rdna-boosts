@@ -1,4 +1,4 @@
-From d1e073cdfa8f9439c2d41714aec6776a73fd7a4c Mon Sep 17 00:00:00 2001
+From fb76ec54aa19d5a829fbbf04fd65cb092b5a6754 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b/P3c -- a mlocked GTT
@@ -99,10 +99,10 @@ buffers; the draft side never loses residency under trunk churn (`-lme 2` and `-
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index faa73a2e9..5575b0e86 100644
+index a3a39142c..b951649c8 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2765,7 +2765,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2768,7 +2768,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ));
      add_opt(common_arg(
          {"-lme", "--limit-host-experts"}, "auto|N",
@@ -112,7 +112,7 @@ index faa73a2e9..5575b0e86 100644
          "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
          "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
          "        bounded pinned pool (MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC) serves the reads.  It is decided at\n"
-@@ -2774,9 +2775,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2777,9 +2778,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
          "        The rest stays in the model mapping.  N above 90% of the available memory is refused, because\n"
          "        that memory cannot be swapped out.\n"
@@ -138,7 +138,7 @@ index faa73a2e9..5575b0e86 100644
          [](common_params & params, const std::string & value) {
              if (value == "auto") {
                  params.host_experts_limit_gib = 0;
-@@ -2791,9 +2805,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2794,9 +2808,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.host_experts_limit_gib = (int64_t) n;
              params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
              if (n > 0) {
@@ -1365,7 +1365,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a7cd3fbaa..e41688fb7 100644
+index 524cc11db..93a46f803 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -1386,7 +1386,7 @@ index a7cd3fbaa..e41688fb7 100644
      std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
      std::unordered_map<int32_t, int32_t> expert_slot;
      bool        slot_dirty  = false;    // a slot changed since the last device-map upload
-@@ -469,6 +473,16 @@ static int alias_find_checked(const void * key, int device, int layer) {
+@@ -532,6 +536,16 @@ static int alias_find_checked(const void * key, int device, int layer) {
      return id;
  }
  bool                                g_enabled    = false;
@@ -1403,7 +1403,7 @@ index a7cd3fbaa..e41688fb7 100644
  bool                                g_init_done  = false;
  bool                                g_report     = true;
  // Teardown snapshot of the report's STRUCTURAL aggregates (tables/slots/arena, hits/misses/fills/evictions and
-@@ -486,6 +500,13 @@ struct moe_report_snapshot {
+@@ -549,6 +563,13 @@ struct moe_report_snapshot {
      int     dev_tables[GGML_CUDA_MAX_DEVICES] = {0};
      int64_t arena_bytes = 0;
      int64_t n_pools = 0, p_slots = 0, p_hits = 0, p_misses = 0, p_fills = 0, p_evict = 0, p_bytes = 0;
@@ -1417,7 +1417,7 @@ index a7cd3fbaa..e41688fb7 100644
  };
  static moe_report_snapshot g_report_snap;
  // issue #274 follow-up (@DanoPTT): the exit census is printed ONCE, by whichever teardown reaches it first --
-@@ -504,6 +525,10 @@ int64_t                             g_min_mib    = 0;      // auto: decline the
+@@ -567,6 +588,10 @@ int64_t                             g_min_mib    = 0;      // auto: decline the
  int                                 g_min_res_pct= 0;      // auto: decline the arena below this percent of the host experts
  int                                 g_slots_hint = 0;    // 0 => derive from budget
  int64_t                             g_arena_bytes= 0;
@@ -1428,7 +1428,7 @@ index a7cd3fbaa..e41688fb7 100644
  int64_t                             g_total_expert_bytes = 0;   // sum over primed tables
  int                                 g_uniform_slots = -1;       // the decided per-table slot count
  // OPEN 2 re-arm: the per-layer slot count `alloc_all_locked` settled on, so a later re-arm can restore
-@@ -905,7 +930,11 @@ void bind_host_dev_locked(table_t & t) {
+@@ -974,7 +999,11 @@ void bind_host_dev_locked(table_t & t) {
  // representable AND the master must have a device mapping.  A pageable model mapping has none, so the
  // table takes the fill-every-miss path instead (issue #116).
  static inline bool table_cold_ok(const table_t & t) {
@@ -1441,7 +1441,7 @@ index a7cd3fbaa..e41688fb7 100644
  }
  
  // MOE_HOST_POOL_COLD (default 1): a pool-backed table (`--host-experts pool`, pageable master, so no in-place
-@@ -4606,7 +4635,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
+@@ -5101,7 +5130,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
      if (arena == nullptr) {
          return;
      }
@@ -1455,7 +1455,7 @@ index a7cd3fbaa..e41688fb7 100644
          ggml_cuda_slab_arena_free(device, arena, reserved);
      } else {
          (void) cudaFree(arena);
-@@ -4811,12 +4845,29 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5306,12 +5340,29 @@ void alloc_table_locked(table_t & t, int slots) {
      // lands *at* the max); then a 0.95 geometric descent for the fragmentation case (a failed
      // cudaMalloc is cheap, so the extra attempts cost nothing measurable).  The table keeps the largest
      // slot count that actually allocates.
@@ -1486,7 +1486,7 @@ index a7cd3fbaa..e41688fb7 100644
          if (use_slab) {
              if (t.arena != nullptr) {
                  return true;
-@@ -4887,7 +4938,13 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5382,7 +5433,13 @@ void alloc_table_locked(table_t & t, int slots) {
      // over-filled arena).
      t.slots        = got_slots;
      const size_t arena_size = (size_t) slots * t.expert_bytes + head_pad;
@@ -1501,7 +1501,7 @@ index a7cd3fbaa..e41688fb7 100644
      t.slot_expert.assign(slots, -1);
      t.slot_prov.assign(slots, 0);
      t.count.assign(t.n_experts, 0);
-@@ -4913,7 +4970,14 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5408,7 +5465,14 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -1517,7 +1517,7 @@ index a7cd3fbaa..e41688fb7 100644
          bool ok = true;
          for (int e = 0; e < t.n_experts && ok; ++e) {
              void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
-@@ -5017,6 +5081,19 @@ static bool moe_cache_tables_complete_locked() {
+@@ -5512,6 +5576,19 @@ static bool moe_cache_tables_complete_locked() {
      return registered + slack >= expected;
  }
  
@@ -1537,7 +1537,7 @@ index a7cd3fbaa..e41688fb7 100644
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
  // `budget / total_expert_bytes`, so an expert resident for gate is resident for up and down too and
  // the effective (all-roles) hit rate is set by the shared slot count, not by the smallest table.
-@@ -5054,7 +5131,7 @@ void alloc_all_locked() {
+@@ -5549,7 +5626,7 @@ void alloc_all_locked() {
      // was configured on but never armed (backend-init ordering, a missing preflight, a per-device
      // decline) -- the arena is a raw cudaMalloc outside the movable boundary, which is the pre-slab crash
      // mode.  Never let that state be silent.  One-time, non-fatal; a no-op on non-HIP and dense models.
@@ -1546,7 +1546,7 @@ index a7cd3fbaa..e41688fb7 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5106,11 +5183,24 @@ void alloc_all_locked() {
+@@ -5601,11 +5678,24 @@ void alloc_all_locked() {
      int64_t dev_one_bytes [GGML_CUDA_MAX_DEVICES] = {0};
      int64_t dev_max_experts[GGML_CUDA_MAX_DEVICES] = {0};
      int     dev_n_tables [GGML_CUDA_MAX_DEVICES] = {0};
@@ -1571,7 +1571,7 @@ index a7cd3fbaa..e41688fb7 100644
          dev_one_bytes [t.device] += (int64_t) t.expert_bytes;
          dev_n_tables  [t.device]++;
          if ((int64_t) t.n_experts > dev_max_experts[t.device]) {
-@@ -5120,6 +5210,10 @@ void alloc_all_locked() {
+@@ -5615,6 +5705,10 @@ void alloc_all_locked() {
              max_dev = t.device;
          }
      }
@@ -1582,7 +1582,7 @@ index a7cd3fbaa..e41688fb7 100644
  
      const size_t reserve = (size_t) g_reserve_mib * 1024 * 1024;
      // the post-clamp budget each device settled on (the identity pre-pass spends it exactly, rounding
-@@ -5137,7 +5231,19 @@ void alloc_all_locked() {
+@@ -5632,7 +5726,19 @@ void alloc_all_locked() {
              continue;
          }
          size_t budget = g_budget;
@@ -1603,7 +1603,7 @@ index a7cd3fbaa..e41688fb7 100644
              device_guard dg(d);
              // OPEN 2 slab: the slab's ARENA REGION owns the memory, so size against its capacity.  A
              // `cudaMemGetInfo` here reads only the small amount left outside the slab, which starves the
-@@ -5243,6 +5349,11 @@ void alloc_all_locked() {
+@@ -5738,6 +5844,11 @@ void alloc_all_locked() {
          if (t.allocated || t.layer < 0 || t.layer >= 512 || t.device < 0 || t.device >= GGML_CUDA_MAX_DEVICES) {
              continue;
          }
@@ -1615,7 +1615,7 @@ index a7cd3fbaa..e41688fb7 100644
          const int s = slots_d[t.device];
          if (layer_slots[t.layer] < 0 || s < layer_slots[t.layer]) {
              layer_slots[t.layer] = s;
-@@ -5311,9 +5422,15 @@ void alloc_all_locked() {
+@@ -5806,9 +5917,15 @@ void alloc_all_locked() {
              std::vector<int> order;
              order.reserve((size_t) n_layers);
              for (int i = 0; i < 512; i++) {
@@ -1633,7 +1633,7 @@ index a7cd3fbaa..e41688fb7 100644
              }
              if (g_heat_on) {
                  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-@@ -5526,6 +5643,23 @@ void alloc_all_locked() {
+@@ -6021,6 +6138,23 @@ void alloc_all_locked() {
      }
      GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
                    __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
@@ -1657,7 +1657,7 @@ index a7cd3fbaa..e41688fb7 100644
      // The traffic report's denominator: one routed-MoE op per (layer, role, device) table per token, so
      // the decode-band census divided by this is the token count.  Snapshotted HERE (sizing) rather than
      // read from `g_tables` at report time, because `llama_model_free` now drops the tables before the
-@@ -5675,6 +5809,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6170,6 +6304,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      if (!g_enabled) {
          return false;
      }
@@ -1699,7 +1699,7 @@ index a7cd3fbaa..e41688fb7 100644
      // wip/umem-arena-guard: refuse the arena on a shared host/device memory pool (see the helper above).
      // This runs at model load, before any table registers, so the whole cache stack (arena, pool, heat
      // map, cache-band fusions) stays inert and the run behaves like `MOE_EXPERT_CACHE_MIB=0`; the
-@@ -5728,19 +5897,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6223,19 +6392,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
                            __func__, g_budget >> 20, device);
          }
      }
@@ -1721,7 +1721,7 @@ index a7cd3fbaa..e41688fb7 100644
      // The pool's AUTO budget is a fraction of the MoE host expert bytes.  This runs once per host-expert
      // device, before the context -- but it is RE-RUN for the same devices (the `--fit` probe, and a
      // second model's preflight for a separate draft/MTP head), so a running sum sized the pool at N x the
-@@ -5803,6 +5961,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6298,6 +6456,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      return true;
  }
  
@@ -1794,7 +1794,7 @@ index a7cd3fbaa..e41688fb7 100644
  void moe_cache_set_extra_reserve(int device, size_t bytes) {
      // WIP r42 (TODO #42): hold this many bytes of the free VRAM for the post-prefill compute layout, so
      // the arena does not take the space a later compute growth (or the grow-in-place realloc) needs.
-@@ -5963,6 +6187,12 @@ bool moe_cache_shrink_step(int device) {
+@@ -6458,6 +6682,12 @@ bool moe_cache_shrink_step(int device) {
          if (t.device != device) {
              continue;
          }
@@ -1807,7 +1807,7 @@ index a7cd3fbaa..e41688fb7 100644
          if (t.arena != nullptr && t.slots > 0) {
              const int64_t b = (int64_t) t.slots * (int64_t) t.expert_bytes;
              if (b > best_b) {
-@@ -6000,6 +6230,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -6495,6 +6725,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
      const size_t target = need_bytes + (256u << 20);
      std::vector<int> order;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
@@ -1819,7 +1819,7 @@ index a7cd3fbaa..e41688fb7 100644
          if (g_tables[i].arena != nullptr && g_tables[i].slots > 0) {
              order.push_back(i);
          }
-@@ -6141,6 +6376,12 @@ static void report_snapshot_locked() {
+@@ -6636,6 +6871,12 @@ static void report_snapshot_locked() {
          g_report_snap.misses += t.misses;
          g_report_snap.fills += t.fills;
          g_report_snap.evictions += t.evictions;
@@ -1832,7 +1832,7 @@ index a7cd3fbaa..e41688fb7 100644
          if (t.slots > 0) {
              g_report_snap.n_tables++;
              g_report_snap.n_slots += t.slots;
-@@ -6457,6 +6698,11 @@ bool moe_cache_rearm() {
+@@ -6952,6 +7193,11 @@ bool moe_cache_rearm() {
      std::map<int, std::vector<int>> by_layer;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
          const table_t & t = g_tables[i];
@@ -1844,7 +1844,7 @@ index a7cd3fbaa..e41688fb7 100644
          if (t.device >= 0 && t.allocated && t.slots == 0) {
              by_layer[t.layer].push_back(i);
          }
-@@ -9640,6 +9886,34 @@ static void report_locked() {
+@@ -10149,6 +10395,34 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -1902,7 +1902,7 @@ index 3c5469637..0cea456ca 100644
  // so the auto-sized arena does not take the space a later compute growth needs.  Called at the
  // prefill -> decode transition, before the arena is sized.
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e138bbfa1..7cef48af0 100644
+index 80de01396..50c73b313 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -2494,7 +2494,7 @@ index e138bbfa1..7cef48af0 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2036,6 +2588,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2055,6 +2607,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -2535,7 +2535,7 @@ index e138bbfa1..7cef48af0 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2557,7 +3143,18 @@ bool llama_model_loader::load_all_data(
+@@ -2576,7 +3162,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -2555,7 +2555,7 @@ index e138bbfa1..7cef48af0 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2618,9 +3215,12 @@ bool llama_model_loader::load_all_data(
+@@ -2637,9 +3234,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  
