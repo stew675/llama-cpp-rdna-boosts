@@ -1,3 +1,46 @@
+## 261110.011 (r255, docs only -- NO delivery change) -- two `TODO` rows retire to the accepted-limitations list: the pool staging residue (`#131`) and the 35B-A3B 3-device host-resident share (`#135`)
+
+**No code, no `patches/`, no `release.json` change** -- the release stays `v16-a691b2345-r254` and the fork is
+untouched.  This is `TODO.md` bookkeeping: both rows describe behaviour that no supported configuration can reach
+(`#131`) or that a load-time guard already refuses (`#135`), so they leave the open list instead of sitting there
+as backlog nobody can close.  The decision was the maintainer's, taken on the two records below.
+
+**`#131` -- demoted, not closed.**  The pool staging residue's own record (r207 + `archive/work/host-pool-speed/`
+§18.2 finding B) had already done the work of retiring it, and the row was the only thing that said otherwise:
+probed with `STAGE_BATCH=0` (31.99), `DIO=0` (8.12), `FRAC 95` (15.03), `FRAC 30` (206.30, i.e. it scales with the
+pinned pool size) and instrumented (`1.04 s` of host time in 423 staging calls, `0.66 s` of copies, `rocprofv3`
+5.04 s vs 4.08 s at matching dispatch counts), with no root cause identified; the shipped default (a pool-backed
+table gathers in the prefill band, prefill logits bit-identical) leaves the path reachable only through
+`GGML_SCHED_DEVGATHER=0`, whose transport is the worst of the three at every width measured (-10 to -20 %).  The
+demotion records three things so the bullet cannot become a false claim: (a) it is **not** the `#135` mechanism
+(that one collapses *decode* at a zero per-device share, for `pinned` and `pool` alike, at flat prefill; here
+`pinned` is healthy and only prefill moves); (b) `GGML_SCHED_DEVGATHER` is now read as *unset = pool prefill gather,
+`0` = kill switch, `1` = the A/B arm that costs a `pinned` master 16-47 % prefill* -- i.e. a kill switch, not a
+policy choice; (c) the **re-entry condition** is a move of that default (`#136` is the open item that could move
+it) or a change to `moe_cache_stage_table`'s shape from `#133`.  The one loose end the old row carried -- the
+`llama-bench pp1024` disagreement (pool 130 ± 73 vs `pinned` 271 ± 2.5) -- retires with it as a *protocol*
+artifact, not a question: `llama-bench` drives random token ids, so every ubatch routes over every expert and this
+path cannot be measured that way at all (`TODO` #273 fact 1, the same reason its arena reads flat there).
+
+**`#135` -- restated as an accepted limitation** (the code and its gate are r250, unchanged; only the statement is
+new).  What the r250 record establishes, and what the limitation now says in `TODO.md`: 35B-A3B (expert FF 512)
+cannot be spread over 3 devices **while its experts are host-resident** unless the quant's block size leaves every
+device a share -- `0/256/256` at a 256-element block (Q4_K 20.5 t/s decode at 3 devices against 109.7 at 2; Q3_K
+23.0 vs 105.0), `128/128/256` at Q8_0's 32 (90.2 at 3), the all-VRAM 3-device arm healthy at 130.9, and prefill
+flat (566 vs 592) in every cell.  So "35B-A3B does not 3-GPU well" is too wide a shorthand: it is a zero-extent
+share that only host placement exposes, it is a **decode** cliff, and it is refused at load with one message
+naming the tensor, axis, granularity and device (`GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` for a measurement).
+Nothing is owed: the usable answers are `-sm layer`, 2 devices, or a finer-block quant.
+
+**Untouched.**  `#132`, `#133`, `#136`, `#141`, `#142`, `#273`, `#282` and `#300` stay in the index -- each has a
+live mechanism (a transport, an in-place identity read, the gather default, a preflight move) or an owed fix, and
+`#300` is a *correctness* item on gfx1151.  `#141` ("measured limit", the bound is static per shape on purpose)
+and `#282` (~1e-5 path difference, two orders inside the tolerance) are the remaining rows of the same
+"limit, not defect" character; they were deliberately left for a separate decision rather than swept up here.
+Handles stay permanent: the `#131`/`#135` text is in the accepted-limitations list under those numbers, and the
+dated narrative in `wip/CAMPAIGNS.md` (the 2026-11-04 audit: "`#131/#132/#133/#136` stay open") is a historical
+record and stays as written -- this entry plus `TODO.md`'s current list are the current state.
+
 ## 261110.010 (r254, RELEASE v16-a691b2345-r254) -- GitHub issue #300: the dsv4 synthetic reserve probes ran against the live (wrong-shaped) memory context and on a cache that the arch list did not name, plus the top-k gather's 2-D copy that the slab refuses
 
 **Release:** `v16-a691b2345-r254`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip

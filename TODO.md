@@ -32,7 +32,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
-| **131** | `--host-experts pool` prefill collapse under a 3+-device `-sm tensor` split: the staging-path root cause, reachable only through the kill switch | performance (block 12; pre-existing backlog) | **OPEN (residue)** — the collapse itself is fixed (r207, measured), the root cause is not — §131 |
 | **132** | the pool's pair decode deficit is the synchronous demand read (~29 % of a decode step) | performance (pre-existing backlog) | **OPEN** (2026-11-03) — re-open the overlap worker the ~6 % ceiling declined — §132 |
 | **133** | a fully-resident (identity) expert table is re-copied out of the arena on every prefill ubatch | performance (delivery defect, default mode; backlog) | **OPEN** (2026-11-03) — 3-device prefill is slower than 1-device because of it — §133 |
 | **136** | `GGML_SCHED_DEVGATHER`'s prefill-band default costs 33 % prefill on 35B-A3B at `MOE_HOST_POOL_FRAC=50` | performance (delivery defect, default-on) | **OPEN** (2026-11-03) — needs a wider sweep before the default moves — §136 |
@@ -121,46 +120,6 @@ native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style
 **PARKED** (2026-09-26).  Re-based onto the delivery as 13 commits (`~/llama-fp8`, branch `fp8-rebase`), builds clean on gfx1201, fully RDNA4-gated — but **gate 2 fails**: on a 4B the fp8 arm is **0.69x Q8_0** where the pre-rebase `cllm` branch had **1.16x**, because the delivery's MMB/GEMM work lifted Q8_0 **+32 %** (8146 vs 6177 t/s pp512) and the fp8 WMMA path did not follow (5607 vs 7184-7260).  Kernel trace: `mul_mat_fp8_wmma` 71.9 %, **`fp8_repack_weights` 7.3 % (running per call instead of once — the likely bug)**, staging 3.3 %, FA 1.3 %.  Not delivery work: nothing here is in `patches/`.  Resume: A/B the GEMM against `~/cllm`, fix the repack cache, re-run the 4B gate, only then convert and measure the 27B.  Detail in §116
 
 The index row also recorded the r209-era kernel trace split: `mul_mat_fp8_wmma` **71.9 %**, `fp8_repack_weights` **7.3 %**, staging **3.3 %**, FA **1.3 %**.
-
-## 131. `--host-experts pool` prefill collapses under a ≥3-device `-sm tensor` split (delivery defect)
-
-**Status: FIXED AND SHIPPED in block 12 (amended, r207, 2026-11-03) — `--host-experts pool`
-now gathers a pool-backed table in the prefill band by default, measured 1502.6-1569.2 t/s prefill against
-`pinned`'s 471.8 at three devices with decode at -0.7 %, and 16.9 t/s with the gather switched off
-(`GGML_SCHED_DEVGATHER=0`).  What remains OPEN is the *root cause inside the staging path*: it is still
-pathologically slow for a pool-backed table at >= 3 devices and is now reachable only through the kill switch, so
-either fix it or delete that branch for pool tables.  **Verification of the fix (2026-11-03):** the prefill-logit
-KLD gate (`--ab "GGML_SCHED_DEVGATHER=0"`) reads **−0.000000 / 100.000 %** (bit-identical prefill), text is
-byte-identical (5835 chars `dc178c29fe89`), and the rate is physically bounded (in-place pinned reads, 19 GB/s per
-device vs a 28.6 GB/s calibration).  Two caveats worth carrying: `GGML_MOE_GATHER_ONCE=1` no longer produces the
-Hole-B corruption at this width/quant (the control is vacuous — do not cite it), and an earlier `pinned` 75.2 t/s reading **did not reproduce** (three reruns: 394.1 / 425.7 / 425.2 t/s), so the
-arm is stable; any "N x faster than pinned" prefill claim still needs a pinned control from the same group.  The
-`llama-bench pp1024` disagreement (pool 130 ± 73 vs pinned 271 ± 2.5) is open and needs a `-r 3` repeat at
-`-ub 1024`.  The `ENVIRONMENT.md` row for the three-valued `GGML_SCHED_DEVGATHER` shipped with it.**  Original finding text follows.
-
-**Found 2026-11-03 on `soar` (`archive/work/host-pool-speed/` README §18.2, session 4), a defect in the DELIVERY's block 12
-code, not in a campaign patch.**  Measured, 122B-A10B `-ncmoe 48`, `-sm tensor`, 5258-token prompt, `HIP_VISIBLE_DEVICES`
-pinned to 3 R9700s: `--host-experts pool` prefills at **16.85 t/s** against `pinned`'s **564.65** (and 1126.8 with
-`GGML_SCHED_DEVGATHER=1`); the same arms at 2 devices are 1024.1 (pool) vs 1603.8 (pinned), i.e. healthy.  The
-defect is in the pool branch of `moe_cache_stage_table` (`!t.host_pinned`): the `pinned` arm stages the same volume
-through the same kernel at full speed.  Probes that did NOT move it (all at 3 devices): `MOE_HOST_POOL_STAGE_BATCH=0`
-(31.99), `MOE_HOST_POOL_DIO=0` buffered (**8.12**), `FRAC 95` (15.03, so it is not the uncovered-expert loop),
-`FRAC 30` (206.30 — i.e. it scales with the PINNED POOL SIZE, 19.9 → 53.5 → 63.7 GiB gives 206 → 16.85 → 15.03).
-Two live candidates: the box is over-committed (73 GiB mapping + 54-64 GiB pinned on 91 GiB RAM) so the staging's
-pageable reads re-read from disk; or the peer-device reads of the pool alias (`pool->base_dev`) are slow and grow
-with the pool's coverage.  **Diagnosis so far (2026-11-03, instrumented — the staging COPY is exonerated):** per-call timing of
-`moe_cache_stage_table` gives **1.04 s of host time for 423 calls** (miss loop 0.76 s) and **0.66 s** for the
-staged copies with a forced copy-stream sync; `rocprofv3` total kernel time is **5.04 s (pool) vs 4.08 s
-(pinned)** at the same prompt with matching per-kernel dispatch counts (except `__amd_rocclr_fillBufferUnAligned`
-3574 vs 1846 ≈ 4 extra allocation/fills per staging call); the host burns 2.3x the task-clock (83.2 vs 35.8 s);
-and `MOE_EXPERT_CACHE_MIB=0` (no arena) recovers 4.3x (50.4 vs 11.8 t/s) while `GGML_MOE_CACHE_STAGE=0` does not
-(16.1).  So the cost is the cache's **per-(table, device) prefill work around** the staging copy — the prime
-suspect is the per-table `cudaMalloc(t.prs_dev)`/`cudaFree` pair (432 of them, 144 tensors × 3 devices) issued
-*inside* the prefill; the fix, if so, is to allocate that 1 KiB map once at registration or use a per-device
-scratch.  Next measurement: time that allocation (instrumented and queued) and the per-split scheduler time; do
-not re-measure the prefill total, it is bracketed.  Workaround until
-then: `GGML_SCHED_DEVGATHER=1` (pool-only use; on `pinned` the gather costs -47 % prefill at 2 devices).  Gates for
-a fix: same-seed greedy text on 2 and 3 devices, `check-gpu-faults.sh`, and the prefill at ≥ `pinned`.
 
 ## 132. The pool's decode deficit on a tensor split is the synchronous demand read — re-open the overlap candidate
 
@@ -550,6 +509,44 @@ artifact instead and close this.
   width rule found in the 3-GPU arm (`N · n_devices < n_vocab`) a second band only makes the **mirrored**
   draft matmul wider, so it is a non-goal, not a parked idea.  Record:
   `archive/work/spec-draft-mtp-vocab/VALIDATION-2026-10-22.md` §5.
+
+- **A pool-backed expert table's whole-table staging is pathologically slow at a large pinned pool on a
+  ≥3-device `-sm tensor` split — NO root cause found, retired as a limit rather than fixed** (`#131`, retired
+  r255; found r207, `archive/work/host-pool-speed/README.md` §18.2 finding B).  Measured, 122B-A10B
+  `-ncmoe 48`, 3 x R9700, 5258-token prompt: `--host-experts pool` prefill **16.85 t/s** against `pinned`'s
+  564.65, and **1126.8** with the gather the delivery now uses by default; decode is at parity (49.99 vs
+  51.97) and the same arms at 2 devices are healthy (1024.1 vs 1603.8).  So it is the prefill *transport*, not
+  the split, the all-reduce or the staging kernel: `pinned` stages the same volume through the same kernel at
+  full speed.  Every probe that could name a cause was run and none of them moved it —
+  `MOE_HOST_POOL_STAGE_BATCH=0` 31.99, `MOE_HOST_POOL_DIO=0` 8.12, `FRAC 95` 15.03, `FRAC 30` 206.30 (it
+  scales with the **pinned pool size**: 19.9 → 53.5 → 63.7 GiB gives 206 → 16.85 → 15.03) — and the
+  instrumented run exonerated the copy itself: `moe_cache_stage_table` costs **1.04 s** of host time for 423
+  calls and **0.66 s** of staged copies over a 273-419 s prefill, `rocprofv3` kernel time is 5.04 s vs 4.08 s
+  with matching dispatch counts, and `MOE_EXPERT_CACHE_MIB=0` recovers 4.3x while `GGML_MOE_CACHE_STAGE=0`
+  does not.  **It is NOT the `#135` scenario** (r250): that one is a zero per-device share of the split axis
+  and it collapses *decode* for `pinned` and `pool` alike, at flat prefill — here `pinned` is healthy and only
+  prefill moves.  Retired because nothing supported reaches it any more: a pool-backed table is gathered in
+  the prefill band by default (`GGML_SCHED_DEVGATHER` unset, r207, prefill logits bit-identical
+  −0.000000 / 100.000 %), `0` is a kill switch whose transport is the worst of the three at every width
+  measured (−10 to −20 %), and `1`/`force` is an A/B arm that costs a `pinned` master 16-47 % prefill.
+  **Re-entry:** only if the gather default is ever moved (`#136` is the open item that could move it, and it
+  needs `GGML_SCHED_DEVGATHER=0` for its own prefill A/Bs), or if `#133`'s in-place identity read changes
+  `moe_cache_stage_table`'s shape.  Record: `WORKLOG.md` 261110.011, `ENVIRONMENT.md` (`GGML_SCHED_DEVGATHER`).
+
+- **35B-A3B cannot be spread over 3 devices while its experts are host-resident unless the quant's block size
+  leaves every device a share of the expert FF axis — a model/quant limit, refused at load** (`#135`, closed
+  r250, restated as a limit r255).  `n_embd` 2048 with a 512-wide expert FF: the loader's equal-division share
+  floored to `lcm(blck_size,128)` is **0/256/256** on a 256-element block (Q4_K 20.5 t/s decode at 3 devices
+  against 109.7 at 2; Q3_K 23.0 vs 105.0), while Q8_0's 32-element block gives 128/128/256 (90.2 at 3) and the
+  **all-VRAM** 3-device arm is healthy at **130.9** — prefill is flat (566 vs 592) in every case.  So the third
+  device is not the problem and this is not a `-sm tensor` defect: it is a zero-extent share that only host
+  placement exposes (the meta split hands that device the whole MIRRORED table, 2x the host bytes and all the
+  expert's compute on one card).  It is now **refused at load** by
+  `llama_model::check_host_expert_split_shares()` with one message naming the tensor, axis, granularity and
+  device, instead of silently decoding 5x slower; `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` overrides it for a
+  measurement only.  Nothing is left to fix: the usable answers are `-sm layer`, 2 devices, or a finer-block
+  quant, which is what the refusal says.  Records: `WORKLOG.md` 261110.006 §1, `INVARIANTS.md` r250,
+  `MANIFESTS.md` gate 09, `ENVIRONMENT.md` (`GGML_TENSOR_SPLIT_ALLOW_DEGENERATE`).
 
 ## Where the current lists live
 
