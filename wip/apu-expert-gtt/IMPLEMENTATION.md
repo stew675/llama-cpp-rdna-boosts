@@ -301,6 +301,17 @@ evictions > 0 and unregisters == 0.
 
 ## P4 — the two load arms
 
+> **P4a DONE 2026-11-11 (after the r262 rebase)** -- the transport half needed NO new design: r262 shipped the
+> `map -> file -> dio` ladder (stall detector + probe-fill A/B) and this stage only had to put the tier back **on**
+> it (`MEASUREMENTS.md` §20).  Two bugs had to be fixed for that to be real: the ladder was initialised only at a
+> POOL build (the tier has no pool, so a pin and `--load-mode buffered|dio` were silently ignored), and the
+> per-table file source was registered only when the pool was on (so the `file`/`dio` arms could be *selected* and
+> then fall back to the mapping memcpy).  Measured: the bufferered arm is **+45 %** on a cold page cache and
+> **+24 %** even warm, `dio` is 11x slower (hence the 3x guard), `auto` latches `file` on the probe, and the text is
+> identical in all three arms, in all four `--load-mode` values, and in an arm where **every fill fails**.
+>
+> **What remains of P4 is the destination side (P4b) and the overlap experiment (P4e).**
+
 `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) is the seam.  Two arms, chosen by the page cache, not by a
 knob (README §3.1):
 

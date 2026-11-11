@@ -926,3 +926,95 @@ table -- so these draft weights cannot be evicted").
   and disables the cache.  It is unchanged and out of scope here (it is the "the crate is on fire" path); on the
   arena tier it would also break the mapping holes generally, which is a pre-existing property of the tier and not
   specific to the draft side.
+
+## 20. 2026-11-11 — P4a: the tier's fills run on **r262's adaptive host-read transport**, and two bugs had to die first
+
+r262 (block 12 amendment, `TODO` #306) shipped the transport P4 was going to invent: a `map -> file -> dio`
+ladder driven by `--load-mode` (`auto` = adaptive), a stall detector (K x this arm's own EWMA) and a probe-fill
+A/B (every Nth fill served by the next arm, same bytes).  So P4 stops being a *design* and becomes a *routing*
+job -- which is also the campaign's own rule ("do not write a second policy").  This is the rebase onto r262 plus
+that routing, measured.
+
+### 20.1 What was already there, and the two places the tier fell off it
+
+`pool_transport_apply_locked()` maps the ladder onto the legacy flags the bounce path reads
+(`g_pool_dio`, `g_pool_fill_src_file`, `g_pool_demand_src_file`), so the read path itself needed no change.  Two
+things did:
+
+1. **The ladder was never INITIALISED on the tier.**  r262 applies it at the first **pool** build
+   (`pool_transport_init_locked`, called from the pool sizing), and an APU has no pool -- pinning is refused on an
+   integrated device, and the tier serves pageable fills from the per-table bounce ring instead.  Consequence,
+   measured: `MOE_HOST_POOL_TRANSPORT=file` and `=dio` both reported `map`, and `--load-mode buffered|dio` did
+   nothing.  Fixed by applying the mode at the tier's own sizing (`alloc_all_locked`, `g_gtt_arena` only): a pin is
+   applied as itself, and `auto` starts optimistically on the mapping — which is what the bounce path already did,
+   so the first apply changes no behaviour, it makes the decision visible and keeps the legacy flags consistent
+   with the arm the census reports.
+2. **The `file`/`dio` arms could be selected and then read the mapping anyway.**  `moe_cache_set_host_source()`
+   returned early when the host pool was off, so `t.src_path`/`src_known` were never set on the tier, and the
+   bounce path's storage branch requires them (`t.src_known && !t.src_path.empty()`).  Measured: the `auto` ladder
+   escalated to `file` and the census then showed **zero storage reads** — the arm was a label.  Fixed by recording
+   the source regardless of the pool (one map entry per expert tensor; nothing is pinned, the pool stays inert) and
+   letting the reader decide.  This is inert by default: `g_pool_dio` and both `*_src_file` flags stay off, so the
+   delivered arm is still the mapping memcpy.
+
+Plus census: the `host read transport:` line was gated on **pool fills** (an APU never has any), so the tier's arm
+was invisible; it now prints when a mode is set and any read happened, the `GTT arena tier:` line names the arm
+(`read transport %s (%s, %d switch(es))`), and the bounce path's probe samples are counted in
+`probe N calls / M ms` like the pool's (they were not, so a run whose ladder moved on probes said "probe 0 calls").
+
+### 20.2 The three arms, measured (`halo`, 35B-A3B, arena `-lme 4`, 0.61 MiB/read, `-n 8`)
+
+Per-expert **fill** reads into the bounce entry (the H2D follows and is unchanged):
+
+| arm | warm page cache | cold page cache (`fadvise(DONTNEED)` on the GGUF before the arm) |
+|---|---|---|
+| `map` (the mapping memcpy — the delivered arm) | 11 637 reads / 7 062.2 MiB / 421 ms = **16 776 MiB/s** | 11 613 / 7 048.1 MiB / 5 306 ms = **1 328 MiB/s** |
+| `file` (buffered `pread`) | 11 637 / 7 062.1 MiB / 318 ms = **22 211 MiB/s** | 11 612 / 7 047.3 MiB / 3 650 ms = **1 931 MiB/s** (**+45 %**) |
+| `dio` (`O_DIRECT`) | 11 633 / 7 060.1 MiB / 4 645 ms = **1 520 MiB/s** | — (bypasses the cache by definition) |
+
+Two things this says about *this tier*, and they are not what the pool measured:
+
+* **The cold-cache collapse is the tier's problem too** (1 328 MiB/s against 16 776 warm, 12.6x), and the buffered
+  arm is **45 % faster** there — the page-fault storm is the mapping's cost, exactly the mechanism r262 documented.
+* **The fill (unlike the pool's fill) does not favour the mapping even when warm**: a buffered `pread` of
+  already-cached pages beats a memcpy out of a perfectly warm mapping (22 211 against 16 776 MiB/s, 24 %), because
+  the mapping still pays a PTE lookup per 4 KiB page while `pread` copies in one syscall with readahead.  `dio` at
+  1 520 MiB/s is the reason `MOE_HOST_POOL_TR_PROBE_GAIN_DIO` (3x) exists: bypassing the cache costs 11x here.
+
+**`auto` on a cold page cache** (the ladder, end to end): states `map` at 1.24 s ("optimistic start"), the
+probe-fill A/B then reports `file` served the same read in **28 us against this arm's 294 us, 3 samples running**
+and latches `file` — after which the run's reads are 10 256 storage reads at **2 086 MiB/s** plus the 1 270 mapping
+reads from before the switch.  One switch, one direction, no flapping.
+
+### 20.3 Correctness: the transport never changes a byte
+
+Same-seed greedy text, hashed from **no-`-lv`** runs, all `627b2ebd7792` (the store-off reference):
+
+* the three pinned arms (`MOE_HOST_POOL_TRANSPORT=map|file|dio`);
+* all four loader modes (`--load-mode mmap|buffered|dio|auto`);
+* `map` and `file` **on a cold page cache** (cache dropped before each arm);
+* **an arm where every fill FAILS** (`MOE_HOST_POOL_FILL_FAULT=late`): 1 886 failed fills, each rolled back and its
+  routed op declined (`FAILED fills: 1886 (each one was rolled back -- the slot is not resident and the routed op
+  was declined…)`), `h=0.0053`, `evictions=0`, and the text is **byte-identical** — the fault arm P4 owed, and it
+  does not corrupt, does not fault and does not need a new env var (r262's knob is the tier's knob).
+
+Regressions on the same build: 35B-A3B store-off / `auto` / `-lme 6` / arena `-lme 4` / arena `-lme 4` + MTP all
+`627b2ebd7792`; Flash-Next arena `-lme 8` and Flash-Next + the SEPARATE drafter `f586785d7183`; the 122B arena
+`-lme 60` `9ccf62ed39c3`.  `check-gpu-faults.sh` clean over every arm.
+
+### 20.4 What P4 still owes, and what changed about it
+
+* **P4b (the destination side) is now the win, and it is newly attractive**: the `file`/`dio` arms read into a host
+  bounce entry and then H2D into the arena — but the arena IS registered host memory, so a `pread` can land
+  **straight in the slot** (probe `12` measured that as legal and coherent; 4096-aligned with the per-fill delta).
+  That deletes a copy and a transfer for two of the three arms, and it is now *reachable* because the source is
+  registered (§20.1 (2)) — before this change the file arms could not read at all.
+* **The `map` arm keeps bounce + H2D**: a direct host `memcpy` into a slot still needs the ordering argument (a host
+  write must follow the previous consumer's reads of that slot; the stream-ordered copy gets it for free).  The
+  ladder makes this optional rather than required, which is the right order to do it in.
+* **P4e (the overlap experiment) is unchanged** and still comes before any worker: r261 measured ±1.5 % for the
+  exact within-layer lookahead on the discrete pool.
+* **Not measured**: the discrete-side effect of the source-registration change (no discrete GPU on `halo`;
+  `scripts/gate-host-pool.sh` is the gate, and the change is inert unless a transport arm is pinned — the pool's
+  own path already registered its sources); multi-device (one GPU); and any throughput claim (the numbers above are
+  per-read rates, not decode).

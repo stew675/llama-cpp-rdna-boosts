@@ -1,3 +1,66 @@
+## 261111.021 (wip, NO delivery change) -- P4a: the tier's fills run on r262's adaptive read transport (`map`/`file`/`dio`), after two fixes that made the ladder reachable at all
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`40be4cb7a0a9a9be8edaf086ce7ec7e190545fc9e2b20deb36e31148163dea6e`, cut against the **r262** `release.json`
+tree `891d4acb…`, produces tree `c8cdb5da…` (verified by `git am` onto the r262 tip).  Record:
+[`MEASUREMENTS.md` §20](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**P4's transport half needed no new design.**  r262 shipped the `map -> file -> dio` ladder (stall detector at K x
+this arm's own EWMA, plus a probe-fill A/B every Nth fill), and `--load-mode` already maps onto it
+(`auto -> 3`, `buffered -> file`, `dio -> dio`).  P4a is the routing, and it is the campaign's own rule: do not
+write a second policy.
+
+**Two bugs made that routing a lie, and both are fixed:**
+
+1. **The ladder was never initialised on the tier.**  r262 applies it at the first **pool** build, and an APU has
+   no pool (pinning is refused on an integrated device) -- so `MOE_HOST_POOL_TRANSPORT=file` and `=dio` both
+   reported `map`, and `--load-mode buffered|dio` did nothing.  It is now applied at the tier's own sizing: a pin
+   as itself, `auto` optimistically on the mapping (which is what the bounce path already did, so the first apply
+   changes no behaviour -- it makes the choice visible and keeps the legacy flags consistent).
+2. **The `file`/`dio` arms could be selected and then read the mapping anyway.**  `moe_cache_set_host_source()`
+   returned early when the pool was off, so `src_path/src_known` were unset on the tier and the bounce path's
+   storage branch requires them.  Measured: the ladder escalated to `file` and the census showed **zero storage
+   reads**.  The source is now recorded regardless of the pool (one map entry per expert tensor, nothing pinned);
+   inert by default, because the legacy flags stay off and the delivered arm is still the mapping memcpy.
+
+Census: the `host read transport:` line was gated on pool fills (an APU never has any) and now prints when a mode
+is set and any read happened; the `GTT arena tier:` line names the arm; the bounce path's probe samples are counted
+in `probe N calls / M ms` (they were not).
+
+**Measured (`MEASUREMENTS.md` §20.2), 35B-A3B arena `-lme 4`, 0.61 MiB/read, fills into the bounce entry:**
+
+| arm | warm page cache | cold page cache |
+|---|---|---|
+| `map` (delivered) | 421 ms / 7 062 MiB = **16 776 MiB/s** | 5 306 ms / 7 048 MiB = **1 328 MiB/s** |
+| `file` (buffered pread) | 318 ms / 7 062 MiB = **22 211 MiB/s** | 3 650 ms / 7 047 MiB = **1 931 MiB/s** (**+45 %**) |
+| `dio` (O_DIRECT) | 4 645 ms / 7 060 MiB = **1 520 MiB/s** | — |
+
+* The mapping's **cold-cache collapse is the tier's problem too** (12.6x), and buffered is **45 %** faster there.
+* Unlike the pool's fill, the tier's fill does not even favour the mapping **warm**: 22 211 against 16 776 MiB/s,
+  because the mapping pays a PTE lookup per 4 KiB page while `pread` copies in one syscall with readahead.  `dio`
+  at 1 520 MiB/s is why the 3x guard for entering it exists.
+* **`auto` works end to end**: `map` at 1.24 s, then the probe reports "file served the same read in 28 us against
+  this arm's 294 us, 3 samples running" and latches `file`; the run then shows 10 256 storage reads at
+  2 086 MiB/s plus the 1 270 mapping reads from before the switch.  One switch, one direction.
+
+**Correctness — the transport never changes a byte** (`627b2ebd7792`, hashes from no-`-lv` runs): the three pinned
+arms; all four `--load-mode` values; `map` and `file` **on a cold page cache**; and **an arm where every fill
+FAILS** (`MOE_HOST_POOL_FILL_FAULT=late`: 1 886 fills rolled back and declined, `h=0.0053`, `evictions=0`, text
+byte-identical, no faults) -- the P4 fault arm, with r262's existing knob instead of a new one.  Regressions on the
+same build: 35B-A3B off / `auto` / `-lme 6` / arena `-lme 4` / arena `-lme 4` + MTP all `627b2ebd7792`; Flash-Next
+arena `-lme 8` and Flash-Next + separate drafter `f586785d7183`; 122B arena `-lme 60` `9ccf62ed39c3`;
+`check-gpu-faults.sh` clean.
+
+**What is left of P4 (§20.4):** **P4b** -- read straight into the arena slot for the `file`/`dio` arms (probe 12
+measured `pread` into registered memory legal and coherent; the arena *is* registered host memory, so this deletes
+a copy and an H2D), which is only now reachable because the source is registered; and **P4e**, the overlap
+experiment (unchanged: r261 measured ±1.5 % for the exact within-layer lookahead before any worker is built).  The
+`map` arm keeps bounce + H2D until the ordering argument for a direct host `memcpy` is made.  **Not measured:** the
+discrete-side effect of the source-registration change (no discrete GPU on `halo`; `scripts/gate-host-pool.sh` is
+its gate, and the change is inert unless a transport arm is pinned), multi-device, and any throughput claim -- the
+numbers above are per-read rates, not decode.
+
 ## 261111.020 (wip, NO delivery change) -- the draft weights are never evicted: the invariant the maintainer asked for, the three paths that had to be told, and a census line that asserts it
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
