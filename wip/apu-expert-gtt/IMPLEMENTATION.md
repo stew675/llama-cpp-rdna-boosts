@@ -57,6 +57,17 @@ region's pages under real memory pressure.  Probe `09` only shows that a *user-i
 
 ## P1 — preflight, detection and **`-lme`** sizing (the gate becomes a policy)
 
+> **STATUS 2026-11-11: P1.1 and P1.2 are BUILT** (`p2-gtt-expert-store.patch`, `MEASUREMENTS.md` §14).  What the
+> accept criteria measured: `MOE_EXPERT_GTT=0` reproduces today's log byte for byte and the same text;
+> `-lme 6` realises **exactly 6 144.0 MiB** and the census names the source; `auto` in the fitting band is the
+> whole set with zero evictions (and says so) and with `MOE_HOST_LIMIT_FRAC=5` it is a bounded hot subset
+> instead; no `-ncmoe` is required anywhere.  **Two deviations, both recorded:** (a) the integrated branch in
+> `moe_cache_shared_pool_device()`/`moe_cache_preflight()` needed **no change at all** -- that preflight is gated
+> on host-expert bytes, and an APU registers none, so the guard never runs on this box and the cache is already
+> inert; `MOE_EXPERT_GTT=0` and `=1` therefore differ only in the new code (`moe-expert-cache.cu` is untouched);
+> (b) `--fit` does **not** see the store (a `no_alloc` probe load skips the plan by design), which is the
+> "does not double-reserve" criterion met the weak way -- P1.3 remains open (README §7 Q8).
+
 Today `moe_cache_shared_pool_device()` (`ggml/src/ggml-cuda/moe-expert-cache.cu:5623`) and
 `moe_cache_preflight()` (`:5641`) take the integrated branch and **disable the whole cache**
 (`g_enabled = false`).  That branch is what this campaign replaces — not "relaxes".
@@ -104,6 +115,21 @@ fitting band keeps everything resident and in the not-fitting band reports evict
 double-reserve the store; no `-ncmoe` is required (and `-ncmoe` is still refused).
 
 ## P2 — the store itself (allocation, buffer type, in-place reads)
+
+> **STATUS 2026-11-11: BUILT and MEASURED** (`MEASUREMENTS.md` §14).  The accept criteria: same-seed greedy
+> text **byte-identical** to `MOE_EXPERT_GTT=0` on 35B-A3B *and* Flash-Next (and to the pre-P2 build); the GPU
+> read rate is **within noise** of the plain device buffer (-0.4 / -1.25 % of pp512, against a run-to-run drift of
+> ~1 %); `MOE_EXPERT_GTT_RO=0` is **materially slower** (-5.9 / -6.2 %), so the flag does something; no fault, and
+> `check-gpu-faults.sh` clean over every arm.  Two things the plan did not anticipate, both recorded in §14:
+> registration is **26 ms/GiB** at the real extent (cheaper than the 30.5 ms/GiB P1.0 predicted, so no pre-fault
+> walk), and the **load fill is page-cache-bound** (13.9 GB/s warm against 2.33 GB/s off a cold 46 GiB file), which
+> is a startup cost P4 does not address (a separate development line is adding explicit buffered reads for the
+> load, README §7 Q7).  **The fill here is the load-time one**; P4's miss fill is untouched.
+>
+> **Scope: Linux only** (maintainer, 2026-11-11) -- the store declines on Windows and the run keeps today's
+> behaviour there; the platform-specific part is one `#if !defined(_WIN32)` function, so a Windows arm later
+> replaces that function and nothing else (README, status header).  **Granularity: best fit** (same decision) --
+> the extent is the budget and the carve may sit up to one expert table under it; P3 makes the two converge.
 
 * Allocation: `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)` + `MADV_HUGEPAGE` over the
   budgeted extent, then `hipHostRegister(Mapped|ReadOnly)`; slice into per-expert slots.  Windows keeps a

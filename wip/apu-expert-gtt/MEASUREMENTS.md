@@ -313,3 +313,150 @@ on disk for free.
   one probe still owed (`probe/README.md`, 15).
 * `O_DIRECT` at a real GGUF offset needs an alignment round-out and a per-fill delta (§13.2); the buffered arm
   is a legitimate (and here faster) alternative and should stay an arm, not be dropped.
+
+---
+
+## 14. 2026-11-11 — the store EXISTS (P1.1 + P2): the keystone re-run, and what the registered region costs and reads at real scale
+
+The design's memory was answered in §13.  This section is the same box measuring the **implemented** store
+(`p2-gtt-expert-store.patch`, `README.md` §2.1): the keystone re-run first (because a design premise that no
+longer holds changes everything), then the numbers only an implementation can give — the registration cost of a
+real 19-41 GiB region, the load-time fill rate, and the model-level read-rate A/B the flag exists for.
+
+Box unchanged: `halo`, Ryzen AI MAX+ 395 / gfx1151, UMA, 123 GiB, kernel 7.2.13, ROCm 10.1.0
+(`/opt/rocm-10.1.0-gfx1151`), `iommu=off`, `HIP_VISIBLE_DEVICES=0`.  Arms: `../arms.sh`
+(`TREE=~/llama-scratch OUT=/tmp/gtt-arms`), text hashed with **no `-lv`**, censuses at **`-lv 4`**.
+
+### 14.1 The keystone still holds on today's driver (`probe/12-pread-registered`, re-run)
+
+`./12-pread-registered <35B-A3B gguf> 256`, first run of the session (a **cold-ish** page cache):
+
+| arm | result |
+|---|---|
+| registered `Mapped\|ReadOnly`, prefilled `0xAA` | CPU sum == GPU sum (45 634 027 520) |
+| `O_DIRECT` pread **into** the registered region | accepted; 2.09 GB/s first round, **6.44 / 6.42** after |
+| GPU read after each pread | sums match **every** round, including the rounds that overwrote the previous expert |
+| buffered pread into the same region | **4.50 GB/s** (this session; §13.2 recorded **15.68** on a warm file) |
+
+**The buffered number is page-cache state, not a regression.**  It is the same file, the same region and the
+same code; §13.2's run had the file warm.  That is why §14.4 measures the fill at both ends rather than quoting
+one figure.
+
+### 14.2 Registration at the store's real extent — cheaper than P1.0 predicted
+
+The store registers **one** untouched `mmap`+`MADV_HUGEPAGE` region (`cudaHostRegister(Mapped|ReadOnly)`), which
+is the pre-faulting-free order: registering faults the pages in and the kernel forms the huge pages (§13.1, second
+row).  Measured inside the store creation, from the census (extent, mode: 2 runs each on 35B-A3B):
+
+| extent | registration mode | mmap + MADV_HUGEPAGE + register | per GiB |
+|---|---|---|---|
+| **19 126.5 MiB** (18.7 GiB) | ReadOnly | **482 / 485 ms** | **25.8 / 26.0** |
+| 6 144.0 MiB (6 GiB) | ReadOnly | 160 / 161 ms | 26.7 / 26.9 |
+| 19 126.5 MiB | WRITABLE (`MOE_EXPERT_GTT_RO=0`) | 483 / 486 ms | 25.9 / 26.0 |
+| **40 925.6 MiB** (39.9 GiB) | ReadOnly | **1 034 ms** | **25.9** |
+
+* **~26 ms/GiB**, against P1.0's **30.5 ms/GiB** for an untouched region (§13.1) and **17.4 ms/GiB** for a
+  pre-faulted one.  So the `memset` pre-fault walk the probe needed is not worth taking at the store's scale:
+  registering the untouched region costs about what pre-faulting alone did.
+* Registration mode makes **no difference to the cost** (25.8 vs 25.9 ms/GiB) — only to the read rate (§14.5).
+* The **whole** store's registration is **0.48 s on a 19 GiB tier and 1.03 s on the 41 GiB Flash-Next tier** -- and
+  the per-GiB figure does not drift with size (25.9 ms/GiB at 6, 19 and 41 GiB), so it is a linear, predictable
+  startup cost.
+* **All 19 126 MiB of it lands as huge pages**: `AnonHugePages` 19 126.0 MiB of 19 126.5 (100.0 %), and 6 144.0 of
+  6 144.5 on the `-lme 6` arm.  `AnonHugePages` is read from `/proc/self/smaps` **after the load**, i.e. after the
+  loader wrote every byte — so the fill does not split them.
+
+### 14.3 The load-time fill (P2's, not P4's)
+
+The fill is the buffered `pread` arm straight into the slot (`read_raw` into `cur->data`, `llama-model-loader.cpp`
+→ `load_data_for`): no alignment round-out, no bounce buffer, no staging ring.  The measured window is
+`carve → census` (the other tensors of the load are `mmap`-mapped, so they are nearly free in that window):
+
+| model | store read from the GGUF | fill window | rate | page cache |
+|---|---|---|---|---|
+| 35B-A3B Q4_K_M | **18 662.0 MiB** | 1.34 s | **13.9 GB/s** | warm (the file had just been read by earlier arms) |
+| Flash-Next GSQ-IQ3_XXS | **40 925.0 MiB** | 17.6 s | **2.33 GB/s** | cold-ish (46 GiB file on a box holding 37 GiB of cache) |
+
+**The fill is page-cache/disk-bound, and that is a LOAD cost, not a decode cost.**  A 41 GiB store takes ~18 s to
+populate when its file is not resident, ~3 s when it is; it is the same 2.3-15.7 GB/s band §13.2 measured for
+`pread` into a registered region, and P4's pipelining does not touch it (P4 pipelines *miss* fills, this is the
+one-shot load fill).  The bytes read account for every expert byte of the carve (the carve is 0.2 MiB larger on Flash-Next: the
+buffer type's per-tensor page padding), and `size_done`'s progress is unaffected.
+
+### 14.4 `-lme` is the store's size (P1.1) — realised, on both models
+
+Census, `-lv 4` (`arms.sh census`).  "Slots" = `(tensor, expert)` slabs; `auto` on a fitting set is the whole set.
+
+| arm | budget source | extent requested → realised | tables / slots | carved | evictions |
+|---|---|---|---|---|---|
+| 35B-A3B, `-lme auto` | `auto: 80% of MemAvailable -> a 92 413.5 MiB cap` | 19 126.5 → **19 126.5 MiB** | 123 / 31 488 (the **whole** set) | 18 662.0 MiB | **0** |
+| 35B-A3B, `-lme 6` | `-lme 6` | 6 144.0 → **6 144.0 MiB** | 36 / 9 216 (a hot subset) | 6 116.0 MiB | n/a (none in this phase) |
+| 35B-A3B, `MOE_HOST_LIMIT_FRAC=5` | `auto: 5% ... -> a 5 804.7 MiB cap` | 5 804.7 → **5 804.7 MiB** | 34 / 8 704 (a hot subset) | 5 796.0 MiB | n/a |
+| Flash-Next, `-lme auto` | `auto: 80% ... -> a 92 613.3 MiB cap` | 40 925.6 → **40 925.6 MiB** | 144 / 73 728 (the **whole** set) | 40 925.2 MiB | **0** |
+
+* `-lme 6` realises **exactly 6 144.0 MiB** — the extent IS the request (page-rounded, and the request is a whole
+  number of pages).  The **carved** bytes are 6 116.0 MiB, i.e. within **one expert table** (155 MiB) of the
+  budget, which is the granularity of this phase: a whole table per residency decision, because there is no
+  eviction yet (P3 is what makes one *slot* the unit).
+* `auto` is `min(MOE_HOST_LIMIT_FRAC x MemAvailable, the expert set)` — a **cap, not a floor**: 35B-A3B's
+  19 126.0 MiB set fits the 92 GiB ceiling so the whole set is resident and nothing can evict; Flash-Next's
+  40 925.0 MiB set also fits on this 123 GiB box.  `MOE_HOST_LIMIT_FRAC=5` exercises the **not-fitting** band: a
+  5 804.7 MiB hot subset 34 tables deep.
+* The Flash-Next counts match §13.5's heat-map geometry exactly — **144 tables, 73 728 slots, 39.97 GiB** — which
+  is the cross-check that the store holds the same set the heat map ranks.
+* 35B-A3B's 123 tables / 19 126 MiB are 3 x 41 layers: the **MTP (nextn) head's** three expert tables are included
+  here, where the delivery's cache keys only the 40 trunk layers (§13.5's 120 tables / 18.22 GiB).
+
+### 14.5 The read rate at model level, and what `MOE_EXPERT_GTT_RO` buys
+
+`llama-bench -m 35B-A3B -ngl 99 -p 512 -n 128 -r 3`, two independent runs of the whole set of arms:
+
+| arm | pp512 (run 1) | pp512 (run 2) | tg128 |
+|---|---|---|---|
+| `MOE_EXPERT_GTT=0` (plain device buffer, today) | 2 268.65 ± 26.67 | **2 289.39 ± 4.78** | 63.22-63.25 |
+| store, registered **ReadOnly** (default) | 2 259.63 ± 15.37 | 2 260.77 ± 8.68 | 63.24 |
+| store, registered **WRITABLE** (`RO=0`) | 2 135.82 ± 1.34 | 2 146.85 ± 12.13 | 63.30-63.34 |
+
+* **The registered ReadOnly store is within noise of the plain device buffer**: -0.40 % in run 1, -1.25 % in run 2,
+  against a drifts between runs of +0.9 % on the plain arm itself.  The store is **not a slow tier**, which is the
+  acceptance criterion P2 set.
+* **`MOE_EXPERT_GTT_RO=0` is materially slower**: -5.9 % and -6.2 % of the plain arm, -5.5 % and -5.0 % of the
+  ReadOnly store, at a spread of ±1.34 / ±12.13 — i.e. well outside the noise.  The 232-vs-60 GB/s fact of probes
+  03/04 **does apply to this region**.
+* The magnitude is *masked by compute*: a 3.9x slower read costs 5-6 % of prefill, not 74 %, because the expert
+  read overlaps arithmetic and only a fraction of prefill is weight-bandwidth-bound.  Do not read the 60 GB/s
+  probe figure as "writable costs 74 % at the model".
+* **Decode does not move at all** (63.22-63.34 t/s across all six runs): a decode step reads top-k experts, so it
+  never approaches the read bandwidth.  A store's value is in what it holds, not in how fast it reads while
+  fitting.
+
+### 14.6 Identity, and the kill switch
+
+Same-seed greedy text, **no `-lv`** (`scripts/extract-generated.py`), prompt `The capital of France is`, `-n 20`:
+
+| model | `MOE_EXPERT_GTT=0` | store `auto` | store `-lme 6` | store `RO=0` | pre-P2 build (`release.json` tree) |
+|---|---|---|---|---|---|
+| 35B-A3B Q4_K_M | `89 chars sha=627b2ebd7792` | **identical** | **identical** | **identical** | **identical** |
+| Flash-Next GSQ-IQ3_XXS | `113 chars sha=f586785d7183` | **identical** | — | — | **identical** |
+
+`-ncmoe 8` on the same box with the store on: identical too (the `-ncmoe` refusal is unchanged, and the store
+simply holds the whole set).
+
+The kill switch's log is **byte-for-byte** the release tree's: the two `-lv 4` logs (pre-P2 build vs
+`MOE_EXPERT_GTT=0`) normalise to the same 329 lines, differing only in the ephemeral server port and the four
+throughput figures.  `scripts/check-gpu-faults.sh --since "90 min ago"` over every arm's log plus the kernel
+journal: **clean**, and no `HSA_STATUS_ERROR_MEMORY_FAULT` in any arm.
+
+### 14.7 What this does not measure (and must not be read as measuring)
+
+* **Eviction, the streaming refill, and the `>RAM` case** — P3/P4/P5.  Every arm above has its expert set
+  *fitting*; the census prints "a hot subset" when it does not, and says there is no eviction.
+* **Pipelining.**  §13.4's requirement (fills behind compute) is untouched: P2 has exactly one fill, at load.
+* **`--fit`'s view of the store.**  A `--fit` probe load is `no_alloc`, so the store plan is skipped entirely
+  (`llama_model_loader.cpp`: `if (no_alloc) return;`) and the probe reserves nothing — confirmed by exactly ONE
+  `plan_gtt_expert_store` line per run with `--fit on` (the default).  But `--fit` therefore does **not** account
+  for the store when it sizes the context; that is P1.3's item, and on this box it did not matter.
+* **Reclamation under memory pressure** — probe `16`, still owed, and now more load-bearing: the store is
+  registered and `MemAvailable` fell by exactly the store's extent on every arm (e.g. 19 126 MiB on the 35B arm).
+  Nothing here tests whether the kernel can take it back.
+* **gfx1150 / Windows / a carve-out APU**, and any second device.

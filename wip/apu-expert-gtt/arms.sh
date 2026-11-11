@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# wip/apu-expert-gtt/arms.sh -- the P1.1 + P2 arms for the UMA GTT expert store.
+#
+# Three things are checked, and they are separate runs (AGENTS.md, the `-lv` table):
+#
+#   text    same-seed greedy text, hashed from a run with NO `-lv` at all, on both field models:
+#             store on (`-lme auto`, and an explicit `-lme 6`)  ==  `MOE_EXPERT_GTT=0` (today's behaviour)
+#   census  the store's own `-lv 4` census: extent requested vs realised, budget source, registration
+#           mode, huge-page granularity, slots, fill bytes
+#   rate    `llama-bench`: the registered READ-ONLY store against the same store registered WRITABLE
+#           (`MOE_EXPERT_GTT_RO=0`, the measured 232 vs 60 GB/s A/B) and against no store at all
+#           (`MOE_EXPERT_GTT=0`, the plain device buffer)
+#
+# Usage:  ./arms.sh [text|census|rate|all] [--quick]
+#         TREE=/path/to/scratch OUT=/tmp/gtt-arms ./arms.sh all
+#
+# Nothing here touches the delivery set, `patches/` or the fork: it only runs binaries out of the scratch
+# tree and writes logs under $OUT.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+TREE="${TREE:-$HOME/llama-scratch}"
+BIN="$TREE/build-rocm/bin"
+OUT="${OUT:-/tmp/gtt-arms}"
+ROCM="${ROCM:-/opt/rocm-10.1.0-gfx1151}"
+
+export LD_LIBRARY_PATH="$ROCM/lib:${LD_LIBRARY_PATH:-}"
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+
+M35=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf
+MFN=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+
+PROMPT="${PROMPT:-The capital of France is}"
+NGEN="${NGEN:-20}"
+QUICK=0
+WHAT="all"
+for arg in "$@"; do
+    case "$arg" in
+        text|census|rate|all) WHAT="$arg" ;;
+        --quick) QUICK=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+
+mkdir -p "$OUT"
+[ -x "$BIN/llama-cli" ] || { echo "no llama-cli in $BIN (build the scratch tree first)" >&2; exit 2; }
+
+fail=0
+note() { printf '\n=== %s\n' "$*"; }
+
+# text_arm TAG MODEL "ENV=VAL ..." [extra llama args...]   -- NO `-lv` at all
+text_arm() {
+    local tag="$1" model="$2" envs="$3"; shift 3
+    local log="$OUT/text-$tag.log"
+    env $envs timeout 1800 "$BIN/llama-cli" -m "$model" -ngl 99 -p "$PROMPT" -n "$NGEN" \
+        --seed 42 --temp 0 --no-display-prompt --single-turn "$@" > "$log" 2>&1
+    if [ $? -ne 0 ]; then
+        printf '  %-28s FAILED (%s)\n' "$tag" "$log"
+        fail=1
+        return
+    fi
+    printf '  %-28s %s\n' "$tag" "$(python3 "$REPO/scripts/extract-generated.py" "$log" 2>&1)"
+}
+
+# census_arm TAG MODEL "ENV=VAL ..." [extra llama args...]  -- `-lv 4`
+census_arm() {
+    local tag="$1" model="$2" envs="$3"; shift 3
+    local log="$OUT/census-$tag.log"
+    env $envs timeout 1800 "$BIN/llama-cli" -m "$model" -ngl 99 -p "$PROMPT" -n 4 \
+        --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 "$@" > "$log" 2>&1
+    if [ $? -ne 0 ]; then
+        printf '  %-28s FAILED (%s)\n' "$tag" "$log"
+        fail=1
+        return
+    fi
+    printf '\n--- %s (%s)\n' "$tag" "$log"
+    grep -E "GTT expert store|plan_gtt_expert_store|gtt_store" "$log" | sed 's/^/    /'
+}
+
+case "$WHAT" in
+text)
+    note "TEXT IDENTITY -- 35B-A3B Q4_K_M (18.22 GiB of experts)"
+    text_arm 35b-store-off  "$M35" "MOE_EXPERT_GTT=0"
+    text_arm 35b-store-auto "$M35" "MOE_EXPERT_GTT=1"
+    text_arm 35b-store-lme6 "$M35" "MOE_EXPERT_GTT=1" -lme 6
+    if [ $QUICK = 0 ]; then
+        note "TEXT IDENTITY -- Flash-Next GSQ-IQ3_XXS (~40 GiB of experts)"
+        text_arm fn-store-off   "$MFN" "MOE_EXPERT_GTT=0"
+        text_arm fn-store-auto  "$MFN" "MOE_EXPERT_GTT=1"
+    fi
+    ;;
+
+census)
+    note "CENSUS -- 35B-A3B"
+    census_arm 35b-census-off  "$M35" "MOE_EXPERT_GTT=0"
+    census_arm 35b-census-auto "$M35" "MOE_EXPERT_GTT=1"
+    census_arm 35b-census-lme6 "$M35" "MOE_EXPERT_GTT=1" -lme 6
+    census_arm 35b-census-rw   "$M35" "MOE_EXPERT_GTT=1 MOE_EXPERT_GTT_RO=0"
+    if [ $QUICK = 0 ]; then
+        note "CENSUS -- Flash-Next"
+        census_arm fn-census-auto "$MFN" "MOE_EXPERT_GTT=1"
+    fi
+    ;;
+
+rate)
+    note "READ RATE -- llama-bench, 35B-A3B (pp512 / tg128)"
+    bench() {
+        local tag="$1" envs="$2"
+        local log="$OUT/bench-$tag.txt"
+        env $envs timeout 2400 "$BIN/llama-bench" -m "$M35" -ngl 99 -p 512 -n 128 -r 3 -o md \
+            > "$log" 2>&1
+        printf '\n--- %s (%s)\n' "$tag" "$log"
+        grep -E '^\|' "$log" | sed 's/^/    /'
+    }
+    bench 35b-store-off "MOE_EXPERT_GTT=0"
+    bench 35b-store-ro  "MOE_EXPERT_GTT=1 MOE_EXPERT_GTT_RO=1"
+    bench 35b-store-rw  "MOE_EXPERT_GTT=1 MOE_EXPERT_GTT_RO=0"
+    ;;
+esac
+
+note "GPU FAULTS"
+for f in "$OUT"/*.log; do
+    [ -e "$f" ] || continue
+    if grep -q "HSA_STATUS_ERROR_MEMORY_FAULT\|MEMORY_APERTURE_VIOLATION" "$f"; then
+        echo "  FAULT in $f"
+        fail=1
+    fi
+done
+[ $fail = 0 ] && echo "  clean" || echo "  SEE ABOVE"
+
+exit $fail

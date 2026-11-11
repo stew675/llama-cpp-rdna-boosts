@@ -1,14 +1,34 @@
 # wip/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
 
-**Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151); P0 **and** the P1.0 keystone probes DONE (all four
-assumptions hold, `MEASUREMENTS.md` §13); nothing implemented, nothing in `patches/`, nothing applied to the
-fork.**  The plan is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
+**Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, and P1.1 + P2 (the
+store itself, built and measured) are DONE; nothing in `patches/`, nothing applied to the fork.**  The plan is
+[`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
-re-run on any UMA box.
+re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
+
+The implementation so far is ONE patch, **cut against the `release.json` tree
+`86389e4a…` and applied with `git am`** (it produces tree `503de382…`):
+
+| artifact | sha256 |
+|---|---|
+| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) — P1.1 (`-lme` sizes the store) + P2 (the region, the device buffer type, the load-time fill, the census, the kill switch) | `a11c6eef48605140c9404e58804a3b47dc202379f597fbff182249f22a2a0305` |
+
+**What is left: P3 (residency/eviction), P4 (the streaming fill arms + overlap), P5 (prefill streaming), P6
+(gate + promotion)**, plus the two owed probes (`15` touch distance, `16` reclamation under pressure).  A run in
+this phase is an **ALL-RESIDENT arm or a static hot subset**; the census says so, every time.
+
+**Scope: Linux only, for now** (maintainer, 2026-11-11).  The store declines on Windows (the single-address
+premise does not hold on WDDM) and the run keeps today's behaviour there.  Nothing in the patch forecloses a
+Windows arm later: the platform-specific part is **one function** (`gtt_store_create_locked()` -- `mmap` +
+`MADV_HUGEPAGE` + the one registration, already `#if !defined(_WIN32)`-guarded), the buffer type is a plain
+device buft whose backing only has to be host-writable, and the loader's fill is `read_raw()` into
+`tensor->data`, which Windows has too.  A Windows arm would replace that one function and either teach the
+buffer type a host/device alias pair or drop the "one address" assertion with a second pointer.
 
 Renamed from `wip/apu-expert-pool/` on 2026-11-11: **there is no pool in this design any more** (§1), and the
 thing the tier holds is a store of resident experts, not a cache tier under a host pool.  Cut against the
-**r259** tree (`release.json` tree `7995db44…`, tip `c80fa8bda…`); file:line references are that tree.
+**r261** tree (`release.json` tree `86389e4a…`, tip `030c8997…`); file:line references are that tree unless they
+name an older one.
 
 ## 0. The shape, in the maintainer's words (2026-11-11)
 
@@ -99,6 +119,33 @@ Two probes are still owed, and neither blocks the design's memory:
   `Unevictable` / `MemAvailable` / `mincore` each report while it does -- is **unmeasured**.  §5's "the budget
   is a reservation" rests on that, so measure it before a >RAM model trusts the budget.
 
+### P1.1 + P2 -- the store exists and is measured (BUILT 2026-11-11; `MEASUREMENTS.md` §14)
+
+The patch is [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) (sha256 in the status header above).  What
+landed, and the number that says it works:
+
+| what | where | measured |
+|---|---|---|
+| the region: `mmap(PROT_READ\|PROT_WRITE, MAP_PRIVATE\|MAP_ANONYMOUS\|MAP_NORESERVE)` + `MADV_HUGEPAGE`, then ONE `cudaHostRegister(Mapped\|ReadOnly)` over the budgeted extent; `cudaHostUnregister` **then** `munmap` at teardown | `ggml/src/ggml-cuda/gtt-expert-store.cu` | **26 ms/GiB** to create+register (19.1 GiB in 482-486 ms), **100 %** of it huge pages *after* the load, and the host VA == the device VA is **asserted** at creation (a second address declines the store) |
+| the buffer type: a DEVICE buft with the plain device type's vtable contract, a per-device unique name, one page of alignment, and a clean NULL decline when a carve does not fit | `ggml-cuda.cu` (`ggml_backend_cuda_gtt_store_buffer_type*`), the KV-region pattern | one carve per load (`19 126.5 MiB` / `40 925.2 MiB`); the expert tables stay in that device's split, so `MUL_MAT_ID` reads them in place -- **no new op, no dispatch, no per-layer copy, and no scheduler input-copy of the table** |
+| `-lme` is the store's size (P1.1), resolved before any tensor is placed, with the discrete arm's own budget and heat ranking | `llama-model-loader.cpp` `plan_gtt_expert_store()`, called from `plan_host_expert_placement()`'s UMA branch | `-lme 6` → **exactly 6 144.0 MiB** realised (6 116.0 MiB carved); `auto` → the whole set when it fits (123 or 144 tables, **zero evictions**), the ceiling as a hot subset when it does not (`MOE_HOST_LIMIT_FRAC=5` → 34 tables) |
+| the load-time fill: the buffered `pread` arm straight into the slot, no alignment round-out | `llama-model-loader.cpp` `load_data_for()` | every expert byte of the carve is read from the GGUF (18 662.0 / 40 925.0 MiB, the carve's remainder being the buffer type's per-tensor padding); **13.9 GB/s** with the file warm, **2.33 GB/s** on a cold 46 GiB file (a *load* cost, not a decode one) |
+| one `-lv 4` census (extent requested vs realised, budget source, registration mode, huge-page share, registration cost, slots, fill bytes, MemAvailable after) + the "ALL-RESIDENT arm only" scope line | `ggml_cuda_gtt_store_report()` | every arm prints it; `MemAvailable` falls by exactly the extent |
+| the kill switch `MOE_EXPERT_GTT=0` | the CUDA device hook returns NULL, the loader plans nothing | same-seed greedy text **identical**, and the `-lv 4` log normalises to the **same 329 lines** as the pre-P2 build |
+| `MOE_EXPERT_GTT_RO` (default 1) | the registration flags | RO is within noise of the plain device buffer (-0.4 / -1.25 % pp512); **WRITABLE is -5.9 / -6.2 %**, i.e. the 232-vs-60 GB/s fact applies to this region |
+
+**The design's memory is now confirmed at store scale, with two corrections:**
+
+1. **Registration is cheaper than P1.0 predicted** -- 26 ms/GiB at the real extent against the probe's
+   30.5 ms/GiB, so the `memset` pre-fault walk is not worth taking.
+2. **The load fill is page-cache-bound, and that is the one number that got worse as the store got bigger**:
+   18.7 GiB in 1.34 s when the GGUF is resident (13.9 GB/s), 40.9 GiB in 17.6 s when it is not (2.33 GB/s).  It
+   changes nothing about decode, but it is the store's **startup** cost on a >RAM set and P4/P5 do not address it.
+
+And **one measured non-fact to keep straight**: decode throughput does not move at all between the store and the
+plain device buffer (63.22-63.34 t/s over six runs).  While the set fits, the store's value is what it makes
+*possible*, not what it makes faster (§5 item 3).
+
 ## 3. How a step and a prefill run
 
 **Decode.**  The routing is known after the gate/softmax, before the `MUL_MAT_ID`:
@@ -176,6 +223,22 @@ slot/remap indirection (`g_dr_key_to_id`, `moe_cache_remap`), the per-layer acce
   in place with no new dispatch and no new op;
 * the fill: `fill_slot_from_host()` (`moe-expert-cache.cu:3452`) retargeted to the two arms of §3.1.
 
+**What P1.1 + P2 actually landed (2026-11-11, `p2-gtt-expert-store.patch`), so a later reader does not have to
+re-derive the shape from the plan above:**
+
+| file | what is in it |
+|---|---|
+| `ggml/src/ggml-cuda/gtt-expert-store.cu/.cuh` (new, ~470 lines) | the region's lifetime (mmap + THP + ONE registration, `unregister` then `munmap` at exit; the single-address assertion), the bump allocator the buffer type carves from, the `/proc` helpers, and the one `-lv 4` census |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | the **buffer type** (`ggml_backend_cuda_gtt_store_*`: per-device name, page alignment, the plain device type's `get_alloc_size`, memcpy `set`/`get`/`memset`/`clear`, a NULL decline when a carve does not fit), the two device hooks, and one line in `supports_buft` |
+| `src/llama-model-loader.{cpp,h}` | `plan_gtt_expert_store()` (the UMA arm of `-lme`: candidates, budget, ceiling, heat ranking, whole-table selection), the placement hook in `buft_for_tensor()`, the `pread`-into-the-slot fill in `load_data_for()`, and the census call |
+| `common/arg.cpp` | the UMA branch of `-lme`'s help text and of its "90 % of available memory" refusal |
+| `ggml/include/ggml-backend.h`, `ggml/src/ggml-backend-impl.h`, `ggml/src/ggml-backend.cpp` | the two appended device hooks (`gtt_store_open` / `gtt_store_report`) and their wrappers |
+
+**Not built yet, deliberately:** `fill_slot_from_host()` is untouched (P4 owns the two fill arms); the eviction
+path does not exist (P3), so the residency unit is one whole expert table; `moe-expert-cache.cu` is unchanged --
+its integrated-device branch never runs on this box anyway (the preflight is host-expert-gated and an APU
+registers no host-expert bytes), which is why `MOE_EXPERT_GTT=0` and `=1` differ only in the new code.
+
 **Deleted *on the UMA arm only*:** the pinned host pool and its master, the `access_locked()` arena->pool
 hand-over, `bounce_acquire()`'s staging ring for the store's fills, and any slab sizing for this tier.  The
 discrete path keeps all of them: this is a UMA branch, not a replacement.
@@ -195,7 +258,7 @@ path already uses.  So the design keeps **one** CLI knob across both modes and a
 | `-lme` | discrete box (today) | APU (this design) |
 |---|---|---|
 | **`auto`** | fits under `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable` -> mirror the whole set; otherwise a bounded per-expert pool | **fits** -> the whole expert set is resident in the store (zero evictions); **does not fit** -> `MOE_HOST_LIMIT_FRAC` x `MemAvailable` of store, i.e. a hot subset with evictions on |
-| **`N`** | pin N GiB, spent on whole tensors in descending hotness (fit case) or as a per-expert pool (not-fitting case) | exactly **N GiB** of registered store, spent at **one (tensor, expert) slot** granularity in descending hotness -- finer than the discrete fit case, so the budget is used byte-for-byte |
+| **`N`** | pin N GiB, spent on whole tensors in descending hotness (fit case) or as a per-expert pool (not-fitting case) | **exactly N GiB of registered store**, spent in descending hotness.  **What landed (P2) spends it on WHOLE expert tables** -- the table is the decision unit until eviction exists (P3), when the unit becomes one (tensor, expert) slot |
 
 Three things the APU arm has to decide differently, and they are P1's work:
 
@@ -218,6 +281,24 @@ Three things the APU arm has to decide differently, and they are P1's work:
 
 Whatever the budget leaves is the page cache, which is where the warm fill arm's source comes from -- so the
 number implicitly decides the cold:warm ratio, which is why the census must print both counters.
+
+**Measured, P1.1 + P2 (2026-11-11, `MEASUREMENTS.md` §14.4).**  The three arms the gate asks for, on the two field
+models, with the census's own numbers:
+
+| arm | extent requested -> realised | tables / slots | zero evictions? |
+|---|---|---|---|
+| 35B-A3B, `-lme auto` (set fits) | 19 126.5 -> **19 126.5 MiB** | 123 / 31 488 (the whole set) | **yes**, and the census says so |
+| 35B-A3B, `-lme 6` | 6 144.0 -> **6 144.0 MiB** | 36 / 9 216 (6 116.0 MiB carved) | n/a -- a hot subset |
+| Flash-Next, `-lme auto` (set fits) | 40 925.6 -> **40 925.6 MiB** | 144 / 73 728 (the whole set) | **yes** |
+| 35B-A3B, `auto` with `MOE_HOST_LIMIT_FRAC=5` | 5 804.7 -> **5 804.7 MiB** | 34 / 8 704 | n/a -- the not-fitting arm |
+
+So `-lme N` **is** the extent (page-rounded), `auto` is a cap not a floor, and the waste between the extent and
+the carved bytes is under one expert table (155 MiB on 35B-A3B) -- the granularity of this phase.
+
+**Settled (maintainer, 2026-11-11): a best fit, not a strict fit.**  The extent is the budget and the carved
+bytes may sit up to one expert table under it; the registered-but-unoccupied tail is the price of the region
+being exactly the size that was asked for, and it is the right trade.  P3 does not change the intent -- a
+slot-granular residency unit simply makes the carve converge on the extent, so the tail disappears by itself.
 
 **A resident slot is not *discardable* by the usual means** -- probe `09` measured a registered range keeping
 1 048 576 of 1 048 576 pages after `fadvise(DONTNEED)` **and** `madvise(DONTNEED)`, where the unregistered
@@ -293,6 +374,28 @@ measurement.
    Windows APU with a fixed VRAM partition, or does the carve-out keep `MOE_EXPERT_CACHE_UNIFIED`?  Different
    detections, measured on one box so far.
 6. **gfx1150** (Strix Point, smaller pool): nothing measured.  Take it or leave it.
+7. **The load fill is page-cache-bound, and nothing in P3-P5 fixes it** (measured, §14.3): a 41 GiB store takes
+   17.6 s to populate off a cold 46 GiB file (2.33 GB/s) against 1.34 s when the file is resident (13.9 GB/s).
+   It is a *startup* cost, not a decode one, but on a >RAM model whose file can never be fully cached it is the
+   floor on every start.  **Owned elsewhere** (maintainer, 2026-11-11): a separate development line is adding
+   **explicit buffered reads** instead of the mmap-only load, precisely because the page cache chokes under
+   low-free-memory conditions.  This store inherits that work for free -- its fill is a buffered `pread` into the
+   slot, so it only needs the *read* to stop depending on the page cache; nothing here needs to change.
+8. **`--fit` does not account for the store** (P1.3 of the plan).  The probe load is `no_alloc`, so the store is
+   deliberately not planned there and the fit pass reserves nothing for it -- correct for the probe, but it means
+   `--fit` sizes the context against a memory budget the store will later take 19-41 GiB out of.  It did not bite
+   on this box (the set fits with 45 GiB to spare); it will bite on a set that does not.
+9. **The whole-table granularity of `-lme N`** (measured §14.4: 6 144.0 MiB requested, 6 116.0 MiB carved) is a
+   P2 artefact, not the design, and **the best-fit behaviour is what was chosen** (maintainer, 2026-11-11).  P3 is
+   what turns the residency unit into one (tensor, expert) slot; until then a budget smaller than one table buys
+   nothing, and `-lme N` is exact to the extent, not to the carve.
+10. **The MTP (nextn) head's expert tables are IN the store** -- 3 of 35B-A3B's 123, and 3 of Flash-Next's 144.
+   That is deliberate: on an APU there is no second placement to give them (one DRAM, and the delivery's
+   "keep the speculative head on the device" rule exists to stop `-ncmoe` moving it to *host* memory, which is
+   not a separate thing here), and they are read on every draft step.  **What P3 must not do** is let the heat
+   ranking evict them: the persisted prior is a long-horizon frequency, and a draft model's head experts are used
+   *every* step but may not be frequent enough in the *target's* routing to survive a hot-subset budget on
+   ranking alone.  When P3 lands, either pin the nextn tables or give them their own prior.
 
 ### 7.1 Slot granularity — the pros and cons (asked 2026-11-11; the answer is "per expert, coalesced I/O")
 
@@ -329,6 +432,8 @@ layer rather than once per expert.  That combination — fine slots, coarse read
 |---|---|
 | `README.md` | this file: the shape, what it replaced, the measured foundation, the step/prefill protocol, the code map, the traps |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | the phased plan: P1.0 keystone probes, the store, residency/eviction, the fills, prefill streaming, preflight/fit, the gate spec, docs, effort, rollback |
-| [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration |
+| [`MEASUREMENTS.md`](MEASUREMENTS.md) | the probe log (dated record, not edited in place): box config, every number, reproduction commands; §13 is the 2026-11-11 P1.0 record and the expert-traffic concentration, §14 the same-day P1.1+P2 record (keystone re-run, registration cost at real extent, the fill rates, the `-lme` arms, the read-rate A/B) |
+| [`p2-gtt-expert-store.patch`](p2-gtt-expert-store.patch) | **the implementation so far**: P1.1 + P2 as ONE patch cut against the `release.json` tree `86389e4a…` (`git am`; sha256 in the status header) |
+| [`arms.sh`](arms.sh) | the P1.1+P2 arms: `text` (same-seed greedy, no `-lv`), `census` (`-lv 4`), `rate` (`llama-bench`, the ReadOnly/writable/absent A/B), plus the GPU-fault scan.  `TREE=~/llama-scratch ./arms.sh all` |
 | [`probe/`](probe/README.md) | the ten P0 probes, the four P1.0 probes (11-14), and two measurement helpers (`gguf-expert-geom.py`, `moe-heatmap-read.py`); probes 15 (touch distance) and 16 (reclamation under pressure) still owed |
-| [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md) | the cold-start prompt for the implementation session: what P1.1/P2 is, the numbers not to contradict, the definition of done |
+| [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md) | the cold-start prompt that drove the P1.1/P2 session (what it is, the numbers not to contradict, the definition of done).  It is now a **record**, not the current prompt: the next session starts from `IMPLEMENTATION.md` P3 |
