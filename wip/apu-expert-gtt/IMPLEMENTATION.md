@@ -176,8 +176,9 @@ the same model; no fault.
 > two words interchangeably in code, comments or records; say "GTT expert store" or "slab arena".
 >
 > **The nextn (MTP) head's tables are pinned in the GTT store and are NOT counted against `-lme N`** (same decision):
-> the head is metadata overhead, read every draft step.  P2 still counts them (README §7 Q10); P3 is where the
-> accounting moves, because that is where "pinned" first means something.
+> the head is metadata overhead, read every draft step.  P2 counted them until P3c moved the accounting
+> (2026-11-11, `MEASUREMENTS.md` §17) -- the head is no longer part of the set when it is not loaded, and both
+> tiers now treat it as pinned overhead on top of the budget.
 
 ### P3.0 — the seams, read before writing anything (2026-11-11)
 
@@ -249,7 +250,7 @@ path's own vocabulary that is `--host-experts pool` with the pool replaced by th
 > (it is a fittability tier, not a speed tier, and it costs decode on a config whose KV/experts fit).
 
 | **P3b** (DONE 2026-11-11, PM) | `-lme` smaller than the set: evictions, fills, the hit-rate census, the transient band only if the measured admission policy wants it (it does not: every miss fills by construction, so touch admission stays a no-op here) | `MEASUREMENTS.md` §16.3/§16.5: **a >RAM model runs** -- 123.45 GiB on this 123 GiB box at `-lme 60` (3.5 t/s) and `-lme 20` (3.0 t/s), `evictions > 0`, `arena releases == 0`, and the text is identical across a 3x residency change and to the store-off arm on both fitting models |
-| **P3c** (TODO) | the nextn tables pinned outside `-lme` | the head's 3 tables are resident in every arm, and `-lme N` arithmetic excludes them -- **not touched**: every P3 arm so far is a plain `llama-cli` run with no drafter |
+| **P3c** (DONE 2026-11-11, PM) | the MTP/nextn head's tables pinned outside `-lme`: partitioned by layer (`>= n_layer_trunk`) and only when `load_mtp` (otherwise the head's tensors are not part of the set at all), the head's bytes added ON TOP of the budget, its tables placed first in placement mode, and at full slot count in arena mode | `MEASUREMENTS.md` §17: 35B-A3B `-lme 4 --spec-type draft-mtp` -> extent **4 560.0** = 4 096 + 464, **123 tables / 7 488 slots** (the head's 3 tables at 256/256 on top of the trunk's 56), trunk slots unchanged, `arena releases=0`, `draft acceptance=1.00000`; the 122B `-lme 60 --spec-type draft-mtp` -> 63 888.0 = 61 440 + 2 448, 147 tables / 19 920 slots.  Same-seed text unchanged in all 10 35B arms and all 4 122B arms (with and without MTP) |
 
 Reuse, do not rebuild: the heat table and its MHT2 prior (`apply_heat_seed_locked`), the slot/remap
 indirection (`g_dr_key_to_id`, `moe_cache_remap`), and `access_locked()` (`moe-expert-cache.cu:3495`) as the

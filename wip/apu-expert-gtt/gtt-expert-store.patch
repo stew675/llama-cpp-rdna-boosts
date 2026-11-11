@@ -1,8 +1,9 @@
-From 1dd95e40259c91b5ff395f43cd10817a74103f75 Mon Sep 17 00:00:00 2001
+From 3a0e919609bbbb181c8b52023ae85acb0f57b0d1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
-Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b -- a mlocked GTT
- expert store, and the tier as a serving ARENA
+Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b/P3c -- a mlocked GTT
+ expert store, the tier as a serving ARENA, and the MTP head pinned outside
+ the budget
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -36,6 +37,11 @@ no host pool and no slab arena below it.
   clamped to RLIMIT_MEMLOCK, a DECLINE with the fix when the model fits in RAM anyway, and a
   REFUSAL with the shortfall when the model cannot run without the store and it cannot be locked
   (0.76 s on a 123 GiB model instead of the 2026-10-19 over-commit).  mlock is free at creation.
+- P3c (the MTP/nextn HEAD): the head's expert tables are PINNED at full residency and are NOT part of
+  `-lme`'s arithmetic -- the head is metadata overhead read on every draft step, so the policy does not
+  get to trade it away and its bytes sit on top of the budget (extent = `-lme N` + head).  The partition
+  is by layer (`>= n_layer_trunk`) and only when the nextn layers are actually loaded (`load_mtp`), so a
+  load without a drafter no longer counts -- or stores, or reads -- tensors no graph will touch.
 - MOE_EXPERT_GTT=0 (kill switch) reproduces today's behaviour and log byte for byte;
   MOE_EXPERT_GTT_RO=0 registers the region writable, the A/B that proves the read-rate claim.
 - The ARENA tier is opt-in and stays opt-in until it has been measured on more than this box: no
@@ -44,25 +50,27 @@ no host pool and no slab arena below it.
 
 Verified on halo (gfx1151, 123 GiB, ROCm 10.1.0): same-seed greedy text identical on 35B-A3B
 (627b2ebd7792) and Flash-Next (f586785d7183) for store-off / auto / -lme 6 / the arena tier at
--lme 4, 6 and 8, and a 3x residency change on the 122B-A10B gives identical text; -lme 6 realises
-exactly 6144.0 MiB; auto on a fitting set is the whole set with zero evictions; registration
-26 ms/GiB; pp512 within noise of the plain device buffer for the registered READ-ONLY arm; the
-lock policy's four arms pass under ulimit -l 8192; the arena tier registers all 120/144 tables,
-evicts under a partial budget with 0 arena releases, and a 123.45 GiB model runs to completion at
--lme 20 and -lme 60; check-gpu-faults.sh clean.
+-lme 4, 6 and 8, with `--spec-type draft-mtp` and without, and a 3x residency change on the
+122B-A10B gives identical text; -lme 6 realises exactly 6144.0 MiB; auto on a fitting set is the
+whole set with zero evictions; registration 26 ms/GiB; pp512 within noise of the plain device
+buffer for the registered READ-ONLY arm; the lock policy's four arms pass under ulimit -l 8192;
+the arena tier registers all 120/144 tables, evicts under a partial budget with 0 arena releases,
+and a 123.45 GiB model runs to completion at -lme 20 and -lme 60; the MTP head is pinned outside
+the budget on both (3 tables / 464 MiB on 35B-A3B, 3 / 2448 MiB on the 122B) with draft acceptance
+unchanged; check-gpu-faults.sh clean.
 ---
  common/arg.cpp                          |  30 +-
- ggml/include/ggml-backend.h             |  20 +
- ggml/src/ggml-backend-impl.h            |  32 ++
- ggml/src/ggml-backend.cpp               |  29 ++
- ggml/src/ggml-cuda/ggml-cuda.cu         | 245 +++++++++-
+ ggml/include/ggml-backend.h             |  22 +
+ ggml/src/ggml-backend-impl.h            |  37 ++
+ ggml/src/ggml-backend.cpp               |  30 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu         | 246 +++++++++-
  ggml/src/ggml-cuda/gtt-expert-store.cu  | 595 ++++++++++++++++++++++++
  ggml/src/ggml-cuda/gtt-expert-store.cuh |  85 ++++
- ggml/src/ggml-cuda/moe-expert-cache.cu  | 199 +++++++-
- ggml/src/ggml-cuda/moe-expert-cache.h   |   7 +
- src/llama-model-loader.cpp              | 472 ++++++++++++++++++-
- src/llama-model-loader.h                |  27 ++
- 11 files changed, 1703 insertions(+), 38 deletions(-)
+ ggml/src/ggml-cuda/moe-expert-cache.cu  | 257 +++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.h   |  11 +
+ src/llama-model-loader.cpp              | 549 +++++++++++++++++++++-
+ src/llama-model-loader.h                |  35 ++
+ 11 files changed, 1857 insertions(+), 40 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -122,10 +130,10 @@ index faa73a2e9..5575b0e86 100644
                  long long avail_mib = -1;
                  if (mi != nullptr) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..6f8f9965e 100644
+index d72bb88d7..e797437f3 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -90,6 +90,26 @@ extern "C" {
+@@ -90,6 +90,28 @@ extern "C" {
      // r212: tell the host pool how the model was loaded (1 = O_DIRECT) so its fills can mirror it.
      GGML_API void                  ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct);
  
@@ -147,16 +155,18 @@ index d72bb88d7..6f8f9965e 100644
 +    // wip/apu-expert-gtt P3: make the GTT store this run's expert ARENA (the cache's slot storage, with
 +    // `extent_bytes` as its budget) instead of a whole-tensor placement.  Used when the store cannot hold the
 +    // whole set -- the set is then served by residency.  False = declined, fall back to placement.
-+    GGML_API bool                  ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes);
++    // `pinned_layers` (P3c) are the MTP/nextn head's expert layers: full residency, outside the budget.
++    GGML_API bool                  ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
++                                                                  const int * pinned_layers, int n_pinned_layers);
 +
      // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
      // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
      // No-op for a backend without a slab or with no ring hole.
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 87c8164ec..1c15ab8a4 100644
+index 87c8164ec..962480009 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -577,6 +577,38 @@ extern "C" {
+@@ -577,6 +577,43 @@ extern "C" {
          // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
          // that never answers leaves the pool on its own default).
          void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
@@ -191,15 +201,20 @@ index 87c8164ec..1c15ab8a4 100644
 +        // residency rather than by placement.  Returns false when the tier is declined (the store is too small
 +        // to be a useful arena), and the caller then falls back to whole-tensor placement.  APPENDED at the very
 +        // end for the positional-initializer reason above; zero-initialized = no arena tier.
-+        bool (*gtt_store_arena)(ggml_backend_dev_t dev, size_t extent_bytes);
++        //
++        // P3c: `pinned_layers` are the MTP/nextn HEAD's expert layers.  They are sized at their full slot count
++        // and are NOT part of the `-lme` arithmetic (the head is read on every draft step, so the residency
++        // policy must not trade it away, and its bytes must not eat the trunk's budget).
++        bool (*gtt_store_arena)(ggml_backend_dev_t dev, size_t extent_bytes,
++                                const int * pinned_layers, int n_pinned_layers);
      };
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 474166cef..a08af0f7b 100644
+index 474166cef..2a4e337fc 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -329,6 +329,35 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
+@@ -329,6 +329,36 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
      dev->iface.moe_cache_set_host_fill_mode(dev, direct);
  }
  
@@ -218,11 +233,12 @@ index 474166cef..a08af0f7b 100644
 +    dev->iface.gtt_store_report(dev, filled_bytes, n_tables, n_slots);
 +}
 +
-+bool ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes) {
++bool ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
++                                      const int * pinned_layers, int n_pinned_layers) {
 +    if (dev == nullptr || dev->iface.gtt_store_arena == nullptr) {
 +        return false;
 +    }
-+    return dev->iface.gtt_store_arena(dev, extent_bytes);
++    return dev->iface.gtt_store_arena(dev, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
 +size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
@@ -236,7 +252,7 @@ index 474166cef..a08af0f7b 100644
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bf574ecf9..84430b1ce 100644
+index bf574ecf9..479bcac95 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -124,6 +124,7 @@
@@ -435,7 +451,7 @@ index bf574ecf9..84430b1ce 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -10450,13 +10618,82 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -10450,13 +10618,83 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -483,7 +499,8 @@ index bf574ecf9..84430b1ce 100644
 +    return ggml_backend_cuda_gtt_store_buffer_type(dev_ctx->device);
 +}
 +
-+static bool ggml_backend_cuda_device_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes) {
++static bool ggml_backend_cuda_device_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
++                                                    const int * pinned_layers, int n_pinned_layers) {
 +    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 +    if (dev_ctx == nullptr || !ggml_cuda_gtt_store_wanted() || moe_cache_gtt_arena()) {
 +        return moe_cache_gtt_arena();
@@ -497,7 +514,7 @@ index bf574ecf9..84430b1ce 100644
 +        GGML_LOG_WARN("%s: device %d: no GTT arena: %s\n", __func__, dev_ctx->device, err);
 +        return false;
 +    }
-+    return moe_cache_preflight_store(dev_ctx->device, extent_bytes);
++    return moe_cache_preflight_store(dev_ctx->device, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
 +static size_t ggml_backend_cuda_device_gtt_store_lockable(ggml_backend_dev_t dev) {
@@ -520,7 +537,7 @@ index bf574ecf9..84430b1ce 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -10598,6 +10835,10 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10598,6 +10836,10 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -1224,7 +1241,7 @@ index 000000000..1778bf18f
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a7cd3fbaa..998a55f2e 100644
+index a7cd3fbaa..88230b016 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -1245,7 +1262,7 @@ index a7cd3fbaa..998a55f2e 100644
      std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
      std::unordered_map<int32_t, int32_t> expert_slot;
      bool        slot_dirty  = false;    // a slot changed since the last device-map upload
-@@ -469,6 +473,11 @@ static int alias_find_checked(const void * key, int device, int layer) {
+@@ -469,6 +473,16 @@ static int alias_find_checked(const void * key, int device, int layer) {
      return id;
  }
  bool                                g_enabled    = false;
@@ -1254,10 +1271,15 @@ index a7cd3fbaa..998a55f2e 100644
 +// cold read is off -- on an APU the "cold" source is the pageable model mapping, and a GPU read of that is the
 +// fatal fault, not a slow path (no PageableMemoryAccess, no XNACK).  Set by `moe_cache_preflight_store()`.
 +bool                                g_gtt_arena  = false;
++// wip/apu-expert-gtt P3c: layers whose expert tables are the MTP/nextn HEAD's (see `moe_cache_preflight_store`).
++// Sized at their FULL slot count and excluded from the budget the trunk's residency is computed from.
++int                                 g_gtt_head_layer[512] = {0};
++int                                 g_gtt_n_head_layers = 0;
++int64_t                             g_gtt_head_bytes = 0;   // resident bytes the head holds outside `-lme`
  bool                                g_init_done  = false;
  bool                                g_report     = true;
  // Teardown snapshot of the report's STRUCTURAL aggregates (tables/slots/arena, hits/misses/fills/evictions and
-@@ -504,6 +513,10 @@ int64_t                             g_min_mib    = 0;      // auto: decline the
+@@ -504,6 +518,10 @@ int64_t                             g_min_mib    = 0;      // auto: decline the
  int                                 g_min_res_pct= 0;      // auto: decline the arena below this percent of the host experts
  int                                 g_slots_hint = 0;    // 0 => derive from budget
  int64_t                             g_arena_bytes= 0;
@@ -1268,7 +1290,7 @@ index a7cd3fbaa..998a55f2e 100644
  int64_t                             g_total_expert_bytes = 0;   // sum over primed tables
  int                                 g_uniform_slots = -1;       // the decided per-table slot count
  // OPEN 2 re-arm: the per-layer slot count `alloc_all_locked` settled on, so a later re-arm can restore
-@@ -905,7 +918,11 @@ void bind_host_dev_locked(table_t & t) {
+@@ -905,7 +923,11 @@ void bind_host_dev_locked(table_t & t) {
  // representable AND the master must have a device mapping.  A pageable model mapping has none, so the
  // table takes the fill-every-miss path instead (issue #116).
  static inline bool table_cold_ok(const table_t & t) {
@@ -1281,7 +1303,7 @@ index a7cd3fbaa..998a55f2e 100644
  }
  
  // MOE_HOST_POOL_COLD (default 1): a pool-backed table (`--host-experts pool`, pageable master, so no in-place
-@@ -4606,7 +4623,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
+@@ -4606,7 +4628,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
      if (arena == nullptr) {
          return;
      }
@@ -1295,7 +1317,7 @@ index a7cd3fbaa..998a55f2e 100644
          ggml_cuda_slab_arena_free(device, arena, reserved);
      } else {
          (void) cudaFree(arena);
-@@ -4811,12 +4833,29 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -4811,12 +4838,29 @@ void alloc_table_locked(table_t & t, int slots) {
      // lands *at* the max); then a 0.95 geometric descent for the fragmentation case (a failed
      // cudaMalloc is cheap, so the extra attempts cost nothing measurable).  The table keeps the largest
      // slot count that actually allocates.
@@ -1326,7 +1348,7 @@ index a7cd3fbaa..998a55f2e 100644
          if (use_slab) {
              if (t.arena != nullptr) {
                  return true;
-@@ -4887,7 +4926,13 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -4887,7 +4931,13 @@ void alloc_table_locked(table_t & t, int slots) {
      // over-filled arena).
      t.slots        = got_slots;
      const size_t arena_size = (size_t) slots * t.expert_bytes + head_pad;
@@ -1341,7 +1363,7 @@ index a7cd3fbaa..998a55f2e 100644
      t.slot_expert.assign(slots, -1);
      t.slot_prov.assign(slots, 0);
      t.count.assign(t.n_experts, 0);
-@@ -4913,7 +4958,14 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -4913,7 +4963,14 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -1357,7 +1379,7 @@ index a7cd3fbaa..998a55f2e 100644
          bool ok = true;
          for (int e = 0; e < t.n_experts && ok; ++e) {
              void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
-@@ -5054,7 +5106,7 @@ void alloc_all_locked() {
+@@ -5054,7 +5111,7 @@ void alloc_all_locked() {
      // was configured on but never armed (backend-init ordering, a missing preflight, a per-device
      // decline) -- the arena is a raw cudaMalloc outside the movable boundary, which is the pre-slab crash
      // mode.  Never let that state be silent.  One-time, non-fatal; a no-op on non-HIP and dense models.
@@ -1366,11 +1388,52 @@ index a7cd3fbaa..998a55f2e 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5137,7 +5189,14 @@ void alloc_all_locked() {
+@@ -5106,11 +5163,24 @@ void alloc_all_locked() {
+     int64_t dev_one_bytes [GGML_CUDA_MAX_DEVICES] = {0};
+     int64_t dev_max_experts[GGML_CUDA_MAX_DEVICES] = {0};
+     int     dev_n_tables [GGML_CUDA_MAX_DEVICES] = {0};
++    int64_t dev_head_bytes[GGML_CUDA_MAX_DEVICES] = {0};
+     int     max_dev = -1;
++    // wip/apu-expert-gtt P3c: the MTP/nextn HEAD's tables are pinned (full slot count) and their bytes are NOT
++    // part of the budget the trunk's residency is computed from -- they are metadata overhead read on every
++    // draft step, so the policy must not be able to trade them away for trunk experts.  They are therefore
++    // excluded from BOTH sides of `slots = budget / per_expert_bytes`: from `dev_one_bytes` (so the trunk's
++    // slot count is not diluted by the head's tables) and from the budget (so they do not eat the trunk's).
+     for (const table_t & t : g_tables) {
+         if (t.allocated || t.device < 0 || t.device >= GGML_CUDA_MAX_DEVICES) {
+             continue;
+         }
++        if (g_gtt_arena && t.layer >= 0 && t.layer < 512 && g_gtt_head_layer[t.layer]) {
++            dev_head_bytes[t.device] += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++            if (t.device > max_dev) {
++                max_dev = t.device;
++            }
++            continue;
++        }
+         dev_one_bytes [t.device] += (int64_t) t.expert_bytes;
+         dev_n_tables  [t.device]++;
+         if ((int64_t) t.n_experts > dev_max_experts[t.device]) {
+@@ -5120,6 +5190,10 @@ void alloc_all_locked() {
+             max_dev = t.device;
+         }
+     }
++    g_gtt_head_bytes = 0;
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++        g_gtt_head_bytes += dev_head_bytes[d];
++    }
+ 
+     const size_t reserve = (size_t) g_reserve_mib * 1024 * 1024;
+     // the post-clamp budget each device settled on (the identity pre-pass spends it exactly, rounding
+@@ -5137,7 +5211,19 @@ void alloc_all_locked() {
              continue;
          }
          size_t budget = g_budget;
 -        {
++        if (g_gtt_arena && dev_head_bytes[d] > 0) {
++            // P3c: `-lme` buys TRUNK residency; the head's bytes sit on top of it, inside the same store.
++            const int64_t trunk_budget = (int64_t) g_budget - dev_head_bytes[d];
++            budget = trunk_budget > 0 ? (size_t) trunk_budget : 0;
++        }
 +        // wip/apu-expert-gtt P3: the GTT store's extent IS this tier's budget, and it is bounded TWICE by
 +        // construction -- the loader sized it from `-lme` under the `MOE_HOST_LIMIT_FRAC` / `MemAvailable`
 +        // ceiling, and every slot comes from `ggml_cuda_gtt_store_reserve()`, which cannot hand out more than
@@ -1382,7 +1445,37 @@ index a7cd3fbaa..998a55f2e 100644
              device_guard dg(d);
              // OPEN 2 slab: the slab's ARENA REGION owns the memory, so size against its capacity.  A
              // `cudaMemGetInfo` here reads only the small amount left outside the slab, which starves the
-@@ -5526,6 +5585,23 @@ void alloc_all_locked() {
+@@ -5243,6 +5329,11 @@ void alloc_all_locked() {
+         if (t.allocated || t.layer < 0 || t.layer >= 512 || t.device < 0 || t.device >= GGML_CUDA_MAX_DEVICES) {
+             continue;
+         }
++        // P3c: a head layer is pinned at its FULL slot count, whatever the trunk's budget came out as.
++        if (g_gtt_arena && g_gtt_head_layer[t.layer]) {
++            layer_slots[t.layer] = (int) t.n_experts;
++            continue;
++        }
+         const int s = slots_d[t.device];
+         if (layer_slots[t.layer] < 0 || s < layer_slots[t.layer]) {
+             layer_slots[t.layer] = s;
+@@ -5311,9 +5402,15 @@ void alloc_all_locked() {
+             std::vector<int> order;
+             order.reserve((size_t) n_layers);
+             for (int i = 0; i < 512; i++) {
+-                if (layer_full[i] >= 0) {
+-                    order.push_back(i);
++                if (layer_full[i] < 0) {
++                    continue;
+                 }
++                // P3c: a pinned head layer is already FULL and its bytes are already outside the budget, so
++                // letting it into this pass would charge them to `remain` a second time and drop trunk layers.
++                if (g_gtt_arena && g_gtt_head_layer[i]) {
++                    continue;
++                }
++                order.push_back(i);
+             }
+             if (g_heat_on) {
+                 std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+@@ -5526,6 +5623,23 @@ void alloc_all_locked() {
      }
      GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
                    __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
@@ -1406,7 +1499,7 @@ index a7cd3fbaa..998a55f2e 100644
      // The traffic report's denominator: one routed-MoE op per (layer, role, device) table per token, so
      // the decode-band census divided by this is the token count.  Snapshotted HERE (sizing) rather than
      // read from `g_tables` at report time, because `llama_model_free` now drops the tables before the
-@@ -5675,6 +5751,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -5675,6 +5789,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      if (!g_enabled) {
          return false;
      }
@@ -1448,7 +1541,7 @@ index a7cd3fbaa..998a55f2e 100644
      // wip/umem-arena-guard: refuse the arena on a shared host/device memory pool (see the helper above).
      // This runs at model load, before any table registers, so the whole cache stack (arena, pool, heat
      // map, cache-band fusions) stays inert and the run behaves like `MOE_EXPERT_CACHE_MIB=0`; the
-@@ -5728,19 +5839,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -5728,19 +5877,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
                            __func__, g_budget >> 20, device);
          }
      }
@@ -1470,7 +1563,7 @@ index a7cd3fbaa..998a55f2e 100644
      // The pool's AUTO budget is a fraction of the MoE host expert bytes.  This runs once per host-expert
      // device, before the context -- but it is RE-RUN for the same devices (the `--fit` probe, and a
      // second model's preflight for a separate draft/MTP head), so a running sum sized the pool at N x the
-@@ -5803,6 +5903,58 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -5803,6 +5941,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      return true;
  }
  
@@ -1486,7 +1579,7 @@ index a7cd3fbaa..998a55f2e 100644
 +// host-expert set, and neither exists here (the store's extent was already decided by `-lme`, and the master is
 +// the model mapping).  This sets the three things the arena arm needs -- enabled, an explicit budget, the tier
 +// flag -- and nothing else.  `g_cold_uva` is disabled by the tier flag itself (see `table_cold_ok`).
-+bool moe_cache_preflight_store(int device, size_t extent_bytes) {
++bool moe_cache_preflight_store(int device, size_t extent_bytes, const int * pinned_layers, int n_pinned_layers) {
 +    {
 +        std::lock_guard<std::mutex> lock(g_mutex);
 +        ensure_env();
@@ -1506,6 +1599,20 @@ index a7cd3fbaa..998a55f2e 100644
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    if (g_gtt_arena) {
 +        return true;   // idempotent: a second model (the MTP draft) preflights the same device
++    }
++    // P3c: the head's layers.  `n_layer_trunk` is not needed here -- the loader has already decided which
++    // layers are the head's, and a layer index is what the tables carry (`name_layer`).
++    g_gtt_n_head_layers = 0;
++    g_gtt_head_bytes    = 0;
++    for (int i = 0; i < 512; i++) {
++        g_gtt_head_layer[i] = 0;
++    }
++    for (int i = 0; i < n_pinned_layers; i++) {
++        const int l = pinned_layers != nullptr ? pinned_layers[i] : -1;
++        if (l >= 0 && l < 512 && !g_gtt_head_layer[l]) {
++            g_gtt_head_layer[l] = 1;
++            g_gtt_n_head_layers++;
++        }
 +    }
 +    g_enabled      = true;
 +    g_auto         = false;
@@ -1529,7 +1636,7 @@ index a7cd3fbaa..998a55f2e 100644
  void moe_cache_set_extra_reserve(int device, size_t bytes) {
      // WIP r42 (TODO #42): hold this many bytes of the free VRAM for the post-prefill compute layout, so
      // the arena does not take the space a later compute growth (or the grow-in-place realloc) needs.
-@@ -9640,6 +9792,13 @@ static void report_locked() {
+@@ -9640,6 +9844,15 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -1537,23 +1644,29 @@ index a7cd3fbaa..998a55f2e 100644
 +    // the census above has to change.  `arena releases` MUST be 0 on a steady-state arm (see the counter).
 +    if (g_gtt_arena) {
 +        GGML_LOG_INFO("%s: GTT arena tier: %lld table(s) resident, %lld arena release(s) (0 = steady state), "
-+                      "extent budget %.1f MiB\n", __func__, (long long) n_tables,
-+                      (long long) g_arena_releases, (double) g_budget / (1024 * 1024));
++                      "extent budget %.1f MiB (%d MTP/nextn head layer(s) pinned at full residency, %.1f MiB "
++                      "outside that budget)\n", __func__, (long long) n_tables,
++                      (long long) g_arena_releases, (double) g_budget / (1024 * 1024),
++                      g_gtt_n_head_layers, (double) g_gtt_head_bytes / (1024 * 1024));
 +    }
      if (g_devremap_offers > 0 || g_devremap_calls > 0) {
          GGML_LOG_INFO("%s: device remap: %lld tables served, %lld of %lld offers declined\n", __func__,
                        (long long) g_devremap_calls, (long long) g_devremap_declined, (long long) g_devremap_offers);
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 3c5469637..1519e55e9 100644
+index 3c5469637..0cea456ca 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -102,6 +102,13 @@ bool moe_cache_floor_active();
+@@ -102,6 +102,17 @@ bool moe_cache_floor_active();
  // the first call; returns true when the cache remains active.
  bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes);
  
 +// wip/apu-expert-gtt P3: enable the cache with the GTT store as its arena and `extent_bytes` as its budget.
 +// Returns false (cache left inert) when the store is too small to be a useful tier.
-+bool moe_cache_preflight_store(int device, size_t extent_bytes);
++//
++// P3c: `pinned_layers` are the MTP/nextn HEAD's expert layers.  Their tables are resident at their FULL slot
++// count and their bytes are NOT part of `-lme`'s arithmetic: the head is metadata overhead read on every draft
++// step, so the residency policy must not be able to trade it away, and it must not eat the trunk's budget.
++bool moe_cache_preflight_store(int device, size_t extent_bytes, const int * pinned_layers, int n_pinned_layers);
 +
 +// True when this run's arena is the GTT store (see `moe_cache_preflight_store`).
 +bool moe_cache_gtt_arena();
@@ -1562,7 +1675,7 @@ index 3c5469637..1519e55e9 100644
  // so the auto-sized arena does not take the space a later compute growth needs.  Called at the
  // prefill -> decode transition, before the arena is sized.
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e138bbfa1..52c237605 100644
+index e138bbfa1..7e4848acd 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -1606,13 +1719,13 @@ index e138bbfa1..52c237605 100644
 -        // A shared host/device pool: every expert stays on its layer's device (see set_host_experts_umem).
 +        // A shared host/device pool: no host-expert tier at all (see set_host_experts_umem).  The expert
 +        // residency knob on such a device is `-lme`, which sizes the registered GTT expert store instead.
-+        plan_gtt_expert_store();
++        plan_gtt_expert_store(n_layer_trunk);
          host_experts_plan_done = false;
 -        host_experts_policy    = "shared host/device memory pool (integrated GPU): no host expert tensors";
          return;
      }
  
-@@ -419,7 +437,395 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +437,472 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -1630,7 +1743,7 @@ index e138bbfa1..52c237605 100644
 +// are contiguous, `nb[2]` per expert), but deciding which SLOT is resident is the eviction policy's job (P3),
 +// and there is no eviction this phase.  So: the hottest whole tables that fit are resident, everything else
 +// keeps its layer's device buffer, and the census says so out loud rather than implying a streaming tier.
-+void llama_model_loader::plan_gtt_expert_store() {
++void llama_model_loader::plan_gtt_expert_store(int n_layer_trunk) {
 +    // Today's state and today's message, so `MOE_EXPERT_GTT=0` reproduces the log byte for byte.
 +    host_experts_policy = "shared host/device memory pool (integrated GPU): no host expert tensors";
 +
@@ -1652,9 +1765,11 @@ index e138bbfa1..52c237605 100644
 +        size_t      nbytes       = 0;
 +        int64_t     score        = 0;
 +    };
-+    std::vector<cand_t> cands;
++    std::vector<cand_t> cands;        // the TRUNK (what `-lme`'s budget buys)
++    std::vector<cand_t> head_cands;   // the MTP/nextn HEAD (pinned, outside that budget -- see below)
 +    size_t total = 0;
 +    size_t padded_total = 0;
++    size_t head_padded  = 0;
 +    for (const auto & kv : weights_map) {
 +        const std::string & name = kv.first;
 +        if (name.find("exps") == std::string::npos) {
@@ -1670,15 +1785,40 @@ index e138bbfa1..52c237605 100644
 +        c.n_experts    = (int) t->ne[2];
 +        c.expert_bytes = (size_t) t->nb[2];   // one (tensor, expert) slot -- the heat prior's own unit
 +        c.nbytes       = ggml_nbytes(t);
-+        total      += c.nbytes;
 +        // The GTT store's alignment is one page per tensor (the buffer type's contract) and the region's extent is
 +        // what gets registered, so the budget is spent on PADDED sizes.  The +4 KiB covers the buffer type's
 +        // own `get_alloc_size` (a quantized tensor reserves one padded row past its end, which the GTT store must
 +        // keep -- see that function); it is an over-estimate of at most 4 KiB per table, so the extent is safe
 +        // by construction and the arithmetic below can never hand the buffer type more than the region holds.
++        // wip/apu-expert-gtt P3c: an MTP/nextn head sits at `layers[n_layer()]` and above, so its expert tables
++        // are the candidates whose layer index is NOT part of the trunk.  They are PINNED (maintainer decision,
++        // 2026-11-11): the head is metadata overhead read on every draft step, so `-lme N` does not get to trade
++        // it away, and its bytes sit on top of that budget rather than inside it.
++        if (n_layer_trunk > 0 && c.layer >= n_layer_trunk) {
++            // `load_mtp` false = the nextn/MTP layers are NOT created for this load, so their tables are not
++            // part of the expert set at all -- counting them would spend store (and a GGUF read) on tensors no
++            // graph will ever touch.  This is also what makes the "whole set" carve the trunk's own set.
++            if (load_mtp) {
++                total       += c.nbytes;
++                head_padded += GGML_PAD(c.nbytes + 4096, 4096);
++                head_cands.push_back(std::move(c));
++            }
++            continue;
++        }
++        total        += c.nbytes;
 +        padded_total += GGML_PAD(c.nbytes + 4096, 4096);
 +        cands.push_back(std::move(c));
 +    }
++    // A model whose expert tables are ALL head (a standalone MTP drafter loaded as the target, or a trunk with
++    // no routed experts) has nothing to pin them against: keep today's uniform arithmetic rather than treating
++    // the whole expert set as overhead (`-lme` would then stop being a cap at all).
++    if (cands.empty()) {
++        cands = std::move(head_cands);
++        head_cands.clear();
++        padded_total = head_padded;
++        head_padded  = 0;
++    }
++    host_experts_store_head_bytes = head_padded;
 +    if (cands.empty()) {
 +        return;
 +    }
@@ -1705,6 +1845,10 @@ index e138bbfa1..52c237605 100644
 +    } else {
 +        budget = padded_total;
 +        source = "auto: MemAvailable unknown -> the whole expert set";
++    }
++    // P3c: the head's bytes never come out of the budget -- they are added to the extent below.
++    if (head_padded > 0) {
++        source += format(" (+ the %.1f MiB MTP/nextn head, pinned outside it)", (double) head_padded / mib);
 +    }
 +    // The GTT store is registered, RESERVED host memory, so two ceilings apply, both read once:
 +    //   1. the machine's own memory -- `-lme N` above 90%% of it is already refused by the arg parser, and this is
@@ -1735,8 +1879,10 @@ index e138bbfa1..52c237605 100644
 +    // reports the truth (`mlocked X of Y` / `NOT locked ... RECLAIMABLE`), and all this function needs is the
 +    // number the policy is clamped to.
 +
-+    // `-lme` is a CAP, not a floor: never register space no expert can occupy.
-+    size_t extent = std::min(budget, padded_total);
++    // `-lme` is a CAP, not a floor: never register space no expert can occupy.  `extent_trunk` is the part the
++    // budget buys; the head's tables (P3c) are on top of it, because they are not the policy's to spend.
++    size_t extent_trunk = std::min(budget, padded_total);
++    size_t extent       = extent_trunk + head_padded;
 +
 +    if (extent > lockable) {
 +        // The store cannot be locked as asked.  Two questions decide what happens, and the second is the one that
@@ -1751,7 +1897,7 @@ index e138bbfa1..52c237605 100644
 +        }
 +        const size_t fit_cap   = avail > 0 ? avail - avail / 10 : 0;
 +        const size_t shortfall = weights > fit_cap ? weights - fit_cap : 0;
-+        const size_t honour    = std::min(lockable, padded_total);   // what the limit still lets us lock+place
++        const size_t honour    = std::min(lockable, padded_total + head_padded);   // what the limit still lets us lock+place
 +        // A clamp smaller than the smallest candidate table buys nothing at all -- do not register (and lock) a
 +        // region no expert can occupy, go straight to the decline/refuse branch.
 +        size_t smallest = padded_total;
@@ -1788,6 +1934,7 @@ index e138bbfa1..52c237605 100644
 +                           "MiB (this model fits in RAM anyway, so this is an optimisation).  %s\n", __func__,
 +                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib, advice);
 +            extent = honour;
++            extent_trunk = honour > head_padded ? honour - head_padded : 0;
 +            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
 +        } else if (clamp_useful && honour >= shortfall && gtt_store_can_stream) {
 +            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
@@ -1796,6 +1943,7 @@ index e138bbfa1..52c237605 100644
 +                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib,
 +                           (double) shortfall / mib, advice);
 +            extent = honour;
++            extent_trunk = honour > head_padded ? honour - head_padded : 0;
 +            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
 +        } else {
 +            // (c) it cannot be honoured and the model cannot run without it: REFUSE, before a byte is read.
@@ -1842,12 +1990,17 @@ index e138bbfa1..52c237605 100644
 +    // (whole-tensor placement for the fitting band, hot-subset placement otherwise).  Do NOT flip this default on
 +    // the strength of a text arm: a fitting-set arm can look perfect and never touch the arena at all.
 +    static const bool arena_wanted = getenv("MOE_EXPERT_GTT_ARENA") != nullptr;
-+    if (arena_wanted && extent < padded_total) {
++    // The test is the TRUNK: `extent` already carries the head's bytes on top of the budget (P3c), so comparing
++    // the total against the trunk's own padded size would never engage the arena on a model with a head.
++    if (arena_wanted && extent_trunk < padded_total) {
 +        // Every table must be able to hold at least one slot, or the cache would serve some op from the
 +        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
 +        // per table before enabling the tier at all.
 +        size_t arena_min = 0;
 +        for (const auto & c : cands) {
++            arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
++        }
++        for (const auto & c : head_cands) {
 +            arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
 +        }
 +        if (extent < arena_min) {
@@ -1860,7 +2013,20 @@ index e138bbfa1..52c237605 100644
 +                if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +                    continue;
 +                }
-+                if (!ggml_backend_dev_gtt_store_arena(d, extent)) {
++                // P3c: the head's expert layers, so the cache can pin them at full residency and keep their
++                // bytes out of the trunk's budget.
++                int head_layers[512];
++                int n_head_layers = 0;
++                for (const auto & c : head_cands) {
++                    bool seen = false;
++                    for (int k = 0; k < n_head_layers && !seen; k++) {
++                        seen = head_layers[k] == c.layer;
++                    }
++                    if (!seen && c.layer >= 0 && c.layer < 512) {
++                        head_layers[n_head_layers++] = c.layer;
++                    }
++                }
++                if (!ggml_backend_dev_gtt_store_arena(d, extent, head_layers, n_head_layers)) {
 +                    continue;
 +                }
 +                // The tier's fill master IS the read-only model mapping: a set that does not fit cannot be
@@ -1885,10 +2051,14 @@ index e138bbfa1..52c237605 100644
 +                host_experts_policy = format(
 +                    "%s -> the GTT store is the MoE ARENA: %.1f MiB of slots for a %.1f MiB expert set, the expert "
 +                    "tensors stay in the read-only MODEL MAPPING (nothing allocated, nothing pinned) and every read "
-+                    "is served from the arena with LFRU residency%s.  No in-place cold read on this tier (the "
-+                    "mapping is not GPU-addressable), so every miss evicts and fills.",
-+                    source.c_str(), (double) extent / mib, (double) padded_total / mib,
-+                    "");
++                    "is served from the arena with LFRU residency.  No in-place cold read on this tier (the "
++                    "mapping is not GPU-addressable), so every miss evicts and fills.%s",
++                    source.c_str(), (double) extent / mib, (double) (padded_total + head_padded) / mib,
++                    head_padded > 0
++                        ? format("  The %.1f MiB MTP/nextn head is PINNED at full residency on top of that budget "
++                                 "(P3c): it is read on every draft step, so `-lme` does not trade it away.",
++                                 (double) head_padded / mib).c_str()
++                        : "");
 +                LLAMA_LOG_WARN("%s: %s\n", __func__, host_experts_policy.c_str());
 +                return;
 +            }
@@ -1959,6 +2129,20 @@ index e138bbfa1..52c237605 100644
 +    size_t  planned = 0;
 +    int     n_tables = 0;
 +    int64_t n_slots  = 0;
++    // P3c: the MTP/nextn head's tables go in FIRST and unconditionally -- the head is read on every draft step,
++    // so the budget does not get to drop it.  They are counted in `planned`, which is why the trunk loop below
++    // can only spend what is left of `extent` (i.e. the `-lme` budget, since the head's bytes were added on top).
++    for (const auto & c : head_cands) {
++        const size_t need = GGML_PAD(c.nbytes + 4096, 4096);
++        if (planned + need > extent) {
++            break;   // cannot happen: `extent` includes the head's bytes; never place it unconditionally anyway
++        }
++        host_experts_store.insert(c.name);
++        host_experts_store_pinned.insert(c.name);
++        planned   += need;
++        n_tables  += 1;
++        n_slots   += c.n_experts;
++    }
 +    for (const auto & c : cands) {
 +        const size_t need = GGML_PAD(c.nbytes + 4096, 4096);
 +        if (planned + need > extent) {
@@ -1983,11 +2167,17 @@ index e138bbfa1..52c237605 100644
 +    host_experts_policy = format("%s -> a registered GTT expert store of %.1f MiB of a %.1f MiB expert set: %d "
 +                                 "tables / %lld (tensor, expert) slots (%.1f MiB) resident, ranked by the %s%s.  "
 +                                 "Everything else keeps its layer's device buffer; eviction and streaming "
-+                                 "fills are not in this phase (P3/P4).",
++                                 "fills are not in this phase (P3/P4).%s",
 +                                 source.c_str(), (double) extent / mib, (double) total / mib, n_tables,
 +                                 (long long) n_slots, (double) planned / mib,
 +                                 heat_seen ? "persisted heat prior" : "model tensor order (no heat prior)",
-+                                 extent >= padded_total ? "; the WHOLE set, zero evictions" : "; a hot subset");
++                                 extent_trunk >= padded_total ? "; the WHOLE set, zero evictions" : "; a hot subset",
++                                 host_experts_store_pinned.empty()
++                                     ? ""
++                                     : format("  %zu MTP/nextn head table(s) of the %.1f MiB head are placed "
++                                              "FIRST and pinned outside the budget (P3c).",
++                                              host_experts_store_pinned.size(),
++                                              (double) host_experts_store_head_bytes / mib).c_str());
 +    // The decision is the thing to see, at WARN like the other tier censuses (issue #274: an INFO line is
 +    // invisible at the default verbosity, and a user must be able to see which expert tier they got).
 +    LLAMA_LOG_WARN("%s: %s\n", __func__, host_experts_policy.c_str());
@@ -2008,7 +2198,7 @@ index e138bbfa1..52c237605 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2036,6 +2442,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2036,6 +2519,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -2049,7 +2239,7 @@ index e138bbfa1..52c237605 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2557,7 +2997,18 @@ bool llama_model_loader::load_all_data(
+@@ -2557,7 +3074,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -2069,7 +2259,7 @@ index e138bbfa1..52c237605 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2618,9 +3069,12 @@ bool llama_model_loader::load_all_data(
+@@ -2618,9 +3146,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  
@@ -2084,10 +2274,10 @@ index e138bbfa1..52c237605 100644
                      validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                          return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 489a0cabe..5643d6867 100644
+index 489a0cabe..d8a211375 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
-@@ -100,11 +100,25 @@ struct llama_model_loader {
+@@ -100,11 +100,30 @@ struct llama_model_loader {
      bool  host_experts_plan_done = false;
      std::set<std::string> host_experts_pinned;      // tensor names that get a pinned host master
      std::set<std::string> host_experts_holes;       // tensor names that stay in the model mapping
@@ -2101,6 +2291,11 @@ index 489a0cabe..5643d6867 100644
 +    // non-null only while a GTT store is open on this load, so `host_expert_is_store()` is false everywhere else
 +    // (a discrete box, `MOE_EXPERT_GTT=0`, a platform the GTT store declined).
 +    std::set<std::string>       host_experts_store;
++    // wip/apu-expert-gtt P3c: the subset of `host_experts_store` that is the MTP/nextn HEAD's tables.  They are
++    // placed first and pinned (they are read on every draft step) and their bytes are NOT part of `-lme`'s
++    // budget -- see `plan_gtt_expert_store`.
++    std::set<std::string>       host_experts_store_pinned;
++    size_t                      host_experts_store_head_bytes = 0;   // the head's padded bytes, on top of the budget
 +    ggml_backend_buffer_type_t  host_experts_store_buft   = nullptr;
 +    size_t                      host_experts_store_extent = 0;   // the budget, in bytes
 +    size_t                      host_experts_store_filled = 0;   // bytes read from the GGUF into it
@@ -2113,7 +2308,7 @@ index 489a0cabe..5643d6867 100644
      std::string host_experts_policy;                // the resolved policy, for the census line
      bool   host_experts_heat_seen    = false;        // the heat prior answered for at least one tensor
      // issue #274: how many host-expert tensors actually got an on-disk source registered for the pool
-@@ -147,6 +161,19 @@ struct llama_model_loader {
+@@ -147,6 +166,22 @@ struct llama_model_loader {
      // before the arch creates any tensor.
      void plan_host_expert_placement(int n_layer_trunk);
  
@@ -2123,7 +2318,10 @@ index 489a0cabe..5643d6867 100644
 +    // discrete arm (`MOE_HOST_LIMIT_FRAC` of MemAvailable, descending hotness from the persisted prior); only
 +    // the granularity differs -- a whole expert tensor here rather than a per-expert pool slot, because the
 +    // GTT store is a placement, not a cache (eviction is P3).
-+    void plan_gtt_expert_store();
++    //
++    // P3c: `n_layer_trunk` splits the candidate set into the TRUNK (what `-lme` buys) and the MTP/nextn HEAD
++    // (`layers[n_layer()]` and above), whose tables are pinned outside that budget.
++    void plan_gtt_expert_store(int n_layer_trunk);
 +
 +    // True when this tensor was placed in the GTT expert store (so its fill is a direct `pread` into the slot).
 +    bool host_expert_is_store(const std::string & name) const {

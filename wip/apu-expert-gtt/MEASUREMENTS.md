@@ -689,3 +689,83 @@ carries it.**
   `MOE_EXPERT_CACHE_TOUCH` is a no-op on this tier by construction (every miss fills), so admission is not tuned.
 * **The mlock arm at MBIG's 61 GiB** is a real reservation under §15.3's model, but its own pressure behaviour
   (a 61 GiB `mlock`ed region) was not probe-tested.
+
+## 17. 2026-11-11 — P3c: the MTP/nextn HEAD is pinned at full residency and outside `-lme`'s budget
+
+Maintainer decision (2026-11-11, `IMPLEMENTATION.md` P3): *the nextn (MTP) head's tables are pinned in the GTT
+store and are NOT counted against `-lme N`, because the head is metadata overhead read every draft step.*  This is
+that accounting, measured.
+
+### 17.1 What the head is, and where it lives
+
+On an MoE model with an embedded nextn block the head is **not a second model**: the MTP draft is a
+`LLAMA_CONTEXT_TYPE_MTP` **context on the target's own weights** (`common/speculative.cpp`'s
+`/*.shares_model =*/ !has_draft`), and the block's tensors are `layers[n_layer()]` of the same file.  So its
+expert tables (`blk.40.ffn_{gate,up,down}_exps` on 35B-A3B, `blk.48.*` on the 122B) are ordinary candidates of
+`plan_gtt_expert_store()`'s set, and the scheduler registers them like any other table once a draft context
+exists.  Two consequences the code had to fix:
+
+1. **They were in the set even when they were never loaded.**  `weights_map` holds the GGUF index, so
+   `padded_total` counted the head's tables on every load (`19 126.5 MiB` for 35B-A3B) while `load_mtp` false
+   meant their tensors were never even created: `-lme auto` then carved **464 MiB of store, and read it from the
+   GGUF, for three tables no graph would touch** (P2's recorded "123 tables / 19 126.5 MiB" is that waste).
+2. **A shared budget would evict them.**  On the arena tier they would get the trunk's uniform slot count
+   (56 of 256 on the `-lme 4` arm), so a draft step would miss and evict on the head — for tables that are read
+   *every* draft step and cost 464 MiB (35B-A3B) or 2 448 MiB (the 122B).
+
+### 17.2 The rule, as implemented
+
+| | |
+|---|---|
+| partition | a candidate is the HEAD when `load_mtp` and its layer index is `>= n_layer_trunk` (`hparams.n_layer()`); otherwise it is the trunk.  `load_mtp` false ⇒ the head's tensors are not part of the set at all |
+| budget | `-lme N` (or `auto`) buys **trunk** residency only; the store's extent is `min(budget, trunk padded) + head padded` |
+| placement mode (P2) | the head's tables are placed **first and unconditionally**, and are marked in a `host_experts_store_pinned` set the census names |
+| arena mode (P3) | the loader passes the head's **layer indices** to `moe_cache_preflight_store()`; the cache sizes every table of such a layer at `slots = n_experts`, excludes the head's per-expert bytes from `dev_one_bytes`, subtracts its bytes from the per-device budget, and keeps head layers out of the identity-aware drop pass (they are already full, and charging them to `remain` twice would drop trunk layers) |
+| no trunk | a model whose expert tables are **all** head (a standalone MTP drafter loaded as the target) keeps the uniform arithmetic — otherwise `-lme` would stop being a cap |
+
+### 17.3 Measured
+
+`halo`, one GPU, every arm guarded (`ulimit -v`, `ulimit -l`, the `SwapFree` monitor).  Text = a separate run with
+**no `-lv`**; census = `-lv 4`.
+
+| arm | extent | resident | head | census |
+|---|---|---|---|---|
+| 35B-A3B, `-lme 4`, **no drafter** | 4 096.0 MiB | 120 tables / 6 720 slots / 4 082.3 MiB | none (set = 18 662.5 MiB) | `arena releases=0`, `0 head layer(s)` |
+| 35B-A3B, `-lme 4`, `--spec-type draft-mtp` | **4 560.0** = 4 096 + 464 | **123 tables / 7 488 slots / 4 546.3 MiB** | **1 layer, 3 tables × 256/256, 464.0 MiB** | `evictions=1 080`, `arena releases=0`, `draft acceptance=1.00000` |
+| 122B-A10B, `-lme 60`, no drafter | 61 440.0 | 144 / 19 152 / 61 047.0 | none (set = 117 504.6 MiB) | `evictions=1 413`, releases 0 |
+| 122B-A10B, `-lme 60`, MTP | **63 888.0** = 61 440 + 2 448 | **147 / 19 920 / 63 495.0** | **1 layer, 3 × 256/256, 2 448.0 MiB** | `evictions=519`, releases 0, `draft acceptance=1.00000`, 3.4 t/s |
+
+`7 488 = 6 720 + 768` and `19 920 = 19 152 + 768`: the head's three tables hold **all 256 experts each** on top of
+the trunk's uniform 56 (35B-A3B) — the trunk's own slot count is unchanged by the head's presence, which is the
+whole point of taking its bytes out of the budget.  `arena=` tracks it exactly (4 546.3 = 4 082.3 + 464.0;
+63 495.0 = 61 047.0 + 2 448.0) and the `GTT arena tier:` line names the pinning.
+
+**Text** (same-seed greedy, hashed from no-`-lv` runs):
+
+| model | arms | hash |
+|---|---|---|
+| 35B-A3B | store-off / `auto` / `-lme 6` / arena `-lme 4` / arena `-lme 6`, **each with and without `--spec-type draft-mtp`** (10 arms) | `627b2ebd7792` in all of them |
+| 122B-A10B | arena `-lme 60` and `-lme 20`, with and without MTP | `9ccf62ed39c3` in all of them |
+
+So pinning the head changes no token, the 3× residency change still changes none, and the head's presence does not
+disturb the trunk's text.  Placement mode's census names it too (`-lme 6 --spec-type draft-mtp`): *"a registered GTT
+expert store of 6 608.0 MiB of a 19 126.0 MiB expert set: 39 tables / 9 984 slots … 3 MTP/nextn head table(s) of
+the 464.0 MiB head are placed FIRST and pinned outside the budget (P3c)"* — 6 614.0 − 464.0 = 6 150 MiB of trunk,
+the same 36 trunk tables the P2 arm had.
+
+**Flash-Next cannot test this**: `--spec-type draft-mtp` fails there with `context type MTP requested but model
+doesn't contain MTP layers`, with the store **off** as well, so it is a property of that GGUF, not of the tier.
+
+### 17.4 What is NOT measured
+
+* **No throughput claim.**  The head's tables are 464 MiB / 2 448 MiB and would have been read from the device
+  buffer anyway; the case for pinning is *fit* (the extra bytes) and *no churn on a table read every draft step*,
+  and neither was measured as a speedup.  The `draft acceptance=1.00000` lines above are a 2-token sanity
+  signal, not the MTP four-axis protocol (`benchmarks/mtp-adaptive-methodology.md`), which this change owes
+  before any promotion.
+* **The trunk's own numbers moved for a non-MTP load**: the store's set is now the trunk's (`18 662.5` MiB rather
+  than `19 126.5` on 35B-A3B, `117 504.6` rather than `119 952.6` on the 122B), so `-lme auto` carves the trunk's
+  whole set and no longer spends 464 MiB / 2 448 MiB on unloaded tensors.  That is a P2 behaviour change, and it
+  is the reason the `auto` census in §16 changes from 123 tables to 120.
+* **Multi-device** is untested (one GPU here); the head's bytes are subtracted per device, which is right under
+  `-sm layer` and untested under `-sm tensor`.

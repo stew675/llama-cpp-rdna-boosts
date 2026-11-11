@@ -1,25 +1,26 @@
 # wip/apu-expert-gtt — a UMA-only, heat-mapped **GTT expert store** (no host pool)
 
 **Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, P1.1 + P2 (the GTT
-store itself) and **P3a/P3b (the store as the expert cache's ARENA: it serves, it evicts, and a 123.45 GiB model
-runs on this 123 GiB box)** are DONE and measured; nothing in `patches/`, nothing applied to the fork.**  The plan
+store itself), **P3a/P3b (the store as the expert cache's ARENA: it serves, it evicts, and a 123.45 GiB model
+runs on this 123 GiB box)** and **P3c (the MTP/nextn head pinned at full residency outside `-lme`)** are DONE and
+measured; nothing in `patches/`, nothing applied to the fork.**  The plan
 is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `79fbbc97…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `02c4cec0…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) | `1643cc9de8c7d8fbc8213424395d5f472876c7c79a5688cdb4c84f491b022c54` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme`) | `7e786815b205389f84306f7267d463f1ee8197059862f62eded657458e26ad3e` |
 
-**What is left: P3c (the nextn/MTP head's tables pinned outside the `-lme` arithmetic), P4 (the streaming fill arms
-+ overlap -- including the direct host `memcpy` into the registered slot that the arena tier still lacks), P5
-(prefill streaming), P6 (gate + promotion).**  P3's own limits are named in `MEASUREMENTS.md` §16.6: there is **no
-throughput claim** for the arena tier, multi-device is untested, and the fill path is still the delivery's pinned
-bounce ring.  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
+**What is left: P4 (the streaming fill arms + overlap -- including the direct host `memcpy` into the registered
+slot that the arena tier still lacks), P5 (prefill streaming), P6 (gate + promotion).**  P3's own limits are named
+in `MEASUREMENTS.md` §16.6 and §17.4: there is **no throughput claim** for the arena tier (and none for the head's
+pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path is
+still the delivery's pinned bounce ring.  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
 config whose experts fit), and nothing about it has been measured beyond this one APU.
 
 **The campaign's environment variables** (not in `ENVIRONMENT.md`: nothing here is in `patches/` yet, so these
@@ -284,7 +285,7 @@ path already uses.  So the design keeps **one** CLI knob across both modes and a
 | `-lme` | discrete box (today) | APU (this design) |
 |---|---|---|
 | **`auto`** | fits under `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable` -> mirror the whole set; otherwise a bounded per-expert pool | **fits** -> the whole expert set is resident in the GTT store (zero evictions); **does not fit** -> `MOE_HOST_LIMIT_FRAC` x `MemAvailable` of GTT store, i.e. a hot subset with evictions on |
-| **`N`** | pin N GiB, spent on whole tensors in descending hotness (fit case) or as a per-expert pool (not-fitting case) | **exactly N GiB of registered GTT store**, spent in descending hotness.  **What landed (P2) spends it on WHOLE expert tables** -- the table is the decision unit until eviction exists (P3), when the unit becomes one (tensor, expert) slot |
+| **`N`** | pin N GiB, spent on whole tensors in descending hotness (fit case) or as a per-expert pool (not-fitting case) | **exactly N GiB of registered GTT store**, spent in descending hotness, **plus the MTP/nextn head's tables on top of it** (P3c: the head is read every draft step, so the budget does not trade it away).  **What landed (P2) spends it on WHOLE expert tables**; in the arena tier (P3) the unit is one (tensor, expert) slot |
 
 Three things the APU arm has to decide differently, and they are P1's work:
 
