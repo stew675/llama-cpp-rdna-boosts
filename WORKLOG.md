@@ -1,3 +1,501 @@
+## 261111.020 (wip, NO delivery change) -- the draft weights are never evicted: the invariant the maintainer asked for, the three paths that had to be told, and a census line that asserts it
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`6bac2dd19e5f7b2c21d624f1a1c11773ebee809850a6e9bef8fb8555bf46b69d`, cut against the `release.json` tree
+`86389e4a…`, produces tree `a1c8dc86…` (verified by `git am` onto the release tip).  Record:
+[`MEASUREMENTS.md` §19](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**The rule** (maintainer, 2026-11-11): *"the draft weights (whether embedded or a separate file) are not subject to
+being evicted."*  Enforced and asserted, not assumed.
+
+**Why the embedded head cannot be evicted, and the three paths that had to be told.**  The head is sized at
+`slots = n_experts` (one slot per expert), and `access_locked()` only evicts when a table has no free slot -- which
+a head table never has.  So the *policy* cannot evict it.  What runs **outside** the policy could, and three paths
+now skip pinned head tables explicitly:
+
+| path | what it does | now |
+|---|---|---|
+| `moe_cache_shrink_step()` | stands down the LARGEST table arena for a failed compute allocation (on the APU the arena is host memory, so it buys nothing) | skips the head -- the trunk gives up its bytes instead; a head layer is a whole layer, so standing one table down would also break slot-uniformity |
+| `moe_cache_shrink_arena()` | releases the largest arenas until `need_bytes` frees | candidate order excludes the head |
+| `moe_cache_rearm()` | re-arms stood-down tables after a compute-buffer drop | excluded explicitly, not merely by `slots == 0`, so no future path can re-arm one at a lower count |
+
+**The census asserts it** (`-lv 4`, with the arena tier's census): `MTP/nextn head residency: 3 table(s), 768/768
+(tensor, expert) slots resident, 0 eviction(s)`, plus an **ERROR** if `evictions != 0` or `slots != experts`.
+
+**Measured under trunk pressure** (the condition the rule exists for -- a starved trunk churning hard):
+
+| arm | trunk | head |
+|---|---|---|
+| 35B-A3B, arena `-lme 2`, MTP, 32 tokens | 123 tables / 2 505.2 MiB, `h=0.7945`, **508 evictions** | **3 tables, 768/768, 0 evictions** |
+| 35B-A3B, arena `-lme 4`, MTP, 32 tokens | 123 tables / 4 546.3 MiB, `h=0.7929`, **7 670 evictions** | **3 tables, 768/768, 0 evictions** |
+| 122B-A10B, arena `-lme 20`, MTP, 8 tokens | 147 tables / 22 644.0 MiB, `h=0.7683`, **3 036 evictions** | **3 tables, 768/768, 0 evictions** (a 2 448 MiB head) |
+
+7 670 trunk evictions against 0 on the head, and the same at the 2.4 GiB head size.  Text unchanged
+(`627b2ebd7792` in the store-off / arena `-lme 4` / arena `-lme 2` + MTP arms re-run after the change);
+`check-gpu-faults.sh` clean.
+
+**The separate file** needs nothing: its tables are a whole-set **device** allocation and are **not cache tables**
+(`MEASUREMENTS.md` §18.4), so no cache path can evict them.  The census reports `0 table(s)` for that shape and the
+loader's decline message now says it in as many words ("already fully resident, and it is NOT a cache table -- so
+these draft weights cannot be evicted").
+
+**Not measured (§19.5):** the three pressure paths are **guarded but not force-tested** (`shrink_step` /
+`shrink_arena` need a failed compute allocation on this 123 GiB APU, re-arm needs a compute-buffer drop); what is
+tested is the policy path and the code-level reason the others can no longer select a head table.
+`moe_cache_release_arena()` -- the last-resort whole-arena release -- still takes every table including the head and
+disables the cache; unchanged and out of scope (it is the "crate is on fire" path, and on the arena tier it would
+break the mapping holes generally).
+
+Rebase state (rebase onto **r262**): this entry and the eight below it were renumbered
+(`261111.009-.017` -> `.012-.020`, inline cross-references included) so the 261111 sequence stays monotone above
+r262's own entries (`.009-.011`, the host-read transport campaign and its release); r262's records are untouched.
+The campaign's artifact is re-cut against the **r262** release tree (`891d4acb…`) and re-verified -- see
+`wip/apu-expert-gtt/README.md`.  `MEASUREMENTS.md` §§0-19 and the probe records are untouched.
+
+## 261111.019 (wip, NO delivery change) -- the SEPARATE MTP drafter: one GTT store, two models.  Two real bugs found and fixed; the head's device buffer is the *right* tier on UMA
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`a5f41c0dc3ebc914495b6416321c28d15d91719a200f288efd56895ac36373d6`, cut against the `release.json` tree
+`86389e4a…`, produces tree `7b40c405…` (verified by `git am` onto the release tip).  Record:
+[`MEASUREMENTS.md` §18](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**The question** (maintainer, 2026-11-11): P3c was measured on the **embedded** nextn head (35B-A3B, the 122B), but
+the head also exists as a **separate draft model** -- `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (arch `qwen4exp`,
+`nextn_shared_target_tensors`, 32 tensors, one `blk.48` block, 3 expert tables = **2 550 MiB**, its WHOLE expert
+set).  Is that handled correctly?
+
+**Answer: yes, and on UMA nothing needs pinning there — but reaching that answer found two real bugs**, both
+pre-existing (P2), both in the "one region, many loads" seam:
+
+1. **A failed carve is FATAL, and the code claimed the opposite.**  `alloc_buffer`'s comment said "a DECLINE, not
+   an abort: the loader places the tensors it cannot fit in the plain device buffer".  It does not --
+   `llama_model.cpp` turns a null buffer into `unable to allocate ROCmGTTStore0 buffer` and the model does not load.
+   Measured: `-lme 1` + the separate drafter, where both models fall back to placement and the drafter's carve
+   collides with the target's (**exit 1**).  Fixed: the loader now sizes its placement against the store's real
+   free bytes (`ggml_backend_dev_gtt_store_free_bytes`, a new hook), and the message is an ERROR naming the
+   largest free run.
+2. **The store buffer released NOTHING** (`free_buffer` was a no-op, "never released"), so a second model in one
+   process found the region exhausted and silently ran on device buffers -- i.e. `llama-bench -m A -m B` measured
+   its two rows under **different expert tiers**.  `free_buffer` now returns the range to the allocator.
+
+**The rule for a second load, now implemented and measured.**  When a store is live, the loader asks how much it
+can still hand out; that free space is the whole budget, and the load: never sizes/grows the region (the extent is
+the first model's, clamped for *that* model against `RLIMIT_MEMLOCK` and 90 % of `MemAvailable`); **never takes the
+arena tier** (the hook reports 0 free while the cache's arena is live -- its extent IS the trunk's budget, and
+carving the head out of it drops the trunk's residency from 100 % to 69 %, measured as 2 550 of 8 192 MiB);
+**adopts** the live region when its set fits free space (`open` accepts a *smaller* request, still refuses a
+larger); and otherwise **declines cleanly** with a message that names the case.
+
+**Measured (`MEASUREMENTS.md` §18.3), text from separate no-`-lv` runs:**
+
+* Flash-Next + separate drafter: **`f586785d7183`** in all of store-off / `auto` / `-lme 6` / arena `-lme 8` --
+  identical to the no-drafter reference.  The target's arena is **untouched** by the drafter (144 tables /
+  8 153.0 of 8 192 MiB, `evictions=0`, `arena releases=0`).
+* The `-lme 1` arm that used to **fail the load** now exits 0 with "has 0.0 MiB free … this load places nothing in
+  it".
+* **Adoption measured** with `llama-bench -m Flash-Next -m 35B-A3B`: model 1 creates 40 925.6 MiB (`auto`) and
+  carves its whole set; the carve is released at teardown; model 2 sees 40 925.6 MiB free and *"adopts the live
+  40925.56 MiB GTT store, placing 18662.47 MiB of expert tables inside it"* -- so both rows are measured under the
+  same tier.
+* 35B-A3B regressions (off / `auto` / `-lme 6` / arena `-lme 4` / arena `-lme 4` + MTP): `627b2ebd7792` in all
+  five; 122B arena `-lme 60`: 144 tables / 61 047.0 MiB unchanged.  `check-gpu-faults.sh` clean.
+
+**Why the head's device buffer is the right answer here (not a fallback).**  On UMA a device buffer is the *same
+host RAM* the store would have held -- no second copy, no memory win.  It is already fully resident as a whole-set
+allocation, so there is no residency policy to pin it against and no churn: the two things P3c exists for belong
+to the *embedded* head, whose tables share the trunk's arena and its uniform slot count.  And taking it out of the
+arena would shrink the trunk's residency.  If a box ever needs those bytes *inside* the region (RAM-bound), the
+size has to be decided when the **target** sizes the store -- the drafter loads afterwards and the region cannot
+grow -- so it is a `common`/`--fit` sizing term (it already estimates the draft context,
+`common_draft_reserve_estimate`), not a loader change.  Recorded as the open item it is (`MEASUREMENTS.md` §18.4).
+
+**Not measured (§18.5):** no throughput claim; the multi-device case of a second load (one GPU here); the
+adoption path's failure arm only via the drafter declines, not a synthetic two-large-models arm.
+
+## 261111.018 (wip, NO delivery change) -- P3c: the MTP/nextn head is pinned at full residency and OUTSIDE `-lme`'s budget (and a load without a drafter no longer stores tensors no graph reads)
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`7e786815b205389f84306f7267d463f1ee8197059862f62eded657458e26ad3e`, cut against the `release.json` tree
+`86389e4a…`, produces tree `02c4cec0…` (verified by `git am` onto the release tip).  Record:
+[`MEASUREMENTS.md` §17](wip/apu-expert-gtt/MEASUREMENTS.md).
+
+**The maintainer's decision, implemented**: the nextn (MTP) head is metadata overhead read on every draft step, so
+it is pinned in the GTT store and is **not** counted against `-lme N`.  Three things came out of implementing it:
+
+* **The head is not a second model.**  An MTP draft is a `LLAMA_CONTEXT_TYPE_MTP` context on the target's own
+  weights (`/*.shares_model =*/ !has_draft`), so its expert tables (`blk.40.ffn_{gate,up,down}_exps` on 35B-A3B)
+  are ordinary candidates of `plan_gtt_expert_store()`.  They are now partitioned by layer (`>= n_layer_trunk`).
+* **They were in the set even when never loaded.**  `weights_map` is the GGUF index, so the set was counted as
+  19 126.5 MiB on 35B-A3B while `load_mtp` false meant the tensors were never created: a plain `-lme auto` carved
+  **464 MiB of store, and read it from the GGUF, for three tables no graph would touch** (2 448 MiB on the 122B).
+  The head is now part of the set only when `load_mtp` — a P2 behaviour change, and an improvement.
+* **A shared budget would have evicted them.**  On the arena tier they would take the trunk's uniform slot count
+  (56 of 256 at `-lme 4`), so a draft step would miss and evict on a table read every draft step.
+
+**How it is wired.**  `-lme` buys TRUNK residency; the store's extent is `min(budget, trunk padded) + head padded`.
+Placement mode places the head's tables **first and unconditionally** (`host_experts_store_pinned`, named in the
+census).  Arena mode passes the head's **layer indices** to `moe_cache_preflight_store()`, which sizes those layers
+at `slots = n_experts`, excludes their per-expert bytes from `dev_one_bytes`, subtracts the head's bytes from the
+per-device budget, and keeps head layers out of the identity-aware drop pass (they are already full, and charging
+them to `remain` twice would drop trunk layers).  A model whose expert tables are *all* head keeps the uniform
+arithmetic, or `-lme` would stop being a cap.
+
+**Measured (`MEASUREMENTS.md` §17.3), guarded arms, text from separate no-`-lv` runs:**
+
+| arm | extent | resident | head |
+|---|---|---|---|
+| 35B-A3B `-lme 4 --spec-type draft-mtp` | **4 560.0** = 4 096 + 464 | **123 tables / 7 488 slots / 4 546.3 MiB** | 3 tables × **256/256**, 464.0 MiB outside the budget |
+| 122B-A10B `-lme 60 --spec-type draft-mtp` | **63 888.0** = 61 440 + 2 448 | **147 / 19 920 / 63 495.0 MiB** | 3 × 256/256, 2 448.0 MiB |
+
+`7 488 = 6 720 + 768` and `19 920 = 19 152 + 768`: the head's tables hold **all 256 experts each** on top of the
+trunk's uniform 56, and **the trunk's own slot count is unchanged** by the head's presence — which is the whole
+point of taking its bytes out of the budget.  `arena releases=0` and `draft acceptance=1.00000` in both.
+
+* **Text unchanged in every arm**: 35B-A3B `627b2ebd7792` across store-off / `auto` / `-lme 6` / arena `-lme 4` /
+  arena `-lme 6`, **each with and without `--spec-type draft-mtp`** (10 arms); the 122B `9ccf62ed39c3` across
+  `-lme 60` and `-lme 20`, with and without MTP.  So pinning the head changes no token and the 3x residency change
+  still changes none.
+* Placement mode names it too (`-lme 6 --spec-type draft-mtp`): 6 608.0 MiB = 6 150 trunk + 464 head, 39 tables /
+  9 984 slots, "3 MTP/nextn head table(s) … placed FIRST and pinned outside the budget (P3c)".
+* **Flash-Next cannot test this**: `--spec-type draft-mtp` fails with `model doesn't contain MTP layers` — with
+  the store **off** as well, so it is that GGUF's property, not the tier's.
+* `scripts/check-gpu-faults.sh` clean over every arm; no `HSA_STATUS_ERROR_MEMORY_FAULT`.
+
+**Not measured, and named as such (§17.4):** no throughput claim for the pinning (the case is fit and no churn; the
+MTP four-axis protocol is owed before promotion, and `draft acceptance=1.0` on a 2-token arm is not it); the
+delivery's `auto` census moves from 123 tables / 19 126.5 MiB to 120 / 18 662.5 MiB on a non-MTP load, which is the
+second bullet above; multi-device untested (one GPU), where the subtraction is per device.
+
+**State of the branch:** `MOE_EXPERT_GTT_ARENA` stays default-OFF.  With it unset an APU behaves as P2 (now with
+the head handled correctly); with it unset AND no drafter, the store no longer spends anything on the head.
+
+## 261111.017 (wip, NO delivery change) -- P3a/P3b: the GTT store SERVES as the expert arena -- `tables=120`, evictions with 0 releases, identical text, and a 123.45 GiB model runs on this 123 GiB box
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`1643cc9de8c7d8fbc8213424395d5f472876c7c79a5688cdb4c84f491b022c54`, cut against the `release.json` tree
+`86389e4a…`, produces tree `79fbbc97…` (verified by `git am` onto the release tip).  Record:
+[`MEASUREMENTS.md` §16](wip/apu-expert-gtt/MEASUREMENTS.md); plan/status:
+[`IMPLEMENTATION.md` P3.0](wip/apu-expert-gtt/IMPLEMENTATION.md).
+
+**`tables=0` was three seams, not one, and each was independently fatal** (§16.1).  Instrumented each declining
+seam with a temporary `MOE_EXPERT_GTT_DEBUG=1` `fprintf` (removed before the patch was re-cut):
+
+1. **`moe_cache_preflight()` returned above the per-device host-expert byte recording.**  On the arena tier that
+   left `expected = 0`, so `moe_cache_tables_complete_locked()` answered *complete on the first registered table*
+   (measured `registered=144.0 MiB expected=0.0 MiB tables=1`, then `g_sized=1`), while `moe_cache_pending()` said
+   no (the scheduler's registration pre-pass never ran) and `moe_cache_stage_ready()` said yes.  Record, then
+   return -- the tier's expected total is the whole host-expert set (18 662 MiB on 35B-A3B).
+2. **`alloc_all_locked()` clamped the tier's budget against free VRAM / the slab's arena capacity** (0 on an APU),
+   so the tables were sized at `layer 0 cannot hold a uniform arena above 0 slots (requested 0)`.  Once every slot
+   comes from `ggml_cuda_gtt_store_reserve()`, the extent *is* the bound; the clamp is skipped for the tier and a
+   1.25x cap is asserted instead.
+3. **The load was not MAPPED.**  `mmap_support` is false for an IGPU device, so AUTO resolved to `--load-mode none`
+   and the "mapping holes" were a **pageable copy of the whole expert set** (`ROCm_HostMap 18 662.00 MiB` of
+   `ggml_aligned_malloc` on 35B-A3B).  The arena arm now forces `use_mmap` (one WARN; `--load-mode mmap` silences
+   it): `MemAvailable` after the load goes **93 → 106 GiB**.
+   Also fixed: the tier no longer arms the movable-boundary slab (the preflight wrapper armed it, and on a shared
+   pool the slab sizes itself as the whole machine).
+
+**Measured (`MEASUREMENTS.md` §16), every arm guarded** (`ulimit -v 96 GiB`, `ulimit -l 8 GiB`, plus a 1 s
+`SwapFree` monitor that kills the run on the first drop):
+
+| arm | resident | census |
+|---|---|---|
+| 35B-A3B, arena `-lme 4` | **120 tables / 6 720 slots / 4 082.3 MiB** of a 4 096 MiB extent | `h=0.5901`, `fills=10 999`, `evictions=4 279`, **`arena releases=0`** |
+| Flash-Next, arena `-lme 8` | 144 tables / 14 688 slots / 8 153.0 MiB of 8 192 | `h=0.9447`, `evictions=867`, releases 0 |
+| 122B-A10B, arena `-lme 60` | 144 tables / 19 152 slots / 61 047.0 MiB of 61 440 | `h=0.8786`, `evictions=1 524`, releases 0, **3.5 t/s** |
+
+* **Text, same-seed greedy, NO `-lv`, hashed by `scripts/extract-generated.py`**: `627b2ebd7792` for 35B-A3B across
+  store-off / `auto` / `-lme 6` (P2) / **arena `-lme 4`** / **arena `-lme 6`**; `f586785d7183` for Flash-Next across
+  store-off / `auto` / **arena `-lme 8`**.  On the **122B: `9ccf62ed39c3` at `-lme 60` (twice) and at `-lme 20`**
+  -- a 3x change of the resident set (133 → 44 slots/table, `h` 0.8786 → 0.5975, evictions 1 524 → 5 052) changes
+  no token, which is P3's accept criterion measured directly.  A `-lv 4` census of the same model does NOT
+  reproduce a hash (4663 vs 4797 chars) -- two runs per arm, never one.
+* **The unbounded allocation did not reproduce**, including the literal case-2 configuration (`-lme 4`, `-lv 4`,
+  default `-c 262144`, inside `MemoryMax=48G`): exit 0, 21.9 t/s, `SwapFree` **unchanged for the whole run**.  The
+  maintainer's `--fit` hypothesis is **not confirmed** (`--fit on` is clean too; the fit probe is skipped for
+  `no_alloc` and the tier's budget never consults it).  Barrier 1 fired on exactly one arm, on an allocation the
+  tier has nothing to do with: Flash-Next needs its 27 465 MiB `per_layer_token_embd.weight` resident as a plain
+  CPU buffer, which does not fit a 96 GiB address space alongside a 41 GiB mapping (clean at `AS_KB=0`).
+* **`MBIG` runs** (the design's point): 123.45 GiB of model on a 123 GiB box, `-lme 60` 3.5 t/s and `-lme 20`
+  3.0 t/s, both to completion, same text.  Short arms on a cold page cache -- **directional only, not a benchmark**.
+* `scripts/check-gpu-faults.sh` clean over every log; no `HSA_STATUS_ERROR_MEMORY_FAULT`; `arena alloc failures=0`.
+
+**Not measured, and named as such (§16.6):** no throughput claim of any kind; the fill is still the delivery's
+pinned bounce ring, **not** the direct host `memcpy` into the registered slot that P3.0 finding 4 calls for (it
+needs the ordering argument; it travels with P4); **P3c (nextn pinning) is not touched** (every arm is a plain run
+with no drafter); multi-device is untested (one GPU here); no eviction-rate/budget curve.
+
+**State of the branch:** `MOE_EXPERT_GTT_ARENA` stays **default-OFF** and the tier is reachable only for a set that
+does not fit.  With it unset, an APU behaves exactly as P2: `627b2ebd7792` / `f586785d7183` re-verified after every
+change in this entry.
+
+## 261111.016 (wip, NO delivery change) -- P3a wired but NOT working: the arena tier registers no tables, and one arm allocated without bound (two box thrashes).  Left default-OFF, with the leads recorded
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  Artifact:
+`wip/apu-expert-gtt/gtt-expert-store.patch` (current sha256/tree in the README status header); plan and the two
+open bugs: [`IMPLEMENTATION.md` P3.0](wip/apu-expert-gtt/IMPLEMENTATION.md).
+
+**What landed (all behind `MOE_EXPERT_GTT_ARENA=1`, default OFF, and only for a set that does not fit).**
+
+* The **arena arm** in the cache: `try_arena()` reserves a table's slot storage from the GTT store (a third arm
+  beside the slab and `cudaMalloc`), `free_arena_backing()` hands the range back through the store's allocator,
+  `g_cold_uva` is off for the tier (the APU's "cold" source is the pageable mapping, which the GPU cannot
+  address), and `moe_cache_preflight_store(device, extent)` enables the cache on an IGPU with the store's extent
+  as its budget -- no slab, no free-VRAM sizing, no pinned pool.
+* `moe_cache_preflight()`'s integrated-device guard now returns early for the arena tier.  That is the
+  "select the GTT store instead of `g_enabled = false`" hookup the campaign was written around, and it finally
+  *matters*: with the experts as mapping holes, `llama_model_moe_cache_preflight` does call it on an APU.
+* The **holes**: `ggml_backend_cuda_device_moe_host_master_buft()` answers `ROCm_HostMap` on an integrated device
+  when the arena tier is on, and `llama-model.cpp`'s existing `host_master_mapped` path then places the expert
+  tensors straight into the read-only model mapping -- nothing allocated, nothing pinned.  **No
+  `weight_buft_supported()` check may be applied to it**: a host master reaches the GPU through the scheduler's
+  OFFLOAD path (`ggml_backend_sched_backend_id_from_cur`), not through `supports_buft`, and asking the device to
+  "support" a host buft silently leaves the tensors on the device (measured: the whole 20 583 MiB model on the
+  device and `tables=0`).  That cost an hour and is recorded in the code comment.
+* An **identity-mirror guard**: on this tier the master is pageable, so the identity fast path (mirror every
+  expert into the arena at sizing) is `n_experts` pageable H2Ds of a whole table -- the first pathological arm
+  (19 GiB mirrored through the mapping for a set that the PLACEMENT mode already covers).  It is skipped now.
+
+**What does NOT work, and must not be papered over.**
+
+1. **The tier registers no tables.**  `MoE expert cache: ... tables=0, slots=0, arena=0.0 MiB` in the census of an
+   arena arm that otherwise produced identical text.  Identical text therefore proves nothing: with no table, the
+   op reads its own buffer and the arena is never touched.  **A text arm is not evidence for this tier** -- the
+   first thing the next session must do is make `tables=` non-zero, and the place to look is why the scheduler's
+   host-weight registration hook is not reached for a host-`mapped` expert weight on an APU
+   (`moe_cache_register_host` / `moe_cache_pending` / `moe_cache_tables_complete_locked`).
+2. **Arena mode can allocate without bound.**  It took this 123 GiB box to full memory + swap **twice**.  The
+   first is now prevented by construction (the identity guard).  The second happened in a `-lv 4` census arm with
+   a *partial* arena (`-lme 4`) **inside a `MemoryMax=48G` cgroup**, so the cause is not simply cgroup-charged
+   anonymous memory.  Suspects, in order: the pageable-master fill path's runtime staging, the prefill staging
+   ring (`span_buf_ensure`), and the heat/ghost mirrors.  Not diagnosed -- the box was not worth a third attempt.
+
+**State of the branch after this entry:** with `MOE_EXPERT_GTT_ARENA` unset (the default) an APU behaves **exactly**
+as P2 -- verified after every one of these changes: same-seed text `627b2ebd7792` for store-off / auto / `-lme 6`,
+no GPU faults.  The arena tier is a development-only path.
+
+## 261111.015 (wip, NO delivery change) -- P3 opens: the GTT store becomes a real allocator, and reading the cache against it simplifies the plan (no transient band in the core loop; the arena seam already exists)
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  The cumulative
+artifact is `wip/apu-expert-gtt/gtt-expert-store.patch` (renamed from `p2-...`: it is no longer P2's artifact),
+sha256 `fca915ce92f22b485126a357e6d2cb4917f75b514224b4fab750d4e950ab33c5`, tree `29418b02…`.  Plan and seams:
+[`IMPLEMENTATION.md` P3.0](wip/apu-expert-gtt/IMPLEMENTATION.md).
+
+**Landed (P3a-1): the store is an allocator, not a bump pointer.**  A first-fit over a sorted, coalesced free list
+(`reserve` / `release` / `largest_free`), with a double-release guard (an overlap is refused, not coalesced), shared
+by both arms so a mode switch never needs a second reservation -- the all-resident carve is just one allocation on
+it.  The expert cache makes ~n_tables allocations of 100-450 MiB each, so a handful of ranges is the whole data
+structure.  Verified as a no-op for P2: same-seed text `627b2ebd7792` (35B-A3B) and `f586785d7183` (Flash-Next)
+across store-off / auto / `-lme 6`, the same carves (18 662.0 / 6 116.0 / 40 925.2 MiB), no GPU faults.
+
+**Four seams read out of `moe-expert-cache.cu`, three of which simplify P3:**
+
+1. **The MUL_MAT_ID interception already exists**: `ggml_cuda_mul_mat_id()` asks `moe_cache_get_table()` at its
+   entry and re-dispatches with `src0c.data = arena` + the remapped ids.  Base pointer only -- no new op, no
+   dispatch change, no copy.  Its `(layer, role, device)` semantic fallback is what finds a table the scheduler
+   never aliased, which is exactly the APU case (the expert weight is not a host-buft input there).
+2. **`access_locked()` is the residency policy already**: hit → `arena + slot*stride`, free slot → take it, full →
+   LFRU victim (smallest decaying count, tie → oldest), with the `admit=value|touch` doorkeeper.
+3. **The transient band is not needed for the core loop.**  `access_locked` only *rejects* a miss when a cold path
+   exists; with none, its own comment says "every mode fills and the policy is a no-op".  On an APU the in-place
+   cold read of a pageable mapping IS the fault (no `PageableMemoryAccess`, no XNACK), so `g_cold_uva` must be
+   false for this tier and every miss evicts+fills.  Nth-touch admission becomes a priced P3b refinement instead
+   of a prerequisite -- §5.1's rationale does not survive the measurement.
+4. **The master is the model mapping**, and the fill must be a plain host `memcpy` into the registered slot (the
+   measured warm arm, 12.8 GB/s) -- `fill_slot_from_host`'s pageable branch does `cudaMemcpyAsync(H2D)`, which is
+   the delivery's known-bad path on RDNA.
+
+So P3 is: **the store is the arena, the model mapping is the master, the cache is the policy** -- the discrete
+path's own `--host-experts pool` shape with the pool replaced by the GTT store and no pinned master.  Staged
+P3a-1..3 (arena, then holes) → P3b (evictions, a >RAM model) → P3c (nextn pinning); the table with each stage's
+verify criterion is in `IMPLEMENTATION.md` P3.0.
+
+## 261111.014 (wip, NO delivery change) -- the GTT store is `mlock`ed, and "cannot lock" becomes a startup decision: refuse a model that cannot fit, decline one that can
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  This lands the
+fix probe `16` (`261111.013`) demanded and answers README §7 Q11.  The cumulative artifact is re-cut:
+`wip/apu-expert-gtt/gtt-expert-store.patch`, sha256
+`4057bef77e4ac57178bd09ca4e2d0153a011f3cbd9d9162c85d94bf7ee12b47b`, tree `0738f3f3…` (it advances with
+the campaign -- `261111.015` is current); record
+[`MEASUREMENTS.md` §15.3](wip/apu-expert-gtt/MEASUREMENTS.md), policy table
+[`README.md` §5.2](wip/apu-expert-gtt/README.md), arms `wip/apu-expert-gtt/arms.sh limit`.
+
+**What it does.**  The region is `mlock`ed right after the single registration (`MOE_EXPERT_GTT_MLOCK`, default
+`1`; `0` is the kill switch and leaves the tier reclaimable by design).  `-lme` is then resolved against
+**`RLIMIT_MEMLOCK`** before any tensor is placed or any byte is read, in `plan_gtt_expert_store()`:
+
+| condition | outcome |
+|---|---|
+| `extent <= lockable` | honour it; the census reports `mlocked X MiB (RLIMIT_MEMLOCK …): a real reservation` |
+| cannot lock, **and the model fits in RAM anyway** (`weights <= 90 % of MemAvailable`) | **decline** the GTT store (or clamp it, when the clamp still holds one expert table) -- one WARN with the numbers and the five ways to raise the limit, then today's behaviour |
+| cannot lock, **and the model cannot fit** | **REFUSE**, with weights / `MemAvailable` / shortfall / limit / what could be honoured, and the fix |
+
+`weights` is every tensor in the loader's index and the 90 % is the reserve the `-lme` argv check already applies,
+so there is one constant, not two.  The refusal is gated on `gtt_store_can_stream` (false until P3/P4), so a clamp
+that *would* cover the shortfall still refuses today and the message says why -- without eviction and streaming a
+>RAM load would over-commit exactly as it did on 2026-10-19.
+
+**Measured (`MEASUREMENTS.md` §15.3), all on `halo`:**
+
+* unlimited limit: `mlocked 6144.0` / `19 126.5` / `40 925.6 MiB` for `-lme 6` / `auto` (35B-A3B) / `auto`
+  (Flash-Next) -- a real reservation in every arm, and **`mlock` is free at creation** (26.3 ms/GiB at 19 GiB
+  against 25.8-26.0 before it, 26.0 vs 25.9 at 41 GiB): the registration has already faulted every page in, so it
+  is a bookkeeping pass over an existing VMA, not a second walk of DRAM.
+* `ulimit -l 8192` (8 MiB, a stock systemd box) with a fitting model: **declined**, one WARN, exit 0, and the
+  same-seed greedy text is **identical** (`627b2ebd7792`) -- a decline changes no output byte.
+* `ulimit -l 8192` with `Qwen3.5-122B-A10B-Q8_0 -lme 80`: **REFUSED in 0.76 s**, before the read -- weights
+  126 403 MiB, `MemAvailable` 114 656 MiB, **shortfall 23 212 MiB**, limit 8 MiB.  At `ulimit -l 33554432` (32 GiB)
+  the clamp would cover the shortfall, and the message then adds that even a locked store would not make it
+  runnable until P3/P4.
+* `MOE_EXPERT_GTT_MLOCK=0` at 8 MiB: the whole policy is skipped (the backend reports `SIZE_MAX`) and the census
+  prints `NOT locked (MOE_EXPERT_GTT_MLOCK=0): RECLAIMABLE under pressure` -- the pre-lock behaviour, deliberately.
+
+**Not measured, and named as such:** a real (19-41 GiB) `mlock`ed store under pressure (probe `16` used 2 GiB; the
+`mlock` arm held 4 of 4 there and the cost model says it scales linearly), and the `clamp` branch (`(b)`), which is
+unreachable until `gtt_store_can_stream` is flipped.  `ENVIRONMENT.md` is untouched: this is still `wip/`, and the
+three variables are catalogued in the campaign README until promotion.
+
+## 261111.013 (wip, NO delivery change) -- probe 16: `hipHostRegister` does NOT pin, so the GTT store is reclaimable and the "budget is a reservation" claim is FALSIFIED -- `mlock` is the fix, and it is a decision
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  New probe
+[`wip/apu-expert-gtt/probe/16-reclaim-pressure.cpp`](wip/apu-expert-gtt/probe/16-reclaim-pressure.cpp); record
+[`MEASUREMENTS.md` §15](wip/apu-expert-gtt/MEASUREMENTS.md); the claim it overturns is corrected in
+[`README.md` §5](wip/apu-expert-gtt/README.md) and `IMPLEMENTATION.md` P1.2, with the open decision as README §7 Q11.
+
+**The question.**  `README.md` §5 called the `-lme` budget "a real reservation" on the strength of probe `09`: a
+registered range keeps 1 048 576 of 1 048 576 pages after `fadvise(DONTNEED)` **and** `madvise(DONTNEED)` where
+the unregistered control releases all of them.  That is a *user-initiated* discard.  The kernel's own reclaim
+under memory pressure is a different mechanism, and the campaign had it listed as owed.
+
+**The measurement.**  Five arms, each in its own process inside a memory cgroup
+(`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=4G`, `PROBE16_HOG_MIB=4096`) so the pressure is
+real but contained; 2 048 MiB region + 2 048 MiB unregistered control; the **GPU read is the first touch** after
+the pressure (a host read would fault the pages back and hide the case).  Every arm's pressure was real: the
+control lost 17-2 048 MiB and the cgroup reached `memory.max` with 2.1-2.2 GiB in swap.
+
+| arm | pages taken (MiB) | huge pages after | GPU read after | `Unevictable` |
+|---|---|---|---|---|
+| `reg` -- `mmap`+THP+`hipHostRegister(ReadOnly)`, **the GTT store's own backing** | 1.1 / 28 / 212 / 436 (0 in 2 runs) | **split every run** (2048 -> 626-1 066) | 29-36 ms when <= 28 taken, **524 ms** when 436 was | **0** |
+| `reg_w` -- registered writable | 286 / 394 (0 in 1) | split (2048 -> 812-1 150) | 78 / 395 / **2 191** ms | **0** |
+| `hostalloc` -- `hipHostMalloc` (a pinned allocation) | 86 (0 in 2) | never had any | 48 / 183 ms | **0** |
+| **`mlock`** -- `mmap`+THP+**`mlock`**+register | **0, 0, 0, 0** | **2048 preserved** | **26-28 ms** | **2 048** |
+
+**Four findings.**
+1. **`hipHostRegister` on an `mmap` region does not pin it on this box.**  The kernel splits the THPs every run and
+   swaps 0-436 MiB of a 2 GiB region out.  (`hipHostMalloc` held in 2 of 3 runs, so it is not absolute either --
+   but it is never THP-backed, which is what the delivery's `ROCm_Host` master trades.)
+2. **It is a slow failure, not a fatal one, and it is one-off.**  The GPU read returned the right bytes in every
+   arm and run -- no `HSA_STATUS_ERROR_MEMORY_FAULT`, the driver re-faults the range at submission -- but the first
+   read that touches the swapped part pays **12-37x** (524 ms and 2 191 ms against 42-59 ms), and the second read
+   is back to 41-44 ms.  A swapped-out GTT store does not corrupt: it stalls.
+3. **Only `mlock` is a reservation, and it is the only arm the accounting reports**: `Unevictable` / `Mlocked` /
+   `smaps Locked` = 2 048 MiB there, and **0** in every other arm *while being reclaimable*.  It also keeps the
+   huge pages and the read rate.
+4. **THP splitting alone costs nothing measurable** (29-36 ms where 0-28 MiB was taken) -- the cost tracks the
+   bytes actually swapped, not the split.
+
+**Consequences, and what is deliberately NOT done yet.**  `-lme`'s sizing arithmetic stands unchanged
+(`MemAvailable` is charged the same way), and no fill path or census field depends on this.  But P2 ships
+**without** `mlock`, so `-lme` is a sizing *intent*, not a guarantee, and the docs now say so.  The fix is one
+call plus one census field, and it needs the maintainer's decision because it costs `RLIMIT_MEMLOCK` (unlimited
+on `halo`, **8 MiB on a stock desktop**): README §7 Q11 lays out refuse / best-effort / don't, and recommends
+best-effort with `mlocked MiB / extent` in the census.
+
+Also recorded in this entry: the naming rule (**never a bare "store"** -- always "GTT store"), the confirmation
+that **the GTT store IS the expert arena** (P3 points the cache's slot allocation at it; "arena" alone still means
+the slab's), and that the **nextn/MTP head's tables are pinned outside `-lme`** (P3 implements the accounting).
+
+## 261111.012 (wip, NO delivery change) -- `apu-expert-gtt` P1.1 + P2: the GTT expert store EXISTS and is measured -- `-lme` is its size, text is identical, and the registered region is not a slow tier
+
+**Campaign-scope only** (no `patches/`, no `release.json`, nothing applied to the fork, no gate owed).  The GTT store
+is ONE patch against the `release.json` tree `86389e4a…`:
+[`wip/apu-expert-gtt/gtt-expert-store.patch`](wip/apu-expert-gtt/gtt-expert-store.patch), sha256
+`31ef8d1b55a765c1468bbb9561d7ffb15b84019df31a8d4a28fef80b720b8466`, producing tree `65aa9208…` (**superseded later the same day by `261111.014`, which adds the mlock policy: the artifact is now `4057bef7…` / tree `29418b02…`**).  Record:
+[`MEASUREMENTS.md` §14](wip/apu-expert-gtt/MEASUREMENTS.md); arms: `wip/apu-expert-gtt/arms.sh`.
+
+**What it is.**  `-lme` (P1.1) resolves into the extent of a registered anonymous region -- `mmap` +
+`MADV_HUGEPAGE`, ONE `cudaHostRegister(Mapped|ReadOnly)`, sliced per `(tensor, expert)` slot -- and the hottest
+expert tables are placed in it through a **device** buffer type (the delivery's KV-region pattern: the plain
+device type's vtable contract, a per-device unique name), so `MUL_MAT_ID` reads them **in place**: no new op, no
+dispatch, no per-layer copy, and no scheduler input-copy of the table.  The fill is the buffered `pread` arm
+straight into the slot.  The budget, the ceiling (`MOE_HOST_LIMIT_FRAC` of `MemAvailable`, never free VRAM) and
+the heat ranking are the **discrete path's own code** (`plan_host_expert_placement()`), not a second policy, and
+`-lme` engages with no `-ncmoe` (which stays refused on UMA).  `MOE_EXPERT_GTT=0` is the kill switch;
+`MOE_EXPERT_GTT_RO=0` registers the region writable, which is the A/B the read-rate claim was owed.
+
+**Measured on `halo` (gfx1151, 123 GiB, ROCm 10.1.0), all of it in §14:**
+
+* **Text identity**, same-seed greedy with **no `-lv`**, hash via `scripts/extract-generated.py`:
+  `MOE_EXPERT_GTT=0` == GTT store `auto` == `-lme 6` == `RO=0` == the **pre-P2 build**, on 35B-A3B Q4_K_M
+  (`89 chars sha=627b2ebd7792`) and Flash-Next GSQ-IQ3_XXS (`113 chars sha=f586785d7183`).  The kill switch's
+  `-lv 4` log normalises to the **same 329 lines** as the release tree's (ephemeral port + four throughput
+  figures aside), and `check-gpu-faults.sh` is clean over every arm and the kernel journal.
+* **`-lme` is the size**: `-lme 6` realises **exactly 6 144.0 MiB** (6 116.0 MiB carved -- under one table, the
+  granularity of this phase); `auto` on a fitting set is the **whole** set (35B-A3B 123 tables / 31 488 slots /
+  19 126.5 MiB; Flash-Next 144 / 73 728 / 40 925.6 MiB) with **zero evictions**, and `MOE_HOST_LIMIT_FRAC=5`
+  exercises the not-fitting band (a 5 804.7 MiB, 34-table hot subset).  `-lme` is a cap, not a floor.
+* **Registration is cheaper than P1.0 predicted**: **26 ms/GiB** at a real 19.1 GiB extent (482-486 ms), against
+  the probe's 30.5 ms/GiB for an untouched region -- so the `memset` pre-fault walk is not worth taking -- and
+  **100 %** of the extent is `AnonHugePages` *after* the load.  ReadOnly and writable cost the same to register.
+* **The load fill is page-cache-bound**: 18 662 MiB in 1.34 s (**13.9 GB/s**) with the GGUF resident, 40 925 MiB
+  in 17.6 s (**2.33 GB/s**) off a cold 46 GiB file.  A startup cost, not a decode one -- and P4 does not address it.
+* **The GTT store is not a slow tier**: `llama-bench -p 512`, two runs: plain device buffer 2 268.65 / 2 289.39 t/s,
+  the registered **ReadOnly** GTT store 2 259.63 / 2 260.77 (-0.4 / -1.25 %, inside the ~1 % run-to-run drift), and
+  the same GTT store registered **WRITABLE** 2 135.82 / 2 146.85 (-5.9 / -6.2 %, far outside its ±1.3 spread).  So
+  the 232-vs-60 GB/s fact of probes 03/04 applies to this region, and the model-level cost of the slow arm is
+  5-6 %, not 74 %, because the read overlaps arithmetic.  **Decode does not move at all** (63.22-63.34 t/s,
+  six runs): while the set fits, the GTT store buys what it makes *possible*, not speed.
+
+**Two findings that changed a plan.**
+
+1. **The integrated-device guard needed NO change.**  `moe_cache_shared_pool_device()` /
+   `moe_cache_preflight()` (`moe-expert-cache.cu:5623/:5641`) were expected to "select the GTT store instead of
+   `g_enabled = false`".  They cannot be reached on this box at all: the preflight is gated on **host-expert
+   bytes**, and an APU registers none (the loader refuses `-ncmoe` and keeps every expert on the device), so the
+   cache is already inert and `moe-expert-cache.cu` is byte-identical in this patch.  Recorded rather than
+   "fixed": a branch that never runs is not a place to add a decision.
+2. **`--fit` does not see the GTT store.**  A `--fit` probe load is `no_alloc`, so the GTT store plan is skipped by
+   design (`if (no_alloc) return;`) and nothing is reserved for a load that allocates nothing -- confirmed by
+   exactly ONE `plan_gtt_expert_store` line per run.  That is the P1 acceptance criterion ("`--fit` does not
+   double-reserve the GTT store") met the weak way: the fit pass also does not *account* for it, which did not bite
+   here (45 GiB spare) and will on a set that does not fit.  README §7 Q8.
+
+**What this does NOT do, and the census says so on every run:** no eviction (P3), no streaming or pipelined miss
+fill (P4), no prefill streaming (P5).  The GTT store is an **all-resident arm or a static hot subset** -- whatever did
+not fit keeps its layer's device buffer.  Probes `15` (touch distance) and `16` (reclamation under pressure) are
+still owed, and `16` now carries more weight: the GTT store is registered and non-swappable, and `MemAvailable` fell
+by exactly its extent on every arm.
+
+**Maintainer's decisions on the report (2026-11-11), recorded so they are not re-asked:**
+
+* **Best fit, not strict fit** for `-lme N`: the extent is the budget and the carve may sit up to one expert table
+  under it (6 144.0 vs 6 116.0 MiB at `-lme 6`), and that is what ships.  P3 makes the two converge on its own;
+  nothing to change.
+* **Linux only for now.**  Windows support is a later session.  The GTT store declines there and the run keeps
+  today's behaviour, and the platform-specific part is deliberately **one** `#if !defined(_WIN32)` function
+  (`gtt_store_create_locked()`) so a Windows arm replaces that function and nothing else -- the buffer type only
+  needs a host-writable backing and the fill is `read_raw()` into `tensor->data`, both of which Windows has.
+* **The page-cache-bound load fill is owned elsewhere**: a separate development line is adding explicit buffered
+  reads instead of the mmap-only load, because the page cache chokes under low-free-memory conditions.  The GTT store
+  inherits it for free -- its fill is already a buffered `pread` into the slot.
+* **Naming: never a bare "store".**  It is always a **GTT store** (or "GTT expert store") in code, in the `-lv`
+  census and in records -- so it cannot be read as disk storage, and cannot be confused with the slab's **arena**,
+  which the GTT store is functionally equivalent to with a different implementation.
+* **The GTT store IS the expert arena** (decision 2026-11-11), i.e. P3 points the existing cache tables' slot
+  allocation at it instead of at the slab/`hipMalloc` arena, reusing admission, LFRU, the remap and the censuses.
+  The word "arena" alone still means the slab's; say "GTT store" when you mean this one.
+* **The MTP (nextn) head's expert tables are PINNED in the GTT store and NOT counted against `-lme N`** (the head's
+  weights are treated as metadata overhead: read on every draft step, so a budget must never be able to evict them
+  or buy itself out of them).  P2 does not implement the accounting yet -- the head's 3 tables are still part of the
+  candidate set (35B-A3B: 123 = 40x3 trunk + 3 nextn) -- because in P2 everything resident is pinned; it moves with
+  P3, where pinning first means something.  A hot-subset `-lme N` can therefore rank a head table out of the GTT
+  store today; it keeps its layer's device buffer, so it stays readable and text is unchanged (README §7 Q10).
+
 ## 261111.011 (r262, release) -- `TODO` #306 retires: the host-read transport is adaptive, `--load-mode buffered` exists, and the mapping is no longer the only arm a spilling set can read
 
 **Release `v16-a691b2345-r262`, 16 blocks, tree `891d4acb44335687ade6eb3a3f6a37c6f836ade6`, canonical tip
