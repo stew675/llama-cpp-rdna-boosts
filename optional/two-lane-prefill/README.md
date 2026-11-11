@@ -1,19 +1,22 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r247`** (against `release.json` tree
-`8f99d2dc6dbe8648b44268b8b82394d11f12f573`; the r246, r243, r241 and r229 cuts and their measurements are kept
-below as the dated record).  The r247 cut is a mechanical rebase — the delivery changed only block-15 defaults
-and options (`ENVIRONMENT.md` §17), so nothing in this artifact's code or numbers moves.
+**Optional artifact, not part of the delivery.  Re-cut on `r259`** (against `release.json` tree
+`7995db440ff79d805b4e1ad946ebfae605a56616`; the r254, r247, r246, r243, r241 and r229 cuts and their measurements
+are kept below as the dated record).  The r259 rebase is **no longer purely mechanical**: the artifact's own code
+is unchanged (its +/− line set is identical across the r247, r254 and r259 cuts), but a **host-expert layout
+(`-ncmoe` + `-ot`) aborted in the pair path** — pre-existing since the r246 cut, never seen because every arm
+below keeps the experts device-resident — and that is fixed in this cut (`What changed in the rebase`, item 13),
+and that tier then measures as a *loss* at a wide ubatch (item 14).
 
-From **PR #268, #279, #284 then #296 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
+From **PR #268, #279, #284, #296 then #301 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
 reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `f5702697eacdb3051dfa787b258dd405c4ab7e47b7f9a814754469944f6983d2`
-* applies at `release.json` tree `8f99d2dc6d…` (r247), produces tree `17f51fb30c39a16db280d0864a0feee784f1010b`
-  (verified by strict `git am` on a fresh checkout of the r247 `rdna-boosts` branch; the r246 cut produced
-  `e4e8be3011…`, and with the retired `host-pool-fill-src` artifact applied first the two produced
-  `db5ed504b5…`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `64f92b608728d48005d38c1562e089d6f67c434393219efb2e83beb6bf7572a9`
+* applies at `release.json` tree `7995db44…` (r259), produces tree `d1c3f0f9c370efc7707caab10ebc6c67c03bfe9a`
+  (verified by strict `git am` on a fresh checkout of the r259 `rdna-boosts` branch; the r254 cut produced
+  `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…` on `8f99d2dc6d…`, and with the
+  `host-pool-fill-src` artifact applied first — `apply-all.sh`'s order — this cut produces `e6e213c6ce…`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one
@@ -63,6 +66,10 @@ This matters more than the knob does, so it is measured, not assumed (3× R9700,
 | `-sm row` | **not usable at all on ROCm**: `llama_model_load: device ROCm0 does not support split buffers` (the r220 cut listed this as a reachable layout — it is an inference, not a measurement, and it is wrong for this backend) |
 | `-sm none` | one GPU backend, i.e. the `-sm tensor` case |
 
+The **expert tier is orthogonal to reachability**: `-ncmoe` / `--host-experts` changes nothing about which
+layouts arm the pair (`-sm layer -ot` still engages, and pairs), it changes whether the pair is *worth it* — on
+host-resident experts it wins at the default ubatch shape and loses at a wide one (*What it measures here*).
+
 The submitter's **dense** reference layout (`-sm layer -ts 1,0`, no `-ot`) is refused here for the same reason,
 so the +13.3 % PR #268 reported for it was not measured with this patch on this base.
 
@@ -71,6 +78,36 @@ so the +13.3 % PR #268 reported for it was not measured with this patch on this 
 `-sm layer -ts 1/1/1 -ot 'blk\.0\.attn_q\.weight=ROCm0'` (a placement-neutral override: it only turns pipeline
 parallelism off) and `-ub 2048 -b 2048` throughout; the `llama-bench` arms add `-t 16 -r 3`, the `llama-cli` arms
 run the tool's default thread count (one arm per line, A B B A order).  Same binary, env-gated.
+
+### The r259 cut (PR #301) — re-measured here, and the host-expert tier
+
+3× R9700 gfx1201, the same layout, same binary, env-gated, A B B A, `prompts/prose-rdna-boosts.txt` for the
+`llama-cli` arms.  Two ubatch shapes: the delivery's `-b 2048 -ub 2048`, and the **tool defaults**
+(`-ub 512 -b 2048`) — what a consumer who tunes nothing actually gets.
+
+| arm | 1 lane | 2 lanes | |
+|---|---|---|---|
+| MoE 35B-A3B Q8_0, `llama-bench pp2048 -b 2048 -ub 2048` | 6544.9 / 6524.6 | **8070.2 / 8056.0** | **+23.4 %** |
+| the same, default `-ub 512` (whole 512-token ubatches pair) | 4077.5 / 4051.0 | **6001.6 / 6033.7** | **+48.1 %** |
+| the same, default `-ub 512`, `-ncmoe 40` (host-resident experts) | 3917.6 / 3930.8 | 4126.2 / 4157.1 | +5.6 % |
+| the same, `-b 2048 -ub 2048`, `-ncmoe 40` | 6276.7 / 6276.7 | 5544.4 / 5530.4 | **−11.8 %** |
+| 27B `GSQ-RCO-IQ3_S-mtp`, `--spec-type draft-mtp --spec-draft-n-max 3` — prefill | 954.4 / 963.5 | **1239.4 / 1238.1** | **+29.2 %** |
+| the same — decode (`-n 32`) | 56.7 / 55.9 | 56.8 / 56.5 | nil |
+| the same model, `--spec-type none` — prefill | 1061.6 / 1053.9 | **1295.2 / 1293.1** | **+22.3 %** |
+
+**Text and the default path.**  Greedy `-n 32 --temp 0 --seed 42` text is `e2dde701fc04` (35B-A3B Q8_0) for
+lanes=1 == lanes=2 == lanes unset, on `-sm tensor` and on the `-ot` layout, and with and without `-ncmoe 40` —
+the delivery's own anchor for that model; the 27B arms read `a4a403d64c40` both ways and under both speculator
+settings (the r246 anchor).  `scripts/gate-prefill-logits.sh` on the **default path** (lanes unset, 27B Q8_0)
+reads mean KLD **0.000000 / same-top-p 100.000 %** against the base recorded from the r259 build, and
+`check-gpu-faults.sh` is clean over every arm.
+
+**The host-expert tier is where this knob loses.**  With `-ncmoe 40` the pair still engages (3 pairs logged,
+`llama-cli -ub 2048 -b 2048`: prefill 5135.4 -> 4218.4 t/s, −17.9 %), but that tier is link-bound: the delivery's
+H2D staging already overlaps the host→device traffic, a second compute-buffer set takes VRAM the expert-cache
+arena wants, and the two lanes contend for the same link.  At the default `-ub 512` shape it still gains, because
+there the second lane overlaps *layer* work instead of waiting on the link.  **On the host-expert tier leave
+`LLAMA_PREFILL_LANES` unset** at a wide ubatch.
 
 ### The r246 cut (PR #296) — the MTP target pairs
 
@@ -157,6 +194,11 @@ chunks (one split batch per call) leaves +5.5 %.
   restores the split's exact single-lane value — `llama-perplexity` output identical to the `-ub 1152` arm (r229).
 
 ### What it costs (all measured, all documented rather than tuned away)
+
+* **The host-expert tier loses at a wide ubatch** (r259): `-ncmoe 40`, `llama-bench pp2048 -b 2048 -ub 2048`,
+  6276.7 -> 5544.4 t/s (**−11.8 %**); `llama-cli` on the 5 256-token prompt, 5135.4 -> 4218.4 (**−17.9 %**).  It
+  gains **+5.6 %** at the default `-ub 512`, so the shape decides.  Before the r259 cut it did not regress — it
+  aborted (`What changed in the rebase`, item 13).
 
 * **A second compute-buffer set per armed context**: ~1.4–1.5 GiB at `-ub 2048` (the r229 record: `ROCm0 441 +
   ROCm1 430 + ROCm2 430 + host 65` MiB, logged once as `compute buffer size = … (prefill lane 2)`).  A **draft**
@@ -256,6 +298,30 @@ current tree with the gate delta and the layout/hardware stated.
     `… draft = %d` again, and the `ctx_other`-vs-`ctx_type` explanation sits above the gate where the next
     reader will look (`ggml_backend_sched_graph_compute_async_pair`'s WARN is the other half of that story).
 
+**r259 (this re-cut, PR #301 plus this repo's amendment):**
+
+13. **FIXED: the pair aborted on a host-expert layout.**  `LLAMA_PREFILL_LANES=2 -sm layer -ot … -ncmoe 40`
+    died at the first prefill on `GGML_ASSERT(sched_a->is_alloc && sched_b->is_alloc)` in
+    `ggml_backend_sched_graph_compute_async_pair`.  `prepare_ubatch()` grew the `lane` parameter in this
+    artifact, but the delivery's two lane-0 placement blocks inside it — the ring narrow→wide drop
+    (`ring_carved && ring_arm && n_tokens_prev < 64`) and the `drop_now` wide→narrow drop/re-reserve — still
+    dropped and re-reserved `sched` (lane 0) unconditionally, so the lane-1 prepare ran them *again* after lane
+    0's ubatch had been prepared and handed the pair an unallocated lane 0.  Both blocks are now `lane == 0`
+    (they manipulate lane 0's scheduler and the context's lane-0 size expectations; a lane-1 ubatch must not
+    re-place lane 0).  Pre-existing since the r246 cut — every arm that cut measured keeps the experts
+    device-resident, so the ring was never carved and the blocks never fired.  After the guard the arm runs and
+    its text is the single-lane text (`e2dde701fc04`).
+14. **Base drift r254 → r259**, no code delta: r258 (block 09, the identity expert table served IN PLACE:
+    `ggml-backend-impl.h` gains `moe_cache_in_place`, `ggml-backend.cpp`'s staging decision and take-over call
+    change, `ggml_backend_buffer_get_usage()` answers for a buffer-less table) and r259 (block 01, the `q8ce`
+    wire) moved the files the artifact touches.  The artifact's +/− line set is identical across the r247, r254
+    and r259 cuts (checked per file on sorted line multisets), so the arm gate, the MTP-target pairing, the draft
+    refusal and the scheduler refactor are unchanged.  Note the r254 cut's own delta note attributed the
+    `GGML_SCHED_STAGE_MODE` retirement to r254: it was **r250** (block 09, `TODO` #284) — the resolution was right,
+    the attribution was not.
+15. **Dropped a stray blank line** the artifact had been adding to `ggml/include/ggml-cuda.h` since the r220 cut
+    (its only change to that file).  That file is untouched now.
+
 ## Known open points
 
 * On the pair-failure path (`graph_compute_pair != SUCCESS`) lane 1's ubatch has already been applied to the
@@ -263,6 +329,9 @@ current tree with the gate delta and the layout/hardware stated.
   only; a double `mctx->apply()` for the same positions is not obviously idempotent for every memory type.
 * `include/llama.h` gains `llama_n_prefill_lanes()`, a public accessor for an internal feature.
 * The ~8 % second-context penalty and the −6.1 % 8-sequence regression above are observed, not explained.
+* The host-expert wide-ubatch loss (−11.8 % / −17.9 %, r259) is measured and explained as link-bound contention,
+  not tuned away; it is documented rather than gated, because the layout that gains is the one the artifact is
+  for.
 * The delivery's own draft detection (`graph_reserve()`'s narrow-2 route, `process_ubatch()`'s `is_draft`, the
   narrow-2 floor re-pin in `sched_reserve()`) still tests `ctx_other` alone, so none of it fires for a
   qwen3-family MTP draft.  That is pre-existing delivery behaviour (`WORKLOG.md` 261109.011 item 3), not this
@@ -281,12 +350,14 @@ current tree with the gate delta and the layout/hardware stated.
 ## Why this is not a block
 
 Promotion needs a **validated win on one of the delivery's own configurations**, and this cut now has several
-(gfx1201, +23.8 % MoE `pp2048`, +32.2 % dense prefill, **+29.9 % on an MTP target**, all in the `-ot` layout) —
-but it still carries open regressions (a second context, −6.1 % at 8 sequences, −0.9 % on a layer-input draft's
-target) and it is **inert in both splits the delivery actually validates** (`-sm tensor` is one backend; plain
-`-sm layer` has pipeline parallelism on).  Reaching it costs a second compute-buffer set and a hand-written
-`-ot` override, and it reaches a *draft* workload only through its target.  So it stays an artifact: a consumer
-with an `-ot` layout gets a large prefill win for a knob and a documented set of costs.
+(gfx1201, +23.4 % MoE `pp2048`, +48.1 % at the default ubatch shape, +22.3 % dense prefill, **+29.2 % on an MTP
+target**, all in the `-ot` layout) — but it still carries open regressions (a second context, −6.1 % at 8
+sequences, −0.9 % on a layer-input draft's target, **−11.8 % on the host-expert tier at a wide ubatch**) and it
+is **inert in both splits the delivery actually validates** (`-sm tensor` is one backend; plain `-sm layer` has
+pipeline parallelism on).  Reaching it costs a second compute-buffer set and a hand-written `-ot` override, and
+it reaches a *draft* workload only through its target.  So it stays an artifact: a consumer with an `-ot` layout
+and device-resident experts gets a large prefill win for a knob and a documented set of costs; a consumer on the
+host-expert tier should not set it.
 
 It becomes a promotion candidate when it reaches `-sm tensor` (pairing inside the Meta device, or a tensor-split
 hazard analysis), when plain `-sm layer` can use it (the pair needs to coexist with, or replace, the scheduler's

@@ -1,3 +1,50 @@
+## 261111.002 (r260, docs + artifact, NO delivery change) -- optional/two-lane-prefill: PR #301 taken as an r259 re-cut, and the host-expert abort it was hiding
+
+**Change:** `optional/two-lane-prefill/` only -- `two-lane-prefill.patch` re-cut onto the r259 tree
+(`7995db44…`, produces `d1c3f0f9…`; sha256 `64f92b60…`), its `README.md` and the `optional/README.md` row.
+`patches/`, `release.json` and `rdna-boosts-all.patch` are untouched, so no gate is owed beyond the artifact's
+own coherence checks, which were run.
+
+1. **PR #301 verified as claimed, and stale on arrival.**  @slavap's re-cut is exactly what it says: sha256
+   `bf6f8f39…` as stated; strict `git am` on the r254 tree `3f2cad2a…` produces `896446c422…` as stated; and its
+   +/− line set is **identical to the r247 cut's, file by file** (sorted line multisets over all nine files), so
+   the "mechanical rebase, no functional delta" claim holds.  But it landed two releases late: r258 (block 09, the
+   identity expert table served IN PLACE) and r259 (block 01, `q8ce`) moved `ggml-backend-impl.h`,
+   `ggml-backend.cpp` and `ggml-cuda.cu`, so strict `git am` on the **r259** tree fails on
+   `ggml-backend-impl.h` and `scripts/apply-all.sh --include-optional` refuses the artifact (it is strict by
+   design -- a 3-way merge there would silently accept a stale cut).  One factual error in its delta note is
+   corrected in the record: `GGML_SCHED_STAGE_MODE` was retired by **r250** (block 09, `TODO` #284), not by r254
+   and not by blocks 12-15; the resolution (take the per-split refactor, do not reintroduce the retired redirect
+   block) was right.
+2. **A host-expert layout aborted, and it was not the PR's fault.**  `LLAMA_PREFILL_LANES=2 -sm layer -ot …
+   -ncmoe 40` died at the first prefill on `GGML_ASSERT(sched_a->is_alloc && sched_b->is_alloc)` -- reproducibly,
+   on the r246 cut's own binary kept here as `bin-lanes-mtp`, i.e. pre-existing and never seen because every arm
+   that cut measured keeps the experts device-resident.  Root cause: `prepare_ubatch()` grew the `lane` parameter
+   in this artifact, but the delivery's two lane-0 placement blocks inside it (the ring narrow→wide drop and the
+   `drop_now` wide→narrow drop/re-reserve) still ran unconditionally, so the lane-1 prepare dropped and
+   re-reserved lane 0 *after* lane 0's ubatch had been prepared.  Both are `lane == 0` now; the arm runs and its
+   greedy text is the single-lane text (`e2dde701fc04`, 35B-A3B Q8_0, 3 × R9700).  Also dropped the stray blank
+   line the artifact had been adding to `ggml/include/ggml-cuda.h` since r220.
+3. **Re-measured on the r259 base** (3 × R9700 gfx1201, `-sm layer -ts 1/1/1 -ot blk\.0\.attn_q\.weight=ROCm0`,
+   A B B A, same binary, env-gated): `llama-bench pp2048 -b 2048 -ub 2048` 35B-A3B Q8_0 **6534.7 -> 8063.1 t/s
+   (+23.4 %)**; the same at the default `-ub 512` shape **4064.3 -> 6017.6 (+48.1 %)**; 27B MTP target prefill
+   **958.9 -> 1238.7 (+29.2 %)** with decode flat (56.3 -> 56.6) and `--spec-type none` **1057.8 -> 1294.2
+   (+22.3 %)**.  Default path (lanes unset) `gate-prefill-logits.sh`: mean KLD **0.000000 / same-top-p
+   100.000 %**; greedy text identical to the delivery build on `-sm tensor` too; `check-gpu-faults.sh` clean over
+   every arm.
+4. **Record correction, in the r259 entry (`261111.001`):** it was written as `v17-a691b2345-r259`, tip
+   `f7d40dab4`, tree `dc225b37`, which is not the release.  `release.json`, `scripts/apply-all.sh` from
+   `patches/` and the tag `v16-a691b2345-r259` all say tip `c80fa8bda` / tree `7995db44`; `f7d40dab4` /
+   `dc225b37` differs from it only by 25+/13− in `ggml-cuda.cu` (a `rot` parameterisation of the `q8ce` kernels
+   that is not in the delivery set).  Corrected there with a dated note; nothing in `patches/`, `release.json` or
+   `rdna-boosts-all.patch` moved.
+5. **The host-expert tier is the documented hole, and it is a loss there at a wide ubatch** -- `-ncmoe 40`:
+   `llama-bench pp2048 -b 2048 -ub 2048` **6276.7 -> 5537.4 (−11.8 %)**, `llama-cli` on the 5 256-token prompt
+   **5135.4 -> 4218.4 (−17.9 %)**, with the pair confirmed engaged (3 pairs); +5.6 % at the default `-ub 512`,
+   where the second lane overlaps layer work instead of contending for the host link.  Recorded in the artifact
+   README as "leave the knob off on that tier", not as a gate: the delivery's primary MoE configs use
+   `-ncmoe`, so it is the sentence a consumer with a 35B on 8-16 GiB cards needs first.
+
 ## 261111.001 (r259, RELEASE v16-a691b2345-r259) -- contributor PR #298: an 8-bit wire for the copy-engine all-reduce, as `GGML_CUDA_ALLREDUCE=q8ce`
 
 **Shipped:** `v16-a691b2345-r259` (block **01** amended, +317/−3 in `ggml/src/ggml-cuda/ggml-cuda.cu`), base
