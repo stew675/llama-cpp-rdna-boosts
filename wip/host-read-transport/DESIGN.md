@@ -9,9 +9,15 @@ The campaign measured a **crossover**, not a winner (`README.md` §Experiment 1,
 
 | page cache holds the host set? | mapping | buffered `pread` | O_DIRECT |
 |---|---|---|---|
-| yes (40G cgroup, 4 GiB set) | **3 040 cold / 17 102 warm** | 2 491 / 7 068 | 2 177 |
+| yes (40G cgroup, 4 GiB set) | **3 040 cold / 17 102 warm**\* | 2 491 / 7 068 | 2 177 |
 | no (4G cgroup, 8 GiB set) | 1 050 / 1 132 | 2 240 / 2 580 | 2 125 |
 | no (1G cgroup) | **593 / 596** | 1 737 / 1 720 | **2 127** |
+
+\* That warm row is a *re-read* microbenchmark (page-table entries already established).  A MODEL run touches
+each expert once per pass, and there the mapping pays a PTE fault per 4 KiB page: the gate measured the real
+delivered paths on this box and the **buffered arm won both** — fills 29 450 against 14 725 MiB/s, demand
+16 348 against 15 197 (`RESULTS.md` §4).  So the mapping's advantage is narrower than the microbenchmark
+suggests, and `auto` reaching `file` on an unpressured box is the correct outcome, not a false positive.
 
 Today the arm is a **guess**: `pool_decide_dio_locked` reads `MemAvailable` once, at the first pool build, and
 compares it with pool + host set. `MemAvailable` is host-wide (wrong inside a cgroup) and the state it predicts
@@ -42,9 +48,9 @@ consumer that never calls the loader's transport hook keeps the delivered heuris
 
 ## 1. Start optimistically
 
-`auto` always starts on the **mapping**: it is the fastest arm whenever the page cache holds the set (17 GiB/s
-random warm against 7 for a buffered read), it is what every delivered run does today, and being wrong costs one
-probe cadence (128 fills). No capacity prior selects the arm.
+`auto` always starts on the **mapping**: it is what every delivered run does today, it is the arm whose
+advantage is cache-dependent (so it should be sampled, not predicted), and being wrong costs one probe cadence
+(128 fills). No capacity prior selects the arm, and no probe is taken ahead of time.
 
 The cgroup-aware `pool_available_ram_bytes()` (`min(MemAvailable, cgroup memory.max − memory.current)`) stays, but
 as the **root-cause fix for the pinned-pool RAM ceiling**, which had the same host-wide bug — not as a transport
@@ -85,6 +91,16 @@ window measured in minutes and a hysteresis argument that does not exist yet.
 | `MOE_HOST_POOL_DIO=0\|1` | legacy override | still honoured; maps onto `file`/`dio` |
 | `MOE_HOST_POOL_TR_{STALL_K,STALL_N,PROBE_FILLS,PROBE_GAIN,PROBE_N}` | tuning | dimensionless thresholds only |
 | `MOE_HOST_POOL_TR_START` | **campaign only** | start on a named arm (staging an escalation test) |
+
+## 4a. The gate (`gate-host-read-transport.sh`, 24/24)
+
+Seven text arms (hashed with no `-lv`) and seven census arms (`-lv 4`), so no assertion is read off the log a
+hashing arm produced.  It proves, per arm, that the transport named was the transport used (the counters differ
+by path: `mapping memcpys` against `storage reads`, and the same split on the demand path), that `auto`
+**converges on the arm the pinned arms prove fastest in the same run** (or stays put within 15 %), that a
+transition cites its evidence, that a starving cgroup makes the ladder actually move, and that the −41 %
+coupling is unreachable.  The convergence check replaced an assumption of mine ("a RAM-rich box must stay on the
+mapping") that the pinned arms disproved on this hardware — see `RESULTS.md` §4.
 
 ## 5. What the prototype established
 

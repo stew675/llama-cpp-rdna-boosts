@@ -77,3 +77,41 @@ Storage read per stage (`/proc/<pid>/io read_bytes`), same runs, MiB:
 the file arms split (better fills, worse bounce). The **32G row is a clear sign**: with the set not cacheable,
 the mapping collapses to 898 / 1 913 MiB/s and the file arms are ~2x better on every decode pass. A proper
 promotion decision needs the interleaved two-direction A/B per shape (owed, README §"Owed").
+
+## 4. The gate (`gate-host-read-transport.sh`) — 24/24 on `soar`, 2026-11-11
+
+Seven TEXT arms (no `-lv`, hashed) and seven CENSUS arms (`-lv 4`, separate runs), so no assertion is read off
+a log that the hashing arm produced. All seven texts: `144 chars sha=de81b28cab7d`.
+
+**The pinned arms, measured on the warm 91 GiB host — this is the number that matters, and it corrects §1:**
+
+| arm | pool fills | demand (bounce) |
+|---|---:|---:|
+| `ref` — mapping | 14 725 MiB/s | 15 197 MiB/s |
+| `file` — buffered `pread` | **29 450 MiB/s** | **16 348 MiB/s** |
+| `dio` — O_DIRECT | 2 461 MiB/s | 2 235 MiB/s |
+
+**The buffered arm wins on BOTH paths on a warm box**, 2x on fills and 8 % on the demand read — it is not the
+"cold-only" arm the campaign's microbenchmark implied. The microbenchmark (`transport-ab.py`) measured a
+4 GiB working set *re-read* in a tight loop, i.e. with the mapping's page-table entries established; a model
+run overwhelmingly touches each expert once per pass, where the mapping pays a PTE fault per 4 KiB page. That
+distinction is the whole story of "mmap fills perform abysmally", including on an unpressured box.
+
+What the gate asserts (each arm must prove itself, none of it is vacuous):
+
+| assertion | result |
+|---|---|
+| all seven texts identical to `ref` | PASS |
+| each pinned arm reports ITS transport (`map`/`file`/`dio`) | PASS |
+| `ref` fills show `N mapping memcpys`, `file` fills show `N storage reads` | PASS (45 717 / 45 718) |
+| `ref` demand path shows `per-expert mapping reads (bounce)`, `file` shows `storage reads (bounce)` | PASS (14 067 / 14 066) |
+| `auto` converges on the arm the PINNED arms prove fastest (or stays put within 15 %) | PASS — file 15 705 vs map 15 008, ended on `file` |
+| a transition must cite its evidence (`probe fill`/`stall`) | PASS |
+| `auto` inside a 32G scope must latch (ladder is not dead code) | PASS — `map -> file`, 1 step |
+| `buffered` + `MOE_HOST_POOL_STAGE_SPAN=0` must be REFUSED (the −41 % coupling) | PASS — falls back to `map` |
+| `auto` + span off must never select `file` | PASS — ends on `map` |
+
+The gate's first two runs (22/24, then 24/24) are the reason its convergence check is written this way: it
+asserted "a RAM-rich box must stay on the mapping", which was an **assumption of mine**, and the pinned arms
+disproved it on this hardware. The check now derives the expected arm from the same run's own pinned
+measurements, so it is box-independent.

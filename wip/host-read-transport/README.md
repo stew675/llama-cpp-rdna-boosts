@@ -126,6 +126,11 @@ Measured: text `de81b28cab7d` for `mmap` / `buffered` / `auto` and the static fo
 scope `auto` latches with `map -> file (probe fill: file served the same read in 33 us against this arm's 50 us,
 3 samples running)`.
 
+**On this box the buffered arm wins BOTH paths even unpressured** (fills 29 450 vs 14 725 MiB/s, demand 16 348 vs
+15 197), so `auto` converging on `file` is correct here — the mapping's edge is limited to re-reads with
+established page-table entries, which a model pass does not do. The gate grades `auto` against the pinned arms'
+own measurement of the same run rather than against an assumption (`RESULTS.md` §4).
+
 ## Owed before anything is promoted
 
 * **A two-direction A/B per shape, interleaved**, on the 56G/44G/32G ladder (this campaign ran one arm per
@@ -145,6 +150,7 @@ scope `auto` latches with `map -> file (probe fill: file served the same read in
 | `0002-adaptive-host-read-transport.patch` | the **adaptive** layer on top of `0001`: cgroup-aware capacity prior + monitored ladder, `MOE_HOST_POOL_TRANSPORT=auto` |
 | `DESIGN.md` | the adaptive design, what the prototype proved, and what it still owes |
 | `test-adaptive.sh` | the prototype's checks (`text`, `escalate`, `slowguard`) |
+| `gate-host-read-transport.sh` | **the gate**: 7 text arms + 7 census arms, 24 assertions (see `RESULTS.md` §4) |
 | `transport-ab.py` | experiment 1: the transport in isolation, under a cgroup-shaped page-cache budget |
 | `text-ab.sh` | the four-arm text-identity check (greedy, hashed with `scripts/extract-generated.py`) |
 | `RESULTS.md` | the raw tables and the run directory names under `wip/bench-56gb/runs/` |

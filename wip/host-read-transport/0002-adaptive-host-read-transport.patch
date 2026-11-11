@@ -1,6 +1,6 @@
-From 2d09e0a48567a551c853ee7ee44936da777f4890 Mon Sep 17 00:00:00 2001
+From f231c83587ab9f6d042c2ca8339e0fe7a1d60cdb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Wed, 11 Nov 2026 08:42:44 -0600
+Date: Wed, 11 Nov 2026 09:03:12 -0600
 Subject: [PATCH] wip(host-read-transport): adaptive transport -- optimistic
  map start, stall detection + probe-fill A/B, and `--load-mode buffered`
 
@@ -41,12 +41,12 @@ Owed: the gate (a transition arm + the pinned arms + the span coupling), the int
 probe knobs, the decode ladder, and a Windows-form measurement.
 ---
  common/arg.cpp                         |   5 +-
- ggml/src/ggml-cuda/moe-expert-cache.cu | 413 ++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 452 ++++++++++++++++++++++++-
  include/llama.h                        |   5 +
- src/llama-model-loader.cpp             |  35 ++-
+ src/llama-model-loader.cpp             |  35 +-
  src/llama.cpp                          |   3 +
  tools/llama-bench/llama-bench.cpp      |   4 +-
- 6 files changed, 450 insertions(+), 15 deletions(-)
+ 6 files changed, 489 insertions(+), 15 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index faa73a2e9..a3a39142c 100644
@@ -72,10 +72,10 @@ index faa73a2e9..a3a39142c 100644
          }
      ).set_env("LLAMA_ARG_LOAD_MODE"));
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index b89194383..0ca3d064f 100644
+index b89194383..24d7a790d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -405,6 +405,39 @@ bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool s
+@@ -405,6 +405,47 @@ bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool s
  // unless asked (`file` is a candidate default for the promotion, not this instrument).
  bool    g_pool_fill_src_file   = false;  // MOE_HOST_POOL_FILL_SRC=file:   the pool FILL reads the file
  bool    g_pool_demand_src_file = false;  // MOE_HOST_POOL_DEMAND_SRC=file: the bounce/demand read does
@@ -111,11 +111,19 @@ index b89194383..0ca3d064f 100644
 +static int     g_pool_tr_probe_n      = 3;     // MOE_HOST_POOL_TR_PROBE_N     (consecutive wins to latch)
 +static int     g_pool_tr_probe_wins   = 0;
 +static int64_t g_pool_tr_bounce_reads = 0;     // the demand path's own probe cadence
++// The two read paths have OPPOSITE biases and both must be heard before the ladder moves.  A pool FILL always
++// touches a cold expert, so the mapping pays a PTE fault per page and the file arm wins even when the cache
++// holds the set (measured on a RAM-rich box: 33 us against 50 us).  The DEMAND read re-reads experts, so the
++// mapping's PTEs are established and it wins.  A decision taken during the pool preload -- when only fills have
++// run -- therefore latches on a biased sample, which is exactly what the first version of this gate caught.
++static int     g_pool_tr_samples_fill   = 0;
++static int     g_pool_tr_samples_bounce = 0;
++static bool    g_pool_tr_bounce_seen    = false;
 +
  // TODO #87 (1): `MOE_HOST_POOL_DIO` is AUTO by default -- decided once, at the first pool build, from
  // MemAvailable vs the host expert set (the same measurement `MOE_HOST_POOL_RAM_PCT` takes).  Buffered fills
  // (DIO=0) let the page cache act as an L3, which is worth +90 % decode / +155 % prefill when the set fits;
-@@ -1153,6 +1186,44 @@ void parse_env() {
+@@ -1153,6 +1194,44 @@ void parse_env() {
          const char * ds = getenv("MOE_HOST_POOL_DEMAND_SRC");
          g_pool_fill_src_file   = fs != nullptr && strcmp(fs, "file") == 0;
          g_pool_demand_src_file = ds != nullptr && strcmp(ds, "file") == 0;
@@ -160,7 +168,7 @@ index b89194383..0ca3d064f 100644
      }
      // TODO #87 (1): AUTO by default (see `g_pool_dio_req`).  An explicit `MOE_HOST_POOL_DIO=0|1` wins and is
      // decided here, so an A/B never depends on the machine.
-@@ -1643,7 +1714,57 @@ static int64_t pool_available_ram_bytes() {
+@@ -1643,7 +1722,57 @@ static int64_t pool_available_ram_bytes() {
          }
      }
      fclose(f);
@@ -219,7 +227,7 @@ index b89194383..0ca3d064f 100644
  #elif defined(GGML_USE_HIP) && defined(_WIN32)
      return ggml_hip_win_available_ram_bytes();
  #else
-@@ -1912,6 +2033,207 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
+@@ -1912,6 +2041,237 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
                    g_pool_dio ? "the set does not fit beside the pool" : "the set fits beside the pool");
  }
  
@@ -252,6 +260,15 @@ index b89194383..0ca3d064f 100644
 +    if (next < 0 || next >= POOL_TR_N) {
 +        return;
 +    }
++    if (next == POOL_TR_FILE && !g_pool_stage_span) {
++        // the coupling above, for an explicit request (`--load-mode buffered`, MOE_HOST_POOL_TRANSPORT=file)
++        GGML_LOG_WARN("%s: a buffered per-expert transport needs the coalesced prefill read "
++                      "(MOE_HOST_POOL_STAGE_SPAN is 0, and the pair is the measured -41 %% arm): keeping the "
++                      "MAPPING transport instead.  Unset MOE_HOST_POOL_STAGE_SPAN to use buffered reads.\n",
++                      __func__);
++        next = POOL_TR_MAP;
++        why  = "the coalesced span is off, so the buffered arm is refused";
++    }
 +    const int prev = g_pool_transport;
 +    if (g_pool_tr_applied && next == prev) {
 +        return;
@@ -264,10 +281,12 @@ index b89194383..0ca3d064f 100644
 +    g_pool_demand_src_file  = next >= POOL_TR_FILE;
 +    g_pool_tr_stalls        = 0;
 +    g_pool_tr_probe_wins    = 0;
++    g_pool_tr_samples_fill  = 0;
++    g_pool_tr_samples_bounce = 0;
 +    g_pool_tr_ewma_us       = 0.0;
 +    g_pool_tr_reads         = 0;
-+    if (next != prev) {
-+        g_pool_tr_switches++;
++    if (prev >= 0 && next != prev) {
++        g_pool_tr_switches++;   // a real transition; the initial apply is not one
 +    }
 +    GGML_LOG_INFO("%s: host read transport -> %s (%s)\n", __func__, pool_transport_name(next), why);
 +}
@@ -323,6 +342,14 @@ index b89194383..0ca3d064f 100644
 +// `g_mutex`.
 +static int pool_transport_next_arm_locked() {
 +    for (int a = g_pool_transport + 1; a < POOL_TR_N; a++) {
++        // THE COUPLING (TODO #306's second condition): a per-expert buffered read without the coalesced span
++        // is the measured -41 % pair, because at depth 1 a 0.6 MiB `pread` is latency-bound where the mapping
++        // gets fault-around prefetch.  `MOE_HOST_POOL_STAGE_SPAN=0` is a delivery kill switch, so it WINS: the
++        // file arm is not selectable at all and the ladder steps over it to O_DIRECT (which does not pay the
++        // fault storm either).  Nothing an operator can type lands in the bad pair.
++        if (a == POOL_TR_FILE && !g_pool_stage_span) {
++            continue;
++        }
 +        if (a == POOL_TR_MAP || pool_file_io_available()) {
 +            return a;
 +        }
@@ -384,8 +411,19 @@ index b89194383..0ca3d064f 100644
 +
 +// One probe sample: the other arm served the same-sized read.  Latch the ladder when it wins by `gain` x,
 +// `N` samples running, against what the CURRENT arm's reads have been taking.
-+static void pool_transport_probe_compare_locked(int64_t probe_us, int64_t cur_us) {
++static void pool_transport_probe_compare_locked(int64_t probe_us, int64_t cur_us, bool from_bounce) {
 +    if (probe_us <= 0 || cur_us <= 0) {
++        return;
++    }
++    if (from_bounce) {
++        g_pool_tr_samples_bounce++;
++    } else {
++        g_pool_tr_samples_fill++;
++    }
++    // Hold the ladder until the demand path has produced its own samples: until then the evidence is
++    // preload-phase fills only, which favour the file arm by construction (see the declaration).
++    if (g_pool_tr_bounce_seen && g_pool_tr_samples_bounce < g_pool_tr_probe_n) {
++        g_pool_tr_probe_wins = 0;
 +        return;
 +    }
 +    if ((double) probe_us * g_pool_tr_probe_gain < (double) cur_us) {
@@ -427,7 +465,7 @@ index b89194383..0ca3d064f 100644
  // Cap this table's `slots` so the WHOLE pinned pool stays under `MOE_HOST_POOL_RAM_PCT` % of MemAvailable.
  // Caller holds `g_mutex` (it updates the process-wide running total).
  //
-@@ -2202,7 +2524,13 @@ static host_pool_t * table_pool_locked(table_t & t) {
+@@ -2202,7 +2562,13 @@ static host_pool_t * table_pool_locked(table_t & t) {
      int64_t planned_pool = g_pool_total_bytes > 0 ? g_pool_total_bytes
                                                   : (host_total * g_pool_frac) / 100;
      // TODO #87 (1): decide the fill mode before ANY read happens, from the process-wide numbers.
@@ -442,7 +480,7 @@ index b89194383..0ca3d064f 100644
      if (g_pool_total_bytes > 0) {
          // explicit process-wide budget, split proportionally to each tensor's share of the host set
          if (host_total > 0) {
-@@ -2403,7 +2731,40 @@ static void pool_reap_locked(host_pool_t & p) {
+@@ -2403,7 +2769,40 @@ static void pool_reap_locked(host_pool_t & p) {
  // when it is unavailable (a platform whose pool file I/O is a stub, a file that cannot be opened) the fill
  // falls back to the mapping instead of failing, because failing here marks the whole pool dead (issue #274).
  // Caller holds `g_mutex`.
@@ -463,7 +501,7 @@ index b89194383..0ca3d064f 100644
 +            int64_t probe_us = 0;
 +            if (pool_read_via_arm_locked(p.path.c_str(), off, map_src, p.host_bytes, dst, next, &probe_us)) {
 +                if (g_pool_tr_ewma_us > 0.0) {
-+                    pool_transport_probe_compare_locked(probe_us, (int64_t) g_pool_tr_ewma_us);
++                    pool_transport_probe_compare_locked(probe_us, (int64_t) g_pool_tr_ewma_us, false);
 +                }
 +                g_fill_read_us     += probe_us;             // it really was a fill: keep the census honest
 +                g_fill_total_bytes += (int64_t) p.host_bytes;
@@ -483,7 +521,7 @@ index b89194383..0ca3d064f 100644
      // wip/host-pool-speed: the fill's WALL TIME, by source.  A demand fill is synchronous (the host thread
      // blocks on it), so this is the number that decides whether an overlapped/coalesced fill is worth
      // building at all (README §16).  Two clock reads per fill: fills are ~1 per miss, so this is free.
-@@ -3398,10 +3759,29 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+@@ -3398,10 +3797,29 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
      const size_t rd_off = trim ? t.src_off       : 0;
      char * const rd_dst = buf + rd_off;
      bool   filled = false;
@@ -500,7 +538,7 @@ index b89194383..0ca3d064f 100644
 +            if (pool_read_via_arm_locked(t.src_path.c_str(), off, msrc, rd_len, rd_dst, next, &probe_us)) {
 +                filled = true;
 +                if (g_pool_tr_ewma_us > 0.0) {
-+                    pool_transport_probe_compare_locked(probe_us, (int64_t) g_pool_tr_ewma_us);
++                    pool_transport_probe_compare_locked(probe_us, (int64_t) g_pool_tr_ewma_us, true);
 +                }
 +            }
 +        }
@@ -514,7 +552,7 @@ index b89194383..0ca3d064f 100644
          !t.src_path.empty()) {
          // DISK TIER (`MOE_HOST_POOL_DIO=1`): read the expert with O_DIRECT so the page cache is not
          // populated -- the whole point of the mode, and it must hold for STAGING too (a whole-table prefill
-@@ -3440,6 +3820,9 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+@@ -3440,10 +3858,14 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
          g_bounce_map_us    += ggml_time_us() - tm;
          g_bounce_map_bytes += (int64_t) rd_len;
          filled = true;
@@ -524,7 +562,12 @@ index b89194383..0ca3d064f 100644
      }
      if (!filled) {
          return false;
-@@ -7048,10 +7431,24 @@ void moe_cache_set_host_pool_budget(size_t bytes) {
+     }
++    g_pool_tr_bounce_seen = true;   // the demand path is live: the ladder must hear it (see the declaration)
+     out->base    = buf;
+     out->kind    = cudaMemcpyHostToDevice;
+     out->bounce  = idx;
+@@ -7048,10 +7470,24 @@ void moe_cache_set_host_pool_budget(size_t bytes) {
      g_pool_budget_override = (int64_t) bytes;
  }
  
@@ -551,7 +594,7 @@ index b89194383..0ca3d064f 100644
  }
  
  void moe_cache_heat_open(const char * model_path) {
-@@ -9690,6 +10087,12 @@ static void report_locked() {
+@@ -9690,6 +10126,12 @@ static void report_locked() {
      }
      if (g_fill_read_calls + g_fill_memcpy_calls > 0) {
          const double tb = (double) g_fill_total_bytes / (1024.0 * 1024.0 * 1024.0);
