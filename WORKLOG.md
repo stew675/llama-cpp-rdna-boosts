@@ -31,11 +31,18 @@ incremented by the observe path a probe returns BEFORE, so once a probe succeede
 42 746 probes serving 42 746 fills, and after the ladder reached `file` every probe was a `dio` read: 67 ms/token
 against 39.  Fixed by counting the cadence on the wrapper line itself; probes are 1 in 128 and cost 15-66 ms.
 
+**The MTP four-axis gate is RUN and passes** (`benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`), on the
+MoE arm of the protocol (Qwen3.6-35B-A3B Q8_0, `-ncmoe 24 -lme 8`) because the canonical dense 27B has no host
+experts and cannot see a transport change: acceptance **identical to five decimal places across all three
+transports on every axis** (0.75118 / 0.75379 / 0.87798 / 0.98667), MTP above plain everywhere (+65 / +71 / +73 /
++112 %), `none` vs `draft-mtp n3` **byte-identical** across transports (prose `2de120b8aeec`, code `42c309c538dd`),
+and adaptive n12 85.7-144.1 t/s at 0.61-0.91 acceptance -- the one latch (recall -> `file`) picked an arm that
+measures 146.22 against the pin's 146.21, i.e. no worse, at a 1.5 % transition cost.
+
 **Owed, and deliberately NOT chased** (the maintainer's "pragmatic" call, same session): the probe thresholds are
 reasoned rather than tuned (the one-off runs were inconclusive because the box drifted -- the same pinned arm read
 12.8 t/s in the matrix and 11.3 ten minutes later; they are env knobs and the gate grades the outcome, so this is
-tuning, not risk), the MTP four-axis protocol has not been run (host-side change, no kernel or numerics), and no
-Windows-form measurement exists.  Promote-or-park is the maintainer's decision; the close-out section of the
+tuning, not risk), and no Windows-form measurement exists (the MTP four-axis is now run -- see above).  Promote-or-park is the maintainer's decision; the close-out section of the
 campaign README carries the checklist for both.
 
 ## 261111.009 (wip, NO delivery change) -- the per-expert host read transport is a CROSSOVER, not a preference: the mapping is the fastest arm while the page cache holds the set and collapses to ~600 MiB/s when it cannot (TODO #306, widened)

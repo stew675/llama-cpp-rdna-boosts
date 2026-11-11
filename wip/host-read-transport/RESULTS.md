@@ -183,3 +183,25 @@ threshold is left at 1.5 and the measurement is owed: interleaved, ballast held,
 **Not run: the MTP four-axis protocol.** The change is host-side (no kernel, no numerics) and the four-axis gate
 is the contract for decode-kernel/speculator changes; it stays owed before a promotion, together with the
 interleaved threshold measurement above.
+
+## 6. The MTP four-axis gate (2026-11-11) — PASS
+
+Full record: [`benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`](../../benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md).
+Run on the MoE arm of the protocol (Qwen3.6-35B-A3B Q8_0, `-ncmoe 24 -lme 8`) because the canonical dense 27B has
+no host experts and cannot see a transport change; `-n 3000`, the four axis prompts with their hashes recorded.
+
+| axis | plain | n3 map | n3 file | acceptance (all three transports) |
+|---|---:|---:|---:|---|
+| R | 64.05 | 105.77 | 105.51 | 0.75118 |
+| P | 62.81 | 107.21 | 106.97 | 0.75379 |
+| C | 62.59 | 108.26 | 107.25 | 0.87798 |
+| K | 61.31 | 129.22 | 129.30 | 0.98667 |
+
+* acceptance **identical to five decimal places across transports on every axis**
+* MTP beats plain everywhere (+65 / +71 / +73 / +112 %)
+* purity: `none` == `draft-mtp n3` **byte-identical** across transports (prose `2de120b8aeec`, code `42c309c538dd`)
+* adaptive n12: 85.7 / 89.6 / 92.3 / 144.1 t/s, acceptance 0.61-0.91; the single latch (recall -> `file`) landed
+  on an arm that measures **146.21 (map) against 146.22 (file)**, so it picked no worse than the pin; the 1.5 %
+  it cost is the transition, inside the protocol's noise band.
+
+With that, every release-gate item for this change except a Windows-form measurement is run.
