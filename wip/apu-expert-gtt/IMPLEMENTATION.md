@@ -428,6 +428,11 @@ repeated-prompt arm; pp rate reported against the all-resident arm.
 > *worse* on this tier at every slot count (0.708 against LFRU's 0.727 at S=56, 0.880 against 0.918 at S=133) and
 > the tier already implements the predicted-best policy (`MEASUREMENTS.md` §26).
 >
+> **The discrete side is measured too** (`MEASUREMENTS.md` §27, 2026-11-11): on `soar` (3x R9700 gfx1201) the tier is
+> inert with its envs forced ON, `-lme` still means the host-expert budget, `scripts/gate-host-pool.sh` is **42/42**
+> with the patched build, and the pool path's throughput is within noise.  §9's "must be provably inert there" is
+> now a measurement.
+>
 > **What is left is the promotion itself.**  The docs are staged: the env table is in `README.md` with
 > each variable's class, the measured facts are in §6/`MEASUREMENTS.md`, and the `ENVIRONMENT.md` /
 > `INVARIANTS.md` / `patches/README.md` texts are written out in the newest `WORKLOG.md` entry.

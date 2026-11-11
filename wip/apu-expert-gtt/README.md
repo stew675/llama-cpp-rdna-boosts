@@ -25,6 +25,12 @@ current then):
 > `WORKLOG.md` entry.  The re-runnable tools are [`arms.sh`](arms.sh), [`guard.sh`](guard.sh),
 > [`cold-cache.py`](cold-cache.py) and [`../../scripts/gate-uma-experts.sh`](../../scripts/gate-uma-experts.sh).
 
+**Cross-machine (2026-11-11, `MEASUREMENTS.md` §27):** the discrete side is measured, not claimed.  On `soar`
+(3x R9700 gfx1201, ROCm 10.1.0) the campaign's envs forced ON are **inert** (zero GTT lines, identical text
+`a99ccbd97ecb`), `-lme` still means the host-expert budget, **`scripts/gate-host-pool.sh` is 42/42 green** with the
+patched build, and the pool path's throughput is within noise (pp512 1750/1774 against 1745/1755, tg128 62.8/61.3
+against 62.9/60.7 t/s).
+
 **Where the wins are, in one line each:** the store itself is a *fittability* tier (a 123.45 GiB model on a 123 GiB
 box); the decode wins are P4b (+15.6 %) and P4f (+13.7 % warm, +56-67 % on a >RAM model); the prefill win is P5
 (+63-67 % on a >RAM model, neutral on a fitting one).  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a

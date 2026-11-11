@@ -1,3 +1,49 @@
+## 261111.030 (wip, NO delivery change) -- CROSS-MACHINE on `soar` (discrete RDNA4, 3x R9700): the campaign is INERT there by measurement, the host-expert pool gate is 42/42, and throughput is unchanged
+
+**Campaign-scope** (no `patches/`, no `release.json`, nothing applied to any checkout that ships).  Record:
+[`MEASUREMENTS.md` §27](wip/apu-expert-gtt/MEASUREMENTS.md).  This closes the campaign's "the discrete side is a
+claim, not a measurement" debt: the promotion criteria require the pool/arena path to be unchanged bit for bit on a
+discrete box, and now it is measured instead of argued.
+
+**Box and method.**  `ssh soar`: 3x **R9700 gfx1201 (RDNA4)** + a gfx1036 iGPU, 91 GiB RAM, kernel 7.3.3, ROCm
+**10.1.0** (`/opt/rocm-10.1.0-gfx120X`).  `~/llama.cpp` there is a clean checkout of the fork at the r262 tip
+`d65b0e889` and was **not touched**: the patched build is a `git clone --shared` at `~/apu-gtt-check`, the campaign
+patch applied with `git am` (tree `9e972b50…`, byte-identical to the campaign's own tree), built with
+`~/bin/build-llama-rocm` into its own `build-rocm`; `~/llama.cpp/build-rocm` is the unpatched reference.
+
+**27.1 Inert on a discrete GPU, by measurement.**  With the campaign's envs *forced on* (`MOE_EXPERT_GTT_ARENA=1`,
+`+ MOE_EXPERT_GTT_PREFILL_READERS=8`) on the pool config (`-ncmoe 47 --host-experts pool`, Flash-Next GSQ-IQ3_XXS,
+`MOE_HOST_LIMIT_FRAC=40`, prior frozen): **zero** `GTT`/`gtt_store` lines in the log, the host pool unchanged
+(141 tensors, 56 964 slots), and the text **`a99ccbd97ecb`** -- the same hash the unpatched build produces and the
+hash recorded in `gate-host-pool.sh`'s own header.  `plan_gtt_expert_store()` is only reachable from the UMA branch,
+`gtt_store_open()` is never called, and the new prefill hook declines on `!g_gtt_arena` before it looks at anything.
+
+**27.2 `-lme` on a discrete box is still the host-expert budget.**  `-lme 4` there gives
+`host experts: pinned 0.0 MiB of 40012.5 MiB (cap 4096.0 MiB), pageable 40012.5 MiB, 141/141 pool sources
+registered; -lme 4 -> a pinned per-EXPERT poo[l]`, pool 7332 slots, text identical, zero GTT lines -- the APU reading
+of the flag (the store's size) stays confined to the UMA branch, so the flag still carries across in the direction
+it was designed to.
+
+**27.3 `scripts/gate-host-pool.sh` with the patched build: 42/42 PASSED.**  All nine arms (`ref`, `dio`, `nodisk`,
+`fail`, `late`, `sink`, `sinkfail`, `pinlate`, `pin0`): every arm's greedy text byte-identical to `ref`
+(`a99ccbd97ecb`), the demote arms really demote (5128) and a failed demote publishes nothing (0 demoted),
+`fail`/`late` keep **takeover=0** and report every failed fill as NOT resident, `pinlate` still serves 5434 fills
+from a pool built before the latch (its text is the documented issue-#282 mid-run mixture, `b981e742aa13`), the
+census prints once from the model teardown in every arm, and the kernel journal plus every arm log are clean
+(`check-gpu-faults.sh`).
+
+**27.4 Throughput, patched vs unpatched, alternating** (35B-A3B Q8_0, `-ncmoe 20 --host-experts pool`, `-r 2`):
+pp512 1745.13/1754.79 against **1750.40/1774.16 t/s**, tg128 62.88/60.71 against **62.76/61.27 t/s** -- **within
+noise on both axes**, with overlapping spreads.  No throughput claim beyond that is made; the point is that the
+discrete path is not disturbed.
+
+**Housekeeping:** `~/apu-gtt-check` (the patched tree + its build) is left on soar so the run can be repeated; the
+campaign patch is at `/tmp/gtt-expert-store.patch` there, and the gate scripts were copied to `~/apu-gtt-gate/`.
+Nothing was pushed, nothing in `~/llama.cpp` was modified (it is still clean at `d65b0e889`).
+
+**Still owed, unchanged:** multi-device (on both boxes -- the APU side has one GPU, and the discrete check above is
+`GPU=0`), the MTP four-axis protocol for the decode-affecting stages, probe 15, and the promotion itself.
+
 ## 261111.029 (wip, NO delivery change) -- `-lme` is the opt-in for STREAMING: with it the arena may stream a set larger than RAM, without it the load refuses (0.2 s, with the fix) instead of over-committing
 
 **Campaign-scope** (no `patches/`, no `release.json`, nothing applied to the fork).  Artifact re-cut:

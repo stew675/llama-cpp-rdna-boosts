@@ -1598,3 +1598,85 @@ and magnitude -- the simulator is not obviously mis-modelling this tier.
   the 122B would be a better bound on its own workload; the *ranking* of the policies is what the question asked
   for, and it is unchanged across S.
 * **SLRU / decay-period tuning**: the +1.8 pt is one trace, three prompts, one box.
+
+## 27. 2026-11-11 — CROSS-MACHINE: the campaign on a discrete RDNA4 box (`soar`, 3x R9700 gfx1201). Inert by measurement, host-expert pool green, throughput unchanged
+
+The promotion criteria demand "no regression on the discrete boxes (the GTT store is unreachable there; the
+pool/arena path must be unchanged bit for bit)".  Until now that was a *claim* from `g_gtt_arena` / `prop.integrated`
+gating; this is the measurement.
+
+**Box** (`ssh soar`): 3x **R9700, gfx1201 (RDNA4)** + a gfx1036 iGPU, Ryzen 9 9950X3D2, **91 GiB RAM**, kernel
+**7.3.3**, ROCm **10.1.0** (`/opt/rocm-10.1.0-gfx120X`).  `~/llama.cpp` is a clean checkout of the fork at the r262
+tip `d65b0e889` and was **not touched**: the patched build lives in a throwaway `git clone --shared` at
+`~/apu-gtt-check` (patch applied with `git am`, tree `9e972b50…` -- the same tree as the campaign's own), built with
+`~/bin/build-llama-rocm` into its own `build-rocm`.  The unpatched reference is `~/llama.cpp/build-rocm`.
+
+### 27.1 The GTT tier is INERT on a discrete GPU
+
+The campaign's envs forced on, on the discrete box, on the host-expert pool config (`-ncmoe 47 --host-experts pool`,
+Flash-Next GSQ-IQ3_XXS, `MOE_HOST_LIMIT_FRAC=40`, prior frozen):
+
+| forced env | text | `GTT` lines in the log | host pool |
+|---|---|---|---|
+| `MOE_EXPERT_GTT_ARENA=1` | `a99ccbd97ecb` (182 chars) | **0** | 141 tensors, 56 964 slots |
+| `+ MOE_EXPERT_GTT_PREFILL_READERS=8` | `a99ccbd97ecb` | **0** | 141 tensors, 56 964 slots |
+
+Zero `GTT expert store` / `GTT arena tier` / `GTT prefill stream` / `plan_gtt_expert_store` lines: `plan_gtt_expert_store()`
+is only reached from the UMA branch of `plan_host_expert_placement()`, `gtt_store_open()` is never called, and
+`moe_cache_prefill_stream()` declines on `!g_gtt_arena` before it looks at anything.  The env vars are inert, not
+merely harmless.
+
+### 27.2 `-lme` on a discrete box still means what it always meant
+
+`-lme 4` on the same config is the **host-expert budget**, and it behaves exactly as r262 left it:
+
+    host experts: pinned 0.0 MiB of 40012.5 MiB (cap 4096.0 MiB), pageable 40012.5 MiB, 141/141 pool sources
+    registered; -lme 4 -> a pinned per-EXPERT poo[l] ...
+    host pool (L2): 141 tensors, 7332 slots
+
+Text identical (`a99ccbd97ecb`), zero GTT lines.  The APU reading of `-lme` (the GTT store's size) is confined to the
+UMA branch, so the one command line still carries across in the direction it was designed to.
+
+### 27.3 `scripts/gate-host-pool.sh` -- 42/42 with the patched build
+
+The discrete host-expert pool gate, run against `~/apu-gtt-check/build-rocm/bin/llama-cli` (nine arms: `ref`, `dio`,
+`nodisk`, `fail`, `late`, `sink`, `sinkfail`, `pinlate`, `pin0`):
+
+* **`42/42 checks passed`** -- every arm's greedy text is byte-identical to `ref` (`a99ccbd97ecb`, 182 chars), which
+  is also the hash recorded in that gate's own header;
+* `sink`: 5128 demoted; `sinkfail`: 5128 demote copies failed and **nothing published** (0 demoted);
+* `fail` / `late`: **takeover=0** (a failed fill declines its op), every failed fill reports the slot as NOT resident,
+  the cause-hiding `async fill failed` message is absent;
+* `pinlate`: the latch stopped the tier GROWING, not its use (5434 fills served from a pool built before the
+  refusal) -- that arm's text is `b981e742aa13` (171 chars), the documented issue-#282 mid-run-mixture condition;
+* the exit census prints once, from the model teardown, in every arm; no arm aborts; **kernel journal and every arm
+  log clean** (`scripts/check-gpu-faults.sh`).
+
+### 27.4 Text identity patched vs unpatched, same config
+
+| build | text (pool arm, `-n 32`, `--temp 0 --seed 42`) | pool |
+|---|---|---|
+| `~/llama.cpp/build-rocm` (unpatched, r262 tip) | **`a99ccbd97ecb`**, 182 chars | 141 tensors, 56 541 slots |
+| `~/apu-gtt-check/build-rocm` (patched) | **`a99ccbd97ecb`**, 182 chars | 141 tensors, 56 823 slots |
+
+(The pool's slot count is sized from free memory at build time, so it varies run to run; the gate asserts `> 0`.)
+
+### 27.5 Throughput, patched vs unpatched, alternating (`-ncmoe 20 --host-experts pool`, 35B-A3B Q8_0, `-r 2`)
+
+| arm | pp512 | tg128 |
+|---|---|---|
+| unpatched | 1745.13 ± 7.19 / 1754.79 ± 10.79 t/s | 62.88 ± 5.69 / 60.71 ± 6.44 t/s |
+| **patched** | 1750.40 ± 3.12 / 1774.16 ± 9.51 t/s | 62.76 ± 5.45 / 61.27 ± 5.20 t/s |
+
+**Within noise on both axes** (+0.3 / +1.1 % prefill, -0.2 / +0.9 % decode, with overlapping spreads).  No throughput
+claim is made beyond that: the point is that the discrete host-expert path is not disturbed.
+
+### 27.6 Not measured
+
+* **`gate-uma-experts.sh` on soar**: it is the UMA gate and has nothing to test there (its `off` arm would pass
+  trivially); the discrete side's gate is `gate-host-pool.sh`, above.
+* **Two or three GPUs at once**: this box has three R9700s, but the pool path here is single-device (`GPU=0`), which
+  is what the gate defines.  A multi-device pool/tensor-split regression check is still owed (it is owed on the APU
+  side too -- see §25.6/§26.3).
+* **A long-running arm**: the gate's arms are 32-token greedy runs; a throughput/acceptance comparison over the
+  MTP four-axis protocol is still the campaign's outstanding debt on any box.
