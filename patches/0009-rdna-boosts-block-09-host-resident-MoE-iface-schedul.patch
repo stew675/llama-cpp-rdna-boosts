@@ -1,4 +1,4 @@
-From 005012663e6c2bfa57d568f46833231915c58f3a Mon Sep 17 00:00:00 2001
+From 141820287f8059ca3cfdfa23d1d425d2afd5846e Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/15] rdna-boosts: block 09: host-resident MoE (iface,
@@ -65,7 +65,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  ggml/src/ggml-cuda/ggml-cuda.cu               | 2739 ++++++-
  ggml/src/ggml-cuda/mmvq.cu                    |  275 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 6607 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 6632 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  347 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -103,7 +103,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17483 insertions(+), 541 deletions(-)
+ 68 files changed, 17508 insertions(+), 541 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -10790,10 +10790,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..acc55466e
+index 000000000..e4ae27776
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6607 @@
+@@ -0,0 +1,6632 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -16253,6 +16253,31 @@ index 000000000..acc55466e
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
++    // issue #294: this is the one path that issues DEVICE copies from a scheduler callback, so it owns the
++    // device the copies run on.  `cudaMemcpyAsync`/`cudaMemcpy2DAsync` -- and the `cudaHostAlloc` bounce
++    // allocation a pageable master needs -- resolve against the CURRENT device, while the table, its arena
++    // and the stream all belong to `t.device`.  The scheduler does not make the backend's device current
++    // (the hook does now, see `ggml-cuda-moe-cache-hooks.cu`), and a disagreement copies through the wrong
++    // device's transfer engine or errors out where the tail's `cudaGetLastError()` eats it.  On a
++    // single-device box the two always agree, which is why this only ever showed up on a multi-device one.
++    // Report a disagreement once (a caller that forgets the hook) and make the fill device-correct anyway.
++    {
++        int cur = -1;
++        if (cudaGetDevice(&cur) == cudaSuccess && cur != t.device) {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                // fprintf and not GGML_LOG_WARN: llama-cli's default threshold is ERROR, so a WARN here is
++                // invisible to the operator -- the same reason the `DEGENERATE TENSOR SPLIT` line uses
++                // stderr.  A reporter's log is the only place this can be seen.
++                fprintf(stderr, "%s: filling the arena for layer=%d role=%s on device %d while device %d is "
++                                "the current one; the device is switched here, but a caller that issues these "
++                                "fills without making the table's device current is a bug (issue #294).\n",
++                        __func__, t.layer, t.role.c_str(), t.device, cur);
++            }
++        }
++    }
++    device_guard dg_fill(t.device);
 +    t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
 +
 +    // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1).  A prefill ubatch is never

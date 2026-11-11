@@ -28931,10 +28931,10 @@ index 000000000..07f58164d
 +int ggml_backend_cuda_buffer_type_device(ggml_backend_buffer_type_t buft);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 new file mode 100644
-index 000000000..c4e797c0b
+index 000000000..715f584e6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,331 @@
 +// MoE expert-cache callbacks + op-offload staging hooks (block 06/09) and the FA/H2D staging
 +// accounting.  Split out of ggml-cuda.cu (an upstream hub).
 +
@@ -29165,6 +29165,7 @@ index 000000000..c4e797c0b
 +
 +bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device, slice_off, split_axis, slices, n_slices);
 +}
 +
@@ -29181,6 +29182,7 @@ index 000000000..c4e797c0b
 +        const struct ggml_tensor * weight_cpy, size_t slice_off, int split_axis,
 +        const struct ggml_backend_moe_slice * slices, int n_slices) {
 +    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_register_host(weight, weight_cpy, cuda_ctx->device, slice_off, split_axis,
 +                                   slices, n_slices) >= 0;
 +}
@@ -29202,12 +29204,14 @@ index 000000000..c4e797c0b
 +
 +bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
 +}
 +
 +// Sync-free decode device remap (GGML_MOE_DEVREMAP; see the iface comment).
 +bool ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_remap_dev(weight, weight_cpy, ids, ctx->stream(), ctx->device, check_only);
 +}
 +
@@ -63698,10 +63702,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..fbe28e47b
+index 000000000..be100e100
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,9958 @@
+@@ -0,0 +1,10002 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -66786,8 +66790,27 @@ index 000000000..fbe28e47b
 +static int bounce_acquire(table_t & t) {
 +    for (int i = 0; i < (int) t.bounce.size(); i++) {
 +        if (t.bounce[(size_t) i].busy) {
++            // issue #294: only `NotReady` means "still copying".  A query that FAILS (a handle from another
++            // device's context, a sticky error from an earlier swallowed call) used to fall through as
++            // "drained" and hand this entry back while its `cudaMemcpyAsync` may still be reading it, which
++            // tears the next expert's bytes into an arena slot.  Say so once; a persistently unqueryable
++            // entry is still reused (skipping it forever would grow the ring without bound), so this line is
++            // the tripwire that says the ring is no longer load-bearing.
 +#if defined(GGML_USE_HIP)
-+            const bool ready = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev) != hipErrorNotReady;
++            const hipError_t qe = hipEventQuery((hipEvent_t) t.bounce[(size_t) i].ev);
++            const bool ready = qe != hipErrorNotReady;
++            if (ready && qe != hipSuccess) {
++                static bool warned_q = false;
++                if (!warned_q) {
++                    warned_q = true;
++                    // fprintf, not GGML_LOG_WARN: llama-cli's default threshold is ERROR (see the
++                    // `DEGENERATE TENSOR SPLIT` line), and this is the one line a reporter can act on.
++                    fprintf(stderr, "%s: reusing a bounce entry whose drain event cannot be queried (layer=%d "
++                                    "role=%s device=%d entry=%d: %s); an in-flight H2D may tear this fill.  "
++                                    "Report this with the run's start-up log (issue #294).\n",
++                            __func__, t.layer, t.role.c_str(), t.device, i, cudaGetErrorString(qe));
++                }
++            }
 +#else
 +            const bool ready = cudaEventQuery(t.bounce[(size_t) i].ev) != cudaErrorNotReady;
 +#endif
@@ -72250,6 +72273,31 @@ index 000000000..fbe28e47b
 +    }
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    table_t & t = g_tables[table];
++    // issue #294: this is the one path that issues DEVICE copies from a scheduler callback, so it owns the
++    // device the copies run on.  `cudaMemcpyAsync`/`cudaMemcpy2DAsync` -- and the `cudaHostAlloc` bounce
++    // allocation a pageable master needs -- resolve against the CURRENT device, while the table, its arena
++    // and the stream all belong to `t.device`.  The scheduler does not make the backend's device current
++    // (the hook does now, see `ggml-cuda-moe-cache-hooks.cu`), and a disagreement copies through the wrong
++    // device's transfer engine or errors out where the tail's `cudaGetLastError()` eats it.  On a
++    // single-device box the two always agree, which is why this only ever showed up on a multi-device one.
++    // Report a disagreement once (a caller that forgets the hook) and make the fill device-correct anyway.
++    {
++        int cur = -1;
++        if (cudaGetDevice(&cur) == cudaSuccess && cur != t.device) {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                // fprintf and not GGML_LOG_WARN: llama-cli's default threshold is ERROR, so a WARN here is
++                // invisible to the operator -- the same reason the `DEGENERATE TENSOR SPLIT` line uses
++                // stderr.  A reporter's log is the only place this can be seen.
++                fprintf(stderr, "%s: filling the arena for layer=%d role=%s on device %d while device %d is "
++                                "the current one; the device is switched here, but a caller that issues these "
++                                "fills without making the table's device current is a bug (issue #294).\n",
++                        __func__, t.layer, t.role.c_str(), t.device, cur);
++            }
++        }
++    }
++    device_guard dg_fill(t.device);
 +    t.dr_lag_n = 0;   // this path runs the policy on the current routing; a pending device-remap lag is stale
 +    if (t.fill_failed) {
 +        // issue #274: this table's fills have failed, so it has no arena it can serve from.  Decline BEFORE

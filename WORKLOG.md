@@ -1,3 +1,98 @@
+## 261110.009 (r253, RELEASE v16-a691b2345-r253) -- GitHub issue #294 follow-up: the expert cache's device-sensitive hooks never made their own device current, which is inactive on one device and active on every multi-device box
+
+**Release:** `v16-a691b2345-r253`.  Base `a691b2345` (base tree `9d7b9a02f0`), canonical tip
+`2f8d454b3` (the `fork-refresh.sh` re-cut; the working chain's tip `427ea46a0` carries the same tree
+`3d3cff4a`), 16 blocks.  `scripts/validate-set.sh` green (checksums, fresh-tarball strict 16/16 `git am`,
+applied tree == recorded tree, Windows portability lint, 289 files), `gate-per-block-build --fast` **4/4**
+(blocks 09, 10, 12 and the tip).  **No block renumbered, merged or
+split**: three folds, **block 09** (`moe-expert-cache.cu`), **block 10** and **block 12**
+(`ggml-cuda-moe-cache-hooks.cu`, which each of them adds part of).  No kernel arithmetic changed, no default
+moved, no environment variable added or repurposed.
+
+### What the reporter's second round added
+
+@kapitalmouse answered every item of the r245 ask, and the answer re-scopes the bug: **the fault needs two
+devices, not two architectures.**
+
+* `-dev ROCm0` alone with `-ncmoe 38` and `-dev ROCm1` alone with `-ncmoe 34` both produce correct text
+  (`Test received: 1 2 3` / `Received: test 1 2 3`).  The mixed pair is not required.
+* `GGML_CUDA_MMB=0`, `GGML_MOE_DEVREMAP=0` and `MOE_EXPERT_CACHE_MIB=4096` all still fail, so r245's fold 1
+  (MMB policy), the decode device remap and the arena size are all ruled out.  One arm
+  (`MOE_EXPERT_CACHE_MIB=4096`, `-sm layer`) ends in a GPU hang instead of the assert.
+* `MOE_EXPERT_CACHE_VALIDATE=3` reports `SLOT-CONTENT-MISMATCH` and `NONFINITE-HEAD` lines, i.e. arena slots
+  that are marked resident and hold bytes that are not the expert they name.  A garbage expert slot is
+  exactly the NaN the reporter's sampler assert is the messenger for.
+* Their `lv4_smtensor.txt` is a **layer**-split run: its cache census is digit-identical to `lv4_smlayer.txt`
+  (102 tables, 54/48 per device, arena 16 534.3 MiB, 23 463 slots).  A real `-sm tensor` arm registers
+  **204** tables (102 per device), which their own `moecache4096_smtensor.txt` shows (`device 0: 102 tables`,
+  `device 1: 102 tables`).  Worth stating because the per-device table count is the quickest way to tell the
+  two split modes apart in a log.
+
+### What could not be reproduced, again
+
+gfx1201 x2 (r251 tree, ROCm 10.1.0), the field config as reported (`-ts 24,16 -ncmoe 34 -lm none -c 65536
+-ctk/-ctv q8_0 --fit off -cram 0`, `prompts/recall.txt`, `-n 64`) plus: `-sm tensor` and `-sm layer`; the auto
+arena (89.9 % residency, 204 tables), `MOE_EXPERT_CACHE_MIB=4096` and `=2048` (arena 3 379.5 MiB, 13 126 fills
+and 21 520 colds under churn); `MOE_EXPERT_CACHE_VALIDATE=3` on every arm; 1 GPU.  Every arm: coherent text,
+zero slot mismatches, zero non-finite heads, `check-gpu-faults.sh` clean.  The 2-device field arm's text is
+`d80ffbb6d77e`, byte-identical to the r245 record.
+
+### The defect: the cache hooks were the only ones that did not set their device
+
+`ggml_backend_sched` calls the cache's backend hooks between splits, and nothing on that path makes the
+backend's device current: the device left current is whichever split ran last.  Every other hook in
+`ggml-cuda-moe-cache-hooks.cu` opens with `ggml_cuda_set_device(...)`; `moe_cache_update`, `register`,
+`gather` and `remap` did not.  The arena fill is the one that matters: `moe_cache_update_host` issues
+`cudaMemcpyAsync`/`cudaMemcpy2DAsync` into `t.device`'s arena, and for a pageable master it first
+`cudaHostAlloc`s a bounce entry -- all of it resolved against the CURRENT device.  With a second device
+current the copy goes through the wrong device's transfer engine, or fails where the fill path's tail
+`cudaGetLastError()` eats it; either way it is a per-slot corruption that only a *demand* fill can produce,
+which is why `MOE_EXPERT_CACHE_MIB=0` (no fill at all) is clean.
+
+Demonstrated on this box, not inferred: with a temporary print in `access_locked`, 2 devices,
+`MOE_EXPERT_CACHE_MIB=2048`, every fill fired as
+`layer=14 role=blk.14.ffn_gate_exps.weight dev=0 current=1`.  With the hooks fixed it does not fire once.
+
+The cut, all verified inert:
+
+1. **Block 10 + 12 -- the hooks set their device.**  `moe_cache_update`, `gather` and `remap` (block 10) and
+   `register` (block 12) now call `ggml_cuda_set_device(ctx->device)` first, like their siblings.
+2. **Block 09 -- the fill owns its device.**  `moe_cache_update_host` takes a `device_guard` on the table's
+   device, so a future caller that forgets cannot silently copy through another device, and prints one
+   `fprintf(stderr)` line naming the disagreement (stderr, not `GGML_LOG_WARN`: `llama-cli`'s default
+   threshold is ERROR, the same reason the `DEGENERATE TENSOR SPLIT` line is on stderr).
+3. **Block 09 -- `bounce_acquire` no longer treats a query error as "drained".**  Only `hipErrorNotReady`
+   means still-copying; anything else used to fall through as ready and hand a pinned bounce entry back
+   while its H2D could still be reading it, which tears the next expert's bytes into a slot.  It is now
+   reported once (stderr) instead of being reused in silence; the entry is still reused, because skipping it
+   forever would grow the ring without bound, so the line is the tripwire that says the ring is no longer
+   load-bearing.
+
+### Verification (gfx1201, ROCm 10.1.0)
+
+| arm | before the fold | after |
+|---|---|---|
+| coherence, 4B Q8_0, 1 GPU (`--seed 42 --temp 0 -n 20`) | `1c5d32ac537d` | `1c5d32ac537d` |
+| coherence, 4B Q8_0, 3 GPU `-sm tensor` | `1c5d32ac537d` | `1c5d32ac537d` |
+| field arm, 2 devices `-sm tensor` (`prompts/recall.txt`, `-n 64`) | `776 chars sha=d80ffbb6d77e` | `776 chars sha=d80ffbb6d77e` |
+| field arm, 2 devices `-sm layer` | (r245 record) `d80ffbb6d77e` | `d80ffbb6d77e` |
+| the new device tripwire on those arms | fires on every demand fill (temporary print) | **0 lines** |
+| `check-gpu-faults.sh --since "90 min ago"` over the three run logs | clean | clean |
+| `scripts/validate-set.sh` | -- | green, 16/16 strict, tree `3d3cff4a` |
+
+No MTP Protocol A: no decode, fusion or speculator kernel moved and no default changed -- the change is
+which device is current on a call path -- and the three text arms above are byte-identical, which is the
+r250 precedent for this shape of change.
+
+### Left open on purpose
+
+* **Issue #294 is NOT closed by this.**  The defect is real, it is on the fill path the reporter's evidence
+  points at, and it is the only thing found in three rounds that is inactive on one device and active on
+  every multi-device run -- but it was reproduced as a *condition*, not as their corruption, and this box
+  cannot run their pair.  The reply asks for the same arm plus one thing that is now cheap: the start-up log
+  (the new stderr tripwire is the direct test, and it needs no `-lv`), and `MOE_EXPERT_CACHE_VALIDATE=3` on
+  the same run so the slot content and the device line are in one file.
+
 ## 261110.008 (r252, docs/artifact only -- NO delivery change) -- two `TODO` handles close: the `MUL_MAT_ID` duplicate-id upstream candidate is re-cut and PASSES (`TODO` #287), and the unified expert store is DECLINED with the numbers (`TODO` #285)
 
 **No delivery change:** `patches/`, `release.json` and the gates are untouched; the release stays

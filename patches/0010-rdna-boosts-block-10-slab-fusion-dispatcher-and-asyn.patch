@@ -1,4 +1,4 @@
-From 6cb5231664a98769ddfc511e7bd0e1ef2a395943 Mon Sep 17 00:00:00 2001
+From 6c73b138312fa9b43578b565e644cc488e79e908 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/15] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -93,7 +93,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  ggml/src/ggml-cuda/gdn-conv.cuh               |   13 +-
  ggml/src/ggml-cuda/ggml-cuda-arena.cu         |   70 +
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
- .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  280 +
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1847 +++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3207 +++++++++
@@ -145,7 +145,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 85 files changed, 16341 insertions(+), 5490 deletions(-)
+ 85 files changed, 16344 insertions(+), 5490 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -5238,10 +5238,10 @@ index 000000000..07f58164d
 +int ggml_backend_cuda_buffer_type_device(ggml_backend_buffer_type_t buft);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 new file mode 100644
-index 000000000..821cb32f6
+index 000000000..abb2ef041
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,283 @@
 +// MoE expert-cache callbacks + op-offload staging hooks (block 06/09) and the FA/H2D staging
 +// accounting.  Split out of ggml-cuda.cu (an upstream hub).
 +
@@ -5443,6 +5443,7 @@ index 000000000..821cb32f6
 +
 +bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device, slice_off, split_axis, slices, n_slices);
 +}
 +
@@ -5462,12 +5463,14 @@ index 000000000..821cb32f6
 +
 +bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
 +}
 +
 +// Sync-free decode device remap (GGML_MOE_DEVREMAP; see the iface comment).
 +bool ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only) {
 +    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    return moe_cache_remap_dev(weight, weight_cpy, ids, ctx->stream(), ctx->device, check_only);
 +}
 +
@@ -22139,7 +22142,7 @@ index 35f625eaa..ea7ce5ad9 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index acc55466e..47c664885 100644
+index e4ae27776..043ac1c2d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1825,6 +1825,40 @@ static void pool_rank_from_prefill_locked() {
@@ -22423,7 +22426,7 @@ index acc55466e..47c664885 100644
      if (table < 0) {
          return false;
      }
-@@ -5503,7 +5631,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5528,7 +5656,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -22432,7 +22435,7 @@ index acc55466e..47c664885 100644
          g_decline_all++;
          return false;
      }
-@@ -5858,7 +5986,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
+@@ -5883,7 +6011,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
@@ -22441,7 +22444,7 @@ index acc55466e..47c664885 100644
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -6109,7 +6237,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6134,7 +6262,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }

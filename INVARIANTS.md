@@ -3819,3 +3819,31 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
    261110.008: a stood-down table that is *not* re-armed for the rest of a run, a measured
    prefill loss the bulk fallback cannot explain, or a new consumer that needs expert-granular residency to
    survive a prefill without re-filling.
+
+## r253 — a cache hook that issues DEVICE copies must make its own device current (GitHub issue #294)
+
+* **The scheduler does not manage a device.**  `ggml_backend_sched` calls the MoE cache's backend hooks
+  (`moe_cache_update`, `register`, `gather`, `remap`, `take_over`) from `ggml-backend.cpp` between splits,
+  and nothing on that path makes that backend's device current: the device left current is whichever split
+  ran last.  Every *other* hook in `ggml-cuda-moe-cache-hooks.cu` opens with `ggml_cuda_set_device(...)`;
+  these four did not, so on a multi-device box the arena fill (`cudaMemcpyAsync`/`cudaMemcpy2DAsync` plus
+  the `cudaHostAlloc` bounce entry a pageable master needs) resolved against the wrong device.
+* **On one device the two always agree**, which is why the defect was invisible for 250 revisions and why a
+  single-GPU arm can never reproduce it.  Measured here first as a temporary print (r253 campaign): with
+  2 devices and `MOE_EXPERT_CACHE_MIB=2048`, every demand fill fired as
+  `layer=14 role=blk.14.ffn_gate_exps.weight dev=0 current=1`.
+* **A `hipEventQuery` error is not "drained".**  `bounce_acquire` treats everything except
+  `hipErrorNotReady` as ready.  A handle from another device's context (or any swallowable error) therefore
+  hands a pinned bounce entry back while its H2D may still be reading it, which tears the next expert's
+  bytes into an arena slot.  It is now reported on stderr (once) rather than reused in silence.
+* **The tripwire, and how to read a report.**  `moe_cache_update_host` now switches to the table's device and
+  prints one `fprintf(stderr)` line if its caller left a different one current.  Both lines are on stderr
+  because `llama-cli`'s default threshold is ERROR (the same reason the `DEGENERATE TENSOR SPLIT` line is);
+  a reporter's start-up log is the only place they can be seen.  `MOE_EXPERT_CACHE_VALIDATE=3` is *not*
+  the instrument for this class: the fill and the validator share `src_off`, so a wrong-device fill that
+  lands is consistent with the comparison and the byte compare stays silent.
+* **Inert where it matters, measured.**  gfx1201, r253 vs the r251 tree: coherence anchor
+  `1c5d32ac537d` (4B Q8_0, 1 GPU and 3-GPU `-sm tensor`, unchanged since r152) and the field arm
+  (Flash-Next GSQ-RCO IQ3_S, 2 devices, `-ts 24,16 -ncmoe 34 -lm none -c 65536`, `prompts/recall.txt`,
+  `-n 64`) `776 chars sha=d80ffbb6d77e` — byte-identical in `-sm tensor` **and** `-sm layer`, and identical
+  to the r245 record.
