@@ -21,7 +21,7 @@ Ten probes, no root, nothing changed in the fork.  [`MEASUREMENTS.md`](MEASUREME
 2. A registered **read-only** range reads at **230-233 GB/s**; the same range registered writable at **60**.
    A `PROT_WRITE` buffer can be registered read-only *after* it is filled.
 3. `pread(O_DIRECT)` into **anonymous** memory works (**3.6 GB/s**); into a `hipMalloc` GTT buffer it is
-   **`EINVAL`** — which is why the store must be anonymous, and why the old arena-shaped plan needed a staging
+   **`EINVAL`** — which is why the GTT store must be anonymous, and why the old arena-shaped plan needed a staging
    ring this design does not have.
 4. Host writes into a registered range are visible to the GPU with **no flush**, in both registration modes.
 5. Registration pins, and the hold survives `hipHostUnregister` while the VMA lives; `MADV_DONTNEED` on a
@@ -65,7 +65,7 @@ region's pages under real memory pressure.  Probe `09` only shows that a *user-i
 > `moe_cache_shared_pool_device()`/`moe_cache_preflight()` needed **no change at all** -- that preflight is gated
 > on host-expert bytes, and an APU registers none, so the guard never runs on this box and the cache is already
 > inert; `MOE_EXPERT_GTT=0` and `=1` therefore differ only in the new code (`moe-expert-cache.cu` is untouched);
-> (b) `--fit` does **not** see the store (a `no_alloc` probe load skips the plan by design), which is the
+> (b) `--fit` does **not** see the GTT store (a `no_alloc` probe load skips the plan by design), which is the
 > "does not double-reserve" criterion met the weak way -- P1.3 remains open (README §7 Q8).
 
 Today `moe_cache_shared_pool_device()` (`ggml/src/ggml-cuda/moe-expert-cache.cu:5623`) and
@@ -82,39 +82,47 @@ branch, not a new flag:
 
 | `-lme` | behaviour on an APU |
 |---|---|
-| `auto` | the set fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable` -> the whole set is resident (mirror, zero evictions); otherwise that same ceiling becomes a **bounded hot-subset** store with evictions on |
-| `N` (GiB) | exactly N GiB of store, spent at one **(tensor, expert) slot** at a time in descending heat order — finer than the discrete fit case, so `-lme 6` means 6 GiB used |
+| `auto` | the set fits `MOE_HOST_LIMIT_FRAC` (80 %) of `MemAvailable` -> the whole set is resident (mirror, zero evictions); otherwise that same ceiling becomes a **bounded hot-subset** GTT store with evictions on |
+| `N` (GiB) | exactly N GiB of GTT store, spent at one **(tensor, expert) slot** at a time in descending heat order — finer than the discrete fit case, so `-lme 6` means 6 GiB used |
 | (unset) | = `auto` (default-on policy: nothing to opt into).  `MOE_EXPERT_GTT=0` is the kill switch and restores today's behaviour verbatim |
 
 * **Reuse the ranking, do not write one.**  `plan_host_expert_placement()` (`src/llama-model-loader.cpp:277-310`)
-  already turns `-lme` into a byte budget and ranks tensors by the persisted heat prior; the APU store needs the
+  already turns `-lme` into a byte budget and ranks tensors by the persisted heat prior; the APU GTT store needs the
   same decision at a finer granularity (per slot rather than per tensor), so the budget and the ordering come
   from that function and `pool_rerank_from_heat_locked` (`moe-expert-cache.cu:2905`), not from a second policy.
-* **Finish it before any tensor is placed**, like the discrete path: the store's extent, the transient band
+* **Finish it before any tensor is placed**, like the discrete path: the GTT store's extent, the transient band
   (README §5.1) and the not-fitting decision are all load-time, logged once, and visible to `--fit` (P1.3).
 * **A set that already fits is not a win** (232.6 GB/s plain GTT vs 232.1 registered, README §5 item 3), so `auto`
-  engages the store only in the not-fitting band; an explicit `-lme N` is the middle ground and the A/B lever.
+  engages the GTT store only in the not-fitting band; an explicit `-lme N` is the middle ground and the A/B lever.
 * The arg needs the **UMA branch in its help text and its validation**: the existing text is written entirely in
   terms of `-ncmoe` and a pinned master, and its "N above 90 % of available memory is refused" rule becomes the
-  store's own non-swappable ceiling (README §5 item 1).
+  GTT store's own non-swappable ceiling (README §5 item 1).
 * `MOE_EXPERT_CACHE_UNIFIED=1` + explicit MIB + `GGML_CUDA_SLAB_RESERVE_MIB` stays as the **carve-out** arm
   (Windows APUs with a fixed VRAM partition).  UMA and carve-out are different detections; do not fold them.
 
 ### P1.2 — the budget's two ceilings
 
+> **MEASURED 2026-11-11 (probe 16, `MEASUREMENTS.md` §15): the "non-swappable" half of this is FALSE as built.**
+> The ceiling arithmetic (`MemAvailable - KV - compute - OS reserve`, read once) is implemented and holds, and the
+> census asserts it against `MemTotal`.  But a region that is `hipHostRegister`ed and NOT `mlock`ed is reclaimable
+> by the kernel: under real pressure it loses 0-436 MiB per 2 GiB (and its huge pages, every run), the next GPU
+> read stalls 12-37x while the driver faults the pages back, and `Unevictable` reports 0 throughout.  **`mlock`
+> is the difference between a reservation and a sizing intent** (README §7 Q11, an open decision).  Nothing else
+> in this section changes: `MemAvailable` is charged the same either way.
+
 * `MemAvailable - KV - compute - OS reserve`, read **once**, floored, and **asserted** in the census
-  (`store + KV + compute < MemTotal`).  `MemAvailable` is not cgroup-aware in either call site —
+  (`GTT store + KV + compute < MemTotal`).  `MemAvailable` is not cgroup-aware in either call site —
   `wip/host-expert-coverage/` owns that; until it lands, stay with `MemAvailable` and document it.
-* **Not** the GTT pool: the store is registered *host* memory, so `amdgpu.gttsize` does not bound it (a 46 GiB
+* **Not** the GTT pool: the GTT store is registered *host* memory, so `amdgpu.gttsize` does not bound it (a 46 GiB
   userptr registration is measured, `MEASUREMENTS.md` §9).  Do not apply the slab's free-VRAM rule here — and do
-  not let the slab see the store either (this tier takes nothing from it).
+  not let the slab see the GTT store either (this tier takes nothing from it).
 
 **Accept (P1):** with `MOE_EXPERT_GTT=0`, `halo` reproduces today's log and behaviour byte for byte; `-lme 6`
-produces a store within a slot of 6 GiB and the census names the budget and its source; `-lme auto` in the
+produces a GTT store within a slot of 6 GiB and the census names the budget and its source; `-lme auto` in the
 fitting band keeps everything resident and in the not-fitting band reports evictions; `--fit` does not
-double-reserve the store; no `-ncmoe` is required (and `-ncmoe` is still refused).
+double-reserve the GTT store; no `-ncmoe` is required (and `-ncmoe` is still refused).
 
-## P2 — the store itself (allocation, buffer type, in-place reads)
+## P2 — the GTT store itself (allocation, buffer type, in-place reads)
 
 > **STATUS 2026-11-11: BUILT and MEASURED** (`MEASUREMENTS.md` §14).  The accept criteria: same-seed greedy
 > text **byte-identical** to `MOE_EXPERT_GTT=0` on 35B-A3B *and* Flash-Next (and to the pre-P2 build); the GPU
@@ -126,7 +134,7 @@ double-reserve the store; no `-ncmoe` is required (and `-ncmoe` is still refused
 > is a startup cost P4 does not address (a separate development line is adding explicit buffered reads for the
 > load, README §7 Q7).  **The fill here is the load-time one**; P4's miss fill is untouched.
 >
-> **Scope: Linux only** (maintainer, 2026-11-11) -- the store declines on Windows and the run keeps today's
+> **Scope: Linux only** (maintainer, 2026-11-11) -- the GTT store declines on Windows and the run keeps today's
 > behaviour there; the platform-specific part is one `#if !defined(_WIN32)` function, so a Windows arm later
 > replaces that function and nothing else (README, status header).  **Granularity: best fit** (same decision) --
 > the extent is the budget and the carve may sit up to one expert table under it; P3 makes the two converge.
@@ -145,10 +153,26 @@ double-reserve the store; no `-ncmoe` is required (and `-ncmoe` is still refused
   60 -> 233 GB/s claim applies to *this* region and not just to a probe.
 
 **Accept:** an all-resident config on `halo` is **byte-identical** (same-seed greedy text, hashed with no
-`-lv`) to the same run with the store off; the store's GPU read rate is within noise of a `hipMalloc` arena on
+`-lv`) to the same run with the GTT store off; the GTT store's GPU read rate is within noise of a `hipMalloc` arena on
 the same model; no fault.
 
 ## P3 — residency and eviction (table only, no data movement)
+
+> **DIRECTION (maintainer, 2026-11-11): the GTT store IS the expert cache's ARENA.**  The existing tables allocate
+> their slots from the GTT store region instead of from the slab/`hipMalloc` arena, and admission, LFRU, the
+> remap/indirection, `access_locked()`'s plan and the censuses are reused unchanged -- which is also what keeps the
+> campaign's "do not write a second policy" rule.  Concretely that means the integrated-device branch **selects the
+> GTT store** rather than disabling the cache (the thing P2 found does not even execute on an APU today, because that
+> preflight is host-expert-gated -- so P3 has to un-gate it deliberately rather than just edit it).
+>
+> **Vocabulary, and this has bitten before: the APU GTT store is the expert ARENA, but it is explicitly NOT the
+> "arena" the slab allocator means.**  Same role (a slot provider for the cache's tables), different
+> implementation (a registered anonymous region vs the discrete boxes' movable-boundary VRAM slab).  Never use the
+> two words interchangeably in code, comments or records; say "GTT expert store" or "slab arena".
+>
+> **The nextn (MTP) head's tables are pinned in the GTT store and are NOT counted against `-lme N`** (same decision):
+> the head is metadata overhead, read every draft step.  P2 still counts them (README §7 Q10); P3 is where the
+> accounting moves, because that is where "pinned" first means something.
 
 Reuse, do not rebuild: the heat table and its MHT2 prior (`apply_heat_seed_locked`), the slot/remap
 indirection (`g_dr_key_to_id`, `moe_cache_remap`), and `access_locked()` (`moe-expert-cache.cu:3495`) as the
@@ -174,9 +198,9 @@ maintainer 2026-11-11) -- do not invent a second policy.
   (`MOE_EXPERT_CACHE_PROVISIONAL`, `moe-expert-cache.cu:722`) to "evicted but intact" with a generation
   counter, so a re-admission is free.  On UMA the bytes are already in DRAM, so this is genuinely free — but it
   must not be able to mistake a stale entry for a fill.
-* Census: `evictions`, `reuses`, `unregisters` (must be 0 on a steady-state arm), `store MiB` vs budget.
+* Census: `evictions`, `reuses`, `unregisters` (must be 0 on a steady-state arm), `GTT store MiB` vs budget.
 
-**Accept:** a config that **evicts** still produces byte-identical text to the same config with the store
+**Accept:** a config that **evicts** still produces byte-identical text to the same config with the GTT store
 large enough that nothing evicts (the eviction path changes *where* bytes are, never *which*); census shows
 evictions > 0 and unregisters == 0.
 
@@ -201,7 +225,7 @@ knob (README §3.1):
   materialises a split's host-weight inputs (synchronize included) before dispatching it, so nothing is in
   flight when the miss set is known, and the pool's placing fill (0.131 ms) is cheaper and earlier than a
   prefetch (`archive/work/host-pool-demand-overlap/`; `TODO` #132 retired on it).  So: **first reproduce the
-  question here** -- does this path ever have work the fill can hide behind, given the store's fill is 3.2x the
+  question here** -- does this path ever have work the fill can hide behind, given the GTT store's fill is 3.2x the
   pool's -- and only then build a worker (`copy_stream` / `order_event`, `moe-expert-cache.cu:8406` is the
   shape).  If it does not, say so and drop the requirement: `-lme` coverage and admission carry the design.
   The gate's arm 9 asserts whichever answer is recorded, not a pipeline.
@@ -221,7 +245,7 @@ declines and does not corrupt.
 
 * Per layer: compute the chunk's used-expert set (the existing per-layer access plan already does this), subtract
   the resident set, and stream the difference coalesced — this is exactly
-  `moe_cache_stage_table()`'s span-read shape with the store as the destination.
+  `moe_cache_stage_table()`'s span-read shape with the GTT store as the destination.
 * Keep the `MOE_HOST_POOL_STAGE_SPAN`-class coalescing (an expert's rows are contiguous; a layer span is
   sequential) — it is the same reason W4 measured +38 % on the discrete pool.
 * Do not re-fetch a bank the previous chunk already holds; the census's per-layer read bytes must fall on a
@@ -255,21 +279,21 @@ hashed with **no `-lv`**; censuses are read at **`-lv 4`** — two runs per arm,
 
 | # | arm | pass criterion |
 |---|---|---|
-| 1 | **text identity** — store on vs `MOE_EXPERT_GTT=0`, on a config that **evicts** | same-seed greedy text **byte-identical** |
-| 2 | **all-resident** — store big enough that nothing evicts | identical text to the plain-device arm; read rate within noise of a `hipMalloc` arena |
+| 1 | **text identity** — GTT store on vs `MOE_EXPERT_GTT=0`, on a config that **evicts** | same-seed greedy text **byte-identical** |
+| 2 | **all-resident** — GTT store big enough that nothing evicts | identical text to the plain-device arm; read rate within noise of a `hipMalloc` arena |
 | 3 | **>RAM** — an expert set larger than RAM | completes; census shows fills (cold and warm) and evictions; no `HSA_STATUS_ERROR_MEMORY_FAULT`; `check-gpu-faults.sh` clean |
 | 4 | **cold page cache** — the same run after dropping the file's cache | the cold arm is really exercised (its counters move); text identical to arm 1 |
-| 5 | **budget** — explicit `MOE_EXPERT_GTT_MIB=N` | the store's extent ≤ N; `MemAvailable` after load above the OS reserve; the census names the source |
+| 5 | **budget** — explicit `MOE_EXPERT_GTT_MIB=N` | the GTT store's extent ≤ N; `MemAvailable` after load above the OS reserve; the census names the source |
 | 6 | **no-movement** — steady-state arm | `unregisters == 0` and no `madvise` on the hot path; evictions > 0 with text identical |
 | 6b | **admission** — `MOE_EXPERT_CACHE_TOUCH=1/2/3`, same prompt set | a higher threshold never changes the text; the census shows fewer promotions, a smaller footprint and more transient fills; `2` must be no slower than `1` on a cold-start session (that is the default's justification) |
-| 6c | **`-lme`** — `-lme 6`, `-lme 12`, `-lme auto`, same model/prompt | the store's extent matches the request (+-1 slot); the census's budget source names `-lme N` vs `auto`; `auto` in the fitting band reports zero evictions and in the not-fitting band non-zero; text identical across all four |
+| 6c | **`-lme`** — `-lme 6`, `-lme 12`, `-lme auto`, same model/prompt | the GTT store's extent matches the request (+-1 slot); the census's budget source names `-lme N` vs `auto`; `auto` in the fitting band reports zero evictions and in the not-fitting band non-zero; text identical across all four |
 | 7 | **kill switch** — `MOE_EXPERT_GTT=0` | reproduces today's behaviour (cache disabled on IGPU) and its exact log |
 | 8 | **fill-fault** — `MOE_EXPERT_GTT_FILL_FAULT=1` | declines cleanly; correct text; never a GPU read of an unfilled slot |
 | 9 | **prefill** — repeated prompt with a resident bank | per-layer read bytes fall; prefill logits identical (from `gate-prefill-logits.sh`) |
-| 10 | **host-buffer A/B** — `GGML_FORCE_NO_INTEGRATED=1` | throughput unchanged within noise, text identical: the store does not depend on the zero-copy UMA weights path |
+| 10 | **host-buffer A/B** — `GGML_FORCE_NO_INTEGRATED=1` | throughput unchanged within noise, text identical: the GTT store does not depend on the zero-copy UMA weights path |
 
 Nothing in this gate runs on a discrete box; the delivery's existing gates are the discrete-side proof (the
-store must be unreachable there).
+GTT store must be unreachable there).
 
 ## §8 Effort and sequencing (estimate, not a commitment)
 
@@ -277,7 +301,7 @@ store must be unreachable there).
 |---|---|---|
 | P1.0 | four probes, no code — **DONE 2026-11-11**, all four hold; probe 15 (touch distance) still owed | none |
 | P1 | preflight branch + budget + kill switch | low |
-| P2 | store allocation + buft + census | medium: a new buffer type the scheduler must accept |
+| P2 | GTT store allocation + buft + census | medium: a new buffer type the scheduler must accept |
 | P3 | residency/eviction wiring | low: the policy already exists |
 | P4 | the two fill arms + ordering | medium: the cold arm's visibility must be proven, not assumed |
 | P5 | prefill streaming | medium: prefill is where the read volume lives |
@@ -287,5 +311,5 @@ store must be unreachable there).
 
 `MOE_EXPERT_GTT=0` restores today's behaviour without a rebuild (the cache disabled on an integrated GPU, the
 host-expert tier refused).  If a phase cannot be made switch-safe it does not ship — that is the lesson of the
-guard this campaign replaces.  The store must never be the only path to a working configuration on a discrete
+guard this campaign replaces.  The GTT store must never be the only path to a working configuration on a discrete
 box, and it must be provably inert there (`GGML_FORCE_NO_INTEGRATED`, arm 10).

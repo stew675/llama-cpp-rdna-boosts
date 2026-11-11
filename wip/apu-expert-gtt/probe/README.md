@@ -66,6 +66,7 @@ Written and run on `halo`; results in `MEASUREMENTS.md` §13.  Build them exactl
 | 12 | `12-pread-registered.cpp` | `pread` **into** a registered RO anon region, then a GPU sum of exactly those bytes — fresh region and the eviction/reuse case | **yes**, `O_DIRECT` accepted, every round's sums match; buffered is faster |
 | 13 | `13-dma-from-mapped-file.cpp` | the copy-engine pull from a registered RO `MAP_SHARED` file mapping into a registered anon slot, at slab and span granularity, compute-stream ordered | **yes**, 0.012 ms/slab warm (60.9 GB/s), bytes verified |
 | 14 | `14-expert-cost.cpp` | the per-fill cost at real GGUF offsets: cold/warm slab latency, span rate, and the `pread -> launch -> sync` floor  (takes `<file> <offset> <slab_bytes> [count]`) | cold **0.413 ms** median (34.9 ms worst), warm **0.069 ms**, round-trip floor **0.420 ms**; `O_DIRECT` needs a 4096 round-out |
+| 16 | `16-reclaim-pressure.cpp` | **can the kernel take a registered region's pages under real memory pressure**, and what each counter reports while it does | **yes it can** -- `hipHostRegister` does not pin: 0-436 MiB of a 2048 MiB region taken across runs, THPs split every time, the next GPU read 8-37x slower (one-off), data always correct, `Unevictable` stays 0.  `mlock` holds (0 taken, THPs intact, `Unevictable` = 2048) |
 
 Two helpers feed them and are re-runnable on their own:
 
@@ -74,14 +75,32 @@ Two helpers feed them and are re-runnable on their own:
 | `gguf-expert-geom.py` | reads a GGUF's tensor table (a minimal GGUF parser) and prints each layer's `*_exps` offsets, the contiguous per-expert slab size and the whole-set footprint.  `--layer N --shell` prints `OFFSET SLAB COUNT` for probe 14 |
 | `moe-heatmap-read.py` | reads the delivery's persisted `MHT2` heat map and prints the traffic concentration (coverage curve, never-touched share, resident-set footprint at 50/80/90/95/99 %) per band |
 
-## Owed: probes 15 and 16
+## Probe 16 — reclamation under pressure (DONE 2026-11-11; it FALSIFIED the reservation claim)
+
+`16-reclaim-pressure.cpp`, results in `../MEASUREMENTS.md` §15.  Five arms, each in its own process, each under a
+**memory cgroup** (`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=4G`) so the pressure is real but
+contained (a machine-wide hog would need ~100 GiB and risks the OOM killer; `PROBE16_HOG_MIB` bounds the hog, and
+the probe also works machine-wide with a `MemAvailable` floor).
+
+| arm | what is mapped | why |
+|---|---|---|
+| `ctl` | a plain anonymous range, nothing registered | the negative control: pressure must take *its* pages or the test has no teeth |
+| `reg` | `mmap` + `MADV_HUGEPAGE` + `hipHostRegister(Mapped\|ReadOnly)` | **the GTT store's own backing** |
+| `reg_w` | the same, registered writable | the `MOE_EXPERT_GTT_RO=0` arm |
+| `hostalloc` | `hipHostMalloc(Mapped\|Portable)` | a genuinely pinned allocation -- the delivery's `ROCm_Host` master |
+| `mlock` | `mmap` + `MADV_HUGEPAGE` + `mlock` + `hipHostRegister(ReadOnly)` | a reservation that *keeps* the huge pages |
+
+The GPU read after the pressure is deliberately the **first** touch of the region: a host read would fault the
+pages back in and hide the case being measured.  The pattern is offset-dependent, so a reinstated page that came
+back as zeros (the `06` trap) shows up as a checksum mismatch.
+
+## Owed: probe 15
 
 | # | probe | question |
 |---|---|---|
 | 15 | the per-session touch distance | how often an expert is used 1x/2x/3x **within one session** -- the input to the admission threshold `N` (`../README.md` §3.2, §7).  A *workload* measurement: the persisted heat map is a long-horizon counter, so it gives concentration but not session sequences.  Candidate sources: the delivery's own `heat`/`ghost` census on a discrete box, or a routing trace from a CPU-only run (`-ngl 0`) replayed offline |
-| 16 | reclamation under pressure | whether the kernel's reclaim can take a **registered** region's pages under real memory pressure (`09` only shows that a user-initiated `fadvise`+`madvise` cannot), and what `mincore`, `Unevictable` and `MemAvailable` report while it tries.  `../README.md` §5 calls the budget a reservation on the strength of `09`, so this has to exist before a >RAM model trusts it |
 
-Neither blocks the design's memory (P1.0 answered that): 15 tunes a default, 16 hardens a claim.
+It does not block anything: it tunes a default (`N = 2` already pays for itself at two uses in a session).
 
 ## What these do not cover
 

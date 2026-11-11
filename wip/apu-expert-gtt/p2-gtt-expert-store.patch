@@ -1,4 +1,4 @@
-From 8fd294059fdaa8df6fff9b756d8687f286ce7d3f Mon Sep 17 00:00:00 2001
+From 3dd51294fb88f32873c94dd4eea58f60fd525e4d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 07:40:40 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 -- a registered GTT expert
@@ -41,7 +41,7 @@ within noise of the plain device buffer with the registered READ-ONLY arm (-0.4 
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index faa73a2e9..20aac8819 100644
+index faa73a2e9..0964822e5 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2765,7 +2765,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -68,9 +68,9 @@ index faa73a2e9..20aac8819 100644
 +        "on its layer's device buffer:\n"
 +        "- auto: the whole expert set when it fits MOE_HOST_LIMIT_FRAC of MemAvailable (then nothing is ever\n"
 +        "        evicted), otherwise that ceiling as a bounded hot subset.\n"
-+        "- N:    exactly N GiB of registered store (capped at the set).  N above 90% of the available memory is\n"
++        "- N:    exactly N GiB of registered GTT store (capped at the set).  N above 90% of the available memory is\n"
 +        "        refused for the same reason as above.\n"
-+        "MOE_EXPERT_GTT=0 disables the store on an APU.  (--host-experts pinned|pool are deprecated shorthands\n"
++        "MOE_EXPERT_GTT=0 disables the GTT store on an APU.  (--host-experts pinned|pool are deprecated shorthands\n"
 +        "for the same budget.)",
          [](common_params & params, const std::string & value) {
              if (value == "auto") {
@@ -91,7 +91,7 @@ index faa73a2e9..20aac8819 100644
                  long long avail_mib = -1;
                  if (mi != nullptr) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..e98450c44 100644
+index d72bb88d7..a8485d64f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -90,6 +90,18 @@ extern "C" {
@@ -100,13 +100,13 @@ index d72bb88d7..e98450c44 100644
  
 +    // wip/apu-expert-gtt P2: the GTT EXPERT STORE -- a UMA-only resident expert tier.  `open` accepts (or
 +    // refuses) a budget of `extent_bytes` and answers the DEVICE buffer type to place the resident MoE expert
-+    // tables in, or NULL when this device offers no store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform
++    // tables in, or NULL when this device offers no GTT store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform
 +    // where the region cannot have one address for host and device -- with `iommu=off` the host VA IS the device
 +    // VA, which is what lets one pointer be both the fill destination and the kernel's source).  The budget is
 +    // the model loader's: it resolves `-lme` into bytes, so the same flag sizes the discrete box's pinned tier
 +    // and this one, and `source` says which arm produced the number for the census.  `report` prints the
-+    // once-per-load census with the bytes the loader read from the GGUF into the store.  No-op for a backend
-+    // without a store.
++    // once-per-load census with the bytes the loader read from the GGUF into the GTT store.  No-op for a backend
++    // without a GTT store.
 +    GGML_API ggml_backend_buffer_type_t ggml_backend_dev_gtt_store_open(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
 +    GGML_API void                  ggml_backend_dev_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
 +
@@ -114,7 +114,7 @@ index d72bb88d7..e98450c44 100644
      // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
      // No-op for a backend without a slab or with no ring hole.
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 87c8164ec..f5f577b32 100644
+index 87c8164ec..a506b034b 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -577,6 +577,20 @@ extern "C" {
@@ -128,10 +128,10 @@ index 87c8164ec..f5f577b32 100644
 +        // reads in place.  `open` accepts (or refuses) a budget of `extent_bytes` -- the model loader resolves
 +        // `-lme` into that number, so the same flag sizes the discrete box's pinned tier and this one -- and
 +        // answers the DEVICE buffer type the loader should place the resident expert tables in, or NULL when
-+        // this device offers no store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform where the region
++        // this device offers no GTT store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform where the region
 +        // cannot have one address for host and device).  `report` prints the once-per-load census with the bytes
-+        // the loader read from the GGUF into the store.  APPENDED at the very end for the positional-initializer
-+        // reason above; zero-initialized for backends that do not set them, so a backend without a store simply
++        // the loader read from the GGUF into the GTT store.  APPENDED at the very end for the positional-initializer
++        // reason above; zero-initialized for backends that do not set them, so a backend without a GTT store simply
 +        // never answers and the loader keeps today's placement.
 +        ggml_backend_buffer_type_t (*gtt_store_open)(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
 +        void (*gtt_store_report)(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
@@ -165,7 +165,7 @@ index 474166cef..45b69eb53 100644
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bf574ecf9..6da6b7a43 100644
+index bf574ecf9..b5e23cdc9 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -124,6 +124,7 @@
@@ -197,7 +197,7 @@ index bf574ecf9..6da6b7a43 100644
 +//     map by name) collapses two device bufts that answer the same string into the FIRST one's context -- the
 +//     same discipline the windowed KV region and the KV pool mirror already follow.
 +//
-+// Nothing here is reachable on a discrete device: the model loader only asks for a store on an
++// Nothing here is reachable on a discrete device: the model loader only asks for a GTT store on an
 +// IGPU (`prop.integrated`), and `MOE_EXPERT_GTT=0` never asks at all.
 +static const char * ggml_backend_cuda_gtt_store_buffer_type_name(ggml_backend_buffer_type_t buft) {
 +    return ((ggml_backend_cuda_buffer_type_context *) buft->context)->name.c_str();
@@ -211,19 +211,19 @@ index bf574ecf9..6da6b7a43 100644
 +    return buffer->context;
 +}
 +
-+// The buffer is a VIEW of the store: the region outlives every buffer cut from it, so freeing releases
++// The buffer is a VIEW of the GTT store: the region outlives every buffer cut from it, so freeing releases
 +// nothing.  The region is released once, by `ggml_cuda_gtt_store_free()`.
 +static void ggml_backend_cuda_gtt_store_free_buffer(ggml_backend_buffer_t buffer) {
 +    GGML_UNUSED(buffer);
 +}
 +
-+// The store is ordinary host memory that the GPU also reads (one address, `iommu=off`), so every host-side
++// The GTT store is ordinary host memory that the GPU also reads (one address, `iommu=off`), so every host-side
 +// copy is a plain `memcpy` with no flush and no staging -- measured coherent in both registration modes
 +// (probe 10) and after a fill that overwrote resident bytes (probe 12).
 +static void ggml_backend_cuda_gtt_store_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
 +        uint8_t value, size_t offset, size_t size) {
 +    if (tensor->buffer->buft != buffer->buft) {
-+        GGML_ABORT("tensor is not in the store");
++        GGML_ABORT("tensor is not in the GTT store");
 +    }
 +    memset((char *) tensor->data + offset, value, size);
 +}
@@ -231,7 +231,7 @@ index bf574ecf9..6da6b7a43 100644
 +static void ggml_backend_cuda_gtt_store_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
 +        const void * data, size_t offset, size_t size) {
 +    if (tensor->buffer->buft != buffer->buft) {
-+        GGML_ABORT("tensor is not in the store");
++        GGML_ABORT("tensor is not in the GTT store");
 +    }
 +    memcpy((char *) tensor->data + offset, data, size);
 +}
@@ -239,7 +239,7 @@ index bf574ecf9..6da6b7a43 100644
 +static void ggml_backend_cuda_gtt_store_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
 +        void * data, size_t offset, size_t size) {
 +    if (tensor->buffer->buft != buffer->buft) {
-+        GGML_ABORT("tensor is not in the store");
++        GGML_ABORT("tensor is not in the GTT store");
 +    }
 +    memcpy(data, (const char *) tensor->data + offset, size);
 +}
@@ -272,7 +272,7 @@ index bf574ecf9..6da6b7a43 100644
 +static size_t ggml_backend_cuda_gtt_store_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
 +    // The plain device type's own rule, deliberately: a quantized tensor whose `ne[0]` is not a multiple of
 +    // `MATRIX_ROW_PADDING` reserves one padded row past its end, and several kernels read a full padded row.
-+    // In a store the bytes after a tensor belong to the NEXT expert table, so dropping that reservation would
++    // In a GTT store the bytes after a tensor belong to the NEXT expert table, so dropping that reservation would
 +    // turn a padded read into a read of a neighbour's data -- or, at the end of the region, past the mapping.
 +    return ggml_backend_cuda_buffer_type_get_alloc_size(buft, tensor);
 +}
@@ -292,7 +292,7 @@ index bf574ecf9..6da6b7a43 100644
 +    void * base = ggml_cuda_gtt_store_carve(buft_ctx->device, size);
 +    if (base == nullptr) {
 +        // A DECLINE, not an abort: the loader places the tensors it cannot fit in the plain device buffer.
-+        GGML_LOG_WARN("%s: device %d: the expert store declined a %.2f MiB carve; those expert tables stay in "
++        GGML_LOG_WARN("%s: device %d: the GTT expert store declined a %.2f MiB carve; those expert tables stay in "
 +                      "the plain device buffer\n", __func__, buft_ctx->device, (double) size / 1048576.0);
 +        return nullptr;
 +    }
@@ -301,7 +301,7 @@ index bf574ecf9..6da6b7a43 100644
 +    return ggml_backend_buffer_init(buft, ggml_backend_cuda_gtt_store_buffer_i, base, size);
 +}
 +
-+// One instance per device (the extent and the registration live in the store module, not here).
++// One instance per device (the extent and the registration live in the GTT store module, not here).
 +static ggml_backend_buffer_type_t ggml_backend_cuda_gtt_store_buffer_type(int device) {
 +    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
 +        return nullptr;
@@ -317,7 +317,7 @@ index bf574ecf9..6da6b7a43 100644
 +                /* .alloc_buffer        = */ ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer,
 +                /* .alloc_buffer_n      = */ NULL,
 +                /* .get_alignment       = */ ggml_backend_cuda_gtt_store_get_alignment,
-+                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX: the store is ONE carve per device
++                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX: the GTT store is ONE carve per device
 +                /* .get_alloc_size      = */ ggml_backend_cuda_gtt_store_get_alloc_size,
 +                /* .get_alloc_size_n    = */ NULL,
 +                /* .is_host             = */ NULL,
@@ -356,7 +356,7 @@ index bf574ecf9..6da6b7a43 100644
 +// `open` accepts (or refuses) a budget and answers the buffer type the resident expert tables should be
 +// placed in; the loader makes the placement decision itself (`plan_host_expert_placement`, so `-lme` and the
 +// heat ranking are the DISCRETE path's own code, not a second policy).  `report` prints the once-per-load
-+// census, with the bytes the loader read from the GGUF into the store.
++// census, with the bytes the loader read from the GGUF into the GTT store.
 +static ggml_backend_buffer_type_t ggml_backend_cuda_device_gtt_store_open(ggml_backend_dev_t dev,
 +        size_t extent_bytes, const char * source) {
 +    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -365,7 +365,7 @@ index bf574ecf9..6da6b7a43 100644
 +    }
 +    // An APU only: on a discrete device the expert set belongs in VRAM, and this tier would be host memory
 +    // read across PCIe.  Same `prop.integrated` question the expert cache's own guard asks, and the reason
-+    // the store must be provably inert on every non-APU device.
++    // the GTT store must be provably inert on every non-APU device.
 +    if (!ggml_cuda_info().devices[dev_ctx->device].integrated) {
 +        return nullptr;
 +    }
@@ -401,7 +401,7 @@ index bf574ecf9..6da6b7a43 100644
  // backend reg
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cu b/ggml/src/ggml-cuda/gtt-expert-store.cu
 new file mode 100644
-index 000000000..832a5e313
+index 000000000..e4ca85663
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cu
 @@ -0,0 +1,414 @@
@@ -434,7 +434,7 @@ index 000000000..832a5e313
 +#include <cerrno>
 +#endif
 +
-+// One store per device.  A `-sm tensor` split over several APUs would open one per device; gfx1151 is one
++// One GTT store per device.  A `-sm tensor` split over several APUs would open one per device; gfx1151 is one
 +// device here, and the plan only ever asks the device it found.
 +struct gtt_store_t {
 +    int      device    = -1;
@@ -448,7 +448,7 @@ index 000000000..832a5e313
 +    size_t   carve_max = 0;
 +    double   create_ms = 0.0;     // mmap + MADV_HUGEPAGE + the ONE registration
 +    int      n_carves  = 0;
-+    size_t   fill      = 0;       // bytes the loader read from the GGUF into the store
++    size_t   fill      = 0;       // bytes the loader read from the GGUF into the GTT store
 +    int      n_tables  = 0;
 +    int64_t  n_slots   = 0;
 +    char     source[192] = {0};   // the budget's source, verbatim from the plan
@@ -504,7 +504,7 @@ index 000000000..832a5e313
 +#endif
 +}
 +
-+// AnonHugePages + Rss of the VMA that starts at `base`.  The store is ONE `mmap`, so one header line matches.
++// AnonHugePages + Rss of the VMA that starts at `base`.  The GTT store is ONE `mmap`, so one header line matches.
 +static void gtt_smaps_of(const void * base, size_t * huge_kib, size_t * rss_kib) {
 +    *huge_kib = 0;
 +    *rss_kib  = 0;
@@ -558,11 +558,11 @@ index 000000000..832a5e313
 +        const cudaError_t err = cudaHostUnregister(s.base);
 +        if (err != cudaSuccess) {
 +            (void) cudaGetLastError();
-+            GGML_LOG_WARN("%s: device %d: cudaHostUnregister of the %.2f GiB expert store failed: %s\n", __func__,
++            GGML_LOG_WARN("%s: device %d: cudaHostUnregister of the %.2f GiB GTT expert store failed: %s\n", __func__,
 +                    s.device, (double) s.created / 1073741824.0, cudaGetErrorString(err));
 +        }
 +        if (munmap(s.base, s.created) != 0) {
-+            GGML_LOG_WARN("%s: device %d: munmap of the expert store failed: %s\n", __func__, s.device,
++            GGML_LOG_WARN("%s: device %d: munmap of the GTT expert store failed: %s\n", __func__, s.device,
 +                    strerror(errno));
 +        }
 +    }
@@ -589,7 +589,7 @@ index 000000000..832a5e313
 +#if defined(_WIN32)
 +    // POSIX-only shape: `mmap`/`MADV_HUGEPAGE` residency plus one flat address.  WDDM gives a distinct device
 +    // alias for host memory, and this design refuses to run on two addresses (see the header).  Decline.
-+    snprintf(err, errn, "the expert store is a POSIX/mmap shape and needs one address for host and device");
++    snprintf(err, errn, "the GTT expert store is a POSIX/mmap shape and needs one address for host and device");
 +    GGML_UNUSED(s);
 +    return false;
 +#else
@@ -608,10 +608,10 @@ index 000000000..832a5e313
 +        snprintf(err, errn, "mmap of %.2f MiB failed: %s", (double) extent / 1048576.0, strerror(errno));
 +        return false;
 +    }
-+    // Best-effort: without THP the store is still correct, just a 4 KiB tier (and the read rate is the thing
++    // Best-effort: without THP the GTT store is still correct, just a 4 KiB tier (and the read rate is the thing
 +    // the census reports, so a machine that refused THP is visible rather than silent).
 +    if (madvise(p, extent, MADV_HUGEPAGE) != 0) {
-+        GGML_LOG_WARN("%s: device %d: MADV_HUGEPAGE on the %.2f GiB expert store failed: %s (the store will be "
++        GGML_LOG_WARN("%s: device %d: MADV_HUGEPAGE on the %.2f GiB GTT expert store failed: %s (the GTT store will be "
 +                      "4 KiB pages; the census reports the realised granularity)\n", __func__, s.device,
 +                      (double) extent / 1073741824.0, strerror(errno));
 +    }
@@ -621,10 +621,10 @@ index 000000000..832a5e313
 +    if (reg != cudaSuccess) {
 +        const char * msg = cudaGetErrorString(reg);
 +        (void) cudaGetLastError();
-+        // A driver that refuses the ReadOnly arm is not a reason to lose the store: fall back to the writable
++        // A driver that refuses the ReadOnly arm is not a reason to lose the GTT store: fall back to the writable
 +        // registration ONCE and say so (the census then reports `writable`, which is the 60 GB/s arm).
 +        if (s.ro) {
-+            GGML_LOG_WARN("%s: device %d: cudaHostRegister(Mapped|ReadOnly) of the %.2f GiB expert store was "
++            GGML_LOG_WARN("%s: device %d: cudaHostRegister(Mapped|ReadOnly) of the %.2f GiB GTT expert store was "
 +                          "refused (%s); registering it WRITABLE instead -- expect the writable read rate\n",
 +                          __func__, s.device, (double) extent / 1073741824.0, msg);
 +            reg = cudaHostRegister(p, extent, cudaHostRegisterMapped);
@@ -653,7 +653,7 @@ index 000000000..832a5e313
 +        (void) cudaHostUnregister(p);
 +        (void) munmap(p, extent);
 +        snprintf(err, errn, "the runtime gave the registered region a SECOND address (host %p, device %p); the "
-+                 "store needs one (iommu=off)", p, d);
++                 "GTT store needs one (iommu=off)", p, d);
 +        return false;
 +    }
 +
@@ -688,7 +688,7 @@ index 000000000..832a5e313
 +            snprintf(s.source, sizeof(s.source), "%s", source != nullptr ? source : "");
 +            return true;
 +        }
-+        snprintf(err, errn, "a store of %.2f MiB is already live on device %d; %.2f MiB cannot replace it in "
++        snprintf(err, errn, "a GTT store of %.2f MiB is already live on device %d; %.2f MiB cannot replace it in "
 +                 "place", (double) s.extent / 1048576.0, device, (double) extent_bytes / 1048576.0);
 +        return false;
 +    }
@@ -705,7 +705,7 @@ index 000000000..832a5e313
 +    snprintf(s.source, sizeof(s.source), "%s", source != nullptr ? source : "");
 +    // The region is created HERE, before a single expert tensor is placed, so a refusal is a clean decline
 +    // (the loader keeps today's placement) instead of a half-placed model.  A `--fit` / `--no-alloc` probe
-+    // load never reaches this point -- the loader skips the store plan entirely there -- so nothing reserves
++    // load never reaches this point -- the loader skips the GTT store plan entirely there -- so nothing reserves
 +    // non-swappable RAM for a load that allocates no weights.
 +    if (!gtt_store_create_locked(s, err, errn)) {
 +        s.opened = false;
@@ -730,7 +730,7 @@ index 000000000..832a5e313
 +    const size_t align = 4096;   // a page: one GGUF expert slab is 0.45-0.92 MiB, so this costs < 1 %
 +    const size_t off   = (s.used + align - 1) & ~(align - 1);
 +    if (size > s.created || off > s.created - size) {
-+        GGML_LOG_ERROR("%s: device %d: a %.2f MiB carve does not fit the %.2f MiB expert store (%.2f MiB used)\n",
++        GGML_LOG_ERROR("%s: device %d: a %.2f MiB carve does not fit the %.2f MiB GTT expert store (%.2f MiB used)\n",
 +                __func__, device, (double) size / 1048576.0, (double) s.created / 1048576.0,
 +                (double) s.used / 1048576.0);
 +        return nullptr;
@@ -748,7 +748,7 @@ index 000000000..832a5e313
 +// ---------------------------------------------------------------------------------------------------------
 +
 +// One line, at INFO (so it is read at `-lv 4`, like every other census) -- and it says what this session does
-+// NOT do: the store is an ALL-RESIDENT tier here.  Eviction, the warm copy-engine arm and prefill streaming
++// NOT do: the GTT store is an ALL-RESIDENT tier here.  Eviction, the warm copy-engine arm and prefill streaming
 +// are P3/P4/P5, so a run whose expert set does not fit the budget is a *hot subset* whose non-resident
 +// experts stay on their layer's device, not a streaming tier.
 +void ggml_cuda_gtt_store_report(int device, size_t filled_bytes, int n_tables, int64_t n_slots) {
@@ -787,9 +787,9 @@ index 000000000..832a5e313
 +    size_t rss_kib  = 0;
 +    gtt_smaps_of(base, &huge_kib, &rss_kib);
 +
-+    // The budget assertion (P1.2): the store is registered, non-swappable host memory, so it must stay under
++    // The budget assertion (P1.2): the GTT store is registered, non-swappable host memory, so it must stay under
 +    // the machine's own memory -- the measured over-commit this replaces (2026-10-19: a 123 GiB box went to
-+    // 121 GiB resident + 13 GiB swap) is exactly what an unchecked store would repeat.
++    // 121 GiB resident + 13 GiB swap) is exactly what an unchecked GTT store would repeat.
 +    const size_t avail_kib = gtt_meminfo_kib("MemAvailable");
 +    const size_t total_kib = gtt_meminfo_kib("MemTotal");
 +    const double thp = created > 0 ? 100.0 * (double) huge_kib / ((double) created / 1024.0) : 0.0;
@@ -807,21 +807,21 @@ index 000000000..832a5e313
 +                  (double) avail_kib / 1024.0, (double) total_kib / 1024.0);
 +
 +    // The resident set this session can serve.  Say so out loud rather than implying the >RAM case works.
-+    GGML_LOG_INFO("%s: device %d: GTT expert store scope: ALL-RESIDENT arm only.  The store holds the hottest "
++    GGML_LOG_INFO("%s: device %d: GTT expert store scope: ALL-RESIDENT arm only.  The GTT store holds the hottest "
 +                  "%d expert tables that fit the budget; anything that did not fit keeps its layer's plain "
 +                  "device buffer.  There is no eviction, no streaming refill and no prefill streaming yet "
 +                  "(P3-P5), so a set larger than the budget is a hot subset, not a streaming tier.  Kill "
 +                  "switch: MOE_EXPERT_GTT=0.\n", __func__, device, n_tables);
 +
 +    if (total_kib > 0 && created / 1024 > total_kib) {
-+        GGML_LOG_WARN("%s: device %d: the store (%.1f MiB) is larger than the machine's MemTotal (%.1f MiB); the "
++        GGML_LOG_WARN("%s: device %d: the GTT store (%.1f MiB) is larger than the machine's MemTotal (%.1f MiB); the "
 +                      "budget is not bounded by MemAvailable on this host\n", __func__, device,
 +                      (double) created / mib, (double) total_kib / 1024.0);
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cuh b/ggml/src/ggml-cuda/gtt-expert-store.cuh
 new file mode 100644
-index 000000000..979e1fcaa
+index 000000000..27eb37ffd
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cuh
 @@ -0,0 +1,60 @@
@@ -840,7 +840,7 @@ index 000000000..979e1fcaa
 +//   * `pread` INTO the registered region is accepted and the GPU reads the fresh bytes (including on the
 +//     reuse arm), so the host may fill the slots through its own mapping with no flush;
 +//   * with `iommu=off` the host VA **is** the device VA, which is what lets ONE pointer be both the fill
-+//     destination and the kernel's source.  That property is ASSERTED at creation and the store declines
++//     destination and the kernel's source.  That property is ASSERTED at creation and the GTT store declines
 +//     when it does not hold (no fault-and-retry exists on this part: an unregistered page is not in the
 +//     GPU's page tables at all, so a second address would be a fatal fault, not a slow path).
 +//
@@ -849,7 +849,7 @@ index 000000000..979e1fcaa
 +// which is where the private `ggml_backend_cuda_buffer_type_context` and the device registry are.
 +//
 +// Windows: `mmap`/`MADV_HUGEPAGE`-shaped residency is POSIX-only here and the single-address premise does
-+// not hold on WDDM, so the store DECLINES there and the run keeps today's behaviour.  Nothing in this tier
++// not hold on WDDM, so the GTT store DECLINES there and the run keeps today's behaviour.  Nothing in this tier
 +// is reachable on a discrete device (`prop.integrated` gates it), and it changes no shared code path.
 +#pragma once
 +
@@ -859,7 +859,7 @@ index 000000000..979e1fcaa
 +#include <cstddef>
 +#include <cstdint>
 +
-+// `MOE_EXPERT_GTT` (default 1): the kill switch.  0 = never offer a store, i.e. today's behaviour on an
++// `MOE_EXPERT_GTT` (default 1): the kill switch.  0 = never offer a GTT store, i.e. today's behaviour on an
 +// integrated device verbatim (the expert cache stays disabled, nothing is registered, nothing is logged).
 +bool ggml_cuda_gtt_store_wanted();
 +
@@ -867,26 +867,26 @@ index 000000000..979e1fcaa
 +// writable (the measured 60 GB/s arm) -- the A/B that proves the flag does something on THIS region.
 +bool ggml_cuda_gtt_store_ro();
 +
-+// Open the store on `device` with `extent_bytes` of capacity and record the budget's source string (the
++// Open the GTT store on `device` with `extent_bytes` of capacity and record the budget's source string (the
 +// census prints it verbatim).  Does NOT allocate or register yet: `--fit` loads with `no_alloc`, and a probe
 +// load must not reserve 40 GiB of non-swappable RAM.  The region is created at the first real carve.
-+// Returns false (and fills `err`) when the store is unavailable, already open with a different extent, or
++// Returns false (and fills `err`) when the GTT store is unavailable, already open with a different extent, or
 +// the platform cannot give it the one address the design needs.
 +bool ggml_cuda_gtt_store_open(int device, size_t extent_bytes, const char * source, char * err, size_t errn);
 +
-+// Carve `size` bytes out of the store (bump allocator; page-aligned, monotonic).  NULL when the store is not
++// Carve `size` bytes out of the GTT store (bump allocator; page-aligned, monotonic).  NULL when the GTT store is not
 +// open or the request does not fit -- the caller then declines the tensor rather than over-committing.
 +void * ggml_cuda_gtt_store_carve(int device, size_t size);
 +
 +// The one `-lv 4` census line: extent requested vs realised, the budget source, the registration mode, the
-+// huge-page granularity, the slots and the bytes the loader read from the GGUF into the store.
++// huge-page granularity, the slots and the bytes the loader read from the GGUF into the GTT store.
 +void ggml_cuda_gtt_store_report(int device, size_t filled_bytes, int n_tables, int64_t n_slots);
 +
-+// Unregister and release every store (idempotent; also runs at process exit).  The region is `mmap`ed so the
++// Unregister and release every GTT store (idempotent; also runs at process exit).  The region is `mmap`ed so the
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e138bbfa1..e608bf1fd 100644
+index e138bbfa1..aa15be20f 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -946,11 +946,11 @@ index e138bbfa1..e608bf1fd 100644
 +// `-lme` (`--limit-host-experts`) already means "cap the NON-SWAPPABLE memory used by host-resident MoE
 +// experts, N GiB, spent in descending hotness from the persisted heat map" on a discrete box.  On an APU
 +// there is no host tier (`-ncmoe`/`-cmoe` are refused there, r236), so the same flag is the only expert
-+// residency knob and it has to engage the store by itself -- same units, same ranking, same ceiling, and no
++// residency knob and it has to engage the GTT store by itself -- same units, same ranking, same ceiling, and no
 +// new sizing variable (IMPLEMENTATION.md P1.1, README.md §5).
 +//
-+// The granularity differs and that is deliberate: a whole expert tensor per decision here, because the store
-+// is a PLACEMENT, not a cache.  Per-(tensor, expert) slots are what the store is sliced into (an expert's rows
++// The granularity differs and that is deliberate: a whole expert tensor per decision here, because the GTT store
++// is a PLACEMENT, not a cache.  Per-(tensor, expert) slots are what the GTT store is sliced into (an expert's rows
 +// are contiguous, `nb[2]` per expert), but deciding which SLOT is resident is the eviction policy's job (P3),
 +// and there is no eviction this phase.  So: the hottest whole tables that fit are resident, everything else
 +// keeps its layer's device buffer, and the census says so out loud rather than implying a streaming tier.
@@ -959,7 +959,7 @@ index e138bbfa1..e608bf1fd 100644
 +    host_experts_policy = "shared host/device memory pool (integrated GPU): no host expert tensors";
 +
 +    // A `--fit` / `--no-alloc` PROBE load places no weights at all (dummy buffers), so it must not reserve and
-+    // register the store either: that would make the fit pass commit the very memory it is trying to measure,
++    // register the GTT store either: that would make the fit pass commit the very memory it is trying to measure,
 +    // and on a fitting model it would be the whole expert set.  The real load plans and reserves it.
 +    if (no_alloc) {
 +        return;
@@ -995,9 +995,9 @@ index e138bbfa1..e608bf1fd 100644
 +        c.expert_bytes = (size_t) t->nb[2];   // one (tensor, expert) slot -- the heat prior's own unit
 +        c.nbytes       = ggml_nbytes(t);
 +        total      += c.nbytes;
-+        // The store's alignment is one page per tensor (the buffer type's contract) and the region's extent is
++        // The GTT store's alignment is one page per tensor (the buffer type's contract) and the region's extent is
 +        // what gets registered, so the budget is spent on PADDED sizes.  The +4 KiB covers the buffer type's
-+        // own `get_alloc_size` (a quantized tensor reserves one padded row past its end, which the store must
++        // own `get_alloc_size` (a quantized tensor reserves one padded row past its end, which the GTT store must
 +        // keep -- see that function); it is an over-estimate of at most 4 KiB per table, so the extent is safe
 +        // by construction and the arithmetic below can never hand the buffer type more than the region holds.
 +        padded_total += GGML_PAD(c.nbytes + 4096, 4096);
@@ -1030,7 +1030,7 @@ index e138bbfa1..e608bf1fd 100644
 +        budget = padded_total;
 +        source = "auto: MemAvailable unknown -> the whole expert set";
 +    }
-+    // The store is REGISTERED, non-swappable host memory, so the ceiling is the machine's own memory, read
++    // The GTT store is REGISTERED, non-swappable host memory, so the ceiling is the machine's own memory, read
 +    // once.  `-lme N` above 90%% of it is already refused by the arg parser; this is the same rule applied to
 +    // the `auto` arm and to a host whose memory changed since the parse.
 +    if (avail > 0 && budget > avail / 10 * 9) {
@@ -1043,7 +1043,7 @@ index e138bbfa1..e608bf1fd 100644
 +        return;
 +    }
 +
-+    // --- 3. open the store, once, before any tensor is placed ---------------------------------------
++    // --- 3. open the GTT store, once, before any tensor is placed ---------------------------------------
 +    ggml_backend_buffer_type_t store_buft = nullptr;
 +    ggml_backend_dev_t         store_dev  = nullptr;
 +    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -1058,7 +1058,7 @@ index e138bbfa1..e608bf1fd 100644
 +        }
 +    }
 +    if (store_buft == nullptr) {
-+        // Nothing to say when the operator turned the store off: that path must be byte-identical to the
++        // Nothing to say when the operator turned the GTT store off: that path must be byte-identical to the
 +        // behaviour before this phase, including its log.
 +        static const bool gtt_off = [] {
 +            const char * e = getenv("MOE_EXPERT_GTT");
@@ -1159,7 +1159,7 @@ index e138bbfa1..e608bf1fd 100644
          }
  
 +        if (!buft) {
-+            // wip/apu-expert-gtt P2: a resident expert table the GTT store holds is placed IN the store's
++            // wip/apu-expert-gtt P2: a resident expert table the GTT store holds is placed IN the GTT store's
 +            // device buffer type, so `MUL_MAT_ID` reads it in place with no new op and no per-layer copy.  The
 +            // decision was made once (`plan_gtt_expert_store`), before any tensor was placed.
 +            if (host_experts_store_buft != nullptr && op == GGML_OP_MUL_MAT_ID &&
@@ -1208,7 +1208,7 @@ index e138bbfa1..e608bf1fd 100644
                      validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                          return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 489a0cabe..748c8ea15 100644
+index 489a0cabe..5fa15a6fa 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -100,11 +100,21 @@ struct llama_model_loader {
@@ -1222,8 +1222,8 @@ index 489a0cabe..748c8ea15 100644
      size_t host_experts_holes_bytes  = 0;           // actual pageable bytes, accumulated at load
      bool   host_experts_pool_holes   = false;        // the holes are served by the bounded pinned pool
 +    // wip/apu-expert-gtt P2: the GTT expert store's placement and its census.  `host_experts_store_buft` is
-+    // non-null only while a store is open on this load, so `host_expert_is_store()` is false everywhere else
-+    // (a discrete box, `MOE_EXPERT_GTT=0`, a platform the store declined).
++    // non-null only while a GTT store is open on this load, so `host_expert_is_store()` is false everywhere else
++    // (a discrete box, `MOE_EXPERT_GTT=0`, a platform the GTT store declined).
 +    std::set<std::string>       host_experts_store;
 +    ggml_backend_buffer_type_t  host_experts_store_buft   = nullptr;
 +    size_t                      host_experts_store_extent = 0;   // the budget, in bytes
@@ -1242,7 +1242,7 @@ index 489a0cabe..748c8ea15 100644
 +    // STORE and has to engage it by itself.  The budget, the ceiling and the ranking are the SAME code as the
 +    // discrete arm (`MOE_HOST_LIMIT_FRAC` of MemAvailable, descending hotness from the persisted prior); only
 +    // the granularity differs -- a whole expert tensor here rather than a per-expert pool slot, because the
-+    // store is a placement, not a cache (eviction is P3).
++    // GTT store is a placement, not a cache (eviction is P3).
 +    void plan_gtt_expert_store();
 +
 +    // True when this tensor was placed in the GTT expert store (so its fill is a direct `pread` into the slot).

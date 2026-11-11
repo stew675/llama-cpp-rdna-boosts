@@ -316,9 +316,9 @@ on disk for free.
 
 ---
 
-## 14. 2026-11-11 — the store EXISTS (P1.1 + P2): the keystone re-run, and what the registered region costs and reads at real scale
+## 14. 2026-11-11 — the GTT store EXISTS (P1.1 + P2): the keystone re-run, and what the registered region costs and reads at real scale
 
-The design's memory was answered in §13.  This section is the same box measuring the **implemented** store
+The design's memory was answered in §13.  This section is the same box measuring the **implemented** GTT store
 (`p2-gtt-expert-store.patch`, `README.md` §2.1): the keystone re-run first (because a design premise that no
 longer holds changes everything), then the numbers only an implementation can give — the registration cost of a
 real 19-41 GiB region, the load-time fill rate, and the model-level read-rate A/B the flag exists for.
@@ -342,11 +342,11 @@ Box unchanged: `halo`, Ryzen AI MAX+ 395 / gfx1151, UMA, 123 GiB, kernel 7.2.13,
 same code; §13.2's run had the file warm.  That is why §14.4 measures the fill at both ends rather than quoting
 one figure.
 
-### 14.2 Registration at the store's real extent — cheaper than P1.0 predicted
+### 14.2 Registration at the GTT store's real extent — cheaper than P1.0 predicted
 
-The store registers **one** untouched `mmap`+`MADV_HUGEPAGE` region (`cudaHostRegister(Mapped|ReadOnly)`), which
+The GTT store registers **one** untouched `mmap`+`MADV_HUGEPAGE` region (`cudaHostRegister(Mapped|ReadOnly)`), which
 is the pre-faulting-free order: registering faults the pages in and the kernel forms the huge pages (§13.1, second
-row).  Measured inside the store creation, from the census (extent, mode: 2 runs each on 35B-A3B):
+row).  Measured inside the GTT store creation, from the census (extent, mode: 2 runs each on 35B-A3B):
 
 | extent | registration mode | mmap + MADV_HUGEPAGE + register | per GiB |
 |---|---|---|---|
@@ -356,10 +356,10 @@ row).  Measured inside the store creation, from the census (extent, mode: 2 runs
 | **40 925.6 MiB** (39.9 GiB) | ReadOnly | **1 034 ms** | **25.9** |
 
 * **~26 ms/GiB**, against P1.0's **30.5 ms/GiB** for an untouched region (§13.1) and **17.4 ms/GiB** for a
-  pre-faulted one.  So the `memset` pre-fault walk the probe needed is not worth taking at the store's scale:
+  pre-faulted one.  So the `memset` pre-fault walk the probe needed is not worth taking at the GTT store's scale:
   registering the untouched region costs about what pre-faulting alone did.
 * Registration mode makes **no difference to the cost** (25.8 vs 25.9 ms/GiB) — only to the read rate (§14.5).
-* The **whole** store's registration is **0.48 s on a 19 GiB tier and 1.03 s on the 41 GiB Flash-Next tier** -- and
+* The **whole** GTT store's registration is **0.48 s on a 19 GiB tier and 1.03 s on the 41 GiB Flash-Next tier** -- and
   the per-GiB figure does not drift with size (25.9 ms/GiB at 6, 19 and 41 GiB), so it is a linear, predictable
   startup cost.
 * **All 19 126 MiB of it lands as huge pages**: `AnonHugePages` 19 126.0 MiB of 19 126.5 (100.0 %), and 6 144.0 of
@@ -372,18 +372,18 @@ The fill is the buffered `pread` arm straight into the slot (`read_raw` into `cu
 → `load_data_for`): no alignment round-out, no bounce buffer, no staging ring.  The measured window is
 `carve → census` (the other tensors of the load are `mmap`-mapped, so they are nearly free in that window):
 
-| model | store read from the GGUF | fill window | rate | page cache |
+| model | GTT store read from the GGUF | fill window | rate | page cache |
 |---|---|---|---|---|
 | 35B-A3B Q4_K_M | **18 662.0 MiB** | 1.34 s | **13.9 GB/s** | warm (the file had just been read by earlier arms) |
 | Flash-Next GSQ-IQ3_XXS | **40 925.0 MiB** | 17.6 s | **2.33 GB/s** | cold-ish (46 GiB file on a box holding 37 GiB of cache) |
 
-**The fill is page-cache/disk-bound, and that is a LOAD cost, not a decode cost.**  A 41 GiB store takes ~18 s to
+**The fill is page-cache/disk-bound, and that is a LOAD cost, not a decode cost.**  A 41 GiB GTT store takes ~18 s to
 populate when its file is not resident, ~3 s when it is; it is the same 2.3-15.7 GB/s band §13.2 measured for
 `pread` into a registered region, and P4's pipelining does not touch it (P4 pipelines *miss* fills, this is the
 one-shot load fill).  The bytes read account for every expert byte of the carve (the carve is 0.2 MiB larger on Flash-Next: the
 buffer type's per-tensor page padding), and `size_done`'s progress is unaffected.
 
-### 14.4 `-lme` is the store's size (P1.1) — realised, on both models
+### 14.4 `-lme` is the GTT store's size (P1.1) — realised, on both models
 
 Census, `-lv 4` (`arms.sh census`).  "Slots" = `(tensor, expert)` slabs; `auto` on a fitting set is the whole set.
 
@@ -403,7 +403,7 @@ Census, `-lv 4` (`arms.sh census`).  "Slots" = `(tensor, expert)` slabs; `auto` 
   40 925.0 MiB set also fits on this 123 GiB box.  `MOE_HOST_LIMIT_FRAC=5` exercises the **not-fitting** band: a
   5 804.7 MiB hot subset 34 tables deep.
 * The Flash-Next counts match §13.5's heat-map geometry exactly — **144 tables, 73 728 slots, 39.97 GiB** — which
-  is the cross-check that the store holds the same set the heat map ranks.
+  is the cross-check that the GTT store holds the same set the heat map ranks.
 * 35B-A3B's 123 tables / 19 126 MiB are 3 x 41 layers: the **MTP (nextn) head's** three expert tables are included
   here, where the delivery's cache keys only the 40 trunk layers (§13.5's 120 tables / 18.22 GiB).
 
@@ -414,32 +414,32 @@ Census, `-lv 4` (`arms.sh census`).  "Slots" = `(tensor, expert)` slabs; `auto` 
 | arm | pp512 (run 1) | pp512 (run 2) | tg128 |
 |---|---|---|---|
 | `MOE_EXPERT_GTT=0` (plain device buffer, today) | 2 268.65 ± 26.67 | **2 289.39 ± 4.78** | 63.22-63.25 |
-| store, registered **ReadOnly** (default) | 2 259.63 ± 15.37 | 2 260.77 ± 8.68 | 63.24 |
-| store, registered **WRITABLE** (`RO=0`) | 2 135.82 ± 1.34 | 2 146.85 ± 12.13 | 63.30-63.34 |
+| GTT store, registered **ReadOnly** (default) | 2 259.63 ± 15.37 | 2 260.77 ± 8.68 | 63.24 |
+| GTT store, registered **WRITABLE** (`RO=0`) | 2 135.82 ± 1.34 | 2 146.85 ± 12.13 | 63.30-63.34 |
 
-* **The registered ReadOnly store is within noise of the plain device buffer**: -0.40 % in run 1, -1.25 % in run 2,
-  against a drifts between runs of +0.9 % on the plain arm itself.  The store is **not a slow tier**, which is the
+* **The registered ReadOnly GTT store is within noise of the plain device buffer**: -0.40 % in run 1, -1.25 % in run 2,
+  against a drifts between runs of +0.9 % on the plain arm itself.  The GTT store is **not a slow tier**, which is the
   acceptance criterion P2 set.
 * **`MOE_EXPERT_GTT_RO=0` is materially slower**: -5.9 % and -6.2 % of the plain arm, -5.5 % and -5.0 % of the
-  ReadOnly store, at a spread of ±1.34 / ±12.13 — i.e. well outside the noise.  The 232-vs-60 GB/s fact of probes
+  ReadOnly GTT store, at a spread of ±1.34 / ±12.13 — i.e. well outside the noise.  The 232-vs-60 GB/s fact of probes
   03/04 **does apply to this region**.
 * The magnitude is *masked by compute*: a 3.9x slower read costs 5-6 % of prefill, not 74 %, because the expert
   read overlaps arithmetic and only a fraction of prefill is weight-bandwidth-bound.  Do not read the 60 GB/s
   probe figure as "writable costs 74 % at the model".
 * **Decode does not move at all** (63.22-63.34 t/s across all six runs): a decode step reads top-k experts, so it
-  never approaches the read bandwidth.  A store's value is in what it holds, not in how fast it reads while
+  never approaches the read bandwidth.  A GTT store's value is in what it holds, not in how fast it reads while
   fitting.
 
 ### 14.6 Identity, and the kill switch
 
 Same-seed greedy text, **no `-lv`** (`scripts/extract-generated.py`), prompt `The capital of France is`, `-n 20`:
 
-| model | `MOE_EXPERT_GTT=0` | store `auto` | store `-lme 6` | store `RO=0` | pre-P2 build (`release.json` tree) |
+| model | `MOE_EXPERT_GTT=0` | GTT store `auto` | GTT store `-lme 6` | GTT store `RO=0` | pre-P2 build (`release.json` tree) |
 |---|---|---|---|---|---|
 | 35B-A3B Q4_K_M | `89 chars sha=627b2ebd7792` | **identical** | **identical** | **identical** | **identical** |
 | Flash-Next GSQ-IQ3_XXS | `113 chars sha=f586785d7183` | **identical** | — | — | **identical** |
 
-`-ncmoe 8` on the same box with the store on: identical too (the `-ncmoe` refusal is unchanged, and the store
+`-ncmoe 8` on the same box with the GTT store on: identical too (the `-ncmoe` refusal is unchanged, and the GTT store
 simply holds the whole set).
 
 The kill switch's log is **byte-for-byte** the release tree's: the two `-lv 4` logs (pre-P2 build vs
@@ -452,11 +452,76 @@ journal: **clean**, and no `HSA_STATUS_ERROR_MEMORY_FAULT` in any arm.
 * **Eviction, the streaming refill, and the `>RAM` case** — P3/P4/P5.  Every arm above has its expert set
   *fitting*; the census prints "a hot subset" when it does not, and says there is no eviction.
 * **Pipelining.**  §13.4's requirement (fills behind compute) is untouched: P2 has exactly one fill, at load.
-* **`--fit`'s view of the store.**  A `--fit` probe load is `no_alloc`, so the store plan is skipped entirely
+* **`--fit`'s view of the GTT store.**  A `--fit` probe load is `no_alloc`, so the GTT store plan is skipped entirely
   (`llama_model_loader.cpp`: `if (no_alloc) return;`) and the probe reserves nothing — confirmed by exactly ONE
   `plan_gtt_expert_store` line per run with `--fit on` (the default).  But `--fit` therefore does **not** account
-  for the store when it sizes the context; that is P1.3's item, and on this box it did not matter.
-* **Reclamation under memory pressure** — probe `16`, still owed, and now more load-bearing: the store is
-  registered and `MemAvailable` fell by exactly the store's extent on every arm (e.g. 19 126 MiB on the 35B arm).
+  for the GTT store when it sizes the context; that is P1.3's item, and on this box it did not matter.
+* **Reclamation under memory pressure** — probe `16`, still owed, and now more load-bearing: the GTT store is
+  registered and `MemAvailable` fell by exactly the GTT store's extent on every arm (e.g. 19 126 MiB on the 35B arm).
   Nothing here tests whether the kernel can take it back.
 * **gfx1150 / Windows / a carve-out APU**, and any second device.
+
+---
+
+## 15. 2026-11-11 — probe 16: reclamation under pressure.  **`hipHostRegister` does not pin; the GTT store is reclaimable; the "budget is a reservation" claim is FALSE as measured**
+
+`probe/16-reclaim-pressure.cpp`.  The question §5 and §12 built a claim on: probe `09` showed a *user-initiated*
+`fadvise(DONTNEED)` + `madvise(DONTNEED)` cannot release a registered range, and the campaign read that as "the
+budget is a reservation".  A user discard is not the kernel's reclaim under pressure.  This is the measurement.
+
+Box unchanged (`halo`, gfx1151, 123 GiB, 183.9 GiB swap, kernel 7.2.13, ROCm 10.1.0, `iommu=off`,
+`TRANS_HUGEPAGE=madvise`).  Each arm runs in its own process **inside a memory cgroup** --
+`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=4G` -- so the pressure is real but contained (a
+machine-wide hog needs ~100 GiB and invites the OOM killer); `PROBE16_HOG_MIB=4096` bounds the hog.  Region
+2048 MiB, control (unregistered anon) 2048 MiB, both filled with an offset-dependent pattern.  `ulimit -l` is
+**unlimited** on this box, which is why the `mlock` arm exists.
+
+### 15.1 The arms, and the verdict
+
+Every arm's pressure was **real**: the unregistered control lost 17-2048 MiB of pages and the cgroup reached its
+`memory.max` with 2.1-2.2 GiB in `memory.swap.current`.
+
+| arm | what the region is | pages the kernel took (MiB), across runs | huge pages after | GPU read after the pressure | `Unevictable` |
+|---|---|---|---|---|---|
+| `ctl` | plain anon, nothing registered | 2048 (all of it) | lost | n/a | 0 |
+| **`reg`** | `mmap`+`MADV_HUGEPAGE`+`hipHostRegister(Mapped\|ReadOnly)` -- **the GTT store's own backing** | **1.1, 28, 212, 436** (and 0 in 2 runs) of 2048 | **split every run**: 2048 → 626-1066 MiB | 29-36 ms when ≤ 28 MiB was taken, **524 ms** when 436 MiB was | **0** |
+| `reg_w` | the same, registered writable | 286, 394 (and 0 in 1 run) | split: 2048 → 812-1150 MiB | 78 ms, 395 ms, **2 191 ms** | **0** |
+| `hostalloc` | `hipHostMalloc(Mapped\|Portable)` -- a *pinned* allocation | 86 (and 0 in 2 runs) | **never had any** (`AnonHugePages` 0) | 48 ms, 183 ms | **0** |
+| **`mlock`** | `mmap`+`MADV_HUGEPAGE`+**`mlock`**+`hipHostRegister(ReadOnly)` | **0, 0, 0, 0** | **2048 MiB preserved** | **26-28 ms** | **2048** (`Mlocked` 2048) |
+
+Four things, in order of how much they change the design:
+
+1. **`hipHostRegister` on an `mmap` region does not pin it on this box.**  Under real pressure the kernel *splits
+   the transparent huge pages* (every run: 2048 MiB → 626-1 150 MiB of `AnonHugePages`) and takes 0-436 MiB of the
+   region's pages into swap.  The delivery's `ROCm_Host` master is `hipHostMalloc`'d, which is a different
+   mechanism; this region is *registered*, not pinned.  (A `hipHostMalloc` region held in 2 of 3 runs and lost
+   86 MiB in the third, so it is not an absolute guarantee either -- it is simply not THP-backed.)
+2. **It is a slow failure, not a fatal one -- and it is one-off.**  The GPU read after the pressure returned the
+   right bytes in **every** arm and run: no `HSA_STATUS_ERROR_MEMORY_FAULT`, because the driver revalidates the
+   userptr range at submission and faults the pages back in.  The cost is that first read: **524 ms against 42 ms**
+   for 2 GiB when 436 MiB had been taken (12x; 2 191 ms / 37x in the worst `reg_w` run), and the **second** read is
+   back to 41-44 ms.  So a swapped-out GTT store does not corrupt and does not crash: it stalls.
+3. **The only reliable reservation is `mlock`** -- and it is the only arm that is *visible* to a monitor:
+   `Unevictable` / `Mlocked` / `smaps Locked` all report the 2 048 MiB, where **every** other arm reports 0 while
+   being reclaimable to some degree.  It also keeps the huge pages (2048 MiB of `AnonHugePages` *after* the
+   pressure) and the read rate (26-28 ms), which is what the GTT store wants; `hipHostMalloc` is the opposite
+   trade (never reclaimable-ish, never huge).
+4. **THP splitting alone costs nothing measurable**: the runs where the kernel split the huge pages but took 0-28 MiB
+   read at 29-36 ms, the same as before the pressure.
+
+### 15.2 What this does to the campaign
+
+* **`README.md` §5's "the budget is a reservation" is wrong** and is corrected there: the GTT store as built (P2)
+  is *reclaimable under pressure*.  A >RAM configuration cannot lean on the budget for anything except its
+  *sizing* intent -- the pages can be swapped, and the GTT store then pays a one-off 10-40x stall on the first read
+  that touches the swapped-out part.
+* **The fix is one line and it needs the maintainer's call:** `mlock()` the region after the fill (or before the
+  registration).  It costs `RLIMIT_MEMLOCK` -- unlimited on this box, but a stock desktop ships 8 MiB, so a real
+  GTT store would be refused there unless the process raises the limit or has `CAP_IPC_LOCK`.  The fallback must
+  therefore be explicit: either decline the GTT store, or accept "reclaimable, with a stall under pressure" and
+  say so in the census.
+* **Nothing else changes**: `MemAvailable` is charged the same either way, so `-lme auto`'s arithmetic stands, and
+  no fill path, no registration mode and no census field depends on this.
+* **Unmeasured, and named as such:** whether a large (`-lme auto`, 19-41 GiB) `mlock`ed region behaves like the
+  2 GiB one; whether `mlock` + registration changes the fill rate (the fill writes already-resident pages, so it
+  should not); and what `mlock`'s interaction with `hipHostUnregister` is at teardown.
