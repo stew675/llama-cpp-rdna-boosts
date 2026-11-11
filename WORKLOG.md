@@ -105,7 +105,7 @@ the change (device and `Host experts` rows), the Qwen3.5-4B **top-k sampler** ar
 | coherence, 4B Q8_0, 1 GPU (`--seed 42 --temp 0 -n 20`) | `1c5d32ac537d` | `1c5d32ac537d` |
 | coherence, 4B Q8_0, 3 GPU `-sm tensor` | `1c5d32ac537d` | `1c5d32ac537d` |
 | top-k sampler, 4B Q8_0, 3 GPU `-sm tensor` (`--temp 0.8 --top-k 40 -n 100`) | `1c87c32e9fc4` | `1c87c32e9fc4` |
-| DeepSeek-V4-Flash-0731 Q8_K_XL, 1 GPU, `-ot exps=CPU`, 16 tokens | coherent | **byte-identical text** |
+| DeepSeek-V4-Flash-0731 Q8_K_XL, 1 GPU, `-ot exps=CPU`, 16 tokens (the top-k kernel A/B, both arms on the fixed probe) | coherent | **byte-identical text** |
 | DeepSeek-V4-Flash-0731 Q8_K_XL, **3 GPU `-sm layer`**, `-ot exps=CPU` | `GGML_ASSERT(sinfo.n_stream() > 1)` | coherent ("... 17*23 = 17*(20+3)=340+"), no faults |
 | `test-llama-archs -a deepseek4 -b ROCm0` | `Host experts` row aborts (assert) | **2/2** (device 7.13e-08, Host experts 7.13e-08) |
 | `test-llama-archs -a deepseek41 -b ROCm0` | `Host experts` row aborts (assert) | **2/2** (device 5.37e-08, Host experts 5.37e-08) |
