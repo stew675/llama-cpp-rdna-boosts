@@ -1,9 +1,9 @@
-From 3a0e919609bbbb181c8b52023ae85acb0f57b0d1 Mon Sep 17 00:00:00 2001
+From d40441f5ff7cd40a777a0f78b171995fbcca24af Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH] wip: apu-expert-gtt P1.1 + P2 + P3a/P3b/P3c -- a mlocked GTT
- expert store, the tier as a serving ARENA, and the MTP head pinned outside
- the budget
+ expert store, the tier as a serving ARENA, the MTP head pinned outside the
+ budget, and one store shared safely by two models
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -42,6 +42,18 @@ no host pool and no slab arena below it.
   get to trade it away and its bytes sit on top of the budget (extent = `-lme N` + head).  The partition
   is by layer (`>= n_layer_trunk`) and only when the nextn layers are actually loaded (`load_mtp`), so a
   load without a drafter no longer counts -- or stores, or reads -- tensors no graph will touch.
+- P3c follow-up (a SEPARATE drafter model -- Flash-Next's `mtp-...-shared-*.gguf`, one qwen4exp nextn
+  block with 3 expert tables): the GTT store is ONE region per device per process, so a second load
+  must not size it, grow it, take the arena tier (its extent is the trunk's budget and the cache
+  reserves from the same free list) or ask for a carve it cannot get.  It now sizes its placement
+  against what is actually free, adopts the live region when its set fits there, and declines cleanly
+  (its layer's device buffer, which on UMA is the same host RAM and already fully resident) with a
+  message that says why.  Two bugs fixed with it: a failed carve returned a null buffer and the OLD
+  comment claimed the loader fell back -- it does not, the model FAILS to load (measured: `unable to
+  allocate ROCmGTTStore0 buffer`, exit 1, on `-lme 1` + a separate drafter); and the store buffer's
+  free path released nothing, so a second model in one process (a reload, or `llama-bench -m A -m B`)
+  found the region exhausted and silently ran on device buffers -- i.e. the two rows were measured
+  under different expert tiers.
 - MOE_EXPERT_GTT=0 (kill switch) reproduces today's behaviour and log byte for byte;
   MOE_EXPERT_GTT_RO=0 registers the region writable, the A/B that proves the read-rate claim.
 - The ARENA tier is opt-in and stays opt-in until it has been measured on more than this box: no
@@ -57,20 +69,23 @@ buffer for the registered READ-ONLY arm; the lock policy's four arms pass under 
 the arena tier registers all 120/144 tables, evicts under a partial budget with 0 arena releases,
 and a 123.45 GiB model runs to completion at -lme 20 and -lme 60; the MTP head is pinned outside
 the budget on both (3 tables / 464 MiB on 35B-A3B, 3 / 2448 MiB on the 122B) with draft acceptance
-unchanged; check-gpu-faults.sh clean.
+unchanged; the separate Flash-Next drafter runs in every arm (store off, `auto`, `-lme 6`, arena
+`-lme 8` and the degenerate `-lme 1`) with text unchanged, the target's arena untouched, and a
+two-model `llama-bench` adopts the live store for its second model instead of falling to device
+buffers; check-gpu-faults.sh clean.
 ---
  common/arg.cpp                          |  30 +-
- ggml/include/ggml-backend.h             |  22 +
- ggml/src/ggml-backend-impl.h            |  37 ++
- ggml/src/ggml-backend.cpp               |  30 ++
- ggml/src/ggml-cuda/ggml-cuda.cu         | 246 +++++++++-
- ggml/src/ggml-cuda/gtt-expert-store.cu  | 595 ++++++++++++++++++++++++
- ggml/src/ggml-cuda/gtt-expert-store.cuh |  85 ++++
+ ggml/include/ggml-backend.h             |  27 +
+ ggml/src/ggml-backend-impl.h            |  45 ++
+ ggml/src/ggml-backend.cpp               |  37 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu         | 279 ++++++++++-
+ ggml/src/ggml-cuda/gtt-expert-store.cu  | 638 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/gtt-expert-store.cuh |  89 ++++
  ggml/src/ggml-cuda/moe-expert-cache.cu  | 257 +++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h   |  11 +
- src/llama-model-loader.cpp              | 549 +++++++++++++++++++++-
+ src/llama-model-loader.cpp              | 618 ++++++++++++++++++++++-
  src/llama-model-loader.h                |  35 ++
- 11 files changed, 1857 insertions(+), 40 deletions(-)
+ 11 files changed, 2026 insertions(+), 40 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -130,10 +145,10 @@ index faa73a2e9..5575b0e86 100644
                  long long avail_mib = -1;
                  if (mi != nullptr) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..e797437f3 100644
+index d72bb88d7..b8bbee7f4 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -90,6 +90,28 @@ extern "C" {
+@@ -90,6 +90,33 @@ extern "C" {
      // r212: tell the host pool how the model was loaded (1 = O_DIRECT) so its fills can mirror it.
      GGML_API void                  ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct);
  
@@ -159,14 +174,19 @@ index d72bb88d7..e797437f3 100644
 +    GGML_API bool                  ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
 +                                                                  const int * pinned_layers, int n_pinned_layers);
 +
++    // wip/apu-expert-gtt P3c: SIZE_MAX when no GTT store is open on `dev` (the caller sizes its own), otherwise
++    // the largest run the LIVE store can still hand out.  A second model in one process must place within it and
++    // must not size, grow or take the arena tier (the extent is the first model's budget).
++    GGML_API size_t                ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev);
++
      // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
      // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
      // No-op for a backend without a slab or with no ring hole.
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 87c8164ec..962480009 100644
+index 87c8164ec..49d5faf84 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -577,6 +577,43 @@ extern "C" {
+@@ -577,6 +577,51 @@ extern "C" {
          // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
          // that never answers leaves the pool on its own default).
          void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
@@ -207,14 +227,22 @@ index 87c8164ec..962480009 100644
 +        // policy must not trade it away, and its bytes must not eat the trunk's budget).
 +        bool (*gtt_store_arena)(ggml_backend_dev_t dev, size_t extent_bytes,
 +                                const int * pinned_layers, int n_pinned_layers);
++
++        // (optional) wip/apu-expert-gtt P3c follow-up: SIZE_MAX when no GTT store is open on this device (the
++        // caller sizes its own), otherwise the largest run the LIVE store can still hand out.  A second model in
++        // one process (a separate MTP drafter's head, or a reload) must place within that and must never size,
++        // grow or take the arena tier: the region's extent is the FIRST model's budget.  APPENDED at the very
++        // end for the positional-initializer reason above; zero-initialized = "no store", which is what a
++        // backend without one must answer.
++        size_t (*gtt_store_free_bytes)(ggml_backend_dev_t dev);
      };
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 474166cef..2a4e337fc 100644
+index 474166cef..d78c24c29 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -329,6 +329,36 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
+@@ -329,6 +329,43 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
      dev->iface.moe_cache_set_host_fill_mode(dev, direct);
  }
  
@@ -241,6 +269,13 @@ index 474166cef..2a4e337fc 100644
 +    return dev->iface.gtt_store_arena(dev, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
++size_t ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev) {
++    if (dev == nullptr || dev->iface.gtt_store_free_bytes == nullptr) {
++        return SIZE_MAX;
++    }
++    return dev->iface.gtt_store_free_bytes(dev);
++}
++
 +size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
 +    if (dev == nullptr || dev->iface.gtt_store_lockable == nullptr) {
 +        return SIZE_MAX;
@@ -252,7 +287,7 @@ index 474166cef..2a4e337fc 100644
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bf574ecf9..479bcac95 100644
+index bf574ecf9..a773ea68d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -124,6 +124,7 @@
@@ -263,7 +298,7 @@ index bf574ecf9..479bcac95 100644
  
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
-@@ -5269,6 +5270,158 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
+@@ -5269,6 +5270,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
      return nullptr;
  }
  
@@ -301,7 +336,19 @@ index bf574ecf9..479bcac95 100644
 +// The buffer is a VIEW of the GTT store: the region outlives every buffer cut from it, so freeing releases
 +// nothing.  The region is released once, by `ggml_cuda_gtt_store_free()`.
 +static void ggml_backend_cuda_gtt_store_free_buffer(ggml_backend_buffer_t buffer) {
-+    GGML_UNUSED(buffer);
++    // Hand the carve back to the store's allocator.  The carve comment says "never released", which was true of
++    // the placement arm and is exactly what made a SECOND load in the same process (a separate MTP drafter, or
++    // llama-bench reloading) run out of region and then fail its load.  The region itself, its registration and
++    // its extent are untouched; only the byte range returns to the free list.
++    if (buffer == nullptr || buffer->context == nullptr || buffer->buft == nullptr) {
++        return;
++    }
++    const ggml_backend_cuda_buffer_type_context * buft_ctx =
++        (const ggml_backend_cuda_buffer_type_context *) buffer->buft->context;
++    if (buft_ctx == nullptr) {
++        return;
++    }
++    ggml_cuda_gtt_store_release(buft_ctx->device, buffer->context, buffer->size);
 +}
 +
 +// The GTT store is ordinary host memory that the GPU also reads (one address, `iommu=off`), so every host-side
@@ -378,9 +425,15 @@ index bf574ecf9..479bcac95 100644
 +    ggml_cuda_set_device(buft_ctx->device);
 +    void * base = ggml_cuda_gtt_store_carve(buft_ctx->device, size);
 +    if (base == nullptr) {
-+        // A DECLINE, not an abort: the loader places the tensors it cannot fit in the plain device buffer.
-+        GGML_LOG_WARN("%s: device %d: the GTT expert store declined a %.2f MiB carve; those expert tables stay in "
-+                      "the plain device buffer\n", __func__, buft_ctx->device, (double) size / 1048576.0);
++        // NOT a soft decline, which the old comment here claimed: `llama_model_load` turns a null buffer into
++        // `unable to allocate ROCmGTTStore0 buffer` and the model does not load (measured: a separate MTP
++        // drafter whose head did not fit the store the target's placement had already filled).  The loader
++        // therefore sizes the placement against the store's real free bytes
++        // (`ggml_backend_dev_gtt_store_free_bytes`) and must never ask for more than it can place.
++        GGML_LOG_ERROR("%s: device %d: the GTT expert store could not carve %.2f MiB (largest free run %.2f "
++                       "MiB); the model cannot be placed in the store -- this is a sizing bug, not a fallback, "
++                       "because a null buffer fails the load\n", __func__, buft_ctx->device,
++                       (double) size / 1048576.0, (double) ggml_cuda_gtt_store_largest_free(buft_ctx->device) / 1048576.0);
 +        return nullptr;
 +    }
 +    GGML_LOG_INFO("%s: device %d: %.2f MiB of expert tables placed in the GTT store at %p\n", __func__,
@@ -422,7 +475,7 @@ index bf574ecf9..479bcac95 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -10251,6 +10404,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
+@@ -10251,6 +10422,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
      return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
@@ -434,7 +487,7 @@ index bf574ecf9..479bcac95 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -10338,6 +10496,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+@@ -10338,6 +10514,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
@@ -451,7 +504,7 @@ index bf574ecf9..479bcac95 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -10450,13 +10618,83 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -10450,13 +10636,97 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -517,6 +570,20 @@ index bf574ecf9..479bcac95 100644
 +    return moe_cache_preflight_store(dev_ctx->device, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
++static size_t ggml_backend_cuda_device_gtt_store_free_bytes(ggml_backend_dev_t dev) {
++    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
++    if (dev_ctx == nullptr) {
++        return SIZE_MAX;
++    }
++    if (moe_cache_gtt_arena()) {
++        // The live store IS this run's arena: its extent is the trunk's budget and the cache reserves its slots
++        // out of the same free list, so there is nothing to share.  A second model taking bytes from here would
++        // silently shrink the trunk's residency (measured: a 2 550 MiB head out of an 8 192 MiB arena).
++        return 0;
++    }
++    return ggml_cuda_gtt_store_free_bytes(dev_ctx->device);
++}
++
 +static size_t ggml_backend_cuda_device_gtt_store_lockable(ggml_backend_dev_t dev) {
 +    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
 +    if (dev_ctx == nullptr) {
@@ -537,7 +604,7 @@ index bf574ecf9..479bcac95 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -10598,6 +10836,10 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10598,6 +10868,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -545,15 +612,16 @@ index bf574ecf9..479bcac95 100644
 +    /* .gtt_store_report          = */ ggml_backend_cuda_device_gtt_store_report,
 +    /* .gtt_store_lockable        = */ ggml_backend_cuda_device_gtt_store_lockable,
 +    /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
++    /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
  };
  
  // backend reg
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cu b/ggml/src/ggml-cuda/gtt-expert-store.cu
 new file mode 100644
-index 000000000..685d27d09
+index 000000000..7c084fc76
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cu
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,638 @@
 +// wip/apu-expert-gtt P2: the GTT expert store's region.  See `gtt-expert-store.cuh` for the design and the
 +// measurements it rests on; the buffer type that carves tensors out of this region lives in `ggml-cuda.cu`.
 +//
@@ -905,6 +973,29 @@ index 000000000..685d27d09
 +            snprintf(s.source, sizeof(s.source), "%s", source != nullptr ? source : "");
 +            return true;
 +        }
++        // A SECOND load may ADOPT the live region for a smaller request that fits in what is still free.  This
++        // is the separate-MTP-drafter shape: the target's store is sized and carved first, and the drafter's
++        // head (one nextn block, 3 expert tables) is placed in the same region on top of it.  The caller has
++        // already capped its budget by `ggml_cuda_gtt_store_free_bytes()`, so this is a share, not a grow: the
++        // region, its extent, its registration and its source string all stay the first model's.
++        if (extent_bytes < s.extent) {
++            size_t best = 0;
++            for (const auto & r : s.free_ranges) {
++                best = r.len > best ? r.len : best;
++            }
++            if (best >= extent_bytes) {
++                GGML_LOG_WARN("%s: device %d: this load adopts the live %.2f MiB GTT store, placing %.2f MiB "
++                              "of expert tables inside it (%.2f MiB still free; the region, its extent and its "
++                              "registration stay the first model's)\n", __func__, device,
++                              (double) s.extent / 1048576.0, (double) extent_bytes / 1048576.0,
++                              (double) best / 1048576.0);
++                return true;
++            }
++            snprintf(err, errn, "a GTT store of %.2f MiB is already live on device %d and only %.2f MiB of it is "
++                     "free; this load asks for %.2f MiB", (double) s.extent / 1048576.0, device,
++                     (double) best / 1048576.0, (double) extent_bytes / 1048576.0);
++            return false;
++        }
 +        snprintf(err, errn, "a GTT store of %.2f MiB is already live on device %d; %.2f MiB cannot replace it in "
 +                 "place", (double) s.extent / 1048576.0, device, (double) extent_bytes / 1048576.0);
 +        return false;
@@ -1033,6 +1124,26 @@ index 000000000..685d27d09
 +    }
 +}
 +
++// How many bytes a SECOND load may still place in the live GTT store: SIZE_MAX when no store is open on this
++// device (the caller sizes its own), otherwise the largest free run.  A second model in one process (a separate
++// MTP drafter's head, or llama-bench reloading the same model) must not size or grow the region: its extent is
++// the FIRST model's budget, and the arena tier reserves its slots out of the same free list.
++size_t ggml_cuda_gtt_store_free_bytes(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return SIZE_MAX;
++    }
++    std::lock_guard<std::mutex> lock(g_store_mutex);
++    const gtt_store_t & s = g_stores[device];
++    if (!s.opened || s.base == nullptr) {
++        return SIZE_MAX;
++    }
++    size_t best = 0;
++    for (const auto & r : s.free_ranges) {
++        best = r.len > best ? r.len : best;
++    }
++    return best;
++}
++
 +size_t ggml_cuda_gtt_store_largest_free(int device) {
 +    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
 +        return 0;
@@ -1151,10 +1262,10 @@ index 000000000..685d27d09
 +}
 diff --git a/ggml/src/ggml-cuda/gtt-expert-store.cuh b/ggml/src/ggml-cuda/gtt-expert-store.cuh
 new file mode 100644
-index 000000000..1778bf18f
+index 000000000..ae7567213
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gtt-expert-store.cuh
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,89 @@
 +// wip/apu-expert-gtt P2: the UMA **GTT expert store** -- one registered anonymous region that holds the
 +// resident MoE expert set, read in place by `MUL_MAT_ID`.
 +//
@@ -1232,6 +1343,10 @@ index 000000000..1778bf18f
 +// The largest single run still free (0 when the store is not open).  The cache's arena sizing asks this to
 +// avoid a failed allocation, and the census prints it.
 +size_t ggml_cuda_gtt_store_largest_free(int device);
++
++// For a SECOND load in the same process: how many bytes it may still place in the live store (SIZE_MAX when no
++// store is open, i.e. "size your own").  See `ggml_cuda_gtt_store_free_bytes` in the .cu.
++size_t ggml_cuda_gtt_store_free_bytes(int device);
 +
 +// The one `-lv 4` census line: extent requested vs realised, the budget source, the registration mode, the
 +// huge-page granularity, the slots and the bytes the loader read from the GGUF into the GTT store.
@@ -1675,7 +1790,7 @@ index 3c5469637..0cea456ca 100644
  // so the auto-sized arena does not take the space a later compute growth needs.  Called at the
  // prefill -> decode transition, before the arena is sized.
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e138bbfa1..7e4848acd 100644
+index e138bbfa1..d66cd9020 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -1725,7 +1840,7 @@ index e138bbfa1..7e4848acd 100644
          return;
      }
  
-@@ -419,7 +437,472 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +437,541 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -1989,10 +2104,70 @@ index e138bbfa1..7e4848acd 100644
 +    // reachable only with `MOE_EXPERT_GTT_ARENA=1`, and without it an APU behaves exactly as P2 does
 +    // (whole-tensor placement for the fitting band, hot-subset placement otherwise).  Do NOT flip this default on
 +    // the strength of a text arm: a fitting-set arm can look perfect and never touch the arena at all.
++
++    // --- 2c-bis. a store may ALREADY BE LIVE for this process ----------------------------------------
++    //
++    // A second model is a normal shape, not an edge case: the MTP head can be a SEPARATE model file (Flash-Next's
++    // `mtp-...-shared-*.gguf`: one qwen4exp nextn block, 3 expert tables, 2.6 GiB), and llama-bench reloads the
++    // same model between reps.  The GTT store is ONE region per device for the whole process, so a second load
++    // must not:
++    //   * SIZE it or grow it -- the extent is the FIRST model's budget, and it was clamped to RLIMIT_MEMLOCK and
++    //     to 90 % of MemAvailable for that model;
++    //   * take the ARENA tier -- the cache's slots are reserved out of the same free list, so a head carved from
++    //     it would silently shrink the trunk's arena (measured: 2 550 MiB of a 8 192 MiB arena);
++    //   * ask for a carve it cannot get -- `ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer` returning null
++    //     FAILS the model load (measured: `unable to allocate ROCmGTTStore0 buffer`, exit 1), it is not the
++    //     fail-soft decline the code used to claim.
++    // So: place within what is actually FREE, and decline cleanly (the weights keep their layer's device buffer,
++    // which on UMA is the same host RAM and is already fully resident) when that is not a whole table.
++    size_t live_free = SIZE_MAX;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;
++        }
++        const size_t f = ggml_backend_dev_gtt_store_free_bytes(d);
++        if (f != SIZE_MAX && f < live_free) {
++            live_free = f;
++        }
++    }
++    const bool store_live = live_free != SIZE_MAX;
++    if (store_live) {
++        // A store from an earlier load is live: it is not ours to size, and its free space is the whole budget.
++        size_t smallest_table = padded_total;
++        for (const auto & c : cands) {
++            smallest_table = std::min(smallest_table, GGML_PAD(c.nbytes + 4096, 4096));
++        }
++        if (live_free < smallest_table) {
++            LLAMA_LOG_WARN("%s: a GTT expert store is already live on this device and has %.1f MiB free, less than "
++                           "the smallest expert table (%.1f MiB), so this load places nothing in it: %s.  On UMA "
++                           "the device buffer is the same host RAM the store would have held, and it is already "
++                           "fully resident, so a nextn head placed this way loses nothing -- the shape this "
++                           "happens for is the SEPARATE MTP drafter model (e.g. Flash-Next's "
++                           "`mtp-...-shared-*.gguf`), whose 3 head tables are its whole expert set.\n", __func__,
++                           (double) live_free / mib, (double) smallest_table / mib,
++                           live_free == 0
++                               ? "the region is either this run's ARENA (its extent is the trunk's budget, and "
++                                 "carving the head out of it would shrink the trunk's residency) or a placement "
++                                 "carve that filled it"
++                               : "what is left of the live store");
++            return;
++        }
++        LLAMA_LOG_WARN("%s: a GTT expert store is already live on this device with %.1f MiB free; this load sizes "
++                       "nothing and takes no arena tier -- it places at most that much in it and keeps everything "
++                       "else in its layer's device buffer (a second model: the head of a separate MTP drafter, or "
++                       "a reload of the same model)\n", __func__, (double) live_free / mib);
++        if (live_free < extent) {
++            extent_trunk = live_free > head_padded ? live_free - head_padded : 0;
++            extent       = std::min(extent, live_free);
++            source += format(", capped to the live store's %.1f MiB free", (double) live_free / mib);
++        }
++    }
++
 +    static const bool arena_wanted = getenv("MOE_EXPERT_GTT_ARENA") != nullptr;
 +    // The test is the TRUNK: `extent` already carries the head's bytes on top of the budget (P3c), so comparing
 +    // the total against the trunk's own padded size would never engage the arena on a model with a head.
-+    if (arena_wanted && extent_trunk < padded_total) {
++    if (arena_wanted && !store_live && extent_trunk < padded_total) {
 +        // Every table must be able to hold at least one slot, or the cache would serve some op from the
 +        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
 +        // per table before enabling the tier at all.
@@ -2154,9 +2329,18 @@ index e138bbfa1..7e4848acd 100644
 +        n_slots   += c.n_experts;
 +    }
 +    if (n_tables == 0) {
++        size_t smallest_table = GGML_PAD(cands.back().nbytes + 4096, 4096);
++        for (const auto & c : cands) {
++            smallest_table = std::min(smallest_table, GGML_PAD(c.nbytes + 4096, 4096));
++        }
 +        LLAMA_LOG_WARN("%s: the %.1f MiB GTT expert store holds no whole expert table (the smallest is %.1f "
-+                       "MiB); every expert keeps its layer's device buffer\n", __func__, (double) extent / mib,
-+                       (double) GGML_PAD(cands.back().nbytes + 4096, 4096) / mib);
++                       "MiB); every expert keeps its layer's device buffer%s\n", __func__, (double) extent / mib,
++                       (double) smallest_table / mib,
++                       store_live ? "  The store is already live for this process, so this load could only place "
++                                    "what was still free in it -- and on UMA that device buffer is the same host "
++                                    "RAM the store would have held, already fully resident (the head of a "
++                                    "separate MTP drafter is the shape this happens for)."
++                                  : "");
 +        return;
 +    }
 +
@@ -2198,7 +2382,7 @@ index e138bbfa1..7e4848acd 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -2036,6 +2519,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2036,6 +2588,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -2239,7 +2423,7 @@ index e138bbfa1..7e4848acd 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2557,7 +3074,18 @@ bool llama_model_loader::load_all_data(
+@@ -2557,7 +3143,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -2259,7 +2443,7 @@ index e138bbfa1..7e4848acd 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2618,9 +3146,12 @@ bool llama_model_loader::load_all_data(
+@@ -2618,9 +3215,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

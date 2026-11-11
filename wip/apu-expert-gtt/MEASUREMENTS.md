@@ -769,3 +769,94 @@ doesn't contain MTP layers`, with the store **off** as well, so it is a property
   is the reason the `auto` census in §16 changes from 123 tables to 120.
 * **Multi-device** is untested (one GPU here); the head's bytes are subtracted per device, which is right under
   `-sm layer` and untested under `-sm tensor`.
+
+## 18. 2026-11-11 — the SEPARATE MTP drafter: one GTT store, two models.  Two real bugs found and fixed, and why the head is *correct* on its own device buffer
+
+`MEASUREMENTS.md` §17 measured the head **embedded** in the target's own file (35B-A3B, the 122B).  The other
+shape is a **separate drafter model**, and it is the Flash-Next one:
+`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` — arch `qwen4exp` with `nextn_shared_target_tensors = true`, 32 tensors,
+all of them `blk.48.*` (one nextn block: `ffn_{gate,up,down}_exps` at 850 MiB each = **2 550 MiB**, the whole of
+its expert set), used as `--spec-draft-model` with `--spec-type draft-mtp`.  The target
+(`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS`) reports `n_layer = n_layer_all = 48`: it has no nextn block of its own.
+
+So the two shapes differ in exactly the way that matters for this tier: the embedded head shares the target's
+**arena**, the separate one arrives as a **second load** into the same process, where the GTT store is ONE region
+per device.
+
+### 18.1 What the separate drafter did before the fix
+
+| arm (`halo`, one GPU) | what happened |
+|---|---|
+| target arena `-lme 8` + drafter | the drafter's plan tried `gtt_store_open(2 550 MiB)` against the live 8 192 MiB region → **refused** (`a GTT store of 8192.00 MiB is already live on device 0; 2550.01 MiB cannot replace it in place`) → "no GTT expert store on this device; the expert weights keep their layer's device buffer".  Text `f586785d7183` (correct), target arena untouched (144 tables / 8 153.0 MiB) |
+| target placement `-lme 6` + drafter | same refusal: the target's placement carves 6 087.6 MiB of a 6 144 MiB extent, so 56.5 MiB free and no store for the head.  Text `f586785d7183` |
+| target `auto` + drafter | the whole 40.9 GiB set is carved; nothing left.  Text `f586785d7183` |
+| **target arena `-lme 1` + drafter** | **the run FAILED, exit 1**: `-lme 1` is below the cache's 2 048 MiB arena floor, so *both* models fell back to whole-tensor placement; the drafter's `open` matched the live 1 024 MiB extent exactly (the idempotent branch), it carved, and `ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer` returned **null** → `llama_model_load: error loading model: unable to allocate ROCmGTTStore0 buffer` → `failed to load draft model` |
+
+**Two real bugs**, both pre-existing (P2, not P3c) and both in the same seam:
+
+1. **A failed carve is FATAL, and the code said the opposite.**  `alloc_buffer`'s comment claimed "a DECLINE, not an
+   abort: the loader places the tensors it cannot fit in the plain device buffer".  It does not:
+   `llama_model.cpp` turns a null buffer into `unable to allocate ... buffer` and the model does not load.  Fixed
+   in two places: the loader now sizes its placement against the store's **real free bytes**
+   (`ggml_backend_dev_gtt_store_free_bytes`, a new hook) so it never asks for a carve it cannot get, and the
+   message is now an ERROR that names the largest free run and says the load cannot proceed.
+2. **The store buffer released nothing** (`free_buffer` was a no-op, "never released"), so a second model in one
+   process found the region exhausted and **silently ran on device buffers** — i.e. `llama-bench -m A -m B`
+   measured its two rows under *different* expert tiers.  `free_buffer` now hands the range back to the store's
+   allocator (the region, its registration and its extent are untouched).
+
+### 18.2 The rule for a second load, and what it does
+
+The loader asks the device how much the **live** store can still hand out (`SIZE_MAX` = nothing live, so it sizes
+its own).  When a store is live, that free space is the entire budget, and the load:
+
+* **never sizes the store and never grows it** — the extent is the first model's, clamped for that model against
+  `RLIMIT_MEMLOCK` and 90 % of `MemAvailable`;
+* **never takes the arena tier** — the hook reports **0** free when the live store is the cache's arena, because
+  its extent *is* the trunk's budget and the cache reserves its slots from the same free list.  Measured
+  consequence of getting this wrong: the head's 2 550 MiB would come out of an 8 192 MiB arena, i.e. the trunk's
+  residency silently drops from 100 % to 69 %;
+* **places within what is free, or declines cleanly** with a message that says which case it is;
+* **adopts** the live region when its set does fit the free space (`ggml_cuda_gtt_store_open` accepts a *smaller*
+  request when the free run covers it; a *larger* one is still refused — the region cannot grow in place).
+
+### 18.3 Measured after the fix (all text from separate no-`-lv` runs)
+
+| arm | result |
+|---|---|
+| Flash-Next + separate drafter: store off / `auto` / `-lme 6` / arena `-lme 8` | text **`f586785d7183`** in all four (identical to the store-off arm and to the no-drafter reference) |
+| Flash-Next + separate drafter, arena `-lme 8` (census) | the target's arena is **untouched**: 144 tables / 14 688 slots / **8 153.0 of 8 192 MiB**, `evictions=0`, `arena releases=0`; the head is declined with the new message ("the region is either this run's ARENA … or a placement carve that filled it") |
+| Flash-Next + separate drafter, placement `-lme 6` (census) | target carves 23 tables / 6 087.6 MiB of 6 144; the head is declined with "has 56.5 MiB free, less than the smallest expert table (850.0 MiB)" |
+| **Flash-Next + separate drafter, arena `-lme 1`** | **exit 0** (was exit 1): "has 0.0 MiB free … this load places nothing in it", head on its device buffer, target unchanged |
+| `llama-bench -m Flash-Next -m 35B-A3B -p 32 -n 8` (two models, one process) | **adoption measured**: model 1 creates 40 925.6 MiB (`auto`) and carves its whole set; at teardown the carve is released; model 2 sees "40 925.6 MiB free" and `this load adopts the live 40925.56 MiB GTT store, placing 18662.47 MiB of expert tables inside it` — so **both bench rows are measured under the same expert tier** |
+| 35B-A3B regressions (store off / `auto` / `-lme 6` / arena `-lme 4` / arena `-lme 4` + `--spec-type draft-mtp`) | `627b2ebd7792` in all five |
+| 122B-A10B arena `-lme 60` regression | 144 tables / 19 152 slots / 61 047.0 MiB, `evictions=1 380`, `arena releases=0` |
+
+`check-gpu-faults.sh` clean over every arm; no `HSA_STATUS_ERROR_MEMORY_FAULT`.
+
+### 18.4 So: is the separate-drafter head handled correctly?  Yes — and on UMA it needs no pinning
+
+The head's 2 550 MiB stays in **its layer's device buffer**, and on this platform that is the *right* answer rather
+than a fallback:
+
+* UMA means the "device buffer" is **the same host RAM** the store would have held — there is no second copy and no
+  memory win from moving it into the store;
+* it is **already fully resident** (a plain device allocation of the whole set), so there is no residency policy to
+  pin it against and **no churn** — the two things P3c exists for apply to the *embedded* head, whose tables share
+  the trunk's arena and its uniform slot count;
+* taking it out of the arena would *shrink the trunk's residency*, which is the wrong trade (§18.2).
+
+That last point is the reason the tier does not try to serve a separate head from the arena.  If a future
+configuration needs the head's bytes *inside* the region (a box where RAM, not the region, is the binding
+constraint), the size has to be decided when the **target** sizes the store — the drafter loads afterwards and the
+region cannot grow — so that is a `common`/`--fit` sizing term (it already knows the draft path and estimates the
+draft context, `common_draft_reserve_estimate`), not a loader change.  Recorded as the open item it is.
+
+### 18.5 What is NOT measured
+
+* No throughput claim of any kind, here or for §17 (the `llama-bench` numbers above were run for the adoption
+  behaviour, not as a perf claim).
+* The **multi-device** case of a second load (one GPU here); the free-bytes query is per device and the loader
+  takes the minimum over the IGPU devices.
+* The adoption path's *failure* arm (a second model whose set does not fit the live store) is covered only by the
+  Flash-Next drafter declines above, not by a synthetic two-large-models arm.

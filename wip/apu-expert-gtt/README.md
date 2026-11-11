@@ -2,25 +2,27 @@
 
 **Status: OPEN — design REVISED 2026-11-11 (`halo`, gfx1151).  P0, the P1.0 keystone probes, P1.1 + P2 (the GTT
 store itself), **P3a/P3b (the store as the expert cache's ARENA: it serves, it evicts, and a 123.45 GiB model
-runs on this 123 GiB box)** and **P3c (the MTP/nextn head pinned at full residency outside `-lme`)** are DONE and
-measured; nothing in `patches/`, nothing applied to the fork.**  The plan
+runs on this 123 GiB box)** and **P3c (the MTP/nextn head pinned at full residency outside `-lme`, for the embedded
+head AND the separate drafter model)** are DONE and measured; nothing in `patches/`, nothing applied to the fork.**  The plan
 is [`IMPLEMENTATION.md`](IMPLEMENTATION.md); the probe log and every number are
 [`MEASUREMENTS.md`](MEASUREMENTS.md); the probe sources are [`probe/`](probe/README.md) so each claim can be
 re-run on any UMA box; the P1.1+P2 arms are [`arms.sh`](arms.sh).
 
 The implementation is ONE **cumulative** patch, cut against the `release.json` tree `86389e4a…` and applied with
-`git am`; it produces tree `02c4cec0…`.  Its sha256 advances as the campaign does — **the value below is always the
+`git am`; it produces tree `7b40c405…`.  Its sha256 advances as the campaign does — **the value below is always the
 current artifact** (older `WORKLOG` entries quote the value that was current then):
 
 | artifact | sha256 |
 |---|---|
-| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme`) | `7e786815b205389f84306f7267d463f1ee8197059862f62eded657458e26ad3e` |
+| [`gtt-expert-store.patch`](gtt-expert-store.patch) — P1.1 (`-lme` sizes the GTT store) + P2 (the region, the device buffer type, the load-time fill, the lock policy, the census, the kill switches) + P3a/P3b (the store as the cache's arena: `try_arena()`, the mapping holes, the forced mapped load, the budget/cap guards, the `GTT arena tier:` census) + P3c (the MTP/nextn head pinned outside `-lme`; and the SEPARATE drafter model sharing the one store safely) | `a5f41c0dc3ebc914495b6416321c28d15d91719a200f288efd56895ac36373d6` |
 
 **What is left: P4 (the streaming fill arms + overlap -- including the direct host `memcpy` into the registered
 slot that the arena tier still lacks), P5 (prefill streaming), P6 (gate + promotion).**  P3's own limits are named
-in `MEASUREMENTS.md` §16.6 and §17.4: there is **no throughput claim** for the arena tier (and none for the head's
-pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path is
-still the delivery's pinned bounce ring.  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
+in `MEASUREMENTS.md` §16.6, §17.4 and §18.5: there is **no throughput claim** for the arena tier (and none for the
+head's pinning -- the MTP four-axis protocol is owed before promotion), multi-device is untested, and the fill path
+is still the delivery's pinned bounce ring.  One sizing item is open by design: a **separate** drafter's head
+cannot be placed in the store, because the target sizes the region before the drafter loads -- if that trade is
+ever wanted (RAM-bound box), it is a `common`/`--fit` sizing term, not a loader change (`MEASUREMENTS.md` §18.4).  **`MOE_EXPERT_GTT_ARENA` stays default-OFF** — it is a *fittability* feature (it costs decode on a
 config whose experts fit), and nothing about it has been measured beyond this one APU.
 
 **The campaign's environment variables** (not in `ENVIRONMENT.md`: nothing here is in `patches/` yet, so these
@@ -407,6 +409,14 @@ measurement.
 * **Do not let the arena tier run on an unmapped load.**  An IGPU device reports `mmap_support = false`, so AUTO
   resolves to `--load-mode none` and the "mapping holes" become a **pageable full copy of the expert set**
   (measured 18 662 MiB on 35B-A3B) -- the exact memory the tier exists to avoid.  The arm forces `use_mmap`.
+* **Do not let a second model in one process size, grow or take the arena.**  The GTT store is ONE region per
+  device for the whole process (a separate MTP drafter, a reload, `llama-bench -m A -m B`).  A second load sizes
+  its placement against the store's **free** bytes only, never takes the arena (its extent is the trunk's budget,
+  and carving a head out of it drops the trunk's residency -- measured 100 % -> 69 %), and adopts the region only
+  up to what is free (`MEASUREMENTS.md` §18).
+* **Do not treat a failed carve as a soft decline.**  `alloc_buffer` returning null **fails the model load**
+  (`unable to allocate ROCmGTTStore0 buffer`); the old comment claimed otherwise and a `-lme 1` + separate-drafter
+  arm died on it.  Size against the free bytes, and treat a null carve as the fatal sizing bug it is.
 * **Do not judge this tier by text alone, and never by a `-lv` run's text.**  The `tables=0` census produced
   byte-identical text with the mechanism completely inert (`MEASUREMENTS.md` §16.1), and a `-lv 4` census of the
   122B gave two different hashes on the same seed.  Text arm: no `-lv`; the mechanism is proved by the census.
