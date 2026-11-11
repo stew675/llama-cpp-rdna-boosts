@@ -1523,7 +1523,9 @@ change), and let `WORKLOG.md` carry the narrative.
   where the ceiling cannot cover one slot.  Same rule for a concentration fit: it must be fitted *to* the ceiling,
   because a uniform rescale of a fitted plan collapses it back to uniform.
 - **At `-ncmoe 48` on a three-device split the expert set is fully VRAM-resident, and the DEFAULT mode still
-  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133).**  The arena sizes to
+  re-copies it out of the arena on every prefill ubatch (r207, `TODO` #133 — FIXED in r258: an identity table is
+  served in place at any width, see the r258 section at the end of this file).**  Kept for the measurement:
+  the shape has to stay recognisable.  The arena sizes to
   `67110.0 MiB of 67110.0` (256/256 slots/table, identity), yet the prefill stages **61 GiB for a 3049-token
   prompt** with `arena=61031.5 MiB host=510.5 MiB` — 99.2 % of it read back out of VRAM into the op's per-split
   weight buffer, once per table per ubatch, serialised against the compute (copy table -> compute -> copy next) at
@@ -1699,7 +1701,8 @@ cost a session to learn; do not re-derive them.
 2. **The measured cost of getting this wrong is the POPULATION, not the steady state.**  On a 113 GB Flash-Next, 2 devices,
    `-ncmoe 48 -lme 60` (host expert set 71.7 GiB, pool 60 GiB, `per_layer_token_embd` 26.8 GiB host-resident): O_DIRECT fills read
    **97 692 × 1.0 MiB = 95.20 GiB at 2 785 MiB/s in 35.8 s** of drive time, all of it inside the load/first-prefill window
-   (`TODO` #142), which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
+   (`TODO` #142 — that row retired in r258; the window is the load/first-prefill one, not a per-ubatch disk read),
+   which reads as "prefill is reading every weight from disk".  Buffered: the same 95.20 GiB at **4 062 MiB/s in
    24.8 s**, and the pages stay reusable.  Nothing is evicted either way (`evictions=0`, `h=0.9073`).
 3. **`-lme N` is a byte budget, so N below the host expert set is a SUB-COVER pool, and the model's expert count decides the
    coverage.**  On a 512-expert/layer model, `-lme 60` against a 71.7 GiB set is 428 slots of 512 = **84 %**, not "it fits"; the
@@ -3061,7 +3064,7 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   for a `≤8`-token pass (which only a warmup provides) and the H2D staging ring stages the expert tables before the
   host path can register them, so the run reports `tables=0`, `arena 0.0 MiB`, `prefill cache staging: nomatch=<N>`.
   With the arena armed the same arm reads **1116-1202 t/s** against 438 unarmed and 529 for unpatched upstream
-  (`wip/prefill-arena-arm/`), and every ubatch it saves is a whole host-expert set that is not streamed
+  (`archive/work/prefill-arena-arm/`), and every ubatch it saves is a whole host-expert set that is not streamed
   (`host_bytes / H2D GB/s` per ubatch — the `-ub` sweep is exactly that law).  What remains true of the original
   entry: the random-token shape has no locality to exploit *within* one ubatch, so an A/B of the pool/arena/host
   transport must still be driven with real text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`, gate step 5b) —
@@ -3132,7 +3135,8 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   is `moe_cache_register` (an iface hook, called for every split's routed host-expert inputs at the top of
   `ggml_backend_sched_compute_splits` while `moe_cache_pending`) plus arming at registration; measured **438 ->
   1209 t/s** (1 GPU), **799 -> 2457** (2 devices `-sm tensor`), with decode, real-text prefill and greedy text
-  inside noise/identical.  Feeds `TODO` #133 (the staged fill still assembles the whole table out of the arena).
+  inside noise/identical.  Fed `TODO` #133 (the staged fill still assembled the whole table out of the arena);
+that half is closed in r258 — an identity table is now served in place at any width.
 - **A `-sm tensor` table can only be discovered WITHOUT routing (r237).**  The Meta `moe_cache_update` declines
   every `n_tok > band`, by design (reading the routing back on every prefill op is the sync the band exists to
   avoid), so a prefill-only tensor-split run never observes its table set from the op path.  Any table-set
@@ -3887,3 +3891,50 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   after `-a deepseek2`'s rows only ~1.2 GiB is free outside it, which is why r253 + `-a 'deepseek2|deepseek4'`
   loads the (then tiny) deepseek4 fixture and the now 1.6-2.4 GiB dsv4 fixtures do not.  Pre-existing, not
   caused by the hosting rows themselves; run `-a deepseek2`, `-a deepseek4`, `-a deepseek41` separately.
+
+## r258 — an identity expert table is served in place in the prefill band, and `buffer == nullptr` is a legal tensor (TODO #133)
+
+* **The band gate was the whole of `TODO` #133, not the transport.**  An identity (fully resident) table's
+  arena is byte-for-byte the table (`slot e` holds expert `e`, `expert_bytes` per slot, strides unchanged), so
+  the decode band has read it in place since session 7 — `moe_cache_get_table`'s identity branch and
+  `moe_cache_take_over` were both gated on `ne[2] <= band`, and above it the scheduler staged the whole table
+  into a ring slot (pinned master) or gathered it into the split input (host pool) *on every ubatch*.  At a
+  100 %-resident arena that is the whole table read back out of VRAM: 63 648 MiB re-copied for a 5246-token
+  prompt on three RDNA4 GPUs, serialised against the compute, which left 3-GPU prefill (1489.6 t/s) **slower
+  than 1-GPU** (1966.8 at 69.1 % residency).  Removing the gate is worth **+171 %** there and +13.5 % on the
+  default pool mirror, and the effect is confined to identity tables: a partly-resident table stages/gathers
+  exactly as before (1 GPU 2275.6 vs 2266.4 — inert).  Records: `benchmarks/2026-11-10-prefill-in-place.md`.
+* **A partly-resident in-place read is still the refuted mechanism; identity is not.**  r40 deleted a
+  device-side *policy* that read the resident half in place while fetching the complement (device map,
+  deferred promotion, device mirrors).  An identity table has no complement, so this path has no policy, no
+  map and no fetch — do not generalise it to a non-identity table by reintroducing that machinery.
+* **A fused MUL_MAT_ID kernel that reads the expert table directly bypasses the dispatch's redirect.**  The
+  redirect lives in `ggml_cuda_mul_mat_id` (via `moe_cache_get_table`); the MMB GLU, the fused MMQ gate+up and
+  the MMQ `mul_mat_q_swiglu` → down fold take `gate->src[0]`/`up->src[0]` and never re-enter it.  So whenever
+  the scheduler takes a prefill input over, `ggml_cuda_cache_blocks_fusion` must stand those down for that
+  table (the per-op chain then redirects).  Cost of standing them down: ~0-2 % at that shape, and the two
+  arithmetic paths are **bit-identical** there -- the prefill-logit gate run as
+  `--ab MOE_EXPERT_PREFILL_IN_PLACE=0` compares staged+**fused** against in-place+per-op and reads KLD
+  -0.000000 / same-top-p 100.000 %.  A new fused MUL_MAT_ID site above the band needs the same guard, and the
+  guard must honour the kill switch, or the A/B arm loses its fusions and stops being the pre-r258 path.
+* **`buffer == nullptr` is a legal tensor for a kernel.**  The cache's arena is a raw `cudaMalloc`, so the
+  redirect hands the op a shallow copy with `buffer = nullptr` (that is what keeps the compute-buffer padding
+  clears from offsetting by the full expert count).  It was safe only by accident while the redirect was
+  band-only: MMVQ guards its clear with `src0->buffer != nullptr`, but `ggml_cuda_mul_mat_q` (MMQ) and
+  `ggml_cuda_mul_mat_takes_mmq` read `t->buffer` unguarded, and the whole family is reached above the band.
+  `ggml_backend_buffer_get_usage(NULL)` therefore answers `GGML_BACKEND_BUFFER_USAGE_ANY` instead of asserting
+  — every caller's test is `== GGML_BACKEND_BUFFER_USAGE_COMPUTE`, and a null buffer is certainly not one.
+  The arena is already over-read-safe: it is allocated and memset with a `min(expert_bytes, 512)` tail pad.
+* **The pre-staging in-place query must not have the take-over's side effects.**  `moe_cache_take_over` bumps
+  `g_write_seq` (the staging snapshot's freshness key) and publishes the alias; a *query* that did the same
+  would force every other table in the pass to rebuild its two-tier map and to order the copy stream behind
+  the compute stream.  `moe_cache_serves_in_place` shares `moe_cache_identity_locked` with the take-over (so
+  the two cannot disagree) and touches nothing.
+* **`TODO` #142 is fixed by r237, and its premise is measurable.**  Both named causes were the *lazy
+  pre-sizing* path: the arena armed only on the first decode-band pass, and the pool was built and prepopulated
+  on first touch.  On r254 the arena sizes at registration and the pool at sizing — before the first ubatch of
+  the first pass (log timestamps: `alloc_all_locked` 1.59 s, pool fills 0.45-1.59 s, first batch 2.32 s).  The
+  residual first-batch constant is **not** pool-specific: on the same shape (3 GPUs `-sm tensor`, `-npp 128`
+  repeated) the pool pays ~0.12-0.15 s, a pinned master ~0.29 s and `MOE_EXPERT_CACHE_MIB=0` ~0.88 s, and
+  `MOE_HOST_POOL_PREWARM=0` moves it by ~0.03 s.  Re-check that ladder, not the pool, if a large box reports a
+  multi-second first prefill again.

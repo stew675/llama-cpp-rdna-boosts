@@ -1,3 +1,92 @@
+## 261110.014 (r258, delivery) -- `TODO` #133 retires: an identity expert table is served IN PLACE in the prefill band (+171 % on the pinned tier), and `TODO` #142 is measured fixed
+
+**Shipped:** `v16-a691b2345-r258` (block **12** amended, +220/−34 across 9 files), base `a691b2345`,
+tip `c1cd962e096f7a8d6a77c634481c53e5086e656c`, tree `108d298f63296024e10a754d9d4e4eb7be9f12bf`, 16 blocks, all
+17 artifact hashes refreshed.  Two rows leave `TODO.md` (`#133` fixed, `#142` fixed by r237) and one old warning
+gets a precise boundary (`#273`).
+
+1. **`#133`: the band gate was the defect, not the transport.**  An identity (fully resident) table's arena is
+   byte-for-byte the table, so the decode band has read it in place since session 7 — but `moe_cache_get_table`'s
+   identity branch and `moe_cache_take_over` were both gated on `ne[2] <= band`, and above it the scheduler staged
+   the whole table into a ring slot (pinned master) or gathered it into the split input (host pool) **on every
+   ubatch**.  At a 100 %-resident arena that is the table read back out of VRAM: the r254 census on three RDNA4
+   GPUs logged `ok=702 arena=63648.0 MiB host=0.0 MiB` for one 5246-token prompt, serialised against the compute,
+   which is why 3-GPU prefill (1489.6 t/s) was **slower than 1-GPU** (1966.8).  The fix removes the gate for
+   identity tables only: a new side-effect-free iface query (`moe_cache_in_place` →
+   `moe_cache_serves_in_place`) lets `sched_stage_issue` skip the staging for that input, the input loop's
+   take-over loses its band test, `moe_cache_get_table` serves any width, and the slot-remapped path is now
+   explicitly band-only.  The prefill MoE fusions that read the expert table directly (MMB GLU, the fused MMQ
+   gate+up, the MMQ swiglu→down fold) stand down for such a table, because they bypass the dispatch's redirect;
+   they are worth only ~0-2 % at this shape.  `ggml_backend_buffer_get_usage(NULL)` now answers
+   `ANY` instead of asserting, because MMQ/MMB take the buffer-less arena tensor above the band.
+2. **`#142` is fixed, and the fix is r237's.**  Both named causes were the *lazy pre-sizing* path (the arena armed
+   only on the first decode-band pass, the pool built on first touch).  On r254 the arena sizes at registration
+   and the pool at sizing, both before the first ubatch of the first pass (`alloc_all_locked` 1.59 s, pool fills
+   0.45-1.59 s, first batch 2.32 s in the same log), and `MOE_HOST_POOL_PREWARM=0` moves the residual by 0.03 s.
+   The residual first-batch constant is **not** pool-specific: pool ~0.12-0.15 s, pinned master ~0.29 s,
+   `MOE_EXPERT_CACHE_MIB=0` ~0.88 s on the same shape — the pool tier is the *fastest* arm, not the slow one.
+
+**What the fix is worth** (35B-A3B Q8_0, `prompts/prose-rdna-boosts.txt` 5246 tokens, `-ub 2048`, `HIP_VISIBLE_DEVICES=0,1,2`,
+`-sm tensor`, `-ncmoe 48`; the kill switch reproduces the pre-change numbers within one binary):
+
+| arm | before | after | |
+|---|---:|---:|---|
+| pinned master, identity arena (100 % residency) | **1125-1508** (4 reps) | **3921-4100** (4 reps) | **2.6-3.6x** |
+| pinned master, `-ub/-b 1024 -c 16384`, MTP arm | 398.6 | **3996.6** | +10.0x |
+| default pool mirror (prefill band gathers) | **3505-3589** (3 reps) | **3968-4072** (3 reps) | +13-14 % |
+| 1 GPU pool, 69.1 % residency (not identity) | 2241.3 | 2275.6 | inert (noise) |
+| 1 GPU pinned, 69.1 % residency (not identity) | 1966.8 | 1982.8 | inert (noise) |
+| 2 GPUs `-sm layer`, `MIB=2048` (`-npl 1,4,8`) | pp 1030/1258/1259 | 1055/1253/1275 | inert (11 % residency) |
+
+The mechanism is visible in the census: the same 4-chunk `llama-perplexity` arm logs **360** device gather calls
+with `MOE_EXPERT_PREFILL_IN_PLACE=0` and **3** without it, at the same PPL 5.1540.
+
+**Gates** (all on the re-cut tree `108d298f63`; commands and every raw number in
+[`benchmarks/2026-11-10-prefill-in-place.md`](benchmarks/2026-11-10-prefill-in-place.md)).
+`gate-prefill-logits.sh --model 35B-Q8_0 --device 0,1,2 --sm tensor --ub 2048 --extra "-ncmoe 48" --ab
+"MOE_EXPERT_PREFILL_IN_PLACE=0"` → **mean KLD −0.000000, same-top-p 100.000 %**, and the same on the pinned tier
+(own base file).  The kill-switch arm is the full pre-r258 path *including* the prefill MoE fusions
+(`GGML_CUDA_FUSE_TRACE`: `ne2=390 allow (prefill)` against `ne2=390 BLOCK (prefill-in-place)`), so the gate
+also proves the fused MMB/MMQ gate+up and the per-op chain are bit-identical at this shape — the premise
+`TODO` #133 named ("the arms are the same bytes, so anything else is a bug").  Same-seed greedy
+text identical on every arm: 4B anchor `1c5d32ac537d`, 35B `-sm tensor` 1 GPU `4a9dd8395acc` / 3 GPU `065817c76b95`
+(and `e9db5cb8db0b` behind the 5246-token multi-ubatch prompt), 2 GPU `-sm layer` `4a9dd8395acc`.  MTP `draft-mtp`
+on the identity arm: **acceptance 0.67258 identical** in both arms, 165.4 vs plain 92.8 t/s.  `llama-batched-bench -npp 512 -ntg 128 -npl 1,4,8` on the identity config:
+pp **+22 % / +28 %** at `-npl 4 / 8` and **+29 %** at steady-state `-npl 1` (`-npl 1,1` ABBA, 8 runs: 3699/3672 vs
+2874/2857 — the b=1 row alone is the warm-up artefact), tg identical; the reference's own gate-1 arms
+(`GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0`, `--host-experts pool`) all read `df25cc87d385` in both arms, and a
+**sequentially driven 2-slot server** answers byte-identically (`4b8106497433` / `7a8bd060ffff`).  `gate-host-pool.sh`
+**42/42 PASSED** (`takeover=0` under the fill faults, every text unchanged; `pinlate` now reads `a99ccbd97ecb`
+like `ref` — see the `#282` note below).  `gate-per-block-build.sh --fast` **16/16 built, 0 failed** (987 s).
+`validate-set.sh` green (checksums, strict `git am`, applied tree = `release.json.tree`, Windows portability 289
+files).  `check-gpu-faults.sh --since "150 min ago"`: clean over the whole session.
+
+**Findings reported, not buried.**  (a) This is the *identity-only* case of an in-place prefill read, and it is
+**not** the r40 mechanism `ENVIRONMENT.md` §1.2 and `TODO` #273 warn against: that one was a device-side
+per-expert policy with a device map and a complement to fetch.  Here there is no complement, so there is no
+policy, no map, no deferral — `#273`'s caution is preserved and the item now says so explicitly.  (b) The
+prefill MoE fusions stand down for an in-place table; the cost is ~0-2 % at this shape against the 2.6-3.6x the
+in-place read is worth, it is confined to identity tables, and the prefill-logit gate shows the two arithmetic
+paths are bit-identical here, so nothing about the *numerics* changes.  (c) `gate-host-pool.sh`'s `pinlate` arm measured
+byte-identical to `ref` this run, where r254 recorded the documented `#282` WARN (`b981e742aa13`); `#282`'s own
+criterion is a KLD inside tolerance and the gate still passes, so nothing is claimed — it is recorded in case the
+mixture's near-tie flips again.  (d) Only r258's own row is new in `ENVIRONMENT.md`; `#133`'s fix has no other
+knob.
+
+**Along the way (docs hygiene, no delivery change).**  `wip/prefill-arena-arm/` was left in `wip/` after r237
+promoted it (`TODO` #305 retired) and its `wip/CAMPAIGNS.md` row still said "OPEN — nothing in `patches/`",
+which is exactly the state the WIP rule exists to prevent; it moved to `archive/work/prefill-arena-arm/`
+with a PROMOTED header, the index row is gone, and every dated record now points at the new path.  Stale
+"`TODO` #133" pointers in `INVARIANTS.md` (r207/r237) and `patches/README.md` (r237, block 09's follow-up
+list) are annotated as closed.
+
+**Landing.**  Folded into block **12** (the block that owns the prefill-arena-arm staging decision and the
+`moe_cache_pending`/`stage_ready` hooks) by `git rebase -i`, `fixup` at that commit; the amended chain's tree is
+**bit-identical** to the working tree the numbers above were measured on, which is why the numbers carry over.
+Docs: `INVARIANTS.md` (five entries appended under `r258`), `ENVIRONMENT.md` §1.2
+(`MOE_EXPERT_PREFILL_IN_PLACE`), `patches/README.md` block 12, `AGENTS.md`'s gate table (a row for the prefill
+transport), `TODO.md` (`#133`/`#142` retired, `#273`'s boundary stated), `benchmarks/2026-11-10-prefill-in-place.md`.
+
 ## 261110.013 (r257, docs + one measurement follow-up -- NO delivery change) -- `TODO` #141 is the decode side of the `#136` band, so its description is corrected and re-verified
 
 **No code, no `patches/`, no `release.json` change.**  Prompted by the obvious question after r256: `#141` is
@@ -1903,7 +1992,7 @@ follow-up and is not in this release.  (b) The staged fill still assembles the W
 every ubatch, so the arm is ~1/3 of the physical bound at high residency: that is `TODO` #133's re-copy (serve
 resident experts in place), the next campaign, and `wip/expert-transfer-engine/`'s "one transport".  (c) Nothing
 is default-off here: the arena fix is on, `mlockr` is a mode the user selects (no new environment variable, so
-no `ENVIRONMENT.md` row).  Records: `benchmarks/2026-11-08-prefill-arena-arm.md` (§5), `wip/prefill-arena-arm/`
+no `ENVIRONMENT.md` row).  Records: `benchmarks/2026-11-08-prefill-arena-arm.md` (§5), `archive/work/prefill-arena-arm/`
 (the campaign README + the pre-fold candidate patch), `INVARIANTS.md` (three entries appended), `TODO` #305
 retired.
 
@@ -1944,7 +2033,7 @@ the whole host expert set: 32 640 MiB at the box's calibrated **28.7 GB/s** = **
 1.17 s/ubatch the arm actually reads.  The `-ub` sweep is that law exactly (439 / 877 / 1742 t/s at `-ub` 512/1024/2048).
 
 **Arming it is the whole win.**  Same arm, arena armed (a single 8-token row first, `-p 8,512`): **1116-1162 t/s**.
-A 148-line candidate (`wip/prefill-arena-arm/0001-prefill-arena-arm.patch`, 7 files) makes that automatic — two new
+A 148-line candidate (`archive/work/prefill-arena-arm/0001-prefill-arena-arm.patch`, 7 files) makes that automatic — two new
 `ggml_backend_i` queries (`moe_cache_pending`: enabled + host experts expected on this device + not armed ⇒ the
 scheduler leaves a routed host-expert table on the host path so the cache can observe its table set;
 `moe_cache_stage_ready`: sized + THIS table has slots ⇒ stage, otherwise take the plain upload instead of a pointless
@@ -1971,7 +2060,7 @@ would stay off for the whole run — measured **356 vs 799 t/s**), and a residen
 from another invocation — the shipped binary reads 1741 there, not 3446).
 
 Records: `benchmarks/2026-11-08-prefill-arena-arm.md` (every arm, the census, and the four traps),
-`wip/prefill-arena-arm/` (the campaign README + the candidate patch), `TODO` #305, and the r236 arena entry in
+`archive/work/prefill-arena-arm/` (the campaign README + the candidate patch), `TODO` #305, and the r236 arena entry in
 `INVARIANTS.md` corrected in place (it said "the arena is inert on the random-token prompt"; it never armed).
 
 **What this does not fix, and the next three steps** (`TODO` #305): `-sm tensor` needs registration at graph build;
@@ -1979,7 +2068,7 @@ the mid-prefill sizing should be re-run after the compute-buffer drop (a warmup-
 arena); and the arm is still only ~1/3 of the physical bound because the staged fill assembles the **whole** table out
 of the arena on every ubatch — `TODO` #133's re-copy, i.e. the cache-aware prefill and the "one transport" direction of
 `wip/expert-transfer-engine/`.  Nothing was promoted: `release.json`, `patches/` and the shipped tree are untouched,
-the candidate lives only in `wip/prefill-arena-arm/`.
+the candidate lives only in `archive/work/prefill-arena-arm/`.
 
 ## 261108.016 (r236, RELEASE v16-a691b2345-r236) -- the re-base lands: 16 blocks re-cut onto `a691b2345`, full gate 13/14 with the one permitted red attributed, fork refreshed
 

@@ -37,7 +37,7 @@ Proof that the arena is the difference (same flags, one 8-token row first so the
 
 ## 2. Arming the arena — the candidate
 
-`wip/prefill-arena-arm/0001-prefill-arena-arm.patch` (7 files, +148/−1, sha256 `75b0fcfb…`): two new
+`archive/work/prefill-arena-arm/0001-prefill-arena-arm.patch` (7 files, +148/−1, sha256 `75b0fcfb…`): two new
 `ggml_backend_i` queries — `moe_cache_pending` (enabled + host experts expected on this device + not armed) and
 `moe_cache_stage_ready` (sized + THIS table has slots) — used by `sched_stage_issue`, plus `moe_cache_update`'s
 priming-time sizing no longer requiring `n_tok <= 8`.

@@ -1,7 +1,12 @@
-# prefill-arena-arm — the `-ncmoe` + `llama-bench` regression is the arena never arming (OPEN, fix measured; nothing in `patches/`)
+# prefill-arena-arm — the `-ncmoe` + `llama-bench` regression is the arena never arming (PROMOTED in r237; archived)
 
-**Status: OPEN — root cause measured, a 148-line fix candidate is gated locally (`0001-prefill-arena-arm.patch`),
-nothing promoted.**  `TODO` **#305**.  Found 2026-11-08 while closing the r236 re-base records: the re-base left one
+**Status: PROMOTED in r237 (`TODO` **#305** retired) and ARCHIVED 2026-11-11.**  The 148-line candidate
+(`0001-prefill-arena-arm.patch`) landed in block 12 as written — the two `ggml_backend_i` queries
+(`moe_cache_pending`, `moe_cache_register`/`moe_cache_stage_ready`), the registration pre-pass and the
+arm-at-registration — and the r237 WORKLOG entry and `benchmarks/2026-11-08-prefill-arena-arm.md` are the
+shipped record.  **The rest of this file is the pre-promotion handover, kept verbatim** (the numbers it
+quotes are r236-vs-candidate, not the shipped set).  Its closing note — "the remaining ~3x is `TODO` #133's
+arena re-copy" — was also closed, in r258 (`benchmarks/2026-11-10-prefill-in-place.md`).  Found 2026-11-08 while closing the r236 re-base records: the re-base left one
 number unexplained — on the `llama-bench` arm the delivery's host-expert prefill was **−15…−18 %** against unpatched
 upstream (`TODO` #296), and upstream's own `--moe-cache-mib` did not change that (its advantage is CPU compute, not
 the cache).  This campaign says why, and fixes it.
@@ -143,7 +148,7 @@ marks a device only when its host expert bytes are > 0, so `pending` is false an
 
 ```bash
 cd ~/llama.cpp                      # rdna-boosts at release.json.tip 0e6daae4e
-git apply ~/llama-cpp-rdna-boosts/wip/prefill-arena-arm/0001-prefill-arena-arm.patch
+git apply ~/llama-cpp-rdna-boosts/archive/work/prefill-arena-arm/0001-prefill-arena-arm.patch
 ~/bin/build-llama-rocm
 M=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
 HIP_VISIBLE_DEVICES=0 ./build-rocm/bin/llama-bench -m $M -ngl 99 -ncmoe 48 -fa 1 -t 8 -ub 512 -p 512 -n 0 -r 5
