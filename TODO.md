@@ -35,7 +35,15 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
   model found (set MODEL); biggest single card = 2 GiB`.  The gate is correct -- run by hand with its proper
   arm (`--ab MOE_EXPERT_GTT_PREFILL=0 --extra "-lme 4 --fit off"`) it reads KLD -0.000000 / 99.990 %.  Fix the
   auto-selection (a pool-aware probe, i.e. `prop.integrated` -> `totalGlobalMem`) or pass `MODEL` through from
-  `fork-refresh.sh`, which invokes the gate with no arguments today.
+  `fork-refresh.sh`, which invokes the gate with no arguments today.  **Confirmed again at r266** (the release was
+  gated by running the same A/B by hand on the canonical fork build: -0.000000 / 99.990 %).
+
+* **`gate-fusion-alias-copy.sh` is INERT on `halo` (gfx1151), so it cannot witness the fusion claim here**
+  (`TODO` #316): its repro arm and its production arm both fail to reach the shape (`-ub 14` is outside this
+  arch's MMVQ MoE band), and they fail **identically on the unmodified r265 release build** -- measured at r266
+  against `~/llama.cpp/build-rocm` before the release.  So the r266 prefill-in-place change's "every fusion stands
+  down for a remap-served table" rests on `moe_cache_table_serves()` still being identity-only, not on an executed
+  gate: **a gfx1201 run is owed** the next time `soar` is up.
 
 * ~~The MTP four-axis protocol is OWED for block 16's decode-affecting stages~~ -- **DONE in r263**: run on
   `halo` at the promotion, acceptance **bit-identical** in every arm (0.72082 / 0.75659 / 0.88057 / 0.99462,

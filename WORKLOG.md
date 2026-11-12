@@ -1,3 +1,52 @@
+## 261112.002 (r266, release) -- `v17-a691b2345-r266` is PUBLISHED: delivery tag + personal fork's `rdna-boosts` at 6bac1773, and the two-slot interference gate ships with it
+
+**Release:** `v17-a691b2345-r266` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`6bac17737588df510c90b2f3959ad8f46e3c63fb`**, tree **`1b9fe414d93c1a506ea38108d8e5eaec2769c49a`**.  Annotated tag
+`a67153f4a` on `main` (`^{}` = `b99223b5`), pushed together with `main` `575dde3c..b99223b5`.
+
+**Published:**
+* delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `575dde3c..b99223b5`, tag `v17-a691b2345-r266`.
+* personal fork `git@github.com:stew675/llama.cpp.git`: `rdna-boosts` `7efb30ae5..6bac17737`, verified by
+  `git ls-remote` -- the remote branch carries exactly `release.json.tip`.  `scripts/fork-refresh.sh --build
+  --push --yes` re-cut it from `patches/` at the base, asserted the tree, built it, and pushed with
+  `--force-with-lease` (lease `7efb30ae5`).
+* ROCm images: the tag is what `radiance`'s `scripts/container-watch.sh` polls for; **nothing was built on the
+  primary box** (policy: the image build is the worker's job).
+
+**What shipped** is the block-16 prefill-in-place amendment (`TODO` #317, closed) -- full record in
+`WORKLOG.md` 261112.001 and `benchmarks/2026-11-12-prefill-in-place-arena.md` -- plus a **new gate**,
+`scripts/gate-prefill-server-slots.sh` (+ `.py`): two `llama-server` slots, request B's prefill landing in the
+middle of request A's decode, asserting A's text is identical across arms and A's decode (whole request AND
+inside B's window) is not worse.  Every other cache gate measures ONE request; a server does not, and the
+maintainer's call was that this had been omitted too long.
+
+**Gate ledger (all on the CANONICAL fork build, `6bac17737`):**
+* `validate-set.sh` OK -- base `a691b2345`, 17 blocks, applied tree `1b9fe414`.
+* deterministic re-cut: `apply-all.sh` on a fresh `-s` clone at `a691b2345` produces tip `6bac1773` / tree
+  `1b9fe414`, i.e. exactly `release.json`.
+* `gate-per-block-build.sh --changed-from 7efb30ae5`: 1/1 built (only block 16's delta changed), `all` target.
+* coherence: `58fba7e8b027` (Q5_K_XL `-lme 75`, 122B, draft-mtp, 32 tokens) -- identical on the r265 release
+  build, on `MOE_EXPERT_PREFILL_IN_PLACE=0` and on the default arm, so the new path changes no byte of output.
+* prefill-logit `--ab "MOE_EXPERT_PREFILL_IN_PLACE=0" --extra "-lme 16 --fit off"` (35B-A3B Q4_K_M):
+  **mean KLD -0.000000 / same-top-p 99.990 %**, journal clean.
+* `gate-prefill-server-slots.sh`: **PASS** -- A's text identical (`3c2245a89587`), A 3.99 vs 3.84 t/s, in-window
+  0.57 vs 0.54 t/s, admission live (126 calls x 78 tables), no faults.
+* `gate-uma-experts.sh --quick --no-ram` **36 checks / 0 failures** with the new `inplace` and `pfcp` arms;
+  MTP acceptance identical (0.74630); `check-gpu-faults` clean on every arm.
+
+**Two findings, reported and recorded rather than papered over:**
+1. `gate-fusion-alias-copy.sh` **fails identically on the unmodified r265 build** on this box (its arms do not
+   reach the shape on gfx1151), so the fusion claim rests on `moe_cache_table_serves()` being identity-only, not
+   on an executed gate.  A gfx1201 run is owed -- added to `TODO` #316.
+2. `fork-refresh.sh --gates` still cannot run the prefill-logit gate on an APU (`TODO` #316); the A/B above was
+   run by hand on the canonical build, as at r265.
+
+**Docs:** `patches/README.md` (block-16 r266 amendment), `INVARIANTS.md` r266, `ENVIRONMENT.md`
+(`MOE_EXPERT_PREFILL_IN_PLACE`'s row extended, no new variable), `benchmarks/2026-11-12-prefill-in-place-arena.md`,
+`TODO` #317 closed / **#318 opened** (the deferred eager seed, P4), `wip/prefill-in-place-arena/` archived to
+`archive/work/prefill-in-place-arena/` (patch, harnesses, replay model driver, censuses, capture recipe) with the
+`wip/` directory and its `CAMPAIGNS.md` row deleted.
+
 ## 261112.001 (r266) -- block 16's prefill band is served IN PLACE out of the arena: the residents are no longer D2D-copied every pass (`TODO` #317 CLOSED)
 
 **Change (block-16 amendment, one file, no new block, no new env).**  The arena tier is only partly resident, so
