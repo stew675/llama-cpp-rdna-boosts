@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 9 Nov 2026 01:35:28 +0000
+Subject: [PATCH] cuda: copy-engine all-reduce, single exchange for 2 ranks
+
+For 2 ranks each GPU sends its whole bf16 partial to the peer once, and one
+kernel forms fp32(bf16(fp32(own) + fp32(peer))) straight into the output.
+That is the rounding of ce_add_bf16 + all-gather + to_fp32 (fp32 addition is
+commutative), so the output bits are unchanged: same bytes on the link, one
+cross-device dependency instead of two, no separate add / convert passes.
+
+GGML_CUDA_AR_CE_SINGLE=0 restores the two-phase form.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 43 +++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7ff0bac49..5772c6f21 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3979,6 +3979,24 @@ static __global__ void ggml_cuda_ce_add_bf16(const nv_bfloat16 * __restrict__ a,
+     }
+ }
+ 
++// Single-exchange form for 2 ranks (GGML_CUDA_AR_CE_SINGLE, default on; =0: the two-phase reduce-scatter + all-gather
++// below).  Each rank ships its whole bf16 partial to the peer once and both ranks form every element themselves as
++// fp32(bf16(fp32(own) + fp32(peer))): the same rounding as the owner's ggml_cuda_ce_add_bf16 followed by the all-gather
++// and to_fp32 (fp32 addition is commutative), so the output bits are unchanged.  Same bytes on the link, one cross-device
++// dependency instead of two, and no separate add / convert passes.
++static __global__ void ggml_cuda_ce_add_bf16_to_f32(const nv_bfloat16 * __restrict__ a,
++                                                    const nv_bfloat16 * __restrict__ b,
++                                                    float * __restrict__ o, long n) {
++    for (long i = blockIdx.x * (long) blockDim.x + threadIdx.x; i < n; i += (long) gridDim.x * blockDim.x) {
++        o[i] = __bfloat162float(__float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i])));
++    }
++}
++
++static bool ggml_cuda_ar_ce_single() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_AR_CE_SINGLE"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
+ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+     const int64_t ne = ggml_nelements(tensors[0]);
+     if (ne == 0) {
+@@ -4248,6 +4266,31 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+         }
+     }
+ 
++    if (n == 2 && ggml_cuda_ar_ce_single()) {
++        // tmp1 (n*chunk_max >= ne elements) receives the peer's whole partial.  It is reused across calls, so the
++        // send waits for the peer's previous read of it (ce_ev_done, recorded after the add); that record is from
++        // the previous call, so the wait does not stall.
++        for (int i = 0; i < 2; ++i) {
++            const int p = 1 - i;
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_done[p], 0));
++            CUDA_CHECK(cudaMemcpyPeerAsync(ctmp1(p), cdev(p), cbuf(i), cdev(i), (size_t) ne * esz, s));
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_send[i], s));
++        }
++        for (int i = 0; i < 2; ++i) {
++            const int p = 1 - i;
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_send[p], 0));
++            ggml_cuda_ce_add_bf16_to_f32<<<256, 256, 0, s>>>(
++                (const nv_bfloat16 *) cbuf(i), (const nv_bfloat16 *) ctmp1(i), (float *) tensors[i]->data, ne);
++            CUDA_CHECK(cudaGetLastError());
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_done[i], s));
++        }
++        return true;
++    }
++
+     // phase 1a: dev i ships its chunk c to dev c, which owns the reduced chunk c.
+     // tmp1 is reused across calls, so wait for the peer's previous phase-1b read -- that record is
+     // from the previous call, so this wait does not stall.
+-- 
+2.53.0
+
