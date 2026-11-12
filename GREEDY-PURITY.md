@@ -155,12 +155,14 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§84** | a re-base owes a re-derivation of the **value** behind a renamed field, never a carry-over: `mmq_args.ncols_max` (count) -> `ntj` (J-tile count, consumed as `grid.x`) made the pair fusion's grid `ncols` instead of `ncols/J` (page fault at a large context, clean at a small one), and `tile_y_max_j` (max index) -> `tile_y_j_sup` (exclusive count) dropped a column per tile in the routed-compact kernel; the ids convention also moved the expert into `tile_spec` (`nchannels_y = 1`, `n_experts` in `nchannels_x`), which had silently turned that dispatch OFF since R09 and hidden the off-by-one behind it.  A re-based dispatch is proved by a census that it FIRES, and a fallback copy of upstream's dispatcher must be upstream's text verbatim (a merged copy re-enabled stale delivery duplicates, one of them not bit-identical in a state-carrying path) | doctrine + fix (r236, re-base R11) |
 | **§85** | a re-derived call into a new API owes the **node type** that API is valid for, and a positional call into an extended parameter list is a silent mis-assignment: the fused `GGML_OP_INDEXER_SCORE` kernel took `ggml_rope_get_truncate(dst)` after `#30206` added an op-type assert (every sparse QSA decode arm aborted since R12, and no gate ran that arm), and `llama_kv_cache`'s ctor gained `is_indexer` **before** `v_enabled`, so the delivery's positional hybrid call put `kv_pool` into `v_enabled` — no V tensor, `cpy_v` null-deref, every GDN model segfaulted at load.  Name the arguments, audit every call site of the symbol, and give each re-derived fused kernel an arm that REACHES it | doctrine + fix (r236, re-base R16) |
 | **§86** | an optimization may not change which kernel **variant** an op takes: "does this op have a mask" is ONE predicate asked by the chooser, the MMA `ncols2` dispatch, the RDNA band predicate and the tile `ncols2` dispatch, never a launcher-side `src[x] != nullptr` copy — after #29510 took `src[5]` for `kv_rows` and moved the derived form to `src[6..8]`, the two copies read `nullptr` on a derived op and took `ncols2 = 1` where the packed form took 4/8, on every layout whose chooser picks the TILE kernel (RDNA3_5/RDNA3_0 heads above their WMMA cap, RDNA2, `GGML_CUDA_FA_WMMA_256=0`); the band site is inert by construction (derived implies `n_tokens > 8`, the band requires `<= 8`) and is carried so the sites cannot drift.  The arm must reach the code: the op suite's only derived tile case has an unaligned `n_kv` and saw nothing (6978/6978 either way), so the aligned head-512 derived case + a forced-tile suite run are part of the fix | doctrine + fix (r268, contributor PR #303) |
+| **§87** | a residency tier's fill **issue ORDER** and its fill **SET** are different things, and only the set is part of the answer: the slot an expert lands in is arbitrary (`pool_fill_empty_locked` takes the first free slot, `apply_heat_seed_locked` fills `0..k`), so a fill may be re-ordered for the file's benefit with no change to any expert byte — but the *set* is policy and may not move, and any mechanism that makes a **covering** tier incomplete (a lazy seed, a lazier prewarm) silently costs the sync-free decode remap rather than a few bytes.  Two orders of the same ranked set measured on the bounded pool: 12 546 ms against 7 774 ms for 42.7 GiB (3.67 -> 6.25 GB/s), text byte-identical both ways | doctrine + fix (r270, `TODO` #318; `benchmarks/2026-11-12-expert-seed-policy.md`) |
 ---
 
 **How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
 behaviour · `fix` = a closed finding, kept because the *rule* it produced still binds.  The entries exist in
 three shapes: `§§1-10` are the **Background** block below (the k-quant rounding-order doctrine they all rest
-on), `§§11-76`, `§82`, `§84`, `§85` and `§86` are full entries, and `§§77-81` are **row-only** -- their whole record is the row plus
+on), `§§11-76`, `§82`, `§84`, `§85`, `§86` and `§87` are full entries, and `§§77-81` are **row-only** -- their whole
+record is the row plus
 the `WORKLOG.md` entry it names.  A fact that changes is corrected in place, tagged with the revision that
 changed it; the dated narrative is always `WORKLOG.md` or the `benchmarks/` record.
 
@@ -2466,3 +2468,34 @@ faults; prefill-logit KLD **0.000000 / 100.000 %**.
 
 **Record.**  `WORKLOG.md` 261112.005; `benchmarks/2026-11-12-meta-split-tail-guard.md`; `INVARIANTS.md` r269;
 `patches/README.md` blocks 09/10.
+
+## 87. A residency tier's fill ORDER and its fill SET are different things, and only the set is part of the answer (r270, `TODO` #318)
+
+**Claim.**  Both expert tiers start with a bulk fill at sizing, and the fill was being read as a cost to remove: the
+item proposed making it lazy, since r266 serves the prefill band out of residency.  Measured on both tiers it is not
+a cost, it is the *prefetch* — and the thing that actually was wrong with it is its **issue order**, which is
+performance-only because the slot an expert lands in is arbitrary.
+
+**Rule.**  *(1) The SET is policy, the ORDER is the file's business.*  `pool_fill_empty_locked` hands out the first
+free slot and `apply_heat_seed_locked` fills `0..k`, so nothing may depend on which slot an expert holds; a fill may
+therefore be re-ordered to walk the GGUF forwards (ascending expert id == ascending file offset, one table's experts
+being contiguous) with no change to any expert byte.  The *set* may not move, and an ordering change must be proven
+by the same text hash on both arms plus a census that the fill count is unchanged — `MOE_HOST_POOL_FILL_ORDER` is
+the kill switch on both call sites.  *(2) A covering tier may not be made incomplete.*  The device remap resolves a
+cold expert to `slots + pool slot` and refuses a map with a hole, so a lazy seed, a lazier prewarm or anything else
+that leaves a mirror pool partly filled silently stands the sync-free decode path down (measured -18.6 % decode for
+byte-identical text).  A mechanism that defers a fill must therefore test the covering case separately from the
+subset one.  *(3) A deferred seed is not free even where it is cheap.*  Storage reads do not fall when the seed is
+deferred (45-46 GiB in every arm at the delivered budgets): the bytes are the workload's, and what changes is
+whether they are read up front at 6.25 GB/s or inline at ~1 GB/s.
+
+**Numbers.**  Bounded pool (`soar`, Flash-Next GSQ-IQ3_XXS `-ncmoe 47`, `-lme 32` = 419/512 slots, cold page cache):
+prewarm **12 546 -> 7 774 ms** for the same 42.7 GiB and set (3.67 -> 6.25 GB/s), TTFT **19.1-20.4 -> 15.5-16.1 s**,
+whole run 30.7 -> 26.6-27.5 s, decode 40.80-40.93 -> 40.91-40.94 t/s, text `6e6d241acc25` in both orders.
+Deferred seed on the same config: prompt eval **0.88 -> 7.24 s**, decode flat.  Mirror pool: remap 70 779 ops -> 0
+and decode **49.17 -> 40.01 t/s**.  APU (`halo`, 122B-A10B Q5_K_XL, `-lme 70` of 79 GiB): TTFT 47.77 -> 28.99 s,
+decode **11.73 -> 4.83 t/s**, reads 166 -> 236 GiB; the r269 binary against `MOE_EXPERT_SEED=eager` on this build is
+byte-identical (`960bdbc9e2dc`) with an identical arena hit rate.
+
+**Record.**  `WORKLOG.md` 261112.006; `benchmarks/2026-11-12-expert-seed-policy.md`;
+`archive/work/expert-seed-policy/`; `INVARIANTS.md` r270; `patches/README.md` block 16.

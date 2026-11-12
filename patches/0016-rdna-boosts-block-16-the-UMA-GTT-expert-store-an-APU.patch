@@ -1,4 +1,4 @@
-From d73abbeea696ac686d9f73bbb481d96d3d146724 Mon Sep 17 00:00:00 2001
+From 2f1030934de5127ad4efad6d6da0b2dbd0f7bc90 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 16/16] rdna-boosts: block 16: the UMA GTT expert store -- an
@@ -59,11 +59,11 @@ every other backend keeps its behaviour (the code is gated on prop.integrated).
  ggml/src/ggml-cuda/ggml-cuda.cu               |  280 ++-
  ggml/src/ggml-cuda/gtt-expert-store.cu        |  638 ++++++
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 1785 ++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 1968 ++++++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   26 +
- src/llama-model-loader.cpp                    |  696 ++++++-
+ src/llama-model-loader.cpp                    |  696 +++++-
  src/llama-model-loader.h                      |   35 +
- 13 files changed, 3658 insertions(+), 70 deletions(-)
+ 13 files changed, 3835 insertions(+), 76 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -1418,7 +1418,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 524cc11db..d5e756fb8 100644
+index 524cc11db..823dc7520 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -1612,7 +1612,81 @@ index 524cc11db..d5e756fb8 100644
  int64_t                             g_bounce_read_calls = 0;
  int64_t                             g_bounce_read_us    = 0;
  int64_t                             g_bounce_read_bytes = 0;
-@@ -974,7 +1098,11 @@ void bind_host_dev_locked(table_t & t) {
+@@ -721,6 +845,73 @@ int64_t                             g_extra_reserve   = 0;
+ bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
+ bool                                g_heat_on         = false; // MOE_EXPERT_HEATMAP=1 (WIP R2): tally the long-horizon per-expert heat
+ 
++// ---------------------------------------------------------------------------------------------
++// TODO #318 (`MOE_EXPERT_SEED`): ONE front-loading policy for BOTH expert tiers.
++//
++// Every tier in this block starts with a bulk fill at sizing: the arena is seeded from the persisted heat
++// prior (`apply_heat_seed_locked`) and the prompt tally (`apply_prefill_seed_locked`), and the discrete host
++// pool is prewarmed (`pool_prepopulate_locked`) and then re-laid-out as the arena's complement
++// (`pool_rerank_from_heat_locked`).  Those fills are all of a size to dominate a small request: measured on
++// `soar` (Flash-Next GSQ-IQ3_XXS, `-ncmoe 47 --host-experts pool`, bounded pool) 42.1 GiB / 77 353 mapping
++// memcpys of pool prewarm and 24 GiB / 43 710 arena slots at sizing, against a 57-token prompt eval of
++// 0.9 s; on `halo` (APU, GTT arena) 75 GiB / ~30 s against 1.3 s.  r266's in-place prefill band removed the
++// reason the arena HAD to be pre-populated (the prompt's own used set is what prefill needs), so the
++// question is now: which of these fills are a PLACEMENT and which are a SEED?
++//
++//   * a PLACEMENT is a tier whose slots cover its whole tensor (`slots == n_experts`): its content is not a
++//     choice -- every expert has a slot -- so the fill is the placement itself, and deferring it would only
++//     move a read that must happen.  On the discrete tier it is also load-bearing: the covering-pool cold
++//     source of the device remap (`GGML_MOE_DEVREMAP`) needs every expert live in the pool at sizing, and a
++//     pool with holes makes the remap stand down (`devremap_prep_locked` declines).
++//   * a SEED is a tier that holds a SUBSET (`slots < n_experts`): the fill decides WHICH experts are hot,
++//     and the demand path re-derives that for free as the run uses them.  The persisted prior is still what
++//     ranks an eviction (the prefill ladder's `heat_rank_vec`, the pool's `pool_rank_experts_locked`), and
++//     ranking needs no fill.
++//
++// Hence the default (`eager`): the seed IS the prefetch, and deferring it moves the same bytes into the
++// request at a worse rate.  Measured on BOTH tiers (r270, see `benchmarks/2026-11-12-expert-seed-policy.md`):
++//   * discrete pool 32 GiB / 40 GiB set (soar, gfx1201): `auto` leaves decode flat, but prompt eval goes
++//     0.88 s -> 7.2 s on a 57-token prompt, and total storage reads do not move (45 -> 46 GiB);
++//   * discrete pool MIRROR (the whole 40 GiB set): `auto`/`lazy` cost TTFT +5.1 s, prompt eval 0.68 s ->
++//     8.0 s and decode 49.2 -> 40.0 t/s, because a covering pool with holes stands the device remap's cold
++//     source down (`devremap_prep_locked`);
++//   * APU GTT arena (halo, gfx1151, 70 GiB store of a 79 GiB set): `auto` buys TTFT -39 % (47.8 -> 29.0 s)
++//     and a 32-token answer comes out 12 % cheaper, but decode falls 11.7 -> 4.8 t/s and the run reads
++//     70 GiB more, so a 250-token answer is 16 % worse.
++// So the two tiers do NOT share a front-loading policy -- they share the QUESTION.  `eager` is the default and
++// the pre-r270 behaviour; `auto` is the APU policy ported verbatim (defer a subset, place a covering tier) and
++// `lazy` defers everything, both opt-in with the numbers above recorded.  It is one knob either way: the
++// alternative is two knobs that drift apart.
++enum moe_seed_policy_t { MOE_SEED_EAGER = 0, MOE_SEED_AUTO = 1, MOE_SEED_LAZY = 2 };
++int                                 g_seed_policy     = MOE_SEED_EAGER;
++// Census: how many tables/pools a run actually deferred (the mechanism must never be invisible).
++int64_t                             g_seed_deferred_tables = 0;
++int64_t                             g_seed_deferred_pools  = 0;
++int64_t                             g_seed_placed_tables   = 0;   // a covering tier, filled at sizing as before
++
++// True when THIS table's sizing fill is a SEED that the policy defers (fill on first miss instead).
++// `t.slots`/`t.n_experts` are known by every caller (sizing runs after the slot count is decided).
++static bool seed_defer_table(const table_t & t) {
++    if (g_seed_policy == MOE_SEED_EAGER) {
++        return false;
++    }
++    if (g_seed_policy == MOE_SEED_LAZY) {
++        return true;
++    }
++    return t.n_experts > 0 && t.slots < t.n_experts;   // auto: place what fits, seed lazily what does not
++}
++
++// The same question for the discrete host pool (its own slot count, which is not the arena's).
++static bool seed_defer_pool(const host_pool_t & p) {
++    if (g_seed_policy == MOE_SEED_EAGER) {
++        return false;
++    }
++    if (g_seed_policy == MOE_SEED_LAZY) {
++        return true;
++    }
++    return p.n_experts > 0 && p.slots < p.n_experts;
++}
++
+ // wip/moe-heatmap-persistence: the on-disk heat map (sidecar next to the model, geometry-keyed).
+ // `g_heat_loaded` is keyed by (layer, sem_role, n_experts, host_bytes) and consulted at table
+ // registration; `g_heat_path` is the chosen sidecar (model dir, else the cache-dir fallback).
+@@ -974,7 +1165,11 @@ void bind_host_dev_locked(table_t & t) {
  // representable AND the master must have a device mapping.  A pageable model mapping has none, so the
  // table takes the fill-every-miss path instead (issue #116).
  static inline bool table_cold_ok(const table_t & t) {
@@ -1625,7 +1699,7 @@ index 524cc11db..d5e756fb8 100644
  }
  
  // MOE_HOST_POOL_COLD (default 1): a pool-backed table (`--host-experts pool`, pageable master, so no in-place
-@@ -1267,6 +1395,18 @@ void parse_env() {
+@@ -1267,6 +1462,18 @@ void parse_env() {
      if (g_pool_stage_span_n < 1) {
          g_pool_stage_span_n = 1;
      }
@@ -1644,7 +1718,37 @@ index 524cc11db..d5e756fb8 100644
      // wip/host-read-transport: the COUPLING, stated where an operator will see it.  A per-expert buffered
      // read at depth 1 is latency-bound where the mapping gets fault-around prefetch, so the file transport
      // is measured at -41 % with the coalesced span OFF.  The promotion makes one decision pick both; the
-@@ -2126,8 +2266,12 @@ static void pool_transport_apply_locked(int next, const char * why) {
+@@ -1345,6 +1552,29 @@ void parse_env() {
+     // Prefill seed: use the prompt's prefill routing to bulk-admit its hot experts as provisional slots
+     // before decode starts (session 14).  Default ON (kill switch `MOE_EXPERT_CACHE_PREFILL_SEED=0`).
+     g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 1) != 0;
++    // TODO #318: which sizing fills happen up front (see `moe_seed_policy_t` above).  `auto` = place a tier
++    // that covers its tensor, seed a tier that holds a subset lazily; `eager` = the pre-r270 behaviour on
++    // every tier (the A/B and bisect arm); `lazy` = no front-loading anywhere, including a covering tier.
++    {
++        const char * sp = getenv("MOE_EXPERT_SEED");
++        if (sp == nullptr || sp[0] == '\0' || strcmp(sp, "eager") == 0 || strcmp(sp, "1") == 0) {
++            g_seed_policy = MOE_SEED_EAGER;
++        } else if (strcmp(sp, "auto") == 0) {
++            g_seed_policy = MOE_SEED_AUTO;
++        } else if (strcmp(sp, "lazy") == 0 || strcmp(sp, "0") == 0) {
++            g_seed_policy = MOE_SEED_LAZY;
++        } else {
++            GGML_LOG_WARN("%s: MOE_EXPERT_SEED=%s is not eager|auto|lazy; using eager\n", __func__, sp);
++            g_seed_policy = MOE_SEED_EAGER;
++        }
++        if (g_seed_policy != MOE_SEED_EAGER) {
++            GGML_LOG_INFO("%s: expert seed policy %s: a tier that holds a SUBSET fills on first miss and keeps "
++                          "the persisted prior for RANKING%s.  This is a measured arm, not the default: the seed "
++                          "is the prefetch the demand path would otherwise pay inline (see the block-16 note).\n",
++                          __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto (place what fits, defer a subset)",
++                          g_seed_policy == MOE_SEED_LAZY ? ", a covering tier too" : ", a covering tier is PLACED");
++        }
++    }
+     // wip/moe-heatmap-persistence -> V2.0 block 09 (r60): the long-horizon per-expert heat map.
+     // DEFAULT ON (kill switch `MOE_EXPERT_HEATMAP=0`): it only has an effect when the cache is active on
+     // host-expert tables, and it turns a cold start into a warm one (measured +34 % decode over a
+@@ -2126,8 +2356,12 @@ static void pool_transport_apply_locked(int next, const char * why) {
  //   * it does not                                                       -> FILE  (the general-purpose baseline;
  //                                                                                  the monitor may escalate to DIO)
  // A wrong prior is corrected by the runtime monitor, in one direction (see `pool_transport_observe_locked`).
@@ -1658,7 +1762,7 @@ index 524cc11db..d5e756fb8 100644
      if (g_pool_tr_applied || g_pool_tr_mode < 0) {
          return;
      }
-@@ -2162,6 +2306,34 @@ static void pool_transport_init_locked(const table_t & t, int64_t planned_pool)
+@@ -2162,6 +2396,34 @@ static void pool_transport_init_locked(const table_t & t, int64_t planned_pool)
      // users of that number (the pinned-pool RAM ceiling), not as a transport selector.
      (void) planned_pool;
      g_pool_transport = -1;
@@ -1693,7 +1797,94 @@ index 524cc11db..d5e756fb8 100644
      pool_transport_apply_locked(POOL_TR_MAP, "optimistic start (the mapping is the fast arm when cached)");
  }
  
-@@ -3838,6 +4010,12 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
+@@ -3360,7 +3622,40 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
+     });
+ }
+ 
++// `MOE_HOST_POOL_FILL_ORDER` (r231, block 12): the order the bulk pool fills are ISSUED in.  `offset` (default) =
++// ascending expert id, which is ascending file offset, because one table's experts are contiguous in the GGUF;
++// `rank` = the pre-r231 order (the prior's), i.e. a random walk over the file.  The SET is identical either way
++// (only where an expert lands changes, and the slot an expert lands in is arbitrary by construction), so this
++// is pure ordering.  r231 gave the rule to the band-transition re-layout; r270 (`TODO` #318) extends it to the
++// load-time prewarm, which was still walking the file at random -- see the measured note in
++// `pool_prepopulate_locked`.
++static bool pool_fill_in_file_order() {
++    static const bool offset = [] {
++        const char * e = getenv("MOE_HOST_POOL_FILL_ORDER");
++        return e == nullptr || strcmp(e, "rank") != 0;   // `rank` = the pre-r231 order, for the A/B
++    }();
++    return offset;
++}
++
+ static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
++    // TODO #318 (`MOE_EXPERT_SEED`): a pool that holds a SUBSET of its tensor is SEEDED -- the layout is a
++    // choice (which experts to front-load) and the demand path makes the same choice for free, in the order
++    // the run actually wants them.  A pool that COVERS its tensor is a PLACEMENT: every expert has a slot, so
++    // the fill is the placement, and the device remap's covering-pool cold source needs it complete.
++    if (seed_defer_pool(p)) {
++        g_seed_deferred_pools++;
++        static bool told = false;
++        if (!told) {
++            told = true;
++            GGML_LOG_INFO("%s: the host pool's prewarm is DEFERRED (MOE_EXPERT_SEED=%s): layer=%d role=%s fills "
++                          "%d of %d slots on demand instead of at load; `pool_rank_experts_locked` still ranks "
++                          "whatever the demand path leaves room for.  The rest of this run's pools say nothing "
++                          "more.\n",
++                          __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto", t.layer, t.role.c_str(),
++                          p.slots, p.n_experts);
++        }
++        return;
++    }
+     static const bool bulk = [] { const char * e = getenv("MOE_HOST_POOL_BULK"); return e == nullptr || atoi(e) != 0; }();
+     if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
+         return;
+@@ -3372,9 +3667,17 @@ static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
+     std::vector<int32_t> rank;
+     pool_rank_experts_locked(t, rank);
+     const int k = p.slots < p.n_experts ? p.slots : p.n_experts;
++    // TODO #318: the SET is the prior's top `k` (unchanged), the ISSUE ORDER is the file's -- the same rule
++    // r231 gave the band-transition re-layout, now for the load-time prewarm.  Measured on `soar` (Flash-Next
++    // GSQ-IQ3_XXS, `-lme 32`, cold page cache, 80 % coverage): the prewarm is 43 GiB of ~0.55 MiB reads, and
++    // walking the file at random under a full page cache costs ~30 % more than walking it forwards.
++    std::vector<int32_t> want(rank.begin(), rank.begin() + std::min<size_t>((size_t) k, rank.size()));
++    if (pool_fill_in_file_order()) {
++        std::sort(want.begin(), want.end());
++    }
+     int filled = 0;
+-    for (int i = 0; i < k; i++) {
+-        if (pool_fill_empty_locked(p, rank[(size_t) i], nullptr) == nullptr) {
++    for (int32_t e : want) {
++        if (pool_fill_empty_locked(p, e, nullptr) == nullptr) {
+             break;
+         }
+         filled++;
+@@ -3401,6 +3704,13 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+     if (pool == nullptr || pool->failed || pool->slots <= 0) {
+         return;
+     }
++    // TODO #318: a SUBSET pool is SEEDED, and its one-shot layout decision is exactly what the policy
++    // defers -- the demand path fills the same experts in the order the run wants them, and reaps a slot the
++    // arena takes (so the pool still converges on the arena's complement).  Deferring also keeps the
++    // `-lme auto` mirror band byte-identical in eager mode, where this function is the layout.
++    if (seed_defer_pool(*pool)) {
++        return;
++    }
+     // Reap FIRST: a retirement whose copy has drained becomes a free slot (and drops its index), which is
+     // what makes the coverage test below see the live set.  TODO #269 relies on it: the remap's cold ids are
+     // built from this map, and "a covering pool's layout is write-once after sizing" is the invariant that
+@@ -3469,10 +3779,7 @@ static void pool_rerank_from_heat_locked(table_t & t) {
+     // around the page cache) removes ~90 % of the tail, which is the fill SOURCE's business, not this
+     // loop's.  The SLOT an expert lands in is arbitrary by construction (`pool_fill_empty_locked` takes the
+     // first empty slot), so this changes nothing but the order the reads are issued in.
+-    static const bool order_offset = [] {
+-        const char * e = getenv("MOE_HOST_POOL_FILL_ORDER");
+-        return e == nullptr || strcmp(e, "rank") != 0;   // `rank` = the pre-r231 order, for the A/B
+-    }();
++    static const bool order_offset = pool_fill_in_file_order();
+     std::vector<int32_t> todo;
+     todo.reserve((size_t) n);
+     for (int i = 0; i < n; i++) {
+@@ -3838,6 +4145,12 @@ static bool expert_host_src(table_t & t, int32_t expert, host_pool_t * pool, boo
              int64_t probe_us = 0;
              if (pool_read_via_arm_locked(t.src_path.c_str(), off, msrc, rd_len, rd_dst, next, &probe_us)) {
                  filled = true;
@@ -1706,7 +1897,7 @@ index 524cc11db..d5e756fb8 100644
                  if (g_pool_tr_ewma_us > 0.0) {
                      pool_transport_probe_compare_locked(probe_us, (int64_t) g_pool_tr_ewma_us, true);
                  }
-@@ -3969,10 +4147,117 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
+@@ -3969,10 +4282,117 @@ static cudaError_t copy_slot_from_src(const table_t & t, void * dst, const exper
  // `cudaErrorInvalidDeviceFunction`, which printed `invalid device function` and sent the issue-#274 reporter
  // looking at the device instead of at the refused `cudaHostAlloc` behind it.
  static const cudaError_t k_no_host_source = cudaErrorMemoryAllocation;
@@ -1824,7 +2015,7 @@ index 524cc11db..d5e756fb8 100644
      host_pool_t * pool = table_pool_locked(t);
      expert_src_t  src;
      const char *  why = nullptr;
-@@ -4038,6 +4323,12 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -4038,6 +4458,12 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
          if (hit_it->second >= 0 && hit_it->second < (int) t.slot_prov.size()) {
              t.slot_prov[hit_it->second] = 0;   // hit: no longer provisional
          }
@@ -1837,7 +2028,7 @@ index 524cc11db..d5e756fb8 100644
          g_acc_hits++;
          return { (char *) t.arena + (size_t) hit_it->second * t.expert_bytes, true };
      }
-@@ -4106,6 +4397,9 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -4106,6 +4532,9 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
          if (slot >= 0) {
              t.expert_slot.erase(victim);
              t.slot_expert[slot] = -1;
@@ -1847,7 +2038,7 @@ index 524cc11db..d5e756fb8 100644
              t.evictions++;
          }
      }
-@@ -4124,6 +4418,9 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -4124,6 +4553,9 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
      if (slot < (int) t.slot_prov.size()) {
          t.slot_prov[slot] = 0;   // a real (policy-chosen) admission is not provisional
      }
@@ -1857,7 +2048,7 @@ index 524cc11db..d5e756fb8 100644
      t.count[expert]++;
      // The expert is resident now, so its outstanding demand is served: reset the doorkeeper.  A
      // later eviction starts the touch count from scratch, which is what makes `touch` a
-@@ -4160,12 +4457,26 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -4160,12 +4592,26 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
          // competition.  Refusing empty fills outright was wrong and measurably harmful -- it turned the pool
          // into a demote-only cache that never read from disk, so at -lme 12 the hit rate collapsed to 4.4 %
          // and every miss took the synchronous bounce ring instead (the fill-time instrument read zero fills).
@@ -1886,7 +2077,7 @@ index 524cc11db..d5e756fb8 100644
              if (t.n_slices != 0 || pool->host_bytes != t.expert_bytes || pool->base == nullptr) {
                  g_sink_decl_geom++;   // structural: this table has no single contiguous pool image
              } else {
-@@ -4236,10 +4547,10 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -4236,10 +4682,10 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
              }
              g_sink_declines = g_sink_decl_noslot + g_sink_decl_geom + g_sink_decl_copy;
          }
@@ -1899,7 +2090,7 @@ index 524cc11db..d5e756fb8 100644
              // Keep a pool-resident source resident: the pool holds the arena's complement, and this expert
              // being in VRAM now does not mean the pool should forget where to find it next time.
              //
-@@ -4343,13 +4654,63 @@ static bool heat_seed_above_floor(const table_t & t) {
+@@ -4343,15 +4789,70 @@ static bool heat_seed_above_floor(const table_t & t) {
  // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
  // populated so the eager remap picks them up.  No-op for an identity table (already wholly resident)
  // or one with no prefill tally.
@@ -1964,8 +2155,15 @@ index 524cc11db..d5e756fb8 100644
 +    }    if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
          return;
      }
++    // TODO #318: a SUBSET arena is SEEDED, not placed -- the policy defers the fill to the first miss, and the
++    // tally above keeps accumulating so the prior still ranks a prefill-ladder eviction (`heat_rank_vec`).
++    if (seed_defer_table(t)) {
++        return;   // counted once, by the heat seed above (which always runs first)
++    }
      // Rank order.  From the tally: descending prefill frequency (expert id asc on a tie).
-@@ -4412,6 +4773,7 @@ void apply_prefill_seed_locked(table_t & t) {
+     std::vector<int32_t> rank((size_t) t.n_experts);
+     for (int e = 0; e < t.n_experts; e++) {
+@@ -4412,6 +4913,7 @@ void apply_prefill_seed_locked(table_t & t) {
      if (seeded > 0) {
          t.fills    += seeded;
          t.slot_dirty = true;
@@ -1973,7 +2171,33 @@ index 524cc11db..d5e756fb8 100644
          GGML_LOG_INFO("%s: layer=%d role=%s prefill-%s %d/%d slots (%d experts; %lld prefill tokens)\n",
                        __func__, t.layer, t.role.c_str(), from_tally ? "seeded" : "loaded",
                        seeded, t.slots, t.n_experts, (long long) t.prefill_tokens);
-@@ -4485,6 +4847,7 @@ void apply_heat_seed_locked(table_t & t) {
+@@ -4431,6 +4933,25 @@ void apply_heat_seed_locked(table_t & t) {
+     if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
+         return;
+     }
++    // TODO #318 (`MOE_EXPERT_SEED`): a tier that holds a SUBSET is seeded lazily -- its slots stay empty and
++    // fill on first miss (from this same prior-ranked table when it comes to an eviction).  A tier that
++    // COVERS its tensor is a PLACEMENT and keeps its eager fill.
++    if (seed_defer_table(t)) {
++        g_seed_deferred_tables++;
++        static bool told = false;
++        if (!told) {
++            told = true;
++            GGML_LOG_INFO("%s: layer=%d role=%s: the arena seed is DEFERRED (MOE_EXPERT_SEED=%s): %d slots of "
++                          "%d experts start EMPTY and fill on first miss; the persisted prior still ranks "
++                          "evictions.  The rest of this run's tables say nothing more.\n",
++                          __func__, t.layer, t.role.c_str(),
++                          g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto", t.slots, t.n_experts);
++        }
++        return;
++    }
++    if (g_seed_policy == MOE_SEED_AUTO && t.slots >= t.n_experts) {
++        g_seed_placed_tables++;
++    }
+     // TODO #88: rank by the DECODE band (with the combined vector as the fallback), because the arena serves
+     // the decode/verify band.  `heat`'s own total is what decides whether there is a prior at all.
+     const std::vector<uint32_t> & rank_by = heat_rank_vec(t);
+@@ -4485,6 +5006,7 @@ void apply_heat_seed_locked(table_t & t) {
      if (seeded > 0) {
          t.fills     += seeded;
          t.slot_dirty = true;
@@ -1981,7 +2205,7 @@ index 524cc11db..d5e756fb8 100644
          GGML_LOG_INFO("%s: layer=%d role=%s heat-seeded %d/%d slots from the persisted map (%d experts, "
                        "ranked by the %s band)\n", __func__, t.layer, t.role.c_str(), seeded, t.slots,
                        t.n_experts, &rank_by == &t.heat_dec ? "DECODE" : "combined");
-@@ -5101,7 +5464,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
+@@ -5101,7 +5623,12 @@ static void free_arena_backing(int device, void * arena, size_t reserved, int ol
      if (arena == nullptr) {
          return;
      }
@@ -1995,7 +2219,7 @@ index 524cc11db..d5e756fb8 100644
          ggml_cuda_slab_arena_free(device, arena, reserved);
      } else {
          (void) cudaFree(arena);
-@@ -5262,9 +5630,11 @@ static void free_table_buffers_locked(table_t & t) {
+@@ -5262,9 +5789,11 @@ static void free_table_buffers_locked(table_t & t) {
      t.remap_cap      = 0;
      t.remap_n_used   = 0;
      t.remap_n_tok    = 0;
@@ -2007,7 +2231,7 @@ index 524cc11db..d5e756fb8 100644
      t.expert_slot.clear();
      t.remap_host.clear();
      t.hook_experts.clear();
-@@ -5306,12 +5676,29 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5306,12 +5835,29 @@ void alloc_table_locked(table_t & t, int slots) {
      // lands *at* the max); then a 0.95 geometric descent for the fragmentation case (a failed
      // cudaMalloc is cheap, so the extra attempts cost nothing measurable).  The table keeps the largest
      // slot count that actually allocates.
@@ -2038,7 +2262,7 @@ index 524cc11db..d5e756fb8 100644
          if (use_slab) {
              if (t.arena != nullptr) {
                  return true;
-@@ -5382,9 +5769,16 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5382,9 +5928,16 @@ void alloc_table_locked(table_t & t, int slots) {
      // over-filled arena).
      t.slots        = got_slots;
      const size_t arena_size = (size_t) slots * t.expert_bytes + head_pad;
@@ -2056,7 +2280,7 @@ index 524cc11db..d5e756fb8 100644
      t.count.assign(t.n_experts, 0);
      t.ghost.assign(t.n_experts, 0);
      t.last.assign(t.n_experts, 0);
-@@ -5408,7 +5802,14 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5408,7 +5961,14 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -2072,7 +2296,7 @@ index 524cc11db..d5e756fb8 100644
          bool ok = true;
          for (int e = 0; e < t.n_experts && ok; ++e) {
              void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
-@@ -5434,6 +5835,7 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -5434,6 +5994,7 @@ void alloc_table_locked(table_t & t, int slots) {
          } else {
              t.expert_slot.clear();
              t.slot_expert.assign(slots, -1);
@@ -2080,7 +2304,7 @@ index 524cc11db..d5e756fb8 100644
              GGML_LOG_WARN("%s: identity fill failed for layer=%d role=%s; keeping the remap path\n",
                            __func__, t.layer, t.role.c_str());
          }
-@@ -5512,6 +5914,19 @@ static bool moe_cache_tables_complete_locked() {
+@@ -5512,6 +6073,19 @@ static bool moe_cache_tables_complete_locked() {
      return registered + slack >= expected;
  }
  
@@ -2100,7 +2324,7 @@ index 524cc11db..d5e756fb8 100644
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
  // `budget / total_expert_bytes`, so an expert resident for gate is resident for up and down too and
  // the effective (all-roles) hit rate is set by the shared slot count, not by the smallest table.
-@@ -5545,11 +5960,22 @@ void alloc_all_locked() {
+@@ -5545,11 +6119,22 @@ void alloc_all_locked() {
          return;   // defer: `g_sized` stays false, so a later decode-band pass re-enters
      }
      g_sized = true;
@@ -2124,7 +2348,7 @@ index 524cc11db..d5e756fb8 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5601,11 +6027,24 @@ void alloc_all_locked() {
+@@ -5601,11 +6186,24 @@ void alloc_all_locked() {
      int64_t dev_one_bytes [GGML_CUDA_MAX_DEVICES] = {0};
      int64_t dev_max_experts[GGML_CUDA_MAX_DEVICES] = {0};
      int     dev_n_tables [GGML_CUDA_MAX_DEVICES] = {0};
@@ -2149,7 +2373,7 @@ index 524cc11db..d5e756fb8 100644
          dev_one_bytes [t.device] += (int64_t) t.expert_bytes;
          dev_n_tables  [t.device]++;
          if ((int64_t) t.n_experts > dev_max_experts[t.device]) {
-@@ -5615,6 +6054,10 @@ void alloc_all_locked() {
+@@ -5615,6 +6213,10 @@ void alloc_all_locked() {
              max_dev = t.device;
          }
      }
@@ -2160,7 +2384,7 @@ index 524cc11db..d5e756fb8 100644
  
      const size_t reserve = (size_t) g_reserve_mib * 1024 * 1024;
      // the post-clamp budget each device settled on (the identity pre-pass spends it exactly, rounding
-@@ -5632,7 +6075,19 @@ void alloc_all_locked() {
+@@ -5632,7 +6234,19 @@ void alloc_all_locked() {
              continue;
          }
          size_t budget = g_budget;
@@ -2181,7 +2405,7 @@ index 524cc11db..d5e756fb8 100644
              device_guard dg(d);
              // OPEN 2 slab: the slab's ARENA REGION owns the memory, so size against its capacity.  A
              // `cudaMemGetInfo` here reads only the small amount left outside the slab, which starves the
-@@ -5738,6 +6193,11 @@ void alloc_all_locked() {
+@@ -5738,6 +6352,11 @@ void alloc_all_locked() {
          if (t.allocated || t.layer < 0 || t.layer >= 512 || t.device < 0 || t.device >= GGML_CUDA_MAX_DEVICES) {
              continue;
          }
@@ -2193,7 +2417,7 @@ index 524cc11db..d5e756fb8 100644
          const int s = slots_d[t.device];
          if (layer_slots[t.layer] < 0 || s < layer_slots[t.layer]) {
              layer_slots[t.layer] = s;
-@@ -5806,9 +6266,15 @@ void alloc_all_locked() {
+@@ -5806,9 +6425,15 @@ void alloc_all_locked() {
              std::vector<int> order;
              order.reserve((size_t) n_layers);
              for (int i = 0; i < 512; i++) {
@@ -2211,7 +2435,7 @@ index 524cc11db..d5e756fb8 100644
              }
              if (g_heat_on) {
                  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-@@ -6021,6 +6487,23 @@ void alloc_all_locked() {
+@@ -6021,6 +6646,23 @@ void alloc_all_locked() {
      }
      GGML_LOG_INFO("%s: per-device sizing: %d device(s), arena total %.1f MiB\n",
                    __func__, max_dev + 1, (double) g_arena_bytes / (1024 * 1024));
@@ -2235,7 +2459,7 @@ index 524cc11db..d5e756fb8 100644
      // The traffic report's denominator: one routed-MoE op per (layer, role, device) table per token, so
      // the decode-band census divided by this is the token count.  Snapshotted HERE (sizing) rather than
      // read from `g_tables` at report time, because `llama_model_free` now drops the tables before the
-@@ -6170,6 +6653,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6170,6 +6812,41 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      if (!g_enabled) {
          return false;
      }
@@ -2277,7 +2501,7 @@ index 524cc11db..d5e756fb8 100644
      // wip/umem-arena-guard: refuse the arena on a shared host/device memory pool (see the helper above).
      // This runs at model load, before any table registers, so the whole cache stack (arena, pool, heat
      // map, cache-band fusions) stays inert and the run behaves like `MOE_EXPERT_CACHE_MIB=0`; the
-@@ -6223,19 +6741,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6223,19 +6900,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
                            __func__, g_budget >> 20, device);
          }
      }
@@ -2299,7 +2523,7 @@ index 524cc11db..d5e756fb8 100644
      // The pool's AUTO budget is a fraction of the MoE host expert bytes.  This runs once per host-expert
      // device, before the context -- but it is RE-RUN for the same devices (the `--fit` probe, and a
      // second model's preflight for a separate draft/MTP head), so a running sum sized the pool at N x the
-@@ -6298,6 +6805,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6298,6 +6964,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      return true;
  }
  
@@ -2372,7 +2596,7 @@ index 524cc11db..d5e756fb8 100644
  void moe_cache_set_extra_reserve(int device, size_t bytes) {
      // WIP r42 (TODO #42): hold this many bytes of the free VRAM for the post-prefill compute layout, so
      // the arena does not take the space a later compute growth (or the grow-in-place realloc) needs.
-@@ -6400,8 +6973,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
+@@ -6400,8 +7132,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
      t.remap_dev    = nullptr;
      t.remap_cap    = 0;
      free_heat_dev_locked(t);   // keep the tally across a stand-down (folds the mirror into `heat`)
@@ -2384,7 +2608,7 @@ index 524cc11db..d5e756fb8 100644
      t.slots        = 0;
      t.slot_dirty   = true;
      t.slot_expert.clear();
-@@ -6458,6 +7032,12 @@ bool moe_cache_shrink_step(int device) {
+@@ -6458,6 +7191,12 @@ bool moe_cache_shrink_step(int device) {
          if (t.device != device) {
              continue;
          }
@@ -2397,7 +2621,7 @@ index 524cc11db..d5e756fb8 100644
          if (t.arena != nullptr && t.slots > 0) {
              const int64_t b = (int64_t) t.slots * (int64_t) t.expert_bytes;
              if (b > best_b) {
-@@ -6495,6 +7075,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -6495,6 +7234,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
      const size_t target = need_bytes + (256u << 20);
      std::vector<int> order;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
@@ -2409,7 +2633,7 @@ index 524cc11db..d5e756fb8 100644
          if (g_tables[i].arena != nullptr && g_tables[i].slots > 0) {
              order.push_back(i);
          }
-@@ -6532,6 +7117,7 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -6532,6 +7276,7 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
          t.identity = false;
          t.slot_expert.clear();
          t.slot_prov.clear();
@@ -2417,7 +2641,7 @@ index 524cc11db..d5e756fb8 100644
          t.expert_slot.clear();
          t.slot_dirty = true;
          n_freed++;
-@@ -6636,6 +7222,12 @@ static void report_snapshot_locked() {
+@@ -6636,6 +7381,12 @@ static void report_snapshot_locked() {
          g_report_snap.misses += t.misses;
          g_report_snap.fills += t.fills;
          g_report_snap.evictions += t.evictions;
@@ -2430,7 +2654,7 @@ index 524cc11db..d5e756fb8 100644
          if (t.slots > 0) {
              g_report_snap.n_tables++;
              g_report_snap.n_slots += t.slots;
-@@ -6647,6 +7239,12 @@ static void report_snapshot_locked() {
+@@ -6647,6 +7398,12 @@ static void report_snapshot_locked() {
          }
      }
      g_report_snap.arena_bytes = g_arena_bytes;
@@ -2443,7 +2667,7 @@ index 524cc11db..d5e756fb8 100644
      g_report_snap.n_pools     = (int64_t) g_host_pools.size();
      for (const auto & kv : g_host_pools) {
          const host_pool_t & p = kv.second;
-@@ -6952,6 +7550,11 @@ bool moe_cache_rearm() {
+@@ -6952,6 +7709,11 @@ bool moe_cache_rearm() {
      std::map<int, std::vector<int>> by_layer;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
          const table_t & t = g_tables[i];
@@ -2455,7 +2679,7 @@ index 524cc11db..d5e756fb8 100644
          if (t.device >= 0 && t.allocated && t.slots == 0) {
              by_layer[t.layer].push_back(i);
          }
-@@ -7565,7 +8168,13 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -7565,7 +8327,13 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
          heat_map_open_locked(path);
      }
      if (!moe_host_pool_on()) {
@@ -2470,7 +2694,7 @@ index 524cc11db..d5e756fb8 100644
      }
      host_src_t & s = g_host_src[tensor_data];
      s.path        = path;
-@@ -8225,6 +8834,7 @@ static span_buf_t * span_buf_acquire(int device, size_t need, size_t align) {
+@@ -8225,6 +8993,7 @@ static span_buf_t * span_buf_acquire(int device, size_t need, size_t align) {
      }
      (void) cudaGetLastError();
      g_stage_span_wait_us += ggml_time_us() - tw;
@@ -2478,7 +2702,7 @@ index 524cc11db..d5e756fb8 100644
      b.busy = false;
      g_span_next[device] = (g_span_next[device] + 1) % used;
      return span_buf_ensure(b, need, align);
-@@ -8961,6 +9571,932 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -8961,6 +9730,932 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      return false;
  }
  
@@ -3411,7 +3635,7 @@ index 524cc11db..d5e756fb8 100644
  // Geometry-only registration: the half of `moe_cache_update_host` that needs no routing.
  //
  // The scheduler calls it for every routed host-expert input of EVERY split before the first split of a
-@@ -9158,7 +10694,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9158,7 +10853,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              }
              t.prefill_tokens += n_tok;
          }
@@ -3435,7 +3659,7 @@ index 524cc11db..d5e756fb8 100644
      }
  
      // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
-@@ -9221,6 +10772,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9221,6 +10931,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          t.device = device;
          alloc_table_locked(t, old_slots);
          t.slot_expert.assign(t.slots, -1);
@@ -3443,7 +3667,7 @@ index 524cc11db..d5e756fb8 100644
          t.expert_slot.clear();
          GGML_LOG_WARN("%s: migrated layer=%d role=%s arena from device %d to %d (%d slots)\n",
                        __func__, t.layer, t.role.c_str(), old_device, device, t.slots);
-@@ -9232,7 +10784,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9232,7 +10943,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (priming, no arena, or `!all` below), the scheduler copies the FULL expert table and the op must
      // read that copy - not the previous token's remap.  The consumer only redirects while
      // `remap_n_used > 0`, so zeroing it here turns "hook declined" into "op reads `input_cpy`".
@@ -3453,7 +3677,7 @@ index 524cc11db..d5e756fb8 100644
  
      // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
      // only registers the tables and runs uncached (the scheduler copies the full experts); the
-@@ -9688,8 +11241,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -9688,8 +11400,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
      }
      g_write_seq++;
      const auto decline = [&]() {
@@ -3465,7 +3689,7 @@ index 524cc11db..d5e756fb8 100644
          return false;
      };
      const int64_t n  = n_used * n_tok;
-@@ -9746,8 +11300,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -9746,8 +11459,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  continue;
              }
              if (!devremap_prep_locked(u, stream)) {
@@ -3477,7 +3701,7 @@ index 524cc11db..d5e756fb8 100644
                  continue;   // its own call retries
              }
              add_job(u, k);
-@@ -9894,11 +11449,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -9894,11 +11608,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
          if (n_tok)        *n_tok        = 0;
          return true;
      }
@@ -3496,10 +3720,22 @@ index 524cc11db..d5e756fb8 100644
          return false;
      }
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
-@@ -10149,21 +11706,120 @@ static void report_locked() {
+@@ -10149,21 +11865,132 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
++    // TODO #318: the front-loading policy that produced this run, and what it actually deferred. A deferred
++    // tier is invisible in the numbers above (the same experts are served, only later), so it needs its own
++    // line: `deferred` tables/pools start EMPTY and fill on first miss, `placed` ones were filled at sizing
++    // because they cover their tensor.
++    if (g_seed_policy != MOE_SEED_EAGER && (g_seed_deferred_tables + g_seed_deferred_pools +
++                                            g_seed_placed_tables) > 0) {
++        GGML_LOG_INFO("%s: expert seed (MOE_EXPERT_SEED=%s): %lld arena table(s) deferred (subset: seed on "
++                      "first miss), %lld placed (covers its tensor: filled at sizing); %lld host pool(s) "
++                      "deferred\n", __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto",
++                      (long long) g_seed_deferred_tables, (long long) g_seed_placed_tables,
++                      (long long) g_seed_deferred_pools);
++    }
 +    // wip/apu-expert-gtt P3: the tier's own two acceptance numbers, on their own line so nothing that parses
 +    // the census above has to change.  `arena releases` MUST be 0 on a steady-state arm (see the counter).
 +    if (g_gtt_arena) {
@@ -3626,7 +3862,7 @@ index 524cc11db..d5e756fb8 100644
          GGML_LOG_INFO("%s: pool fills: %lld storage reads %.0f ms, %lld mapping memcpys %.0f ms, %.2f GiB total "
                        "(%.1f MiB/fill, %.0f MiB/s effective)\n",
                        __func__, (long long) g_fill_read_calls, g_fill_read_us / 1000.0,
-@@ -10411,6 +12067,31 @@ static void report_locked() {
+@@ -10411,6 +12238,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }

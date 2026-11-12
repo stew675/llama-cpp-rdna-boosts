@@ -4293,3 +4293,43 @@ tail.  The facts:
 * **The diagnostic `GGML_META_SPLIT_COPY=0` + cache-on arm is not a valid oracle**: it aborts in
   `ggml_backend_cuda_get_tensor_2d_async` on this model.  Use the cache-off mirrored arm (or `-sm layer`) as the
   control, and do not read the kill-switch's abort as part of this fix.
+
+## r270 — the expert seed is the PREFETCH, not a fixed cost, and it does not port from the APU to the discrete tier (`TODO` #318)
+
+Both expert tiers fill at sizing (the arena from the heat prior + prompt tally, the discrete host pool from the
+prewarm and then the re-layout).  r266's in-place prefill band suggested the fill could be lazy.  The facts:
+
+* **A tier's sizing fill is a PREFETCH of the working set, and deferring it does not save the bytes.**  Measured
+  with a deterministic pool (`-lme 32`, `MOE_HOST_POOL_RAM_PCT=0`) on `soar`, Flash-Next GSQ-IQ3_XXS `-ncmoe 47`,
+  cold page cache: total storage reads are **45-46 GiB in the eager arm and in the deferred arm**; a 500-token
+  decode's byte range is the whole host set either way.  So the question is only *where* the cost lands.
+* **The APU premise does not hold on the discrete pool tier, because that tier has no in-place prefill band.**  Its
+  prefill stages the whole expert table into the op's `input_cpy` and prefetches the **complement** whether the pass
+  routes it or not (a routing-aware staging needs the host ids readback the gather design exists to avoid, r265).
+  Deferring the seed therefore moves the whole complement read into the prompt, one cold per-expert read at a time:
+  **prompt eval 0.88 s -> 7.24 s** on a 57-token prompt, **7.63 s -> 17.18 s** on a 5 246-token one (694 -> 308 t/s),
+  decode flat.  Do not reason about the discrete tier from the APU tier's in-place band; the band is `g_gtt_arena`
+  only (`pf_in_place_locked`).
+* **A COVERING pool with holes loses the device remap, and that is a decode regression, not a slow path.**  The
+  sync-free decode remap resolves a cold expert to `slots + pool slot`, so `devremap_prep_locked` refuses a map with
+  any hole and every table stands down.  Measured on the `-lme auto` mirror pool (the whole 40 012 MiB set):
+  remap served 70 779 ops eagerly, 0 lazily, and **decode 49.17 -> 40.01 t/s (-18.6 %)** for byte-identical text.
+  Anything that makes a covering pool incomplete mid-run (a lazy seed, a lazier prewarm) costs this class.
+* **On an APU the deferred seed is a real window and not a default**: `halo`, 122B-A10B Q5_K_XL on a `-lme 70` store
+  (225 of 256 slots/table): TTFT **47.8 -> 29.0 s (-39 %)** and a 32-token answer 50.3 -> 44.5 s, but decode
+  **11.73 -> 4.83 t/s** and **+70 GiB** of storage reads over a 250-token answer (236 vs 166 GiB).  The mechanism is
+  residency, not warm-up: the lazy arm's arena `h` is 0.906 against 0.9796, and every miss on that tier is a
+  `pread` (the mapping is not a GPU-readable cold source, `MOE_EXPERT_CACHE_TOUCH` is a no-op there).
+* **The seed's cost is its TRANSPORT, and the bounded-pool prewarm's was the issue ORDER.**  `pool_prepopulate_locked`
+  walked the GGUF in *rank* order -- a random walk over 40 GiB under a page cache that cannot hold it -- which is the
+  r231 defect left unfixed in the load-time path.  Filling the SAME set in ascending expert id (ascending file
+  offset; the slot an expert lands in is arbitrary by construction) is **12 546 -> 7 774 ms** for 42.7 GiB
+  (3.67 -> 6.25 GB/s), **TTFT -20 %**, whole run -13 %, decode unchanged, text identical.  `MOE_HOST_POOL_FILL_ORDER`
+  now covers both call sites; `MOE_HOST_POOL_DIO=1` is the wrong answer here (**21.3 s** for the same bytes -- a
+  ~0.55 MiB `O_DIRECT` read at depth 1 is latency-bound).
+* **The AUTO pool budget depends on WHEN the pool is built, so an A/B against it must pin the budget.**  In the
+  not-fitting band the budget is `MOE_HOST_LIMIT_FRAC` % of `MemAvailable` *at the first pool build*, and the
+  RAM ceiling (`MOE_HOST_POOL_RAM_PCT` of `MemAvailable` at the same moment) rescales every table.  An arm that has
+  already faulted the model into the page cache therefore sizes a SMALLER pool than the arm it is compared with --
+  measured 33.6 GiB against 40.0 GiB (a subset against a mirror, which then differ in the device remap too).  Pin it
+  (`-lme N` + `MOE_HOST_POOL_RAM_PCT=0`) for any pool A/B, and drop the page cache before every run.

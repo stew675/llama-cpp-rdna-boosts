@@ -1,3 +1,86 @@
+## 261112.006 (r270, release) -- the expert seed is the prefetch, not a fixed cost: one `MOE_EXPERT_SEED` policy for both tiers, and the pool prewarm walks the file (`TODO` #318)
+
+**Release:** `v17-a691b2345-r270` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`2f1030934de5127ad4efad6d6da0b2dbd0f7bc90`**, tree **`4316df62bcefeb872dbca0a240f4dd404c87e281`**.  Block 16
+amended (the seed policy + the prewarm's fill order); no new block, one new environment variable
+(`MOE_EXPERT_SEED`, default `eager` = the pre-r270 behaviour), one existing knob extended
+(`MOE_HOST_POOL_FILL_ORDER` now covers the prewarm).  No expert byte changes: same-seed greedy text is identical in
+every arm and on both tiers.
+
+### The question
+
+`TODO` #318 (split out of #317 at r266): the sizing fill is the small prompt's dominant fixed cost -- 75 GiB / ~30 s
+on `halo`, 43.9 GiB / 57 s on `soar`, against a ~1 s prompt eval -- and r266's in-place prefill band removed the
+reason the arena had to be pre-populated, so the fill "could be LAZY (fill on first miss; the prior only needs to
+RANK evictions)".  The item also required ONE policy for both tiers, because the discrete host pool's prewarm and
+57 s cold fill are "the same decision".
+
+### The answer: measured on both tiers, and it is `eager`
+
+The fill is not a fixed cost -- it is the **prefetch the demand path would otherwise pay inline**.  Deferring it
+does not save the bytes: total storage reads are **45-46 GiB in every arm** on the discrete tier at the delivered
+budgets, because a 500-token decode's byte range is the whole host set either way.  What changes is *where* the cost
+lands, and on the discrete tier it lands badly:
+
+* **the discrete pool tier has no in-place prefill band.**  `pf_in_place_locked` is `g_gtt_arena` only, so a
+  prefill there stages the whole expert table into the op's `input_cpy` and prefetches the **complement** whether
+  the pass routes it or not (a routing-aware staging needs the host ids readback the gather design avoids, r265).
+  Deferring the seed moves that whole read into the prompt, one cold per-expert read at a time -- **prompt eval
+  0.88 s -> 7.24 s** on a 57-token prompt, **7.63 s -> 17.18 s** on a 5 246-token one (694 -> 308 t/s), decode flat.
+* **a covering pool with holes loses the sync-free decode remap.**  On the `-lme auto` mirror pool (the whole
+  40 012 MiB set) the lazy arm served **0** remap ops against 70 779, and decode fell **49.17 -> 40.01 t/s
+  (-18.6 %)** for byte-identical text (`devremap_prep_locked` refuses a cold map with a hole).
+* **on an APU the deferred seed is a real window, and not a default.**  `halo`, 122B-A10B Q5_K_XL on a `-lme 70`
+  store (225 of 256 slots/table): TTFT **47.77 -> 28.99 s (-39 %)** and a 32-token answer 50.3 -> 44.5 s (-12 %),
+  but decode **11.73 -> 4.83 t/s** and **+70 GiB** of reads over a 250-token answer (236 vs 166 GiB).
+
+So the tiers share the QUESTION and the knob, not the answer: `eager` ships as the default, `auto` (defer a tier
+that holds a subset, place a tier that covers its tensor -- the APU policy ported verbatim) and `lazy` are the
+measured arms, and the APU short-answer window is documented in `ENVIRONMENT.md` rather than defaulted.  A side
+finding is recorded as an invariant: the AUTO pool budget is a function of `MemAvailable` *at the first pool build*,
+so an A/B against it must pin the budget (`-lme N` + `MOE_HOST_POOL_RAM_PCT=0`) or the arms differ in tier *and*
+policy (this cost the first cut of the measurement: 33.6 GiB against 40.0 GiB).
+
+### What the seed's cost actually was
+
+The bounded pool's prewarm issued its slots in **rank** order -- a random walk over a 40 GiB GGUF under a page cache
+that cannot hold it -- which is the r231 defect, left unfixed in the load-time path.  `MOE_HOST_POOL_FILL_ORDER`
+(whose default is already `offset` = file order) now governs `pool_prepopulate_locked` as well as the re-layout.
+The same **set**, ascending expert id = ascending file offset (the slot an expert lands in is arbitrary by
+construction, so only the issue order moves):
+
+| | prewarm | effective rate | TTFT | whole run | decode | text |
+|---|---:|---:|---:|---:|---:|---|
+| rank order (r269) | 12 546 ms | 3.67 GB/s | 19.10-20.39 s | 30.69-30.92 s | 40.80-40.93 t/s | `6e6d241acc25` |
+| **file order (r270)** | **7 774 ms** | **6.25 GB/s** | **15.54-16.13 s** | **26.55-27.54 s** | 40.91-40.94 t/s | `6e6d241acc25` |
+
+**-38 % of the seed, -20 % TTFT, -13 % of the run.**  `MOE_HOST_POOL_DIO=1` is the wrong answer for it (21 252 ms
+of storage reads at 2.1 GB/s: a ~0.55 MiB `O_DIRECT` read at depth 1 is latency-bound).
+
+### Gates (canonical build `~/llama.cpp/build-rocm`, gfx1201 unless noted)
+
+* `scripts/gate-host-pool.sh`: **42/42**, every arm byte-identical (`a99ccbd97ecb`), kernel journal clean.
+* `scripts/gate-prefill-logits.sh`: mean KLD **0.000000**, same-top-p **100.000 %**.
+* `scripts/gate-uma-experts.sh --quick --no-ram` on `halo` (gfx1151, new build): **36 checks, 0 failures**; the
+  in-place arm still serves 108 tables / 16 272 admissions.  **Neutrality on gfx1151**: the saved r269 binary and
+  this build with `MOE_EXPERT_SEED=eager` are byte-identical in text (`960bdbc9e2dc`, 821 chars), identical in
+  arena hit rate (0.9796), and within 1.1 % on decode.
+* `scripts/validate-set.sh`: 17 blocks, checksums OK, applied tree `4316df62b`, Windows scans clean (291 files).
+* Same-seed greedy text identical across every arm on both tiers, and against r269
+  (`6e6d241acc25` bounded/mirror pool, `960bdbc9e2dc` APU); the MTP four-axis protocol was not re-run because no
+  decode kernel or fusion changed (the residency *set* is unchanged; measured decode is flat to +0.3 %).
+
+### Records
+
+`benchmarks/2026-11-12-expert-seed-policy.md` (all arms, both tiers, the configs and the two measurement traps);
+`archive/work/expert-seed-policy/` (the harness + `RESULTS.csv`); `INVARIANTS.md` r270; `GREEDY-PURITY.md` §87;
+`ENVIRONMENT.md` §20 + the `MOE_HOST_POOL_FILL_ORDER` row; `patches/README.md` block 16.  `TODO` #318 retired.
+
+**Left as an observation:** `git am` prints one pre-existing whitespace warning on block 10's patch ("new blank
+line at EOF").  It is not from this change -- the patch body is byte-identical to r269's apart from the `From` line
+-- and the applied tree matches, but `MANIFESTS.md` says a whitespace warning is a regeneration bug, so the
+generator's trailing-line handling is worth a look on its own.
+
 ## 261112.005 (r269, release) -- the Meta split copy's tail guard is zeroed per device, so Qwen3.8-Flash-Next UD-Q4_K_XL stops emitting repeated `/` on a 3-GPU tensor split
 
 **Release:** `v17-a691b2345-r269` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

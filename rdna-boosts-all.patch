@@ -65376,10 +65376,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..d5e756fb8
+index 000000000..823dc7520
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,12299 @@
+@@ -0,0 +1,12470 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -66227,6 +66227,73 @@ index 000000000..d5e756fb8
 +bool                                g_prefill_seed    = false; // MOE_EXPERT_CACHE_PREFILL_SEED=1: warm the arena from the prefill routing
 +bool                                g_heat_on         = false; // MOE_EXPERT_HEATMAP=1 (WIP R2): tally the long-horizon per-expert heat
 +
++// ---------------------------------------------------------------------------------------------
++// TODO #318 (`MOE_EXPERT_SEED`): ONE front-loading policy for BOTH expert tiers.
++//
++// Every tier in this block starts with a bulk fill at sizing: the arena is seeded from the persisted heat
++// prior (`apply_heat_seed_locked`) and the prompt tally (`apply_prefill_seed_locked`), and the discrete host
++// pool is prewarmed (`pool_prepopulate_locked`) and then re-laid-out as the arena's complement
++// (`pool_rerank_from_heat_locked`).  Those fills are all of a size to dominate a small request: measured on
++// `soar` (Flash-Next GSQ-IQ3_XXS, `-ncmoe 47 --host-experts pool`, bounded pool) 42.1 GiB / 77 353 mapping
++// memcpys of pool prewarm and 24 GiB / 43 710 arena slots at sizing, against a 57-token prompt eval of
++// 0.9 s; on `halo` (APU, GTT arena) 75 GiB / ~30 s against 1.3 s.  r266's in-place prefill band removed the
++// reason the arena HAD to be pre-populated (the prompt's own used set is what prefill needs), so the
++// question is now: which of these fills are a PLACEMENT and which are a SEED?
++//
++//   * a PLACEMENT is a tier whose slots cover its whole tensor (`slots == n_experts`): its content is not a
++//     choice -- every expert has a slot -- so the fill is the placement itself, and deferring it would only
++//     move a read that must happen.  On the discrete tier it is also load-bearing: the covering-pool cold
++//     source of the device remap (`GGML_MOE_DEVREMAP`) needs every expert live in the pool at sizing, and a
++//     pool with holes makes the remap stand down (`devremap_prep_locked` declines).
++//   * a SEED is a tier that holds a SUBSET (`slots < n_experts`): the fill decides WHICH experts are hot,
++//     and the demand path re-derives that for free as the run uses them.  The persisted prior is still what
++//     ranks an eviction (the prefill ladder's `heat_rank_vec`, the pool's `pool_rank_experts_locked`), and
++//     ranking needs no fill.
++//
++// Hence the default (`eager`): the seed IS the prefetch, and deferring it moves the same bytes into the
++// request at a worse rate.  Measured on BOTH tiers (r270, see `benchmarks/2026-11-12-expert-seed-policy.md`):
++//   * discrete pool 32 GiB / 40 GiB set (soar, gfx1201): `auto` leaves decode flat, but prompt eval goes
++//     0.88 s -> 7.2 s on a 57-token prompt, and total storage reads do not move (45 -> 46 GiB);
++//   * discrete pool MIRROR (the whole 40 GiB set): `auto`/`lazy` cost TTFT +5.1 s, prompt eval 0.68 s ->
++//     8.0 s and decode 49.2 -> 40.0 t/s, because a covering pool with holes stands the device remap's cold
++//     source down (`devremap_prep_locked`);
++//   * APU GTT arena (halo, gfx1151, 70 GiB store of a 79 GiB set): `auto` buys TTFT -39 % (47.8 -> 29.0 s)
++//     and a 32-token answer comes out 12 % cheaper, but decode falls 11.7 -> 4.8 t/s and the run reads
++//     70 GiB more, so a 250-token answer is 16 % worse.
++// So the two tiers do NOT share a front-loading policy -- they share the QUESTION.  `eager` is the default and
++// the pre-r270 behaviour; `auto` is the APU policy ported verbatim (defer a subset, place a covering tier) and
++// `lazy` defers everything, both opt-in with the numbers above recorded.  It is one knob either way: the
++// alternative is two knobs that drift apart.
++enum moe_seed_policy_t { MOE_SEED_EAGER = 0, MOE_SEED_AUTO = 1, MOE_SEED_LAZY = 2 };
++int                                 g_seed_policy     = MOE_SEED_EAGER;
++// Census: how many tables/pools a run actually deferred (the mechanism must never be invisible).
++int64_t                             g_seed_deferred_tables = 0;
++int64_t                             g_seed_deferred_pools  = 0;
++int64_t                             g_seed_placed_tables   = 0;   // a covering tier, filled at sizing as before
++
++// True when THIS table's sizing fill is a SEED that the policy defers (fill on first miss instead).
++// `t.slots`/`t.n_experts` are known by every caller (sizing runs after the slot count is decided).
++static bool seed_defer_table(const table_t & t) {
++    if (g_seed_policy == MOE_SEED_EAGER) {
++        return false;
++    }
++    if (g_seed_policy == MOE_SEED_LAZY) {
++        return true;
++    }
++    return t.n_experts > 0 && t.slots < t.n_experts;   // auto: place what fits, seed lazily what does not
++}
++
++// The same question for the discrete host pool (its own slot count, which is not the arena's).
++static bool seed_defer_pool(const host_pool_t & p) {
++    if (g_seed_policy == MOE_SEED_EAGER) {
++        return false;
++    }
++    if (g_seed_policy == MOE_SEED_LAZY) {
++        return true;
++    }
++    return p.n_experts > 0 && p.slots < p.n_experts;
++}
++
 +// wip/moe-heatmap-persistence: the on-disk heat map (sidecar next to the model, geometry-keyed).
 +// `g_heat_loaded` is keyed by (layer, sem_role, n_experts, host_bytes) and consulted at table
 +// registration; `g_heat_path` is the chosen sidecar (model dir, else the cache-dir fallback).
@@ -66867,6 +66934,29 @@ index 000000000..d5e756fb8
 +    // Prefill seed: use the prompt's prefill routing to bulk-admit its hot experts as provisional slots
 +    // before decode starts (session 14).  Default ON (kill switch `MOE_EXPERT_CACHE_PREFILL_SEED=0`).
 +    g_prefill_seed   = env_int("MOE_EXPERT_CACHE_PREFILL_SEED", 1) != 0;
++    // TODO #318: which sizing fills happen up front (see `moe_seed_policy_t` above).  `auto` = place a tier
++    // that covers its tensor, seed a tier that holds a subset lazily; `eager` = the pre-r270 behaviour on
++    // every tier (the A/B and bisect arm); `lazy` = no front-loading anywhere, including a covering tier.
++    {
++        const char * sp = getenv("MOE_EXPERT_SEED");
++        if (sp == nullptr || sp[0] == '\0' || strcmp(sp, "eager") == 0 || strcmp(sp, "1") == 0) {
++            g_seed_policy = MOE_SEED_EAGER;
++        } else if (strcmp(sp, "auto") == 0) {
++            g_seed_policy = MOE_SEED_AUTO;
++        } else if (strcmp(sp, "lazy") == 0 || strcmp(sp, "0") == 0) {
++            g_seed_policy = MOE_SEED_LAZY;
++        } else {
++            GGML_LOG_WARN("%s: MOE_EXPERT_SEED=%s is not eager|auto|lazy; using eager\n", __func__, sp);
++            g_seed_policy = MOE_SEED_EAGER;
++        }
++        if (g_seed_policy != MOE_SEED_EAGER) {
++            GGML_LOG_INFO("%s: expert seed policy %s: a tier that holds a SUBSET fills on first miss and keeps "
++                          "the persisted prior for RANKING%s.  This is a measured arm, not the default: the seed "
++                          "is the prefetch the demand path would otherwise pay inline (see the block-16 note).\n",
++                          __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto (place what fits, defer a subset)",
++                          g_seed_policy == MOE_SEED_LAZY ? ", a covering tier too" : ", a covering tier is PLACED");
++        }
++    }
 +    // wip/moe-heatmap-persistence -> V2.0 block 09 (r60): the long-horizon per-expert heat map.
 +    // DEFAULT ON (kill switch `MOE_EXPERT_HEATMAP=0`): it only has an effect when the cache is active on
 +    // host-expert tables, and it turns a cold start into a warm one (measured +34 % decode over a
@@ -68914,7 +69004,40 @@ index 000000000..d5e756fb8
 +    });
 +}
 +
++// `MOE_HOST_POOL_FILL_ORDER` (r231, block 12): the order the bulk pool fills are ISSUED in.  `offset` (default) =
++// ascending expert id, which is ascending file offset, because one table's experts are contiguous in the GGUF;
++// `rank` = the pre-r231 order (the prior's), i.e. a random walk over the file.  The SET is identical either way
++// (only where an expert lands changes, and the slot an expert lands in is arbitrary by construction), so this
++// is pure ordering.  r231 gave the rule to the band-transition re-layout; r270 (`TODO` #318) extends it to the
++// load-time prewarm, which was still walking the file at random -- see the measured note in
++// `pool_prepopulate_locked`.
++static bool pool_fill_in_file_order() {
++    static const bool offset = [] {
++        const char * e = getenv("MOE_HOST_POOL_FILL_ORDER");
++        return e == nullptr || strcmp(e, "rank") != 0;   // `rank` = the pre-r231 order, for the A/B
++    }();
++    return offset;
++}
++
 +static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
++    // TODO #318 (`MOE_EXPERT_SEED`): a pool that holds a SUBSET of its tensor is SEEDED -- the layout is a
++    // choice (which experts to front-load) and the demand path makes the same choice for free, in the order
++    // the run actually wants them.  A pool that COVERS its tensor is a PLACEMENT: every expert has a slot, so
++    // the fill is the placement, and the device remap's covering-pool cold source needs it complete.
++    if (seed_defer_pool(p)) {
++        g_seed_deferred_pools++;
++        static bool told = false;
++        if (!told) {
++            told = true;
++            GGML_LOG_INFO("%s: the host pool's prewarm is DEFERRED (MOE_EXPERT_SEED=%s): layer=%d role=%s fills "
++                          "%d of %d slots on demand instead of at load; `pool_rank_experts_locked` still ranks "
++                          "whatever the demand path leaves room for.  The rest of this run's pools say nothing "
++                          "more.\n",
++                          __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto", t.layer, t.role.c_str(),
++                          p.slots, p.n_experts);
++        }
++        return;
++    }
 +    static const bool bulk = [] { const char * e = getenv("MOE_HOST_POOL_BULK"); return e == nullptr || atoi(e) != 0; }();
 +    if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
 +        return;
@@ -68926,9 +69049,17 @@ index 000000000..d5e756fb8
 +    std::vector<int32_t> rank;
 +    pool_rank_experts_locked(t, rank);
 +    const int k = p.slots < p.n_experts ? p.slots : p.n_experts;
++    // TODO #318: the SET is the prior's top `k` (unchanged), the ISSUE ORDER is the file's -- the same rule
++    // r231 gave the band-transition re-layout, now for the load-time prewarm.  Measured on `soar` (Flash-Next
++    // GSQ-IQ3_XXS, `-lme 32`, cold page cache, 80 % coverage): the prewarm is 43 GiB of ~0.55 MiB reads, and
++    // walking the file at random under a full page cache costs ~30 % more than walking it forwards.
++    std::vector<int32_t> want(rank.begin(), rank.begin() + std::min<size_t>((size_t) k, rank.size()));
++    if (pool_fill_in_file_order()) {
++        std::sort(want.begin(), want.end());
++    }
 +    int filled = 0;
-+    for (int i = 0; i < k; i++) {
-+        if (pool_fill_empty_locked(p, rank[(size_t) i], nullptr) == nullptr) {
++    for (int32_t e : want) {
++        if (pool_fill_empty_locked(p, e, nullptr) == nullptr) {
 +            break;
 +        }
 +        filled++;
@@ -68953,6 +69084,13 @@ index 000000000..d5e756fb8
 +    }
 +    host_pool_t * pool = table_pool_locked(t);
 +    if (pool == nullptr || pool->failed || pool->slots <= 0) {
++        return;
++    }
++    // TODO #318: a SUBSET pool is SEEDED, and its one-shot layout decision is exactly what the policy
++    // defers -- the demand path fills the same experts in the order the run wants them, and reaps a slot the
++    // arena takes (so the pool still converges on the arena's complement).  Deferring also keeps the
++    // `-lme auto` mirror band byte-identical in eager mode, where this function is the layout.
++    if (seed_defer_pool(*pool)) {
 +        return;
 +    }
 +    // Reap FIRST: a retirement whose copy has drained becomes a free slot (and drops its index), which is
@@ -69023,10 +69161,7 @@ index 000000000..d5e756fb8
 +    // around the page cache) removes ~90 % of the tail, which is the fill SOURCE's business, not this
 +    // loop's.  The SLOT an expert lands in is arbitrary by construction (`pool_fill_empty_locked` takes the
 +    // first empty slot), so this changes nothing but the order the reads are issued in.
-+    static const bool order_offset = [] {
-+        const char * e = getenv("MOE_HOST_POOL_FILL_ORDER");
-+        return e == nullptr || strcmp(e, "rank") != 0;   // `rank` = the pre-r231 order, for the A/B
-+    }();
++    static const bool order_offset = pool_fill_in_file_order();
 +    std::vector<int32_t> todo;
 +    todo.reserve((size_t) n);
 +    for (int i = 0; i < n; i++) {
@@ -70095,6 +70230,11 @@ index 000000000..d5e756fb8
 +    }    if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
 +        return;
 +    }
++    // TODO #318: a SUBSET arena is SEEDED, not placed -- the policy defers the fill to the first miss, and the
++    // tally above keeps accumulating so the prior still ranks a prefill-ladder eviction (`heat_rank_vec`).
++    if (seed_defer_table(t)) {
++        return;   // counted once, by the heat seed above (which always runs first)
++    }
 +    // Rank order.  From the tally: descending prefill frequency (expert id asc on a tie).
 +    std::vector<int32_t> rank((size_t) t.n_experts);
 +    for (int e = 0; e < t.n_experts; e++) {
@@ -70174,6 +70314,25 @@ index 000000000..d5e756fb8
 +    }
 +    if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
 +        return;
++    }
++    // TODO #318 (`MOE_EXPERT_SEED`): a tier that holds a SUBSET is seeded lazily -- its slots stay empty and
++    // fill on first miss (from this same prior-ranked table when it comes to an eviction).  A tier that
++    // COVERS its tensor is a PLACEMENT and keeps its eager fill.
++    if (seed_defer_table(t)) {
++        g_seed_deferred_tables++;
++        static bool told = false;
++        if (!told) {
++            told = true;
++            GGML_LOG_INFO("%s: layer=%d role=%s: the arena seed is DEFERRED (MOE_EXPERT_SEED=%s): %d slots of "
++                          "%d experts start EMPTY and fill on first miss; the persisted prior still ranks "
++                          "evictions.  The rest of this run's tables say nothing more.\n",
++                          __func__, t.layer, t.role.c_str(),
++                          g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto", t.slots, t.n_experts);
++        }
++        return;
++    }
++    if (g_seed_policy == MOE_SEED_AUTO && t.slots >= t.n_experts) {
++        g_seed_placed_tables++;
 +    }
 +    // TODO #88: rank by the DECODE band (with the combined vector as the fallback), because the arena serves
 +    // the decode/verify band.  `heat`'s own total is what decides whether there is a prior at all.
@@ -77088,6 +77247,18 @@ index 000000000..d5e756fb8
 +    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
 +                  __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
 +                  n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
++    // TODO #318: the front-loading policy that produced this run, and what it actually deferred. A deferred
++    // tier is invisible in the numbers above (the same experts are served, only later), so it needs its own
++    // line: `deferred` tables/pools start EMPTY and fill on first miss, `placed` ones were filled at sizing
++    // because they cover their tensor.
++    if (g_seed_policy != MOE_SEED_EAGER && (g_seed_deferred_tables + g_seed_deferred_pools +
++                                            g_seed_placed_tables) > 0) {
++        GGML_LOG_INFO("%s: expert seed (MOE_EXPERT_SEED=%s): %lld arena table(s) deferred (subset: seed on "
++                      "first miss), %lld placed (covers its tensor: filled at sizing); %lld host pool(s) "
++                      "deferred\n", __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto",
++                      (long long) g_seed_deferred_tables, (long long) g_seed_placed_tables,
++                      (long long) g_seed_deferred_pools);
++    }
 +    // wip/apu-expert-gtt P3: the tier's own two acceptance numbers, on their own line so nothing that parses
 +    // the census above has to change.  `arena releases` MUST be 0 on a steady-state arm (see the counter).
 +    if (g_gtt_arena) {

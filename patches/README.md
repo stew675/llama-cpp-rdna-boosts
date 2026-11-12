@@ -4852,6 +4852,29 @@ one decoding while the other prefills: text identical, decode not slower) and MT
 **Record:** `archive/work/apu-expert-gtt/` (README §0 the shape, §5 sizing, §6 the trap list, IMPLEMENTATION P0-P6,
 MEASUREMENTS §13-§27, the probes, and the campaign's own gate).
 
+**r270 amendment to block 16 — ONE front-loading policy for both expert tiers (`TODO` #318), and the prewarm's fill
+order.**  Both tiers began with a bulk fill at sizing (the arena from the persisted heat prior + the prompt tally,
+`apply_heat_seed_locked`/`apply_prefill_seed_locked`; the discrete host pool from `pool_prepopulate_locked` and
+then `pool_rerank_from_heat_locked`), and r266's in-place prefill band raised the question of whether that fill can
+be LAZY now that a prompt's own used set is admitted on the pass that needs it.  It is now ONE knob,
+`MOE_EXPERT_SEED`, because the question is shared — and the measured answer is **`eager`** (the default, = the
+pre-r270 behaviour): the fill is not a fixed cost, it is the *prefetch* the demand path would otherwise pay inline.
+`auto` (defer a tier that holds a SUBSET, place a tier that covers its tensor — the APU policy ported verbatim) and
+`lazy` (defer everything) ship as measured arms.  Numbers (`benchmarks/2026-11-12-expert-seed-policy.md`), all
+arms text-identical: **discrete pool 32 GiB / 40 GiB set** (`soar`) prompt eval **0.88 s -> 7.24 s** with decode
+flat and the same 45-46 GiB of storage reads in both arms; **discrete MIRROR pool** TTFT 13.6 -> 18.7 s, prompt
+eval 0.68 -> 8.01 s and decode **49.2 -> 40.0 t/s** (a covering pool with holes stands the device remap's cold
+source down); **APU GTT arena** (`halo`, `-lme 70` of a 79 GiB set) TTFT 47.8 -> 29.0 s but decode **11.7 -> 4.8
+t/s** and +70 GiB read over a 250-token answer (a 32-token answer is 12 % cheaper, which is the whole window).
+The second half is the item's real cost: the bounded pool's prewarm issued its fills in RANK order — a random walk
+over a 40 GiB GGUF — and `MOE_HOST_POOL_FILL_ORDER` (r231's rule, `offset` = file order) now governs the prewarm as
+well: **12 546 -> 7 774 ms** for the same 42.7 GiB and the same set (3.67 -> 6.25 GB/s), **TTFT -20 %**, whole run
+-13 %, decode unchanged, text byte-identical.  Gates: `gate-host-pool.sh` **42/42**, `gate-prefill-logits.sh`
+**0.000000 / 100.000 %**, `gate-uma-experts.sh --quick --no-ram` on `halo` **36/0** (and the r269 binary vs
+`MOE_EXPERT_SEED=eager` on this build is byte-identical text / identical hit rate / 1.1 % decode, i.e. the shipped
+default moves nothing on gfx1151).  Record: `benchmarks/2026-11-12-expert-seed-policy.md`, `archive/work/expert-seed-policy/`,
+`WORKLOG.md` 261112.006.
+
 ## Dated history
 
 [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) — every amendment note

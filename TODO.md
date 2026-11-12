@@ -74,7 +74,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **318** | the arena's eager sizing seed fills every slot up front (75 GiB / ~30 s on `halo`; 43.9 GiB / 57 s cold on `soar`) and is the SMALL prompt's dominant fixed cost | performance (block 16, both expert tiers) | **OPEN** (2026-11-12, r266) — split out of #317: with the prefill band now served in place (r266) the seed can be LAZY (fill on first miss; the prior only needs to RANK evictions), but the discrete pool tier has the same shape, so it must be ONE policy — §318 |
 
 ## Handle numbering
 
@@ -218,24 +217,3 @@ identity-only case, where the arena IS the table and there is no complement to f
 item -- consolidating the three transports for a PARTLY resident table -- is untouched.
 
 **OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
-
-
-## 318. The eager sizing seed is the small prompt's fixed cost, and it could be lazy
-
-**Sizing fills every slot before the first token.**  `apply_heat_seed_locked` / `apply_prefill_seed_locked` read
-`slots` experts per table at sizing: **75 GiB / ~30 s** on `halo` (122B Q5_K_XL `-lme 75`) and **43.9 GiB / 80 446
-memcpys = 57.0 s cold, 3.7 s warm** on `soar` (discrete pool).  Against that, a 34-token prompt's *prompt eval* is
-~1.2 s -- the seed dominates a short request entirely.
-
-**Why it can now be lazy (r266).**  The seed exists to (a) place the hot set and (b) rank evictions by the persisted
-prior.  With the prefill band served in place (`TODO` #317, r266), the placement half is no longer needed to make a
-prompt fast -- the prompt's own used set is admitted on the pass that needs it.  The prior is still needed for the
-*ranking* of an eviction, which is available without a fill.
-
-**Why it is not a one-line change.**  A lazy seed means a first-touch miss per expert, i.e. the same total bytes on a
-workload that touches everything, and it changes the *starting* residency (which the r266 replay shows is what makes
-an admission cheap).  The two tiers must agree: the discrete pool's `pool_rerank_from_heat_locked` and its 57 s cold
-fill are the same decision.  Measure: time-to-first-token, prompt eval, first-500-token decode `h`, and the total
-read bytes, on both tiers, against the eager arm.
-
-**Kind:** performance / policy.  Block-16 amendment once measured.  No handle is claimed for it elsewhere.
