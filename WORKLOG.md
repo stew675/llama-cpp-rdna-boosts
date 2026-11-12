@@ -1,3 +1,30 @@
+## 261111.035 (r264, release) -- `v17-a691b2345-r264` is PUBLISHED: delivery repo pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip, and the ROCm images are for the off-host worker to pick up
+
+**Release:** `v17-a691b2345-r264` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`c334e17fe`**, tree **`d6c158654`**.  Annotated tag `da110614c` on `main` (`^{}` = `f4026e09`).
+
+**Published:**
+* delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `4df584b4..f4026e09`, tag
+  `v17-a691b2345-r264`.
+* personal fork `git@github.com:stew675/llama.cpp.git`: `rdna-boosts` `d32696128..c334e17fe`, verified by
+  `git ls-remote` -- the remote branch carries exactly `release.json.tip`.  `scripts/fork-refresh.sh --push --yes`
+  re-cut it from `patches/` at the base, asserted the tree first, and pushed with `--force-with-lease` (lease
+  `d32696128`).
+* ROCm container images: nothing to do here -- the worker watcher on `radiance` polls for the tag and builds both
+  ROCm lines off-host (`scripts/container-watch.sh`, policy in `AGENTS.md`/`CONTAINERS.md`).
+
+**Gate ledger** (the same set recorded in 261111.033, which is the change itself): `validate-set.sh` (17 hashes,
+fresh-tarball strict `git am`, tree match, Windows path/portability lint), deterministic re-cut (two independent
+clones, same tip `c334e17fe`), `gate-per-block-build.sh --fast --changed-from d32696128` **2/2 built / 0 failed**,
+`gate-kv-residency.sh --window-only` **21/21 PASS** (`wref == wres == wspill = be904e86f248`) and
+`--pool-only MULTI_DEVICES=0` **PASS** (decline + both hint arms, `pdecl == pres == plegacy = fb0e8f53af2d`),
+coherence 4B 1 GPU `1c5d32ac537d` (== the r254 reference), `check-gpu-faults.sh` clean.
+
+**Two findings stay open** (recorded in 261111.033, not fixed by this release): the fit's UMA projection does not
+model block 16's GTT store, so a supported `-lme` streaming config still reads "does NOT fit ... allocator
+out-of-memory abort"; and `gate-kv-residency.sh`'s multi-device section runs when the box has fewer devices than
+`MULTI_DEVICES` names (`MULTI_DEVICES=0` on a 1-GPU box).
+
 ## 261111.034 (docs-only, NO delivery change) -- why a `97.5 %` arena hit rate still reads **1-1.5 GB/s** off the drive on the 122B Q8_0 (the miss arithmetic of the GTT arena)
 
 **The question (field report).** `Qwen3.5-122B-A10B-Q8_0`, `-lme 90`, one decode stream on `halo`: the per-turn
