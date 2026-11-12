@@ -1205,6 +1205,15 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r273 amendment: a released upload's pages are DROPPED, not merely unmapped.**  `LLAMA_LOAD_RELEASE_MMAP`
+> already unmapped a device-bound tensor's range after its H2D; it now also issues
+> `posix_fadvise(POSIX_FADV_DONTNEED)` on that range (POSIX half, in `llama_mmap::impl::unmap_fragment`).  The
+> unmap is what makes the drop legal -- `fadvise` skips pages that are mapped into any process, which is why the
+> pages were previously left to reclaim -- and the tensor is read exactly once and never again, so those pages are
+> pure overhead next to the device copy.  Measured on a 4.3 GiB model: peak `Cached` during load **5.15 GiB with the
+> release off against 1.99 GiB with it**.  It changes no read transport (a mapped upload stays mapped and fast) and
+> never touches a host-expert tensor (those are not released).  `WORKLOG.md` 261112.009, `INVARIANTS.md` r273 §2.
+
 > **r245 amendment (GitHub issue #294, hardening): `moe_cache_shrink_arena()` syncs the devices before it
 > frees, and a stand-down clears `identity`.**  The MoE kernels receive the ARENA ADDRESS AS A KERNEL
 > ARGUMENT (the fused redirect repoints `data` at the arena) and the compute is asynchronous, so freeing a
@@ -4774,6 +4783,32 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 (build `2ed3997f5`); record `benchmarks/2026-11-01-spec-draft-window-264.md`.
 
 ## Block 16 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
+
+> **r273 amendment: the DISCRETE host pool's placement, exchange guard and budget provenance live here too**, because
+> `moe-expert-cache.cu` is the one file both tiers share (so this is also where the per-block note belongs).
+> Four changes, all measured (`WORKLOG.md` 261112.009):
+> 1. **The one-shot PLACEMENT read is O_DIRECT whatever `--load-mode` says** (`pool_mirror_bulk_fill_locked`,
+>    `MOE_HOST_POOL_BULK_DIO=0` = the buffered A/B).  A buffered `pread` materialises the file's pages in the page
+>    cache and then copies them into the pool, so filling a covering pool doubled the footprint: page-cache
+>    high-water **+33.7 GiB buffered against +3.9 GiB direct** on a 32 640 MiB mirror, for 4.9 s against 6.8 s.  The
+>    expert tensors stay MAPPED (they are the pool-backed master), so the second copy cannot be `fadvise`d away.
+>    r215 built the path for O_DIRECT; r262's transport mirror silently made it follow `--load-mode`.  `--load-mode`
+>    still owns the DEMAND-read transport.
+> 2. **`host_pool_t::demote_ok` gates the arena exchange.**  The demote is one contiguous D2H of a whole expert, so a
+>    `-sm tensor` split (each device owns a slice) can never express it -- 766 758 declines out of 766 758 attempts --
+>    yet the exchange was "engaged" and **retired the pool's copy of every expert it promoted** with nothing to refill
+>    the vacancy: 792 321 retirements against 52 704 slots, 701 706 refills, h=0.3473, 0 evictions, and a 1-1.2 GB/s
+>    disk stream during decode.  `g_sink_need_slot` (declared to make this demand-driven) was written 3x and read 0x.
+> 3. **Budget provenance**: an explicit absolute budget (`-lme N`, `MOE_HOST_POOL_MIB`) is honoured in full and is not
+>    scaled by `MOE_HOST_POOL_RAM_PCT`; a derived one (`-lme auto`'s resolution, FRAC/COV) is.  The mirror/near-mirror
+>    classification now runs AFTER the clamp (it used to report "MIRROR / exchange INERT" for a pool clamped to
+>    95.3 %), and one RESOLVED-layout WARN reports coverage, shape, exchange state and budget class.
+> 4. **Irreversible pins are headroom-gated**: `MOE_HOST_POOL_PREWARM_RESERVE_MIB` (defer a pool that cannot be placed)
+>    and `LLAMA_LAZY_MLOCK_RESERVE_MIB` (decline an `mlock`/`mlockr` populate that would not fit, leaving the table on
+>    the on-demand path = `--lazy-mode auto`).  `-lme`'s CLI refusal is now at 100 % of MemAvailable, not 90 %, with
+>    the numbers in the units the operator typed.
+> Gate: `scripts/gate-host-pool.sh` grows `tsplit`/`tsplitnosink` (2 devices, `-sm tensor`) -- the single-GPU arms
+> could never reach the geometry -- and passes **48/48**.
 
 **What it is.**  On an integrated GPU there is no host-expert tier (r236 refuses `-ncmoe`/`--host-experts` there)
 and upstream disables the expert cache outright, so a MoE model whose expert set exceeds RAM cannot run.  Block 16

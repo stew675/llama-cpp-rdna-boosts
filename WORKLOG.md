@@ -1,3 +1,86 @@
+## 261112.009 (r273, RELEASE v17-a691b2345-r273) -- the page-cache amplification, the pool exchange's missing guard, and `-lme N` finally meaning N
+
+**Release:** `v17-a691b2345-r273` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`6245ba844`**, tree **`2f4f24f46608492fa91c6eaa61dab49887eeb43e`**.  Blocks 09 and 16 amended.  Three new environment
+variables (`MOE_HOST_POOL_BULK_DIO`, `MOE_HOST_POOL_PREWARM_RESERVE_MIB`, `LLAMA_LAZY_MLOCK_RESERVE_MIB`); `-lme`'s
+refusal and `MOE_HOST_POOL_RAM_PCT`'s reach both re-scoped.  **No numerics move: every arm byte-identical**
+(`a99ccbd97ecb` on the gate's config, `8c39335bbceb` on the split pair), prefill-logit KLD **0.000000 / 100.000 %**.
+
+### What the report actually was
+
+The maintainer reported that `--load-mode buffered` cut decode to half the `--load-mode dio` rate while the disk ran
+at 1-1.2 GB/s, on Flash-Next Q4_K_XL (`-ncmoe 36 -lme 70`, 2 x R9700, `-sm tensor`), and that the pool claimed to be a
+mirror while behaving as if it barely existed.  Two independent defects turned out to be stacked, plus three smaller
+ones the investigation exposed.
+
+1. **The pool was being emptied by its own exchange.**  On a `-sm tensor` split each device owns a SLICE of every
+   expert, so the arena->pool demote (one contiguous D2H of a whole expert) can never be expressed --
+   **766 758 geometry declines out of 766 758 attempts**.  `pool_sink_active()` asked only "is the sink on and the
+   pool a sub-mirror?", so the exchange was "engaged": it reserved ~4 % of every table's slots for a demote that
+   could never land AND retired the pool's copy of every expert it promoted to VRAM, on the assumption that a
+   just-evicted expert would take the vacancy.  Nothing ever did.  Census: **792 321 retirements against 52 704
+   slots, 701 706 refills, h=0.3473, 0 evictions** -- ~695 GiB of host reads across one 317 s generation, which is
+   the 1-1.2 GB/s of disk.  `MOE_HOST_POOL_SINK=0` was the workaround (h=0.9221, **24.17 -> 59.24 t/s**).
+   The guard the code declared for this (`g_sink_need_slot`, "makes the retirement demand-driven") was written three
+   times and never read.  Fixed structurally: `host_pool_t::demote_ok`, decided once from the table geometry at pool
+   build, now gates the whole exchange (no reserve, no demote, no retirement, no churn).
+2. **The placement read doubled the footprint in the page cache.**  The pinned pool is not the read buffer: a
+   buffered `pread` materialises the file's pages in the page cache and then copies them into the pool.  Measured
+   (35B-A3B Q8_0, 32 640 MiB mirror, cold cache): page-cache high-water **+33.7 GiB buffered against +3.9 GiB with
+   O_DIRECT**, for 4.9 s against 6.8 s of fill.  On the maintainer's box that is ~150 GiB of demand on 91.4 GiB, and
+   it cannot be reclaimed afterwards: the expert tensors stay MAPPED (they are the pool-backed master), and
+   `posix_fadvise(DONTNEED)` skips mapped pages.  r215 built this path for O_DIRECT and r262's transport mirror
+   silently made it follow `--load-mode`.  The placement read is now **O_DIRECT whatever `--load-mode` says**
+   (`MOE_HOST_POOL_BULK_DIO=0` = the A/B); `--load-mode` remains the demand-read transport.
+3. **The budget's provenance decides the ceiling, and the resolver now runs first.**  An explicit absolute budget
+   (`-lme N`, `MOE_HOST_POOL_MIB`) is honoured in full; a derived one (`-lme auto`'s resolution, FRAC/COV) keeps
+   `MOE_HOST_POOL_RAM_PCT`.  The ceiling had been shaving `-lme 70` to 95.3 % silently, and the mirror/near-mirror
+   classification ran BEFORE the clamp -- which is how the census said "108 mirror tables, exchange INERT" about a
+   pool that was 95.3 % and engaged.  A RESOLVED-layout WARN now reports coverage, shape, exchange state and budget
+   class once, after the number is final.
+4. **`-lme 75` was refused with a message claiming 80 was allowed.**  The test compared against 90 % of MemAvailable
+   while the message printed the allowance rounded to whole GiB.  Now: refused only at **or above 100 % of
+   MemAvailable**, with exact units, and 85-100 % is a WARNING (verified: `-lme 85` refused at 105 %, `-lme 75`
+   accepted at 92.8 %).
+5. **Two irreversible pins got headroom gates.**  The pool prewarm (`MOE_HOST_POOL_PREWARM_RESERVE_MIB`, default
+   1024) defers a pool it cannot place -- pinned memory is never given back, and `h` still converges to 1.0000 on a
+   run whose whole prewarm was deferred.  `--lazy-mode mlock`/`mlockr` (`LLAMA_LAZY_MLOCK_RESERVE_MIB`, default
+   1024) decline the populate of a table larger than what is left and leave it on the on-demand path, which is
+   exactly `--lazy-mode auto`: measured on Flash-Next, `mlock DECLINED: the marked tables are 27466.0 MiB and only
+   82376.9 MiB is available`.
+
+### The gate was blind to the defect, and that is now closed
+
+`gate-host-pool.sh` ran **one** device, where `expert_bytes == host_bytes` and the demote always succeeds, so the
+annihilator in (1) was unreachable: the gate was green **41/41** through the entire defect.  Two arms added --
+`tsplit` and `tsplitnosink` (2 devices, `-sm tensor`, same pool, `MOE_HOST_POOL_SINK=1` vs `0`): `tsplit` must build
+a real pool, report the sink census, and show the exchange **INERT** (`0 demoted, 0 geometry declines, 0
+retirements`), and the two arms must generate byte-identical text.  The single-GPU `sink` arm still proves the demote
+is exercised where it *can* be, so the pair cannot pass by the sink silently going global-off.
+
+### Also landed: released uploads are dropped from the page cache
+
+`LLAMA_LOAD_RELEASE_MMAP` unmaps a device-bound tensor's range after its H2D, and now also
+`posix_fadvise(POSIX_FADV_DONTNEED)`s it -- which is only possible after the unmap, and is the cheap half of "do not
+flush the system page cache for weights that are already placed".  Measured on a 4.3 GiB model: peak `Cached` during
+load **5.15 -> 1.99 GiB**.  This also explains the maintainer's "decode got significantly faster": the load was
+reclaiming exactly the pages the decode band uses (the 26.8 GiB lazy PLE, read every token).
+
+### Gates
+
+`gate-host-pool.sh` **48/48** (11 arms; the two new ones included) · `fork-refresh.sh --build --gates` green, canonical
+tip `6245ba844`, applied tree `2f4f24f46` · prefill-logit **KLD 0.000000, same-top-p 100.000 %** ·
+`validate-set.sh` green (17 blocks, base tree + applied tree + Windows portability scan) ·
+`check-gpu-faults.sh` clean over the gate's window and every arm log · coherence: the pin0/sinkfail/ref arms byte-identical.
+
+**Not run:** MTP Protocol A (`benchmarks/mtp-adaptive-methodology.md`) and `llama-batched-bench -npl 1,4,8`.  This
+change moves no kernel — it changes which SOURCE a fill reads and when a pool copy is retired — and every gate arm
+above is byte-identical, but the policy's decode gate is owed and is recorded as such rather than assumed.
+
+**Not shipped:** the `-sm tensor` arm's own performance has not been re-measured end to end at the maintainer's config
+(`-lme 70 -ncmoe 36`, 2 devices); the mechanism is proven by the census (0 retirements, 0 geometry declines) and the
+text, and the maintainer's own run is the measurement.
+
 ## 261112.008 (r272, release) -- `v17-a691b2345-r272`: the copy-engine all-reduce's 2-rank arm exchanges ONCE (contributor PR #304), and `GGML_CUDA_ALLREDUCE=auto` finally means the default
 
 **Release:** `v17-a691b2345-r272` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip

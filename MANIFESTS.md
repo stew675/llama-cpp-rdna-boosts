@@ -451,7 +451,7 @@ in CI.  The model-level gates are manual:
    (== r208), KLD 0.000000 / 100.000 %, per-block 4/4, no faults.
 
 20. **Host-expert pool** — `scripts/gate-host-pool.sh` (r219, issue #274; seven arms since r224; the teardown-census  **r262:** a change to the HOST-READ TRANSPORT (`--load-mode buffered`, the adaptive `auto`, `MOE_HOST_POOL_TRANSPORT`, or `pool_transport_*`) also owes `scripts/gate-host-read-transport.sh` (every arm must take the transport it names, proven by its own counters; `auto` within 10 % of the best pinned arm on a 1000-token decode; `MOE_HOST_POOL_STAGE_SPAN=0` must REFUSE the buffered arm) and, because it is a default-on path, the MTP four-axis + `batched-bench -npl 1,4,8` pair.
-   arm since r227; the latched-pinned-tier arm since r229; the pinned-tier kill-switch arm since r233): one pool-backed host-expert config
+   arm since r227; the latched-pinned-tier arm since r229; the pinned-tier kill-switch arm since r233; the two `-sm tensor` split arms -- `tsplit` and `tsplitnosink` -- since r273, asserting the exchange is INERT where the demote cannot be expressed and that SINK=1 changes no byte there): one pool-backed host-expert config
    (Flash-Next, `--n-cpu-moe 47`, `--load-mode mmap`, a `MOE_HOST_LIMIT_FRAC` low enough that the set does not
    fit), arms and same-seed greedy text: shipped / `MOE_HOST_POOL_DIO=1` / `MOE_HOST_POOL_DIO_FAULT=1` (a
    platform with NO pool disk tier: the Windows shape) / `MOE_HOST_POOL_FILL_FAULT=1` (no source can be

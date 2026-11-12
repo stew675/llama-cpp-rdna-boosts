@@ -45,6 +45,19 @@
 #                                                already owns, so the existing pools must keep serving the
 #                                                fills (`N expert fills were served from a host pool built
 #                                                BEFORE the refusal`, N > 0) and the text must not move)
+#     tsplit  the SAME pool on a 2-device `-sm tensor` split, sink on (r273)
+#     tsplitnosink the same, MOE_HOST_POOL_SINK=0 -- the A/B the split arm is judged against
+#                                                (r273: a tensor split gives each device a SLICE of every
+#                                                expert, so the arena->pool demote cannot be expressed at
+#                                                all.  The exchange was nevertheless "engaged", which
+#                                                reserved slots no demote could use AND retired the pool's
+#                                                copy of every expert it promoted with nothing to refill the
+#                                                vacancy: measured 766 758 geometry declines out of 766 758
+#                                                attempts, 792 321 retirements against 52 704 slots,
+#                                                701 706 refills, h=0.3473 and 0 evictions.  The arm proves
+#                                                the r273 guard: on that geometry the exchange is INERT --
+#                                                0 demoted, 0 geometry, 0 retirements -- and SINK=1 is
+#                                                indistinguishable from SINK=0)
 #     pin0    MOE_HOST_POOL_PIN=0                (r233: the kill switch closes the pinned tier from the start
 #                                                on ANY platform -- the state a Windows box stuck on the
 #                                                driver-shipped HIP runtime can run in, issue #278.  No pool
@@ -65,6 +78,11 @@
 #           filled.  The TEXT half of that is box-dependent (a stale-but-valid `input_cpy` can hide it -- it
 #           did here; it corrupted the reporter's server), but the take-over counter is not: measured
 #           takeover=128/129 on the pre-fix code and 0 with the fix, in both arms.
+#   HARD  * `tsplit` builds a real pool, and on that geometry the exchange is INERT: 0 demoted, 0 geometry
+#           declines and 0 promoter slots retired.  `tsplit` must also match `tsplitnosink` byte for byte: with
+#           no expressible demote there is nothing for the exchange to do, so switching it on may not change
+#           one byte of the answer.  (Before r273 the same arm retired ~15x its slot count and refilled every
+#           expert from the page cache; the TEXT matched then too, which is why the census is the check.)
 #   HARD  * `sink` demotes at least once (the arm is not vacuous) and its text is byte-identical to `ref`
 #   HARD  * `sinkfail`: text byte-identical to `ref`, the census reports copy-error declines > 0 (the arm
 #           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
@@ -118,6 +136,10 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 GPU="${GPU:-0}"
+# r273: the tensor-split arms need TWO devices.  Pinned explicitly: on this box the 9950X3D's iGPU (gfx1036)
+# is enumerated as a HIP device and a split that enumerates every device aborts at load with
+# `invalid kernel file` (AGENTS.md -> Verify), which would look like a defect in the change under test.
+GPU2="${GPU2:-0,2}"
 CTX="${CTX:-4096}"
 UB="${UB:-1024}"
 NCMOE="${NCMOE:-47}"
@@ -179,6 +201,30 @@ run_arm() {
     return 0
 }
 
+# r273: the same arm on a 2-device TENSOR split.  Everything else is identical (`--load-mode mmap`, the same
+# pool, no `-lme` so the AUTO band decides), which is what makes the split and the single-device arm a
+# geometry A/B rather than a config change.
+run_arm_split() {
+    local arm="$1"; shift
+    local dir="$KEEPOUT/$arm"
+    mkdir -p "$dir"
+    echo "==> arm $arm${*:+ ($*)} [2 devices, -sm tensor]"
+    env "$@" HIP_VISIBLE_DEVICES="$GPU2" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \
+        MOE_EXPERT_HEATMAP="${HEATMAP:-load}" \
+        timeout 3600 "$LLAMA_CLI" -v -m "$MODEL" --fit off -ngl all --n-cpu-moe "$NCMOE" \
+        --load-mode mmap --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
+        -b "$UB" -ub "$UB" -t 8 --jinja --spec-type none -sm tensor -mg 0 \
+        -p "$PROMPT" -n "$NGEN" --temp 0 --seed 42 --single-turn --no-display-prompt \
+        $EXTRA_ARGS > "$dir/out.txt" 2> "$dir/err.txt"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        fail "$arm: llama-cli exited $rc"
+        tail -5 "$dir/err.txt" | sed 's/^/      /'
+        return 1
+    fi
+    return 0
+}
+
 text_hash() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1/out.txt"; }
 text_only() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1/out.txt" --text > "$KEEPOUT/$1/text.txt"; }
 
@@ -204,6 +250,11 @@ sink_line()  { grep -o 'sink (MOE_HOST_POOL_SINK): .*' "$KEEPOUT/$1/err.txt" | t
 # reported "no copy-error declines" against a log that said 4069, i.e. a gate that fails for its own bug).
 sink_demoted(){ sink_line "$1" | sed -n 's/.*SINK): \([0-9][0-9]*\) demoted.*/\1/p'; }
 sink_copyerr(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) copy-error.*/\1/p'; }
+# r273: the exchange must be INERT on a geometry whose demote cannot be expressed.  Two independent counters
+# say so: the structural declines AND the retirements (a retirement without a demote that can land is the
+# defect).  Both are taken from the same census line, with the `[0-9][0-9]*` digit class the note above explains.
+sink_geomdecl(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) geometry.*/\1/p'; }
+sink_retired(){  sink_line "$1" | sed -n 's/.*\([0-9][0-9]*\) promoter slots retired.*/\1/p'; }
 # `gt0 <value>`: true when value is a number above zero (empty/garbage is false)
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
@@ -217,8 +268,10 @@ run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
 run_arm sinkfail MOE_HOST_POOL_SINK=1 MOE_HOST_POOL_SINK_FAULT=1 || exit 2
 run_arm pinlate MOE_HOST_POOL_PIN_FAULT=late || exit 2
 run_arm pin0    MOE_HOST_POOL_PIN=0          || exit 2
+run_arm_split tsplit        MOE_HOST_POOL_SINK=1 || exit 2
+run_arm_split tsplitnosink MOE_HOST_POOL_SINK=0 || exit 2
 
-for a in ref dio nodisk fail late sink sinkfail pinlate pin0; do text_only "$a"; done
+for a in ref dio nodisk fail late sink sinkfail pinlate pin0 tsplit tsplitnosink; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
@@ -317,6 +370,48 @@ if [ -n "$(sink_line sinkfail)" ]; then
     ok "sinkfail: the demote census is reported"
 else
     fail "sinkfail: no sink census line (the arm did not reach the sink at all)"
+fi
+
+# ---- HARD: the exchange is INERT where a demote cannot be expressed (r273) --------------------
+# The demote is one contiguous D2H of a WHOLE expert from an arena slot (`t.host_bytes` <- `t.expert_bytes`).
+# A `-sm tensor` split gives each device a SLICE, so the copy can never be written into the pool's image and
+# every attempt declines structurally -- measured 766 758 of 766 758.  The defect was that the exchange was
+# still "engaged": `pool_sink_active()` asked only "is the sink on and the pool sub-mirror?", so
+#   * ~4 % of every table's slots were held free for a demote that could never happen, and
+#   * every expert promoted from the pool into the arena had its pool copy RETIRED ("the vacancy is taken by
+#     a just-evicted expert") with nothing ever parked in it.
+# Result on the reporter's 2-device tensor split: 792 321 retirements against 52 704 slots, 701 706 refills,
+# h=0.3473, 0 evictions, and every host read resolved to the page cache/disk -- decode at half the rate of the
+# same budget placed as a pinned master.  The TEXT was identical throughout (the pool computes the same
+# answer, slowly), which is exactly why this check reads the census and not the answer.
+hard
+tps="$(pool_slots tsplit)"; tpm="$(pool_mib tsplit)"
+if gt0 "$tps" && gt0 "$tpm"; then
+    ok "tsplit built the pool on a tensor split: $tps slots/table, $tpm MiB pinned"
+else
+    fail "tsplit built no pool (slots='${tps}' MiB='${tpm}') -- the arm is vacuous"
+fi
+hard
+if [ -n "$(sink_line tsplit)" ]; then
+    ok "tsplit: the exchange census is reported (the sink is ON, so this is not the sink-off path)"
+else
+    fail "tsplit: no sink census line -- MOE_HOST_POOL_SINK was not on, so the arm proves nothing"
+fi
+hard
+td="$(sink_demoted tsplit)"; tg="$(sink_geomdecl tsplit)"; tr="$(sink_retired tsplit)"
+if [ "${td:-x}" = "0" ] && [ "${tg:-x}" = "0" ] && [ "${tr:-x}" = "0" ]; then
+    ok "tsplit: the exchange is INERT (0 demoted, 0 geometry declines, 0 retirements) -- demote_ok is false"
+else
+    fail "tsplit: the exchange acted on a geometry that cannot demote (demoted='${td}' geometry='${tg}' retired='${tr}')"
+    echo "      a retirement with no demote that can land empties the pool: every promoted expert has to be"
+    echo "      refilled from the page cache/disk (measured 792 321 retirements / 701 706 refills / h=0.3473)"
+fi
+hard
+if [ "$(text_hash tsplit)" = "$(text_hash tsplitnosink)" ] && [ -s "$KEEPOUT/tsplit/text.txt" ]; then
+    ok "tsplit SINK=1 == SINK=0 on the same split ($(text_hash tsplit))"
+else
+    fail "tsplit SINK=1 != SINK=0 ($(text_hash tsplit) against $(text_hash tsplitnosink))"
+    diff <(sed 's/^/      /' "$KEEPOUT/tsplit/text.txt") <(sed 's/^/      /' "$KEEPOUT/tsplitnosink/text.txt") | head -6
 fi
 
 # ---- HARD: a latched pinned tier keeps what it owns (issue #278) ------------------------------
@@ -431,7 +526,7 @@ for a in ref fail sink; do
 done
 
 # ---- HARD: no abort anywhere ------------------------------------------------------------------
-for a in ref dio nodisk fail late pinlate pin0; do
+for a in ref dio nodisk fail late pinlate pin0 tsplit tsplitnosink; do
     hard
     if grep -qE 'GGML_ASSERT|terminate called|what\(\):|HAVE_ABORT' "$KEEPOUT/$a/err.txt"; then
         fail "$a aborted (see $KEEPOUT/$a/err.txt)"
@@ -458,8 +553,8 @@ fi
 
 echo
 echo "==> $((CHECKS - FAILED))/$CHECKS checks passed"
-for a in ref dio nodisk fail late pinlate pin0; do
-    printf "    %-7s %-52s %s\n" "$a" "$(text_hash "$a")" "$(grep -o 'Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s' "$KEEPOUT/$a/out.txt" | tail -1)"
+for a in ref dio nodisk fail late pinlate pin0 tsplit tsplitnosink; do
+    printf "    %-12s %-52s %s\n" "$a" "$(text_hash "$a")" "$(grep -o 'Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s' "$KEEPOUT/$a/out.txt" | tail -1)"
 done
 echo "    logs: $KEEPOUT"
 [ "$KEEP" -eq 1 ] || echo "    (--keep keeps them; the gate removed nothing either way)"

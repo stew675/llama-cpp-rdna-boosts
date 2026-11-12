@@ -4370,3 +4370,60 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   Also: `--load-mode dio` makes `-lme`'s pinned pool **NOT APPLIED** (`a pool needs a mapped load`), so a
   "host-pool" arm measured with `dio` is a file-read arm — check the placement line before quoting one as a
   pool result.
+
+## r273 -- the placement page-cache amplification, the pool exchange's missing guard, and where the budget ceiling belongs
+
+1. **A buffered per-expert placement doubles the footprint, and the second copy CANNOT be reclaimed.**  The pinned
+   pool is not the read buffer: a buffered `pread` materialises the file's pages in the page cache (they are the
+   block layer's DMA target) and only then copies them into the pool, so filling a covering pool adds the whole set
+   to the page cache *on top of* the pinned bytes.  Measured 35B-A3B Q8_0 (`-ncmoe 40 -lme 40` = a 32 640 MiB
+   mirror, cold cache): page-cache high-water **+3.9 GiB with an O_DIRECT placement against +33.7 GiB buffered**
+   — i.e. the whole set, twice over — for 6.8 s against 4.9 s of fill time.  On the reporter's box (91.4 GiB RAM,
+   `-lme 70` against a 54 750 MiB set, plus a 26.8 GiB lazy PLE and `--cache-ram 8192`) that is ~150 GiB of demand:
+   the kernel reclaims anonymous pages to make room and the box swaps/freezes.  Unlike an uploaded tensor, the
+   expert pages stay **mapped** (they ARE the pool-backed master), so `posix_fadvise(DONTNEED)` skips them and the
+   copy is not reclaimable on demand.  The placement read is therefore **O_DIRECT whatever `--load-mode` says**
+   (`pool_mirror_bulk_fill_locked`, `MOE_HOST_POOL_BULK_DIO=0` = the buffered A/B).  r215 built that path for
+   O_DIRECT and r262's transport mirror silently re-enabled the amplification for `buffered`/`mmap` loads; the
+   transport knob is a DEMAND-read policy.
+2. **The complement of (1): a released upload's pages must be DROPPED, not merely unmapped.**  Device-bound
+   weights are read once and never again, and `LLAMA_LOAD_RELEASE_MMAP` unmaps their range after the H2D — which is
+   also what makes a `posix_fadvise(POSIX_FADV_DONTNEED)` legal (fadvise skips mapped pages, so before the unmap it
+   was a no-op and the pages were left to reclaim).  Measured on a 4.3 GiB model: peak `Cached` during load
+   **5.15 GiB with the release off against 1.99 GiB with it**.  This needs no read-transport change (and must not
+   be implemented by forcing DIO on the upload: a non-mapped load stages through `LLAMA_LOAD_STAGE_MB` slots and
+   loses readahead, and the upload is H2D-bound anyway).
+3. **An exchange whose demote cannot be expressed must be INERT, and `retire` must ask.**  The arena->pool demote
+   is one contiguous D2H of a WHOLE expert, so a `-sm tensor` split (each device owns a slice) can never perform
+   it: **766 758 geometry declines out of 766 758 attempts**.  `pool_sink_active()` nevertheless asked only "is the
+   sink on and the pool a sub-mirror?", so the exchange (a) reserved ~4 % of the slots for a demote that could never
+   land and (b) **retired the pool's copy of every expert it promoted to VRAM** — "the vacancy is taken by a
+   just-evicted expert" — with nothing ever parked in it.  Measured on the 2-device split: **792 321 retirements
+   against 52 704 slots, 701 706 refills, h=0.3473, 0 evictions**, sustained 1-1.2 GB/s of disk reads during
+   decode, at half the pinned-master rate.  The greedy TEXT was identical throughout (the pool computes the same
+   answer, slowly), which is why the census — not the answer — is the instrument.  `host_pool_t::demote_ok` (set
+   once from the table geometry at build) now gates the whole exchange; the same cell reports `0 demoted, 0
+   geometry, 0 retirements`.  `g_sink_need_slot` was declared to make this demand-driven and was written three
+   times and never read.
+4. **The budget's PROVENANCE decides the ceiling, and the resolver must run before anything reports.**  An
+   explicit absolute budget (`-lme N`, `MOE_HOST_POOL_MIB`) is a reservation: it is honoured in full and
+   `MOE_HOST_POOL_RAM_PCT` may not scale it.  A derived one (`-lme auto`'s resolution, FRAC/COV) keeps the
+   ceiling.  Consequences that bit: (a) the ceiling used to shave an explicit `-lme 70` to 95.3 % **silently**,
+   which is the band where the exchange is engaged and (on a tensor split) cannot demote; (b) the mirror/
+   near-mirror classification ran BEFORE the clamp, so the census printed "108 mirror tables, exchange INERT"
+   for a pool that was 95.3 %; (c) the `-lme` refusal compared `n` against 90 % of MemAvailable while printing
+   the allowance rounded to whole GiB, so `-lme 75` was refused with a message claiming 80 was allowed — it now
+   refuses only at **or above 100 % of MemAvailable**, with exact units.  Report the RESOLVED layout (coverage,
+   shape, exchange state, budget class) once, after the number is final.
+5. **A single-GPU gate cannot cover a split geometry.**  `gate-host-pool.sh` ran one device, where
+   `expert_bytes == host_bytes`, so the demote always succeeds and the annihilator in (3) is unreachable — the
+   gate was green (`41/41`) through the whole defect.  Its `tsplit`/`tsplitnosink` arms (2 devices, `-sm tensor`,
+   same pool) now assert the exchange is inert and that `SINK=1` changes no byte there; the pair is what makes
+   the arm non-vacuous, because the single-GPU `sink` arm still proves the demote is exercised where it can be.
+6. **Pinning is not reversible, so the prewarm needs a headroom gate.**  `MOE_EXPERT_SEED=eager` places the whole
+   budget at build; a pool that does not fit cannot be un-pinned, so it must not be placed.  A pool whose
+   placement would leave less than `MOE_HOST_POOL_PREWARM_RESERVE_MIB` (default 1024) of MemAvailable is
+   DEFERRED — its slots exist and the experts arrive on demand (`h` still converges to 1.0000 on a run whose
+   whole prewarm was deferred).  Same rule for `--lazy-mode mlock`/`mlockr`, which populate a multi-GiB table at
+   the END of the load: `LLAMA_LAZY_MLOCK_RESERVE_MIB` (default 1024), and a table that does not fit is declined
+   with one WARN and stays on the on-demand path (identical to `--lazy-mode auto`).

@@ -1,4 +1,4 @@
-From 8d9a143e6c3736f4083bb7b0cca5bfd4e6fefee7 Mon Sep 17 00:00:00 2001
+From 9ec98c5611c1fe959f74287330fc4666b8c84121 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/16] rdna-boosts: block 09: host-resident MoE (iface,
@@ -93,7 +93,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama-cparams.h                           |   11 +
  src/llama-ext.h                               |   11 +
  src/llama-kv-cache.cpp                        |    7 +-
- src/llama-mmap.cpp                            |   57 +-
+ src/llama-mmap.cpp                            |   73 +-
  src/llama-mmap.h                              |    5 +
  src/llama-model-loader.cpp                    |  694 +-
  src/llama-model-loader.h                      |  118 +-
@@ -103,7 +103,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama.cpp                                 |   16 +-
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 68 files changed, 17539 insertions(+), 540 deletions(-)
+ 68 files changed, 17555 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -19427,7 +19427,7 @@ index 432cb53c6..45fe45bb2 100644
                      continue;
                  }
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index 2e036aaf1..9131b3cb3 100644
+index 2e036aaf1..e9fc74a1c 100644
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
 @@ -69,6 +69,7 @@ static std::string llama_format_win_err(DWORD err) {
@@ -19465,7 +19465,20 @@ index 2e036aaf1..9131b3cb3 100644
  size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
  bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
  
-@@ -553,22 +556,24 @@ struct llama_mmap::impl {
+@@ -478,10 +481,12 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
++    int fd = -1;   // r273: kept so a released range's page-cache copy can be dropped (see `unmap_fragment`)
+ 
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         size = file->size();
+         int fd = file->file_id();
++        this->fd = fd;   // r273: retained for the post-unmap DONTNEED
+         int flags = MAP_SHARED;
+         if (numa) { prefetch = 0; }
+ #ifdef __linux__
+@@ -553,22 +558,38 @@ struct llama_mmap::impl {
          GGML_ASSERT(last % page_size == 0);
          GGML_ASSERT(last > first);
  
@@ -19495,6 +19508,20 @@ index 2e036aaf1..9131b3cb3 100644
 +                if (munmap((char *) addr + lo, hi - lo)) {
 +                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
 +                }
++#ifdef __linux__
++                // r273: drop the page-cache copy of a tensor that has just been uploaded to a device and
++                // UNMAPPED.  It is read exactly once and never again, so those pages are pure overhead next
++                // to the device copy -- and while the range was MAPPED, `posix_fadvise` could not drop them at
++                // all (it skips mapped pages, which is why the delivered path left them to reclaim).  This is
++                // the cheap half of "do not flush the system page cache for weights that are already placed":
++                // the release is per tensor and already exists, the drop just was not asked for.  It does not
++                // change the read transport (a mapped upload stays mapped and fast); it removes what is left
++                // behind afterwards.  `MOE_LAZY`/host-expert tensors never reach here (they are not released).
++                if (fd >= 0 && posix_fadvise(fd, (off_t) lo, (off_t) (hi - lo), POSIX_FADV_DONTNEED)) {
++                    LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n",
++                            strerror(errno));
++                }
++#endif
 +                if (frag.first < first) {
 +                    new_mapped_fragments.emplace_back(frag.first, first);
 +                }
@@ -19504,7 +19531,7 @@ index 2e036aaf1..9131b3cb3 100644
              } else {
                  new_mapped_fragments.push_back(frag);
              }
-@@ -636,8 +641,24 @@ struct llama_mmap::impl {
+@@ -636,8 +657,24 @@ struct llama_mmap::impl {
      }
  
      void unmap_fragment(size_t first, size_t last) {
