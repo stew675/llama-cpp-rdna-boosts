@@ -56,7 +56,12 @@ Mirror pool (`-lme auto` = the whole 40 012 MiB set, 512/512 slots):
 | arm | TTFT | wall | prompt eval | decode | device remap | storage reads | text |
 |---|---:|---:|---:|---:|---|---:|---|
 | `eager` | **13.58 s** | **22.21 s** | **0.68 s** | **49.17 t/s** | **served** (70 779 ops) | 46 GiB | `6e6d241acc25` |
+| `auto` | 13.30 s | 22.19 s | 0.66 s | **49.44 t/s** | **served** (70 779 ops) | 45 GiB | `6e6d241acc25` |
 | `lazy` | 18.71 s | 31.14 s | 8.01 s | 40.01 t/s | **stands down** (0 served) | 51 GiB | `6e6d241acc25` |
+
+`auto` is **inert** on a covering pool: the policy PLACES it (its content is not a choice), so only the *arena*
+seed is deferred, and the prefill re-earns that within noise.  The whole loss belongs to `lazy`, which defers a
+tier that must be complete.
 
 Long prompt (`prompts/prose-rdna-boosts.txt`, 5 246 tokens, `-n 32`, bounded pool, `-c 8192`):
 
@@ -74,10 +79,10 @@ host set resident every pass, and the seed is exactly the prefetch that makes th
 does not save the bytes — total storage reads are 45-47 GiB in **every** arm — it only moves them into the
 request, one cold read at a time, 8x slower on a short prompt and 2.3x on a long one.
 
-**On a covering pool it also costs the device remap**, which is the second half of the same story: a mirror pool
-with holes cannot express the cold ids the remap kernel resolves (`devremap_prep_locked` refuses a map with a
-hole), so every table stands the remap down and decode loses the sync-free path — measured **49.2 -> 40.0 t/s
-(-18.6 %)**.
+**On a covering pool, deferring it also costs the device remap** (`lazy` only — `auto` places a covering tier),
+which is the second half of the same story: a mirror pool with holes cannot express the cold ids the remap kernel
+resolves (`devremap_prep_locked` refuses a map with a hole), so every table stands the remap down and decode loses
+the sync-free path — measured **49.2 -> 40.0 t/s (-18.6 %)**.
 
 ## 2. The APU tier — the same trade, softer, but still not a default
 

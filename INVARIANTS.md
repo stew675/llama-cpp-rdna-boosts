@@ -4315,6 +4315,9 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   any hole and every table stands down.  Measured on the `-lme auto` mirror pool (the whole 40 012 MiB set):
   remap served 70 779 ops eagerly, 0 lazily, and **decode 49.17 -> 40.01 t/s (-18.6 %)** for byte-identical text.
   Anything that makes a covering pool incomplete mid-run (a lazy seed, a lazier prewarm) costs this class.
+  (r271) **`auto` is inert there** -- 13.30 s TTFT / 49.44 t/s / remap served against `eager`'s 13.58 / 49.17 /
+  served, because it PLACES a covering tier and only defers the arena seed, which the prefill re-earns within
+  noise.  The loss is `lazy`'s alone.
 * **On an APU the deferred seed is a real window and not a default**: `halo`, 122B-A10B Q5_K_XL on a `-lme 70` store
   (225 of 256 slots/table): TTFT **47.8 -> 29.0 s (-39 %)** and a 32-token answer 50.3 -> 44.5 s, but decode
   **11.73 -> 4.83 t/s** and **+70 GiB** of storage reads over a 250-token answer (236 vs 166 GiB).  The mechanism is

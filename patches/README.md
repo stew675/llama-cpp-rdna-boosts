@@ -4862,9 +4862,9 @@ pre-r270 behaviour): the fill is not a fixed cost, it is the *prefetch* the dema
 `auto` (defer a tier that holds a SUBSET, place a tier that covers its tensor — the APU policy ported verbatim) and
 `lazy` (defer everything) ship as measured arms.  Numbers (`benchmarks/2026-11-12-expert-seed-policy.md`), all
 arms text-identical: **discrete pool 32 GiB / 40 GiB set** (`soar`) prompt eval **0.88 s -> 7.24 s** with decode
-flat and the same 45-46 GiB of storage reads in both arms; **discrete MIRROR pool** TTFT 13.6 -> 18.7 s, prompt
+flat and the same 45-46 GiB of storage reads in both arms; **discrete MIRROR pool** `lazy` TTFT 13.6 -> 18.7 s, prompt
 eval 0.68 -> 8.01 s and decode **49.2 -> 40.0 t/s** (a covering pool with holes stands the device remap's cold
-source down); **APU GTT arena** (`halo`, `-lme 70` of a 79 GiB set) TTFT 47.8 -> 29.0 s but decode **11.7 -> 4.8
+source down; `auto` is inert there at 13.30 s / 49.44 t/s / remap served); **APU GTT arena** (`halo`, `-lme 70` of a 79 GiB set) TTFT 47.8 -> 29.0 s but decode **11.7 -> 4.8
 t/s** and +70 GiB read over a 250-token answer (a 32-token answer is 12 % cheaper, which is the whole window).
 The second half is the item's real cost: the bounded pool's prewarm issued its fills in RANK order — a random walk
 over a 40 GiB GGUF — and `MOE_HOST_POOL_FILL_ORDER` (r231's rule, `offset` = file order) now governs the prewarm as

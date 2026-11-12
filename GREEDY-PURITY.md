@@ -2492,8 +2492,8 @@ whether they are read up front at 6.25 GB/s or inline at ~1 GB/s.
 **Numbers.**  Bounded pool (`soar`, Flash-Next GSQ-IQ3_XXS `-ncmoe 47`, `-lme 32` = 419/512 slots, cold page cache):
 prewarm **12 546 -> 7 774 ms** for the same 42.7 GiB and set (3.67 -> 6.25 GB/s), TTFT **19.1-20.4 -> 15.5-16.1 s**,
 whole run 30.7 -> 26.6-27.5 s, decode 40.80-40.93 -> 40.91-40.94 t/s, text `6e6d241acc25` in both orders.
-Deferred seed on the same config: prompt eval **0.88 -> 7.24 s**, decode flat.  Mirror pool: remap 70 779 ops -> 0
-and decode **49.17 -> 40.01 t/s**.  APU (`halo`, 122B-A10B Q5_K_XL, `-lme 70` of 79 GiB): TTFT 47.77 -> 28.99 s,
+Deferred seed on the same config: prompt eval **0.88 -> 7.24 s**, decode flat.  Mirror pool (`lazy`; `auto` is
+inert there -- 13.30 s TTFT / 49.44 t/s against 13.58 / 49.17): remap 70 779 ops -> 0 and decode **49.17 -> 40.01 t/s**.  APU (`halo`, 122B-A10B Q5_K_XL, `-lme 70` of 79 GiB): TTFT 47.77 -> 28.99 s,
 decode **11.73 -> 4.83 t/s**, reads 166 -> 236 GiB; the r269 binary against `MOE_EXPERT_SEED=eager` on this build is
 byte-identical (`960bdbc9e2dc`) with an identical arena hit rate.
 

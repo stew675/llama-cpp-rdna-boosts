@@ -1,3 +1,38 @@
+## 261112.007 (r271, release) -- the seed-policy record names the arm it measured: `auto` is INERT on a covering pool, the mirror loss is `lazy`'s alone
+
+**Release:** `v17-a691b2345-r271` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`b5395bf8df59d9f938da8c2acafaf4ec2bd7bdbe`**, tree **`5ff217df618e673e96e5014074911c8b24595f98`**.  A correction to r270's
+record and to the source comment, plus one measurement it was missing.  **No behaviour change** (`eager` remains the
+default and the code paths are untouched); the only source edit is a comment, so every data point from r270 stands.
+
+### What was wrong
+
+r270's block-16 comment and its table summarised the mirror-pool arm as "`auto`/`lazy` cost TTFT +5.1 s ... decode
+49.2 -> 40.0 t/s".  Only `lazy` was measured there.  `auto` is a different arm by construction -- it PLACES a tier
+that covers its tensor and defers only a subset, so on a mirror pool it defers the *arena* seed and keeps the pool
+prewarm.  Measured now (`soar`, `-lme auto` = the whole 40 012 MiB set, 57-token prompt, 500-token greedy decode,
+cold page cache, text `6e6d241acc25` in all three arms):
+
+| arm | TTFT | wall | prompt eval | decode | device remap | reads |
+|---|---:|---:|---:|---:|---|---:|
+| `eager` | 13.58 s | 22.21 s | 0.68 s | 49.17 t/s | served | 46 GiB |
+| **`auto`** | **13.30 s** | **22.19 s** | **0.66 s** | **49.44 t/s** | **served** | 45 GiB |
+| `lazy` | 18.71 s | 31.14 s | 8.01 s | 40.01 t/s | stands down | 51 GiB |
+
+So `auto` is **inert** on a covering pool: the covering tier is placed (complete, so the remap's cold source holds),
+and the deferred arena seed is re-earned by the prefill within noise.  The -18.6 % decode belongs to `lazy` alone,
+i.e. to deferring a tier that must be complete -- which is exactly the rule `GREEDY-PURITY.md` §87 states.
+
+Corrected in place: the block-16 comment, `benchmarks/2026-11-12-expert-seed-policy.md`,
+`INVARIANTS.md` r270 (tagged `(r271)`), `ENVIRONMENT.md` §20, `patches/README.md` block 16, `GREEDY-PURITY.md` §87.
+`archive/work/expert-seed-policy/RESULTS.csv` gained the row.
+
+**Gates:** the source delta is a comment, so r270's gates stand (`gate-host-pool.sh` 42/42,
+`gate-prefill-logits.sh` 0.000000 / 100.000 %, `gate-uma-experts.sh --quick --no-ram` on `halo` 36/0); the arm above
+was run on the r270 build and re-run's text hash equals it.  `scripts/validate-set.sh` re-run for the new tree.
+
+**Record:** this entry; `benchmarks/2026-11-12-expert-seed-policy.md` §1's mirror table.
+
 ## 261112.006 (r270, release) -- the expert seed is the prefetch, not a fixed cost: one `MOE_EXPERT_SEED` policy for both tiers, and the pool prewarm walks the file (`TODO` #318)
 
 **Release:** `v17-a691b2345-r270` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

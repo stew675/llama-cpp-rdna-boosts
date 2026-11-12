@@ -65376,10 +65376,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..823dc7520
+index 000000000..e792ca906
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,12470 @@
+@@ -0,0 +1,12471 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -66254,9 +66254,10 @@ index 000000000..823dc7520
 +// request at a worse rate.  Measured on BOTH tiers (r270, see `benchmarks/2026-11-12-expert-seed-policy.md`):
 +//   * discrete pool 32 GiB / 40 GiB set (soar, gfx1201): `auto` leaves decode flat, but prompt eval goes
 +//     0.88 s -> 7.2 s on a 57-token prompt, and total storage reads do not move (45 -> 46 GiB);
-+//   * discrete pool MIRROR (the whole 40 GiB set): `auto`/`lazy` cost TTFT +5.1 s, prompt eval 0.68 s ->
-+//     8.0 s and decode 49.2 -> 40.0 t/s, because a covering pool with holes stands the device remap's cold
-+//     source down (`devremap_prep_locked`);
++//   * discrete pool MIRROR (the whole 40 GiB set): `auto` is INERT (13.3 vs 13.6 s TTFT, 49.44 vs 49.17 t/s --
++//     the covering tier is placed, and the deferred arena seed is re-earned by the prefill), while `lazy`
++//     costs TTFT +5.1 s, prompt eval 0.68 s -> 8.0 s and decode 49.2 -> 40.0 t/s, because a covering pool with
++//     holes stands the device remap's cold source down (`devremap_prep_locked`);
 +//   * APU GTT arena (halo, gfx1151, 70 GiB store of a 79 GiB set): `auto` buys TTFT -39 % (47.8 -> 29.0 s)
 +//     and a 32-token answer comes out 12 % cheaper, but decode falls 11.7 -> 4.8 t/s and the run reads
 +//     70 GiB more, so a 250-token answer is 16 % worse.
