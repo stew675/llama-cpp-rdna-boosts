@@ -341,7 +341,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the MTP draft KV window (block 15 Goal C) | `scripts/gate-spec-draft-window.sh` |
 | a drafter's own KV cache: the DFlash/MTP prompt-ingest tail, a restored draft checkpoint, or anything that decides which rows a draft ingests | `scripts/gate-spec-reuse-window.sh` |
 | the KV window/region provider, the attendance pool, `is_streaming()` or the sparse decode arm (block 15) | `scripts/gate-kv-residency.sh` |
-| the GTT store, its residency/eviction, the fill transport, the prefill stream, the lock/budget policy or the shape decision (block 16) | `scripts/gate-uma-experts.sh`, plus `scripts/gate-prefill-logits.sh` and (discrete) `scripts/gate-host-pool.sh` |
+| the GTT store, its residency/eviction, the fill transport, the prefill stream/IN-PLACE band, the admission ladder, the lock/budget policy or the shape decision (block 16) | `scripts/gate-uma-experts.sh` (its `inplace` and `pfcp` arms), `scripts/gate-prefill-server-slots.sh` (two slots: one decoding while the other prefills), plus `scripts/gate-prefill-logits.sh` and (discrete) `scripts/gate-host-pool.sh` |
 | the delivery set itself (any regenerated patch) | `scripts/validate-set.sh` |
 | anything (before a tag) | `scripts/gate-per-block-build.sh --changed-from <prev tip>` + `scripts/check-gpu-faults.sh` |
 

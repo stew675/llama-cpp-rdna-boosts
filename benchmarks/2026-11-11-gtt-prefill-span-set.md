@@ -66,4 +66,4 @@ this tier's eager seed: **43.90 GiB / 80 446 memcpy pool fills**, costing **57.0
 (789 MiB/s) against 3.7 s warm (14 986 MiB/s) — recorded in the follow-up campaign, not fixed here.
 
 **Record:** block-16 amendment, `WORKLOG.md` 261111.036 (r265). Follow-up (the per-pass copy that remains):
-[`wip/prefill-in-place-arena/`](../wip/prefill-in-place-arena/README.md).
+[`archive/work/prefill-in-place-arena/`](../archive/work/prefill-in-place-arena/README.md).

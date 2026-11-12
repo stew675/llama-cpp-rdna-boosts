@@ -4140,10 +4140,48 @@ byte-identical in both arms.  Rules:
   pass (30 060.5 MiB for a 38-token prompt).  The identity tier already reads in place at any width (r258); the
   ARENA tier's slot-remap path is still decode-band-only (`moe_cache_update_host` returns early, `moe_cache_get_table`
   refuses `>MOE_EXPERT_CACHE_MAX_TOK`, `remap_cap` is `n_experts*8`).  Follow-up:
-  `wip/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
+  `archive/work/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
   predicted the *complement* of a partly resident table; this one removes a copy of the *residents*).
 * **The discrete host-pool tier was checked and does not have it**: its map is complete, and its measured staged
   reads track the per-table complement, not the prompt width (24 B prompt -> 1 146.6 MiB / 2 223 experts;
   2 KB -> 1 858.3 MiB / 3 626 on `soar`).  Its residual, by-design difference is that the destination there is
   the WHOLE split-input table, so the complement is prefetched whether routed or not; restricting it needs the
   host routing readback that the gather path exists to avoid.  Do not re-open it as "the same bug".
+
+## r266 — the arena tier's prefill band is served in place, and the admission ladder's rule is "never reclaim a slot the pass ROUTES" (block 16, `TODO` #317)
+
+**The prefill band used to copy `O(used)` and now copies nothing.**  With `-lme` below the set, no table is identity,
+so every prefill ubatch staged its used set into the scheduler's `input_cpy`; measured 30 060.5 MiB of D2D against
+1 578.6 MiB really read (38-token prompt, 122B Q5_K_XL `-lme 75`).  r266 admits the used-and-missing experts and
+publishes the slot-remapped routing, so `MUL_MAT_ID` reads the arena: 0 copies + the miss fills.  Facts to keep:
+
+* **A prefill pass may only serve a table in place when `|used| <= slots`.**  That is arithmetic, not tuning: every
+  used expert needs a slot, and a slot the pass routes cannot be reclaimed (the op is about to read it).  So a
+  4 096-token ubatch -- which routes all 256 experts of a trunk table -- is servable only on a fully covering arena;
+  on the 78 %-resident Q8 config it declines 123 of 144 tables and is exactly inert (3 paired runs, 0 difference).
+  A wide prefill CANNOT validate this arm; the exposing arms are short and medium prompts (34 and 250 tokens).
+* **The ladder is: empty slot -> the table's landing slots -> the coldest NON-routed resident, ranked by the decode
+  heat prior (then LFRU `count`/`last`).**  The landing set is the coldest `slots/16` seeded slots: a SOFT reserve
+  (seeded like any other), so a cold start pays no extra read and decode keeps them until prefill needs them; a
+  landing occupant decode hits is promoted and never reusable.  A landing reserve ALONE cannot hold this: at
+  `-lme 90` it declines 57-138 of 147 tables and is neutral-to-negative (measured), because a streaming pass's miss
+  set scales as `|used| x (1 - resident/n_experts)`.
+* **Rung 2 owes the same rule as rung 3, and getting it wrong is invisible to text.**  The first cut let a prefill
+  pass recycle a landing slot whose occupant it ROUTED: prefill-logit KLD **0.1157 / same-top-p 87.3 %** (PPL
+  5.82 -> 6.30) on 35B-A3B `-lme 16` while EVERY greedy-text arm stayed byte-identical.  With the rule applied to
+  every rung: KLD -0.000000 / 99.990 %.  A prefill-path change owes `gate-prefill-logits.sh --ab`, always.
+* **Admission on prefill HELPS the following decode, does not hurt it** (the opposite of the intuitive worry).
+  Replay (Q8_0 `-lme 90`, 538-token prompt, 200-token follow-up): -447..-1101 of 11 559 decode misses for 200-538
+  token prompts, `h` 0.9515 -> 0.9534-0.9561, because the admitted set IS the continuation's routing and the reclaim
+  ranking only gives up the coldest non-routed expert.  Real two-slot server traffic agrees (A's decode 4.03 vs
+  3.78 t/s, longest gap 414 vs 623 ms while B prefills).
+* **The reserve costs no arena memory; the remap staging costs `n_used x -ub` per table.**  `arena=` is byte-identical
+  in both arms; the staging grows from 8 KiB to 128 KiB/table at `-ub 4096` (**+34 MiB** over 147 tables) because the
+  buffer must stay per table -- the scheduler issues every table's input work before the split's graph runs, so a
+  shared buffer would be overwritten under a live op.
+* **`preadv`-straight-into-the-slot is a wash against the coalesced ring** (601 vs 603 ms of hook, same text) and costs
+  a per-table stream drain for ordering.  The ring serves both prefill arms, and the `O_DIRECT` offset round-out
+  (`aoff`/`skip`/`blen`) lives there -- that defect (short spans silently falling back per-expert) is FIXED.
+* **A gate can be blind to its own box.**  `gate-fusion-alias-copy.sh` fails identically on the unmodified r265 build
+  (its arms do not reach the shape on gfx1151), so it is NOT evidence about this change either way; run the
+  unmodified build when attributing a gate failure.

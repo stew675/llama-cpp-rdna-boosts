@@ -150,7 +150,7 @@ def segment_passes(recs):
 
 class TableState:
     __slots__ = ("slots", "slot_expert", "expert_slot", "count", "ghost", "last", "clock",
-                 "last_decay", "hits", "misses", "cold", "fills", "evictions")
+                 "last_decay", "hits", "misses", "cold", "fills", "evictions", "landing")
 
     def __init__(self, t, slots):
         self.slots = min(slots, t.n_experts)
@@ -166,6 +166,8 @@ class TableState:
         self.cold = 0
         self.fills = 0
         self.evictions = 0
+        # TODO #317: the slots this table's PREFILL admissions own (the arena's landing set).
+        self.landing = set()
 
 
 def decay(st, period):
@@ -352,11 +354,16 @@ def seed_prior(tables, passes, seed, sidecar=None, probe_passes=0, mass_band="de
     sys.exit("unknown --seed %r" % seed)
 
 
-def apply_seed(states, tables, prior):
+def apply_seed(states, tables, prior, landing_frac=0):
     """Mirror of `apply_heat_seed_locked`: rank by the prior (count desc, expert id asc) and place the top
     `slots` in slot order with `count=0, ghost=0, last=0` -- a pre-filled expert has not been USED yet, so it
     must be the first thing eviction gives up (seeding `count=1` made arbitrary residents outlive genuinely
-    hot ones and cost the real cache ~800 tokens of hit rate)."""
+    hot ones and cost the real cache ~800 tokens of hit rate).
+
+    `landing_frac` (TODO #317) marks the COLDEST `slots // landing_frac` seeded slots as that table's landing
+    set -- the mirror of `pf_landing_mark`/`pf_landing_reserve`.  The reserve is soft: those slots are seeded
+    like any other, so a cold start pays no extra read and decode may use them; they are only the slots a
+    prefilling pass may reclaim first."""
     for key, t in tables.items():
         st = states.get(key)
         prior_t = prior.get(key) if prior else None
@@ -371,10 +378,88 @@ def apply_seed(states, tables, prior):
             st.count[e] = 0
             st.ghost[e] = 0
             st.last[e] = 0
+        if landing_frac > 0 and st.slots > 0:
+            reserve = max(1, st.slots // landing_frac)
+            for s in range(max(0, len(order) - reserve), len(order)):
+                st.landing.add(s)
+
+
+def prefill_admit_pass(states, tables, p, mode, prior):
+    """One PREFILL pass of TODO #317's in-place arm: admit this pass's used-and-missing experts.
+
+    Mirrors `pf_in_place_locked`'s placement ladder, in policy order:
+
+      free     an EMPTY slot -- nothing is disturbed;
+      landing  one of this table's landing slots (a previous prefill fill decode never asked for);
+      ladder   a resident this PASS DOES NOT ROUTE, coldest first by the decode prior (then `count`/`last`,
+               the LFRU tie-break).  A slot this pass ROUTES is never reclaimed: the op is about to read it.
+
+    `mode` is one of "free"/"landing"/"ladder".  A table whose miss set exceeds the capacity its mode allows
+    DECLINES as a whole (no partial admission), exactly like the C++: the scheduler's copy then serves it.
+
+    Returns (admitted, landed, reclaimed, declined) and adds the copy-path counterfactual to `p`'s caller
+    through the counters it returns -- the caller accumulates the bytes.
+    """
+    adm = landed = reclaimed = declined = 0
+    for r in p:
+        key = (r.layer, r.role)
+        st = states.get(key)
+        t = tables.get(key)
+        if st is None or t is None or st.slots <= 0:
+            continue
+        used = set(e for e in r.ids if 0 <= e < t.n_experts)
+        miss = [e for e in used if e not in st.expert_slot]
+        if not miss:
+            continue
+        free = [s for s in range(st.slots) if st.slot_expert[s] < 0]
+        # A landing slot whose occupant THIS PASS ROUTES is not reclaimable: the op reads it.  (The C++ first
+        # cut of the ladder checked that rule for the reclaim rung only; the engine caught it -- see
+        # pf_in_place_locked's comment and gate-prefill-logits.)
+        land = sorted(s for s in st.landing if st.slot_expert[s] >= 0 and st.slot_expert[s] not in used)
+        pool = free + land
+        if mode == "free":
+            pool = free
+        elif mode == "landing":
+            pool = free + land
+        if len(pool) < len(miss):
+            reclaim = []
+            if mode == "ladder":
+                for s in range(st.slots):
+                    e = st.slot_expert[s]
+                    if e < 0 or e in used or s in st.landing:
+                        continue
+                    reclaim.append(s)
+                pt = prior.get(key) if prior else None
+                hot = (lambda e: pt[e]) if pt and len(pt) == t.n_experts else None
+                reclaim.sort(key=lambda s: ((hot(st.slot_expert[s]) if hot else 0),
+                                            st.count.get(st.slot_expert[s], 0),
+                                            st.last.get(st.slot_expert[s], 0)))
+                pool = pool + reclaim
+            if len(pool) < len(miss):
+                declined += 1
+                continue
+        for i, e in enumerate(sorted(miss)):
+            s = pool[i]
+            old = st.slot_expert[s]
+            if old >= 0:
+                st.expert_slot.pop(old, None)
+                if s in st.landing:
+                    landed += 1
+                else:
+                    reclaimed += 1
+            st.slot_expert[s] = e
+            st.expert_slot[e] = s
+            st.landing.add(s)
+            st.count[e] = 0
+            st.last[e] = 0
+            adm += 1
+    return adm, landed, reclaimed, declined
 
 
 def score(tables, passes, slots_by_layer=None, arena_bytes=0, period=32, admit="touch", touch=2,
-          policy="shipped", prior=None, churn=True, score_band="all"):
+          policy="shipped", prior=None, churn=True, score_band="all",
+          prefill_admit="off", prefill_prompt_tokens=0, prefill_band_tokens=64, decode_scoped=0,
+          landing_frac=16):
     states = {}
     for key, t in tables.items():
         slots = slots_by_layer.get(t.layer, 0) if slots_by_layer is not None else t.slots
@@ -390,13 +475,47 @@ def score(tables, passes, slots_by_layer=None, arena_bytes=0, period=32, admit="
                 st.expert_slot[e] = s
                 st.last[e] = 0
     elif prior is not None:
-        apply_seed(states, tables, prior)
+        apply_seed(states, tables, prior, landing_frac=landing_frac)
 
     tokens = 0
+    d2d = files = 0          # the PREFILL pass's copy-path counterfactual (bytes; TODO #317)
+    used_b = 0
+    padm = pland = precl = pdecl = 0
+    decode_passes = 0
     for p in passes:
         band_tokens = p[0].n_tok if p else 0
+        if band_tokens > prefill_band_tokens:
+            # A PREFILL pass.  It is never SCORED (the copy path stages the whole table, so a prefill position
+            # never reaches the cache's hits/misses), but it is exactly where the in-place arm acts -- and the
+            # copy it either pays (baseline) or does not (in place) is the number the policy is traded against.
+            for r in p:
+                st = states.get((r.layer, r.role))
+                t = tables.get((r.layer, r.role))
+                if st is None or t is None:
+                    continue
+                ids = r.ids[:prefill_prompt_tokens * r.n_used] if prefill_prompt_tokens > 0 else r.ids
+                used = set(e for e in ids if 0 <= e < t.n_experts)
+                used_b += len(used) * t.expert_bytes
+                for e in used:
+                    if e in st.expert_slot:
+                        d2d += t.expert_bytes        # the resident the copy path D2D-copies
+                    else:
+                        files += t.expert_bytes      # the miss BOTH arms read from storage
+            if prefill_admit != "off":
+                if prefill_prompt_tokens > 0:
+                    p = [Rec(r.band, r.layer, r.role, prefill_prompt_tokens, r.n_used,
+                             r.ids[:prefill_prompt_tokens * r.n_used]) for r in p]
+                a, l, rc, d = prefill_admit_pass(states, tables, p, prefill_admit, prior)
+                padm += a
+                pland += l
+                precl += rc
+                pdecl += d
+            continue
         if score_band == "decode" and band_tokens > 64:
             continue    # the prefill band stages whole tables; scoring it only blurs a policy comparison
+        if decode_scoped > 0 and decode_passes >= decode_scoped:
+            continue    # the follow-up horizon: what a decode right after the prompt actually sees
+        decode_passes += 1
         tokens += band_tokens
         if policy == "window":
             # pass-start pre-admission of the whole distinct routed set, hottest-miss first
@@ -455,6 +574,12 @@ def score(tables, passes, slots_by_layer=None, arena_bytes=0, period=32, admit="
     return {
         "policy": policy,
         "seeded": prior is not None, "churn": churn,
+        "prefill_admit": prefill_admit,
+        "decode_passes": decode_passes,
+        "prefill_admitted": padm, "prefill_landed": pland, "prefill_reclaimed": precl,
+        "prefill_declined": pdecl,
+        "prefill_copy_mib": d2d / 1048576.0, "prefill_read_mib": files / 1048576.0,
+        "prefill_used_mib": used_b / 1048576.0,
         "hits": hits, "misses": misses, "reaches": reaches,
         "h": (hits / reaches) if reaches else 0.0,
         "cold": cold, "fills": fills, "evictions": evict,
@@ -1042,6 +1167,22 @@ def main(argv=None):
                     help="score the decode band only (the prefill stages whole tables, so it does not "
                          "discriminate between pool policies); default on")
     ap.add_argument("--all-bands", dest="decode_only", action="store_false")
+    ap.add_argument("--prefill-admit", choices=("off", "free", "landing", "ladder"), default="off",
+                    help="TODO #317: the in-place PREFILL admission policy on the prefill band -- `off` (the "
+                         "delivered copy path), `free` (empty slots only), `landing` (also this table's own "
+                         "landing slots) or `ladder` (also the coldest NON-ROUTED resident, ranked by the "
+                         "decode prior).  A table whose miss set exceeds what its mode allows declines whole.")
+    ap.add_argument("--landing-frac", type=int, default=16,
+                    help="TODO #317: the landing reserve is the coldest seeded slots//N of each table (the "
+                         "code's pf_landing_reserve: slots/16).  0 disables the reserve.")
+    ap.add_argument("--prefill-prompt-tokens", type=int, default=0, metavar="N",
+                    help="score only the first N prompt tokens of each prefill pass (sweep the prompt size "
+                         "without re-tracing; 0 = the whole prompt)")
+    ap.add_argument("--prefill-band-tokens", type=int, default=64, metavar="N",
+                    help="a pass with more than N tokens is the prefill band (default 64)")
+    ap.add_argument("--decode-scoped", type=int, default=0, metavar="N",
+                    help="score only the first N decode passes after the prompt (the follow-up horizon; "
+                         "0 = the whole decode band)")
     ap.add_argument("--measured-h", type=float, default=None,
                     help="the run's logged `MoE expert cache: h=` -- printed beside the model's own "
                          "`shipped` h so the model's error is visible (it is a model, not the cache)")
@@ -1158,12 +1299,18 @@ def main(argv=None):
             sq = quota_slots(tables, arena_bytes, mass_by_layer, args.min_slots)
             r = score(tables, passes, slots_by_layer=sq, arena_bytes=arena_bytes,
                       period=args.period, admit=args.admit, touch=args.touch, policy="quota",
-                      prior=prior, churn=args.churn == "on", score_band=args.score_band)
+                      prior=prior, churn=args.churn == "on", score_band=args.score_band,
+                      prefill_admit=args.prefill_admit, prefill_prompt_tokens=args.prefill_prompt_tokens,
+                      prefill_band_tokens=args.prefill_band_tokens, decode_scoped=args.decode_scoped,
+                      landing_frac=args.landing_frac)
             r["layer_slots"] = {str(k): v for k, v in sorted(sq.items())}
         else:
             r = score(tables, passes, slots_by_layer=None, arena_bytes=arena_bytes,
                       period=args.period, admit=args.admit, touch=args.touch, policy=pol,
-                      prior=prior, churn=args.churn == "on", score_band=args.score_band)
+                      prior=prior, churn=args.churn == "on", score_band=args.score_band,
+                      prefill_admit=args.prefill_admit, prefill_prompt_tokens=args.prefill_prompt_tokens,
+                      prefill_band_tokens=args.prefill_band_tokens, decode_scoped=args.decode_scoped,
+                      landing_frac=args.landing_frac)
         results[pol] = r
 
     bound = static_bound(tables, arena_bytes)
@@ -1191,6 +1338,19 @@ def main(argv=None):
                   % (pol, r["h"], r["misses"], r["cold"], r["mib_per_token"], r["resident_mib"],
                      r["covered_mass_pct"]))
         print()
+        if args.prefill_admit != "off":
+            hdr2 = "%-8s %8s %9s %11s %11s %9s %9s %8s" % (
+                "policy", "h", "misses", "prefill D2D", "prefill read", "admitted", "reclaimed", "declined")
+            print()
+            print(hdr2)
+            print("-" * len(hdr2))
+            for pol in pols:
+                r = results[pol]
+                print("%-8s %8.4f %9d %10.1fM %10.1fM %9d %9d %8d"
+                      % (pol, r["h"], r["misses"], r["prefill_copy_mib"], r["prefill_read_mib"],
+                         r["prefill_admitted"], r["prefill_reclaimed"], r["prefill_declined"]))
+            print("(prefill D2D = the resident bytes the copy path D2Ds out of the arena on the prefill band, "
+                  "--prefill-admit off; prefill read = the misses both arms read from storage)")
         print("static bound (global top-f, same slot count): %.2f%% of the routed mass" % bound)
         print("arena seed: %s, churn: %s" % (args.seed, args.churn))
         sh = results.get("shipped")

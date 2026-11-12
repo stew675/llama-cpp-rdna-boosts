@@ -4779,8 +4779,31 @@ is unchanged (`58fba7e8b027`, streaming vs `MOE_EXPERT_GTT_PREFILL=0`), `gate-um
 the wrong set nearly the right one) -- the exposing arm is a short prompt.  The **discrete host-pool tier does not
 have it** (its `prs_host`/`gprs_host` are complete two-tier maps; measured on `soar`, staged reads track the
 per-table complement, not the prompt width), so nothing changed there.  The per-pass D2D copy of the resident used
-set that remains is `TODO` #317 / [`wip/prefill-in-place-arena/`](../wip/prefill-in-place-arena/README.md).
+set that remains is `TODO` #317 / [`archive/work/prefill-in-place-arena/`](../archive/work/prefill-in-place-arena/README.md).
 Record: `benchmarks/2026-11-11-gtt-prefill-span-set.md`, `WORKLOG.md` 261111.036.
+
+**r266 amendment to block 16 -- the prefill band is served IN PLACE out of the arena (`TODO` #317).**  The arena
+tier is only partly resident, so above the decode/verify band it staged the used set into the scheduler's split-input
+copy, D2D-copying every *resident* used expert out of the store on every pass: `O(used)`, not `O(missing)` --
+measured 30 060.5 MiB of copy against 1 578.6 MiB read for a 38-token prompt.  The prefill band now takes the same
+slot-remap path the identity tier got in r258: admit the used-and-missing experts, publish the slot-remapped ids for
+the whole `n_used x n_tok` routing, and let `MUL_MAT_ID` read the arena -- **0 copies + the miss fills**.  Admission
+follows a three-rung ladder, in policy order: an **empty** slot; one of this table's **landing** slots (the coldest
+`slots/16` seeded slots, a SOFT reserve -- seeded like any other, so a cold start pays no extra read and decode may
+use them); then a resident **this pass does not route**, coldest by the decode heat prior.  A slot the pass ROUTES is
+never reclaimed, which is the arm's hard bound (`|used| <= slots`); a table that cannot be served in place is
+declined WHOLE and keeps the scheduler's copy, i.e. the wide band at `-ub 4096` on a 78 %-resident arena is exactly
+inert (3 paired runs, 0 difference).  Measured on `halo`, text identical in every arm: **Q8_0 122B `-lme 90`** (the
+>RAM model, 200/256 slots) 250-token prompt **50.8 -> 54.0 t/s prompt eval (+6.3 %)**, decode +5 %, MTP acceptance
+identical, `arena D2D 40 535 -> 0 MiB`; **Q5_K_XL `-lme 75`** (241/256) **25.0 -> 32.9 t/s (+32 %)** small and
+**123.2 -> 158.3 (+28.5 %)** at 250 tokens, wide 24 576 tok **+4.5 %**.  The arena is byte-identical with and
+without it (`arena=78239.3`/`94248.0` MiB in both arms); the cost is the remap staging `n_used x -ub` per table
+(**+34 MiB** at `-ub 4096`) plus 1 byte per slot.  The coalesced read engine it fills through also fixes the
+`O_DIRECT` span-alignment defect (P2a) for both prefill arms.  Gates: `gate-uma-experts.sh` **36/0** with a new
+`inplace` arm, prefill-logit **-0.000000 / 99.990 %** (the first cut failed it at 0.1157 / 87.3 % -- rung 2 could
+recycle a *routed* landing slot; the rule now holds on every rung), a NEW `gate-prefill-server-slots.sh` (two slots,
+one decoding while the other prefills: text identical, decode not slower) and MTP acceptance identical.  Record:
+`benchmarks/2026-11-12-prefill-in-place-arena.md`, `WORKLOG.md` 261112.001.
 
 **Record:** `archive/work/apu-expert-gtt/` (README §0 the shape, §5 sizing, §6 the trap list, IMPLEMENTATION P0-P6,
 MEASUREMENTS §13-§27, the probes, and the campaign's own gate).

@@ -36,6 +36,16 @@
 #                                                   the ones a previous chunk left), and P4e's answer asserted: the
 #                                                   fill is on the CRITICAL PATH, so there is no fill worker
 #     pfoff    MOE_EXPERT_GTT_PREFILL=0             the A/B for the arm above: the delivery's per-expert copy
+#     pfcp     MOE_EXPERT_PREFILL_IN_PLACE=0        the r265 span STAGING arm (the prefill copy path), i.e. the
+#                                                   A/B base for the in-place arm below; its P5 census is what
+#                                                   the streaming assertions are read from
+#     inplace  -lme 16 (TODO #317)                  the PREFILL band served IN PLACE out of the arena: the used
+#                                                   set is admitted and the slot-remapped routing is published, so
+#                                                   `MUL_ID` reads the arena and no resident is D2D-copied.  16 GiB
+#                                                   is the smallest budget on this model whose slot count can hold
+#                                                   a 512-token pass's routing (~200 of 256 experts); at the
+#                                                   default `-lme 4` (26 slots) every table must decline, which is
+#                                                   the arm's documented hard bound `|used| <= slots`
 #     pfverify MOE_EXPERT_GTT_PREFILL_VERIFY=1      every coalesced span is byte-compared against the model
 #                                                   mapping -- a shard-relative offset or an O_DIRECT slip shows up
 #                                                   here and nowhere else
@@ -199,6 +209,16 @@ pf_fallback_mib() { grep -oE 'pageable-master fallback: [0-9]+ ranges, [0-9.]+ M
 lock_clamped() { grep -cE 'clamp|could honour|RLIMIT_MEMLOCK|below the cache' "$KEEPOUT/$1/err.txt"; }
 pf_spans()  { grep -oE 'in [0-9]+ coalesced span' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '[0-9]+'; }
 pf_declined(){ grep -oE 'declined [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/declined //'; }
+# TODO #317: `GTT prefill in place: <calls> call(s) x <tables> table(s), <admits> slot admission(s) (<land> into a
+# landing slot, <recl> reclaiming ...), arena D2D 0.0 MiB, read <r> MiB of <u> MiB used, remap <m> MiB, ...`
+pfip_calls()   { grep -oE 'GTT prefill in place: [0-9]+ call' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '[0-9]+'; }
+pfip_tables()  { grep -oE 'GTT prefill in place: [0-9]+ call\(s\) x [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '[0-9]+$'; }
+pfip_admits()  { grep -oE '[0-9]+ slot admission' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '^[0-9]+'; }
+pfip_land()    { grep -oE '\([0-9]+ into a landing slot' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '[0-9]+'; }
+pfip_recl()    { grep -oE '[0-9]+ reclaiming the coldest' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE '^[0-9]+'; }
+pfip_read()    { grep -oE 'in place: .*read [0-9.]+ MiB' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE 'read [0-9.]+' | grep -oE '[0-9.]+'; }
+pfip_used()    { grep -oE 'read [0-9.]+ MiB of [0-9.]+ MiB used' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE 'of [0-9.]+' | grep -oE '[0-9.]+'; }
+pfip_decl()    { grep -oE 'in place: .*declined [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | grep -oE 'declined [0-9]+' | grep -oE '[0-9]+'; }
 pf_failed() { grep -oE 'failed [0-9]+' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/failed //'; }
 # the P4e answer, asserted: a demand fill never has a millisecond of GPU work to hide behind
 drain_1ms() { grep -oE 'longest drain [0-9]+ us, [0-9]+ fill\(s\) waited >= 100 us, [0-9]+ >= 1 ms' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9]*\) >= 1 ms/\1/'; }
@@ -247,6 +267,16 @@ LME_FLAG="-lme $LME"
 run_arm shapefit "$MODEL" "$LME" "$AS_KB" "$LOCK_KB"
 LME_FLAG="-lme $LME"
 run_arm pfoff "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_GTT_PREFILL=0
+# TODO #317: the r265 span STAGING arm (the A/B base for in place), and in place itself at a budget whose slot
+# count can hold a 512-token pass's routing.
+LME_FLAG="-lme $LME"
+run_arm pfcp "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" MOE_EXPERT_PREFILL_IN_PLACE=0
+# The store is mlocked, so the 8 GiB RLIMIT_MEMLOCK CLAMPS an -lme 16 request -- and a clamped arena cannot hold
+# a pass's routing, which would leave the arm inert (measured: 117 declines, 0 calls).  This arm relaxes the
+# barrier exactly like `resident` does, so `-lme 16` is real placement.
+LME_INPLACE="${LME_INPLACE:-16}"
+LME_FLAG="-lme $LME_INPLACE"
+run_arm inplace "$MODEL" "$LME_INPLACE" 0 unlimited "${BASE_ENV[@]}" MOE_EXPERT_PREFILL_IN_PLACE=1
 if [ "$SKIP_RAM" = 0 ]; then
     # `-lme` is the opt-in for STREAMING: without it, a model whose weights do not fit RAM must be refused at load
     # (fast, with the fix) instead of being placed and left to swap.
@@ -267,7 +297,7 @@ note "text identity (every arm must match the delivery's own behaviour, arm 'off
 REF="$(text_hash off)"
 echo "    off      $REF"
 [ -n "$REF" ] && ok "the reference arm produced a hash" || fail "off: no text hash (see $KEEPOUT/off/out.txt)"
-for arm in ref resident budget lmeauto lock pfoff shapefit cold fault nohb; do
+for arm in ref resident budget lmeauto lock pfoff pfcp inplace shapefit cold fault nohb; do
     [ -f "$KEEPOUT/$arm/out.txt" ] || continue
     hard
     H="$(text_hash "$arm")"
@@ -337,26 +367,68 @@ else
     ok "(skipped: --quick)"
 fi
 
-note "P5 prefill streaming (arm 'ref')"
-U="$(pf_used ref)"; RD="$(pf_read ref)"; SP="$(pf_spans ref)"
+note "P5 prefill streaming (arm 'pfcp': MOE_EXPERT_PREFILL_IN_PLACE=0, the r265 copy path)"
+U="$(pf_used pfcp)"; RD="$(pf_read pfcp)"; SP="$(pf_spans pfcp)"
 hard
 if [ -n "$U" ] && [ -n "$RD" ] && awk "BEGIN{exit !($RD > 0 && $RD < $U)}"; then
-    ok "ref: read ${RD} MiB of ${U} MiB used ($(awk "BEGIN{printf \"%.1f\", 100*$RD/$U}") %) -- the residents are NOT re-read"
+    ok "pfcp: read ${RD} MiB of ${U} MiB used ($(awk "BEGIN{printf \"%.1f\", 100*$RD/$U}") %) -- the residents are NOT re-read"
 else
-    fail "ref: read='${RD:-}' used='${U:-}' (read must be > 0 and strictly below used)"
+    fail "pfcp: read='${RD:-}' used='${U:-}' (read must be > 0 and strictly below used)"
 fi
-hard; { [ -n "$SP" ] && [ "$SP" -gt 0 ]; } && ok "ref: $SP coalesced span(s)" || fail "ref: no coalesced span (the transport is not in play)"
+hard; { [ -n "$SP" ] && [ "$SP" -gt 0 ]; } && ok "pfcp: $SP coalesced span(s)" || fail "pfcp: no coalesced span (the transport is not in play)"
 hard
 PFB="$(pf_fallback_mib pfoff)"
-if [ -n "$PFB" ] && [ -n "$(pf_read ref)" ] && awk "BEGIN{exit !($PFB > $(pf_read ref))}"; then
-    ok "pfoff: $PFB MiB served per-expert vs $(pf_read ref) MiB streamed ($(awk "BEGIN{printf \"%.1f\", 100*$(pf_read ref)/$PFB}") % of the per-expert traffic)"
+if [ -n "$PFB" ] && [ -n "$(pf_read pfcp)" ] && awk "BEGIN{exit !($PFB > $(pf_read pfcp))}"; then
+    ok "pfoff: $PFB MiB served per-expert vs $(pf_read pfcp) MiB streamed ($(awk "BEGIN{printf \"%.1f\", 100*$(pf_read pfcp)/$PFB}") % of the per-expert traffic)"
 else
-    fail "pfoff: fallback bytes='${PFB:-}' vs the streaming arm's $(pf_read ref) MiB -- the streaming arm must read less"
+    fail "pfoff: fallback bytes='${PFB:-}' vs the streaming arm's $(pf_read pfcp) MiB -- the streaming arm must read less"
 fi
+note "TODO #317: the prefill band served IN PLACE (arm 'inplace', -lme $LME_INPLACE)"
+IC="$(pfip_calls inplace)"; IT="$(pfip_tables inplace)"; IA="$(pfip_admits inplace)"
+IL="$(pfip_land inplace)"; IR="$(pfip_recl inplace)"; IRD="$(pfip_read inplace)"
+IU="$(pfip_used inplace)"; ID="$(pfip_decl inplace)"
+hard; { [ -n "$IC" ] && [ "$IC" -gt 0 ]; } && ok "inplace: $IC table call(s) served in place over $IT table(s)" \
+     || fail "inplace: no in-place census (calls='${IC:-}') -- the arm is inert"
+hard; { [ -n "$IA" ] && [ "$IA" -gt 0 ]; } && ok "inplace: $IA slot admission(s) ($IL landing, $IR reclaiming a non-routed resident)" \
+     || fail "inplace: no slot admission ('${IA:-}')"
+# The census line's own `arena D2D 0.0 MiB` is by construction (this arm issues no copy at all); what must hold is
+# that the D2D the run really paid is BELOW the staging arm's, i.e. the copy the tier used to make is gone.
+hard
+D2D_IP="$(grep -oE 'arena D2D [0-9.]+ MiB' "$KEEPOUT/inplace/err.txt" | grep -oE '[0-9.]+' | sort -t. -k1,1nr | head -1)"
+D2D_CP="$(grep -oE 'arena D2D [0-9.]+ MiB' "$KEEPOUT/pfcp/err.txt" | grep -oE '[0-9.]+' | sort -t. -k1,1nr | head -1)"
+if [ -n "${D2D_CP:-}" ] && awk "BEGIN{exit !(${D2D_IP:-1e18} < $D2D_CP)}"; then
+    ok "inplace: arena D2D ${D2D_IP:-0} MiB vs pfcp's $D2D_CP MiB at the SAME per-table slots"
+else
+    fail "inplace: arena D2D '${D2D_IP:-}' not below pfcp's '${D2D_CP:-}' -- the copy is still being made"
+fi
+# The residency subtraction must still hold: only the misses are read, not the whole used set.
+hard
+if [ -n "${IRD:-}" ] && [ -n "${IU:-}" ] && awk "BEGIN{exit !($IRD > 0 && $IRD < $IU)}"; then
+    ok "inplace: read $IRD MiB of $IU MiB used ($(awk "BEGIN{printf \"%.1f\", 100*$IRD/$IU}") %)"
+else
+    fail "inplace: read='${IRD:-}' used='${IU:-}' (read must be > 0 and below used)"
+fi
+# A decline is not a failure (the arm's hard bound is `|used| <= slots`), but the arm must SAY so, and the
+# staging path must then have served those tables.
+if [ -n "${ID:-}" ] && [ "${ID:-0}" -gt 0 ]; then
+    ok "inplace: $ID table call(s) declined (named: 'no room without evicting a routed expert' / short read) -- the staging arm served them"
+else
+    ok "inplace: 0 declines (every table's used set fit the arena)"
+fi
+# The acceptance number the plan asks for, on this arm: the arena copy must be a small residue of pfcp's.
+hard
+CP_TOTAL="$(grep -oE 'arena D2D [0-9.]+ MiB' "$KEEPOUT/pfcp/err.txt" | grep -oE '[0-9.]+' | awk '{s+=$1} END{printf "%.1f", s}')"
+IP_TOTAL="$(grep -oE 'arena D2D [0-9.]+ MiB' "$KEEPOUT/inplace/err.txt" | grep -oE '[0-9.]+' | awk '{s+=$1} END{printf "%.1f", s}')"
+if [ -n "${CP_TOTAL:-}" ] && [ -n "${IP_TOTAL:-}" ] && awk "BEGIN{exit !($IP_TOTAL <= 0.5 * $CP_TOTAL)}"; then
+    ok "inplace: arena D2D $IP_TOTAL MiB vs pfcp's $CP_TOTAL MiB (<= half)"
+else
+    fail "inplace: arena D2D '${IP_TOTAL:-}' vs pfcp's '${CP_TOTAL:-}' -- not at most half"
+fi
+
 # P4e's recorded answer, asserted rather than assumed: no demand fill ever has >= 1 ms of GPU work to hide behind.
 hard
-if [ -f "$KEEPOUT/ref/err.txt" ] && grep -q 'fill-side overlap headroom' "$KEEPOUT/ref/err.txt"; then
-    D="$(drain_1ms ref)"
+if [ -f "$KEEPOUT/pfcp/err.txt" ] && grep -q 'fill-side overlap headroom' "$KEEPOUT/pfcp/err.txt"; then
+    D="$(drain_1ms pfcp)"
     if [ "${D:-1}" = "0" ]; then ok "ref: no demand fill waited >= 1 ms -- P4e's answer (no fill worker) holds"; else fail "ref: a fill waited >= 1 ms (${D:-?}); the P4e answer is stale, re-measure before shipping"; fi
 else
     fail "ref: the fill-drain census is missing (P4e's answer cannot be asserted)"

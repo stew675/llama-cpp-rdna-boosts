@@ -1,5 +1,12 @@
 # prefill-in-place-arena — serve the wide band IN PLACE from the GTT arena (`TODO` #317)
 
+**Status: CLOSED (r266) — PROMOTED into block 16.**  The in-place prefill band shipped as the block-16 r266
+amendment: the admission ladder (empty slot -> landing slot -> coldest NON-routed resident by the decode heat
+prior), the prefill-width remap, the finite-head guard over slot order, and the coalesced fill engine (which also
+carries the `O_DIRECT` offset round-out, P2a).  Numbers and gates:
+[`benchmarks/2026-11-12-prefill-in-place-arena.md`](../../../benchmarks/2026-11-12-prefill-in-place-arena.md),
+`WORKLOG.md` 261112.001.  The handover prompt below is kept as the record of what was scoped, not as live work.
+
 **Status: OPEN — scoping note + a measured reproduction.  Nothing implemented; nothing in `patches/`.**
 **Handover prompt for driving it: [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md)** (self-contained; paste it
 into a fresh session).

@@ -1,3 +1,79 @@
+## 261112.001 (r266) -- block 16's prefill band is served IN PLACE out of the arena: the residents are no longer D2D-copied every pass (`TODO` #317 CLOSED)
+
+**Change (block-16 amendment, one file, no new block, no new env).**  The arena tier is only partly resident, so
+above the decode/verify band it staged the used expert set into the scheduler's split-input copy -- D2D-copying
+every *resident* used expert out of the store on every pass, i.e. `O(used)` instead of `O(missing)`: 30 060.5 MiB of
+copy against 1 578.6 MiB read for a 38-token prompt (r265's census).  The prefill band now takes the slot-remap path
+the identity tier got in r258: admit the used-and-missing experts, publish the slot-remapped ids for the whole
+`n_used x n_tok` routing, and let `MUL_MAT_ID` read the arena.  `MOE_EXPERT_PREFILL_IN_PLACE` is the knob (it already
+existed); `=0` is byte-identical to r265.
+
+**Policy, as the maintainer decided it** (Q1 = rank by the decode heat prior; Q2 = prefer room, then "it should
+never evict", refined by the maintainer to "may admit if there is room").  Admission is a three-rung ladder: an
+**empty** slot; one of the table's **landing** slots (the coldest `slots/16` seeded slots -- a SOFT reserve, so a
+cold start pays no extra read and decode keeps them until prefill needs them); then a resident **this pass does not
+route**, coldest by the decode heat prior.  A slot the pass ROUTES is never reclaimed -- that is also the arm's hard
+bound (`|used| <= slots`), and a table that cannot be served in place is declined WHOLE (no partial admission) and
+keeps the scheduler's copy.
+
+**Measured on `halo`** (Q8_0 122B = the model that does NOT fit, 133 GiB of weights in 123 GiB RAM; text identical
+in every arm):
+
+| config | arm | copy (r265) | in place | delta |
+|---|---|---:|---:|---:|
+| Q8_0 `-lme 90` (200/256 slots) | 250-tok prompt eval | 50.8 t/s | **54.0 t/s** | **+6.3 %** |
+| Q8_0 `-lme 90` | 250-tok + 64 decode | 10.9 t/s | **11.45 t/s** | +5 % |
+| Q8_0 `-lme 90` | MTP `-n 512` (acceptance) | 10.55 t/s (0.74630) | **10.75 t/s (0.74630)** | +1.9 %, identical |
+| Q8_0 `-lme 90` | 24 576 tok, `-ub 4096` | 366.6 t/s | 366.6 t/s | inert (`|used| > slots`) |
+| Q8_0 `-lme 90` | 24 576 tok, `-ub 1024` | 151.7 t/s | **161.7 t/s** | +6.6 % |
+| Q8_0 `-lme 90` | arena D2D, 34-tok prompt | 40 535 MiB | **0** | removed |
+| Q5_K_XL `-lme 75` (241/256) | 34-tok prompt eval | 25.0 t/s | **32.9 t/s** | **+32 %** |
+| Q5_K_XL `-lme 75` | 250-tok prompt eval | 123.2 t/s | **158.3 t/s** | **+28.5 %** |
+| Q5_K_XL `-lme 75` | 24 576 tok, `-ub 4096` | 580.3 t/s | **606.7 t/s** | +4.5 % |
+| Q5_K_XL `-lme 75` | arena D2D, 34-tok prompt | 30 251 MiB | **0** | removed |
+
+**The wide band is conditional and that is structural**: a 4 096-token ubatch routes all 256 experts of a trunk
+table, so it can only be served in place when the arena holds that many slots -- at `-lme 90` (200 slots) the Q8 arm
+declines 123 of 144 tables and is exactly inert (3 paired runs, 0 difference); at `-lme 75` (241) it serves most
+calls; at `-ub 1024` both serve partially and gain.  Nothing regresses when it declines.
+
+**Decode cost, answered by simulation and then by measurement.**  A new `--prefill-admit {off,free,landing,ladder}`
+model in `scripts/moe-trace-replay.py` (driver `archive/work/prefill-in-place-arena/admission-sim.sh`) replays a real
+Q8_0 `-lme 90` trace (538-token prompt + 200 decode tokens): the ladder **removes 447-1101 of 11 559 decode misses**
+(prompt 200-538 tokens, `h` 0.9515 -> 0.9534-0.9561) -- admitting on prefill is a PREFETCH of the continuation, not a
+disturbance, and the reclaim rung only gives up the coldest non-routed expert.  The reserve-only arm (the strict
+"never evict" reading) is the worst of the four: it declines 99-138 of 144 tables and is neutral-to-negative.
+
+**Two-slot server interference -- a NEW gate, because this was omitted too long.**  `scripts/gate-prefill-server-slots.sh`
+(+ `.py`) runs `llama-server -np 2` and fires request B's 250-token PREFILL into the middle of request A's DECODE:
+A's text identical (`3c2245a89587`), A's decode **4.03 vs 3.78 t/s**, inside B's prefill window **0.58 vs 0.52 t/s**,
+A's longest inter-token gap **414 vs 623 ms**, B 15.6 s vs 17.2 s, no faults, and the admission really ran
+(126 calls x 78 tables, 1959 admissions).
+
+**A real defect the logits gate caught** (recorded so it cannot come back): the first cut checked "never reclaim a
+slot this pass ROUTES" for rung 3 only, so rung 2 could recycle a *routed* landing slot mid-pass.
+`gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0" --extra "-lme 16 --fit off"` measured **KLD 0.1157 /
+same-top-p 87.3 %** (PPL 5.82 -> 6.30) while every greedy-text arm stayed byte-identical; with the rule on every rung
+it is **-0.000000 / 99.990 %**.  The same bug was fixed in the replay model before its numbers were used.
+
+**Gates:** `gate-uma-experts.sh --quick --no-ram` **36 checks / 0 failures** with a new `inplace` arm (`-lme 16`:
+108 calls, 1603 admissions, D2D 1194 vs 3358 MiB, read 971.7 of 11 446.2 MiB) and a new `pfcp` arm
+(`MOE_EXPERT_PREFILL_IN_PLACE=0`, the r265 staging path, which owns the P5 streaming assertions now); prefill-logit
+**-0.000000 / 99.990 %**; MTP acceptance **0.74630 identical**; the new two-slot gate PASS; `check-gpu-faults` clean
+on every arm.  **`gate-fusion-alias-copy.sh` FAILS IDENTICALLY on the unmodified r265 build** (its repro and
+production arms do not reach the shape on gfx1151) -- pre-existing and box-specific, reported rather than skipped.
+
+**Memory:** the arena is byte-identical with and without the mechanism (`arena=78239.3` / `94248.0` MiB in BOTH
+arms -- the reserve is a designation, not a partition).  The cost is the remap staging `n_used x -ub` per table,
+**+34.4 MiB** at `-ub 4096` over 147 tables (~9 MiB at `-ub 2048`), plus `slot_land` at 1 byte/slot (**35 KiB**).
+
+**Not adopted (measured):** the `preadv`/direct read straight into the arena slots (601 vs 603 ms of hook, a wash,
+and it needs a per-table stream drain); the coalesced ring engine serves both arms and is where the **P2a `O_DIRECT`
+offset round-out is fixed**.  **P4 (the eager seed) is untouched** and stays `TODO` #318.
+
+Record: [`benchmarks/2026-11-12-prefill-in-place-arena.md`](benchmarks/2026-11-12-prefill-in-place-arena.md); campaign
+archived to [`archive/work/prefill-in-place-arena/`](archive/work/prefill-in-place-arena/).
+
 ## 261111.037 (r265, release) -- `v17-a691b2345-r265` is PUBLISHED: delivery repo + tag pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip
 
 **Release:** `v17-a691b2345-r265` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
@@ -94,7 +170,7 @@ page-cache thrash), so it should not wait long.
 `176ed88667e26cd426a857edd330b6d9219f5065`.  Published as **`v17-a691b2345-r265`** -- see 261111.037 for the tag, the fork refresh and the
 gate ledger.  Docs: `patches/README.md` (block-16
 amendment), `INVARIANTS.md` (r265), `benchmarks/2026-11-11-gtt-prefill-span-set.md`; the copy that remains is
-`TODO` #317 + [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md).
+`TODO` #317 + [`archive/work/prefill-in-place-arena/`](archive/work/prefill-in-place-arena/README.md).
 
 ## 261111.035 (r264, release) -- `v17-a691b2345-r264` is PUBLISHED: delivery repo pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip, and the ROCm images are for the off-host worker to pick up
 
