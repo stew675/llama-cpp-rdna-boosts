@@ -1,3 +1,90 @@
+## 261112.008 (r272, release) -- `v17-a691b2345-r272`: the copy-engine all-reduce's 2-rank arm exchanges ONCE (contributor PR #304), and `GGML_CUDA_ALLREDUCE=auto` finally means the default
+
+**Release:** `v17-a691b2345-r272` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`8cf740b7b9536af0f2d6aa7d4e19e38e5422583f`**, tree **`8bed4c1bae53385ee13231e508d04b655f4229be`**.  Block 01 amended
+(+71/-8, one file, `ggml-cuda.cu`); one new environment variable (`GGML_CUDA_AR_CE_SINGLE`, default on);
+`GGML_CUDA_ALLREDUCE` gains `auto` as a value.  **No numerics move: the arm is bit-identical by construction and by a
+byte-for-byte log-prob compare.**
+
+### The report (contributor PR #304, `briansp2020`, written by Claude on their behalf)
+
+For `n == 2` the bf16 large-tensor arm ran a reduce-scatter (each rank ships half its partial, the owner adds) then an
+all-gather of the reduced halves plus a `to_fp32`.  Their +43 lines send **each rank's whole bf16 partial to the peer
+once** and form every element as `fp32(bf16(fp32(own) + fp32(peer)))` in one kernel.  Claims: same bits, same link
+bytes, one cross-device dependency instead of two, no separate add / convert passes; `GGML_CUDA_AR_CE_SINGLE=0`
+restores the two-phase form; `n == 2` only.  Their measurements were on 2x R9700 (x8 each) with 2x Flash-Next:
++2.2-5.5 % prefill on their host-pool arm, +0.3-1.0 % all-VRAM, decode unchanged, replies byte-identical.
+
+### Assessment
+
+* **The bit-identity claim is right.**  Both forms compute the same expression from the same two staged bf16 partials
+  (the two-phase owner's `ggml_cuda_ce_add_bf16` + all-gather + `to_fp32`; the new kernel's identical
+  `__float2bfloat16` cast), and fp32 addition is commutative, so every element and every rank agree.  Verified the
+  strong way rather than by text: `llama-perplexity --kl-divergence-base` writes the per-position log-probs of the
+  whole vocabulary, **5 065 891 540 B** for 40 x 512, and the two arms' files are **`cmp`-identical**.  Same-seed
+  greedy text is `10a82b5559a9` in all four arms (2 devices either form, 3 devices, the previous binary).
+* **The gate that reaches it is not the documented one.**  The delivery's all-reduce arm is gated at
+  `--sm tensor --device 0,1,2`, and 3 ranks never enter this branch.  The reaching arm is `--device 0,2` (the x8
+  pair): mean KLD **-0.000000 / 100.000 %** with the base recorded from the two-phase form.
+* **What it buys here: +1.0-1.4 % prefill, decode flat.**  27B Q8_0, `-sm tensor` 0,2, `GGML_CUDA_ALLREDUCE=ce`,
+  `llama-bench -p 512,2048,4096 -n 64 -r 3`, two interleaved rounds: pp512 2298.6/2289.8 -> **2317.4/2315.4**, pp2048
+  2257.9/2255.1 -> **2285.4/2284.6**, pp4096 2230.9/2229.8 -> **2254.8/2255.6**, tg64 flat (33.4-33.9 both).  Smaller
+  than the submitter's host-pool figure and larger than their all-VRAM one, which is the expected shape for a change
+  that removes one kernel pass: it is a bigger fraction of a prefill that is not already waiting on host reads.
+* **Their biggest number is not resolvable on this box, and the attempt found a delivery bug instead.**  A 2-device
+  host-expert arm (`Flash-Next IQ3_S`, `-ncmoe 47 -lme 47`, 5 246-token prompt, warm runs) has a 4-6 % spread within
+  ONE arm -- `ce` read 2083.6 / 2241.8 / 2234.4 / 2238.3 t/s -- so no arm choice is decidable there.  Probing it
+  exposed something real: **`GGML_CUDA_ALLREDUCE=auto`, the value `ENVIRONMENT.md` documents the default under, was
+  not an accepted value.**  It hit the unknown-value branch and selected the butterfly: **2041.7 / 2051.3 t/s against
+  2164.0 / 2159.3** for the unset default on that arm, i.e. a run asking for the default silently lost the whole comm
+  layer (the unset default, `internal` and `ce` all land at 2158-2164, inside the noise).  Fixed in the same block:
+  `auto` is the default by name, `none`/`meta` are the butterfly by name, and an unrecognised value WARNs and says
+  what it selected.
+* **Two things the contributed cut lacked, both required by policy.**  The arm had **no census surface at all** -- a
+  `-lv 4` log could not say which form ran (the block's own r268 precedent was "per-arm logging") -- so it now prints
+  one `all-reduce: copy-engine 2-rank arm -- ONE exchange` line on the first call.  And the new variable had no
+  `ENVIRONMENT.md` row; it is there now, class kill-switch, default on.
+* **Also fixed while gating (tooling):** `gate-prefill-logits.sh` recorded no `device`/`sm` in the base meta, so a
+  1-device `layer` base and a 2-device `tensor` base were the same file name and the wrong-arm compare was silent.
+  Both are recorded now and the compat check refuses a mismatch (verified: a 1-device run against the 2-device base
+  fails with `base meta mismatch: device='0,2' != current '0'` before any GPU work).
+
+### What shipped
+
+Block 01 only: the single-exchange kernel + branch (`n == 2`, after the `q8ce` wire's early return, so the 8-bit wire
+keeps the two-phase form), the one-shot INFO, and `auto`/`meta` in the dispatcher.  `patches/README.md` block 01,
+`ENVIRONMENT.md` §6 (the new row + the corrected `ALLREDUCE` row), `INVARIANTS.md` (r272), `MANIFESTS.md` (block-01
+row + the rank-count rule in gate 4).  No numbers of record moved anywhere else.
+
+**Gates** (canonical build `~/llama.cpp/build-rocm`, gfx1201, ROCm 10.1.0):
+
+* `gate-prefill-logits.sh --device 0,2 --sm tensor --ab "GGML_CUDA_ALLREDUCE=ce GGML_CUDA_AR_CE_SINGLE=0"` ->
+  **mean KLD -0.000000 / same-top-p 100.000 %** (base PPL 5.9303, re-recorded with `device=`/`sm=` in the meta).
+* `gate-prefill-logits.sh --device 0,1,2 --sm tensor` against a base recorded from the **r270 binary** ->
+  **0.000000 / 99.990 %**, which is exactly what that binary reads against itself, i.e. the `n >= 3` path did not move.
+* the 5 GB log-prob `cmp` above, and greedy text `10a82b5559a9` on 2 and 3 devices.
+* mechanism: `-lv 4` prints the ONE-exchange line on the default arm and not with `=0`; `GGML_CUDA_ALLREDUCE=auto`
+  prints no `unknown ... value` WARN and selects the dual-arm chain.
+* MTP, the decode-width arm this change CAN reach (`draft-mtp n3` = a 4-row verify batch, 2 devices, 27B
+  UD-Q4_K_XL `-sm tensor`, `-n 3000`, Protocol A's P axis, `GGML_CUDA_ALLREDUCE=ce`): draft acceptance
+  **0.62074 (1951 accepted / 3143 generated, mean len 2.86) in both arms**, 91.6 vs 91.3 t/s, prefill
+  1486.7 -> 1531.7 (+3.0 %).  Identical acceptance is the expected result of identical values, not a
+  coincidence: a four-axis sweep would report the same four numbers in both arms.
+* `scripts/check-gpu-faults.sh` clean over the whole session's journal window and every arm log; the KLD gate's own
+  per-run journal check clean.
+* `scripts/gate-per-block-build.sh --changed-from b5395bf8d` (block 01 changed; block 09's delta re-registered
+  because block 01 moved `ggml-cuda.cu`'s context) -> **3/3 built** (6 / 16 / 8 s), `all` target, fresh build dir
+  per commit.
+* `scripts/validate-set.sh` -> **17 blocks**, checksums + fresh-tarball strict apply, applied tree
+  `8bed4c1b...`, Windows portability scan 291 files clean.
+* `scripts/fork-refresh.sh --build --gates` -> re-cut in a clean checkout at `a691b2345` reproduces **tip
+  `8cf740b7b`, tree `8bed4c1b`**; its build + 1-device prefill-logit arm pass (0.000000 / 100.000 %).
+
+### Records
+
+`benchmarks/2026-11-12-allreduce-ce-single-exchange.md` (the arms, the numbers, the `auto` finding, what is NOT
+resolvable); `INVARIANTS.md` r272; `patches/README.md` block 01; `ENVIRONMENT.md` §6; `MANIFESTS.md` gate 4 + block 01.
+
 ## 261112.007 (r271, release) -- the seed-policy record names the arm it measured: `auto` is INERT on a covering pool, the mirror loss is `lazy`'s alone
 
 **Release:** `v17-a691b2345-r271` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

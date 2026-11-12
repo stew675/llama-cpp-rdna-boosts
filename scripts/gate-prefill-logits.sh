@@ -359,14 +359,18 @@ le() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 <= b+0) }'; }
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 >= b+0) }'; }
 
 # ---------------------------------------------------------------------------
-# base compatibility (model/corpus/ctx/chunks must match to be a valid compare)
+# base compatibility (model/corpus/ctx/chunks/device/sm must match to be a valid compare)
 # ---------------------------------------------------------------------------
 base_meta_field() { [ -f "$META" ] && sed -n "s/^$1=//p" "$META" | head -1 || true; }
 
 check_base_compat() {
     [ -f "$META" ] || { echo "    WARN: no base metadata ($META); cannot verify the base matches this model/corpus"; return 0; }
     local problems=0 k v want
-    for k in model corpus_sha256 ctx chunks kv; do
+    # `device` and `sm` are part of the POINT (r272): an all-reduce arm is only reachable on >= 2 devices with a
+    # `tensor` split, and the base file name carries neither, so without this check a 1-device `layer` base is
+    # silently accepted as the reference for a 2-device `tensor` arm -- which reads as a gate result and is not one.
+    # A legacy base has neither field and is left alone.
+    for k in model corpus_sha256 ctx chunks kv device sm; do
         v="$(base_meta_field "$k")"
         case "$k" in
             model)         want="$MODEL" ;;
@@ -374,6 +378,8 @@ check_base_compat() {
             ctx)           want="$CTX" ;;
             chunks)        want="$CHUNKS" ;;
             kv)            want="$KV" ;;
+            device)        want="$DEVICE" ;;
+            sm)            want="$SM" ;;
         esac
         if [ -n "$v" ] && [ "$v" != "$want" ]; then
             echo "    base meta mismatch: $k='$v' != current '$want'" >&2
@@ -438,6 +444,8 @@ if [ "$RECORD" -eq 1 ]; then
         echo "ngl=$NGL"
         echo "fa=$FA"
         echo "kv=$KV"
+        echo "device=$DEVICE"
+        echo "sm=$SM"
         echo "arm=${RECORD_ENV:-<default>}"
         echo "base_ppl=$b_ppl"
         echo "base_sha256=$b_sha"
@@ -475,6 +483,8 @@ if [ "$RECORD" -eq 1 ]; then
             echo "ngl=$NGL"
             echo "fa=$FA"
             echo "kv=$KV"
+            echo "device=$DEVICE"
+            echo "sm=$SM"
             echo "ub=$CONTROL_UB"
             echo "arm=${RECORD_ENV:-<default>}"
             echo "base_ppl=$c_ppl"

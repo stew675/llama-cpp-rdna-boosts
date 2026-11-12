@@ -1,4 +1,4 @@
-From bcb2a04a09b743f4a94de0cc55f36ab5c054819d Mon Sep 17 00:00:00 2001
+From 58ba598b5b31f404c0c92906e353159a8ddfdc70 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/16] rdna-boosts: block 05: flash-attention band, native
@@ -5438,7 +5438,7 @@ index a1c3a12d3..0bc638b7a 100644
 +    return true;
  }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 28e9ca8d1..59e630fa1 100644
+index d320983ca..526a4349b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -75,6 +75,7 @@
@@ -5449,7 +5449,7 @@ index 28e9ca8d1..59e630fa1 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -5837,6 +5838,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5900,6 +5901,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -5476,7 +5476,7 @@ index 28e9ca8d1..59e630fa1 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -6019,12 +6040,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6082,12 +6103,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -5498,7 +5498,7 @@ index 28e9ca8d1..59e630fa1 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -6074,6 +6104,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6137,6 +6167,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }

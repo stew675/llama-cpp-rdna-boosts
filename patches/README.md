@@ -392,8 +392,30 @@ worse at B=4/B=8; and `none` == `draft-mtp n3` == `n7` byte-identically on every
 draft/verify band is not on the wire at all.
 `benchmarks/2026-11-11-allreduce-q8ce-wire.md`; `WORKLOG.md` 261111.001.
 
-**Knobs.**  `GGML_CUDA_ALLREDUCE` (`auto` default on Linux/HIP since r165, `hybrid`, `nccl`, `internal`,
-`ce`, `q8ce`, `meta`), `GGML_CUDA_AR_CE_PEER`, `GGML_CUDA_AR_P2P*`,
+**r272 -- the copy-engine 2-rank arm exchanges ONCE (contributor PR #304).**  For two ranks the bf16 large-tensor
+arm no longer runs a reduce-scatter and then an all-gather: each rank ships its whole bf16 partial to the peer
+once, and one kernel forms `fp32(bf16(fp32(own) + fp32(peer)))` straight into the output.  That is the rounding
+of `ce_add_bf16` on the owner followed by the all-gather and `to_fp32` (fp32 addition is commutative, and the
+kernel's cast is the same `__float2bfloat16`), so **the output bits cannot move** -- measured as a **byte-identical
+5 GB log-prob dump** of a 40x512 prefill across the two arms, mean KLD **-0.000000 / 100.000 %** on the 2-device
+`-sm tensor` arm, and identical same-seed greedy text on 2 and 3 devices.  Same bytes on the link in each
+direction; one cross-device dependency instead of two, one kernel instead of an add pass plus a separate
+`to_fp32` pass.  Worth **+1.0-1.4 %** prefill on the delivery's 2-device pair (27B Q8_0, pp512/2048/4096, two
+interleaved rounds), decode flat.  Reach: `n == 2` only -- 3+ ranks keep the two-phase form untouched (a
+3-device arm against a base recorded from the previous build reads 0.000000 / 99.990 %, the same numbers the
+previous build reads against itself), and the `q8ce` 8-bit wire returns before this branch, so it keeps the
+two-phase form.  Two delivery corrections to the contributed cut: `-lv 4` now prints one line when the form
+fires (the arm had no census surface at all, and the policy is that a new arm must be nameable from a log), and
+`GGML_CUDA_ALLREDUCE=auto` -- **the name this default is documented under** -- is now an accepted value.  Before
+r272 it fell through the unknown-value branch and selected the butterfly: a run asking for the default lost the
+whole comm layer, measured **-5 %** on a 2-device host-expert prefill (2046.8 -> 2158.4 t/s, two rounds each;
+the arm-choice question there is NOT resolvable -- `ce` measured 2083.6 and 2241.8 on the same arm -- so the
+finding is "the delivery's comm layer is worth 5 % here", not "the CE arm beats RCCL").  Gate:
+`benchmarks/2026-11-12-allreduce-ce-single-exchange.md`; `WORKLOG.md` 261112.008.
+
+**Knobs.**  `GGML_CUDA_ALLREDUCE` (unset = the dual-arm default on Linux/HIP since r165; `auto` is the same
+chain by name since r272, then `hybrid`, `nccl`, `internal`, `ce`, `q8ce`, `none` / `meta` = the butterfly),
+`GGML_CUDA_AR_CE_PEER`, `GGML_CUDA_AR_CE_SINGLE`, `GGML_CUDA_AR_P2P*`,
 `GGML_CUDA_AR_CE_SCRATCH_MIB`, `GGML_CUDA_AR_SPIN_TIMEOUT_MS` / `_HARD_MS`,
 `GGML_CUDA_AR_SMALL_BLOCKS` / `_SMALL_BYTES`, `GGML_CUDA_AR_KER_EVENTS`, `GGML_CUDA_AR_PROFILE`.
 

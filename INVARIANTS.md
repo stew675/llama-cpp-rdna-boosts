@@ -4336,3 +4336,37 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   already faulted the model into the page cache therefore sizes a SMALLER pool than the arm it is compared with --
   measured 33.6 GiB against 40.0 GiB (a subset against a mirror, which then differ in the device remap too).  Pin it
   (`-lme N` + `MOE_HOST_POOL_RAM_PCT=0`) for any pool A/B, and drop the page cache before every run.
+
+### r272 — the copy-engine 2-rank arm exchanges once, and `GGML_CUDA_ALLREDUCE=auto` is a value
+
+* **The two-phase reduce-scatter + all-gather and the single exchange cannot disagree, and that is why the
+  arm ships on by default.**  For `n == 2` both forms compute `bf16(fp32(own) + fp32(peer))` from the same two
+  staged bf16 partials — the two-phase one on the chunk's owner in `ggml_cuda_ce_add_bf16`, then gathered as
+  bf16 and widened by `to_fp32`; the single-exchange one in `ggml_cuda_ce_add_bf16_to_f32` with the same
+  `__float2bfloat16` cast — and fp32 addition is commutative, so every element is bit-identical and every rank
+  agrees.  The measurement that settles it: a **5 065 891 540 B** per-position log-prob dump of a 40x512
+  prefill is **byte-identical** across the arms (`cmp`), and same-seed greedy text is `10a82b5559a9` in all
+  four arms (2 devices either form, 3 devices, previous binary).  Worth +1.0-1.4 % prefill on the 2-device pair,
+  decode flat.  Do not "verify" this class with text alone — dump and `cmp` the log-probs.
+* **A `-sm tensor` arm's `n` is what makes a large-tensor arm reachable or not, and the CE arm is reachable at
+  BATCHED decode widths too.**  A single-token all-reduce (20 KB on 27B) is under `GGML_CUDA_AR_SMALL_BYTES`
+  and takes the internal pipeline, but `tg64` (1.3 MB) and a speculator's 4-8-row verify batch (163-327 KB) take
+  the CE arm at `n == 2`.  That is why a 2-rank-only change can still touch a decode arm, and why the
+  `gate-prefill-logits.sh --device 0,2 --sm tensor` arm — not the documented `--device 0,1,2` one — is the gate
+  that reaches it.
+* **`gate-prefill-logits.sh`'s base file name does not carry the device list or the split mode; the meta does
+  now (r272).**  A 1-device `layer` base and a 2-device `tensor` base were the same file name, so the wrong-arm
+  compare was silent (it reads as a gate result and is not one).  `device=` and `sm=` are recorded and checked,
+  and a legacy base without them is left alone.
+* **`GGML_CUDA_ALLREDUCE=auto` selected the BUTTERFLY until r272.**  The dispatcher accepted
+  `hybrid|nccl|internal|ce|q8ce|none` and treated anything else as unknown -> `init_none` (the butterfly), so
+  the literal string `auto` — the name `ENVIRONMENT.md` documents the default under — silently cost the whole
+  comm layer: **2041.7 / 2051.3 t/s against 2164.0 / 2159.3** for the unset default on a 2-device host-expert
+  prefill (Flash-Next IQ3_S, `-ncmoe 47 -lme 47`, 5 246-token prompt, warm).  `auto` is now the unset default by
+  name; `none`/`meta` are the butterfly by name; an unrecognised value WARNs and takes it.
+* **A host-expert prefill on this box cannot resolve an all-reduce arm choice.**  The `ce` arm measured
+  2083.6 / 2241.8 / 2234.4 / 2238.3 t/s on four identical warm runs of one config, i.e. a 4-6 % spread wider
+  than any arm-to-arm difference; only the *presence* of the comm layer (5 % over the butterfly) is stable.
+  Also: `--load-mode dio` makes `-lme`'s pinned pool **NOT APPLIED** (`a pool needs a mapped load`), so a
+  "host-pool" arm measured with `dio` is a file-read arm — check the placement line before quoting one as a
+  pool result.
