@@ -26,10 +26,13 @@ which is why only the quantized arm died.  Verified by graph census (`HIST`/`DUM
 the commit): the q8_0 graph carries 321 `MUL_MAT` / 320 `RESHAPE` / 40 `CONT` / 40 `FLASH_ATTN_EXT` against the f16
 arm's 161 / 40 / 0 / 40, and the extra nodes are `cache_k_rot_l0` / `cache_v_rot_l0` mul-mats.
 
-**Mainline `a691b2345` alone aborts on the same model**: with `LLAMA_KQ_MASK_DERIVED=0` (probe out of the way) it
-falls off `hash_set.size >= n_nodes + n_leafs` in `ggml_backend_sched_reserve`.  The delivery only got there first,
-through the derived-kq-mask **probe** (64 tokens, `split_only` path, no size assert), which is why the reporter saw
-an opaque `GGML_ABORT` instead of an assert.
+**Mainline `a691b2345` alone aborts on the same model, at the same bare abort.**  Built unpatched in a separate tree
+(`all` target, gfx1201): its own **`kv_rows` probe** (`n_tokens=1`, `split_only`) splits a **1649-node / 413-leaf**
+graph against the same 2053-entry table and dies at `ggml_hash_find_or_insert`.  So there is no assert to see: the
+`split_only` probe path calls `ggml_backend_sched_split_graph` directly, which is also why the delivery's own probe
+(derived-kq-mask, 64 tokens, the same node count) reaches it with no llama-level message.  Which probe dies is the
+only difference: upstream probes `kv_rows` unconditionally, the delivery only with `--kv-unified`, so on
+`llama-cli`'s default the derived-kq-mask probe is the one that overflows.
 
 ### What shipped
 
@@ -79,7 +82,9 @@ nothing is built on the primary box -- `radiance`'s `scripts/container-watch.sh`
 
 **Docs:** `patches/README.md` (block 12, r267 amendment), `INVARIANTS.md` r267, `ENVIRONMENT.md` (a new §8 row for
 the upstream `LLAMA_ATTN_ROT_DISABLE` -- the A/B arm this bug is diagnosed with, and the switch that drops the budget
-term with the tensors).  No new variable.  No `TODO` item: nothing is left open.
+term with the tensors).  No new variable.  `upstream/kv-rotation-node-budget/` carries the unadulterated-upstream
+version (built and measured on `a691b2345`, `all` target, phi-4 aborts unpatched and loads with it), because the
+regression is upstream's.  No `TODO` item: nothing is left open.
 
 ## 261112.002 (r266, release) -- `v17-a691b2345-r266` is PUBLISHED: delivery tag + personal fork's `rdna-boosts` at 6bac1773, and the two-slot interference gate ships with it
 

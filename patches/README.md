@@ -4010,8 +4010,10 @@ phi-4 (`phi3`, 40 layers, 243 tensors, `q8_0`/`q8_0`, `-fa on`) therefore builds
 415 leafs) against a 1944-entry budget, and the delivery reached the overflow in `ggml_backend_sched_split_graph`
 through the derived-kq-mask **probe** (64 tokens; the `split_only` path has no size assert, so it is a bare
 `GGML_ABORT("visited all hash table entries")` at `ggml-impl.h:337`).  **Upstream mainline `a691b2345` aborts on
-the same model** -- at the `hash_set.size >= n_nodes + n_leafs` assert in `ggml_backend_sched_reserve` -- so this is
-upstream's regression, not a delivery one; the delivery's job was to stop crashing opaquely first.  The budget now
+the same model, with the same bare message** -- in its own `kv_rows` probe (1 token, `split_only`, 1649 nodes + 413
+leafs against the same 2053-entry table; the `split_only` path bypasses the reserve/alloc size asserts, so there is
+never an assert to read) -- so this is upstream's regression, not a delivery one; the delivery's job was to stop
+crashing opaquely first.  The budget now
 asks the memory module: `llama_memory_i::graph_extra_entries()` returns **7 entries per rotated tensor per layer**
 (6 nodes + 1 leaf), counted from the rotation tensors the cache really created (so the ctor's predicate -- quantized
 type, head dim % 64, `LLAMA_ATTN_ROT_DISABLE` -- is not duplicated), and `llama_kv_cache_iswa` /

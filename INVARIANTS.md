@@ -4207,10 +4207,13 @@ they are what a future "the scheduler's hash set is full" report must be read ag
   `ggml_hash_find_or_insert` ("visited all hash table entries", `ggml-impl.h:337`) with no llama-level message at all
   -- which is the trace a reporter sees (`#3 ggml_backend_sched_split_graph`, `#5 resolve_fused_ops(...)::{lambda}`).
   Do not read that abort as "ggml's hash table is buggy": it is the budget.
-* **It reproduces on unadulterated upstream.**  `a691b2345` alone aborts on the same model at the
-  `hash_set.size >= n_nodes + n_leafs` assert once the probe is out of the way (`LLAMA_KQ_MASK_DERIVED=0`); the
-  delivery only reached it first, through the derived-kq-mask probe, and therefore with a worse message.  A report
-  that says "unmodified build" is still our bug to make diagnosable.
+* **It reproduces on unadulterated upstream, with the same bare abort.**  `a691b2345` alone dies at
+  `ggml_hash_find_or_insert` in its own `kv_rows` probe (1 token, `split_only`, 1649 nodes + 413 leafs against the
+  same 2053-entry table).  **A `split_only` probe graph never reaches the `hash_set.size >= n_nodes + n_leafs`
+  assert** -- `graph_reserve(split_only=true)` calls `ggml_backend_sched_split_graph` directly -- so "the budget
+  assert will tell us" is wrong for every probe-based check, ours included.  Which probe dies is only a matter of
+  when each is enabled (upstream's `kv_rows` runs unconditionally, the delivery's derived-kq-mask probe runs on a
+  non-unified single-stream cache).  A report that says "unmodified build" is still our bug to make diagnosable.
 * **Budget from the cache's own tensors, never from a copied predicate.**  `llama_memory_i::graph_extra_entries()`
   walks the rotation tensors `init_rotation()` actually created (7 entries each: 6 nodes + 1 leaf), and the compound
   memory types (`llama_kv_cache_iswa`, `llama_memory_hybrid`, `llama_memory_hybrid_iswa`) sum their attention caches --

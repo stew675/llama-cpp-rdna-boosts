@@ -1,0 +1,218 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 973aea25b..3334d8524 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2960,6 +2960,8 @@ extern "C" {
+     GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
+     GGML_API struct ggml_tensor ** ggml_graph_nodes  (struct ggml_cgraph * cgraph);
+     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
++    // the graph's leaf count: the scheduler's per-tensor tables are indexed for nodes AND leafs
++    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
+ 
+     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index f8cf75b3a..556474d8c 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7828,6 +7828,10 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
+     return cgraph->n_nodes;
+ }
+ 
++int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
++    return cgraph->n_leafs;
++}
++
+ void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
+     cgraph->nodes[cgraph->n_nodes] = tensor;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a450d8257..7a9bfa520 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2765,6 +2765,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+     }
+ 
++    // the memory module's own graph builders: the KV Hadamard rotation adds two mul-mat chains and one
++    // rotation-constant leaf per rotated tensor per layer, and every one of them occupies an entry of the
++    // scheduler's hash table / node+leaf id arrays.  Without this term a quantized-KV model whose graph
++    // lands just above `8 * n_tensors` aborts inside ggml_backend_sched_split_graph with "visited all hash
++    // table entries" (phi-4 q8_0: 2064 entries against a 1944-entry budget).
++    res += memory ? memory->graph_extra_entries() : 0;
++
+     if (cparams.training) {
+         res *= 4;
+     }
+@@ -2880,6 +2887,18 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     auto * gf = model.build_graph(gparams);
+ 
++    // The scheduler's hash table and its node/leaf id arrays are sized from graph_max_nodes(), which is a
++    // heuristic.  A graph that does not fit them aborts deep inside ggml_backend_sched_split_graph with
++    // "visited all hash table entries" (ggml-impl.h).  Refuse the graph here instead, so the cause is named.
++    const int n_nodes_gf = gf ? ggml_graph_n_nodes(gf) : 0;
++    const int n_leafs_gf = gf ? ggml_graph_n_leafs(gf) : 0;
++    if ((int64_t) n_nodes_gf + n_leafs_gf > res->get_max_nodes()) {
++        LLAMA_LOG_WARN("%s: the graph needs %d entries (%d nodes + %d leafs) but the scheduler was reserved "
++                "for %d - this model/configuration is over its node budget (graph_max_nodes)\n",
++                __func__, n_nodes_gf + n_leafs_gf, n_nodes_gf, n_leafs_gf, (int) res->get_max_nodes());
++        return nullptr;
++    }
++
+     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
+     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
+         llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+diff --git a/src/llama-kv-cache-iswa.cpp b/src/llama-kv-cache-iswa.cpp
+index 8ce8e0165..ac7d4009e 100644
+--- a/src/llama-kv-cache-iswa.cpp
++++ b/src/llama-kv-cache-iswa.cpp
+@@ -156,6 +156,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
+     return mb;
+ }
+ 
++uint32_t llama_kv_cache_iswa::graph_extra_entries() const {
++    return kv_base->graph_extra_entries() + kv_swa->graph_extra_entries();
++}
++
+ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+     // first try simple split
+     do {
+diff --git a/src/llama-kv-cache-iswa.h b/src/llama-kv-cache-iswa.h
+index 65aba2af7..715743ebf 100644
+--- a/src/llama-kv-cache-iswa.h
++++ b/src/llama-kv-cache-iswa.h
+@@ -78,6 +78,9 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+ 
++    // llama_memory_i: both sub-caches' Hadamard rotation entries
++    uint32_t graph_extra_entries() const override;
++
+     // state write/load
+ 
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a1ec67e26..6d81e31fe 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1597,6 +1597,23 @@ std::vector<ggml_tensor *> llama_kv_cache::get_k_rot() const {
+     return res;
+ }
+ 
++uint32_t llama_kv_cache::graph_extra_entries() const {
++    // per rotated tensor: two `llama_mul_mat_hadamard` chains (the rows going into the cache and the
++    // attention result coming out; 3 nodes each - cont/reshape + mul_mat + reshape) plus its rotation
++    // constant as a graph leaf, see build_attn() and init_rotation().
++    if (n_rot_k == 0 && n_rot_v == 0) {
++        return 0;
++    }
++
++    uint32_t res = 0;
++    for (const auto & layer : layers) {
++        res += layer.k_rot ? 7 : 0;
++        res += layer.v_rot ? 7 : 0;
++    }
++
++    return res;
++}
++
+ std::vector<ggml_tensor *> llama_kv_cache::get_v_rot() const {
+     std::vector<ggml_tensor *> res(hparams.n_layer_all, nullptr);
+     for (const auto & [il, idx] : map_layer_ids) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5aafbebb3..45d06264f 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -239,6 +239,9 @@ public:
+     std::vector<ggml_tensor *> get_k_rot() const;
+     std::vector<ggml_tensor *> get_v_rot() const;
+ 
++    // llama_memory_i: the graph entries (nodes + leafs) the Hadamard rotation adds to every graph
++    uint32_t graph_extra_entries() const override;
++
+     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+ 
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+index 6d843c76e..beb564b58 100644
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -193,6 +193,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
+     return mb;
+ }
+ 
++uint32_t llama_memory_hybrid_iswa::graph_extra_entries() const {
++    // only the attention (iSWA) cache rotates; the recurrent memory has no K/V rotation
++    return mem_attn->graph_extra_entries();
++}
++
+ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     mem_attn->state_write(io, seq_id, flags);
+     mem_recr->state_write(io, seq_id, flags);
+diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
+index 52c885ac9..14e752850 100644
+--- a/src/llama-memory-hybrid-iswa.h
++++ b/src/llama-memory-hybrid-iswa.h
+@@ -71,6 +71,9 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+ 
++    // llama_memory_i: the attention (iSWA) cache's Hadamard rotation entries
++    uint32_t graph_extra_entries() const override;
++
+     // state write/load
+ 
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 7d3b27908..a2b31bac8 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -188,6 +188,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
+     return mb;
+ }
+ 
++uint32_t llama_memory_hybrid::graph_extra_entries() const {
++    // only the attention cache rotates; the recurrent memory has no K/V rotation
++    return mem_attn->graph_extra_entries();
++}
++
+ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     mem_attn->state_write(io, seq_id, flags);
+     mem_recr->state_write(io, seq_id, flags);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 2b4d1269c..50bbaf9fa 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -71,6 +71,9 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+ 
++    // llama_memory_i: the attention cache's Hadamard rotation entries
++    uint32_t graph_extra_entries() const override;
++
+     // state write/load
+ 
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 37d01ed11..5079a25f4 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -150,6 +150,17 @@ struct llama_memory_i {
+ 
+     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+ 
++    // the graph entries (nodes + leafs) this memory module's graph builders add to EVERY graph, on top of
++    // what the model's own builder produces.  Today that is the KV Hadamard rotation: a rotated cache
++    // inserts two `llama_mul_mat_hadamard` chains (cont/reshape + mul_mat + reshape = 3 nodes each) per
++    // rotated tensor per layer, and -- since #31073 keeps the rotation constants on the device -- one graph
++    // LEAF per rotated tensor per layer.  `graph_max_nodes()` is what sizes the scheduler's hash table and
++    // its node/leaf id arrays, and both are indexed over nodes AND leafs, so a budget that does not cover
++    // this aborts inside `ggml_backend_sched_split_graph` with "visited all hash table entries" (phi-4 with
++    // a q8_0 cache adds 12 nodes and 2 leafs per layer, ~560 entries of a 1944-entry budget).  Counted from
++    // the tensors the cache really created, so there is no second copy of the predicate to keep in sync.
++    virtual uint32_t graph_extra_entries() const { return 0; }
++
+     //
+     // state write/read
+     //
