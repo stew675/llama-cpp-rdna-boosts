@@ -1,0 +1,73 @@
+From 3cdc8261239cf0232d2e3ff1b2d897d24029bf2c Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:07:01 +0800
+Subject: [PATCH] FA: the GQA choices of the RDNA band and tile launchers count
+ the derived KQ mask at src[6] (GGML_CUDA_FA_DERIVED_GQA=0: src[5])
+
+Upstream #29510 (the a691b2345 base, r236 onward) took src[5] of GGML_OP_FLASH_ATTN_EXT for kv_rows and moved the derived KQ
+mask to src[6..8].  ggml_cuda_flash_attn_ext_has_mask counts src[6], but fattn-rdna.cuh (ggml_cuda_fattn_band_wmma_applies) and
+fattn-tile.cuh (use_gqa_opt in launch_fattn_tile_switch_ncols2) still ask src[5], so an op with the derived mask (ubatches of 9+
+tokens: n-gram verify batches of 9..16 rows, short prefill chunks) takes other kernel variants than the same op with a mask tensor.
+Results are unchanged; only the kernel choice is.  GGML_CUDA_FA_DERIVED_GQA=0 restores the src[5] check.
+
+Written by Claude (AI) on behalf of overdoingism.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-common.cuh | 9 +++++++++
+ ggml/src/ggml-cuda/fattn-rdna.cuh   | 4 +++-
+ ggml/src/ggml-cuda/fattn-tile.cuh   | 3 ++-
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 839deeb27..35284f86b 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -20,6 +20,15 @@
+ // runs.  A skipped group only ever contained maximum-subtracted -INF logits, so the softmax/PV
+ // accumulators are unchanged and the result is bit-identical.  GGML_CUDA_FA_MASK_SKIP=0 is the
+ // A/B kill-switch.
++// The derived kq mask (ggml_flash_attn_ext_add_kq_derived) sits at src[6] since upstream #29510 took src[5] for kv_rows.  The
++// GQA-optimization choices of the RDNA and tile launchers must count it as a mask, as ggml_cuda_flash_attn_ext_has_mask does,
++// or a derived op takes other kernel variants than the same op with a mask tensor (r236..r262 checked src[5]).
++// GGML_CUDA_FA_DERIVED_GQA=0: the src[5] check again.
++static inline bool ggml_cuda_fattn_derived_mask(const ggml_tensor * dst) {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FA_DERIVED_GQA"); return e == nullptr || atoi(e) != 0; }();
++    return on ? dst->src[6] != nullptr : dst->src[5] != nullptr;
++}
++
+ static inline bool ggml_cuda_fattn_kq_block_skip_enabled() {
+     static const bool enabled = []() {
+         const char * e = getenv("GGML_CUDA_FA_MASK_SKIP");
+diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
+index 2d056f238..982892b33 100644
+--- a/ggml/src/ggml-cuda/fattn-rdna.cuh
++++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
+@@ -432,7 +432,9 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+ 
+     // The same GQA-optimization / alignment conditions the GQA kernels require: a mask is present,
+     // no ALiBi, the KV is FATTN_KQ_STRIDE-aligned, and every non-quantized operand is 16-byte aligned.
+-    bool gqa_opt = (mask != nullptr || dst->src[5] != nullptr) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // the derived kq mask is src[6] since upstream #29510 took src[5] for kv_rows: it must count as a mask here, as in
++    // ggml_cuda_flash_attn_ext_has_mask, or a derived op takes other kernel variants than the same op with a mask tensor
++    bool gqa_opt = (mask != nullptr || ggml_cuda_fattn_derived_mask(dst)) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index e585f7eeb..ffb9cbeb2 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1944,7 +1944,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     const int device_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(device_cc);
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+-    const bool use_gqa_opt = (mask != nullptr || KQV->src[5] != nullptr) && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // the derived kq mask is src[6] (src[5] is kv_rows since upstream #29510), see ggml_cuda_fattn_derived_mask
++    const bool use_gqa_opt = (mask != nullptr || ggml_cuda_fattn_derived_mask(KQV)) && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     // RDNA2 (gfx1030): cap ncols2<=2 for D=128. D=256 was capped on the belief that the wider
+     // variants overflow the register file (occupancy 0 -> abort), but measured 4x8 D=256 launches
+-- 
+2.43.0
+
