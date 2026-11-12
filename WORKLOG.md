@@ -1,3 +1,36 @@
+## 261111.037 (r265, release) -- `v17-a691b2345-r265` is PUBLISHED: delivery repo + tag pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip
+
+**Release:** `v17-a691b2345-r265` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`7efb30ae5`**, tree **`176ed8866`**.  Annotated tag `d7e29517` on `main` (`^{}` = `7a3a78cf`).
+
+**Published:**
+* delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `3788f6ec..7a3a78cf`, tag
+  `v17-a691b2345-r265`.
+* personal fork `git@github.com:stew675/llama.cpp.git`: `rdna-boosts` `c334e17fe..7efb30ae5`, verified by
+  `git ls-remote` -- the remote branch carries exactly `release.json.tip`.  `scripts/fork-refresh.sh --gates
+  --push --yes` re-cut it from `patches/` at the base, asserted the tree (`Applied tree matches release.json`),
+  ran the gates, and pushed with `--force-with-lease` (lease `c334e17fe`).
+* ROCm container images: nothing to do here -- the worker watcher on `radiance` polls for the tag and builds both
+  ROCm lines off-host (`scripts/container-watch.sh`, policy in `AGENTS.md`/`CONTAINERS.md`).  No image build was
+  run on the primary box.
+
+**Gate ledger** (`--build --gates` on `7efb30ae5`, plus the two gates that box needs set up by hand):
+`validate-set.sh` (17 hashes, fresh-tarball strict `git am`, tree match `176ed8866`, Windows path/portability
+lint); deterministic re-cut (an independent local clone at `a691b2345` reproduces tip `7efb30ae5` / tree
+`176ed8866` exactly, and `apply-all.sh` prints `Applied tree matches release.json`); full canonical build
+(`~/bin/build-llama-rocm`, no errors); coherence 4B 1 GPU **`1c5d32ac537d`** (100 chars) == the r254/r264
+reference; **prefill-logit KLD -0.000000 / same-top-p 99.990 %** (build `7efb30ae5`, base PPL 5.8238, journal
+clean); `gate-uma-experts.sh --quick --no-ram` **29 checks / 0 failures**; greedy text identical between block
+16's streaming arm and the delivery's per-expert copy (`58fba7e8b027`).
+
+**One tooling finding (recorded, not fixed).**  `scripts/fork-refresh.sh --gates` invokes
+`gate-prefill-logits.sh` bare, and the gate's model auto-pick keys on the biggest device's reported VRAM -- on an
+APU that is ~2 GiB, so it refuses with `no auto model found (set MODEL); biggest single card = 2 GiB` on a box
+with 123 GiB of unified memory.  The gate itself is fine when given `MODEL=` (and `PPL_EXTRA=` to reproduce the
+recorded base's suffix, which this box's base carries: `-lme 4 --fit off`).  Two suggestions for a later change:
+make the APU case fall back to the host/GTT figure (or say so), and have the coherence arm print the extracted
+hash rather than the last three stdout lines (whose banner/footer make a vacuous arm look like a check).
+
 ## 261111.036 (r265) -- block 16's prefill span plan read the WHOLE table minus the used residents: a 38-token prompt went 3.2 -> 26.6-29.7 t/s, and a wide prefill +9.6 %
 
 **The report.**  A few-hundred-byte prompt in the WebUI "looks like it reads the entire set of model weights from
@@ -58,8 +91,8 @@ page-cache thrash), so it should not wait long.
 
 **Delivery state.**  `patches/` 0000-0016 + `rdna-boosts-all.patch` regenerated from the canonical chain,
 `release.json` = `v17-a691b2345-r265`, tip `7efb30ae5f075aa76c0d31a1a7dbde1b263f1591`, tree
-`176ed88667e26cd426a857edd330b6d9219f5065`.  **Not yet published** (no push, no tag): the fork refresh
-(`scripts/fork-refresh.sh --push`) and the tag are the maintainer's call.  Docs: `patches/README.md` (block-16
+`176ed88667e26cd426a857edd330b6d9219f5065`.  Published as **`v17-a691b2345-r265`** -- see 261111.037 for the tag, the fork refresh and the
+gate ledger.  Docs: `patches/README.md` (block-16
 amendment), `INVARIANTS.md` (r265), `benchmarks/2026-11-11-gtt-prefill-span-set.md`; the copy that remains is
 `TODO` #317 + [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md).
 
