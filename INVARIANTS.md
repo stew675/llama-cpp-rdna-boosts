@@ -4263,3 +4263,33 @@ it and asked `src[5]` (upstream's `kv_rows` slot since #29510) alone.  The facts
   `FATTN_KQ_STRIDE`-aligned, so `use_gqa_opt` stayed false even after the fix: 6978/6978 either way.  The aligned
   head-512 derived case added in r268 is the tile GQA arm on any cap <= 320 layout and the MMA arm on gfx1201; the
   second `test-backend-ops` run with `GGML_CUDA_FA_WMMA_MAX_HEAD=128` is what makes it an oracle here.
+
+## r269 — a split expert upload's guard is PER DEVICE, not one contiguous 512-byte source tail (block 09/10, Qwen3.8-Flash-Next UD-Q4_K_XL `////`)
+
+`copy_experts` appends `min(expert_size, 512)` bytes of the next expert after a used-expert group so the quantized
+`MUL_MAT_ID` MMQ's tail over-read is finite.  Under `-sm tensor` that **source** range is split across devices, and
+the guard a device needs is the first bytes of *its own* next-expert slot, not its share of one contiguous source
+tail.  The facts:
+
+* **Q8_0's down-expert row is 680 B, and a 3-device split makes the last device start past the 512-byte guard.**  A
+  `ffn_down_exps` row is `n_embd / blck_size * type_size`: Q8_0 at 640 elements is 680 B (Q5_1 is 400 B, Q4_K 1440 B).
+  The granularity-rounded shares on 3 devices are 128/256/256 elements = 136/272/272 B.  The 512-byte source tail is
+  distributed 136 + 272 + 104: the last device's slice starts at byte 408 and only 104 of its 272 bytes are written.
+  The other 168 bytes are uninitialised (normally NaN), and the MMQ over-read poisons the tile — the repeated-`/`
+  (or `3`) corruption.  A Q5_1/Q4_K row is wide enough that the 512-byte tail covers a full device row, which is why
+  the defect is quant-specific and not a general tensor-split failure.
+* **It is the copy, not the cache or the scheduler.**  `MOE_EXPERT_CACHE_MIB=0` still corrupts; `-sm layer` is clean
+  (no per-device row split); `GGML_META_SPLIT_COPY=0` (mirrored copies) is clean.  The failure is in
+  `ggml_backend_meta_set_tensor_async`'s partial-tail path, not in the expert cache's residency.
+* **The guard fill is a TAIL operation, and it is per device.**  After the available source bytes are copied, zero
+  the rest of the first 512 bytes of each device's next-expert **device slot**; the slot is contiguous across device
+  rows, so an axis-0 slice narrower than 512 B is filled across rows, not just one row.  A head partial row must not
+  be zeroed — its prefix belongs to a previous chunk — and the segmented (fused-table) async/sync setters need the
+  same fill because a fused table can carry the same Q8_0 segment.
+* **Only Q4_K_XL UD reproduces it because only it has Q8_0 down experts here** (layers 4/30/46/47; layer 2 is Q5_K
+  gate/up and is not host-resident at `-ncmoe 44`).  Q4_K_M's down experts are Q5_1, so its text is byte-identical
+  across the fix (436 chars `21f493f3ab52`); IQ4_NL is clean.  A future quant with a down row whose device slice
+  starts after the source guard will hit the same class.
+* **The diagnostic `GGML_META_SPLIT_COPY=0` + cache-on arm is not a valid oracle**: it aborts in
+  `ggml_backend_cuda_get_tensor_2d_async` on this model.  Use the cache-off mirrored arm (or `-sm layer`) as the
+  control, and do not read the kill-switch's abort as part of this fix.

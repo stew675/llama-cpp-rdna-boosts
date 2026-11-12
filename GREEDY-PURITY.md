@@ -2440,3 +2440,29 @@ repro.  `test-backend-ops -o FLASH_ATTN_EXT`: **6979/6979** on both the default 
 
 **Record.**  This entry; `INVARIANTS.md` r268; `benchmarks/2026-11-12-fa-derived-tile-gqa.md`; `WORKLOG.md`
 261112.004; contributor PR #303 (`overdoingism`).
+
+## 87. A split expert upload's MMQ guard is per device: one contiguous source tail leaves the last device's slot uninitialised (r269, Qwen3.8-Flash-Next UD-Q4_K_XL)
+
+**Claim.**  `copy_experts` guards the quantized `MUL_MAT_ID` MMQ's tail over-read with `min(expert_size, 512)` bytes
+of the next expert.  Under `-sm tensor` the Meta splitter distributes that **source** range across the devices; the
+guard a device needs is the first bytes of *its own* next-expert slot.  When a device's slice starts beyond the
+512-byte source tail, the rest of that device's guard is uninitialised (normally NaN), and the over-read poisons the
+tile — the repeated-`/` corruption.
+
+**Rule.**  In the Meta setter's **partial-tail** path, after copying the bytes the source actually provides, zero the
+remainder of the first 512 bytes of every device's next-expert **device slot** (contiguous across device rows; an
+axis-0 slice narrower than 512 B is filled across rows).  Do not zero a head partial row — its prefix belongs to a
+previous chunk — and apply the same fill to the segmented async and synchronous setters.  The guard bytes are not
+real data, so zero is a legal value; the real expert bytes must not move.
+
+**Numbers.**  Q8_0 `ffn_down_exps`: 640-element row = **680 B**; 3-device shares 128/256/256 elements =
+**136/272/272 B**; the 512-byte tail writes 136 + 272 + **104**, leaving **168 B** of the last device's slice
+uninitialised.  Pre-fix the reporter's config returns 512 `/` (and a simple prompt `3333...`); post-fix the same
+config returns 2208 chars `53882027cf15`, max `/` run 1, three builds.  Cache off pre-fix 96 `/`, post-fix 388 chars;
+`-sm layer` and cache-off `GGML_META_SPLIT_COPY=0` are coherent controls.  Q4_K_M (Q5_1 down, 400 B rows) is
+byte-identical pre/post (**436 chars `21f493f3ab52`**); `gate-qwen4exp-quant-coherence.sh` on Q4_K_XL + Q4_K_M
+(3 GPU, `-ncmoe 44`, `-c 32768`, 96 tokens) passes with gather ON == OFF (`b1af8904a110` / `7160cb056885`) and no
+faults; prefill-logit KLD **0.000000 / 100.000 %**.
+
+**Record.**  `WORKLOG.md` 261112.005; `benchmarks/2026-11-12-meta-split-tail-guard.md`; `INVARIANTS.md` r269;
+`patches/README.md` blocks 09/10.

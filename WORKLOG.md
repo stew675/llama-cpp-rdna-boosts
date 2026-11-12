@@ -1,3 +1,70 @@
+## 261112.005 (r269, release) -- the Meta split copy's tail guard is zeroed per device, so Qwen3.8-Flash-Next UD-Q4_K_XL stops emitting repeated `/` on a 3-GPU tensor split
+
+**Release:** `v17-a691b2345-r269` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`42f90c9b83812fb008c34045d6ad7260c2a690c4`**, tree **`db3494fa1d0a52aff7d6365f25067ee87848559b`**.  Blocks 09
+and 10 amended (the generic/synchronous tail guard in 09, the segmented async tail in 10); no new block, no new
+environment variable, no default moved, no real expert byte changed -- only the guard bytes after the last used
+expert are now deterministic instead of uninitialised.
+
+### The report
+
+A `llama-server` on 3 x R9700 (gfx1201) with **Qwen3.8-Flash-Next UD-Q4_K_XL** (4 shards, 106 GiB),
+`--n-cpu-moe 44 --limit-host-experts auto --split-mode tensor`, q8_0 K/V, `-c 204800`, adaptive MTP + ngram-mod,
+returned **512 `/` characters** for the reporter's Three.js prompt; a simple "The capital of France is" request
+returned `333333...`.  Q4_K_M and IQ4_NL of the same model were coherent, and `-sm layer` was coherent with the
+same Q4_K_XL file.
+
+### Root cause
+
+`copy_experts` appends a `min(expert_size, 512)`-byte guard from the next expert after a used-expert group so the
+quantized `MUL_MAT_ID` MMQ's tail over-read is finite (`ggml/src/ggml-backend.cpp`).  Under `-sm tensor`,
+`ggml_backend_meta_set_tensor_async()` splits that contiguous source range across the devices.  For an axis-0
+`ffn_down_exps` table the device slice is a row slice: Q8_0's 640-element row is **680 B**, and the 3-device
+granularity-rounded shares are 128/256/256 elements = **136/272/272 B**.  The 512-byte guard is distributed as
+136 + 272 + 104: the last device's slice starts at byte 408 and only 104 of its 272 bytes were written.  The other
+168 bytes stayed uninitialised (normally NaN), and the MMQ over-read poisoned the tile -- the repeated-`/`
+signature.
+
+Q4_K_XL is the only quant here with **Q8_0 down experts** (layers 4, 30, 46, 47; layer 2 is Q5_K gate/up and is
+not host-resident at `-ncmoe 44`).  Q4_K_M's down experts are Q5_1: 400-byte rows, so the 512-byte guard covers a
+whole device row and the residual is absent.  The cache is not the culprit: `MOE_EXPERT_CACHE_MIB=0` still emits
+`/`, and `GGML_META_SPLIT_COPY=0` (mirroring the per-split copy) is coherent.
+
+### What shipped
+
+* **Block 09** -- in the partial-tail path of the generic async setter, after the available source bytes are
+  copied, zero the rest of each device's next-expert guard: the first 512 bytes of the **device slot**, filled
+  contiguously (an axis-0 device row can be narrower than 512 B, so the fill spans device rows).  The head partial
+  row is untouched; its prefix belongs to a previous chunk.  The synchronous segmented setter gets the same fill.
+* **Block 10** -- the same fill in the segmented **async** setter (the fused-table path).
+* No new variable, no default change.  The guard is still finite; it is now deterministic zero rather than
+  whatever the previous allocation held.
+
+### Gates (canonical build `~/llama.cpp/build-rocm`, gfx1201, 3 x R9700 unless noted)
+
+* Reporter's config and prompt at `-c 204800`, 512 tokens: pre-fix **512 `/`**; post-fix **2208 chars
+  `53882027cf15`, max `/` run 1** (three builds, identical).  `-c 32768` cache-off: pre-fix 96 `/`, post-fix 388
+  chars.  `-sm layer` and `GGML_META_SPLIT_COPY=0`-with-cache-off controls coherent before and after.
+* **Q4_K_M is byte-identical pre/post** at the same `-sm tensor -ncmoe 44` shape (436 chars `21f493f3ab52`), and
+  IQ4_NL is coherent (389 chars).
+* **`gate-qwen4exp-quant-coherence.sh QUANTS="Q4_K_XL Q4_K_M" NGPU=3 NCMOE=44 CTX=32768 NGEN=96 QSA_ARM=0`**:
+  PASS both quants, gather ON == OFF (`b1af8904a110` / `7160cb056885`), 0 slash runs, kernel journal and every
+  arm log clean.
+* **`gate-prefill-logits.sh`**: mean KLD **0.000000**, same-top-p **100.000 %** (27B Q8_0, 40 chunks).
+* **`gate-per-block-build.sh --fast --changed-from e533fb2af --tip 42f90c9b8`**: **3/3** (block 09 321 s,
+  block 10 327 s, tip 6 s).
+* **`validate-set.sh`**: 17 blocks, checksums + strict apply, applied tree `db3494fa`, Windows scan 291 files
+  clean.
+
+**Left as an observation:** the `GGML_META_SPLIT_COPY=0` diagnostic arm with the expert cache **on** aborts in
+`ggml_backend_cuda_get_tensor_2d_async` on this model; the shipped default does not take that arm, and the
+cache-off control is what the diagnosis used.  It is recorded, not fixed, in this release.
+
+### Records
+
+`benchmarks/2026-11-12-meta-split-tail-guard.md` (repro, the byte arithmetic, the full arm table);
+`INVARIANTS.md` r269; `GREEDY-PURITY.md` §87; `patches/README.md` blocks 09/10.
+
 ## 261112.004 (r268, release) -- `v17-a691b2345-r268`: the derived kq mask takes the same FA kernel variants as the packed mask -- one predicate, asked by every launcher (contributor PR #303)
 
 **Release:** `v17-a691b2345-r268` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

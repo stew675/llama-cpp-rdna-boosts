@@ -1,4 +1,4 @@
-From 8af06aed949c26bf19b34f0639bef71ec619a7b1 Mon Sep 17 00:00:00 2001
+From 494e25dbcc6b473226d89853ae7a7e8898203f0e Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -64,7 +64,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  ggml/include/ggml.h                           |    1 -
  ggml/src/ggml-alloc.c                         |   28 +-
  ggml/src/ggml-backend-impl.h                  |    6 +-
- ggml/src/ggml-backend-meta.cpp                |  323 +-
+ ggml/src/ggml-backend-meta.cpp                |  334 +-
  ggml/src/ggml-backend.cpp                     |   92 +-
  ggml/src/ggml-cuda/allreduce-hip.cu           |    3 +
  ggml/src/ggml-cuda/allreduce.cu               |    3 +
@@ -146,7 +146,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 86 files changed, 16405 insertions(+), 5494 deletions(-)
+ 86 files changed, 16416 insertions(+), 5494 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -286,7 +286,7 @@ index 6a6e30d01..86f7f2829 100644
          // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
          // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 2b05e22d4..097661b79 100644
+index 31198ca2f..b30cc25da 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -469,7 +469,7 @@ index 2b05e22d4..097661b79 100644
          GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
-@@ -2650,8 +2784,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2659,8 +2793,116 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          // splitter would treat the remainder as a <=512-byte MMQ tail, so any other mid-row caller would
          // corrupt the tensor.  The reverted `size % row_stride <= 512` attempt tried to divert such a
          // range into a whole-tensor accumulator; a partial per-op upload never reached `total`, stranding
@@ -549,6 +549,7 @@ index 2b05e22d4..097661b79 100644
 +                GGML_ASSERT((pos % seg_row_stride) == 0);
 +                const int64_t R = (int64_t) (pos / seg_row_stride);
 +                GGML_ASSERT(R < (int64_t) seg_n_rows);
++                static thread_local std::vector<uint8_t> zero_buf(512, 0);
 +                size_t p_src = 0;
 +                std::vector<size_t> p_dst(n_backends, 0);
 +                for (size_t s = 0; s < split_state.n_segments; s++) {
@@ -559,11 +560,21 @@ index 2b05e22d4..097661b79 100644
 +                            const size_t nbytes = seg_chunk_bytes(s, j);
 +                            const size_t lo = std::max(p_src, (size_t) 0);
 +                            const size_t hi = std::min(p_src + nbytes, remaining);
++                            const size_t written = hi > lo ? hi - p_src : 0;
 +                            if (lo < hi) {
 +                                ggml_backend_tensor_set_async(simple_backend, simple_tensor,
 +                                    (const char *) data + ((size_t) R * seg_row_stride + lo - offset),
 +                                    p_dst[j] + (size_t) R * simple_tensor->nb[seg_dst_dim] + (lo - p_src),
 +                                    hi - lo);
++                            }
++                            // Same guard as the non-segmented tail: every device's slice of the next
++                            // expert needs finite bytes for the MMQ tail over-read, and a partial row
++                            // can end before the last device's slice starts.
++                            const size_t guard = std::min<size_t>(nbytes, 512);
++                            if (written < guard) {
++                                ggml_backend_tensor_set_async(simple_backend, simple_tensor, zero_buf.data(),
++                                    p_dst[j] + (size_t) R * simple_tensor->nb[seg_dst_dim] + written,
++                                    guard - written);
 +                            }
 +                            p_src += nbytes;
 +                            p_dst[j] += nbytes;
@@ -577,7 +588,7 @@ index 2b05e22d4..097661b79 100644
          ggml_backend_tensor_set(tensor, data, offset, size);
          return;
      }
-@@ -2843,7 +3074,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2875,7 +3117,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          if (chunk_size_j == 0) {
              continue;
          }
@@ -589,7 +600,7 @@ index 2b05e22d4..097661b79 100644
          void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
          if (slot_ptr == nullptr) {
              return false;
-@@ -3597,11 +3831,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3629,11 +3874,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  // filled).
  static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
  
@@ -648,7 +659,7 @@ index 2b05e22d4..097661b79 100644
      // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
      // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
      if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
-@@ -3611,13 +3891,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3643,13 +3934,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
          return false;
      }
      const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
@@ -686,7 +697,7 @@ index 2b05e22d4..097661b79 100644
      size_t off = 0;
      bool all = true;
      for (size_t j = 0; j < n_backends; j++) {
-@@ -3627,7 +3927,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3659,7 +3970,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
              return false;
          }
          const bool took = simple_backend->iface.moe_cache_update(
