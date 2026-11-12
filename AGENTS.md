@@ -330,6 +330,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the host-expert pool: a fill/staging path, `expert_host_src()`, the cache's admission, the `-lme`/`--host-experts pool` placement, the loader's source registration | `scripts/gate-host-pool.sh` |
 | the expert-cache prefill transport: the staging/gather decision, the pre-staging `moe_cache_in_place` query, `moe_cache_get_table`'s identity branch, or a fused kernel that reads a routed expert table directly | `scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` on an **identity** arena (`-device 0,1,2 --sm tensor --ub 2048 --extra "-ncmoe 48"`, 35B-A3B Q8_0) must read KLD 0.000000, plus same-seed greedy text both arms and `gate-host-pool.sh` |
 | the server's idle-slot parking / a memory type carrying a second cache | `scripts/gate-park-idle-slots.sh` |
+| the node budget (`graph_max_nodes()`), the scheduler's sizing, or a memory module that adds graph nodes/leafs (the KV rotation is the current case) | `scripts/gate-node-budget.sh` |
 | the server's context-checkpoint or speculative-checkpoint path | `scripts/gate-ckpt-reuse.sh` / `scripts/gate-spec-ckpt-device.sh` |
 | a state save/restore (`llama_io_*`, `state_stage`) | `scripts/gate-state-pipe.sh` |
 | the verify-batch alignment / a multi-slot draft width | `scripts/gate-spec-align.sh` / `scripts/gate-spec-width-band.sh` |

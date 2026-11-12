@@ -4023,7 +4023,9 @@ type, head dim % 64, `LLAMA_ATTN_ROT_DISABLE` -- is not duplicated), and `llama_
 unreservable probe graph as "cannot verify -> disable" instead of throwing.  Numerics-neutral: phi-4 f16
 `a1b7eb2ee7a6`, Qwen3.5-4B `1c5d32ac537d`, Qwen3.8-27B `d45e2221805a`, gemma-4-12B `cd85935d5fee` are all
 byte-identical to r266, phi-4 `q8_0` now loads and reads the same `a1b7eb2ee7a6`, and the prefill-logit gate reads
-**0.000000 / 100.000 %** on both the f16 and the `--kv q8_0` base (`WORKLOG.md` 261112.003).
+**0.000000 / 100.000 %** on both the f16 and the `--kv q8_0` base (`WORKLOG.md` 261112.003).  The gate is
+`scripts/gate-node-budget.sh` (four seeded arms on phi-4: q8_0 at `-ub 2048` and `-ub 512`, f16, and q8_0 with
+`LLAMA_ATTN_ROT_DISABLE=1`, plus the "no refusal" line), negative-tested against the unpatched `a691b2345` build.
 
 ---
 

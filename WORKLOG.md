@@ -73,6 +73,10 @@ only difference: upstream probes `kv_rows` unconditionally, the delivery only wi
   the tree and pushed `rdna-boosts` `6bac17737..1d76ca9c8` (force-with-lease) to the personal fork; `git ls-remote`
   confirms the branch carries exactly `release.json.tip`.  The `all` build of the re-cut tree is what the build
   above used.
+* **`gate-node-budget.sh`** (new, this release): PASS -- phi-4 `a1b7eb2ee7a6` on all four arms (q8_0 `-ub 2048`, q8_0
+  `-ub 512`, f16, and q8_0 with `LLAMA_ATTN_ROT_DISABLE=1`) with `--rotation-ref`.  Negative-tested against the
+  unpatched `a691b2345` build in a separate tree: its two quantized arms abort (exit 134) while the f16 and
+  rotation-off arms pass, i.e. the gate fails exactly on the reported shape.
 * **GPU faults**: `check-gpu-faults.sh --since "3 hours ago"` + 7 arm logs -- clean.
 
 **Published:** delivery repo `github.com:stew675/llama-cpp-rdna-boosts` -- `main` + tag `v17-a691b2345-r267`;
