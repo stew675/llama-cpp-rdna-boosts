@@ -411,7 +411,13 @@ in CI.  The model-level gates are manual:
    cursor is round-robin and the top-k selection moves) -- at `-c 32768`, depth 25 763 and 8 192 pages,
    144 claims/resolve is the resident arm's floor, and the floor-vs-resident delta is what the gate compares.
    **Negative-tested**: an off-by-one pool slot in `kv_pool_map_fill_kernel` (a wrong-page resolve) diverges the
-   text and the acceptance, and the gate FAILs.  **Multi-device pool arms (r213)** run the same three arms on
+   text and the acceptance, and the gate FAILs.  **r264: on a shared host/device pool the pool is REFUSED BY
+   DESIGN** (`TODO` #300 retired), so that platform grades the refusal instead of the placement: exactly **one**
+   `--kv-attendance-pool was declined` WARN, no arm engaging the pool, and the KV unchanged against a no-pool
+   `pdecl` arm on the **same** (default) decode arm -- `pref` is the *sparse* arm the pool replaces, so it is not
+   that reference.  Two `--fit` placement-hint arms cover the advice a failing fit prints: `hintwin` (a trunk with
+   no sparse indexer: `--kv-window` must be offered, `--kv-attendance-pool` must not) and `hintpool` (the pool
+   model: **absent** on a shared pool, **present** on a discrete GPU, so an absence-only check cannot pass).  **Multi-device pool arms (r213)** run the same three arms on
    `MULTI_DEVICES` (default `0,1`, `-sm layer`), judged **within** the device count (the reference is the 2-device
    no-pool arm `pmref`, never `pref`): `pmres`/`pmfloor` must be byte-identical to it, the enable line must report
    the device span, and the teardown counters must report **one counter block per device** -- that last assertion is

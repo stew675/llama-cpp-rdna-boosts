@@ -1,3 +1,112 @@
+## 261111.034 (docs-only, NO delivery change) -- why a `97.5 %` arena hit rate still reads **1-1.5 GB/s** off the drive on the 122B Q8_0 (the miss arithmetic of the GTT arena)
+
+**The question (field report).** `Qwen3.5-122B-A10B-Q8_0`, `-lme 90`, one decode stream on `halo`: the per-turn
+line reads `MoE arena = 0.97xx`, decode is ~11 t/s, and the drive is sustaining 1-1.5 GB/s.  "If it is missing 1 in
+40 reaches, isn't that drive rate too high?"
+
+**No -- it is exactly the miss traffic.**  The hit rate is per **expert reach**, and a miss costs a WHOLE expert:
+
+| quantity | value | where it comes from |
+|---|---|---|
+| one expert (Q8_0) | 3 x 3072 x 1024 params -> **10 027 008 B = 9.5625 MiB** | `ffn_{gate,up}_exps [3072,1024,256]`, `ffn_down_exps [1024,3072,256]`, all Q8_0 (3 342 336 B each) |
+| reaches per token | 8 used experts x 48 trunk MoE layers = **384** | `expert_used_count 8`, `block_count 49` (block 48 = the nextn/MTP head, pinned and resident) |
+| misses per token at h = 0.975 | 384 x 0.025 = **9.6** | 1 miss per ~40 *reaches*, i.e. per ~5 layers -- not per token |
+| miss bytes per token | 9.6 x 9.5625 MiB = **91.8 MiB/token** | |
+| **drive rate at 11 t/s** | 91.8 MiB x 11 = **1010 MiB/s** | |
+
+So 1.0 GB/s is the *expected* figure at h = 97.5 % and 11 t/s; 1.5 GB/s is h ~= 96.4 %.  The other direction is the
+useful one: 92 MiB/token over a ~1.2 GB/s drive is **~80 ms of the 91 ms** a token takes at 11 t/s -- the miss
+traffic **is** the decode budget here, which is why this box reads 11 t/s and not 20+.  Each point of hit rate is
+384 x 0.01 x 9.5625 MiB x 11 t/s ~= **0.4 GB/s** of drive traffic.
+
+**Why so many misses at `-lme 90`.**  Block 16's GTT store: the expert set is 48 x 256 x 9.5625 MiB = **114.7 GiB**
+(+2.4 GiB MTP head) against a 123 GiB box, so `-lme 90` is *below* the set -> the store is the **ARENA**, not a
+placement: 90 GiB / 117 GiB ~= 77 % of the *experts* resident, while the routing is skewed enough that 77 % of the
+slots still catch 97.5 % of the *reaches* (the LFRU working as designed, not a contradiction).  A miss is one
+buffered `pread` of the expert straight into the vacated slot (`fill_slot_direct_locked`) and it **drains the
+compute stream first**, so the ~10 misses/token are serialized on the decode path.  Confirmed from the log at
+`-lv 4` (`MoE expert cache: h=...`, `GTT arena tier: ...`, `direct slot fills ... MiB/s`, `fill-side overlap
+headroom ... ms/fill`) and from `/proc/<pid>/io read_bytes` == misses x 9.5625 MiB.
+
+**Levers, in order.** (1) A quant whose whole expert set fits the budget turns the store into a **placement**
+(static, zero decode reads) -- Q4_K_XL's set is well under this box's 90 %-of-`MemAvailable` ceiling (~105 GiB),
+which is the big one; (2) raise `-lme` toward that ceiling (`-lme 100` is legal here), worth ~0.4 GB/s per point of
+hit rate; (3) the discrete knobs (`MOE_HOST_POOL_*`, `MOE_EXPERT_CACHE_MIB`) do not apply -- there is no pinned
+host pool on an APU -- and `MOE_EXPERT_CACHE_TOUCH` is a documented no-op on this tier (every miss fills).
+
+## 261111.033 (r264) -- `TODO` #300 RETIRED: the attendance pool is refused on a shared host/device pool **by design**, and `--fit` stops advertising placements that the model+device will refuse (it printed a wall of red for a feature nobody asked for)
+
+**The report.** On `halo` (gfx1151 Strix Halo, UMA, 123 GiB) the field command
+`llama-server -m Qwen3.5-122B-A10B-Q8_0 -lme auto -ub 4096 -b 4096 -c 102400` -- which **runs fine** (11 t/s, the
+GTT store streaming, see 261111.034) -- printed, before the load, an ERROR block ending in **8 lines about
+`--kv-window` and `--kv-attendance-pool`**: `common_params_fit_impl: two placements can buy the KV back ...`.  The
+operator had not asked for either, the model is a **qwen35moe** trunk (no sparse indexer, so the pool has nothing
+to serve) and the device is an **APU** (so the pool is refused anyway, r236).  The kernel of that sequence is
+also in `TODO` #300 as "the pool is INCORRECT on a UMA device, the fix is owed".
+
+**The decision: `#300` is retired, not fixed.**  The pool is a **distinct-memory** design: it buys *device* memory
+back by keeping the authoritative KV in a **pinned host mirror** and caching only the indexer pages the sparse
+decode selects.  That trade only exists where the host and the device are separate tiers.  On a shared host/device
+pool they are one: the KV is already in the memory the GPU reads, so there is nothing to buy back, and the
+two-tier resolve (MARK/CLAIM/MAP+FILL, `kv_pool_invalidate()`, the dirty-refill protocol) has no second memory kind
+to be correct against -- which is exactly what r236 measured (a *fully resident* pool still verifying ~93 M
+mismatched bytes against its own mirror, a different text every run).  Chasing the resolve would leave a
+placement that cannot help on the one device it would then claim to support, so the item is closed as **"not
+supported on a shared host/device pool, by design"** and its record moved here from `TODO.md` (which per policy
+carries no closed items).
+
+**What changed (all block 15).**
+* `src/llama-kv-cache.cpp` -- the decline message now states the *reason* as a design property ("the pool buys
+  device memory back ... here they are one ... NOT SUPPORTED on such a device, by design") instead of pointing at an
+  open TODO, and the comment above `kv_pool_shared_pool_device()` says the same.  Still **one WARN**, KV unchanged.
+* `common/fit.cpp` -- `fit_placement_hint()` offers only placements **this model + these devices** can take
+  (`g_fit_kv_pool_applicable`: the model needs `hparams.indexer_head_size > 0`, and no device may be an
+  `IGPU` or a Meta).  The **window** paragraph is unaffected (model-agnostic, validated on gfx1151); when neither
+  is eligible the hint prints **nothing**.  The hint is **advice**, so it now prints at `WARN` (the over-budget
+  facts stay `ERROR`); the singular/plural wording follows what is actually offered.
+* `src/llama-ext.h` + `src/llama-model.cpp` -- `llama_model_has_kv_indexer()`, the model-level predicate above
+  (the cache keeps its own shape/window/device checks).
+* **Log formatting**: `common_log_add`/`LOG_ERR` prefix the message they are handed, *not* each `\n`-separated line,
+  so the multi-line blocks printed continuation lines with **no level and no timestamp** (the operator literally
+  saw `common_params_fit_impl:   layers) or use a smaller quant...` as raw output).  One call per line now, in both
+  the over-budget block and the hint.
+
+**Measured (halo, gfx1151, 2026-11-11).**  Forced over-budget fit (`-c` pinned + `-fitt`), before -> after:
+`Qwen3.5-4B` (no indexer, any device) **11 hint lines incl. 5 red `--kv-attendance-pool` ones -> 7 lines, all `WARN`,
+no pool line, `--kv-window` only**; `Qwen3.8-Flash-Next` (indexer trunk, this APU) **same, no pool line** (the
+device gate); the pool request itself prints **one** WARN and the KV is untouched.  `llama-fit-params` is the fast
+lever for both (metadata + a `no_alloc` context, ~0.2 s, no weights).
+
+**Gate: `scripts/gate-kv-residency.sh`.**  New assertions, and one **pre-existing defect fixed**:
+* `hintwin` (4B, any platform): the hint must fire and offer `--kv-window`; it must not name `--kv-attendance-pool`
+  (the MODEL gate).  `hintpool` (the pool model): **absent** on a shared pool, **present** on a discrete GPU -- an
+  absence-only check would pass on a build that advertises nothing.
+* The UMA branch's "nothing changed" reference was `pref == pres == plegacy`, but `pref` is the *sparse* arm
+  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), which is the arm the POOL replaces: with the pool declined nothing replaces
+  it, so that branch compared two different decode arms and **could never pass** (measured: `1e944569dbd6` against
+  `fb0e8f53af2d`).  It now runs a no-pool `pdecl` arm on the **default** decode arm and compares
+  `pdecl == pres == plegacy` -- which passes (`fb0e8f53af2d`).  The decline count is also asserted to be exactly
+  **one** (grepping `--kv-attendance-pool was declined`, because `set_host_experts_umem` prints its own
+  "SHARED host/device pool" line on an APU and made the naive count read 2).
+
+**Gate ledger.** `gate-kv-residency.sh --window-only` **21/21 PASS** (window hashes unchanged:
+`wref == wres == wspill = be904e86f248`, `wspill` 16 flips / 64 MiB host-backed; the r236 selftest arms unchanged);
+`--pool-only MULTI_DEVICES=0` **PASS** on halo (decline graded, `pdecl == pres == plegacy = fb0e8f53af2d`, one WARN,
+both hint arms) with the sparse reference `1e944569dbd6` unchanged; GPU-fault scan clean on both.  The discrete
+branch's `hintpool` "must be present" arm needs a discrete box (run with the next release's gate ladder).
+
+**Findings NOT fixed here (for the maintainer).**
+1. **The fit's UMA projection does not model the GTT store.**  On this box the 122B Q8_0 (124 GiB) on 123 GiB is the
+   *supported* streaming shape with `-lme`, yet `--fit` reports "does NOT fit in device memory ... ends in an
+   allocator out-of-memory abort", which is false (it runs at 11 t/s).  The fit measures `ggml_backend_dev_memory`
+   of the ROCm device (the GTT pool) and counts the model's mapping pages against it, while the store is mlocked
+   host RAM the GPU reads in place.  Either `--fit` learns the store's extent (and that streaming is allowed), or
+   the over-budget text says so on a shared pool.  Needs a decision -- not a log tweak.
+2. **`gate-kv-residency.sh`'s multi-device section runs when the box has fewer devices than `MULTI_DEVICES` names**
+   (the default `0,1` on a 1-GPU box): the `pm*` arms then run single-device and every 2-device assertion fails.
+   The skip condition only tests `MULTI_DEVICES=0`.  Doc says set `MULTI_DEVICES=0` on a 1-GPU box; the default
+   should detect it.
+
 ## 261111.032 (r263, release) -- `v17-a691b2345-r263` is PUBLISHED: delivery repo pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip, and the ROCm images building off-host
 
 **Release:** `v17-a691b2345-r263` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

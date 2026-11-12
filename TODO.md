@@ -66,7 +66,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **300** | gfx1151 / RDNA3.5: the attendance pool (`--kv-attendance-pool`) is INCORRECT on a UMA device | correctness (RDNA3.5) | **PARKED** — the pool now declines on an integrated GPU, so nothing can reach it; the fix is owed — §300 |
 
 ## Handle numbering
 
@@ -219,48 +218,19 @@ item -- consolidating the three transports for a PARTLY resident table -- is unt
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie
 
-## 300. gfx1151: the attendance pool (`--kv-attendance-pool`, alias `--kv-region-pool`) is INCORRECT on RDNA3.5 — do not claim it there
-
-Found at R16 validating on `halo` (gfx1151 Strix Halo, UMA) with `scripts/gate-kv-residency.sh`.  The **window**
-(Goal A) is fine (`wref == wres == wspill` `be904e86f248`, 16 flips / 64 MiB pinned host) and the **sparse**
-decode arm is fine, but the **pool** (Goal B) produces wrong results:
-
-| arm (Flash-Next GSQ-IQ3_XXS + MTP, `-c 32768` q8_0) | text | pool `bad` |
-|---|---|---|
-| `pref` (no pool, sparse ref) | `1e944569dbd6` | — |
-| `pres`, whole cache resident (8192 pages), VERIFY off | `b08d3dbcb1e9` | 0 (not verified) |
-| `pres`, whole cache resident, `LLAMA_KV_POOL_VERIFY=1` | `8c1b0d16ecd3` | **93 399 360** |
-| `pfloor` (4104 pages, forced misses), VERIFY on | differs | **95 173 888** |
-
-Three different texts from the same arm, and a *fully resident* pool (every block of the cache has a page) still
-reports ~93 M byte mismatches against its own mirror -- i.e. this is not a residency/thrash effect, the resolve
-is wrong.  The mismatch count moves run to run, so it is (at least partly) a race.  The gate therefore reports
-`FAIL pres != pref`, a different draft acceptance, and `FAIL pfloor: bad != 0`; everything else in that gate
-passes on the box (39 PASS).
-
-Prime suspect: the pool is a **discrete-GPU design** -- a pinned host *mirror* plus a device pool filled by DMA.
-On UMA the "mirror" and the weights are the same physical memory pool, so the MARK/CLAIM/MAP+FILL ordering (and
-the `kv_pool_invalidate()` / dirty-refill protocol) is reasoning about two kinds of memory that are one here.
-It may also be the per-device counter/page-table single-instance path (`bad` varies).
-
-**Mitigated at r236 (`2aac85e78`): the pool now DECLINES on a shared host/device pool** (any
-`GGML_BACKEND_DEVICE_TYPE_IGPU` device) with one message naming RDNA3.5/gfx1151 and this item, and the KV takes the
-plain device buffer; `gate-kv-residency.sh` grades that decline (once per arm, no arm engaging the placement,
-`pref == pres == pfloor`) instead of grading numbers that cannot exist.  So no consumer can trip the defect by
-opting in on an APU.
-
-**Still owed: the fix.**  Prime suspect is the tier's own model: a pinned host *mirror* plus DMA fills is a
-discrete-GPU design, and on UMA the mirror and the weights are one physical pool, so the MARK/CLAIM/MAP+FILL
-ordering, `kv_pool_invalidate()` and the dirty-refill protocol are reasoning about two kinds of memory that are
-one.  The per-device counter/page-table single-instance path is the second candidate (`bad` varies run to run).
-Start from the gate's `pres` + `LLAMA_KV_POOL_VERIFY=1` arm, which reproduces in ~5 min on halo and needs no
-20-minute prefill (any `-c` works) — and from the fact that a *fully resident* pool is already wrong, so no
-residency/thrash hypothesis is needed.
-
-The window and the sparse arm are unaffected and validated there.  Pre-existing: the pool shipped in r235 and was
-never run on RDNA3.5 before this validation.
-
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+- **The attendance pool (`--kv-attendance-pool`) is NOT SUPPORTED on a shared host/device pool (an integrated
+  GPU), by design** (block 15; **`#300`, retired in r264** — the record is `WORKLOG.md` 261111.033 and
+  `INVARIANTS.md` r264, and the refusal is graded by `scripts/gate-kv-residency.sh`).  The pool buys device memory
+  back by keeping the authoritative KV in a **pinned host mirror**, so it only has a meaning where the host and
+  the device are **separate tiers**.  On an APU they are one: the KV is already in the memory the GPU reads, there
+  is nothing to buy back, and the two-tier resolve has no model to be correct against (measured 2026-11-08: a
+  *fully resident* pool still reported ~93 M byte mismatches against its own mirror, and each run gave a different
+  text).  The cache therefore refuses the request with **one** WARN and leaves the KV as it is; the resident
+  **window** (`--kv-window`) and the sparse decode arm are supported there and validated on gfx1151.  This is not
+  a defect to re-report: re-entry is a *discrete* device, or a future tier whose mirror really is a second memory
+  pool.
 
 - **A prefill-dominated multi-slot mix (`-npl 4`, `-npl 8`) is slower with `MOE_HOST_POOL_RANK=decode`** (r224,
   block 12; **`#275`**, maintainer-accepted).  The decode ranking is a **single-user** win and its sign inverts

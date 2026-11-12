@@ -49,6 +49,10 @@
 #     plegacy       the r246 spelling `--kv-region-pool 32768` (the whole cache): accepted for compatibility
 #                   and IGNORED, so it must build the SAME pool as `pres` and say so; it carries
 #                   `LLAMA_KV_POOL_VERIFY=1` (the oracle arm is where a wrong-page resolve would show)
+#     pdecl         DECLINED platforms only (a shared host/device pool): no pool, the DEFAULT decode arm.  The
+#                   decline has to be invisible, and `pref` is the wrong reference for that -- it also turns the
+#                   SPARSE arm on, which is what the pool replaces.  Without this arm the UMA branch compared
+#                   two different decode arms and could never pass (fixed in r264).
 #     and one assertion beyond residency (r217): `pres` must keep >= `PREFILL_MIN_PCT` (40 %) of `pref`'s
 #     PROMPT rate.  `plegacy` runs with the verify oracle and is not a timing arm.
 #   Pool, MULTI-DEVICE (`-sm layer`, the same model/prompt/knobs on `MULTI_DEVICES`, default `0,1`): the pool
@@ -81,6 +85,19 @@
 #       SMALLER than the cache (so the claim pressure is real), a legacy numeric request builds the SAME
 #       size, and the text is byte-identical to the sparse arm.
 #
+#   The `--fit` placement hint is ALSO an arm here (r264): when a pinned `-c` cannot fit, `--fit` names the
+#   placements that could buy the KV back, and it must name only ones THIS model and THESE devices can take --
+#   it used to offer `--kv-attendance-pool` to a qwen4exp-less trunk and to an integrated GPU, both of which
+#   refuse the pool, i.e. a wall of advice about a no-op (TODO #300, retired here).  Two sensitivity controls,
+#   because an absence-only check passes when the hint never fires:
+#     hintwin       the 4B (no indexer geometry, any device): the hint fires and names `--kv-window`, and it
+#                   must NOT name `--kv-attendance-pool` (the MODEL gate)
+#     hintpool      the pool model, graded per platform: on a shared host/device pool the pool must be absent
+#                   (the DEVICE gate); on a discrete GPU it must be PRESENT (the hint still offers it where it
+#                   works, so the device gate is not "always absent")
+#   Both use `llama-fit-params` with a target margin above the whole device, which reaches the hint without
+#   loading the weights.
+#
 #   The KV-ACCOUNTING section prints, per cache and from the log only (never from arithmetic on the knobs):
 #   cells, logical MiB, device MiB and its share, host/pinned MiB, and the buffer each placement really got.
 #   It is the report the archive plan's P0 asks for; `--fit`'s own consequence is `common_memory_breakdown`
@@ -91,6 +108,7 @@
 #
 # Environment:
 #   LLAMA_CLI    binary (default: ~/llama.cpp/build-rocm/bin/llama-cli)
+#   LLAMA_FIT    binary for the placement-hint arms (default: llama-fit-params beside LLAMA_CLI)
 #   MODEL_WIN    default: /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf
 #   MODEL_POOL   default: /llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 #   DRAFT_POOL   default: its mtp-...-shared-Q8_0.gguf sidecar (the same directory)
@@ -125,6 +143,7 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
+LLAMA_FIT="${LLAMA_FIT:-$(dirname "$LLAMA_CLI")/llama-fit-params}"
 MODEL_WIN="${MODEL_WIN:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}"
 MODEL_POOL="${MODEL_POOL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 DRAFT_POOL="${DRAFT_POOL:-$(dirname "$MODEL_POOL")/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}"
@@ -159,6 +178,7 @@ mkdir -p "$KEEPOUT"
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ]      || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
+[ -x "$LLAMA_FIT" ]      || { echo "error: no llama-fit-params at $LLAMA_FIT (the placement-hint arms need it)" >&2; exit 2; }
 [ -f "$MODEL_WIN" ]      || { echo "error: no model at $MODEL_WIN" >&2; exit 2; }
 [ -f "$PROMPT_WIN" ]     || { echo "error: no prompt at $PROMPT_WIN" >&2; exit 2; }
 if [ "$DO_POOL" = 1 ] || [ "$DO_MULTI" = 1 ]; then
@@ -199,6 +219,22 @@ run_arm() {
         fail "$arm: llama-cli failed (see $err)"
         return 1
     fi
+    return 0
+}
+
+# the `--fit` placement hint, reached without loading the weights: a target margin above the whole device
+# makes the fit refuse, and a refusing fit is what prints the advice.  `llama-fit-params` exits 1 in that case,
+# which IS the arm's condition -- the assertions read the LOG, and the "the hint fired" check is what keeps a
+# crash from passing as "the pool was not offered".
+fit_hint_probe() {   # fit_hint_probe <arm> <model> <ctx>
+    local arm=$1 model=$2 ctx=$3
+    local out="$KEEPOUT/$arm.out" err="$KEEPOUT/$arm.err"
+    if [ "$REUSE" = 1 ]; then
+        [ -s "$err" ] || { fail "$arm: no log to re-grade at $err"; return 1; }
+        return 0
+    fi
+    HIP_VISIBLE_DEVICES="${RUN_DEVS:-0}" ROCBLAS_USE_HIPBLASLT=0 timeout 600 "$LLAMA_FIT" \
+        -m "$model" -ngl 99 -c "$ctx" -fitt 2000000 -v >"$out" 2>"$err"
     return 0
 }
 
@@ -370,6 +406,19 @@ if [ "$DO_WINDOW" = 1 ]; then
     [ "$(count wref 'WINDOWED KV ENABLED')" = 0 ] && pass "wref (no knob) built no window" \
         || fail "wref enabled a window without LLAMA_KV_RESIDENT_CELLS"
 
+    # ... and the placement ADVICE a failing fit prints must name only placements this MODEL can take (r264,
+    # TODO #300 retired).  The 4B is a qwen35moe trunk: it has no sparse indexer, so the attendance pool has
+    # nothing to serve and the cache declines it -- advertising it (which the r247 hint did) is a wall of red
+    # about a no-op, and a reader cannot tell it from a supported suggestion.  The window is model-agnostic and
+    # must still be offered; that is also the check that the hint fired at all, so the absence below is real.
+    fit_hint_probe hintwin "$MODEL_WIN" "$CTX_WIN"
+    [ "$(count hintwin '--kv-window N')" -ge 1 ] \
+        && pass "hintwin: the fit's placement hint fired and offered --kv-window" \
+        || fail "hintwin: no --kv-window placement line in the fit log (the hint did not fire, so the check below is vacuous)"
+    [ "$(count hintwin '--kv-attendance-pool')" = 0 ] \
+        && pass "hintwin: the hint did NOT offer --kv-attendance-pool on a trunk without the sparse indexer" \
+        || fail "hintwin: the hint offered --kv-attendance-pool to a model that cannot take the pool (TODO #300)"
+
     # INFO only, no assertion: a window that spills below the depth the run reaches is a DOCUMENTED trade-off
     # (11-26 %, `ENVIRONMENT.md` 17.0), so its prompt rate is reported for the record and never gated.  The
     # assertion in the pool section is the one that has no such excuse (r217).
@@ -405,21 +454,52 @@ if [ "$DO_POOL" = 1 ]; then
     HPRE=$(hash_of pref); HPRES=$(hash_of pres); HPFLR=$(hash_of plegacy)
     info "pref text: $HPRE    pres: $HPRES    plegacy: $HPFLR"
 
-    # A shared host/device memory pool (an integrated GPU, e.g. RDNA3.5 / gfx1151) REJECTS the pool: the mirror
-    # is not a separate memory tier there and the page table is not correct on such a device yet (TODO #300).
-    # That decline is the designed behaviour, so on that platform the section asserts the DECLINE plus "nothing
-    # changed", instead of the placement's residency numbers -- the same treatment a declined park gets.
-    if [ "$(count pres 'SHARED host/device pool')" -ge 1 ]; then
+    # A shared host/device memory pool (an integrated GPU, e.g. RDNA3.5 / gfx1151) REFUSES the pool BY DESIGN
+    # (r264, TODO #300 retired): the pool buys device memory back by moving the authoritative KV to a pinned
+    # host mirror, so it needs two tiers, and here the host and the device are ONE -- the KV is already in the
+    # memory the GPU reads, so there is nothing to buy back and no two-tier model for the resolve to be correct
+    # against.  That decline is the designed behaviour, so on that platform the section asserts the DECLINE plus
+    # "nothing changed", instead of the placement's residency numbers -- the same treatment a declined park gets.
+    if [ "$(count pres '--kv-attendance-pool was declined')" -ge 1 ]; then
         info "the pool was DECLINED on this platform (shared host/device memory pool -- an integrated GPU;"
-        info "  the window and the sparse arm are the supported placements there, TODO #300):"
-        [ "$HPRE" = "$HPRES" ] && [ "$HPRE" = "$HPFLR" ] \
-            && pass "the declined pool changed no token (pref == pres == plegacy = $HPRE)" \
-            || fail "the pool DECLINED but the text changed: '$HPRE' / '$HPRES' / '$HPFLR'"
+        info "  the window and the sparse decode arm are the supported placements there, TODO #300 retired):"
+        # The reference here is NOT `pref`: that arm also turns the SPARSE decode on
+        # (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), which is the arm the POOL replaces.  With the pool declined
+        # nothing replaces it, so the same-placement reference is a no-pool arm on the DEFAULT decode arm.
+        # (Comparing against `pref` -- what this branch did before r264 -- could never pass on a UMA box, so the
+        # decline had no real "nothing changed" assertion at all.)
+        pool_arm pdecl "" || exit 1
+        HPDECL=$(hash_of pdecl)
+        info "pdecl text (no pool, the same dense decode arm): $HPDECL"
+        [ -n "$HPDECL" ] && [ "$HPRES" = "$HPDECL" ] && [ "$HPFLR" = "$HPDECL" ] \
+            && pass "the declined pool changed no token (pdecl == pres == plegacy = $HPDECL)" \
+            || fail "the pool DECLINED but the text changed: pdecl '$HPDECL' / pres '$HPRES' / plegacy '$HPFLR'"
         [ "$(count pres 'ATTENDANCE POOL ENABLED')" = 0 ] && [ "$(count plegacy 'ATTENDANCE POOL ENABLED')" = 0 ] \
             && pass "no pool arm engaged the placement (nothing to verify, nothing to get wrong)" \
             || fail "an arm reported 'ATTENDANCE POOL ENABLED' while another reported the decline: the guard and the placement disagree"
+        # ONE line per request: the refusal is a decline, not a wall.  (`set_host_experts_umem` prints its own
+        # "SHARED host/device pool" line on this platform -- a different refusal -- so this greps the pool's.)
+        [ "$(count pres '--kv-attendance-pool was declined')" = 1 ] \
+            && pass "the decline was reported exactly ONCE (a refusal is one line, not a wall)" \
+            || fail "the decline was reported $(count pres '--kv-attendance-pool was declined') times (want 1: one line per request)"
+        # ... and a failing fit must not OFFER the pool this device refuses (the device half of the r264 gate;
+        # `hintwin` covers the model half).  This model CAN take the pool, so the only reason to withhold it is
+        # the device -- and the window line proves the hint fired.
+        fit_hint_probe hintpool "$MODEL_POOL" "$CTX_POOL"
+        [ "$(count hintpool '--kv-window N')" -ge 1 ] \
+            && pass "hintpool: the fit's placement hint fired and offered --kv-window" \
+            || fail "hintpool: no --kv-window placement line in the fit log (the hint did not fire, so the check below is vacuous)"
+        [ "$(count hintpool '--kv-attendance-pool')" = 0 ] \
+            && pass "hintpool: the hint did NOT offer the attendance pool on a shared host/device pool" \
+            || fail "hintpool: the hint offered the attendance pool on a device that refuses it (TODO #300)"
         info "-- pool section: DECLINED BY DESIGN on this platform (not a pass of the placement's numbers)"
     else
+    # the other half of the device gate: where the pool IS supported, the hint must still OFFER it -- an
+    # absence-only check would pass on a build that advertises nothing at all.
+    fit_hint_probe hintpool "$MODEL_POOL" "$CTX_POOL"
+    [ "$(count hintpool '--kv-attendance-pool')" -ge 1 ] \
+        && pass "hintpool: the hint offers the attendance pool where the device supports it (the gate is not always-off)" \
+        || fail "hintpool: no --kv-attendance-pool placement line on a discrete GPU with an indexer trunk (a supported placement was dropped, or the hint did not fire)"
     [ -n "$HPRE" ] && [ "$HPRE" = "$HPRES" ] \
         && pass "pres == pref (the pool is byte-identical to the sparse arm it replaces)" \
         || fail "pres != pref: '$HPRE' vs '$HPRES'"

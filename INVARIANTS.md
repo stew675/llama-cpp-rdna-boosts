@@ -3037,7 +3037,9 @@ Measured 2026-11-07 on a **PCIe5 x16** host, `wip/expert-transfer-engine/` (`h2d
   stable (`1e944569dbd6`).  So it is not a residency/thrash effect and not a text-noise effect -- the resolve
   itself is wrong, at least partly racily.  The **window** (Goal A, one VA range, no mirror) and the sparse decode
   arm are fine on the same box (`be904e86f248`, identical to gfx1201), which is what localises the defect to the
-  mirror/pool tier rather than to the KV placement.  Until fixed, do not claim the pool for gfx1151 (`TODO` #300).
+  mirror/pool tier rather than to the KV placement.  Do not claim the pool for gfx1151 -- it is **refused there by
+  design** since r264 (`TODO` #300 retired): see the r264 entry at the end of this file.  Do not "fix" the
+  resolve for UMA: the pool's premise (buy device memory back from a separate host tier) does not exist there.
 - **A single `rocprofv3 --kernel-trace` run cannot resolve a sub-1.5 % kernel delta — measure twice, and argue from
   the arm (r236, `TODO` #303).**  Two consecutive traces of the **same** binary gave dense-`mul_mat_q` totals of
   521.26 and 527.11 ms: a **±1.1 % run-to-run floor**, larger than the effect being chased.  Per-kernel numbers need
@@ -4068,3 +4070,45 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
 * **The tier is inert on a discrete GPU, measured** (3x R9700 gfx1201): with `MOE_EXPERT_GTT_ARENA=1` forced on,
   zero GTT census lines, `-lme` still means the host-expert budget, `gate-host-pool.sh` 42/42 with the same build,
   and the pool path's throughput within noise.  Record: `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.
+* **A "97.5 % hit rate" is not a small miss traffic: the denominator is REACHES and a miss is a whole expert.**
+  On the 122B-A10B Q8_0 the unit is 9.5625 MiB (3 x `3072x1024` Q8_0) and a decode token makes 8 used experts x 48
+  MoE layers = **384 reaches**, so h = 0.975 is ~9.6 misses = **91.8 MiB/token** = **1.0 GB/s at 11 t/s** -- and
+  92 MiB/token over a ~1.2 GB/s drive is ~80 ms of the 91 ms a token takes, i.e. the miss traffic IS the decode
+  budget.  Each point of h is ~0.4 GB/s at 11 t/s.  Do not "explain" a 1 GB/s drive read as a defect without
+  doing this arithmetic first (WORKLOG.md 261111.034 has the table and the `-lv 4` census fields to confirm it).
+
+## r264 — the attendance pool is refused by DESIGN on a shared host/device pool, and `--fit` may only offer a placement the model+device can take (`TODO` #300 retired)
+
+**The refusal is the answer, not a workaround.**  `--kv-attendance-pool` buys *device* memory back by keeping the
+authoritative KV in a **pinned host mirror** and caching only the indexer pages the sparse decode selects.  That
+trade only exists where the host and the device are **separate tiers**.  On a shared host/device pool (an
+integrated GPU — gfx1151) they are one: the KV is already in the memory the GPU reads, so there is nothing to buy
+back, and the two-tier resolve (MARK/CLAIM/MAP+FILL, `kv_pool_invalidate()`, the dirty-refill protocol) has no
+second memory kind to be correct against.  The measured symptom (r236: a *fully resident* pool still verifies
+~93 M mismatched bytes against its own mirror, a different text every run) is what a design applied to the wrong
+memory model looks like, which is why r264 **retires** the item instead of chasing the resolve: the defect is the
+premise, so a "fixed" resolve on UMA would still be a placement that cannot help.  Rules:
+
+* The cache refuses the pool on any `GGML_BACKEND_DEVICE_TYPE_IGPU` device with **one** WARN and leaves the KV
+  exactly as it was; the message must contain `--kv-attendance-pool was declined` (the gate greps it) and must not
+  advertise the pool as a future fix.  The **window** (`--kv-window`) and the sparse decode arm are supported and
+  validated there — the two are ALTERNATIVES, and the window is the UMA answer.
+* **`--fit` must not offer a placement the code will refuse.**  A hint paragraph about a no-op is
+  indistinguishable, to a reader, from a supported suggestion, and on this box it printed as a wall of *red*:
+  measured on gfx1151 with `Qwen3.5-122B-A10B-Q8_0 -lme auto -c 102400`, the over-budget fit block ended with 8
+  `--kv-window`/`--kv-attendance-pool` lines at `ERROR` level, for a **qwen35moe** trunk (no sparse indexer, so the
+  pool never had anything to serve) on an **APU** (so it is refused anyway).  Two independent predicates:
+  the model needs the indexer geometry (`hparams.indexer_head_size > 0` — `llama_model_has_kv_indexer`), and no
+  device may be an IGPU or a Meta (a tensor split has no per-device mirror).  Neither eligible placement → no hint
+  at all.  The window paragraph is model- and device-agnostic, so it stays.
+* **Advice is a WARN, not an ERROR.**  The over-budget facts stay `ERROR` (they are errors); the "a placement can
+  buy the KV back" block is advice and prints at `WARN`, once per fit.
+* **`common_log_add`/`LOG_ERR` prefix the message they are handed, not each `\n`-separated line.**  A multi-line
+  call prints its continuation lines with **no level and no timestamp** (`common_params_fit_impl:   layers) or use a
+  smaller quant...` read as raw output, which is a large part of why the block read as a wall).  One call per line.
+* **Gate both directions.**  `scripts/gate-kv-residency.sh` now runs `hintwin` (a trunk with no indexer: the window
+  must be offered, the pool must NOT be) and `hintpool` (the pool model: absent on a shared pool, **present** on a
+  discrete GPU — an absence-only check passes on a build that advertises nothing).  It also asserts the decline is
+  reported **once**, and its UMA branch's "nothing changed" reference is a new no-pool arm on the **default**
+  decode arm (`pdecl`): comparing against `pref`, which also turns the *sparse* arm on (the arm the pool replaces),
+  could never pass — so the branch graded a text difference that was never the decline's.
