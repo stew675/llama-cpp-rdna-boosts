@@ -4112,3 +4112,38 @@ premise, so a "fixed" resolve on UMA would still be a placement that cannot help
   reported **once**, and its UMA branch's "nothing changed" reference is a new no-pool arm on the **default**
   decode arm (`pdecl`): comparing against `pref`, which also turns the *sparse* arm on (the arm the pool replaces),
   could never pass — so the branch graded a text difference that was never the decline's.
+
+## r265 — a prefill read plan is built from the USED bitset, never from "not resident" alone (block 16, `TODO` #317 opened for the copy that remains)
+
+**`map[]` in `moe_cache_prefill_stream()` is not a residency map.**  It holds a slot only for an expert that is
+**both routed by this ubatch and resident** (everything else, including every expert the ubatch does not use, is
+`-1`).  A run of `map[e] < 0` is therefore *"not (used AND resident)"*, and reading it fetches the whole table
+minus the used residents.  The delivery's own host-pool tiers do not have this shape: `prs_host` (staging) and
+`gprs_host` (device gather) are COMPLETE two-tier maps (`>= 0` arena slot, `<= -2` pool slot, `-1` in neither),
+so there `-1` genuinely means "must come from storage" — that asymmetry is why the bug existed on exactly one
+tier.  Measured (122B-A10B Q5_K_XL, `-lme 75` arena 241/256 slots/table): a 38-token prompt planned **8550**
+spans / 10 031 ms of reads instead of **684** / 61 ms (prompt eval **3.2 -> 26.6-29.7 t/s**), and a 24 576-token
+prefill planned 23 985 instead of 10 353 (+9.6 % prefill: 499.9 -> 547.7 t/s), with the used/read/D2D census
+byte-identical in both arms.  Rules:
+
+* **A read plan's run set is `used[e] && missing(e)`**, and a run breaks at the first expert that is not used or
+  is resident (a span covers a contiguous file range either way).  `benchmarks/2026-11-11-gtt-prefill-span-set.md`.
+* **A wide prefill cannot validate this class**: used ~= all makes the wrong set nearly equal the right one, so
+  the arm that exposes it is a SHORT prompt (tens of tokens), whose used set is a small subset of a resident
+  table.  Every prefill-read change owes a short-prompt arm as well as a wide one.
+* **Census a span by the bytes it really reads, not by the bytes it served.**  `g_pf_span_bytes` was accumulated
+  from the used experts a span delivered, so wasted reads were invisible and `MiB/span` could print below the
+  smallest expert (1.02 MiB against a 2.06 MiB floor was the visible tell).  A per-span average under one expert
+  is now impossible, and an inconsistency there means a planner defect.
+* **The per-pass copy that remains is `O(used)` and is the next item** (`TODO` #317): with `-lme` below the set,
+  no table is identity, so the resident used set is D2D-copied into the scheduler's single `input_cpy` on every
+  pass (30 060.5 MiB for a 38-token prompt).  The identity tier already reads in place at any width (r258); the
+  ARENA tier's slot-remap path is still decode-band-only (`moe_cache_update_host` returns early, `moe_cache_get_table`
+  refuses `>MOE_EXPERT_CACHE_MAX_TOK`, `remap_cap` is `n_experts*8`).  Follow-up:
+  `wip/prefill-in-place-arena/`, which is NOT the in-place/remap direction `TODO` #273 refuted (that one
+  predicted the *complement* of a partly resident table; this one removes a copy of the *residents*).
+* **The discrete host-pool tier was checked and does not have it**: its map is complete, and its measured staged
+  reads track the per-table complement, not the prompt width (24 B prompt -> 1 146.6 MiB / 2 223 experts;
+  2 KB -> 1 858.3 MiB / 3 626 on `soar`).  Its residual, by-design difference is that the destination there is
+  the WHOLE split-input table, so the complement is prefetched whether routed or not; restricting it needs the
+  host routing readback that the gather path exists to avoid.  Do not re-open it as "the same bug".

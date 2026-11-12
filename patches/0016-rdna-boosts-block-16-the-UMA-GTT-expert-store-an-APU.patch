@@ -1,4 +1,4 @@
-From 18a4b30e5165f334e30a2d20756e3c2991f9c78d Mon Sep 17 00:00:00 2001
+From 7efb30ae5f075aa76c0d31a1a7dbde1b263f1591 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 16/16] rdna-boosts: block 16: the UMA GTT expert store -- an
@@ -59,11 +59,11 @@ every other backend keeps its behaviour (the code is gated on prop.integrated).
  ggml/src/ggml-cuda/ggml-cuda.cu               |  280 +++-
  ggml/src/ggml-cuda/gtt-expert-store.cu        |  638 +++++++++
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 ++
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 1208 ++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 1221 ++++++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   26 +
  src/llama-model-loader.cpp                    |  696 +++++++++-
  src/llama-model-loader.h                      |   35 +
- 13 files changed, 3096 insertions(+), 55 deletions(-)
+ 13 files changed, 3109 insertions(+), 55 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -1418,7 +1418,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 524cc11db..0bed79b88 100644
+index 524cc11db..20c1e7178 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -2027,12 +2027,12 @@ index 524cc11db..0bed79b88 100644
 -                    order.push_back(i);
 +                if (layer_full[i] < 0) {
 +                    continue;
-+                }
+                 }
 +                // P3c: a pinned head layer is already FULL and its bytes are already outside the budget, so
 +                // letting it into this pass would charge them to `remain` a second time and drop trunk layers.
 +                if (layer_pinned_head(i)) {
 +                    continue;
-                 }
++                }
 +                order.push_back(i);
              }
              if (g_heat_on) {
@@ -2284,7 +2284,7 @@ index 524cc11db..0bed79b88 100644
      b.busy = false;
      g_span_next[device] = (g_span_next[device] + 1) % used;
      return span_buf_ensure(b, need, align);
-@@ -8961,6 +9472,526 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -8961,6 +9472,539 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      return false;
  }
  
@@ -2586,10 +2586,20 @@ index 524cc11db..0bed79b88 100644
 +        }
 +    }
 +
-+    // ---- the read: one coalesced span per maximal run of missing used experts --------------------------------
++    // ---- the read: one coalesced span per maximal run of USED and MISSING experts --------------------------
 +    // A run is contiguous in the FILE (`src_offs + e*host_bytes`) AND in the DESTINATION (`dst + e*expert_bytes`),
 +    // so a span costs one pread and one H2D.  The bytes, the destination layout and the start arm are the
 +    // delivery's (`stage_span_fill`'s shape); only the granularity and the depth of the ring are different.
++    //
++    // A RUN IS "USED AND MISSING", NOT "NOT RESIDENT".  `map[]` above holds a slot only for an expert that is
++    // BOTH used by this ubatch AND resident, so `map[e] < 0` on its own means "not (used && resident)" -- it
++    // also covers every expert this ubatch does not route to.  Reading those is pure waste (they are not in
++    // the destination the op reads), and on a SMALL prompt it is most of the table: measured
++    // (122B-A10B Q5_K_XL, `-lme 75` arena, a 34-token prompt, one pass) 8550 spans / 10031 ms of reads before
++    // against 684 / 61 ms after, with `read` bytes unchanged (1578.6 MiB of a 31639.1 MiB used set) -- prompt
++    // eval 3.2 -> 29.7 t/s.  A WIDE prefill hides it completely (used ~= all, so the two sets nearly
++    // coincide), which is why the campaign's measurements never saw it; the tell is a span average far below
++    // one expert, and the census now counts the bytes a span really reads so it cannot hide again.
 +    if (t.src_fd < 0) {
 +        t.src_fd = pool_open_file(t.src_path.c_str(), g_pool_dio);
 +        if (t.src_fd >= 0) {
@@ -2605,12 +2615,12 @@ index 524cc11db..0bed79b88 100644
 +    struct pf_win_t { int e; int n; };
 +    std::vector<pf_win_t> wins;
 +    for (int e = 0; e < n_experts; ) {
-+        if (map[(size_t) e] >= 0) {
++        if (used[(size_t) e] == 0 || map[(size_t) e] >= 0) {
 +            e++;
 +            continue;
 +        }
 +        int run_end = e + 1;
-+        while (run_end < n_experts && map[(size_t) run_end] < 0) {
++        while (run_end < n_experts && used[(size_t) run_end] != 0 && map[(size_t) run_end] < 0) {
 +            run_end++;
 +        }
 +        for (int s = e; s < run_end; ) {
@@ -2696,6 +2706,7 @@ index 524cc11db..0bed79b88 100644
 +            err = cudaMemcpyAsync(dst + (size_t) b.win_e[i] * t.expert_bytes, b.jobs[i].dst, b.jobs[i].len,
 +                                  cudaMemcpyHostToDevice, st);
 +            if (err == cudaSuccess) {
++                g_pf_span_bytes += (int64_t) b.jobs[i].len;   // what the span REALLY read (see the plan above)
 +                const int n = (int) (b.jobs[i].len / t.expert_bytes);
 +                for (int k = 0; k < n; k++) {
 +                    served[(size_t) (b.win_e[i] + k)] = 1;
@@ -2803,7 +2814,9 @@ index 524cc11db..0bed79b88 100644
 +    if (g_pf_n_tok_min == 0 || n_tok < g_pf_n_tok_min) g_pf_n_tok_min = n_tok;
 +    if (n_used_experts > g_pf_nexp_max) g_pf_nexp_max = n_used_experts;
 +    g_pf_span_reads     += (int64_t) wins.size();
-+    g_pf_span_bytes     += read_b;
++    // `g_pf_span_bytes` is accumulated where each span's H2D is issued (its real length), NOT from `read_b`:
++    // `read_b` counts the used experts a span served, so the two only agree while every window is a run of used
++    // experts -- and the census's MiB/span is the number that shows when they do not.  See the plan above.
 +    (void) n_resident;
 +    return true;
 +}
@@ -2811,7 +2824,7 @@ index 524cc11db..0bed79b88 100644
  // Geometry-only registration: the half of `moe_cache_update_host` that needs no routing.
  //
  // The scheduler calls it for every routed host-expert input of EVERY split before the first split of a
-@@ -10149,21 +11180,99 @@ static void report_locked() {
+@@ -10149,21 +11193,99 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -2920,7 +2933,7 @@ index 524cc11db..0bed79b88 100644
          GGML_LOG_INFO("%s: pool fills: %lld storage reads %.0f ms, %lld mapping memcpys %.0f ms, %.2f GiB total "
                        "(%.1f MiB/fill, %.0f MiB/s effective)\n",
                        __func__, (long long) g_fill_read_calls, g_fill_read_us / 1000.0,
-@@ -10411,6 +11520,31 @@ static void report_locked() {
+@@ -10411,6 +11533,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }

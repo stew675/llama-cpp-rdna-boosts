@@ -66,6 +66,7 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
+| **317** | a prefill pass D2D-copies the resident used set out of the GTT arena (`O(used)`, not `O(missing)`) | performance (block 16, the UMA arena tier) | **OPEN** — measured; shape + the two open decisions in `wip/prefill-in-place-arena/` — §317 |
 
 ## Handle numbering
 
@@ -209,6 +210,45 @@ identity-only case, where the arena IS the table and there is no complement to f
 item -- consolidating the three transports for a PARTLY resident table -- is untouched.
 
 **OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
+
+## 317. A prefill pass copies the resident used set out of the GTT arena (`O(used)`, not `O(missing)`)
+
+**A prefill ubatch re-materialises the whole used expert set into the split-input copy on every pass, even though
+94 % of it is already in the store.**  Measured on `halo`, `Qwen3.5-122B-A10B Q5_K_XL`, `-lme 75` (arena = 241/256
+slots per trunk table, 78 239.3 MiB = 94.3 % of the 81.06 GiB set): a **38-token** prompt uses 31 639.1 MiB of
+experts; after r265 only **1 578.6 MiB (5.0 %)** is read from storage, and **30 060.5 MiB (95.0 %) is D2D-copied**
+out of the arena into the scheduler's `input_cpy`.  At `-ub 4096` a 100k-token prompt is ~25 passes ⇒ **~1.85 TiB
+of copies**; a WebUI request that the server processes in 3 passes still copies ~90 GiB for a 34-token prompt.  The
+identical table under the *identity* shape (slot == expert, whole set resident) is already read **in place at any
+width** (r258, `MOE_EXPERT_PREFILL_IN_PLACE`, +171 % prefill measured), so this is the arena's missing half.
+
+**Why it cannot be avoided today** — three decode-band gates, in order: `moe_cache_update_host()` returns before
+admission/remap for `n_tok > MOE_EXPERT_CACHE_MAX_TOK`; `moe_cache_get_table()` refuses the remap above the band
+(the identity branch is width-free); and `t.remap_cap = t.n_experts * 8` (2 048 int32) is far below
+`n_used x n_tok` = 32 768 at `-ub 4096`.  The routing is already on the host when the prefill hook runs (the
+scheduler reads it back to build the used-expert bitset), so the remap owes no new synchronise.
+
+**Kind:** performance / delivery — a block-16 amendment once its decisions are taken.
+
+**Plan (detail, traps and gates: [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md)).**  Admit
+the misses into slots and publish a slot-remapped routing so the op reads the arena in place; double-buffer the
+*remap* (two 128 KiB buffers per device — not 2 x 856 MiB of experts); add the MMQ finite-head zeroing over slot
+runs (an uninitialised neighbour slot is a NaN, not a slow path); `preadv` the miss set into its slots (the store is
+host-addressable, so no bounce and no H2D) -- which also fixes a MEASURED defect that arm has today: the span read
+aligns its destination but not its GGUF offset, so under `O_DIRECT` every span is short and silently falls back to
+the per-expert source (measured `read 0.0 MiB in 23 985 spans of 0.00 MiB`, hook 10 253 vs 3 146 ms buffered); and
+decide the eager seed separately (75 GiB / ~30 s at sizing here; 43.9 GiB / 57 s cold on the discrete tier).
+
+**Two decisions for the maintainer:**
+1. **Prefill eviction rank** — (a) rank by the DECODE heat prior so a prefill pass evicts what decode cares least
+   about (cheapest, reuses the arena's own prior), or (b) a ~6 %-of-arena per-table *landing* reserve that prefill
+   misses use and residents never enter (provably non-perturbing, costs ~4.8 GiB of the 75 GiB).
+2. **Should prefill admit at all**, or only fill a fixed landing set (i.e. prefill neither pollutes nor benefits
+   from residency)?
+
+This is **not** the in-place/remap direction `TODO` #273 refuted: that refutation was about predicting the
+*complement* of a partly resident discrete pool table, where the transactions did not pay.  Here the residents are
+94 % of the table in one addressable region and the change removes a copy of *them*.
 
 ## 282. A mid-run pinned-tier latch perturbs the logits by ~1e-5 (a path difference, not corruption)
 

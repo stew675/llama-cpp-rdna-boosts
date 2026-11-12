@@ -1,3 +1,68 @@
+## 261111.036 (r265) -- block 16's prefill span plan read the WHOLE table minus the used residents: a 38-token prompt went 3.2 -> 26.6-29.7 t/s, and a wide prefill +9.6 %
+
+**The report.**  A few-hundred-byte prompt in the WebUI "looks like it reads the entire set of model weights from
+the drive several times" on `Qwen3.5/122B-A10B/Q5_K_XL` with `-lme 75`, even though the census says the store holds
+94 % of the expert set.  It did: the prefill stream's read plan was built from the wrong set.
+
+**Root cause (block 16, P5).**  `moe_cache_prefill_stream()` builds its coalesced spans from "`map[e] < 0`", but
+`map[]` is populated only for an expert that is **both routed by this ubatch AND resident**.  So a "run of missing
+experts" was a run of *"not (used and resident)"*, which also covers every expert the ubatch does not route to --
+and those were read from storage, then **not counted** (the census added up the used bytes a span served), so
+`MiB/span` could print *below* the smallest expert (1.02 MiB against a 2.06 MiB floor) and hide it.  On a wide
+prefill the wrong set nearly equals the right one (`used ~= all`), which is why the campaign measured this shape as
+clean; on a short prompt it is most of the table.
+
+**Fix (block-16 amendment).**  The run set is `used[e] && missing(e)` (breaking at the first expert that is not used
+or is resident), and `g_pf_span_bytes` is accumulated where each span's H2D is issued (its real length), so the
+census cannot hide the class again.  No new environment variable, no semantic change: it fetches strictly less of
+the same bytes, from the same sources, into the same destination.
+
+**Measured (`halo`, gfx1151, 122B-A10B Q5_K_XL: 81.06 GiB expert set, 147 tables, `-lme 75` -> arena 241/256 slots
+per trunk table = 78 239.3 MiB, head pinned outside; `-ub 4096 -b 4096 -ngl all --fit off --spec-type draft-mtp`,
+prior frozen):**
+
+| arm | metric | before | after |
+|---|---|---:|---:|
+| 38-token prompt (1 pass) | spans / span read time | 8 550 / 10 031 ms | **684 / 61 ms** |
+| | hook total | 11 093 ms | **239 ms** |
+| | prompt eval | 3.2 t/s | **26.6-29.7 t/s** |
+| 24 576-token prefill (6 passes) | spans | 23 985 (1.02 MiB avg) | **10 353 (2.37 MiB)** |
+| | read time / ring wait | 5 307 ms / 2 158 ms | **1 118 ms / 6 ms** |
+| | prefill | 499.9 t/s | **547.7 t/s** |
+
+The used / read / arena-D2D census is byte-identical in both arms (wide: `used 519 970.8 MiB`, `read 24 486.7 MiB`
+= 4.7 %, `arena D2D 495 484.1 MiB`) -- only the fetched set changed.
+
+**Verification.**  `validate-set.sh` OK (17 hashes, fresh-tarball strict apply, tree `176ed8866`, Windows lint);
+deterministic re-cut reproduces the amended tip **`7efb30ae5`** exactly (independent local clone at `a691b2345`);
+`gate-uma-experts.sh --quick --no-ram` **29 checks / 0 failures** (`ref` reads 9451.6 of 12 809.2 MiB used, `pfoff`
+11 608.1 MiB, `pfverify` clean, no GPU fault); `gate-prefill-logits.sh --ab "MOE_EXPERT_GTT_PREFILL=0"` **mean KLD
+-0.000000 / same-top-p 99.990 %**, base PPL 5.8238 unchanged, journal clean; greedy text identical between the
+streaming arm and the delivery's per-expert copy (`sha=58fba7e8b027`, 142 chars, `-n 32 --temp 0 --seed 42`).
+
+**Checked and NOT present on the discrete host-pool tier** (`soar`, gfx1201, r264 tree): `prs_host` (pool staging)
+and `gprs_host` (device gather) are *complete* two-tier residency maps (`>= 0` arena, `<= -2` pool, `-1` neither),
+so `-1` really means "must come from storage".  Measured on `gate-host-pool.sh`'s config (Flash-Next GSQ-IQ3_XXS,
+`-ncmoe 47`, `MOE_HOST_LIMIT_FRAC=40`, `mmap`, `-ub 1024`): a 24-byte prompt staged 1 146.6 MiB / 2 223 experts,
+a 2 KB prompt 1 858.3 MiB / 3 626 -- the read volume tracks the per-table *complement*, not the prompt.  Nothing
+changed there.  What that run did expose (recorded, not fixed): the discrete tier's sizing fill is 43.90 GiB in
+80 446 memcpys, **57.0 s cold / 3.7 s warm** -- the same eager-seed shape as this tier's 75 GiB arena seed.
+
+**Found in passing, NOT fixed (reported, not silently carried).**  The tier's prefill span read does not honour
+`O_DIRECT` alignment: it aligns the *destination* but issues `pread(fd, dst, len, src_offs + e*host_bytes)` with the
+raw GGUF offset (32 B aligned), so on the `dio` arm every span is short and silently falls back to the per-expert
+source -- measured (24 576-token prefill, `--load-mode dio`): `read 0.0 MiB in 23 985 spans of 0.00 MiB`,
+`fallback 24 486.7 MiB`, hook 10 253 ms against 3 146 ms buffered.  `stage_span_fill()` (the discrete pool path)
+already round-outs correctly.  Recorded as P2a of the follow-up campaign; it is the arm a >RAM box needs (no
+page-cache thrash), so it should not wait long.
+
+**Delivery state.**  `patches/` 0000-0016 + `rdna-boosts-all.patch` regenerated from the canonical chain,
+`release.json` = `v17-a691b2345-r265`, tip `7efb30ae5f075aa76c0d31a1a7dbde1b263f1591`, tree
+`176ed88667e26cd426a857edd330b6d9219f5065`.  **Not yet published** (no push, no tag): the fork refresh
+(`scripts/fork-refresh.sh --push`) and the tag are the maintainer's call.  Docs: `patches/README.md` (block-16
+amendment), `INVARIANTS.md` (r265), `benchmarks/2026-11-11-gtt-prefill-span-set.md`; the copy that remains is
+`TODO` #317 + [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md).
+
 ## 261111.035 (r264, release) -- `v17-a691b2345-r264` is PUBLISHED: delivery repo pushed, personal fork's `rdna-boosts` re-cut and force-pushed at the recorded tip, and the ROCm images are for the off-host worker to pick up
 
 **Release:** `v17-a691b2345-r264` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

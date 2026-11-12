@@ -65301,10 +65301,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..0bed79b88
+index 000000000..20c1e7178
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,11752 @@
+@@ -0,0 +1,11765 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -75077,10 +75077,20 @@ index 000000000..0bed79b88
 +        }
 +    }
 +
-+    // ---- the read: one coalesced span per maximal run of missing used experts --------------------------------
++    // ---- the read: one coalesced span per maximal run of USED and MISSING experts --------------------------
 +    // A run is contiguous in the FILE (`src_offs + e*host_bytes`) AND in the DESTINATION (`dst + e*expert_bytes`),
 +    // so a span costs one pread and one H2D.  The bytes, the destination layout and the start arm are the
 +    // delivery's (`stage_span_fill`'s shape); only the granularity and the depth of the ring are different.
++    //
++    // A RUN IS "USED AND MISSING", NOT "NOT RESIDENT".  `map[]` above holds a slot only for an expert that is
++    // BOTH used by this ubatch AND resident, so `map[e] < 0` on its own means "not (used && resident)" -- it
++    // also covers every expert this ubatch does not route to.  Reading those is pure waste (they are not in
++    // the destination the op reads), and on a SMALL prompt it is most of the table: measured
++    // (122B-A10B Q5_K_XL, `-lme 75` arena, a 34-token prompt, one pass) 8550 spans / 10031 ms of reads before
++    // against 684 / 61 ms after, with `read` bytes unchanged (1578.6 MiB of a 31639.1 MiB used set) -- prompt
++    // eval 3.2 -> 29.7 t/s.  A WIDE prefill hides it completely (used ~= all, so the two sets nearly
++    // coincide), which is why the campaign's measurements never saw it; the tell is a span average far below
++    // one expert, and the census now counts the bytes a span really reads so it cannot hide again.
 +    if (t.src_fd < 0) {
 +        t.src_fd = pool_open_file(t.src_path.c_str(), g_pool_dio);
 +        if (t.src_fd >= 0) {
@@ -75096,12 +75106,12 @@ index 000000000..0bed79b88
 +    struct pf_win_t { int e; int n; };
 +    std::vector<pf_win_t> wins;
 +    for (int e = 0; e < n_experts; ) {
-+        if (map[(size_t) e] >= 0) {
++        if (used[(size_t) e] == 0 || map[(size_t) e] >= 0) {
 +            e++;
 +            continue;
 +        }
 +        int run_end = e + 1;
-+        while (run_end < n_experts && map[(size_t) run_end] < 0) {
++        while (run_end < n_experts && used[(size_t) run_end] != 0 && map[(size_t) run_end] < 0) {
 +            run_end++;
 +        }
 +        for (int s = e; s < run_end; ) {
@@ -75187,6 +75197,7 @@ index 000000000..0bed79b88
 +            err = cudaMemcpyAsync(dst + (size_t) b.win_e[i] * t.expert_bytes, b.jobs[i].dst, b.jobs[i].len,
 +                                  cudaMemcpyHostToDevice, st);
 +            if (err == cudaSuccess) {
++                g_pf_span_bytes += (int64_t) b.jobs[i].len;   // what the span REALLY read (see the plan above)
 +                const int n = (int) (b.jobs[i].len / t.expert_bytes);
 +                for (int k = 0; k < n; k++) {
 +                    served[(size_t) (b.win_e[i] + k)] = 1;
@@ -75294,7 +75305,9 @@ index 000000000..0bed79b88
 +    if (g_pf_n_tok_min == 0 || n_tok < g_pf_n_tok_min) g_pf_n_tok_min = n_tok;
 +    if (n_used_experts > g_pf_nexp_max) g_pf_nexp_max = n_used_experts;
 +    g_pf_span_reads     += (int64_t) wins.size();
-+    g_pf_span_bytes     += read_b;
++    // `g_pf_span_bytes` is accumulated where each span's H2D is issued (its real length), NOT from `read_b`:
++    // `read_b` counts the used experts a span served, so the two only agree while every window is a run of used
++    // experts -- and the census's MiB/span is the number that shows when they do not.  See the plan above.
 +    (void) n_resident;
 +    return true;
 +}

@@ -4764,6 +4764,24 @@ The store's sizing for a *separate* drafter's head is parked (a `common`/`--fit`
 loader change).  The lock policy still refuses a >RAM model on a clamp that covers the RAM shortfall but cannot fund
 one slot per table -- relaxing that is a separate change with its own arms.
 
+**r265 amendment to block 16 -- the prefill span plan is the USED set, and its census counts what it reads.**
+`moe_cache_prefill_stream()` planned its coalesced reads from "`map[e] < 0`", but `map[]` holds a slot only for an
+expert that is **both routed by this ubatch and resident**, so a "missing run" was really a run of *not (used and
+resident)* -- it fetched every expert the ubatch does not use, and those bytes were counted only when they happened
+to be used, so the census reported a span average *below* one expert (1.02 MiB against a 2.06 MiB floor: the tell).
+The run set is now `used[e] && missing(e)`, and `g_pf_span_bytes` is accumulated from each span's real length
+instead of the used bytes it served.  Measured on `halo` (122B-A10B Q5_K_XL, `-lme 75`, arena 241/256 slots/table):
+a **38-token** prompt plans **684** spans / 61 ms of reads instead of **8550** / 10 031 ms (**prompt eval 3.2 ->
+26.6-29.7 t/s**), and a **24 576-token** prefill plans 10 353 instead of 23 985 (**+9.6 % prefill, 499.9 -> 547.7
+t/s**), with the used/read/arena-D2D census byte-identical in both arms (`read 24 486.7 MiB` = 4.7 % of used).  Text
+is unchanged (`58fba7e8b027`, streaming vs `MOE_EXPERT_GTT_PREFILL=0`), `gate-uma-experts.sh --quick --no-ram`
+**29/29**, prefill-logit **-0.000000 / 99.990 %**.  A *wide* prefill cannot validate this class (used ~= all makes
+the wrong set nearly the right one) -- the exposing arm is a short prompt.  The **discrete host-pool tier does not
+have it** (its `prs_host`/`gprs_host` are complete two-tier maps; measured on `soar`, staged reads track the
+per-table complement, not the prompt width), so nothing changed there.  The per-pass D2D copy of the resident used
+set that remains is `TODO` #317 / [`wip/prefill-in-place-arena/`](../wip/prefill-in-place-arena/README.md).
+Record: `benchmarks/2026-11-11-gtt-prefill-span-set.md`, `WORKLOG.md` 261111.036.
+
 **Record:** `archive/work/apu-expert-gtt/` (README §0 the shape, §5 sizing, §6 the trap list, IMPLEMENTATION P0-P6,
 MEASUREMENTS §13-§27, the probes, and the campaign's own gate).
 
