@@ -213,7 +213,9 @@ only as a rough shape.
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth (+ r218: `spec_draft_align_cache()` realigns the drafter's KV with the batch it ingests, issue #272) | +1381 / −62 | 23 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker (+ r241: the conv-state store's rollback index is built once per graph per device instead of once per conv layer, `LLAMA_SHARE_SLOT_REV=0` the kill switch — GitHub issue #291) | +3362 / −31 | 25 |
 | 04 | `0004-…-block-04-BF16-KV-cache-and-native-BF16-f` | BF16 KV cache + native-BF16 FA | +602 / −193 | 8 |
-| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242; + r172: the derived mask covers batches of several sequences — 1.03 GiB device + 0.94 GiB host back on a 2-slot unified server, PR #247; + r208: RDNA2 (gfx1030) prefill — the `q_global` threshold 16 → 64 and the D=256 `ncols2` cap lift, and the clamped in-bounds tail — PR #270/#271; + r254: `resolve_fused_ops`' `multi_stream` names `LLM_ARCH_DEEPSEEK41`, so the derived-kq-mask probe is skipped on V4.1's always-per-sequence cache (`llama-server -np 4 --kv-unified` aborted at `deepseek41.cpp:552` before this) — GitHub issue #300) | +5600 / −633 | 295 |
+| 05 | `0005-…-block-05-flash-attention-band-native-qua` | FA band / native quantized K-V / derived kq mask (+ the three kq-mask fills that lacked their sibling's buffer guard, r131; + the band's fully-masked group skip, r133; + r160: the packed kq mask is only **reserved** where a batch needing it is reachable, issue #238; + r164: the derived input is reusable on hybrid models, PR #242; + r172: the derived mask covers batches of several sequences — 1.03 GiB device + 0.94 GiB host back on a 2-slot unified server, PR #247; + r208: RDNA2 (gfx1030) prefill — the `q_global` threshold 16 → 64 and the D=256 `ncols2` cap lift, and the clamped in-bounds tail — PR #270/#271; + r254: `resolve_fused_ops`' `multi_stream` names `LLM_ARCH_DEEPSEEK41`, so the derived-kq-mask probe is skipped on V4.1's always-per-sequence cache (`llama-server -np 4 --kv-unified` aborted at `deepseek41.cpp:552` before this) — GitHub issue #300; + r268: the launchers' GQA choice asks the one mask predicate
+`ggml_cuda_flash_attn_ext_has_mask()` (moved to `fattn-common.cuh`), so a derived op takes the same `ncols2` as the
+packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class closed — contributor PR #303) | +5630 / −628 | 295 |
 | 06 | `0006-…-block-06-MMB-quantized-prefill-GEMM` | MMB quantized prefill GEMM (+ r132: the per-arch dispatch keys on the running device, not the primary; + r245: the policy accessors are per DEVICE too) | +3001 / −17 | 11 |
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +933 / −142 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5653 / −459 | 38 |
@@ -678,6 +680,20 @@ almost all of them `template-instances/*.cu`.
   created; a graph that never consumes it leaves it **unallocated**, so every fill site is guarded on
   `tensor && tensor->buffer` (r131 closed the last three — the hybrid-K one aborted `-np 1` on
   `bailingmoe3`; see Purity below).
+* **The derived form takes the same kernel variants as the packed mask — one predicate (r268, contributor PR
+  #303).**  `ggml_cuda_flash_attn_ext_has_mask()` was a `static` in `fattn.cu`, so the two `.cuh` launchers kept
+  hand-copies of an older form of it (`mask != nullptr || src[5] != nullptr`) and asked upstream's `kv_rows` slot
+  alone — which is `nullptr` on a derived op.  The tile `ncols2` dispatch therefore took `ncols2 = 1` where the same
+  op with a packed mask took `ncols2 = 4`/`8`, on every layout whose chooser picks the **tile** kernel (RDNA3_5/
+  RDNA3_0 heads above their `GGML_CUDA_FA_WMMA_MAX_HEAD` cap, RDNA2, `GGML_CUDA_FA_WMMA_256=0`); on gfx1201 an
+  aligned derived op with `n_q > 8` is MMA, which already asked the predicate — so the divergence is invisible there.
+  `has_mask()` now lives in `fattn-common.cuh` and all four sites ask it.  The **band** hunk is inert by construction
+  (a derived batch is always `n_tokens > 8`, the band requires `Q->ne[1] <= 8`) and is carried so the sites cannot
+  drift.  Numerics unchanged (all-logits byte-identical, head 256/gqa 4 and head 128/gqa 8); pp512 +0.6-1.0 % and
+  +1.3 % on the forced-launcher arms; and it closes the `GGML_ABORT` that a derived op reaching the DKQ 320/576 tile
+  instances (no non-GQA arm) would have hit.  `tests/test-backend-ops.cpp` gains the aligned head-512 derived case,
+  the one shape that reaches the tile GQA dispatch on a cap <= 320 layout
+  (`benchmarks/2026-11-12-fa-derived-tile-gqa.md`, `INVARIANTS.md` r268).
 * **The derived input is reusable through a hybrid memory context (r164, PR #242).** `can_reuse()` compares
   `params.mctx` — but a hybrid model's context is a `llama_memory_hybrid_context`, never the
   `llama_kv_cache_context` this input was built from, so the pre-r164 code rejected the reuse for *every*

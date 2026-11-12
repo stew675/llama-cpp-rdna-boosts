@@ -1,3 +1,77 @@
+## 261112.004 (r268, release) -- `v17-a691b2345-r268`: the derived kq mask takes the same FA kernel variants as the packed mask -- one predicate, asked by every launcher (contributor PR #303)
+
+**Release:** `v17-a691b2345-r268` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`e533fb2af92c6aa0f3ea2180ba411cfe0d2e3281`**, tree **`ce7e306fdaa08c4de095dc1a5cde4b28d8bc1692`**.  Block 05
+amended (+43/−16 over 5 files); no new block, no new environment variable, no kernel body or dispatch row touched —
+the change is *which* existing row a derived op takes.
+
+### The report (contributor PR #303, `overdoingism`, written by Claude on their behalf)
+
+Upstream #29510 (the `a691b2345` base) gave `GGML_OP_FLASH_ATTN_EXT` a `kv_rows` operand at `src[5]` and moved block
+05's derived kq mask to `src[6..8]`; `ggml_cuda_flash_attn_ext_has_mask()` counts `src[6]`, but two launcher checks in
+block 05 still asked `src[5]`: `ggml_cuda_fattn_band_wmma_applies` (fattn-rdna.cuh) and `launch_fattn_tile_switch_ncols2`
+(fattn-tile.cuh).  Their evidence was r241 only (`git apply --check` on r262), 25 + 7 requests with identical text,
+draft counts and top-5 logprobs, and "−0.13 % / +0.13 %" on the request with the most 9..16-row verify batches.
+
+### Assessment (r268, before the amendment)
+
+* **The observation is right, the effect was not where the PR put it.**  On the reported configuration (Qwen3.8-27B
+  UD-Q4_K_XL = `qwen35`, head 256, gqa 6, gfx1201) a derived op with `n_q > 8` takes the WMMA route and
+  `BEST_FATTN_KERNEL_MMA_F16`, whose `ncols2` dispatch *already* asked `has_mask()` -- so neither changed line
+  executes there and the "within noise" arm measured an inert change.
+* **The band hunk is dead code.**  `kq_mask_derivable()` refuses `n_tokens <= 8` and requires `n_stream == 1`, so
+  `Q->ne[1] > 8` on every derived op, while `ggml_cuda_fattn_band_wmma_applies()` ends with `Q->ne[1] <= 8`.  Disjoint
+  by construction; carried in r268 only so the sites cannot drift apart again.
+* **Numerics do not move.**  Forcing the tile launcher on gfx1201 (`GGML_CUDA_FA_WMMA_MAX_HEAD`), the all-logits dumps
+  are byte-identical across derived / packed / pre-r268 on head 256-gqa 4 (`ncols2` 4 vs 1, md5
+  `ae3b6835dd0d8077bb14eb7cbeaae931`) and head 128-gqa 8 (`ncols2` 8 vs 1, md5
+  `dc4ef6213c8fb6a5f7bf709be7db4b56`) -- the two tile `ncols2` variants share a reduction order, so the choice is a
+  proxy, not arithmetic.
+* **What it does buy:** +0.6-1.0 % pp512 (4B, head 256/gqa 4) and +1.3 % (30B-A3B, head 128/gqa 8) on a forced-launcher
+  arm, three interleaved rounds each; and it removes an abort class -- the DKQ 320/576 tile instances have no non-GQA
+  arm, so a derived op that reached them died in `GGML_ABORT` (reachable only with a non-MLA head-320/576 model on a
+  layout whose chooser picks the tile kernel; not observed).
+* **The PR was not promotable as written:** a third fragment of the mask predicate (`ggml_cuda_fattn_derived_mask`)
+  where the delivery's whole point is one, a new `GGML_CUDA_FA_DERIVED_GQA` variable (the A/B arm is already
+  `LLAMA_KQ_MASK_DERIVED=0`, and a new variable owes an `ENVIRONMENT.md` row), no build or run on the current tree, and
+  no gate that reaches the code.  Reply posted on the PR; the amend below credits the finding.
+
+### What shipped
+
+* `ggml_cuda_flash_attn_ext_has_mask()` moves from `fattn.cu` to `fattn-common.cuh` (ahead of the `fattn-rdna.cuh`
+  include, as `static inline`), and `ggml_cuda_fattn_band_wmma_applies()` + `launch_fattn_tile_switch_ncols2()` ask it
+  instead of `mask != nullptr || src[5] != nullptr`.  The kernel chooser and the MMA dispatch were already asking it,
+  so the four sites are now one predicate (`INVARIANTS.md` r268).
+* `tests/test-backend-ops.cpp` gains the **aligned head-512 derived case** (`n_kv` 4096, gqa 4): the MMA arm on
+  gfx1201, the **tile GQA** arm on any cap <= 320 layout.  Without it the suite is blind to the dispatch -- the only
+  derived case that reached the tile launcher (`hsk` 128, gqa 4, `n_kv` 4090) is not `FATTN_KQ_STRIDE`-aligned, so
+  `use_gqa_opt` stayed false even with the fix (proved with a temporary `REACHED` probe: 6978/6978 either way).  The
+  stale "the MMA kernel is the only one that implements the derived form" comment is corrected.
+
+### Gates (canonical build `~/llama.cpp/build-rocm`, gfx1201, 1x R9700 unless noted)
+
+* **`test-backend-ops -o FLASH_ATTN_EXT` 6979/6979**, twice: default, and with `GGML_CUDA_FA_WMMA_MAX_HEAD=128` so the
+  head-256/512 derived cases (and the `n_q` 9..16 verify-band cases) take the tile launcher -- the second run is the
+  oracle for the changed dispatch.
+* **`gate-prefill-logits.sh`** 27B Q8_0 f16 **0.000000 / 100.000 %**; `--kv q8_0` **0.000000 / 100.000 %**; and the
+  forced-launcher derivative arm `GGML_CUDA_FA_WMMA_MAX_HEAD=128 --ab "LLAMA_KQ_MASK_DERIVED=0"` **0.000000 /
+  100.000 %** (new base `prefill-logit-gfx1201-Qwen3.8-27B-Q8_0-tile-gqa.kld`, base PPL 5.9326).
+* **Coherence, byte-identical to r267** (`llama-cli`, `-p "The capital of France is" -n 20 --seed 42 --temp 0`, no
+  `-lv`): Qwen3.8-27B UD-Q4_K_XL `d45e2221805a`, Qwen3.5-4B `1c5d32ac537d`, phi-4 f16 `a1b7eb2ee7a6`.  The MTP
+  four-axis protocol is not owed: the changed dispatch is unreachable for a derived op on gfx1201 (MMA), and the
+  verify-width derived cases are covered by the forced-tile op-suite arm above.
+* **`gate-per-block-build.sh --tip 4b8b0c485 --changed-from 1d76ca9c8`**: **2/2** (block 05 400 s, tip 8 s), `all`
+  target, fresh build dir per commit.
+* **`validate-set.sh`**: 17 blocks, checksums + strict apply, applied tree `ce7e306f...`, Windows portability scan
+  291 files clean.
+* Kernel journal clean over every gate window (`gate-prefill-logits.sh` checks it per run).
+
+### Records
+
+`benchmarks/2026-11-12-fa-derived-tile-gqa.md` (the arms, the two md5s, the pp512 table and what is NOT established);
+`INVARIANTS.md` r268 (the facts); `MANIFESTS.md` block-05 gate row; `patches/README.md` block 05.  Upstream candidate:
+none -- the derived form is the delivery's own, and upstream has no `src[6]` to ask.
+
 ## 261112.003 (r267, release) -- `v17-a691b2345-r267`: the node budget pays for the quantized KV cache's per-layer Hadamard rotation, so phi-4 loads again (GitHub issue #302)
 
 **Release:** `v17-a691b2345-r267` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

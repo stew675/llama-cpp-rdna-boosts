@@ -1,4 +1,4 @@
-From c196eab0ebfca176a8f73eb684bc16897a7575d6 Mon Sep 17 00:00:00 2001
+From 8af06aed949c26bf19b34f0639bef71ec619a7b1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -2329,7 +2329,7 @@ index 2d0b3cfea..ecb0a13f6 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 4fc240b4b..839deeb27 100644
+index da089ed5b..14f35fda1 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,6 +3,8 @@
@@ -2375,7 +2375,7 @@ index 4fc240b4b..839deeb27 100644
  
  typedef float (*vec_dot_KQ_t)(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
-@@ -1285,6 +1301,9 @@ __launch_bounds__(D, 1)
+@@ -1306,6 +1322,9 @@ __launch_bounds__(D, 1)
  static __global__ void flash_attn_stream_k_fixup_uniform(
          float * dst_ptr,
          const float2 * dst_fixup_ptr,
@@ -2385,7 +2385,7 @@ index 4fc240b4b..839deeb27 100644
          const int ne01, const int ne02,
          const int ne12, const int nblocks_stream_k,
          const int gqa_ratio,
-@@ -1298,6 +1317,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
+@@ -1319,6 +1338,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
      const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
  
      const int tile_idx = blockIdx.x; // One block per output tile.
@@ -2397,7 +2397,7 @@ index 4fc240b4b..839deeb27 100644
      const int j        = blockIdx.y;
      const int c        = blockIdx.z;
      const int jc       = j*ncols2 + c;
-@@ -1359,7 +1383,14 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
+@@ -1380,7 +1404,14 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
      }
  
      // Write back final result:
@@ -2413,7 +2413,7 @@ index 4fc240b4b..839deeb27 100644
  }
  
  // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
-@@ -1369,6 +1400,7 @@ __launch_bounds__(D, 1)
+@@ -1390,6 +1421,7 @@ __launch_bounds__(D, 1)
  static __global__ void flash_attn_stream_k_fixup_general(
          float * dst_ptr,
          const float2 * dst_fixup_ptr,
@@ -2421,7 +2421,7 @@ index 4fc240b4b..839deeb27 100644
          const int ne01, const int ne02,
          const int gqa_ratio,
          const int total_work,
-@@ -1470,16 +1502,27 @@ static __global__ void flash_attn_stream_k_fixup_general(
+@@ -1491,16 +1523,27 @@ static __global__ void flash_attn_stream_k_fixup_general(
      }
  
      // Write back final result:
@@ -2452,7 +2452,7 @@ index 4fc240b4b..839deeb27 100644
      ggml_cuda_pdl_lc();
      const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
      const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
-@@ -1528,7 +1571,111 @@ static __global__ void flash_attn_combine_results(
+@@ -1549,7 +1592,111 @@ static __global__ void flash_attn_combine_results(
          VKQ_denominator += KQ_max_scale * meta[l].y;
      }
  
@@ -2565,7 +2565,7 @@ index 4fc240b4b..839deeb27 100644
  }
  
  // Q pre-scaled and converted to half2 pairs, contiguous as [ne03][ne02][ne01][ne00/2]. The tile
-@@ -1555,7 +1702,11 @@ void launch_fattn(
+@@ -1576,7 +1723,11 @@ void launch_fattn(
      ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
      const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
      const int kv_native_kernel = FATTN_KV_NATIVE_PER_OPERAND, const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
@@ -2578,7 +2578,7 @@ index 4fc240b4b..839deeb27 100644
  ) {
      constexpr int ncols = ncols1 * ncols2;
  
-@@ -1606,32 +1757,175 @@ void launch_fattn(
+@@ -1627,32 +1778,175 @@ void launch_fattn(
          (kv_native_kernel != FATTN_KV_NATIVE_PER_OPERAND ? kv_native_kernel :
           (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)));
  
@@ -2770,7 +2770,7 @@ index 4fc240b4b..839deeb27 100644
      // The pool buffers are freed in reverse declaration order, and the VMM pool (GGML_HIP_NO_VMM=OFF / CUDA)
      // requires that to be the reverse of the allocation order: declare them in the order they are allocated
      // (KV_max, kq_blocks, then dst_tmp / dst_tmp_meta).  kq_blocks used to be declared last although it is
-@@ -1652,12 +1946,17 @@ void launch_fattn(
+@@ -1673,12 +1967,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -2791,7 +2791,7 @@ index 4fc240b4b..839deeb27 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1680,7 +1979,7 @@ void launch_fattn(
+@@ -1701,7 +2000,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -2800,7 +2800,7 @@ index 4fc240b4b..839deeb27 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1690,8 +1989,13 @@ void launch_fattn(
+@@ -1711,8 +2010,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -2816,7 +2816,7 @@ index 4fc240b4b..839deeb27 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1850,6 +2154,14 @@ void launch_fattn(
+@@ -1871,6 +2175,14 @@ void launch_fattn(
          kq_blocks_arg = kq_blocks.ptr;
      }
  
@@ -2831,7 +2831,7 @@ index 4fc240b4b..839deeb27 100644
      const int * kv_max_arg = KV_max.ptr;
  
      const dim3 block_dim(warp_size, nwarps, 1);
-@@ -1887,7 +2199,10 @@ void launch_fattn(
+@@ -1908,7 +2220,10 @@ void launch_fattn(
      const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
  
      dim3 blocks_num;
@@ -2843,7 +2843,7 @@ index 4fc240b4b..839deeb27 100644
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
          const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
  
-@@ -2032,6 +2347,180 @@ void launch_fattn(
+@@ -2053,6 +2368,180 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -3024,7 +3024,7 @@ index 4fc240b4b..839deeb27 100644
      ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
      ggml_cuda_kernel_launch(fattn_kernel, launch_params,
          (const char *) Q->data,
-@@ -2054,55 +2543,65 @@ void launch_fattn(
+@@ -2075,55 +2564,65 @@ void launch_fattn(
          cell_pos ? (const int *) cell_pos->data : nullptr,
          tok_lo   ? (const int *) tok_lo  ->data : nullptr,
          tok_hi   ? (const int *) tok_hi  ->data : nullptr,
@@ -3357,7 +3357,7 @@ index 160d6ce55..19622e3bd 100644
  
  
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 6d28b7241..e585f7eeb 100644
+index e82b7772f..3072e9b61 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -1327,7 +1327,10 @@ static __global__ void flash_attn_tile(
@@ -3388,10 +3388,10 @@ index abc9ba186..5c5107733 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 25ddb224a..1e6b0a3d9 100644
+index 0bc638b7a..50e9570df 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -263,7 +263,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -256,7 +256,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
              // instead of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the
              // 16-warp block is mostly idle), so the KV-length gate cannot change any output either.
              // GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
@@ -3400,7 +3400,7 @@ index 25ddb224a..1e6b0a3d9 100644
              if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                  ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
              } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
-@@ -939,6 +939,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -932,6 +932,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      return f16_extra.end - (uintptr_t) dst->data;
  }
  
@@ -26000,7 +26000,7 @@ index 4c41264d5..ba3821e93 100644
      // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
      // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b78d0d284..40b72050b 100644
+index 75bee76d3..eb3d99015 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -87,7 +87,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -26131,7 +26131,7 @@ index b78d0d284..40b72050b 100644
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-@@ -13146,6 +13177,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13156,6 +13187,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                      test_cases.emplace_back(new test_topk_moe({384,  8, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
@@ -26139,7 +26139,7 @@ index b78d0d284..40b72050b 100644
                      // rows at and just past the limit where one block still covers all rows
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
-@@ -13391,6 +13423,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13401,6 +13433,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  

@@ -4227,3 +4227,39 @@ they are what a future "the scheduler's hash set is full" report must be read ag
   (X nodes + Y leafs) but the scheduler was reserved for M" rather than aborting inside ggml, and
   `resolve_fused_ops()` treats an unreservable **probe** graph as "cannot verify -> disable" (throwing there turns an
   unverifiable optimization into a load failure).  The reserve that follows still fails hard, with the numbers.
+
+## r268 — a kernel CHOICE must not depend on which mask form the graph uses: one predicate, asked by every launcher (block 05, contributor PR #303)
+
+The delivery's derived kq mask is an *optimization*: `LLAMA_KQ_MASK_DERIVED` must be bit-identical to the packed
+mask, which means the kernel chooser and every `ncols2` dispatch have to see both forms.  `has_mask()` was written
+for that, but it lived as a `static` in `fattn.cu`, so the two `.cuh` launchers kept hand-copies of an older form of
+it and asked `src[5]` (upstream's `kv_rows` slot since #29510) alone.  The facts:
+
+* **The derived form is `src[6..8]`, the packed mask `src[3]`, and `kv_rows` `src[5]`; a derived op carries neither
+  of the first two.**  The `src[5]` copies therefore read `nullptr` for a derived op and returned the
+  `ncols2 = 1` variants where the same op with a packed mask took `ncols2 = 4`/`8`/`16`.  One predicate,
+  `ggml_cuda_flash_attn_ext_has_mask()`, now lives in `fattn-common.cuh` (ahead of the `fattn-rdna.cuh` include) and
+  is asked by the chooser, the MMA dispatch, the RDNA band predicate and the tile dispatch.  A fifth site that
+  needs "does this op have a mask" owes a call to it, never a local `src[x] != nullptr` test.
+* **The RDNA band predicate can never see a derived op, by construction.**  `llama_kv_cache::kq_mask_derivable()`
+  refuses `n_tokens <= 8` and requires one KV stream, so `Q->ne[1] > 8` on every derived op; the band predicate
+  ends with `Q->ne[1] <= 8`.  A report that names the band as a divergent site is describing future-proofing, not a
+  live defect -- say so rather than "fixing" it.
+* **On gfx1201 the divergence is unreachable at the default settings**, which is why an arm measured there proves
+  nothing: a derived op with `K->ne[1] % 256 == 0` and `n_q > 8` takes the WMMA route (`Q->ne[1] > 8`) and
+  `BEST_FATTN_KERNEL_MMA_F16`.  The live layouts are RDNA3_5/RDNA3_0 heads above their `GGML_CUDA_FA_WMMA_MAX_HEAD`
+  cap, RDNA2 (no WMMA), and any arch with `GGML_CUDA_FA_WMMA_256=0` or a lowered cap -- the way to force the code
+  path on gfx1201 for a gate.
+* **The two tile `ncols2` variants are bit-identical for a derived op** (all-logits dumps, 1.01 GB, equal md5, head
+  256/gqa 4 and head 128/gqa 8), so the divergence cost a *choice*, not numerics: +0.6-1.0 % and +1.3 % pp512 on the
+  forced-launcher arms.  A "kernel selection differs" report is still worth acting on -- the next derived extension
+  (decode widths) would not be bit-identical by luck.
+* **The DKQ 320 and DKQ 576 tile instances have no non-GQA arm** (`GGML_ABORT`), so a derived op that reaches them
+  died before r268.  Not observed: it needs a non-MLA head-320/576 model on a layout whose chooser picks the tile
+  kernel (MLA builders pass `allow_derived = false`, so they never form a derived op).  The one predicate closes the
+  class; do not re-open it by special-casing a head size.
+* **A gate that cannot reach the dispatch is not a gate.**  `test-backend-ops -o FLASH_ATTN_EXT` had exactly one
+  derived case that reached the tile launcher (`hsk` 128, gqa 4, `n_kv` 4090, `n_tps` 33) and its `n_kv` is not
+  `FATTN_KQ_STRIDE`-aligned, so `use_gqa_opt` stayed false even after the fix: 6978/6978 either way.  The aligned
+  head-512 derived case added in r268 is the tile GQA arm on any cap <= 320 layout and the MMA arm on gfx1201; the
+  second `test-backend-ops` run with `GGML_CUDA_FA_WMMA_MAX_HEAD=128` is what makes it an oracle here.
