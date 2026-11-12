@@ -230,9 +230,12 @@ scheduler reads it back to build the used-expert bitset), so the remap owes no n
 
 **Kind:** performance / delivery — a block-16 amendment once its decisions are taken.
 
-**Plan (detail, traps and gates: [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md)).**  Admit
+**Plan (detail, traps and gates: [`wip/prefill-in-place-arena/`](wip/prefill-in-place-arena/README.md); the
+session handover that drives it to a decision is
+[`NEXT-SESSION-PROMPT.md`](wip/prefill-in-place-arena/NEXT-SESSION-PROMPT.md)).**  Admit
 the misses into slots and publish a slot-remapped routing so the op reads the arena in place; double-buffer the
-*remap* (two 128 KiB buffers per device — not 2 x 856 MiB of experts); add the MMQ finite-head zeroing over slot
+*remap*'s CAPACITY (it is already per table: 128 KiB at `-ub 4096`, ~19 MiB across 147 tables — size
+`remap_cap`, do not add buffers for the experts); add the MMQ finite-head zeroing over slot
 runs (an uninitialised neighbour slot is a NaN, not a slow path); `preadv` the miss set into its slots (the store is
 host-addressable, so no bounce and no H2D) -- which also fixes a MEASURED defect that arm has today: the span read
 aligns its destination but not its GGUF offset, so under `O_DIRECT` every span is short and silently falls back to

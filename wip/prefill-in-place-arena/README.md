@@ -1,6 +1,8 @@
 # prefill-in-place-arena — serve the wide band IN PLACE from the GTT arena (`TODO` #317)
 
 **Status: OPEN — scoping note + a measured reproduction.  Nothing implemented; nothing in `patches/`.**
+**Handover prompt for driving it: [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md)** (self-contained; paste it
+into a fresh session).
 
 Opened 2026-11-11 (r265), the same session that fixed the block-16 prefill **read plan**
 (`benchmarks/2026-11-11-gtt-prefill-span-set.md`, `WORKLOG.md` 261111.036).  That fix removed the reads of
@@ -44,10 +46,14 @@ used-expert bitset and hands it over), so no new synchronise is owed.
 **P1 — admit + remap at prefill width (the whole win).**  For each table: for every `used && !resident` expert,
 claim a slot (the existing LFRU admission, one buffered `pread` straight into it), then publish the slot-remapped
 ids for the whole `n_used x n_tok` routing and let `MUL_MAT_ID` read the arena in place.  Per pass that is
-**0 copies + the miss fills** instead of 30 GiB of D2D.  The remap buffer is per table and must be
-**double-buffered** (two `n_used x n_tok` int32 buffers per device — 2 x 128 KiB, not 2 x 856 MiB): the scheduler
-issues every table's input work before the split's graph runs, so table *k+1*'s remap is written while table *k*'s
-op may still be reading its own.  This is the maintainer's two-region ping-pong, at the only place it is cheap.
+**0 copies + the miss fills** instead of 30 GiB of D2D.  The remap staging is **already per table**
+(`table_t::remap_host`/`remap_dev`, published through `remap_n_used`/`remap_n_tok` and consumed by
+`moe_cache_get_table`), so the wide band needs *capacity*, not a second buffer: `remap_cap` is `n_experts * 8`
+(2 048 int32) and must hold `n_used x n_tok` = **32 768** at `-ub 4096` -- 128 KiB per table, ~19 MiB across the
+147 tables of the field config.  **Do not share one remap buffer across tables to save that memory**: the scheduler
+issues every table's input work before the split's graph runs, so a shared buffer would be overwritten while the
+previous table's op is still reading it (that is the case that would need a ping-pong; at 19 MiB it is not worth
+it).
 
 **P1a — the MMQ finite-head guard is mandatory here.**  Above the band the `MUL_MAT_ID` dispatcher may pick MMQ, whose
 tail over-read runs 512 B past a routed expert's end into the *next* slot.  In the identity tier the next slot holds
