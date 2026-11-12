@@ -3999,6 +3999,30 @@ a hook is CUDA-only (the non-CUDA entries stay NULL and the feature is simply in
   model to be replaced by a measurement.  `gate-host-pool.sh` gained an arm asserting the census prints once
   and before the teardown line (31/31).
 
+**r267 amendment to block 12 -- the node budget pays for the KV rotation, and a graph over it is refused by
+name (GitHub issue #302).**  `graph_max_nodes()` sizes the scheduler's hash table AND its node/leaf id arrays, and
+both are indexed over nodes **and** leafs, but its default branch (`max(1024, 8 * n_tensors)`) is a per-tensor
+heuristic.  Upstream **#31073** (between r235's base `6050b467c` and r244's `a691b2345`) made the KV Hadamard
+rotation constants **per layer on the device** (one shared host tensor per graph before), so every layer of a
+**quantized** K/V cache now adds 2 graph leafs plus the 12 nodes of its four `llama_mul_mat_hadamard` chains
+(cont/reshape + mul_mat + reshape, twice per rotated tensor: rows into the cache, attention result out).
+phi-4 (`phi3`, 40 layers, 243 tensors, `q8_0`/`q8_0`, `-fa on`) therefore builds a 2064-entry graph (1649 nodes +
+415 leafs) against a 1944-entry budget, and the delivery reached the overflow in `ggml_backend_sched_split_graph`
+through the derived-kq-mask **probe** (64 tokens; the `split_only` path has no size assert, so it is a bare
+`GGML_ABORT("visited all hash table entries")` at `ggml-impl.h:337`).  **Upstream mainline `a691b2345` aborts on
+the same model** -- at the `hash_set.size >= n_nodes + n_leafs` assert in `ggml_backend_sched_reserve` -- so this is
+upstream's regression, not a delivery one; the delivery's job was to stop crashing opaquely first.  The budget now
+asks the memory module: `llama_memory_i::graph_extra_entries()` returns **7 entries per rotated tensor per layer**
+(6 nodes + 1 leaf), counted from the rotation tensors the cache really created (so the ctor's predicate -- quantized
+type, head dim % 64, `LLAMA_ATTN_ROT_DISABLE` -- is not duplicated), and `llama_kv_cache_iswa` /
+`llama_memory_hybrid` / `llama_memory_hybrid_iswa` sum their attention caches.  phi-4 goes 1944 -> **2504**
+(hash table 2053 -> 4099), gemma-4-12B (iSWA, two sub-caches) 6016.  Two failure paths no longer abort:
+`graph_reserve()` refuses a graph that does not fit and names both numbers, and `resolve_fused_ops()` treats an
+unreservable probe graph as "cannot verify -> disable" instead of throwing.  Numerics-neutral: phi-4 f16
+`a1b7eb2ee7a6`, Qwen3.5-4B `1c5d32ac537d`, Qwen3.8-27B `d45e2221805a`, gemma-4-12B `cd85935d5fee` are all
+byte-identical to r266, phi-4 `q8_0` now loads and reads the same `a1b7eb2ee7a6`, and the prefill-logit gate reads
+**0.000000 / 100.000 %** on both the f16 and the `--kv q8_0` base (`WORKLOG.md` 261112.003).
+
 ---
 
 ## Facts that span blocks

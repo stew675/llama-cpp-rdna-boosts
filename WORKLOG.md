@@ -1,3 +1,86 @@
+## 261112.003 (r267, release) -- `v17-a691b2345-r267`: the node budget pays for the quantized KV cache's per-layer Hadamard rotation, so phi-4 loads again (GitHub issue #302)
+
+**Release:** `v17-a691b2345-r267` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip
+**`1d76ca9c88c1103ecd57ef6069927c563875590d`**, tree **`958d2683b06b707776e9969178230bb1ac732e19`**.  Block 12
+amended (+92/-1 over 12 files); no new block, no new environment variable, no kernel or dispatch row touched.
+
+### The report (GitHub issue #302, `overdoingism`)
+
+`phi-4-IQ4_XS.gguf` (`phi3` arch, 40 layers, 243 tensors) on 1x R9700 aborts ~3 s into
+`llama-server -c 16384 -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0 -ngl 99 --parallel 1` with a bare
+`ggml-impl.h:337: fatal error` ("visited all hash table entries") at
+`ggml_abort <- ggml_backend_sched_split_graph <- llama_context::graph_reserve <- resolve_fused_ops::{lambda} <-
+sched_reserve`.  Their matrix: `f16`/`f16` loads (FA on or off), `q8_0`/`q8_0` aborts on r244 and r251 and loads on
+r235, and Qwen3.x / Mistral-7B / gpt-oss-20b load with the same q8_0 KV.  They had not checked whether mainline
+`a691b2345` alone aborts, and suspected the 1944-entry `graph_max_nodes()` budget.
+
+### What it is (upstream's regression, reproduced here on unmodified mainline)
+
+Upstream **#31073** (`kv-cache: keep rotation constants on the GPU`, between r235's base `6050b467c` and r244's
+`a691b2345`) made the KV Hadamard rotation constants **per layer on the device**; before it, one K and one V constant
+were shared by the whole graph.  A quantized K/V cache rotates Q/K/V/out per layer through four
+`llama_mul_mat_hadamard` chains (3 nodes each) and now carries **2 leafs per layer** too: **12 nodes + 2 leafs = 14
+hash entries per layer**.  phi-4's graph is **2064 entries (1649 nodes + 415 leafs)** against a
+`graph_max_nodes()` budget of `max(1024, 8*243) = 1944` (hash table 2053) -- short by 11, and `f16` is 1169 nodes,
+which is why only the quantized arm died.  Verified by graph census (`HIST`/`DUMP` instrumentation, removed before
+the commit): the q8_0 graph carries 321 `MUL_MAT` / 320 `RESHAPE` / 40 `CONT` / 40 `FLASH_ATTN_EXT` against the f16
+arm's 161 / 40 / 0 / 40, and the extra nodes are `cache_k_rot_l0` / `cache_v_rot_l0` mul-mats.
+
+**Mainline `a691b2345` alone aborts on the same model**: with `LLAMA_KQ_MASK_DERIVED=0` (probe out of the way) it
+falls off `hash_set.size >= n_nodes + n_leafs` in `ggml_backend_sched_reserve`.  The delivery only got there first,
+through the derived-kq-mask **probe** (64 tokens, `split_only` path, no size assert), which is why the reporter saw
+an opaque `GGML_ABORT` instead of an assert.
+
+### What shipped
+
+* `llama_memory_i::graph_extra_entries()` -- the graph entries a memory module's own builders add every graph --
+  implemented by `llama_kv_cache` (**7 per rotated tensor per layer**: 6 nodes + 1 leaf) by walking the rotation
+  tensors `init_rotation()` really created, and summed by `llama_kv_cache_iswa` / `llama_memory_hybrid` /
+  `llama_memory_hybrid_iswa`.  No copy of the ctor's predicate (quantized type, `n_embd_head_%64`, `LLAMA_ATTN_ROT_DISABLE`).
+* `graph_max_nodes()` adds that term.  phi-4 **1944 -> 2504** (hash table 2053 -> 4099), gemma-4-12B (iSWA, both
+  sub-caches) **6016**.  Host-only cost: the scheduler's context buffer is `graph_size * 30 * 2 * sizeof(ggml_tensor)`
+  (phi-4 47 -> 60 MB); nothing on the device moves.
+* `ggml_graph_n_leafs()` (the id arrays are indexed over nodes AND leafs).
+* `graph_reserve()` **refuses** a graph that does not fit and names both numbers (`needs 2064 entries (1649 nodes +
+  415 leafs) but the scheduler was reserved for 1944`) instead of aborting inside ggml, and `resolve_fused_ops()`
+  treats an unreservable probe graph as "cannot verify -> disable" instead of throwing.
+
+### Gates (canonical build; all on `~/llama.cpp/build-rocm`, gfx1201, 1x R9700 unless noted)
+
+* **The reporter's own command**, verbatim, on the release build: server healthy, `/v1/chat/completions` answers
+  (19-token prompt 343 t/s prompt eval; 3591-token prompt **2522 t/s** prefill, 48 tokens out), `--parallel 2
+  --kv-unified` also healthy.  `-ub 512` arm identical (`a1b7eb2ee7a6`).  The derived kq mask is now **enabled** on
+  phi-4 (`resolve_fused_ops: derived kq mask flash attention enabled`) -- it was unreachable before, because the
+  probe aborted.
+* **Coherence, byte-identical to r266** (`llama-cli`, `-p "The capital of France is" -n 20 --seed 42 --temp 0`):
+  phi-4 f16 `a1b7eb2ee7a6`, Qwen3.5-4B `1c5d32ac537d` (hybrid memory), Qwen3.8-27B UD-Q4_K_XL `d45e2221805a`,
+  gemma-4-12B `cd85935d5fee` (iSWA memory) -- each captured on the r266 build **and** on the release build, and
+  phi-4 `q8_0` now reads the same `a1b7eb2ee7a6` as its f16 and `LLAMA_ATTN_ROT_DISABLE=1` arms.
+* **Prefill logits** (`gate-prefill-logits.sh`): default f16 base **mean KLD 0.000000 / same-top-p 100.000 %** and
+  `--kv q8_0` base **0.000000 / 100.000 %**, journals clean.
+* **MTP smoke** (27B UD-Q4_K_XL, 3 GPU `-sm tensor`, `-c 8192 -ub 1024`, `prompts/reasoning.txt`, `-n 512`,
+  `--spec-draft-n-max 3`): plain **49.6 t/s**, `draft-mtp` **99.1 t/s**, greedy text **byte-identical**
+  (`12363e2d6ba3`, 2571 chars) -- the draft context's own budget is exercised.
+* **Per-block build** `--changed-from 6bac17737 --fast`: **3/3 built** (block 12 and the two blocks whose delta
+  moved, `all`-profile cost avoided per the gate's own header).  This gate caught a stray `}` my first block-15
+  conflict resolution left behind -- recorded here because it is exactly the class of defect the gate exists for.
+* **`validate-set.sh`**: OK -- checksums, strict 17/17 apply on a fresh tarball, tree `958d2683b`, 291 added
+  C/C++ files through the Windows portability lint.
+* **Deterministic re-cut**: `fork-refresh.sh --build --push --yes` re-cut from `patches/` at `a691b2345`, asserted
+  the tree and pushed `rdna-boosts` `6bac17737..1d76ca9c8` (force-with-lease) to the personal fork; `git ls-remote`
+  confirms the branch carries exactly `release.json.tip`.  The `all` build of the re-cut tree is what the build
+  above used.
+* **GPU faults**: `check-gpu-faults.sh --since "3 hours ago"` + 7 arm logs -- clean.
+
+**Published:** delivery repo `github.com:stew675/llama-cpp-rdna-boosts` -- `main` + tag `v17-a691b2345-r267`;
+personal fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` `6bac17737..1d76ca9c8` (above).  ROCm images:
+nothing is built on the primary box -- `radiance`'s `scripts/container-watch.sh` polls for this tag and runs
+`scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune` there (`CONTAINERS.md`).
+
+**Docs:** `patches/README.md` (block 12, r267 amendment), `INVARIANTS.md` r267, `ENVIRONMENT.md` (a new §8 row for
+the upstream `LLAMA_ATTN_ROT_DISABLE` -- the A/B arm this bug is diagnosed with, and the switch that drops the budget
+term with the tensors).  No new variable.  No `TODO` item: nothing is left open.
+
 ## 261112.002 (r266, release) -- `v17-a691b2345-r266` is PUBLISHED: delivery tag + personal fork's `rdna-boosts` at 6bac1773, and the two-slot interference gate ships with it
 
 **Release:** `v17-a691b2345-r266` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical tip

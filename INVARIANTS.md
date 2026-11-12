@@ -4185,3 +4185,42 @@ publishes the slot-remapped routing, so `MUL_MAT_ID` reads the arena: 0 copies +
 * **A gate can be blind to its own box.**  `gate-fusion-alias-copy.sh` fails identically on the unmodified r265 build
   (its arms do not reach the shape on gfx1151), so it is NOT evidence about this change either way; run the
   unmodified build when attributing a gate failure.
+
+## r267 — the node budget is a per-tensor HEURISTIC, and a quantized KV cache's Hadamard rotation spends ~14 entries per layer of it (block 12, GitHub issue #302)
+
+`graph_max_nodes()` sizes the scheduler's hash table and its node/leaf id arrays, both indexed over **nodes + leafs**;
+its default branch is `max(1024, 8 * n_tensors)`.  Every fact below was re-derived while chasing a `phi3` abort, and
+they are what a future "the scheduler's hash set is full" report must be read against:
+
+* **The KV Hadamard rotation is part of the graph, and it scales with LAYERS, not with tensors.**  With a quantized
+  K or V cache (`ggml_is_quantized(type)` and `n_embd_head_%64 == 0`, or a DeepSeek/GLM-DSA lightning indexer), every
+  layer inserts four `llama_mul_mat_hadamard` chains -- Q and K for the k rotation, V and the attention result for the
+  v rotation, 3 nodes each (cont/reshape + mul_mat + reshape) -- plus **one rotation constant per rotated tensor per
+  layer as a graph leaf**.  That is **12 nodes + 2 leafs per layer**, i.e. 14 hash entries/layer.  A `phi3` model
+  declares 4 matmuls/layer (fused QKV + out + ffn_up + ffn_out), so 8x per tensor is not enough margin for it: phi-4
+  (40 layers, 243 tensors) needs **2064** entries (1649 nodes + 415 leafs) against a **1944** budget (hash table
+  2053).  #31073 (`kv-cache: keep rotation constants on the GPU`) is what made the constants per layer -- before it
+  there were 2 shared leaves per graph and the same model fit, which is exactly why r235 loaded and r244 did not.
+* **`ggml_backend_sched_new(graph_size)` is what fixes the hash table, and the `split_only` path has NO size assert.**
+  `ggml_backend_sched_reserve`/`alloc_graph` assert `hash_set.size >= n_nodes + n_leafs`; `graph_reserve(...,
+  split_only=true)` calls `ggml_backend_sched_split_graph` directly, so an oversized **probe** graph aborts at
+  `ggml_hash_find_or_insert` ("visited all hash table entries", `ggml-impl.h:337`) with no llama-level message at all
+  -- which is the trace a reporter sees (`#3 ggml_backend_sched_split_graph`, `#5 resolve_fused_ops(...)::{lambda}`).
+  Do not read that abort as "ggml's hash table is buggy": it is the budget.
+* **It reproduces on unadulterated upstream.**  `a691b2345` alone aborts on the same model at the
+  `hash_set.size >= n_nodes + n_leafs` assert once the probe is out of the way (`LLAMA_KQ_MASK_DERIVED=0`); the
+  delivery only reached it first, through the derived-kq-mask probe, and therefore with a worse message.  A report
+  that says "unmodified build" is still our bug to make diagnosable.
+* **Budget from the cache's own tensors, never from a copied predicate.**  `llama_memory_i::graph_extra_entries()`
+  walks the rotation tensors `init_rotation()` actually created (7 entries each: 6 nodes + 1 leaf), and the compound
+  memory types (`llama_kv_cache_iswa`, `llama_memory_hybrid`, `llama_memory_hybrid_iswa`) sum their attention caches --
+  gemma-4-12B's two iSWA caches read 6016, not 1944.  A duplicated `attn_rot_v` predicate in `llama-context.cpp`
+  would drift the moment the ctor's conditions change; the tensors cannot.
+* **A budget bump costs host memory only, and it is proportional.**  `ggml_backend_sched_new` mallocs
+  `graph_size * GGML_SCHED_MAX_SPLIT_INPUTS(30) * 2 * sizeof(ggml_tensor)` for its context buffer (phi-4: 60 MB at
+  2504, 47 MB at 1944), plus the id arrays; nothing on the device changes.  Note the hash-size ladder jumps
+  2053 -> 4099, so *any* bump past 2053 doubles the table -- budget the entries you need, not "one more".
+* **Two failure paths must stay named and non-fatal.**  `graph_reserve()` returns `nullptr` and logs "needs N entries
+  (X nodes + Y leafs) but the scheduler was reserved for M" rather than aborting inside ggml, and
+  `resolve_fused_ops()` treats an unreservable **probe** graph as "cannot verify -> disable" (throwing there turns an
+  unverifiable optimization into a load failure).  The reserve that follows still fails hard, with the numbers.
