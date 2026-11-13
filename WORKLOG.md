@@ -37,6 +37,8 @@
   means the merged `generate_cu_files.py` disagrees with the tree (it would delete the delivery's 126 typed
   instances), so the repair touches block 05's artifact and is the maintainer's call.  It blocks the
   driver-linking gates only (`gate-norm-rows-alias.sh`, which is R11's anyway); no rung's exit needs it.
+  **Mechanism (corrected in 261113.006):** the typed layout is one file per head per `(ncols1,ncols2)` pair, so
+  the fix is 32 new single-declaration instance files plus a *typed* generator loop — see `DECISIONS.md` `D5-a`.
 * **Climb state:** R00..R09 done (blocks 00-08) on `rebase-r278` at `a95c0497b`; R10 parked.  Two items need
   the maintainer before the climb continues: **`D5-a`** (repair or accept) and the **R10 `-sm tensor` arena
   fault** (fix at R10 — the candidate is `D10`'s copy gate).
@@ -73,9 +75,13 @@ what R06's `D5` proof did not check: its "`ls | grep -c dkq40/dkq72` = 16" count
 (`fattn-tile-instance-dkq40-dv40-*`), not the mma ones.  Second half of the same gap: the merged
 `generate_cu_files.py` still emits the **head-agnostic** mma files while the tree ships the delivery's **126 typed**
 ones, so re-running it in-tree would delete all 126 and silently revert block 05's matrix.  Repair is additive
-(declare 40/72 in the 16 typed ncols files, and/or restore the generator loop on the union head list) but it
-changes block 05's artifact, so the maintainer decides; it does not block the climb, but it blocks every gate
-that **links a driver** against the backend library.
+but it changes block 05's artifact (`patches/` is only re-cut at R18), so the maintainer decides; it does not
+block the climb, but it blocks every gate that **links a driver** against the backend library.  **Mechanism
+(corrected 2026-11-13, the first note had it wrong):** the typed mma layout is one file per head per
+`(ncols1,ncols2)` pair, so the repair is **32 new single-declaration instance files**
+(`...-dkq40-dv40.cu` / `...-dkq72-dv72.cu` × the 16 pairs) **plus** making the generator's mma loop emit that
+typed layout again (today it emits upstream's 21 head-agnostic files and would delete the delivery's 126 on a
+re-run).  Applied as a labelled rung-repair commit on the green R09 and squashed into block 05 at R18.
 * **Verification correction:** `gate-norm-rows-alias.sh` is **not** R09's gate.  The r225 narrow-row fusion
 (`ggml_cuda_norm_rows_try_fuse`, `norm_rows_alias_conflict`, the `norm-rows:` census) is block 10's code and is
 absent at R09 -- block 08's `norm-gated.cu` is the other, smaller norm fusion and is silent.  The gate is

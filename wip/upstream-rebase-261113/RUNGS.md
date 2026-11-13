@@ -409,9 +409,16 @@ ones.  Second half of the same gap: the merged `generate_cu_files.py` still emit
 `fattn-mma-f16-instance-ncols1_*-ncols2_*.cu` files (25 of them, heads 40..256 — verified by running it in an
 empty temp dir) while the tree ships the delivery's **126 typed** `...-dkqN-dvN.cu` files, so re-running the
 generator in-tree would delete all 126 and silently revert block 05's instance matrix.  Registered as **`D5-a`**
-in `DECISIONS.md`, **AWAITING** the maintainer (repair is additive: declare heads 40/72 in the typed set, or
-restore upstream's generator loop on the union head list — but it changes block 05's artifact, so it is not a
-campaign-autonomous change).
+in `DECISIONS.md`, **AWAITING** the maintainer.  Corrected mechanism (the first write-up here had the shape
+wrong): the typed mma layout is **one file per head per (ncols1,ncols2) pair**, so the repair is **32 new tiny
+instance files** (`...-dkq40-dv40.cu` / `...-dkq72-dv72.cu` × the 16 pairs a non-niche head allows), **plus**
+restoring the generator's mma loop as a *typed* loop (the merged script still emits upstream's 21 head-agnostic
+files and would delete the delivery's 126 on a re-run).  Block 05 owns both halves; only (1) — repair — keeps
+both the delivery's matrix and upstream's coverage, and the heads are reachable on AMD (`case 40:`/`case 72:`
+in `ggml_cuda_flash_attn_ext_mma_f16()` are unconditional), so this is a latent abort, not a link artefact.
+**Ladder mechanics:** it is applied as a labelled rung-repair commit on top of the green R09 (no re-resolution
+of R06..R09, no rung sha invalidated) and is **squashed into block 05 at R18**, when `make-patches.sh` re-cuts
+the series as exactly 17 block commits.
 
 ## R10 — block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine) · **BLOCKED 2026-11-13**
 

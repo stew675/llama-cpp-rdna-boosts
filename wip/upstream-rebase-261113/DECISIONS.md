@@ -157,14 +157,42 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
 * **Second half:** the merged `generate_cu_files.py` still emits the **head-agnostic** mma files (25 of them,
   heads 40..256) while the tree ships the typed 126, so running the generator in-tree would `os.remove` all
   126 and silently revert block 05's instance matrix.
-* **Questions / options:** (1) declare heads 40/72 in the 16 typed `fattn-mma-f16-instance-ncols1_*-ncols2_*.cu`
-  files (additive; keeps the typed scheme; no generator change) — **recommended**; (2) also restore upstream's
-  mma generation loop on the union head list so the generator agrees with the tree; (3) accept the hole as a
-  documented limitation (head-40/72 models are not in the delivery's validated set) and teach the driver-linking
-  gates to link with `--allow-shlib-undefined`.  (1) and (2) are the same kind of change; (3) leaves a crash on
-  models upstream supports.
-* **Cost:** 16 translation units recompile with 2 extra cases each; build time only, no runtime change on the
-  delivery's own models (all head 128).
+* **What upstream's switch actually cost us (measured 2026-11-13):** the typed set at the **old base**
+  (`a691b2345`) and at **r277** is byte-identical — 126 files, heads
+  {64, 80, 96, 112, 128, 192→128, 256, 320→256, 512, 576→512}; block 05 never touched the mma instances (it
+  added tile/vec/band).  Upstream **converted typed -> head-agnostic inside the range** and folded its **two
+  new heads (40, 72)** into that conversion, so the R06 "keep the delivery's typed set" resolution (correct)
+  silently dropped exactly those two heads, and nothing else.
+* **Exact repair (additive; block 05 owns both halves):**
+  1. **32 new instance files**, one declaration each, following the tree's own convention
+     (`template-instances/fattn-mma-f16-instance-ncols1_<N>-ncols2_<M>-dkq40-dv40.cu` /
+     `-dkq72-dv72.cu`, body `DECL_FATTN_MMA_F16_CASE(40, 40, N, M);`): the 16 `(ncols1,ncols2)` pairs the
+     generator's rule allows for a non-niche head — `(64,1) (32,2) (16,4) (8,8)`, `(32,1) (16,2) (8,4) (4,8)`,
+     `(16,1) (8,2) (4,4) (2,8)`, `(8,1) (4,2) (2,4) (1,8)` — times {40, 72}.  CMake globs
+     `template-instances/fattn-mma*.cu`, so **no CMake change** is needed.
+  2. **Restore the mma loop in `generate_cu_files.py` as a typed loop** (one file per head per ncols pair, on
+     `HEAD_SIZES_KQ`), because the merged script still emits upstream's 21 head-agnostic files: running it
+     today would `os.remove` all 126 typed files and re-introduce the gap.  With heads 40/72 added the script
+     then reproduces the tree exactly (158 files).
+* **Options:** (1) the repair above — **recommended**; (2) instead delete upstream's head-40/72 dispatch
+  (`fattn.cu` `case 40:`/`case 72:` + the `DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(40|72, …)` declarations) and keep
+  the typed set as it is — a deliberate drop of an upstream capability, needing no build cost but leaving the
+  delivery unable to serve a head-40/72 model on **any** backend, and adding an `upstream/`-shaped divergence
+  nobody measured; (3) accept the hole and teach the driver-linking gates to link with
+  `--allow-shlib-undefined` — keeps a live abort (see reachability) and hides it from the gates.  Only (1)
+  preserves both the delivery's matrix and upstream's coverage.
+* **Reachability (not NV-only):** `ggml_cuda_flash_attn_ext_mma_f16()`'s `case 40:`/`case 72:` are
+  **unconditional**, and `ggml_cuda_get_best_fattn_kernel()` returns `BEST_FATTN_KERNEL_MMA_F16` for those heads
+  whenever the shape is not steered to vec/tile (e.g. a prefill with `Q->ne[1] > 2` and f16 KV on gfx1201).
+  So on AMD a head-40/72 model would abort on the first such call — a latent crash for a model upstream serves,
+  not merely a link artefact.  None of the delivery's validated models are head 40/72 (4B/35B-A3B/Flash-Next
+  are 128), which is why no gate caught it.
+* **Cost:** 32 additional `fattn-mma-f16` template instantiations (~2-6 min on a cold configure; incremental
+  ~0 on a warm ccache if the files are unchanged).  No runtime change on any head-128 model.
+* **Verify:** `nm -D --undefined-only libggml-hip.so | grep -c flash_attn_ext_mma_f16_case` = **0**,
+  build green, `test-backend-ops -o FLASH_ATTN_EXT` 6996/0 **and** now genuinely exercising heads 40/72 through
+  mma where the predicate selects it, coherence `sha=1c5d32ac537d`, then `gate-norm-rows-alias.sh` links and
+  runs, and `gate-per-block-build.sh` on the re-cut block 05.
 * **Verify after either:** `nm -D --undefined-only` clean, `test-backend-ops -o FLASH_ATTN_EXT` still
   6996/0, coherence `sha=1c5d32ac537d`, then `gate-norm-rows-alias.sh` links and runs.
 * **Status:** `AWAITING` — the maintainer decides, because it changes block 05's artifact.  It does **not** block
