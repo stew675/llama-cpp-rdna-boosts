@@ -181,6 +181,10 @@ Not a rung in the climb — the release gate set, in the order the traps fire:
 
 ## §5  Resuming
 
+**Cold start: read [`HANDOVER.md`](HANDOVER.md) first** — it is the state document (branches, rung shas, the
+next rung's conflict plan, decision statuses, traps, the R18 ladder with this campaign's additions).  The
+copy-paste brief for a fresh session is [`PROMPT.md`](PROMPT.md).
+
 ```bash
 cd ~/llama-cpp-rdna-boosts && grep -n '^## R' wip/upstream-rebase-261113/RUNGS.md   # find the open rung
 cd ~/llama.cpp && git log --oneline -3 && git status                               # confirm the branch state
