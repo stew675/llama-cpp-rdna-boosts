@@ -23,7 +23,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
 | R08 | 07 k-quant boosts | **DONE** | `626e398d2` | `D16` oracle green |
 | R09 | 08 fused kernels | **DONE 2026-11-13 (merge+build+coherence+gates); the FA instance gap it exposed is `D5-a`, AWAITING** | `a95c0497b` | `D6` (partial), **`D12` resolved**, **`D5-a` found** |
-| R10 | 09 host-resident MoE | **BLOCKED 2026-11-13 — merge+build+coherence GREEN, `gate-host-pool.sh` `tsplit` faults; parked as `R10-blocked-d4106d6f6.patch`, branch back at `a95c0497b`** | — | **`D1`** (no port needed — upstream moved its own cache), `D9`, `D15`, `D18`; **`D10` risk realised? (see the blocker)** |
+| R09r | **rung-repair, block 05's artifact** (found at R09, `D5-a`) | **DONE 2026-11-13** | `9c94ce139` | FA instance set: heads 40/72 for `fattn-mma-f16` (32 files) + the FP8 KV column (14 files) + a **typed** `generate_cu_files.py`; squashed into block 05 at R18 |
+| R10 | 09 host-resident MoE | **DONE 2026-11-13** | `a6809f75b` (after the rung-repair `9c94ce139`) | **`D1`** answered (no port needed — upstream moved its own cache), `D9`, `D15`, `D18` checked; **`gate-host-pool.sh` `tsplit*` deferred to R13** |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
 | R12 | 11 qwen4exp | **TODO** | — | `D11` |
 | R13 | 12 campaign remainder | **TODO** | — | `D10`, `D11`, `D15` |
@@ -420,13 +421,45 @@ in `ggml_cuda_flash_attn_ext_mma_f16()` are unconditional), so this is a latent 
 of R06..R09, no rung sha invalidated) and is **squashed into block 05 at R18**, when `make-patches.sh` re-cuts
 the series as exactly 17 block commits.
 
-## R10 — block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine) · **BLOCKED 2026-11-13**
+## R09r — rung-repair: block 05's FA instance set (found at R09, `D5-a`) · **DONE 2026-11-13**
 
-**Status: merge + build + coherence GREEN, but the rung's own gate is RED on the 2-device `-sm tensor`
-arm — a GPU page fault the same arm does not take on r277.  Parked per `README.md` §5: the resolved commit
-is kept as the tag `r10-blocked-d4106d6f6` in `~/llama.cpp` and as
-[`R10-blocked-d4106d6f6.patch`](R10-blocked-d4106d6f6.patch) here; `rebase-r278` is rolled back to the last
-green rung `a95c0497b` (R09).  Nothing was dropped, no delivery mechanism was removed.**
+Not a block: a repair of **block 05's artifact**, applied on top of the green R09 so that no already-resolved
+rung is invalidated, and **squashed into block 05** when `make-patches.sh` re-cuts the series at R18.
+
+* **What upstream's typed -> head-agnostic conversion cost us.**  The mma instance set is byte-identical at
+  the old base (`a691b2345`), at r277 and at R09 — 126 typed files, heads
+  {64, 80, 96, 112, 128, 192→128, 256, 320→256, 512, 576→512}; block 05 never touched it.  Upstream
+  (`9d7b2d739`, `#30285`) converted those files to one-per-ncols-pair *and folded its two new heads, 40 and 72,
+  into that conversion*.  R06's "keep the delivery's typed layout" (correct — the RDNA4 band instances are named
+  in it) therefore dropped exactly those two heads, leaving **32 undefined
+  `ggml_cuda_flash_attn_ext_mma_f16_case<40|72,...>`** symbols while `fattn.cu` still dispatched both heads
+  unconditionally (`ggml_cuda_get_best_fattn_kernel()` -> `MMA_F16` for those heads on any shape not steered to
+  vec/tile: a latent abort on AMD, not an NVIDIA-only artefact).  The same conversion left the tree without the
+  **FP8 KV column** upstream added (12 tile + 2 asymmetric vec instances).
+* **`a95c0497b` -> `9c94ce139`** (additive only; no existing instance file edited, nothing removed):
+  **32** new `fattn-mma-f16-instance-ncols1_<N>-ncols2_<M>-dkq40-dv40.cu` / `-dkq72-dv72.cu` (one
+  `DECL_FATTN_MMA_F16_CASE` each, over the 16 pairs a non-niche head allows), **14** FP8 KV instances (tile `x12`
+  + `fattn-vec-instance-{f8_e4m3-iq4_nl,iq4_nl-f8_e4m3}.cu`), and `generate_cu_files.py`'s mma loop restored as
+  a **typed** loop over `HEAD_SIZES_KQ` (as merged it emitted upstream's 21 head-agnostic files and would
+  `os.remove` the delivery's 126 on a re-run — the trap this repair exists to remove).
+* **Verified:** `nm -D --undefined-only … | grep -c flash_attn_ext_mma_f16_case` **32 -> 0** (482 defined);
+  build green (46 new TUs, ~22 s incremental); `test-backend-ops -o FLASH_ATTN_EXT` **6995/6995, 0 failures**
+  with **448 head-40** and **1009 head-72** cases exercised; coherence **100 chars `sha=1c5d32ac537d`**;
+  `generate_cu_files.py` is **idempotent** w.r.t. the tree (a second run changes nothing — `git status` clean);
+  and `gate-norm-rows-alias.sh` **now links and runs** (every arm produces the gate's recorded reference digest
+  `bcc36422f9a120ac`, `fused=0 declined=0`) — its remaining failure is R11's missing r225 matcher, which is
+  exactly the shape that gate is for.
+* No CMake change (the glob `template-instances/fattn-mma*.cu` / the vec/tile helpers pick the files up).
+* **At R18:** this commit is squashed into block 05; `patches/README.md`'s block-05 note gains one line and
+  `gate-per-block-build.sh` covers the re-cut block.
+
+## R10 — block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine) · **DONE 2026-11-13**
+
+**Status: DONE at `a6809f75b`** (on top of the rung-repair `9c94ce139`), build-green and coherent, with the
+arena live on 1 device and the pool's text identity proven across its fault/sink/no-disk arms.  Its own gate's
+two `tsplit*` arms are **deferred to R13** with the mechanism named (`moe_cache_pool_backed`, block 12) — the
+rung cannot pass them by construction.  (R10 was first resolved and parked as `d4106d6f6` while that fault was
+attributed to the merge; the diagnosis below is what cleared it.)
 
 * block sha `495d00d45` · 69 files · **expected conflicts: 8**
 
@@ -444,13 +477,36 @@ green rung `a95c0497b` (R09).  Nothing was dropped, no delivery mechanism was re
 upstream's cache dormant (the r236 either/or measurement stands).  **`D18`** is consistency only: do not let
 the SYCL scheduler flags change the CUDA predicate.
 
-### R10 result: **BLOCKED** — `d4106d6f6` (parked), branch back at R09 `a95c0497b`
+### R10 result: **DONE** — `a6809f75b` (on top of the rung-repair `9c94ce139`)
 
-69 files, +30 830 / −900 applied onto `a95c0497b`; **8 conflicted files / 14 hunks** (the probe was right on
-the file set).  Build green with the canonical `GGML_HIP_NO_VMM=OFF` recipe (three first-error passes, see
-below); coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars
-`sha=1c5d32ac537d`**; the 1-device arena is **live and reached** (see the census below); `MUL_MAT_ID` not
-re-run (block 09 touches no MMQ dispatch).
+69 files, +30 830 / −900 applied onto the rung-repair commit; **8 conflicted files / 14 hunks** (the probe was
+right on the file set).  Build green with the canonical `GGML_HIP_NO_VMM=OFF` recipe (three first-error passes);
+coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**; the
+arena is **live and reached** (see the census below); `nm` shows **0** undefined FA symbols.
+
+**How it got here, because it matters for the next rung:** R10 was first resolved, built and coherent as
+`d4106d6f6` and then PARKED, because the last arm of its own gate (`gate-host-pool.sh` `tsplit`, a 2-device
+`-sm tensor` pool) faulted.  The fault turned out **not** to be a merge defect and **not** R10's to fix: the
+Meta backend at this rung has no `moe_cache_pool_backed` forwarding at all (`grep` finds the symbol nowhere in
+the tree), and **block 12 adds it** — `ggml_backend_meta_moe_cache_pool_backed()`, "wip/host-pool-speed (#131):
+forward the pool-backed query to the simple devices.  A tensor split gives every simple device the SAME host
+master, so the answer is uniform".  Without it a Meta-wrapped host expert weight is not reported as
+pool-backed, so the fused MoE kernel reads the **pageable** host master directly -> `Page not present` on both
+devices, right after slab init.  The r277 tree passes that arm only because block 12 is in it.  So the two
+`tsplit*` arms are **R13's**, exactly like `gate-norm-rows-alias.sh` is R11's, and they are the arms that must
+go green at R13 (they are recorded there).
+
+
+#### What was verified at this rung
+
+| arm | result |
+|---|---|
+| build (`~/bin/build-llama-rocm`, VMM=OFF, gfx1201) | green |
+| coherence, 4B Q8_0, 1 GPU, `-sm layer`, seed 42, no `-lv` | **100 chars `sha=1c5d32ac537d`** (unchanged since R01) |
+| 1-device arena census (35B-A3B Q8_0, `-ncmoe 20 -c 8192 -lv 4`) | **live**: `SLAB_INIT dev=0 … slab 9.50 GiB`; `MoE expert cache (auto): arena 8287.5 MiB of 16320.0 MiB (50.8 %)`; `h=0.5205 (2161/4152 reaches), fills=1991 evictions=0, tables=60, slots=7800`; `takeover=540 decline_all=0 get_ok=867`; `expert access: hits=2161 fills=1991 colds=0`.  **1991 fills through the scheduler copy callback** is the proof upstream's `hv_tensor_requires_copy` gate (merged at this rung) does not starve the host-expert staging on a 1-device layout. |
+| `gate-host-pool.sh` | **11 of 13 arms ran clean** (the gate `exit 2`s on the first failing arm; it reached arm 12).  Its verdict block needs the two `tsplit*` arms, so the gate cannot print a PASS before R13; the substance of the arms it does reach was verified directly below. |
+| pool text identity, single device (`Flash-Next GSQ-RCO-IQ3_XXS`, `-ncmoe 47`, `--load-mode mmap`) | **`ref`, `MOE_HOST_POOL_FILL_FAULT=1`, `MOE_HOST_POOL_SINK=1` and `MOE_HOST_POOL_DIO=1 + _DIO_FAULT=1` are all 182 chars `sha=a99ccbd97ecb`** — the same hash the 2-device `-sm layer` pool run gives, so the default, a failed fill, the sink demote and a platform with no disk tier all compute the same logits. |
+| the `tsplit` fault, characterised | `-sm tensor` + arena **faults**; the same arm with **`MOE_EXPERT_CACHE_MIB=0`** (arena off) passes; `-sm layer` 2 devices passes; r277 passes.  Not graphs (`GGML_CUDA_DISABLE_GRAPHS=1` faults), not the lazy mapping (`--lazy-mode off` faults), not the pinned tier (`MOE_HOST_POOL_PIN=0` faults).  Faulting kernel `mul_mat_vec_q_moe<(ggml_type)42,2,false>`, address a pageable host pointer, both devices.  Log shows per-device slabs (`dev=0` 24.44 GiB, `dev=1` 24.25 GiB) and `report_host_expert_placement: pinned 0.0 MiB … pageable 40012.5 MiB` — the kernel read the pageable master.  Owner: **R13** (`moe_cache_pool_backed` forwarding). |
 
 #### Resolutions (all "both sides"; nothing dropped)
 
@@ -458,101 +514,29 @@ re-run (block 09 touches no MMQ dispatch).
 |---|---|
 | `src/llama-context.h` (1) | upstream's new `sched_params sched_params_cur;` **plus** the delivery's `sched_alt` / `sched_alt_in_use` (the second-scheduler draft path). |
 | `src/llama-context.cpp` (2) | `sched_reserve`: the delivery's `sched_alt.reset()` / `gf_res_prev_active_alt = nullptr` **plus** upstream's `gf_res_reserve->set_max_nodes()` + `gf_res_prev` reset loop and its `sched_new({.max_nodes, .parallel, .op_offload})` struct form.  `get_gf_res_prev()`: **the delivery's `bool alt` slot index wins** — it subsumes upstream's `n_outputs > 0` axis, because `sched_alt_for()` *returns* `n_outputs > 0` for an MTP draft and the batch kind for a DFlash draft (whose two graphs both carry no outputs); the lazy `new llm_graph_result(gf_res_reserve->get_max_nodes())` is kept.  `sched_alt_select()`'s `sched_new(max_nodes, pipeline_parallel)` re-expressed on the struct form (`(size_t)` cast for the narrowed `max_nodes`). |
-| `ggml/src/ggml-cuda/common.cuh` (3) | **(1)** union: `ggml_cuda_pool_debug_enabled()` **and** the delivery's `ggml_cuda_graph_mem_gen()/freed()`.  **(2)** upstream's move wins: the full `ggml_cuda_graph` / `ggml_cuda_stream_context` definitions stay in `graph.cuh` (common.cuh keeps only the forward declarations), and the delivery's one addition to the struct — `uint64_t mem_gen` with its comment — is transplanted into `graph.cuh`.  **(3)** the delivery's keyed graph cache wins over upstream's bare `const void *` key: `ggml_cuda_graph_key` (first node + token width + weight identity + structural signature) with the eviction sweep, declared in common.cuh and **defined out-of-line in `ggml-cuda.cu`** (the body needs the complete `ggml_cuda_graph`; an inline body in common.cuh does not compile once the struct lives in graph.cuh — that was first-error pass 1). |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` (2) | **(1)** block 09 **moved** `ggml_cuda_should_fuse_mul_mat_vec_q()` and `ggml_cuda_match_shared_expert()` into `mmvq.cu` (non-static, declared in `mmvq.cuh`, plus the new `ggml_cuda_match_shared_expert_try_fuse()`); accept the move and port upstream's two changes into the new home — the predicate now uses `ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])` (`#31533`/`#31959`) instead of `ggml_is_quantized() && ne[1] <= MMVQ_MAX_BATCH_SIZE` (the shared-expert shape checks upstream added were already in the delivery's copy).  `mmvq.cu` also needed `#include "graph.cuh"` for the `ctx.stream_context().concurrent_events` guard (first-error pass 2).  **(2)** `ggml_cuda_graph_update_executable()`: **upstream's signature wins** (its `ggml_cuda_graph_instance` carries the cluster snapshot, `#31284`) **and** the delivery's HIP `hipGraphExecUpdate` leak workaround (`ROCm/rocm-systems#10713`, `GGML_HIP_GRAPH_FORCE_UPDATE=1` escape) runs first inside the body, on `instance.handle`.  Upstream's out-of-line `cuda_graph(const void *)` is dropped (the keyed accessor replaces it). |
-| `ggml/src/ggml-backend.cpp` (2, identical) | **union**: upstream's `hv_tensor_requires_copy[hash_id(input)]` reachability test (`#31419`, `D10`) **and** the delivery's `ggml_backend_sched_copy_input(..., st)` copy-state argument, on both the non-host-weight pass and the host-weight pass.  **This is the one resolution with real risk:** the host-expert staging runs inside the copy callback, so upstream's "do not upload an input that is not read" now gates it.  Flagged for the gate, which is where it has to be proven. |
-| `common/fit.cpp` (1) | `D15`: upstream's `path_model` -> **`paths_model`** (the external-PLE `std::vector<std::string>`) **plus** the delivery's `host_expert_bytes` / `host_experts` out-params (which the merged impl already declares with `= nullptr` defaults).  Two delivery call sites (the `dmds_min`/`dmds_ngl` preflight) and one `extra->path_model` still used the old single-path name and were adapted -> first-error pass 3. |
+| `ggml/src/ggml-cuda/common.cuh` (3) | **(1)** union: `ggml_cuda_pool_debug_enabled()` **and** the delivery's `ggml_cuda_graph_mem_gen()/freed()`.  **(2)** upstream's move wins: the full `ggml_cuda_graph` / `ggml_cuda_stream_context` definitions stay in `graph.cuh` (common.cuh keeps only the forward declarations), and the delivery's one addition to the struct — `uint64_t mem_gen` with its comment — is transplanted into `graph.cuh`.  **(3)** the delivery's keyed graph cache wins over upstream's bare `const void *` key: `ggml_cuda_graph_key` (first node + token width + weight identity + structural signature) with the eviction sweep, **defined out-of-line in `ggml-cuda.cu`** (the body needs the complete `ggml_cuda_graph`; an inline body in common.cuh does not compile once the struct lives in graph.cuh — first-error pass 1). |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` (2) | **(1)** block 09 **moved** `ggml_cuda_should_fuse_mul_mat_vec_q()` and `ggml_cuda_match_shared_expert()` into `mmvq.cu` (non-static, declared in `mmvq.cuh`, plus the new `ggml_cuda_match_shared_expert_try_fuse()`); accept the move and port upstream's change into the new home — the predicate now uses `ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])` (`#31533`/`#31959`) instead of `ggml_is_quantized() && ne[1] <= MMVQ_MAX_BATCH_SIZE`.  `mmvq.cu` also needed `#include "graph.cuh"` for the `ctx.stream_context().concurrent_events` guard (first-error pass 2).  **(2)** `ggml_cuda_graph_update_executable()`: **upstream's signature wins** (its `ggml_cuda_graph_instance` carries the cluster snapshot, `#31284`) **and** the delivery's HIP `hipGraphExecUpdate` leak workaround (`ROCm/rocm-systems#10713`, `GGML_HIP_GRAPH_FORCE_UPDATE=1` escape) runs first inside the body, on `instance.handle`.  Upstream's out-of-line `cuda_graph(const void *)` is dropped (the keyed accessor replaces it). |
+| `ggml/src/ggml-backend.cpp` (2, identical) | **union**: upstream's `hv_tensor_requires_copy[hash_id(input)]` reachability test (`#31419`, `D10`) **and** the delivery's `ggml_backend_sched_copy_input(..., st)` copy-state argument, on both the non-host-weight pass and the host-weight pass.  **Validated at this rung**, not merely merged: the 1-device census shows 1991 fills through the copy callback, so the gate does not starve the staging (`D10` closed for this rung). |
+| `common/fit.cpp` (1) | `D15`: upstream's `path_model` -> **`paths_model`** (the external-PLE `std::vector<std::string>`) **plus** the delivery's `host_expert_bytes` / `host_experts` out-params (which the merged impl already declares with `= nullptr` defaults).  The delivery's `dmds_min`/`dmds_ngl` preflight call sites and one `extra->path_model` used the old single-path name and were adapted -> first-error pass 3. |
 | `common/speculative.cpp` (1) | the delivery's pre-loaded `model_dft_pre` draft model (slab-transient-absorption step 4) **plus** upstream's loader for the fallback: `common_model_load(params.speculative.draft.mparams.get_paths(), mparams)` instead of `llama_model_load_from_file(model_path.c_str(), ...)`.  `D7` untouched (block 02's controller is unchanged). |
-| `src/llama-mmap.cpp` (2) | `D9`: upstream's Windows rewrite wins wholesale — the paired buffered/direct handle (`fp_win32`/`fp_win32_direct`, `init_buffered_io()`/`init_direct_io()`) supersedes the delivery's old ctor; upstream already declares `std::string fname;` (at the end of the block), so the delivery's `llama_file::path()` and the `fname` uses are intact and no member is redeclared.  The delivery's `llama_mmap::impl` changes (`int fd`, the fragment-wise `unmap_fragment` + post-unmap DONTNEED, r273) are untouched by this rung and still present. |
+| `src/llama-mmap.cpp` (2) | `D9`: upstream's Windows rewrite wins wholesale — the paired buffered/direct handle (`fp_win32`/`fp_win32_direct`, `init_buffered_io()`/`init_direct_io()`) supersedes the delivery's old ctor; upstream already declares `std::string fname;` (at the end of the block), so the delivery's `llama_file::path()` and the `fname` uses are intact and no member is redeclared.  The delivery's `llama_mmap::impl` changes (`int fd`, the fragment-wise `unmap_fragment` + post-unmap DONTNEED, r273) are untouched and still present. |
 
 **`D1` (the MoE cache) needed no port at all, and that is the finding:** upstream `#32157` moved *its own*
 cache from `llama-graph.cpp` to `src/llama-moe-cache.{cpp,h}` (`apply()`/`ensure()` -> `build_lookup()` /
 `get_experts()` / `copy()`), but the delivery's cache is a **different implementation in a different place** —
 the CUDA-side arena (`moe-expert-cache.{cu,h}`), the movable-boundary slab, the scheduler copy callback
 (`llama_context::sched_copy_experts`, which already calls `moe_cache->copy()` for upstream's dormant path) and
-the `moe_cache_rearm`/`set_reserve` dev hooks.  Block 09 touches **no** file of upstream's cache
-(`git status | grep llama-graph` is empty).  So the r236 either/or ruling stands untouched: the arena is
-default-on, upstream's cache stays dormant behind `--moe-cache-mib`.  The r143-era measurement carried in the
-block's own commit message (35B-A3B Q8_0, `-ncmoe 20`, `-c 8192`, 16.3 GiB host experts, 1 GPU, equal 4080
-MiB budgets): arena prefill **547.6** / decode **53.5** t/s vs upstream `--moe-cache-mib 4096` **544.2** / **62.9**
-and streaming 470 / 49, text byte-identical — upstream's cache is 17.6 % faster on decode at that shape, which
-is exactly why the ruling is "ours default, theirs dormant" and not "theirs wins".  **No new measurement is
-owed at this rung** (the ruling is unchanged); an update belongs to R18's arms.
+the `moe_cache_rearm`/`set_reserve` dev hooks.  Block 09 touches **no** file of upstream's cache.  So the r236
+either/or ruling stands untouched: the arena is default-on, upstream's cache stays dormant behind
+`--moe-cache-mib`.  The r143-era measurement carried in the block's own commit message (35B-A3B Q8_0,
+`-ncmoe 20`, `-c 8192`, 16.3 GiB host experts, 1 GPU, equal 4080 MiB budgets): arena prefill **547.6** /
+decode **53.5** t/s vs upstream `--moe-cache-mib 4096` **544.2** / **62.9** and streaming 470 / 49, text
+byte-identical — upstream's cache is 17.6 % faster on decode at that shape, which is exactly why the ruling is
+"ours default, theirs dormant" and not "theirs wins".  No new measurement is owed at this rung.
 
-#### The mechanism is live (1 device)
+**Owed at R13:** `gate-host-pool.sh` `tsplit` + `tsplitnosink` (need block 12's `moe_cache_pool_backed` Meta
+forwarding).
 
-`HIP_VISIBLE_DEVICES=0`, 35B-A3B Q8_0, `-ngl 99 -sm layer -ncmoe 20 -c 8192 -lv 4`:
-`SLAB_INIT dev=0 free=13.51 GiB reserve=4.00 GiB size(VA)=9.50 GiB boundary=1.25 GiB`;
-`alloc_all_locked: MoE expert cache (auto): arena 8287.5 MiB of 16320.0 MiB host experts (50.8% residency)`;
-`moe_cache_report: MoE expert cache: h=0.5205 (2161/4152 reaches), fills=1991 evictions=0, tables=60,
-slots=7800`; `takeover=540 decline_all=0 get_ok=867 cold=uva cold_reaches=0`; `expert access: hits=2161
-fills=1991 colds=0`.  So the arena, the slab, the fill transport and the scheduler copy hook all run on the
-merged tree — including **1991 fills through the copy callback**, i.e. upstream's `hv_tensor_requires_copy` gate
-did **not** starve the host-expert staging on the 1-device layout.
-
-#### THE BLOCKER: `gate-host-pool.sh` `tsplit` GPU page fault
-
-`./scripts/gate-host-pool.sh` passes **12 of 13 arms** (`ref`, `qd1`, `bulkbuf`, `dio`, `nodisk`, `fail`,
-`late`, `sink`, `sinkfail`, `pinlate`, `pin0`, plus their text arms) and **fails the last one**, the 2-device
-`-sm tensor` pool arm (`GPU2=0,2`, the x8 field pair):
-
-```
-Memory access fault by GPU node-1 on address 0x7f5fca898000. Reason: Page not present or supervisor privilege.
-kernel: void mul_mat_vec_q_moe<(ggml_type)42, 2, false>(...)
-```
-
-The address is a **host** address (0x7f…), the kernel is the delivery's **fused shared+routed expert MMVQ**
-(`mul_mat_vec_q_moe`), and both GPUs fault on the same address.  Discrimination runs (all same command, only
-the variable named changed):
-
-| arm | result |
-|---|---|
-| r277 binaries (`build-rocm/bin-r277/llama-cli`), same arm | **PASS** (generates, 110.4 / 54.2 t/s) |
-| merged tree, `-sm tensor`, pool on | **fault** (reproducible, `SINK=0` and `SINK=1`) |
-| merged tree, `-sm tensor`, `GGML_CUDA_DISABLE_GRAPHS=1` | **fault** (not graph capture) |
-| merged tree, `-sm tensor`, `--lazy-mode off` | **fault** (not the lazy mapping drop) |
-| merged tree, `-sm tensor`, `MOE_HOST_POOL_PIN=0` | **fault** (not the pinned tier) |
-| merged tree, `-sm tensor`, **`MOE_EXPERT_CACHE_MIB=0`** (arena off, streaming) | **PASS** |
-| merged tree, **`-sm layer`**, 2 devices, pool on | **PASS** (182 chars `sha=a99ccbd97ecb`) |
-| merged tree, 1 device (`-sm layer`), pool on | **PASS** (all 12 other gate arms) |
-
-So: **the host-expert arena on a `-sm tensor` (Meta-device) split reads an address the GPU cannot access**;
-the same binary, model and flags are clean on one device and on a layer split, and clean on a tensor split
-with the arena off, and clean on r277 with the arena on.  It is a merge interaction, and the two candidates,
-in order, are:
-
-1. **The host-weight copy gate.**  In `ggml-backend.cpp` upstream now skips the copy of an input/weight that
-   "is not read" (`hv_tensor_requires_copy`).  Under `-sm tensor` the weights are reached through the **Meta**
-   device's buffers, and the arena's fill runs inside that copy callback.  If the Meta path marks a host
-   expert weight not-required, the fill is skipped and the fused kernel reads the **host master** through UVA
-   — which is exactly the fault signature (host address, inside `mul_mat_vec_q_moe`).  The 1-device layout
-   marks it required (1991 fills observed), so the bug would be Meta-specific.  **Check first:**
-   `hv_tensor_requires_copy` for a host-expert weight under a Meta wrapper, and whether
-   `sched_copy_experts` runs at all for the tensor split (add the existing `-lv 4` fill census to a
-   `-sm tensor` run and compare `fills=` against the 1-device 1991).
-2. **The Meta device's view/pointer slot.**  `sched_alt_select()` calls `ggml_backend_meta_set_view_slot(alt ? 1 : 0)`
-   and block 09 merges `ggml-backend-meta.cpp` (the delivery's `GGML_META_COMPUTE_HEADROOM` plus upstream's
-   256-view floor, `#31447`).  A wrong slot would hand the kernel the wrong device buffer — also a fault.
-   **Check:** whether the alarm is a *wrong pointer* (slot) or an *unmapped host pointer* (gate 1): print the
-   table pointer the kernel receives under both splits.
-
-Do **not** "fix" this by taking upstream's gate out of `ggml-backend.cpp` without the measurement above: if the
-gate is right, the delivery needs its staging registered as a read (an upstream `sched` change or an explicit
-`requires_copy` mark), which is a different change.
-
-#### Where it was parked
-
-* `~/llama.cpp`: `git reset --hard a95c0497b` (R09 green, clean tree, no `CHERRY_PICK_HEAD`); the resolved
-  commit is kept as the local tag **`r10-blocked-d4106d6f6`**.
-* `R10-blocked-d4106d6f6.patch` in this directory — `git am` it on `a95c0497b` to resume (no regeneration
-  needed; it is the exact resolved commit, including the three first-error-pass fixes).
-* Reproduce the blocker exactly:
-  `HIP_VISIBLE_DEVICES=0,2 ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC=40 llama-cli -m
-  /llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
-  --fit off -ngl all --n-cpu-moe 47 --load-mode mmap --lazy-mode on -c 4096 -np 1 -fa on -ctk q8_0 -ctv q8_0
-  -b 1024 -ub 1024 -t 8 --jinja --spec-type none -sm tensor -mg 0 -p "The capital of France is" -n 32
-  --temp 0 --seed 42 --single-turn --no-display-prompt`
-  (or just `./scripts/gate-host-pool.sh`, ~12 arms before the failure).
 
 ## R11 — block 10: slab, fusion dispatcher and async input ring · **TODO**
 

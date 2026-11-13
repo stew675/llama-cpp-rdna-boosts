@@ -195,10 +195,14 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   runs, and `gate-per-block-build.sh` on the re-cut block 05.
 * **Verify after either:** `nm -D --undefined-only` clean, `test-backend-ops -o FLASH_ATTN_EXT` still
   6996/0, coherence `sha=1c5d32ac537d`, then `gate-norm-rows-alias.sh` links and runs.
-* **Status:** `AWAITING` — the maintainer decides, because it changes block 05's artifact.  It does **not** block
-  the climb: no rung's exit criterion needs a head-40/72 model, but **every gate that links a driver**
-  (`gate-norm-rows-alias.sh`, `gate-hc-fusions.sh` is fine — it uses `llama-cli`) is blocked until it is
-  repaired, and `gate-norm-rows-alias.sh` is owed at **R11**.
+* **Status:** **`DECIDED` (2026-11-13, maintainer: option 1) and APPLIED as the rung-repair commit
+  `9c94ce139`** on top of the green R09 — additive only, no existing instance file edited, nothing removed:
+  the 32 mma head-40/72 instances, the 14 FP8 KV instances the same conversion hid, and a **typed**
+  `generate_cu_files.py` loop.  Verified: undefined FA symbols **32 -> 0**, build green, FLASH_ATTN_EXT
+  **6995/6995 with 448 head-40 and 1009 head-72 cases**, coherence unchanged, the generator idempotent on the
+  tree, and `gate-norm-rows-alias.sh` links and runs (its remaining failure is R11's missing matcher).  It is
+  **not** a rung: it is squashed into block 05 when `make-patches.sh` re-cuts the series at R18 (the ledger row
+  is `R09r` in `RUNGS.md`).  It no longer blocks any gate.
 
 ## D6 — CUDA graph and concurrent-stream state left `common.cuh`
 
@@ -301,17 +305,20 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   new reachability test.
 * **Questions:** does every host-expert/staging upload still happen on the merged tree?  Do the async-ring
   arms still measure a win?
-* **Status:** **`MEASURING` — the risk is live at R10 (2026-11-13).**  `ggml-backend.cpp` merged as a union:
-  upstream's `hv_tensor_requires_copy[hash_id(input)]` reachability test **and** the delivery's
-  `ggml_backend_sched_copy_input(..., st)` state argument, on both the non-host-weight and the host-weight
-  pass.  On one device the host-expert staging still runs (the 1-device 35B-A3B census shows **1991 fills**
-  through the copy callback), so the gate did not starve it there.  On a **`-sm tensor`** (Meta-device) split
-  the arena faults on a **host** address inside `mul_mat_vec_q_moe` while the same arm is clean on r277, clean
-  on one device and clean with the arena off — and a skipped host-weight copy is the leading explanation (a
-  Meta-wrapped host weight marked not-required, so the fill never runs and the fused kernel reads the host
-  master through UVA).  `gate-host-pool.sh`'s `tsplit` arm is the oracle.  Do **not** take upstream's gate out
-  without that measurement: if the gate is right, the delivery needs its staging *registered as a read* (an
-  upstream `sched` change or an explicit mark), which is a different change.  Full evidence: `RUNGS.md` R10.
+* **Status:** **`CLOSED` for R10 (2026-11-13) — the union is validated, and the `-sm tensor` fault that was
+  blamed on it is not it.**  `ggml-backend.cpp` merged as a union: upstream's
+  `hv_tensor_requires_copy[hash_id(input)]` reachability test (set only when the *consuming node* carries
+  `GGML_TENSOR_FLAG_COMPUTE`) **and** the delivery's `ggml_backend_sched_copy_input(..., st)` state argument, on
+  both the non-host-weight and the host-weight pass.  The 1-device 35B-A3B census is the proof the delivery's
+  staging survives it: **1991 fills through the copy callback** (`h=0.5205`, `takeover=540`).  The
+  `gate-host-pool.sh` `tsplit` fault was attributed to this gate while R10 was parked and the attribution was
+  **wrong**: the Meta backend at this rung has no `moe_cache_pool_backed` forwarding at all (the symbol exists
+  nowhere in the tree) and **block 12 adds it** ("forward the pool-backed query to the simple devices.  A tensor
+  split gives every simple device the SAME host master"), so a Meta-wrapped host expert weight is not reported
+  as pool-backed and the fused kernel reads the pageable host master -> `Page not present` on both devices.  The
+  two `tsplit*` arms are therefore **R13's** and must go green there.  What remains of `D10` proper (does the
+  delivery's staging still happen on the merged scheduler, do the ring arms still win) is unchanged and was
+  always R11/R13's: the same 1991-fill evidence covers the staging half, the ring arms are R11's.
 
 ## D11 — `ggml.c` / RPC / test-surface refactors
 
@@ -352,8 +359,10 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   r236 record: on this base the DSV4 HC pre/post ops are **byte-identical to their chain** (`a512ee68c4b3`),
   i.e. the r236 numeric-`SOFT_EXPECT` anchor (`6a102dbc62d6`) no longer describes them — a *stronger* result,
   recorded rather than "reported".  `gate-norm-rows-alias.sh` itself is **not** R09's (the r225 narrow-row
-  fusion and its `norm-rows:` census arrive with block 10): it is owed at **R11**, and it is blocked until
-  **`D5-a`** is repaired (its section A links a driver against the backend library).
+  fusion and its `norm-rows:` census arrive with block 10): it is owed at **R11**.  Its section A used to be
+  blocked on `D5-a` (the driver link); that is **fixed** (`9c94ce139`) — the gate now builds and runs its driver
+  and produces its recorded reference digest `bcc36422f9a120ac` on every arm with `fused=0 declined=0`, i.e. it
+  fails only because the matcher it guards is not in the tree yet.
 
 ## D13 — HIP: a fixed rocBLAS workspace
 
@@ -424,8 +433,11 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   R01's block-00 commit `43a418c10` is the decided shape (36 files, +1049/−357 against `4f9dfa0e3`): the
   pre-#30542 VMM pool on every backend, no HIP-only split.  The revert is dropped at the next re-base once
   upstream fixes the HIP pool (the provenance note lives in `BASE-BLOCKER.md` and this entry).  Verification
-  still owed at R10/R17 (`gate-host-pool.sh`, `gate-uma-experts.sh --quick` on `halo`) — the arena/GTT store
-  are the first delivery code that actually exercises a large reservation.
+  **Partially verified at R10 (2026-11-13):** the slab and the arena allocate on the VMM pool with the revert in
+  place — `SLAB_INIT dev=0 … slab 9.50 GiB`, per-device slabs under `-sm tensor` (`dev=0` 24.44 GiB / `dev=1`
+  24.25 GiB), `MoE expert cache (auto): arena 8287.5 MiB`, and 1991 expert fills — so `#30542`'s halved
+  reservation does not disturb the delivery's arena on this box.  Still owed at **R17**:
+  `gate-uma-experts.sh --quick` on `halo` (the region size `-lmt`/`-lme` asks for).
 
 ## D18 — SYCL gained a device-side MoE scheduler
 

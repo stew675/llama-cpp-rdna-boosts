@@ -13,11 +13,10 @@ conflict map is in [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 |---|---|
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `a95c0497b`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R09 done = blocks 00-08**; **R10 = block 09 is BLOCKED** (resolved, built and coherent, but its own gate faults on the 2-device `-sm tensor` arm — see §5.5).  The next action is to fix that, not to start R11 |
-| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) |
-| parked rung | **R10 `d4106d6f6`** — tag `r10-blocked-d4106d6f6` in `~/llama.cpp` + `R10-blocked-d4106d6f6.patch` here; `git am` it on `a95c0497b` to resume |
-| canonical build | `~/llama.cpp/build-rocm` — **back on the R09 tree** after the R10 rollback (rebuild it before measuring), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `a6809f75b`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
+| progress | **R00-R10 done = blocks 00-08 + the rung-repair + block 09**; next is **R11 = block 10 (slab, fusion dispatcher, async input ring)** |
+| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) |
+| canonical build | `~/llama.cpp/build-rocm` — **R10 tree** (`a6809f75b`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
 | coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 |
@@ -38,9 +37,9 @@ cd ~/llama-cpp-rdna-boosts && git log --oneline -3 && sed -n '1,40p' wip/upstrea
 Expect: `rebase-r278` clean at `a95c0497b`, no `CHERRY_PICK_HEAD`
 (`ls ~/llama.cpp/.git/CHERRY_PICK_HEAD` must fail), delivery on `rebase-261113`.
 
-Then read, in this order: **this file** -> [`RUNGS.md`](RUNGS.md) `R10` + the `R09 result` section ->
-[`DECISIONS.md`](DECISIONS.md) `D1`/`D9`/`D15`/`D17`/`D18` (the R10 items) and **`D5-a`** (the open finding
-R09 handed over) -> [`README.md`](README.md) §1 (rung mechanics) and §3-§4 (decision policy + release ladder).
+Then read, in this order: **this file** -> [`RUNGS.md`](RUNGS.md) §R11 (the next rung) and §R10/§R09r ->
+[`DECISIONS.md`](DECISIONS.md) `D6`/`D8`/`D10` (the R11 items) -> [`README.md`](README.md) §1 (rung mechanics)
+and §3-§4 (decision policy + release ladder).
 `BASE-BLOCKER.md` is history now (`D17` decided) but explains why block 00 carries a revert.
 
 ---
@@ -113,10 +112,10 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R07 | 06 MMB prefill | DONE | `c1d8b7c04` | our blocks on upstream's MMVF/fusion predicates; MMB census 6915 t/s |
 | R08 | 07 k-quant boosts | DONE | `626e398d2` | graph-reuse union; `MUL_MAT` 2681/0 (`D16`) |
 | **R09** | **08 fused kernels** | **DONE** | `a95c0497b` | 7 conflicts resolved; **`D12` dual store kept**, `D6` partial; **found `D5-a`** (heads 40/72 have no mma instance — R06 gap, AWAITING) |
-| R10 | 09 host-resident MoE | **BLOCKED** (parked `d4106d6f6`) | — | resolved/built/coherent, but `gate-host-pool.sh` `tsplit` (2-device `-sm tensor`) page-faults; see §5.5 |
+| R10 | 09 host-resident MoE | **DONE** | `a6809f75b` | 14 hunks, all "both sides"; `D1` answered (no port), arena live, pool text identity `a99ccbd97ecb`; its gate's `tsplit*` arms are **R13's** — see §5.5 |
 | R11 | 10 infrastructure | TODO | — | 10 conflicts (biggest); `D6`, `D8`, `D10`; **owes `gate-node-budget.sh`** |
 | R12 | 11 qwen4exp | TODO | — | 5 conflicts; `D11`; owes `gate-hc-fusions.sh`, `gate-qwen4exp-quant-coherence.sh` |
-| R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15` |
+| R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15`; **owes `gate-host-pool.sh` `tsplit`/`tsplitnosink`** (block 12 adds `moe_cache_pool_backed`) |
 | R14 | 13 MTP vocab subset | TODO | — | **0 conflicts**; re-verify `D7` |
 | R15 | 14 relaxed-tensor (TEMPORARY) | TODO | — | **0 conflicts**; check upstream has not started allowing those arches |
 | R16 | 15 streamed KV | TODO | — | 5 conflicts; `D3`, `D19`; owes the KV residency gates |
@@ -127,8 +126,8 @@ table).  Every gate that hashes text passes no `-lv` at all.
 rebased earlier ones, so the order is not negotiable):
 
 ```
-R10 495d00d45   R11 05f298fea   R12 ea4963486   R13 c7628e974
-R14 f0c7f3359   R15 6b4d9865e   R16 99d33117a   R17 9d7c0502c
+R11 05f298fea   R12 ea4963486   R13 c7628e974   R14 f0c7f3359   R15 6b4d9865e
+R16 99d33117a   R17 9d7c0502c
 ```
 
 Per-rung expected conflict paths and "what to expect" notes: `CONFLICT-MAP.md` (measured) and `RUNGS.md`
@@ -163,34 +162,37 @@ case sit beside it.  Two things were learned that matter later:
 * the box's `GGML_CUDA_FA_QUANTS` cache now carries the union list (`…;iq4_nl-iq4_nl;f8_e4m3-f8_e4m3`), so
   the r277-era "hand-set iq4_nl" trap no longer bites.
 
-### §5.5 R10 (block 09) — BLOCKED: the arena faults on a `-sm tensor` split
+### §5.5 R09r (rung-repair) + R10 (block 09) — both DONE; the `-sm tensor` fault is R13's
 
-The rung is **resolved, build-green and coherent** (`d4106d6f6`; 14 conflict hunks across the 8 files, all
-"both sides"; full table in [`RUNGS.md`](RUNGS.md) `R10 result`), and the 1-device arena is **live**
-(`h=0.5205`, `fills=1991`, `takeover=540` on 35B-A3B Q8_0 `-ncmoe 20` at `-c 8192`).  It is parked because
-`scripts/gate-host-pool.sh` fails its **last** arm, the 2-device `-sm tensor` pool (the x8 field pair):
+**`9c94ce139` (R09r) — block 05's FA instance set, found at R09 as `D5-a`, decided and applied.**  Upstream's
+typed -> head-agnostic instance conversion folded its two new heads (40, 72) into itself, so R06's correct
+"keep the delivery's typed layout" dropped exactly those two: 32 undefined
+`ggml_cuda_flash_attn_ext_mma_f16_case<40|72,…>` symbols against an unconditional dispatch in `fattn.cu` (a
+latent abort on AMD, not an NVIDIA-only artefact), plus the FP8 KV column the same conversion hid.  The repair
+is **additive**: 32 new mma instance files + 14 FP8 KV instances + a **typed** `generate_cu_files.py` loop
+(as merged it emits upstream's head-agnostic files and would delete the delivery's 126 on a re-run).  Verified:
+undefined FA symbols **32 -> 0**, build green, `FLASH_ATTN_EXT` **6995/6995** (448 head-40, 1009 head-72),
+coherence `sha=1c5d32ac537d`, generator idempotent on the tree, and `gate-norm-rows-alias.sh` now links and runs.
+It is squashed into block 05 at R18.
 
-```
-Memory access fault ... address 0x7f5fca898000 (a HOST address)
-kernel: void mul_mat_vec_q_moe<(ggml_type)42, 2, false>(...)
-```
+**`a6809f75b` (R10) — block 09, DONE.**  14 conflict hunks across 8 files, every one "both sides" (table in
+`RUNGS.md`); build green; coherence `sha=1c5d32ac537d`; the 1-device arena is live (`h=0.5205`, **fills=1991**,
+`takeover=540`); the pool's `ref` / failed-fill / sink / no-disk-tier arms are all **182 chars
+`sha=a99ccbd97ecb`**, the same hash as the 2-device `-sm layer` run.  `D1` was **answered, not deferred**:
+upstream moved *its own* MoE cache to `llama-moe-cache.*`, the delivery's tier is a different implementation in
+a different place, and the r236 either/or ruling stands.
 
-Discrimination (same command, one variable changed): **r277 binaries PASS**; merged tree `-sm layer` on 2
-devices **PASS** (182 chars `sha=a99ccbd97ecb`); 1 device **PASS**; `MOE_EXPERT_CACHE_MIB=0` (arena off) with
-`-sm tensor` **PASS**; `GGML_CUDA_DISABLE_GRAPHS=1`, `--lazy-mode off` and `MOE_HOST_POOL_PIN=0` all still
-**FAULT**.  So it is the **arena on a Meta-device split** reading a host address the GPU cannot reach.  Two
-candidates, in order: **(1) `D10`** — upstream's `hv_tensor_requires_copy` gate now skips the copy of an
-input/weight it believes is not read, and the fill runs *inside* that copy callback, so a Meta-wrapped host
-expert weight marked not-required would leave the fused kernel reading the host master; **(2)** the Meta
-device's view/pointer slot (`ggml_backend_meta_set_view_slot()`) handing the kernel the wrong buffer.  Check
-(1) first: does `sched_copy_experts` run at all under `-sm tensor` (compare the `fills=` census against the
-1-device 1991)?  **Do not "fix" it by deleting upstream's gate** without that measurement.
-
-Everything is preserved: the commit is the local tag `r10-blocked-d4106d6f6` and
-`R10-blocked-d4106d6f6.patch` in this directory; `rebase-r278` is rolled back to the green R09 tip
-`a95c0497b` (clean, no `CHERRY_PICK_HEAD`).  `D1` came out **answered without a port** (upstream moved its own
-cache; the delivery's tier is a different implementation and the either/or ruling stands) — that part of R10 is
-finished and must not be re-litigated.
+**The `-sm tensor` arena fault was NOT a merge defect.**  R10 was parked on it (as `d4106d6f6`) and the
+attribution to `D10`'s `hv_tensor_requires_copy` union was **wrong**.  The Meta backend at this rung has **no
+`moe_cache_pool_backed` forwarding at all** (`grep -rn moe_cache_pool_backed` finds nothing) and **block 12 adds
+it** — "forward the pool-backed query to the simple devices.  A tensor split gives every simple device the SAME
+host master".  Without it a Meta-wrapped host expert weight is not reported as pool-backed, so the fused kernel
+(`mul_mat_vec_q_moe`) reads the **pageable** host master -> `Page not present` on both GPUs, right after slab
+init.  r277 passes that arm only because block 12 is in it.  So **`gate-host-pool.sh`'s `tsplit` +
+`tsplitnosink` arms are R13's** (like `gate-norm-rows-alias.sh` is R11's) and they must go green there; at R10
+the gate reaches 11 of its 13 arms and cannot print a verdict, so the substance was verified directly (the four
+hashes above plus the 1-device census).  The parked tag `r10-blocked-d4106d6f6` remains in `~/llama.cpp` as
+history; the patch file was deleted once re-applied (it no longer applied on the repair commit's parent).
 
 ### §5.4 R09 (block 08) — the last rung, DONE at `a95c0497b`
 The full result, the six `norm.cu` conflict resolutions and the verification table are in

@@ -1,3 +1,47 @@
+## 261113.007 (r277 + campaign rungs R09r/R10, NO delivery change) -- `D5-a` repaired, so the FA instance matrix is complete again (heads 40/72, the FP8 KV column and a typed generator), and R10 (block 09) is DONE with its `-sm tensor` arms owned by R13
+
+**No patch changes, no `release.json` change.**  One rung repair (`R09r`) and one block (`R10`) of the
+`4f9dfa0e3` climb.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` (§R09r, §R10).
+
+* **R09r = `9c94ce139` — the `D5-a` repair, decided (option 1) and applied.**  Upstream's typed ->
+  head-agnostic instance conversion folded its two **new heads (40, 72)** into itself, so R06's correct "keep
+  the delivery's typed layout" dropped exactly those two: 32 undefined
+  `ggml_cuda_flash_attn_ext_mma_f16_case<40|72,...>` against an **unconditional** dispatch in `fattn.cu` (a
+  latent abort on AMD, not an NVIDIA-only artefact), plus the **FP8 KV column** the same conversion hid (12
+  tile + 2 asymmetric vec instances).  Additive repair: **32** new single-declaration mma instance files,
+  **14** FP8 KV instances, and `generate_cu_files.py`'s mma loop restored as a **typed** loop (as merged it
+  emitted upstream's 21 head-agnostic files and would delete the delivery's 126 on a re-run).  Verified:
+  undefined FA symbols **32 -> 0** (482 defined), build green (46 new TUs, ~22 s incremental),
+  `test-backend-ops -o FLASH_ATTN_EXT` **6995/6995** with **448 head-40 + 1009 head-72** cases exercised,
+  coherence **100 chars `sha=1c5d32ac537d`**, the generator **idempotent** on the tree, and
+  `gate-norm-rows-alias.sh` now **links and runs** its driver (every arm yields the gate's recorded reference
+  digest `bcc36422f9a120ac`) — it fails only because the r225 matcher it guards is R11's code.  It is squashed
+  into block 05 when `make-patches.sh` re-cuts the series at R18.
+* **R10 = `a6809f75b` — block 09 (host-resident MoE), DONE.**  14 conflict hunks across 8 files, every one
+  "both sides" (the table is in `RUNGS.md`); build green; coherence unchanged; the 1-device arena is live
+  (`SLAB_INIT` 9.50 GiB, arena 8287.5 MiB / 50.8 % residency, **fills=1991**, `takeover=540`); and the pool's
+  `ref` / failed-fill / sink / no-disk-tier arms are **all 182 chars `sha=a99ccbd97ecb`**, the same hash as the
+  2-device `-sm layer` run, so the fault paths do not change the logits.  **`D1` answered, not deferred**:
+  upstream moved *its own* MoE cache to `llama-moe-cache.*`; the delivery's tier is a different implementation
+  in a different place (CUDA arena + slab + scheduler copy callback), block 09 touches no file of upstream's
+  cache, and the r236 either/or ruling stands (arena default-on, upstream cache dormant).  The **1991 fills**
+  also close `D10`'s staging question: upstream's `hv_tensor_requires_copy` reachability gate does not starve
+  the delivery's host-expert staging.
+* **The `-sm tensor` arena fault was not a merge defect, and `D10` was wrongly blamed for it.**  R10 was parked
+  on a `Page not present` fault inside `mul_mat_vec_q_moe` on a 2-device tensor split.  Diagnosis: the Meta
+  backend at this rung has **no `moe_cache_pool_backed` forwarding at all**, and **block 12 adds it** ("forward
+  the pool-backed query to the simple devices.  A tensor split gives every simple device the SAME host
+  master"), so a Meta-wrapped host expert weight is not reported as pool-backed and the fused kernel reads the
+  **pageable** host master (log: `pinned 0.0 MiB ... pageable 40012.5 MiB`; the fault is on both GPUs, right
+  after per-device slab init, and the arena-off build of the same arm passes).  r277 passes only because block
+  12 is present.  So **`gate-host-pool.sh`'s `tsplit` + `tsplitnosink` arms are R13's**, like
+  `gate-norm-rows-alias.sh` is R11's; at R10 the gate reaches 11 of its 13 arms and cannot print a verdict,
+  which is why the substance was verified directly (the four identical hashes plus the census).
+* **Climb state:** R00..R10 done on `rebase-r278` at `a6809f75b` (`9c94ce139` is the repair between blocks 08
+  and 09); **next is R11 = block 10** (slab, fusion dispatcher, async input ring), which owes
+  `gate-node-budget.sh` **and** `gate-norm-rows-alias.sh`.  Open decision items: none blocking; `D4`/`D5`'s
+  few-row halves stay R18 numbers.
+
 ## 261113.006 (r277 + campaign rungs R09/R10, NO delivery change) -- R09 is green and R10 is PARKED: the host-expert arena faults on a 2-device `-sm tensor` split (a merge interaction, not a r277 shape), and the FA instance matrix is missing heads 40/72
 
 **No patch changes, no `release.json` change.**  Rungs R09 (block 08) and R10 (block 09) of the
