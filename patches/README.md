@@ -4954,6 +4954,32 @@ well: **12 546 -> 7 774 ms** for the same 42.7 GiB and the same set (3.67 -> 6.2
 default moves nothing on gfx1151).  Record: `benchmarks/2026-11-12-expert-seed-policy.md`, `archive/work/expert-seed-policy/`,
 `WORKLOG.md` 261112.006.
 
+**r277 amendment to block 16 -- the PLACEMENT READ QUEUE (and the pool-base alignment shift it exposed).**  Every
+placement fill is a work queue drained by the reader pool block 16 already had: the host pool's load-time prewarm
+(`pool_prepopulate_locked`), its one-shot band re-layout (`pool_rerank_from_heat_locked`), a covering mirror
+(`pool_mirror_bulk_fill_locked`) and this block's own GTT arena SIZING seeds (`apply_heat_seed_locked`,
+`apply_prefill_seed_locked`).  A placement fill has no decode latency to lose and its whole work list is known
+before the first read, so it runs at depth; a DEMAND miss cannot (its next read is not known until the routing
+arrives), and that stays the scheduler item in `archive/work/host-pool-demand-overlap/`.  r273's transport rule is
+extended with it: **the placement read is O_DIRECT whatever `--load-mode` says, and `--load-mode` /
+`MOE_HOST_POOL_DIO` decide only the DEMAND transport** -- the prewarm had been left on the demand transport, i.e.
+filling through the model mapping, measured **1 183 MiB/s** cold against **6 103** for the same bytes read from
+the file.  Numbers (cold, same-seed text byte-identical in every arm): O_DIRECT depth 1 -> 8 on a 576 KiB read
+**2 219 -> 6 937 MiB/s** (the drives plateau at ~6.8 GiB/s SN7100 / ~14 GB/s SN8100), host-pool prewarm
+**2 694 -> 6 103** and mirror **4 471 -> 6 640** on the 91 GiB box, mirror **5 674 -> 13 555** and prewarm
+**3 296 -> 11 185** on the PCIe-5 box (whole run -29 % / -40 %), GTT arena seeds on `halo` **17 152 -> 33 189**
+MiB/s (page-cache-served there, so a latency/fault-parallelism win).  The block also carries the pool-base
+alignment shift that makes the mirror ONE aligned window instead of an aligned-bounce plus a full memcpy
+(`base_alloc`/`POOL_PLACE_ALIGN`: `base` is congruent to the GGUF tensor offset; 8 751 vs 5 674 MiB/s at depth 1),
+and a dead-code/warning cleanup of block 09/12/16 leftovers (6 unused functions, 6 write-only census counters, one
+sign-compare; no behaviour change -- the slot-map occupancy invariant moved onto `pool_slot_assign_locked` and the
+"nothing evicts, so no per-slot drain" rationale onto the `TODO` #87 note).  One new env var, `MOE_EXPERT_FILL_QD`
+(tuning, default `8`; `1` is the depth-1 A/B).  Gates: `gate-host-pool.sh` **54/54** with a new `qd1` arm
+(`MOE_EXPERT_FILL_QD=1`) and a new `bulkbuf` arm (`MOE_HOST_POOL_BULK_DIO=0`), plus census checks that the queue
+really ran (the mechanism must be LIVE, not merely benign -- the text is identical either way), `gate-uma-experts.sh`
+**38/0** with the seed-queue census asserted, prefill-logit **0.000000 / 100.000 %**.  Record: `WORKLOG.md`
+261113.003, `INVARIANTS.md` (r277).
+
 ## Dated history
 
 [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) — every amendment note

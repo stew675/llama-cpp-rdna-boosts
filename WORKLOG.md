@@ -1,3 +1,97 @@
+## 261113.003 (r277, RELEASE v17-a691b2345-r277) -- the placement read queue: startup placement at drive depth, and `--load-mode` becomes a DEMAND-only decision
+
+**Release:** `v17-a691b2345-r277` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`9d7c0502c`**, tree **`0104361a095f7463d52376a408b8a7863d83f2d7`**.  **Block 16 amended** (the only block whose
+patch body changes); one new environment variable (`MOE_EXPERT_FILL_QD`, default `8`), and `MOE_HOST_POOL_BULK_DIO`'s
+reach now covers every placement fill instead of the mirror alone.  **No numerics move: every arm byte-identical**
+(`a99ccbd97ecb` / `8c39335bbceb` on the pool gate's configs, `4ac3a523160f` on the placement arms), prefill-logit
+KLD **0.000000 / 100.000 %**.
+
+### The problem, and why it is one question and not two
+
+r273 (correctly) made the *placement* read O_DIRECT so a bulk load stops over-committing the page cache, and that is
+what ended the startup thrashing.  It left two things on the table.  One: every placement read is still issued at
+**depth 1**, which on an NVMe is a latency wall -- a 576 KiB O_DIRECT read runs at **2 219 MiB/s** at depth 1,
+3 896 at 2, 5 307 at 3, 6 348 at 4 and **6 937** at 8, against a drive plateau of ~6.8 GiB/s (SN7100) / ~14 GB/s
+(SN8100).  Two: only the *mirror* got that O_DIRECT rule; the per-slot **prewarm** and the one-shot **band
+re-layout** still followed the demand transport, i.e. they filled through the model mapping / page cache -- the exact
+over-commit r273 removed, measured cold at **1 183 MiB/s**.  Both are startup-placement questions, so they are
+answered together: **a placement fill never uses the page cache, and it runs at depth.**
+
+### What shipped
+
+1. **The placement read queue.**  A job is `{off, len, dst}`; the workers are the persistent reader threads block 16
+   already built for the GTT prefill span stream (`pf_read_pool`/`pf_read_submit`/`pf_read_wait` -- deliberately
+   leaked, parked between fills), so nothing creates a thread per fill and one run has one story about how many
+   readers it has.  Placement fills only: the workers `pread`, and **every** counter, slot reservation and publish
+   stays on the calling thread, so a failed job releases its reservation and the existing serial loop retries it with
+   all its fallbacks.  Wired into the covering mirror, the prewarm, the band re-layout and block 16's GTT arena
+   sizing seeds.  `MOE_EXPERT_FILL_QD=1` is the depth-1 arm and the A/B -- the same code path, not a fork of it.
+2. **The placement transport is O_DIRECT, unconditionally** (`MOE_HOST_POOL_BULK_DIO=0` = the buffered A/B).  The
+   placement read opens its own handle and closes it again, because the O_DIRECT bit lives in the open flags and
+   leaving it behind would make the demand path's unaligned `pread` fail.  `--load-mode` / `MOE_HOST_POOL_DIO` keep
+   their whole meaning for the **demand** transport -- the per-miss reads during prefill/decode, where a warm
+   page-cache hit for an evicted expert is a genuine win (r212's measurement stands).  The once-per-run line now
+   says which question the answer is about, so an operator cannot read one as the other.
+3. **The pool-base alignment shift, and the mirror's aligned window.**  A GGUF tensor offset is 32-byte aligned, not
+   4096, so every O_DIRECT placement read used to round out through a bounce buffer and then **memcpy the whole
+   expert** -- one extra pass over the placement bytes, serialized with that worker's own I/O.  Each pool now
+   reserves one alignment unit of slack at both ends and shifts its base by `file_offs % POOL_PLACE_ALIGN`, which
+   makes `base` congruent to the tensor offset; the covering mirror then maps `[base_alloc, base_alloc+total)` onto
+   `[file_offs - pad, ...)` and is **one aligned window** -- no bounce, no memcpy (**8 751 vs 5 674 MiB/s at depth
+   1** on the PCIe-5 box, i.e. the copy was half the wall time at low depth).  Per-slot fills keep the bounce, and
+   that is measured, not assumed: splitting a request into "bounce the head, read the aligned body straight in,
+   bounce the tail" LOSES at every size a pool fill uses (576 KiB 5.21 vs 6.64 GiB/s, 1 MiB 5.79 vs 6.35, 8 MiB 6.58
+   vs 6.73) because a 4 KiB unbuffered read is pure device latency.  Recorded so nobody "optimises" it back in.
+4. **A dead-code/warning cleanup** of block 09/12/16 leftovers found while auditing the file for Windows
+   portability: 6 unreachable static functions (`check_invariant`, `pool_resident_locked`, `table_arena_bytes`,
+   `pool_slot_locked`, and the `pool_slot_sync` drain that lost its only caller with it), 6 write-only census
+   counters, one dead local and one sign-compare.  No behaviour change; the two load-bearing notes were moved, not
+   dropped (the slot-map occupancy invariant onto `pool_slot_assign_locked`, the "nothing evicts, so no per-slot
+   drain" rationale onto the `TODO` #87 note).  The pool census therefore reads `evictions=0` **by construction**.
+
+### Measurements (all cold, all same-seed text byte-identical)
+
+| arm | depth 1 | default (8) | note |
+|---|---|---|---|
+| prewarm, default config (mapping arm before) | 2 694 | **6 103** | 91 GiB box, SN7100; was **1 183** on the shipped default before this change |
+| covering mirror, 32 640 MiB | 4 471 | **6 640** | same box; window removes the memcpy |
+| mirror (PCIe-5 SN8100) | 5 674 | **13 555** | whole run 9.11 -> 5.50 s (-40 %) |
+| prewarm (PCIe-5) | 3 296 | **11 185** | whole run 10.74 -> 7.61 s (-29 %) |
+| GTT arena sizing seeds (`halo`, gfx1151) | 17 152 | **33 189** | page-cache-served -> fault/latency parallelism |
+
+### The gates caught what the text could not, and that is now permanent
+
+Every arm is byte-identical **with the queue inert**, so a text-only gate would pass a queue nothing reaches.
+`gate-host-pool.sh` therefore grew a `qd1` arm (`MOE_EXPERT_FILL_QD=1`) and a `bulkbuf` arm
+(`MOE_HOST_POOL_BULK_DIO=0`), plus census checks that ref's placement reads are **O_DIRECT**, that the placement
+queue **really ran** (batch count and reads > 0, 8 readers), that `QD=1` really reports 1 reader, and that
+`BULK_DIO=0` really flips the transport.  `gate-uma-experts.sh` asserts the same for the GTT sizing seeds
+(`heat-seeded ... placement queue`, and no line falls back to `serial fills`).
+
+### Gates
+
+`gate-host-pool.sh` **54/54** (13 arms) · `gate-uma-experts.sh --quick --no-ram` on `halo` **38/0** ·
+`gate-per-block-build.sh --fast --changed-from 378256be4` green (block 16 is the only delta) · `fork-refresh.sh
+--build --gates` green, canonical tip `9d7c0502c`, applied tree `0104361a0` · prefill-logit **KLD 0.000000,
+same-top-p 100.000 %** · `validate-set.sh` green (17 blocks, base tree + applied tree + Windows portability scan) ·
+coherence: every pool-gate arm byte-identical, `check-gpu-faults.sh` clean over every arm log.
+
+**Windows:** no toolchain here, so the posture is r275's -- `check-windows-portability.sh` clean (291 added files,
+no unguarded POSIX call, no `windows.h` macro collision), and the change adds **zero** warnings under
+`-Wall -Wextra -Wformat=2 -Wmissing-field-initializers` (verified against the r275 baseline file: identical warning
+sets).  Two things are *better* there rather than merely unbroken: `cudaHostRegister` wants a page-aligned start,
+which is why the pin registers `base_alloc` and not the shifted `base`; and `FILE_FLAG_NO_BUFFERING` wants offset,
+length and buffer as sector multiples, which is exactly what the mirror's aligned window is (the 32-byte-aligned
+GGUF offset used to force the `_aligned_malloc` bounce on every table).
+
+**Not run:** MTP Protocol A (`benchmarks/mtp-adaptive-methodology.md`) and `llama-batched-bench -npl 1,4,8` -- this
+is a load-time/placement change and every arm is byte-identical, but the policy's decode gate is owed rather than
+assumed (the same note r273 carries).  **Not changed:** the demand path (a miss is still one depth-1 read; the
+batching it needs is the recorded scheduler item), and the GTT store's *whole-set* placement, which is the loader's
+per-tensor fill (one 142 MiB `pread` per table -- already saturated at depth 1, and its loss is mlock/registration,
+not queue depth).
+
 ## 261113.002 (r276, docs + tooling, NO delivery change) -- `TODO` #316 closes both halves: the APU device-pool probe and the owed gfx1201 fusion-alias run; `TODO` #282's detail restored, block 16's carried-forward list dissolved into rows
 
 **No patch changes, no `release.json` change** (`validate-set.sh`/`re-cut` untouched): this is the tracker repair

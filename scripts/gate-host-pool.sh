@@ -46,6 +46,11 @@
 #                                                fills (`N expert fills were served from a host pool built
 #                                                BEFORE the refusal`, N > 0) and the text must not move)
 #     tsplit  the SAME pool on a 2-device `-sm tensor` split, sink on (r273)
+#     qd1     MOE_EXPERT_FILL_QD=1               (r277: the placement read queue at depth 1 -- the A/B for
+#                                                the batch fill.  Its text must equal ref's AND the census
+#                                                must show the queue ran with 8 readers in ref)
+#     bulkbuf MOE_HOST_POOL_BULK_DIO=0           (r277: the placement reads buffered through the page cache;
+#                                                the A/B for "a placement fill never uses the page cache")
 #     tsplitnosink the same, MOE_HOST_POOL_SINK=0 -- the A/B the split arm is judged against
 #                                                (r273: a tensor split gives each device a SLICE of every
 #                                                expert, so the arena->pool demote cannot be expressed at
@@ -260,6 +265,11 @@ gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
 # ---- the arms ---------------------------------------------------------------------------------------
 run_arm ref    MOE_HOST_POOL_DIO=0 || exit 2
+# r277: the PLACEMENT read queue.  `qd1` is the same arm at depth 1 (the pre-r277 one-read-at-a-time
+# transport) and `bulkbuf` is the same arm with the placement reads buffered through the page cache; both must
+# generate ref's text byte for byte, and the census below must show the queue was really the path taken.
+run_arm qd1     MOE_HOST_POOL_DIO=0 MOE_EXPERT_FILL_QD=1  || exit 2
+run_arm bulkbuf MOE_HOST_POOL_DIO=0 MOE_HOST_POOL_BULK_DIO=0 || exit 2
 run_arm dio    MOE_HOST_POOL_DIO=1 || exit 2
 run_arm nodisk MOE_HOST_POOL_DIO=1 MOE_HOST_POOL_DIO_FAULT=1 || exit 2
 run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
@@ -271,7 +281,7 @@ run_arm pin0    MOE_HOST_POOL_PIN=0          || exit 2
 run_arm_split tsplit        MOE_HOST_POOL_SINK=1 || exit 2
 run_arm_split tsplitnosink MOE_HOST_POOL_SINK=0 || exit 2
 
-for a in ref dio nodisk fail late sink sinkfail pinlate pin0 tsplit tsplitnosink; do text_only "$a"; done
+for a in ref dio nodisk fail late sink sinkfail pinlate pin0 tsplit tsplitnosink qd1 bulkbuf; do text_only "$a"; done
 
 REF_HASH="$(text_hash ref)"
 echo "==> text: ref $(text_hash ref)"
@@ -292,7 +302,7 @@ echo "==> text: ref $(text_hash ref)"
 # papered over: the check still fails loudly for a WHOLESALE fault arm, and for a mixture it requires both
 # that the mixture is real (get_ok > 0 and decline_all > 0) and that `fail` proved the fallback's identity in
 # the same run.
-for a in dio nodisk fail late sink sinkfail pinlate pin0; do
+for a in dio nodisk fail late sink sinkfail pinlate pin0 qd1 bulkbuf; do
     hard
     if [ "$(text_hash "$a")" = "$REF_HASH" ] && [ -s "$KEEPOUT/$a/text.txt" ]; then
         ok "$a text == ref ($(text_hash "$a"))"
@@ -308,6 +318,40 @@ for a in dio nodisk fail late sink sinkfail pinlate pin0; do
         sed 's/^/      /' "$KEEPOUT/$a/text.txt" | head -5
     fi
 done
+
+# ---- HARD: the PLACEMENT read queue (r277) ---------------------------------------------------
+# The mechanism must be LIVE, not merely benign: a gate that only compares text passes with the queue inert
+# (the pool would fill serially and produce the same bytes).  These checks read the census the queue prints,
+# so a run whose batch path silently declined (a fallback to the serial loop, a refused file handle) fails
+# here rather than shipping four new arms of nothing.
+hard
+if grep -q "host pool PLACEMENT reads: O_DIRECT" "$KEEPOUT/ref/err.txt"; then
+    ok "ref: the placement read is O_DIRECT (a placement fill never goes through the page cache)"
+else
+    fail "ref: no 'host pool PLACEMENT reads: O_DIRECT' line (the placement transport is not the shipped one)"
+    grep -m3 "PLACEMENT reads\|host pool fill mode" "$KEEPOUT/ref/err.txt" | sed 's/^/      /'
+fi
+hard
+qj="$(grep -oE 'host pool placement queue: [0-9]+ batch\(es\), [0-9]+ read\(s\)' "$KEEPOUT/ref/err.txt" | tail -1)"
+qread="$(printf '%s' "$qj" | grep -oE '[0-9]+ read' | grep -oE '[0-9]+')"
+if [ -n "$qj" ] && [ "${qread:-0}" -gt 0 ] && grep -q "placement queue: .*, 8 reader(s)" "$KEEPOUT/ref/err.txt"; then
+    ok "ref: the placement queue really ran ($qj, 8 readers)"
+else
+    fail "ref: the placement queue did not run with the default width ('${qj:-<no census line>}'); the prewarm fell back to serial"
+    grep -m3 "placement queue\|prewarmed host pool" "$KEEPOUT/ref/err.txt" | sed 's/^/      /'
+fi
+hard
+if grep -q "placement queue: .*, 1 reader(s)" "$KEEPOUT/qd1/err.txt"; then
+    ok "qd1: MOE_EXPERT_FILL_QD=1 restores the depth-1 arm (the A/B is real)"
+else
+    fail "qd1: MOE_EXPERT_FILL_QD=1 did not report 1 reader"
+fi
+hard
+if grep -q "host pool PLACEMENT reads: buffered" "$KEEPOUT/bulkbuf/err.txt"; then
+    ok "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 flips the placement read to buffered (the A/B is real)"
+else
+    fail "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 did not report a buffered placement read"
+fi
 
 # ---- HARD: a real pool, no fill failures ------------------------------------------------------
 for a in ref dio nodisk; do

@@ -453,6 +453,25 @@ else
     ok "(skipped: --quick)"
 fi
 
+# ---- HARD: the GTT arena's SIZING fills take the placement queue (r277) -------------------------------
+# A warm page cache can make these fills look fine at any depth, so the check is on the CENSUS: the sizing
+# fills must report the queue, not the serial arm (a run whose batch declined -- no direct source, a refused
+# geometry -- would silently ship a queue nothing reaches).
+hard
+if grep -qE "heat-seeded [0-9]+/[0-9]+ slots .*placement queue" "$KEEPOUT/ref/err.txt"; then
+    ok "ref: the arena sizing fills ran on the placement queue ($(grep -oE 'placement queue\)' "$KEEPOUT/ref/err.txt" | wc -l) seed line(s))"
+else
+    fail "ref: the GTT sizing fills did not report the placement queue (the batch path declined silently)"
+    grep -m3 "heat-seeded\|prefill-seeded\|prefill-loaded" "$KEEPOUT/ref/err.txt" | sed 's/^/      /'
+fi
+hard
+if grep -qE "heat-seeded [0-9]+/[0-9]+ slots .*serial fills" "$KEEPOUT/ref/err.txt"; then
+    fail "ref: some sizing fills fell back to the serial arm"
+    grep -m3 "serial fills" "$KEEPOUT/ref/err.txt" | sed 's/^/      /'
+else
+    ok "ref: no sizing fill fell back to the serial arm"
+fi
+
 note "the DEFAULT SHAPE follows -lme: a cap below the set -> arena; a budget that covers it -> placement"
 if [ -f "$KEEPOUT/shapefit/err.txt" ]; then
     hard

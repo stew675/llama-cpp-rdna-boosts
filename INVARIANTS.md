@@ -4506,3 +4506,54 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   repro and production arms both fail to reach the shape (`-ub 14` is outside that arch's MMVQ MoE band) and fail
   **identically on an unmodified build**, so an `halo` run is not evidence either way — a fusion-stand-down claim
   that needs this gate must be run on gfx1201 (`TODO` #316 closed; record: `WORKLOG.md` 261113.002).
+
+## The placement read queue (r277, block 16)
+
+* **A placement fill has no decode latency to lose, and its whole work list is known before the first read** --
+  that is the entire property that makes depth available to it.  A DEMAND miss does not have it (its next read is
+  not known until the routing arrives), so a queue there is the scheduler change in
+  `archive/work/host-pool-demand-overlap/`, never this one.  Do not "share" the queue with the demand path.
+* **The depth ladder is the drive, not the code.**  64-byte-aligned cold O_DIRECT on the real GGUF: 576 KiB at
+  depth 1/2/3/4/8 = **2 219 / 3 896 / 5 307 / 6 348 / 6 937 MiB/s**; 1 MiB at 1/4 = 3 103 / 6 865; 4 MiB at
+  1/2 = 5 527 / 6 934; 32 MiB at 1 = 6 490.  So **a big request is already at depth on its own** (the 32 MiB mirror
+  loop lost only ~2 % to the queue) and **a small request is pure latency** (the 576 KiB per-expert fill lost 3x).
+  Default `MOE_EXPERT_FILL_QD=8`: within 5 % of the plateau on the 6.8 GiB/s SN7100, +19 % over 4 on a ~14 GB/s
+  SN8100, and 16 buys nothing on either.  Re-measure before changing the default; do not derive it from a spec sheet.
+* **Measure at the app's own unit size.**  The queue's first cut used 8 MiB units for the mirror; the win there came
+  from the *window*, not the depth (below), which a 1 MiB-only microbenchmark would have hidden and a 32 MiB-only
+  one would have missed entirely.
+* **A placement read is O_DIRECT whatever `--load-mode` says; `--load-mode`/`MOE_HOST_POOL_DIO` are DEMAND
+  policies.**  The two are different questions and answering one with the other is what r262 broke and r273 half
+  fixed: r273 gave the rule to the covering mirror only, so the *prewarm* still filled through the model mapping --
+  measured cold at **1 183 MiB/s** where the same bytes read from the file are 2 694 (depth 1) / 6 103 (depth 8).
+  `MOE_HOST_POOL_BULK_DIO=0` is the buffered placement A/B.  The placement read opens its OWN handle and closes it:
+  the O_DIRECT bit is in the open flags, and an O_DIRECT fd left open makes a later demand fill's unaligned `pread`
+  fail with EINVAL.
+* **Congruence beats a split: shift the POOL, not the read.**  The head/body/tail optimisation ("bounce the ends,
+  read the aligned middle straight in") is a **loss** at every size a pool fill uses -- 576 KiB **5.21** vs 6.64
+  GiB/s, 1 MiB 5.79 vs 6.35, 8 MiB 6.58 vs 6.73 -- because a 4 KiB unbuffered read is ~70 us of pure device
+  latency, more than the memcpy it saves.  What wins is making the request aligned at BOTH ends: each pool keeps one
+  alignment unit of slack at both ends and shifts `base` by `file_offs % POOL_PLACE_ALIGN`, so `base` is congruent
+  to the GGUF tensor offset and the covering **mirror** (`[base_alloc, base_alloc+total)` onto
+  `[file_offs - pad, ...)`) is ONE aligned window with no bounce and no memcpy: **8 751 vs 5 674 MiB/s at depth 1**.
+  A filesystem whose `st_blksize` exceeds `POOL_PLACE_ALIGN` keeps the bounce (the fill checks the fd's real
+  alignment); the shift is not a correctness assumption, only an optimisation.
+* **`cudaHostRegister` wants the ALLOCATION, not the shifted base** -- register `base_alloc`/`alloc_bytes`, then take
+  the device alias at the same shift (`base_dev = alias + pad`).  Same for `munmap`/`cudaHostFree`: free
+  `base_alloc`.  This is also why the change is Windows-safe rather than merely Windows-clean (the Windows arms take
+  their alias from the CUDA allocation and shift it identically).
+* **A gate that only compares text cannot see this feature at all.**  Every arm is byte-identical with the queue
+  inert, so the assertions must read the census: `host pool placement queue: <n> batch(es), <m> read(s) ... <d>
+  reader(s)` must show m > 0 and the configured width, and `MOE_EXPERT_FILL_QD=1` / `MOE_HOST_POOL_BULK_DIO=0` must
+  visibly flip the arm.  `gate-host-pool.sh` (`qd1`, `bulkbuf`) and `gate-uma-experts.sh` (the seed census) now do;
+  a silent fallback to the serial loop is a FAIL, not a pass.
+* **On an APU the GTT sizing seeds are page-cache-served, so the queue buys latency, not bandwidth** (`halo`,
+  `-lme 4` with a frozen prior: 17 152 -> 33 189 MiB/s, 238 -> 123 ms of a 3.5 s run).  The store's *whole-set*
+  placement is the loader's per-tensor fill instead (one ~142 MiB `pread` per table), already saturated at depth 1;
+  its remaining loss is mlock/registration, not queue depth.  Do not conflate the two when measuring UMA.
+* **Nothing in the pool evicts any more, on either band, so no per-slot drain is needed.**  The prewarm and the
+  re-layout are PLACEMENT: they reserve a free slot up front and stop when the pool is full
+  (`pool_fill_batch_locked`), so a slot is never rewritten while a device copy reads it -- `pool_slot_sync`'s drain
+  and the eviction-capable `pool_slot_locked` had no caller left and were removed in r277.  The census's
+  `evictions=0` is now true by construction rather than by policy; if a future change reintroduces eviction it must
+  reintroduce the drain with it.
