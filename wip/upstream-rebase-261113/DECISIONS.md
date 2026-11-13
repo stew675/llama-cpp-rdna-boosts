@@ -33,7 +33,21 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   changes the cache's reach.
 * **Questions:** (1) port the delivery's hook to the new `llama-moe-cache` seam; (2) does `#31888`'s async
   CPU part change the r236 measurement?  (It should not — our arena is the default and the cache is off.)
-* **Status:** `OPEN` — R10.
+* **Status:** **`OPEN` but ANSWERED at R10 (2026-11-13): there is no port to do — upstream moved its *own*
+  cache, not ours.**  `#32157` relocated upstream's cache from `llama-graph.cpp` to
+  `src/llama-moe-cache.{cpp,h}` (the `apply()`/`ensure()` split became `build_lookup()` / `get_experts()` /
+  `copy()` / `build_experts()`), and `cf34d3113` stopped its CPU part waiting.  The delivery's tier is a
+  **different implementation in a different place** — the CUDA-side arena (`moe-expert-cache.{cu,h}`), the
+  movable-boundary slab, `llama_context::sched_copy_experts` (which already forwards to `moe_cache->copy()`
+  for upstream's dormant path) and the `moe_cache_rearm`/`set_reserve` device hooks — and block 09 touches no
+  file of upstream's cache at all (`git status | grep llama-graph` is empty).  So the r236 **either/or ruling
+  stands**: arena default-on, upstream's cache shipped-but-dormant behind `--moe-cache-mib`.  The r143-era
+  measurement in the block's own commit message (35B-A3B Q8_0, `-ncmoe 20`, `-c 8192`, 16.3 GiB host experts,
+  1 GPU, equal 4080 MiB budgets) is why the ruling is "ours default, theirs dormant" rather than "theirs wins":
+  arena prefill **547.6** / decode **53.5** t/s vs upstream cache **544.2** / **62.9** and streaming 470 / 49,
+  text byte-identical — theirs is 17.6 % faster on decode at that shape.  No new measurement is owed at the
+  rung; R18's arms update the numbers.  **The rung itself is parked for a different reason** (the `-sm tensor`
+  arena fault — `RUNGS.md` R10 and `D10`), not for `D1`.
 
 ## D2 — Chunked GDN: upstream **removed** the non-fused GDN path and every ubatch-dependent graph node
 
@@ -239,7 +253,13 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   not duplicated.  This is the *only* block-00 conflict in the probe.
 * **Questions:** does `--lazy-mode mlock` still pin the PLE table without a copy on the new path?  Does the
   iGPU gating change which device the delivery's `--lazy-mode` fallback reaches?
-* **Status:** `OPEN` — R01 (resolve), re-verify R10/R17.
+* **Status:** **`PARTIAL` — R01 resolved the only conflict; R10 took upstream's Windows rewrite wholesale.**
+  R10's `src/llama-mmap.cpp` conflicts resolved to upstream's paired buffered/direct handle
+  (`fp_win32`/`fp_win32_direct`, `init_buffered_io()`/`init_direct_io()`); upstream already carries
+  `std::string fname;`, so the delivery's `llama_file::path()` and every `fname` use survive with no member
+  redeclared, and the delivery's `llama_mmap::impl` work (`int fd`, the fragment-wise `unmap_fragment` with the
+  post-unmap `MADV_DONTNEED`, r273) is untouched.  The substantive questions — is the PLE table still pinned,
+  does the iGPU gating change the `--lazy-mode` fallback — are **R16/R17**'s.
 
 ## D10 — Scheduler upload/prefetch/graph-result reuse
 
@@ -253,7 +273,17 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   new reachability test.
 * **Questions:** does every host-expert/staging upload still happen on the merged tree?  Do the async-ring
   arms still measure a win?
-* **Status:** `OPEN` — R11/R13.
+* **Status:** **`MEASURING` — the risk is live at R10 (2026-11-13).**  `ggml-backend.cpp` merged as a union:
+  upstream's `hv_tensor_requires_copy[hash_id(input)]` reachability test **and** the delivery's
+  `ggml_backend_sched_copy_input(..., st)` state argument, on both the non-host-weight and the host-weight
+  pass.  On one device the host-expert staging still runs (the 1-device 35B-A3B census shows **1991 fills**
+  through the copy callback), so the gate did not starve it there.  On a **`-sm tensor`** (Meta-device) split
+  the arena faults on a **host** address inside `mul_mat_vec_q_moe` while the same arm is clean on r277, clean
+  on one device and clean with the arena off — and a skipped host-weight copy is the leading explanation (a
+  Meta-wrapped host weight marked not-required, so the fill never runs and the fused kernel reads the host
+  master through UVA).  `gate-host-pool.sh`'s `tsplit` arm is the oracle.  Do **not** take upstream's gate out
+  without that measurement: if the gate is right, the delivery needs its staging *registered as a read* (an
+  upstream `sched` change or an explicit mark), which is a different change.  Full evidence: `RUNGS.md` R10.
 
 ## D11 — `ggml.c` / RPC / test-surface refactors
 
@@ -325,7 +355,13 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   campaign (not part of the delivery, not applied here) measures a row store on top.
 * **Relation:** the delivery's load-bearing `madvise` loop must be re-expressed on the new loader; the
   `fit.cpp` reshuffle is a merge, not a decision.
-* **Status:** `OPEN` — R10/R16.
+* **Status:** **`OPEN` (merge done at R10, verify at R16)** — R10 merged `common/fit.cpp` as upstream's
+  `path_model` -> **`paths_model`** (`std::vector<std::string>`, the external-PLE form) **plus** the delivery's
+  `host_expert_bytes` / `host_experts` out-params (the merged `common_get_device_memory_data_impl` already
+  declares them with `= nullptr` defaults), and adapted the delivery's `dmds_min`/`dmds_ngl` preflight call
+  sites and one `extra->path_model` that still used the single-path name.  The PLE `madvise(WILLNEED)` loop is
+  block 12's (R13) and block 15's (R16); the loader-side question — does `--lazy-mode mlock`/WILLNEED still pin
+  the PLE table on the new external-PLE load path — is R16's.
 
 ## D16 — MUL_MAT src1 precision tests and gating
 
@@ -371,7 +407,10 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   predicates are shared.
 * **Relation:** cross-backend consistency only — do not "fix" SYCL, do not let the SYCL flags change the
   CUDA predicate.
-* **Status:** `OPEN` — R10.
+* **Status:** **`CHECKED` at R10 (2026-11-13) — nothing to do.**  Block 09's conflict set contains no SYCL file
+  and no change to a shared op-table flag, so the SYCL device-side MoE scheduler (`#30156`) and the delivery's
+  CUDA/HIP host tier do not interact through the CUDA predicate.  The 1-device arena census (`h=0.5205`,
+  `fills=1991`, `takeover=540`) is the evidence the CUDA side is unchanged.
 
 ## D19 — Recurrent cache tensor renaming removed in plamo2
 

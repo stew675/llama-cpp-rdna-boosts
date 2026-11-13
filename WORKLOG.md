@@ -1,3 +1,46 @@
+## 261113.006 (r277 + campaign rungs R09/R10, NO delivery change) -- R09 is green and R10 is PARKED: the host-expert arena faults on a 2-device `-sm tensor` split (a merge interaction, not a r277 shape), and the FA instance matrix is missing heads 40/72
+
+**No patch changes, no `release.json` change.**  Rungs R09 (block 08) and R10 (block 09) of the
+`4f9dfa0e3` climb.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md`.
+
+* **R09 = block 08 (fused kernels), commit `a95c0497b` — DONE.**  Build green, coherence unchanged (`100 chars
+  sha=1c5d32ac537d`), `test-backend-ops -o MUL_MAT_ID` **1056/1056**, `gate-hc-fusions.sh` **PASS** (7 arms,
+  444 chars `sha=a512ee68c4b3`).  `D12` decided: the BF16 RMS_NORM **dual store** survives `#32135` uncollapsed
+  (`if (store_f32) { rms_norm_store4(...) }` **and** `if (dst16c) { ... norm_f2bf ... }`, both paths, both
+  includes); the `mmq.cu` issue-#241 assert narrowed *inside* `if (gate)` so upstream's new no-gate fused-scale
+  arm is not aborted.  (R09's own full record is `WORKLOG` 261113.005.)
+* **R10 = block 09 (host-resident MoE), commit `d4106d6f6` — PARKED, branch rolled back to `a95c0497b`.**
+  Merged (8 files / 14 hunks, every one "both sides"), build-green, coherent (`sha=1c5d32ac537d`), and the
+  1-device arena is live (`h=0.5205`, `fills=1991`, `takeover=540` on 35B-A3B Q8_0 `-ncmoe 20 -c 8192`).
+  **It is parked because `scripts/gate-host-pool.sh` fails its 13th arm**, the 2-device `-sm tensor` pool (the
+  x8 field pair): `Memory access fault ... address 0x7f5fca898000` — a **host** address — inside
+  `mul_mat_vec_q_moe`, on both GPUs.  The same arm **passes on the r277 binaries**, and on the merged tree
+  passes with `-sm layer` (2 devices, 182 chars `sha=a99ccbd97ecb`), on 1 device, and with
+  `MOE_EXPERT_CACHE_MIB=0` (arena off); it still faults with graphs disabled, `--lazy-mode off` and
+  `MOE_HOST_POOL_PIN=0`.  So the **arena on a Meta-device split** reads a host address the GPU cannot reach.
+  Leading suspect: `D10` — upstream's new `hv_tensor_requires_copy` gate skips the copy of an input/weight it
+  believes is not read, and the fill runs *inside* that copy callback, so a Meta-wrapped host expert weight
+  marked not-required leaves the fused kernel reading the host master (the 1-device layout marks it required,
+  hence 1991 fills there).  The commit is preserved as the tag `r10-blocked-d4106d6f6` and as
+  `wip/upstream-rebase-261113/R10-blocked-d4106d6f6.patch`; the tree is clean at the green R09 tip.
+* **`D1` is ANSWERED, not deferred, and no port was needed.**  Upstream `#32157` moved *its own* MoE cache from
+  `llama-graph.cpp` to `src/llama-moe-cache.{cpp,h}` (`build_lookup()` / `get_experts()` / `copy()`); the
+  delivery's tier is a different implementation in a different place (CUDA-side arena, movable-boundary slab,
+  the scheduler copy callback, the device rearm/reserve hooks) and block 09 touches no file of upstream's
+  cache.  The r236 **either/or ruling stands** — arena default-on, upstream's cache dormant behind
+  `--moe-cache-mib` — and the r143 measurement in the block's own message is why (35B-A3B, equal 4080 MiB:
+  arena 547.6 prefill / 53.5 decode t/s vs upstream cache 544.2 / 62.9, streaming 470 / 49, identical text).
+* **Open finding `D5-a` (from R09, still AWAITING):** the merged FA instance matrix has no
+  `fattn-mma-f16` instantiation for upstream's heads **40 and 72**, so `libggml-hip.so` carries 32 undefined
+  `ggml_cuda_flash_attn_ext_mma_f16_case<40|72,...>` symbols while `fattn.cu` still dispatches both heads — an
+  R06 merge gap (`GREEDY-PURITY.md` §20 class), found because a driver-linking gate hit the link.  It also
+  means the merged `generate_cu_files.py` disagrees with the tree (it would delete the delivery's 126 typed
+  instances), so the repair touches block 05's artifact and is the maintainer's call.  It blocks the
+  driver-linking gates only (`gate-norm-rows-alias.sh`, which is R11's anyway); no rung's exit needs it.
+* **Climb state:** R00..R09 done (blocks 00-08) on `rebase-r278` at `a95c0497b`; R10 parked.  Two items need
+  the maintainer before the climb continues: **`D5-a`** (repair or accept) and the **R10 `-sm tensor` arena
+  fault** (fix at R10 — the candidate is `D10`'s copy gate).
+
 ## 261113.005 (r277 + campaign rung R09, NO delivery change) -- R09 lands (block 08, fused kernels): the BF16 RMS_NORM **dual store** survives `#32135`, and the merged FA instance matrix is missing heads 40/72 (`D5-a`, AWAITING)
 
 **No patch changes, no `release.json` change.**  Rung R09 of the `4f9dfa0e3` climb: block 08 replayed onto

@@ -14,9 +14,10 @@ conflict map is in [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
 | fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `a95c0497b`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R09 done = blocks 00-08**; next is **R10 = block 09 (host-resident MoE)** |
+| progress | **R00-R09 done = blocks 00-08**; **R10 = block 09 is BLOCKED** (resolved, built and coherent, but its own gate faults on the 2-device `-sm tensor` arm — see §5.5).  The next action is to fix that, not to start R11 |
 | rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) |
-| canonical build | `~/llama.cpp/build-rocm` — R09 tree, `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| parked rung | **R10 `d4106d6f6`** — tag `r10-blocked-d4106d6f6` in `~/llama.cpp` + `R10-blocked-d4106d6f6.patch` here; `git am` it on `a95c0497b` to resume |
+| canonical build | `~/llama.cpp/build-rocm` — **back on the R09 tree** after the R10 rollback (rebuild it before measuring), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
 | coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 |
@@ -112,7 +113,7 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R07 | 06 MMB prefill | DONE | `c1d8b7c04` | our blocks on upstream's MMVF/fusion predicates; MMB census 6915 t/s |
 | R08 | 07 k-quant boosts | DONE | `626e398d2` | graph-reuse union; `MUL_MAT` 2681/0 (`D16`) |
 | **R09** | **08 fused kernels** | **DONE** | `a95c0497b` | 7 conflicts resolved; **`D12` dual store kept**, `D6` partial; **found `D5-a`** (heads 40/72 have no mma instance — R06 gap, AWAITING) |
-| R10 | 09 host-resident MoE | TODO | — | 8 conflicts; **`D1` (stop-and-ask)**, `D9`, `D15`, `D17`, `D18` |
+| R10 | 09 host-resident MoE | **BLOCKED** (parked `d4106d6f6`) | — | resolved/built/coherent, but `gate-host-pool.sh` `tsplit` (2-device `-sm tensor`) page-faults; see §5.5 |
 | R11 | 10 infrastructure | TODO | — | 10 conflicts (biggest); `D6`, `D8`, `D10`; **owes `gate-node-budget.sh`** |
 | R12 | 11 qwen4exp | TODO | — | 5 conflicts; `D11`; owes `gate-hc-fusions.sh`, `gate-qwen4exp-quant-coherence.sh` |
 | R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15` |
@@ -162,6 +163,35 @@ case sit beside it.  Two things were learned that matter later:
 * the box's `GGML_CUDA_FA_QUANTS` cache now carries the union list (`…;iq4_nl-iq4_nl;f8_e4m3-f8_e4m3`), so
   the r277-era "hand-set iq4_nl" trap no longer bites.
 
+### §5.5 R10 (block 09) — BLOCKED: the arena faults on a `-sm tensor` split
+
+The rung is **resolved, build-green and coherent** (`d4106d6f6`; 14 conflict hunks across the 8 files, all
+"both sides"; full table in [`RUNGS.md`](RUNGS.md) `R10 result`), and the 1-device arena is **live**
+(`h=0.5205`, `fills=1991`, `takeover=540` on 35B-A3B Q8_0 `-ncmoe 20` at `-c 8192`).  It is parked because
+`scripts/gate-host-pool.sh` fails its **last** arm, the 2-device `-sm tensor` pool (the x8 field pair):
+
+```
+Memory access fault ... address 0x7f5fca898000 (a HOST address)
+kernel: void mul_mat_vec_q_moe<(ggml_type)42, 2, false>(...)
+```
+
+Discrimination (same command, one variable changed): **r277 binaries PASS**; merged tree `-sm layer` on 2
+devices **PASS** (182 chars `sha=a99ccbd97ecb`); 1 device **PASS**; `MOE_EXPERT_CACHE_MIB=0` (arena off) with
+`-sm tensor` **PASS**; `GGML_CUDA_DISABLE_GRAPHS=1`, `--lazy-mode off` and `MOE_HOST_POOL_PIN=0` all still
+**FAULT**.  So it is the **arena on a Meta-device split** reading a host address the GPU cannot reach.  Two
+candidates, in order: **(1) `D10`** — upstream's `hv_tensor_requires_copy` gate now skips the copy of an
+input/weight it believes is not read, and the fill runs *inside* that copy callback, so a Meta-wrapped host
+expert weight marked not-required would leave the fused kernel reading the host master; **(2)** the Meta
+device's view/pointer slot (`ggml_backend_meta_set_view_slot()`) handing the kernel the wrong buffer.  Check
+(1) first: does `sched_copy_experts` run at all under `-sm tensor` (compare the `fills=` census against the
+1-device 1991)?  **Do not "fix" it by deleting upstream's gate** without that measurement.
+
+Everything is preserved: the commit is the local tag `r10-blocked-d4106d6f6` and
+`R10-blocked-d4106d6f6.patch` in this directory; `rebase-r278` is rolled back to the green R09 tip
+`a95c0497b` (clean, no `CHERRY_PICK_HEAD`).  `D1` came out **answered without a port** (upstream moved its own
+cache; the delivery's tier is a different implementation and the either/or ruling stands) — that part of R10 is
+finished and must not be re-litigated.
+
 ### §5.4 R09 (block 08) — the last rung, DONE at `a95c0497b`
 The full result, the six `norm.cu` conflict resolutions and the verification table are in
 [`RUNGS.md`](RUNGS.md) `R09 result`.  The three facts a later rung needs:
@@ -184,7 +214,7 @@ The full result, the six `norm.cu` conflict resolutions and the verification tab
 
 | item | status |
 |---|---|
-| `D1` MoE cache relocation / CPU share | **OPEN** — R10.  The r236 either/or ruling stands (arena default-on, upstream cache dormant). |
+| `D1` MoE cache relocation / CPU share | **ANSWERED at R10** — no port needed (upstream moved its *own* cache; the delivery's arena/slab/copy-callback tier is elsewhere and untouched).  The r236 either/or ruling stands: arena default-on, upstream cache dormant. |
 | `D2` GDN pruning | **DECIDED** complementary (R04) |
 | `D3` FP8/BF16 KV types | **CLOSED** (R05 audit + R06 FA oracle) |
 | `D4` MMVF BF16 few-row | **DEFERRED to R18** (no rung conflict; a `llama-bench` arm) |
@@ -192,16 +222,16 @@ The full result, the six `norm.cu` conflict resolutions and the verification tab
 | `D6` graph/stream state moved to `graph.cuh` | **PARTIAL** — R09: the move landed and no delivery hook had to follow it (block 08's hooks are `ggml_backend_cuda_context` members, which stayed in `common.cuh`); the cluster-dim key is verified at R11 |
 | `D7` MTP device-buffer hidden state | **MEASURED/DECIDED** (R03): activates on `-sm layer`, declines on `-sm tensor` ("the device has no events" — the Meta device has no `event_new`) and falls back to the delivery's host path.  Upstream-gap note: give the Meta device events (an `upstream/` candidate).  Re-verify at R14. |
 | `D8` the prune | **MECHANICAL/OPEN**: it also removes *includes* — a build break, not a conflict (§8 trap 4).  Blocks 10/11 will hit it. |
-| `D9` mmap / Win-load / lazy-mode | **PARTIAL** — R01 resolved the only conflict; the substantive questions (does `--lazy-mode mlock` still pin the PLE table? does the iGPU gating change the fallback?) are verified at R10/R17 |
-| `D10` scheduler upload/prefetch/graph-result | **OPEN** — R11/R13 |
+| `D9` mmap / Win-load / lazy-mode | **PARTIAL** — R01 resolved the only conflict and R10 took upstream's Windows rewrite wholesale (the delivery's `fname`/`path()` and `llama_mmap::impl` work survive); the substantive questions are R16/R17's |
+| `D10` scheduler upload/prefetch/graph-result | **`MEASURING` — the risk is live at R10**: the `hv_tensor_requires_copy` union is the leading suspect for the `-sm tensor` arena fault; `gate-host-pool.sh`'s `tsplit` arm is the oracle |
 | `D11` `ggml.c`/RPC/test refactors | **OPEN** — R12/R13 |
 | `D12` BF16 RMS_NORM | **DECIDED at R09** — dual store kept (both destinations ship), upstream's typed `dstc` writer + the delivery's bf16 side channel; the rows gate is R11's, the side channel's own gate is R16's |
 | `D13` HIP BLAS workspace | **CHECKED** (R02) |
 | `D14` GDN/SSM kernels | **CHECKED** (R04) |
-| `D15` external PLE | **OPEN** — R10/R16 |
+| `D15` external PLE | **merge done at R10** (`path_model` -> `paths_model` + the delivery's host-expert out-params); the PLE-residency question is R16's |
 | `D16` MUL_MAT src1 precision | **CLOSED** (R08, 2681/0) |
 | `D17` VMM pool | **DECIDED** (option 1) |
-| `D18` SYCL device-side MoE | **OPEN (consistency only)** — R10 |
+| `D18` SYCL device-side MoE | **CHECKED at R10** — no SYCL file in the conflict set, no shared op flag changed |
 | `D19` plamo2 recurrent cache names | **OPEN (verify only)** — R16 |
 
 ---

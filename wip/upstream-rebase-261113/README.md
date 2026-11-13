@@ -1,6 +1,9 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R09 done 2026-11-13 (blocks 00-08); R10 (block 09, host-resident MoE) is next.**  `D17`
+**Status: OPEN — R00..R09 done 2026-11-13 (blocks 00-08); R10 (block 09, host-resident MoE) is MERGED,
+BUILT, COHERENT and PARKED on a GPU page fault in its own gate's 2-device `-sm tensor` arm** (the resolved
+commit is the tag `r10-blocked-d4106d6f6` and `R10-blocked-d4106d6f6.patch` here; the branch is back at the
+green R09 tip `a95c0497b`; see `RUNGS.md` R10 and `HANDOVER.md` §5.5).  `D17`
 (the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
 the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
 R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
@@ -127,7 +130,7 @@ bound: the probe chained through marker-carrying trees).
 | 2 | R07 | 06 MMB prefill | 1 | **DONE** — our blocks on upstream's refactored MMVF/fusion predicates; MMB on, 6915 t/s prefill |
 | 2 | R08 | 07 k-quant boosts | 2 | **DONE** — graph-reuse union + test-matrix union; MUL_MAT 2681/0 |
 | 3 | R09 | 08 fused kernels | 7 | **DONE 2026-11-13** — 7 conflicts (6 union + the `D12` dual-store merge); coherence `1c5d32ac537d`, `MUL_MAT_ID` 1056/0, `gate-hc-fusions` PASS; **found `D5-a`** (FA heads 40/72 uninstantiated, an R06 gap) and reassigned the rows gate to R11 |
-| 3 | R10 | 09 host-resident MoE | 8 | **NEXT** — **`D1`** (upstream moved the MoE cache out of `llama-graph` — a stop-and-ask), `D9`, `D15`, `D17`, `D18` |
+| 3 | R10 | 09 host-resident MoE | 8 (14 hunks) | **BLOCKED/PARKED** — all "both sides"; `D1` came out **answered without a port** (upstream moved its own cache), `D9`/`D15`/`D18` merged; the `-sm tensor` arena page fault is the blocker (`D10` suspect) |
 | 4 | R11 | 10 infrastructure | 10 | `D6`, `D8` (prune/`llama-ext.h`), `D10` (scheduler upload/prefetch) |
 | 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
 | 4 | R13 | 12 campaign remainder | 4 | `D10` (backend upload/prefetch), `D15` (external PLE) |
