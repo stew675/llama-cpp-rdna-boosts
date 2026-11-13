@@ -1,4 +1,4 @@
-From 6e6c72977895c95eaac5c348f80cbc3b6a58f7fa Mon Sep 17 00:00:00 2001
+From 6b4d9865e006aff7a94879b592d7e15ee618c4e0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/16] rdna-boosts: block 14: relaxed-tensor split mode
@@ -151,7 +151,7 @@ index cec0f033c..a69d3508c 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 268d3d5db..85d1e5b84 100644
+index 4dfbf4f58..e250b8fe8 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -54,6 +54,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -277,7 +277,7 @@ index 268d3d5db..85d1e5b84 100644
              case GGML_OP_PAD: {
                  split_state = handle_pad(src_ss);
              } break;
-@@ -2196,6 +2252,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
+@@ -2197,6 +2253,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
              GGML_ASSERT(value == 0);
              [[fallthrough]];
          }
@@ -287,7 +287,7 @@ index 268d3d5db..85d1e5b84 100644
          case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
              for (size_t j = 0; j < n_bufs; j++) {
                  ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-@@ -2354,6 +2413,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -2355,6 +2414,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                  ggml_backend_tensor_set(simple_tensor, data, offset, size);
              }
          } break;
@@ -297,7 +297,7 @@ index 268d3d5db..85d1e5b84 100644
          case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
              GGML_ASSERT(tensor->type == GGML_TYPE_F32);
              GGML_ASSERT(offset % sizeof(float) == 0);
-@@ -2553,6 +2615,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2554,6 +2616,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
                  ggml_backend_tensor_get(simple_tensor, data, offset, size);
              }
          } break;
@@ -308,7 +308,7 @@ index 268d3d5db..85d1e5b84 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -3586,7 +3652,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3587,7 +3653,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      }
                      ggml_tensor * next = cgraph->nodes[id+1];
                      if (next->op == GGML_OP_MUL && next->src[0] == node &&

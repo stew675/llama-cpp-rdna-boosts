@@ -4460,3 +4460,30 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    is exempt by construction (`table_cold_ok`), and the VRAM the cap was protecting is better recovered with
    block 15's streaming KV window/pool than by capping the arena.  Record:
    `benchmarks/2026-11-12-eager-takeover-arena-bound.md`; re-entry condition in `TODO.md` (accepted limitations).
+
+## r275 -- `<windows.h>`'s empty keyword macros, and why clang's `-Wshadow` is scoped (issue #306)
+
+1. **`near`, `far`, `pascal` and `cdecl` are macros under `<windows.h>`, and they are EMPTY.**  `minwindef.h`
+   (`#undef`s then `#define`s them) makes `near`/`far` expand to nothing and `pascal`/`cdecl` to a calling-convention
+   alias, so a local, parameter or member with one of those names is a hard compile error on the Windows HIP
+   toolchain: r273's `const bool near = ...` in `moe-expert-cache.cu` became `const bool = ...` (three errors,
+   `expected unqualified-id` / `expected expression`).  `NOMINMAX` protects `min`/`max` only.  The detector is
+   `scripts/check-windows-portability.sh` (it already ran on every `validate-set.sh` for POSIX calls, issue #231);
+   it now checks these four names on the same `_WIN32`-compiled lines.  There is no Windows runner here, so a lint
+   plus a reporter's log is the whole coverage.
+2. **clang cannot express GCC's `-Wshadow=local`, and upstream's field/parameter idiom is not the delivery's to
+   fix.**  Plain clang `-Wshadow` reports every "local or parameter named after the field it belongs to" — 102 of
+   the 103 sites at r275 are upstream (`mctx`, `params`, `n_embd`, `n_kv`, the `ml` member/parameter of TODO #101);
+   the one delivery site was `llama_kv_cache_context::is_streaming`'s parameter.  Renaming upstream's identifiers
+   re-skins every re-base conflict for no correctness gain, and the weekly re-base picks up upstream's own fixes, so
+   `src/CMakeLists.txt` keeps `-Wshadow=local` for GCC (container/CI) and on clang uses `-Wno-shadow` for the
+   `llama` target with `-Wshadow` re-enabled on the files the delivery adds.  **A clang `-Wshadow` hit in an upstream
+   file is not a finding.**  The 2026-09-11 dead-mask-chain class is still caught: GCC sees it everywhere, and clang
+   sees it in delivery-added code.
+3. **The `loop not unrolled` flood is a DEVICE-LINK diagnostic, and `-Wno-pass-failed` does not reach it.**  ~9 762
+   `ld.lld: warning: <unknown>:0:0: loop not unrolled` lines come from the HIP device-link LTO optimizing the
+   runtime-bounded `#pragma unroll` hints in `fattn-mma-f16.cuh` (line 516 dominates; `-Rpass-missed=loop-unroll`
+   localizes the rest to 499/582/599/1180/1213/1893/2428/2446).  The flag already on the compile and link lines is a
+   clang-frontend option; the only lld-level silencer is `-Xoffload-linker --no-warnings`, which would hide every
+   device-link warning.  Do not "fix" it by removing the pragmas (other instantiations do honour them) and do not
+   chase it with `-Wno-pass-failed`.

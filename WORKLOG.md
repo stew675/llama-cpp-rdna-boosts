@@ -1,3 +1,78 @@
+## 261113.001 (r275, RELEASE v17-a691b2345-r275) -- the Windows `near` build break (issue #306), the portability lint learns windows.h macros, and a compiler-warning sweep
+
+**Release:** `v17-a691b2345-r275` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
+**`378256be4`**, tree **`accca310c35a0b846be1e1f645ce26f5fa829236`**.  Blocks 00, 09, 12, 15 and 16 amended.  **No
+numerics move** (every change is a rename, a diagnostic string, a zero-valued initializer entry, a switch case for an
+op the CPU never computes, or a compile flag): same-seed greed text unchanged, prefill-logit KLD **0.000000 /
+100.000 %**.
+
+### The Windows build break (issue #306, reproduced in discussion #305)
+
+`ggml/src/ggml-cuda/moe-expert-cache.cu:2716-2721` declared `const bool near = ...` inside
+`pool_report_layout_once_locked`.  `<windows.h>` (via `<minwindef.h>`) defines `near` (and `far`) as **empty macros**,
+so the line preprocessed to `const bool = ...`: three hard errors on the Windows HIP toolchain --
+`moe-expert-cache.cu:2716:25: expected unqualified-id` and `:2718:34` / `:2721:40: expected expression` -- at the
+exact columns the reporter named.  The file already defines `NOMINMAX` before its `<windows.h>` include; `near` had no
+equivalent guard.  Renamed to `near_mirror` at the three sites (block 16).  A no-op on every other platform.
+
+**The detector, not just the fix.**  `scripts/check-windows-portability.sh` (issue #231's POSIX-call lint) now also
+rejects a local, parameter or member named `near`, `far`, `pascal` or `cdecl` on a line compiled on Windows, using the
+same `_WIN32`-pinned preprocessor walk and comment/literal stripping.  `min`/`max` are deliberately excluded (NOMINMAX
+is defined before every windows.h include here and upstream calls them as functions).  **Negative control:** a
+worktree at r273's tip `6245ba844` reports exactly the three sites and exits 1; the fixed tree scans 291 added files
+clean.  It still runs from `validate-set.sh`, so there is no longer a Windows-only class that depends on a reporter's
+build log.
+
+### The compiler-warning sweep (real warnings first)
+
+All delivery-owned, all behaviour-neutral:
+* **2 `-Wformat` in `moe-expert-cache.cu`** -- a literal `-41 %)` in the transport-coupling WARN (block 12) and
+  `used_experts=%d` against an `int64_t` in the GTT prefill-stream debug line (block 16, now `%lld` + cast).
+* **1 `-Wswitch` in `ggml-cpu.c`** -- `GGML_OP_KV_POOL` joins the GPU-only `GGML_OP_INDEXER_{SCORE,FILL}` abort group
+  (`ggml-cpu.cpp`'s `supports_op` already refuses it, block 15).
+* **1 `-Wunused-parameter`** -- the cold split-state helper ignores `assume_sync`; `GGML_UNUSED` (block 00).
+* **7 `-Wmissing-field-initializers`** -- the `moe_host_master_buft`/`moe_cache_pool_backed`/`moe_cache_prefill_stream`/
+  `gtt_store_*` fields the delivery appended to the backend/device ifaces were left implicit in the meta, CPU and RPC
+  positional initializers (and `tests/test-backend-tensor.cpp`'s buffer-type mock).  They are now listed as
+  `nullptr`/`NULL`, i.e. the value they already had (blocks 09 and 16).
+
+### `-Wshadow`: the flag is scoped on clang, upstream identifiers stay
+
+The sweep found **103** `-Wshadow` hits.  A blame of every site: **102 are upstream code** -- the documented
+"local or parameter named after the field it belongs to" idiom (`mctx`, `params`, `n_embd`, `n_kv`, ...) plus
+`llama_model_loader * ml`, the case the delivery deliberately does not rename because it re-skins every re-base
+conflict (TODO #101).  The 103rd was delivery code (`llama_kv_cache_context::is_streaming(uint32_t n_kv)`, block 15)
+and its parameter is now `n_kv_asked`.
+
+`clang` has no `-Wshadow=local`, so plain `-Wshadow` reports the upstream idiom wholesale.  **Maintainer's decision: do
+not touch upstream's code -- the weekly re-base will pick up their fixes.**  `src/CMakeLists.txt` (block 00) now keeps
+GCC's `-Wshadow=local` over the whole target (the container/CI arm), and on clang uses `-Wno-shadow` for the target with
+`-Wshadow` re-enabled on the file this delivery adds (`llama-lazy-reader.cpp`), where a new shadow is a defect.  A clean
+clang build is now warning-free.
+
+**Left alone on purpose:** the ~9 762 `ld.lld: warning: <unknown>:0:0: loop not unrolled` lines from the HIP
+**device-link LTO**.  They are upstream's runtime-bounded `#pragma unroll` hints in `fattn-mma-f16.cuh` (line 516
+dominates), the existing `-Wno-pass-failed` reaches only the frontend, and the only lld-level silencer is
+`-Xoffload-linker --no-warnings`, which would hide every device-link warning.  The hints are advisory and already
+fail, so the code is unaffected (a `-Rpass-missed=loop-unroll` run localized them on 2026-11-13).
+
+### Verification
+
+* `scripts/validate-set.sh`: 17/17 strict `git am` on a fresh `a691b2345` tarball, base tree
+  `9d7b9a02f0...` OK, applied tree **`accca310c3...`** OK, per-block conflict-marker/subject scan clean, Windows lint
+  **291 files clean** (negative control above).
+* `scripts/gate-per-block-build.sh --fast --changed-from 6245ba844`: **5/5** changed blocks build (00, 09, 12, 15,
+  16), **717 s**, 0 failures.  The other 12 blocks' deltas are unchanged (patch-id) and were skipped; the tip was
+  built.
+* `scripts/fork-refresh.sh --build --gates` (re-cut from `a691b2345`): tree/tip reproduce **`accca310c3...` /
+  `378256be4`**; coherence gate ran; prefill-logit mean KLD **0.000000** (limit 0.005), same-top-p **100.000 %**
+  (floor 98 %); `check-gpu-faults.sh` clean in the gate logs.
+* MTP Protocol A was not run: no decode/attention/fusion numerics changed in this release.
+
+Docs touched: `release.json` (regenerated), `patches/README.md` (the five block notes), `INVARIANTS.md` (the r275
+facts), `AGENTS.md` / `scripts/README.md` (the lint's new check).  The fork branch is refreshed by
+`scripts/fork-refresh.sh --push`; the container images are built off-host by the worker watcher from the tag.
+
 ## 261112.010 (r274, docs only -- NO delivery change) -- `TODO` #141 retires: the take-over's bound is a CAPPED ARENA x a sub-complement pool, and the default arena never enters it
 
 **No code, no `patches/`, no `release.json` change** -- the release stays `v17-a691b2345-r273` and the fork is

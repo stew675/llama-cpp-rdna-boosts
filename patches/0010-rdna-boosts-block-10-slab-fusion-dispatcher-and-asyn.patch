@@ -1,4 +1,4 @@
-From f4ee4bda9897e2e100adc5d0901cb4d060266f89 Mon Sep 17 00:00:00 2001
+From 05f298feab75a1898232467dd11ba03295476545 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -286,7 +286,7 @@ index 6a6e30d01..86f7f2829 100644
          // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
          // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 31198ca2f..b30cc25da 100644
+index de749afc9..0f0544a23 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -469,7 +469,7 @@ index 31198ca2f..b30cc25da 100644
          GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
-@@ -2659,8 +2793,116 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2660,8 +2794,116 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          // splitter would treat the remainder as a <=512-byte MMQ tail, so any other mid-row caller would
          // corrupt the tensor.  The reverted `size % row_stride <= 512` attempt tried to divert such a
          // range into a whole-tensor accumulator; a partial per-op upload never reached `total`, stranding
@@ -588,7 +588,7 @@ index 31198ca2f..b30cc25da 100644
          ggml_backend_tensor_set(tensor, data, offset, size);
          return;
      }
-@@ -2875,7 +3117,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2876,7 +3118,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          if (chunk_size_j == 0) {
              continue;
          }
@@ -600,7 +600,7 @@ index 31198ca2f..b30cc25da 100644
          void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
          if (slot_ptr == nullptr) {
              return false;
-@@ -3629,11 +3874,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3630,11 +3875,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  // filled).
  static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
  
@@ -659,7 +659,7 @@ index 31198ca2f..b30cc25da 100644
      // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
      // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
      if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
-@@ -3643,13 +3934,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3644,13 +3935,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
          return false;
      }
      const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
@@ -697,7 +697,7 @@ index 31198ca2f..b30cc25da 100644
      size_t off = 0;
      bool all = true;
      for (size_t j = 0; j < n_backends; j++) {
-@@ -3659,7 +3970,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3660,7 +3971,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
              return false;
          }
          const bool took = simple_backend->iface.moe_cache_update(

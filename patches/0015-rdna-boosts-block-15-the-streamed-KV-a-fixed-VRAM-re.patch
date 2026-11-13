@@ -1,4 +1,4 @@
-From 52da659d31f07c032dda21db8ddba61d1fce6680 Mon Sep 17 00:00:00 2001
+From 99d33117a1d5499affada02e17b2d1faed8eab97 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/16] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -125,6 +125,7 @@ is unchanged) and divided by MiB only for display.
  ggml/include/ggml-rpc.h                    |    4 +-
  ggml/include/ggml.h                        |   42 +
  ggml/src/ggml-backend-meta.cpp             |  143 +-
+ ggml/src/ggml-cpu/ggml-cpu.c               |    1 +
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
  ggml/src/ggml-cuda/fattn-qsa.cu            |   40 +-
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
@@ -158,7 +159,7 @@ is unchanged) and divided by MiB only for display.
  src/llama-model.cpp                        |  198 ++-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   66 +-
- 45 files changed, 7085 insertions(+), 846 deletions(-)
+ 46 files changed, 7086 insertions(+), 846 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -1518,7 +1519,7 @@ index e7e01dc62..5822e523c 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 85d1e5b84..fdc0db4a5 100644
+index e250b8fe8..393296efb 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -1680,7 +1681,7 @@ index 85d1e5b84..fdc0db4a5 100644
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
  
  // [TAG_META_UNALLOC_ALIAS]
-@@ -3581,8 +3719,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3582,8 +3720,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
                  // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
                  // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
@@ -1692,6 +1693,18 @@ index 85d1e5b84..fdc0db4a5 100644
                      chunk.backend->iface.stage_d2d(chunk.backend, chunk.orig, chunk.slot,
                                                     ggml_nbytes(simple_tensor));
                  } else {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 46e08a77c..c3325c49c 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2152,6 +2152,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             } break;
+         case GGML_OP_INDEXER_SCORE:
+         case GGML_OP_INDEXER_FILL:
++        case GGML_OP_KV_POOL:
+             {
+                 // GPU-only fused indexer ops (no CPU forward): the CPU plan
+                 // phase above already aborts on them ("op not implemented")
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
 index 5e77cd482..21d59e41d 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
@@ -5602,7 +5615,7 @@ index 2c32cf2f8..79a23e5fb 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a160fe936..524cc11db 100644
+index a13d912e9..e211b8c96 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
@@ -6090,7 +6103,7 @@ index 7811dc049..7c5753e8b 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 42ab1f782..65b43d7d4 100644
+index 42ab1f782..aa660d06a 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,335 @@ static bool ggml_is_power_of_2(int n) {
@@ -7283,8 +7296,8 @@ index 42ab1f782..65b43d7d4 100644
 +    return has_kv_pool() || (kv_region && kv_resident_cells != 0 && n_kv > kv_resident_cells);
 +}
 +
-+bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
-+    return kv->is_streaming(n_kv);
++bool llama_kv_cache_context::is_streaming(uint32_t n_kv_asked) const {
++    return kv->is_streaming(n_kv_asked);
 +}
 +
 +llama_kv_cache::~llama_kv_cache() {
@@ -7498,7 +7511,7 @@ index 42ab1f782..65b43d7d4 100644
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 4015728cb..b5177c63c 100644
+index 4015728cb..2976a0837 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -120,9 +120,23 @@ public:
@@ -7654,7 +7667,7 @@ index 4015728cb..b5177c63c 100644
      uint32_t get_n_kv_rows() const;
  
 +    // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
-+    bool is_streaming(uint32_t n_kv) const;
++    bool is_streaming(uint32_t n_kv_asked) const;
 +
 +    // wip/kv-residency (TODO #118) B-A: see llama_kv_cache::has_kv_pool
 +    bool has_kv_pool() const;

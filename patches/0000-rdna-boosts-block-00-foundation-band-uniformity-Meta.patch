@@ -1,4 +1,4 @@
-From 6717d580240597badd02bd3727367c8a2fa113f5 Mon Sep 17 00:00:00 2001
+From f15430d1e2568448e61a148f40e5213b9d7c6d50 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 00/16] rdna-boosts: block 00: foundation - band-uniformity,
@@ -64,7 +64,7 @@ not an error (the llama target keeps -Wshadow enabled for new code).
  common/arg.cpp                                |  23 +-
  common/speculative.cpp                        |  10 +-
  ggml/src/ggml-alloc.c                         |  88 +++++
- ggml/src/ggml-backend-meta.cpp                | 110 ++++++-
+ ggml/src/ggml-backend-meta.cpp                | 111 ++++++-
  ggml/src/ggml-cpu/llamafile/sgemm.cpp         |   8 +-
  ggml/src/ggml-cuda/fattn-common.cuh           |  10 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |  21 +-
@@ -74,7 +74,7 @@ not an error (the llama target keeps -Wshadow enabled for new code).
  .../vulkan-shaders/flash_attn.comp            |  29 +-
  .../vulkan-shaders/flash_attn_cm1.comp        |  49 ++-
  include/llama.h                               |  15 +-
- src/CMakeLists.txt                            |  21 ++
+ src/CMakeLists.txt                            |  23 ++
  src/llama-batch.cpp                           |  64 ++--
  src/llama-context.cpp                         | 139 +++++---
  src/llama-grammar.cpp                         |   6 +-
@@ -95,7 +95,7 @@ not an error (the llama target keeps -Wshadow enabled for new code).
  tools/completion/README.md                    |   2 +-
  tools/llama-bench/llama-bench.cpp             |  10 +-
  tools/server/README.md                        |   2 +-
- 34 files changed, 1042 insertions(+), 340 deletions(-)
+ 34 files changed, 1045 insertions(+), 340 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 69be4a61e..747e52318 100644
@@ -280,7 +280,7 @@ index b0c067b49..022ff710e 100644
          struct ggml_tensor * node = graph->nodes[i];
          struct node_alloc * node_alloc = &galloc->node_allocs[i];
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 991398316..a0161dce1 100644
+index 991398316..50eb5438a 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -517,13 +517,43 @@ static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, cons
@@ -338,7 +338,7 @@ index 991398316..a0161dce1 100644
  
              for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                  if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
-@@ -1242,20 +1272,49 @@ static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+@@ -1242,20 +1272,50 @@ static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
      return ggml_is_view(tensor) && ggml_backend_buffer_is_host(tensor->view_src->buffer);
  }
  
@@ -356,6 +356,7 @@ index 991398316..a0161dce1 100644
 +#endif
 +static GGML_META_COLD struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_cold(
 +        const struct ggml_tensor * tensor, bool assume_sync) {
++    GGML_UNUSED(assume_sync);
 +    // [TAG_META_UNALLOC_ALIAS] a nested alias may not have its inherited buffer yet: resolve the chain
 +    // to the buffer the allocator will give it, so it is classified like the tensor it aliases
 +    ggml_backend_buffer_t buffer = tensor->buffer;
@@ -396,7 +397,7 @@ index 991398316..a0161dce1 100644
  }
  
  static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
-@@ -1807,8 +1866,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1807,8 +1867,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
@@ -415,7 +416,7 @@ index 991398316..a0161dce1 100644
      const ggml_init_params params_static = {
          /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
          /*.mem_buffer =*/ nullptr,
-@@ -1854,7 +1921,22 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+@@ -1854,7 +1922,22 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
                  t->buffer = meta_buf_ctx->bufs[i].get();
              }
          }
@@ -1142,10 +1143,10 @@ index 428f51f8d..ac07645d1 100644
  
      enum llama_context_type {
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 426c48741..81c101b4e 100644
+index 426c48741..7a1464ebd 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -72,6 +72,27 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+@@ -72,6 +72,29 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
  find_package(Threads REQUIRED)
  target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
  
@@ -1155,18 +1156,20 @@ index 426c48741..81c101b4e 100644
 +    # "declaration shadows a member" constructor idiom and "hides constructor", which the delivery
 +    # does not police and which the container build (GCC host compiler) surfaced by the thousand;
 +    # -Wshadow=local keeps the dangerous local-shadow class and drops that member/global output.
-+    # clang has no =local form, so it keeps plain -Wshadow and therefore *does* report the
-+    # "declaration shadows a field" idiom that upstream uses: 9 standing warnings, all benign and
-+    # deliberately not renamed.  Eight are llama-model.cpp's `llama_model_loader * ml` member against
-+    # the `ml` parameter of its `load_*()` overrides -- renaming that parameter to `ml_l` re-skinned
-+    # every re-base conflict in the file for no correctness gain (TODO #101), so upstream's name stays
-+    # -- and the ninth is `build_amax_src1_f16()`'s `n_embd` local in llama-graph.cpp.  Read a
-+    # -Wshadow hit in those two files as that idiom; a hit anywhere else is the class this flag exists
-+    # for.
++    #
++    # clang has no =local form: plain -Wshadow there also reports every upstream "local or parameter
++    # named after the field it belongs to" (`mctx`, `params`, `n_embd`, `n_kv`, ... -- 100+ sites across
++    # src/ and src/models/) as well as the `ml` member/parameter idiom.  The delivery deliberately keeps
++    # upstream's identifiers (renaming them re-skins every re-base conflict for no correctness gain:
++    # TODO #101) and picks up upstream's own fixes on the weekly re-base, so it does not police that
++    # class on clang.  Keep -Wshadow on the files this delivery ADDS (where a new shadow is a defect,
++    # as it was in the 2026-09-11 finding) and leave it off elsewhere on clang; the container build
++    # (GCC) still has -Wshadow=local over the whole target.
 +    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 +        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow=local>)
 +    else()
-+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>)
++        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-shadow>)
++        set_source_files_properties(llama-lazy-reader.cpp PROPERTIES COMPILE_OPTIONS "-Wshadow")
 +    endif()
 +endif()
 +

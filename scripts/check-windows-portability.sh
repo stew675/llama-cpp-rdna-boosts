@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Fail if the delivery adds a POSIX-only call outside a Windows-excluding preprocessor region.
+# Fail if the delivery adds a POSIX-only call or a windows.h keyword-macro identifier outside a
+# Windows-excluding preprocessor region.
 #
-# WHY THIS EXISTS (issue #231):
+# WHY THIS EXISTS (issues #231 and #306):
 #   The delivery's host-side CUDA code is built with HIP *on Windows* too (clang-cl + the MSVC STL),
 #   where <unistd.h>/<fcntl.h> do not exist and `close`, `pread`, `open`, `fsync`, ... are undeclared.
 #   `ggml/src/ggml-cuda/moe-expert-cache.cu` is consciously portable: every file call goes through five
@@ -23,6 +24,12 @@
 #   (`obj.close()`, `x->open()`, `Klass::close()`) or part of a longer name (`pool_close_file()`), which
 #   is why this is a reviewable lint and not a compiler.  Comments and literals are stripped first, so a
 #   documented `close(fd)` is not a finding.
+#
+#   It also rejects a local, parameter or member named `near`, `far`, `pascal` or `cdecl` on a line
+#   compiled on Windows: <windows.h>/<minwindef.h> defines those as empty or calling-convention macros,
+#   so `const bool near = ...` expands to `const bool = ...` and is a hard compile error (issue #306,
+#   `moe-expert-cache.cu` in r273).  `min`/`max` are deliberately not checked -- NOMINMAX is defined
+#   before every windows.h include in this tree and upstream calls them as functions.
 #
 #   SCOPE: by default only files the delivery **adds** (git `--diff-filter=A`) inside ggml/, src/,
 #   common/ and tools/.  An upstream file the delivery merely edits is upstream's Windows CI's business,
@@ -453,7 +460,16 @@ def local_includes(rel):
 
 
 findings = []
+macro_findings = []
 scanned = 0
+# <windows.h> (via minwindef.h) defines these as empty or calling-convention macros.  A local,
+# parameter or member named `near`/`far` expands to nothing and is a hard compile error with HIP on
+# Windows (issue #306: `const bool near = ...` became `const bool = ...`; `pascal`/`cdecl` are the
+# same class).  `min`/`max` are deliberately NOT here: NOMINMAX is defined before every windows.h
+# include in this tree and upstream uses them as functions.  Checked on the same Windows-compiled
+# lines as the POSIX calls, with comments/literals already stripped.
+WINDOWS_KEYWORD_MACROS = ("near", "far", "pascal", "cdecl")
+MACRO_RE = re.compile(r"(?<![A-Za-z0-9_.>:])(" + "|".join(WINDOWS_KEYWORD_MACROS) + r")\b")
 for rel in sys.argv[1:]:
     path = os.path.join(root, rel)
     macros = {}
@@ -471,6 +487,8 @@ for rel in sys.argv[1:]:
             continue
         for m in CALL_RE.finditer(line):
             findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))
+        for m in MACRO_RE.finditer(line):
+            macro_findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))
 
 if findings:
     names = ", ".join(sorted({f[2] for f in findings}))
@@ -487,5 +505,19 @@ if findings:
   reporter's build log) was the only detector.  Please do not ship it again.""" % names)
     sys.exit(1)
 
-print("    OK: %d file(s) scanned, no unguarded POSIX call outside a Windows-excluding region" % scanned)
+if macro_findings:
+    names = ", ".join(sorted({f[2] for f in macro_findings}))
+    print("FAIL: %d windows.h keyword-macro collision(s) in %d scanned file(s) -- these do not compile"
+          " with HIP on Windows (_WIN32):" % (len(macro_findings), scanned))
+    for rel, lineno, name, text in macro_findings:
+        print("  %s:%d: %s" % (rel, lineno, text))
+    print("""
+  `%s` is a macro from <windows.h>/<minwindef.h> (empty, or a calling-convention alias): a local,
+  parameter or member with that name expands to nothing and becomes `const bool = ...` under the
+  Windows HIP toolchain (issue #306).  Rename the identifier (e.g. `near` -> `near_mirror`); the
+  rename is a no-op on every other platform.  No gate on this box can see this -- there is no
+  Windows runner -- so a reporter's build log is otherwise the only detector.""" % names)
+    sys.exit(1)
+
+print("    OK: %d file(s) scanned, no unguarded POSIX call and no windows.h keyword-macro collision" % scanned)
 PY

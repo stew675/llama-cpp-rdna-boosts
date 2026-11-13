@@ -1,4 +1,4 @@
-From b580d0d4bdcee71490b1e35a644f24ea3dd2bc0b Mon Sep 17 00:00:00 2001
+From 378256be4f59ba6a1432d11d81e8ceb296b23959 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 16/16] rdna-boosts: block 16: the UMA GTT expert store -- an
@@ -53,7 +53,9 @@ every other backend keeps its behaviour (the code is gated on prop.integrated).
  common/arg.cpp                                |   70 +-
  ggml/include/ggml-backend.h                   |   32 +-
  ggml/src/ggml-backend-impl.h                  |   61 +-
+ ggml/src/ggml-backend-meta.cpp                |   13 +
  ggml/src/ggml-backend.cpp                     |   53 +-
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |   19 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   10 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |    4 +
  ggml/src/ggml-cuda/ggml-cuda.cu               |  285 ++-
@@ -61,9 +63,10 @@ every other backend keeps its behaviour (the code is gated on prop.integrated).
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 +
  ggml/src/ggml-cuda/moe-expert-cache.cu        | 2241 ++++++++++++++++-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   30 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp                |   19 +
  src/llama-model-loader.cpp                    |  746 +++++-
  src/llama-model-loader.h                      |   35 +
- 13 files changed, 4172 insertions(+), 122 deletions(-)
+ 16 files changed, 4223 insertions(+), 122 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -302,6 +305,37 @@ index 87c8164ec..89d09a2a8 100644
      };
  
      struct ggml_backend_device {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 393296efb..43c63fb24 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -342,6 +342,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .slab_set_ring_cap    = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
++    /* .moe_host_master_buft      = */ nullptr,
++    /* .moe_cache_band            = */ nullptr,
++    /* .moe_cache_forget          = */ nullptr,
++    /* .moe_cache_set_host_pool_budget = */ nullptr,
++    /* .moe_heat_open             = */ nullptr,
++    /* .moe_heat_score            = */ nullptr,
++    /* .moe_cache_set_host_fill_mode = */ nullptr,
++    /* .gtt_store_open            = */ nullptr,
++    /* .gtt_store_report          = */ nullptr,
++    /* .gtt_store_lockable        = */ nullptr,
++    /* .gtt_store_arena           = */ nullptr,
++    /* .gtt_store_free_bytes      = */ nullptr,
+ };
+ 
+ bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+@@ -4805,6 +4817,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
+     /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
+     /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
++    /* .moe_cache_prefill_stream = */ nullptr,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 474166cef..6ff219ebd 100644
 --- a/ggml/src/ggml-backend.cpp
@@ -383,6 +417,43 @@ index 474166cef..6ff219ebd 100644
              // group consecutive experts and copy them together
              auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                  const size_t expert_offset = first_id * expert_size;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 21d59e41d..af0dfefa2 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -393,6 +393,13 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+     /* .moe_cache_band          = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+     /* .moe_cache_remap         = */ NULL,
++    /* .moe_cache_pool_backed   = */ NULL,
++    /* .cpy_tensor_async_nowait = */ NULL,
++    /* .moe_cache_pending       = */ NULL,
++    /* .moe_cache_register      = */ NULL,
++    /* .moe_cache_stage_ready   = */ NULL,
++    /* .moe_cache_in_place      = */ NULL,
++    /* .moe_cache_prefill_stream = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_cpu_guid(void) {
+@@ -722,6 +729,18 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+     /* .slab_set_ring_cap    = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
++    /* .moe_host_master_buft      = */ nullptr,
++    /* .moe_cache_band            = */ nullptr,
++    /* .moe_cache_forget          = */ nullptr,
++    /* .moe_cache_set_host_pool_budget = */ nullptr,
++    /* .moe_heat_open             = */ nullptr,
++    /* .moe_heat_score            = */ nullptr,
++    /* .moe_cache_set_host_fill_mode = */ nullptr,
++    /* .gtt_store_open            = */ nullptr,
++    /* .gtt_store_report          = */ nullptr,
++    /* .gtt_store_lockable        = */ nullptr,
++    /* .gtt_store_arena           = */ nullptr,
++    /* .gtt_store_free_bytes      = */ nullptr,
+ };
+ 
+ // CPU backend - backend (reg)
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 index ecd24c289..2fe0655d1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
@@ -1510,7 +1581,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 524cc11db..878d6e86c 100644
+index e211b8c96..38ca10d90 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -2009,12 +2080,12 @@ index 524cc11db..878d6e86c 100644
 +    done = true;
 +    const double cov    = 100.0 * (double) slots / (double) t.n_experts;
 +    const bool   mirror = slots >= t.n_experts;
-+    const bool   near   = !mirror && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts;
++    const bool   near_mirror = !mirror && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts;
 +    const char * shape  = mirror ? "a MIRROR (every expert of the table is resident)"
-+                        : near   ? "a NEAR-MIRROR (coverage gap under 4 %)"
++                        : near_mirror ? "a NEAR-MIRROR (coverage gap under 4 %)"
 +                                 : "a COMPLEMENT of the arena (a sub-complement budget)";
 +    const char * exch   = !g_pool_sink     ? "the arena exchange is OFF (MOE_HOST_POOL_SINK=0)"
-+                        : (mirror||near)   ? "the arena exchange is INERT for it (no reserve, no demote)"
++                        : (mirror||near_mirror) ? "the arena exchange is INERT for it (no reserve, no demote)"
 +                                           : "the arena exchange is ENGAGED for it";
 +    char budget[256];
 +    if (g_pool_budget_explicit) {
@@ -3804,8 +3875,8 @@ index 524cc11db..878d6e86c 100644
 +    }
 +
 +    if (getenv("MOE_EXPERT_GTT_PREFILL_DEBUG") != nullptr) {
-+        GGML_LOG_INFO("%s: layer=%d role=%s n_tok=%lld used_experts=%d resident=%lld | read=%lld arena=%lld "
-+                      "fallback=%lld\n", __func__, t.layer, t.role.c_str(), (long long) n_tok, n_used_experts,
++        GGML_LOG_INFO("%s: layer=%d role=%s n_tok=%lld used_experts=%lld resident=%lld | read=%lld arena=%lld "
++                      "fallback=%lld\n", __func__, t.layer, t.role.c_str(), (long long) n_tok, (long long) n_used_experts,
 +                      (long long) n_resident, (long long) read_b, (long long) arena_b, (long long) fallback_b);
 +    }
 +
@@ -4485,6 +4556,43 @@ index 3c5469637..409444053 100644
  // Kernel consumer seam.  Given the op (`op`) and the (redirected) expert table the op will read
  // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
  // `arena` holds `n_slots` experts of `expert_bytes`, and `remap_dev` holds the slot-remapped ids for
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 87f62c703..c2ee9c546 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1334,6 +1334,13 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .moe_cache_band          = */ NULL,
+     /* .moe_cache_gather        = */ NULL,
+     /* .moe_cache_remap         = */ NULL,
++    /* .moe_cache_pool_backed   = */ NULL,
++    /* .cpy_tensor_async_nowait = */ NULL,
++    /* .moe_cache_pending       = */ NULL,
++    /* .moe_cache_register      = */ NULL,
++    /* .moe_cache_stage_ready   = */ NULL,
++    /* .moe_cache_in_place      = */ NULL,
++    /* .moe_cache_prefill_stream = */ NULL,
+ };
+ 
+ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+@@ -3139,6 +3146,18 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .slab_set_ring_cap    = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
++    /* .moe_host_master_buft      = */ nullptr,
++    /* .moe_cache_band            = */ nullptr,
++    /* .moe_cache_forget          = */ nullptr,
++    /* .moe_cache_set_host_pool_budget = */ nullptr,
++    /* .moe_heat_open             = */ nullptr,
++    /* .moe_heat_score            = */ nullptr,
++    /* .moe_cache_set_host_fill_mode = */ nullptr,
++    /* .gtt_store_open            = */ nullptr,
++    /* .gtt_store_report          = */ nullptr,
++    /* .gtt_store_lockable        = */ nullptr,
++    /* .gtt_store_arena           = */ nullptr,
++    /* .gtt_store_free_bytes      = */ nullptr,
+ };
+ 
+ // backend reg interface
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 80de01396..c19162f0b 100644
 --- a/src/llama-model-loader.cpp
