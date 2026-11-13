@@ -1,3 +1,70 @@
+## 261112.010 (r274, docs only -- NO delivery change) -- `TODO` #141 retires: the take-over's bound is a CAPPED ARENA x a sub-complement pool, and the default arena never enters it
+
+**No code, no `patches/`, no `release.json` change** -- the release stays `v17-a691b2345-r273` and the fork is
+untouched.  `#141` asked what to do about "a genuine sub-complement host-expert budget declines the eager take-over
+at wide decode".  Re-measured on r273 before touching anything, the answer is that **the row blamed the wrong
+knob**, the cliff is real but needs a second one, and the cell is an accepted limitation (maintainer's call: a
+purpose-built cold source for an artificially capped arena is not a good use of development time when the pragmatic
+answers -- cache off, or block 15's streaming KV to recover the VRAM -- already exist).
+
+**The measurements** (r273 tip `6245ba844`, 2 x R9700 `HIP_VISIBLE_DEVICES=0,2`, `-sm layer -fa on -t 12`,
+35B-A3B Q4_K_M `-ncmoe 40`, `-lme 8` = 8192 MiB = **43.8 %** pool coverage; full tables in
+[`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md)):
+
+| `MOE_EXPERT_CACHE_MIB` | slots/table | tg `-npl 8` | tg `-npl 16` | `decline_all` |
+|---|---:|---:|---:|---:|
+| unset (auto) | 256 (`n_experts` clamp) | **298.7** | **384.0** | **0** |
+| 5120 | 134 | -- | 289.9 | 0 |
+| 2560 | 67 | 134.2 | 66.2 | 117 / 30 837 |
+| 2048 | 53 | **46.1** | -- | 122 997 |
+| 0 (cache off) | -- | **102.8** | **149.0** | -- |
+
+**1. The sub-complement budget alone does NOT enter the band.**  At the delivery's default arena the item's own
+arm is the *fastest* measured (`298.7 / 384.0`, `takeover=0 decline_all=0`), because auto sizing clamps every table
+at `n_experts` (256 here) and the guard is `t.slots < n_used * n_tok` (8 x 8 = 64 at `-npl 8`).  What crosses it is
+an **explicitly capped** `MOE_EXPERT_CACHE_MIB` -- and the cap's requirement scales with the widest batch served
+(8 x 16 = 128 slots/table at the band top), so `2560` fixes `-npl 8` and leaves `-npl 16` at 66.2 against 149.0
+for the cache off.  Cross-checked on the field model (Flash-Next IQ3_S, 512 experts, `-lme 20`, default arena):
+470-483 slots/table, `decline_all=0`, 106.0 tg -- nowhere near this bound; the `device remap: 27 651 of 27 651
+declined` there is r221's cold-id limit, a different line and a different ~9.9 %, and the record says so.
+
+**2. The heat map is not the variable** (the maintainer's fair challenge, `-ntg 128` being 128 generated tokens per
+slot but a short run for a heat-driven cache anyway): re-run at `-ntg 1024` with a converged map (`h=0.8359`,
+82.3 % of the routed mass) the cliff reads **46.13** against **46.40** at 128 tokens, and the fixed arm 134.17
+against 143.31.  The take-over's success is a per-shape constant by construction (r221 fact 5, the reason the bound
+exists), so it cannot warm up out of the band.
+
+**3. The candidates in the row were scored, not guessed.**  (a) "size it, do not decline it" works and costs the
+operator's cap (+512 MiB/device for `-npl 8`, +3 GiB for the band top) -- a floor on an explicit cap would override
+the knob whose whole purpose is reserving VRAM for KV, i.e. the opposite of r273's "an explicit budget is
+authoritative"; (b) a ring cold source for a neither-tier expert is the same order of bytes (the ring must hold a
+pass's distinct uncovered experts) and is really the `#273`/gather campaign; (c) let the graph re-capture is already
+refuted (graph-less batched decode 137 -> 52 t/s).
+
+**Purity:** the decline is a performance path only.  Same-seed greedy text (`llama-cli -n 20 --seed 42 --temp 0
+--no-display-prompt --single-turn`, no `-lv`) is **`627b2ebd7792` / 89 chars** at `MOE_EXPERT_CACHE_MIB=2048`
+(every routed op declined) == `auto` == `0`, i.e. the fallback reads the same values from the pageable mapping.
+
+**Retirement.**  `#141` leaves the open list for a new **accepted limitations** section in `TODO.md`, with its
+numbers, the answers in order (`MOE_EXPERT_CACHE_MIB=0` is 2.2x the declining arm; `-lme auto` / `--host-experts
+pinned` are exempt by construction; the streaming KV window/pool is how the memory comes back) and a re-entry
+condition (a real report on a supported configuration, or a campaign that lowers the band's need for its own
+reasons).  **No WARN was shipped on purpose**: it is code plus a gate for a configuration the delivery does not
+validate, and `decline_all` / `takeover=` already name the cell at `-lv 4`.
+
+**Docs touched** (all current-state headers, no dated record edited in place): `TODO.md` (row + section removed,
+accepted-limitations entry added), `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`: the band, the measured cliff and the
+answers), `INVARIANTS.md` (new `r274` -- five facts, and the r261 entry's `TODO` #141 pointer now names the
+retirement), `benchmarks/2026-11-12-eager-takeover-arena-bound.md` (the record + the reproduce command).
+`patches/README.md`'s dated r210/r262 amendment notes keep their `TODO` #141 citation -- the handle is permanent
+and resolves to the accepted-limitations entry.  **`benchmarks/README.md`'s dated index was deliberately not touched**:
+it has been stale since 2026-10-29 (none of the 2026-11 records are listed), so adding this one alone would
+misrepresent it as current -- `WORKLOG.md` is the current state, and rebuilding that index is its own task if it is
+wanted.  Raw arm logs are not kept (repo convention): the record carries the commands, the censuses and the numbers.
+The record also states how to read a `llama-batched-bench` table (`B` = `-npl`, `TG` = `-ntg` per slot, `S_TG`
+aggregate), because misreading `B` as the generation length is what prompted the heat-map re-run.  No gate run is owed (nothing executable changed); the arms above
+are the measurement and `scripts/check-gpu-faults.sh` was clean on the session's runs.
+
 ## 261112.009 (r273, RELEASE v17-a691b2345-r273) -- the page-cache amplification, the pool exchange's missing guard, and `-lme N` finally meaning N
 
 **Release:** `v17-a691b2345-r273` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip

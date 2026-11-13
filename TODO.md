@@ -71,7 +71,6 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
-| **141** | a sub-complement host-expert budget declines the eager take-over at wide decode | performance (block 09, the pool tier) | **OPEN — measured limit** (2026-11-04, re-verified on r254 in r256) — the bound is static per shape on purpose — §141 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 
@@ -155,31 +154,6 @@ native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style
 
 The index row also recorded the r209-era kernel trace split: `mul_mat_fp8_wmma` **71.9 %**, `fp8_repack_weights` **7.3 %**, staging **3.3 %**, FA **1.3 %**.
 
-## 141. A sub-complement host-expert budget declines the eager take-over at wide decode
-
-A **genuine sub-complement** host-expert budget (`-lme N` well below the host expert set — 43 % of it at `-lme 8` — or a `MOE_HOST_POOL_FRAC` below 100 **in the not-fitting band only**, see the r256 note) declines the eager take-over at wide decode: `llama-batched-bench -npp 512 -ntg 128 -npl 8` gives **48.0 tg** on the r254 tree, i.e. worse than the cache being off (109.6), because `slots + pool coverage < n_used * n_tok` cannot guarantee a complete remap and the run falls back to the pageable mapping
-
-**Kind:** performance (block 09, the pool tier).
-
-**OPEN -- measured limit** (2026-11-04, `WORKLOG.md` 261104.002 §4; re-verified on r254 in r256).  The bound is static per shape on purpose (a per-token decision cannot be baked into a captured graph), so the honest answers are a bigger arena, the pinned tier, or the retired `MOE_HOST_POOL_SIZING`/coverage work.  Candidates worth scoring offline with `scripts/moe-trace-replay.py` before any code: (a) require the arena to hold `n_used * band` slots for a pool-backed table (size it, do not decline it), (b) serve a neither-tier expert from the bounce ring *inside* the take-over instead of declining the table (needs the ring to be a legal cold source for one token), (c) accept the variance and let the graph re-capture.  Nothing is in flight; the r211 fix covers only the covering case
-
-**r256: this is the DECODE half of the band `#136` retired from, and the `#136` sweep corrects two things in the
-paragraph above** (`benchmarks/2026-11-10-devgather-coverage.md`, `WORKLOG.md` 261110.013).  (1) **`MOE_HOST_POOL_FRAC` is
-not a second way into this band**: when `-lme auto` fits the whole set under `MOE_HOST_LIMIT_FRAC` the pool is a
-**mirror** and the percentage is not read at all — FRAC 30/50/95 measured 1233.6 / 1240.9 / 1234.5 t/s prefill
-with every one of the 120 tables at 256/256 slots — so "any FRAC below 100" holds only in the *not-fitting* band
-(where the knob lives).  (2) **The band costs prefill as well as decode**, and the census names the shared cause:
-at `-lme 9` on 2 devices the gather issues the same 2574 calls as the mirror, but **191 279 routed experts are
-copied from the bounce/pool-fill path ("neither tier")** — the prefill face of exactly the "a neither-tier expert
-has no cold id" problem this item is about.  There the gather default costs **−8.8 % / −10.1 %** at ~70 % / ~43 %
-coverage on a 2-device tensor split, while the same budget on 3-device `-sm layer` is **+16.3 %** (the uncovered
-fill is a per-expert serialisation the layer split does not pay).  That is a second datum for candidate **(b)**:
-a bounce ring legal as a cold source *inside* the take-over would serve the decode band and the prefill gather at
-once.  **Re-verified r256** (2 devices, 35B-A3B Q4_K_M `-ncmoe 40`, `MOE_EXPERT_CACHE_MIB=2048`, `-sm layer`,
-`-fa on`, `-npl 1,8`): `-lme 8` **tg 48.0 / pp 825.0**, `-lme auto` (mirror) **tg 176.6 / pp 1261.4**, `MIB=0`
-(cache off) **tg 109.6 / pp 745.5** — the r211 record's absolutes (50.4 / 270.3 / 129.2) are a different rig; the
-*shape* (sub-complement below cache-off, ~3.7x below a covering pool) is what reproduces.
-
 ## 273. Three prefill transports where one should do
 
 **Three prefill transports where one should do**: a host-resident expert table's prefill is served by the device gather, the staged fill or the scheduler's bulk upload, selected by `GGML_SCHED_DEVGATHER` x `GGML_MOE_CACHE_STAGE` and a tier test — each wins somewhere, so no single default is right.  Measured on r234: bulk wins at ≤ 67 % arena residency (+16 % at 44 %, +6 % at 67 %, 1 and 2 devices, both box phases), the staged fill wins at ≥ 83 % (up to +10 %; at 99 % it sends 0.0 % of the bytes over PCIe), on the pool tier the staged fill is mandatory (the alternative is the per-expert pinned bounce, 5-10x slower), and the gather is the pool default that wins at `-ub` ≤ 4096.  The trade is **bytes saved vs transactions issued**, and the resident set is scattered so the complement cannot be coalesced
@@ -217,3 +191,33 @@ identity-only case, where the arena IS the table and there is no complement to f
 item -- consolidating the three transports for a PARTLY resident table -- is untouched.
 
 **OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
+
+---
+
+## Accepted limitations (deliberately not fixed — do not re-report)
+
+These are closed: no work is owed and no row above tracks them.  The handle is kept so the dated records that
+cite it still resolve, and so a re-entry condition has a name.
+
+### #141 — the eager take-over's bound is a CAPPED ARENA x a sub-complement pool (retired r274)
+
+`moe_cache_update_host` declines the whole routed op when a pool-backed table is neither a pinned master
+(`table_cold_ok`) nor covered by its pool (`pool_covers_table`) and the arena holds fewer than `n_used * n_tok`
+slots.  Measured on r273 (2 devices, 35B-A3B Q4_K_M `-ncmoe 40 -lme 8` = 43.8 % coverage):
+`MOE_EXPERT_CACHE_MIB=2048` (53 slots/table) reads **46.1 tg** at `-npl 8` against **102.8** for the cache being
+off; `2560` (67 slots) fixes `-npl 8` (**134.2**) but not `-npl 16` (**66.2** vs 149.0 off), and the band top needs
+**5120** (134 slots, **289.9**).  The row's own premise was wrong: the sub-complement host budget alone does not
+reach the band — at the **default** arena the same `-lme 8` arm is the fastest measured (**298.7 / 384.0**, `0`
+declines), because auto sizing clamps each table at `n_experts` (256 here).  Both knobs are needed at once, i.e.
+asking too much of too little.
+
+**The answers, in order** (cheaper than a cold-source redesign, and why nothing is owed): `MOE_EXPERT_CACHE_MIB=0`
+is 2.2x faster than the declining arm; or `-lme auto` (the covering mirror) / `--host-experts pinned` (exempt by
+construction); or recover the capped VRAM with block 15's streaming KV (`--kv-window`, `--kv-attendance-pool`).
+Not shipped on purpose: a WARN for the cell (a code change and a gate for a configuration the delivery does not
+validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
+
+**Re-entry condition:** a real operator report on a supported configuration, or a campaign that lowers the band's
+need on its own merits (a legal cold source for a neither-tier expert — the `#273`/gather side of the same
+population).  Record: [`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md);
+`WORKLOG.md` 261112.010; `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`); `INVARIANTS.md` r274.

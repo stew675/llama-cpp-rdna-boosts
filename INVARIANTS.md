@@ -4009,8 +4009,8 @@ Docs/artifact only: the delivery tree is unchanged. Facts:
   neither the arena nor the pool (92.8 % arena, 6.3 % pool, 1 315 ids/token), and of what a prefetch stages
   the pool's inline empty-slot fill claims most of it (0.131 ms against the fallback's 0.449 ms, and the
   expert stays resident).  Built and measured end to end: **±1.5 %, noise**.  Do not rebuild it; if the
-  fallback reads are to be attacked, the lever is fewer of them (`TODO` #141) or a device-resolvable cold
-  source, not moving them earlier.  Record: `benchmarks/2026-11-11-host-pool-slice-read.md` §2b.
+  fallback reads are to be attacked, the lever is fewer of them (`TODO` #141 — an accepted limitation since r274: they
+  are the arena cap x sub-complement pool cell) or a device-resolvable cold source, not moving them earlier.  Record: `benchmarks/2026-11-11-host-pool-slice-read.md` §2b.
 * **The read is bandwidth-bound at single-queue depth, with ~1.8x available at depth 4.**  64 random 1.77 MiB
   `O_DIRECT` reads of the real shard: depth 1 **3.3 GiB/s** (0.50 ms, matching the measured 0.531 ms fallback
   fill), depth 2 4.9, depth 4 **5.8**, depth 8 6.0.  So a faster demand path exists in principle, but a depth
@@ -4427,3 +4427,36 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    whole prewarm was deferred).  Same rule for `--lazy-mode mlock`/`mlockr`, which populate a multi-GiB table at
    the END of the load: `LLAMA_LAZY_MLOCK_RESERVE_MIB` (default 1024), and a table that does not fit is declined
    with one WARN and stays on the on-demand path (identical to `--lazy-mode auto`).
+
+## r274 -- the eager take-over's completeness bound is ARENA-triggered, not host-budget-triggered (`TODO` #141 retired)
+
+1. **A sub-complement host budget never reaches the bound on its own; the ARENA cap does.**  The guard in
+   `moe_cache_update_host` is `!table_cold_ok(t) && !pool_covers_table(t) && t.slots < n_used * n_tok`, and the
+   only term a host budget sets is `pool_covers_table` — which flips to *true* (exempt) as the budget covers the
+   set and *false* (the bound applies) below it, but the bound then needs `t.slots < n_used * n_tok` to fire.  The
+   default arena sizes each table from free VRAM and **clamps at `n_experts`**, so on a 256-expert model it is
+   256 slots/table and the bound cannot fire: measured 35B-A3B Q4_K_M `-ncmoe 40 -lme 8` (8192 MiB = **43.8 %**
+   pool coverage) is **298.7 tg** at `-npl 8` / **384.0** at `-npl 16` with `takeover=0 decline_all=0`, i.e. the
+   fastest arm measured.  The item's premise came from arms that also carried `MOE_EXPERT_CACHE_MIB=2048` — a
+   capped arena — and it attributed the whole effect to `-lme`.
+2. **The band's need scales with the WIDEST batch served, and so does the arena that fixes it.**  The requirement is
+   `slots/table >= n_used * n_tok` per shape, and the band top is `n_used * MOE_EXPERT_CACHE_MAX_TOK` (8 x 16 =
+   **128** here).  Measured on that rig, `-lme 8`: `2048` (53 slots) **46.1** tg at `-npl 8` against **102.8** for
+   `MOE_EXPERT_CACHE_MIB=0`; `2560` (67) fixes only `-npl 8` (**134.2**) and leaves `-npl 16` at **66.2** against
+   **149.0** off; `5120` (134) reads **289.9** at `-npl 16`.  So one MiB number is not "the fix" — the cap must
+   cover the widest batch the deployment serves, which is why a floor on an explicit `MOE_EXPERT_CACHE_MIB` is not
+   a safe default: it spends exactly the VRAM the operator capped (and r273 made an explicit budget authoritative).
+3. **The decision is per-shape constant, so a longer run cannot warm out of the band.**  `46.40` at `-ntg 128`
+   against `46.13` at `-ntg 1024` (h=0.8359, 82.3 % of the routed mass resident) — a converged heat map does not
+   move it, and nor does a higher-coverage one (134.17 with 87.71 % resident).  Judge this path on the census (`decline_all`,
+   `takeover=`), never on a rate that "looks like warm-up".
+4. **A big-expert field model with an uncapped arena is NOT in this band — and its decline is a different one.**
+   Flash-Next IQ3_S (512 experts, 108 tables), 2 devices, `-lme 20` = 55.5 % coverage, default arena: 470-483
+   slots/table against a need of 64, `takeover=27 753 decline_all=0`, **106.0 tg** at `-npl 8` — but
+   `device remap: 0 tables served, 27 651 of 27 651 offers declined`, i.e. r221's cold-id representability (worth
+   ~+9.9 % where it applies), not this bound.  Do not read one census line as the other.
+5. **The pragmatic answers win, which is why nothing is owed.**  `MOE_EXPERT_CACHE_MIB=0` is 2.2x faster than the
+   declining arm (102.8 / 149.0 against 46.1 / 66.2), `-lme auto` (the covering mirror) or `--host-experts pinned`
+   is exempt by construction (`table_cold_ok`), and the VRAM the cap was protecting is better recovered with
+   block 15's streaming KV window/pool than by capping the arena.  Record:
+   `benchmarks/2026-11-12-eager-takeover-arena-bound.md`; re-entry condition in `TODO.md` (accepted limitations).
