@@ -42,16 +42,22 @@ process spins in `ggml_cuda_pool_vmm::alloc` inside `libamdhip64` (the `AMD_LOG_
 `GGML_HIP_NO_VMM=ON` because block 09/16's arena and GTT store need VMM.  **DECIDED 2026-11-13 (maintainer): option 1, carry a full revert of `ac931b5bc` folded into block 00** (the
 ladder branch already carries it as `43a418c10`); the revert is dropped at the next re-base once upstream fixes
 the HIP pool.  Nothing in `patches/` changes before R18.
-* **Climb state after the first session:** R00..R05 done on `rebase-r278` (blocks 00-04) --
+* **Climb state (session 2 close):** R00..R08 done on `rebase-r278` (blocks 00-07) --
   `43a418c10` (block 00 + the revert), `ab433a7dd` (01, clean; hybrid all-reduce pipeline proven on 3 GPU),
   `50a0b30f8` (02; `D7`: upstream's MTP device buffer activates on `-sm layer` and declines on `-sm tensor`
   ("the device has no events" -- the Meta device has no `event_new`), so the delivery's host path is the only
   reachable one on the field layout; `D8`: the prune also removes *includes*, a build break rather than a
   conflict), `43891459e` (03; `D2` resolved **without** dropping anything -- upstream deleted its own non-fused
   GDN builders and tags, the delivery's chunked kernels are the surviving path, 6908 t/s prefill), `4c6a5019a`
-  (04, clean; `D3`: `bf16` + upstream's `f8_e4m3` + `q8_0` KV all coherent).  Every rung is build-green and
-  coherent (`sha=1c5d32ac537d` on the 4B).  **Next: R06 = block 05 (flash attention), the `D5` decision
-  point.**
+  (04, clean; `D3`: `bf16` + upstream's `f8_e4m3` + `q8_0` KV all coherent), `22fcde21e` (05; `D5`'s FA half is
+  complementary -- union instance matrix, upstream's `DKQp`/`DVp` padded-head mechanism re-added,
+  **`test-backend-ops -o FLASH_ATTN_EXT` 6996/0** with 18 derived, 385 `iq4_nl`, 7 `f8_e4m3`, 448 head-40 and
+  1010 head-72 cases), `c1d8b7c04` (06; our MMB/verify blocks on upstream's refactored MMVF and fusion
+  predicates -- MMB census + 6915 t/s prefill), `626e398d2` (07; graph-reuse union + the MUL_MAT test-matrix
+  union, **`MUL_MAT` 2681/0** for `D16`).  Every rung is build-green and coherent (`sha=1c5d32ac537d` on the
+  4B).  **Next: R09 = block 08 (fused kernels)** -- the `D6`/`D12` rung; its 7-way conflict analysis is in
+  `RUNGS.md` and the cherry-pick was aborted clean at `626e398d2`, so the next session starts from a clean
+  branch (the `norm.cu` dual-store merge needs its own build + `gate-norm-rows-alias.sh` cycle).
 
 ## 261113.003 (r277, RELEASE v17-a691b2345-r277) -- the placement read queue: startup placement at drive depth, and `--load-mode` becomes a DEMAND-only decision
 
