@@ -1,3 +1,48 @@
+## 261113.004 (r277 + campaign start, NO delivery change) -- the re-base to `4f9dfa0e3` opens as a ladder climb: campaign, probe, decision register and branch `rebase-r278`
+
+**No patch changes, no `release.json` change.**  This is the start of the next re-base campaign (`BASELINE.md`
+records the b236 re-base; this is the one after r277) and its setup rung only.
+
+* **New fork point `4f9dfa0e3`** (2026-11-13 17:50 +0100, `requirements, Fix CI: support Python 3.15 (#32199)`),
+the maintainer's snapshot of upstream `master` in `~/llama.cpp`.  The old point is `a691b2345`: **164 commits**,
+**751 files**, +40 612 / −24 226.  The delivery is replayed from its r277 tip `9d7c0502c` (tree `0104361a0`).
+* **Campaign [`wip/upstream-rebase-261113/`](wip/upstream-rebase-261113/README.md)** -- the method proved at r236,
+carried forward as one rung per block so a session can stop after any rung: `RUNGS.md` (R00 setup, R01..R17 =
+blocks 00..16, R18 = release ladder), `DECISIONS.md` (19 stop-and-ask items), `CONFLICT-MAP.md` +
+`conflict-map.json` + `probe-conflicts.py` (the measured ladder).
+* **The probe:** replaying all 17 blocks with `git merge-tree` onto `4f9dfa0e3` leaves **55 conflicted paths** plus
+16 modify/delete entries; blocks **01, 04, 13, 14 and 16 apply clean**; the largest cluster is block 10 (10), then
+blocks 05 (8), 09 (8) and 08 (7).  The previous climb opened with 75 conflicts and block 00 at 12 -- the current
+block 00 is the resolved r236 shape and now has **one** conflict (`src/llama-mmap.cpp`, upstream's Windows
+unbuffered load rewrite).
+* **The decision points that can drop delivery code** are registered with the upstream commit that raises them:
+`D2` (`#32078` removed the non-fused GDN and every ubatch-dependent graph node -- block 03), `D5` (FA grew FP8,
+head 40/72 and an sm70 case, and `#31533` added few-row MMQ -- blocks 05/06), `D6` (`#32001` moved graph +
+concurrent-stream state out of `common.cuh` -- blocks 08/10), `D7` (`#31927` reads the MTP target hidden states
+from a device buffer -- block 02), `D9` (`#26014` rewrote the Windows unbuffered model load -- block 00/09) and
+`D12` (`#32135` rewrote BF16 RMS_NORM -- block 08).  Each stops for the maintainer with a measurement in hand;
+none is decided by the campaign.
+* **State:** `~/llama.cpp` on `rebase-r278` at `4f9dfa0e3` (`master` stays pristine), the r277 binaries preserved at
+`build-rocm/bin-r277` (`build 12222, commit 9d7c0502c`).  The delivery repo works on `rebase-261113`; nothing merges
+to `main` until the climb is green.
+* **R01 (block 00) is green, and it found a base blocker.**  The only conflict was `src/llama-mmap.cpp` and it
+resolved as an *upstream-wins rename* (block 00 renames the `read_aligned_chunk` parameter `size` -> `size_l`,
+upstream's Windows-unbuffered rewrite independently renamed it `size` -> `len`; same body, so upstream's naming is
+taken in both platform variants and the delivery's real content -- `llama_mlock::size()/release()/granularity()` --
+auto-merged).  With the revert below folded in, the rung is **build green with the canonical `GGML_HIP_NO_VMM=OFF`**
+and coherent: `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**
+(`Prompt 256.0 / Gen 92.1` t/s), `test-backend-ops -o MUL_MAT_ID` **1040/1040** on gfx1201.
+* **BASE BLOCKER (`D17`, `wip/upstream-rebase-261113/BASE-BLOCKER.md`): upstream `ac931b5bc` (`#30542`, the
+halved VMM reservation + retry) hangs the HIP VMM pool on ROCm 10.1/gfx1201.**  A *pure `master`* build
+(`4f9dfa0e3`, no delivery patches) never returns from its first GPU compute with `GGML_HIP_NO_VMM=OFF` -- the
+process spins in `ggml_cuda_pool_vmm::alloc` inside `libamdhip64` (the `AMD_LOG_LEVEL=3` trace shows a
+`hipMemAddressReserve(..., 0, ...)` -> `hipErrorInvalidValue` loop, and the error path itself spins in
+`hipGetErrorString`); CPU works, and unpatched `master` with `GGML_HIP_NO_VMM=ON` runs at 265/89 t/s.  Reverting
+`ac931b5bc` restores the VMM build (263.7/90.2 on the same arm).  The delivery cannot dodge it with
+`GGML_HIP_NO_VMM=ON` because block 09/16's arena and GTT store need VMM.  **A candidate fix (full revert of
+`ac931b5bc`, folded into block 00) is on the ladder branch and is `AWAITING` the maintainer's decision** -- four
+options are in `BASE-BLOCKER.md`; nothing in `patches/` has changed.
+
 ## 261113.003 (r277, RELEASE v17-a691b2345-r277) -- the placement read queue: startup placement at drive depth, and `--load-mode` becomes a DEMAND-only decision
 
 **Release:** `v17-a691b2345-r277` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip
