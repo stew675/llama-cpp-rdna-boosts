@@ -1,7 +1,7 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R11 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
-and blocks 09-10); R12 (block 11, qwen4exp) is next.**  Two gate arms are deferred to **R13** by construction,
+**Status: OPEN — R00..R12 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
+and blocks 09-11); R13 (block 12, "campaign remainder") is next.**  Two gate arms are deferred to **R13** by construction,
 both because the code they need ships with block 12: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (the
 `moe_cache_pool_backed` Meta forwarding) and `gate-node-budget.sh` (`graph_max_nodes()` + the "over its node
 budget" refusal) — see `RUNGS.md` R10/R11 and `HANDOVER.md` §5.5.  `D17` (the base blocker) is decided: block 00
@@ -133,7 +133,7 @@ bound: the probe chained through marker-carrying trees).
 | 3 | R09r | rung-repair, block 05's artifact | — | **DONE** — FA instance set: heads 40/72 (32 files) + the FP8 KV column (14) + a typed generator loop; undefined FA symbols 32 -> 0, FA oracle 6995/0.  Squashed into block 05 at R18 |
 | 3 | R10 | 09 host-resident MoE | 8 (14 hunks) | **DONE** — all "both sides"; `D1` came out **answered without a port**, `D9`/`D15`/`D18` merged/checked, arena live (`fills=1991`), pool text identity `a99ccbd97ecb`; the gate's `tsplit*` arms are **R13's** |
 | 4 | R11 | 10 infrastructure | 9 (20 hunks) | **DONE 2026-11-13** — the dispatcher moved into `ggml-cuda-try-fuse.cu`; `D6` closed (packed replay guard + cluster check kept), `D8` fired again (`diagmask.cuh` pruned), `D10` closed; `gate-norm-rows-alias.sh` PASS; `gate-node-budget.sh` is R13's |
-| 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
+| 4 | R12 | 11 qwen4exp | 5 (6 hunks) | **DONE 2026-11-13** — `D11` decided (op count **105**, RPC 7); `gate-hc-fusions.sh` PASS (`d62340fbf566`); quant-coherence A-D PASS, its **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
 | 4 | R13 | 12 campaign remainder | 4 | `D10` (backend upload/prefetch), `D15` (external PLE) |
 | 5 | R14 | 13 MTP vocab subset | **0** | `D7` verify only |
 | 5 | R15 | 14 relaxed-tensor (**temporary**) | **0** | re-check it is still not subsumed |

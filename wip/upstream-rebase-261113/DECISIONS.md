@@ -336,7 +336,17 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
 * **Relation:** mechanical re-derivation: the delivery's ops/messages are re-registered on the new tables.
 * **Questions:** every new op has one registration + one dispatch + one test oracle; every RPC message has
   a matching handler on both ends.
-* **Status:** `OPEN` — R12/R13.
+* **Status:** **`DECIDED` at R12 (2026-11-13) — mechanical re-derivation, and the op count was the real
+  question.**  Block 11's six new ops (`FLASH_ATTN_QSA`, `INDEXER_TOPK`, `INDEXER_SCORE`, `INDEXER_FILL`,
+  `HC_MIX`, `HC_COMBINE`) each have one op-table registration, one CUDA dispatch and one test-backend-ops
+  oracle; the include surface is the union above.  The `GGML_OP_COUNT` static_assert (three copies: `ggml.c` x2,
+  `ggml-rpc.h` x1) is **105** — HEAD's 99 plus block 11's 6 — **not** the 108 block 11 carried nor the 99 HEAD
+  carried: block 11's 108 describes its own tree (old base + blocks 00-11), which holds 3 more ops than the new
+  base because upstream's `29dbbad2b` prune removed them.  `RPC_PROTO_PATCH_VERSION` stays **7** (the fork's op
+  table diverges from upstream's 0, so an RPC peer must refuse a mismatched table); R18 revisits if upstream
+  renumbers.  Four conflict hunks, all mechanical — the op table, the RPC header, the qwen4exp include set and
+  the GET_ROWS test matrix.  **For R13:** block 12 touches the *RPC message* surface (`ggml-rpc.h` + the
+  handlers in `ggml.c`), so that rung re-checks "one message, one handler on both ends".
 
 ## D12 — BF16 RMS_NORM: upstream rewrote `norm.cu`
 

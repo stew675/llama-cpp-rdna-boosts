@@ -1,3 +1,39 @@
+## 261113.009 (r277 + campaign rung R12, NO delivery change) -- R12 (block 11, qwen4exp) is the cleanest rung of the climb: 6 hunks, and the `GGML_OP_COUNT` on neither side was the merged value (105)
+
+**No patch changes, no `release.json` change.**  Rung R12 (`1d83b50e0`, block 11 "qwen4exp: model,
+hyper-connections, lazy reader, QSA/indexer").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R12.
+
+* **Result `1d83b50e0`**, **5 conflicted files / 6 hunks** (the probe was exactly right), build green after
+  **one** first-error pass, coherence unchanged (**100 chars `sha=1c5d32ac537d`**).
+* **`D11` decided, and the op count is the interesting bit.**  HEAD asserted `GGML_OP_COUNT == 99`, block 11
+  asserted `108`; the merged enum is **105** = 99 + the **6** ops block 11 adds (`FLASH_ATTN_QSA`,
+  `INDEXER_TOPK`, `INDEXER_SCORE`, `INDEXER_FILL`, `HC_MIX`, `HC_COMBINE`).  Block 11's 108 describes *its* tree
+  (old base + blocks 00-11), which carries 3 more ops because upstream's `29dbbad2b` prune removed them in the
+  range.  All three `static_assert`s set to 105; `RPC_PROTO_PATCH_VERSION` stays **7** (the fork's op table
+  diverges; an RPC peer must refuse a mismatched table).
+* **The one real merge decision:** `qwen4exp.cpp` — upstream's `build_inp_embd_state(inp.get(),
+  hparams.n_embd_out())` wins over block 11's inline tensor, because the builder asserts `n_embd_out() == hc_dim`
+  two lines above (same width) and the helper carries the **D7 row-gather path** for
+  `ubatch.data->embd_state_row`.  The inline block *is* the helper's else-branch, so nothing was dropped.
+* **`scripts/gate-hc-fusions.sh` PASS** — 5 hard arms byte-identical to the unfused chain (**449 chars
+  `sha=d62340fbf566`**, the r236-recorded chain hash) and the 2 numeric DSV4 arms differ from the chain and
+  **match their recorded anchor** `6a102dbc62d6`.  (At R09 the same gate showed all 7 equal: block 11 is what
+  makes the HC arms real, and the gate's anchors now describe the tree exactly.)
+* **`scripts/gate-qwen4exp-quant-coherence.sh`: A-D PASS, section E is R16's.**  Gather on == off == one hash
+  per quant (IQ3_XXS `249787803687`, IQ4_NL `beb145b43949`, Q4_K_M `16d7957b2c0f`; IQ4_XS has no model on this
+  box), no `////` runs.  The **sparse QSA arm** aborts with `GGML_ASSERT(a->op == GGML_OP_ROPE || ROPE_BACK)`
+  from `ggml_rope_get_truncate()` (`ggml.c:4470`): `indexer-score.cu` calls that ROPE-only accessor on its fused
+  `GGML_OP_INDEXER_SCORE` node and upstream **`#30206`** added the assert in the range.  **Block 15 carries the
+  fix** (literal `no_trunc` + the 6-arg `ggml_rope_yarn_corr_dims`), so section E goes green at **R16**.  The
+  shipped default is unaffected — the gate's `dense` arm runs clean on the same 5 246-token prompt; only the
+  env-forced sparse arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) reaches the aborting call site.
+* That is the **third** gate-arm-deferred-to-a-later-block item of the climb (`tsplit` -> R13, `node-budget` ->
+  R13, sparse QSA -> R16) — each recorded with the block and the symbol that makes it impossible earlier, so a
+  later session can clear them mechanically.
+* **Climb state:** R00..R12 done on `rebase-r278` at `1d83b50e0`.  **Next: R13 = block 12**, which owes
+  `gate-host-pool.sh` `tsplit`/`tsplitnosink`, `gate-node-budget.sh` (**with the margin shown, not just a green
+  line**), and the RPC message surface re-check.
+
 ## 261113.008 (r277 + campaign rung R11, NO delivery change) -- R11 (block 10) is DONE: the fusion dispatcher moves into its own TU and merges clean, `gate-norm-rows-alias.sh` PASSES, and the node-budget gate turns out to be R13's
 
 **No patch changes, no `release.json` change.**  Rung R11 (`13176810a`, block 10 "slab, fusion dispatcher and

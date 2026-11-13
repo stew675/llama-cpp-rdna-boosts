@@ -26,7 +26,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R09r | **rung-repair, block 05's artifact** (found at R09, `D5-a`) | **DONE 2026-11-13** | `9c94ce139` | FA instance set: heads 40/72 for `fattn-mma-f16` (32 files) + the FP8 KV column (14 files) + a **typed** `generate_cu_files.py`; squashed into block 05 at R18 |
 | R10 | 09 host-resident MoE | **DONE 2026-11-13** | `a6809f75b` (after the rung-repair `9c94ce139`) | **`D1`** answered (no port needed — upstream moved its own cache), `D9`, `D15`, `D18` checked; **`gate-host-pool.sh` `tsplit*` deferred to R13** |
 | R11 | 10 infrastructure (slab, fusion dispatcher, async input ring) | **DONE 2026-11-13** | `13176810a` | 9 files / 20 hunks; `D6` graph state into graph.cuh, `D8` prune include, `D10` ring; **`gate-norm-rows-alias.sh` PASS**; **`gate-node-budget.sh` deferred to R13** (its sizing + refusal are block 12's) |
-| R12 | 11 qwen4exp | **TODO** | — | `D11` |
+| R12 | 11 qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) | **DONE 2026-11-13** | `1d83b50e0` | 5 files / 6 hunks — the cleanest rung yet; `D11` resolved (op count 105, RPC 7); `gate-hc-fusions.sh` **PASS**; quant-coherence A-D **PASS**, **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
 | R13 | 12 campaign remainder | **TODO** | — | `D10`, `D11`, `D15` |
 | R14 | 13 MTP vocab subset | **TODO** | — | `D7` verify |
 | R15 | 14 relaxed-tensor (**temporary**) | **TODO** | — | — |
@@ -600,18 +600,42 @@ src0->ne[1] % 128 != 0` -> MMVQ) now runs **after** upstream's `ggml_cuda_should
 decides shapes few-row MMQ declines.  The delivery-vs-upstream few-row ordering is the `D5` `llama-bench` arm
 deferred to R18; it is not decided here.
 
-## R12 — block 11: qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) · **TODO**
+## R12 — block 11: qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) · **DONE 2026-11-13**
 
-* block sha `ea4963486` · 51 files · **expected conflicts: 5**
+* block sha `ea4963486` · **result `1d83b50e0`** · **5 conflicted files / 6 hunks** — the cleanest rung of the
+  climb (the probe's 5 files was exactly right).
 
-| conflicted path | what to expect |
+Build green after **one** first-error pass; coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`,
+seed 42 -> **100 chars `sha=1c5d32ac537d`**; `git grep -I '<<<<<<<'` empty.
+
+| conflicted path | resolution |
 |---|---|
-| `ggml/include/ggml-rpc.h`, `ggml/src/ggml.c` | RPC surface + op table (`0eebb6edd` TRI backward, `57d04820d` Top-K) + the prune.  **`D11`**. |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | the op dispatch + the new graph/stream state. |
-| `src/models/qwen4exp.cpp` | `ccd360f06` removed GDN/ubatch-dependent nodes from this model.  **`D2`**-adjacent. |
-| `tests/test-backend-ops.cpp` | the public-API move. |
+| `ggml/src/ggml.c` (2 hunks) + `ggml/include/ggml-rpc.h` (1) | **`D11`, and neither side's number was right.**  HEAD asserts `GGML_OP_COUNT == 99`, block 11 asserts `== 108`.  The merged enum's value is **105** = HEAD's 99 + the **6** ops block 11 actually adds (`GGML_OP_FLASH_ATTN_QSA`, `INDEXER_TOPK`, `INDEXER_SCORE`, `INDEXER_FILL`, `HC_MIX`, `HC_COMBINE`); block 11's 108 counted its own tree (old base + blocks 00-11), which carries 3 more ops because upstream's `29dbbad2b` prune removed them in the range.  So both `static_assert`s and the RPC one are set to **105**, and `RPC_PROTO_PATCH_VERSION` keeps block 11's **7** (the fork's op table diverges from upstream's, which is at 0; an RPC peer must refuse a mismatched table) — recorded so R18 can revisit it if upstream renumbers. |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` (1) | union of the includes: upstream's `fp8.cuh` **and** block 11's `fattn-qsa.cuh` / `indexer-topk.cuh` / `indexer-score.cuh`. |
+| `src/models/qwen4exp.cpp` (1) | **upstream's `build_inp_embd_state(inp.get(), hparams.n_embd_out())` wins** over block 11's inline `ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens)`: the builder already asserts `hparams.n_embd_out() == hc_dim` two lines above, so the width is identical, and the helper carries the **D7 row-gather path** (`ubatch.data->embd_state_row` -> `ggml_get_rows(h_nextn_src, h_rows)`) that the inline block cannot express.  Not a drop — the inline block *is* the helper's else-branch. |
+| `tests/test-backend-ops.cpp` (1) | union: upstream's `GGML_TYPE_F8_E4M3` GET_ROWS row widths `{1, 3, 257}` **and** block 11's IQ4_NL sub-block widths `{32, 128, 160, 224}` (the qwen4exp indexer key row is 128). |
 
-**Exit:** `gate-hc-fusions.sh` on the qwen4exp model, `gate-qwen4exp-quant-coherence.sh`.
+**First-error pass (one):** the union of the GET_ROWS matrices put block 11's loop inside HEAD's unterminated
+`for`, so the tail's `}` closed the wrong block — the loop bodies are now paired.
+
+**Verified:**
+* `scripts/gate-hc-fusions.sh` **PASS** — 5 hard arms byte-identical to the unfused chain (**449 chars
+  `sha=d62340fbf566`**, which is the r236-recorded chain hash) and the 2 numeric DSV4 arms differ from the chain
+  **and match their recorded anchor** `6a102dbc62d6` (the documented re-baseline class).  Note the contrast with
+  R09, where the same gate showed all 7 arms equal: block 11 is the block that makes the HC arms real, and the
+  gate's own anchors now describe the tree exactly.  No GPU faults in the gate's window.
+* `scripts/gate-qwen4exp-quant-coherence.sh` **sections A-D PASS**: gather-on == gather-off == one hash for
+  every quant present (IQ3_XXS `249787803687`, IQ4_NL `beb145b43949`, Q4_K_M `16d7957b2c0f`), no `////` runs,
+  IQ4_XS skipped (no such model on this box).  **Section E (the sparse QSA decode arm) FAILS, and it is R16's:**
+  the `sparse` arm aborts with `GGML_ASSERT(a->op == GGML_OP_ROPE || a->op == GGML_OP_ROPE_BACK)` from
+  `ggml_rope_get_truncate()` (`ggml.c:4470`), because `indexer-score.cu` calls that ROPE-only accessor on its
+  **fused `GGML_OP_INDEXER_SCORE`** node and upstream **`#30206`** added the assert in the range.  **Block 15
+  carries the fix** (its patch replaces the call with a literal `no_trunc` + the 6-argument
+  `ggml_rope_yarn_corr_dims`, with exactly that rationale), so section E must go green at **R16**.  The default
+  policy is unaffected: the gate's `dense` arm runs clean on the same 5 246-token prompt — only the env-forced
+  sparse arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) reaches the aborting call site.  *This is the third
+  gate-arm-deferred-to-a-later-block item of the climb* (`tsplit` -> R13, `node-budget` -> R13, sparse QSA ->
+  R16), each recorded with the block and the symbol that makes it impossible earlier.
 
 ## R13 — block 12: campaign remainder (CPU wins, backend iface fills, DFlash, FA build grouping, server prompt cache) · **TODO**
 
