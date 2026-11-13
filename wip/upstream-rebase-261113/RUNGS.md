@@ -14,7 +14,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | rung | block | status | sha | decision points |
 |---|---|---|---|---|
 | R00 | setup | **DONE 2026-11-13** | — | — |
-| R01 | 00 foundation | **DONE (merge+build+coherence); base fix `AWAITING`** | `43a418c10` | `D9`, **`D17`/B1** |
+| R01 | 00 foundation | **DONE (merge+build+coherence); base fix DECIDED (opt 1)** | `43a418c10` | `D9`, **`D17`/B1** |
 | R02 | 01 hybrid all-reduce | **BLOCKED on B1** | — | `D13` |
 | R03 | 02 adaptive MTP | **TODO** | — | `D7`, `D8` |
 | R04 | 03 chunked GDN | **TODO** | — | **`D2`** (stop-and-ask), `D14` |
@@ -56,7 +56,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 ---
 
 ## R01 — block 00: foundation (band uniformity, Meta wrapper, allocator) · **DONE 2026-11-13 (merge +
-build + coherence); the folded base fix is AWAITING the maintainer (see `BASE-BLOCKER.md` / `D17`)**
+build + coherence); the folded base fix is DECIDED (`D17` option 1)**
 
 * block sha `f15430d1e` · 34 files · **expected conflicts: 1**
 
@@ -82,9 +82,9 @@ the resolution takes upstream's `len` in both platform variants and keeps the de
 `sha=1c5d32ac537d`** (`Prompt 256.0 / Gen 92.1` t/s); `test-backend-ops -o MUL_MAT_ID` **1040/1040** on
 gfx1201 (the duplicate-id fix reaches the new tile grid); `git grep '<<<<<<<'` empty.
 
-**Base fix (AWAITING):** the revert of `ac931b5bc` is what makes the VMM=OFF build run at all on this box
-(without it the unpatched base hangs — `BASE-BLOCKER.md`).  If the maintainer rejects it, R01's tree must be
-rebuilt with `GGML_HIP_NO_VMM=ON` and R10/R17 stay blocked until upstream fixes the HIP pool.
+**Base fix (DECIDED 2026-11-13, `D17` option 1):** the revert of `ac931b5bc` is folded into block 00 — it is
+what makes the VMM=OFF build run at all on this box (without it the unpatched base hangs —
+`BASE-BLOCKER.md`).  Dropped at the next re-base once upstream fixes the HIP pool.
 
 ## R02 — block 01: hybrid HIP all-reduce (RDNA4-gated) · **BLOCKED on `D17`/B1**
 

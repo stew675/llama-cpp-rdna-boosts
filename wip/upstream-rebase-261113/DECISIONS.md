@@ -250,8 +250,12 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   devices this delivery does not validate.
 * **Verification owed when decided:** `gate-uma-experts.sh --quick` on `halo` (the region size `-lme` asks
   for) and `gate-host-pool.sh` (the arena decline path) at R10/R17.
-* **Status:** `AWAITING` — the candidate revert is on `rebase-r278` as part of R01's block-00 commit
-  (`43a418c10`); nothing in `patches/` changes until the maintainer decides.
+* **Status:** **`DECIDED` (2026-11-13, maintainer: option 1 — carry the full revert, folded into block 00).**
+  R01's block-00 commit `43a418c10` is the decided shape (36 files, +1049/−357 against `4f9dfa0e3`): the
+  pre-#30542 VMM pool on every backend, no HIP-only split.  The revert is dropped at the next re-base once
+  upstream fixes the HIP pool (the provenance note lives in `BASE-BLOCKER.md` and this entry).  Verification
+  still owed at R10/R17 (`gate-host-pool.sh`, `gate-uma-experts.sh --quick` on `halo`) — the arena/GTT store
+  are the first delivery code that actually exercises a large reservation.
 
 ## D18 — SYCL gained a device-side MoE scheduler
 

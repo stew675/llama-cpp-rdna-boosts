@@ -39,9 +39,9 @@ process spins in `ggml_cuda_pool_vmm::alloc` inside `libamdhip64` (the `AMD_LOG_
 `hipMemAddressReserve(..., 0, ...)` -> `hipErrorInvalidValue` loop, and the error path itself spins in
 `hipGetErrorString`); CPU works, and unpatched `master` with `GGML_HIP_NO_VMM=ON` runs at 265/89 t/s.  Reverting
 `ac931b5bc` restores the VMM build (263.7/90.2 on the same arm).  The delivery cannot dodge it with
-`GGML_HIP_NO_VMM=ON` because block 09/16's arena and GTT store need VMM.  **A candidate fix (full revert of
-`ac931b5bc`, folded into block 00) is on the ladder branch and is `AWAITING` the maintainer's decision** -- four
-options are in `BASE-BLOCKER.md`; nothing in `patches/` has changed.
+`GGML_HIP_NO_VMM=ON` because block 09/16's arena and GTT store need VMM.  **DECIDED 2026-11-13 (maintainer): option 1, carry a full revert of `ac931b5bc` folded into block 00** (the
+ladder branch already carries it as `43a418c10`); the revert is dropped at the next re-base once upstream fixes
+the HIP pool.  Nothing in `patches/` changes before R18.
 
 ## 261113.003 (r277, RELEASE v17-a691b2345-r277) -- the placement read queue: startup placement at drive depth, and `--load-mode` becomes a DEMAND-only decision
 

@@ -1,7 +1,7 @@
 # BASE BLOCKER B1 — upstream `ac931b5bc` (#30542) hangs the HIP VMM pool on ROCm 10.1 / gfx1201
 
-**Found 2026-11-13 at rung R01.  Status: candidate fix applied to the ladder branch, `AWAITING` the
-maintainer's decision.**  Registered as `DECISIONS.md` `D17`.
+**Found 2026-11-13 at rung R01.  DECIDED 2026-11-13: option 1 — carry the full revert, folded into block 00
+(maintainer).**  Registered as `DECISIONS.md` `D17`.
 
 ## What happens
 
@@ -68,15 +68,21 @@ delivery ships the pre-#30542 VMM pool behaviour on every backend.
 * When upstream fixes it (or if the maintainer prefers a HIP-only gate), the revert is dropped at the next
   re-base and the base advances.
 
-## Options presented to the maintainer
+## Options presented to the maintainer (option 1 was chosen)
 
 1. **Carry the revert in block 00** (current ladder state; recommended — it is the only configuration that
    restores the delivery's required VMM path, and it is one revert commit that disappears with the next
-   base).
+   base).  **CHOSEN.**
 2. **HIP-gate the revert** (CUDA keeps #30542).  More code, no validated benefit on this repo's scope.
 3. **Verify rungs with `GGML_HIP_NO_VMM=ON`** and leave the arena/GTT rungs (R10, R17) blocked until
    upstream fixes it.  Non-canonical build for the whole climb; not recommended past R09.
 4. **Move the fork point to `ac931b5bc^`** (i.e. one commit earlier) — loses 60+ unrelated upstream commits.
+
+## Decision
+
+**Option 1, 2026-11-13 (maintainer).**  Block 00 carries the revert on every backend.  The revert is dropped
+at the next re-base once upstream fixes the HIP pool.  Nothing about upstream's CUDA combined-memory target is
+lost here (untested by this repo); the delivery is back to the pool behaviour r277 shipped.
 
 ## Consequence for R18
 
