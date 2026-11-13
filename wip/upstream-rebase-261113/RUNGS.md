@@ -22,7 +22,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
 | R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
 | R08 | 07 k-quant boosts | **DONE** | `626e398d2` | `D16` oracle green |
-| R09 | 08 fused kernels | **NEXT** | — | `D6`, `D12` |
+| R09 | 08 fused kernels | **NEXT — conflict analysis done, branch clean** | — | `D6`, `D12` |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
 | R12 | 11 qwen4exp | **TODO** | — | `D11` |
@@ -272,7 +272,7 @@ rather than a fallback.
 **`D4`** (MMVF BF16 few-row) did not conflict at this rung — `#31959`'s dispatch sits beside the delivery's
 without overlap; the few-row A/B stays a R18 `llama-bench` arm.
 
-## R09 — block 08: fused kernels · **TODO**
+## R09 — block 08: fused kernels · **NEXT** (analysed 2026-11-13; not begun — left clean for a fresh session)
 
 * block sha `7f1ed0723` · 38 files · **expected conflicts: 7**
 
@@ -284,6 +284,29 @@ without overlap; the few-row A/B stays a R18 `llama-bench` arm.
 | `ggml/src/ggml-cuda/norm.cu` | `31953bcf7` (`#32135`) rewrote BF16 RMS_NORM (−180/+180).  **`D12`**. |
 
 **Exit:** `gate-norm-rows-alias.sh` on the merged tree; the fusion-alias gate if the out-node set moved.
+
+### R09 pre-analysis (2026-11-13, no work committed — the cherry-pick was aborted cleanly at `626e398d2`)
+
+The rung is **7 conflicted files**; six are "our block + upstream's refactor" unions, one (`norm.cu`) is the
+`D12` merge that needs its own build + gate cycle.  Conflict shapes measured from the live cherry-pick:
+
+| path | conflicts | shape |
+|---|---|---|
+| `ggml/src/ggml-cuda/common.cuh` | 1 | **union**: upstream's `std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;` **and** the delivery's `q8_1_cache_entry` / per-graph Q8_1 cache block (both are context members; neither supersedes the other). |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 5 | the delivery's `ggml_cuda_rdna3_5_dense_glu_disabled()` + its 1-arg `ggml_cuda_should_fuse_mul_mat_vec_f(tensor)` vs upstream's 2-arg form (`gate = nullptr`, used by the `_q` path).  Resolution: **keep the rdna3_5 guard and upstream's 2-arg signature** (the delivery's body has no `gate` use), and adapt the call sites to `(up_n, gate_n)`.  A second definition site must be checked for duplication after the merge. |
+| `ggml/src/ggml-cuda/mmq.cu` | 1 | **theirs** (delivery): a stricter fusion assert (`gate && !x_bias && !gate_bias && !x_scale && !gate_scale` + the "ids is not dense-only / issue #241" comment).  Upstream `#31188/#31288` changed the same neighbourhood; the assert must still match the merged `ggml_cuda_mm_fusion_args_host`. |
+| `ggml/src/ggml-cuda/mmvq.cu` | 1 | **theirs** (delivery): the per-graph Q8_1 cache (`ctx.q8_1_cache_get(...)`, view-root keying, `q8_1_src_range_ok`).  Upstream `#31533` added the few-row quantizer beside it; check the cache's `quantize_row_q8_1_cuda` call still matches. |
+| `ggml/src/ggml-cuda/quantize.cu` | 1 | upstream's new `quantize_mmq_few_q8_1` kernel (from `#31533`) vs the delivery's kernel set — likely **union** (the few-row kernel and the delivery's chunked/mmq quantizers coexist). |
+| `ggml/src/ggml-cuda/quantize.cuh` | 1 | **theirs** (delivery): `ggml_cuda_quantize_mmq_q8_1_n_chunks(cc)` (gfx1151-only chunking, measured ~1.5x on the halo) — additive. |
+| `ggml/src/ggml-cuda/norm.cu` | 3 | **`D12`, the real work.**  Upstream `#32135` rewrote the file for BF16 RMS_NORM and introduced `rms_norm_store4(dstc, i, r)` + a typed `T` destination; the delivery has a **dual store** (`store_f32` -> `dstc`, plus a `dst16c`/`norm_f2bf` BF16 side channel for the HC16 producer slots) and the `mmb.cuh` include.  The merge is `if (store_f32) { rms_norm_store4(...) }` + `if (dst16c) { ... }` in both the 4-wide and the scalar path, plus both includes — **not** a take-theirs, because taking either side alone loses one of the two destinations.  After the merge: `gate-norm-rows-alias.sh` and `gate-hc-fusions.sh` are both owed (the bf16 side channel is the HC16 producer). |
+
+Two traps for the next session:
+* the delivery's `rms_norm_store4`/`store_f32`/`dst16c` names may collide with upstream's typed store helper
+  (both are in the same kernel); resolve by keeping upstream's helper as the `dstc` writer and the delivery's
+  `dst16c` as an independent second write, never by merging the two stores into one.
+* the `mmq.cu` assert is load-bearing history (issue #241: upstream's assert aborted every model it fired on).
+  Keep the delivery's narrowed form and re-verify with `test-backend-ops -o MUL_MAT_ID` (the routed fusion
+  arm) plus `gate-hc-fusions.sh`.
 
 ## R10 — block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine) · **TODO**
 

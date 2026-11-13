@@ -123,7 +123,7 @@ bound: the probe chained through marker-carrying trees).
 | 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **DONE** — `D5` FA half complementary: union instance matrix + upstream's `DKQp`/`DVp`; 6996/0 FA oracle |
 | 2 | R07 | 06 MMB prefill | 1 | **DONE** — our blocks on upstream's refactored MMVF/fusion predicates; MMB on, 6915 t/s prefill |
 | 2 | R08 | 07 k-quant boosts | 2 | **DONE** — graph-reuse union + test-matrix union; MUL_MAT 2681/0 |
-| 3 | R09 | 08 fused kernels | 7 | **NEXT** — **`D6`** (graph state left `common.cuh`) + **`D12`** (BF16 RMS_NORM) |
+| 3 | R09 | 08 fused kernels | 7 | **NEXT** — analysed (conflict table in `RUNGS.md`); **`D6`** + **`D12`** (`norm.cu` dual-store merge, needs its own build+gate cycle) |
 | 3 | R10 | 09 host-resident MoE | 8 | **`D1`** (upstream moved the MoE cache out of `llama-graph`), `D9`, `D15`, `D17` |
 | 4 | R11 | 10 infrastructure | 10 | `D6`, `D8` (prune/`llama-ext.h`), `D10` (scheduler upload/prefetch) |
 | 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
