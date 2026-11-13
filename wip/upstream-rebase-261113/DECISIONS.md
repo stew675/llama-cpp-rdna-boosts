@@ -124,7 +124,16 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
 * **Questions:** measure adaptive-MTP four-axis (the gate in `benchmarks/mtp-adaptive-methodology.md`) on the
   merged tree; compare the delivery's hidden-state transport with the device buffer at the field shape.
   Also check the `--spec-draft-p-min` warning does not fire for the delivery's defaults.
-* **Status:** `OPEN` — R03 (and re-verify at R14).
+* **Status:** **measured at R03, `OPEN` as a decision (nothing is dropped).**  On the R03 tree
+  (`50a0b30f8`), 35B-A3B Q8_0 bf16 KV with `draft-mtp-adaptive`: the adaptive controller is live on both
+  layouts (acceptance 0.89130 on `-sm tensor`, 1.00000 on `-sm layer`), and upstream's device-buffer
+  transport activates **only** on `-sm layer` (`target h rows on the device: yes`).  Under `-sm tensor` it
+  declines with `the device has no events, extracting the h_nextn rows to host memory` — the output device is
+  the Meta device, whose `iface.event_new` is null — and falls back to the host path (where the delivery's
+  `llama_set_embeddings_nextn_from` skip still applies).  So the two are complementary, not competing, on the
+  field layout; the delivery keeps its host path and its controller.  Upstream gap worth an `upstream/`
+  candidate: give the Meta device backend events so `#31927` is reachable under `-sm tensor`.  Re-verify at
+  R14 (the vocab-subset block changes what a draft sees) and measure on `-sm layer` in R18's MTP four-axis.
 
 ## D8 — The prune: `llama` and `ggml` removed dead surface
 
@@ -138,7 +147,14 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   call moves to the public API or the block drops the call.
 * **Questions:** after each rung, `git grep` the delivery's symbols; confirm none points at a pruned
   declaration.
-* **Status:** `OPEN` — R03/R11.
+* **Status:** **hit at R03, `OPEN` mechanically — the prune also removes *includes*.**  Two concrete lessons:
+  (a) the moved declarations (`llama_set_embeddings_nextn`, `llama_set_nextn_layer_offset`,
+  `llama_model_dflash_selector_top_k`, `llama_model_target_layer_ids(_n)`) are *not* re-added to
+  `src/llama-ext.h`, because upstream has public versions in `include/llama.h`; only delivery-only API stays.
+  (b) `common/speculative.cpp` lost `#include "../src/llama-ext.h"` with the prune (the include's comment named
+  the now-public calls), which is a **build break, not a merge conflict** — the block's include hunk attaches
+  cleanly and the symbol then resolves nowhere.  Check the include surface after every prune rung; blocks 10
+  and 11 touch `llama-ext.h` and will meet the same thing.  Re-check at R11/R12.
 
 ## D9 — mmap / lazy load / load-mode: upstream rewrote the Windows unbuffered load
 

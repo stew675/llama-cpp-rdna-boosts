@@ -15,9 +15,9 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 |---|---|---|---|---|
 | R00 | setup | **DONE 2026-11-13** | — | — |
 | R01 | 00 foundation | **DONE (merge+build+coherence); base fix DECIDED (opt 1)** | `43a418c10` | `D9`, **`D17`/B1** |
-| R02 | 01 hybrid all-reduce | **BLOCKED on B1** | — | `D13` |
-| R03 | 02 adaptive MTP | **TODO** | — | `D7`, `D8` |
-| R04 | 03 chunked GDN | **TODO** | — | **`D2`** (stop-and-ask), `D14` |
+| R02 | 01 hybrid all-reduce | **DONE** | `ab433a7dd` | `D13` |
+| R03 | 02 adaptive MTP | **DONE** | `50a0b30f8` | `D7`, `D8` |
+| R04 | 03 chunked GDN | **NEXT — STOPS FOR `D2`** | — | **`D2`** (stop-and-ask), `D14` |
 | R05 | 04 BF16 KV | **TODO** | — | `D3` |
 | R06 | 05 flash attention | **TODO** | — | **`D5`**, `D3` |
 | R07 | 06 MMB prefill | **TODO** | — | `D5` |
@@ -86,16 +86,20 @@ gfx1201 (the duplicate-id fix reaches the new tile grid); `git grep '<<<<<<<'` e
 what makes the VMM=OFF build run at all on this box (without it the unpatched base hangs —
 `BASE-BLOCKER.md`).  Dropped at the next re-base once upstream fixes the HIP pool.
 
-## R02 — block 01: hybrid HIP all-reduce (RDNA4-gated) · **BLOCKED on `D17`/B1**
+## R02 — block 01: hybrid HIP all-reduce (RDNA4-gated) · **DONE 2026-11-13**
 
 * block sha `d3470daa6` · 4 files · **expected conflicts: 0** (CLEAN)
 
-**Expect:** `432433637` (`#31838`, fixed BLAS workspace) and `ac931b5bc` (`#30542`, VMM pool) are in the
-same files but were not reported as conflicts.  Verify the RCCL/HIP all-reduce dispatch still selects the
-delivery's hybrid arm on a 3-GPU `-sm tensor` arm, and that the gate is still reachable (`--sm tensor
---device 0,1,2`).  **`D13`**.
+**R02 result: `ab433a7dd`** — 4 files, +2900 / −49 (it was 2 365 / −44 at r277: the new base has more to merge
+around).  Applied **clean** (the probe was right), no resolution owed.  Build green; 1-GPU `-sm layer`
+coherence unchanged (**100 chars `sha=1c5d32ac537d`**); the delivery's hybrid arm is reachable and initializes on
+the 3-GPU arm exactly as it did at r277: `ggml_cuda_ar_pipeline_init: initialized HIP AllReduce pipeline: 3 GPUs,
+1024 KB chunked kernel staging + 32 MB copy-engine staging per GPU` (`HIP_VISIBLE_DEVICES=0,1,2 -sm tensor`,
+`-lv 4`), and the same 3-GPU arm's clean text is also `sha=1c5d32ac537d` (94.7 / 104.9 t/s).  **`D13`** checked:
+`432433637` (fixed BLAS workspace) and the `#30542` revert in block 00 do not disturb the dispatch or the
+all-reduce's scratch allocation.
 
-## R03 — block 02: adaptive MTP draft depth · **TODO**
+## R03 — block 02: adaptive MTP draft depth · **DONE 2026-11-13**
 
 * block sha `e16b66272` · 23 files · **expected conflicts: 3**
 
@@ -105,10 +109,32 @@ delivery's hybrid arm on a 3-GPU `-sm tensor` arm, and that the gate is still re
 | `src/llama-context.cpp` | the same `#31927` (+199 lines) — the device buffer's context surface meets the delivery's draft-depth control. |
 | `src/llama-ext.h` | `8ca5a8008` (`#30565`) prunes the file (−64); the delivery adds to it.  Re-add *only* the delivery's declarations.  **`D8`**. |
 
-**Exit:** adaptive-MTP four-axis protocol (`benchmarks/mtp-adaptive-methodology.md`) is owed here if the
-device-buffer path changes the measured decode; otherwise record why not.
+**R03 result: `50a0b30f8`** — 23 files, +1391 / −65 (was +1186 / −54 at r277: upstream's `#31927` device-row
+work merges in).  Build green; 1-GPU coherence unchanged (`sha=1c5d32ac537d`); `test-speculative-adaptive` all OK.
 
-## R04 — block 03: chunked gated-delta-net prefill · **TODO — STOPS FOR `D2`**
+**Resolutions (all "both sides", no delivery code dropped):**
+| site | resolution |
+|---|---|
+| `common/speculative.cpp` (members + ctor) | upstream's device-row members (`dev_rows`, `n_batch_tgt`, `verify_row0`) **and** the delivery's adaptive members (`adaptive`, `n_cap`, `n_last`, `adaptive_ctrl`, `align`, `band`, `n_hard`) coexist; the ctor keeps the delivery's extra `(adaptive, align)` parameters and its initializer, and upstream's body init (`n_batch_tgt`, `verify_row0`, `dev_rows = llama_set_embeddings_nextn_dev(...) && llama_set_ctx_state_src(...)`) is intact below it. |
+| `src/llama-ext.h` | the prune moved `llama_set_embeddings_nextn` and `llama_set_nextn_layer_offset` to the public `include/llama.h` (**`D8`**), so their delivery declarations are **not** re-added; only the delivery-only `llama_set_embeddings_nextn_from` stays.  The same applies to `llama_model_dflash_selector_top_k` / `llama_model_target_layer_ids(_n)` (upstream now has public versions); `llama_model_set_embeddings_layer_inp_preset` is still delivery-only and stays. |
+| `common/speculative.cpp` (includes) | **`D8` again, silent this time:** the prune deleted `#include "../src/llama-ext.h"` from this file (its comment named the two now-public calls), so our block's include hunk had nothing to attach to and the build failed on `llama_set_embeddings_nextn_from`.  Re-added with the comment narrowed to the `_from` call.  *A prune that removes an include is a build break, not a merge conflict — check the include surface after every prune rung.* |
+| `src/llama-context.cpp` (nextn readback) | **the real `D7` merge**: upstream skips the host extraction when the device buffer is active (`!write_h_nextn`); the delivery skips it when every row is below the sequence's `llama_set_embeddings_nextn_from` threshold (`nextn_unneeded`, masked/vision rows always read).  Resolved as `if (nextn_rows && !write_h_nextn) { if (nextn_unneeded) { bookkeeping only } else { readback } }` — upstream's gate outer, the delivery's skip inner. |
+
+**`D7` measurement (the device buffer vs our host path), 35B-A3B Q8_0, bf16 KV, `draft-mtp-adaptive`, `-n 200`:**
+* `-sm tensor` (ROCm0,ROCm2, the field layout): `adaptive draft depth enabled`, acceptance **0.89130**
+  (82/92), mean len 2.46 — but upstream's device path **declines**: `h_nextn_dev_alloc: the device has no
+  events, extracting the h_nextn rows to host memory`.  The output device under `-sm tensor` is the Meta
+  device and `ggml-backend-meta.cpp` sets `iface.event_new = nullptr`, so `ggml_backend_event_new()` returns
+  null.  The fallback is clean (host rows, our `_from` skip still applies).
+* `-sm layer` (ROCm0,ROCm2): `target h rows on the device: yes`, acceptance **1.00000** (19/19), mean len 2.0.
+  So the device transport activates only on a layer split today.
+* **Conclusion for the rung:** both paths coexist; ours is the only reachable one on the field's `-sm tensor`
+  layout, upstream's is reachable on `-sm layer`.  No decode measurement is owed yet: the device path is
+  inert where the delivery is validated.  **Open upstream gap recorded for `TODO`**: give the Meta device an
+  `event_new` (or fall back to the output device's own backend) so `#31927` is reachable under `-sm tensor`;
+  that is an upstream/ candidate, not a delivery change.  MTP four-axis stays R18's job.
+
+## R04 — block 03: chunked gated-delta-net prefill · **NEXT — STOPS FOR `D2`**
 
 * block sha `dd81963db` · 25 files · **expected conflicts: 1**
 
