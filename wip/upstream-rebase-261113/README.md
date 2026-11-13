@@ -1,7 +1,8 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00 (setup + probe) and R01 (block 00) done 2026-11-13; R02 is blocked on base blocker
-`B1`/`D17`.**  Rungs R01..R17 are the replay; R18 is the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
+**Status: OPEN — R00..R05 done 2026-11-13 (blocks 00-04); R06 (block 05, flash attention) is next.**  `D17`
+(the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
+the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
 R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
 point is **`4f9dfa0e3`**.
 
@@ -115,11 +116,11 @@ bound: the probe chained through marker-carrying trees).
 |---|---|---|---|---|
 | 0 | R00 | — | — | **DONE 2026-11-13** — campaign, branch, `bin-r277`, conflict map, decision register |
 | 1 | R01 | 00 foundation | 1 | **DONE** — resolved as an upstream-wins rename; green with the folded base fix; **`D9`**, **`D17`/B1** |
-| 1 | R02 | 01 hybrid all-reduce | **0** | **BLOCKED on B1** until `D17` is decided; then `D13` |
-| 1 | R03 | 02 adaptive MTP | 3 | **`D7`** (upstream MTP device-buffer hidden state), `D8` (prune) |
-| 1 | R04 | 03 chunked GDN | 1 | **`D2` — upstream `#32078` REMOVED the non-fused GDN + ubatch-dependent nodes: the strongest subsume candidate in this range** |
-| 1 | R05 | 04 BF16 KV | **0** | **`D3`** — upstream added FP8 KV/FA in the same range; cross-backend consistency only |
-| 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **`D5`** — FA grew FP8, head 40/72 and an sm70 case |
+| 1 | R02 | 01 hybrid all-reduce | **0** | **DONE** — clean; hybrid all-reduce pipeline proven on 3 GPU |
+| 1 | R03 | 02 adaptive MTP | 3 | **DONE** — `D7` measured (device path is `-sm layer`-only today), `D8` include lesson |
+| 1 | R04 | 03 chunked GDN | 1 | **DONE** — `D2` **not** a subsume: upstream deleted its own graph builders/tags; our chunked kernels are the surviving path |
+| 1 | R05 | 04 BF16 KV | **0** | **DONE** — clean; `D3` audit passed (bf16 + f8_e4m3 + q8_0 all coherent) |
+| 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **NEXT** — **`D5`** (FA grew FP8, head 40/72, sm70; 16 modify/delete template instances) |
 | 2 | R07 | 06 MMB prefill | 1 | `D5`-adjacent (few-row MMQ `#31533` lands in the same dispatch) |
 | 2 | R08 | 07 k-quant boosts | 2 | `D16` (MUL_MAT src1 precision gating) |
 | 3 | R09 | 08 fused kernels | 7 | **`D6`** (graph state left `common.cuh`) + **`D12`** (BF16 RMS_NORM) |

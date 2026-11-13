@@ -17,9 +17,9 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R01 | 00 foundation | **DONE (merge+build+coherence); base fix DECIDED (opt 1)** | `43a418c10` | `D9`, **`D17`/B1** |
 | R02 | 01 hybrid all-reduce | **DONE** | `ab433a7dd` | `D13` |
 | R03 | 02 adaptive MTP | **DONE** | `50a0b30f8` | `D7`, `D8` |
-| R04 | 03 chunked GDN | **NEXT — STOPS FOR `D2`** | — | **`D2`** (stop-and-ask), `D14` |
-| R05 | 04 BF16 KV | **TODO** | — | `D3` |
-| R06 | 05 flash attention | **TODO** | — | **`D5`**, `D3` |
+| R04 | 03 chunked GDN | **DONE (both-sides, nothing dropped)** | `43891459e` | **`D2` resolved as complementary**, `D14` |
+| R05 | 04 BF16 KV | **DONE** | `4c6a5019a` | `D3` checked |
+| R06 | 05 flash attention | **NEXT** | — | **`D5`**, `D3` |
 | R07 | 06 MMB prefill | **TODO** | — | `D5` |
 | R08 | 07 k-quant boosts | **TODO** | — | `D4`, `D16` |
 | R09 | 08 fused kernels | **TODO** | — | `D6`, `D12` |
@@ -134,7 +134,7 @@ work merges in).  Build green; 1-GPU coherence unchanged (`sha=1c5d32ac537d`); `
   `event_new` (or fall back to the output device's own backend) so `#31927` is reachable under `-sm tensor`;
   that is an upstream/ candidate, not a delivery change.  MTP four-axis stays R18's job.
 
-## R04 — block 03: chunked gated-delta-net prefill · **NEXT — STOPS FOR `D2`**
+## R04 — block 03: chunked gated-delta-net prefill · **DONE 2026-11-13 — `D2` needed no stop**
 
 * block sha `dd81963db` · 25 files · **expected conflicts: 1**
 
@@ -142,21 +142,49 @@ work merges in).  Build green; 1-GPU coherence unchanged (`sha=1c5d32ac537d`); `
 |---|---|
 | `src/models/delta-net-base.cpp` | **`ccd360f06` (`#32078`) removed the non-fused GDN and every ubatch-dependent graph node** (−405 lines here, plus `clef`/`clover-moe`/`kimi-linear`/`qwen35`/`qwen35moe`/`qwen4exp`/`models.h`/`llama-context.*`/`llama-cparams.h`/`llama-graph.h`).  **`D2`**. |
 
-**Do not resolve blind.**  Read both sides first: (a) did upstream delete the *non-fused* builder our
-chunked path replaced (then ours is the surviving implementation and the merge is a de-registration), or
-(b) is our separate graph path now dead weight?  Measure prefill on a hybrid recurrent model with the
-delivery path on and off, present to the maintainer, and wait.  **`D14`** (kernel side: `a8575a3ef`,
-`998200491`) is a consistency check only.
+**R04 result: `43891459e`** — 25 files, +3363 / −31.  Build green; 1-GPU coherence unchanged
+(`sha=1c5d32ac537d`); the delivery's chunked kernel is reached **after** upstream's removal:
+`-lv 4` on the 4B with a 5 298-token prompt gives
+`ggml_cuda_op_gated_delta_net_impl: whole-batch chunked GDN prefill n=2048 K=1 n_seqs=1 (> 16: no snapshot
+tail needed)` and `n_rs_batch = 1` in the cparams banner, prefill **6908.1 t/s** on one GPU.
+
+**`D2` outcome — upstream did NOT subsume the delivery, and nothing is dropped.**  The two sides are
+complementary: upstream `#32078` deleted **its own** non-fused graph builders
+(`build_delta_net_chunking`, `build_delta_net_autoregressive`, the `build_delta_net()` chooser) and the GDN
+fused-node tags and registry entries — all of which existed in the **old base** (`a691b2345`) and were
+therefore upstream code the delivery merely sat beside.  The delivery's substance is elsewhere: an extra
+`n_rs_batch` argument on `ggml_gated_delta_net()` (so a chunked kernel can skip rollback snapshots for a
+batch that can never be rolled back into), the pre-batch snapshot copy in `build_recurrent_attn()`, and the
+`gated_delta_net_chunked*.cu` kernels.  Upstream now *always* routes through that same fused op, so the
+delivery's kernels are the surviving implementation of the path upstream simplified to.
+
+| conflicted hunk | resolution |
+|---|---|
+| `build_delta_net_fused` call | upstream's tag deletion is taken (the `LLM_FUSED_OP_GDN_AR/CH` registrations are **not** re-added — upstream removed the enum values and their registry entries, so re-adding them would not compile); the delivery's `/*n_rs_batch=*/1` argument stays. |
+| `build_recurrent_attn` call | same: `ggml_gated_delta_net(..., K, cparams.n_rs_batch)` without the tags.  The delivery's pre-batch snapshot copy (the non-conflicting hunk above it) stays. |
+
+**A note on the rollback test:** `test-recurrent-state-depth` reports 83 failures (Phase A numeric
+mismatches, max diff ~0.23) on this box **and 73 on the shipped r277 build** with the same command — so it
+is not a R04 regression and it is not caused by the merge; record it as a pre-existing observation.  The
+r236 campaign recorded `PASS 0` on its own config, so the gate is config-sensitive; the command and both
+counts are here so it can be re-derived (`TODO`-shaped, not a blocker).
+
+**`D14` check:** `a8575a3ef` (SpacemiT GATED_DELTA_NET, CPU) and `998200491` (SSM_SCAN d_state=64) are in the
+merged tree; neither is reachable on gfx1201.  Kernel-side consistency only.
 
 ## R05 — block 04: BF16 KV cache and native-BF16 flash attention · **TODO**
 
 * block sha `7708d67ff` · 8 files · **expected conflicts: 0** (CLEAN)
 
-**Expect:** applies clean, but `202c1a229` (`#28392`, FP8 KV) and `9e9619d03` (`#28413`, OCP FP8) are the
-new neighbours — audit that the KV type set, the FA instances and the `supports_op` predicates stay
-mutually consistent for every backend; a reachable-but-uninstantiated type is a crash
-(`GREEDY-PURITY.md` §20).  **`D3`**.  No measurement beyond coherence: this block's own A/B is the BF16 KV
-decode arm, re-run at R18.
+**R05 result: `4c6a5019a`** — 8 files, +602 / −191, applied **clean** (the probe was right).
+
+**`D3` audit (KV type set vs upstream's FP8):** the merged `-ctk/-ctv` set is
+`f32 f16 bf16 f8_e4m3 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` — upstream's `f8_e4m3` sits beside the delivery's
+`bf16`, and neither the FA instance list nor a `supports_op` predicate aborts.  Measured on `Qwen3.5-4B Q8_0`
+(1 GPU, `-sm layer`, `-c 4096`, same seed): `bf16`, `f8_e4m3` and `q8_0` all run and produce the same
+**100 chars `sha=1c5d32ac537d`**.  The delivery's BF16 FA instance is compiled in
+(`GGML_CUDA_FA_QUANTS` carries `bf16-bf16`), so the arm reaches the delivery path, not a fallback.  The BF16
+KV decode A/B stays R18's job (it is a release number, not a rung cost).
 
 ## R06 — block 05: flash-attention band, native quantized K/V and derived kq mask · **TODO**
 

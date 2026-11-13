@@ -52,7 +52,18 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   dead weight.
 * **Questions:** read the two diffs side by side at R04; then measure prefill on a hybrid recurrent model
   (block 03's win) with the delivery path on and off on the merged tree.
-* **Status:** `OPEN` — **R04 stops here.**
+* **Status:** **`DECIDED` at R04 (2026-11-13) — upstream did not subsume the delivery; both sides ship and
+  nothing is dropped.**  `#32078` deleted *upstream's own* non-fused graph builders
+  (`build_delta_net_chunking`/`build_delta_net_autoregressive`/the chooser) and its GDN fused-node tags and
+  registry entries — all present in the old base, so none of it was delivery code.  The delivery's substance
+  survives and is the surviving implementation of the simplified path: the `n_rs_batch` argument on
+  `ggml_gated_delta_net()` (a chunked kernel may skip rollback snapshots for a batch that can never be rolled
+  back into), the pre-batch snapshot copy in `build_recurrent_attn()`, and the `gated_delta_net_chunked*.cu`
+  kernels — now reached because upstream always routes through that one fused op.  Upstream's tag deletion is
+  taken (re-adding the enum values would not compile).  Measured: `whole-batch chunked GDN prefill n=2048
+  K=1 n_seqs=1`, prefill **6908 t/s** on one R9700 (4B, 5 298-token prompt), coherence unchanged.
+  `test-recurrent-state-depth` is red on this box on the shipped r277 too (73 failures) — pre-existing and
+  config-sensitive, recorded in `RUNGS.md` R04, not a rung regression.
 
 ## D3 — KV cache types: upstream added FP8 (KV and FA)
 
@@ -66,7 +77,12 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   not a scope question.
 * **Questions:** does the merged tree expose every `{k,v}` type pair its own dispatch can reach (including
   fp8 and bf16), and does the delivery's BF16 path stay the default where measured faster?
-* **Status:** `OPEN` — R05 (audit) and R06 (FA instances).
+* **Status:** **audit PASSED at R05 (2026-11-13).**  The merged `-ctk/-ctv` set is
+  `f32 f16 bf16 f8_e4m3 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1`: the delivery's `bf16` and upstream's `f8_e4m3`
+  coexist, and on the 4B (1 GPU, `-c 4096`, seed 42) the `bf16`, `f8_e4m3` and `q8_0` arms all run and give the
+  same `sha=1c5d32ac537d`.  The BF16 FA instance is compiled in and reached.  **Still owed at R06:** the FA
+  *instance matrix* (block 05) and the FP8 vec FA instance, which is where a type can be reachable but
+  uninstantiated (`GREEDY-PURITY.md` §20).
 
 ## D4 — MMVF: upstream dispatches BF16 to MMVF for few rows at small batch
 
