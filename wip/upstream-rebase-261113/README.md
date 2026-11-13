@@ -1,10 +1,13 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R08 done 2026-11-13 (blocks 00-07); R09 (block 08, fused kernels) is next.**  `D17`
+**Status: OPEN — R00..R09 done 2026-11-13 (blocks 00-08); R10 (block 09, host-resident MoE) is next.**  `D17`
 (the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
 the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
 R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
-point is **`4f9dfa0e3`**.
+point is **`4f9dfa0e3`**.  **Open finding `D5-a`** (found at R09): upstream's new FA heads 40/72 have no
+`fattn-mma-f16` instantiation in the merged instance matrix (32 undefined symbols in the backend library);
+it does not block the climb, but it blocks every gate that links a driver (`gate-norm-rows-alias.sh`, owed at
+R11) until it is repaired, and the maintainer decides because it changes block 05's artifact.
 
 This campaign is a **ladder climb**, not a single rebase: one rung per delivery block, each rung ending in
 a resolved commit, a green build and a coherence run, so a session can stop after any rung and the next one
@@ -123,8 +126,8 @@ bound: the probe chained through marker-carrying trees).
 | 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **DONE** — `D5` FA half complementary: union instance matrix + upstream's `DKQp`/`DVp`; 6996/0 FA oracle |
 | 2 | R07 | 06 MMB prefill | 1 | **DONE** — our blocks on upstream's refactored MMVF/fusion predicates; MMB on, 6915 t/s prefill |
 | 2 | R08 | 07 k-quant boosts | 2 | **DONE** — graph-reuse union + test-matrix union; MUL_MAT 2681/0 |
-| 3 | R09 | 08 fused kernels | 7 | **NEXT** — analysed (conflict table in `RUNGS.md`); **`D6`** + **`D12`** (`norm.cu` dual-store merge, needs its own build+gate cycle) |
-| 3 | R10 | 09 host-resident MoE | 8 | **`D1`** (upstream moved the MoE cache out of `llama-graph`), `D9`, `D15`, `D17` |
+| 3 | R09 | 08 fused kernels | 7 | **DONE 2026-11-13** — 7 conflicts (6 union + the `D12` dual-store merge); coherence `1c5d32ac537d`, `MUL_MAT_ID` 1056/0, `gate-hc-fusions` PASS; **found `D5-a`** (FA heads 40/72 uninstantiated, an R06 gap) and reassigned the rows gate to R11 |
+| 3 | R10 | 09 host-resident MoE | 8 | **NEXT** — **`D1`** (upstream moved the MoE cache out of `llama-graph` — a stop-and-ask), `D9`, `D15`, `D17`, `D18` |
 | 4 | R11 | 10 infrastructure | 10 | `D6`, `D8` (prune/`llama-ext.h`), `D10` (scheduler upload/prefetch) |
 | 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
 | 4 | R13 | 12 campaign remainder | 4 | `D10` (backend upload/prefetch), `D15` (external PLE) |
@@ -138,7 +141,8 @@ Rung mechanics, per-rung conflict file lists and the resume command: [`RUNGS.md`
 
 ## §3  Decision points
 
-Nineteen upstream/delivery questions are registered in [`DECISIONS.md`](DECISIONS.md).  The ones that can
+Nineteen upstream/delivery questions are registered in [`DECISIONS.md`](DECISIONS.md) (plus **`D5-a`**, opened at
+R09 by what R06's FA proof did not check).  The ones that can
 **drop delivery code** are `D2` (GDN graph pruning), `D5` (FA restructure + FP8), `D6` (graph state move),
 `D7` (MTP hidden-state device buffer), `D9` (mmap/Win-load rewrite) and `D12` (BF16 RMS_NORM); every one of
 them stops for a maintainer decision with a measurement in hand.  The rest are "coexist, verify the

@@ -22,7 +22,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
 | R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
 | R08 | 07 k-quant boosts | **DONE** | `626e398d2` | `D16` oracle green |
-| R09 | 08 fused kernels | **NEXT — conflict analysis done, branch clean** | — | `D6`, `D12` |
+| R09 | 08 fused kernels | **DONE 2026-11-13 (merge+build+coherence+gates); the FA instance gap it exposed is `D5-a`, AWAITING** | `a95c0497b` | `D6` (partial), **`D12` resolved**, **`D5-a` found** |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
 | R12 | 11 qwen4exp | **TODO** | — | `D11` |
@@ -272,7 +272,18 @@ rather than a fallback.
 **`D4`** (MMVF BF16 few-row) did not conflict at this rung — `#31959`'s dispatch sits beside the delivery's
 without overlap; the few-row A/B stays a R18 `llama-bench` arm.
 
-## R09 — block 08: fused kernels · **NEXT** (analysed 2026-11-13; not begun — left clean for a fresh session)
+**AMENDMENT 2026-11-13 (found at R09, `D5-a`):** the `D5` proof above is incomplete — the instance matrix is
+missing `fattn-mma-f16` instantiations for upstream's new **heads 40 and 72**, which leaves 32 undefined
+`ggml_cuda_flash_attn_ext_mma_f16_case<40|72,...>` symbols in `libggml-hip.so`, while `fattn.cu` still
+dispatches both heads.  The check quoted above ("`ls | grep -c dkq40/dkq72` = 16") counted the **tile**
+instances, not the mma ones; the gate that caught it is a *link*, not the FA oracle (the 6996 cases pass
+because they route heads 40/72 through the tile/vec kernels on this build).  Also: the merged
+`generate_cu_files.py` still writes the **head-agnostic** mma instance files while the tree ships the delivery's
+126 typed ones, so re-running it in-tree would delete them.  Full evidence, scope and the two repair options
+are in the `R09 result` section (`D5-a`); the repair is **AWAITING** the maintainer because it changes block
+05's artifact.
+
+## R09 — block 08: fused kernels · **DONE 2026-11-13**
 
 * block sha `7f1ed0723` · 38 files · **expected conflicts: 7**
 
@@ -307,6 +318,100 @@ Two traps for the next session:
 * the `mmq.cu` assert is load-bearing history (issue #241: upstream's assert aborted every model it fired on).
   Keep the delivery's narrowed form and re-verify with `test-backend-ops -o MUL_MAT_ID` (the routed fusion
   arm) plus `gate-hc-fusions.sh`.
+
+### R09 result: `a95c0497b`
+
+38 files, +12 271 / −1 406 applied onto `626e398d2` (block 08's tree; the rung also carries the three
+`mmq-instance-q{3,4,5,6}_k`/`q8_0`/`generate_cu_files.py` edits of the block).  Build green with the canonical
+`GGML_HIP_NO_VMM=OFF` recipe (only the pre-existing `ld.lld` unroll notes plus two pre-existing
+`mmb.cu` `nodiscard` warnings); coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 ->
+**100 chars `sha=1c5d32ac537d`**; `git grep -I '<<<<<<<'` empty; no `TODO(rebase)`.
+
+**First-error pass (as predicted):** the build failed once on `mmvq.cu:2492` — `src1_q8_1` undeclared.  Upstream
+had wrapped the Q8_1 quantize in `{ }` (the pool allocation's scope) and `mul_mat_vec_q_switch_type()` reads the
+buffer *after* that block, so keeping upstream's braces around the delivery's cache logic scoped the buffer
+away.  Resolution: drop the braces (the delivery's `src1_s11/s12/s13` names exist precisely so the scope is not
+needed) and keep the cache at function scope.  Rebuild green, then `git commit --amend` into the rung commit
+(a rung commit is not green until it builds).
+
+The pre-analysis was right about six of the seven files and about `D12`; four things differed and are recorded
+here because a later rung reads them as facts:
+
+| site | resolution (what actually shipped) |
+|---|---|
+| `common.cuh` (1 conflict) | **union**, as planned: upstream's `std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;` (constructed in `ggml-cuda.cu`, `stream_context()` returns `*ptr`) **plus** the delivery's whole per-graph Q8_1 cache block (`q8_1_cache_entry`, `q8_1_arena`/`_retired`/`_pos`, `q8_1_cache_clear()`, `q8_1_cache_get()`, `q8_1_src_range_ok()`).  The delivery's by-value `ggml_cuda_stream_context concurrent_stream_context;` context line is **not** kept — it was patch context, and upstream now owns that member as a `unique_ptr` (`D6`). |
+| `ggml-cuda.cu` (5 conflicts) | upstream's **2-arg** `ggml_cuda_should_fuse_mul_mat_vec_f(tensor, gate = nullptr)` (its merged body *does* read `gate`, so the 2-arg form is required) with the delivery's `ggml_cuda_rdna3_5_dense_glu_disabled()` helper kept **above** it; the duplicate 1-arg definition is gone.  Both fusion arms keep the delivery's guard: upstream's new `_f` arm at the three gate+up+GLU sites is guarded exactly like the delivery had already guarded the `_q` arm (`ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled()`), because the guard's subject is the *dense gate+up+GLU fusion*, not one kernel.  The plain `mm_node` `_f` sites stay unguarded (the delivery never guarded those). |
+| `mmq.cu` (1 conflict) | **not a plain take-theirs.**  Upstream now calls `ggml_cuda_mul_mat_q()` from a *no-gate* fused-scale arm (`ggml-cuda.cu`, the nvfp4 `w_s` epilogue, `#26048`: `fusion_data.x_scale = scale`, `gate == nullptr`), so the delivery's literal `GGML_ASSERT(gate && ...)` would abort a call site that did not exist at r277 — a new cross-backend abort, which the scope policy forbids.  The narrowing is kept and re-homed: `GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias);` above, and the delivery's `GGML_ASSERT(!fusion->x_scale && !fusion->gate_scale);` **inside `if (gate)`** (where it also subsumes upstream's `!x_scale == !gate_scale`), with the issue-#241 comment kept and extended.  On AMD the whole arm is NVIDIA-only anyway (`ggml_cuda_mul_mat_q_fusion_matches` ends in `turing_mma_available`), so this is consistency, not behaviour. |
+| `mmvq.cu` (1) / `quantize.cu` (1) / `quantize.cuh` (1) | mmvq: the delivery's per-graph Q8_1 cache taken whole (view-root keying, `q8_1_src_range_ok`, `GGML_ABORT` on a stale range).  quantize.cu: **union** — upstream's `quantize_mmq_few_q8_1` kernel + launcher and the delivery's `quantize_mmq_q8_1_glu_cuda` / `_swiglu_cuda` are complete independent definitions; marker removal only.  quantize.cuh: the delivery's block (`ggml_cuda_quantize_mmq_q8_1_n_chunks()`, gfx1151-only, plus the `quantize_cuda_t` typedef) — additive, no duplicate after the merge. |
+| **`norm.cu` (6 conflicts, not 3)** | **`D12` — see below.**  The probe under-counted: the `mmb.cuh`/`convert.cuh` include pair, the 4-wide store, the scalar store, the `vec` gate, the add-operand typed dispatch **and** the fused-mul launcher all conflict. |
+
+#### `D12` resolution — the dual store survives, and it is not a merge of the two stores
+
+Upstream `#32135` made `rms_norm_f32` generic in the destination type (`T * dst`, `T * dstc`,
+`rms_norm_store4()` / `ggml_cuda_cast<T>()`, `rms_norm_launch_typed()`), and it added a *typed `add` operand* arm
+(a BF16 residual).  The delivery has a **second, independent destination**: a `uint16_t *` BF16 side channel
+(`dst16` -> `dst16c`, written with `norm_f2bf`, gated by `store_f32`) that feeds the MMB/HC16 producer slots.
+Merged shape, both paths:
+
+* 4-wide: `if (store_f32) { rms_norm_store4(dstc, i, r); }` then `if (dst16c != nullptr) { dst16c[4*i + k] = norm_f2bf(r.k); }`
+  (the delivery's `dst4[i] = r` is gone; `rms_norm_store4` is the typed `dstc` writer).
+* scalar: the delivery's `float v` chain is kept, then `if (store_f32) { dstc[col] = ggml_cuda_cast<T>(v); }` and
+  `if (dst16c != nullptr) { dst16c[col] = norm_f2bf(v); }` — upstream's `xi` declaration and its
+  `ggml_cuda_cast<float>(addc[add_col])` are used inside the delivery's value chain.
+* includes: **both** `convert.cuh` (upstream's typed casts) and `mmb.cuh` (the delivery's contract/census).
+* `vec` gate: the delivery's opt-in latch `ggml_cuda_rms_norm_vec()` (issue #229 — the default reduction is the
+  one the MTP numbers and the fused norm kernels are built on) **on upstream's type-aware alignment test**
+  (`ncols % 4 == 0 && (uintptr_t) dst % (4*sizeof(T)) == 0 && ggml_cuda_is_aligned(x_t, 4*sizeof(T))`), which is
+  the correct test for a BF16 destination (8 bytes, not 16).
+* add operand + fused launcher: upstream's two typed `rms_norm_f32_dispatch<..., float/T>` arms and its
+  `rms_norm_launch_typed()` wrapper, both carrying the delivery's trailing `stream, 1.0f, dst16, store_f32`.
+  `rms_norm_mul_f32_cuda` kept default args (`dst16 = nullptr`, `store_f32 = true`), so the untouched
+  `fused_add` call site still compiles.
+* At this rung nothing fills `dst16` yet: `ggml_cuda_op_rms_norm_fused` passes `dst16 = nullptr,
+  store_f32 = true` and says the MMB copy hook is a later block's (block 15, R16).  So the side channel is
+  inert here and its gate is R16's; what R09 owes is that the merged kernel is *bit-identical to upstream*
+  on the delivery's default path, which the coherence hash shows.
+
+#### Verification
+
+| arm | result |
+|---|---|
+| build (`~/bin/build-llama-rocm`, VMM=OFF, gfx1201) | green |
+| coherence, 4B Q8_0, 1 GPU, `-sm layer`, seed 42, no `-lv` | **100 chars `sha=1c5d32ac537d`** (unchanged since R01) |
+| `test-backend-ops -o MUL_MAT_ID` | **1056/1056 OK** (up from 1040 at R01: upstream's matrix grew).  This is the arm that exercises the routed gate/up fusion the `mmq.cu` assert guards. |
+| `gate-hc-fusions.sh` (qwen4exp `Flash-Next/GSQ-IQ3_XXS`, BF16-hc class) | **PASS** — all 7 arms byte-identical to the chain+chain reference, `444 chars sha=a512ee68c4b3`, no GPU fault.  The bf16 side channel's producer slots are these arms. |
+| `gate-norm-rows-alias.sh` | **NOT OWED AT THIS RUNG — reassigned to R11** (see below). |
+
+Two findings from those arms:
+
+1. **The `norm-rows` gate is R11's, not R09's.**  `scripts/gate-norm-rows-alias.sh` guards the *r225 narrow-row*
+fusion (`ggml_cuda_norm_rows_try_fuse`, `norm_rows_alias_conflict`, the `norm-rows: i=...` decision lines, the
+`GGML_CUDA_NORM_ROWS_DEBUG` census) — and **none of that is in the tree at R09**: `grep -rn 'norm-rows:'` finds
+nothing, and block 08's `norm-gated.cu` is the *other, smaller* norm fusion (`ggml_cuda_norm_gated_match_at` /
+`ggml_cuda_norm_rows_match_at` / `ggml_cuda_op_norm_gated`, dispatched from `ggml-cuda.cu`, silent).  The rows
+gate's code arrives with block 10 (R11).  Replicated sections B/C by hand anyway (Ling-3.0-tiny, `-c 8192`, the
+5 228-token prompt): fused vs `GGML_CUDA_DISABLE_NORM_ROWS=1` text is **identical, 177 chars
+`sha=06e380d7475f`** (prompt 5228.7 / 5284.9 t/s, generation 153.1 / 152.8 t/s) — i.e. the kill switch is
+neutral on that model and the block-08 norm fusion is inert-by-shape there.  No census exists at this rung to
+say more; R11 owns the real oracle.
+2. **`D5-a` — the merged FA instance matrix has no `fattn-mma-f16` instantiation for heads 40 and 72, and that is
+an R06 gap, not an R09 one.**  Found because the norm-rows gate's section A *links* a driver against
+`libggml-hip.so` and the link now fails on 32 undefined symbols (`ggml_cuda_flash_attn_ext_mma_f16_case<40,40,...>`
+× 16 `ncols1/ncols2` combos and `<72,72,...>` × 16).  Evidence: `nm -D --undefined-only` shows **0** such
+symbols on `build-rocm/bin-r277/libggml-hip.so` and on the pristine `build-rocm-base2` (upstream), **32** on the
+R09 build; `git ls-tree` shows 0 typed mma instance files for `dkq40`/`dkq72` at **both** `626e398d2` (R08) and
+`a95c0497b` (R09), and block 08 touches no `fattn*` file — so the hole is R06's, and it is a reachable-but-
+uninstantiated kernel case (`GREEDY-PURITY.md` §20: `fattn.cu` still has `case 40:`/`case 72:` and
+`fattn-mma-f16.cuh` still declares both), i.e. a crash on a head-dim-40/72 model, none of which the delivery
+validates today (4B/35B-A3B/Flash-Next are all head 128).  R06's `D5` proof is what needs correcting: its check
+"`ls | grep -c dkq40/dkq72` = 16" counted **tile** instances (`fattn-tile-instance-dkq40-dv40-*`, 8 + 8), not mma
+ones.  Second half of the same gap: the merged `generate_cu_files.py` still emits **head-agnostic**
+`fattn-mma-f16-instance-ncols1_*-ncols2_*.cu` files (25 of them, heads 40..256 — verified by running it in an
+empty temp dir) while the tree ships the delivery's **126 typed** `...-dkqN-dvN.cu` files, so re-running the
+generator in-tree would delete all 126 and silently revert block 05's instance matrix.  Registered as **`D5-a`**
+in `DECISIONS.md`, **AWAITING** the maintainer (repair is additive: declare heads 40/72 in the typed set, or
+restore upstream's generator loop on the union head list — but it changes block 05's artifact, so it is not a
+campaign-autonomous change).
 
 ## R10 — block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine) · **TODO**
 

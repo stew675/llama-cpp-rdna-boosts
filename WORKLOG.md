@@ -1,3 +1,49 @@
+## 261113.005 (r277 + campaign rung R09, NO delivery change) -- R09 lands (block 08, fused kernels): the BF16 RMS_NORM **dual store** survives `#32135`, and the merged FA instance matrix is missing heads 40/72 (`D5-a`, AWAITING)
+
+**No patch changes, no `release.json` change.**  Rung R09 of the `4f9dfa0e3` climb: block 08 replayed onto
+`rebase-r278`, resolved, built and verified.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` (`R09 result`).
+
+* **Rung commit `a95c0497b`** (block 08 `7f1ed0723`; build green with `GGML_HIP_NO_VMM=OFF` on gfx1201; coherence
+unchanged on the 4B -- **100 chars `sha=1c5d32ac537d`**; `test-backend-ops -o MUL_MAT_ID` **1056/1056**;
+`gate-hc-fusions.sh` **PASS**, all 7 arms byte-identical, 444 chars `sha=a512ee68c4b3`).
+* **`D12` (BF16 RMS_NORM) DECIDED, and nothing is collapsed.**  Upstream `#32135` made `rms_norm_f32` generic in
+the destination type (`T * dst`, `rms_norm_store4()`, `ggml_cuda_cast<T>()`, `rms_norm_launch_typed()`) and added
+a typed `add` operand.  The delivery's `uint16_t * dst16` / `norm_f2bf` side channel feeds the MMB/HC16 producer
+slots and is a write to a *different buffer*, so it cannot be expressed as upstream's typed destination: both
+paths now do `if (store_f32) { rms_norm_store4(dstc, i, r); }` **and then** `if (dst16c) { ... }`, with both
+`convert.cuh` and `mmb.cuh` included and the `vec` gate keeping the delivery's opt-in latch on upstream's
+type-aware alignment test.  Nothing fills `dst16` until block 15, so the side channel is inert here (its gate is
+R16's); what this rung had to prove is that the merged kernel is bit-identical to upstream on the default path,
+which the coherence hash shows.
+* **`mmq.cu` was not a plain take-theirs.**  Upstream's new **no-gate fused-scale** arm (`ggml-cuda.cu`, the nvfp4
+`w_s` epilogue from `#26048`) calls `ggml_cuda_mul_mat_q()` with `gate == nullptr`, so the delivery's literal
+`GGML_ASSERT(gate && ...)` would newly abort a call site that did not exist at r277 -- a cross-backend abort the
+scope policy forbids.  The issue-#241 narrowing is kept and re-homed *inside* `if (gate)` instead (AMD never
+reaches that arm at all: the fused-MMQ match ends in `turing_mma_available`).
+* **Finding `D5-a` (new, AWAITING): the merged FA instance matrix has no `fattn-mma-f16` instantiation for
+upstream's new heads 40 and 72.**  `libggml-hip.so` carries **32 undefined**
+`ggml_cuda_flash_attn_ext_mma_f16_case<40|72,...>` symbols (0 on the r277 build and 0 on the pristine base), while
+`fattn.cu` still dispatches both heads -- a reachable-but-uninstantiated kernel case (`GREEDY-PURITY.md` §20, a
+crash on a head-dim-40/72 model; none of the delivery's own models are).  It is an **R06** gap, not R09's
+(`git ls-tree` shows no `dkq40`/`dkq72` mma instance at R08 either; block 08 touches no `fattn*` file), and it is
+what R06's `D5` proof did not check: its "`ls | grep -c dkq40/dkq72` = 16" counted the **tile** instances
+(`fattn-tile-instance-dkq40-dv40-*`), not the mma ones.  Second half of the same gap: the merged
+`generate_cu_files.py` still emits the **head-agnostic** mma files while the tree ships the delivery's **126 typed**
+ones, so re-running it in-tree would delete all 126 and silently revert block 05's matrix.  Repair is additive
+(declare 40/72 in the 16 typed ncols files, and/or restore the generator loop on the union head list) but it
+changes block 05's artifact, so the maintainer decides; it does not block the climb, but it blocks every gate
+that **links a driver** against the backend library.
+* **Verification correction:** `gate-norm-rows-alias.sh` is **not** R09's gate.  The r225 narrow-row fusion
+(`ggml_cuda_norm_rows_try_fuse`, `norm_rows_alias_conflict`, the `norm-rows:` census) is block 10's code and is
+absent at R09 -- block 08's `norm-gated.cu` is the other, smaller norm fusion and is silent.  The gate is
+reassigned to **R11**; its sections B/C were replicated by hand anyway (Ling-3.0-tiny: fused vs
+`GGML_CUDA_DISABLE_NORM_ROWS=1` text **identical, 177 chars `sha=06e380d7475f`**).  Section A is blocked by `D5-a`
+until it is repaired.  Also noted for the r236 record: on this base the DSV4 HC pre/post ops are **byte-identical
+to their chain** (`a512ee68c4b3`), so the r236 numeric `SOFT_EXPECT` anchor `6a102dbc62d6` no longer describes them.
+* **Climb state:** R00..R09 done (blocks 00-08) on `rebase-r278` at `a95c0497b`.  **Next: R10 = block 09
+(host-resident MoE)**, whose `D1` is a genuine stop-and-ask (upstream moved the MoE cache out of `llama-graph`
+into `llama-moe-cache.{cpp,h}`).
+
 ## 261113.004 (r277 + campaign start, NO delivery change) -- the re-base to `4f9dfa0e3` opens as a ladder climb: campaign, probe, decision register and branch `rebase-r278`
 
 **No patch changes, no `release.json` change.**  This is the start of the next re-base campaign (`BASELINE.md`

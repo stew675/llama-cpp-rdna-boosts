@@ -13,10 +13,10 @@ conflict map is in [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 |---|---|
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `626e398d2`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R08 done = blocks 00-07**; next is **R09 = block 08 (fused kernels)** |
-| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) |
-| canonical build | `~/llama.cpp/build-rocm` — R07/R08 tree, `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `a95c0497b`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
+| progress | **R00-R09 done = blocks 00-08**; next is **R10 = block 09 (host-resident MoE)** |
+| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) |
+| canonical build | `~/llama.cpp/build-rocm` — R09 tree, `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
 | coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 |
@@ -34,13 +34,13 @@ cd ~/llama.cpp        && git status --short --branch && git log --oneline -3
 cd ~/llama-cpp-rdna-boosts && git log --oneline -3 && sed -n '1,40p' wip/upstream-rebase-261113/RUNGS.md
 ```
 
-Expect: `rebase-r278` clean at `626e398d2`, no `CHERRY_PICK_HEAD`
+Expect: `rebase-r278` clean at `a95c0497b`, no `CHERRY_PICK_HEAD`
 (`ls ~/llama.cpp/.git/CHERRY_PICK_HEAD` must fail), delivery on `rebase-261113`.
 
-Then read, in this order: **this file** -> [`RUNGS.md`](RUNGS.md) §R09 + the pre-analysis at its end ->
-[`DECISIONS.md`](DECISIONS.md) `D6`/`D12` (the R09 items) -> [`README.md`](README.md) §1 (rung mechanics) and
-§3-§4 (decision policy + release ladder).  `BASE-BLOCKER.md` is history now (`D17` decided) but explains why
-block 00 carries a revert.
+Then read, in this order: **this file** -> [`RUNGS.md`](RUNGS.md) `R10` + the `R09 result` section ->
+[`DECISIONS.md`](DECISIONS.md) `D1`/`D9`/`D15`/`D17`/`D18` (the R10 items) and **`D5-a`** (the open finding
+R09 handed over) -> [`README.md`](README.md) §1 (rung mechanics) and §3-§4 (decision policy + release ladder).
+`BASE-BLOCKER.md` is history now (`D17` decided) but explains why block 00 carries a revert.
 
 ---
 
@@ -111,8 +111,8 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R06 | 05 flash attention | DONE | `22fcde21e` | `D5` FA half complementary; 6996/0 FA oracle; union instance matrix |
 | R07 | 06 MMB prefill | DONE | `c1d8b7c04` | our blocks on upstream's MMVF/fusion predicates; MMB census 6915 t/s |
 | R08 | 07 k-quant boosts | DONE | `626e398d2` | graph-reuse union; `MUL_MAT` 2681/0 (`D16`) |
-| **R09** | **08 fused kernels** | **NEXT** | — | **7 conflicts, analysed — see §5.4**; `D6`, `D12` |
-| R10 | 09 host-resident MoE | TODO | — | 8 conflicts; `D1`, `D9`, `D15`, `D17`, `D18` |
+| **R09** | **08 fused kernels** | **DONE** | `a95c0497b` | 7 conflicts resolved; **`D12` dual store kept**, `D6` partial; **found `D5-a`** (heads 40/72 have no mma instance — R06 gap, AWAITING) |
+| R10 | 09 host-resident MoE | TODO | — | 8 conflicts; **`D1` (stop-and-ask)**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | TODO | — | 10 conflicts (biggest); `D6`, `D8`, `D10`; **owes `gate-node-budget.sh`** |
 | R12 | 11 qwen4exp | TODO | — | 5 conflicts; `D11`; owes `gate-hc-fusions.sh`, `gate-qwen4exp-quant-coherence.sh` |
 | R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15` |
@@ -126,7 +126,7 @@ table).  Every gate that hashes text passes no `-lv` at all.
 rebased earlier ones, so the order is not negotiable):
 
 ```
-R09 7f1ed0723   R10 495d00d45   R11 05f298fea   R12 ea4963486   R13 c7628e974
+R10 495d00d45   R11 05f298fea   R12 ea4963486   R13 c7628e974
 R14 f0c7f3359   R15 6b4d9865e   R16 99d33117a   R17 9d7c0502c
 ```
 
@@ -162,23 +162,21 @@ case sit beside it.  Two things were learned that matter later:
 * the box's `GGML_CUDA_FA_QUANTS` cache now carries the union list (`…;iq4_nl-iq4_nl;f8_e4m3-f8_e4m3`), so
   the r277-era "hand-set iq4_nl" trap no longer bites.
 
-### §5.4 R09 (block 08) — the analysed next rung
-`git cherry-pick 7f1ed0723` gives **7 conflicted files**.  Do not start it without reading the full
-pre-analysis table at the end of `RUNGS.md` §R09.  Summary:
+### §5.4 R09 (block 08) — the last rung, DONE at `a95c0497b`
+The full result, the six `norm.cu` conflict resolutions and the verification table are in
+[`RUNGS.md`](RUNGS.md) `R09 result`.  The three facts a later rung needs:
 
-| path | resolution |
-|---|---|
-| `ggml/src/ggml-cuda/common.cuh` | **union**: upstream's `concurrent_stream_context` pointer **and** the delivery's `q8_1_cache_entry` / per-graph Q8_1 cache block. |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` (5) | keep the delivery's `ggml_cuda_rdna3_5_dense_glu_disabled()` guard, but on **upstream's 2-arg** `ggml_cuda_should_fuse_mul_mat_vec_f(tensor, gate = nullptr)`; adapt call sites to `(up_n, gate_n)`; check for a duplicated definition after the merge. |
-| `ggml/src/ggml-cuda/mmq.cu` (1) | **theirs**: the delivery's narrowed fusion assert (`gate && !x_bias && !gate_bias && !x_scale && !gate_scale` + the issue-#241 comment).  Load-bearing: upstream's form aborted every model it fired on. |
-| `ggml/src/ggml-cuda/mmvq.cu` (1) | **theirs**: per-graph Q8_1 cache (`ctx.q8_1_cache_get`, view-root keying, `q8_1_src_range_ok`).  Check the `quantize_row_q8_1_cuda` call still matches upstream `#31533`. |
-| `ggml/src/ggml-cuda/quantize.cu` (1) | likely **union**: upstream's new `quantize_mmq_few_q8_1` beside the delivery's quantizers. |
-| `ggml/src/ggml-cuda/quantize.cuh` (1) | **theirs**: `ggml_cuda_quantize_mmq_q8_1_n_chunks(cc)` (gfx1151-only chunking, ~1.5x measured). |
-| `ggml/src/ggml-cuda/norm.cu` (3) | **`D12` — the real merge.**  Upstream `#32135` rewrote BF16 RMS_NORM around `rms_norm_store4()` with a typed `T` destination; the delivery has a **dual store** (`store_f32` -> `dstc`, plus a `dst16c`/`norm_f2bf` BF16 side channel that feeds the HC16 producer slots).  Merge as `if (store_f32) { rms_norm_store4(...) }` **+** `if (dst16c) { ... }` in both the 4-wide and the scalar path, and keep both includes (`convert.cuh` **and** `mmb.cuh`).  Never collapse the two stores into one. |
-
-After the build: **`scripts/gate-norm-rows-alias.sh`** and **`scripts/gate-hc-fusions.sh <qwen4exp model>`**
-are owed (the bf16 side channel *is* the HC16 producer), plus `test-backend-ops -o MUL_MAT_ID` for the routed
-fusion assert.  Expect a first-build error pass like R06's (`DKQp`/`DVp`-style): fix, rebuild, then gate.
+* **`D12` merged as a dual store, not a collapse**: `if (store_f32) { rms_norm_store4(dstc, i, r); }` **and**
+  `if (dst16c) { ... norm_f2bf ... }`, in *both* the 4-wide and the scalar path, with both `convert.cuh` and
+  `mmb.cuh` included.  Nothing fills `dst16` until block 15, so the side channel is inert and its gate is R16's.
+* **`mmq.cu` did not become a plain take-theirs**: upstream's new **no-gate fused-scale** arm
+  (`ggml-cuda.cu`, nvfp4 `w_s`) calls `ggml_cuda_mul_mat_q()` with `gate == nullptr`, so the delivery's literal
+  `GGML_ASSERT(gate && ...)` would abort it.  The narrowing is kept *inside `if (gate)`* instead.
+* **`gate-norm-rows-alias.sh` is R11's, not R09's** — the r225 narrow-row fusion and its `norm-rows:` census
+  are block 10's code and are absent at R09.  It is also blocked until **`D5-a`** is repaired, because its
+  section A links a driver against `libggml-hip.so` and the merged matrix leaves 32 FA case symbols undefined.
+  `D5-a` (heads 40/72 have no `fattn-mma-f16` instantiation; the generator disagrees with the tree) is an **R06**
+  gap, is **AWAITING** the maintainer, and does not block the climb.
 
 ---
 
@@ -190,14 +188,14 @@ fusion assert.  Expect a first-build error pass like R06's (`DKQp`/`DVp`-style):
 | `D2` GDN pruning | **DECIDED** complementary (R04) |
 | `D3` FP8/BF16 KV types | **CLOSED** (R05 audit + R06 FA oracle) |
 | `D4` MMVF BF16 few-row | **DEFERRED to R18** (no rung conflict; a `llama-bench` arm) |
-| `D5` FA + few-row MMQ | **DECIDED** FA half (R06); few-row half **deferred to R18** |
-| `D6` graph/stream state moved to `graph.cuh` | **OPEN** — R09/R11 |
+| `D5` FA + few-row MMQ | **DECIDED** FA half (R06); few-row half **deferred to R18**; **`D5-a` (heads 40/72 have no mma instance) found at R09 — AWAITING** |
+| `D6` graph/stream state moved to `graph.cuh` | **PARTIAL** — R09: the move landed and no delivery hook had to follow it (block 08's hooks are `ggml_backend_cuda_context` members, which stayed in `common.cuh`); the cluster-dim key is verified at R11 |
 | `D7` MTP device-buffer hidden state | **MEASURED/DECIDED** (R03): activates on `-sm layer`, declines on `-sm tensor` ("the device has no events" — the Meta device has no `event_new`) and falls back to the delivery's host path.  Upstream-gap note: give the Meta device events (an `upstream/` candidate).  Re-verify at R14. |
 | `D8` the prune | **MECHANICAL/OPEN**: it also removes *includes* — a build break, not a conflict (§8 trap 4).  Blocks 10/11 will hit it. |
 | `D9` mmap / Win-load / lazy-mode | **PARTIAL** — R01 resolved the only conflict; the substantive questions (does `--lazy-mode mlock` still pin the PLE table? does the iGPU gating change the fallback?) are verified at R10/R17 |
 | `D10` scheduler upload/prefetch/graph-result | **OPEN** — R11/R13 |
 | `D11` `ggml.c`/RPC/test refactors | **OPEN** — R12/R13 |
-| `D12` BF16 RMS_NORM | **OPEN — R09** |
+| `D12` BF16 RMS_NORM | **DECIDED at R09** — dual store kept (both destinations ship), upstream's typed `dstc` writer + the delivery's bf16 side channel; the rows gate is R11's, the side channel's own gate is R16's |
 | `D13` HIP BLAS workspace | **CHECKED** (R02) |
 | `D14` GDN/SSM kernels | **CHECKED** (R04) |
 | `D15` external PLE | **OPEN** — R10/R16 |
