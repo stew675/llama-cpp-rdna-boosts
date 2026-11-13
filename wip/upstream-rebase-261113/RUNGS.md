@@ -21,8 +21,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R05 | 04 BF16 KV | **DONE** | `4c6a5019a` | `D3` checked |
 | R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
 | R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
-| R08 | 07 k-quant boosts | **NEXT** | — | `D4`, `D16` |
-| R09 | 08 fused kernels | **TODO** | — | `D6`, `D12` |
+| R08 | 07 k-quant boosts | **DONE** | `c6a2f6f31` | `D16` oracle green |
+| R09 | 08 fused kernels | **NEXT** | — | `D6`, `D12` |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
 | R12 | 11 qwen4exp | **TODO** | — | `D11` |
@@ -250,7 +250,7 @@ delivery-vs-upstream few-row *measurement* (BS 2-24) is a release A/B, so it is 
 `llama-bench` arms rather than decided at this rung.  **Prefill-logit gate for this block is owed at R18**
 (the rung's base record does not exist yet).
 
-## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) · **TODO**
+## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) · **DONE 2026-11-13**
 
 * block sha `42c96a0ea` · 9 files · **expected conflicts: 2**
 
@@ -259,8 +259,18 @@ delivery-vs-upstream few-row *measurement* (BS 2-24) is a release A/B, so it is 
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `0fb8f1577` few-row MMQ, `494d0f47b` src1-precision gating, `5d4c8eeb2` MoE tiles. |
 | `tests/test-backend-ops.cpp` | `494d0f47b`/`03d6c824e` reworked the MUL_MAT oracle. |
 
-**Expect:** **`D4`** (MMVF BF16 few-row — measure against the delivery dispatch) and **`D16`** (the
-src1-precision gate must reach our path, not a fallback).
+**R08 result: `c6a2f6f31`** — 9 files, +372 / −36.  Build green; coherence unchanged
+(`sha=1c5d32ac537d`).  **`D16` oracle: `test-backend-ops -o MUL_MAT` 2681 OK / 0 FAIL** — upstream's
+src1-precision gating passes with the delivery's MMQ/MMVQ dispatch, so the gate reaches the delivery's path
+rather than a fallback.
+
+| conflicted hunk | resolution |
+|---|---|
+| `ggml_cuda_graph_evaluate_and_capture` graph-reuse gate | **union**: the delivery's `!op_timing` condition plus upstream's `#15759e0ca` reuse short-circuit (`graph_reused = cgraph->uid != 0 && cgraph->uid == graph->uid`; `graph_compatible = graph_reused || check_compability(...)`).  Both matter: op-timing instrumentation cannot capture, and a reused graph must not re-run the compat check. |
+| `tests/test-backend-ops.cpp` MUL_MAT matrix | **union** of the batch sizes (`1,4,5,6,7,8,32,64,128,256,512` — the delivery's 5/6/7 are the mmvq-VDR widths) and of the type lists (upstream's Q2_K/Q3_K **and** the delivery's Q5_K). |
+
+**`D4`** (MMVF BF16 few-row) did not conflict at this rung — `#31959`'s dispatch sits beside the delivery's
+without overlap; the few-row A/B stays a R18 `llama-bench` arm.
 
 ## R09 — block 08: fused kernels · **TODO**
 

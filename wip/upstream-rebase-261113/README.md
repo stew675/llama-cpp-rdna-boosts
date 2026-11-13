@@ -1,6 +1,6 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R07 done 2026-11-13 (blocks 00-06); R08 (block 07, k-quant boosts) is next.**  `D17`
+**Status: OPEN — R00..R08 done 2026-11-13 (blocks 00-07); R09 (block 08, fused kernels) is next.**  `D17`
 (the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
 the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
 R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
@@ -122,8 +122,8 @@ bound: the probe chained through marker-carrying trees).
 | 1 | R05 | 04 BF16 KV | **0** | **DONE** — clean; `D3` audit passed (bf16 + f8_e4m3 + q8_0 all coherent) |
 | 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **DONE** — `D5` FA half complementary: union instance matrix + upstream's `DKQp`/`DVp`; 6996/0 FA oracle |
 | 2 | R07 | 06 MMB prefill | 1 | **DONE** — our blocks on upstream's refactored MMVF/fusion predicates; MMB on, 6915 t/s prefill |
-| 2 | R08 | 07 k-quant boosts | 2 | **NEXT** — `D16` (MUL_MAT src1 precision gating), `D4` |
-| 3 | R09 | 08 fused kernels | 7 | **`D6`** (graph state left `common.cuh`) + **`D12`** (BF16 RMS_NORM) |
+| 2 | R08 | 07 k-quant boosts | 2 | **DONE** — graph-reuse union + test-matrix union; MUL_MAT 2681/0 |
+| 3 | R09 | 08 fused kernels | 7 | **NEXT** — **`D6`** (graph state left `common.cuh`) + **`D12`** (BF16 RMS_NORM) |
 | 3 | R10 | 09 host-resident MoE | 8 | **`D1`** (upstream moved the MoE cache out of `llama-graph`), `D9`, `D15`, `D17` |
 | 4 | R11 | 10 infrastructure | 10 | `D6`, `D8` (prune/`llama-ext.h`), `D10` (scheduler upload/prefetch) |
 | 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
