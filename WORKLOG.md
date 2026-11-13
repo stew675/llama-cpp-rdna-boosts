@@ -1,3 +1,70 @@
+## 261113.002 (r276, docs + tooling, NO delivery change) -- `TODO` #316 closes both halves: the APU device-pool probe and the owed gfx1201 fusion-alias run; `TODO` #282's detail restored, block 16's carried-forward list dissolved into rows
+
+**No patch changes, no `release.json` change** (`validate-set.sh`/`re-cut` untouched): this is the tracker repair
+plus the two gate defects `TODO` #316 carried since r264, and both are now closed on evidence rather than on an
+argument.
+
+**#316 half (a) -- `gate-prefill-logits.sh` could not select a model on an APU.**  `vram_gib()` read
+`/sys/class/drm/card*/device/mem_info_vram_total`, and an integrated GPU reports its VRAM **carve-out** there
+(`halo`: **2 GiB** against a 123.5 GiB machine pool), so the gate died with `no auto model found (set MODEL);
+biggest single card = 2 GiB` and `fork-refresh.sh --gates` could not run it -- the r264/r266 releases were gated by
+running the A/B by hand.  It is now `device_pool_gib()`: a card with a real VRAM figure (>= 8 GiB) is sized by that
+figure, a carve-out is sized by **`mem_info_gtt_total`** (the pool the device actually reads), and **a discrete card
+wins over a co-resident iGPU** so a model the card cannot hold is never chosen.  The integrated test is the PAIR
+(small VRAM *and* `gtt > 4 x vram`), because a discrete R9700 exposes a 45 GiB GTT window of its own -- `gtt > vram`
+alone would have mis-classified every card on `soar`.  Measured: `soar` **31 GiB** (unchanged -> still the 27B
+Q8_0), `halo` **121 GiB** (was the 2 GiB carve-out).  Verified end to end on `halo`: `--record --chunks 2
+--base-dir /tmp/ppl-base-smoke` auto-selected `Qwen3.8-27B-Q8_0`, base PPL **6.0676**, candidate **mean KLD
+0.000000 / same top p 100.000 %**, PASS.
+
+**#316 half (b) -- the gfx1201 run `gate-fusion-alias-copy.sh` was owed is done, and it PASSES.**
+`scripts/gate-fusion-alias-copy.sh` on `soar` against the r275 release tree (`378256be4`): all 7 arms, every text arm
+**`3fab4da87774`** (A fused == A chain == A `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` == B `MOE_HOST_POOL_FILL_FAULT=200`
+== C production anchor), A's trace logs `GLU<-NONE/copy@268435456` (the arm really reaches a compute-buffer leaf
+overlap, so the comparison is not vacuous), C logs 1 distinct declined alias class, `check-gpu-faults.sh` clean on
+kernel and on all 7 logs.  So the r266 prefill-in-place change's "every fusion stands down for a remap-served table"
+now rests on an **executed gate on gfx1201**, not only on `moe_cache_table_serves()` being identity-only.  The gate
+stays INERT on `halo` (gfx1151): `-ub 14` is outside that arch's MMVQ MoE band and the arms fail identically on an
+unmodified build, which is why the run was owed on this box.
+
+**Docs repaired (`TODO.md`, and the tracker is now internally consistent).**  Three defects, all from the **r266**
+commit `b99223b5`, whose single hunk `@@ -211,356 +211,23 @@` deleted 356 lines to add 20:
+
+1. **`TODO` #282's detail section was deleted while the item stayed OPEN.**  Its table row is still `OPEN` and the
+   newest `gate-host-pool.sh` runs still call it "the known `pinlate` WARN, unchanged", so the section is restored
+   **verbatim** from `575dde3c:TODO.md` and the row's `-- §282` resolves again.  (`#282` is unchanged otherwise: a
+   ~1e-5 mixture path difference, two orders inside the tolerance.)
+2. **The whole `## Documented, deliberately NOT fixed` block went with it** (attendance pool on an APU `#300`; the
+   `MOE_HOST_POOL_RANK=decode` `-npl 4/8` regression `#275`; the Windows pinned-host ceiling, which never had a
+   handle).  Only `#141` came back, at r274.  All three are restored as accepted limitations with their numbers and
+   their `ARCHIVE`/`ENVIRONMENT.md` pointers.
+3. **`### Block 16 ... carried forward` sat ABOVE the index table** in bullet form, with a struck-through DONE item,
+   two open `TODO` #316 defects (now closed above), and five unnumbered carried-forward items.  It is gone: `#316`
+   closes, `#319` opens for the lock-policy band (the refusal is the SAFE branch -- the load throws before a byte
+   is read, so the "arena declines, placement over-commits" combination is not reachable; relaxing it needs arms on
+   a >RAM APU model with `ulimit -l` inside `[shortfall, arena_min)`, which no box here is configured for), `#320`
+   is the parked drafter-head sizing, and the rest lands in accepted limitations: multi-device is untested
+   (**re-entry: a multi-APU host**), Windows declines by design, and block 16's owed `llama-batched-bench -npl
+   1,4,8` width arm is **not owed for this tier** (the store/arena is inert on a discrete GPU by measurement --
+   zero `GTT` lines with the envs forced on -- so that arm cannot witness it; the width arm belongs to blocks
+   12/15 and the MTP protocol).
+4. Also: **probe 15 closes on the campaign's own simulator** (the Nth-touch admission the delivery ships is
+   predicted *worse* on this tier at every slot count -- -1.9 pts at S=56, -3.8 at S=133 -- and the tier already
+   implements the predicted-best policy, so the probe has nothing left to set); the `## Handle numbering` note is
+   compressed to "append after `#320`, never reuse" plus the two allocation mistakes; and `## 273` now leads with
+   what is OPEN (the state was buried under two history paragraphs, which is what made a live row look closed).
+
+**One operational consequence, and it is deliberate.**  `halo`'s recorded gfx1151 bases are for the **9B** lineage
+(`prefill-logit-gfx1151-Qwen3.5-9B-{Q6_K,Q8_0}.kld`, 2026-10), and the auto path now selects the 27B Q8_0 on that box
+because the pool can hold it, so the FIRST `fork-refresh.sh --gates` run there stops at
+`ERROR: base not found: .../prefill-logit-gfx1151-Qwen3.8-27B-Q8_0.kld` with the `--record` command printed (it no
+longer stops earlier at the 2 GiB carve-out).  That is the gate behaving correctly: record a base from a known-good
+build, or pass `MODEL=` to keep the 9B point.  Nothing changes on `soar` (31 GiB, same model, same base).
+
+**Files:** `TODO.md`, `scripts/gate-prefill-logits.sh` (`device_pool_gib()`, header + failure message),
+`scripts/README.md` (both gate rows), `INVARIANTS.md` (two entries), `WORKLOG.md`.  No `patches/`, no
+`release.json`, no gate re-run owed beyond what is recorded here.
+
 ## 261113.001 (r275, RELEASE v17-a691b2345-r275) -- the Windows `near` build break (issue #306), the portability lint learns windows.h macros, and a compiler-warning sweep
 
 **Release:** `v17-a691b2345-r275` -- 17 blocks (block 00 + blocks 01-16), base `a691b2345`, canonical re-cut tip

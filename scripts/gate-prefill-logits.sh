@@ -57,8 +57,10 @@
 #   --base-dir DIR    BASE_DIR       default base directory
 #                                    (default: ~/.cache/rdna-boosts/gates)
 #   --model FILE      MODEL          model gguf (default: auto: Q8_0 if the largest
-#                                    single card has >= 28 GiB, else the first
-#                                    available 24-GiB-class quant)
+#                                    single DEVICE POOL has >= 28 GiB, else the first
+#                                    available 24-GiB-class quant.  The pool is the card's
+#                                    VRAM on a discrete GPU and the GTT pool on an integrated
+#                                    one -- see device_pool_gib() below (r276, `TODO` #316 closed)
 #   --corpus FILE     CORPUS         default /llm/models/wikitext-2-raw/wiki.test.raw
 #   --ppl FILE        LLAMA_PPL      default ~/llama.cpp/build-rocm/bin/llama-perplexity (the canonical
 #                                    ~/bin/build-llama-rocm tree)
@@ -206,16 +208,40 @@ command -v awk >/dev/null || die "awk required"
 ARCH="$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-f]+' || true)"
 ARCH="${ARCH:-gpu}"
 
-vram_gib() {
-    local best=0 f b gib
-    for f in /sys/class/drm/card*/device/mem_info_vram_total; do
-        [ -r "$f" ] || continue
-        b="$(cat "$f" 2>/dev/null)" || continue
-        case "$b" in ''|*[!0-9]*) continue ;; esac
-        gib=$((b / 1073741824))
-        [ "$gib" -gt "$best" ] && best="$gib"
+# The memory ONE device can address, in GiB.
+#
+# On a discrete card that is its VRAM.  On an integrated GPU (an APU) it is NOT: amdgpu reports
+# `mem_info_vram_total` as the VRAM CARVE-OUT (2 GiB on a 128 GiB Strix Halo) while the memory the
+# device actually reads is the GTT pool, `mem_info_gtt_total` (the machine pool).  Selecting the
+# model from the carve-out is what made this gate refuse to run under `fork-refresh.sh --gates` on
+# an APU -- "no auto model found (set MODEL); biggest single card = 2 GiB" (`TODO` #316, closed r276).  A
+# discrete card exposes a GTT window too (45 GiB on a 32 GiB R9700), so the integrated test is the
+# PAIR -- a carve-out-sized VRAM total against a much larger GTT total -- never `gtt > vram` alone.
+device_pool_gib() {
+    local dir vram gtt gib best_card=0 best_pool=0
+    for dir in /sys/class/drm/card*/device; do
+        [ -r "$dir/mem_info_vram_total" ] || continue
+        vram="$(cat "$dir/mem_info_vram_total" 2>/dev/null)" || continue
+        case "$vram" in ''|*[!0-9]*) continue ;; esac
+        gib=$((vram / 1073741824))
+        if [ "$gib" -ge 8 ]; then
+            [ "$gib" -gt "$best_card" ] && best_card=$gib   # a discrete card: its VRAM
+            continue
+        fi
+        gtt=0
+        if [ -r "$dir/mem_info_gtt_total" ]; then
+            gtt="$(cat "$dir/mem_info_gtt_total" 2>/dev/null)" || gtt=0
+            case "$gtt" in ''|*[!0-9]*) gtt=0 ;; esac
+        fi
+        if [ "$gtt" -gt $((vram * 4)) ]; then
+            gib=$((gtt / 1073741824))       # an APU: the VRAM figure is a carve-out
+            [ "$gib" -gt "$best_pool" ] && best_pool=$gib
+        fi
     done
-    echo "$best"
+    # A discrete card is the reference when there is one: an iGPU on the same box has its own pool,
+    # and sizing from that pool would choose a model the card cannot hold.  The pool is the answer
+    # only on an integrated-only box.
+    if [ "$best_card" -gt 0 ]; then echo "$best_card"; else echo "$best_pool"; fi
 }
 
 # Auto model: Q8_0 when a single card can hold it, else the first available
@@ -229,7 +255,7 @@ resolve_model() {
         /llm/models/Qwen3.8/27B/Q6_K/Qwen3.8-27B-Q6_K.gguf
     )
     if [ -n "$MODEL" ]; then return 0; fi
-    local gib; gib="$(vram_gib)"
+    local gib; gib="$(device_pool_gib)"
     if [ "$gib" -ge 28 ] && [ -f "$q8" ]; then
         MODEL="$q8"
         return 0
@@ -238,7 +264,8 @@ resolve_model() {
     for c in "${cands[@]}"; do
         if [ -f "$c" ]; then MODEL="$c"; return 0; fi
     done
-    die "no auto model found (set MODEL); biggest single card = ${gib} GiB"
+    die "no auto model found (set MODEL, or --model FILE); biggest single device pool = ${gib} GiB
+       (a discrete card's VRAM, or an APU's GTT pool -- NOT its VRAM carve-out, which is ~2 GiB)"
 }
 resolve_model
 [ "$FAMILY_SWITCH" -eq 1 ] && [ "$MODEL_GIVEN" -eq 0 ] && die "family-switch mode needs an explicit --model

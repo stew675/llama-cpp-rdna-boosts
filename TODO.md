@@ -27,67 +27,25 @@ The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is *
 every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
 (the base is unchanged since; the release id is `release.json.release`).
 
-### Block 16 (r263, the UMA GTT expert store) — carried forward
-
-* **`fork-refresh.sh --gates` cannot run the prefill-logit gate on an APU as written** (`TODO` #316):
-  `gate-prefill-logits.sh` auto-selects a model from "the biggest single card", and an integrated GPU reports
-  its VRAM **carve-out** (2 GiB) rather than the machine pool, so the release flow stops with `ERROR: no auto
-  model found (set MODEL); biggest single card = 2 GiB`.  The gate is correct -- run by hand with its proper
-  arm (`--ab MOE_EXPERT_GTT_PREFILL=0 --extra "-lme 4 --fit off"`) it reads KLD -0.000000 / 99.990 %.  Fix the
-  auto-selection (a pool-aware probe, i.e. `prop.integrated` -> `totalGlobalMem`) or pass `MODEL` through from
-  `fork-refresh.sh`, which invokes the gate with no arguments today.  **Confirmed again at r266** (the release was
-  gated by running the same A/B by hand on the canonical fork build: -0.000000 / 99.990 %).
-
-* **`gate-fusion-alias-copy.sh` is INERT on `halo` (gfx1151), so it cannot witness the fusion claim here**
-  (`TODO` #316): its repro arm and its production arm both fail to reach the shape (`-ub 14` is outside this
-  arch's MMVQ MoE band), and they fail **identically on the unmodified r265 release build** -- measured at r266
-  against `~/llama.cpp/build-rocm` before the release.  So the r266 prefill-in-place change's "every fusion stands
-  down for a remap-served table" rests on `moe_cache_table_serves()` still being identity-only, not on an executed
-  gate: **a gfx1201 run is owed** the next time `soar` is up.
-
-* ~~The MTP four-axis protocol is OWED for block 16's decode-affecting stages~~ -- **DONE in r263**: run on
-  `halo` at the promotion, acceptance **bit-identical** in every arm (0.72082 / 0.75659 / 0.88057 / 0.99462,
-  identical accepted/generated counts) across the store-OFF, ARENA and PLACEMENT configurations
-  (`archive/work/apu-expert-gtt/MEASUREMENTS.md` §28).  The `llama-batched-bench -npl 1,4,8` width arm was
-  inconclusive on that box (no data rows in either arm) and is still owed on the 3x R9700 box.
-* **Multi-device is untested on this tier** (one GPU on the APU box; the discrete cross-check was `GPU=0`).  The
-  per-device budget, the per-device head subtraction and the free-bytes query have never seen a `-sm tensor` /
-  `-sm layer` split across APUs, and the prefill-stream hook declines by geometry on a slice (by construction, not by
-  measurement).
-* **The lock policy still refuses a >RAM model on a clamp that covers the RAM shortfall but cannot fund one slot
-  per expert table** (`gtt_store_can_stream` is `-lme`, but the clamp branch also requires `honour >= arena_min`).
-  Relaxing it needs its own arms: the dangerous combination is a clamp that covers the shortfall yet is below one
-  slot per table, where the arena would decline and placement would over-commit.
-* **Probe 15 (the per-session touch distance) is still owed.**  It was going to set the admission default `N`; the
-  admission knob turned out to be a documented no-op on this tier (every miss fills), so nothing is blocked on it --
-  and the campaign's policy simulator already predicts the delivered Nth-touch admission would be *worse* here.
-* **Sizing the store for a separate drafter's head is PARKED** (maintainer): the target sizes the region before the
-  drafter loads, so it would be a `common`/`--fit` term, not a loader change.
-* **Windows**: the tier declines there (the single-address premise does not hold on WDDM) and the run keeps the
-  previous behaviour.  Nothing forecloses an arm later: the platform part is one `mmap`+`register` function.
-
 ## The open list
 
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
-| **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; the 100 %-residency identity case left the list in r258 (`TODO` #133) — §273 |
+| **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
+| **319** | block 16's lock policy refuses a >RAM model on a clamp too small for one expert table | capability (block 16, the UMA tier) | **OPEN** (2026-11-13) — the refusal is the safe branch; relaxing it needs the band's own arms — §319 |
+| **320** | sizing the GTT store for a separate drafter's head | parked (block 16; a `common`/`--fit` term) | **PARKED** (maintainer, r263) — the target sizes the region before the drafter loads — §320 |
 
 ## Handle numbering
 
-**Renumbered 2026-10-31 (docs-only).**  The r187-r189 sessions allocated `#190`-`#196` (and `#218`) as if the
-sequence had advanced past a run of closed items, but `#119` was the last handle ever allocated and `#120`-`#189`
-were never used.  They are **`#120`-`#126`** now (plus `#127` for the `cpy_2d_vec16` limitation), so the sequence
-is contiguous.  The r187-r190 **commit messages** (immutable) still cite the old handles; they mean these rows.
-The old numbers are **retired** — do not reuse them.
+**New handles append after `#320`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
-> **Handle numbering (corrected 2026-11-03, sequence re-checked 2026-11-04):** the real sequence runs to **#130**
-> (closed, issue #263), so this file's `#268`/`#269` — allocated by the 2026-11-02 session — are themselves out of
-> sequence, the same failure the 2026-10-31 renumbering note above describes.  **#131`-`#143 are allocated** (the
-> 2026-11-03/04 items; `#143` closed in r214; `#270` is the r215 finding), so **new items continue from `#273`** (`#271`/`#272` closed in r234).  Renumbering `#268`/`#269` would also touch
-> `WORKLOG.md` 261102.* and the campaign records that cite them, so it is left as a decision for the maintainer
-> rather than done here.
+**Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
+records** (the commit messages that cite them are immutable).  The r187-r189 sessions allocated `#190`-`#196` (and
+`#218`) as if the sequence had run past `#119`; they are `#120`-`#127` wherever the file was later corrected.  The
+2026-11-02 session allocated `#268`/`#269` out of sequence in the same way.  Neither set is reusable.
 
 ---
 
@@ -160,44 +118,65 @@ The index row also recorded the r209-era kernel trace split: `mul_mat_fp8_wmma` 
 
 **Kind:** architecture / delivery — a transport consolidation.
 
-**r236 (2026-11-08, `TODO` #296): the measurement method changed, and there is a floor to beat.**  Two facts that
-should steer this item:
-1. **`llama-bench` cannot measure this path.**  Its prompt is `std::rand() % n_vocab` (uniformly random token ids),
-   so every ubatch routes over every expert of every layer and the heat-ranked arena has no signal.  On that shape
-   the arena is measurably inert: 35B-A3B Q8_0, 1 x R9700, `-ncmoe 48`, `-ub 512`, pp1450 = **414.1 / 414.5 /
-   414.5 / 414.5** t/s at `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto.  The *same* arm driven with the shipped
-   prose prompt reads **401.6 / 583.6 / 676.9 / 1063.6** t/s -- the arena is the whole win.  Any A/B of a transport
-   must therefore be driven with real text (`llama-cli -f prompts/prose-rdna-boosts.txt -n 0`), which is now
-   `scripts/gate-rebase-release.sh` step 5b (`--only textprefill`).
-2. **The random-token floor is the target.**  On the no-locality shape the delivery's host transport is
-   **414 t/s against unpatched `a691b2345`'s 508** (-18 %, and it is flat across the arena sizes above, i.e. the
-   arena is not the cost); on real text the same pair is **1064 against 379** (+181 %), and streaming-only is
-   402 against 379 (+6 %).  So the sign of the comparison depends on routing locality, and upstream *computing the
-   experts on the CPU out of local RAM* is the thing that wins when locality is absent: it reads the same bytes but
-   never crosses the bus, and a uniform 16-rows-per-expert split is its best case.  The gap is therefore
-   **transport-shaped, not policy-shaped** -- it scales with the number of host-resident layers (delivery vs base
-   prefill: `-ncmoe` 12 -> +9 %, 24 -> -5.6 %, 48 -> -18 %) and it scales with the ubatch COUNT, not its size
-   (pp4096 at `-ub` 512/1024/2048/4096 = 439/877/1744/3446 t/s = exactly 1/2/4/8 x a constant per-ubatch cost).
-   That per-ubatch constant is the resident-complement re-read; a transport that avoids it under no locality is
-   the floor this item should be measured against.  Census for a real-text prefill (4k tokens, 69 % residency):
-   `hits=83.11% fills=14.74% cold=2.14%`, **351.7 MiB of expert H2D traffic for the whole prefill**.
-   Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert-prefill-transport.md`.
+**OPEN — the current direction (2026-11-08, `TODO` #296 -> this row).**  The **host-set SIZE is the primary
+lever**: every transport scales with the bytes of host-resident experts a ubatch must read (measured 1872 -> 1989
+t/s, **+6.3 %**, from `-ncmoe 48` to `36`).  Arena residency is secondary — only a transport that *reads* the
+duplicate can use it, which is why bulk measured flat across residency — and transaction count is third (the SDMA
+phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (the range chosen by a
+heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D
+overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to
+plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its
+decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  The framing still on
+the table as an alternative is that what remains is an **arena-sizing policy** (decode hits vs prefill bytes)
+rather than a transport rule: the ≥ 83 %-residency cells are not a target, because high residency means the arena
+was sized from VRAM the user did not need to offload, and the right answer there is fewer `-ncmoe` layers or a
+capped arena.  Parked experiment and all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md)
+(`0001-no-pinned-staging.patch`: gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a
+2-device 99 %-residency tensor split = the hole to close first).  **Next work: does a capped arena cost decode?**
 
-**r258 (`TODO` #133, closed): the 100 %-residency cell has left this list.**  An identity (fully resident)
-arena is now read IN PLACE by the op at any width (`MOE_EXPERT_PREFILL_IN_PLACE`, `benchmarks/2026-11-10-prefill-in-place.md`): 1489.6 -> 4033.9 t/s on 3 GPUs `-sm tensor` (pinned tier) and
-3588.8 -> 4072.4 on the default pool mirror, i.e. the cell the item called a misconfiguration is now also
-the fastest one, at zero copy.  That is NOT the refuted in-place/remap transport below: it is the
-identity-only case, where the arena IS the table and there is no complement to fetch.  The rest of the
-item -- consolidating the three transports for a PARTLY resident table -- is untouched.
+**Method (`TODO` #296, r236) — `llama-bench` cannot measure this path.**  Its prompt is `std::rand() % n_vocab`, so
+every ubatch routes over every expert and the heat-ranked arena has no signal: pp1450 measures flat at 414.1 /
+414.5 / 414.5 / 414.5 t/s across `MOE_EXPERT_CACHE_MIB` 0 / 4096 / 8192 / auto, while the *same* arm on the shipped
+prose prompt reads 401.6 / 583.6 / 676.9 / 1063.6.  Any A/B here is driven with real text (`llama-cli -f
+prompts/prose-rdna-boosts.txt -n 0`, `scripts/gate-rebase-release.sh --only textprefill`), and the no-locality
+floor to beat is unpatched `a691b2345`'s **508 t/s** against the delivery's 414: upstream computes the experts on
+the CPU out of local RAM and never crosses the bus, and a uniform per-ubatch split is its best case.  The gap is
+transport-shaped, not policy-shaped (it scales with the host-resident layer count and with the ubatch COUNT, not
+its size).  Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert-prefill-transport.md`.
 
-**OPEN — direction refined: the host-set SIZE is the primary lever** (bulk's prefill traffic is the host-set bytes per ubatch: measured 1872 -> 1989 t/s, +6.3 %, from `-ncmoe 48` to `36` — every transport scales with it), arena residency is secondary (only a transport that *reads* the duplicate can use it, which is why bulk measured flat across residency), and transaction count is third (the SDMA phase).  **Leading candidate for one transport**: a *contiguous* static VRAM tier (range chosen by a heat-maximising sliding window) + a **two-transaction fill** — one bulk DMA of the contiguous complement and one D2D overlay of the resident range — which has bulk's transaction count and staging's byte saving, and degenerates to plain bulk at 0 % residency.  It needs the freeze-vs-slab problem from `wip/moe-static-hot-tier/` solved and its decode hit-rate cost measured (a heat-*seeded* static set already costs ~1.8 points, r74).  Earlier framing, kept for the bulk default: consolidate on BULK, and the ≥ 83 %-residency cells are **not a target**: they are misconfigurations (high residency means the arena was sized from VRAM the user did not need to offload — `min(1, (free − reserve)/host set)` — so the right answer there is fewer `-ncmoe` layers or none, not a faster transport; and `-ncmoe` is the wrong lever to lower residency, capping the arena is).  What remains is an **arena-sizing policy** (decode hits vs prefill bytes), not a transport rule.  Rationale: simplest, most stable, already wins at ≤ 67 % on 1 and 2 deviceswith its high-residency hole closed by a **sizing** decision (a decode-sized arena — the arena exists for the decode band and its auto-size, which eats all free VRAM, is the only reason residency reaches ≥ 83 %) rather than by an in-place/remap read (the maintainer does not want to re-enter that; it is also the direction the archive refuted for the pool tier).  Parked experiment + all numbers: [`wip/expert-transfer-engine/`](wip/expert-transfer-engine/README.md) (`0001-no-pinned-staging.patch`, gated 41/41, text byte-identical, +6..16 % at low residency, **-4.6 %** on a 2-device 99 %-residency tensor split = the hole to close first).  Steps 1-2 there are the next work: does a capped arena cost decode?
+**One sub-case has closed and is NOT what this row is about** (`TODO` #133, r258): an identity (fully resident)
+arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -> 4033.9 t/s on 3 GPUs
+`-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
+table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
+
+## 282. A mid-run pinned-tier latch perturbs the logits by ~1e-5 (a path difference, not corruption)
+
+**A mid-run pinned-tier latch (`MOE_HOST_POOL_PIN_FAULT=late`) perturbs the logits by ~1e-5, which flips one near-tie token in a 32-token greedy run**: the arm declines a MIXTURE of ops (some cache-served, some stood down) and that mixture reproduces neither `ref` nor the wholesale-stand-down arms, so a box that latches mid-run (the Windows aperture case in #278) does not answer identically to one that does not
+
+**Kind:** purity (delivery — `gate-host-pool.sh` `pinlate` arm; NOT corruption).
+
+**OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
+
+## 319. Block 16's lock policy refuses a >RAM model on a clamp too small for one expert table
+
+**A clamp that covers the RAM shortfall but cannot fund one slot per expert table REFUSES the load** instead of running it: `plan_gtt_expert_store()` (`src/llama-model-loader.cpp`, the `extent > lockable` branch) takes the clamp only when `clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream` (`gtt_store_can_stream` is `-lme` given), and otherwise throws **before a byte is read**, printing weights / MemAvailable / shortfall / `RLIMIT_MEMLOCK` / what it could honour and the fix.  So the combination this item used to worry about — the arena declining while placement over-commits — is **not reachable**: the load refuses instead.
+
+**What is still owed is whether the refusal is NECESSARY in that band.**  A store below one slot per table can place nothing, so every table keeps its layer's device buffer, and on an APU those bytes come out of the same DRAM the store wanted — which is why refusing is the honest answer today and why a relaxation must be measured, not argued.  The arms need a >RAM model on an APU (`Qwen3.5-122B-A10B Q8_0`, ~130 GiB against `halo`'s 123 GiB — the r266 arm already ran it at `-lme 90`) with `ulimit -l` set INSIDE the band `[shortfall, arena_min)`: one arm recording the refusal, one on a relaxed policy, and the coherence + prefill-logit gates on the relaxed arm.
+
+**Re-entry:** an operator who owns a clamp in that band, or a relaxation proposal with those arms attached.
+Record: `archive/work/apu-expert-gtt/README.md` §5 and §7 (`-lme` as the streaming opt-in), `WORKLOG.md` 261111.031, and the policy comments in `llama-model-loader.cpp`.
+
+## 320. Sizing the GTT store for a separate drafter's head — PARKED
+
+**The store's extent is decided by the TARGET's loader, before a drafter loads**, so a store sized to also hold the MTP head's expert tables would have to be a `common`/`--fit` term — a placement decision made once both models are known — not a loader change.  **Parked by the maintainer (r263):** no measurement is owed and nothing depends on it, because the head is pinned **outside** the `-lme` budget today (`plan_gtt_expert_store()`'s `head_cands`, r263), so the current shape is correct, just not budget-visible.  Record: `archive/work/apu-expert-gtt/README.md` §5.
 
 ---
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
-These are closed: no work is owed and no row above tracks them.  The handle is kept so the dated records that
-cite it still resolve, and so a re-entry condition has a name.
+These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
+the dated records that cite it still resolve and a re-entry condition has a name; the ones that never had a handle
+say so in their heading.
 
 ### #141 — the eager take-over's bound is a CAPPED ARENA x a sub-complement pool (retired r274)
 
@@ -221,3 +200,56 @@ validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
 need on its own merits (a legal cold source for a neither-tier expert — the `#273`/gather side of the same
 population).  Record: [`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md);
 `WORKLOG.md` 261112.010; `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`); `INVARIANTS.md` r274.
+
+### #300 — the attendance pool is NOT supported on a shared host/device pool (an APU) (retired r264)
+
+The pool buys device memory back by keeping the authoritative KV in a **pinned host mirror**, so it only has a
+meaning where the host and the device are **separate tiers**.  On an APU they are one: the KV is already in the
+memory the GPU reads, there is nothing to buy back, and the two-tier resolve has no model to be correct against
+(measured 2026-11-08: a *fully resident* pool still reported ~93 M byte mismatches against its own mirror, and each
+run gave a different text).  The cache therefore refuses the request with **one** WARN and leaves the KV as it is;
+the resident **window** (`--kv-window`) and the sparse decode arm *are* supported there and validated on gfx1151.
+This is not a defect to re-report.  **Re-entry:** a *discrete* device, or a future tier whose mirror really is a
+second memory pool.  Record: `WORKLOG.md` 261111.033, `INVARIANTS.md` r264, `scripts/gate-kv-residency.sh`.
+
+### #275 — a prefill-dominated multi-slot mix (`-npl 4`, `-npl 8`) is slower with `MOE_HOST_POOL_RANK=decode` (r224)
+
+The decode ranking is a **single-user** win and its sign inverts under `llama-batched-bench`'s prefill-dominated
+mix: on the frozen real-world prior at `-lme 36`, `-npl 4` prefill is 1144.69 t/s against 1292.88 for `combined`
+(**-11.5 %**), and one `-npl 8` rep measured -21 % in total (memory was not the cause: `MemAvailable` stayed at
+40 GiB).  Accepted because a single-user stream is the common case, and the workaround is documented rather than
+hidden: **`MOE_HOST_POOL_RANK=combined`** restores the pre-r224 ranking while keeping the demote, and that is the
+setting for a deployment whose traffic is parallel slots.  The demote itself is safe in every cell measured
+(+5.3 % single-stream, +1.8 / -0.9 / +0.3 % at npl 1/4/8).  Record: `WORKLOG.md` 261106.012 + the r224 entry,
+`archive/work/host-expert-split/HANDOVER.md` §4.3, `ENVIRONMENT.md` (`MOE_HOST_POOL_RANK`).
+
+### No handle — the Windows pinned-host ceiling has no cap, only a measurement (r223)
+
+`hipHostAlloc` there is budgeted by WDDM against the adapter's shared (aperture) segment, and the published model
+for it — roughly `(total RAM / 2) / visible HIP devices` (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339) — is
+**refuted as a predictor by the reporter's own numbers**: GPU shared usage stops at 9.32-9.35 GiB on a 47 GB box
+and again on the same box at 64 GB, with one visible adapter and ~60 GB of commit headroom (`WORKLOG.md`
+261106.016).  A ceiling derived from the model was implemented and **deliberately withdrawn**; r227 ships the
+measurement instead — the exit census prints the pinned tier's realized total, and on Windows the aperture
+segments' `CommitLimit`/`BytesResident` for every process (`ggml_hip_win_shared_mem_info`) — plus a loud, latching
+refusal for a pool allocation the driver will not give.  The shipped guard is mechanism-independent: the first
+refused `cudaHostAlloc` logs once and latches the pinned tier off, and no new pool is attempted after it.  The old
+`TODO` #95 pointer (the reporter's r227 log) has left this file; **re-entry is that log.**
+
+### No handle — block 16's GTT tier does not reach a multi-device split, or Windows, or a discrete box
+
+Three limits of the same tier, recorded together because they are one hardware story:
+
+* **Multi-device is untested, not merely unclaimed.**  The per-device budget, the per-device head subtraction and
+  the free-bytes query have never seen a `-sm tensor` / `-sm layer` split across APUs, and the prefill-stream hook
+  declines by geometry on a slice (by construction, not by measurement).  Every box in this repo's validation set
+  is one APU or discrete cards, so the gap cannot be closed here.  **Re-entry: a multi-APU host.**
+* **Windows: the tier declines by design.**  The single-address premise does not hold on WDDM, so the run keeps
+  the previous behaviour (one WARN).  Nothing forecloses an arm later — the platform part is one `mmap`+`register`
+  function — and that is the re-entry.
+* **The `llama-batched-bench -npl 1,4,8` width arm is NOT owed for this tier.**  It was owed for a discrete box,
+  but the store/arena is **inert on a discrete GPU by measurement** (forced-on envs produce zero `GTT` lines:
+  `plan_gtt_expert_store()` is only reached from the UMA branch, `gtt_store_open()` is never called, and
+  `moe_cache_prefill_stream()` declines on `!g_gtt_arena`), so that arm cannot witness this tier there.  The width
+  arm's own subject is decode width (blocks 12/15) and it lives in the MTP protocol, not here.  Record:
+  `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.

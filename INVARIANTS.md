@@ -4487,3 +4487,22 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    clang-frontend option; the only lld-level silencer is `-Xoffload-linker --no-warnings`, which would hide every
    device-link warning.  Do not "fix" it by removing the pragmas (other instantiations do honour them) and do not
    chase it with `-Wno-pass-failed`.
+
+- **An integrated GPU's `mem_info_vram_total` is a CARVE-OUT, not the memory a model can use — and a discrete card
+  exposes a GTT window of its own, so the test is the pair (r276, `TODO` #316).**  `halo` (gfx1151) reports a
+  **2 GiB** VRAM total against a **123.5 GiB** machine pool (`mem_info_gtt_total`, 121 GiB) while a 32 GiB R9700
+  reports a **45 GiB** GTT total against 31 GiB of VRAM, so `gtt > vram` alone mis-classifies every discrete card on
+  `soar`.  Anything that sizes work from "the biggest single card" must read the pair — a VRAM figure below 8 GiB
+  with `gtt > 4 x vram` is a carve-out, and the pool is the answer; where a discrete card exists it wins over a
+  co-resident iGPU's pool, or the choice is a model the card cannot hold.  `scripts/gate-prefill-logits.sh`'s
+  `device_pool_gib()` is the implementation (it replaced a `vram_gib()` that stopped `fork-refresh.sh --gates` dead
+  on an APU with `ERROR: no auto model found ... biggest single card = 2 GiB`), measured 31 GiB on `soar` and
+  121 GiB on `halo`, with the APU arm verified end to end (27B Q8_0 auto-selected, self-compare KLD 0.000000 /
+  100.000 %).
+- **`gate-fusion-alias-copy.sh` witnesses gfx1201 and is INERT on gfx1151; the r266 "fusion stands down for a
+  remap-served table" claim has an executed gate as of r276.**  All 7 arms pass on `soar` against the r275 release
+  tree (`378256be4`): every text arm `3fab4da87774`, the repro arm's trace logging `GLU<-NONE/copy@268435456` (so the
+  comparison is not vacuous), the production arm declining one distinct alias class, journal clean.  On gfx1151 the
+  repro and production arms both fail to reach the shape (`-ub 14` is outside that arch's MMVQ MoE band) and fail
+  **identically on an unmodified build**, so an `halo` run is not evidence either way — a fusion-stand-down claim
+  that needs this gate must be run on gfx1201 (`TODO` #316 closed; record: `WORKLOG.md` 261113.002).
