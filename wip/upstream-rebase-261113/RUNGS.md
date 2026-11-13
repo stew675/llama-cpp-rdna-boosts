@@ -69,7 +69,7 @@ the r236 resolution dropped).  The current 34-file block is the resolved r236 sh
 mechanical merge.  Also verify the `GGML_COMPUTE_BUFFER_MARGIN_PCT` invariant still fires (upstream's Meta
 compute-view floor is unchanged in this range).
 
-**R01 result: `43a418c10`** (block 00 `f15430d1e` + `git revert ac931b5bc`; 37 files, +1025 / −356 against
+**R01 result: `43a418c10`** (block 00 `f15430d1e` + `git revert ac931b5bc`; 36 files, +1049 / −357 against
 the new base).  The only conflict was `src/llama-mmap.cpp`, and it resolved as an **upstream-wins rename**:
 block 00 renames the `read_aligned_chunk` parameter `size` -> `size_l` (the `-Wshadow` pass) while upstream's
 Windows-unbuffered rewrite independently renamed it `size` -> `len`; the bodies are otherwise identical, so
@@ -77,7 +77,7 @@ the resolution takes upstream's `len` in both platform variants and keeps the de
 (`llama_mlock::size()/release()/granularity()` + the `raw_lock` rename), which auto-merged.  No marker, no
 `TODO(rebase)`.
 
-**Exit:** build green with the canonical `GGML_HIP_NO_VMM=OFF` (37-file delta; only the pre-existing
+**Exit:** build green with the canonical `GGML_HIP_NO_VMM=OFF` (36-file delta; only the pre-existing
 `ld.lld` unroll notes); coherence on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars
 `sha=1c5d32ac537d`** (`Prompt 256.0 / Gen 92.1` t/s); `test-backend-ops -o MUL_MAT_ID` **1040/1040** on
 gfx1201 (the duplicate-id fix reaches the new tile grid); `git grep '<<<<<<<'` empty.
