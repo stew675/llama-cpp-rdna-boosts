@@ -21,7 +21,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R05 | 04 BF16 KV | **DONE** | `4c6a5019a` | `D3` checked |
 | R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
 | R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
-| R08 | 07 k-quant boosts | **DONE** | `c6a2f6f31` | `D16` oracle green |
+| R08 | 07 k-quant boosts | **DONE** | `626e398d2` | `D16` oracle green |
 | R09 | 08 fused kernels | **NEXT** | — | `D6`, `D12` |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
@@ -259,7 +259,7 @@ delivery-vs-upstream few-row *measurement* (BS 2-24) is a release A/B, so it is 
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `0fb8f1577` few-row MMQ, `494d0f47b` src1-precision gating, `5d4c8eeb2` MoE tiles. |
 | `tests/test-backend-ops.cpp` | `494d0f47b`/`03d6c824e` reworked the MUL_MAT oracle. |
 
-**R08 result: `c6a2f6f31`** — 9 files, +372 / −36.  Build green; coherence unchanged
+**R08 result: `626e398d2`** — 9 files, +372 / −36.  Build green; coherence unchanged
 (`sha=1c5d32ac537d`).  **`D16` oracle: `test-backend-ops -o MUL_MAT` 2681 OK / 0 FAIL** — upstream's
 src1-precision gating passes with the delivery's MMQ/MMVQ dispatch, so the gate reaches the delivery's path
 rather than a fallback.
