@@ -20,8 +20,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R04 | 03 chunked GDN | **DONE (both-sides, nothing dropped)** | `43891459e` | **`D2` resolved as complementary**, `D14` |
 | R05 | 04 BF16 KV | **DONE** | `4c6a5019a` | `D3` checked |
 | R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
-| R07 | 06 MMB prefill | **NEXT** | — | `D5`-adjacent |
-| R08 | 07 k-quant boosts | **TODO** | — | `D4`, `D16` |
+| R07 | 06 MMB prefill | **DONE** | `c1d8b7c04` | `D5`'s few-row half deferred to R18 |
+| R08 | 07 k-quant boosts | **NEXT** | — | `D4`, `D16` |
 | R09 | 08 fused kernels | **TODO** | — | `D6`, `D12` |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
 | R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
@@ -224,7 +224,7 @@ band is a *selector* over the same kernel matrix, so both ship.
 | `tests/test-backend-ops.cpp` | union: upstream's `q_head_padding` + the delivery's `derived`/`derived_hole`/`mask_hole`.  `q_head_padding` goes **last** in the ctor (no upstream call site passes it, checked), so the delivery's positional test cases keep their meaning; `vars()` keeps upstream's `VARS_TO_STR18` + the three flags. |
 | block-05 call sites vs upstream's context refactor | `graph_max_nodes(n_tokens)` -> **`graph_max_nodes()`** (upstream `#32078` removed the ubatch dependence; `gate-node-budget.sh` is owed at R11/R18), and `sched_new(max_nodes, false)` -> upstream's **`sched_new({.max_nodes, .parallel, .op_offload})`** struct form (`#32009`).  `graph_reserve(..., packed_kq_mask)` merged as-is (the header already carried both sides' parameters). |
 
-## R07 — block 06: MMB quantized prefill GEMM · **TODO**
+## R07 — block 06: MMB quantized prefill GEMM · **DONE 2026-11-13**
 
 * block sha `7f17e7534` · 11 files · **expected conflicts: 1**
 
@@ -232,7 +232,23 @@ band is a *selector* over the same kernel matrix, so both ship.
 |---|---|
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `0fb8f1577` (`#31533`) rewrote the MMQ/MMVQ dispatch and added `mmq-few.cu`; `0d69255c5` (`#26048`) added the nvfp4 w_s epilogue. |
 
-**Exit:** prefill-logit gate (this is a prefill-kernel block), plus the MMB kill switch's own A/B.
+**R07 result: `c1d8b7c04`** — 11 files, +3000 / −16.  Build green; coherence unchanged
+(`sha=1c5d32ac537d`); the MMB path is **on by default and reached**: with `GGML_CUDA_MMB_LOG=1` a 5 298-token
+prefill (`-b 2048 -ub 2048`) prints
+`MMB_CFG device=0 cc=0x1001201 dense_geom=1 min_t=512 glu_thresh=32 ... glu=1 bf16w=1` and runs at
+**6915.2 t/s** prefill.
+
+| conflicted hunk | resolution |
+|---|---|
+| `ggml_cuda_mul_mat` MMVF branch | the delivery's two additive blocks (MMB dispatch, and the `ne11_mmvf` verify-batch pin) are kept, but the predicate call is re-expressed on **upstream's refactored signature** `ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)` (`#29633`/`#31959` made it take the tensor and derive type/ne/nb inside).  Upstream's own call had the same 4-arg shape, so the merge is "our blocks + their predicate". |
+| fused MoE gate+up dispatch | the delivery's MMB gate/up/swiglu block is kept; the shared predicate becomes upstream's `ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)` (upstream added the `gate` argument; the merged declaration defaults it to `nullptr`, so both call shapes compile — the 2-arg form is used). |
+| `// A transposed vector can still use MMVQ` | the delivery side had glued this comment onto the closing brace and renamed MMVF->MMVQ; restored upstream's wording (the following code is the MMVF transposed path). |
+
+**`D5`'s few-row half:** upstream's `mmq-few.cu` (`#31533`) is in the tree and the delivery's MMB predicate is
+prefill-only (`T >= 512`), so the two do not compete for the same shapes in the merged dispatch.  The
+delivery-vs-upstream few-row *measurement* (BS 2-24) is a release A/B, so it is deferred to R18's
+`llama-bench` arms rather than decided at this rung.  **Prefill-logit gate for this block is owed at R18**
+(the rung's base record does not exist yet).
 
 ## R08 — block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad) · **TODO**
 
