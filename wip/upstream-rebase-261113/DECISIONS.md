@@ -216,17 +216,18 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   re-instantiation matters for us: our fusions change launch geometry, which is exactly the key it watches.
 * **Questions:** does every delivery hook that touches graph/stream state still fire after the move, and
   does the cluster-dim key invalidate a captured delivery fusion correctly?
-* **Status:** **PARTIAL at R09 (2026-11-13) — the move landed, nothing had to follow it, the key is still owed at
-  R11.**  `graph.cuh` now owns `ggml_cuda_stream_context` (and `ggml_cuda_graph`), and
-  `ggml_backend_cuda_context` stayed in `common.cuh` with the concurrent-stream state as a
-  `std::unique_ptr<ggml_cuda_stream_context>` built in `ggml-cuda.cu`.  Block 08's hooks are all *members of
-  `ggml_backend_cuda_context`* (the per-graph Q8_1 cache: `q8_1_cache_entry`, `q8_1_arena`/`_retired`/`_pos`,
-  `q8_1_cache_clear()`, `q8_1_cache_get()`, `q8_1_src_range_ok()`), i.e. the struct that did **not** move, so the
-  union was a straight member merge and no delivery hook was left behind.  The delivery's by-value
-  `ggml_cuda_stream_context concurrent_stream_context;` line is dropped in favour of upstream's `unique_ptr`
-  (it was patch context, not a delivery member).  The **cluster-dim re-instantiation key**
-  (`2e325dcd5`, `#31284`) is untouched: the delivery fusion that changes launch geometry most is block 10's
-  (`gate-grid-stall-pad.sh`'s pad), so the key is verified at **R11**.
+* **Status:** **`CLOSED` at R11 (2026-11-13).**  The move is complete and the delivery's state follows it:
+  `graph.cuh` owns `ggml_cuda_graph` / `ggml_cuda_stream_context` / `ggml_cuda_graph_instance`, while
+  `ggml_backend_cuda_context` stayed in `common.cuh`.  Block 10's additions to the graph state were transplanted
+  into `graph.cuh` — `capture_deferred` (a deferred capture while the slab's wide band was armed) and the
+  **packed** replay guard (`src_properties` / `prop_nodes` / `prop_src_off` / `prop_srcs`), which replaces
+  upstream's fixed-layout `node_properties`/`node_props` and removes its last user (the delivery's packed form
+  spends 328 bytes/node against 1048, measured at 1.4 non-null sources per decode node).  Upstream's
+  `ggml_cuda_graph_instance` + cluster snapshot is kept, so **`2e325dcd5`'s cluster-dim re-instantiation still
+  fires** in `ggml_cuda_graph_update_executable()` (upstream's signature, with the delivery's HIP
+  `hipGraphExecUpdate` leak workaround as its first body block).  The keyed cache (`ggml_cuda_graph_key`) and its
+  eviction sweep are unchanged; the accessor is out-of-line in `ggml-cuda.cu`.  Verified by the R10/R11 coherence
+  runs (graphs on by default); `gate-grid-stall-pad.sh` at R18 covers the pad site.
 
 ## D7 — MTP: upstream reads the target hidden states from a **device buffer**
 
@@ -265,14 +266,14 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   call moves to the public API or the block drops the call.
 * **Questions:** after each rung, `git grep` the delivery's symbols; confirm none points at a pruned
   declaration.
-* **Status:** **hit at R03, `OPEN` mechanically — the prune also removes *includes*.**  Two concrete lessons:
-  (a) the moved declarations (`llama_set_embeddings_nextn`, `llama_set_nextn_layer_offset`,
-  `llama_model_dflash_selector_top_k`, `llama_model_target_layer_ids(_n)`) are *not* re-added to
-  `src/llama-ext.h`, because upstream has public versions in `include/llama.h`; only delivery-only API stays.
-  (b) `common/speculative.cpp` lost `#include "../src/llama-ext.h"` with the prune (the include's comment named
-  the now-public calls), which is a **build break, not a merge conflict** — the block's include hunk attaches
-  cleanly and the symbol then resolves nowhere.  Check the include surface after every prune rung; blocks 10
-  and 11 touch `llama-ext.h` and will meet the same thing.  Re-check at R11/R12.
+* **Status:** **`OPEN` mechanically, and it fired again at R11.**  Three lessons, each measured: (a) the moved
+  declarations (`llama_set_embeddings_nextn`, `llama_set_nextn_layer_offset`, `llama_model_dflash_selector_top_k`,
+  `llama_model_target_layer_ids(_n)`) are **not** re-added to `src/llama-ext.h` — upstream has public versions
+  (R03); (b) `common/speculative.cpp` lost `#include "../src/llama-ext.h"` with the prune (R03) — a *build break,
+  not a conflict*; (c) at R11 the prune's `29dbbad2b` had deleted **`ggml/src/ggml-cuda/diagmask.cuh`** itself,
+  which block 10's extracted `ggml-cuda-try-fuse.cu` still included — dropped, nothing used from it.  Block 10's
+  own `llama-ext.h` declarations all survive against `include/llama.h` (the build is the check).  Re-check at
+  R12/R13 (`ggml.c` op table, RPC headers).
 
 ## D9 — mmap / lazy load / load-mode: upstream rewrote the Windows unbuffered load
 
@@ -316,9 +317,14 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   nowhere in the tree) and **block 12 adds it** ("forward the pool-backed query to the simple devices.  A tensor
   split gives every simple device the SAME host master"), so a Meta-wrapped host expert weight is not reported
   as pool-backed and the fused kernel reads the pageable host master -> `Page not present` on both devices.  The
-  two `tsplit*` arms are therefore **R13's** and must go green there.  What remains of `D10` proper (does the
-  delivery's staging still happen on the merged scheduler, do the ring arms still win) is unchanged and was
-  always R11/R13's: the same 1991-fill evidence covers the staging half, the ring arms are R11's.
+  two `tsplit*` arms are therefore **R13's** and must go green there.  **R11 closed the rest of it:** block 10's
+  async input ring landed as the context-owned host-pinned **splice ring** (`splice_pin_slot` /
+  `splice_pin_ring` / `splice_pin_idx` in `ggml_backend_cuda_context`) feeding
+  `ggml_backend_cuda_set_tensor_2d_async()` for the strided-splice H2D, and it merged without touching the
+  scheduler's upload/prefetch logic — upstream's `#31419` reachability test, `#32100` prefetch ordering and
+  `#32089` graph-result reuse all coexist with it (the ring is *below* the scheduler).  The `-sm tensor`
+  `tsplit*` arms remain the open R13 item; the ring's own A/B is `D4`/R18's `llama-bench` shape, not a
+  correctness gate.
 
 ## D11 — `ggml.c` / RPC / test-surface refactors
 

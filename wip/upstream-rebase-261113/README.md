@@ -1,16 +1,16 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R10 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
-and block 09); R11 (block 10, slab + fusion dispatcher + async input ring) is next.**  `R10`'s own gate's two
-`-sm tensor` arms are deferred to **R13** by construction (block 12 adds the `moe_cache_pool_backed` Meta
-forwarding they need) — see `RUNGS.md` R10 and `HANDOVER.md` §5.5.  `D17`
-(the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
-the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
-R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
-point is **`4f9dfa0e3`**.  **Open finding `D5-a`** (found at R09): upstream's new FA heads 40/72 have no
-`fattn-mma-f16` instantiation in the merged instance matrix (32 undefined symbols in the backend library);
-it does not block the climb, but it blocks every gate that links a driver (`gate-norm-rows-alias.sh`, owed at
-R11) until it is repaired, and the maintainer decides because it changes block 05's artifact.
+**Status: OPEN — R00..R11 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
+and blocks 09-10); R12 (block 11, qwen4exp) is next.**  Two gate arms are deferred to **R13** by construction,
+both because the code they need ships with block 12: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (the
+`moe_cache_pool_backed` Meta forwarding) and `gate-node-budget.sh` (`graph_max_nodes()` + the "over its node
+budget" refusal) — see `RUNGS.md` R10/R11 and `HANDOVER.md` §5.5.  `D17` (the base blocker) is decided: block 00
+carries the `#30542` revert.  `D5-a` (found at R09) is **decided and applied** as the rung-repair `9c94ce139`:
+upstream's FA heads 40/72 have their `fattn-mma-f16` instantiations again (32 undefined symbols -> 0), with the
+FP8 KV column and a typed `generate_cu_files.py` restored alongside.  Rungs R01..R17 are the replay; R18 is the
+release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until R18.
+Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork point is
+**`4f9dfa0e3`**.
 
 This campaign is a **ladder climb**, not a single rebase: one rung per delivery block, each rung ending in
 a resolved commit, a green build and a coherence run, so a session can stop after any rung and the next one
@@ -132,7 +132,7 @@ bound: the probe chained through marker-carrying trees).
 | 3 | R09 | 08 fused kernels | 7 | **DONE 2026-11-13** — 7 conflicts (6 union + the `D12` dual-store merge); coherence `1c5d32ac537d`, `MUL_MAT_ID` 1056/0, `gate-hc-fusions` PASS; **found `D5-a`** (FA heads 40/72 uninstantiated, an R06 gap) and reassigned the rows gate to R11 |
 | 3 | R09r | rung-repair, block 05's artifact | — | **DONE** — FA instance set: heads 40/72 (32 files) + the FP8 KV column (14) + a typed generator loop; undefined FA symbols 32 -> 0, FA oracle 6995/0.  Squashed into block 05 at R18 |
 | 3 | R10 | 09 host-resident MoE | 8 (14 hunks) | **DONE** — all "both sides"; `D1` came out **answered without a port**, `D9`/`D15`/`D18` merged/checked, arena live (`fills=1991`), pool text identity `a99ccbd97ecb`; the gate's `tsplit*` arms are **R13's** |
-| 4 | R11 | 10 infrastructure | 10 | `D6`, `D8` (prune/`llama-ext.h`), `D10` (scheduler upload/prefetch) |
+| 4 | R11 | 10 infrastructure | 9 (20 hunks) | **DONE 2026-11-13** — the dispatcher moved into `ggml-cuda-try-fuse.cu`; `D6` closed (packed replay guard + cluster check kept), `D8` fired again (`diagmask.cuh` pruned), `D10` closed; `gate-norm-rows-alias.sh` PASS; `gate-node-budget.sh` is R13's |
 | 4 | R12 | 11 qwen4exp | 5 | `D11` (the `ggml.c`/RPC/test refactors) |
 | 4 | R13 | 12 campaign remainder | 4 | `D10` (backend upload/prefetch), `D15` (external PLE) |
 | 5 | R14 | 13 MTP vocab subset | **0** | `D7` verify only |

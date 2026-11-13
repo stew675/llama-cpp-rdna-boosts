@@ -1,3 +1,43 @@
+## 261113.008 (r277 + campaign rung R11, NO delivery change) -- R11 (block 10) is DONE: the fusion dispatcher moves into its own TU and merges clean, `gate-norm-rows-alias.sh` PASSES, and the node-budget gate turns out to be R13's
+
+**No patch changes, no `release.json` change.**  Rung R11 (`13176810a`, block 10 "slab, fusion dispatcher and
+async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R11.
+
+* **Result `13176810a`**, 9 conflicted files / **20 hunks** (the probe predicted 10 files; `norm.cu` auto-merged).
+  Build green after six mechanical first-error passes; coherence unchanged (**100 chars
+  `sha=1c5d32ac537d`**); no markers.
+* **The rung is a MOVE, not a conflict fight.**  Block 10 extracts the whole fusion dispatcher (~2000 lines) into
+  `ggml-cuda-try-fuse.cu` and adds `ggml-cuda-slab.cu` / `ggml-cuda-arena.cu` / `ggml-cuda-moe-cache-hooks.cu` /
+  `mmvq-moe.cu` / `gdn-conv-store.cu` / `mmvq-ksplit-body.inc`.  Before accepting the move the arm set was
+  compared arm-by-arm: everything the old dispatcher had is in the new TU except four names, and those four are
+  still **defined** in their owning TUs (block 10 refactored their dispatch into `_try_fuse()` arms) — so no
+  upstream fusion arm was lost, and the new TU adds **31** delivery arms.  The real work was re-expressing the
+  extracted TU on the merged APIs (upstream's tensor-form `ggml_cuda_should_use_mmvf`, the FFMA/MMB tagging, the
+  `should_use_mmq_few` gate).
+* **`D6` closed:** `capture_deferred` and the delivery's **packed** per-node replay guard
+  (`prop_nodes`/`prop_srcs`/`prop_src_off`, 328 bytes/node against upstream's 1048) were transplanted into
+  `graph.cuh`, while upstream's `ggml_cuda_graph_instance` + cluster snapshot is kept — so `#31284`'s cluster-dim
+  re-instantiation still fires, with the delivery's HIP `hipGraphExecUpdate` leak workaround as its first body
+  block.
+* **`D8` fired again, exactly as recorded:** upstream's prune `29dbbad2b` deleted
+  `ggml/src/ggml-cuda/diagmask.cuh` itself, and block 10's new TU still included it — the include was dropped
+  (nothing used from it).  Block 10's `llama-ext.h` declarations all survive against `include/llama.h`.
+* **`D10` closed (rest of it):** the async input ring landed as the context-owned host-pinned **splice ring**
+  feeding `ggml_backend_cuda_set_tensor_2d_async()`, i.e. *below* the scheduler — upstream's upload reachability,
+  prefetch ordering and graph-result reuse are untouched.  The `-sm tensor` `tsplit*` arms stay R13's.
+* **Verified:** `scripts/gate-norm-rows-alias.sh` **PASS** — the r225 narrow-row fusion arrives with this block,
+  the driver links (the `D5-a` breakage is gone), the gated form on Ling-3.0-tiny fuses every node with 0
+  declined, and the SILU-gated hybrid takes the PLAIN form (344 fused, 0 gated, 0 declined) with byte-identical
+  text (139 chars `sha=d2ffb97ccb76`); no GPU faults.
+* **`gate-node-budget.sh` is R13's, not R11's** (the handover expected R11 to owe it).  Arms A (`q8_0 -ub 2048`)
+  and B (`q8_0 -ub 512`) abort in `ggml_backend_sched_split_graph` on this tree; the **r277 reference build passes
+  all four arms**, and the gate's header records arm A aborting on the unpatched base.  The `graph_max_nodes()`
+  sizing **and** the "over its node budget" refusal are both in **block 12** (`patches/0012-…`), so the gate cannot
+  pass before R13.  Note for R13: arm B passed on the unpatched base but aborts here, so the async ring's node cost
+  needs measuring before the sizing is re-bumped — R13 must show the margin, not just a green line.
+* **Climb state:** R00..R11 done on `rebase-r278` at `13176810a`.  **Next: R12 = block 11 (qwen4exp)**, which owes
+  `gate-hc-fusions.sh` and `gate-qwen4exp-quant-coherence.sh`.
+
 ## 261113.007 (r277 + campaign rungs R09r/R10, NO delivery change) -- `D5-a` repaired, so the FA instance matrix is complete again (heads 40/72, the FP8 KV column and a typed generator), and R10 (block 09) is DONE with its `-sm tensor` arms owned by R13
 
 **No patch changes, no `release.json` change.**  One rung repair (`R09r`) and one block (`R10`) of the

@@ -25,7 +25,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R09 | 08 fused kernels | **DONE 2026-11-13 (merge+build+coherence+gates); the FA instance gap it exposed is `D5-a`, AWAITING** | `a95c0497b` | `D6` (partial), **`D12` resolved**, **`D5-a` found** |
 | R09r | **rung-repair, block 05's artifact** (found at R09, `D5-a`) | **DONE 2026-11-13** | `9c94ce139` | FA instance set: heads 40/72 for `fattn-mma-f16` (32 files) + the FP8 KV column (14 files) + a **typed** `generate_cu_files.py`; squashed into block 05 at R18 |
 | R10 | 09 host-resident MoE | **DONE 2026-11-13** | `a6809f75b` (after the rung-repair `9c94ce139`) | **`D1`** answered (no port needed — upstream moved its own cache), `D9`, `D15`, `D18` checked; **`gate-host-pool.sh` `tsplit*` deferred to R13** |
-| R11 | 10 infrastructure | **TODO** | — | `D6`, `D8`, `D10` |
+| R11 | 10 infrastructure (slab, fusion dispatcher, async input ring) | **DONE 2026-11-13** | `13176810a` | 9 files / 20 hunks; `D6` graph state into graph.cuh, `D8` prune include, `D10` ring; **`gate-norm-rows-alias.sh` PASS**; **`gate-node-budget.sh` deferred to R13** (its sizing + refusal are block 12's) |
 | R12 | 11 qwen4exp | **TODO** | — | `D11` |
 | R13 | 12 campaign remainder | **TODO** | — | `D10`, `D11`, `D15` |
 | R14 | 13 MTP vocab subset | **TODO** | — | `D7` verify |
@@ -538,22 +538,67 @@ byte-identical — upstream's cache is 17.6 % faster on decode at that shape, wh
 forwarding).
 
 
-## R11 — block 10: slab, fusion dispatcher and async input ring · **TODO**
+## R11 — block 10: slab, fusion dispatcher and async input ring · **DONE 2026-11-13**
 
-* block sha `05f298fea` · 86 files · **expected conflicts: 10** (the largest cluster)
+* block sha `05f298fea` · **result `13176810a`** · 9 conflicted files / **20 hunks** (the probe predicted 10
+  files; `norm.cu` auto-merged this time).
 
-| conflicted path | what to expect |
+Build green with the canonical `GGML_HIP_NO_VMM=OFF` recipe after **six** first-error passes; coherence
+unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**.
+
+**The rung's shape: block 10 MOVES the whole fusion dispatcher out of `ggml-cuda.cu`** into a new TU
+(`ggml-cuda-try-fuse.cu`, ~2000 lines, declared in `ggml-cuda-try-fuse.cuh`) and adds six files of its own
+(`ggml-cuda-slab.cu`, `ggml-cuda-arena.cu`, `ggml-cuda-moe-cache-hooks.cu`, `mmvq-moe.cu`, `gdn-conv-store.cu`,
+`mmvq-ksplit-body.inc`).  So most of the work was not conflict resolution but the §8-trap-5 job: **re-expressing
+the extracted TU's call sites on the merged tree's APIs**.  Before accepting the move I verified the arm set:
+every fusion arm in the old `ggml-cuda.cu` dispatcher is present in the new TU **except four**
+(`ggml_cuda_op_gated_delta_net_fused_cache`, `ggml_cuda_op_rms_norm_q8_1`, `ggml_cuda_op_ssm_conv_l2_gatebeta`,
+`ggml_cuda_op_ssm_scan_fused_cache`), and all four are still **defined** in their owning TUs
+(`gated_delta_net.cu`, `norm.cu`, `mmvq.cu`, `ssm-scan.cu`) — block 10 refactored their dispatch into
+`_try_fuse()` arms (`gdn_cache_cpy`, `norm_q8_1`/`add_rms_q8_1`, `ssm_prescan`, `ssm_scan_cache_cpy`), so nothing
+upstream-side was dropped.  The new TU also brings **31** delivery arms the old dispatcher did not have
+(`norm_rows`, `mul_mat_q_swiglu(_dense)`, `moe_down_fold`, `moe_weighted_reduction`, `cpy_batch`, `ple_conv`,
+`ssm_prescan`, `fa_had`, `fwht_q8_1`, `scale_unary`, …).
+
+| conflicted path | resolution |
 |---|---|
-| `ggml/src/ggml-cuda/common.cuh` | `17701e48d` graph/concurrent state move.  **`D6`**. |
-| `ggml/src/ggml-cuda/cpy.cu`, `mmvf.cu`, `mmvq.cu`, `norm.cu` | `0fb8f1577`, `494d0f47b`, `31953bcf7`, `432433637`. |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | graph move + cluster dims + few-row dispatch. |
-| `src/llama-context.cpp` | `cb44fdb18` (`#32089`) graph-result reuse, `4fffab623` (`#32043`) metadata pages, `a8fad21e9`.  **`D10`**. |
-| `src/llama-ext.h` | the prune (−64) vs the delivery's additions.  **`D8`**. |
-| `src/llama-graph.cpp` | `951d465f5` MoE-cache move, `cb44fdb18`, `4fffab623`. |
-| `tests/test-backend-ops.cpp` | the public-API test refactor. |
+| `ggml/src/ggml-cuda/common.cuh` (2) | **(1)** `graph.cuh` owns the structs (upstream's forward declarations kept); the delivery's `ggml_cuda_graph` additions — `capture_deferred` **and** the packed per-node replay guard (`src_properties` / `prop_nodes` / `prop_src_off` / `prop_srcs`, which *replaces* upstream's fixed-layout `node_properties`/`node_props`) — transplanted into `graph.cuh`, keeping upstream's `ggml_cuda_graph_instance`+cluster wrapper and its `is_enabled()` (with `ggml_cuda_pool_debug_enabled()`).  **(2)** union: the delivery's host-pinned **splice ring** (`splice_pin_slot` / `splice_pin_ring` / `splice_pin_idx`, the async input ring) **and** upstream's `cublasLtHandle` block; the array initialisers keep upstream's `{}` forms (identical semantics).  **`D6`.** |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` (8) | the dispatcher move (above) plus: `MMVF_MAX_BATCH_SIZE_FLAT` (the QSA indexer's flattened `ne11`) on upstream's tensor-form `ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)`; upstream's "MMVF" comment restored; **the MMVQ arm is a union** — upstream's `ggml_cuda_should_use_mmq_few()` gate keeps precedence and the delivery's RDNA4/RDNA3_5 dense-band promotion now runs *after* it (see the `D5` note below), both under `MMB_T(…, 4)`; upstream's FP8 cublas branch kept before the delivery's `MMB_T(cublas, 6)`; `mul_mat_id_needs_sync` and `mul_mat_id` take the delivery's band extension (quantized experts are no longer capped at `MMVQ_MAX_BATCH_SIZE`) **with upstream's FP8 MMVF arm kept between** the quantized and the generic-AMD cases; the graph-compute caller keeps the delivery's `ggml_cuda_graph *` 5th argument (upstream's keyed signature gives way — the keyed accessor is still what *mints* the graph). |
+| `ggml/src/ggml-cuda/mmvq.cu` (3) | both includes (`graph.cuh` from R10 **and** `gdn-conv.cuh`); the kernel body accepted as the new `mmvq-ksplit-body.inc` (block 10's extraction + the mixed row-concat arm), with upstream's `#31533` change **ported into the `.inc`** (`mmvq_prefetch_l2()` -> the shared `ggml_cuda_prefetch_l2()`); HEAD's duplicate copy of `ggml_cuda_should_fuse_mul_mat_vec_q()` deleted (block 10 moved it up the file) and the surviving copy re-based on upstream's `ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])` predicate, with `cc` hoisted above it. |
+| `ggml/src/ggml-cuda/mmvf.cu` (2) | both helpers (upstream's `mmvf_load_fp8x2` **and** block 10's `mmvf_op_sigmoid`); theirs' template parameter list is the superset (`gate_beta`, `sig_mul_add`); block 10's `sma_dst` / `gb_x2` dispatch arms taken **with upstream's fuller `has_fusion`** (which includes `x_scale`/`gate_scale` — those FP8 arms exist in this tree). |
+| `ggml/src/ggml-cuda/cpy.cu` (1) | union: block 10's `cpy_2d_vec16` fallback (when the 2-D memcpy guard refuses) placed ahead of upstream's FP8 cpy chains. |
+| `src/llama-context.cpp` (1) | block 10's `kq_mask_packed_reachable()` rationale comment kept, **upstream's struct-form `sched_new(const sched_params &)`** kept (block 10's hunk still had the old two-argument signature); R10's `(size_t)` cast stays. |
+| `src/llama-ext.h` (1) | **`D8`**: block 10's declarations taken as-is, and the build proves none duplicates a now-public `include/llama.h` symbol (`llama_get_embeddings_nextn(_ith)`, `llama_set/get_embeddings_layer_inp(_dev)`, `llama_supports_embd_row`, `llama_batch_ext_add_embd_row`). |
+| `src/llama-graph.cpp` (1) | block 10's ISWA branch taken; its duplicate `mctx_iswa`/`mctx_cur` declarations (upstream already had them above) removed. |
+| `tests/test-backend-ops.cpp` (1) | union: upstream's BF16 rms_norm width matrix **and** block 10's `GGML_TYPE_BF16` in the `set_rows` loop (the two `for (… set_rows_type …)` headers collapsed onto upstream's wider set). |
 
-**Exit:** `gate-node-budget.sh` (the async ring adds graph nodes), `gate-grid-stall-pad.sh` if the pad site
-moved.
+**First-error passes (six, all mechanical):** `cpy-batch.cu` needs `graph.cuh` for `stream_context()`;
+`ggml-cuda-try-fuse.cu` needs `graph.cuh` and **included `ggml-cuda/diagmask.cuh`, which upstream's prune
+`29dbbad2b` deleted** (`D8`'s "a prune removes includes — a build break, not a conflict"; nothing was used from
+it); six `ggml_cuda_should_use_mmvf()` call sites (two in the new TU, three in `mmvf.cu`, one in `topk-moe.cu`)
+were still on the old six-argument `(type, cc, warp_size, ne, nb, n)` form and moved to upstream's tensor form;
+the `sched_new` duplicate signature line and the `mctx_*` / `set_rows` duplicates above.
+
+**Verified:**
+* build green; coherence **100 chars `sha=1c5d32ac537d`** (unchanged since R01), `git grep -I '<<<<<<<'` empty.
+* **`scripts/gate-norm-rows-alias.sh` PASS** — the r225 narrow-row fusion arrives with this block and the gate is
+  now fully armed: section A builds and runs its driver (the `D5-a` link failure is gone), the gated form on
+  Ling-3.0-tiny fuses every node with **0 declined** and its text equals the kill-switch arm, and the SILU-gated
+  hybrid takes the PLAIN form (**344 fused, 0 gated, 0 declined**) with identical text (139 chars
+  `sha=d2ffb97ccb76`).  No GPU faults in the gate's window.
+* **`scripts/gate-node-budget.sh` is R13's, not R11's.**  Arms A (`q8_0 -ub 2048`) and B (`q8_0 -ub 512`) abort in
+  `ggml_backend_sched_split_graph` (`ggml-impl.h:337`, "visited all hash table entries") on this tree; C and D
+  pass.  The **r277 reference build passes all four arms**, and the gate's own header records arm A aborting on
+  the **unpatched base**.  The `graph_max_nodes()` sizing and the "over its node budget" refusal both live in
+  **block 12** (`grep -l 'over its node budget' patches/*` -> `0012-…`), which is R13 — so the gate cannot pass
+  before R13.  **One note for R13:** arm B passed on the unpatched base per the header but aborts here, so the
+  async ring's node cost needs a measurement before the sizing is re-bumped: R13 must show the margin, not just
+  the pass.
+
+**`D5` note (for R18):** the delivery's RDNA4/RDNA3_5 "dense band promotion" (`ne11 <= MMVQ_MOE_MAX_BATCH_SIZE &&
+src0->ne[1] % 128 != 0` -> MMVQ) now runs **after** upstream's `ggml_cuda_should_use_mmq_few()` gate, so it only
+decides shapes few-row MMQ declines.  The delivery-vs-upstream few-row ordering is the `D5` `llama-bench` arm
+deferred to R18; it is not decided here.
 
 ## R12 — block 11: qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) · **TODO**
 

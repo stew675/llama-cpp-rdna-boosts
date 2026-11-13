@@ -13,10 +13,10 @@ conflict map is in [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 |---|---|
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `a6809f75b`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R10 done = blocks 00-08 + the rung-repair + block 09**; next is **R11 = block 10 (slab, fusion dispatcher, async input ring)** |
-| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) |
-| canonical build | `~/llama.cpp/build-rocm` — **R10 tree** (`a6809f75b`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `13176810a`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
+| progress | **R00-R11 done = blocks 00-08 + the rung-repair + blocks 09-10**; next is **R12 = block 11 (qwen4exp)** |
+| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) |
+| canonical build | `~/llama.cpp/build-rocm` — **R11 tree** (`13176810a`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
 | coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 |
@@ -113,9 +113,9 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R08 | 07 k-quant boosts | DONE | `626e398d2` | graph-reuse union; `MUL_MAT` 2681/0 (`D16`) |
 | **R09** | **08 fused kernels** | **DONE** | `a95c0497b` | 7 conflicts resolved; **`D12` dual store kept**, `D6` partial; **found `D5-a`** (heads 40/72 have no mma instance — R06 gap, AWAITING) |
 | R10 | 09 host-resident MoE | **DONE** | `a6809f75b` | 14 hunks, all "both sides"; `D1` answered (no port), arena live, pool text identity `a99ccbd97ecb`; its gate's `tsplit*` arms are **R13's** — see §5.5 |
-| R11 | 10 infrastructure | TODO | — | 10 conflicts (biggest); `D6`, `D8`, `D10`; **owes `gate-node-budget.sh`** |
+| R11 | 10 infrastructure (slab, fusion dispatcher, async ring) | **DONE** | `13176810a` | 9 files / 20 hunks; the whole fusion dispatcher moved into `ggml-cuda-try-fuse.cu`; `gate-norm-rows-alias.sh` **PASS**; `gate-node-budget.sh` is **R13's** |
 | R12 | 11 qwen4exp | TODO | — | 5 conflicts; `D11`; owes `gate-hc-fusions.sh`, `gate-qwen4exp-quant-coherence.sh` |
-| R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15`; **owes `gate-host-pool.sh` `tsplit`/`tsplitnosink`** (block 12 adds `moe_cache_pool_backed`) |
+| R13 | 12 campaign remainder | TODO | — | 4 conflicts; `D10`, `D11`, `D15`; **owes `gate-host-pool.sh` `tsplit`/`tsplitnosink`** (block 12 adds `moe_cache_pool_backed`) **and `gate-node-budget.sh`** (block 12 has `graph_max_nodes()` + the "over its node budget" refusal; at R11 arm B aborts, so R13 must show the margin, not just the pass) |
 | R14 | 13 MTP vocab subset | TODO | — | **0 conflicts**; re-verify `D7` |
 | R15 | 14 relaxed-tensor (TEMPORARY) | TODO | — | **0 conflicts**; check upstream has not started allowing those arches |
 | R16 | 15 streamed KV | TODO | — | 5 conflicts; `D3`, `D19`; owes the KV residency gates |
