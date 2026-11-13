@@ -80,9 +80,10 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
 * **Status:** **audit PASSED at R05 (2026-11-13).**  The merged `-ctk/-ctv` set is
   `f32 f16 bf16 f8_e4m3 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1`: the delivery's `bf16` and upstream's `f8_e4m3`
   coexist, and on the 4B (1 GPU, `-c 4096`, seed 42) the `bf16`, `f8_e4m3` and `q8_0` arms all run and give the
-  same `sha=1c5d32ac537d`.  The BF16 FA instance is compiled in and reached.  **Still owed at R06:** the FA
-  *instance matrix* (block 05) and the FP8 vec FA instance, which is where a type can be reachable but
-  uninstantiated (`GREEDY-PURITY.md` §20).
+  same `sha=1c5d32ac537d`.  The BF16 FA instance is compiled in and reached.  **Closed at R06:** the FA instance matrix
+  (block 05) merged on the union set, and upstream's FP8 vec FA instance is compiled and exercised
+  (`f8_e4m3` cases in the 6996-case FLASH_ATTN_EXT oracle, 0 failures) — no reachable-but-uninstantiated
+  type remains (`GREEDY-PURITY.md` §20).
 
 ## D4 — MMVF: upstream dispatches BF16 to MMVF for few rows at small batch
 
@@ -110,7 +111,15 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   few-row win redundant.
 * **Questions:** re-derive the FA band over the new instance matrix (including FP8 and the 40/72 heads);
   measure MMB/MMQ few-row (BS 2-24) delivery vs upstream.
-* **Status:** `OPEN` — R06/R07.
+* **Status:** **`DECIDED` at R06 (2026-11-13) — complementary, nothing dropped.**  The FA half: the delivery's
+  band is a selector over the kernel matrix, so upstream's FP8 vec FA, heads 40/72 and the sm70 case sit
+  beside it.  The instance matrix was regenerated on the union (the delivery's 121 typed instances supersede
+  the 16 head-agnostic files; upstream's 40/72 additions are declared in the typed set and were exercised),
+  and upstream's `DKQp`/`DVp` padded-head mechanism was re-added because the delivery's inherited loops and
+  Q-tile stride need it for head 72.  Oracle: `test-backend-ops -o FLASH_ATTN_EXT` **6996 OK / 0 FAIL**
+  (18 derived, 385 iq4_nl, 7 f8_e4m3, 448 head-40, 1010 head-72).  The **few-row MMQ half of D5 is still
+  open**: `#31533`'s `mmq-few.cu` meets the delivery's MMB/MMQ dispatch at R07, and that is where the
+  delivery-vs-upstream few-row measurement belongs.
 
 ## D6 — CUDA graph and concurrent-stream state left `common.cuh`
 

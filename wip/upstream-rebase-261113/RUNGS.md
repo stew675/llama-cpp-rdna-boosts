@@ -19,8 +19,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R03 | 02 adaptive MTP | **DONE** | `50a0b30f8` | `D7`, `D8` |
 | R04 | 03 chunked GDN | **DONE (both-sides, nothing dropped)** | `43891459e` | **`D2` resolved as complementary**, `D14` |
 | R05 | 04 BF16 KV | **DONE** | `4c6a5019a` | `D3` checked |
-| R06 | 05 flash attention | **NEXT** | — | **`D5`**, `D3` |
-| R07 | 06 MMB prefill | **TODO** | — | `D5` |
+| R06 | 05 flash attention | **DONE** | `22fcde21e` | **`D5` resolved as complementary**, `D3` closed |
+| R07 | 06 MMB prefill | **NEXT** | — | `D5`-adjacent |
 | R08 | 07 k-quant boosts | **TODO** | — | `D4`, `D16` |
 | R09 | 08 fused kernels | **TODO** | — | `D6`, `D12` |
 | R10 | 09 host-resident MoE | **TODO** | — | **`D1`**, `D9`, `D15`, `D17`, `D18` |
@@ -186,7 +186,7 @@ merged tree; neither is reachable on gfx1201.  Kernel-side consistency only.
 (`GGML_CUDA_FA_QUANTS` carries `bf16-bf16`), so the arm reaches the delivery path, not a fallback.  The BF16
 KV decode A/B stays R18's job (it is a release number, not a rung cost).
 
-## R06 — block 05: flash-attention band, native quantized K/V and derived kq mask · **TODO**
+## R06 — block 05: flash-attention band, native quantized K/V and derived kq mask · **DONE 2026-11-13**
 
 * block sha `a45c508e9` · 295 files · **expected conflicts: 8 + 16 modify/delete**
 
@@ -202,6 +202,27 @@ KV decode A/B stays R18's job (it is a release number, not a rung cost).
 **Expect:** **`D5`** — re-derive the delivery's FA band selector over the new instance matrix (including
 the FP8 vec FA), keeping our band as the preferred path where it wins and upstream's kernel reachable.
 `iq4_nl` instances are set by hand on this box (`GGML_CUDA_FA_QUANTS`) — re-set them when this rung lands.
+
+**R06 result: `22fcde21e`** — 295 files, +5641 / −659 (232 instance files added by the block, 16 old ones
+deleted).  Build green; coherence unchanged (`sha=1c5d32ac537d`, also with `-ctk/-ctv q8_0`); the derived
+kq-mask probe resolves at load (`resolve_fused_ops: derived kq mask flash attention enabled`).
+**`test-backend-ops -o FLASH_ATTN_EXT`: 6996 OK / 0 FAIL**, including 18 `derived=1` cases (the delivery's V3
+mask), 385 `iq4_nl` (native quantized K/V), 7 `f8_e4m3` (upstream's FP8 vec FA), and **448 at head 40 +
+1010 at head 72** (upstream's new MMA head sizes) — so the merged instance matrix covers both sides.
+
+**`D5` outcome — complementary, nothing dropped.**  Upstream's FA changes (`#30285` heads 40/72, `#27997`
+sm70 case, `#32018` unused params, `#28413`/`#28392` FP8) are additive to the delivery's band; the delivery's
+band is a *selector* over the same kernel matrix, so both ship.
+
+| site | resolution |
+|---|---|
+| `TYPES_KV` (generator), `FA_TYPES` (common.cmake), `GGML_CUDA_FA_QUANTS` default (ggml/CMakeLists.txt) | **union**: the delivery's list gains upstream's `f8_e4m3` (`...;iq4_nl-iq4_nl;f8_e4m3-f8_e4m3`), and `FA_TYPES` gains it at the end.  The box's cache now carries the union (the r277-era hand-set `iq4_nl-iq4_nl` trap is resolved by this rung, as the campaign predicted). |
+| 16 × `template-instances/fattn-mma-f16-instance-ncols1_*-ncols2_*.cu` (**UD**) | **accept block 05's deletion.**  The delivery replaced the head-agnostic files with 121 typed `...-dkqN-dvN.cu` instances; the typed set already declares heads 40 and 72 (`ls | grep -c dkq40/dkq72` = 16), so upstream's additions are covered rather than lost — proven by the oracle above. |
+| `fattn-mma-f16.cuh` (8 conflicts) | take the delivery's band-extended functions, **and re-add upstream's `DKQp`/`DVp = GGML_PAD(..,16)`**: upstream added the padded head width for head 72, and the delivery's inherited loops/Q-tile stride/VKQ_C sizing need it.  `stride_tile_Q = DKQp/2 + 4` in both functions; `VKQ_C` keeps the delivery's fp32/fp16 distinction (GREEDY-PURITY §46) but sizes on `DVp`, which is the bound the upstream rescale/combine loops iterate. |
+| `src/llama-graph.h` | the delivery's `LLM_FUSED_OP_FLASH_ATTN_DERIVED`, `llm_graph_kq_derived`, `llm_graph_moe_cache_slots`; **not** `LLM_FUSED_OP_GDN_AR/CH` (upstream removed them at R04). |
+| `src/llama-cparams.h`, `src/llama-context.cpp` | the delivery's derived/packed kq-mask config and reachability latch; **removed the now-dead `fused_gdn_ar`/`fused_gdn_ch`/`auto_fgdn`** (their consumers were the GDN fused-node tags upstream deleted — D2). |
+| `tests/test-backend-ops.cpp` | union: upstream's `q_head_padding` + the delivery's `derived`/`derived_hole`/`mask_hole`.  `q_head_padding` goes **last** in the ctor (no upstream call site passes it, checked), so the delivery's positional test cases keep their meaning; `vars()` keeps upstream's `VARS_TO_STR18` + the three flags. |
+| block-05 call sites vs upstream's context refactor | `graph_max_nodes(n_tokens)` -> **`graph_max_nodes()`** (upstream `#32078` removed the ubatch dependence; `gate-node-budget.sh` is owed at R11/R18), and `sched_new(max_nodes, false)` -> upstream's **`sched_new({.max_nodes, .parallel, .op_offload})`** struct form (`#32009`).  `graph_reserve(..., packed_kq_mask)` merged as-is (the header already carried both sides' parameters). |
 
 ## R07 — block 06: MMB quantized prefill GEMM · **TODO**
 

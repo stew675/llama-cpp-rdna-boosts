@@ -1,6 +1,6 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R05 done 2026-11-13 (blocks 00-04); R06 (block 05, flash attention) is next.**  `D17`
+**Status: OPEN — R00..R06 done 2026-11-13 (blocks 00-05); R07 (block 06, MMB prefill) is next.**  `D17`
 (the base blocker) is decided: block 00 carries the `#30542` revert.  Rungs R01..R17 are the replay; R18 is
 the release ladder.  Nothing here is delivery: `patches/`, `release.json` and the fork are untouched until
 R18.  Target release is the next one after r277 (r278 unless an amendment intervenes) and the next fork
@@ -120,8 +120,8 @@ bound: the probe chained through marker-carrying trees).
 | 1 | R03 | 02 adaptive MTP | 3 | **DONE** — `D7` measured (device path is `-sm layer`-only today), `D8` include lesson |
 | 1 | R04 | 03 chunked GDN | 1 | **DONE** — `D2` **not** a subsume: upstream deleted its own graph builders/tags; our chunked kernels are the surviving path |
 | 1 | R05 | 04 BF16 KV | **0** | **DONE** — clean; `D3` audit passed (bf16 + f8_e4m3 + q8_0 all coherent) |
-| 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **NEXT** — **`D5`** (FA grew FP8, head 40/72, sm70; 16 modify/delete template instances) |
-| 2 | R07 | 06 MMB prefill | 1 | `D5`-adjacent (few-row MMQ `#31533` lands in the same dispatch) |
+| 2 | R06 | 05 flash attention | 8 (+16 modify/delete) | **DONE** — `D5` FA half complementary: union instance matrix + upstream's `DKQp`/`DVp`; 6996/0 FA oracle |
+| 2 | R07 | 06 MMB prefill | 1 | **NEXT** — `D5`'s few-row half (`#31533` `mmq-few.cu` vs the delivery's MMB dispatch) |
 | 2 | R08 | 07 k-quant boosts | 2 | `D16` (MUL_MAT src1 precision gating) |
 | 3 | R09 | 08 fused kernels | 7 | **`D6`** (graph state left `common.cuh`) + **`D12`** (BF16 RMS_NORM) |
 | 3 | R10 | 09 host-resident MoE | 8 | **`D1`** (upstream moved the MoE cache out of `llama-graph`), `D9`, `D15`, `D17` |
