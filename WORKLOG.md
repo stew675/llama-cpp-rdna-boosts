@@ -1,3 +1,56 @@
+## 261113.010 (r277 + campaign rung R13, NO delivery change) -- R13 (block 12) lands both armed block-12 gates: the pool's `tsplit`/`tsplitnosink` go green and the node budget passes 4/4 with a 440-entry margin, while the FA generator's head-40/72 skips are rejected to keep the R09r invariant
+
+**No patch changes, no `release.json` change.**  Rung R13 (`75d83f231`, block 12 "campaign remainder: CPU wins,
+backend iface fills, DFlash, FA build grouping, server prompt cache").  Campaign record:
+`wip/upstream-rebase-261113/RUNGS.md` §R13.
+
+* **Result `75d83f231`** (tree `d862165c5`), **5 conflicted files / 8 hunks** (the probe said 4; the extra is
+  `src/llama-ext.h`), build green with **zero** first-error passes (a first for the climb), coherence unchanged
+  (**100 chars `sha=1c5d32ac537d`**), no stray end-markers.
+* **`D11` re-derived, and the answer was 106, not 105 and not 109.**  Block 12 adds exactly one op
+  (`GGML_OP_ALL_GATHER`), so all three `static_assert`s are **106** and `RPC_PROTO_PATCH_VERSION` becomes **8**;
+  block 12's literal 109 counts its own tree, which carries 3 ops upstream's `29dbbad2b` prune removed.  The RPC
+  *message* surface is untouched (three appended `buffer_type_i` fields set to `NULL`) and re-checked
+  mechanically: **24 messages, every one with a server `case` and a client send site.**
+* **The FA generator was the rung's one real decision, and the answer is "keep the R09r set".**  Block 12 is the
+  block that gives the mma matrix one TU per (head, ncols1, ncols2), but it kept upstream's
+  `if head_size_kq == 40/72: continue` because in *its* tree upstream's head-agnostic files carried those heads.
+  On this base those files are gone (the `9c94ce139` repair replaced them with the typed set), so the skips
+  would delete 32 instance files and resurrect `D5-a`.  The skips are dropped, with the reason in the script;
+  `generate_cu_files.py` run **twice** leaves `git status` clean (390 files, 25 `dkq40` + 25 `dkq72` + 29
+  `f8_e4m3`), i.e. the **compiled instance set is identical to R12's** — which is why this rung owes no
+  `gate-prefill-logits.sh` run.
+* **`D8`'s prune fired twice.**  Upstream's `llama : prune (#30565)` deleted `set_warmup()`/`cparams.warmup`, so
+  block 12's re-addition is not restored (nothing reads it), and it promoted three of the four `llama-ext.h`
+  declarations block 12 appends into `include/llama.h` — only `llama_model_n_layer_swa()` is re-added.
+* **`scripts/gate-node-budget.sh` PASS 4/4, and the margin is the number R11 asked for** (measured with a
+  throw-away INFO line on the refusal test, then reverted and rebuilt before the gate ran): **2064/2504** for
+  both `q8_0` arms and **1504/1944** for the `f16` and rotation-off arms — **440 entries in every arm**.  Two
+  facts fall out: the node count does not depend on the ubatch width (so R11's arm-B abort was not a width
+  effect — before block 12 the budget was upstream's bare `8 * n_tensors`), and the margin is invariant because
+  `memory->graph_extra_entries()` models the rotation **exactly** (+560 entries = 12 nodes + 2 leafs per layer
+  x 40 layers).  Every arm's text is `31 chars sha=a1b7eb2ee7a6`, the recorded rotation identity.
+* **`scripts/gate-host-pool.sh`: 42/54, and the two arms R13 owed are CLEARED.**  `tsplit` builds a real pool on
+  a 2-device `-sm tensor` split (58 797 slots/table, 32 588.3 MiB pinned), the arena->pool exchange is **INERT**
+  (0 demoted / 0 geometry / 0 retirements) and `tsplit` == `tsplitnosink` byte for byte (**171 chars
+  `sha=8c39335bbceb`**).  That is block 12's `moe_cache_pool_backed` Meta forwarding doing exactly what R10's
+  parked fault needed.  `ref`/`dio`/`nodisk`/`sink`/`sinkfail`/`pin0` text is `182 chars sha=a99ccbd97ecb`;
+  `sink` demotes 2 720x with 0 copy-error, `sinkfail` declines all 2 720 as copy-errors and publishes none.
+* **The 12 remaining checks are two later blocks' mechanisms, not defects — and one of them corrects the R10
+  record.**  `fail`/`late`/`pinlate` (8 checks) are **R16's**: `host_expert_buft()` still ends in
+  `(void) want_mapping; return ggml_backend_dev_host_buffer_type(dev);`, so the host master is the **pinned**
+  `ROCm_Host` and `bind_host_dev_locked()`'s `cudaHostGetDevicePointer()` succeeds; block 15 is what returns
+  `ggml_backend_dev_moe_host_master_buft(dev)` (`ROCm_HostMap`, the pageable pool-backed master), and only then
+  does `expert_host_src()` reach `pool_fill_fault()`/the bounce-grow latch.  The arms are therefore **vacuous**
+  here (their text still equals `ref`), which means those three arms were already vacuous at R10 — R10 proved
+  text identity, not the fault path.  The other 4 checks (`ref`'s `PLACEMENT reads: O_DIRECT` + placement queue,
+  `qd1`, `bulkbuf`) are **R17's**: `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the placement read queue
+  all live in `patches/0016-*`.  Nothing was weakened — both arms stay in the gate and are recorded with the
+  block and the symbol.
+* **Climb state:** R00..R13 done on `rebase-r278` at `75d83f231`; build dir holds the R13 tree.
+  **Next: R14 = block 13** (`--spec-draft-mtp-vocab N`, `f0c7f3359`, 0 expected conflicts), which re-verifies
+  `D7`.
+
 ## 261113.009 (r277 + campaign rung R12, NO delivery change) -- R12 (block 11, qwen4exp) is the cleanest rung of the climb: 6 hunks, and the `GGML_OP_COUNT` on neither side was the merged value (105)
 
 **No patch changes, no `release.json` change.**  Rung R12 (`1d83b50e0`, block 11 "qwen4exp: model,

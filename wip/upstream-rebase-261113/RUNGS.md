@@ -27,7 +27,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R10 | 09 host-resident MoE | **DONE 2026-11-13** | `a6809f75b` (after the rung-repair `9c94ce139`) | **`D1`** answered (no port needed — upstream moved its own cache), `D9`, `D15`, `D18` checked; **`gate-host-pool.sh` `tsplit*` deferred to R13** |
 | R11 | 10 infrastructure (slab, fusion dispatcher, async input ring) | **DONE 2026-11-13** | `13176810a` | 9 files / 20 hunks; `D6` graph state into graph.cuh, `D8` prune include, `D10` ring; **`gate-norm-rows-alias.sh` PASS**; **`gate-node-budget.sh` deferred to R13** (its sizing + refusal are block 12's) |
 | R12 | 11 qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) | **DONE 2026-11-13** | `1d83b50e0` | 5 files / 6 hunks — the cleanest rung yet; `D11` resolved (op count 105, RPC 7); `gate-hc-fusions.sh` **PASS**; quant-coherence A-D **PASS**, **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
-| R13 | 12 campaign remainder | **TODO** | — | `D10`, `D11`, `D15` |
+| R13 | 12 campaign remainder | **DONE 2026-11-13** | `75d83f231` | 5 files / 8 hunks, **zero** first-error passes; `D11` re-derived (op count **106**, RPC **8**, 24 messages all paired); `D8` prune (`set_warmup` kept out, 3 of 4 `llama-ext.h` decls already upstream's); FA generator keeps the **typed set with no head-40/72 skips** (idempotent, 390 files); `gate-node-budget.sh` **PASS 4/4 with the margin (440 entries every arm)**; `gate-host-pool.sh` **42/54 — `tsplit`+`tsplitnosink` CLEARED**; 12 remaining checks are **R16's** (block 15's `host_expert_buft` `want_mapping` -> `ROCm_HostMap`) and **R17's** (block 16's `MOE_EXPERT_FILL_QD`/placement queue) |
 | R14 | 13 MTP vocab subset | **TODO** | — | `D7` verify |
 | R15 | 14 relaxed-tensor (**temporary**) | **TODO** | — | — |
 | R16 | 15 streamed KV | **TODO** | — | `D3`, `D19` |
@@ -637,22 +637,83 @@ seed 42 -> **100 chars `sha=1c5d32ac537d`**; `git grep -I '<<<<<<<'` empty.
   gate-arm-deferred-to-a-later-block item of the climb* (`tsplit` -> R13, `node-budget` -> R13, sparse QSA ->
   R16), each recorded with the block and the symbol that makes it impossible earlier.
 
-## R13 — block 12: campaign remainder (CPU wins, backend iface fills, DFlash, FA build grouping, server prompt cache) · **TODO**
+## R13 — block 12: campaign remainder (CPU wins, backend iface fills, DFlash, FA build grouping, server prompt cache) · **DONE 2026-11-13**
 
-* block sha `c7628e974` · 62 files · **expected conflicts: 4**
+* block sha `c7628e974` · 62 files · **result `75d83f231`** · tree `d862165c5` · **5 conflicted files / 8 hunks**
+  (the probe said 4 files; `src/llama-ext.h` is the extra — `D8`'s prune, see below).
 
-| conflicted path | what to expect |
-|---|---|
-| `ggml/include/ggml-rpc.h`, `ggml/src/ggml.c` | `D11` + `D8`. |
-| `ggml/src/ggml-cuda/template-instances/generate_cu_files.py` | the FA generator (FA build grouping). |
-| `src/llama-context.cpp` | `a8fad21e9`, `cb44fdb18`.  **`D10`**. |
+Build green with the canonical `GGML_HIP_NO_VMM=OFF` recipe and **zero** first-error passes (the first rung in
+the climb that needed none); coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 ->
+**100 chars `sha=1c5d32ac537d`**; `git grep -In '^<<<<<<< \|^=======$\|^>>>>>>> '` empty.
+
+| conflicted path | hunks | resolution |
+|---|---|---|
+| `ggml/include/ggml-rpc.h` | 1 | **`D11`, and again neither side's number was right.**  HEAD asserted 105 / patch version 7, block 12 asserts 109 / 8.  The merged enum is **106** = 105 + the **one** op block 12 adds (`GGML_OP_ALL_GATHER`); block 12's 109 counts *its* tree (old base + blocks 00-12, which holds 3 more ops than the new base after upstream's `29dbbad2b` prune).  `RPC_PROTO_PATCH_VERSION` **8** — the fork's op table changed by one entry, so an RPC peer built at R12 (105 ops) must refuse it.  The **message** surface is unchanged (block 12 adds three NULL `buffer_type_i` fields — `get_compute_margin_pct`, `alloc_buffer_usage`, `get_compute_chunk_bytes` — and no `RPC_CMD`): re-checked mechanically, **24 messages, every one with a server `case` and a client send site, none orphaned** ("one message, one handler on both ends"). |
+| `ggml/src/ggml.c` | 2 | the two `GGML_OP_NAME` / `GGML_OP_SYMBOL` tables took `ALL_GATHER` (block 12's hunks); both `static_assert`s set to **106**. |
+| `src/llama-context.cpp` | 2 | **(1)** the pipeline-parallel retry keeps **upstream's struct-form `sched_new({.max_nodes, .parallel, .op_offload})`** *and* block 12's appended `/*reserve_injection =*/ dflash_draft` on `graph_reserve(...)` (a continuation-line union — trap 12 territory, checked at the seam).  **(2)** block 12's `backend_sampler_reserve_once()` (the `LLAMA_BACKEND_SAMPLER_RESERVE_ONCE` kill switch + the `sampling.reserved` node-width check in `set_sampler`) is taken, and its **`set_warmup()` re-addition is NOT**: upstream's `llama : prune (#30565)` deleted `set_warmup()` / `cparams.warmup` in this range and the delivery reads neither.  `D8`'s prune class — a decision, recorded, not a silent delete. |
+| `src/llama-ext.h` | 1 | **`D8` again, and only one of four symbols is really missing.**  Block 12 appends four declarations; upstream's `#30565` promoted three of them (`llama_model_dflash_selector_top_k`, `llama_model_target_layer_ids`, `..._ids_n`) into `include/llama.h`'s "NextN / speculative draft model queries" section, so only **`llama_model_n_layer_swa()`** is re-added (it exists nowhere else and `common/speculative.cpp` calls it).  No duplicate, nothing pruned restored. |
+| `ggml/src/ggml-cuda/template-instances/generate_cu_files.py` | 1 | **the R09r invariant decided it.**  Block 12 is the block that turns the mma matrix into one TU per (head, ncols1, ncols2) — but it still carried upstream's `if head_size_kq == 40/72: continue`, because in *its* tree upstream's head-agnostic files carried those two heads.  On this base there are **no** head-agnostic files any more (the R09r repair replaced them with the typed set), so the skips would delete 32 needed instance files and bring `D5-a` back.  Resolution: block 12's typed loop **and its comment**, with the two skips **dropped** (and the reason written into the script).  Verified: `python3 generate_cu_files.py` run **twice** leaves `git status` clean (390 files, **25 `dkq40` + 25 `dkq72` + 29 `f8_e4m3` present**) — the compiled instance set is therefore **identical to R12's**, which is why this rung owes no `gate-prefill-logits.sh` run (block 12 adds no prefill kernel). |
+
+**Verified**
+
+* coherence (above); markers clean; generator idempotent (above).
+* **`scripts/gate-node-budget.sh` PASS, all four arms**, every arm `31 chars sha=a1b7eb2ee7a6` (the r267
+  rotation-identity reference), no "over its node budget" refusal.  **The margin R11 asked for** (measured with
+  a throw-away `LLAMA_LOG_INFO` on the refusal test in `graph_reserve`, then reverted and rebuilt before the
+  gate ran):
+
+  | arm | graph needs (nodes + leafs) | budget | margin |
+  |---|---|---|---|
+  | A `q8_0 -ub 2048` | **2064** (1649 + 415) | 2504 | **440 (17.6 %)** |
+  | B `q8_0 -ub 512`  | **2064** (1649 + 415) | 2504 | **440 (17.6 %)** |
+  | C `f16 -ub 2048`  | **1504** (1169 + 335) | 1944 | **440 (22.6 %)** |
+  | D `q8_0`, `LLAMA_ATTN_ROT_DISABLE=1` | **1504** (1169 + 335) | 1944 | **440 (22.6 %)** |
+
+  Two facts fall out.  **The node count does not depend on the ubatch width** (A and B are identical), so R11's
+  arm-B abort was not a width effect: before block 12 the budget was upstream's bare `8 * n_tensors` (**1944**)
+  and the rotation's **+560** entries (12 nodes + 2 leafs per layer x 40 layers) put both q8_0 arms over it.
+  And **the margin is 440 in every arm because `memory->graph_extra_entries()` (block 12) models the rotation
+  exactly** — budget +560, need +560 — so the rotation gets back precisely the headroom the model had without
+  it.  That is a sizing that is exact rather than padded, and it is the answer to "show the margin, not the
+  pass".
+* **`scripts/gate-host-pool.sh`: 42/54 — the two R13 arms are CLEARED, and all 12 failures are two later
+  blocks' mechanisms** (see the deferral table below).  `tsplit` builds a real pool on a 2-device `-sm tensor`
+  split (**58 797 slots/table, 32 588.3 MiB pinned**), the exchange is **INERT** (0 demoted, 0 geometry
+  declines, 0 retirements) and `tsplit` == `tsplitnosink` byte for byte (**171 chars `sha=8c39335bbceb`**) —
+  i.e. block 12's `moe_cache_pool_backed` Meta forwarding is exactly what R10's parked `tsplit` fault needed,
+  and the `-sm tensor` host-master fault is gone.  `ref`/`dio`/`nodisk`/`sink`/`sinkfail`/`pin0`/`qd1`/`bulkbuf`
+  text is `182 chars sha=a99ccbd97ecb` (the r236 record); `sink` demotes 2 720 x with 0 copy-error, `sinkfail`
+  declines all 2 720 demotes as copy-errors and publishes none, `nodisk` falls back to buffered, `pin0` builds
+  no pool and names the kill switch.
+
+**Gate arms deferred to a later block (the 4th and 5th of the climb, both measured, neither a defect)**
+
+| failing checks | arm(s) | owner | symbol / mechanism |
+|---|---|---|---|
+| 8 | `fail`, `late`, `pinlate` ("no FAILED fills", `takeover=4932`, no "NOT resident" line, no latch line, 0 post-latch fills) | **R16 (block 15)** | `llama_model_loader::host_expert_buft()` — the current branch ends in `(void) want_mapping; return ggml_backend_dev_host_buffer_type(dev);`, i.e. **the host master is always the PINNED `ROCm_Host` buffer**.  Block 15 inserts `if (want_mapping && use_mmap && !pin_master) return ggml_backend_dev_moe_host_master_buft(dev);` (`ROCm_HostMap`, the pageable pool-backed master).  Until it lands, `bind_host_dev_locked()`'s `cudaHostGetDevicePointer()` **succeeds**, the table takes the in-place cold read and `expert_host_src()` never reaches `pool_fill_fault()` / the bounce-grow latch — so the three fault arms are **vacuous** (their text still equals `ref`, which is why R10's text-only check read green).  Proof: our log has **no** `bind_host_dev_locked: the host expert master is pageable` line and `tensor … buffer type overridden to ROCm_Host`, while `bin-r277` (which has block 15) prints the pageable line, `… overridden to ROCm_HostMap`, pool `h=0.9559 (40837/42719)`, `FAILED fills` 142 x and `takeover=0`. |
+| 4 | `ref` ("no `host pool PLACEMENT reads: O_DIRECT`", "the placement queue did not run"), `qd1` ("did not report 1 reader"), `bulkbuf` ("did not report a buffered placement read") | **R17 (block 16)** | `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the placement read queue (`host pool placement queue: N batch(es) … N reader(s)`) are **block 16's** (`grep -l` -> `patches/0016-*`); this rung's pool still prewarms serially out of the mapping. |
+
+Nothing was weakened: the gate script is untouched, both arms stay in it, and each is recorded with the block
+and the symbol that makes it impossible earlier.  **Correction to the R10 record:** the pool's *demand* path was
+never reached in that config, so the `fail`/`late`/`pinlate` arms were already vacuous at R10 — what R10 proved
+was text identity, and that still holds.
+* `D15`: block 12 touches **no** PLE file (`git show --stat` on `common/fit.cpp` is empty; its
+  `src/llama-model-loader.cpp` hunks are the `--load-mode buffered` read transport, which the gate exercises:
+  `host pool fill mode: buffered (page cache as L3)` and, with `MOE_HOST_POOL_DIO=1`, `O_DIRECT`).  The PLE
+  `madvise(WILLNEED)` loop came in with block 11 at R12; the R10 `paths_model` merge stands; the PLE-residency
+  question stays **R16's**.
+* `D10`: the `tsplit*` arms were its last open item and they are green; upstream's `#31419`/`#32100`/`#32089`
+  and the delivery's ring/fills coexist (the pool census proves the fills run on a split).
 
 ## R14 — block 13: MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`) · **TODO**
 
 * block sha `f0c7f3359` · 19 files · **expected conflicts: 0** (CLEAN)
 
 **Expect:** clean, but upstream's MTP device-buffer path (`D7`) changes what a draft sees — verify the
-vocab-subset filter still applies to the drafted tokens.
+vocab-subset filter still applies to the drafted tokens.  `D7` was measured at R03 (`-sm layer` activates the
+device-buffer row gather, `-sm tensor` declines and falls back to the host path) and R12 kept the helper that
+carries it; re-verify on this rung's tree, with the field MTP arm (`35B-A3B`, `--spec-type draft-mtp-adaptive`,
+`-lv 4`, grep `adaptive draft depth enabled` / `target h rows on the device` / `draft acceptance`).
 
 ## R15 — block 14: `-sm relaxed-tensor` (**TEMPORARY**) · **TODO**
 

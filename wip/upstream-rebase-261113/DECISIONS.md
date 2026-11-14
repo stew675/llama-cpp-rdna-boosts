@@ -325,6 +325,13 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   `#32089` graph-result reuse all coexist with it (the ring is *below* the scheduler).  The `-sm tensor`
   `tsplit*` arms remain the open R13 item; the ring's own A/B is `D4`/R18's `llama-bench` shape, not a
   correctness gate.
+* **`CLOSED` at R13 (2026-11-13).**  Block 12's `moe_cache_pool_backed` Meta forwarding cleared the last two
+  arms: `gate-host-pool.sh` `tsplit` now builds a real pool on a 2-device `-sm tensor` split (58 797 slots/table,
+  32 588.3 MiB pinned), the arena->pool exchange is **INERT** on that geometry (0 demoted, 0 geometry declines,
+  0 retirements) and `tsplit` == `tsplitnosink` byte for byte (**171 chars `sha=8c39335bbceb`**); no
+  `Page not present`, no GPU fault.  The ring's own A/B, and the two *demand-transport* items the same gate
+  still cannot reach (see `R16`/`R17` in `RUNGS.md` §R13), are not D10's: they are block 15's pageable
+  pool-backed master and block 16's placement read queue.
 
 ## D11 — `ggml.c` / RPC / test-surface refactors
 
@@ -347,6 +354,15 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   renumbers.  Four conflict hunks, all mechanical — the op table, the RPC header, the qwen4exp include set and
   the GET_ROWS test matrix.  **For R13:** block 12 touches the *RPC message* surface (`ggml-rpc.h` + the
   handlers in `ggml.c`), so that rung re-checks "one message, one handler on both ends".
+* **`CLOSED` at R13 (2026-11-13).**  Block 12 adds **one** op (`GGML_OP_ALL_GATHER`, registered in
+  `GGML_OP_NAME`/`GGML_OP_SYMBOL`, dispatched on CUDA/Meta and exercised by `test-backend-ops`), so the merged
+  count is **106** = R12's 105 + 1 — *not* block 12's literal 109, which counts its own tree (old base + blocks
+  00-12) the same way block 11 counted 108.  All three `static_assert`s are 106; `RPC_PROTO_PATCH_VERSION` goes
+  **8** (the op table changed by one entry after R12, so a peer built at R12 must refuse it).  Block 12 touches
+  **no** `RPC_CMD`: its `ggml-rpc.cpp` hunk is the three appended `buffer_type_i` fields
+  (`get_compute_margin_pct`, `alloc_buffer_usage`, `get_compute_chunk_bytes`) set to `NULL`, and they sit in the
+  merged struct's order.  Verified mechanically: **24 messages, every one has a server `case` and a client send
+  site, none orphaned** — the "one message, one handler on both ends" check the R12 note asked for.
 
 ## D12 — BF16 RMS_NORM: upstream rewrote `norm.cu`
 
@@ -415,6 +431,15 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   sites and one `extra->path_model` that still used the single-path name.  The PLE `madvise(WILLNEED)` loop is
   block 12's (R13) and block 15's (R16); the loader-side question — does `--lazy-mode mlock`/WILLNEED still pin
   the PLE table on the new external-PLE load path — is R16's.
+* **R13 check (2026-11-13): block 12 touches no PLE file, and the attribution in the Delivery line above is
+  wrong in a harmless way** — the PLE `madvise(WILLNEED)` loop actually arrived with **block 11** at R12
+  (`grep -l MADV_WILLNEED patches/*` -> `0011-*`, `src/models/qwen4exp.cpp`'s lazy reader; upstream's own
+  `llama_prefetch` in `src/llama-mmap.cpp` is untouched).  `git show --stat c7628e974 -- common/fit.cpp` is
+  **empty**, and its `src/llama-model-loader.cpp` hunks are the `--load-mode buffered` read transport, which
+  R13's pool gate exercises (`host pool fill mode: buffered (page cache as L3)`; `MOE_HOST_POOL_DIO=1` ->
+  `O_DIRECT`).  So the `paths_model` merge and the delivery's `madvise` loop are both in the tree and R10's
+  status stands.  **Still `OPEN`: the loader-side residency question is R16's** (does `--lazy-mode
+  mlock`/WILLNEED pin the PLE table on the external-PLE path).
 
 ## D16 — MUL_MAT src1 precision tests and gating
 

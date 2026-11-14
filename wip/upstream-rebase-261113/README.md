@@ -1,10 +1,11 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R12 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
-and blocks 09-11); R13 (block 12, "campaign remainder") is next.**  Two gate arms are deferred to **R13** by construction,
-both because the code they need ships with block 12: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (the
-`moe_cache_pool_backed` Meta forwarding) and `gate-node-budget.sh` (`graph_max_nodes()` + the "over its node
-budget" refusal) — see `RUNGS.md` R10/R11 and `HANDOVER.md` §5.5.  `D17` (the base blocker) is decided: block 00
+**Status: OPEN — R00..R13 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
+and blocks 09-12); R14 (block 13, "MTP draft vocabulary subset") is next.**  The two arms that had to wait for
+block 12 were both **cleared at R13**: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (the
+`moe_cache_pool_backed` Meta forwarding: pool built on a 2-device `-sm tensor` split, exchange INERT, both arms
+byte-identical) and `gate-node-budget.sh` (`graph_max_nodes()` + the "over its node budget" refusal: 4/4 with a
+440-entry margin per arm).  The pool gate's remaining 12 checks belong to blocks 15/16 — see `HANDOVER.md` §5.7.  `D17` (the base blocker) is decided: block 00
 carries the `#30542` revert.  `D5-a` (found at R09) is **decided and applied** as the rung-repair `9c94ce139`:
 upstream's FA heads 40/72 have their `fattn-mma-f16` instantiations again (32 undefined symbols -> 0), with the
 FP8 KV column and a typed `generate_cu_files.py` restored alongside.  Rungs R01..R17 are the replay; R18 is the
@@ -134,11 +135,11 @@ bound: the probe chained through marker-carrying trees).
 | 3 | R10 | 09 host-resident MoE | 8 (14 hunks) | **DONE** — all "both sides"; `D1` came out **answered without a port**, `D9`/`D15`/`D18` merged/checked, arena live (`fills=1991`), pool text identity `a99ccbd97ecb`; the gate's `tsplit*` arms are **R13's** |
 | 4 | R11 | 10 infrastructure | 9 (20 hunks) | **DONE 2026-11-13** — the dispatcher moved into `ggml-cuda-try-fuse.cu`; `D6` closed (packed replay guard + cluster check kept), `D8` fired again (`diagmask.cuh` pruned), `D10` closed; `gate-norm-rows-alias.sh` PASS; `gate-node-budget.sh` is R13's |
 | 4 | R12 | 11 qwen4exp | 5 (6 hunks) | **DONE 2026-11-13** — `D11` decided (op count **105**, RPC 7); `gate-hc-fusions.sh` PASS (`d62340fbf566`); quant-coherence A-D PASS, its **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
-| 4 | R13 | 12 campaign remainder | 4 | `D10` (backend upload/prefetch), `D15` (external PLE) |
-| 5 | R14 | 13 MTP vocab subset | **0** | `D7` verify only |
+| 4 | R13 | 12 campaign remainder | 5 (8 hunks) | **DONE 2026-11-13** — `D10`/`D11` **closed** (`tsplit*` green, op count **106** / RPC **8** / 24 messages paired), `D15` checked (the PLE loop is block 11's); FA generator keeps the typed matrix (no head-40/72 skips) and is idempotent; `gate-node-budget` PASS with the margin; `gate-host-pool` **42/54** — the 12 remaining checks are R16's/R17's |
+| 5 | R14 | 13 MTP vocab subset | **0** | `D7` verify only — **NEXT** |
 | 5 | R15 | 14 relaxed-tensor (**temporary**) | **0** | re-check it is still not subsumed |
-| 5 | R16 | 15 streamed KV | 5 | `D3` (FP8 KV instance set), `D19` (recurrent cache rename) |
-| 5 | R17 | 16 UMA GTT expert store | **0** | re-check the VMM pool change (`D17`) |
+| 5 | R16 | 15 streamed KV | 5 | `D3` (FP8 KV instance set), `D19` (recurrent cache rename); owes quant-coherence section E (sparse QSA) **and** `gate-host-pool`'s `fail`/`late`/`pinlate` |
+| 5 | R17 | 16 UMA GTT expert store | **0** | re-check the VMM pool change (`D17`); owes `gate-host-pool`'s placement-transport checks (`qd1`/`bulkbuf`/placement queue) |
 | 6 | R18 | — | — | release ladder: regenerate, validate, gates, `release.json`, fork refresh, records |
 
 Rung mechanics, per-rung conflict file lists and the resume command: [`RUNGS.md`](RUNGS.md).
