@@ -4795,12 +4795,18 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   served in place, 1 194.4 MiB of arena D2D against the copy arm's 3 357.6 MiB, 8.5 % of "fetch every used
   expert" read) and `gate-prefill-server-slots.sh` (3 checks, 0 failures -- A's text identical `3c2245a89587`,
   decode 3.64 → 4.02 tok/s, in B's prefill window 0.47 → 0.59) the APU-only gate set is closed at r285.
-* **The loader's pinned staging ring DOES outlive the meta backend's queued copies (r285, `TODO` #326's
-  question, answered in the code).**  The ring is `n_buffers = 4` slots with one event each;
-  `ggml_backend_event_synchronize(events[buffer_idx])` runs **before** a slot is rewritten; that event was
-  recorded on the Meta backend immediately after `set_tensor_async`, and `ggml_backend_meta_event_record`
-  records on **every** simple device's stream (its `event_wait`/`synchronize` waits on all of them).  So the
-  async arm's precondition -- "a caller whose source outlives the queued copies" -- holds for the loader, and
-  the r279 "90 async→sync transitions in one `-lm none` load" is the loader legitimately using the row-aligned
-  arm.  What is left of #326 is correcting the two comments (a block-10 patch change); no caller-visible flag is
-  warranted on this evidence.
+* **The loader's pinned staging ring DOES outlive the meta backend's queued copies (r285, `TODO` #326 closed).**
+  The ring is `n_buffers = 4` slots with one event each; `ggml_backend_event_synchronize(events[buffer_idx])`
+  runs **before** a slot is rewritten; that event was recorded on the Meta backend immediately after
+  `set_tensor_async`, and `ggml_backend_meta_event_record` records on **every** simple device's stream (its
+  `event_wait`/`synchronize` waits on all of them).  So the async arm's precondition -- "a caller whose source
+  outlives the queued copies" -- holds for the loader by construction, and the r279 "90 async→sync transitions
+  in one `-lm none` load" is the loader legitimately using the row-aligned arm.  A caller-visible flag is
+  therefore not warranted, and the two places a reader looks state the guarantee: the arm's precondition comment
+  (block 10) and the loader's ring note (block 09) -- which is the whole of this release's tree delta.
+* **A comment-only release is verified by INERTNESS, not by re-deriving the gates (r285).**  r285's entire patch
+  delta is two comment blocks (+17/−4, blocks 09 and 10; blocks 00-08 byte-identical), so the release's own
+  measurements ARE the claim: coherence text identical to r284 on the 1-GPU and 3-GPU `-sm tensor` arms
+  (`1c5d32ac537d`) and the 40-chunk prefill logits identical to the r279 base (0.000697 / 98.784 %).  A moved
+  hash or a moved KLD would mean the "comments only" statement is wrong -- which is why those arms run instead of
+  being asserted, and why `git diff <prev tip> <tip>` is quoted in the release record.

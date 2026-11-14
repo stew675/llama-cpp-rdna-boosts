@@ -1331,6 +1331,15 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r285 amendment (`TODO` #326 closed): the loader's staging ring note states the LIFETIME it relies on.**  The
+> `upload_backend()` note about a Meta device (this block's) said only that the event proxy "fans a record out to
+> every simple device, so the staging ring below still gets its backpressure".  It now also says why that makes
+> the ring slot SAFE to reuse: each of the `n_buffers = 4` slots has one event, the chunk loop synchronises slot
+> N's event **before** reading into slot N, and the Meta backend's `event_record` records on **every** simple
+> device's stream (its `event_wait`/`synchronize` waits on all of them) -- so the async `set_tensor_async` arm's
+> "the caller's source outlives the queued copies" precondition holds by construction for this caller.  Comments
+> only (+6 lines); `INVARIANTS.md` r285 carries the finding.  The r285 tree delta is this note plus block 10's.
+
 > **r275 amendment:** `tests/test-backend-tensor.cpp`'s buffer-type mock lists the appended
 > `get_compute_margin_pct`/`alloc_buffer_usage`/`get_compute_chunk_bytes` entries (`NULL`, i.e. the value they already
 > had) -- the `-Wmissing-field-initializers` cleanup for the field this block adds.
@@ -2050,6 +2059,14 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 ---
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
+
+> **r285 amendment (`TODO` #326 closed): the segmented async arm names BOTH callers that satisfy its contract.**
+> The Meta `set_tensor_async` comment required "(a) `offset` on a row boundary and (b) a caller whose source
+> outlives the queued copies -- which the scheduler guarantees", while the loader's row-aligned chunk had also been
+> reaching the arm since r279 (90 async -> synchronous transitions in one `-sm tensor --load-mode none` load).  The
+> comment now names the loader and the mechanism that makes it safe (its 4-slot pinned ring waits on its own
+> slot's event, recorded behind the per-device copies), and says a future caller with neither property must use the
+> synchronous setter.  Comments only (+11/-4); no code, no default, no branch.  `INVARIANTS.md` r285.
 
 > **r240 amendment (GitHub issue #290): the device pool stack gains a live/dead census, and both per-graph
 > activation caches stop replacing their block per layer.**  Three changes, all instruments of the same defect

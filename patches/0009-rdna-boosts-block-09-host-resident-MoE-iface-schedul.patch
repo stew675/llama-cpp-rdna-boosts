@@ -1,4 +1,4 @@
-From f5e2f4fe0974d482ed805e2562ca4c2940c64add Mon Sep 17 00:00:00 2001
+From 2cb4f65ca36928a10a590df4fc112e610d57fb69 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/16] rdna-boosts: block 09: host-resident MoE (iface,
@@ -96,7 +96,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  src/llama-kv-cache.cpp                        |    7 +-
  src/llama-mmap.cpp                            |   68 +-
  src/llama-mmap.h                              |    5 +
- src/llama-model-loader.cpp                    |  694 +-
+ src/llama-model-loader.cpp                    |  700 +-
  src/llama-model-loader.h                      |  118 +-
  src/llama-model.cpp                           |  266 +-
  src/llama-model.h                             |   11 +
@@ -105,7 +105,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 17631 insertions(+), 540 deletions(-)
+ 70 files changed, 17637 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -19647,7 +19647,7 @@ index 4f71f49f2..1bdfdc8df 100644
  
      void seek(size_t offset, int whence) const;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 4ee2b5ae5..e3741147b 100644
+index 4ee2b5ae5..d607d4337 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -10,11 +10,19 @@
@@ -20384,7 +20384,7 @@ index 4ee2b5ae5..e3741147b 100644
      std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
  
      // 4 staging buffers for async uploads, each sized `buffer_size` below (LLAMA_LOAD_STAGE_MB,
-@@ -1841,6 +2438,15 @@ bool llama_model_loader::load_all_data(
+@@ -1841,6 +2438,21 @@ bool llama_model_loader::load_all_data(
              return nullptr;
          }
  
@@ -20395,12 +20395,18 @@ index 4ee2b5ae5..e3741147b 100644
 +        // safe.  A segmented tensor whose chunk starts mid-row, and a PARTIAL split tensor, fall
 +        // back to the synchronous setter inside the Meta backend.  The event proxy fans a record
 +        // out to every simple device, so the staging ring below still gets its backpressure.
++        // TODO #326: that fan-out is also what makes the RING SLOT's lifetime safe, and it is the
++        // reason a slot may NOT be rewritten as soon as the call returns.  Each slot has one event;
++        // the chunk loop synchronises slot N's event BEFORE it reads into slot N, and the event was
++        // recorded on the (Meta) backend after its `set_tensor_async` -- i.e. on every simple device's
++        // stream, behind that chunk's queued copies.  So `set_tensor_async`'s "source outlives the
++        // copies" precondition holds here by construction, not by luck.
 +        // (The old `ggml_backend_dev_is_meta(dev) -> nullptr` bail predated that and forced the
 +        // whole-tensor pageable `read_buf` path, which is several times slower on `--load-mode none`.)
          if (buft != ggml_backend_dev_buffer_type(dev)) {
              LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                  ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-@@ -1856,6 +2462,21 @@ bool llama_model_loader::load_all_data(
+@@ -1856,6 +2468,21 @@ bool llama_model_loader::load_all_data(
          }
  
          auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -20422,7 +20428,7 @@ index 4ee2b5ae5..e3741147b 100644
          if (!host_buft) {
              LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                  ggml_backend_dev_name(dev));
-@@ -1969,11 +2590,31 @@ bool llama_model_loader::load_all_data(
+@@ -1969,11 +2596,31 @@ bool llama_model_loader::load_all_data(
                      lmlock->grow_to(weight->offs + n_size);
                  }
  
@@ -20457,7 +20463,7 @@ index 4ee2b5ae5..e3741147b 100644
              }
          } else {
              const auto & file = files.at(weight->idx);
-@@ -2067,6 +2708,18 @@ bool llama_model_loader::load_all_data(
+@@ -2067,6 +2714,18 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -20476,7 +20482,7 @@ index 4ee2b5ae5..e3741147b 100644
          size_done += n_size;
      }
  
-@@ -2098,11 +2751,20 @@ bool llama_model_loader::load_all_data(
+@@ -2098,11 +2757,20 @@ bool llama_model_loader::load_all_data(
          // unmap offloaded tensors and metadata
          if (use_mmap) {
              for (uint32_t idx = 0; idx < mappings.size(); idx++) {

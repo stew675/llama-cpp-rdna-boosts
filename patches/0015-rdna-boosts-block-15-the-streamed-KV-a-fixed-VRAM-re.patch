@@ -1,4 +1,4 @@
-From 6d281e0f41f7d720f2e5a14583a76e1012924841 Mon Sep 17 00:00:00 2001
+From 75feb6f44847b697031c12c76c2dacf1462cdb15 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/16] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -1524,7 +1524,7 @@ index ec759281c..9c7daf95c 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 2e00a4681..a28a738ec 100644
+index 4ff41ed5a..4d816eaad 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -1686,7 +1686,7 @@ index 2e00a4681..a28a738ec 100644
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
  
  // [TAG_META_UNALLOC_ALIAS]
-@@ -3635,8 +3773,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3642,8 +3780,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
                  // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
                  // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
@@ -7842,7 +7842,7 @@ index bd1e900ab..395c0a5c2 100644
      // what the model's own builder produces.  Today that is the KV Hadamard rotation: a rotated cache
      // inserts two `llama_mul_mat_hadamard` chains (cont/reshape + mul_mat + reshape = 3 nodes each) per
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2ca81ae3b..702d2fa32 100644
+index 32e2e3653..afbbaf093 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,168 +53,566 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m

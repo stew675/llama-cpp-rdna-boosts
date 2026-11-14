@@ -1,4 +1,4 @@
-From 7bc6a063e760418660f3bee64453c92113eb17c0 Mon Sep 17 00:00:00 2001
+From 6b49ec2bae4359af759cd1a9695d38468291ebba Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/16] rdna-boosts: block 11: qwen4exp (model,
@@ -432,7 +432,7 @@ index 5ad464fd8..076534b2e 100644
      // custom operators
  
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index e95a36bc4..d50117f7f 100644
+index 71508a402..a54dd03ea 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1581,6 +1581,40 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -10734,7 +10734,7 @@ index 479065dac..4048d27f5 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index e3741147b..ed32c3439 100644
+index d607d4337..a900d82af 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -16,17 +16,35 @@
@@ -10849,7 +10849,7 @@ index e3741147b..ed32c3439 100644
          const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
          is_lazy = lazy.add(tn.str(), cur, w);
  
-@@ -2716,8 +2724,10 @@ bool llama_model_loader::load_all_data(
+@@ -2722,8 +2730,10 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {

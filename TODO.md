@@ -26,8 +26,9 @@ tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 i
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
 are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the
-prefill-logit base file name), #324 (both `optional/` artifacts stale) and #325 (the APU-only gate set) -- closed
-at **r285** (`WORKLOG.md` 261114.006), which is why nothing about them is left in this file.  The r236 re-base
+prefill-logit base file name), #324 (both `optional/` artifacts stale), #325 (the APU-only gate set) and #326 (the
+loader's async-upload lifetime) -- closed at **r285** (`WORKLOG.md` 261114.006), which is why nothing about them is
+left in this file.  The r236 re-base
 (`archive/work/upstream-rebase-261108/`) is superseded and closed.
 
 ## The open list
@@ -37,7 +38,6 @@ at **r285** (`WORKLOG.md` 261114.006), which is why nothing about them is left i
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **326** | the loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies | correctness (block 10; a question to close) | **OPEN** (2026-11-13) — 12 loads were byte-correct, so no defect is known; either document the guarantee or give the arm a caller-visible flag — §326 |
 
 ## Handle numbering
 
@@ -158,38 +158,6 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 **Kind:** purity (delivery — `gate-host-pool.sh` `pinlate` arm; NOT corruption).
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
-
-## 326. The loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies
-
-**Found while fixing issue #308.**  The segmented `set_tensor_async()` async arm's own comment states its
-requirement: "`offset` on a row boundary and a caller whose source outlives the queued copies -- which the scheduler
-guarantees: it uploads from the immutable pinned host master", with a mid-row range staying on the synchronous setter
-because "the loader's chunked upload ... pinned staging ring may be reused as soon as the call returns".
-
-The r279 measurement shows the loader **does** reach the async arm: **90 async -> synchronous transitions in one
-35B-A3B `-sm tensor --load-mode none` load**, every one of them a row-aligned loader chunk followed by a mid-row one.
-So either the loader does keep its ring slot alive long enough (12 consecutive loads were byte-correct, and the
-`-lm none` queue arms at QD 8 are byte-identical in `gate-host-pool.sh`), or a source-lifetime hazard is sitting
-behind the same arm the drain now protects for ordering.
-
-**Not a known defect** — no arm has produced a wrong byte from it.  **Re-entry:** either (a) show the ring slot's
-lifetime (an event wait per chunk) and correct the comment, or (b) make the arm caller-visible (a flag the scheduler
-passes, which the loader does not) so "source outlives the copies" becomes a precondition the compiler enforces
-instead of a comment.  A wrong answer from a `-lm none` load that reproduces within one build but varies between
-loads re-opens this first.
-
-**r285: (a) is ANSWERED, and what is left is the comment correction (a block-10 patch change).**  The lifetime is
-structural, not a coincidence: `llama_model_loader`'s pinned staging ring is `n_buffers = 4` slots with one event
-each, and `ggml_backend_event_synchronize(events[buffer_idx])` runs **before** a slot is rewritten (the
-"Wait for previous upload to complete before reusing buffer" line inside the chunk loop).  That event was recorded
-on the **Meta** backend right after the `set_tensor_async`, and `ggml_backend_meta_event_record` records on
-**every** simple device's stream while `ggml_backend_meta_event_wait`/`_synchronize` waits on all of them — so the
-per-slot event really does sit behind the queued per-device copies, and a slot cannot be reused while a copy from
-it is in flight.  So the async arm's precondition holds for the loader (and the r279 "90 transitions" measurement
-is the loader legitimately using the row-aligned arm).  **Re-entry:** correct the two comments (the arm's
-precondition text in `ggml-backend-meta.cpp` and the loader's ring note) in block 10 — a comment-only patch change,
-so it rides with the next release that touches that block rather than justifying a release of its own.  The
-option-(b) hardening (a caller-visible flag) is NOT needed on this evidence and would be unwarranted churn.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

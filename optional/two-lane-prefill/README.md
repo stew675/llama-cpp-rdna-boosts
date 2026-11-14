@@ -14,7 +14,9 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `two-lane-prefill.patch` — the artifact.  sha256 `9ec906a277938e3c5327042e908cd089ce0a4c7771a675b281c841a41474892d`
-* applies at `release.json` tree `39ad82e0e…` (r284/r285), produces tree `a9384ba7dce5b8d341de1ba63ad974af12ea2492`
+* applies at `release.json` tree `3a6304107…` (r285), produces tree `772c652409f2f5830edbce0fcee37077ed787889`
+  (the r284 tree `39ad82e0e…` produced `a9384ba7dce5b8d341de1ba63ad974af12ea2492`; the r285 delivery is the r284
+  tree plus the two comment corrections of `TODO` #326, so the artifact's own bytes are unchanged)
   (verified by strict `git am` on a fresh checkout of the r285 `rdna-boosts` branch; the r259 cut produced
   `d1c3f0f9c3…` on `7995db44…`, the r254 cut `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…` on
   `8f99d2dc6d…`)

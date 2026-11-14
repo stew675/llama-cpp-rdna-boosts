@@ -1,4 +1,4 @@
-From 4614671559611289688818dd5d59395d0a231999 Mon Sep 17 00:00:00 2001
+From 08384771b0e4be4787ac3df895a2c97a35badeeb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/16] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -1033,7 +1033,7 @@ index 86f7f2829..87c8164ec 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index d50117f7f..d1947432a 100644
+index a54dd03ea..1a9f689d0 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -67,6 +67,12 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -1099,7 +1099,7 @@ index d50117f7f..d1947432a 100644
      size_t                      n_reduce_steps;
      int                         max_nnodes    = 0;
      size_t                      max_tmp_size  = 0;
-@@ -3658,6 +3686,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3665,6 +3693,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              };
  
              int i_start = 0;
@@ -1107,7 +1107,7 @@ index d50117f7f..d1947432a 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-@@ -3667,12 +3696,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3674,12 +3703,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                      max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                  }
@@ -1129,7 +1129,7 @@ index d50117f7f..d1947432a 100644
  
                  // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                  // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
-@@ -3695,10 +3731,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3702,10 +3738,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      auto & bcj = backend_ctx->backend_configs[j];
                      bcj.cgraphs[n_subgraphs].offset = i_start;
                  }
@@ -1142,7 +1142,7 @@ index d50117f7f..d1947432a 100644
          }
  
          backend_ctx->uid         = cgraph->uid;
-@@ -3720,7 +3758,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3727,7 +3765,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
              const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
              const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
@@ -1152,7 +1152,7 @@ index d50117f7f..d1947432a 100644
              const ggml_init_params params = {
                  /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                  /*.mem_buffer =*/ nullptr,
-@@ -3741,6 +3780,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3748,6 +3787,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                  backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
              }
@@ -1167,7 +1167,7 @@ index d50117f7f..d1947432a 100644
          }
  
          for (size_t j = 0; j < n_backends; j++) {
-@@ -3749,11 +3796,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3756,11 +3803,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                  const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                  const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
@@ -1186,7 +1186,7 @@ index d50117f7f..d1947432a 100644
                      const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                      const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                      cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
-@@ -3942,6 +3994,102 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3949,6 +4001,102 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      };
  
  
@@ -1289,7 +1289,7 @@ index d50117f7f..d1947432a 100644
      for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
          for (size_t j = 0; j < n_backends; j++) {
              auto & bcj = backend_ctx->backend_configs[j];
-@@ -3951,6 +4099,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3958,6 +4106,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -1304,7 +1304,7 @@ index d50117f7f..d1947432a 100644
          if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
              bool backend_allreduce_success = false;
              if (backend_ctx->comm_ctx) {
-@@ -4089,11 +4245,99 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -4096,11 +4252,99 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
      return all;
  }
  
@@ -1405,7 +1405,7 @@ index d50117f7f..d1947432a 100644
      if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2) {
          return false;
      }
-@@ -4112,11 +4356,44 @@ static bool ggml_backend_meta_moe_cache_take_over(ggml_backend_t backend, const
+@@ -4119,11 +4363,44 @@ static bool ggml_backend_meta_moe_cache_take_over(ggml_backend_t backend, const
          if (simple_tensor == nullptr || simple_backend->iface.moe_cache_take_over == nullptr) {
              return false;
          }
@@ -1451,7 +1451,7 @@ index d50117f7f..d1947432a 100644
  // wip/moe-expert-cache (B2): forward the device-side expert gather to each simple device.  The gather
  // reads the routing on-device, so every device must have its own device-resident routing: the ids must be
  // a MIRRORED meta tensor (a simple per-device copy) or there must be a single device.  A single-device
-@@ -4147,6 +4424,20 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
+@@ -4154,6 +4431,20 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
      return n_backends > 0 ? band : 8;
  }
  
@@ -1472,7 +1472,7 @@ index d50117f7f..d1947432a 100644
  static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
          const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
          size_t slice_off, int split_axis) {
-@@ -4297,6 +4588,12 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -4304,6 +4595,12 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_meta_moe_cache_remap,
@@ -12465,7 +12465,7 @@ index 37d01ed11..bd1e900ab 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index ed32c3439..2ca81ae3b 100644
+index a900d82af..32e2e3653 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -40,11 +40,19 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -12570,7 +12570,7 @@ index ed32c3439..2ca81ae3b 100644
      // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
      // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
      this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
-@@ -2724,9 +2776,18 @@ bool llama_model_loader::load_all_data(
+@@ -2730,9 +2782,18 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
