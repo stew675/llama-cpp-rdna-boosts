@@ -1117,12 +1117,35 @@ is why an APU running a qwen35moe trunk no longer sees a `--kv-attendance-pool` 
 The KV cache's VRAM cost becomes a **resident window** of the newest `W` cells; the cells below it live in
 pinned system RAM, in the same VA reservation (so no kernel and no op changes).  **Default: off** — with the
 knob unset the KV takes the plain device buffer and the run is byte-identical to a build without the block,
-including its OOM.  The opt-in semantics are deliberate: a window below the depth you actually run costs
-11-26 %, so it is a decision, not a default.
+including its OOM.  The opt-in semantics are deliberate: what a window costs is decided by bytes you spill,
+so it is a decision, not a default.
+
+**What a spilled cell costs, and what sets it (r286, issue #313).**  Nothing is copied for a spilled cell: the
+attention kernel reads the host-location mapping **in place** over PCIe, so the per-token cost is
+`spilled bytes / the in-place read rate`.  That read path is *its own measurement*: on gfx1201 it lands at
+**16-29 GB/s**, i.e. close to the copy-engine (H2D) link, because a spilled tensor's leading cells are one
+**contiguous** byte range and a step reads it as a long linear run.  On a card that reads its host aperture
+*below* its DMA rate it is much lower — that is the case behind #313 (a gfx1100 behind a PCIe 3.0 x4 chipset
+link: 3.25 GB/s DMA, under 1 GB/s effective), and it is why one reporter's decode fell to 0.24-10.6 t/s on one
+card and 0.40 t/s on a split while another's (same repo, faster link) stayed usable.  Three things a user needs:
+
+* **The cost is linear in depth past the window**, so `W` must be chosen against the depth you actually run.
+  Measured on one R9700, 27B q8_0 KV, 32 greedy tokens (nothing else running): a 5 246-token request is
+  unchanged at `W=2048` and −10 % at `W=1`; 10 492 tokens is −10 % at `W=4096` and −19 % at `W=2048`; 31 000
+  tokens is **−42 %** at `W=8192` and −46 % at `W=4096`.  A 2-card `-sm tensor` split costs the same ~15 % at
+  10 492 tokens.
+* **The spill is quantised to a whole map unit per tensor** (4 MiB here, ~3 600 cells of a 27B), so a window
+  whose spill is under one unit spills **nothing** and costs **nothing** — that is why `--kv-window 2048` and
+  `8192` are identical to no window at a 5 246-token request.
+* **The device's own in-place read rate is calibrated at startup**
+  (`ggml_backend_cuda_kv_region_spill_read_gbps`: one cold 128-256 MiB linear pass over mapped pinned host RAM,
+  once per device) and both the `WINDOWED KV ENABLED` line and `--fit`'s per-token estimate divide by **it**
+  rather than by the copy engine.  The log states the worst-case read time at full spill, so the decision is
+  made on a measured number; `benchmarks/2026-11-14-kv-window-313.md` has the table.
 
 | variable | default | what it does |
 |---|---|---|
-| `--kv-window [auto\|N]` (env form `LLAMA_ARG_KV_WINDOW`; **`LLAMA_KV_RESIDENT_CELLS` is the deprecated alias**, still read and now warns) | **`0` = off** | `N` = keep the newest `N` cells in VRAM; `auto` = `--fit` sizes it (only for a `-c` the user pinned — the fit then reports the split, the per-token read cost and the depth below which nothing spills); `0` = off.  Promoted from the env var in **r247**, so the placement is visible in `--help` and per-run.  **A tensor split carries the same window since r204 (`TODO` #124):** one region per child device, all children at the same `W` cells, the grow fanned out to every child, and `--fit` sizes it against the split's per-device budget (before r204 the Meta device had no backend reg, so `-sm tensor` declined the window with one message -- r181).  A **MIRRORED** cache (dsv4 / HRM, where every device holds the whole cache) still declines it, with one message: one window would cost `n_devices x` and the pinned-spill plan is per logical cache.  `-sm layer` and one device are unaffected.  `auto` hands down three states to the cache, so "the fit decided the KV fits fully resident" is silent while "nobody decided" still warns (r181).  **`-nkvo` declines it** (one message): the window is a device region plus a pinned host tail, and a cache that is not device-offloaded is already pageable host RAM, so there is nothing to window -- and the streamed decode arm keys on the placement actually taken, not on the plan (r197). |
+| `--kv-window [auto\|N]` (env form `LLAMA_ARG_KV_WINDOW`; **`LLAMA_KV_RESIDENT_CELLS` is the deprecated alias**, still read and now warns) | **`0` = off** | `N` = keep the newest `N` cells in VRAM; `auto` = `--fit` sizes it (only for a `-c` the user pinned — the fit then reports the split, the per-token read cost and the depth below which nothing spills); `0` = off.  Promoted from the env var in **r247**, so the placement is visible in `--help` and per-run.  **A tensor split carries the same window since r204 (`TODO` #124):** one region per child device, all children at the same `W` cells, the grow fanned out to every child, and `--fit` sizes it against the split's per-device budget (before r204 the Meta device had no backend reg, so `-sm tensor` declined the window with one message -- r181).  A **MIRRORED** cache (dsv4 / HRM, where every device holds the whole cache) still declines it, with one message: one window would cost `n_devices x` and the pinned-spill plan is per logical cache.  `-sm layer` and one device are unaffected.  `auto` hands down three states to the cache, so "the fit decided the KV fits fully resident" is silent while "nobody decided" still warns (r181).  **The per-token cost `--fit` reports divides by the calibrated in-place read rate, not the copy-engine rate (r286)**: on gfx1201 those are close (16-29 vs 29-55 GB/s), but a card whose aperture reads below its DMA rate is exactly where the window hurts, so the fit must not quote the DMA number there.  **`-nkvo` declines it** (one message): the window is a device region plus a pinned host tail, and a cache that is not device-offloaded is already pageable host RAM, so there is nothing to window -- and the streamed decode arm keys on the placement actually taken, not on the plan (r197). |
 | `LLAMA_KV_SPILL_RAM_PCT` | **`85`** (**kill switch**: `0` disables the cap) | Cap the pinned spill at this % of `MemAvailable`.  At creation the window is **widened** until the worst case fits; at run time a mapping that would exceed it is refused loudly instead of being OOM-killed.  `--fit` only takes that widening while the wider window still meets its VRAM target: if the ceiling would demand a window that no longer fits VRAM, the fit reports it and drops the window (then fits the context by shrinking `-c`) rather than planning a spill bigger than the machine (r181).  **Windows (r209)**: `MemAvailable` comes from `GlobalMemoryStatusEx`, so the ceiling applies there too (it was skipped: no figure off Linux). |
 | `LLAMA_KV_REGION` | **on** (**kill switch**: `0` disables the provider) | Whether the region provider may be used at all.  It is only ever *taken* when a window is asked for, so this switch is for A/B testing and bisection. |
 | `LLAMA_KV_REGION_QUARANTINE` | **on** (A/B switch: `0` = the bug) | Holds the physical a `cuMemUnmap` just released across the `cuMemCreate`/`cuMemMap` that follows.  **Without it a spilled KV is silently wrong** (the driver zeroes a neighbouring live host mapping).  Default on; `0` exists only to reproduce the hazard — never ship it in a server config. |

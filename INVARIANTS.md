@@ -4810,3 +4810,51 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   (`1c5d32ac537d`) and the 40-chunk prefill logits identical to the r279 base (0.000697 / 98.784 %).  A moved
   hash or a moved KLD would mean the "comments only" statement is wrong -- which is why those arms run instead of
   being asserted, and why `git diff <prev tip> <tip>` is quoted in the release record.
+* **A region-backed buffer's 2-D state directions must be 1-D only, in BOTH interfaces (r286, issue #313).**  The
+  windowed KV's VMM region mixes device-location and host-location mappings inside one reservation, and a 2-D
+  device copy on that VA is refused by the driver on some stacks -- a mixed gfx1100 + gfx1201 `-sm tensor`
+  server aborted its prompt-cache save with `ROCm error: invalid argument` from
+  `ggml_backend_cuda_buffer_get_tensor_2d`, on both the pinned-bounce and the direct arm, with nothing spilled
+  (a wholly device-resident range).  It is the same class already recorded for the movable-boundary slab
+  (r183/r253) and for a mixed host/VRAM range (r204 (c)), so the rule is not "the driver may refuse a mixed
+  backing" but **"never issue a 2-D copy against a region-backed VA"**: r204 (c)/(d) fixed the ASYNC directions
+  and the two `_get/set_tensor_2d` buffer-interface directions stayed 2-D until r286.  Do not restore a 2-D path
+  here because "it works on gfx1201" -- it did, on this box, on both ROCm lines, which is exactly why the bug
+  shipped.  `LLAMA_KV_REGION_DEBUG=1` logs the taken path (`… as 1-D copies (region-backed, no 2-D copy)`).
+* **A per-row loop in a state copy is a 100x performance bug, and the batched arm must be gated against it
+  (r286).**  One 1-D copy per row is what the region's async directions did, and a split splice's row is 544 B
+  (q8_0, 4 KV heads, 2 devices): a windowed 16k cache's batched save+load measured **4 686 ms** against the
+  synchronous arm's 41 ms, 191x worse, and it was the *default* server path (`--cache-ram`) for every windowed
+  run.  The fix is one staged chunk per sync, gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) ->
+  24.5 ms.  `scripts/gate-state-pipe.sh` **HARD 4** now requires the batched save+load within 3x of the
+  synchronous arm (the cliff is 114x, so the bound has 38x of margin, and both arms run the same requests back
+  to back so it is not a board-noise measurement).  A timing check is legitimate here *because* the cliff is
+  two orders of magnitude.
+* **A spilled KV cell is read IN PLACE, and its cost model must divide by a measurement of THAT read path, not
+  by the copy engine (r286, issue #313).**  Nothing is copied for a spilled cell: the attention kernel loads the
+  host-location mapping over PCIe.  On gfx1201 that path runs at **16-29 GB/s**, i.e. near the link -- a spilled
+  tensor's leading cells are ONE contiguous byte range (`cell i` sits at `i*nb1`), so a step reads it as a long
+  linear run (a `hipHostMalloc` mapping and a `cuMemCreate(HOST)` VMM mapping measure within 4 % of each other;
+  the KV cost curve agrees: one extra 4 MiB unit per tensor costs 4.6 ms of a 60 ms step at a 31k request, i.e.
+  15-30 GB/s).  The delivery's original ~29 GB/s link model was therefore right *on this box*, and what makes a
+  deep spill catastrophic is a card that reads its host aperture **below** its DMA rate -- the #313 reporter's
+  gfx1100 behind a PCIe 3.0 x4 chipset (3.25 GB/s DMA, under 1 GB/s effective, 0.24-10.6 t/s decode).  So the
+  model divides by a per-device measurement of the read path (`ggml_backend_cuda_kv_region_spill_read_gbps`: one
+  cold linear pass over 128-256 MiB of mapped pinned host RAM), which is a different quantity from the
+  copy-engine number exactly where it matters.  **A strided probe is not representative** (544 B every 34 816 B
+  reported 0.07-1.1 GB/s and is what the first draft of r286's calibration used -- the spill has no such
+  shape), and **`LLAMA_KV_REGION_DEBUG=1` costs 10-40x decode on a spilling arm**, which is how r286's first
+  draft produced a decode curve that was entirely an artifact of the diagnostic (the shipped curve: 30.5 t/s
+  resident, -10 % at one unit, -19 % at two at 10 492 tokens, -42 % at six at 31 000 tokens).  Two corollaries:
+  the spill is quantised to a whole map unit per tensor, so a window whose spill is under one unit (4 MiB =
+  ~3 600 cells of a 27B) spills nothing and costs nothing; and never quote a decode number taken with the debug
+  knob on.
+* **A delivery option that takes a context parameter belongs in the common arg set, and `llama-bench` has its
+  own parser (r286).**  `--kv-window` and `--kv-attendance-pool` were registered with
+  `set_examples({SERVER, PERPLEXITY, CLI})`, and `common_params_parser_init` does not merely hide such an option
+  from the other tools -- it never adds it, so neither the flag nor its `LLAMA_ARG_*` env form existed in
+  `llama-bench`, `llama-batched-bench`, `llama-parallel` or `llama-speculative`.  They are common options now,
+  like `-lm`/`-lme`/`-lzm`.  `llama-bench` is special: it hand-parses its own arguments (a `cmd_params` field, a
+  default, a help line, a parse branch, an instance field, a `cparams` assignment, and the CSV/markdown field
+  lists), so a knob added to `common/arg.cpp` alone is invisible there -- which is what a reporter hit when
+  trying to *measure* the window.

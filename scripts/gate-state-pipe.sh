@@ -29,6 +29,12 @@
 #           (a run that re-prefilled the whole prompt would pass a text comparison by never restoring)
 #   HARD  * every arm's 64 greedy tokens are byte-identical to the SYNCHRONOUS arm
 #           (LLAMA_STATE_ASYNC=0: the per-tensor synchronous save and restore, the pre-r96 path)
+#   HARD  * the batched save+load (median "prompt cache update took") is at most SAVE_SLOW_X (default 3) times
+#           the SYNCHRONOUS arm's.  This is the only arm that sees a *performance* cliff in the state path, and
+#           one shipped (issue #313): a windowed KV's 2-D get/set issued one synchronous copy per ROW, so the
+#           batched arms took 4 686 ms against the synchronous arm's 41 ms (114x) on a 16k window.  A per-row
+#           copy, a lost event or a copy that waits on the wrong stream all show up here; the comparison is
+#           between two arms of the SAME run, so it is not a board-noise measurement.
 #   HARD  * every arm's text is byte-identical to the arm that differs from it in ONE direction only:
 #           `read1` (LLAMA_STATE_ASYNC_READ=0: batched save, per-tensor synchronous restore) isolates the
 #           SAVE side against `sync`, and `pipe` isolates the RESTORE side against `read1`.  A torn state in
@@ -42,8 +48,15 @@
 #   INFO  the measurement request's median `prompt_ms` per arm, and the save+load time the server logs
 #           ("prompt cache update took"), which isolates the copy from the prefill and the sampler
 #
-#   The pipelining arm is expected to be the FASTEST, but a timing delta is not gated on (board noise would
-#   make that flaky); a pipelining arm that is slower than the unpipelined one only prints a warning.
+#   The pipelining arm is expected to be the FASTEST, but a delta between the batched arms is not gated on
+#   (board noise would make that flaky); a pipelining arm that is slower than the unpipelined one only prints a
+#   warning.  The batched-vs-synchronous bound above is 3x, which is 38x away from the cliff it guards.
+#
+# THE WINDOWED-KV ARM (required for any block-15 change, issue #313)
+#   Set KV_WINDOW=<cells> to run the whole gate on a `--kv-window` cache (it exports the deprecated
+#   LLAMA_KV_RESIDENT_CELLS alias for every arm).  On a 2-GPU `-sm tensor` split this is the arm that reaches
+#   the windowed region's 2-D state copies, which are the ones that aborted a reporter's server on a mixed
+#   gfx1100 + gfx1201 box: run the gate once with KV_WINDOW and once without and require BOTH to pass.
 #
 # Usage:
 #   ./gate-state-pipe.sh [--keep]
@@ -63,6 +76,9 @@
 #   NGPU          GPUs                  (default: 2 -> HIP_VISIBLE_DEVICES=0,2, the x8 pair)
 #   CTX           context               (default: 16384)
 #   PIPE_GROUPS   the arm under test    (default: 8, the delivery default; see ENVIRONMENT.md)
+#   KV_WINDOW     resident KV window, in cells (default: empty = fully resident).  Set it to gate the
+#                 windowed region's state copies (issue #313); see above
+#   SAVE_SLOW_X   the batched/synchronous save+load bound (default: 3)
 #   PORT          server port           (default: 18101)
 #   EXTRA_ARGS    extra llama-server args
 #   KEEPOUT       dir for the per-arm logs (default: mktemp -d)
@@ -86,6 +102,8 @@ NCMOE="${NCMOE:-10}"
 NGPU="${NGPU:-2}"
 CTX="${CTX:-16384}"
 GROUPS_ARM="${PIPE_GROUPS:-8}"
+KV_WINDOW="${KV_WINDOW:-}"
+SAVE_SLOW_X="${SAVE_SLOW_X:-3}"
 SUFFIX_MAX="${SUFFIX_MAX:-32}"
 PORT="${PORT:-18101}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
@@ -217,6 +235,10 @@ fi
 
 echo "==> batched state save/restore gate ($SM, $NGPU GPU, -ncmoe $NCMOE, ctx $CTX, groups $GROUPS_ARM)"
 echo "    model: $(basename "$MODEL")"
+if [ -n "$KV_WINDOW" ]; then
+    echo "    KV window: $KV_WINDOW cells (the windowed-region arm, issue #313)"
+    export LLAMA_KV_RESIDENT_CELLS="$KV_WINDOW"
+fi
 
 run_arm pipe  env LLAMA_STATE_PIPE_GROUPS="$GROUPS_ARM" || { echo "==> FAIL: the pipelining arm did not run"; exit 1; }
 run_arm copy0 env LLAMA_STATE_PIPE_GROUPS="$GROUPS_ARM" LLAMA_STATE_COPY_THREADS=0 \
@@ -265,10 +287,10 @@ if [ "$FAULTS" -eq 1 ]; then
     fi
 fi
 
-python3 - "$KEEPOUT" "$SUFFIX_MAX" <<'PY'
+python3 - "$KEEPOUT" "$SUFFIX_MAX" "$SAVE_SLOW_X" <<'PY'
 import json, statistics, sys
 
-root, suffix_max = sys.argv[1], int(sys.argv[2])
+root, suffix_max, save_slow_x = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 arms = {}
 for a in ("pipe", "copy0", "pipe1", "read1", "sync"):
     try:
@@ -369,6 +391,7 @@ if "pipe" in med and "copy0" in med:
 
 print()
 print("server save+load trace (median of 'prompt cache update took', ms):")
+save_med = {}
 for a in ("pipe", "copy0", "pipe1", "read1", "sync"):
     try:
         vals = [float(l.split("took")[1].split("ms")[0])
@@ -378,7 +401,25 @@ for a in ("pipe", "copy0", "pipe1", "read1", "sync"):
         vals = []
     vals = [v for v in vals if v > 1.0]     # the first request has nothing to save
     if vals:
-        print("  %-6s %8.2f ms   (n=%d)" % (a, statistics.median(vals), len(vals)))
+        save_med[a] = statistics.median(vals)
+        print("  %-6s %8.2f ms   (n=%d)" % (a, save_med[a], len(vals)))
+
+# HARD 4: the batched path exists to be FASTER than the per-tensor synchronous one.  A cliff here is a
+# performance bug in the copy mechanism (issue #313: one synchronous copy per ROW in a region's 2-D
+# directions = 114x the synchronous arm), and both arms run the same requests back to back, so the ratio is
+# stable enough to gate.  HARD 3 already separates a *torn* copy from a slow one.
+if "sync" in save_med:
+    for a in ("pipe", "copy0", "pipe1", "read1"):
+        if a not in save_med or save_med["sync"] <= 0:
+            continue
+        ratio = save_med[a] / save_med["sync"]
+        if ratio > save_slow_x:
+            print("FAIL  %s: the batched save+load is %.2fx the synchronous arm (%.1f ms vs %.1f ms, bound %.1fx)"
+                  % (a, ratio, save_med[a], save_med["sync"], save_slow_x))
+            fails += 1
+        else:
+            print("PASS  %s: the batched save+load is %.2fx the synchronous arm (%.1f ms vs %.1f ms, bound %.1fx)"
+                  % (a, ratio, save_med[a], save_med["sync"], save_slow_x))
 
 sys.exit(1 if fails else 0)
 PY

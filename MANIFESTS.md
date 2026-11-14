@@ -207,8 +207,13 @@ in CI.  The model-level gates are manual:
    `=1`, `LLAMA_STATE_ASYNC_READ=0`, and `LLAMA_STATE_ASYNC=0`), and requires (a) every arm's restored greedy
    text to be byte-identical to the **synchronous** arm cycle by cycle, (b) the arm that differs in one
    direction only to reproduce the other (`read1` isolates the save bytes, `pipe` the restore), (c) the run to
-   have actually restored (`prompt_n` <= 32), and (d) no abort and no GPU fault.  Required for any change to
-   `llama_io_write_host` / `llama_io_read_host`, `state_stage`, the state pipelining or its events.  **No
+   have actually restored (`prompt_n` <= 32), (d) no abort and no GPU fault, and (e) the batched save+load
+   (`prompt cache update took`) within `SAVE_SLOW_X` (3x) of the synchronous arm's -- r286's HARD 4, added
+   because a region-backed buffer's per-row 2-D state copies made every batched arm **114x** slower than the
+   synchronous one on a windowed split (4 686 ms vs 41 ms) while the text stayed byte-identical.  Required for
+   any change to `llama_io_write_host` / `llama_io_read_host`, `state_stage`, the state pipelining or its events,
+   and **with `KV_WINDOW=<cells>` set** for anything that touches a region-backed buffer (r286, issue #313:
+   the window's 2-D directions are 1-D only, in both the buffer interface and the async one).  **No
    other gate reaches the host path**: `llama-cli`/`llama-bench` never save a state, and the file-based slot
    save/restore (`POST /slots/N?action=save\|restore`) goes through `llama_io_write_file` / `read_file`, which
    call `ggml_backend_tensor_get`/`set` per tensor and never touch the stage.  A torn state is a silent wrong
@@ -383,8 +388,9 @@ in CI.  The model-level gates are manual:
    of the window, the single-device and `-nkvo` arms are unchanged (the r197 contract), the fit reports a
    WINDOWED cache on the split and keeps the pinned `-c`, `auto` decides, the pinned-RAM ceiling widens the
    window where it can and drops it where it cannot, and `LLAMA_KV_REGION=0` says nothing about a window.
-   `scripts/gate-state-pipe.sh` with `LLAMA_KV_RESIDENT_CELLS` set is the required companion arm (the batched
-   state save/restore of a windowed split; that is where the 2-D D2H of a mixed host/VRAM backing failed).
+   `scripts/gate-state-pipe.sh KV_WINDOW=<cells>` is the required companion arm (the batched AND synchronous
+   state save/restore of a windowed split; that is where the 2-D D2H of a mixed host/VRAM backing failed, and
+   where a per-row copy cost 114x -- r286, issue #313).
    **No other gate reaches this code**: the coherence/prefill-logit/MTP protocols run no window, and the
    single-device window arms do not build a Meta buffer type at all.  Required for any change to
    `ggml_backend_meta_kv_region_*`, the region buffer type/vmm region, `llama_kv_cache`'s region selection,

@@ -207,6 +207,38 @@ lines).
 The **pre-V2.0 16-block notes** (provenance and edit history of the old block numbering) are in
 [`archive/docs/pre-v2-block-notes.md`](archive/docs/pre-v2-block-notes.md).
 
+### The streamed KV (`--kv-window`): what a window costs, before you pick one
+
+A window buys VRAM by moving the *older* cells of the attention KV to pinned system RAM inside the same VA
+reservation.  Nothing is copied per step: the attention kernel reads those cells **in place** over PCIe, so the
+cost is `spilled bytes / the in-place read rate`, and it is **linear in how far a request outgrows the window**.
+On one R9700 that rate is ~16-29 GB/s (measured; close to the copy engine's, because a spilled tensor's leading
+cells are one contiguous run), which makes the cost curve look like this (27B, q8_0 KV, 32 greedy tokens, full
+table in [`benchmarks/2026-11-14-kv-window-313.md`](benchmarks/2026-11-14-kv-window-313.md)):
+
+| request depth | window | decode |
+|---|---|---|
+| 5 246 tokens | off, `2048`, `4096` | 30.5 t/s (spill under one map unit: nothing spills, nothing costs) |
+| 5 246 tokens | `512` or `1` | 27.3 t/s (−10 %) |
+| 10 492 tokens | off | 30.0 t/s |
+| 10 492 tokens | `4096` / `2048` | 27.0 / 24.3 t/s (−10 % / −19 %) |
+| 31 000 tokens | off | 29.0 t/s |
+| 31 000 tokens | `8192` / `4096` | **16.8 / 15.6 t/s (−42 % / −46 %)** |
+
+and it is set by *your* read path, not by the link's spec sheet: a 7900 GRE behind a PCIe 3.0 x4 chipset link
+measures 3.25 GB/s of DMA and reads its spill at under 1 GB/s, where a 30k-cell spill cost **0.24 t/s**.  Four
+things follow:
+
+* **Pick `W` from the depth you actually run, not from `-c`.**  A window at or above your request depth costs
+  nothing; one well below it costs the table above at that depth.  `--fit` sizes `--kv-window auto` against
+  VRAM and reports the per-token read time at the **calibrated in-place rate** for your card, so read that line.
+* **The startup line states it.**  `WINDOWED KV ENABLED: …` names the spill at full context, the measured
+  in-place rate and the resulting read time per token.
+* **One 4 MiB map unit per tensor is the quantum.**  A spill smaller than that maps nothing, so a shallow
+  window is free — and a *deep* one is not, abruptly.
+* This is a **fittability** feature, not a speed feature: at those depths the alternative to a spilled KV is an
+  OOM.  If the table says seconds, use a smaller `-c`, `-sm layer`, or a model that fits.
+
 ## Consumer workflow
 
 ```

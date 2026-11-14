@@ -1,3 +1,75 @@
+## 261114.007 (r286) -- issue #313 closes: a region-backed buffer stops issuing 2-D device copies (the abort), the batched state path stops copying one row at a time (4 686 -> 24.5 ms per slot save+load), `--kv-window` reaches `llama-bench`, and the spill's cost model is a per-device MEASUREMENT of the read path instead of the copy engine's number
+
+**`release.json` changed: tip `a0172be96` -> `83d2593fe`, tree `3a6304107` -> `79d18f41b9ab9b235d35fd3a5034858eddd94844`,
+release `v17-4f9dfa0e3-r285` -> `v17-4f9dfa0e3-r286`; 17 blocks, base unchanged (`4f9dfa0e3`).**  The whole delta is
+**block 15** (+7 files: `ggml-cuda.cu`, `cpy.cu`, `cpy.cuh`, `llama-kv-cache.cpp`, `common/fit.cpp`,
+`common/arg.cpp`, `tools/llama-bench/llama-bench.cpp`); blocks 00-14 are byte-identical.  Issue **#313** is the
+report: a mixed gfx1100 + gfx1201 `-sm tensor` server aborts in its prompt-cache save with
+`ROCm error: invalid argument` as soon as `--kv-window` is active.  Record + measurements:
+[`benchmarks/2026-11-14-kv-window-313.md`](benchmarks/2026-11-14-kv-window-313.md).
+
+* **The abort is the SYNC 2-D state copy on the window's VMM region.**  The reporter's stack names
+  `ggml_backend_cuda_kv_region_get_tensor_2d` -> `ggml_backend_cuda_buffer_get_tensor_2d`, i.e. the *buffer
+  interface*, not the async one: r204 (c)/(d) had translated the region's 2-D **async** directions into 1-D
+  copies and left the two sync ones issuing `hipMemcpy2DAsync` against a VA that mixes device- and host-location
+  mappings.  It reaches that path because the batched save declines above `LLAMA_STATE_ASYNC_MAX_MIB` (256 MiB)
+  and a 27B's 10 800-token slot state is ~670 MiB (323.93 MiB at 5 246 tokens here), which is also why their
+  `LLAMA_STATE_ASYNC=0` arm gave the identical stack.  **A region-backed buffer's 2-D directions are 1-D only
+  now, in both interfaces**: the block is gathered/scattered on the device with the new
+  `ggml_cuda_cpy_2d_rows()` (`cpy.cu`: 16-byte units, the row from the grid -- the `cpy_2d_vec16` pattern) through
+  a grow-only per-device staging buffer, and crosses the link as ONE contiguous copy per chunk.  This driver
+  (10.1.0 *and* 7.14.1, gfx1201) accepts the tight 2-D copy, which is exactly why the bug shipped; it is the
+  third instance of the class already recorded (the movable-boundary slab, r183/r253; a mixed host/VRAM range,
+  r204 (c)), and the rule is now stated as one: never issue a 2-D copy against a region-backed VA.
+* **The same loop was a 191x performance cliff, and it was the DEFAULT server path.**  One *synchronous* copy per
+  ROW is what r204's async fallback did, and a split splice's row is 544 B: on a windowed 2-GPU split
+  `gate-state-pipe.sh`'s batched arms measured **4 686 / 4 714 / 4 696 ms** per slot save+load against the
+  synchronous arm's **41 ms**, i.e. every `--cache-ram` server handoff on a windowed run paid seconds.  Now
+  **24.5 / 27.2 / 26.1 ms** (0.61-0.80x of `sync`, so the batched path is back to being faster than the arm it
+  exists to beat).  The gate gained **HARD 4**: the batched save+load must stay within `SAVE_SLOW_X` (3x) of the
+  synchronous arm; the cliff it guards is 114x, so there is 38x of margin, and both arms run the same requests
+  back to back (not a board-noise measurement).
+* **`--kv-window` and `--kv-attendance-pool` were invisible outside the server/CLI/perplexity trio.**  They were
+  registered with `set_examples({SERVER, PERPLEXITY, CLI})`, and `common_params_parser_init` does not *hide* an
+  option from another tool -- it never adds it, so neither the flag nor `LLAMA_ARG_KV_WINDOW` existed in
+  `llama-bench`, `llama-batched-bench`, `llama-parallel` or `llama-speculative`.  They are common options now
+  (the `-lm`/`-lme`/`-lzm` convention).  `llama-bench` is separate: it hand-parses its own arguments, so it got
+  a real `--kv-window <auto|N>` (field, default, help, parse branch, instance field, `cparams` assignment, CSV +
+  markdown field lists) -- that was @kapitalmouse's report, and it is the tool a user needs to *measure* a
+  window before choosing one.
+* **The cost model was quoting the wrong rate, and the first attempt to fix it was wrong twice.**  A spilled KV
+  cell is never copied -- the attention kernel reads the host-location mapping in place -- so what a step pays is
+  that read path's rate.  On gfx1201 it measures **27.9 GB/s** (`hipHostMalloc` mapped) and **29.0 GB/s**
+  (`cuMemCreate(HOST)`, the mapping a spill actually uses) for a linear pass, i.e. close to the link, and the
+  decode curve agrees (one extra 4 MiB unit per tensor = 4.6 ms of a 60 ms step at a 31k request = 15-30 GB/s).
+  What makes a deep spill catastrophic is a card that reads its aperture *below* its DMA rate: the reporter's
+  gfx1100 behind a PCIe 3.0 x4 chipset (3.25 GB/s DMA) reads under 1 GB/s and cost **0.24 t/s**.  So the window's
+  line and `--fit`'s per-token estimate now divide by a per-device measurement of THAT
+  (`ggml_backend_cuda_kv_region_spill_read_gbps`, one cold 128-256 MiB linear pass), which is the number that
+  diverges exactly where the feature hurts.  **Two traps this took, both now recorded in `INVARIANTS.md`:**
+  (a) the bench harness exported `LLAMA_KV_REGION_DEBUG=1` for the mapping census, and that knob verifies the
+  whole region per grow -- its own row says *"10-40x slower on a spilling arm, never quote a timing from it"* --
+  so every spilling arm first read 4.8 / 2.6 t/s ("catastrophic") and 27.0 / 24.3 t/s with it off;
+  (b) the first probe used the *per-head gather* shape (544 B every 34 816 B) and reported 0.07-1.1 GB/s, but a
+  spilled tensor's leading cells are ONE contiguous run, so it measured a pattern no step performs.
+  **The shipped curve** (27B q8_0 KV, one R9700, nothing else running, 32 greedy tokens): 5 246 tokens 30.5 t/s
+  at `W` 0/2048/4096 and -10 % at `W=1`; 10 492 tokens 30.0 off, -10 % at `4096`, -19 % at `2048`; 31 000
+  tokens 29.0 off, **-42 % at `8192`**, -46 % at `4096`; a 2-GPU split costs the same -15 % at 10 492.  Linear in
+  the number of spilled 4 MiB map units (the quantisation is why a shallow window is free), prompt side -1..-2 %.
+* **Verified.**  `gate-state-pipe.sh KV_WINDOW=4096` **PASS** (3 cycles, every arm's restored text
+  byte-identical to the synchronous arm, HARD 4 0.61-0.80x, faults clean) and the no-window arm **PASS**
+  (21.1 ms vs 41.4 ms, 0.50-0.66x); coherence `1c5d32ac537d` on 4B 1-GPU **and** the 3-GPU `-sm tensor` split
+  (unchanged since r152); prefill-logit **0.000697 / 98.784 %** (the r279 base, unchanged); `gate-kv-window-split.sh`
+  **PASS** on every arm (3 devices, 2 devices, a 1 MiB map unit, draft-MTP, `-c 1048576`, `nkvo`, and the six
+  `--fit` arms) with the journal clean; `gate-kv-residency.sh` **PASS** (both placements resident-identical, the
+  pool's hit rate 89-91 %, the arms provably leave their resident arm); per-block build **2/2** (`--changed-from a0172be96`: blocks 15-16, 19 s on a warm ccache);
+  `validate-set.sh` strict on a fresh tarball, tree `79d18f41b`, 510 files through the Windows portability scan.
+* **Found along the way (implemented, not filed):** the delivery's own bench harness had to stop exporting the
+  region debug knob (a note in `benchmarks/…-313.md` says why); `ENVIRONMENT.md` §17.0 now carries the measured
+  cost curve and the map-unit quantum, `README.md` a consumer section with the same table, and `INVARIANTS.md`
+  four facts (the 2-D-copy rule, the per-row cliff + HARD 4, the in-place read rate + the two measurement traps,
+  and the argument-registration rule incl. `llama-bench`'s own parser).
+
 ## 261114.006 (r285) -- `TODO` #322/#323/#324/#325 close, and #326's open question closes with them: the DFlash baseline is re-recorded with provenance, the prefill-logit base file becomes the POINT (device/split), the last `optional/` artifact is ported onto the tree (the other is archived, because r262 had already promoted its premise), the APU-only gate set is green on `halo`, and the loader's async-upload lifetime is now stated where a reader will look for it
 
 **`release.json` changed: tip `e4d3bf7c8` -> `a0172be968abc40910c663cca59e0069870c724a`, tree `39ad82e0e` ->
