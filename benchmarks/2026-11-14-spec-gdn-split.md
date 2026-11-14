@@ -102,7 +102,7 @@ draftless n-gram width is untouched (no clamp): it is a throughput knob again.
 | `scripts/gate-spec-gdn-split.sh` (Unsloth Q8_0, 4 speculator sets) | **FAIL** tail `16/16/16/65`, text `5c381ee010d7 != fffe3d3d88fe` | **PASS** tail `16` in all four, `n_rs_batch` `0/5/16/65`, text `fffe3d3d88fe` in all four |
 | the same with `MODEL_ALT` = Bartowski Q8_0 | (not run pre-fix; same code) | **PASS** tail `16` throughout, text `fa09a6c3519d` in all four |
 | copy-prompt n-gram mean accepted length | 53.33 (default) / 16.00 (bounded) | unchanged: the wide draft still drafts deep |
-| verbatim-copy decode, `draft-mtp-adaptive,ngram-mod` | 480.3 t/s (impure) | **528.2 t/s and pure**; the 15-token clamp read 252.4 |
+| verbatim-copy decode, `draft-mtp-adaptive,ngram-mod` | 480.3 t/s (impure) | **528.2 t/s and pure**; the 15-token clamp read 252.4.  **Read the 480.3 -> 528.2 pair as "the wide-draft band is retained", not as a gain from the fix**: the pre-fix prefill state diverged, so the continuation each arm ended up copying had a different n-gram density (mean accepted length 62.8 pre-fix vs 53.3 on this prompt), and the two runs decode different text.  Outside the copy regime the arms are flat (prose 96.3 vs 96.1 t/s) |
 | prose prompt, `plain` vs the n-gram set | — | 36.5 vs 96.3 t/s (the win), texts identical |
 | `test-llama-context -m Qwen3.5-4B -c 1024` | — | 17/18, 1 skip, **0 fail** (`rollback`, `rollback_bound` both OK) |
 | `test-backend-ops -o GATED_DELTA_NET` | — | **55/55** |

@@ -4,6 +4,15 @@
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
 
+> **r283: the n-gram family gets the greedy-purity notice the draft family already had.**  A draftless
+> (n-gram) speculator's width is a verify-batch width like `--spec-draft-n-max` is, but it had no
+> clamp into the guaranteed band and its default (ngram-mod 64, the ngram-map family 48) is already
+> outside it, so a user who only asked for `--spec-type ngram-mod` was in the relaxed band silently.
+> `common_init_from_params` now prints the same W-level trade there, once, naming
+> `--spec-ngram-mod-n-max 7`.  No default moved, no computation changed: a notice only.  Blocks 10-16
+> are re-cut (`From` id only); `benchmarks/2026-11-14-spec-gdn-split.md`,
+> `GREEDY-PURITY.md` §11.
+>
 > **r282: GitHub issue #309 -- the SPECULATOR SET chose the chunked-GDN prefill split.**  The chunked
 > `/ sequential GDN threshold is now the snapshot set, `max(K > 16 ? K : 16)`, not floored at
 > `n_rs_batch`: the draftless n-gram family is unbounded (`--spec-ngram-mod-n-max` defaults to 64), so

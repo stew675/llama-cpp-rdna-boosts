@@ -216,10 +216,27 @@ one deliberate:
   keeping the guarantee would mean giving up WMMA for 9..N-token batches.  There is **no corruption** in
   1..15 (deterministic recurrent-state sweep).
 
+**The last pure width is 8 rows, and the notice threshold is exact, not conservative (r283).**  There is no
+"the batcher corrects the offending row" margin to spend: every row of a verify batch is sampled by the
+target (`common_sampler_sample_and_accept_n()` walks `idxs[0..draft.size()]`, one `common_sampler_sample()`
+per row, and the token at the first mismatch **is** the row's token, emitted as-is).  So a flip at any row
+changes the text, and the first width that can flip is the first width on the other kernel family.  Measured:
+`W = 1..8` is one logits class and `W = 9..16` another (27B UD-Q4_K_XL, 2026-09-13, with FA disabled too, so
+it is not only the FA chooser), i.e. `n_max 7` is pure and `n_max 8` is the first impure depth.  The
+`--spec-draft-n-max > 7` notice therefore starts exactly where the guarantee ends.  Two caveats worth
+keeping: the FA chooser divides by `ncols2` (`Q->ne[1] <= 16/ncols2` and friends in `fattn.cu`) and the
+per-type MMVQ caps differ (NVIDIA's Ada/Blackwell tables return less than `MMVQ_MAX_BATCH_SIZE`), so "8 rows"
+is a measurement on the validated head shapes, not a shape-independent theorem; and do not reason "the next
+token is re-sampled at W=1 so depth+1 is safe", because the mismatch row's token is emitted before any
+re-sample happens.
+
 **Rules.**  Establish a boundary with the **raw-logit probe, not the text gate** -- text equality is
 evidence *for* purity, never *against* divergence, because near-ties are rare.  Above the range, gate on
 acceptance + MTP-vs-plain throughput; adaptive MTP's `n_max = 12` is deliberately outside it (and upstream
-is worse: `9cf3bf256` diverges at the first width step on CPU).
+is worse: `9cf3bf256` diverges at the first width step on CPU).  **Say it out loud when a speculator puts
+the user there by default** (r283): the draftless n-gram family has no clamp into the band and
+`--spec-ngram-mod-n-max` defaults to 64, so `common_init_from_params` prints the same trade there, naming
+the knob that narrows it.
 
 **RDNA3_0 joins the band (r95).**  The boundary is about the *kernels* a width selects, not about an
 architecture, so RDNA3_0 (gfx1100-1102) gets the same verify-band fusions RDNA4 has had since r78: the

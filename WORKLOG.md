@@ -1,3 +1,37 @@
+## 261114.004 (r283) -- the n-gram family gets the greedy-purity notice the draft family already had, and the notice threshold is documented as exact
+
+**`release.json` changed: tip `add359b62` -> (see below), tree `7bb5113de5` -> (see below), release
+`v17-4f9dfa0e3-r282` -> `v17-4f9dfa0e3-r283`; 17 blocks, base unchanged.**  A notice only: no default moved,
+no computation changed, nothing in `patches/` before block 09 moved.
+
+* **Why.**  `--spec-draft-n-max > 7` has always printed the verify-band trade (`GREEDY-PURITY.md` §11 cause
+  B: above 8 rows the FA and matmul kernels reduce in a different order, so a near-tie can drift).  A
+  **draftless** (n-gram) speculator's width is a verify-batch width in exactly the same sense, but it has no
+  clamp into the band and its default is already outside it (`--spec-ngram-mod-n-max` 64, the ngram-map
+  family's `size_m` 48).  So a user who only asked for `--spec-type ngram-mod` was in the relaxed band
+  silently.  Before r282 that was at least accompanied by the prefill split moving, which is exactly what
+  r282 removed; leaving the notice out then makes the band silent.  `common_init_from_params` now prints a
+  W-level four-line notice for an ENABLED draftless speculator whose width exceeds 7, naming
+  `--spec-ngram-mod-n-max 7` (or `size_m`) as the way back to the guaranteed band.  Measured: it fires for
+  `--spec-type ngram-mod` (default), is silent with `--spec-ngram-mod-n-max 7`, silent with no speculator,
+  and silent for `--spec-type draft-mtp` at its default depth.
+* **The threshold question, settled from the code.**  Asked whether a divergence at "depth 8" is corrected
+  by the batcher and can therefore only occur at depth 9: no.  `common_sampler_sample_and_accept_n()`
+  samples every row of the verify batch and the token at the first mismatch **is** that row's token, emitted
+  as-is; the next token is only re-sampled at W=1 after it.  The first width that can flip is the first
+  width on the other kernel family, which is measured (`W=1..8` one logits class, `W=9..16` another, 27B
+  UD-Q4_K_XL 2026-09-13 with FA off too), i.e. `n_max 7` pure and `n_max 8` the first impure depth.  The
+  `> 7` notice is therefore exact rather than conservative, with the caveat that the FA chooser divides by
+  `ncols2` and the NVIDIA per-type MMVQ caps differ, so 8 rows is a measurement on the validated head
+  shapes.  Both facts are now in `GREEDY-PURITY.md` §11 and `INVARIANTS.md` r283.
+* **Also recorded** (`benchmarks/2026-11-14-spec-gdn-split.md`): the r282 copy-regime pair 480.3 (impure) vs
+  528.2 t/s (pure) is **not** a gain from the fix -- the pre-fix prefill state diverged, so each arm copied a
+  continuation with a different n-gram density (mean accepted length 62.8 vs 53.3).  Read it as "the
+  wide-draft band is retained"; outside the copy regime the arms are flat.
+* **Gates.**  `validate-set.sh` green; `gate-per-block-build.sh --fast --changed-from add359b62`;
+  `gate-prefill-logits.sh` unchanged (no numerics moved); `gate-spec-gdn-split.sh` PASS; coherence texts
+  unchanged.  The notice itself was verified in the four cases above.
+
 ## 261114.003 (r282) -- GitHub issue #309: the SPECULATOR SET chose the chunked-GDN prefill split, so adding `ngram-mod` to `--spec-type` changed the model's own text.  The threshold is now the snapshot set, and the wide draft stays
 
 **`release.json` changed: tip `69296dde5` -> `add359b62`, tree `549f379e6` -> `7bb5113de5`, release

@@ -4694,3 +4694,17 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   @ 64 all byte-identical on qwen35 27B Q8_0 (Bartowski and Unsloth) with one prefill tail of 16, while
   `n_rs_batch` read 0 / 5 / 16 / 65; the same four arms before the fix split 16/16/16/**65** and the 64-width
   arm's text diverged.  Gate: `scripts/gate-spec-gdn-split.sh` (fails on the pre-fix build, passes after).
+
+* **The pure verify width is 8 rows and the notice threshold is exact, not conservative (r283).**  A verify
+  batch's rows are not "corrected": `common_sampler_sample_and_accept_n()` samples every row
+  (`common_sampler_sample()` per `idxs[0..draft.size()]`) and the token at the first mismatch **is** that
+  row's token, emitted as-is, so a flip at any row changes the text and the next token is only re-sampled at
+  W=1 *after* that.  The first width that can flip is therefore the first width on the other kernel family,
+  and it is measured: `W = 1..8` one logits class, `W = 9..16` another (27B UD-Q4_K_XL, 2026-09-13, FA off
+  too), i.e. `n_max 7` pure and `n_max 8` the first impure depth, which is exactly where the
+  `--spec-draft-n-max > 7` notice fires.  Two bounds on that statement: the FA chooser divides by `ncols2`
+  (`Q->ne[1] <= 16/ncols2` etc. in `fattn.cu`) and the per-type MMVQ caps differ (NVIDIA Ada/Blackwell
+  return less than `MMVQ_MAX_BATCH_SIZE`), so 8 rows is measured on the validated head shapes rather than
+  proved shape-independently.  A speculator whose DEFAULT puts a user outside the band must say so: since
+  r283 `common_init_from_params` prints the same W-level trade for an enabled draftless (n-gram) speculator
+  whose width exceeds 7, naming `--spec-ngram-mod-n-max 7`.  `GREEDY-PURITY.md` §11.

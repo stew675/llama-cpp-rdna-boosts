@@ -1,4 +1,4 @@
-From d8f06c0f4981189057da84287344882d3a3748cd Mon Sep 17 00:00:00 2001
+From 0c02a9448660c1852910ff15d4c833dabc9990a4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/16] rdna-boosts: block 09: host-resident MoE (iface,
@@ -37,14 +37,14 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
 ---
  common/CMakeLists.txt                         |    2 +
  common/arg.cpp                                |   75 +-
- common/common.cpp                             |  239 +-
+ common/common.cpp                             |  258 +-
  common/common.h                               |   65 +-
  common/draft-reserve.cpp                      |  236 +
  common/draft-reserve.h                        |   44 +
  common/fit.cpp                                |  501 +-
  common/fit.h                                  |    7 +
- common/speculative.cpp                        |  102 +-
- common/speculative.h                          |   31 +-
+ common/speculative.cpp                        |  130 +-
+ common/speculative.h                          |   37 +-
  docs/multi-gpu.md                             |    4 +-
  .../speculative-simple/speculative-simple.cpp |    4 +-
  ggml/include/ggml-alloc.h                     |    1 +
@@ -105,7 +105,7 @@ sha 8d6e74e98d89) in every arm.  That is D1's first measurement, not its decisio
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 17578 insertions(+), 540 deletions(-)
+ 70 files changed, 17631 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -238,7 +238,7 @@ index 96331e69a..497414560 100644
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 diff --git a/common/common.cpp b/common/common.cpp
-index 6429b0d50..f989425f2 100644
+index 6429b0d50..1193c8b17 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -521,11 +521,30 @@ index 6429b0d50..f989425f2 100644
      // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
      // bounds, and they have different severities:
      //
-@@ -1523,7 +1701,38 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+@@ -1523,7 +1701,57 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
          }
      }
  
 -    common_init_result_ptr res(new common_init_result(params, model_only));
++    // The SAME notice for the DRAFTLESS n-gram family (r283).  Its width is a width control with no clamp
++    // into the pure band, and its default is already wide (ngram-mod 64, the ngram-map family 48), so a
++    // user who only asked for `--spec-type ngram-mod` is in the relaxed band without ever choosing a depth:
++    // warn, once, with the knob that narrows it.  The band is the VERIFY WIDTH (`n_max + 1` rows) and the
++    // first width that leaves the decode kernel families is 9 (n_max 8), which is exactly why the draft
++    // family's notice above fires at `> 7` too -- see GREEDY-PURITY.md 11, where the 8-row figure is a
++    // measurement (W=1..8 one logits class, W=9..16 another), not a conservative rounding.
++    {
++        const int32_t ngram_n_max = common_speculative_ngram_n_max(&params.speculative);
++        if (ngram_n_max > 7) {
++            LOG_WRN("the n-gram speculator drafts up to %d tokens, so a verify batch is up to %d rows.  Above\n",
++                    ngram_n_max, ngram_n_max + 1);
++            LOG_WRN("%s", "8 rows the flash-attention and matmul kernels reduce in a different order than a\n");
++            LOG_WRN("%s", "single-token decode, so the output may drift non-deterministically on a near-tie.  It\n");
++            LOG_WRN("%s", "stays valid and coherent.  Narrow it to the guaranteed band with --spec-ngram-mod-n-max 7\n");
++            LOG_WRN("%s", "(or the ngram-map family's size_m) if you would rather have the guarantee.\n");
++        }
++    }
++
 +    // A speculative verify batch carries `n_max` drafts plus the sampled token, and the tools hand that
 +    // batch to the target context as one `common_batch::get()` (-> `get_sub_batch()`), which is capped by
 +    // the context's logical batch size (`llama_n_batch`).  A smaller `-b` therefore aborted in the batch
@@ -561,7 +580,7 @@ index 6429b0d50..f989425f2 100644
  
      llama_model * model = res->model();
      if (model == NULL) {
-@@ -1788,6 +1997,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1788,6 +2016,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -581,7 +600,7 @@ index 6429b0d50..f989425f2 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1864,6 +2086,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1864,6 +2105,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -1597,7 +1616,7 @@ index 431c41836..b6c762b26 100644
  
  // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 6ac55083d..69a44519b 100644
+index 6ac55083d..95e28c496 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1707,9 +1707,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1701,10 +1720,38 @@ index 6ac55083d..69a44519b 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -3770,3 +3812,49 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3770,3 +3812,77 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }
++
++int32_t common_speculative_ngram_n_max(const common_params_speculative * spec) {
++    if (spec == nullptr) {
++        return 0;
++    }
++
++    // Only an enabled speculator's width matters: an unused type's `n_max`/`size_m` is inert (the same
++    // rule `common_speculative_clamp_ngram_n_max` uses).
++    const auto enabled = [spec](common_speculative_type type) {
++        return std::find(spec->types.begin(), spec->types.end(), type) != spec->types.end();
++    };
++
++    int32_t n_max = 0;
++    if (enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD)) {
++        n_max = std::max(n_max, spec->ngram_mod.n_max);
++    }
++    // `ngram-cache` has a fixed 8-token draft and no knob, so it cannot exceed the band.
++    if (enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE)) {
++        n_max = std::max<int32_t>(n_max, spec->ngram_simple.size_m);
++    }
++    if (enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K)) {
++        n_max = std::max<int32_t>(n_max, spec->ngram_map_k.size_m);
++    }
++    if (enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)) {
++        n_max = std::max<int32_t>(n_max, spec->ngram_map_k4v.size_m);
++    }
++    return n_max;
++}
 +
 +bool common_speculative_clamp_ngram_n_max(common_params_speculative * spec, int32_t cap) {
 +    if (spec == nullptr || cap <= 0) {
@@ -1752,10 +1799,10 @@ index 6ac55083d..69a44519b 100644
 +    return clamped;
 +}
 diff --git a/common/speculative.h b/common/speculative.h
-index 605a847b0..358ff49ce 100644
+index 605a847b0..3b1abb9b2 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
-@@ -111,14 +111,40 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
+@@ -111,14 +111,46 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
  // print statistics about the speculative decoding
  void common_speculative_print_stats(const common_speculative * spec);
  
@@ -1775,6 +1822,12 @@ index 605a847b0..358ff49ce 100644
 +// `n_max` (ngram-mod discards a draft shorter than `n_min`, so a naked `n_max` clamp would silently
 +// disable it on the default `n_min 48`).  Returns true when anything was clamped.
 +bool common_speculative_clamp_ngram_n_max(common_params_speculative * spec, int32_t cap);
++
++// The widest draft any ENABLED draftless (n-gram) speculator can produce, 0 when none is enabled.  The
++// draft-based family's depth is `speculative.draft.n_max`; this is the other half, and it is what the
++// greedy-purity notice in `common_init_from_params` reads, because a n-gram width is a verify-batch width
++// (`n_max + 1` rows) just as an MTP depth is.
++int32_t common_speculative_ngram_n_max(const common_params_speculative * spec);
 +
  struct common_speculative_deleter {
      void operator()(common_speculative * s) { common_speculative_free(s); }
@@ -1797,7 +1850,7 @@ index 605a847b0..358ff49ce 100644
      ~common_speculative_init_result();
  
      llama_model   * model();
-@@ -131,4 +157,5 @@ private:
+@@ -131,4 +163,5 @@ private:
  
  using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
  

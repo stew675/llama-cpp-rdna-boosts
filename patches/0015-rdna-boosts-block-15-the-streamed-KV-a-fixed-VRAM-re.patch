@@ -1,4 +1,4 @@
-From ba39e465db457aa012f17179243a2a568cdf41de Mon Sep 17 00:00:00 2001
+From 9b478ac376ce66ec5c1aa7fcc4c3beaaf0cae642 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 15/16] rdna-boosts: block 15: the streamed KV -- a fixed-VRAM
@@ -278,7 +278,7 @@ index 3517b8380..eadaae156 100644
          {"--spec-draft-n-min-adaptive"}, "N",
          string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
 diff --git a/common/common.cpp b/common/common.cpp
-index 2074185ba..0ca98f582 100644
+index b1f38dec9..2b37c5e46 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1254,11 +1254,42 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
@@ -327,7 +327,7 @@ index 2074185ba..0ca98f582 100644
  }
  
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-@@ -2099,6 +2130,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -2118,6 +2149,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -1214,7 +1214,7 @@ index 622d2acb6..0e27c2e07 100644
      } catch (const std::runtime_error & e) {
          LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 0ca5ed03b..8e7c27f19 100644
+index 0f84f1a0a..013d9a14a 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1749,6 +1749,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1394,7 +1394,7 @@ index 0ca5ed03b..8e7c27f19 100644
  
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
 diff --git a/common/speculative.h b/common/speculative.h
-index 358ff49ce..a166fcde2 100644
+index 3b1abb9b2..092b6c895 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -37,6 +37,12 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
