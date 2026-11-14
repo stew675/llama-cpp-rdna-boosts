@@ -510,6 +510,15 @@ coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0
   24.25 GiB), `MoE expert cache (auto): arena 8287.5 MiB`, and 1991 expert fills — so `#30542`'s halved
   reservation does not disturb the delivery's arena on this box.  Still owed at **R17**:
   `gate-uma-experts.sh --quick` on `halo` (the region size `-lmt`/`-lme` asks for).
+* **R17 (2026-11-13): the store half of that verification is NOT observable on this box, and that is now the
+  recorded state.**  Block 16 landed clean (`767907a3f`), and with it the discrete evidence is definitive: the
+  35B-A3B Q8_0 `-ncmoe 20 -c 8192` arm reports a live arena (`h=0.8127`, `fills=9418 evictions=689`, `tables=60
+  slots=10212`, `takeover=1377 decline_all=0 get_ok=357`) and **zero `GTT` lines**, and `gate-uma-experts.sh`'s
+  own `ref` arm over this box's `UD-Q4_K_M` builds no arena at all (`tables=''`, 0 releases, `evictions='0'`).
+  So `plan_gtt_expert_store()`/`gtt_store_open()` never run here and **the region the store asks for cannot be
+  measured on gfx1201** — the question needs `halo`/`soar` (gfx1151), together with `gate-uma-experts.sh`
+  (`inplace`/`pfcp` arms) and `gate-prefill-server-slots.sh`.  `D17`'s VMM-pool half stays verified as at R10;
+  its store-region half is an **R18-on-an-APU** item, not a rung blocker.
 
 ## D18 — SYCL gained a device-side MoE scheduler
 

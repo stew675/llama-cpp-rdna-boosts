@@ -32,7 +32,7 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R15 | 14 relaxed-tensor (**temporary**) | **DONE 2026-11-13** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` still refuses flint with the delivery's pointer, `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`), 4B tensor/relaxed/layer all `1c5d32ac537d`; **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and no range commit touches it, so the block stays TEMPORARY |
 | R16 | 15 streamed KV | **DONE 2026-11-13** | `f745bbf1b` + rung-repair `9c940db6f` | 5 files / 8 hunks, one first-error pass; `D11` = **107** ops / RPC **9**; `D3` superset (upstream's K/V scales + block 15's pool page), `D15` merge, `D19` unchanged; **R16r**: upstream `#31927`'s h_nextn assert now accepts the delivery's folded HC export; `gate-kv-residency` selftest + window + single-device pool **PASS**, `gate-kv-window-split` / `gate-spec-draft-window` / `gate-spec-reuse-window` **PASS**, quant-coherence **section E CLEARED** (`200edcd422c7`), `gate-host-pool` **50/54** with `fail`/`late`/`pinlate` now real (4 left = R17's); **new finding `D20`**: MTP draft on 2 devices is not reproducible (r277 too) |
 | R17 | 16 UMA GTT store | **NEXT** | — | `D17` verify |
-| R18 | release ladder | **TODO** | — | all `AWAITING` items resolved |
+| R18 | release ladder | **NEXT (needs the maintainer's go-ahead)** | — | squash **both** rung-repairs (`R09r` -> block 05, R16r -> block 11); the APU gate set + `D17`'s store-region half; `gate-kv-residency.sh`'s multi-device section stays red (`D20`/#321, pre-existing) |
 
 ---
 
@@ -845,12 +845,39 @@ too (both `pmres` and `pmlegacy` differed there).
 **Files a later rung needs:** the repaired assert lives in `src/llama-graph.cpp` (`build_h_nextn_dev`), a file
 blocks 01/05/10/13 already hunk; the squash target at R18 is **block 11**.
 
-## R17 — block 16: the UMA GTT expert store · **TODO**
+## R17 — block 16: the UMA GTT expert store · **DONE 2026-11-13**
 
-* block sha `9d7c0502c` · 16 files · **expected conflicts: 0** (CLEAN)
+* block sha `9d7c0502c` · 16 files (+4 730/−344) · **result `767907a3f`** · tree `69161d3b0` · **0 conflicts**
+  (the probe was right) and **0 first-error passes** (second rung in the climb with none).
 
-**Expect:** clean.  Verify **`D17`**: the halved VMM reservation + retry must not change the region the
-GTT store asks for (`-lme` on `halo`/`soar`).  Gate: `gate-uma-experts.sh --quick`.
+Build green; coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars
+`sha=1c5d32ac537d`**; no stray end-markers.
+
+**`gate-host-pool.sh` 54/54 — PASS, and it closes the last deferred arm of the whole climb.**  The four
+placement-transport checks R13 handed here are green with block 16 in: `ref` reports `host pool PLACEMENT reads:
+O_DIRECT` and the placement queue with **8 readers**, `qd1` reports **1 reader**, `bulkbuf` reports a buffered
+placement read.  (History: R13 read 42/54, R16 read 50/54, R17 reads **54/54**.)
+
+**The block's own gates are APU gates, and this box is a discrete gfx1201 — recorded, not skipped:**
+
+| gate | why it cannot run here | what ran instead |
+|---|---|---|
+| `scripts/gate-uma-experts.sh` | it is the **integrated-GPU** gate: `-lme 4` on a 35B-A3B whose 18.2 GiB expert set evicts out of a SHARED DRAM pool (`prop.integrated`), and it pins `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx1151/lib` (the APU ROCm line).  Run anyway with the box's `UD-Q4_K_M` name override: every arm executes, but `ref` builds **no** GTT arena (`tables=''`, no releases, `evictions='0'`) — i.e. **the store declines on a discrete GPU**, which is the delivery's documented state, so the gate's own assertions cannot be satisfied by construction.  The `ram` arm exits 1 for the same reason (nothing to fit). | the discrete-side mechanism oracle below |
+| `scripts/gate-prefill-server-slots.sh` | needs the **122B-A10B Q8_0** (≈130 GiB, absent from this box; the gate's default path does not exist here) with `-lme 90`, and `LLAMA_SERVER` defaults to a scratch tree — a >RAM host-expert config that only an APU with 128 GiB+ can host. | — |
+
+**Discrete-side mechanism oracle (the right witness for a block that rewrites `moe-expert-cache.cu` +2 970):**
+35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192`, `-lv 4` ->
+`MoE expert cache: h=0.8127 (9674/11904 reaches), fills=9418 evictions=689, tables=60, slots=10212, arena=10850.2
+MiB auto`, `takeover=1377 decline_all=0 get_ok=357`, `expert access: hits=9674 fills=1900 colds=330`, and
+**0 `GTT` lines**.  The arena is live and evicting, and the UMA tier is provably **inert** on this device — the
+two facts a discrete box can state about block 16.
+
+**Owed to an APU box (`halo`/`soar`, gfx1151, per `AGENTS.md` "the store/arena is inert on a discrete GPU by
+measurement"):** `gate-uma-experts.sh` (its `inplace` and `pfcp` arms included) and
+`gate-prefill-server-slots.sh` (two slots: one decoding while the other prefills), **and with them `D17`'s
+region check** — the halved VMM reservation + retry must not change the region the GTT store asks for.  On this
+box the store never opens, so the region question is unobservable; `D17` therefore stays **verified only for the
+VMM pool's own allocation** (R10's slab/arena) and its store-region half is R18-on-an-APU.
 
 ## R18 — release ladder · **TODO**
 

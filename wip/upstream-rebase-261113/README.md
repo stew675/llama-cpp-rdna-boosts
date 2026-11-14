@@ -1,11 +1,18 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: OPEN — R00..R13 done 2026-11-13 (blocks 00-08, the `R09r` rung-repair of block 05's FA instance set,
-and blocks 09-12); R14 (block 13, "MTP draft vocabulary subset") is next.**  The two arms that had to wait for
-block 12 were both **cleared at R13**: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (the
-`moe_cache_pool_backed` Meta forwarding: pool built on a 2-device `-sm tensor` split, exchange INERT, both arms
-byte-identical) and `gate-node-budget.sh` (`graph_max_nodes()` + the "over its node budget" refusal: 4/4 with a
-440-entry margin per arm).  The pool gate's remaining 12 checks belong to blocks 15/16 — see `HANDOVER.md` §5.7.  `D17` (the base blocker) is decided: block 00
+**Status: ALL RUNGS DONE (R00..R17, 2026-11-13) — R18 (the release ladder) is next and needs the maintainer's
+go-ahead.**  Every one of the 17 blocks is on `rebase-r278` (`767907a3f`, tree `69161d3b0`), each rung built and
+coherent (`100 chars sha=1c5d32ac537d` at every rung since R01), and **every gate arm that was deferred mid-climb
+has been cleared by the block it was owed to**: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (R13, block 12's
+`moe_cache_pool_backed`), `gate-node-budget.sh` (R13, 4/4 with a 440-entry margin), quant-coherence **section E**
+(R16, block 15's `#30206` fix), the pool's `fail`/`late`/`pinlate` (R16, block 15's pageable `ROCm_HostMap`
+master) and its placement transport (**R17, 54/54**, block 16's read queue — HANDOVER §5.7/§5.9/§5.11).  Two
+rung-repairs are carried and must be squashed into their owning blocks at R18: `9c94ce139` -> block 05 (the FA
+instance matrix) and `9c940db6f` -> block 11 (the folded hyper-connection `h_nextn` export vs upstream
+`#31927`).  Known-red and recorded: `gate-kv-residency.sh`'s **multi-device** pool section (a pre-existing
+2-device MTP nondeterminism, `D20`/`TODO` #321) and the **APU-only** gates (`gate-uma-experts.sh`,
+`gate-prefill-server-slots.sh`, `D17`'s store region) which cannot run on this gfx1201 box.
+`D17` (the base blocker) is decided: block 00
 carries the `#30542` revert.  `D5-a` (found at R09) is **decided and applied** as the rung-repair `9c94ce139`:
 upstream's FA heads 40/72 have their `fattn-mma-f16` instantiations again (32 undefined symbols -> 0), with the
 FP8 KV column and a typed `generate_cu_files.py` restored alongside.  Rungs R01..R17 are the replay; R18 is the
@@ -139,8 +146,8 @@ bound: the probe chained through marker-carrying trees).
 | 5 | R14 | 13 MTP vocab subset | **0** | `D7` verify only — **NEXT** |
 | 5 | R15 | 14 relaxed-tensor (**temporary**) | **0** | re-check it is still not subsumed |
 | 5 | R16 | 15 streamed KV | 5 | `D3` (FP8 KV instance set), `D19` (recurrent cache rename); owes quant-coherence section E (sparse QSA) **and** `gate-host-pool`'s `fail`/`late`/`pinlate` |
-| 5 | R17 | 16 UMA GTT expert store | **0** | re-check the VMM pool change (`D17`); owes `gate-host-pool`'s placement-transport checks (`qd1`/`bulkbuf`/placement queue) |
-| 6 | R18 | — | — | release ladder: regenerate, validate, gates, `release.json`, fork refresh, records |
+| 5 | R17 | 16 UMA GTT expert store | **0** | **DONE 2026-11-13** — 0 conflicts, 0 first-error passes; **`gate-host-pool.sh` 54/54**, the last deferred arm; discrete arena live (`h=0.8127`, fills 9418) with 0 `GTT` lines; its own gates are APU-only (§5.11) |
+| 6 | R18 | — | — | **NEXT (go-ahead needed)** — release ladder: regenerate (squash BOTH rung-repairs), validate, gates, `release.json`, fork refresh, records |
 
 Rung mechanics, per-rung conflict file lists and the resume command: [`RUNGS.md`](RUNGS.md).
 

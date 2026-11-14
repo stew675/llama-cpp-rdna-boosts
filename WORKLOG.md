@@ -1,3 +1,35 @@
+## 261113.014 (r277 + campaign rung R17, NO delivery change) -- R17 (block 16) closes the climb: it is the cleanest rung of the set AND the one that turns `gate-host-pool.sh` fully green (54/54), the last deferred arm; block 16's own gates turn out to be APU gates
+
+**No patch changes, no `release.json` change.**  Rung R17 (`767907a3f`, tree `69161d3b0`; block 16 "the UMA GTT
+expert store").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R17.
+
+* **16 files, 0 conflicts, 0 first-error passes.**  Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no
+  stray markers.  **All 17 blocks are now on `rebase-r278`.**
+* **`gate-host-pool.sh` 54/54 — PASS, and that closes the last deferred gate arm of the whole climb.**  The four
+  placement-transport checks R13 handed to block 16 are green now: `ref` reports `host pool PLACEMENT reads:
+  O_DIRECT` and the placement queue with **8 readers**, `qd1` reports **1 reader**, `bulkbuf` reports a buffered
+  placement read.  The progression is the campaign's cleanest piece of bookkeeping: R13 42/54 (block 12 cleared
+  `tsplit*`), R16 50/54 (block 15 made `fail`/`late`/`pinlate` real), R17 **54/54** (block 16 shipped the
+  placement read queue).
+* **Block 16's own gates are APU gates and cannot run on a discrete gfx1201 — recorded with the reason, not
+  skipped.**  `gate-uma-experts.sh` is the integrated-GPU gate (`prop.integrated`, `-lme 4` on a 35B-A3B whose
+  18.2 GiB expert set evicts out of shared DRAM, and it pins the gfx1151 ROCm lib path); run anyway with this
+  box's `UD-Q4_K_M` name override, every arm executes but `ref` builds **no GTT arena** (`tables=''`, no
+  releases, `evictions='0'`) — the store declining on a discrete GPU is the delivery's documented state, so the
+  gate's assertions are unsatisfiable by construction.  `gate-prefill-server-slots.sh` needs the **122B-A10B
+  Q8_0** (≈130 GiB, absent here) with `-lme 90`.
+* **The discrete-side mechanism oracle, which is what a discrete box CAN state:** 35B-A3B Q8_0, 1 GPU,
+  `-ncmoe 20 -c 8192 -lv 4` -> the host-expert arena is **live and evicting** after block 16's +2 970-line
+  rewrite of `moe-expert-cache.cu` (`h=0.8127 (9674/11904)`, `fills=9418 evictions=689`, `tables=60 slots=10212`,
+  `takeover=1377 decline_all=0 get_ok=357`, `expert access: hits=9674 fills=1900 colds=330`) and the UMA tier is
+  **inert** (**0 `GTT` lines**).
+* **`D17`'s store-region half is therefore unobservable here** and joins the APU gate set as an
+  **R18-on-`halo`/`soar`** item; its VMM-pool half stays verified as at R10.
+* **Climb state:** R00..R17 done on `rebase-r278` at `767907a3f`; build dir holds the R17 tree.  **Next is R18 —
+  the release ladder — and it needs the maintainer's go-ahead.**  Two things it must carry: squash **both**
+  rung-repairs (`R09r` -> block 05, the R16r h_nextn repair -> block 11), and `gate-kv-residency.sh`'s
+  **multi-device** section stays red because of the pre-existing 2-device MTP nondeterminism (`D20`/`TODO` #321).
+
 ## 261113.013 (r277 + campaign rung R16, NO delivery change) -- R16 (block 15, the streamed KV) lands with a second rung-repair: upstream `#31927`'s h_nextn assert has to accept the delivery's folded hyper-connection export, and the rung clears the last three deferred gate arms
 
 **No patch changes, no `release.json` change.**  Rung R16 (`f745bbf1b` + the rung-repair `9c940db6f`, tree
