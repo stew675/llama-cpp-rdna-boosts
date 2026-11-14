@@ -29,32 +29,32 @@ READ FIRST, IN THIS ORDER
 4. wip/upstream-rebase-261113/README.md §1 and §5 (rung mechanics and the blocked-rung protocol)
 
 STATE
-R00..R14 are done on `rebase-r278`: blocks 00-08 (R01-R09), the rung-repair `9c94ce139` (block 05's FA instance
-matrix: heads 40/72, the FP8 KV column, a typed generator), block 09 `a6809f75b`, block 10 `13176810a` (which
-moved the whole fusion dispatcher into `ggml-cuda-try-fuse.cu`), block 11 `1d83b50e0` (qwen4exp;
-GGML_OP_COUNT is 106 after R13), block 12 `75d83f231` (campaign remainder; tree `d862165c5`) and block 13
-`aca78625a` (MTP draft vocabulary subset; tree `061a71a98`) and block 14 `f040d394f` (`-sm relaxed-tensor`,
-TEMPORARY; tree `0c8a1fd58`), block 15 `f745bbf1b` (the streamed KV), the **R16 rung-repair `9c940db6f`**
-(tree `14f99e579`) and block 16 `767907a3f` (the UMA GTT store; tree `69161d3b0`).  Coherence is `100 chars sha=1c5d32ac537d` at every rung since R01, re-verified on the R16
-tree.  Block 14 is still load-bearing (upstream's `#31081` deny is verbatim at `4f9dfa0e3` and nothing in
-`a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`) — do not drop it in passing; HANDOVER §5.8.
-R16 cleared three gate arms and added a rung-repair (§5.9); R17 cleared the **last** one — `gate-host-pool.sh`
-is **54/54** now — and block 16's own gates (`gate-uma-experts.sh`, `gate-prefill-server-slots.sh`) are **APU
-gates that cannot run on this discrete box** (§5.11), as is `D17`'s store-region half.  `D7` was re-verified at R14: the device-buffer hidden-state
-row gather is live on BOTH splits now (`target h rows on the device: yes`), because block 09's
-`ggml_backend_meta_device_event_new()` closed the R03 gap — the `upstream/` candidate is purely upstream's.
+**R00..R17 are done — ALL 17 BLOCKS are on `rebase-r278` at `767907a3f` (tree `69161d3b0`), plus two
+rung-repairs.**  Coherence is `100 chars sha=1c5d32ac537d` at every rung since R01, re-verified on the R17 tree.
+Per-rung shas, resolutions and gate results: `RUNGS.md` §0 ledger + each §Rnn.  Rung chain in order:
+block 00 `43a418c10`, 01 `ab433a7dd`, 02 `50a0b30f8`, 03 `43891459e`, 04 `4c6a5019a`, 05 `22fcde21e`,
+**rung-repair `9c94ce139`** (block 05's FA instance matrix: heads 40/72, the FP8 KV column, a typed generator),
+06 `c1d8b7c04`, 07 `626e398d2`, 08 `a95c0497b`, 09 `a6809f75b`, 10 `13176810a`, 11 `1d83b50e0`,
+12 `75d83f231`, 13 `aca78625a`, 14 `f040d394f`, 15 `f745bbf1b`, **rung-repair `9c940db6f`** (upstream
+`#31927`'s h_nextn assert vs the delivery's folded hyper-connection export), 16 `767907a3f`.
 
-R13 cleared both block-12 gates it owed: `gate-host-pool.sh` `tsplit`+`tsplitnosink` (pool built on a 2-device
-`-sm tensor` split, exchange INERT, both arms `171 chars sha=8c39335bbceb`) and `gate-node-budget.sh` (4/4, every
-arm `a1b7eb2ee7a6`, margin 440 entries: 2064/2504 q8_0, 1504/1944 f16 and rotation-off).  The pool gate is
-**42/54** and its 12 remaining checks belong to LATER blocks — do not re-litigate them, do not weaken the gate:
-  * `fail`, `late`, `pinlate` (8 checks) -> R16: `host_expert_buft()` still returns the PINNED `ROCm_Host`; block
-    15 inserts the `want_mapping` -> `ggml_backend_dev_moe_host_master_buft(dev)` (`ROCm_HostMap`) branch, which
-    is what makes the master pageable and the pool's fault/latch hooks reachable.
-  * `ref`'s placement transport + placement queue, `qd1`, `bulkbuf` (4 checks) -> R17: `MOE_EXPERT_FILL_QD`,
-    `MOE_HOST_POOL_BULK_DIO` and the placement read queue are block 16's.
-  * Still open from R12: `gate-qwen4exp-quant-coherence.sh` section E (sparse QSA) -> R16 (block 15 replaces
-    `ggml_rope_get_truncate(dst)` on the fused INDEXER_SCORE node, which upstream #30206's assert rejects).
+Every gate arm that was deferred mid-climb is now CLEARED by the block it was owed to — do not re-litigate any of
+them: `gate-host-pool.sh` `tsplit`/`tsplitnosink` (R13, block 12's `moe_cache_pool_backed`), `gate-node-budget.sh`
+(R13, 4/4, margin 440 entries per arm), quant-coherence **section E** (R16, block 15's `#30206` fix),
+`gate-host-pool.sh`'s `fail`/`late`/`pinlate` (R16, block 15's pageable `ROCm_HostMap` master) and finally its
+placement transport (**R17 — the gate is 54/54**, block 16's read queue).
+
+Three things R18 must carry, all recorded:
+  * **Squash BOTH rung-repairs** into their owning blocks: `9c94ce139` -> block 05, `9c940db6f` -> block 11.
+    The series must be exactly 17 block commits (block 00 keeps prefix `0000`).
+  * **APU-only work, owed to `halo`/`soar` (gfx1151)** — it cannot run on this gfx1201 box and must NOT be
+    marked passed: `gate-uma-experts.sh` (incl. its `inplace`/`pfcp` arms), `gate-prefill-server-slots.sh`, and
+    `D17`'s GTT store-region check (the store is inert on a discrete GPU — 0 `GTT` lines; HANDOVER §5.11).
+  * **Known-red:** `gate-kv-residency.sh`'s **multi-device** pool section — a PRE-EXISTING 2-device MTP
+    nondeterminism (`D20`/`TODO` #321; `bin-r277` reproduces it, `--spec-type none` and one device are stable).
+    The gate was not weakened and must not be; the single-device, window and selftest sections are green.
+  * `D7` was re-verified at R14: the device-buffer hidden-state row gather is live on BOTH splits (`target h rows
+    on the device: yes`) because block 09's `ggml_backend_meta_device_event_new()` closed the R03 gap.
 
 YOUR TASK
 **R18 is the release ladder, and it is NOT a rung.**  It rewrites the delivery (`patches/`, `release.json`, the
@@ -97,10 +97,6 @@ RULES
 
 IF R18 COMPLETES
 The climb is over: the delivery is re-based and released.  Report the new base/tip/tree, the gate numbers, the
-APU-deferred set and `D20`/#321 to the maintainer.  It is not a rung: `make-patches.sh` (squashing BOTH rung-repairs — `R09r` into block 05 and the
-R16r h_nextn repair into block 11), `make-release.sh`, `validate-set.sh`, `gate-per-block-build.sh`, the
-prefill-logit record + arms, the coherence set (dense 4B, the 35B-A3B field config, a hybrid recurrent model,
-the qwen4exp class), the MTP four-axis protocol, `gate-rebase-release.sh`, `check-gpu-faults.sh`, the fork
-refresh (personal fork only) and the records.  Known-red items to carry: `gate-kv-residency.sh`'s **multi-device**
-pool section (`D20`/`TODO` #321 — pre-existing 2-device MTP nondeterminism; nothing to do with the delivery).
+APU-deferred set (which must be labelled "not run on this box") and the known-red `D20`/`TODO` #321 item to the
+maintainer, then move this campaign to `archive/work/upstream-rebase-261113/` with no `wip/` stub.
 ```
