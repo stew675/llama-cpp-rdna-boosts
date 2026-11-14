@@ -1,3 +1,32 @@
+## 261113.012 (r277 + campaign rung R15, NO delivery change) -- R15 (block 14) keeps `-sm relaxed-tensor` alive: the mode is byte-identical to `-sm layer` on Flint while `-sm tensor` still refuses it, and upstream has not started allowing those arches
+
+**No patch changes, no `release.json` change.**  Rung R15 (`f040d394f`, block 14 "relaxed-tensor split mode
+(TEMPORARY: MoE amax per-device scalar)").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R15.
+
+* **Result `f040d394f`** (tree `0c8a1fd58`), 11 files, **0 conflicts**, **0 first-error passes**; coherence
+  unchanged (**100 chars `sha=1c5d32ac537d`**); no stray markers; GPU faults clean over the rung's window and
+  every arm log.
+* **The block's claims re-measured, not assumed.**  `--help` lists `{none,layer,row,tensor,relaxed-tensor}`;
+  Flint Q8_0 on 3 GPUs with `-sm tensor` is **refused** (`LLAMA_SPLIT_MODE_TENSOR not implemented for
+  architecture 'flint'; this arch's MoE amax rescale needs '-sm relaxed-tensor'`) — upstream `#31081`'s deny is
+  intact and the block only adds the escape hatch; with `-sm relaxed-tensor` the same model **generates text
+  byte-identical to `-sm layer`** (`103 chars sha=cc4fbc3e8367`); and a non-amax arch (Qwen3.5-4B, 2 GPU) is
+  byte-identical across `-sm tensor` / `-sm relaxed-tensor` / `-sm layer` (all `1c5d32ac537d`), i.e. the
+  per-device state is unreachable where no amax op exists.
+* **The drop condition is UNMET, so block 14 stays TEMPORARY.**  Upstream's deny is verbatim at the pristine
+  base `4f9dfa0e3` (`if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch))
+  throw …`), `flint`/`mellum`/`mistral4` are still in the function's false list, and **nothing in
+  `a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`** (`git log -S` on the range is empty; the only
+  range commit touching `ggml-backend-meta.cpp` is the `29dbbad2b` prune).  Dropping it remains a maintainer
+  decision for a future base, never a merge outcome — recorded in `HANDOVER.md` §5.8 so a later session does
+  not "notice" the block is TEMPORARY and drop it in passing.
+* **Climb state:** R00..R15 done on `rebase-r278` at `f040d394f`; build dir holds the R15 tree.
+  **Next: R16 = block 15** (the streamed KV, `99d33117a`, 5 expected conflicts — `common/fit.cpp`,
+  `common/speculative.cpp`, `ggml/include/ggml-rpc.h` + `ggml/src/ggml.c`, `src/llama-kv-cache.cpp`), which owes
+  the KV-residency gates, `gate-qwen4exp-quant-coherence.sh` section E **and `gate-host-pool.sh`'s
+  `fail`/`late`/`pinlate`** (block 15 is what makes the host master pageable, so those three arms finally stop
+  being vacuous).
+
 ## 261113.011 (r277 + campaign rung R14, NO delivery change) -- R14 (block 13) is the first rung with no conflict and no first-error pass: the draft-vocabulary subset lands, its own regression test passes, and `D7`'s `-sm tensor` asymmetry turns out to have been closed by block 09
 
 **No patch changes, no `release.json` change.**  Rung R14 (`aca78625a`, block 13 "MTP draft vocabulary subset,

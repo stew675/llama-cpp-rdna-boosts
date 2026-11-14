@@ -29,8 +29,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R12 | 11 qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) | **DONE 2026-11-13** | `1d83b50e0` | 5 files / 6 hunks — the cleanest rung yet; `D11` resolved (op count 105, RPC 7); `gate-hc-fusions.sh` **PASS**; quant-coherence A-D **PASS**, **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
 | R13 | 12 campaign remainder | **DONE 2026-11-13** | `75d83f231` | 5 files / 8 hunks, **zero** first-error passes; `D11` re-derived (op count **106**, RPC **8**, 24 messages all paired); `D8` prune (`set_warmup` kept out, 3 of 4 `llama-ext.h` decls already upstream's); FA generator keeps the **typed set with no head-40/72 skips** (idempotent, 390 files); `gate-node-budget.sh` **PASS 4/4 with the margin (440 entries every arm)**; `gate-host-pool.sh` **42/54 — `tsplit`+`tsplitnosink` CLEARED**; 12 remaining checks are **R16's** (block 15's `host_expert_buft` `want_mapping` -> `ROCm_HostMap`) and **R17's** (block 16's `MOE_EXPERT_FILL_QD`/placement queue) |
 | R14 | 13 MTP vocab subset | **DONE 2026-11-13** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits match the full vocab with 0 mismatches, two live contexts keep their own `N`); runtime `--spec-draft-mtp-vocab 32768` drafts on 32 801 of 248 320 rows; **`D7` re-verified and it has moved**: `-sm tensor` now takes the device row gather too, because block 09's `ggml_backend_meta_device_event_new()` closed the R03 gap |
-| R15 | 14 relaxed-tensor (**temporary**) | **NEXT** | — | — |
-| R16 | 15 streamed KV | **TODO** | — | `D3`, `D19` |
+| R15 | 14 relaxed-tensor (**temporary**) | **DONE 2026-11-13** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` still refuses flint with the delivery's pointer, `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`), 4B tensor/relaxed/layer all `1c5d32ac537d`; **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and no range commit touches it, so the block stays TEMPORARY |
+| R16 | 15 streamed KV | **NEXT** | — | `D3`, `D19` |
 | R17 | 16 UMA GTT store | **TODO** | — | `D17` verify |
 | R18 | release ladder | **TODO** | — | all `AWAITING` items resolved |
 
@@ -739,12 +739,31 @@ kill-switch for the device path, so this rung records the behaviour, not a byte-
 `upstream/` note stands for upstream itself** (give upstream's Meta device an `event_new`); it is no longer a gap
 in this delivery.
 
-## R15 — block 14: `-sm relaxed-tensor` (**TEMPORARY**) · **TODO**
+## R15 — block 14: `-sm relaxed-tensor` (**TEMPORARY**) · **DONE 2026-11-13**
 
-* block sha `6b4d9865e` · 11 files · **expected conflicts: 0** (CLEAN)
+* block sha `6b4d9865e` · 11 files · **result `f040d394f`** · tree `0c8a1fd58` · **0 conflicts**, **0
+  first-error passes** (the probe was right again).
 
-**Expect:** clean.  Re-check upstream has not started allowing the arches the relaxation covers; if it has,
-this block is dropped by decision, not by merge.
+Build green; coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars
+`sha=1c5d32ac537d`**; no stray end-markers; GPU faults clean over the rung's window and every arm log.
+
+**Verified (the block's own claims, re-measured on this tree)**
+
+| arm | result |
+|---|---|
+| `llama-cli --help` split modes | `{none,layer,row,tensor,relaxed-tensor}` — the mode is wired through the arg parser (`LLAMA_SPLIT_MODE_RELAXED_TENSOR = 4`) |
+| Flint Q8_0, 3 GPU, `-sm tensor` | **refused**, exit 1, with the delivery's pointer: `LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE amax rescale needs '-sm relaxed-tensor'` — upstream `#31081`'s deny is intact, the block only adds the escape hatch |
+| Flint Q8_0, 3 GPU, `-sm layer` vs `-sm relaxed-tensor` | **byte-identical**: `103 chars sha=cc4fbc3e8367` both ways (the r236 record's `904c62d1d4f9` is the same equality at a longer prompt) |
+| Qwen3.5-4B (a non-amax arch), 2 GPU, `-sm tensor` / `-sm relaxed-tensor` / `-sm layer` | all three **`100 chars sha=1c5d32ac537d`** — the relaxed state is unreachable for an arch that never produces it, exactly as the block argues |
+
+**The redundancy check the rung owed: upstream has NOT started allowing those arches.**  At the pristine base
+`4f9dfa0e3` the deny is verbatim (`if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+!llm_arch_supports_sm_tensor(arch)) throw …`), `flint`/`mellum`/`mistral4` are still in
+`llm_arch_supports_sm_tensor()`'s false list, and **no commit in `a691b2345..4f9dfa0e3` touches that function
+or the `POOL_1D`-under-a-split question** (`git log -S'llm_arch_supports_sm_tensor'` on the range is empty; the
+only range commit touching `ggml-backend-meta.cpp` is the `29dbbad2b` prune).  So block 14 is **still
+load-bearing** on this base and stays TEMPORARY — the drop condition (upstream lands a real fix) is unmet, and
+dropping it remains a decision for the maintainer, never a merge outcome.
 
 ## R16 — block 15: the streamed KV — window (Goal A) + attendance pool (Goal B) + MTP draft window · **TODO**
 
