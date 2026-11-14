@@ -1,3 +1,56 @@
+## 261114.001 (r280) -- PR #310 accepted as a DELIVERY fix, not a `wip/` patch: block 11's `LLAMA_LAZY_BUF_MB` export builds on Windows, and the portability lint now judges the lines the delivery inserts into an upstream file
+
+**`release.json` changed: tip `f61ac4bd8` -> `f25fd3ff2`, tree `d6372d47a` -> `b83424ef5`, release
+`v17-4f9dfa0e3-r279` -> `v17-4f9dfa0e3-r280`; 17 blocks, base unchanged.**  Blocks 11-16 were re-cut (block 11's
+content, blocks 12-16 only their `From` id); no kernel, model or API code moved -- the tree delta against r279 is
+one file, `tests/test-llama-archs.cpp` (19 insertions, 6 deletions).
+
+* **The report is accurate, line for line.**  Block 11 exports `LLAMA_LAZY_BUF_MB` around `llama_model_load` in
+  `tests/test-llama-archs.cpp`'s `get_model()` with the POSIX `setenv`/`unsetenv`; the MSVC CRT that clang-cl uses
+  under the Windows HIP SDK has neither, so a Windows build that includes the tests stops in that TU (the
+  libraries and `llama-server` are unaffected -- which is why no gate here ever saw it, and why the reporter's
+  "since r236" range is credible: r236 is when block 11 gained the export).  Every scope claim in the PR was
+  re-measured on r279: `check-windows-portability.sh` default **OK: 337 files**, `--modified-too` **6 hits**
+  (`sysconf`, `getpid`, hexagon `mmap()`, metal/zDNN), `tests/` never selected, and `setenv`/`unsetenv` absent
+  from the call list.  `git apply --check` clean on the r279 tree, as claimed.
+* **Accepted, with three amendments (the maintainer's call was to take the fix, not the patch verbatim).**
+  (1) **Placement**: it is a delivery defect in block 11, so it is folded into block 11 (`edit` + `fixup` +
+  `--autosquash`, the r278/r279 procedure), not committed as `wip/win-setenv-shim/` -- `wip/` is experimental work
+  by policy, and this patch is a Windows build fix for shipped code.  (2) **Implementation**: the contributor's
+  shim defines file-static `setenv`/`unsetenv` in the global namespace; that is a redefinition hazard the moment a
+  platform header declares them, and the lint reads a *definition* as a call site.  The delivery uses the
+  call-site split block 01 already uses for `NCCL_P2P_DISABLE`: `#if defined(_WIN32)` -> `_putenv_s(name, value)` /
+  `_putenv_s(name, "")` (which removes the variable, exactly like `unsetenv`), `#else` -> `setenv`/`unsetenv`.
+  Also `#include <cstdlib>` is added, because block 11 had been relying on a transitive `<stdlib.h>` for the
+  POSIX pair.  (3) **The detector gap is fixed, not documented**: that is the part worth keeping.
+* **The lint now scopes by LINE, not by file.**  `scripts/check-windows-portability.sh` gained `tests/` in its
+  default path set, `setenv`/`unsetenv`/`putenv` in the POSIX call list, and -- the real change -- an
+  **added-line report mask** for a file the delivery merely edits: the whole file is still parsed (so an upstream
+  `#ifdef _WIN32` above an inserted line keeps excluding it), but only lines `git diff -U0 base..HEAD` adds are
+  reported.  The file-level `--diff-filter=A` exclusion was chosen to keep upstream's own POSIX-ish names
+  (hexagon's `mmap(bool)`, metal's macOS-only `setenv`, zDNN's `sysconf`) out of a CI failure, and it still does;
+  what it could not do is separate "upstream wrote it" from "we inserted it".  `--modified-too` keeps its old
+  meaning (whole edited files, noisy by construction) and now reads 7 hits, one of them `setenv` in
+  `ggml-metal.cpp` -- upstream, macOS-only, and not reported by the default scope.  Policy text updated in
+  `AGENTS.md`, `scripts/README.md`, `patches/README.md` and `INVARIANTS.md` (r280).
+* **Gates.**  `validate-set.sh` **green** (strict `git am` on a fresh tarball at `4f9dfa0e3`, applied tree ==
+  `b83424ef5`, sha256s, the portability lint **509 files** clean); `gate-per-block-build.sh --changed-from
+  f61ac4bd8` **2/2** (blocks 11 and 16, `all` targets -- the profile that matters because the commit touches
+  `tests/`) in 10 s; coherence **`1c5d32ac537d`** (dense 4B, unchanged since r152) and no GPU fault in the arm's
+  own window (`gate-rebase-release.sh --only text,faults`).  Plus the lint's **negative control**, which is the
+  measurement that says the new mask is not vacuous: the r279 worktree reports exactly
+  `tests/test-llama-archs.cpp:844 setenv` and `:846 unsetenv`, the r280 tree none, both at 509 files scanned.
+* **What was NOT run, and why that is honest rather than convenient.**  No kernel, model-graph, loader or API code
+  changed (verified by `git diff --stat f61ac4bd8 HEAD`: one test file), so the prefill-logit gate, the MTP
+  four-axis protocol, `gate-host-pool.sh`, `gate-kv-*`, the qwen4exp pair and `test-backend-ops` are untouched by
+  this release and r279's numbers for them stand on the same base with the same blocks.  **The Windows claim
+  itself is review-level, not build-level**: there is no Windows runner here, exactly as for issue #307 in r279 --
+  the reporter builds Windows with the tests enabled and carried the equivalent patch from r236 through r279, and
+  the shape now matches the idiom block 01 already ships.  Stated that way everywhere it is claimed.
+* **PR #310 answered on GitHub**: accepted in substance, not in form -- folded into block 11 (not `wip/`), the
+  shim replaced by the call-site split, and the lint's scope widened as the PR itself suggested (added-line
+  scanning of edited files), which is what would have caught it in r236.
+
 ## 261113.016 (r279) -- two contributor-reported CORRECTNESS fixes land before the re-base is published: the `-sm tensor` loader can zero real weight bytes (issue #308) and the Windows placement read queue waits on the wrong object (issue #307).  r278 was recorded but never tagged or pushed
 
 **`release.json` changed again: tip `0e264ad30` -> `f61ac4bd8`, tree `69161d3b0` -> `d6372d47a`, release

@@ -4626,3 +4626,24 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
 * **`check-gpu-faults.sh` without `--since` scans the whole boot journal.**  A new gate that reads the journal must
   pass a start timestamp, or a fault from an earlier session reads as its own (a 16:52 gfxhub fault was reported
   against 23:0x runs before this was fixed).
+
+## r280 — the delivery owns the lines it inserts into upstream files (the Windows tests build)
+
+* **"The delivery must build with HIP on Windows" covers the files it *edits*, not only the ones it adds.**  A
+  POSIX call inserted into an upstream file is a hard compile error on the Windows toolchain and **upstream's
+  Windows CI never builds the delivery**, so no upstream gate and no Linux gate can see it.  `tests/` is inside
+  that contract too: a Windows HIP build that enables the tests compiles `tests/test-llama-archs.cpp`
+  (r236-r279: `setenv`/`unsetenv` from block 11, reported in PR #310 — the libraries and `llama-server` were
+  fine, which is exactly why nothing here noticed).
+* **The environment pair does not exist in the MSVC CRT.**  clang-cl under the Windows HIP SDK has `getenv`,
+  `_putenv` and `_putenv_s`, and has **no** `setenv`/`unsetenv`/`putenv`.  `_putenv_s(name, "")` **removes** the
+  variable (the mirror of `unsetenv`), so a call-site platform split is exact; defining `setenv`/`unsetenv`
+  yourself is worse than it looks — a platform header may already declare them, and the portability lint reads a
+  *definition* as a call site.  Block 01's `NCCL_P2P_DISABLE` (`ggml-cuda.cu`) is the idiom to copy.
+* **A lint scoped to "files the delivery adds" is blind to the delivery's insertions.**  `--diff-filter=A` was
+  chosen to keep upstream's own POSIX-ish names (hexagon's `mmap(bool)`, metal's macOS-only `setenv`) out of the
+  report, and it does; but a *file-level* filter cannot separate "upstream wrote it" from "we inserted it".
+  The fix is a **line-level** one: parse the whole file (an upstream `#ifdef _WIN32` above an inserted line
+  still excludes it) and *report* only the lines `git diff -U0 base..HEAD` adds.  Negative control for the
+  check itself: the r279 tree must report exactly `test-llama-archs.cpp:844 setenv` and `:846 unsetenv`, and the
+  r280 tree none, at the same 509 files scanned.

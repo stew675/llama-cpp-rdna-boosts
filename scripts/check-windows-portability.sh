@@ -31,11 +31,17 @@
 #   `moe-expert-cache.cu` in r273).  `min`/`max` are deliberately not checked -- NOMINMAX is defined
 #   before every windows.h include in this tree and upstream calls them as functions.
 #
-#   SCOPE: by default only files the delivery **adds** (git `--diff-filter=A`) inside ggml/, src/,
-#   common/ and tools/.  An upstream file the delivery merely edits is upstream's Windows CI's business,
-#   and several of them use module-local names that collide with POSIX ones (hexagon's `mmap(bool)`,
-#   vulkan's `Klass::close()`, zDNN's unguarded `sysconf` on a backend Windows never builds).  Use
-#   `--modified-too` for a wider sweep; read its output, it is not CI-clean by construction.
+#   SCOPE: by default the files the delivery **adds** (git `--diff-filter=A`) inside ggml/, src/,
+#   common/, tools/ and tests/, **plus the lines the delivery inserts into a file it merely edits or
+#   renames**.  The second half is the point: the exclusion of edited upstream files is right for the
+#   code upstream wrote -- module-local names collide with POSIX ones (hexagon's `mmap(bool)`, vulkan's
+#   `Klass::close()`, zDNN's unguarded `sysconf` on a backend Windows never builds) -- but a POSIX call
+#   *the delivery inserts* into such a file is ours and upstream's Windows CI never builds the delivery.
+#   r279 shipped one that way: `setenv`/`unsetenv` in `tests/test-llama-archs.cpp` (block 11, reported in
+#   PR #310), a hard compile error for a Windows build that includes the tests.  So an edited file is
+#   parsed in full (an upstream `#ifdef _WIN32` above an inserted line still excludes it) and only the
+#   inserted lines are *reported*.  Use `--modified-too` for the whole-file sweep; read its output, it
+#   is not CI-clean by construction.
 #
 # WHAT IT IS NOT: a Windows compiler. It cannot see a missing `#include`, a type that differs under
 #   MSVC, or a `std::min<int64_t>` mangling clash (issue #217) -- those still need a build log.
@@ -45,18 +51,21 @@
 #
 # Options / environment:
 #   --root DIR          ROOT        tree to scan (default: this repo's ../llama.cpp, the fork checkout)
-#   --diff-from REV     DIFF_FROM   window for "added files" (`git diff --diff-filter=A REV..HEAD`).
-#                                   Default: release.json's `.base` when that commit exists in ROOT,
-#                                   else every tracked file.
+#   --diff-from REV     DIFF_FROM   window (`git diff --diff-filter=AMRT REV..HEAD`).  Default:
+#                                   release.json's `.base` when that commit exists in ROOT, else every
+#                                   tracked file.
 #   --all                           every tracked source file (implies --all-paths)
-#   --modified-too                  include files the delivery edits, not only the ones it adds
-#   --path SPEC         PATHS       path prefix filter (repeatable; default: ggml/ src/ common/ tools/)
+#   --modified-too                  judge edited upstream files WHOLE, not only the lines inserted into
+#                                   them (review sweep; upstream code makes it noisy by construction)
+#   --path SPEC         PATHS       path prefix filter (repeatable; default: ggml/ src/ common/ tools/
+#                                   tests/)
 #   -h, --help
 #
 # Exit: 0 = clean, 1 = findings, 2 = usage/prerequisite error.
 #
 # The caller that matters is scripts/validate-set.sh (tier-1 CI, no compiler): it runs this on the
-# freshly applied tree with `--diff-from HEAD~n_blocks`, so only files the delivery adds are judged.
+# freshly applied tree with `--diff-from HEAD~n_blocks`, so only what the delivery adds or inserts is
+# judged -- added files whole, edited files on their inserted lines.
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,7 +94,7 @@ command -v python3 >/dev/null || { echo "ERROR: python3 is required" >&2; exit 2
 [ -d "$ROOT" ] || { echo "ERROR: --root $ROOT is not a directory" >&2; exit 2; }
 
 if [ ${#PATHS[@]} -eq 0 ]; then
-    PATHS=(ggml/ src/ common/ tools/)
+    PATHS=(ggml/ src/ common/ tools/ tests/)
 fi
 
 # Default the diff window to the delivery's fork point when the tree carries it (a fresh
@@ -100,17 +109,41 @@ if [ -z "$DIFF_FROM" ] && [ "$SCAN_ALL" = 0 ] && [ -f "$REPO_DIR/release.json" ]
 fi
 
 declare -a FILES=()
+MASK_FILE=""
 if [ -n "$DIFF_FROM" ]; then
     git -C "$ROOT" cat-file -e "$DIFF_FROM^{commit}" 2>/dev/null \
         || { echo "ERROR: --diff-from $DIFF_FROM not in $ROOT" >&2; exit 2; }
     if [ "$MODIFIED_TOO" = 1 ]; then
         FILTER="ACMRT"
+        WINDOW="added/modified since $DIFF_FROM (whole edited files: read the output, upstream code is in it)"
     else
-        FILTER="A"
+        FILTER="AMRT"
+        WINDOW="added since $DIFF_FROM, plus the lines inserted into an edited file"
     fi
     mapfile -t FILES < <(git -C "$ROOT" diff --name-only --diff-filter="$FILTER" "$DIFF_FROM"..HEAD 2>/dev/null)
-    WINDOW="added since $DIFF_FROM"
-    [ "$MODIFIED_TOO" = 1 ] && WINDOW="added/modified since $DIFF_FROM"
+
+    # Reporting masks (`--diff-from` only, and not with --modified-too): an *added* file is judged whole,
+    # an *edited* file only on the lines the delivery inserts.  This is reporting-only -- the Python side
+    # still walks the whole file, so an upstream `#ifdef _WIN32` above an inserted line keeps excluding
+    # it.  Without the mask the lint is blind to a POSIX call inserted into an upstream file, which is
+    # how r279's `setenv` in tests/test-llama-archs.cpp shipped (PR #310).
+    if [ "$MODIFIED_TOO" = 0 ]; then
+        MASK_FILE="$(mktemp)"
+        trap 'rm -f "$MASK_FILE"' EXIT
+        for f in "${FILES[@]}"; do
+            [ -n "$f" ] || continue
+            [ -f "$ROOT/$f" ] || continue
+            # added (or copied) in this window: every line is reportable, so no mask entry
+            if git -C "$ROOT" diff --name-only --diff-filter=AC "$DIFF_FROM"..HEAD -- "$f" 2>/dev/null \
+                    | grep -qxF "$f"; then
+                continue
+            fi
+            ranges=$(git -C "$ROOT" diff --no-color -U0 "$DIFF_FROM"..HEAD -- "$f" 2>/dev/null \
+                | sed -n 's/^@@ -[0-9]*\(,[0-9]*\)\{0,1\} +\([0-9]*\)\(,\([0-9]*\)\)\{0,1\} @@.*/\2 \4/p' \
+                | awk '{ n = ($2 == "") ? 1 : $2; if (n > 0) printf "%d-%d,", $1, $1+n-1 }')
+            printf '%s\t%s\n' "$f" "${ranges%,}" >> "$MASK_FILE"
+        done
+    fi
 else
     mapfile -t FILES < <(git -C "$ROOT" ls-files)
     WINDOW="tracked"
@@ -138,7 +171,7 @@ fi
 
 echo "==> Windows portability scan: ${#SCAN[@]} $WINDOW C/C++ file(s) in $ROOT"
 
-ROOT="$ROOT" python3 - "${SCAN[@]}" <<'PY'
+ROOT="$ROOT" MASK_FILE="$MASK_FILE" python3 - "${SCAN[@]}" <<'PY'
 import os
 import re
 import sys
@@ -154,6 +187,10 @@ POSIX = (
     "posix_memalign", "posix_fadvise", "posix_fallocate", "fallocate", "copy_file_range",
     "ftruncate", "mkstemp", "symlink", "readlink", "sysconf", "getpid", "dlopen", "dlsym",
     "mmap", "munmap", "usleep",
+    # the environment pair: the MSVC CRT (clang-cl under the Windows HIP SDK) has neither, only
+    # `_putenv`/`_putenv_s`/`getenv`.  r279's `tests/test-llama-archs.cpp` used these ungated and broke a
+    # Windows build of the tests (PR #310).  `putenv` is POSIX too (MSVC's is the deprecated `_putenv`).
+    "setenv", "unsetenv", "putenv",
 )
 CALL_RE = re.compile(r"(?<![.>:\w])(" + "|".join(POSIX) + r")\s*\(")
 
@@ -462,6 +499,34 @@ def local_includes(rel):
 findings = []
 macro_findings = []
 scanned = 0
+
+# Reporting masks, one line per edited file: `<path>\t<ranges>` with ranges as `a-b,c`.  A file with no
+# entry was added by the delivery and is judged whole.  An entry with an empty range list means the file
+# is parsed but nothing in it is reportable (a pure rename).  Only the *reports* are masked: the
+# preprocessor walk below still sees the whole file, so an upstream guard above an inserted line holds.
+MASKS = {}
+_mask_file = os.environ.get("MASK_FILE", "")
+if _mask_file:
+    try:
+        with open(_mask_file, "r", encoding="utf-8", errors="replace") as _f:
+            for _line in _f:
+                _line = _line.rstrip("\n")
+                if not _line:
+                    continue
+                _rel, _, _spec = _line.partition("\t")
+                _lines = set()
+                for _part in _spec.split(","):
+                    _part = _part.strip()
+                    if not _part:
+                        continue
+                    if "-" in _part:
+                        _a, _b = _part.split("-", 1)
+                        _lines.update(range(int(_a), int(_b) + 1))
+                    else:
+                        _lines.add(int(_part))
+                MASKS[_rel] = _lines
+    except (OSError, ValueError):
+        MASKS = {}
 # <windows.h> (via minwindef.h) defines these as empty or calling-convention macros.  A local,
 # parameter or member named `near`/`far` expands to nothing and is a hard compile error with HIP on
 # Windows (issue #306: `const bool near = ...` became `const bool = ...`; `pascal`/`cdecl` are the
@@ -472,6 +537,7 @@ WINDOWS_KEYWORD_MACROS = ("near", "far", "pascal", "cdecl")
 MACRO_RE = re.compile(r"(?<![A-Za-z0-9_.>:])(" + "|".join(WINDOWS_KEYWORD_MACROS) + r")\b")
 for rel in sys.argv[1:]:
     path = os.path.join(root, rel)
+    mask = MASKS.get(rel)
     macros = {}
     learn_macros([path] + local_includes(rel), macros)
     try:
@@ -484,6 +550,8 @@ for rel in sys.argv[1:]:
     raw_lines = raw.split("\n")
     for lineno, word, line, excluded in walk_directives(code, macros):
         if word is not None or excluded:
+            continue
+        if mask is not None and lineno not in mask:
             continue
         for m in CALL_RE.finditer(line):
             findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))

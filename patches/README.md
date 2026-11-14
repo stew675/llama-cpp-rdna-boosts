@@ -4,6 +4,13 @@
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
 
+> **r280: block 11's test-only `LLAMA_LAZY_BUF_MB` export is portable (PR #310), and the portability lint now
+> judges the lines the delivery inserts into an upstream file.**  One file moved — `tests/test-llama-archs.cpp` —
+> so nothing in a model, kernel or loader path changed; r279's tree `d6372d47a` becomes `b83424ef5` and the gates
+> whose code did not move were not re-run.  The BLOCK 11 note below carries the detail; the detector change
+> (`tests/` in scope, `setenv`/`unsetenv`/`putenv` listed, added-line reporting for edited files) is in
+> `scripts/README.md` and `INVARIANTS.md` (r280), and the campaign record is `archive/work/win-setenv-shim/`.
+>
 > **r279: two contributor-reported correctness fixes, folded into the blocks that own the code.**  Cut, validated
 > and gated *before* r278 was ever tagged or pushed — r278's tree is `69161d3b0`, r279's is `d6372d47a`, base and
 > block structure unchanged.
@@ -2938,6 +2945,19 @@ Numbers: `benchmarks/2026-10-31-cpy-2d-vec16.md`; record `archive/work/cpy-2d-ve
 `archive/work/host-experts-window-beta` (beta 0016, withdrawn 2026-11-02), from the KV campaign's `f8e47e392`).
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
+
+> **r280 amendment (contributor PR #310, DanoPTT): the test's `LLAMA_LAZY_BUF_MB` export is portable.**
+> `tests/test-llama-archs.cpp` exports the managed PLE reader budget around `llama_model_load` with the POSIX
+> `setenv`/`unsetenv`, and the MSVC CRT that clang-cl uses under the Windows HIP SDK has neither (only
+> `_putenv_s`), so a Windows build that **includes the tests** stopped in that file from r236 on — the libraries
+> and `llama-server` were unaffected, which is why no Linux gate saw it.  The export is now a call-site
+> platform split (`#if defined(_WIN32)` → `_putenv_s(name, value)` / `_putenv_s(name, "")`, which removes the
+> variable exactly like `unsetenv`; `#else` → `setenv`/`unsetenv`), the same idiom block 01 already uses for
+> `NCCL_P2P_DISABLE` in `ggml-cuda.cu`.  No behaviour change on Linux and no change to any model path: the
+> parameter is a test-only override of `LAZY_MODE_AUTO`.  It also closed the detector gap that let it happen
+> (see `INVARIANTS.md` r280): `scripts/check-windows-portability.sh` now scans `tests/`, lists
+> `setenv`/`unsetenv`/`putenv`, and judges the lines the delivery **inserts into an upstream file** — the only
+> thing that could see a call added to a file it does not own.
 
 > **r243 amendment (contributor PR #289): the host PLE gather writes the graph input in place and fans out over
 > `--threads`.**  `llm_graph_input_ple::set_input` gathers `ple_n_heads` hashed rows per token out of the host

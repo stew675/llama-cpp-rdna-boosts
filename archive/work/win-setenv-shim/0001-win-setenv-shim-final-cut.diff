@@ -1,0 +1,43 @@
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index a98db3999..34f220686 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -13,6 +13,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
+ #include <filesystem>
+@@ -838,12 +839,24 @@ static llama_model_ptr get_model(
+     llama_model_params model_params = llama_model_default_params();
+     model_params.progress_callback = silent_model_load_progress;
+     // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
+-    // parameter as an override by exporting the equivalent MiB value around the load
+-    if (lazy_buf_size > 0) {
+-        const size_t mb = lazy_buf_size / (1024*1024);
+-        setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb > 0 ? mb : 1).c_str(), 1);
+-    } else {
+-        unsetenv("LLAMA_LAZY_BUF_MB");
++    // parameter as an override by exporting the equivalent MiB value around the load.
++    // The export has to build on Windows too: clang-cl under the Windows HIP SDK uses the MSVC CRT,
++    // which has no setenv/unsetenv (only _putenv_s), and a Windows build that includes the tests
++    // would stop here otherwise (issue: reported in PR #310, caught by
++    // scripts/check-windows-portability.sh once it judged the lines the delivery inserts into an
++    // upstream file).  `mb == 0` means "no override": unset on both platforms, because _putenv_s with
++    // an empty value removes the variable just like unsetenv does.
++    {
++        const size_t mb = lazy_buf_size > 0 ? std::max<size_t>(lazy_buf_size / (1024*1024), 1) : 0;
++#if defined(_WIN32)
++        _putenv_s("LLAMA_LAZY_BUF_MB", mb > 0 ? std::to_string(mb).c_str() : "");
++#else
++        if (mb > 0) {
++            setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb).c_str(), 1);
++        } else {
++            unsetenv("LLAMA_LAZY_BUF_MB");
++        }
++#endif
+     }
+     std::vector<ggml_backend_dev_t> devs_copy = devs;
+     devs_copy.push_back(nullptr);

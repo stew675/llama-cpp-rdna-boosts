@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DanoPTT <36499762+DanoPTT@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 08:23:07 +0100
+Subject: [PATCH] tests: setenv/unsetenv shim for Windows in test-llama-archs
+ (block 11)
+
+Block 11 hands the managed PLE reader budget to the load as
+LLAMA_LAZY_BUF_MB, exported around llama_model_load with the POSIX
+setenv/unsetenv. The MSVC CRT (which clang++ uses under the HIP SDK on
+Windows) has neither, so a Windows build that includes the tests stops at
+test-llama-archs.cpp. Map both onto _putenv_s under _WIN32: setenv keeps
+the POSIX overwrite=0 semantics, and an empty value removes the variable.
+
+No change on non-Windows builds.
+---
+ tests/test-llama-archs.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index a98db39998..964ff4b942 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -24,6 +24,21 @@
+ #include <utility>
+ #include <vector>
+ 
++#ifdef _WIN32
++#include <cstdlib>
++
++// stew block 11 exports LLAMA_LAZY_BUF_MB with the POSIX calls; the MSVC CRT has only _putenv_s
++static int setenv(const char * name, const char * value, int overwrite) {
++    if (!overwrite && getenv(name) != nullptr) {
++        return 0;
++    }
++    return _putenv_s(name, value);
++}
++static int unsetenv(const char * name) {
++    return _putenv_s(name, ""); // an empty value removes the variable
++}
++#endif
++
+ static bool arch_matches(const std::string & filter, llm_arch arch) {
+     if (filter.empty()) {
+         return true;
+-- 
+2.53.0.windows.2
+

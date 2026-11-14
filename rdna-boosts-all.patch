@@ -107758,10 +107758,18 @@ index 000000000..f4fd3f599
 +
 +#endif
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 1f4c8a46b..a98db3999 100644
+index 1f4c8a46b..34f220686 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
-@@ -196,16 +196,29 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
+@@ -13,6 +13,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
+ #include <filesystem>
+@@ -196,16 +197,29 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
      return ret;
  }
  
@@ -107792,7 +107800,7 @@ index 1f4c8a46b..a98db3999 100644
  // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
  struct kv_writer {
      struct gguf_context * gguf_ctx;
-@@ -818,10 +831,20 @@ static llama_model_ptr get_model(
+@@ -818,10 +832,32 @@ static llama_model_ptr get_model(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
          const std::vector<ggml_backend_dev_t> & devs,
          const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
@@ -107804,17 +107812,29 @@ index 1f4c8a46b..a98db3999 100644
      llama_model_params model_params = llama_model_default_params();
      model_params.progress_callback = silent_model_load_progress;
 +    // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
-+    // parameter as an override by exporting the equivalent MiB value around the load
-+    if (lazy_buf_size > 0) {
-+        const size_t mb = lazy_buf_size / (1024*1024);
-+        setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb > 0 ? mb : 1).c_str(), 1);
-+    } else {
-+        unsetenv("LLAMA_LAZY_BUF_MB");
++    // parameter as an override by exporting the equivalent MiB value around the load.
++    // The export has to build on Windows too: clang-cl under the Windows HIP SDK uses the MSVC CRT,
++    // which has no setenv/unsetenv (only _putenv_s), and a Windows build that includes the tests
++    // would stop here otherwise (issue: reported in PR #310, caught by
++    // scripts/check-windows-portability.sh once it judged the lines the delivery inserts into an
++    // upstream file).  `mb == 0` means "no override": unset on both platforms, because _putenv_s with
++    // an empty value removes the variable just like unsetenv does.
++    {
++        const size_t mb = lazy_buf_size > 0 ? std::max<size_t>(lazy_buf_size / (1024*1024), 1) : 0;
++#if defined(_WIN32)
++        _putenv_s("LLAMA_LAZY_BUF_MB", mb > 0 ? std::to_string(mb).c_str() : "");
++#else
++        if (mb > 0) {
++            setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb).c_str(), 1);
++        } else {
++            unsetenv("LLAMA_LAZY_BUF_MB");
++        }
++#endif
 +    }
      std::vector<ggml_backend_dev_t> devs_copy = devs;
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
-@@ -842,8 +865,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -842,8 +878,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
          const std::vector<ggml_backend_dev_t> & devs,
          const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
@@ -107826,7 +107846,7 @@ index 1f4c8a46b..a98db3999 100644
  
      llama_context_params ctx_params = llama_context_default_params();
      ctx_params.n_ctx = 0;
-@@ -1333,6 +1357,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+@@ -1333,6 +1370,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                  if (dc.host_experts && (!moe || !host_experts_test(arch))) {
                      continue;
                  }
@@ -107836,7 +107856,7 @@ index 1f4c8a46b..a98db3999 100644
                  const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
  
                  // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
-@@ -1422,7 +1449,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+@@ -1422,7 +1462,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                          GGML_ASSERT(file != nullptr);
  
                          {
