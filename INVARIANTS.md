@@ -599,8 +599,8 @@ change), and let `WORKLOG.md` carry the narrative.
   clamp runs AFTER `llama_init_from_model`, on the arena's real state (r129, TODO #96):** the model-load band
   only says the slab was *armed*, so clamping there clamped slab-declined (streaming, no-arena) configs.  It
   therefore no longer lowers `cparams.n_rs_batch` — that stays the **unclamped** safety bound (a partial
-  rollback can land in any batch up to an unclamped draft; the value also floors the chunked-GDN threshold,
-  so an ngram speculator's prefill *tail* ubatches take the sequential bit-identical GDN path) — and the
+  rollback can land in any batch up to an unclamped draft; since r282 it is *not* a chunked-GDN
+  kernel-selection input, see the block-03 entry above) — and the
   slab's narrow verify reserve takes the band-limited width instead (`llama_context::verify_batch_width()`),
   so a live arena reserves exactly what it did before.  Rule:
   `GREEDY-PURITY.md` §50; records: `archive/work/ngram-mod-host-experts/EVIDENCE-2026-10-24.md`,
@@ -1046,25 +1046,29 @@ change), and let `WORKLOG.md` carry the narrative.
   draft and target share the defect; use the perplexity ratio vs the dense masked path
   (`LLAMA_QSA_SPARSE_FA=0`). A fused op with several heads sharing a staging buffer must keep the block
   homogeneous in every index the staging reads (QSA: the K/V head). `GREEDY-PURITY.md` §21.
-- **Block 03 (GDN; old block 02):** the chunked prefill is K-independent with threshold `max(K>16?K:16, n_rs_batch)`,
-  `n_rs_batch = common_speculative_n_max()+1`; `GGML_CUDA_GDN_CHUNKED=0` forces the sequential kernel
-  (correct, bit-identical, slow). The pure `none == draft-mtp` range is `n_max <= 7`.
+- **Block 03 (GDN; old block 02):** the chunked prefill threshold is `max(K > 16 ? K : 16)` — the
+  **snapshot set only**, never the draft width (r282, issue #309: it used to be floored at
+  `n_rs_batch = common_speculative_n_max() + 1`, so merely adding `ngram-mod` to `--spec-type` moved the
+  tail from 16 to 65 and changed the model's own greedy text). `GGML_CUDA_GDN_CHUNKED=0` forces the
+  sequential kernel (correct, bit-identical, slow). The pure `none == draft-mtp` range is `n_max <= 7`.
   **Our chunked kernel is the only one the delivery dispatches, on every device class** (r127 gfx1151
   A/B): upstream's `gated_delta_net_mma` (in the 2026-10 window) *is* eligible on RDNA3.5 at
   `n_tokens >= 2048` (qwen35's `H_k = ssm.group_count = 16` satisfies its gate) but our branch returns
   first — measured gfx1151 pp2048 interleaved **3232 vs 3131 t/s (+3.2 %)** for ours, prefill-logit
   **KLD 0.000074 / 99.637 %**.  Upstream's MMA only runs behind our stand-down (`kda`, `S_v` outside
   {16,32,64,128}, or the `=0` kill switch): never add a second chunked kernel per device class.
-  `GREEDY-PURITY.md` §27, `patches/README.md` (block 03), `WORKLOG.md` 2026-09-12.
+  `GREEDY-PURITY.md` §27 and §88, `patches/README.md` (blocks 03/10), `WORKLOG.md` 2026-09-12 and
+  `benchmarks/2026-11-14-spec-gdn-split.md`.
 - **The rollback bound is enforced by `n_rs_batch`, not observed — do not re-derive it.**  `common`
   sets `cparams.n_rs_batch = common_speculative_n_max() + 1` over **every** speculator type (draft
   simple/mtp/adaptive/eagle3/dflash/dspark *and* ngram simple/map/mod/cache, so ngram-mod's default
   n_max 64 gives 65), `llama_context` floors it at `n_rs_seq + 1`, and `delta-net-base` passes it as
-  GDN op param 1.  The op's threshold is floored at it, so a **speculative verify batch can never take
-  the chunked path** and always restores snapshots it wrote (r91; the campaign's "ngram is an exposure"
-  claim was wrong).  The r91 sequential tail (`GGML_CUDA_GDN_TAIL`, block 10) then covers the remaining
-  source of a partial rollback: a **non-speculator** rewind into a prefill batch (server cancel /
-  `--cache-reuse`).  The per-sequence tracker is block 03's (`prepare()` folds in every ubatch;
+  GDN op param 1.  It is the bound `llama_memory_recurrent::seq_rm` checks and the width the slab's
+  narrow reserve is sized from — but since r282 it is **not** a kernel-selection input (see the entry
+  above): the kernel rule is the snapshot set plus the fixed-D tail, which covers every batch that
+  `rs_max` lets a rollback land in.  The r91 sequential tail (`GGML_CUDA_GDN_TAIL`, block 10) also
+  covers a **non-speculator** rewind into a prefill batch (server cancel / `--cache-reuse`).  The
+  per-sequence tracker is block 03's (`prepare()` folds in every ubatch;
   `LLAMA_RS_ROLLBACK_DEBUG=1` shows `RSPREP`/`RSROLL`).  Record + probe:
   `archive/work/rs-rollback-boundary/`.
 - **A recurrent cell that `find_slot` moves keeps its rollback snapshot planes (r195, PR #261, block 03).**
@@ -4672,3 +4676,21 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   `DKQp`/`DVp` no-op at 256), and the two builds still produced different code, because the *TU* grew.  Removing
   the added config rows, the tile specializations, the `DECL_...` lines or the `DKQp` padding individually does
   **not** restore it; only the `min()` does.
+
+* **A speculator must not be able to move the chunked-GDN prefill split, and `n_rs_batch` is not a kernel
+  input (r282, issue #309 — `GGML_CHUNKED_MIN_TOKENS` / `benchmarks/2026-11-14-spec-gdn-split.md`).**  The
+  only correct kernel-selection bound is the SNAPSHOT SET: `D = max(K > 16 ? K : 16)` with
+  `K = n_rs_seq + 1`, and a single-sequence batch above `D` chunks its prefix and finishes on the sequential
+  kernel for the last `D` tokens (`GGML_CUDA_GDN_TAIL`, r91).  Why that is sufficient is upstream's per-cell
+  rollback bound, `cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0` in
+  `llama_memory_recurrent::prepare()`: a batch with more than `K` per-seq tokens **cannot be partially rolled
+  back at all** (`seq_rm` refuses, and the tools restore a full state checkpoint when a draft is deeper than
+  `n_rs_seq` — the server/cli's `spec_ckpt_*`, which is the message the reporter saw), while a batch that CAN
+  be is `<= K <= D` and therefore sequential.  Flooring `D` with `n_rs_batch` (2026-09-12, before the tail
+  existed) was redundant after r91 and cost correctness of a different kind: `n_rs_batch` follows the
+  DRAFTLESS family too, so `--spec-ngram-mod-n-max 64` (the default) made `D = 65` and the model's prefill
+  split differed from the same command without `ngram-mod` — a greedy trajectory change with no draft in use.
+  Measured (`benchmarks/2026-11-14-spec-gdn-split.md`): `plain`, `draft-mtp`, `draft-mtp,ngram-mod` @ 15 and
+  @ 64 all byte-identical on qwen35 27B Q8_0 (Bartowski and Unsloth) with one prefill tail of 16, while
+  `n_rs_batch` read 0 / 5 / 16 / 65; the same four arms before the fix split 16/16/16/**65** and the 64-width
+  arm's text diverged.  Gate: `scripts/gate-spec-gdn-split.sh` (fails on the pre-fix build, passes after).

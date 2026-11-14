@@ -1,3 +1,61 @@
+## 261114.003 (r282) -- GitHub issue #309: the SPECULATOR SET chose the chunked-GDN prefill split, so adding `ngram-mod` to `--spec-type` changed the model's own text.  The threshold is now the snapshot set, and the wide draft stays
+
+**`release.json` changed: tip `69296dde5` -> `add359b62`, tree `549f379e6` -> `7bb5113de5`, release
+`v17-4f9dfa0e3-r281` -> `v17-4f9dfa0e3-r282`; 17 blocks, base unchanged.**  One file moved
+(`ggml/src/ggml-cuda/gated_delta_net.cu`, in **block 10**, which owns the fixed-D sequential tail):
+block 10 was amended, blocks 11-16 were re-cut (their `From` id only), blocks 00-09 are byte-identical.
+Record: [`benchmarks/2026-11-14-spec-gdn-split.md`](benchmarks/2026-11-14-spec-gdn-split.md); rule:
+`GREEDY-PURITY.md` §88; fact: `INVARIANTS.md` r282; new gate: `scripts/gate-spec-gdn-split.sh`.
+
+* **The report.**  issue #309 (slavap): a **Bartowski** `Qwen3.8-27B-Q8_0` on 3 x R9700, `-sm tensor
+  -ts 1,2,2`, `--spec-type draft-mtp-adaptive,ngram-mod --spec-ngram-mod-n-match 40 --spec-draft-n-max 4`,
+  deep agentic context; the same command on the **Unsloth** Q8_0 of the same model was reported fine.  The
+  log jumps from ~56 to ~390 t/s with `draft acceptance 0.99329, mean len 55.28` and a 32 000-token answer,
+  i.e. a self-reinforcing echo.  The `speculative checkpoints ... not on exactly one GPU` notice the
+  reporter flagged is benign; it is printed at the first draft deeper than `n_rs_seq`, so it marks the
+  regime rather than causing it.
+* **Not the file.**  The two GGUFs differ in exactly one functional way: `blk.N.ssm_alpha/beta.weight` are
+  **F32** in Bartowski's and Q8_0 in Unsloth's (that is the whole 69 MB size delta); the tokenizer arrays
+  hashed identical, `padding_token_id` is read nowhere outside the vocab, and the chat template differs
+  only by `tojson | safe`.  And the defect reproduces on **both** files, so it is not the quant at all.
+* **The mechanism.**  `GDN_CHUNKED_MIN_TOKENS = max(K > 16 ? K : 16, n_rs_batch)` with
+  `n_rs_batch = common_speculative_n_max() + 1` over *every* speculator type, the draftless n-gram family
+  included (`--spec-ngram-mod-n-max` defaults to **64**).  So the speculator SET picked the prefill split:
+  `ngram-mod`'s default made the tail 65 instead of 16, the chunked/sequential boundary moved, and the
+  post-prefill state differed for every following token.  Identified by `GGML_CUDA_GDN_CHUNKED=0` collapsing
+  the difference, and by the flip landing exactly at `n_rs_batch 17` (the threshold is a constant 16 for
+  `K <= 16`).
+* **Why the floor was never needed after r91.**  Upstream bounds a partial rollback per cell
+  (`cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0`): a batch with more than `K` per-seq
+  tokens cannot be partially rolled back at all (the tools restore a full checkpoint instead, and that is
+  what a draft deeper than `n_rs_seq` always does), while a batch that can be is `<= K <= D` and is
+  sequential.  The floor was added 2026-09-12 (260912.010) when the chunked path had **no** tail and
+  therefore wrote no snapshots; r91's tail made it redundant for the snapshots but it stayed, and the r129
+  re-verification compared text on one model where no near-tie flipped.
+* **What shipped.**  `GDN_CHUNKED_MIN_TOKENS = K > 16 ? K : 16`; the tail length and `n_rs_batch` both in
+  the `-lv 4` census; the reasoning in the kernel's comment block.  No new environment variable, no default
+  moved, **no clamp on the n-gram width** - it is a throughput knob again.  An intermediate 15-token clamp
+  was written, gated and thrown away: it restored purity by giving up the win (verbatim-copy decode
+  480.3 -> 252.4 t/s), and the correct fix keeps both.
+* **The wide draft is intact and pure.**  Verbatim-copy decode **528.2 t/s** with `plain == draft-mtp ==
+  draft-mtp,ngram-mod`; ordinary prose 96.3 vs 36.5 plain (the win) and 96.3 vs 96.1 for the n-gram set vs
+  MTP alone (flat).  The default path is untouched: 4B `ae0ca6cd1b53` and 27B 3-GPU prose
+  `b2179f193df2` are identical to r281, because a plain run's `n_rs_batch` is 1 and never reached the
+  threshold.
+* **Gates.**  `gate-spec-gdn-split.sh` (**new**) pre-fix **FAIL** on both HARD checks (tail
+  `16/16/16/65`, text `5c381ee010d7 != fffe3d3d88fe`) and post-fix **PASS** on the Unsloth file and on
+  `MODEL_ALT` = the Bartowski file (tail `16` in all four arms, `n_rs_batch` `0/5/16/65`, texts
+  `fffe3d3d88fe` / `fa09a6c3519d`); `test-llama-context` **17/18, 0 fail** (`rollback` and
+  `rollback_bound` both OK); `GATED_DELTA_NET` **55/55**; `test-recurrent-state-depth` **byte-identical**
+  to the pre-fix build (its `n_rs_seq >= 8` Phase-A failures are the documented 8-row verify trade);
+  `gate-prefill-logits.sh` **0.000697 / 98.784 %** (unchanged); `gate-ckpt-reuse.sh` **PASS**;
+  `llama-batched-bench -npl 1,4,8` neutral; `gate-per-block-build.sh --fast --changed-from 69296dde5`
+  **2/2**; `validate-set.sh` green (tree `7bb5113de5`); no GPU fault in any arm.
+* **Why no gate saw it, and what now does.**  The coherence gate, the prefill-logit gate and the MTP
+  four-axis protocol all run ONE speculator set, so a set-dependent prefill split has nothing to be
+  compared against.  The new gate compares four sets on a hybrid target and HARD-requires one census tail
+  for all of them (the mechanism, which a near-tie cannot defeat) plus byte-identical text (the symptom).
+
 ## 261114.002 (r281) -- GitHub issue #311: the deep-prefill regression is upstream #30285's `min()` in the FA tile loader, which costs the head-256 prefill kernel 13 % of its own time
 
 **`release.json` changed: tip `f25fd3ff2` -> `69296dde5`, tree `b83424ef5` -> `549f379e6`, release

@@ -1,4 +1,4 @@
-From 88a0603b85ce3e1ca8f4d6eab1ab2198e0fd5c25 Mon Sep 17 00:00:00 2001
+From f9e0c10566d22fe34530aff1074a6266cf7f7dd5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -100,7 +100,7 @@ defect rate is ~1/24 loads, so a green series is evidence the ordering gap is cl
  ggml/src/ggml-cuda/fattn.cuh                  |   12 +
  ggml/src/ggml-cuda/fwht.cu                    |   83 +-
  ggml/src/ggml-cuda/fwht.cuh                   |   49 +-
- ggml/src/ggml-cuda/gated_delta_net.cu         |  297 +-
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  350 +-
  ggml/src/ggml-cuda/gated_delta_net.cuh        |    8 +
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |   11 +-
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |    5 +-
@@ -165,7 +165,7 @@ defect rate is ~1/24 loads, so a green series is evidence the ordering gap is cl
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 16520 insertions(+), 5562 deletions(-)
+ 87 files changed, 16562 insertions(+), 5573 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -3688,7 +3688,7 @@ index e7ad53475..77ae8cb1f 100644
 +// (rows of up to 512 elements; dst rows padded to MATRIX_ROW_PADDING are not handled).
 +bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1 = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index a3e4d4065..dc728a110 100644
+index a3e4d4065..85d1fe6fa 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -33,7 +33,10 @@ gated_delta_net_cuda(const float * q,
@@ -3822,8 +3822,19 @@ index a3e4d4065..dc728a110 100644
      GGML_ASSERT(ggml_is_contiguous_rows(src_q));
      GGML_ASSERT(ggml_is_contiguous_rows(src_k));
      GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-@@ -354,24 +390,29 @@ static void ggml_cuda_op_gated_delta_net_impl(
-     // is exactly the batch that gets rolled back into, so the bound must cover the longest draft.
+@@ -346,37 +382,72 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const int K = ggml_get_op_params_i32(dst, 0);
+     const bool keep_rs = K > 1;
+ 
+-    // op param 1 is the largest per-seq batch that can be rolled back into (0 = unset). The
+-    // rollback snapshots only cover K tokens and only the sequential kernel writes them, so a
+-    // batch longer than this bound must not take the chunked path. K alone is NOT a safe bound:
+-    // the snapshot depth comes from the draft-model n_max, while ngram-style speculators can draft
+-    // far longer (ngram-mod n_max = 64 by default). A verify batch then holds 1 + n_max tokens and
+-    // is exactly the batch that gets rolled back into, so the bound must cover the longest draft.
++    // op param 1 is the widest per-seq batch the CALLER may roll back into (0 = unset).  It is NOT part
++    // of the kernel-selection rule below: see the note on GDN_CHUNKED_MIN_TOKENS.  It is kept as the
++    // census/diagnostic value and as a defensive floor for the whole-batch multi-seq path.
      const int64_t n_rs_batch = keep_rs ? std::max<int64_t>(1, ggml_get_op_params_i32(dst, 1)) : 0;
  
 -    // K-independent chunked prefill -- no K-dependent boundary and no sequential tail.  The
@@ -3839,10 +3850,43 @@ index a3e4d4065..dc728a110 100644
 +    // it served would restore a slot it never wrote (measured: logit NMSE 0.09-0.72).  One rule
 +    // handles both: a single-sequence batch always finishes with D = GDN_CHUNKED_MIN_TOKENS tokens
 +    // decoded by the SEQUENTIAL kernel, so slots 0..D-1 exist for every batch and the state handed
-+    // to the next batch is an fp32 sequential result.  D depends on K only above K > 16 (and on
-+    // n_rs_batch), never on the draft depth inside the clamp: a K-dependent boundary would make
++    // to the next batch is an fp32 sequential result.  D depends on K only above K > 16, never on
++    // the draft depth inside the clamp: a K-dependent boundary would make
 +    // plain decode and MTP chunk a prefill differently, and the two post-prefill states would
 +    // disagree (greedy near-ties flipping between --spec-type none and draft-mtp).
++    //
++    // THE TAIL IS THE WHOLE CORRECTNESS ARGUMENT, AND n_rs_batch IS NOT PART OF IT.  A per-seq batch
++    // can be partially rolled back only while its state's `rs_max` allows it, and upstream's
++    // llama_memory_recurrent::prepare() sets
++    //     cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
++    // so a batch with more than K = n_rs_seq + 1 per-seq tokens cannot be rolled back at all: seq_rm
++    // refuses (`rollback <= cell.rs_max` fails) and the caller must restore a full state checkpoint
++    // instead (the tools do exactly that when a draft is deeper than n_rs_seq -- the server/cli's
++    // `spec_ckpt_*`).  A batch that CAN be rolled back has n_seq_tokens <= K <= D, so it is at or
++    // below the threshold and takes the sequential kernel, which writes every slot it may read.
++    // Both halves therefore hold with D = the snapshot-set bound alone, and `n_rs_batch` is not a
++    // kernel-selection input.
++    //
++    // WHY THE FLOOR AT `n_rs_batch` WAS THERE AND WHY IT IS GONE (issue #309).  The 2026-09-12
++    // amendment that introduced `n_rs_batch` did so when the chunked path had NO sequential tail:
++    // a whole-batch chunked run wrote no snapshots, so any rollback restored an unwritten plane
++    // (test-recurrent-state-rollback: max diff 6.5366).  The fix of the day was to push every
++    // possible verify batch onto the sequential kernel by flooring the threshold with n_rs_batch.
++    // The fixed-D tail (r91) then made that floor redundant for the snapshots -- but it stayed, so
++    // an n-gram speculator's default draft width (ngram-mod n_max = 64 => n_rs_batch = 65) moved
++    // GDN_CHUNKED_MIN_TOKENS from the constant 16 to 65, the PREFILL was split at a different point
++    // than in the same run without that speculator, and the two post-prefill states disagreed for
++    // every following token: measured on qwen35 27B Q8_0 (Bartowski AND Unsloth, -sm tensor, 3
++    // devices, -n 1200 --temp 0) `--spec-type draft-mtp-adaptive` and
++    // `--spec-type draft-mtp-adaptive,ngram-mod` emitted different text, and identical text once
++    // GGML_CUDA_GDN_CHUNKED=0 pinned one kernel.  A speculator must not change the model's own
++    // greedy output, and the draft width is a throughput knob, so the floor is dropped: the tail
++    // length is a function of the snapshot set only, and it is the same for a plain decode, an MTP
++    // verify and an n-gram verify.
++    //
++    // `n_rs_batch` keeps its real jobs: it is op param 1 here for the census, the invariant the
++    // llama_memory_recurrent seq_rm guard checks, and the value the slab's narrow (decode/verify)
++    // reserve is sized from (`llama_context::verify_batch_width()`).
      //
 -    // The alignment is done by giving BOTH paths the SAME call -- chunk the whole batch, exactly
 -    // what K == 1 does -- rather than by sharing a sequential tail.  A batch with more tokens than
@@ -3854,22 +3898,31 @@ index a3e4d4065..dc728a110 100644
 -    // sequential kernel below, which writes the K snapshots the spec rollback actually reads.
 -    // (Verified: over llama-cli draft-mtp and llama-server with --cache-reuse, every partial
 -    // rollback was preceded by a batch of exactly K or fewer tokens.)
-+    // The bound is ENFORCED, not merely observed.  `llama_context_params::n_rs_batch` is the widest
-+    // verify batch any enabled speculator can present -- common sets it to
-+    // `common_speculative_n_max() + 1`, which covers draft-simple/mtp/adaptive/eagle3/dflash/dspark
-+    // AND ngram-simple/map/mod/cache (ngram-mod at its default n_max = 64 raises it to 65) -- and
-+    // this op receives it as op param 1.  GDN_CHUNKED_MIN_TOKENS is floored at that value, so a
-+    // speculative verify batch can never take the chunked path: it is always at or below the
-+    // threshold, falls through to the sequential kernel below, and restores only slots it wrote.
-+    // The tail then covers the remaining source of a partial rollback, a NON-speculator rewind into
-+    // a prefill batch (server cancel / --cache-reuse) -- without it that case would read an
-+    // unwritten slot.  Cost stays bounded: D tokens per batch, not per token, no extra memory, no
-+    // extra graph and no ubatch split (which measured -13.7 % pp512; see
-+    // archive/work/rs-rollback-boundary/).  GGML_CUDA_GDN_TAIL=0 restores whole-batch chunking.
++    // What this does NOT claim: a verify batch WIDER than the threshold takes the chunked path, so
++    // its rows are computed with a different reduction order than a W = 1 decode and a greedy
++    // near-tie can flip inside that band.  That is the same documented trade as a verify above 8
++    // rows (`GREEDY-PURITY.md` 11/19) and it is bounded by the draft width the user configured,
++    // not by an unrelated knob.  The state itself is exact: the tail writes the slots, and rs_max
++    // bounds what may be read.
      //
-     // The threshold must be a constant for K <= 16 or the two paths diverge again on short prompts;
-     // 16 covers K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  The floor
-@@ -390,11 +431,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
+-    // The threshold must be a constant for K <= 16 or the two paths diverge again on short prompts;
+-    // 16 covers K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  The floor
+-    // at K keeps verify batches sequential for deeper drafts, so those keep the K-dependent
+-    // boundary and stay correct-but-not-bit-identical, exactly as before.
++    // The tail also covers the non-speculator rewind case (server cancel / --cache-reuse into a
++    // prefill batch) -- without it that case would read an unwritten slot.  Cost stays bounded: D
++    // tokens per batch, not per token, no extra memory, no extra graph and no ubatch split (which
++    // measured -13.7 % pp512; see archive/work/rs-rollback-boundary/).  GGML_CUDA_GDN_TAIL=0
++    // restores whole-batch chunking.
++    //
++    // D must be a CONSTANT for K <= 16 or the two paths diverge again on short prompts; 16 covers
++    // K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  K > 16 is only
++    // reachable with LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0, and then D = K keeps a rollback-able batch at
++    // or below the threshold as well.
+     //
+     // The fused GDN->cpy (cache != nullptr) is still honoured: the chunked kernel writes the new
+     // state (slot 0) straight into the cache slot, so the cpy node can be skipped.  n_seqs > 1
+@@ -390,12 +461,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
      // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
      if (!kda && n_tokens > 1 &&
          (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
@@ -3878,6 +3931,7 @@ index a3e4d4065..dc728a110 100644
 -            // Minimum batch size that may take the whole-batch chunked path.  A constant for
 -            // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
 -            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
+-            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
 +        // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
 +        static const bool chunked_on = [] {
 +            const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
@@ -3885,13 +3939,14 @@ index a3e4d4065..dc728a110 100644
 +        }();
 +        if (chunked_on) {
 +            // Threshold for the chunked path: a batch above it is chunked on its first
-+            // n_tokens - D tokens and finished by the sequential tail.  A constant for K <= 16 (see
-+            // above); the floors at K and n_rs_batch keep deeper drafts and every possible verify
-+            // batch entirely on the sequential kernel, which writes the rollback snapshots.
-             const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
++            // n_tokens - D tokens and finished by the sequential tail.  D is the snapshot-set
++            // bound only (a constant 16 for K <= 16) -- see the note above for why n_rs_batch is
++            // not a factor and what that bought (issue #309).
++            const int64_t GDN_CHUNKED_MIN_TOKENS = K > 16 ? (int64_t) K : 16;
              // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA chunked kernel is the
              // DEFAULT for S_v == 128 prefill on RDNA3/RDNA4 (opt out with `=0`).  It is
-@@ -407,9 +453,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
+             // near-lossless, NOT bit-exact (bf16 operands, fp32 accumulation, ~1e-5 op NMSE);
+@@ -407,9 +483,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
  #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
                  const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                  const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
@@ -3906,7 +3961,7 @@ index a3e4d4065..dc728a110 100644
                  if (want_bf16_c) {
                      if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
                          return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
-@@ -422,13 +470,56 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -422,13 +500,57 @@ static void ggml_cuda_op_gated_delta_net_impl(
  
              if (n_seqs == 1) {
                  if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
@@ -3959,15 +4014,16 @@ index a3e4d4065..dc728a110 100644
 -                            GGML_LOG_INFO("%s: whole-batch chunked GDN prefill n=%ld K=%d n_seqs=%ld "
 -                                          "(> %ld: no snapshot tail needed)\n",
 +                            GGML_LOG_INFO("%s: chunked GDN prefill n=%ld K=%d n_seqs=%ld (chunked %ld + "
-+                                          "sequential tail %ld, snapshots written; GGML_CUDA_GDN_TAIL=0 "
++                                          "sequential tail %ld, snapshots written; rollback bound n_rs_batch=%ld is "
++                                          "NOT a selection input, see the note above; GGML_CUDA_GDN_TAIL=0 "
 +                                          "restores whole-batch chunking)\n",
                                            __func__, (long) n_tokens, K, (long) n_seqs,
 -                                          (long) GDN_CHUNKED_MIN_TOKENS);
-+                                          (long) n_head, (long) (n_head > 0 ? D : 0));
++                                          (long) n_head, (long) (n_head > 0 ? D : 0), (long) n_rs_batch);
                              logged_free = true;
                          }
                          return;
-@@ -469,21 +560,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -469,21 +591,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -3993,7 +4049,7 @@ index a3e4d4065..dc728a110 100644
          }
      }
  }
-@@ -496,3 +587,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+@@ -496,3 +618,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
          ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
      ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
  }

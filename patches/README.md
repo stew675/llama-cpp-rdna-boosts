@@ -4,6 +4,16 @@
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
 
+> **r282: GitHub issue #309 -- the SPECULATOR SET chose the chunked-GDN prefill split.**  The chunked
+> `/ sequential GDN threshold is now the snapshot set, `max(K > 16 ? K : 16)`, not floored at
+> `n_rs_batch`: the draftless n-gram family is unbounded (`--spec-ngram-mod-n-max` defaults to 64), so
+> adding `ngram-mod` to `--spec-type` moved the prefill tail 16 -> 65 and changed the model's own
+> greedy text, on the Bartowski AND the Unsloth Q8_0 of qwen35 27B, with no quant difference involved.
+> The wide draft is kept (verbatim-copy decode 528.2 t/s, pure); no new environment variable.  One
+> file moved (`ggml/src/ggml-cuda/gated_delta_net.cu`, **block 10**, which owns the fixed-D tail);
+> blocks 00-09 are byte-identical -- `benchmarks/2026-11-14-spec-gdn-split.md`, `GREEDY-PURITY.md` §88,
+> `INVARIANTS.md` r282, gate `scripts/gate-spec-gdn-split.sh`.
+>
 > **r281: GitHub issue #311 -- upstream #30285's padded-head clamp cost the head-256 prefill 13 % of its kernel,
 > and block 05 spells it so an unpadded head does not pay.**  `min(k0_stop, DKQ/2) - k0_start` in
 > `fattn-mma-f16.cuh`'s K/V tile loader exists so a **padded** head (40/72) never reads past its real head size; for
@@ -654,7 +664,11 @@ speculative rewind into a prefill safe.
 
 **Contents.**
 
-* Chunked prefill is **K-independent**: threshold `max(K > 16 ? K : 16, n_rs_batch)`.
+* Chunked prefill threshold is the **snapshot set only**: `max(K > 16 ? K : 16)` (r282, issue #309).  It used to
+  be floored at `n_rs_batch = common_speculative_n_max() + 1`, which follows the DRAFTLESS n-gram width too,
+  so `--spec-ngram-mod-n-max`'s default 64 moved the prefill tail to 65 and the model's own greedy text
+  depended on whether `ngram-mod` was in `--spec-type`.  `n_rs_batch` stays the `seq_rm` guard and the
+  slab's verify-band width, and is reported in the chunked-prefill census; it is not a selection input.
 * **Rollback snapshots**: only the sequential kernel writes the `K = n_rs_seq + 1` snapshot planes, and a
   whole-batch rollback also needs a pre-batch plane (copied into slot `n_tokens` when
   `0 < n_tokens < K`).

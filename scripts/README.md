@@ -38,6 +38,7 @@ scripts/gate-state-pipe.sh                            # batched state save/resto
 scripts/gate-ckpt-reuse.sh                            # context-checkpoint reuse gate (checkpoint changes / every release)
 scripts/gate-spec-ckpt-device.sh                       # target speculative-checkpoint location gate (server spec-path changes / every release)
 scripts/gate-spec-align.sh                            # speculative verify-batch alignment gate, 2/3 GPU + host experts (issue #234)
+scripts/gate-spec-gdn-split.sh                         # speculator GDN-split gate (issue #309): the prefill tail must not depend on the speculator set, and every set must reproduce the plain greedy text
 scripts/gate-spec-width-band.sh                       # speculative verify-WIDTH band gate, band-0 3 GPU, 1/2/4 slots (r185)
 scripts/gate-spec-draft-window.sh                      # MTP draft KV window gate, 2 slots over a unified cache (issue #264)
 scripts/gate-spec-reuse-window.sh                      # drafter KV reuse gate: the ingest tail vs a partially reused prompt (issue #272)

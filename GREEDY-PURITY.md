@@ -477,6 +477,12 @@ long drafts, so the bound now comes from the widest speculator draft:
 `GDN_CHUNKED_MIN_TOKENS = max(K > 16 ? K : 16, n_rs_batch)`.  A whole-batch rollback also needs a
 **pre-batch plane** (`0 < n_tokens < K`), which the graph copies into slot `n_tokens`.
 
+**Superseded in part by §88 (r282, issue #309).**  The `n_rs_batch` floor on the *kernel-selection*
+threshold is gone: it was redundant once the fixed-`D` tail existed, and it made the speculator SET choose the
+prefill split (so `ngram-mod`'s default width changed the model's own text).  What survives from this entry,
+unchanged: `n_rs_batch` as the `seq_rm` guard and the slab's verify-band width, the pre-batch plane, the
+tail, and the rule below.  Read §88 for the current threshold.
+
 **Current state (r91, 2026-10-19).**  The bound is **enforced, not observed**: `common` sets
 `cparams.n_rs_batch = common_speculative_n_max() + 1` over **every** speculator type (draft
 simple/mtp/adaptive/eagle3/dflash/dspark *and* ngram simple/map/mod/cache, so ngram-mod's default n_max 64
@@ -2499,3 +2505,45 @@ byte-identical (`960bdbc9e2dc`) with an identical arena hit rate.
 
 **Record.**  `WORKLOG.md` 261112.006; `benchmarks/2026-11-12-expert-seed-policy.md`;
 `archive/work/expert-seed-policy/`; `INVARIANTS.md` r270; `patches/README.md` block 16.
+
+## 88. A speculator set must not choose the prefill split: the chunked-GDN threshold is the snapshot set, never the draft width (r282, issue #309)
+
+**Claim.** `plain`, `draft-mtp` and `draft-mtp-adaptive,ngram-mod` must emit the model's OWN greedy text.  They
+did not: adding `ngram-mod` to `--spec-type` moved the chunked-GDN prefill tail from 16 to 65 tokens and
+changed the text, with no draft even being used, and independent of the model FILE (Bartowski and Unsloth
+Q8_0 of qwen35 27B both do it).
+
+**Rule.** A numeric kernel-selection input may depend on the MODEL (`n_rs_seq`, hence `K`, hence the tail), and
+on nothing the user turned on for throughput.  The chunked-GDN threshold is
+`GDN_CHUNKED_MIN_TOKENS = K > 16 ? K : 16`, i.e. the snapshot set; the rollback bound `n_rs_batch` is a GUARD
+(`llama_memory_recurrent::seq_rm`) and a reserve width (`verify_batch_width()`), never a selection input.  A
+change that wants to push a verify batch onto the sequential kernel for numerical identity must say that it
+costs the prefill split, and the tools' own bound is `n_rs_seq` anyway (a draft deeper than that already takes
+a full state checkpoint).
+
+**Why the threshold alone is sufficient.**  Upstream bounds the rollback per cell:
+`cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0`.  A batch with more than `K` per-seq tokens
+cannot be rolled back at all, so the chunked path is safe for it; a batch that can be is `<= K <= D` and is
+therefore sequential, which writes every slot it may read.  The fixed-`D` tail (r91) is what makes the second
+half true for a batch above `D` — which is why the 2026-09-12 floor was needed when it was written (no tail
+then) and redundant after r91.
+
+**Numbers** (`benchmarks/2026-11-14-spec-gdn-split.md`, qwen35 27B Q8_0, `-sm tensor` 3 devices, seed 42,
+`--temp 0`, `prompts/prose-rdna-boosts.txt -n 600`).
+
+| arm | `n_rs_batch` | prefill tail, pre-fix | pre-fix text | prefill tail, post-fix | post-fix text |
+|---|---:|---:|---|---:|---|
+| `none` | 0 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp n4` | 5 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp-adaptive,ngram-mod`, `n_max 15` | 16 | 16 | `fffe3d3d88fe` | 16 | `fffe3d3d88fe` |
+| `draft-mtp-adaptive,ngram-mod`, default 64 | 65 | **65** | **`5c381ee010d7`** | 16 | `fffe3d3d88fe` |
+
+The same split shows on the reporter's file: Bartowski Q8_0 (F32 `ssm_alpha/beta`, so it is the only
+arrangement that also exercises the F32 GEMM) reads `fa09a6c3519d` in all four arms after the fix.
+`GGML_CUDA_GDN_CHUNKED=0` collapsed the pre-fix difference, which is what identified the mechanism.  The
+wide-draft win is untouched: verbatim-copy decode 528.2 t/s against 36.5 plain (the 15-token clamp cost it
+480 -> 252 t/s, which is why the clamp was the wrong fix).  Ordinary prose: 96.3 vs 96.1, i.e. flat.
+
+**Record.** `benchmarks/2026-11-14-spec-gdn-split.md`; gate `scripts/gate-spec-gdn-split.sh` (FAIL on the
+pre-fix build: tail `65` and divergent text; PASS after); `WORKLOG.md` 261114.003; `patches/README.md`
+block 10; `INVARIANTS.md` r282.
