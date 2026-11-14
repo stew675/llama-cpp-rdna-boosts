@@ -30,8 +30,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R13 | 12 campaign remainder | **DONE 2026-11-13** | `75d83f231` | 5 files / 8 hunks, **zero** first-error passes; `D11` re-derived (op count **106**, RPC **8**, 24 messages all paired); `D8` prune (`set_warmup` kept out, 3 of 4 `llama-ext.h` decls already upstream's); FA generator keeps the **typed set with no head-40/72 skips** (idempotent, 390 files); `gate-node-budget.sh` **PASS 4/4 with the margin (440 entries every arm)**; `gate-host-pool.sh` **42/54 — `tsplit`+`tsplitnosink` CLEARED**; 12 remaining checks are **R16's** (block 15's `host_expert_buft` `want_mapping` -> `ROCm_HostMap`) and **R17's** (block 16's `MOE_EXPERT_FILL_QD`/placement queue) |
 | R14 | 13 MTP vocab subset | **DONE 2026-11-13** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits match the full vocab with 0 mismatches, two live contexts keep their own `N`); runtime `--spec-draft-mtp-vocab 32768` drafts on 32 801 of 248 320 rows; **`D7` re-verified and it has moved**: `-sm tensor` now takes the device row gather too, because block 09's `ggml_backend_meta_device_event_new()` closed the R03 gap |
 | R15 | 14 relaxed-tensor (**temporary**) | **DONE 2026-11-13** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` still refuses flint with the delivery's pointer, `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`), 4B tensor/relaxed/layer all `1c5d32ac537d`; **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and no range commit touches it, so the block stays TEMPORARY |
-| R16 | 15 streamed KV | **NEXT** | — | `D3`, `D19` |
-| R17 | 16 UMA GTT store | **TODO** | — | `D17` verify |
+| R16 | 15 streamed KV | **DONE 2026-11-13** | `f745bbf1b` + rung-repair `9c940db6f` | 5 files / 8 hunks, one first-error pass; `D11` = **107** ops / RPC **9**; `D3` superset (upstream's K/V scales + block 15's pool page), `D15` merge, `D19` unchanged; **R16r**: upstream `#31927`'s h_nextn assert now accepts the delivery's folded HC export; `gate-kv-residency` selftest + window + single-device pool **PASS**, `gate-kv-window-split` / `gate-spec-draft-window` / `gate-spec-reuse-window` **PASS**, quant-coherence **section E CLEARED** (`200edcd422c7`), `gate-host-pool` **50/54** with `fail`/`late`/`pinlate` now real (4 left = R17's); **new finding `D20`**: MTP draft on 2 devices is not reproducible (r277 too) |
+| R17 | 16 UMA GTT store | **NEXT** | — | `D17` verify |
 | R18 | release ladder | **TODO** | — | all `AWAITING` items resolved |
 
 ---
@@ -765,19 +765,85 @@ only range commit touching `ggml-backend-meta.cpp` is the `29dbbad2b` prune).  S
 load-bearing** on this base and stays TEMPORARY — the drop condition (upstream lands a real fix) is unmet, and
 dropping it remains a decision for the maintainer, never a merge outcome.
 
-## R16 — block 15: the streamed KV — window (Goal A) + attendance pool (Goal B) + MTP draft window · **TODO**
+## R16 — block 15: the streamed KV — window (Goal A) + attendance pool (Goal B) + MTP draft window · **DONE 2026-11-13**
 
-* block sha `99d33117a` · 46 files · **expected conflicts: 5**
+* block sha `99d33117a` · 46 files (+7 086/−846) · **result `f745bbf1b`** · tree `5437201e0`, plus the
+  **rung-repair `9c940db6f`** (below); final tree `14f99e579`.
+* **5 conflicted files / 8 hunks** — the probe's 5 files was exactly right.  Build green after **one**
+  first-error pass.  Coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars
+  `sha=1c5d32ac537d`**; no stray end-markers.
 
-| conflicted path | what to expect |
+| conflicted path | hunks | resolution |
+|---|---|---|
+| `ggml/include/ggml-rpc.h` + `ggml/src/ggml.c` | 1 + 2 | **`D11` again: the merged enum is 107** = R13's 106 + block 15's ONE op (`GGML_OP_KV_POOL`, which has its `GGML_OP_NAME`/`GGML_OP_SYMBOL` entries, a CPU + CUDA dispatch and `ggml_kv_pool` in `ggml.c`).  Block 15 asserted 110 (its own tree, +3 as always).  `RPC_PROTO_PATCH_VERSION` **9**; no new `RPC_CMD`. |
+| `src/llama-kv-cache.cpp` | 1 | union at the `kv_layer` initialiser: **upstream's `k_cache_s`/`v_cache_s` scale tensors** (the `#28392`-era quantized-KV scales, `D3`) **and** block 15's per-layer pool page (pool K/V + page table + inverse map + use map + one counter block per DEVICE).  Field order taken from the auto-merged `kv_layer` struct. |
+| `common/speculative.cpp` | 2 | union: upstream's `dev_rows` / `n_batch_tgt` / `verify_row0` declarations and their constructor body (`D7`) **and** block 15's per-sequence `dft_skip` latch (issue #297). |
+| `common/fit.cpp` | 2 | **`D15`**: upstream's `paths_model` (the external-PLE path LIST) **plus** the delivery's `host_expert_bytes`/`host_experts` **plus** block 15's `kv_bytes`/`kv_pool_vram`/`kv_pool_ram` out-params.  The merged `common_get_device_memory_data_impl` signature already declared all five outputs. |
+
+**First-error pass (one, `D15`'s known class):** block 15's *new* call sites still used the pre-`paths_model`
+singular name — `if (!g_fit_target_model.empty() && path_model != nullptr && g_fit_target_model == path_model)`
+and `g_fit_target_model = path_model != nullptr ? path_model : ""` (the fit's target-identity latch, TODO #300)
+— re-expressed on the vector as `paths_model.empty() ? std::string() : paths_model.front()`.
+
+### R16r — the rung-repair (`9c940db6f`), and why it exists
+
+`gate-kv-residency.sh`'s pool section **aborted** on this tree:
+`GGML_ASSERT(src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens)` at `llama-graph.cpp:4628`
+(upstream `a8fad21e9`, `#31927`, the device-buffer hidden-state read).  The measured shapes:
+`src = [2560, 4, 512]` (elements 5 242 880 = 10240 x 512), `h_nextn_dev = [10240, 2049]`, `n_tokens = 512`,
+`nextn=1 masked=0`.  Two causes in one line: the assert assumed a **2-D** export, and the `ggml_reshape_2d(...,
+src->ne[0], n_tokens)` that follows it would have failed on the element count anyway.
+
+The cause is the delivery's own export layout, not a merge slip: `src/models/qwen4exp.cpp` exports the
+**contiguous `build_hc_combine()` result** `[n_embd, hc, n_tokens]` on purpose (a pure view gets no backend
+assignment from the scheduler and the host readback looks one up), and that tensor's memory layout **is**
+`[n_embd*hc, n_tokens]` = `[n_embd_out, n_tokens]` — the same bytes in the same order.  So the invariant is on
+the **folded row**: one `n_embd_out`-wide row per batch token.  The repair keeps the original width/row checks
+verbatim for a 2-D export and asserts `ne[0]*ne[1] == n_embd_out && ne[2]*ne[3] == n_tokens` for the folded
+layout (a first attempt keyed on `ne[2]==1 && ne[3]==1` mis-classified the **1-token** graph `[2560, 4, 1]`,
+which is why the discriminator is `ne[0] == n_embd_out`, not the trailing dims).  Nothing is weakened for the
+2-D case and no delivery mechanism changes.
+
+**`r277` cannot reproduce the abort because `#31927` is not in the old base** (`git grep 9d7c0502c` finds no
+`embeddings_nextn_dev`/`set_ctx_state_src`/`dev_rows` at all): the feature arrives with the new base, and this
+rung is where its first gate reaches it.  **Squash into block 11 (qwen4exp) at R18** — it is that export's
+counterpart, exactly like `R09r` belongs to block 05.
+
+### Verified
+
+| gate | result |
 |---|---|
-| `common/fit.cpp` | the PLE/fit reshuffle.  **`D15`**. |
-| `common/speculative.cpp` | `a8fad21e9` device-buffer MTP.  **`D7`**. |
-| `ggml/include/ggml-rpc.h`, `ggml/src/ggml.c` | `D11`. |
-| `src/llama-kv-cache.cpp` | `202c1a229` (`#28392`) added the FP8 KV type to every instance/predicate table.  **`D3`**. |
+| `scripts/gate-kv-residency.sh` | the provider **selftest** (both arms, incl. the sensitivity control), the **window** section (wref/wres/wspill: `be904e86f248`, resident 100 %, wspill slides 16 flips + 64 MiB host, `hintwin`), and the whole **single-device pool** section are **PASS**: `pref == pres == plegacy` (**`f260d1824ab3`**), 252 resolves, 55 174/42 123 claims, hit rate 89.85/90.40 %, derived pool 4 104 pages < 8 192, prompt-rate floor 384.67 vs 390.46 t/s, identical draft acceptance.  **This is the repair's proof: before it, the section could not run at all.** |
+| `scripts/gate-kv-window-split.sh` | **PASS** (big2 windowed split on `-c 1048576`, every slide on the map grid, `-nkvo` still declines, four `--fit` arms incl. the pinned-RAM widening and the drop) |
+| `scripts/gate-spec-draft-window.sh` | **PASS** (window == no-window on both slots, reserve vs allocation agree at 3 072 cells, the mtmd ring fallback, `auto` grant/decline/small, default off on both split modes) |
+| `scripts/gate-spec-reuse-window.sh` | **PASS** (strict + M-RoPE, three turns each, tail == no-tail with the cached counts equal) |
+| `scripts/gate-qwen4exp-quant-coherence.sh` | **PASS, and SECTION E (sparse QSA) IS GREEN** — `fused == chain` on the sparse arm (**`200edcd422c7`**), census sensitive (0 lines with the fused op off and on the dense arm), the arm differs from the dense arm so it is not vacuous.  **The third deferred arm of the climb is cleared, at the rung that was predicted.**  Quant arms: IQ3_XXS `249787803687`, IQ4_NL `beb145b43949`, Q4_K_M `16d7957b2c0f` (IQ4_XS absent by design).  *The first full run OOM-killed the Q4_K_M arm (`exit 137`, kernel `oom-kill`, `shmem-rss` 72.8 GB) with several Flash-Next arms in flight; re-run alone it passes.* |
+| `scripts/gate-host-pool.sh` | **50/54 — `fail`, `late` AND `pinlate` are now REAL and GREEN**, exactly as R13 predicted (§R13): `ref` pool hit rate **h=0.9705 (41716/42985)** where R13 read `h=0.0000 (0/0)`; `fail` `FAILED fills: 2790`, `takeover=0 decline_all=5070 get_ok=0`, 141 `the slot is NOT resident` lines, text == ref; `late` `FAILED fills: 2721`, same shape; `pinlate` `FAILED fills: 29` with the post-latch fills still served by the pool that existed before the refusal.  The **4** remaining checks are the **placement-transport** ones (`ref`'s `PLACEMENT reads: O_DIRECT` + placement queue, `qd1`, `bulkbuf`) and they are **block 16's / R17's** (`MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO`, the read queue -> `patches/0016-*`). |
 
-**Exit:** `gate-kv-residency.sh`, `gate-kv-window-split.sh`, `gate-spec-draft-window.sh`,
-`gate-spec-reuse-window.sh`.  `D19` (`940a30ee3`) is a verify-only item here.
+### FINDING — the gate's multi-device pool arm has no reproducible reference (pre-existing, not this rung)
+
+`gate-kv-residency.sh`'s `-sm layer` pool section compares `pmres` (pool) with `pmref` (no pool) **within the
+2-device count**.  On this box that assertion is **unsatisfiable, because `pmref` itself is not reproducible**:
+
+| arm (Flash-Next GSQ-IQ3_XXS + MTP sidecar, `-ncmoe 48`, q8_0 KV, `-c 32768`, 25 763-token prompt, seed 42, temp 0) | 3 identical reruns |
+|---|---|
+| **2 devices**, `-sm layer`, `--spec-type draft-mtp`, sparse decode | `f260d1824ab3` / `7ca535e1da91` / `b08d3dbcb1e9` — **three different texts** |
+| 2 devices, `-sm layer`, `--spec-type draft-mtp`, DENSE decode | `cf49426bbab0` / `cf49426bbab0` / `7ca535e1da91` — **also unstable** |
+| 2 devices, `-sm layer`, `--spec-type none` | `7a347cbe5f1` x 3 — **stable** |
+| 1 device, sparse decode, `--spec-type draft-mtp` | `f260d1824ab3` x 3 — **stable** |
+| **`bin-r277`, 2 devices, sparse decode** | `b08d3dbcb1e9` / `2550c6866f6c` / `f260d1824ab3` — **unstable on r277 too** |
+
+So: a same-seed greedy run is **not reproducible when an MTP (`--spec-type draft-mtp`) run is spread over two
+devices with `-sm layer`** — the target alone is deterministic and one device is deterministic, so the
+nondeterminism is in the MTP draft path across devices.  It predates this re-base (`r277` shows it) and it is a
+GREEDY-PURITY-class defect (an accepted/rejected draft must be a function of the target's logits and the seed).
+The gate passed the section **once by luck** during this rung and failed the next time.  Recorded as `D20` +
+`TODO` #3xx; **the gate is NOT weakened** and its arm is NOT simplified — it stays, and it will keep failing
+until the draft path is made deterministic.  Gate-vs-tree matrix for the record: this section fails on `r277`
+too (both `pmres` and `pmlegacy` differed there).
+
+**Files a later rung needs:** the repaired assert lives in `src/llama-graph.cpp` (`build_h_nextn_dev`), a file
+blocks 01/05/10/13 already hunk; the squash target at R18 is **block 11**.
 
 ## R17 — block 16: the UMA GTT expert store · **TODO**
 

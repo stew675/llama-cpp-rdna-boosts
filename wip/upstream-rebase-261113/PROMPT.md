@@ -10,10 +10,10 @@ You are continuing a multi-session upstream re-base of the "rdna-boosts" deliver
 LAYOUT
 - Delivery repo (cwd): ~/llama-cpp-rdna-boosts, branch `rebase-261113`. Never merge to `main` until the whole
   climb is green; never push anything anywhere.
-- Fork checkout: ~/llama.cpp on branch `rebase-r278`, expected clean at HEAD `f040d394f`.
+- Fork checkout: ~/llama.cpp on branch `rebase-r278`, expected clean at HEAD `9c940db6f`.
   `master` there is the pristine upstream snapshot `4f9dfa0e3` — never commit to it.
 - Build: `cd ~/llama.cpp && ~/bin/build-llama-rocm` (ROCm 10.1, gfx1201, GGML_HIP_NO_VMM=OFF, ccache warm;
-  ~20-30 s incremental). The build dir currently holds the R15 tree.
+  ~20-30 s incremental). The build dir currently holds the R16 tree.
 - Reference builds: `build-rocm/bin-r277/llama-cli` = the FULL 17-block delivery (use it to tell "this block
   broke it" from "a later block fixes it"); `build-rocm-base2` = unpatched 4f9dfa0e3 with VMM=ON.
 - Models: /llm/models/Qwen3.5/4B/Q8_0 (coherence oracle), Qwen3.6/35B-A3B/Q8_0 (host-expert/MTP field config),
@@ -22,9 +22,9 @@ LAYOUT
 
 READ FIRST, IN THIS ORDER
 1. wip/upstream-rebase-261113/HANDOVER.md   (§0 state, §3 mechanics, §5 decisions, §7 env, §8 traps)
-2. wip/upstream-rebase-261113/RUNGS.md      (§0 ledger, then §R16; §R13/R14/R15 are what the last rungs
-                                             decided, and §R13 lists the gate arms it handed to R16/R17 —
-                                             HANDOVER §5.7)
+2. wip/upstream-rebase-261113/RUNGS.md      (§0 ledger, then §R17; §R13-R16 are what the last rungs decided —
+                                             which arms they cleared and which they handed to R17 — and
+                                             HANDOVER §5.7/§5.9/§5.10)
 3. wip/upstream-rebase-261113/DECISIONS.md  (D7 is now re-verified; D6/D8/D9/D10/D11/D12/D5-a are closed)
 4. wip/upstream-rebase-261113/README.md §1 and §5 (rung mechanics and the blocked-rung protocol)
 
@@ -34,9 +34,11 @@ matrix: heads 40/72, the FP8 KV column, a typed generator), block 09 `a6809f75b`
 moved the whole fusion dispatcher into `ggml-cuda-try-fuse.cu`), block 11 `1d83b50e0` (qwen4exp;
 GGML_OP_COUNT is 106 after R13), block 12 `75d83f231` (campaign remainder; tree `d862165c5`) and block 13
 `aca78625a` (MTP draft vocabulary subset; tree `061a71a98`) and block 14 `f040d394f` (`-sm relaxed-tensor`,
-TEMPORARY; tree `0c8a1fd58`).  Coherence is `100 chars sha=1c5d32ac537d` at every rung since R01, re-verified on
-the R15 tree.  Block 14 is still load-bearing (upstream's `#31081` deny is verbatim at `4f9dfa0e3` and nothing in
-`a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`) — do not drop it in passing; HANDOVER §5.8.  `D7` was re-verified at R14: the device-buffer hidden-state
+TEMPORARY; tree `0c8a1fd58`), block 15 `f745bbf1b` (the streamed KV) and the **R16 rung-repair `9c940db6f`**
+(tree `14f99e579`).  Coherence is `100 chars sha=1c5d32ac537d` at every rung since R01, re-verified on the R16
+tree.  Block 14 is still load-bearing (upstream's `#31081` deny is verbatim at `4f9dfa0e3` and nothing in
+`a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`) — do not drop it in passing; HANDOVER §5.8.
+R16 cleared the last three gate arms of the climb, added a rung-repair (§5.9) and found `D20`/`TODO` #321.  `D7` was re-verified at R14: the device-buffer hidden-state
 row gather is live on BOTH splits now (`target h rows on the device: yes`), because block 09's
 `ggml_backend_meta_device_event_new()` closed the R03 gap — the `upstream/` candidate is purely upstream's.
 
@@ -53,40 +55,31 @@ arm `a1b7eb2ee7a6`, margin 440 entries: 2064/2504 q8_0, 1504/1944 f16 and rotati
     `ggml_rope_get_truncate(dst)` on the fused INDEXER_SCORE node, which upstream #30206's assert rejects).
 
 YOUR TASK
-Execute R16 = block 15 ("the streamed KV — window (Goal A) + attendance pool (Goal B) + the MTP draft window"),
-commit `99d33117a`, 46 files, **5 expected conflicts**:
-`common/fit.cpp`, `common/speculative.cpp`, `ggml/include/ggml-rpc.h` + `ggml/src/ggml.c`,
-`src/llama-kv-cache.cpp`.
-1. `cd ~/llama.cpp && git cherry-pick 99d33117a`, then re-measure the conflict set.  Expect:
-   - `ggml/include/ggml-rpc.h` + `ggml/src/ggml.c` — `D11`: re-derive `GGML_OP_COUNT` from the merged enum (it was
-     **106** at R13; block 15 adds ops) and bump `RPC_PROTO_PATCH_VERSION` only if the op table changes; re-check
-     that every `RPC_CMD` still has a server case and a client send site.
-   - `src/llama-kv-cache.cpp` — `202c1a229` (`#28392`) added the FP8 KV type to every instance/predicate table;
-     the delivery's types must stay a SUPERSET (a missing instance is a crash on whichever backend reaches it).
-     `D3`.
-   - `common/speculative.cpp` — the `a8fad21e9` device-buffer MTP work; `D7`.
-   - `common/fit.cpp` — the PLE/fit reshuffle; `D15` (its loader-side residency question is this rung's).
-   - It also carries the `#30206` fix (`ggml_rope_get_truncate()` on the fused `INDEXER_SCORE` node), which is
-     what unblocks `gate-qwen4exp-quant-coherence.sh` section E.
-2. Build (`~/bin/build-llama-rocm`). Expect first-error passes (this is a 46-file block that rewrites the KV
-   cache); if it adds/removes files matched by a bare `file(GLOB ...)`, `touch` that CMakeLists.txt first; fix,
-   rebuild, then `git add -A && GIT_EDITOR=true git commit --amend --no-edit`.
+Execute R17 = block 16 ("the UMA GTT expert store -- an APU's MoE expert set in ONE registered, mlock'd region,
+with a slot-storage ARENA when the budget is below the set"), commit `9d7c0502c`, 16 files, **0 expected
+conflicts**.
+1. `cd ~/llama.cpp && git cherry-pick 9d7c0502c`.  Expect clean; if a path conflicts, re-measure and resolve as
+   "both sides" unless a measurement says otherwise.
+2. Build (`~/bin/build-llama-rocm`); `touch ggml/src/ggml-cuda/CMakeLists.txt` first if the block adds/removes
+   files matched by a bare `file(GLOB ...)`; fix first-error passes, then
+   `git add -A && GIT_EDITOR=true git commit --amend --no-edit`.
 3. Verify, then record:
    - coherence: HIP_VISIBLE_DEVICES=0 llama-cli 4B -ngl 99 -sm layer -p "The capital of France is" -n 20
      --seed 42 --temp 0 --no-display-prompt --single-turn, NO -lv; expect `sha=1c5d32ac537d` via
      scripts/extract-generated.py.
-   - `scripts/gate-kv-residency.sh`, `scripts/gate-kv-window-split.sh`, `scripts/gate-spec-draft-window.sh`,
-     `scripts/gate-spec-reuse-window.sh`.
-   - `scripts/gate-qwen4exp-quant-coherence.sh` — **section E (sparse QSA) must now pass**; it was the third
-     deferred arm and this block carries its fix.
-   - `scripts/gate-host-pool.sh` — **`fail`, `late` and `pinlate` must now stop being vacuous** (this block makes
-     the host master pageable through `host_expert_buft()`'s `want_mapping` -> `ROCm_HostMap` branch; HANDOVER
-     §5.7).  The four placement-transport checks stay R17's (block 16) — that is the only expected remaining
-     failure, and it must be recorded with the block and the symbol, never by weakening the gate.
+   - **`D17` (the VMM region check):** the halved VMM reservation + retry must not change the region the GTT
+     store asks for.  `scripts/gate-uma-experts.sh --quick` (its `inplace` and `pfcp` arms), plus
+     `scripts/gate-prefill-server-slots.sh` (two slots: one decoding while the other prefills).
+   - **`scripts/gate-host-pool.sh` must reach 54/54**: the four checks R13/R16 handed here are the placement
+     read transport (`ref`'s `host pool PLACEMENT reads: O_DIRECT` line + the placement queue census with its
+     8 reader(s)), `qd1` (`MOE_EXPERT_FILL_QD=1` -> 1 reader) and `bulkbuf` (`MOE_HOST_POOL_BULK_DIO=0` -> a
+     buffered placement read).  If they still do not appear, name the symbol that is missing — do not weaken the
+     gate.
+   - the 8 GB-class discrete path must stay inert (the store is UMA-only by measurement) and the discrete
+     `gate-host-pool`/`gate-kv-residency` arms must not change.
    - `git grep -In '^<<<<<<< \|^=======$\|^>>>>>>> '` — must be empty.
-4. RUNGS.md: ledger row + result/resolution log (incl. which gate arms remain deferred and to whom);
-   DECISIONS.md `D3`, `D19` (verify only), `D15`; HANDOVER §0/§5/§6; a dated WORKLOG entry; commit the delivery
-   repo on `rebase-261113`; point PROMPT.md at R17.
+4. RUNGS.md: ledger row + result/resolution log; DECISIONS.md `D17`; HANDOVER §0/§4/§5/§6; a dated WORKLOG entry;
+   commit the delivery repo on `rebase-261113`; point PROMPT.md at R18.
 
 RULES
 - Report to the maintainer and STOP before dropping any delivery mechanism. Overlaps resolve as "both sides"
@@ -99,11 +92,12 @@ RULES
 - If you run out of room: `git cherry-pick --abort`, record what you learned in RUNGS.md, update HANDOVER §0,
   and stop. Do not leave a half-resolved rung.
 
-IF R16 COMPLETES
-Continue with R17 (block 16, `9d7c0502c`, the UMA GTT expert store, 16 files, 0 expected conflicts), which owes
-`scripts/gate-uma-experts.sh --quick`, the `gate-prefill-server-slots.sh` two-slot arm, a re-check of `D17` (the
-halved VMM reservation + retry must not change the region the GTT store asks for) **and `gate-host-pool.sh`'s four
-placement-transport checks** (`MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO`, the placement read queue).  After
-that, R18 is the release ladder (`README.md` §4 + HANDOVER §10) — do not start it without the maintainer's
-go-ahead.
+IF R17 COMPLETES
+R18 is the release ladder (`README.md` §4 + HANDOVER §10) — **do not start it without the maintainer's
+go-ahead**.  It is not a rung: `make-patches.sh` (squashing BOTH rung-repairs — `R09r` into block 05 and the
+R16r h_nextn repair into block 11), `make-release.sh`, `validate-set.sh`, `gate-per-block-build.sh`, the
+prefill-logit record + arms, the coherence set (dense 4B, the 35B-A3B field config, a hybrid recurrent model,
+the qwen4exp class), the MTP four-axis protocol, `gate-rebase-release.sh`, `check-gpu-faults.sh`, the fork
+refresh (personal fork only) and the records.  Known-red items to carry: `gate-kv-residency.sh`'s **multi-device**
+pool section (`D20`/`TODO` #321 — pre-existing 2-device MTP nondeterminism; nothing to do with the delivery).
 ```

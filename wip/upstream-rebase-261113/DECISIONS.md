@@ -99,6 +99,14 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   (`f8_e4m3` cases in the 6996-case FLASH_ATTN_EXT oracle, 0 failures) — no reachable-but-uninstantiated
   type remains (`GREEDY-PURITY.md` §20).
 
+**R16 update (block 15): the superset survived the KV rewrite.**  Block 15 rewrites `src/llama-kv-cache.cpp`
+(+1238) and `src/llama-kv-cache.h` (+120) around its pool page; the conflict was the `kv_layer` initialiser and
+it resolved as a union, so **upstream's `k_cache_s`/`v_cache_s` scale tensors are kept** beside block 15's pool
+K/V + page table + per-DEVICE counter block.  `GGML_TYPE_F8_E4M3` is still wired through the cache's type
+predicates (`grep -c` = 2 in `llama-kv-cache.cpp`), BF16 KV is unchanged from R05, and the rung's KV gates
+(`gate-kv-residency`, `gate-kv-window-split`, `gate-spec-draft-window`, `gate-spec-reuse-window`) plus the
+coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0 matrix is still a superset.
+
 ## D4 — MMVF: upstream dispatches BF16 to MMVF for few rows at small batch
 
 * **Upstream:** `459ab1cdd` (`#31959`) sends BF16 `MUL_MAT` with few rows and a small batch to MMVF, plus a
@@ -453,8 +461,16 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   **empty**, and its `src/llama-model-loader.cpp` hunks are the `--load-mode buffered` read transport, which
   R13's pool gate exercises (`host pool fill mode: buffered (page cache as L3)`; `MOE_HOST_POOL_DIO=1` ->
   `O_DIRECT`).  So the `paths_model` merge and the delivery's `madvise` loop are both in the tree and R10's
-  status stands.  **Still `OPEN`: the loader-side residency question is R16's** (does `--lazy-mode
-  mlock`/WILLNEED pin the PLE table on the external-PLE path).
+  status stands.  **R16 (2026-11-13): the merge held and the loader question is answered as far as this rung goes.**  Block 15
+  rewrites `src/llama-model-loader.cpp` heavily (−1372/+1372-ish: the `-lme` budget plan, the pool-hosted
+  master path, the coalesced read transport) and `common/fit.cpp` was a conflict again; the resolution kept
+  upstream's **`paths_model`** vector everywhere (25 uses in `common/fit.cpp`, build green) with the delivery's
+  `host_expert_bytes`/`host_experts` **and** block 15's `kv_bytes`/`kv_pool_vram`/`kv_pool_ram` out-params.  The
+  `paths_model` adaptation of block 15's *new* call sites was the rung's one first-error pass (the fit's
+  `g_fit_target_model` identity now uses `paths_model.front()`).  The PLE `madvise(WILLNEED)` loop is present
+  (block 11, `src/models/qwen4exp.cpp`).  **What stays open is only the runtime question** — does
+  `--lazy-mode mlock`/WILLNEED actually pin the PLE table on the external-PLE path — and it needs an
+  external-PLE model, which this box does not have; carry it as a `TODO` for R18 rather than a rung blocker.
 
 ## D16 — MUL_MAT src1 precision tests and gating
 
@@ -508,9 +524,42 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   CUDA/HIP host tier do not interact through the CUDA predicate.  The 1-device arena census (`h=0.5205`,
   `fills=1991`, `takeover=540`) is the evidence the CUDA side is unchanged.
 
-## D19 — Recurrent cache tensor renaming removed in plamo2
+## D19 — Recurrent cache tensor renaming removed in plamo2  · **`CLOSED` (verify only, R16)**
 
 * **Upstream:** `940a30ee3` (`#31984`) stops renaming the recurrent cache tensors in `src/models/plamo2.cpp`.
 * **Delivery:** block 15's streamed KV and the recurrent memory instances the delivery's placement touches.
 * **Relation:** verify: the delivery must not depend on the old names for a recurrent cache.
-* **Status:** `OPEN` — R16.
+* **Status:** **`CLOSED` at R16 (2026-11-13) — verify-only, and nothing depends on the old names.**  Block 15
+  touches no recurrent-cache tensor name: its KV work is the stage's `llama-kv-cache.{cpp,h}` (the pool page and
+  the window) and its MTP work is the draft's own cache window; `src/models/plamo2.cpp` is not in block 15's
+  file list, the tree builds, `gate-kv-residency` / `gate-kv-window-split` / `gate-spec-draft-window` /
+  `gate-spec-reuse-window` are green, and `940a30ee3`'s rename is simply upstream's to keep.
+
+## D20 — An MTP draft spread over 2 devices is **not reproducible** (found at R16, pre-existing)
+
+* **Upstream:** nothing — this is the delivery's own speculative path, and it reproduces on `r277`.
+* **Delivery:** the MTP draft context that `--spec-type draft-mtp` builds against the target, on a
+  `-sm layer` split of two devices (blocks 02/13's driver + block 09/10's slab/staging beneath it).
+* **Relation:** a *defect*, not a decision: same seed, `--temp 0`, identical command line, three runs -> three
+  different texts.
+* **Measured at R16** (Flash-Next `GSQ-IQ3_XXS` + the shared MTP sidecar, `-ncmoe 48`, q8_0 KV, `-c 32768`,
+  the 25 763-token `prompts/kld-corpus-35b-in-domain.txt`, `-n 64 --seed 42 --temp 0`, 3 identical reruns):
+
+  | arm | 3 reruns |
+  |---|---|
+  | 2 devices, `-sm layer`, `draft-mtp`, sparse decode | `f260d1824ab3` / `7ca535e1da91` / `b08d3dbcb1e9` |
+  | 2 devices, `-sm layer`, `draft-mtp`, dense decode | `cf49426bbab0` / `cf49426bbab0` / `7ca535e1da91` |
+  | 2 devices, `-sm layer`, **`--spec-type none`** | `7a347cbe5f1` × 3 — stable |
+  | 1 device, `draft-mtp`, sparse decode | `f260d1824ab3` × 3 — stable |
+  | **`bin-r277`**, 2 devices, `draft-mtp`, sparse | `b08d3dbcb1e9` / `2550c6866f6c` / `f260d1824ab3` |
+
+  So the target alone is deterministic and one device is deterministic: the nondeterminism is in the **draft
+  path across devices**.  It is a GREEDY-PURITY-class violation (an accept/reject decision must be a function of
+  the target's logits and the seed), and it is **pre-existing** — `r277` shows it, so it is not this re-base's.
+* **Consequence for `gate-kv-residency.sh`:** its multi-device pool section compares `pmres` with a `pmref`
+  reference **within the 2-device count**, and that reference is itself unreproducible, so the section cannot be
+  made green by any change to block 15.  It passed once by luck during R16 and failed on the next run.  **The
+  gate is not weakened and the arm is not simplified**; the section stays red until this is fixed.
+* **Status:** `OPEN` — needs a real fix (owner: the MTP driver / slab staging on a split, not block 15).  Carry
+  as a `TODO.md` item; it blocks `gate-kv-residency.sh`'s multi-device section at R18 and it is worth an
+  `INVARIANTS.md` entry once fixed.

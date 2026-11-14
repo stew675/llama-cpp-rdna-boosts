@@ -1,6 +1,6 @@
 # HANDOVER — cold-start brief for the `4f9dfa0e3` re-base (`upstream-rebase-261113`)
 
-**Refreshed 2026-11-13 at the end of session 6 (R13 -> R15).**  Read this first, then `RUNGS.md`.  It is a
+**Refreshed 2026-11-13 at the end of session 7 (R13 -> R16).**  Read this first, then `RUNGS.md`.  It is a
 *state* document: the method is in [`README.md`](README.md), the per-rung ledger and resolution logs are in
 [`RUNGS.md`](RUNGS.md), the stop-and-ask register in [`DECISIONS.md`](DECISIONS.md), the measured conflict map
 in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next session in
@@ -14,13 +14,13 @@ in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next s
 |---|---|
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `f040d394f`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R15 done = blocks 00-08 + one rung-repair + blocks 09-14**; next is **R16 = block 15 (the streamed KV, 5 expected conflicts)** |
-| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) `1d83b50e0` (11) `75d83f231` (12) `aca78625a` (13) **`f040d394f` (14)** |
-| canonical build | `~/llama.cpp/build-rocm` — **R15 tree** (`f040d394f`, tree `0c8a1fd58`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `9c940db6f`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
+| progress | **R00-R16 done = blocks 00-08 + TWO rung-repairs + blocks 09-15**; next is **R17 = block 16 (the UMA GTT store, 0 expected conflicts)** |
+| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) `1d83b50e0` (11) `75d83f231` (12) `aca78625a` (13) `f040d394f` (14) `f745bbf1b` (15) **`9c940db6f` (R16r rung-repair, block 11's artifact)** |
+| canonical build | `~/llama.cpp/build-rocm` — **R16 tree** (`9c940db6f`, tree `14f99e579`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) — **the whole 17-block delivery**, so it is the answer to "would block N alone do this?" |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
-| coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 (re-verified on the R15 tree) |
+| coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 (re-verified on the R16 tree) |
 | parked history | tags `r10-blocked-d4106d6f6` / `r10-reapplied` in `~/llama.cpp` (the R10 park, since re-applied as `a6809f75b`); no patch file is live — do not look for one |
 | delivery untouched | `patches/`, `release.json` and the fork are **not** changed until R18.  Nothing is pushed anywhere. |
 
@@ -134,14 +134,14 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R14 | 13 MTP vocab subset | **DONE** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits == full vocab, 0 mismatches, two live contexts independent); `--spec-draft-mtp-vocab 32768` drafts on 32 801/248 320 rows; **`D7` re-verified and it moved** — `-sm tensor` now takes the device row gather too (block 09's Meta `event_new`) |
 | R15 | 14 relaxed-tensor (**TEMPORARY**) | **DONE** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` refuses flint with the delivery's pointer and `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`; 4B tensor/relaxed/layer all `1c5d32ac537d`); **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and nothing in `a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`, so the block stays TEMPORARY (§5.8) |
 | R16 | 15 streamed KV | TODO | — | 5 conflicts; `D3`, `D19`, `D15`'s loader question; owes the KV residency gates, `gate-qwen4exp-quant-coherence.sh` **section E** (the sparse QSA arm — block 15 replaces `ggml_rope_get_truncate(dst)` on the fused `INDEXER_SCORE` node, which upstream `#30206`'s assert rejects) **and `gate-host-pool.sh`'s `fail`/`late`/`pinlate` arms** (block 15 is what makes the host master pageable — see §5.7) |
-| R17 | 16 UMA GTT store | TODO | — | **0 conflicts**; verify `D17` (VMM region size) with `gate-uma-experts.sh --quick`; owes **`gate-host-pool.sh`'s placement-transport checks** (`ref` `PLACEMENT reads: O_DIRECT` + placement queue, `qd1`, `bulkbuf` — block 16 ships `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the read queue; §5.7) |
+| **R17** | 16 UMA GTT store | **NEXT** | — | **0 conflicts**; verify `D17` (VMM region size) with `gate-uma-experts.sh --quick`; owes **`gate-host-pool.sh`'s placement-transport checks** (`ref` `PLACEMENT reads: O_DIRECT` + placement queue, `qd1`, `bulkbuf` — block 16 ships `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the read queue; §5.7) |
 | R18 | — | TODO | — | release ladder, `README.md` §4 + §10 below |
 
 **Remaining block commits to cherry-pick** (from `release.json` order; a later block is judged against the
 rebased earlier ones, so the order is not negotiable):
 
 ```
-R16 99d33117a   R17 9d7c0502c
+R17 9d7c0502c
 ```
 
 Per-rung expected conflict paths and "what to expect" notes: `CONFLICT-MAP.md` (measured, generated from the
@@ -257,7 +257,10 @@ R13 cleared the two arms it owed (`gate-host-pool.sh` `tsplit` + `tsplitnosink`:
   `MOE_HOST_POOL_BULK_DIO` and the placement read queue (`host pool placement queue: N batch(es) … N reader(s)`)
   are all block 16's (`grep -l` -> `patches/0016-*`); this rung's pool prewarms serially out of the mapping.
 
-**Do not weaken the gate and do not drop an arm**: both rungs must re-run it and expect 54/54.
+**Do not weaken the gate and do not drop an arm**: both rungs must re-run it and expect 54/54.  *R16 update:*
+R16 got **50/54** — `fail`/`late`/`pinlate` are **green and real now** (`ref` pool `h=0.9705` against R13's
+`h=0.0000`; `fail` `FAILED fills: 2790` / `takeover=0`; `late` 2721; `pinlate` 29 with the pre-latch pool still
+serving).  The four remaining checks are R17's, as predicted; §5.7 stays as the record of why they were vacuous.
 
 ### §5.8 R15 — block 14 (`-sm relaxed-tensor`) is still load-bearing, and it stays TEMPORARY
 
@@ -277,6 +280,32 @@ So the drop condition (upstream lands a real fix) is **unmet**.  Dropping block 
 future base, never a merge outcome; until then it is `patches/README.md`'s TEMPORARY item and its own gate is the
 Flint/`-sm layer` text identity above.
 
+### §5.9 R16 — the second rung-repair: upstream `#31927` vs the delivery's hyper-connection export
+
+`gate-kv-residency.sh`'s pool section **aborted** on the block-15 tree with
+`GGML_ASSERT(src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens)` (`llama-graph.cpp:4628`,
+upstream `a8fad21e9`/`#31927`).  Measured: `src = [2560, 4, 512]`, `h_nextn_dev = [10240, 2049]`,
+`n_tokens = 512`.  The delivery exports the contiguous `build_hc_combine()` result `[n_embd, hc, n_tokens]` on
+purpose (a pure view gets no backend assignment and the host readback looks one up), and its memory layout **is**
+`[n_embd_out, n_tokens]` — so only the assert (and the reshape under it) assumed 2-D.  The repair `9c940db6f`
+keys the invariant on the **folded row** (`ggml_nelements(src) == n_embd_out*n_tokens`, keeping the original
+checks for a 2-D export and `ne[0]*ne[1] == n_embd_out && ne[2]*ne[3] == n_tokens` for the folded one; the
+discriminator must be `ne[0] == n_embd_out`, because a **1-token** graph is `[2560, 4, 1]` and `ne[2]==ne[3]==1`
+there too).  **`r277` never hits it because `#31927` is not in the old base** (`git grep 9d7c0502c` finds no
+`embeddings_nextn_dev`/`set_ctx_state_src`/`dev_rows`).  **Squash into block 11 at R18.**  Effect: the pool
+section went from *cannot run at all* to *fully green* (`pref == pres == plegacy = f260d1824ab3`).
+
+### §5.10 R16 — `D20`: a 2-device MTP draft is not reproducible, and that makes one gate section unsatisfiable
+
+`gate-kv-residency.sh`'s `-sm layer` pool section compares `pmres` with a 2-device `pmref` reference **within the
+device count** — correct in principle, but **`pmref` itself is not reproducible**: 3 identical reruns of
+Flash-Next + the MTP sidecar on 2 devices gave 3 different texts (`f260d1824ab3` / `7ca535e1da91` /
+`b08d3dbcb1e9`), the dense-decode arm is unstable too, while `--spec-type none` on 2 devices and one device with
+`draft-mtp` are both stable — and **`bin-r277` reproduces the instability**.  So it is a **pre-existing**
+GREEDY-PURITY-class defect of the MTP draft path on a split, not this re-base's.  The section passed once by luck
+during R16.  **Do not weaken the gate and do not simplify the arm to the one that passes**: it stays red until
+the draft path is deterministic.  `DECISIONS.md` `D20` + `TODO.md` #321 carry the table and a re-entry plan.
+
 ---
 
 ## §6  Decision register status (do not re-decide by accident)
@@ -285,7 +314,7 @@ Flint/`-sm layer` text identity above.
 |---|---|
 | `D1` MoE cache relocation / CPU share | **ANSWERED at R10** — no port needed; the r236 either/or ruling stands (arena default-on, upstream cache dormant) |
 | `D2` GDN pruning | **DECIDED** complementary (R04) |
-| `D3` FP8/BF16 KV types | **CLOSED** (R05 audit + R06 FA oracle + R09r FP8 KV instances) |
+| `D3` FP8/BF16 KV types | **CLOSED** (R05 audit + R06 FA oracle + R09r FP8 KV instances); **re-checked at R16** — the block-15 KV rewrite kept upstream's `k_cache_s`/`v_cache_s` beside the pool page and the F8_E4M3 predicates are intact |
 | `D4` MMVF BF16 few-row | **DEFERRED to R18** (no rung conflict; a `llama-bench` arm) |
 | `D5` FA + few-row MMQ | **DECIDED** FA half (R06); **`D5-a` DECIDED and APPLIED** (`9c94ce139`); few-row **ordering** is an R18 `llama-bench` arm |
 | `D6` graph/stream state moved to `graph.cuh` | **CLOSED at R11** — packed replay guard + cluster check kept, accessor out-of-line (see §5.4) |
@@ -297,11 +326,12 @@ Flint/`-sm layer` text identity above.
 | `D12` BF16 RMS_NORM | **DECIDED at R09** — dual store kept (both destinations ship); the rows gate passed at R11, the bf16 side channel's own gate is R16 |
 | `D13` HIP BLAS workspace | **CHECKED** (R02) |
 | `D14` GDN/SSM kernels | **CHECKED** (R04) |
-| `D15` external PLE | **merge done at R10** (`path_model` -> `paths_model` + the delivery's host-expert out-params); the `madvise` loop is block 11's (R12), NOT block 12's; the PLE-residency question is R16's |
+| `D20` a 2-device MTP draft is not reproducible | **OPEN (found at R16, pre-existing — `r277` too)**; blocks `gate-kv-residency.sh`'s multi-device section; `TODO` #321, §5.10 |
+| `D15` external PLE | **merge done at R10, held through R16's loader rewrite** (`path_model` -> `paths_model` + the delivery's host-expert out-params); the `madvise` loop is block 11's (R12), NOT block 12's; the PLE-residency question is R16's |
 | `D16` MUL_MAT src1 precision | **CLOSED** (R08, 2681/0) |
 | `D17` VMM pool | **DECIDED** (option 1); partially verified at R10 (slab/arena allocate with the revert in place), R17 verifies the GTT region |
 | `D18` SYCL device-side MoE | **CHECKED at R10** — no SYCL file in the conflict set, no shared op flag changed |
-| `D19` plamo2 recurrent cache names | **OPEN (verify only)** — R16 |
+| `D19` plamo2 recurrent cache names | **CLOSED at R16** — block 15 touches no recurrent-cache name; verify-only |
 
 ---
 

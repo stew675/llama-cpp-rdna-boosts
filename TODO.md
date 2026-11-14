@@ -172,6 +172,31 @@ Record: `archive/work/apu-expert-gtt/README.md` §5 and §7 (`-lme` as the strea
 
 ---
 
+## 321. An MTP draft over 2 devices is not reproducible (same seed, temp 0, 3 runs, 3 texts)
+
+**Found at R16** by `scripts/gate-kv-residency.sh`'s multi-device pool section; recorded as `D20` in
+`wip/upstream-rebase-261113/DECISIONS.md`, which carries the full table.  Flash-Next `GSQ-IQ3_XXS` + its shared
+MTP sidecar, `-ncmoe 48`, q8_0 KV, `-c 32768`, the 25 763-token `prompts/kld-corpus-35b-in-domain.txt`,
+`-n 64 --seed 42 --temp 0`:
+
+* **2 devices, `-sm layer`, `--spec-type draft-mtp`** -> three identical reruns gave
+  `f260d1824ab3` / `7ca535e1da91` / `b08d3dbcb1e9` (and the dense-decode arm is unstable too).
+* **2 devices, `-sm layer`, `--spec-type none`** -> `7a347cbe5f1` x 3.  **1 device, draft-mtp** ->
+  `f260d1824ab3` x 3.
+* **Pre-existing: `bin-r277` reproduces it** (`b08d3dbcb1e9` / `2550c6866f6c` / `f260d1824ab3`), so it is not a
+  re-base regression.
+
+So the target is deterministic and one device is deterministic: the nondeterminism is in the **draft path across
+devices** (the MTP driver's h_nextn handoff and/or the draft's staging on a split, blocks 02/09/10/13).  It is a
+GREEDY-PURITY-class violation — an accept/reject decision must be a function of the target's logits and the
+seed — and it makes `gate-kv-residency.sh`'s multi-device section unsatisfiable, because that section's own
+2-device reference arm (`pmref`) is the unstable one.  **Do not "fix" this by relaxing the gate**: the gate's
+within-device-count comparison is right.
+
+**Re-entry:** bisect the draft path on a 2-device `-sm layer` arm (kill switches: `GGML_CUDA_DISABLE_GRAPHS=1`,
+`MOE_EXPERT_CACHE_MIB=0`, `--lazy-mode off`, the draft KV window `--spec-draft-kv-window`), then a
+`INVARIANTS.md` entry once it is fixed.  Owner: the MTP driver, not block 15.
+
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so

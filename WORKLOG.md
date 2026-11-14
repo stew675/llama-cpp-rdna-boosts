@@ -1,3 +1,53 @@
+## 261113.013 (r277 + campaign rung R16, NO delivery change) -- R16 (block 15, the streamed KV) lands with a second rung-repair: upstream `#31927`'s h_nextn assert has to accept the delivery's folded hyper-connection export, and the rung clears the last three deferred gate arms
+
+**No patch changes, no `release.json` change.**  Rung R16 (`f745bbf1b` + the rung-repair `9c940db6f`, tree
+`14f99e579`; block 15 "the streamed KV -- window (Goal A) + attendance pool (Goal B) + MTP draft window").
+Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R16.
+
+* **46 files, 5 conflicted files / 8 hunks** (the probe's 5 files was exactly right), one first-error pass.
+  Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no stray markers.
+* **`D11` again: the merged op count is 107** (106 + block 15's `GGML_OP_KV_POOL`; block 15 asserted 110 on its
+  own tree) and `RPC_PROTO_PATCH_VERSION` is **9**.  **`D3`** kept upstream's `k_cache_s`/`v_cache_s` scale
+  tensors beside block 15's per-layer pool page (the KV type matrix stays a superset); **`D15`** kept
+  `paths_model` (the rung's one first-error pass was block 15's *new* call sites still using the singular
+  `path_model` — the fit's target-identity latch now uses `paths_model.front()`); **`D19` verified and closed**.
+* **The rung-repair, and it is the block-15 gate that found it:** `gate-kv-residency.sh`'s pool section
+  **aborted** — `GGML_ASSERT(src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens)` at
+  `llama-graph.cpp:4628`, upstream `a8fad21e9` (**`#31927`**, the device-buffer hidden-state read).  Measured
+  `src = [2560, 4, 512]`, `h_nextn_dev = [10240, 2049]`, `n_tokens = 512`.  The delivery's qwen4exp exports the
+  **contiguous `build_hc_combine()` result** `[n_embd, hc, n_tokens]` on purpose (a pure view gets no backend
+  assignment and the host readback looks one up) and that layout **is** `[n_embd_out, n_tokens]` in memory, so
+  only the assert (and the reshape under it) assumed 2-D.  `9c940db6f` re-keys the invariant on the folded row
+  and keeps the original checks for a 2-D export.  **`r277` cannot hit it: `#31927` is not in the old base** —
+  it arrives with `4f9dfa0e3`, and this rung is where its first gate reaches it.  Squash into block 11 at R18.
+* **Gates:** `gate-kv-residency.sh` — selftest, **window** and the whole **single-device pool** section **PASS**
+  (`pref == pres == plegacy = f260d1824ab3`, 252 resolves, hit rate 89.85/90.40 %, derived pool 4 104 < 8 192
+  pages, prompt-rate floor met, identical draft acceptance); the repair is what makes the section runnable at
+  all.  `gate-kv-window-split.sh`, `gate-spec-draft-window.sh`, `gate-spec-reuse-window.sh` **PASS**.
+  `gate-qwen4exp-quant-coherence.sh` **PASS with SECTION E GREEN** (`200edcd422c7`, census sensitive, arm not
+  vacuous) — **the third and last deferred arm of the climb is cleared at the rung that was predicted**, because
+  block 15 carries the `#30206` `ggml_rope_get_truncate` fix.  `gate-host-pool.sh` **50/54**: the three
+  fault-injection arms that were vacuous since R10 are now **real and green** (`ref` pool `h=0.9705` vs R13's
+  `h=0.0000`; `fail` `FAILED fills: 2790`, `takeover=0`, `decline_all=5070 get_ok=0`, 141 "NOT resident" lines;
+  `late` 2721; `pinlate` 29 with the pre-latch pool still serving) — exactly the R13 prediction.  The 4 remaining
+  checks are block 16's placement-transport ones (R17).
+* **FINDING (`D20`, `TODO` #321): a 2-device MTP draft is not reproducible, and it is PRE-EXISTING.**  Three
+  identical reruns of Flash-Next + its MTP sidecar on 2 devices (`-sm layer`, `--spec-type draft-mtp`, seed 42,
+  temp 0) gave three different texts; the dense-decode arm is unstable too; `--spec-type none` (2 devices) and
+  one device with `draft-mtp` are both **stable**; and **`bin-r277` reproduces it**.  So the nondeterminism is in
+  the draft path across devices (a GREEDY-PURITY-class violation), not in this re-base and not in block 15.  It
+  makes `gate-kv-residency.sh`'s **multi-device** pool section unsatisfiable — its own 2-device reference arm is
+  the unstable one, so the section passed once by luck and failed the next run.  **The gate was not weakened and
+  the arm was not simplified**; it stays red until the draft path is deterministic.
+* One environment note for the next session: the first quant-coherence run had its `Q4_K_M` arm **OOM-killed**
+  (`exit 137`, kernel `oom-kill`, `shmem-rss` 72.8 GB) with several Flash-Next arms in flight; run alone it
+  passes (`16d7957b2c0f`).  The Flash-Next arms map a ~70 GiB model and pin a ~32 GiB pool, so run those gates
+  one at a time on an idle box.
+* **Climb state:** R00..R16 done on `rebase-r278` at `9c940db6f`; build dir holds the R16 tree.
+  **Next: R17 = block 16** (the UMA GTT expert store, `9d7c0502c`, 16 files, 0 expected conflicts), which owes
+  `gate-uma-experts.sh --quick`, the two-slot prefill arm, the `D17` region check **and `gate-host-pool.sh`'s
+  four placement-transport checks**.
+
 ## 261113.012 (r277 + campaign rung R15, NO delivery change) -- R15 (block 14) keeps `-sm relaxed-tensor` alive: the mode is byte-identical to `-sm layer` on Flint while `-sm tensor` still refuses it, and upstream has not started allowing those arches
 
 **No patch changes, no `release.json` change.**  Rung R15 (`f040d394f`, block 14 "relaxed-tensor split mode
