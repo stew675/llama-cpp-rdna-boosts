@@ -1,3 +1,60 @@
+## 261114.008 (r287) -- PR #312 is accepted as **block 17**: a q8_0 K cache with a q4_0 / q5_0 / q5_1 V cache is read natively on 256-wide heads, the QSA model and every other pair stay refused, and the default path is bit-identical (prefill-logit 0.000697 / 98.784 % f16, 0.000580 / 98.882 % q8_0)
+
+**`release.json` changed: tip `83d2593fe` -> `f8c79c35c9b56964ab7019569afda75678b506a7`, tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` ->
+`89b2555296146290f556f1cf017ed6ee124dfce6`, release `v17-4f9dfa0e3-r286` -> `v18-4f9dfa0e3-r287`; 18 blocks
+(block 00 + blocks 01-17), base unchanged (`4f9dfa0e3`).**  The delta is **block 17** (11 files, +171/-42;
+the tile kernel's second V type and three head-256 instances, the F16-scratch allocator's V type, the RDNA4
+band predicate, the context gate's one exception, and the op/width-probe tests), plus the delivery docs, the new
+`scripts/gate-mixed-kv.sh`, and the archived original artifact.  Blocks 00-16 are **byte-identical** to r286
+(their patch files changed only the `[PATCH NN/17]` series count); the new block is an addition, not a
+re-base.  Record: [`archive/work/mixed-kv/`](archive/work/mixed-kv/README.md) (the original PR artifact,
+its revision-2 review and the measurements) and [`patches/README.md` → Block 17](patches/README.md).
+
+* **The PR's diagnosis and its revision 2 were right.**  The 2026-09-11 reject was taken against a chooser that
+  returned `BEST_FATTN_KERNEL_NONE` for a mixed pair, so a mixed cache lost flash attention entirely; after the
+  2026-09-13 re-base (upstream `5a4d0feca`, the per-pair `GGML_FA_QUANTS` list) prefill already reads K and V
+  with their own types and only decode/verify paid the F16 staging.  The tile kernel's **one** K/V type parameter
+  was the remaining cause.  Revision 2 (14 Nov) added the two review changes: qwen4exp is refused because
+  `GGML_OP_FLASH_ATTN_QSA` asserts `K->type == V->type`, and the tile dispatch takes its V type from
+  `ggml_cuda_fattn_tile_type_V()`, the same function the allocator sizes the F16 scratch with.
+* **Why a new block 17, not block 05.**  The context-gate hunk lives in block 10's `src/llama-context.cpp` and
+  the width-probe support in block 06's `tests/test-logits-width-probe.cpp`; folding the feature into block 05
+  would have had to split it across three blocks and re-cut 11 subsequent blocks.  A new block keeps every
+  earlier block tree byte-identical and is the AGENTS "cut a new block" promotion path; the original optional
+  artifact is archived rather than kept as a second copy of delivered code (the `optional/README.md` rule).
+* **The default path did not move.**  `gate-prefill-logits.sh` reads **0.000697 / 98.784 %** (f16) and
+  **0.000580 / 98.882 %** (q8_0), identical to the r286 base; same-seed greedy text `1c5d32ac537d` on 4B 1 GPU,
+  3-GPU `-sm tensor` and 3-GPU `-sm layer`, and the 27B/35B arms are unchanged.  Same-type caches do not enter
+  the new code.
+* **The new pair is correct and width-pure on all three delivery arches.**  `test-backend-ops -o FLASH_ATTN_EXT`
+  **7021/7021** on gfx1201 (3x R9700), gfx1100 (`fingon`) and gfx1151 (`halo`), in the default,
+  `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms; W=1..8 width purity **maxdiff 0** for
+  q8_0/q8_0 and all three pairs on gfx1201 (1 GPU, `-sm layer`, `-sm tensor`) and on gfx1100/gfx1151 alone;
+  plain == draft-mtp at n_max 1/3/7 (128 tokens) on all three arches, and the 1-GPU 27B mixed arm at n=1000
+  is byte-identical with acceptance **0.47003 (149/317)**.
+* **VRAM and speed, measured (not quoted from the PR).**  27B Q4_K_M, 3-GPU `-sm tensor`, `-c 131072`:
+  KV **4352 MiB** (q8_0/q8_0) -> **3712 / 3584 / 3328** (q5_1 / q5_0 / q4_0), the same compute buffers
+  (156.78 MiB) and `graph splits = 2`; decode at 32768 cells 47.0 vs 51.6 t/s short / 46.92 vs 47.04 t/s deep
+  for q8_0/q5_1, with q5_1/q5_1 at 49.55 / 45.95 -- mixed sits between the same-type neighbours.  The staged
+  kill-switch arm is 12 % behind at 32768 cells and 25 % at 100000.  `llama-batched-bench -npp 16 -ntg 32 -npl
+  1,4,8`: q8_0/q5_1 0.674 / 0.858 / 1.012 s against q8_0/q8_0 0.683 / 0.857 / 1.002 s (B=1 -1.3 %, B=4/B=8
+  within noise).
+* **Quality.**  WikiText-2, 8 x 4096, 27B, 3-GPU tensor, against an f16 base: mean KLD **0.0071** (q8_0/q8_0),
+  **0.0079** (q8_0/q5_1), **0.0082** (q8_0/q5_0), **0.0074** (q8_0/q4_0) -- the mixed pair costs ~11 % of the
+  same-type q8_0/q8_0 quantization cost, which is the PR's claim; the absolute values are this tree's (the
+  PR's r279 table used a different base/model run and its 0.0030-0.0049 should not be quoted as current).  The
+  PR's own MTP-acceptance-per-pair and quality-at-depth arms remain uncovered (4096-token chunks; no
+  32k/100k KLD), and are named as limits, not gates.
+* **Delivery validation.**  `scripts/gate-mixed-kv.sh` **14/14** on the canonical build (3 op arms, 4 width
+  probes, 4 text arms, the non-256 and Qwen4Exp refusals, journal clean); `scripts/gate-per-block-build.sh
+  --changed-from 83d2593fe` **1/1** (block 17, `all`, 130 s); `scripts/validate-set.sh` **green** (18 patches,
+  fresh-tarball strict apply, applied tree `89b2555`, 513 files through the Windows portability scan);
+  `scripts/fork-refresh.sh --build --gates` re-cut the branch to **`f8c79c35c`** (tree `89b2555`) and its
+  coherence + prefill-logit halves passed; MTP Protocol A on the dense 27B bf16-KV arm: **plain == draft-mtp**
+  text `b9c10f46b5ae` (11 413 chars), 30.1 -> 55.2 t/s, acceptance **0.47385 (299/631)**.  Block 15's window and
+  pool are text-identical with the mixed cache on 1 and 3 GPUs (the feature is a cache-type choice, not a
+  placement).  Journals clean on all three boxes.
+
 ## 261114.007 (r286) -- issue #313 closes: a region-backed buffer stops issuing 2-D device copies (the abort), the batched state path stops copying one row at a time (4 686 -> 24.5 ms per slot save+load), `--kv-window` reaches `llama-bench`, and the spill's cost model is a per-device MEASUREMENT of the read path instead of the copy engine's number
 
 **`release.json` changed: tip `a0172be96` -> `83d2593fe`, tree `3a6304107` -> `79d18f41b9ab9b235d35fd3a5034858eddd94844`,

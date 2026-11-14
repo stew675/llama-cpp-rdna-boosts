@@ -12,7 +12,7 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | item | value |
 |---|---|
 | fork point (upstream `ggml-org/llama.cpp` master) | **`release.json .base`** |
-| delivery | 17 blocks, `block 00` + `blocks 01-16` (`release.json .n_blocks`); **block 14 is temporary**; block 15 is the promoted windowed KV; block 16 is the promoted UMA GTT expert store |
+| delivery | 18 blocks, `block 00` + `blocks 01-17` (`release.json .n_blocks`); **block 14 is temporary**; block 15 is the promoted windowed KV; block 16 is the promoted UMA GTT expert store; block 17 is the promoted mixed K/V cache types (r287, PR #312) |
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 

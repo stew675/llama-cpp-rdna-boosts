@@ -26,9 +26,9 @@ change), and let `WORKLOG.md` carry the narrative.
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
-- **Apply method:** all 16 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
+- **Apply method:** all 18 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
   `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **16 blocks, 00-15** (block 15 is the **streamed KV** — both Goals
+- **Naming (V2.1):** the current set is **18 blocks, 00-17** (block 15 is the **streamed KV** — both Goals
   A and B of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor` block, see `patches/README.md`;
   the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
   carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
@@ -59,6 +59,11 @@ change), and let `WORKLOG.md` carry the narrative.
   embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
+- **Block 16 is the UMA GTT expert store and block 17 is the mixed K/V cache types (r263 / r287).**  Block 16
+  (an APU's MoE expert set in one registered region, `-lme`-sized) has its own section below.  Block 17 adds
+  the one mixed K/V pair the delivery reads natively (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, 256-wide heads
+  only, qwen4exp refused; default on, `GGML_CUDA_FA_KV_MIXED=0` restores the staged path); every other mixed
+  pair is still refused.  See the mixed-K/V bullet above and `scripts/gate-mixed-kv.sh`.
 - **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r200,
   issue #264).**  Under `--kv-unified` the one draft cache holds every sequence, so its cell count is
   `(win + one batch) x n_seq_max` (capped at the context) — the r193-r199 `win + n_ubatch` shape was shared by
@@ -556,8 +561,18 @@ change), and let `WORKLOG.md` carry the narrative.
   must use the main KV type for the draft context too**, and a *small, fast* model under `-sm tensor` pays
   1.5-3 % decode for it (the quantized KV write costs a few host-side node evaluations per step; GPU kernel
   time is identical).  Record: `WORKLOG.md` 261024.005, issue #216.
-- **Mixed K/V cache types are HARD-REJECTED** at context creation (`params.type_k != params.type_v`);
-  every mixed pair measured 1.7-3.6x slower and never smaller. Pass matching `-ctk`/`-ctv`.
+- **Mixed K/V cache types: ONE pair is native, every other pair is still refused (r287, block 17, PR #312).**
+  `llama_init_from_model` accepts K `q8_0` with V `q4_0` / `q5_0` / `q5_1` **only** on a model whose
+  attention layers are all 256-wide and that does not use the sparse QSA attention (qwen4exp is refused
+  because `GGML_OP_FLASH_ATTN_QSA` asserts `K->type == V->type`); every other head size, pair and arch keeps
+  the same-type rule and the old error text names the one form.  The tile kernel now has a second type
+  parameter for V (`type_V`), and its V type, the allocator's F16-scratch decision and the RDNA4 band all
+  read one function (`ggml_cuda_fattn_tile_type_V`) -- before block 17 a mixed pair was staged through the
+  whole-cache F16 scratch (1.7-3.6x slower and never smaller in the 2026-09-11 measurement).  Same-type
+  caches do not reach the new code (mean KLD 0.000000 against the previous release, same-seed text
+  identical).  `GGML_CUDA_FA_KV_MIXED=0` restores the staged path for a mixed pair (the block-17 behaviour
+  was 11-12 % behind at 32768 cells and 25 % behind at 100000 on a 2-GPU tensor split).  Gate:
+  `scripts/gate-mixed-kv.sh`; record: `WORKLOG.md` r287.
 - **The MTP draft-vocabulary trim is opt-in and draft-only (block 13, r107).**  `--spec-draft-mtp-vocab N`
   copies the LM-head rows for ids `< N` (+ control/user ids) into the draft context, scores the draft over them
   and scatters into a full-vocab row of `-inf`; the target still verifies the full vocabulary, so the trim can
@@ -4858,3 +4873,19 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   default, a help line, a parse branch, an instance field, a `cparams` assignment, and the CSV/markdown field
   lists), so a knob added to `common/arg.cpp` alone is invisible there -- which is what a reporter hit when
   trying to *measure* the window.
+* **A mixed K/V pair is a NEW kernel family, and the tile instantiation, the F16-scratch allocator and the
+  RDNA4 band must read ONE V-type function (r287, block 17, PR #312).**  The tile kernel's V type used to be
+  its one `type_KV`; block 17 gives it a second template parameter and instantiates head 256 only (K `q8_0`
+  with V `q4_0` / `q5_0` / `q5_1`).  `ggml_cuda_fattn_tile_type_V()` is that one function: the launcher's
+  `need_f16_V`, `ggml_cuda_flash_attn_ext_get_alloc_size`'s scratch decision and the tile dispatch all ask it,
+  so a mixed pair cannot be read natively while its F16 scratch is still reserved (or vice versa).  This is
+  the contract the three earlier drifts broke (the missing q4_0 arm, the mixed-K/V NaNs, the missing RDNA2
+  bf16 scratch), and it is why the new mixed instances are always compiled: the context gate cannot see a
+  build's `GGML_CUDA_FA_QUANTS` list, so a conditional build would accept a pair it did not compile.  The
+  pair is reached only through two DIFFERENT `--cache-type-k`/`--cache-type-v` values; a same-type cache does
+  not enter the new code (mean KLD 0.000000 against the previous release).  `GGML_CUDA_FA_KV_MIXED=0` is the
+  staged path (12 % behind the native read at 32768 cells, 25 % at 100000 on a 2-GPU tensor split); the
+  context gate still accepts the pair, so the switch is an A/B arm, not a refusal.  Verified on gfx1201,
+  gfx1100 and gfx1151: `FLASH_ATTN_EXT` 7021/7021 default / `MIXED=0` / `NATIVE=0`; W=1..8 width purity
+  maxdiff 0 for q8_0/q8_0 and all three pairs on 1 GPU, `-sm layer` and `-sm tensor`; plain == draft-mtp at
+  n_max 1/3/7.  Gate: `scripts/gate-mixed-kv.sh`.

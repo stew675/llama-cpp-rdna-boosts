@@ -10,7 +10,7 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
-It ships as **17 patches** (block 00 + blocks 01-16) for a clean llama.cpp checkout at the fork point
+It ships as **18 patches** (block 00 + blocks 01-17) for a clean llama.cpp checkout at the fork point
 **`4f9dfa0e3`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
@@ -24,17 +24,17 @@ not the changelog.
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (17 commits)
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (18 commits)
 
 # OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every artifact, no prompt
 
 # OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 blocks + beta/*/*.patch
+bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 18 blocks + beta/*/*.patch
 ```
 
-- One-line summary of each block: [The 17 blocks](#the-17-blocks-v21)
+- One-line summary of each block: [The 18 blocks](#the-18-blocks-v21)
 - What each block contains, its knobs and its purity notes: [`patches/README.md`](patches/README.md)
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
 - Every environment variable, with its default and class: [`ENVIRONMENT.md`](ENVIRONMENT.md)
@@ -133,8 +133,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── ENVIRONMENT.md         # every env var the set adds or repoints, with its default and class
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
-├── rdna-boosts-all.patch  # convenience: the entire 17-block net as ONE patch
-├── patches/               # the delivery set: 0000-0015 (one `git am` block each)
+├── rdna-boosts-all.patch  # convenience: the entire 18-block net as ONE patch
+├── patches/               # the delivery set: 0000-0017 (one `git am` block each)
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
@@ -158,7 +158,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 17 blocks (V2.1)
+## The 18 blocks (V2.1)
 
 `release.json` (V2.1; the current release).  Each row is one `git am` commit.
 
@@ -178,6 +178,17 @@ is **inert on a discrete GPU, measured** (zero census lines with its envs forced
 `ENVIRONMENT.md` §20 is the knob list, `patches/README.md` → Block 16 the detail, and
 `archive/work/apu-expert-gtt/` the campaign record.
 
+**r287 adds block 17 — mixed K/V cache types (PR #312).**  The delivery refused every `type_k != type_v`
+pair since 2026-09-11 because a mixed pair could not take the native decode band and was staged through the
+whole-cache F16 scratch (1.7-3.6x slower and never smaller at the time).  Block 17 gives the tile
+flash-attention kernel a second type parameter for V and the three head-256 instances, so **K `q8_0` with V
+`q4_0` / `q5_0` / `q5_1`** is read natively on a model whose attention layers are all 256-wide.  Every other
+head size and pair stays refused (and qwen4exp, whose QSA op asserts K->type == V->type).  Same-type caches
+are untouched; `GGML_CUDA_FA_KV_MIXED=0` is the staged-path kill switch.  Measured at `-c 131072` on a 27B:
+KV 4352 MiB (`q8_0/q8_0`) → 3712 / 3584 / 3328 (q5_1 / q5_0 / q4_0), with 0.3-3.2 % less decode at 32768
+cells.  Gate: [`scripts/gate-mixed-kv.sh`](scripts/gate-mixed-kv.sh); details: `patches/README.md` → Block
+17; the original artifact and review: `archive/work/mixed-kv/`.
+
 | patch | subject | concern |
 |-------|---------|---------|
 | `0000` | **foundation** — band-uniformity, Meta-wrapper, allocator fixes | old-00 + old-05 + old-07 + old-09a + the multi-ubatch logits readback + the `ggml-alloc` view release; + the meta hot-path dispatcher restoration (r86) |
@@ -196,6 +207,7 @@ is **inert on a discrete GPU, measured** (zero census lines with its envs forced
 | `0013` | **MTP draft vocabulary subset** (`--spec-draft-mtp-vocab N`, **opt-in**, default off) | the MTP draft scores only the LM-head rows for token ids < N (+ control/user ids) and scatters them into a full-vocab row of `-inf` — the target's verification is untouched, so the draft can only lose proposals; the `ggml-backend-meta` row-range read that makes it work under `-sm tensor` (r107) |
 | `0015` | **streamed KV** (**all three placements opt-in, default OFF since r247**: `--kv-window` / `--kv-attendance-pool` window and pool, and `--spec-draft-kv-window`, the MTP draft ring — see `ENVIRONMENT.md` §17 for why the draft ring's old default was a decode regression) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `archive/work/kv-residency`)  **The same block also carries the attendance pool** (r190, Goal B: `--kv-attendance-pool on\|off`, whose size is derived from the model since r247 — the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages the sparse decode resolves through, 204 MiB instead of 1.6-2.4 GiB of resident KV at 103k-180k, `--fit`-visible) and the streaming arm policy (a streamed cache takes the sparse decode arm, +34 %/+47 % on a spilled KV).  Both placements are **opt-in and default off**  + r204: the same **window across a `-sm tensor` split** (`TODO` #124): one VMM region per child device of the Meta wrapper, the grow fanned out to every child, `--fit` sizing it against the split's per-device budget (a MIRRORED dsv4/HRM cache still declines it); + r222: the provider binds the device at every driver-reaching entry point and a buffer type answers capability without touching the driver, so a **plain** 2-GPU `-sm tensor` run does no VMM driver call at all (issue #275: the construction-time probe ran cross-context, which crashed the first kernel launch on Windows); + r248: the MTP draft ring is a **true** ring, so a batch the position window cannot place (an M-RoPE image chunk) evicts the drafter's oldest cells instead of failing the request, and a drafter failure can no longer return a 500 (issue #297) |
 | `0016` | **the UMA GTT expert store** (an APU's MoE expert set in one registered region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm, and prefill streaming.  Inert on a discrete GPU (measured) |
+| `0017` | **mixed K/V cache types** (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, head 256 only) | new in r287 (PR #312): the tile kernel's second V type and the three head-256 instances, the RDNA4 band accepting the pairs, and the context gate's one exception; `GGML_CUDA_FA_KV_MIXED=0` restores the staged path.  Same-type caches unchanged; every other pair refused |
 | `0014` | **`-sm relaxed-tensor`** (**TEMPORARY**, `flint`/`mellum`/`mistral4` only) | tensor split that also admits a replicated tensor whose values differ per GPU (the MoE amax row max, which no device can complete). Exact on RDNA/HIP, zero VRAM, and **not a supported feature**: it relaxes upstream #31081 and is expected to be dropped when upstream fixes the amax under a tensor split. Delete this patch to get back to the r136 tree |
 
 Phase-2 additionally moved each concern into a self-contained file: the `ggml_cuda_try_fuse` arms, the
@@ -248,9 +260,9 @@ FORK=https://github.com/ggml-org/llama.cpp
 git clone $FORK && cd llama.cpp
 git checkout "$BASE"
 
-# 2. apply the set (automated; strict 17/17 git am on the recorded base)
+# 2. apply the set (automated; strict 18/18 git am on the recorded base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0000…0016  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0000…0017  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -306,7 +318,7 @@ avoids the tier that the driver runtime cannot grow.  See `ENVIRONMENT.md` for b
 ### Manual equivalent
 
 ```bash
-git am patches/00*.patch   # block 00 + blocks 01-16
+git am patches/00*.patch   # block 00 + blocks 01-17
 ```
 
 ### The `mmb` campaign is in the delivery
@@ -327,7 +339,7 @@ any more**:
   `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults and the lazy reader
   (the old block 14 + the old block 15 remainder).
 
-Applying the 17 patches to the fork point in [`release.json`](release.json) therefore reproduces the
+Applying the 18 patches to the fork point in [`release.json`](release.json) therefore reproduces the
 **full campaign tree** in one pass:
 
 ```bash
@@ -621,6 +633,7 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/bakon11
 - https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18; PR #213: the split-state cache hit returns instead of copying the state, folded into block 09 in r132)
 - https://github.com/eoprede
+- https://github.com/mjohanning99  (PR #312: the mixed K/V cache types — a q8_0 K with a q4_0 / q5_0 / q5_1 V read natively through a second tile type parameter, head 256 only, with the QSA refusal and the one-V-type-function contract; promoted into block 17 in r287 after the gate ladder, `scripts/gate-mixed-kv.sh`)
 - https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission.  PR #223: the fully-masked KV-group skip extended to the band itself, so a resident idle conversation no longer taxes the active one's decode — folded into block 05 in r133.  Issue #224: the r126 row change left widths 5..8 on a different per-column KV split, so greedy decode with a draft diverged from plain decode; the band's own 64-column instantiation is back in r134, with a build-time guard and a width probe that reaches it)
 - https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work, now folded into the delivery — formerly `archive/work/mmb-general/`)
 - https://github.com/slavap  (the gfx1030 / Radeon Pro V620 bring-up: the block 00-04 add-on set (PR #165) and the FA follow-ups (PR #181, #198); PR #218: MMB's per-arch dispatch keyed to the running device (a mixed-arch box ran RDNA3 kernels on the RDNA2 card and zeroed its output projection) and the Q8_1 cache's view-offset identity + source-range guard — folded into blocks 06/08/10 in r132)

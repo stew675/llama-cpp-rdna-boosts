@@ -1,8 +1,19 @@
 # The delivery patches — what each block is and what it does
 
-**17 blocks** (block 00 + blocks 01-16) against `release.json.base` (**`4f9dfa0e3`**; the base is the
+**18 blocks** (block 00 + blocks 01-17) against `release.json.base` (**`4f9dfa0e3`**; the base is the
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
+
+> **r287: block 17 — mixed K/V cache types (PR #312, @mjohanning99).**  K `q8_0` with V `q4_0` / `q5_0` /
+> `q5_1` on a model whose attention layers are all 256-wide is read natively instead of staged through the
+> whole-cache F16 scratch: the tile kernel takes a second type parameter for V, the three pairs have head-256
+> instances, and the RDNA4 band accepts them.  `GGML_CUDA_FA_KV_MIXED=0` restores the staged path; every other
+> mixed pair (and qwen4exp, whose QSA op asserts K->type == V->type) is still refused.  The default path is
+> unchanged (prefill-logit 0.000697 / 98.784 % f16 and 0.000580 / 98.882 % q8_0, same as r286).  Block 17 is
+> a new block, not an amendment: the context-gate hunk lives in block 10's file and the width-probe hunk in
+> block 06's, so folding it into block 05 would have had to split it across three blocks.  Gate:
+> `scripts/gate-mixed-kv.sh`; record: `WORKLOG.md` r287.  The original artifact, measurements and review are
+> preserved in `archive/work/mixed-kv/`.
 
 > **r283: the n-gram family gets the greedy-purity notice the draft family already had.**  A draftless
 > (n-gram) speculator's width is a verify-batch width like `--spec-draft-n-max` is, but it had no
@@ -5164,3 +5175,33 @@ arm is refused.  All three transports read the same bytes (greedy text `de81b28c
 five decimal places across arms).  Gate: `scripts/gate-host-read-transport.sh`; record:
 `archive/work/host-read-transport/` + `benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`.
 
+## Block 17 — mixed K/V cache types: a q8_0 K cache with a q4_0 / q5_0 / q5_1 V cache, read natively
+
+**What it is.**  The delivery refused every `type_k != type_v` pair since 2026-09-11 because a mixed pair missed
+the native decode band and was staged through the whole-cache F16 scratch (1.7-3.6x slower, never smaller at the
+time).  Block 17 gives the tile kernel a second template parameter for V (`type_V`, defaulting to `type_KV`) and
+instantiates it for **head 256 only**: K `q8_0` with V `q4_0`, `q5_0` or `q5_1`.  The tile dispatch's V type comes
+from `ggml_cuda_fattn_tile_type_V()`, the same function the F16-scratch allocator asks, so the instantiation, the
+launcher and the allocator cannot disagree — the contract the three earlier drifts broke (the missing q4_0 arm,
+the mixed-K/V NaNs, the missing RDNA2 bf16 scratch).  `ggml_cuda_fattn_kv_mixed_native()` names the pairs, the
+RDNA4 band predicate accepts them, and `llama_init_from_model` accepts them on a model whose attention layers are
+all 256-wide and that does not use QSA (qwen4exp is refused; `GGML_OP_FLASH_ATTN_QSA` asserts `K->type ==
+V->type`).  Every other head size and pair keeps the same-type rule, and the error text names the one form.
+
+**Knobs.**  `GGML_CUDA_FA_KV_MIXED=0` (kill-switch, default on): the mixed pair takes the staged F16 path (the
+pre-block-17 behaviour); the context gate still accepts the pair.  A same-type cache does not reach the new code
+at all.  The three mixed instances are always compiled, so a build cannot accept a pair it did not compile (the
+context gate cannot see the backend's build flags; making them conditional would need a backend query).
+
+**Measured (r287, gfx1201 + gfx1100 + gfx1151).**  `test-backend-ops -o FLASH_ATTN_EXT` **7021/7021** on each
+arch, default / `GGML_CUDA_FA_KV_MIXED=0` / `GGML_CUDA_FA_KV_NATIVE=0`; W=1..8 width purity **maxdiff 0** for
+q8_0/q8_0 and all three pairs on 1 GPU, `-sm layer` and `-sm tensor`; plain == draft-mtp at n_max 1/3/7 on all
+three arches.  At `-c 131072`, 27B Q4_K_M, 3-GPU `-sm tensor`: KV **4352 MiB** (q8_0/q8_0) → **3712 / 3584 /
+3328** (q5_1 / q5_0 / q4_0), the same compute buffers and `graph splits = 2`; decode at 32768 cells is 0.3-3.2 %
+below q8_0/q8_0 and mixed sits between the same-type neighbours (47.0 vs 51.6 / 46.0 t/s at 3 GPUs, q8_0/q5_1).
+The staged kill-switch arm is 12 % behind the native read at 32768 cells and 25 % at 100000.  Quality (27B, 3-GPU
+tensor, WikiText-2, 8 x 4096): mean KLD against an f16 base 0.0071 (q8_0/q8_0), 0.0079 (q8_0/q5_1), 0.0082
+(q8_0/q5_0), 0.0074 (q8_0/q4_0) — the mixed pair is within ~11 % of the same-type q8_0/q8_0 cost.
+
+**Not covered.**  Head sizes other than 256 (still refused), other mixed pairs (still refused), and quality at
+depth (the KLD run is 4096-token chunks).  `scripts/gate-mixed-kv.sh`.

@@ -18,10 +18,10 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **17-block V2.1 set** (block 00 + blocks 01-16) at fork point **`4f9dfa0e3`**
+**Current state:** the **18-block V2.1 set** (block 00 + blocks 01-17) at fork point **`4f9dfa0e3`**
 (the 2026-11-13 r278 re-base); read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
-draft window -- all three opt-in, default off).  `release.json` is the source of truth for the
+draft window -- all three opt-in, default off).  Block 17 is the **mixed K/V cache types** (r287, PR #312; the one native pair, head 256 only).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
