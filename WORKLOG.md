@@ -54,6 +54,16 @@ into the last block.
   pair, kv-residency, ckpt/state/spec gates, the op oracles, node-budget) — their subjects are untouched by these
   two hunks, and r278's numbers for them stand on the same base with the same blocks.  The APU-only set stays owed
   (`TODO` #325).  `gate-kv-residency.sh`'s multi-device section stays red (`D20`/`TODO` #321).
+* **`D20` re-measured on r279 and the loader is RULED OUT as its cause** (`TODO` #321).  The gate's own `pmref` arm
+  (Flash-Next GSQ-IQ3_XXS + the shared MTP sidecar, 2 devices `-sm layer`, `-ncmoe 48`, q8_0 KV, `-c 32768`, the
+  25 763-token prefix, `--spec-type draft-mtp --spec-draft-n-max 4`, `-n 64`, seed 42, temp 0), 4 runs per load mode:
+  `--load-mode none` gave **2 distinct texts in 4 runs** (`f260d1824ab3` x2, `c5f360a75ec7` x2) and
+  `--load-mode mmap` gave **3 distinct texts in 4** (`b08d3dbcb1e9`, `c5f360a75ec7`, `53bfc420ab6b`, `f260d1824ab3`).
+  So the nondeterminism is **not** the loader (mmap does not take the staged chunked path at all) and — since r279's
+  drain is the only load-path change — it is still the **draft path across devices**, exactly as R16 attributed it.
+  A separate 3-run sample of the *field* config (35B-A3B, 2 devices, `-sm tensor`, `draft-mtp n3`) was stable 3/3,
+  which suggests `-sm layer` is the affected geometry, but three runs cannot settle that either (`TODO` #321 carries
+  the bisect plan and now says so).
 * **Also recorded while investigating (and NOT caused by these runs):** the kernel journal carries gfxhub page
   faults at **16:52** from an earlier session's `-sm tensor` work; `check-gpu-faults.sh` with no `--since` scans the
   whole boot journal, so the new gate passes `--since` from its own start timestamp (a fresh gate that reads the

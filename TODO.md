@@ -200,6 +200,13 @@ seed — and it makes `gate-kv-residency.sh`'s multi-device section unsatisfiabl
 2-device reference arm (`pmref`) is the unstable one.  **Do not "fix" this by relaxing the gate**: the gate's
 within-device-count comparison is right.
 
+**r279 re-measurement (2026-11-13): the loader is RULED OUT.**  The same 2-device `-sm layer` arm, 4 runs per load
+mode: `--load-mode none` -> 2 distinct texts in 4, `--load-mode mmap` -> 3 distinct texts in 4.  mmap never takes
+the staged chunked upload, so this is not a load-path defect (r279 fixed the one load-path ordering hazard there
+was, issue #308, and it did not change this).  A 3-run sample of the *tensor* split (35B-A3B, `draft-mtp n3`) was
+stable 3/3, which points at `-sm layer` as the affected geometry — 3 runs is a weak sample, so record it as a lead,
+not a conclusion.
+
 **Re-entry:** bisect the draft path on a 2-device `-sm layer` arm (kill switches: `GGML_CUDA_DISABLE_GRAPHS=1`,
 `MOE_EXPERT_CACHE_MIB=0`, `--lazy-mode off`, the draft KV window `--spec-draft-kv-window`), then a
 `INVARIANTS.md` entry once it is fixed.  Owner: the MTP driver, not block 15.
