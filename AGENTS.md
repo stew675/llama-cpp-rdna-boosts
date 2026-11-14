@@ -57,6 +57,11 @@ touch.
 11. **Record the work**: a dated `WORKLOG.md` entry (newest first) for anything delivery-affecting, plus the
     per-block note in `patches/README.md` when a block's contents change.
 12. **Report findings before you commit, not after** (see the next section).
+13. **ALWAYS ask before creating a new delivery patch block.**  A new block, a block renumbering, or a
+    change that moves a feature across block boundaries is the maintainer's decision — never a gate
+    outcome.  A green gate ladder, a validated win, a passing PR or an optional artifact ready to
+    promote are **not** approval.  Stop and ask before cutting, adding or renumbering a block, and before
+    any release commit/tag/push that depends on that structure.  See the promotion rules below.
 
 ## Report findings before shipping (MANDATORY)
 
@@ -66,6 +71,12 @@ in a commit message, a post-push summary or a GitHub reply. If something turns u
 ask instead of finishing the release and mentioning it afterwards. The maintainer decides whether a
 finding is fixed now, deferred or dropped, and the decision is recorded (a `TODO.md` item, a block
 amendment, or a note in the relevant record).
+
+**A new delivery patch block is never created without the maintainer's explicit approval.**  ALWAYS ask
+before adding a block to `patches/`, renumbering blocks, folding a feature into a different block in a
+way that changes the block structure, or promoting an optional/beta artifact into the delivery.  The
+maintainer owns the block structure; "the gates are green" is not permission.  If the block decision is
+still open, stop before the release cut, the commit and the tag.
 ## Pushing policy (MANDATORY — read before any `git push`)
 
 **Never push to upstream llama.cpp.** The only permitted push targets are this repo (the delivery,
@@ -164,7 +175,8 @@ or any llama.cpp checkout, and never fold its content into `patches/`, **unless 
 asks for that specific item**. WIP stays env-gated OFF and excluded from `patches/`; the sanctioned way
 out is promotion: collect *validated* wins, give each an env kill-switch, re-validate the
 **combination** (individual validations do not carry over), then cut a new block with the maintainer's
-go-ahead. Anything also applicable to unadulterated upstream gets a copy under `upstream/`.
+go-ahead — **a new block is ALWAYS asked first and is never a gate outcome** (see "Report findings before
+shipping"). Anything also applicable to unadulterated upstream gets a copy under `upstream/`.
 
 **`beta/` is the external-validation holding area, not a third kind of source.**  `scripts/apply-all.sh
 --include-beta` is the sanctioned way to *test* one (it applies `beta/*/*.patch` after the release blocks and
