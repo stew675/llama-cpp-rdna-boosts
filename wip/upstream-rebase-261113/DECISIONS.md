@@ -253,6 +253,21 @@ are `a691b2345..4f9dfa0e3` (164 commits); a delivery block is named by its numbe
   field layout; the delivery keeps its host path and its controller.  Upstream gap worth an `upstream/`
   candidate: give the Meta device backend events so `#31927` is reachable under `-sm tensor`.  Re-verify at
   R14 (the vocab-subset block changes what a draft sees) and measure on `-sm layer` in R18's MTP four-axis.
+* **Re-verified at R14 (2026-11-13), and the `-sm tensor` half has moved — by the delivery's own hand.**
+  Field arm, 35B-A3B Q8_0 bf16 KV, `--spec-type draft-mtp-adaptive --spec-draft-n-max 3
+  --spec-draft-n-min-adaptive 1`, `-lv 4`: `-sm layer` gives `target h rows on the device: yes` and
+  `draft acceptance = 1.00000 (11/11), mean len 2.00`; **`-sm tensor` now also reports
+  `target h rows on the device: yes`** with the identical 11/11 / 2.00.  The cause is block 09 (R10):
+  `ggml_backend_meta_device_event_new()` forwards to a simple device's event, so the Meta device's
+  `iface.event_new` is no longer null (`git log -S` -> `a6809f75b`; upstream's pristine
+  `ggml-backend-meta.cpp` still has `/* .event_new = */ nullptr`).  So the R03 decline no longer happens and the
+  device transport is live on **both** splits.  Both arms run clean (no GPU fault in the rung's window) and
+  accept identically; the two texts differ because the split changes the reduction order, and there is **no
+  kill switch** for the device path, so this is recorded as a behaviour change with its mechanism named, not as
+  a byte-identity A/B.  The rival question in this item is answered the other way round from what was expected:
+  the delivery is not the one that needed the port — **it is the one that carries the fix**, and the `upstream/`
+  candidate (events for upstream's Meta device) is now purely an upstream gap.  Nothing is dropped; the
+  adaptive controller and the vocab subset work on both layouts.  R18 still owes the four-axis measurement.
 
 ## D8 — The prune: `llama` and `ggml` removed dead surface
 

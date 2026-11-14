@@ -1,3 +1,35 @@
+## 261113.011 (r277 + campaign rung R14, NO delivery change) -- R14 (block 13) is the first rung with no conflict and no first-error pass: the draft-vocabulary subset lands, its own regression test passes, and `D7`'s `-sm tensor` asymmetry turns out to have been closed by block 09
+
+**No patch changes, no `release.json` change.**  Rung R14 (`aca78625a`, block 13 "MTP draft vocabulary subset,
+`--spec-draft-mtp-vocab N`").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R14.
+
+* **Result `aca78625a`** (tree `061a71a98`), 19 files, **0 conflicts** and **0 first-error passes** — the
+  cleanest rung of the whole climb.  Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no stray markers,
+  GPU-fault scan clean (the `gfxhub page fault` lines still in the journal are stamped **16:52:11**, before this
+  session started, and the rung's own window has zero).
+* **The block's own oracle passes on the merged tree.**  `test-mtp-draft-vocab` (27B `IQ4_NL`, `-ngl 99`): with
+  `N = 32768` the draft head marks exactly the ids outside `{< N} + control + user-defined` as `-inf`
+  (`draftable 32801/248320`, non-finite inside 0, finite outside 0) and its finite logits match a
+  full-vocabulary context **0 mismatches / max |diff| 0** at every step; `N = 0` keeps all 248 320 rows; and two
+  **live** contexts over the same model each keep their own subset in either creation order (`create` and
+  `concurrent` sections, `65536` vs `32768` vs `0`).  Runtime arm with `--spec-draft-mtp-vocab 32768` on the
+  field config: `mtp_draft_vocab = 32768: MTP draft head uses 32801 of 248320 rows (68.07 MiB of q8_0, ROCm1)`,
+  `draft acceptance = 0.91667 (11 accepted / 12 generated)` — a 68 MiB draft head instead of the full-vocab one.
+* **`D7` re-verified, and it has moved — by the delivery's own hand.**  R03 recorded the device-buffer hidden
+  state as `-sm layer`-only, declining on `-sm tensor` because "the device has no events" (the Meta device's
+  `iface.event_new` is null upstream — the pristine `ggml-backend-meta.cpp` still carries
+  `/* .event_new = */ nullptr`).  On this tree **both splits report `target h rows on the device: yes`** and
+  both accept `11/11, mean len 2.00`: block 09 (R10) added `ggml_backend_meta_device_event_new()`, which
+  forwards to a simple device's event.  So the R03 decline is gone, the device transport is live on both
+  layouts, and the `upstream/` candidate ("give upstream's Meta device events") is now purely an upstream gap —
+  the delivery is the side that carries the fix.  Recorded as a behaviour change with its mechanism named: the
+  two arms' texts differ legitimately (the split changes the reduction order) and there is no kill switch for
+  the device path, so no byte-identity A/B exists; **R18 still owes the MTP four-axis measurement**.
+* **Climb state:** R00..R14 done on `rebase-r278` at `aca78625a`; build dir holds the R14 tree.
+  **Next: R15 = block 14** (`-sm relaxed-tensor`, `6b4d9865e`, TEMPORARY, 0 expected conflicts) — the rung to
+  check whether upstream has started allowing those arches, which is how it should eventually be dropped (by
+  decision, not by merge).
+
 ## 261113.010 (r277 + campaign rung R13, NO delivery change) -- R13 (block 12) lands both armed block-12 gates: the pool's `tsplit`/`tsplitnosink` go green and the node budget passes 4/4 with a 440-entry margin, while the FA generator's head-40/72 skips are rejected to keep the R09r invariant
 
 **No patch changes, no `release.json` change.**  Rung R13 (`75d83f231`, block 12 "campaign remainder: CPU wins,

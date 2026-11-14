@@ -28,8 +28,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R11 | 10 infrastructure (slab, fusion dispatcher, async input ring) | **DONE 2026-11-13** | `13176810a` | 9 files / 20 hunks; `D6` graph state into graph.cuh, `D8` prune include, `D10` ring; **`gate-norm-rows-alias.sh` PASS**; **`gate-node-budget.sh` deferred to R13** (its sizing + refusal are block 12's) |
 | R12 | 11 qwen4exp (model, hyper-connections, lazy reader, QSA/indexer) | **DONE 2026-11-13** | `1d83b50e0` | 5 files / 6 hunks — the cleanest rung yet; `D11` resolved (op count 105, RPC 7); `gate-hc-fusions.sh` **PASS**; quant-coherence A-D **PASS**, **section E (sparse QSA) is R16's** (block 15 carries the `#30206` fix) |
 | R13 | 12 campaign remainder | **DONE 2026-11-13** | `75d83f231` | 5 files / 8 hunks, **zero** first-error passes; `D11` re-derived (op count **106**, RPC **8**, 24 messages all paired); `D8` prune (`set_warmup` kept out, 3 of 4 `llama-ext.h` decls already upstream's); FA generator keeps the **typed set with no head-40/72 skips** (idempotent, 390 files); `gate-node-budget.sh` **PASS 4/4 with the margin (440 entries every arm)**; `gate-host-pool.sh` **42/54 — `tsplit`+`tsplitnosink` CLEARED**; 12 remaining checks are **R16's** (block 15's `host_expert_buft` `want_mapping` -> `ROCm_HostMap`) and **R17's** (block 16's `MOE_EXPERT_FILL_QD`/placement queue) |
-| R14 | 13 MTP vocab subset | **TODO** | — | `D7` verify |
-| R15 | 14 relaxed-tensor (**temporary**) | **TODO** | — | — |
+| R14 | 13 MTP vocab subset | **DONE 2026-11-13** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits match the full vocab with 0 mismatches, two live contexts keep their own `N`); runtime `--spec-draft-mtp-vocab 32768` drafts on 32 801 of 248 320 rows; **`D7` re-verified and it has moved**: `-sm tensor` now takes the device row gather too, because block 09's `ggml_backend_meta_device_event_new()` closed the R03 gap |
+| R15 | 14 relaxed-tensor (**temporary**) | **NEXT** | — | — |
 | R16 | 15 streamed KV | **TODO** | — | `D3`, `D19` |
 | R17 | 16 UMA GTT store | **TODO** | — | `D17` verify |
 | R18 | release ladder | **TODO** | — | all `AWAITING` items resolved |
@@ -705,15 +705,39 @@ was text identity, and that still holds.
 * `D10`: the `tsplit*` arms were its last open item and they are green; upstream's `#31419`/`#32100`/`#32089`
   and the delivery's ring/fills coexist (the pool census proves the fills run on a split).
 
-## R14 — block 13: MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`) · **TODO**
+## R14 — block 13: MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`) · **DONE 2026-11-13**
 
-* block sha `f0c7f3359` · 19 files · **expected conflicts: 0** (CLEAN)
+* block sha `f0c7f3359` · 19 files · **result `aca78625a`** · tree `061a71a98` · **0 conflicts** (the probe was
+  right, and the cherry-pick applied cleanly with no manual hunk work at all).
 
-**Expect:** clean, but upstream's MTP device-buffer path (`D7`) changes what a draft sees — verify the
-vocab-subset filter still applies to the drafted tokens.  `D7` was measured at R03 (`-sm layer` activates the
-device-buffer row gather, `-sm tensor` declines and falls back to the host path) and R12 kept the helper that
-carries it; re-verify on this rung's tree, with the field MTP arm (`35B-A3B`, `--spec-type draft-mtp-adaptive`,
-`-lv 4`, grep `adaptive draft depth enabled` / `target h rows on the device` / `draft acceptance`).
+Build green with **zero** first-error passes; coherence unchanged on `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`,
+seed 42 -> **100 chars `sha=1c5d32ac537d`**; no stray end-markers; GPU-fault scan of every R14 log and of the
+kernel journal for the rung's window **clean** (the four `gfxhub page fault` lines `journalctl` still holds are
+stamped 16:52:11, i.e. before this session started).
+
+**What the block is.**  A per-MTP-context draft vocabulary subset: the draft head computes logits over token ids
+`< N` plus the control/user-defined ids only (`mtp_draft_vocab = N … MTP draft head uses 32801 of 248320 rows`),
+verification is untouched, and two live contexts over the same model may hold different `N` independently.  It
+also carries `ggml_backend_meta.cpp` (+53), which is the Meta wrapper this delivery already owns.
+
+**Verified**
+
+| check | result |
+|---|---|
+| the block's own oracle `test-mtp-draft-vocab` (27B `IQ4_NL`, `-ngl 99`) | **PASS** — `N=32768` gives `draftable 32801/248320, non-finite inside 0, finite outside 0`, and the finite logits match a full-vocabulary context with **0 mismatches, max abs diff 0** at every step; `N=0` keeps all 248 320 rows; the two-live-context sections (`create` and `concurrent`, `65536` vs `32768` vs `0`) each draft over their **own** subset in either creation order |
+| runtime arm, `--spec-draft-mtp-vocab 32768` (`35B-A3B Q8_0`, `-sm layer`, bf16 KV, `draft-mtp-adaptive`, `-lv 4`) | the subset reaches the drafted tokens: `mtp_draft_vocab = 32768: MTP draft head uses 32801 of 248320 rows (68.07 MiB of q8_0, ROCm1)`, then `draft acceptance = 0.91667 (11 accepted / 12 generated)` — a 68 MiB draft head instead of the full-vocab one, at the same draft lengths |
+| `D7` re-verify (`35B-A3B Q8_0`, `0,2`, bf16 KV, `--spec-type draft-mtp-adaptive --spec-draft-n-max 3 --spec-draft-n-min-adaptive 1`, `-lv 4`) | `-sm layer`: `adaptive draft depth enabled`, **`target h rows on the device: yes`**, `draft acceptance = 1.00000 (11/11), mean len = 2.00`.  **`-sm tensor` now also reports `target h rows on the device: yes`** with the same `11/11, mean len 2.00` — see below |
+
+**`D7` changed since R03, and the change is the delivery's own.**  R03 measured the device-buffer row gather as
+`-sm layer`-only, because the Meta device had no `event_new` and the tensor split fell back to the delivery's
+host path.  Block 09 (R10) added `ggml_backend_meta_device_event_new()` (it forwards to a simple device's event;
+upstream's `ggml-backend-meta.cpp` still carries `/* .event_new = */ nullptr` at the pristine base), so on this
+tree `llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(...)` succeeds on a **Meta**
+device too and the device path is taken on both splits.  Nothing was weakened by that: both arms run clean, both
+accept at 11/11, and the two texts legitimately differ (the split changes the reduction order) — there is no
+kill-switch for the device path, so this rung records the behaviour, not a byte-identity A/B.  **D7's
+`upstream/` note stands for upstream itself** (give upstream's Meta device an `event_new`); it is no longer a gap
+in this delivery.
 
 ## R15 — block 14: `-sm relaxed-tensor` (**TEMPORARY**) · **TODO**
 

@@ -1,6 +1,6 @@
 # HANDOVER — cold-start brief for the `4f9dfa0e3` re-base (`upstream-rebase-261113`)
 
-**Refreshed 2026-11-13 at the end of session 6 (R13).**  Read this first, then `RUNGS.md`.  It is a
+**Refreshed 2026-11-13 at the end of session 6 (R13 + R14).**  Read this first, then `RUNGS.md`.  It is a
 *state* document: the method is in [`README.md`](README.md), the per-rung ledger and resolution logs are in
 [`RUNGS.md`](RUNGS.md), the stop-and-ask register in [`DECISIONS.md`](DECISIONS.md), the measured conflict map
 in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next session in
@@ -14,13 +14,13 @@ in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next s
 |---|---|
 | campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `75d83f231`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R13 done = blocks 00-08 + one rung-repair + blocks 09-12**; next is **R14 = block 13 (MTP vocab subset)** |
-| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) `1d83b50e0` (11) **`75d83f231` (12)** |
-| canonical build | `~/llama.cpp/build-rocm` — **R13 tree** (`75d83f231`, tree `d862165c5`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `aca78625a`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
+| progress | **R00-R14 done = blocks 00-08 + one rung-repair + blocks 09-13**; next is **R15 = block 14 (`-sm relaxed-tensor`, TEMPORARY)** |
+| rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) `1d83b50e0` (11) `75d83f231` (12) **`aca78625a` (13)** |
+| canonical build | `~/llama.cpp/build-rocm` — **R14 tree** (`aca78625a`, tree `061a71a98`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) — **the whole 17-block delivery**, so it is the answer to "would block N alone do this?" |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
-| coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 (re-verified on the R13 tree) |
+| coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 (re-verified on the R14 tree) |
 | parked history | tags `r10-blocked-d4106d6f6` / `r10-reapplied` in `~/llama.cpp` (the R10 park, since re-applied as `a6809f75b`); no patch file is live — do not look for one |
 | delivery untouched | `patches/`, `release.json` and the fork are **not** changed until R18.  Nothing is pushed anywhere. |
 
@@ -131,8 +131,8 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R11 | 10 infrastructure (slab, fusion dispatcher, async ring) | DONE | `13176810a` | 9 files / 20 hunks; the **whole fusion dispatcher moved into `ggml-cuda-try-fuse.cu`**; `D6`/`D10` closed; `gate-norm-rows-alias.sh` **PASS**; `node-budget` is **R13's** |
 | R12 | 11 qwen4exp | DONE | `1d83b50e0` | 5 files / 6 hunks — the cleanest rung; `D11` decided (`GGML_OP_COUNT` **105**, RPC 7); `gate-hc-fusions.sh` **PASS** (`d62340fbf566`), quant-coherence A-D **PASS**; its section E (sparse QSA) is **R16's** |
 | R13 | 12 campaign remainder (CPU wins, backend iface fills, DFlash, FA build grouping, server prompt cache) | **DONE** | `75d83f231` | 5 files / 8 hunks, **zero** first-error passes; `D11` op count **106** / RPC **8** / 24 messages paired; **FA generator = the typed set with NO head-40/72 skips** and idempotent; `gate-node-budget.sh` **PASS 4/4, margin 440 entries every arm**; `gate-host-pool.sh` **42/54 with `tsplit`+`tsplitnosink` CLEARED** — the 12 remaining checks are **R16's** (block 15 `host_expert_buft` -> `ROCm_HostMap`) and **R17's** (block 16 placement queue) |
-| **R14** | 13 MTP vocab subset | **NEXT** | — | **0 conflicts**; re-verify `D7` |
-| R15 | 14 relaxed-tensor (**TEMPORARY**) | TODO | — | **0 conflicts**; check upstream has not started allowing those arches; expect to drop it eventually |
+| R14 | 13 MTP vocab subset | **DONE** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits == full vocab, 0 mismatches, two live contexts independent); `--spec-draft-mtp-vocab 32768` drafts on 32 801/248 320 rows; **`D7` re-verified and it moved** — `-sm tensor` now takes the device row gather too (block 09's Meta `event_new`) |
+| **R15** | 14 relaxed-tensor (**TEMPORARY**) | **NEXT** | — | **0 conflicts**; check upstream has not started allowing those arches; expect to drop it eventually |
 | R16 | 15 streamed KV | TODO | — | 5 conflicts; `D3`, `D19`, `D15`'s loader question; owes the KV residency gates, `gate-qwen4exp-quant-coherence.sh` **section E** (the sparse QSA arm — block 15 replaces `ggml_rope_get_truncate(dst)` on the fused `INDEXER_SCORE` node, which upstream `#30206`'s assert rejects) **and `gate-host-pool.sh`'s `fail`/`late`/`pinlate` arms** (block 15 is what makes the host master pageable — see §5.7) |
 | R17 | 16 UMA GTT store | TODO | — | **0 conflicts**; verify `D17` (VMM region size) with `gate-uma-experts.sh --quick`; owes **`gate-host-pool.sh`'s placement-transport checks** (`ref` `PLACEMENT reads: O_DIRECT` + placement queue, `qd1`, `bulkbuf` — block 16 ships `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the read queue; §5.7) |
 | R18 | — | TODO | — | release ladder, `README.md` §4 + §10 below |
@@ -141,7 +141,7 @@ table).  Every gate that hashes text passes no `-lv` at all.
 rebased earlier ones, so the order is not negotiable):
 
 ```
-R14 f0c7f3359   R15 6b4d9865e   R16 99d33117a   R17 9d7c0502c
+R15 6b4d9865e   R16 99d33117a   R17 9d7c0502c
 ```
 
 Per-rung expected conflict paths and "what to expect" notes: `CONFLICT-MAP.md` (measured, generated from the
@@ -271,7 +271,7 @@ R13 cleared the two arms it owed (`gate-host-pool.sh` `tsplit` + `tsplitnosink`:
 | `D4` MMVF BF16 few-row | **DEFERRED to R18** (no rung conflict; a `llama-bench` arm) |
 | `D5` FA + few-row MMQ | **DECIDED** FA half (R06); **`D5-a` DECIDED and APPLIED** (`9c94ce139`); few-row **ordering** is an R18 `llama-bench` arm |
 | `D6` graph/stream state moved to `graph.cuh` | **CLOSED at R11** — packed replay guard + cluster check kept, accessor out-of-line (see §5.4) |
-| `D7` MTP device-buffer hidden state | **MEASURED/DECIDED** (R03): activates on `-sm layer`, declines on `-sm tensor` (the Meta device has no `event_new`) and falls back to the delivery's host path.  R12 kept the helper that carries that row-gather path (`build_inp_embd_state`).  **Re-verify at R14.**  Upstream-gap note: give the Meta device events (an `upstream/` candidate). |
+| `D7` MTP device-buffer hidden state | **RE-VERIFIED at R14, and the R03 asymmetry is GONE**: block 09's `ggml_backend_meta_device_event_new()` (R10) gives the Meta device events, so `-sm tensor` takes the device row gather too (`target h rows on the device: yes` on both splits, 11/11 acceptance each).  R12's `build_inp_embd_state` still carries the host fallback.  The `upstream/` candidate (events for upstream's Meta device) is now purely upstream's gap.  R18 owes the four-axis measurement. |
 | `D8` the prune | **MECHANICAL, and it has bitten three times** — it removes *includes* as well as declarations (`common/speculative.cpp` at R03, `diagmask.cuh` itself at R11).  See §8 trap 4 |
 | `D9` mmap / Win-load / lazy-mode | **PARTIAL** — R01 resolved the only conflict, R10 took upstream's Windows rewrite wholesale (the delivery's `fname`/`path()` and `llama_mmap::impl` work survive); the substantive questions are R16/R17's |
 | `D10` scheduler upload/prefetch/graph-result | **CLOSED at R13** — union validated by the 1991 host-expert fills (R11); the async ring sits below the scheduler; the `tsplit*` arms are **green** (R13: pool built on the split, exchange inert, `8c39335bbceb`) |
