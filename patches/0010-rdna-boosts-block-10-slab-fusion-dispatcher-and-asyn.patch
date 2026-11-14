@@ -1,4 +1,4 @@
-From 7304634c8df1a64fc7369409896417a852bdea10 Mon Sep 17 00:00:00 2001
+From f89b760ce12879a2a23689f5b823b5fd6a8c306a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -59,12 +59,30 @@ fused-vs-unfused, so every fusion arm is bit-identical to the unfused chain on t
 gate-norm-rows-alias.sh green (180 fused, 0 declined, fused == chain f476efaac086);
 test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (87.4 vs
 69.0 t/s) and +38% on the 35B-A3B tensor arm (80.5 vs 58.4).
+
+r279 amendment (GitHub issue #308, reported by briansp2020): drain a queued async segmented upload before the
+synchronous splice.
+The segmented (fused) tensor arm queues its copies on each device's stream and, when the requested range ends
+mid-row, queues a zero guard of up to 512 bytes PAST the end of that range (the scheduler's `copy_experts` MMQ
+pad).  A row-aligned chunk of the LOADER's chunked `--load-mode none` upload takes that same arm, and the chunk
+after it usually starts mid-row, so it falls through to the synchronous splice -- and a synchronous write is not
+ordered against copies already queued on a device stream.  A late guard therefore zeroes the first bytes of the
+next chunk, i.e. real weight data: two loads of the same file produce different weights (each load internally
+deterministic, the fingerprint changing between loads -- 2 of 6 loads on stock r273, 1 of 24 on r277 per the
+report, and a needle answer flips).  The backend context now records that an async segmented upload may still be
+in flight on a model/weights buffer and the synchronous arm drains it first, which also restores the intended
+order (guard first, then the real bytes overwrite it).  `GGML_META_SEG_DRAIN=0` is the A/B/bisect arm and
+`GGML_META_SEG_DRAIN_LOG=1` prints one census line per drain (a fix whose firing is invisible cannot be gated).
+Measured on gfx1201: 90 async->sync transitions in ONE 35B-A3B `-sm tensor --load-mode none` load (the
+protection is not vacuous), and 12 loads -- 6 with the drain, 6 with the kill switch -- gave ONE greedy text, so
+the change is text-neutral where the race does not bite.  Gate: `scripts/gate-meta-seg-drain.sh`.  The observed
+defect rate is ~1/24 loads, so a green series is evidence the ordering gap is closed, not proof it was hit here.
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
  ggml/src/ggml-alloc.c                         |   28 +-
  ggml/src/ggml-backend-impl.h                  |    6 +-
- ggml/src/ggml-backend-meta.cpp                |  334 +-
+ ggml/src/ggml-backend-meta.cpp                |  390 +-
  ggml/src/ggml-backend.cpp                     |   92 +-
  ggml/src/ggml-cuda/allreduce-hip.cu           |    3 +
  ggml/src/ggml-cuda/allreduce.cu               |    3 +
@@ -147,7 +165,7 @@ test-backend-ops -o MUL_MAT_ID 931/931.  Fusion is worth +26% decode on the 4B (
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 16464 insertions(+), 5562 deletions(-)
+ 87 files changed, 16520 insertions(+), 5562 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -287,7 +305,7 @@ index 6a6e30d01..86f7f2829 100644
          // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
          // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index c34726abe..9a3b844d7 100644
+index c34726abe..e95a36bc4 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -470,7 +488,57 @@ index c34726abe..9a3b844d7 100644
          GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
-@@ -2657,8 +2791,116 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2524,6 +2658,17 @@ struct ggml_backend_meta_context {
+     // elision down exactly as the single-backend path does
+     bool                        opt_has_eval_callback = false;
+ 
++    // Issue #308: a segmented (fused) tensor upload that took the ASYNC arm may have queued a zero guard
++    // PAST the requested range (the `copy_experts` MMQ pad, see the comment on the arm below).  The loader's
++    // chunked upload can then hand the NEXT chunk -- whose first bytes are real weight data -- to the
++    // SYNCHRONOUS splice, and a synchronous write is not ordered against copies already queued on a device
++    // stream: a late guard zeroes those bytes, so two loads of the same file produce different weights (each
++    // load internally deterministic, the fingerprint differing between loads).  This flag means "an async
++    // segmented upload may still be in flight on a model/weights buffer"; the synchronous arm drains it
++    // first, which also restores the intended ordering (guard first, real bytes after).
++    bool                        seg_upload_async_pending = false;
++    size_t                      seg_upload_drain_count = 0;
++
+     // op-offload H2D staging for the tensor split (issue #50 WIP).  The scheduler's own staging path
+     // assumes one destination and an event on the split backend's device; under -sm tensor one logical
+     // upload is spliced across N devices and the split's consumers read the per-device "simple"
+@@ -2640,8 +2785,31 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+     delete backend;
+ }
+ 
++static void ggml_backend_meta_synchronize(ggml_backend_t backend);
++
++// Issue #308, kill switch: `GGML_META_SEG_DRAIN=0` restores the pre-fix ordering (the synchronous splice does
++// not wait for a queued async segmented upload) so the fix has an A/B and bisect arm.  The census
++// (`GGML_META_SEG_DRAIN_LOG=1`) prints one line per drain, because a fix whose firing is invisible cannot be
++// gated -- the load-path defect it repairs is a data race that a passing run does not disprove.
++static bool ggml_backend_meta_seg_drain_enabled() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_META_SEG_DRAIN");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++static bool ggml_backend_meta_seg_drain_log() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_META_SEG_DRAIN_LOG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
+ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
++    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+     GGML_ASSERT(ggml_is_contiguous(tensor));
+     if (size == 0) {
+         // A zero-element tensor has no meaningful meta split state (UNKNOWN); nothing to upload.
+@@ -2657,8 +2825,138 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          // splitter would treat the remainder as a <=512-byte MMQ tail, so any other mid-row caller would
          // corrupt the tensor.  The reverted `size % row_stride <= 512` attempt tried to divert such a
          // range into a whole-tensor accumulator; a partial per-op upload never reached `total`, stranding
@@ -583,13 +651,35 @@ index c34726abe..9a3b844d7 100644
 +                    }
 +                }
 +            }
++
++            // Issue #308: the queued tail guard above reaches up to 512 bytes past `offset + size`, i.e. into
++            // the next expert's/row's real bytes.  A COMPUTE buffer is consumed by the graph that follows on
++            // the same stream, so stream order is enough there; a model/weights buffer is also written by the
++            // LOADER's synchronous chunks, which are not stream-ordered -- that is the case the drain covers.
++            if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++                backend_ctx->seg_upload_async_pending = true;
++            }
 +            return;
 +        }
 +
++        // A synchronous splice is not ordered against copies queued on the device streams (issue #308):
++        // drain them first, so a queued tail guard cannot land after this chunk's real bytes.  On the
++        // loader's chunked path this is one drain per async->sync transition, not one per chunk.
++        if (backend_ctx->seg_upload_async_pending) {
++            if (ggml_backend_meta_seg_drain_enabled()) {
++                ggml_backend_meta_synchronize(backend);
++                backend_ctx->seg_upload_drain_count++;
++                if (ggml_backend_meta_seg_drain_log()) {
++                    GGML_LOG_INFO("%s: drained %zu pending segmented async upload(s) before a synchronous "
++                                  "splice (issue #308)\n", __func__, backend_ctx->seg_upload_drain_count);
++                }
++            }
++            backend_ctx->seg_upload_async_pending = false;
++        }
          ggml_backend_tensor_set(tensor, data, offset, size);
          return;
      }
-@@ -2873,7 +3115,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2873,7 +3171,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          if (chunk_size_j == 0) {
              continue;
          }
@@ -601,7 +691,7 @@ index c34726abe..9a3b844d7 100644
          void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
          if (slot_ptr == nullptr) {
              return false;
-@@ -3627,11 +3872,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3627,11 +3928,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  // filled).
  static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
  
@@ -660,7 +750,7 @@ index c34726abe..9a3b844d7 100644
      // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
      // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
      if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
-@@ -3641,13 +3932,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3641,13 +3988,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
          return false;
      }
      const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
@@ -698,7 +788,7 @@ index c34726abe..9a3b844d7 100644
      size_t off = 0;
      bool all = true;
      for (size_t j = 0; j < n_backends; j++) {
-@@ -3657,7 +3968,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3657,7 +4024,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
              return false;
          }
          const bool took = simple_backend->iface.moe_cache_update(

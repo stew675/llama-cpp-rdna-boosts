@@ -6012,7 +6012,7 @@ index 545880b06..89d09a2a8 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 595a5824a..8634cf3fa 100644
+index 595a5824a..acda336b1 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -7894,7 +7894,7 @@ index 595a5824a..8634cf3fa 100644
          meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
      }
      return meta_buf;
-@@ -1889,12 +2997,48 @@ struct ggml_backend_meta_context {
+@@ -1889,12 +2997,59 @@ struct ggml_backend_meta_context {
      ggml_context_ptr            ctx;
      std::vector<ggml_cgraph *>  cgraphs_aux;
      std::vector<ggml_tensor *>  nodes_aux;
@@ -7912,6 +7912,17 @@ index 595a5824a..8634cf3fa 100644
 +    // backends' per-device marking pass (graph_compute) so a callback-split graph stands the F32
 +    // elision down exactly as the single-backend path does
 +    bool                        opt_has_eval_callback = false;
++
++    // Issue #308: a segmented (fused) tensor upload that took the ASYNC arm may have queued a zero guard
++    // PAST the requested range (the `copy_experts` MMQ pad, see the comment on the arm below).  The loader's
++    // chunked upload can then hand the NEXT chunk -- whose first bytes are real weight data -- to the
++    // SYNCHRONOUS splice, and a synchronous write is not ordered against copies already queued on a device
++    // stream: a late guard zeroes those bytes, so two loads of the same file produce different weights (each
++    // load internally deterministic, the fingerprint differing between loads).  This flag means "an async
++    // segmented upload may still be in flight on a model/weights buffer"; the synchronous arm drains it
++    // first, which also restores the intended ordering (guard first, real bytes after).
++    bool                        seg_upload_async_pending = false;
++    size_t                      seg_upload_drain_count = 0;
 +
 +    // op-offload H2D staging for the tensor split (issue #50 WIP).  The scheduler's own staging path
 +    // assumes one destination and an event on the split backend's device; under -sm tensor one logical
@@ -7943,7 +7954,7 @@ index 595a5824a..8634cf3fa 100644
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -1917,6 +3061,26 @@ struct ggml_backend_meta_context {
+@@ -1917,6 +3072,26 @@ struct ggml_backend_meta_context {
          }
          name += ")";
  
@@ -7970,7 +7981,7 @@ index 595a5824a..8634cf3fa 100644
          if (n_devs > 1) {
              ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                  ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-@@ -1939,6 +3103,12 @@ struct ggml_backend_meta_context {
+@@ -1939,6 +3114,12 @@ struct ggml_backend_meta_context {
              GGML_ASSERT(comm_free != nullptr);
              comm_free(comm_ctx);
          }
@@ -7983,11 +7994,36 @@ index 595a5824a..8634cf3fa 100644
          for (auto & bc : backend_configs) {
              ggml_backend_free(bc.backend);
          }
-@@ -1960,12 +3130,134 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -1958,14 +3139,181 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+     delete backend;
+ }
  
++static void ggml_backend_meta_synchronize(ggml_backend_t backend);
++
++// Issue #308, kill switch: `GGML_META_SEG_DRAIN=0` restores the pre-fix ordering (the synchronous splice does
++// not wait for a queued async segmented upload) so the fix has an A/B and bisect arm.  The census
++// (`GGML_META_SEG_DRAIN_LOG=1`) prints one line per drain, because a fix whose firing is invisible cannot be
++// gated -- the load-path defect it repairs is a data race that a passing run does not disprove.
++static bool ggml_backend_meta_seg_drain_enabled() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_META_SEG_DRAIN");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++static bool ggml_backend_meta_seg_drain_log() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_META_SEG_DRAIN_LOG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
  static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
 -    GGML_ASSERT(offset == 0);
++    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
      GGML_ASSERT(ggml_is_contiguous(tensor));
 +    if (size == 0) {
 +        // A zero-element tensor has no meaningful meta split state (UNKNOWN); nothing to upload.
@@ -8112,16 +8148,38 @@ index 595a5824a..8634cf3fa 100644
 +                    }
 +                }
 +            }
++
++            // Issue #308: the queued tail guard above reaches up to 512 bytes past `offset + size`, i.e. into
++            // the next expert's/row's real bytes.  A COMPUTE buffer is consumed by the graph that follows on
++            // the same stream, so stream order is enough there; a model/weights buffer is also written by the
++            // LOADER's synchronous chunks, which are not stream-ordered -- that is the case the drain covers.
++            if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++                backend_ctx->seg_upload_async_pending = true;
++            }
 +            return;
 +        }
 +
++        // A synchronous splice is not ordered against copies queued on the device streams (issue #308):
++        // drain them first, so a queued tail guard cannot land after this chunk's real bytes.  On the
++        // loader's chunked path this is one drain per async->sync transition, not one per chunk.
++        if (backend_ctx->seg_upload_async_pending) {
++            if (ggml_backend_meta_seg_drain_enabled()) {
++                ggml_backend_meta_synchronize(backend);
++                backend_ctx->seg_upload_drain_count++;
++                if (ggml_backend_meta_seg_drain_log()) {
++                    GGML_LOG_INFO("%s: drained %zu pending segmented async upload(s) before a synchronous "
++                                  "splice (issue #308)\n", __func__, backend_ctx->seg_upload_drain_count);
++                }
++            }
++            backend_ctx->seg_upload_async_pending = false;
++        }
 +        ggml_backend_tensor_set(tensor, data, offset, size);
 +        return;
 +    }
  
      switch (split_state.axis) {
          case GGML_BACKEND_SPLIT_AXIS_0:
-@@ -1973,25 +3265,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -1973,25 +3321,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          case GGML_BACKEND_SPLIT_AXIS_2: {
              // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
              const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
@@ -8242,7 +8300,7 @@ index 595a5824a..8634cf3fa 100644
              for (size_t j = 0; j < n_backends; j++) {
                  ggml_backend_tensor_set_async(
                      ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
-@@ -2004,57 +3376,265 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2004,57 +3432,265 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
  }
  
  static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -8547,7 +8605,7 @@ index 595a5824a..8634cf3fa 100644
  static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
      GGML_ASSERT(cgraph->grads == nullptr);
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
-@@ -2089,11 +3669,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2089,11 +3725,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
          }
          for (ggml_backend_buffer_t buf : used_buffers) {
              ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
@@ -8563,7 +8621,7 @@ index 595a5824a..8634cf3fa 100644
              stc.simple_tensors.clear();
          }
          size_t n_subgraphs  = 0;
-@@ -2104,6 +3683,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2104,6 +3739,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
@@ -8581,7 +8639,7 @@ index 595a5824a..8634cf3fa 100644
                  if (!ggml_backend_buffer_is_meta(node->buffer)) {
                      // [TAG_META_HOST_VIEWS]
                      GGML_ASSERT(ggml_backend_meta_is_host_view(node));
-@@ -2117,6 +3707,40 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2117,6 +3763,40 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -8622,7 +8680,7 @@ index 595a5824a..8634cf3fa 100644
          {
              // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
              auto get_i_delayed_branch = [&](const int i) -> int {
-@@ -2177,7 +3801,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2177,7 +3857,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      }
                      ggml_tensor * next = cgraph->nodes[id+1];
                      if (next->op == GGML_OP_MUL && next->src[0] == node &&
@@ -8637,7 +8695,7 @@ index 595a5824a..8634cf3fa 100644
                          node = next;
                          id++;
                          idr = id;
-@@ -2276,6 +3906,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2276,6 +3962,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              };
  
              int i_start = 0;
@@ -8645,7 +8703,7 @@ index 595a5824a..8634cf3fa 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
                  if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-@@ -2285,12 +3916,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2285,12 +3972,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                      max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                  }
@@ -8667,7 +8725,7 @@ index 595a5824a..8634cf3fa 100644
  
                  // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                  // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
-@@ -2313,10 +3951,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2313,10 +4007,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      auto & bcj = backend_ctx->backend_configs[j];
                      bcj.cgraphs[n_subgraphs].offset = i_start;
                  }
@@ -8680,7 +8738,7 @@ index 595a5824a..8634cf3fa 100644
          }
  
          backend_ctx->uid         = cgraph->uid;
-@@ -2338,7 +3978,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2338,7 +4034,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
              const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
              const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
@@ -8690,7 +8748,7 @@ index 595a5824a..8634cf3fa 100644
              const ggml_init_params params = {
                  /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                  /*.mem_buffer =*/ nullptr,
-@@ -2359,6 +4000,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2359,6 +4056,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                  backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
              }
@@ -8705,7 +8763,7 @@ index 595a5824a..8634cf3fa 100644
          }
  
          for (size_t j = 0; j < n_backends; j++) {
-@@ -2367,11 +4016,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2367,11 +4072,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                  const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                  const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
@@ -8724,7 +8782,7 @@ index 595a5824a..8634cf3fa 100644
                      const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                      const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                      cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
-@@ -2379,12 +4033,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2379,12 +4089,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->uid = ggml_graph_next_uid();
              }
          }
@@ -8768,7 +8826,7 @@ index 595a5824a..8634cf3fa 100644
          ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
          memset(ret, 0, sizeof(ggml_tensor));
          ret->op   = GGML_OP_NONE;
-@@ -2529,6 +4214,102 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2529,6 +4270,102 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      };
  
  
@@ -8871,7 +8929,7 @@ index 595a5824a..8634cf3fa 100644
      for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
          for (size_t j = 0; j < n_backends; j++) {
              auto & bcj = backend_ctx->backend_configs[j];
-@@ -2538,6 +4319,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2538,6 +4375,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -8886,7 +8944,7 @@ index 595a5824a..8634cf3fa 100644
          if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
              bool backend_allreduce_success = false;
              if (backend_ctx->comm_ctx) {
-@@ -2562,6 +4351,434 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2562,6 +4407,434 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -9321,7 +9379,7 @@ index 595a5824a..8634cf3fa 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2576,9 +4793,28 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2576,9 +4849,28 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_plan_update       = */ nullptr,
      /* .graph_plan_compute      = */ nullptr,
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
@@ -63555,10 +63613,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..92c1f2b2d
+index 000000000..8e6e4751e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,12970 @@
+@@ -0,0 +1,12987 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -65352,6 +65410,20 @@ index 000000000..92c1f2b2d
 +}
 +static pool_ssize_t pool_pread(pool_fd_t fd, void * dst, size_t len, size_t off) {
 +    const HANDLE h = (HANDLE) (intptr_t) fd;
++    // Issue #307 (DanoPTT): EVERY overlapping read needs its OWN event.  With `hEvent == NULL` the handle
++    // itself is the completion object, and a handle is signalled when ANY I/O on it completes -- while the
++    // placement read queue hands the SAME fd to `qd` readers at once.  A reader then wakes on another
++    // reader's completion and returns while its own ReadFile is still in flight: its slot is published from a
++    // buffer the DMA has not written yet (silently wrong expert bytes -> a run that degenerates into one
++    // token), and when the read does land the kernel writes the IO_STATUS_BLOCK into a stack frame that is
++    // already gone (the silent exit during the prewarm).  MS documents this against one handle with several
++    // outstanding operations.  One manual-reset event per reading thread, reset before each ReadFile, makes
++    // `GetOverlappedResult` wait for THIS operation.  (POSIX needs nothing: `pread` is synchronous and
++    // offset-explicit, which is why the defect is Windows-only.)
++    static thread_local HANDLE pool_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++    if (pool_ev == nullptr) {
++        return 0;   // a failed fill: the caller falls back to the mapping
++    }
 +    size_t done = 0;
 +    while (done < len) {
 +        // `ReadFile` takes a DWORD length; a coalesced prefill span is a few MiB, so this is the whole range.
@@ -65361,9 +65433,12 @@ index 000000000..92c1f2b2d
 +        const unsigned long long o = (unsigned long long) (off + done);
 +        ov.Offset     = (DWORD) (o & 0xffffffffull);
 +        ov.OffsetHigh = (DWORD) (o >> 32);
++        ResetEvent(pool_ev);
++        ov.hEvent = pool_ev;
 +        DWORD got = 0;
 +        if (!ReadFile(h, (char *) dst + done, n, &got, &ov)) {
-+            // The handle is FILE_FLAG_OVERLAPPED, so a queued read reports ERROR_IO_PENDING.
++            // The handle is FILE_FLAG_OVERLAPPED, so a queued read reports ERROR_IO_PENDING.  With `hEvent`
++            // set, `GetOverlappedResult(h, ...)` waits on THIS operation, not on the shared handle.
 +            if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(h, &ov, &got, TRUE)) {
 +                break;   // short/failed read: the caller falls back to the mapping
 +            }

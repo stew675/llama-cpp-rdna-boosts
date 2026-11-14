@@ -4,6 +4,30 @@
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
 
+> **r279: two contributor-reported correctness fixes, folded into the blocks that own the code.**  Cut, validated
+> and gated *before* r278 was ever tagged or pushed — r278's tree is `69161d3b0`, r279's is `d6372d47a`, base and
+> block structure unchanged.
+>
+> 1. **Block 10 — `-sm tensor --load-mode none` could load different weights on different loads (GitHub issue
+>    #308).**  The meta backend's segmented (fused) `set_tensor_async()` row-aligned ASYNC arm queues a zero guard of
+>    up to 512 bytes **past** the requested range (the scheduler's `copy_experts` MMQ pad).  The loader's chunked
+>    upload reaches that arm for row-aligned chunks, and the next chunk usually starts mid-row — the SYNCHRONOUS
+>    splice — which is not ordered against copies already queued on a device stream, so a late guard zeroed the next
+>    chunk's real weight bytes.  Symptom: each load internally deterministic, the fingerprint changing **between**
+>    loads (2/6 on stock r273, 1/24 on r277 per the report; a needle answer can flip).  The backend context now
+>    records a pending async segmented upload on a model/weights buffer and the synchronous arm drains it first
+>    (`GGML_META_SEG_DRAIN=0` = A/B, `GGML_META_SEG_DRAIN_LOG=1` = census).  Measured on this box: **90
+>    async->sync transitions in ONE 35B-A3B `-sm tensor --load-mode none` load**, and 12 loads produced one text.
+>    Gate: `scripts/gate-meta-seg-drain.sh`.  **Not Windows-specific** — nothing in the mechanism is.
+> 2. **Block 12 — Windows `pool_pread()` waited on the shared HANDLE, not on its own read (GitHub issue #307).**
+>    `hEvent == NULL` makes the handle the completion object, and a handle is signalled when *any* I/O on it
+>    completes, while the placement read queue hands the same fd to `qd` readers at once: a reader returns while its
+>    own read is in flight (wrong expert bytes — a run that degenerates to one token) and the late completion writes
+>    into a dead stack frame (the silent prewarm exit).  Each reading thread now owns a manual-reset event, reset
+>    before every `ReadFile`; a failed `CreateEventW` fails the fill.  **Windows-only by construction:** the POSIX
+>    arm is one synchronous `pread`, and the queue arms here are byte-identical at the default QD 8 — the fix rests
+>    on review + the reporter's Windows runs, and is re-linted by `validate-set.sh`, not measured on Linux.
+
 > **r278: the `4f9dfa0e3` re-base.**  No contributor patch.  The whole set was replayed from `a691b2345` onto
 > upstream `master` at `4f9dfa0e3` (164 commits, 751 files, +40 612 / −24 226) as a ladder climb — one rung per
 > block, each rung resolved, built and coherent — then re-cut here.  The campaign's ledger, conflict map and 20

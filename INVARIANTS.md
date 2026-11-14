@@ -4605,3 +4605,24 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   `git apply --3way` against the r278 tree (`moe-expert-cache.cu`, `ggml-backend-impl.h`, `ggml-backend.cpp`,
   `ggml-cuda.cu`).  They are stale until re-cut; `apply-all.sh --include-optional` is still the only sanctioned
   way to test one (`TODO` #324).
+
+## r279 — two load-path correctness fixes (issues #307, #308)
+
+* **A synchronous write is not ordered against copies queued on a device stream.**  That asymmetry is the whole of
+  #308: the meta backend's segmented async arm queues a zero guard up to 512 bytes past its range (the
+  `copy_experts` MMQ pad), and the loader's next chunk takes the *synchronous* splice, so a late guard lands on real
+  weight bytes.  The invariant: whenever a host-side synchronous write can follow a queued async copy of the same
+  tensor, drain before the write.  The defect is invisible to every text gate on a lucky run — its signature is a
+  **per-load** difference (internally deterministic, fingerprint changes between loads), which is why it survived
+  the whole gate set until a reporter looked at fingerprints across loads.
+* **A fix on a race needs a non-vacuity check, not just a green run.**  The drain is observable
+  (`GGML_META_SEG_DRAIN_LOG=1`), and the measurement that matters is that the transition actually happens:
+  **90 async -> synchronous transitions in one 35B-A3B `-sm tensor --load-mode none` load**.  A gate that only
+  compares text would pass with the drain wired to nothing.
+* **`GetOverlappedResult(h, ..., TRUE)` with `hEvent == NULL` waits on the HANDLE** — i.e. on *any* I/O completing
+  on it, which is undefined the moment two reads are outstanding on one handle.  Every overlapping read needs its
+  own event (issue #307).  The mirror-image rule on POSIX: `pread` is synchronous and offset-explicit, so the same
+  code needs nothing there — and "the same code" being platform-split is why the defect was Windows-only.
+* **`check-gpu-faults.sh` without `--since` scans the whole boot journal.**  A new gate that reads the journal must
+  pass a start timestamp, or a fault from an earlier session reads as its own (a 16:52 gfxhub fault was reported
+  against 23:0x runs before this was fixed).

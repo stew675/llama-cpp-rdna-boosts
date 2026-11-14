@@ -928,5 +928,10 @@ VMM pool's own allocation** (R10's slab/arena) and its store-region half is R18-
 **Not run, and not marked passed:** `gate-uma-experts.sh`, `gate-prefill-server-slots.sh`, `D17`'s
 store-region half (APU-only; `TODO` #325).
 
+**Superseded before publication:** r278 was cut, validated and gated but never tagged or pushed; two
+contributor-reported correctness fixes (issues #308 and #307) landed on top as **r279**
+(`v17-4f9dfa0e3-r279`, tip `f61ac4bd8`, tree `d6372d47a`) — folded into blocks 10 and 12, with
+`scripts/gate-meta-seg-drain.sh` added as the new gate.  Records: `WORKLOG.md` 261113.016.
+
 **Left to the maintainer (this session did none of them):** the commit/tag in this repo, the fork refresh
 (`scripts/fork-refresh.sh --build --gates --push`, personal fork only), and the off-host container images.

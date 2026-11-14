@@ -42,10 +42,11 @@ are recorded in `WORKLOG.md` 261113.015.  What it left open is #322/#323/#324/#3
 | **323** | `gate-prefill-logits.sh`'s base file name does not carry `device`/`sm`, so the tensor arm overwrites the layer base | tooling (pre-release gate) | **OPEN** (2026-11-13) — record sequentially, canonical arm last — §323 |
 | **324** | both `optional/` artifacts are stale: neither applies to the r278 tree | tooling / optional artifacts | **OPEN** (2026-11-13) — re-cut against `69161d3b0` before they are offered again — §324 |
 | **325** | the R18 APU-only gate set is not runnable on gfx1201 and is owed to `halo`/`soar` | waiting on hardware (gfx1151) | **OPEN** — `gate-uma-experts.sh`, `gate-prefill-server-slots.sh`, `D17`'s store region — §325 |
+| **326** | the loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies | correctness (block 10; a question to close) | **OPEN** (2026-11-13) — 12 loads were byte-correct, so no defect is known; either document the guarantee or give the arm a caller-visible flag — §326 |
 
 ## Handle numbering
 
-**New handles append after `#320`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#326`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -262,6 +263,25 @@ verify with `apply-all.sh --include-optional`; if an artifact has lost its premi
 **Re-entry:** one session on `halo`/`soar` (gfx1151) with the two gates and the store region check, recorded as a
 `WORKLOG.md` entry on this release's tree.  The discrete-side evidence that CAN be stated is already recorded:
 the host-expert arena is live and evicting (`h=0.8127`, `fills=9418 evictions=689`) and the UMA tier is inert.
+
+## 326. The loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies
+
+**Found while fixing issue #308.**  The segmented `set_tensor_async()` async arm's own comment states its
+requirement: "`offset` on a row boundary and a caller whose source outlives the queued copies -- which the scheduler
+guarantees: it uploads from the immutable pinned host master", with a mid-row range staying on the synchronous setter
+because "the loader's chunked upload ... pinned staging ring may be reused as soon as the call returns".
+
+The r279 measurement shows the loader **does** reach the async arm: **90 async -> synchronous transitions in one
+35B-A3B `-sm tensor --load-mode none` load**, every one of them a row-aligned loader chunk followed by a mid-row one.
+So either the loader does keep its ring slot alive long enough (12 consecutive loads were byte-correct, and the
+`-lm none` queue arms at QD 8 are byte-identical in `gate-host-pool.sh`), or a source-lifetime hazard is sitting
+behind the same arm the drain now protects for ordering.
+
+**Not a known defect** — no arm has produced a wrong byte from it.  **Re-entry:** either (a) show the ring slot's
+lifetime (an event wait per chunk) and correct the comment, or (b) make the arm caller-visible (a flag the scheduler
+passes, which the loader does not) so "source outlives the copies" becomes a precondition the compiler enforces
+instead of a comment.  A wrong answer from a `-lm none` load that reproduces within one build but varies between
+loads re-opens this first.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

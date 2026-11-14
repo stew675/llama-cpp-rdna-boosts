@@ -328,6 +328,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | decode kernels, fusions, the MoE host-expert path, a speculator | same-seed greedy text, then the MTP four-axis protocol (`benchmarks/mtp-adaptive-methodology.md`) and `llama-batched-bench -npl 1,4,8` |
 | a prefill kernel, an approximate default-on path, an all-reduce arm | `scripts/gate-prefill-logits.sh` |
 | the host-expert pool: a fill/staging path, `expert_host_src()`, the cache's admission, the `-lme`/`--host-experts pool` placement, the loader's source registration | `scripts/gate-host-pool.sh` |
+| a `-sm tensor` **segmented (fused) tensor upload**, the meta backend's synchronous splice, or the loader's `--load-mode none` chunked upload | `scripts/gate-meta-seg-drain.sh` |
 | the expert-cache prefill transport: the staging/gather decision, the pre-staging `moe_cache_in_place` query, `moe_cache_get_table`'s identity branch, or a fused kernel that reads a routed expert table directly | `scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` on an **identity** arena (`-device 0,1,2 --sm tensor --ub 2048 --extra "-ncmoe 48"`, 35B-A3B Q8_0) must read KLD 0.000000, plus same-seed greedy text both arms and `gate-host-pool.sh` |
 | the server's idle-slot parking / a memory type carrying a second cache | `scripts/gate-park-idle-slots.sh` |
 | the node budget (`graph_max_nodes()`), the scheduler's sizing, or a memory module that adds graph nodes/leafs (the KV rotation is the current case) | `scripts/gate-node-budget.sh` |

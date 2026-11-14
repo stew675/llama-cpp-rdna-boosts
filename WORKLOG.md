@@ -1,3 +1,64 @@
+## 261113.016 (r279) -- two contributor-reported CORRECTNESS fixes land before the re-base is published: the `-sm tensor` loader can zero real weight bytes (issue #308) and the Windows placement read queue waits on the wrong object (issue #307).  r278 was recorded but never tagged or pushed
+
+**`release.json` changed again: tip `0e264ad30` -> `f61ac4bd8`, tree `69161d3b0` -> `d6372d47a`, release
+`v17-4f9dfa0e3-r278` -> `v17-4f9dfa0e3-r279`.**  The base is unchanged (`4f9dfa0e3`) and so is the block structure
+(17 commits, block 00 keeps `0000`).  r278's entry above is kept as written: it was cut, validated and gated, and
+then two correctness reports arrived **before any tag or push**, so r279 is the release that ships.  Both fixes are
+folded into the blocks that own the code (`edit` + amend in the ladder — block 10 for #308, block 12 for #307), not
+into the last block.
+
+* **#308 (briansp2020) — `-sm tensor --load-mode none` can load DIFFERENT WEIGHTS on different loads.**  The meta
+  backend's segmented (fused) `set_tensor_async()` has a row-aligned ASYNC arm that queues its copies on each
+  device's stream, plus a zero guard of up to 512 bytes **past** the requested range (the scheduler's `copy_experts`
+  MMQ pad).  The loader's chunked upload reaches that arm for row-aligned chunks, and the next chunk usually starts
+  mid-row, so it takes the SYNCHRONOUS splice — which is not ordered against copies already queued on a stream.  A
+  late guard then zeroes the next chunk's real weight bytes.  The symptom is a **per-load** difference: each load is
+  internally deterministic (repeated requests bit-identical), the fingerprint changes between loads (2/6 loads on
+  stock r273, 1/24 on r277 per the report), and a needle answer can flip.  Fix (block 10): the backend context
+  records that an async segmented upload may be in flight on a model/weights buffer, and the synchronous arm drains
+  it first — which also restores the intended order.  `GGML_META_SEG_DRAIN=0` is the A/B arm,
+  `GGML_META_SEG_DRAIN_LOG=1` the census (`ENVIRONMENT.md`).
+  **Measured here (it is NOT a Windows-only defect — nothing in it is platform-specific):** **90 async -> synchronous
+  transitions in ONE 35B-A3B `-sm tensor --load-mode none` load**, i.e. the loader really does take that arm at this
+  scale, so the protection is not vacuous; 12 loads (6 with the drain, 6 with the kill switch) produced **one** greedy
+  text (`d9a77213c096` at `-n 200`, `e2dde701fc04` in the gate's arm), so the change is text-neutral where the race
+  does not bite.  The defect rate is ~1/24 loads, so this is *evidence* the ordering gap is closed, not proof it was
+  hit here.  New gate `scripts/gate-meta-seg-drain.sh` (asserts the census fires, the text is neutral on/off, and
+  repeated fresh loads agree; its header states what it cannot force).
+  **Residual, recorded as `TODO` #326:** the async arm's own comment says it requires a source that outlives the
+  queued copies ("the scheduler uploads from the immutable pinned host master"), yet the loader's row-aligned chunks
+  take it while their staging ring may be reused; 12 loads were byte-correct, so this is a question to close, not a
+  known defect.
+* **#307 (DanoPTT) — Windows only: `MOE_EXPERT_FILL_QD > 1` corrupts host-pool fills or kills the prewarm.**  The
+  Windows `pool_pread()` issued `ReadFile` with `hEvent == NULL` and then `GetOverlappedResult(h, &ov, &got, TRUE)`.
+  With no event the HANDLE is the completion object, and a handle is signalled when **any** I/O on it completes —
+  while the placement read queue hands the same fd to `qd` readers at once.  A reader wakes on another reader's
+  completion and returns while its own read is in flight: the slot is published from a buffer the DMA has not
+  written (a run that degenerates to `3333333…`) and, when the read lands, the kernel writes the IO_STATUS_BLOCK
+  into a dead stack frame (the silent exit during prewarm).  Fix (block 12, which owns `pool_pread`): one
+  manual-reset event **per reading thread**, reset before every `ReadFile`, and a failed `CreateEventW` fails the
+  fill instead of degrading it.  **Linux was verified clean by construction and by measurement:** the POSIX arm is a
+  single `pread` (synchronous, offset-explicit), and the queue arms are byte-identical at the default QD 8
+  (`gate-host-pool.sh` 54/54, `ref` 182 chars `a99ccbd97ecb`).  The fix is therefore validated by review + the
+  reporter's Windows runs (0 failures in 4 QD-8 runs and 2 more on a ROCm 10.1 SDK build), and by
+  `validate-set.sh`'s Windows portability lint — **not** by a Linux build, and it is stated that way.
+* **Everything that moved was re-verified on the new tree** (canonical re-cut tip `f61ac4bd8`, tree `d6372d47a`):
+  `validate-set.sh` **green** (strict apply on a fresh tarball at `4f9dfa0e3`, tree equality, sha256s, the 337-file
+  Windows lint); `gate-per-block-build.sh` **17/17 in 85 s**; coherence **`1c5d32ac537d`** (dense 4B) and the field
+  config **271 chars `8d733a56c740`** (35B-A3B, `-sm tensor`, bf16 KV) — both unchanged from r278;
+  `gate-prefill-logits.sh` default **0.000697 / 98.784 %** and `--sm tensor --device 0,1,2` **0.000558 / 98.833 %**
+  (identical to r278, i.e. the upload fix moves no numerics); `gate-host-pool.sh` **54/54**;
+  `gate-kv-window-split.sh` **PASS** (the tensor-split arms are the ones the meta change reaches);
+  `gate-meta-seg-drain.sh` **PASS** (new).  No GPU fault in any arm's own window.
+* **Not re-run, and why:** the block gates whose code did not move (MTP four-axis, batched-bench, the qwen4exp
+  pair, kv-residency, ckpt/state/spec gates, the op oracles, node-budget) — their subjects are untouched by these
+  two hunks, and r278's numbers for them stand on the same base with the same blocks.  The APU-only set stays owed
+  (`TODO` #325).  `gate-kv-residency.sh`'s multi-device section stays red (`D20`/`TODO` #321).
+* **Also recorded while investigating (and NOT caused by these runs):** the kernel journal carries gfxhub page
+  faults at **16:52** from an earlier session's `-sm tensor` work; `check-gpu-faults.sh` with no `--since` scans the
+  whole boot journal, so the new gate passes `--since` from its own start timestamp (a fresh gate that reads the
+  journal must do the same, or a six-hour-old fault reads as today's).
+
 ## 261113.015 (r278) -- the `4f9dfa0e3` re-base lands: the delivery is re-cut as 17 block commits with BOTH rung-repairs squashed, every runnable gate is green, and the three known-red / owed items are named (D20's multi-device pool section, the APU-only gate set, the stale `gate-server-arms` baseline)
 
 **`release.json` changed: base `a691b2345` -> `4f9dfa0e3`, tip `9d7c0502c` -> `0e264ad30`, tree `0104361a0` ->
