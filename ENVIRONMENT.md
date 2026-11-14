@@ -1298,6 +1298,12 @@ who applies an optional artifact is running these code paths and needs the same 
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
+`optional/mixed-kv` (a `q8_0` K cache with a `q5_1` / `q5_0` / `q4_0` V cache, read natively):
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_FA_KV_MIXED` | **on** | kill-switch | `0` switches the native read of a mixed K/V pair off: `ggml_cuda_fattn_kv_mixed_native()` returns false, the tile kernel takes its F16 instantiation and the launcher stages both operands, and the RDNA4 decode/verify band is left (the pre-artifact behaviour of a mixed pair; measured on a 2-GPU tensor split: decode 11-12 % behind the native read at 32768 cells and 25 % behind at 100000, and +1100 MiB at load at `-c 204800`).  The context gate still accepts the pair.  A same-type cache does not reach this variable's path at all.  `optional/mixed-kv` only. |
+
 ## Maintaining this file
 
 The tables were derived from the code, so re-derive rather than trust them after a block change:

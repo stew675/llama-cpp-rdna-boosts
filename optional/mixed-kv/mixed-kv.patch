@@ -1,0 +1,582 @@
+From 5d25f70db3756fe9ec660ea21bd8fc3456cf1454 Mon Sep 17 00:00:00 2001
+From: Marvin Johanning <email@marvinjohanning.de>
+Date: Fri, 13 Nov 2026 21:32:17 +0100
+Subject: [PATCH] ggml-cuda, llama: native mixed K/V cache types (q8_0 K with
+ q4_0 / q5_0 / q5_1 V)
+
+The tile flash-attention kernel takes a separate V type, with instances for head 256.
+The RDNA4 decode/verify band and the context gate accept the three pairs on models whose
+attention heads are all 256 wide. GGML_CUDA_FA_KV_MIXED=0 keeps the staged path.
+test-logits-width-probe takes KVV=<type> for the V cache.
+---
+ ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
+ ggml/src/ggml-cuda/fattn-tile.cu              | 21 +++++
+ ggml/src/ggml-cuda/fattn-tile.cuh             | 83 +++++++++++--------
+ ggml/src/ggml-cuda/fattn.cu                   |  2 +-
+ ...tn-tile-instance-dkq256-dv256-q8_0-q4_0.cu |  5 ++
+ ...tn-tile-instance-dkq256-dv256-q8_0-q5_0.cu |  5 ++
+ ...tn-tile-instance-dkq256-dv256-q8_0-q5_1.cu |  5 ++
+ .../template-instances/generate_cu_files.py   | 12 +++
+ src/llama-context.cpp                         | 17 +++-
+ tests/test-backend-ops.cpp                    |  9 ++
+ tests/test-logits-width-probe.cpp             | 11 +--
+ 11 files changed, 162 insertions(+), 42 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
+
+diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
+index 1c2626477..4c86ee4b4 100644
+--- a/ggml/src/ggml-cuda/fattn-rdna.cuh
++++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
+@@ -265,6 +265,29 @@ static inline int ggml_cuda_fattn_tile_kv_native_type(const ggml_tensor * K, con
+     return tk != FATTN_KV_NATIVE_NONE && tk == ggml_cuda_fattn_kv_native_type(V) ? tk : FATTN_KV_NATIVE_NONE;
+ }
+ 
++// Mixed K/V: a q8_0 K with a smaller quantized V (q4_0 / q5_0 / q5_1), each operand read through its own
++// dequant arm.  The MMA kernel takes a native type per operand; the tile kernel has one instance per pair,
++// for head 256 only (ggml_cuda_fattn_tile_kv_mixed_ok).  GGML_CUDA_FA_KV_MIXED=0: off, a mixed pair is then
++// staged through F16 as before.
++static inline bool ggml_cuda_fattn_kv_mixed_native(const ggml_tensor * K, const ggml_tensor * V) {
++    static const bool on = []() {
++        const char * env = getenv("GGML_CUDA_FA_KV_MIXED");
++        return env == nullptr || atoi(env) != 0;
++    }();
++    if (!on || K == nullptr || V == nullptr) {
++        return false;
++    }
++    if (ggml_cuda_fattn_kv_native_type(K) != FATTN_KV_NATIVE_Q8_0) {
++        return false;
++    }
++    const int tv = ggml_cuda_fattn_kv_native_type(V);
++    return tv == FATTN_KV_NATIVE_Q4_0 || tv == FATTN_KV_NATIVE_Q5_0 || tv == FATTN_KV_NATIVE_Q5_1;
++}
++
++static inline bool ggml_cuda_fattn_tile_kv_mixed_ok(const ggml_tensor * K, const ggml_tensor * V) {
++    return ggml_cuda_fattn_kv_mixed_native(K, V) && K->ne[0] == 256 && V->ne[0] == 256;
++}
++
+ // The native K/V type a kernel instantiated with `type_KV` reads through the *dequant loaders*
+ // (constexpr, because the tile and vec kernels fix their K/V type at compile time).  BF16 and F16 are
+ // read through the kernel's own T_KV, so they map to NONE here.
+@@ -306,11 +329,19 @@ static inline ggml_type ggml_cuda_fattn_tile_type(const ggml_tensor * K, const g
+     if (K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc)) {
+         return GGML_TYPE_BF16;
+     }
++    if (ggml_cuda_fattn_tile_kv_mixed_ok(K, V)) {
++        return K->type;
++    }
+     const int tile_native = ggml_cuda_fattn_tile_kv_native_type(K, V);
+     return (tile_native == FATTN_KV_NATIVE_BF16) ? GGML_TYPE_F16
+                                                  : ggml_cuda_fattn_native_ggml_type(tile_native);
+ }
+ 
++// The tile instantiation's V type: its K/V type, except for a mixed pair the tile kernel has an instance for.
++static inline ggml_type ggml_cuda_fattn_tile_type_V(const ggml_tensor * K, const ggml_tensor * V, const int cc) {
++    return ggml_cuda_fattn_tile_kv_mixed_ok(K, V) ? V->type : ggml_cuda_fattn_tile_type(K, V, cc);
++}
++
+ // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
+ // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
+ // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
+@@ -456,7 +487,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+     // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
+     // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
+     const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
+-    const bool kv_quant  = kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V);
++    const bool kv_quant  = (kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V)) ||
++        ggml_cuda_fattn_kv_mixed_native(K, V);
+     const bool kv_f16    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+     const bool kv_ok     = kv_quant || kv_f16;
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cu b/ggml/src/ggml-cuda/fattn-tile.cu
+index 54a08ded6..194782c58 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cu
++++ b/ggml/src/ggml-cuda/fattn-tile.cu
+@@ -11,6 +11,27 @@ static void ggml_cuda_flash_attn_ext_tile_case_type(ggml_backend_cuda_context &
+     // scratch the launcher may stage into cannot disagree.
+     const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+ 
++#ifdef FAST_FP16_AVAILABLE
++    // mixed K/V pairs: instantiated for head 256 only, the same predicate as the allocator's
++    if constexpr (DKQ == 256 && DV == 256) {
++        if (ggml_cuda_fattn_tile_kv_mixed_ok(K, V)) {
++            switch (V->type) {
++                case GGML_TYPE_Q4_0:
++                    ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
++                    return;
++                case GGML_TYPE_Q5_0:
++                    ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0>(ctx, dst);
++                    return;
++                case GGML_TYPE_Q5_1:
++                    ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1>(ctx, dst);
++                    return;
++                default:
++                    GGML_ABORT("fatal error");
++            }
++        }
++    }
++#endif // FAST_FP16_AVAILABLE
++
+     switch (tile_type) {
+         case GGML_TYPE_BF16:
+             // BF16 K/V is read natively and accumulated in FP32 (native-BF16 hardware only).
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 3072e9b61..69119f1e1 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -927,7 +927,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+ 
+ // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_Q, typename T_KV, typename T_KQ, typename T_acc, typename T_KV_tmp>
++    bool use_logit_softcap, bool oob_check, ggml_type type_KV, ggml_type type_V, typename T_Q, typename T_KV, typename T_KQ, typename T_acc, typename T_KV_tmp>
+ static __device__ __forceinline__ void flash_attn_tile_iter(
+         const half2 * __restrict__ Qg_base,
+         const int   * __restrict__ q_row,
+@@ -1137,8 +1137,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     static_assert(nbatch_V % np == 0, "bad nbatch_V");
+ #pragma unroll
+     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
+-        if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
+-            flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
++        if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_V>() != FATTN_KV_NATIVE_NONE) {
++            flash_attn_tile_load_tile_native<type_V, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                 (kv_q8.V + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
+         } else {
+             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+@@ -1296,7 +1296,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV> // D == head size
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, ggml_type type_V> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
+                        ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+@@ -1386,12 +1386,15 @@ static __global__ void flash_attn_tile(
+     // tile kernel reads bf16 natively through its own type_KV, so it never needs the bf16 arm here.
+     constexpr int kv_native_self = ggml_cuda_fattn_native_type_from_kernel<type_KV>();
+     constexpr bool kv_is_native  = kv_native_self != FATTN_KV_NATIVE_NONE;
++    // mixed K/V: type_V differs from type_KV only for two natively read quantized types (both staged as half2)
++    constexpr int kv_native_self_V = ggml_cuda_fattn_native_type_from_kernel<type_V>();
++    static_assert(type_V == type_KV || (kv_is_native && kv_native_self_V != FATTN_KV_NATIVE_NONE), "bad mixed K/V tile types");
+     const fattn_kv_native_t kv_q8 = {
+         kv_is_native ? K + nb13*sequence + nb12*(head0 / gqa_ratio) : nullptr,
+         kv_is_native ? V + nb23*sequence + nb22*(head0 / gqa_ratio) : nullptr,
+         nb11, nb21,
+         kv_native_self,
+-        kv_native_self,
++        kv_native_self_V,
+     };
+ 
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+@@ -1568,14 +1571,14 @@ static __global__ void flash_attn_tile(
+                 continue;
+             }
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, type_V>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8);
+         }
+         if (k_VKQ_0 < k_VKQ_max &&
+                 !(kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0/nbatch_fa, nbatch_fa))) {
+             constexpr bool oob_check = true;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, type_V>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+         }
+@@ -1595,14 +1598,14 @@ static __global__ void flash_attn_tile(
+ #if defined(RDNA2)
+             if (k_VKQ_0 + nbatch_fa > k_VKQ_max) {
+                 constexpr bool oob_check_tail = true;
+-                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check_tail, type_KV>
++                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check_tail, type_KV, type_V>
+                     (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                     stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+                 continue;
+             }
+ #endif // defined(RDNA2)
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, type_V>
+                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+         }
+@@ -1775,7 +1778,7 @@ static __global__ void flash_attn_tile(
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
+-template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV>
++template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV, ggml_type type_V>
+ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+     const ggml_tensor * K = dst->src[1];
+@@ -1783,9 +1786,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+ 
+     // K/V types other than the kernel KV type are converted to it by the launcher.
+     const bool need_f16_K = K->type != type_KV;
+-    const bool need_f16_V = V->type != type_KV;
++    const bool need_f16_V = V->type != type_V;
+ 
+-    // This kernel has ONE K/V type parameter, so its native read type is fixed by type_KV and applies
++    // Outside the mixed pairs (type_V != type_KV, both read natively, nothing for the launcher to stage) this
++    // kernel has ONE K/V type, so its native read type is fixed by type_KV and applies
+     // to both operands (FATTN_KV_NATIVE_NONE = the launcher stages).  Passing it to launch_fattn is
+     // what keeps the launcher from skipping the staging of a q8_0/q4_0 operand this F16 instantiation
+     // would then read as F16 (mixed K/V pairs, test-backend-ops FLASH_ATTN_EXT).
+@@ -1809,7 +1813,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         constexpr int cols_per_block = ncols2 > 2 ? ncols2 : 2;
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+         // The q_h2 argument must mirror the kernel-side q_global condition
+         // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64): the wide RDNA2 kernels
+         // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
+@@ -1842,7 +1846,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 64;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1860,7 +1864,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 32;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1874,7 +1878,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 16;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1888,7 +1892,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 8;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1902,7 +1906,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 4;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1915,7 +1919,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         constexpr int cols_per_block = 2;
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, type_V>;
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+                 need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
+@@ -1926,7 +1930,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+     GGML_ABORT("fatal error");
+ }
+ 
+-template <int DKQ, int DV, bool use_logit_softcap, ggml_type type_KV>
++template <int DKQ, int DV, bool use_logit_softcap, ggml_type type_KV, ggml_type type_V>
+ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * KQV  = dst;
+     const ggml_tensor * Q    = dst->src[0];
+@@ -1962,12 +1966,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+         // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
+ #ifdef GGML_USE_HIP
+         if (use_gqa_opt && gqa_ratio % 32 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 32, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 32, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+ #else
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+ #endif // GGML_USE_HIP
+@@ -1976,11 +1980,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+ 
+     if constexpr (DKQ == 576) {
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+         if (use_gqa_opt && gqa_ratio % 4 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+     }
+@@ -1988,11 +1992,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     if constexpr (DKQ == 192) {
+         // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+         GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
+@@ -2000,39 +2004,39 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+ 
+     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+         if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+ 
+         if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 4 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+ 
+         if (use_gqa_opt && gqa_ratio % 2 == 0) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+ 
+         if constexpr (DV <= 256) {
+-            launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, type_KV>(ctx, dst);
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, type_KV, type_V>(ctx, dst);
+             return;
+         }
+     }
+     GGML_ABORT("fatal error");
+ }
+ 
+-template <int DKQ, int DV, ggml_type type_KV>
++template <int DKQ, int DV, ggml_type type_KV, ggml_type type_V = type_KV>
+ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+ 
+     if (logit_softcap == 0.0f) {
+         constexpr bool use_logit_softcap = false;
+-        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV>(ctx, dst);
++        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, type_V>(ctx, dst);
+     } else {
+         constexpr bool use_logit_softcap = true;
+-        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV>(ctx, dst);
++        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, type_V>(ctx, dst);
+     }
+ }
+ 
+@@ -2075,6 +2079,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor
+     EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_Q5_1);            \
+     EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_IQ4_NL)
+ 
++// Mixed K/V pairs (q8_0 K with a smaller V), head 256 only: see ggml_cuda_fattn_tile_kv_mixed_ok.
++#define DECL_FATTN_TILE_CASE_MIXED(DKQ, DV, TK, TV)                       \
++    template void ggml_cuda_flash_attn_ext_tile_case                      \
++    <DKQ, DV, TK, TV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
++
++#define EXTERN_DECL_FATTN_TILE_CASE_MIXED(DKQ, DV, TK, TV)                \
++    extern template void ggml_cuda_flash_attn_ext_tile_case               \
++    <DKQ, DV, TK, TV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
++
++EXTERN_DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
++EXTERN_DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0);
++EXTERN_DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1);
++
+ EXTERN_DECL_FATTN_TILE_CASES( 40,  40);
+ EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
+ EXTERN_DECL_FATTN_TILE_CASES( 72,  72);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 35ae5603b..b44f93c55 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -925,7 +925,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+             // into the neighbouring buffer).
+             const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[device].cc);
+             need_f16_K = K->type != tile_type;
+-            need_f16_V = V->type != tile_type;
++            need_f16_V = V->type != ggml_cuda_fattn_tile_type_V(K, V, ggml_cuda_info().devices[device].cc);
+         } break;
+         case BEST_FATTN_KERNEL_MMA_F16: {
+             // V4 / block 15: a q8_0 (dequantized) or bf16 (converted) K/V cache is read natively by
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu
+new file mode 100644
+index 000000000..abe0dcf25
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu
+new file mode 100644
+index 000000000..53b0e3c3f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
+new file mode 100644
+index 000000000..56f32e18b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index 64dcacf05..7b4bf9077 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -17,6 +17,13 @@ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.
+ DECL_FATTN_TILE_CASE_TYPE({head_size_kq}, {head_size_v}, {type_kv});
+ """
+ 
++SOURCE_FATTN_TILE_MIXED = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, {type_v});
++"""
++
+ SOURCE_FATTN_VEC = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+ 
+ #include "../fattn-vec.cuh"
+@@ -104,6 +111,11 @@ for head_size_kq in HEAD_SIZES_KQ:
+         with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}-{get_short_name(type_kv)}.cu", "w") as f:
+             f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v, type_kv=type_kv))
+ 
++# mixed K/V pairs of the tile kernel (q8_0 K, smaller V), head 256 only
++for type_v in ["GGML_TYPE_Q4_0", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1"]:
++    with open(f"fattn-tile-instance-dkq256-dv256-q8_0-{get_short_name(type_v)}.cu", "w") as f:
++        f.write(SOURCE_FATTN_TILE_MIXED.format(type_v=type_v))
++
+ for type_k in TYPES_KV:
+     for type_v in TYPES_KV:
+         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0e2c63874..c3258f014 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6420,9 +6420,22 @@ llama_context * llama_init_from_model(
+     // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
+     // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
+     // --cache-type-k (or --cache-type-v) can trigger this.
+-    if (params.type_k != params.type_v) {
++    // Exception: a q8_0 K with a q4_0 / q5_0 / q5_1 V on a model whose attention heads are all 256 wide.  The HIP
++    // flash-attention kernels read that pair natively (ggml_cuda_fattn_kv_mixed_native and
++    // ggml_cuda_fattn_tile_kv_mixed_ok in ggml/src/ggml-cuda/fattn-rdna.cuh), so it is smaller and not staged.
++    // The tile kernel's mixed instances exist for head 256 only, so any other head size keeps the rule.
++    bool kv_mixed_native = params.type_k == GGML_TYPE_Q8_0 &&
++        (params.type_v == GGML_TYPE_Q4_0 || params.type_v == GGML_TYPE_Q5_0 || params.type_v == GGML_TYPE_Q5_1);
++    for (uint32_t il = 0; kv_mixed_native && il < model->hparams.n_layer_all; ++il) {
++        if (model->hparams.has_kv(il) &&
++                (model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256)) {
++            kv_mixed_native = false;
++        }
++    }
++    if (params.type_k != params.type_v && !kv_mixed_native) {
+         LLAMA_LOG_ERROR("%s: models require the same K and V cache types, got K=%s and V=%s; "
+-                "set --cache-type-v to match --cache-type-k (both default to f16)\n",
++                "set --cache-type-v to match --cache-type-k (both default to f16); the one mixed form is "
++                "K=q8_0 with V=q4_0, q5_0 or q5_1 on a model whose attention heads are all 256 wide\n",
+                 __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+         return nullptr;
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1c165cd41..58bef42a7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13540,6 +13540,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // mixed K/V cache types (q8_0 K, smaller V) at head 256: decode / verify widths and a prefill width, GQA 4 and 6
++    for (ggml_type type_V : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, }) {
++        for (int gqa : { 4, 6, }) {
++            for (int nb : { 1, 3, 8, 32, }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {gqa, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V));
++            }
++        }
++    }
++
+     // KV-head counts that do not divide the device count
+     for (int hs : { 128, 256, 512, }) {
+         for (int nh : { 1, 2, 6, }) {
+diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
+index 120e9f8ff..411d0872f 100644
+--- a/tests/test-logits-width-probe.cpp
++++ b/tests/test-logits-width-probe.cpp
+@@ -21,6 +21,7 @@
+ // Env: RS=0|from_w|<n>  pins llama_context_params.n_rs_seq (default 0 = plain decode)
+ //      FA=0|1|auto     (default auto)
+ //      KV=f16|bf16|q8_0|q4_0|... (default f16)
++//      KVV=q4_0|q5_0|q5_1 the V cache type when it differs from KV (the mixed pairs: KV=q8_0)
+ // Exit: 0 all rows bit-identical across widths, 2 otherwise.
+ 
+ #include "llama.h"
+@@ -43,9 +44,9 @@ static uint64_t fnv1a(const void * p, size_t n) {
+     return h;
+ }
+ 
+-static ggml_type kv_from_env() {
+-    const char * s = getenv("KV");
+-    if (!s) return GGML_TYPE_F16;
++static ggml_type kv_from_env(const char * name = "KV", ggml_type dflt = GGML_TYPE_F16) {
++    const char * s = getenv(name);
++    if (!s) return dflt;
+     if (!strcmp(s, "f16"))   return GGML_TYPE_F16;
+     if (!strcmp(s, "bf16"))  return GGML_TYPE_BF16;
+     if (!strcmp(s, "q8_0"))  return GGML_TYPE_Q8_0;
+@@ -54,7 +55,7 @@ static ggml_type kv_from_env() {
+     if (!strcmp(s, "q5_0"))  return GGML_TYPE_Q5_0;
+     if (!strcmp(s, "q5_1"))  return GGML_TYPE_Q5_1;
+     if (!strcmp(s, "iq4_nl"))return GGML_TYPE_IQ4_NL;
+-    fprintf(stderr, "unknown KV=%s\n", s);
++    fprintf(stderr, "unknown %s=%s\n", name, s);
+     exit(1);
+ }
+ 
+@@ -168,7 +169,7 @@ int main(int argc, char ** argv) {
+                                 : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                 : LLAMA_FLASH_ATTN_TYPE_AUTO;
+         }
+-        cp.type_k = kv_type; cp.type_v = kv_type;
++        cp.type_k = kv_type; cp.type_v = kv_from_env("KVV", kv_type);
+         llama_context * ctx = llama_init_from_model(model, cp);
+         if (!ctx) { fprintf(stderr, "ctx init failed (W=%d)\n", W); return 1; }
+ 
+-- 
+2.56.1
+
