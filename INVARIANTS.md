@@ -4753,3 +4753,54 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   comparison across processes pins the cache state, exactly as it pins `ROCBLAS_USE_HIPBLASLT=0` (§44);
   `gate-kv-residency.sh` now forces `MOE_EXPERT_HEATMAP=load` and its multi-device section is green.
   `GREEDY-PURITY.md` §89, `benchmarks/2026-11-14-residency-reproducibility.md`.
+* **A gate's RECORDED BASELINE is an artefact of a tree and a build, and it must be re-recorded with provenance
+  rather than "fixed" (r285, `TODO` #322).**  `gate-server-arms.sh`'s `35b10` arm (35B-A3B Q8_0 + DFlash2,
+  `-ncmoe 10`, `-sm layer`, 3 devices) read `a9d494a15521 ee21682d22a5` with acceptance 0.42771/0.59124 on the
+  r284 tree **and, to the digit, on the shipped r277 build** (`build-rocm/bin-r277`) against an r236 recording of
+  `2cf19becd4ee e26a28d3f3ae` / 0.44720/0.59124 -- so the recording, not the delivery, was stale, and the
+  `fn24`/`fn10` arms still reproduced their r236 values on both builds.  The rule the gate now carries: a hash
+  set is only a baseline once it has been measured on the tree under test AND on the previous release's build and
+  the two agree (`hash-1 hash-2` + acceptance, pasted from a `--record` run); a tolerance must never be widened
+  in its place, because the exact-hash criterion is what makes the arm's silence-proof property real.
+* **A prefill-logit base file is one POINT, and on disk the point is the NAME (r285, `TODO` #323).**  The `.meta`
+  has pinned `device=`/`sm=` since r272 and the compare refuses a mismatch, but the name carried neither, so
+  recording the all-reduce arm (`--sm tensor --device 0,1,2` -- the only way block 01's change is reachable)
+  overwrote the single-device `layer` base: the gate's own compatibility check then refused the canonical arm
+  until it was re-recorded, so a release could hold only one of the two points.  The name now tags a
+  non-canonical point (`…-dev0-1-2-smtensor.kld`) and leaves the canonical one (`--device 0`, the CLI's own
+  `layer`) untagged, which keeps every pre-r285 base findable; verified with both points recorded into one
+  directory and both compares PASS.
+* **An `optional/` artifact's "rebase it onto every release" policy needs an instrument or it silently rots
+  (r285, `TODO` #324).**  Both artifacts had drifted 40+ releases (r241/r243 and r259 trees) while
+  `apply-all.sh --include-optional` kept offering them, and a consumer only learned at apply time.  Two things
+  follow: `validate-set.sh`'s **check 8** applies every `optional/*/*.patch` strictly, cumulatively, on the
+  freshly built release tree (tier-1 CI, one `git am` per artifact), and an artifact whose **premise has been
+  promoted** into the delivery is archived rather than re-cut -- a second copy of delivered code is drift with
+  no consumer (that is why `host-pool-fill-src` went to `archive/work/` once `MOE_HOST_POOL_TRANSPORT` existed).
+* **The delivery's own `optional/` artifact can be inert on the default path and still be worth carrying
+  (r285).**  `two-lane-prefill`, ported onto the r284 tree, measures the release's own prefill-logit reading on
+  the default path (mean KLD 0.000697 / same-top-p 98.784 %, i.e. bit-identical) while winning **+25.6 %**
+  prefill (5426.6 → 6815.6 t/s, 3 pairs) on the one layout it reaches (`-sm layer` + any `-ot`), with the same
+  greedy text (`e2dde701fc04`) because the pair's outputs are extracted per lane on that lane's scheduler.  A
+  port, not a replay: the delivery's D10 input pruning (`hv_tensor_requires_copy` gating both copy passes), the
+  per-input copy slots (`split->input_events[input_id]`) and the nextn/h_nextn decode body all have to be
+  reconciled, and taking the artifact's stale r259 body wholesale would have reverted delivery code.
+* **On an APU the `-lme` region is a REAL, single, huge-page reservation, and the `#30542` revert block 00
+  carries does not squeeze it (r285, `TODO` #325 / `D17`'s store-region half).**  `halo` (gfx1151, ROCm 10.1.0):
+  `-lme 20` on the 35B-A3B reports **18 662.5 MiB realised of 18 662.5 MiB requested**, `registered ReadOnly`,
+  **100 % huge pages** (`AnonHugePages` = the region), created+registered in **481 ms (26.4 ms/GiB)**, carved
+  into 120 tables / 30 720 slots, `mlock`ed; and the 122B-A10B with `-lme 90` opens a **92 160.0 MiB** registered,
+  locked arena region and completes its load.  That is the observable a discrete box cannot produce (0 `GTT`
+  lines), and with `gate-uma-experts.sh` (49 checks, 0 failures -- including the `inplace` arm: 108 table calls
+  served in place, 1 194.4 MiB of arena D2D against the copy arm's 3 357.6 MiB, 8.5 % of "fetch every used
+  expert" read) and `gate-prefill-server-slots.sh` (3 checks, 0 failures -- A's text identical `3c2245a89587`,
+  decode 3.64 → 4.02 tok/s, in B's prefill window 0.47 → 0.59) the APU-only gate set is closed at r285.
+* **The loader's pinned staging ring DOES outlive the meta backend's queued copies (r285, `TODO` #326's
+  question, answered in the code).**  The ring is `n_buffers = 4` slots with one event each;
+  `ggml_backend_event_synchronize(events[buffer_idx])` runs **before** a slot is rewritten; that event was
+  recorded on the Meta backend immediately after `set_tensor_async`, and `ggml_backend_meta_event_record`
+  records on **every** simple device's stream (its `event_wait`/`synchronize` waits on all of them).  So the
+  async arm's precondition -- "a caller whose source outlives the queued copies" -- holds for the loader, and
+  the r279 "90 async→sync transitions in one `-lm none` load" is the loader legitimately using the row-aligned
+  arm.  What is left of #326 is correcting the two comments (a block-10 patch change); no caller-visible flag is
+  warranted on this evidence.

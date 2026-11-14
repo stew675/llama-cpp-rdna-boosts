@@ -25,7 +25,9 @@ draft window -- all three opt-in, default off).  `release.json` is the source of
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
-are recorded in `WORKLOG.md` 261113.015.  What it left open is #322/#323/#324/#325; the r236 re-base
+are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the
+prefill-logit base file name), #324 (both `optional/` artifacts stale) and #325 (the APU-only gate set) -- closed
+at **r285** (`WORKLOG.md` 261114.006), which is why nothing about them is left in this file.  The r236 re-base
 (`archive/work/upstream-rebase-261108/`) is superseded and closed.
 
 ## The open list
@@ -35,10 +37,6 @@ are recorded in `WORKLOG.md` 261113.015.  What it left open is #322/#323/#324/#3
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **322** | `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces (on ANY build) | tooling / stale gate baseline | **OPEN** (2026-11-13) — the arm fails identically on `bin-r277`; re-record, do not "fix" — §322 |
-| **323** | `gate-prefill-logits.sh`'s base file name does not carry `device`/`sm`, so the tensor arm overwrites the layer base | tooling (pre-release gate) | **OPEN** (2026-11-13) — record sequentially, canonical arm last — §323 |
-| **324** | both `optional/` artifacts are stale: neither applies to the r278 tree | tooling / optional artifacts | **OPEN** (2026-11-13) — re-cut against `69161d3b0` before they are offered again — §324 |
-| **325** | the R18 APU-only gate set is not runnable on gfx1201 and is owed to `halo`/`soar` | waiting on hardware (gfx1151) | **OPEN** — `gate-uma-experts.sh`, `gate-prefill-server-slots.sh`, `D17`'s store region — §325 |
 | **326** | the loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies | correctness (block 10; a question to close) | **OPEN** (2026-11-13) — 12 loads were byte-correct, so no defect is known; either document the guarantee or give the arm a caller-visible flag — §326 |
 
 ## Handle numbering
@@ -161,66 +159,6 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
 
-## 322. `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces on ANY build
-
-**Found at R18** (2026-11-13) while running the release gate set.  The two-slot host-expert DFlash arm
-`35b10` (35B-A3B Q8_0 + its DFlash2, `-ncmoe 10`, `-sm layer`, 3 devices) reports
-`a9d494a15521 ee21682d22a5` against the recorded set `2cf19becd4ee e26a28d3f3ae`, with acceptance
-**0.42771 / 0.59124**.  **The shipped `bin-r277` build fails it with the same two texts and the same acceptance
-to the digit**, so this is a stale baseline (recorded at r236 on the r236 tree), not a re-base regression and
-not a delivery defect.  `fn24` and `fn10` pass on both builds.
-
-The criterion that still means something — acceptance is not a collapse (≥ 0.5x baseline) and the text is sane
-and identical across builds — passes; the exact-hash criterion is what is stale.  **Re-entry:** re-record the
-baseline with `./scripts/gate-server-arms.sh --record` on a tree whose numbers are trusted (and paste the
-`record:` lines into `ARMS`), then re-run on this tree and on `bin-r277` to confirm both.  Do **not** widen the
-tolerance instead: an exact-hash set is what makes this arm's silence-proof property real.
-
-## 323. `gate-prefill-logits.sh`'s base file is one point per (model, kv, ub, extra) — not per device/sm
-
-**Found at R18.**  The `.meta` pins `device` and `sm` and the compare refuses a mismatch, but the **file name**
-carries only the model/arch/kv/ub/extra, so recording an all-reduce arm (`--sm tensor --device 0,1,2`, which is
-how block 01's change is reachable) **silently overwrites** the default single-device `layer` base for the same
-model.  Re-running the default arm then fails the meta compatibility check until the base is re-recorded — which
-is safe but means a release that needs both arms must record them sequentially (and re-record the canonical one
-last), and there is no way to keep both on disk.
-
-**Re-entry:** fold `-dev<LIST>` / `-sm<MODE>` into the base file name (the meta already has the fields), then a
-release can hold both points at once.  Until then: record → compare → record the canonical point again, and say
-which point the file holds in the release record.
-
-## 324. Both `optional/` artifacts are stale (they do not apply to the r278 tree)
-
-`AGENTS.md` requires an `optional/` artifact to be rebased onto **every** release tree, and neither is:
-`optional/host-pool-fill-src/host-pool-fill-src.patch` was cut at r243's tree (`e9300f1dbd…`) and
-`optional/two-lane-prefill/two-lane-prefill.patch` at r259's (`7995db44…`).  Against the r278 tree `69161d3b0`
-both conflict under `git apply --3way` (`moe-expert-cache.cu`; `ggml-backend-impl.h`, `ggml-backend.cpp`,
-`ggml-cuda.cu`), so `scripts/apply-all.sh --include-optional` cannot produce a verified tree from either today.
-
-The conflicts are the expected kind — the artifacts edit files that blocks 12/15/16 rewrote — so the re-cut is a
-semantic resolution against the new code, not a mechanical replay.  **Re-entry:** apply the artifact's intent to
-the r278 tree, re-cut against `69161d3b0`, update the artifact's `README.md` (new sha256, new produced tree) and
-verify with `apply-all.sh --include-optional`; if an artifact has lost its premise, archive it under
-`archive/work/` instead.  Nothing in `patches/` is affected.
-
-## 325. The R18 APU-only gate set is owed to a gfx1151 box (`halo`/`soar`)
-
-**R18 could not run three of its own gate items on the primary box, and they are NOT marked passed**
-(`WORKLOG.md` 261113.015 states the same):
-
-* `scripts/gate-uma-experts.sh` (including its `inplace` and `pfcp` arms) — the integrated-GPU gate: it needs
-  `prop.integrated`, `-lme 4` on a 35B-A3B whose 18.2 GiB expert set evicts out of shared DRAM, and
-  `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx1151/lib`.  On a discrete gfx1201 every arm executes but the `ref` arm
-  builds **no GTT arena** (`tables=''`, no releases, `evictions='0'`) — the store declining is the documented
-  discrete behaviour, so the assertions are unsatisfiable by construction.
-* `scripts/gate-prefill-server-slots.sh` — needs `Qwen3.5-122B-A10B Q8_0` (≈130 GiB, absent here) with `-lme 90`.
-* `D17`'s **store-region** half (the VMM region the store registers) — unobservable on a discrete GPU (**0 `GTT`
-  lines**); its VMM-pool half stays verified (r10).
-
-**Re-entry:** one session on `halo`/`soar` (gfx1151) with the two gates and the store region check, recorded as a
-`WORKLOG.md` entry on this release's tree.  The discrete-side evidence that CAN be stated is already recorded:
-the host-expert arena is live and evicting (`h=0.8127`, `fills=9418 evictions=689`) and the UMA tier is inert.
-
 ## 326. The loader's row-aligned chunk takes the meta async arm, whose contract says the source must outlive the copies
 
 **Found while fixing issue #308.**  The segmented `set_tensor_async()` async arm's own comment states its
@@ -239,6 +177,19 @@ lifetime (an event wait per chunk) and correct the comment, or (b) make the arm 
 passes, which the loader does not) so "source outlives the copies" becomes a precondition the compiler enforces
 instead of a comment.  A wrong answer from a `-lm none` load that reproduces within one build but varies between
 loads re-opens this first.
+
+**r285: (a) is ANSWERED, and what is left is the comment correction (a block-10 patch change).**  The lifetime is
+structural, not a coincidence: `llama_model_loader`'s pinned staging ring is `n_buffers = 4` slots with one event
+each, and `ggml_backend_event_synchronize(events[buffer_idx])` runs **before** a slot is rewritten (the
+"Wait for previous upload to complete before reusing buffer" line inside the chunk loop).  That event was recorded
+on the **Meta** backend right after the `set_tensor_async`, and `ggml_backend_meta_event_record` records on
+**every** simple device's stream while `ggml_backend_meta_event_wait`/`_synchronize` waits on all of them — so the
+per-slot event really does sit behind the queued per-device copies, and a slot cannot be reused while a copy from
+it is in flight.  So the async arm's precondition holds for the loader (and the r279 "90 transitions" measurement
+is the loader legitimately using the row-aligned arm).  **Re-entry:** correct the two comments (the arm's
+precondition text in `ggml-backend-meta.cpp` and the loader's ring note) in block 10 — a comment-only patch change,
+so it rides with the next release that touches that block rather than justifying a release of its own.  The
+option-(b) hardening (a caller-visible flag) is NOT needed on this evidence and would be unwarranted churn.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

@@ -53,7 +53,11 @@
 #
 # Options / environment (the environment variable is the default for the flag):
 #   --base FILE       BASE           base logits file (default:
-#                                    $BASE_DIR/prefill-logit-<arch>-<modelstem>.kld)
+#                                    $BASE_DIR/prefill-logit-<arch>-<modelstem>[-familyswitch][-kv<type>]
+#                                      [-x<extra>][-dev<LIST>][-sm<MODE>][-ub<N>].kld -- the canonical point
+#                                    (`--device 0`, the CLI's own `layer` split) carries no -dev/-sm tag, so a
+#                                    multi-device `tensor` all-reduce arm gets its own file instead of
+#                                    overwriting the single-device reference)
 #   --base-dir DIR    BASE_DIR       default base directory
 #                                    (default: ~/.cache/rdna-boosts/gates)
 #   --model FILE      MODEL          model gguf (default: auto: Q8_0 if the largest
@@ -99,11 +103,13 @@
 #                                    calibration, for a switch that provably cannot meet
 #                                    them).  Off by default so a bad change cannot pass
 #                                    just because the point is insensitive.
-#   --device LIST     DEVICE         HIP_VISIBLE_DEVICES (default 0; a list selects a multi-device arm)
+#   --device LIST     DEVICE         HIP_VISIBLE_DEVICES (default 0; a list selects a multi-device arm).
+#                                    A non-default LIST is in the base FILE NAME since r285 (`TODO` #323).
 #   --sm MODE         SM             pass `-sm MODE` to llama-perplexity (default: unset = the CLI
 #                                    default, `layer`).  Needed for anything that changes the
 #                                    ALL-REDUCE: a layer split needs none, so an AR change is invisible
 #                                    to this gate unless the arm is `--sm tensor` on >= 2 devices.
+#                                    An explicit MODE other than `layer` is in the base file name since r285.
 #   --timeout N       TIMEOUT        per-run seconds (default 1800)
 #   --keep            KEEP=1         keep the per-run logs
 #   --no-faults       FAULTS=0       skip the kernel-journal fault check (a box with no readable
@@ -290,7 +296,19 @@ if [ -z "$BASE" ]; then
     if [ -n "$PPL_EXTRA" ]; then
         xt_tag="-x$(printf '%s' "$PPL_EXTRA" | tr -cs 'A-Za-z0-9.' '-' | sed 's/^-*//;s/-*$//')"
     fi
-    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${UB:+-ub${UB}}.kld"
+    # The DEVICE SET and the SPLIT MODE are part of the point (the meta pin below, r272; the name from r285,
+    # `TODO` #323).  An ALL-REDUCE arm is only reachable on >= 2 devices with `-sm tensor`, so the two points
+    # a block-01 change needs are the single-device `layer` reference and the multi-device `tensor` arm --
+    # and before r285 both wrote the same file, so recording one silently destroyed the other and a release
+    # could not hold both.  The canonical point (`--device 0`, the CLI's own `layer`) keeps the UNTAGGED
+    # name, so every base recorded before this change is still found; a non-canonical point is tagged.
+    dev_tag=""
+    sm_tag=""
+    if [ "$DEVICE" != "0" ] || [ "${SM:-layer}" != "layer" ]; then
+        dev_tag="-dev$(printf '%s' "$DEVICE" | tr ',' '-')"
+        sm_tag="-sm${SM:-layer}"
+    fi
+    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${dev_tag}${sm_tag}${UB:+-ub${UB}}.kld"
 fi
 META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
@@ -394,9 +412,9 @@ check_base_compat() {
     [ -f "$META" ] || { echo "    WARN: no base metadata ($META); cannot verify the base matches this model/corpus"; return 0; }
     local problems=0 k v want
     # `device` and `sm` are part of the POINT (r272): an all-reduce arm is only reachable on >= 2 devices with a
-    # `tensor` split, and the base file name carries neither, so without this check a 1-device `layer` base is
-    # silently accepted as the reference for a 2-device `tensor` arm -- which reads as a gate result and is not one.
-    # A legacy base has neither field and is left alone.
+    # `tensor` split; the base file NAME carries them since r285 (`TODO` #323), so a mis-named base is not even
+    # found -- but this check is what makes a wrongly NAMED file (an explicit `--base`) fail instead of
+    # comparing two different points.  A legacy base has neither field and is left alone.
     for k in model corpus_sha256 ctx chunks kv device sm; do
         v="$(base_meta_field "$k")"
         case "$k" in

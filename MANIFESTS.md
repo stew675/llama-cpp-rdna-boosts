@@ -71,7 +71,10 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
    `--include-optional-all` applies every one without asking, which is what a scripted or headless apply
    must use.  `--include-beta` then applies `beta/*/*.patch` the same way.  Either flag leaves the checkout
    **not** the release tree, which the script reports; optional artifacts are not covered by the gates
-   below (`optional/README.md`).
+   below (`optional/README.md`).  **What IS covered since r285: every `optional/*/*.patch` must still apply
+   strictly on this tree** -- `validate-set.sh`'s check 8 applies them cumulatively on the freshly built
+   release tree and fails when one has drifted (`TODO` #324: both artifacts had gone stale for 40+
+   releases because "rebase it every release" was a policy with no instrument).
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 
@@ -131,7 +134,11 @@ in CI.  The model-level gates are manual:
    2-rank form is unreachable at 3 devices, so its gate is `--device 0,2 --sm tensor` with the base
    recorded from the previous form, and the 3-device arm is the proof that the untouched path did not move.
    The base meta records `device=` and `sm=` and the gate refuses a mismatch -- a 1-device base is not a
-   reference for a 2-device `tensor` arm.  The base arm is the previous arm via `--ab "GGML_CUDA_ALLREDUCE=hybrid"`.
+   reference for a 2-device `tensor` arm -- and since **r285** (`TODO` #323) the base FILE NAME carries them too,
+   so the two points a release needs (the single-device `layer` reference and the multi-device `tensor` arm,
+   `--dev0-1-2-sm tensor.kld`) **coexist on disk** instead of overwriting each other.  A base recorded before
+   r285 keeps its untagged (canonical-point) name and is still found; a non-canonical point is tagged.  The base
+   arm is the previous arm via `--ab "GGML_CUDA_ALLREDUCE=hybrid"`.
    The default arm is an **f16 KV cache**, which skips the quantized-cache prefill paths (the F16 FA staging
    arena, `GGML_CUDA_FA_KV_NATIVE`'s tile read); a change to those also needs `--kv q8_0` (its own base file,
    r156).

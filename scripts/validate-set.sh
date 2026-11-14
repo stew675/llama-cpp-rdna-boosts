@@ -17,6 +17,12 @@
 #      Windows-excluding preprocessor region (issue #231: two `close()` calls added
 #      to moe-expert-cache.cu in r143 are a hard compile error with HIP on Windows,
 #      and no gate on a Linux box can see it -- scripts/check-windows-portability.sh)
+#   8. every `optional/<name>/<name>.patch` still applies STRICTLY (git am, no 3-way)
+#      on the applied tree, cumulatively in `apply-all.sh --include-optional-all`'s
+#      order, and its produced tree is reported (`TODO` #324 / r285: two artifacts had
+#      silently gone stale for 40+ releases because "rebase it every release" was a
+#      policy with no instrument -- a consumer's `--include-optional` then refused the
+#      artifact at apply time, which is the worst place to learn it)
 #
 # Checks 3-5 are the ones that would have caught the 2026-09-13 CI break (a
 # stale fork point) in a minute instead of after three failed matrix jobs.
@@ -147,6 +153,35 @@ done
 echo "==> scanning the delivery repo's tracked files for conflict markers"
 repo_hits="$(git -C "$REPO_DIR" grep -I -l -e '^<<<<<<< ' -e '^=======$' -e '^>>>>>>> ' -- . 2>/dev/null || true)"
 [ -z "$repo_hits" ] || { echo "FAIL: conflict markers in the delivery repo:" >&2; printf '        %s\n' $repo_hits >&2; fail "delivery-repo marker scan failed (see above)"; }
+
+# optional/ artifacts: an artifact is cut against THIS release's tree and must apply strictly on top of
+# it (`optional/README.md`).  Nothing enforced that between releases until r285 (`TODO` #324): both
+# artifacts had drifted 40+ releases, so `apply-all.sh --include-optional` could not produce a verified
+# tree from either.  The check is cheap (one `git am` per artifact in a throwaway branch) and it runs
+# cumulatively in `--include-optional-all`'s order, which is the contract a consumer gets.
+shopt -s nullglob
+OPTIONAL_PATCHES=( "$REPO_DIR"/optional/*/*.patch )
+shopt -u nullglob
+APPLIED_TIP="$(git rev-parse HEAD)"
+if [ "${#OPTIONAL_PATCHES[@]}" -eq 0 ]; then
+  echo "==> optional/: no artifacts to check"
+else
+  echo "==> checking ${#OPTIONAL_PATCHES[@]} optional artifact(s) against the applied tree (strict git am, cumulative)"
+  git checkout -q -B validate-optional "$APPLIED_TIP"
+  for p in "${OPTIONAL_PATCHES[@]}"; do
+    name="$(basename "$(dirname "$p")")"
+    want="$(sha256sum "$p" | awk '{print $1}')"
+    if ! git am "$p" >/dev/null 2>&1; then
+      git am --abort >/dev/null 2>&1 || true
+      git checkout -q "$APPLIED_TIP"
+      fail "optional/$name does not apply strictly on tree ${tree:-$APPLIED_TIP}
+       it was cut against an older release tree: re-cut it against THIS tree (optional/README.md), or
+       archive it to archive/work/<name>/ if its premise is gone -- do not relax the strict apply"
+    fi
+    echo "    optional/$name OK ($(git rev-parse --short=9 HEAD^{tree}) <- $want)"
+  done
+  git checkout -q "$APPLIED_TIP"
+fi
 
 # Windows portability lint (issue #231): a POSIX-only call in a file the delivery adds is a hard
 # compile error with HIP on Windows, and nothing on a Linux box can compile it.  Cheap (~1 s) and

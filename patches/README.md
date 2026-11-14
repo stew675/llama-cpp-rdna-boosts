@@ -3414,7 +3414,9 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > The fill-source half of the investigation (`MOE_HOST_POOL_FILL_SRC`, reading the pool fill from the file too) is
 > **not** in this release: +38 % on top of this change but -41 % on its own, and exactly neutral when the pages are
 > cacheable, so it is a headroom bet — recorded in `archive/work/host-pool-fill-transport/` and `WORKLOG.md`
-> 261107.006, and since 2026-11-09 delivered as the optional artifact `optional/host-pool-fill-src/` (`TODO` #306).
+> 261107.006, and from 2026-11-09 staged as the optional artifact `optional/host-pool-fill-src/` (`TODO` #306 —
+> **superseded in r262** by the delivery's own `MOE_HOST_POOL_TRANSPORT` / `--load-mode buffered|auto`, which is why
+> that artifact was archived to `archive/work/host-pool-fill-src/` at r285, `TODO` #324).
 
 > **r234 amendment (`TODO` #271/#272): name the prefill staging decline, and split the priming pass out of
 > the census.**  Two additions in `moe-expert-cache.cu`, both log/accounting only (no data path changes):

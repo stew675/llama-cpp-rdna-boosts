@@ -1,5 +1,16 @@
 # `host-pool-fill-src` — the host pool's buffered fill reads the file, not the model mapping
 
+> **ARCHIVED at r285 (2026-11-14): this artifact's premise was PROMOTED into the delivery at r262, so it is no
+> longer an `optional/` artifact.**  `MOE_HOST_POOL_TRANSPORT` (`--load-mode mmap|buffered|dio|auto`, block 12)
+> is the general answer the artifact was a narrow case of: the mapping, the file and `O_DIRECT` are three arms
+> with a default that adapts, and the artifact's own `MOE_HOST_POOL_FILL_SRC` survives in the delivery as a
+> **diagnostic** (`=file` moves only the fill, `=map` restores the pre-r232 mapping memcpy -- `ENVIRONMENT.md`
+> §20's transport table).  It was kept in `optional/` "for older trees" for two releases and then could no
+> longer be rebased onto the r278+ tree without re-deriving code the delivery already has (it edits
+> `moe-expert-cache.cu`, which blocks 12/16 rewrote), so `TODO` #324 retired it here rather than re-cutting a
+> duplicate.  Applying it to an r284/r285 tree is **not** supported; use `MOE_HOST_POOL_TRANSPORT=file`
+> instead.  The measurements below are the r241/r243 record that motivated r262 and are kept as such.
+
 **Optional artifact, not part of the delivery.  Re-cut on `r243`** (against `release.json` tree
 `e9300f1dbd0b2f0b96c1828829d2072d73f34bca`; first cut on `r241`).
 

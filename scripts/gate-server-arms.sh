@@ -83,13 +83,24 @@ mkdir -p "$KEEPOUT"
 
 # arm | model | drafter | ncmoe | baseline sha set (sorted) | baseline acceptance set (sorted)
 #
-# Baselines measured at r236 on the primary box (3 x R9700, ROCm 10.1.0, `-sm layer`, greedy, prose
-# prompt, n_predict 128): two independent runs per arm agreed to the digit.  `fn10` and `fn24` agree
-# with each other, i.e. the `-ncmoe` level does not move the numerics on this shape.
+# Baselines measured on the primary box (3 x R9700, ROCm 10.1.0, `-sm layer`, greedy, prose prompt,
+# n_predict 128): two independent runs per arm agreed to the digit.  `fn10` and `fn24` agree with each
+# other, i.e. the `-ncmoe` level does not move the numerics on this shape.
+#
+# 35b10 WAS RE-RECORDED AT r285 (2026-11-14, `TODO` #322) and this is the provenance that makes it a
+# baseline rather than a snapshot: the r236 recording (`2cf19becd4ee e26a28d3f3ae`, acceptance
+# 0.44720/0.59124) no longer reproduced on ANY build -- the r284 tree (commit e4d3bf7c8) and the
+# SHIPPED r277 build (`build-rocm/bin-r277`, commit 9d7c0502c) both read `a9d494a15521 ee21682d22a5`
+# with acceptance 0.42771/0.59124, to the digit, so the drift is the recording's age (r236's tree), not
+# a delivery regression.  `fn24`/`fn10` still reproduce their r236 values exactly on both builds, so
+# only this arm was stale.  Do NOT widen the tolerance instead: an exact-hash set is what makes this
+# arm's silence-proof property real -- when a hash drifts again, re-record it the same way (measure on
+# the tree under test AND on the previous release's build, and require them to agree) and paste the
+# `record:` line here.
 ARMS=(
 "fn24|$FN|$FN_D|24|b337648c3ef9 b73aa781bca5|0.72269 0.74359"
 "fn10|$FN|$FN_D|10|b337648c3ef9 b73aa781bca5|0.72269 0.74359"
-"35b10|$A35|$A35_D|10|2cf19becd4ee e26a28d3f3ae|0.44720 0.59124"
+"35b10|$A35|$A35_D|10|a9d494a15521 ee21682d22a5|0.42771 0.59124"
 )
 
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"

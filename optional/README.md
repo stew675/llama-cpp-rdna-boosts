@@ -26,7 +26,10 @@ the hardware a supported, rebased artifact, and keeps the delivery honest about 
 * **Rebase-only-against-the-fully-applied-delivery-set.**  An optional patch is rebased onto a new
   release whenever the delivery moves; it is never cut against a working branch, a part-applied set or
   an older release.  If it no longer applies, that is a rebase task, not a reason to relax the strict
-  apply (`apply-all.sh --include-optional` refuses a 3-way merge for exactly this reason).
+  apply (`apply-all.sh --include-optional` refuses a 3-way merge for exactly this reason).  **Enforced
+  since r285:** `scripts/validate-set.sh` check 8 applies every `optional/*/*.patch` strictly and
+  cumulatively on the freshly built release tree, so a drifted artifact fails CI instead of a consumer's
+  apply (`TODO` #324 -- both artifacts had gone 40+ releases stale before that check existed).
 * **Nothing here is applied by default.**  `scripts/apply-all.sh --include-optional` steps through every
   `optional/*/*.patch` (sorted) **on top of the verified release tree** and asks `[y/N]` for each one —
   `N` is the default — applying the accepted ones with strict `git am`, one commit each, and reporting the
@@ -45,11 +48,13 @@ An artifact is promoted into the delivery — folded into the block that owns th
 the full release gate ladder — only when it has a **validated win on one of the delivery's own
 configurations** (gfx1201 RDNA4, gfx1151 RDNA3.5, gfx1100 RDNA3; the splits `patches/README.md` names).
 Until then it stays here.  An artifact that turns out to be wrong is archived to `archive/work/<name>/`
-and recorded in `WORKLOG.md`; no stubs are left behind.
+and recorded in `WORKLOG.md`; no stubs are left behind.  An artifact whose **premise has been promoted**
+into the delivery is archived the same way (`host-pool-fill-src` → `archive/work/`, r285: the delivery's
+`MOE_HOST_POOL_TRANSPORT` is the general form of it), because a second copy of delivered code is drift
+with no consumer.
 
 ## Current artifacts
 
 | artifact | what | measured | status |
 |---|---|---|---|
-| `host-pool-fill-src/` | `MOE_HOST_POOL_FILL_SRC`: the host pool's **buffered fill** reads the file (a buffered `pread` through the OS page cache) instead of one `memcpy` per expert out of the model mapping — the second half of issue #281 (the first half, the coalesced span, is block 12 since r232) | **+38 % prefill on top of the coalesced span** at 26 % pool coverage (821-875 → 1138-1146 t/s) and 95 → 23.8 GiB of storage reads, **−41 % on its own** (a 0.7 MiB `pread` per fill is latency-bound at depth 1) and **exactly neutral once the pages are cacheable**.  A page-cache-headroom bet: it pays where the span pays (a sub-complement pool) and nowhere else, and `MOE_HOST_POOL_STAGE_SPAN=0` drops it into the slow arm | **optional**, r241 cut, 2026-11-09 |
-| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits, plus the sub-ubatch split that makes a single wide batch pair (from PRs #268/#279/#296/#301, @slavap).  The MTP (nextn) **target** also pairs now; a **draft** context (MTP via `ctx_type`, DFlash/EAGLE3 via `ctx_other`) is refused at the arm gate | **+23.4 % MoE 35B-A3B pp2048, +47.9 % at the default `-ub 512`, +22.3 % dense 27B prefill, +29.2 % on an MTP target** (r259 re-measure, 3 x R9700 gfx1201, `-sm layer -ot`, the only layout it reaches); nil decode, text identical in every arm, default path **KLD 0.000000**.  The gain needs both halves -- the split alone is a loss, the pair alone nil.  Costs: a second compute-buffer set (~1.4 GiB/armed context), ~8 % on a second context (r229), **−6.1 % at `-npl 8`**, −0.9 % on a layer-input draft's target, and on the **host-expert tier** (`-ncmoe`) **−11.8 % at a wide ubatch** (+5.6 % at `-ub 512`) -- leave the knob off there.  The r259 cut also **fixes an abort** this artifact had on `-ncmoe` since r246 (a lane-0 placement block re-ran for the lane-1 ubatch) | **optional**, r259 re-cut (PR #301 = the r254 rebase, plus this repo's host-expert abort fix and base-drift record), 2026-11-11 |
+| `two-lane-prefill/` | `LLAMA_PREFILL_LANES=2`: two consecutive prefill ubatches on two backend schedulers with interleaved splits, plus the sub-ubatch split that makes a single wide batch pair (from PRs #268/#279/#296/#301, @slavap).  The MTP (nextn) **target** also pairs; a **draft** context (MTP via `ctx_type`, DFlash/EAGLE3 via `ctx_other`) is refused at the arm gate | **+25.6 % prefill** re-measured on the r285 cut (35B-A3B Q8_0, the 5 298-token prose prompt, `-sm layer -ot`, 3 pairs logged: 5426.6 → 6815.6 t/s), **+23.4 % MoE pp2048, +47.9 % at the default `-ub 512`, +22.3 % dense 27B prefill, +29.2 % on an MTP target** (r259 record, 3 x R9700 gfx1201); nil decode, text identical in every arm (`e2dde701fc04` at r285), default path **KLD 0.000697 / 98.784 %** (the release's own reading).  The gain needs both halves -- the split alone is a loss, the pair alone nil.  Costs: a second compute-buffer set (~1.4 GiB/armed context), ~8 % on a second context (r229), **−6.1 % at `-npl 8`**, −0.9 % on a layer-input draft's target, and on the **host-expert tier** (`-ncmoe`) **−11.8 % at a wide ubatch** (+5.6 % at `-ub 512`; the r285 re-check reads −13.6 %) -- leave the knob off there | **optional**, r285 re-cut (the r259 code, ported onto the r284/r285 delivery: D10's input-pruning guard, the per-input copy slots, the nextn/h_nextn device path and the `has_next`-gated readback), 2026-11-14 |

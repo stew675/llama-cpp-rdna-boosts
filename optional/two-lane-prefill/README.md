@@ -1,26 +1,29 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r259`** (against `release.json` tree
-`7995db440ff79d805b4e1ad946ebfae605a56616`; the r254, r247, r246, r243, r241 and r229 cuts and their measurements
-are kept below as the dated record).  The r259 rebase is **no longer purely mechanical**: the artifact's own code
-is unchanged (its +/− line set is identical across the r247, r254 and r259 cuts), but a **host-expert layout
-(`-ncmoe` + `-ot`) aborted in the pair path** — pre-existing since the r246 cut, never seen because every arm
-below keeps the experts device-resident — and that is fixed in this cut (`What changed in the rebase`, item 13),
-and that tier then measures as a *loss* at a wide ubatch (item 14).
+**Optional artifact, not part of the delivery.  Re-cut on `r285`** (against `release.json` tree
+`39ad82e0e7ad754eb52c5e833840e072195d6942`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their
+measurements are kept below as the dated record).  The r285 rebase is a **port, not a replay**: the delivery
+rewrote both files the artifact owns between r259 and r284 (D10's "do not upload an input that is not read"
+now gates both copy passes; the copy helper is keyed per input slot; the decode loop grew the nextn/h_nextn
+device path and the `has_next`-gated readback).  The artifact's own mechanisms are unchanged (arm gate,
+sub-ubatch split, pair/hazard analysis, per-lane output extraction); `What changed in the rebase` item 16 says
+exactly what had to be reconciled.
 
 From **PR #268, #279, #284, #296 then #301 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
 reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `64f92b608728d48005d38c1562e089d6f67c434393219efb2e83beb6bf7572a9`
-* applies at `release.json` tree `7995db44…` (r259), produces tree `d1c3f0f9c370efc7707caab10ebc6c67c03bfe9a`
-  (verified by strict `git am` on a fresh checkout of the r259 `rdna-boosts` branch; the r254 cut produced
-  `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…` on `8f99d2dc6d…`, and with the
-  `host-pool-fill-src` artifact applied first — `apply-all.sh`'s order — this cut produces `e6e213c6ce…`)
+* `two-lane-prefill.patch` — the artifact.  sha256 `9ec906a277938e3c5327042e908cd089ce0a4c7771a675b281c841a41474892d`
+* applies at `release.json` tree `39ad82e0e…` (r284/r285), produces tree `a9384ba7dce5b8d341de1ba63ad974af12ea2492`
+  (verified by strict `git am` on a fresh checkout of the r285 `rdna-boosts` branch; the r259 cut produced
+  `d1c3f0f9c3…` on `7995db44…`, the r254 cut `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…` on
+  `8f99d2dc6d…`)
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
   # --include-optional steps through the artifacts and asks [y/N] for each one
   ```
+  (r285: it is now the **only** artifact in `optional/` -- `host-pool-fill-src` was archived to
+  `archive/work/` because r262 promoted its premise into the delivery.)
 
 ## What it does
 
@@ -78,6 +81,28 @@ so the +13.3 % PR #268 reported for it was not measured with this patch on this 
 `-sm layer -ts 1/1/1 -ot 'blk\.0\.attn_q\.weight=ROCm0'` (a placement-neutral override: it only turns pipeline
 parallelism off) and `-ub 2048 -b 2048` throughout; the `llama-bench` arms add `-t 16 -r 3`, the `llama-cli` arms
 run the tool's default thread count (one arm per line, A B B A order).  Same binary, env-gated.
+
+### The r285 cut — the port re-measured (3 x R9700 gfx1201, ROCm 10.1.0)
+
+The same layout and the same arms as the r259 table below, on the r284/r285 delivery with the artifact applied
+(`-sm layer -ts 1/1/1 -ot 'blk\.0\.attn_q\.weight=ROCm0'`, `-b 2048 -ub 2048`, the 5 298-token
+`prompts/prose-rdna-boosts.txt`, `MOE_EXPERT_HEATMAP=load` pinned so a text comparison is meaningful -- §89):
+
+| arm | 1 lane | 2 lanes | |
+|---|---|---|---|
+| 35B-A3B Q8_0, `-n 0` (prefill only) | 5426.6 t/s | **6815.6 t/s** | **+25.6 %**, 3 pairs logged (`GGML_SCHED_PAIR_DEBUG=1`) |
+| the same, `-n 32` — decode | 71.2 t/s | 70.6 t/s | nil |
+| the same, `-n 32` — greedy text | `e2dde701fc04` | `e2dde701fc04` | **identical** (the pair's per-lane output extraction is exact on this shape) |
+| 35B-A3B `-ncmoe 40` (host-resident experts), `-n 8` | 5138.4 t/s | 4439.8 t/s | **-13.6 %** — the documented wide-ubatch loss on that tier; text identical (`49bf8044ec4b`) and the r259 abort stays fixed |
+
+Default path (lanes unset) and the release anchors, this cut:
+
+* `scripts/gate-prefill-logits.sh` (27B Q8_0, 40 chunks, 1 device): mean KLD **0.000697** / same-top-p
+  **98.784 %** against the r279 base -- **the release's own reading**, so the artifact is inert on the default path.
+* coherence, 4B Q8_0 `-p "The capital of France is" -n 20 --seed 42 --temp 0`: `1c5d32ac537d` on 1 GPU and on the
+  3-GPU `-sm tensor` split, **identical to the release build** on the same box.
+* `-sm tensor` with `LLAMA_PREFILL_LANES=2`: refused at the arm gate
+  (`LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0, draft = 0)`), dense text unchanged.
 
 ### The r259 cut (PR #301) — re-measured here, and the host-expert tier
 
@@ -321,6 +346,35 @@ current tree with the gate delta and the layout/hardware stated.
     the attribution was not.
 15. **Dropped a stray blank line** the artifact had been adding to `ggml/include/ggml-cuda.h` since the r220 cut
     (its only change to that file).  That file is untouched now.
+
+**r285 (this re-cut): a PORT, because the delivery rewrote both files the artifact owns between r259 and r284.**
+
+16. **What had to be reconciled, file by file.**  The artifact's own mechanisms (arm gate, split, pair, hazard
+    analysis, per-lane extraction) needed no change; the code around them did.
+    * `ggml/src/ggml-backend.cpp` — D10 ("do not upload an input that is not read") added
+      `hv_tensor_requires_copy`, and it now gates **both** copy passes (non-weight and host-weight).  The
+      artifact's two call sites keep that guard and pass the input **slot index** instead of the tensor, because
+      the eager-copy events are per slot (`split->input_events[input_id]`, `ggml_backend_sched_copy_input(sched,
+      split, input_id, st)`).  `hv_tensor_split_ids` is a new field beside the delivery's three, allocated and
+      reset with them.  The pair/hazard machinery, `async_inputs`/`eager_copies` and the `eager_producer`
+      allocation placement are the artifact's and are unchanged.
+    * `src/llama-context.cpp` — the r259 file had the decode body inline; the artifact moved it into
+      `extract_outputs()`.  The delivery's body had since grown the nextn/h_nextn **device** path
+      (`write_h_nextn`, `#31927`), the `-ot` state-row ordering block, `extract_layer_inputs(..., sched_x)` and
+      the `has_next`-gated readback sync.  The lambda is therefore built from **the delivery's current body**
+      (`ubatch` -> `ub`, `sched.get()` -> `sched_x`) rather than from the artifact's r259 copy, so none of that
+      delivery code is reverted; `ubatch_fail`, `count_outputs`, the lane branch, `n_ubatch_eff` and the pair
+      entry points are the artifact's own and are unchanged.
+    * `ggml/src/ggml-backend-impl.h` / `ggml/src/ggml-cuda/ggml-cuda.cu` — the one new iface member
+      (`event_elapsed_time`, debug-only) appends **after** block 16's `gtt_store_*` members, because this iface
+      is positionally initialized.
+17. The three r259 items are carried unchanged: the host-expert-layout abort fix (both lane-0-only placement
+    blocks), the MTP-target-pairs / draft-refused arm gate, and no stray blank line in
+    `ggml/include/ggml-cuda.h`.
+18. `optional/host-pool-fill-src` is **gone** (archived to `archive/work/`, r285): it was the other artifact in
+    this directory, and its premise was promoted by r262's `MOE_HOST_POOL_TRANSPORT`.  `apply-all.sh
+    --include-optional` therefore offers exactly one artifact now, and the combined-tree hash the r259 note
+    records no longer applies.
 
 ## Known open points
 

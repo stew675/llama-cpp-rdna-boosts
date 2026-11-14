@@ -1288,11 +1288,11 @@ These exist only in a checkout made with `scripts/apply-all.sh --include-optiona
 who applies an optional artifact is running these code paths and needs the same default/class discipline
 (`optional/README.md`).
 
-`optional/host-pool-fill-src` (the second half of issue #281):
-
-| variable | default | class | notes |
-|---|---|---|---|
-| `MOE_HOST_POOL_FILL_SRC` | unset = the pool's **file** (buffered `pread`) | kill-switch (value) | (**SUPERSEDED in r262 by the delivery's `MOE_HOST_POOL_TRANSPORT` / `--load-mode buffered`** -- §19.  Kept because the artifact still applies to older trees.) `map` restores the pre-r232 fill: one `memcpy` per expert out of the read-only model mapping.  Both read the same page-cache pages, so the pool contents are identical and only the transport changes — a mapped fill on Windows is a demand fault per 4 KiB page (715 MiB/s measured) where a buffered `pread` gets the OS readahead.  **Keep `MOE_HOST_POOL_STAGE_SPAN` on:** this arm is +38 % *on top of* the coalesced span and −41 % with the span off.  Inert where the disk tier is on (an O_DIRECT fill already reads the file), where the arena serves the table, and where the pool file I/O is a stub.  `optional/host-pool-fill-src` only. |
+**No artifact defines a fill/source variable any more.**  The one that did (`optional/host-pool-fill-src`,
+`MOE_HOST_POOL_FILL_SRC`) was archived at r285 (`TODO` #324) because r262 promoted its premise into the
+delivery: see `MOE_HOST_POOL_TRANSPORT` / `_FILL_SRC` / `_DEMAND_SRC` in §19, where `=file` is the artifact's
+arm as a **diagnostic** and `auto` is the shipped default.  `archive/work/host-pool-fill-src/` keeps the
+r241/r243 measurement that motivated it.
 
 `optional/two-lane-prefill` (from PR #268/#279/#296, @slavap):
 
