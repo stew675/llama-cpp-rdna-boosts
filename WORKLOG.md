@@ -1,3 +1,46 @@
+## 261114.002 (r281) -- GitHub issue #311: the deep-prefill regression is upstream #30285's `min()` in the FA tile loader, which costs the head-256 prefill kernel 13 % of its own time
+
+**`release.json` changed: tip `f25fd3ff2` -> `69296dde5`, tree `b83424ef5` -> `549f379e6`, release
+`v17-4f9dfa0e3-r280` -> `v17-4f9dfa0e3-r281`; 17 blocks, base unchanged.**  One file moved
+(`ggml/src/ggml-cuda/fattn-mma-f16.cuh`, in block 05): blocks 06-16 were re-cut (their `From` id only).
+Record: [`benchmarks/2026-11-14-fa-prefill-min-codegen.md`](benchmarks/2026-11-14-fa-prefill-min-codegen.md).
+
+* **The report reproduces, and it is not ours.**  DanoPTT's r279-vs-r250 A/B (dense Qwen3.8-27B UD-Q5_K_XL,
+  1 × R9700, `q8_0` KV, FA, `-ub 512 -b 1024`) reproduces here to the tenth of a percent: `pp4096 @ d32768`
+  **875.6 -> 839.4 t/s (-4.1 %)**, `pp512 @ d32768` 878.0 -> 842.0, `pp512 @ d0` -2.7 %, text and acceptance
+  identical.  The reporter's own clean-upstream bisect (A `a691b2345` / M `459ab1cdd` / Z `4f9dfa0e3`, reported in
+  the issue) puts the loss in the **first half of the re-base**, i.e. in upstream, not in the delivery.
+* **One kernel, and one line.**  A `rocprofv3 --kernel-trace` of `pp512 @ d30720` attributes **all** of the delta
+  to `flash_attn_ext_f16<256,256,32,2,...>`: **4543.7 -> 5108.2 ms (+12.4 %)** over the same 992 dispatches, with
+  every other kernel inside +-0.5 % (`mul_mat_q` Q6_K 10188.2 vs 10169.5, Q5_K 9091.9 vs 9083.3).  Launch
+  geometry, resources and every runtime argument are identical (instrumented: `nthreads 256`, `nbatch_fa 64`,
+  `K2/V2 128`, `combine 64`, `shmem 38400`, `swz 0`, `Q_in_reg 1`, grid `6144x8`, VGPR 256 / SGPR 128 /
+  scratch 640), and an **f16** KV arm loses the same 4 %, so the quantized-KV/staging path is not involved.
+  The device ISA of that instance TU is where it shows: kernel **107 342 -> 108 759** instructions,
+  `flash_attn_ext_f16_load_tile_rows<132,...>` 4 594 -> 4 755, object 1 501 968 -> 1 523 472 B.  Compiling the
+  **r250 header** with r280's compiler/flags/`common.cuh` reproduces r250's counts exactly, and bisecting that
+  header's 34 hunks lands the jump on a single one: upstream #30285's `min(k0_stop, DKQ/2) - k0_start` in the K/V
+  tile loader (its `i0_diff` twin is the same shape).  Heads-40/72 config rows, tile specializations, `DECL_...`
+  lines and the `DKQp/DVp` padding are each **not** the trigger (each removed in isolation, counts unchanged).
+* **The fix keeps upstream's clamp where it exists and removes its cost where it does not.**  A padded head
+  (`DKQp > DKQ`, 40/72) keeps `min(k0_stop, DKQ/2)`; an unpadded head takes a plain subtraction, spelled as a
+  constant-folded alternative (`DKQp == DKQ ? k0_stop - k0_start : min(...)`) so no reader has to work out why.
+  The instance ISA then matches r250 **exactly** (107 342 / 4 594) and the arm goes back to
+  `pp4096 @ d32768` **876.0** (`pp512 @ d0` 1254.4, `pp512 @ d32768` 881.6) -- r250 is 875.6 / 1251.7 / 878.0, so
+  the regression is fully recovered and slightly ahead.  The change is upstream-applicable and is mirrored in
+  [`upstream/fa-tile-loader-min/`](upstream/fa-tile-loader-min/).
+* **The decode half of the report does not reproduce, and is not this cause.**  `llama-cli -f <62k tokens> -n 128
+  --spec-type draft-mtp --spec-draft-n-max 3 -c 65536` (q8_0 KV, acceptance 13/26 live) reads **47.0 / 46.9 /
+  47.1 t/s** for r280 / r281 / r250 with the prompt rate moving 854.4 -> 882.4 / 881.4, and `llama-bench tg128 @
+  d32768` is flat (25.22 / 25.21 / 25.19).  The decode/verify band kernel
+  (`flash_attn_ext_f16<256,256,4,8,...>`) is untouched by the regression (320.6 vs 321.9 ms), so the report's
+  -4..-6 % tg at 63k/101k is not reproduced here on Linux; it is reported back as such rather than claimed fixed.
+* **Gates on the shipped tree** (`549f379e6`, tip `69296dde5`): `test-backend-ops -o FLASH_ATTN_EXT`
+  **6997/6997** (the full instance matrix, padded heads included); `gate-prefill-logits.sh` **0.000697 / 98.784 %**
+  (f16) and **0.000580 / 98.882 %** (`--kv q8_0`) -- the same numbers r279/r280 read, so numerically a no-op;
+  `test-logits-width-probe` at P=3584 **PASS, worst maxdiff 0**; coherence 4B Q8_0 `196 chars sha=83eec5e9b4f0`
+  on 1 GPU and 3 GPU `-sm tensor`, identical before and after; `validate-set.sh` strict 17/17; no GPU faults.
+
 ## 261114.001 (r280) -- PR #310 accepted as a DELIVERY fix, not a `wip/` patch: block 11's `LLAMA_LAZY_BUF_MB` export builds on Windows, and the portability lint now judges the lines the delivery inserts into an upstream file
 
 **`release.json` changed: tip `f61ac4bd8` -> `f25fd3ff2`, tree `d6372d47a` -> `b83424ef5`, release

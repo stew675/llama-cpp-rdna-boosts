@@ -4,6 +4,18 @@
 2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
 `git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
 
+> **r281: GitHub issue #311 -- upstream #30285's padded-head clamp cost the head-256 prefill 13 % of its kernel,
+> and block 05 spells it so an unpadded head does not pay.**  `min(k0_stop, DKQ/2) - k0_start` in
+> `fattn-mma-f16.cuh`'s K/V tile loader exists so a **padded** head (40/72) never reads past its real head size; for
+> `DKQ % 16 == 0` it cannot bind, yet it changes codegen for the whole instantiation: the RDNA4 head-256 prefill
+> kernel went **4543.7 -> 5108.2 ms (+12.4 %)** over the same 992 dispatches (identical launch geometry and
+> resources, identical text/PPL/acceptance) and `pp4096 @ d32768` on the reporter's dense 27B arm went
+> **875.6 -> 839.4 t/s**.  The unpadded arm is now a constant-folded plain subtraction, which restores r250's ISA
+> exactly (107 342 instructions in the kernel, 4 594 in `load_tile_rows<132,...>`) and the arm to **876.0**.  One
+> file in block 05; blocks 06-16 were re-cut (their `From` id only).  Gates: `FLASH_ATTN_EXT` 6997/6997,
+> prefill-logit 0.000697 / 98.784 % (f16) and 0.000580 / 98.882 % (q8_0), width probe PASS, dense coherence
+> identical -- `benchmarks/2026-11-14-fa-prefill-min-codegen.md`, `INVARIANTS.md` r281.
+>
 > **r280: block 11's test-only `LLAMA_LAZY_BUF_MB` export is portable (PR #310), and the portability lint now
 > judges the lines the delivery inserts into an upstream file.**  One file moved — `tests/test-llama-archs.cpp` —
 > so nothing in a model, kernel or loader path changed; r279's tree `d6372d47a` becomes `b83424ef5` and the gates
@@ -717,6 +729,16 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **The tile loader's padded-head clamp is constant-folded for an unpadded head (r281, issue #311).**
+  `flash_attn_ext_f16_load_tile_impl`'s K/V bounds carry upstream #30285's `min(k0_stop, DKQ/2)` (and the twin
+  `min(i0_stop, DV)`) so a padded head (40/72, `DKQp > DKQ`) loads only its real head size.  For an unpadded head
+  the clamp cannot bind, but as a bare `min()` against a constant it is **not** free: it changes the optimizer's
+  handling of the tile-load loop and costs the RDNA4 head-256 prefill instance **12.4 %** of its kernel time
+  (4543.7 -> 5108.2 ms, 992 dispatches, `pp512 @ d30720`) with identical launch geometry, resources, text, PPL and
+  acceptance.  Both bounds are now spelled `DKQp == DKQ ? k0_stop - k0_start : min(k0_stop, DKQ/2) - k0_start`
+  (the padded arm is upstream's expression verbatim), which puts the instance ISA back on r250's exact counts.
+  Gate: `FLASH_ATTN_EXT` (the padded instances are the reason the clamp exists), the prefill-logit pair, and a
+  `rocprofv3` census of the prefill instantiation -- `benchmarks/2026-11-14-fa-prefill-min-codegen.md`.
 * **The band kernels** (`fattn-rdna.cuh`): the RDNA4 head-256 GQA-6 band (the GQA group folded into
   `ncols2 = 8`, a round-robin KV split over a fixed `P`), extended to the 2-byte (f16/bf16) arm and capped
   by `GGML_HIP_FA_BAND_WMMA_GQA_MAX` (default 12) for GQA-12 models.  Since r92 the 2-byte arm uses the

@@ -1,4 +1,4 @@
-From f89b760ce12879a2a23689f5b823b5fd6a8c306a Mon Sep 17 00:00:00 2001
+From 88a0603b85ce3e1ca8f4d6eab1ab2198e0fd5c25 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -3171,10 +3171,10 @@ index 7fc1436d6..c3e32eeb6 100644
      CUDA_CHECK(cudaGetLastError());
  }
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 974b35808..2597a3a03 100644
+index 99f027134..8dec6f09e 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1873,6 +1873,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1880,6 +1880,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          const int zt_gqa,
          const int kb0_start,
          const int kb0_stop, const kq_derived_t derived, const fattn_kv_native_t kv_native,
@@ -3186,7 +3186,7 @@ index 974b35808..2597a3a03 100644
          // > 1 only in the decode/verify band, where the block processes the KV iterations
          // kb0_start, kb0_start + kb0_step, ... (< kb0_stop) and may own none of them.
          const int kb0_step = 1) {
-@@ -2065,7 +2070,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2072,7 +2077,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              // the bitmap is produced only where that pipeline does not exist (AMD has no cp_async),
              // so every block can take last_iter=false and the accumulation is unchanged.
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3195,7 +3195,7 @@ index 974b35808..2597a3a03 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2125,7 +2130,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2132,7 +2137,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
            if constexpr (band_depth == 1) {
              // The next iteration is the next KV block that is not fully masked (the stream continues into it).
              auto unmasked = [&](int k) {
@@ -3204,7 +3204,7 @@ index 974b35808..2597a3a03 100644
                      k += kb0_step;
                  }
                  return k;
-@@ -2148,7 +2153,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2155,7 +2160,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              }
            } else {
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3213,7 +3213,7 @@ index 974b35808..2597a3a03 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2355,7 +2360,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2362,7 +2367,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
              ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
          }
@@ -3221,7 +3221,7 @@ index 974b35808..2597a3a03 100644
          __syncthreads();
  
          if (np == 1) {
-@@ -2430,6 +2434,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2437,6 +2441,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
                  }
              }
@@ -3234,7 +3234,7 @@ index 974b35808..2597a3a03 100644
  
              // Combined KQ max + rowsum.
              static_assert(cols_per_warp <= warp_size);
-@@ -2559,8 +2569,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2566,8 +2576,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
  
                          if (!needs_fixup && !is_fixup) {
                              const float KQ_rowsum_j = meta_j[1];
@@ -3258,7 +3258,7 @@ index 974b35808..2597a3a03 100644
                          }
  
                          if (is_fixup) {
-@@ -2633,7 +2656,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -2640,7 +2663,12 @@ static __global__ void flash_attn_ext_f16(
          const int    * __restrict__ tok_hi_ptr,
          // Native (V4 q8_0 / block-15 bf16) K/V: byte-addressed rows, read natively by the loaders
          // (null / FATTN_KV_NATIVE_NONE when the launcher staged F16).
@@ -3272,7 +3272,7 @@ index 974b35808..2597a3a03 100644
      ggml_cuda_pdl_sync(); // TODO optimize placement
  #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
      const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
-@@ -2652,6 +2680,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2659,6 +2687,8 @@ static __global__ void flash_attn_ext_f16(
      const int  * GGML_CUDA_RESTRICT KV_max        = KV_max_ptr;
      float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
      float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
@@ -3281,7 +3281,7 @@ index 974b35808..2597a3a03 100644
  
      // Skip unused kernel variants for faster compilation:
      if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
-@@ -2759,20 +2789,24 @@ static __global__ void flash_attn_ext_f16(
+@@ -2766,20 +2796,24 @@ static __global__ void flash_attn_ext_f16(
              const int kb0_stop  = iter_k;
              const int kb0_step  = gridDim.y;
  
@@ -3308,7 +3308,7 @@ index 974b35808..2597a3a03 100644
              }
              return;
          }
-@@ -2805,6 +2839,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -2812,6 +2846,11 @@ static __global__ void flash_attn_ext_f16(
          const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
              (const half *) (mask + nb33*(sequence % ne33));
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3320,7 +3320,7 @@ index 974b35808..2597a3a03 100644
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
  
-@@ -2829,19 +2868,23 @@ static __global__ void flash_attn_ext_f16(
+@@ -2836,19 +2875,23 @@ static __global__ void flash_attn_ext_f16(
          if (use_sparse) {
              kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
          } else if (KV_max) {
@@ -3347,7 +3347,7 @@ index 974b35808..2597a3a03 100644
          }
  
          // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
-@@ -2873,6 +2916,9 @@ static __global__ void flash_attn_ext_f16(
+@@ -2880,6 +2923,9 @@ static __global__ void flash_attn_ext_f16(
      const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
          (const half *) (mask + nb33*(sequence % ne33));
      float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3357,7 +3357,7 @@ index 974b35808..2597a3a03 100644
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
      const fattn_kv_native_t kv_native = {
-@@ -2895,14 +2941,16 @@ static __global__ void flash_attn_ext_f16(
+@@ -2902,14 +2948,16 @@ static __global__ void flash_attn_ext_f16(
      if (use_sparse) {
          kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
      } else if (KV_max) {
@@ -3376,7 +3376,7 @@ index 974b35808..2597a3a03 100644
  #else
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, kq_blocks_ptr,
          max_bias, m0, m1, n_head_log2, logit_softcap,
-@@ -2912,7 +2960,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2919,7 +2967,8 @@ static __global__ void flash_attn_ext_f16(
                nb11, nb12, nb13,
                nb21, nb22, nb23,
                ne31, ne32, ne33,
@@ -3386,7 +3386,7 @@ index 974b35808..2597a3a03 100644
      NO_DEVICE_CODE;
  #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
  }
-@@ -3076,7 +3125,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+@@ -3083,7 +3132,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
  
      const bool async_kv_preload = nstages == 2 && !use_sparse;
      launch_fattn<DV, ncols1, ncols2>

@@ -2,7 +2,7 @@
 
 > **Promoted:** `apu-expert-gtt` is now **block 16** of the delivery (r263, `v17-a691b2345-r263`); its record moved to [`archive/work/apu-expert-gtt/`](../archive/work/apu-expert-gtt/README.md) and its gate is `scripts/gate-uma-experts.sh`.  It is no longer an open campaign.
 >
-> **Archived (2026-11-13):** the `4f9dfa0e3` re-base campaign (`upstream-rebase-261113`) is **complete** — the delivery is re-cut at `v17-4f9dfa0e3-r280` (base `4f9dfa0e3`, tip `f25fd3ff2`, tree `b83424ef5`; r279 folds two contributor-reported correctness fixes, issues #307/#308, and r280 folds PR #310's Windows test-build fix, on top of the r278 re-cut) and its record moved to [`archive/work/upstream-rebase-261113/`](../archive/work/upstream-rebase-261113/README.md).  It is not an open campaign and it is not kept here as a stub; what it left open is `TODO` #322-#326.
+> **Archived (2026-11-13):** the `4f9dfa0e3` re-base campaign (`upstream-rebase-261113`) is **complete** — the delivery is re-cut at `v17-4f9dfa0e3-r278` and has moved on since (r279/#307+#308, r280/#310, r281/#311); the campaign record's own tree values are historical and its record moved to [`archive/work/upstream-rebase-261113/`](../archive/work/upstream-rebase-261113/README.md).  It is not an open campaign and it is not kept here as a stub; what it left open is `TODO` #322-#326.
 
 This is the index `AGENTS.md` refers to.  `wip/` holds **active exploration only** — nothing here is part
 of the delivery, and nothing here may be applied to the fork without the maintainer's explicit go-ahead

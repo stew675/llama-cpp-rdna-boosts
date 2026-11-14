@@ -4647,3 +4647,28 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   still excludes it) and *report* only the lines `git diff -U0 base..HEAD` adds.  Negative control for the
   check itself: the r279 tree must report exactly `test-llama-archs.cpp:844 setenv` and `:846 unsetenv`, and the
   r280 tree none, at the same 509 files scanned.
+
+## r281 -- a dead clamp in a device template is still a codegen decision (issue #311)
+
+* **`min(x, CONST)` in a hot device loop changes codegen even where it is provably a no-op.**  Upstream #30285
+  (the head 40/72 support, in the r278 re-base) wrote the FA K/V tile-loader bound as
+  `min(k0_stop, DKQ/2) - k0_start` so a **padded** head never reads past its real size.  For an unpadded head
+  (`DKQ % 16 == 0`) the clamp cannot bind, yet it costs the RDNA4 head-256 prefill instance **12.4 %** of its own
+  kernel time (4543.7 -> 5108.2 ms over 992 dispatches, `pp512 @ d30720`) with **identical** launch geometry
+  (`nthreads 256`, `nbatch_fa 64`, `K2/V2 128`, `combine 64`, `shmem 38400`), **identical** resources (VGPR 256 /
+  SGPR 128 / scratch 640) and **identical** text, PPL and draft acceptance.  What moves is the ISA: 107 342 ->
+  108 759 instructions in the kernel and 4 594 -> 4 755 in `flash_attn_ext_f16_load_tile_rows<132,...>`.
+  The fix is the constant-folded alternative (`DKQp == DKQ ? k0_stop - k0_start : min(k0_stop, DKQ/2) - k0_start`),
+  which restores r250's counts exactly.  Measured r250 875.6 -> r280 839.4 (=-4.1 %) -> r281 876.0 t/s at
+  `pp4096 @ d32768`, dense 27B Q5_K_XL, 1 x R9700, `q8_0` KV; `benchmarks/2026-11-14-fa-prefill-min-codegen.md`.
+* **A prefill regression of this class is invisible to every text gate.**  Greedy text, PPL (1.8578 +- 0.02354 on
+  the reporter's box) and draft acceptance were identical across the whole regression, and `llama-bench tg` was
+  flat -- so the instruments that find it are a **kernel-level census** (`rocprofv3 --kernel-trace`, which names
+  one kernel and one instantiation) and the **instance ISA** (extract the TU's `gfx1201` code object, count
+  instructions per symbol; a header-level hunk bisect against those counts is cheap and exact).  Do not judge a
+  prefill change by reading the diff, even when the arithmetic is provably unchanged.
+* **"The same source" is only true at the TU's preprocessed level.**  The r250 and r280 `flash_attn_ext_f16`
+  bodies were byte-identical for `DKQ=DV=256` (every other hunk in that header was heads-40/72 scaffolding or a
+  `DKQp`/`DVp` no-op at 256), and the two builds still produced different code, because the *TU* grew.  Removing
+  the added config rows, the tile specializations, the `DECL_...` lines or the `DKQp` padding individually does
+  **not** restore it; only the `min()` does.

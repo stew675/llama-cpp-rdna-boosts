@@ -33,6 +33,7 @@ delivery then carries only the fork-local remainder.
 
 | directory | what | in the delivery | status |
 |---|---|---|---|
+| [`fa-tile-loader-min/`](fa-tile-loader-min/README.md) | ggml-cuda: do not pay the padded-head clamp (`min(k0_stop, DKQ/2)` / `min(i0_stop, DV)`) on an unpadded FA head — a no-op clamp that costs the RDNA4 head-256 prefill instance 12.4 % of its kernel time (108 759 vs 107 342 ISA instructions) | **block 05** (r281, GitHub issue #311) | cut against **`4f9dfa0e3`**, `git apply --check` clean; the padded 40/72 arm keeps upstream's expression verbatim; `FLASH_ATTN_EXT` 6997/6997, prefill-logit 0.000697 / 98.784 % (f16) and 0.000580 / 98.882 % (q8_0), text identical, `pp4096 @ d32768` 839.4 -> 876.0 t/s |
 | [`fa-kv-split-width/`](fa-kv-split-width/README.md) | ggml-cuda: make the FA KV-split (`parallel_blocks`) heuristic query-width independent for small batches, so decode and every spec-verify width reduce identically | **block 00** | validated (gfx1201, issue #25), applies clean to its base |
 | [`fa-decode-verify-kernel-family/`](fa-decode-verify-kernel-family/README.md) | ggml-cuda: keep the decode/verify band on one FA kernel family (a quantized K/V cache took VEC for `n_q <= 2`, TILE from 3) | **block 05** | validated (3x gfx1201) |
 | [`fa-512-rdna-head-cap/`](fa-512-rdna-head-cap/README.md) | ggml-cuda: let RDNA4 use the WMMA FA kernel for head 512 (prefill-only), instead of always falling to the tile kernel | **block 05** (r92, issue #188) | builds and runs on `097cf33d9`; `FLASH_ATTN_EXT` 3993/3993 |
