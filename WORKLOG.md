@@ -40,13 +40,19 @@ one file, `tests/test-llama-archs.cpp` (19 insertions, 6 deletions).
   own window (`gate-rebase-release.sh --only text,faults`).  Plus the lint's **negative control**, which is the
   measurement that says the new mask is not vacuous: the r279 worktree reports exactly
   `tests/test-llama-archs.cpp:844 setenv` and `:846 unsetenv`, the r280 tree none, both at 509 files scanned.
+* **The release cut itself.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the canonical chain from
+  `patches/` — applied tip **`f25fd3ff2`**, applied tree **`b83424ef5`** (both equal to `release.json`), force-with-lease
+  pushed to the personal fork (lease `f61ac4bd8`).  Its `--gates` half ran the **prefill-logit KLD gate** even though
+  nothing numeric moved, and it is green: **0.000697 / same-top-p 98.784 %**, i.e. identical to r279 on the same base
+  and blocks, with the kernel journal clean since the run's own start.  That is the useful part — the gate is not
+  merely "untouched", it re-measured the identical number on the re-cut tree.
 * **What was NOT run, and why that is honest rather than convenient.**  No kernel, model-graph, loader or API code
-  changed (verified by `git diff --stat f61ac4bd8 HEAD`: one test file), so the prefill-logit gate, the MTP
-  four-axis protocol, `gate-host-pool.sh`, `gate-kv-*`, the qwen4exp pair and `test-backend-ops` are untouched by
-  this release and r279's numbers for them stand on the same base with the same blocks.  **The Windows claim
-  itself is review-level, not build-level**: there is no Windows runner here, exactly as for issue #307 in r279 --
-  the reporter builds Windows with the tests enabled and carried the equivalent patch from r236 through r279, and
-  the shape now matches the idiom block 01 already ships.  Stated that way everywhere it is claimed.
+  changed (verified by `git diff --stat f61ac4bd8 HEAD`: one test file), so the MTP four-axis protocol,
+  `gate-host-pool.sh`, `gate-kv-*`, the qwen4exp pair and `test-backend-ops` are untouched by this release and
+  r279's numbers for them stand on the same base with the same blocks.  **The Windows claim itself is review-level,
+  not build-level**: there is no Windows runner here, exactly as for issue #307 in r279 -- the reporter builds
+  Windows with the tests enabled and carried the equivalent patch from r236 through r279, and the shape now matches
+  the idiom block 01 already ships.  Stated that way everywhere it is claimed.
 * **PR #310 answered on GitHub**: accepted in substance, not in form -- folded into block 11 (not `wip/`), the
   shim replaced by the call-site split, and the lint's scope widened as the PR itself suggested (added-line
   scanning of edited files), which is what would have caught it in r236.
