@@ -583,6 +583,14 @@ coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0
   `7ca535e1da91`, `pmres` `f260d1824ab3`, `pmlegacy` `b08d3dbcb1e9` — **exactly the three R16 values**, on a
   different day and a different build.  Everything else in the gate (window, selftest, the whole single-device
   pool section, the per-device counter blocks) is green.
-* **Status:** `OPEN` — needs a real fix (owner: the MTP driver / slab staging on a split, not block 15).  Carry
-  as `TODO.md` #321; it blocks `gate-kv-residency.sh`'s multi-device section and it is worth an `INVARIANTS.md`
-  entry once fixed.
+* **Status:** `RESOLVED at r284 (2026-11-14) -- the attribution above is wrong: it is NOT the MTP driver and NOT
+  the slab staging.**  The nondeterminism needs the drafter model **loaded** (not used: `--spec-type none -md`
+  reproduces it, no `-md` is stable 10/10) and it is carried by the **persisted `.moe-heatmap` prior**, i.e. by
+  residency: one prior state gives `7ca535e1da91`, another `7a3474cbe5f1`, each reproducible within its own state,
+  and `MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two (`GGML_MOE_DEVREMAP=0`,
+  `MOE_EXPERT_CACHE_IDENTITY_PREF=0` and `GGML_CUDA_MMB=0` do not).  So residency selects the kernel SET (a fully
+  resident table is served in place and its prefill fusions stand down, r258/r266) and the sets are not
+  bit-identical in this configuration; the magnitude is unmeasured (`llama-perplexity` cannot load a drafter).
+  `gate-kv-residency.sh` now pins the prior (`MOE_EXPERT_HEATMAP=load`) like it pins `ROCBLAS_USE_HIPBLASLT=0`, and
+  its multi-device section is green on the same assertions; `TODO.md` #321 is retired into accepted limitations.
+  Record: `benchmarks/2026-11-14-residency-reproducibility.md`, `INVARIANTS.md` r284, `GREEDY-PURITY.md` §89.

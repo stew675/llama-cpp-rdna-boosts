@@ -1,3 +1,61 @@
+## 261114.005 (r284) -- `TODO` #319/#320/#321: the APU store's refusal now tests the number the cache accepts, and "the MTP draft is not reproducible" turns out to be the expert cache's RESIDENCY in the text
+
+**`release.json` changed: tip `6a4af82e2` -> `e4d3bf7c8`, tree `f0921dec3` -> `39ad82e0e`, release
+`v17-4f9dfa0e3-r283` -> `v17-4f9dfa0e3-r284`; 17 blocks, base unchanged.**  Block 16 was amended (its `From` id
+only); blocks 00-15 are byte-identical.  No new environment variable, no default moved.
+
+* **#319 -- the lock policy tested `arena_min`, the cache accepts `max(arena_min, floor)`.**  `TODO` #319 asked
+  whether block 16's refusal of a >RAM model on a clamp "too small for one expert table" was necessary.  It is,
+  but the *arithmetic was wrong*: `plan_gtt_expert_store()` tested the clamp against one slot per expert table
+  while `moe_cache_preflight_store()` declines any store below **2048 MiB**, so a clamp in between was accepted
+  as a streaming tier, declined by the cache, and then reported as *"the arena is unavailable on this device"*
+  -- with the advice to pass `-lme`, which the operator had already done.  The floor is now a backend answer
+  (`ggml_backend_dev_gtt_store_arena_min` → `moe_cache_gtt_arena_floor()`, one definition), the streaming test is
+  `arena_need = max(arena_min, floor)`, and the refusal names the constraint that binds and the number to raise.
+  **The band itself is empty for any model more than one slot-set over RAM:** on `halo` the 122B-A10B Q8_0 reads
+  weights 126 403.0 MiB / fit cap 101 669.6 / shortfall 23 967 MiB / one slot per table **459.6 MiB**, so
+  `[shortfall, arena_min)` cannot be entered; the reachable refusal band is `[shortfall, 2048 MiB)`, i.e. a model
+  within 2 GiB of fitting, where refusing is necessary (the arena is the only tier that streams and it declines
+  below its floor) and two documented escapes exist (raise `ulimit -l`, or `MOE_EXPERT_GTT_MLOCK=0`, which
+  bypasses the lock policy so the arena is reclaimable).  Four arms on `halo`, r284 build: `-lme 1` refuses
+  naming *"the budget (1024.0 MiB) is below the GTT arena's own floor of 2048.0 MiB"* and *"raise `-lme` to at
+  least 2048.0 MiB: 459.6 MiB is what this model's expert tables need at one slot each"*; `-lme auto` under
+  `ulimit -l` 1 GiB refuses naming the 21 741.3 MiB shortfall against the 1024.0 MiB it could honour; and
+  **`-lme 3` runs** -- arena 3072.0 MiB (2754.0 MiB of slots, 144 tables, 6 slots each), 864 direct buffered
+  fills at 4158 MiB/s, the 117 504.6 MiB expert set streamed from the page-cache mapping, text produced.
+* **#320 retired unimplemented.**  Parked by the maintainer at r263 for a reason that still holds (the MTP head is
+  pinned *outside* the `-lme` budget on purpose, and making it budget-visible is a `common`/`--fit` term with no
+  measurement behind it and nothing depending on it).  No viable course of action, so the item is gone and the
+  reasoning is in `TODO.md` -> accepted limitations.
+* **#321 -- it is not the MTP draft, and it is not a race: greedy text is a function of the expert cache's
+  residency.**  The recorded attribution ("the draft path across devices") is wrong on both halves.  What the
+  nondeterminism needs is the drafter model **loaded** (not used): `--spec-type none` with `-md` reproduces it,
+  and the same arm with **no `-md` at all** is stable **10/10**; 1 device is stable, `GGML_CUDA_DISABLE_GRAPHS=1`
+  does not help, `MOE_EXPERT_CACHE_MIB=0` is stable (7/7), and a 35B-A3B arm with the long prompt is stable 12/12
+  either way.  The mechanism is the **persisted `.moe-heatmap` prior**: with one prior `cp`'d in, 2/2 runs give
+  `7ca535e1da91`; with no prior, 2/2 give `7a3474cbe5f1`; `MOE_EXPERT_HEATMAP=load` (frozen) is `7ca535e1da91`
+  x6.  Knob matrix (prior SET vs absent): `GGML_MOE_DEVREMAP=0`, `MOE_EXPERT_CACHE_IDENTITY_PREF=0` and
+  `GGML_CUDA_MMB=0` all stay prior-dependent, **`MOE_EXPERT_PREFILL_IN_PLACE=0` gives `7a3474cbe5f1` for both** --
+  i.e. residency selects the kernel SET (a fully resident table is served in place and its prefill fusions stand
+  down, r258/r266), and the two sets are not bit-identical here.  The flip lands ~60 tokens into the generation
+  (a near-tie), not at the first token.  **The magnitude is unmeasured** and is recorded as such: `llama-perplexity`
+  cannot load a drafter, which is the state that produces the partial residency, and without one both priors read
+  KLD 0.000000 / same-top-p 100 % (at 99.65 % residency).  The delivery-side consequence is a comparison rule, and
+  it is implemented: `scripts/gate-kv-residency.sh` forces `MOE_EXPERT_HEATMAP=load` on **every** arm next to
+  `ROCBLAS_USE_HIPBLASLT=0`, and with it the multi-device pool section -- red at R16/R18 with three different texts
+  in three arms (`7ca535e1da91` / `f260d1824ab3` / `b08d3dbcb1e9`) -- is **green on the same assertions**
+  (`pmref == pmres == pmlegacy` `b08d3dbcb1e9`, 2 device counter blocks, 228 resolves, bad 0).  Record:
+  [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md); rule
+  `GREEDY-PURITY.md` §89; facts `INVARIANTS.md` r284; `TODO.md` #321 retired into accepted limitations.
+* **Gates.**  `fork-refresh.sh` re-cut the canonical chain at `4f9dfa0e3` (tree `39ad82e0e`, tip `e4d3bf7c8`);
+  `validate-set.sh` green (17 blocks, fresh tarball apply, Windows portability scan 509 files);
+  `gate-per-block-build.sh --fast --changed-from 6a4af82e2` (block 16 only, 18 s); coherence identical to the
+  recorded references on this box (4B 1 GPU `897 / a77fa8c1107a`, 3 GPU tensor `964 / eab86065e67e` -- the
+  loader change is inert without an IGPU, `arena_need == arena_min`); `gate-kv-residency.sh --multi-only` green;
+  `gate-prefill-logits.sh` unchanged (0.000697 / 98.784 %, the r279 base -- no numerics moved).  Block 16's own
+  APU gates (`gate-uma-experts.sh`, `gate-prefill-server-slots.sh`) remain owed on `halo` under `TODO` #325; this
+  entry's `halo` arms cover the `-lme`/lock path only.
+
 ## 261114.004 (r283) -- the n-gram family gets the greedy-purity notice the draft family already had, and the notice threshold is documented as exact
 
 **`release.json` changed: tip `add359b62` -> (see below), tree `7bb5113de5` -> (see below), release

@@ -4708,3 +4708,48 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   proved shape-independently.  A speculator whose DEFAULT puts a user outside the band must say so: since
   r283 `common_init_from_params` prints the same W-level trade for an enabled draftless (n-gram) speculator
   whose width exceeds 7, naming `--spec-ngram-mod-n-max 7`.  `GREEDY-PURITY.md` §11.
+
+## r284 — the arena's minimum is `max(one slot per table, the cache's floor)`, and residency is an input to greedy text
+
+* **`arena_min` was never the tier's minimum (block 16's lock policy, `TODO` #319).**  `plan_gtt_expert_store()`
+  tested a clamped store against `arena_min` (one slot per expert table) to decide "this clamp can still
+  stream, so the load can run", but `moe_cache_preflight_store()` declines any store below its own **floor**
+  (2048 MiB), so a clamp in `[arena_min, floor)` passed the loader's test, was declined by the cache, and the
+  load was then refused as *"the arena is unavailable on this device"* with the advice to pass `-lme` -- which
+  it had.  The floor is now asked for from the backend that owns it
+  (`ggml_backend_dev_gtt_store_arena_min()` → `moe_cache_gtt_arena_floor()`), so the streaming test and the
+  cache's acceptance are the same number, and the refusal names the binding constraint with the number to raise.
+  Measured on `halo` (gfx1151, 123 GiB, r283 build): `Qwen3.5-122B-A10B Q8_0` weights **126 403.0 MiB**,
+  MemAvailable **113 817.5 MiB**, fit cap **102 435.8 MiB** → shortfall **23 967 MiB**; the model's expert set
+  is **117 504.6 MiB in 144 tables** of 256 experts (816 MiB per table, 3.19 MiB per slot; the loader's own
+  padded arithmetic reports **459.6 MiB**, an offline sum over the file's tensor table 469.1 MiB).  So
+  `shortfall ≫ arena_min` and `TODO` #319's band `[shortfall, arena_min)` is **empty** for every model more
+  than `arena_min` over RAM; the reachable refusal band is `[shortfall, 2048 MiB)`, i.e. a model within 2 GiB of
+  fitting.  Refusing there is **necessary** (the arena is the only tier that can stream and it declines below
+  its floor), and the operator has two documented escapes: raise `RLIMIT_MEMLOCK`, or
+  `MOE_EXPERT_GTT_MLOCK=0` (an unlocked arena is reclaimable -- a stall on a miss, not a fault -- which is why
+  that kill switch bypasses the whole lock policy).  The four arms on `halo`, same model, r284 build:
+  `-lme 1` → refuses naming *"the budget (1024.0 MiB) is below the GTT arena's own floor of 2048.0 MiB"* and
+  *"raise `-lme` to at least 2048.0 MiB: 459.6 MiB is what this model's expert tables need at one slot each"*
+  (the r283 build said *"the arena is unavailable on this device"* and advised passing `-lme`, which it had);
+  `-lme auto` with `ulimit -l` 1 GiB → refuses on the clamp, naming the 21 741.3 MiB shortfall against the
+  1024.0 MiB it could honour; and **`-lme 3` runs** -- the arena opens at 3072.0 MiB (2754.0 MiB of slots,
+  144 tables, 6 slots each), 864 direct buffered fills at 4158 MiB/s, the 117 504.6 MiB expert set streamed
+  from the page-cache mapping, text produced.
+* **A permission read from the device is a policy input, and `SIZE_MAX`/`0` must mean "no answer"** — the new
+  iface member is appended at the end (the positional-initializer rule), returns 0 for a device with no arena
+  and for any backend that does not implement it, and the loader keeps `arena_need == arena_min` when no IGPU
+  answers, which is why the change is inert on a discrete box (coherence identical: 4B 1 GPU `a77fa8c1107a`,
+  3 GPU tensor `eab86065e67e`).
+* **Greedy text is a function of the expert cache's RESIDENCY state (r284, `TODO` #321 retired).**  The
+  persisted `.moe-heatmap` prior orders residency; residency decides which MoE path serves an op (a fully
+  resident table is served in place at prefill widths and its fusions stand down, r258/r266), and on a 2-device
+  `-sm layer` split with the drafter loaded those paths are not bit-identical.  Measured (Flash-Next
+  GSQ-IQ3_XXS + its `mtp-...-shared` sidecar, `-ncmoe 48 -c 32768`, 64 tokens): one prior `7ca535e1da91` ×4,
+  a different one `7a3474cbe5f1` ×4, `MOE_EXPERT_HEATMAP=load` `7ca535e1da91` ×6, and
+  `MOE_EXPERT_PREFILL_IN_PLACE=0` gives `7a3474cbe5f1` for both; the drafter being **loaded** is the trigger
+  (its context reserve shrinks the arena into the partly-resident band), not the draft path -- with no `-md`
+  the same arm is stable 10/10, and `--spec-type none` with `-md` loaded reproduces it.  Consequence: a text
+  comparison across processes pins the cache state, exactly as it pins `ROCBLAS_USE_HIPBLASLT=0` (§44);
+  `gate-kv-residency.sh` now forces `MOE_EXPERT_HEATMAP=load` and its multi-device section is green.
+  `GREEDY-PURITY.md` §89, `benchmarks/2026-11-14-residency-reproducibility.md`.

@@ -1,4 +1,4 @@
-From affc4c94d2b0c2c6217fd577fd2a407c9615ba6a Mon Sep 17 00:00:00 2001
+From db6cbf1667d517d8e8a9af4666bcf4926d25472e Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 16/16] rdna-boosts: block 16: the UMA GTT expert store -- an
@@ -74,22 +74,22 @@ pool_slot_assign_locked and the "nothing evicts, so no per-slot drain" rationale
 onto the TODO #87 note).
 ---
  common/arg.cpp                                |   70 +-
- ggml/include/ggml-backend.h                   |   32 +-
- ggml/src/ggml-backend-impl.h                  |   61 +-
+ ggml/include/ggml-backend.h                   |   38 +-
+ ggml/src/ggml-backend-impl.h                  |   70 +-
  ggml/src/ggml-backend-meta.cpp                |   13 +
- ggml/src/ggml-backend.cpp                     |   53 +-
+ ggml/src/ggml-backend.cpp                     |   60 +-
  ggml/src/ggml-cpu/ggml-cpu.cpp                |   19 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |   10 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |    4 +
- ggml/src/ggml-cuda/ggml-cuda.cu               |  285 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  299 +-
  ggml/src/ggml-cuda/gtt-expert-store.cu        |  638 ++++
  ggml/src/ggml-cuda/gtt-expert-store.cuh       |   89 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 2970 +++++++++++++++--
- ggml/src/ggml-cuda/moe-expert-cache.h         |   30 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 2981 +++++++++++++++--
+ ggml/src/ggml-cuda/moe-expert-cache.h         |   35 +-
  ggml/src/ggml-rpc/ggml-rpc.cpp                |   19 +
- src/llama-model-loader.cpp                    |  746 ++++-
+ src/llama-model-loader.cpp                    |  795 ++++-
  src/llama-model-loader.h                      |   35 +
- 16 files changed, 4730 insertions(+), 344 deletions(-)
+ 16 files changed, 4831 insertions(+), 344 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cu
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
@@ -195,10 +195,10 @@ index eadaae156..d44c0980a 100644
              }
          }
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..9cdf1aab0 100644
+index d72bb88d7..7a7ffd13f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -84,12 +84,42 @@ extern "C" {
+@@ -84,12 +84,48 @@ extern "C" {
      // host-master tier in descending hotness.  `open` once (with the GGUF path) before any placement
      // decision; `score` per candidate host expert tensor, or -1 when the prior has no record of it (the
      // caller then keeps its own tensor order).  No-op / -1 for a backend that does not answer.
@@ -239,11 +239,17 @@ index d72bb88d7..9cdf1aab0 100644
 +    // must not size, grow or take the arena tier (the extent is the first model's budget).
 +    GGML_API size_t                ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev);
 +
++    // TODO #319: the smallest store `ggml_backend_dev_gtt_store_arena` accepts on `dev`, in bytes; 0 when this
++    // device has no arena tier.  The loader's `-lme` lock policy tests the clamp against it as well as against
++    // one slot per expert table, because a store below it can never stream a table -- and streaming is the only
++    // thing that makes a model that does not fit in RAM runnable.
++    GGML_API size_t                ggml_backend_dev_gtt_store_arena_min(ggml_backend_dev_t dev);
++
      // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
      // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
      // No-op for a backend without a slab or with no ring hole.
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 87c8164ec..89d09a2a8 100644
+index 87c8164ec..d0bf5b3f2 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -372,6 +372,20 @@ extern "C" {
@@ -276,7 +282,7 @@ index 87c8164ec..89d09a2a8 100644
          void    (*moe_heat_open)(ggml_backend_dev_t dev, const char * model_path);
          int64_t (*moe_heat_score)(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
  
-@@ -577,6 +591,51 @@ extern "C" {
+@@ -577,6 +591,60 @@ extern "C" {
          // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
          // that never answers leaves the pool on its own default).
          void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
@@ -325,6 +331,15 @@ index 87c8164ec..89d09a2a8 100644
 +        // end for the positional-initializer reason above; zero-initialized = "no store", which is what a
 +        // backend without one must answer.
 +        size_t (*gtt_store_free_bytes)(ggml_backend_dev_t dev);
++
++        // (optional) TODO #319: the smallest store this device's ARENA can serve, in bytes (0 = no arena on
++        // this device).  `gtt_store_arena` declines anything below it, so a store that small can never stream
++        // an expert table -- and streaming is what makes a model that does not fit in RAM runnable.  The model
++        // loader's `-lme` lock policy asks for this so its "the store can stream" test and the cache's own
++        // floor are ONE number; without it a clamp in [one slot per table, floor) passed the loader's test,
++        // declined in the cache, and was refused as if the device had no arena at all.  APPENDED at the very
++        // end for the positional-initializer reason above; zero-initialized = no arena tier.
++        size_t (*gtt_store_arena_min)(ggml_backend_dev_t dev);
      };
  
      struct ggml_backend_device {
@@ -360,7 +375,7 @@ index a28a738ec..acda336b1 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index c25538fbe..0dfca15b0 100644
+index c25538fbe..79a70b16e 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -301,11 +301,11 @@ void ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev) {
@@ -377,7 +392,7 @@ index c25538fbe..0dfca15b0 100644
  }
  
  void ggml_backend_dev_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -329,6 +329,43 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
+@@ -329,6 +329,50 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
      dev->iface.moe_cache_set_host_fill_mode(dev, direct);
  }
  
@@ -411,6 +426,13 @@ index c25538fbe..0dfca15b0 100644
 +    return dev->iface.gtt_store_free_bytes(dev);
 +}
 +
++size_t ggml_backend_dev_gtt_store_arena_min(ggml_backend_dev_t dev) {
++    if (dev == nullptr || dev->iface.gtt_store_arena_min == nullptr) {
++        return 0;
++    }
++    return dev->iface.gtt_store_arena_min(dev);
++}
++
 +size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
 +    if (dev == nullptr || dev->iface.gtt_store_lockable == nullptr) {
 +        return SIZE_MAX;
@@ -421,7 +443,7 @@ index c25538fbe..0dfca15b0 100644
  bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
-@@ -3431,6 +3468,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3431,6 +3475,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  }
              }
  
@@ -514,7 +536,7 @@ index d82930ec3..69f0d4411 100644
  bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
  bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 545b72e17..43afcdcdc 100644
+index 545b72e17..ff4b80d73 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -126,6 +126,7 @@
@@ -752,7 +774,7 @@ index 545b72e17..43afcdcdc 100644
  }
  
  static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -10778,13 +10966,97 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -10778,13 +10966,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -818,6 +840,19 @@ index 545b72e17..43afcdcdc 100644
 +    return moe_cache_preflight_store(dev_ctx->device, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
++static size_t ggml_backend_cuda_device_gtt_store_arena_min(ggml_backend_dev_t dev) {
++    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
++    if (dev_ctx == nullptr || !ggml_cuda_gtt_store_wanted()) {
++        return 0;
++    }
++    // Only an integrated device offers the arena (`gtt_store_arena` refuses every other device), and the floor
++    // belongs to the cache that serves it -- one definition, `moe_cache_gtt_arena_floor()`.
++    if (!ggml_cuda_info().devices[dev_ctx->device].integrated) {
++        return 0;
++    }
++    return moe_cache_gtt_arena_floor();
++}
++
 +static size_t ggml_backend_cuda_device_gtt_store_free_bytes(ggml_backend_dev_t dev) {
 +    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
 +    if (dev_ctx == nullptr) {
@@ -852,7 +887,7 @@ index 545b72e17..43afcdcdc 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -10926,6 +11198,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10926,6 +11211,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -861,6 +896,7 @@ index 545b72e17..43afcdcdc 100644
 +    /* .gtt_store_lockable        = */ ggml_backend_cuda_device_gtt_store_lockable,
 +    /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
 +    /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
++    /* .gtt_store_arena_min       = */ ggml_backend_cuda_device_gtt_store_arena_min,
  };
  
  // backend reg
@@ -1604,7 +1640,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 4fda11990..8e6e4751e 100644
+index 4fda11990..1f541ca81 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -3802,12 +3838,12 @@ index 4fda11990..8e6e4751e 100644
 -                    order.push_back(i);
 +                if (layer_full[i] < 0) {
 +                    continue;
-+                }
+                 }
 +                // P3c: a pinned head layer is already FULL and its bytes are already outside the budget, so
 +                // letting it into this pass would charge them to `remain` a second time and drop trunk layers.
 +                if (layer_pinned_head(i)) {
 +                    continue;
-                 }
++                }
 +                order.push_back(i);
              }
              if (g_heat_on) {
@@ -3916,10 +3952,21 @@ index 4fda11990..8e6e4751e 100644
      // The pool's AUTO budget is a fraction of the MoE host expert bytes.  This runs once per host-expert
      // device, before the context -- but it is RE-RUN for the same devices (the `--fit` probe, and a
      // second model's preflight for a separate draft/MTP head), so a running sum sized the pool at N x the
-@@ -6315,6 +7307,72 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
+@@ -6315,6 +7307,83 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
      return true;
  }
  
++// wip/apu-expert-gtt P3 / TODO #319: the smallest GTT store the ARENA can serve.  Below it the cache stays
++// inert (a store that small cannot hold a useful part of an expert set), which means it can never stream a
++// table -- and streaming is the ONLY thing that makes a model that does not fit in RAM runnable.  The model
++// loader asks for this number (`ggml_backend_dev_gtt_store_arena_min`) so its refusal arithmetic and this
++// floor are one number: `arena_min` alone (one slot per expert table, typically a few hundred MiB) is far
++// below what the cache will actually accept, and testing only that let a clamp land between the two, decline
++// the arena, and then report the refusal as "the arena is unavailable on this device".
++size_t moe_cache_gtt_arena_floor() {
++    return (size_t) 2048 * 1024 * 1024;
++}
++
 +// wip/apu-expert-gtt P3: SELECT THE GTT STORE as this run's expert arena.
 +//
 +// This is the branch the campaign set out to replace: on an integrated device the cache used to be switched OFF
@@ -3942,7 +3989,7 @@ index 4fda11990..8e6e4751e 100644
 +    }
 +    // A store smaller than the cache's own floor cannot hold a useful part of an expert set: leave the cache
 +    // inert, and the caller's `-lme` plan (whole-tensor placement, or its refusal) is what applies.
-+    const size_t floor_b = (size_t) 2048 * 1024 * 1024;
++    const size_t floor_b = moe_cache_gtt_arena_floor();
 +    if (extent_bytes < floor_b) {
 +        GGML_LOG_INFO("%s: device %d: GTT expert store is %.1f MiB, below the cache's %zu MiB floor -- the cache "
 +                      "stays OFF and the store keeps its whole-tensor placement\n", __func__, device,
@@ -3989,7 +4036,7 @@ index 4fda11990..8e6e4751e 100644
  void moe_cache_set_extra_reserve(int device, size_t bytes) {
      // WIP r42 (TODO #42): hold this many bytes of the free VRAM for the post-prefill compute layout, so
      // the arena does not take the space a later compute growth (or the grow-in-place realloc) needs.
-@@ -6417,8 +7475,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
+@@ -6417,8 +7486,9 @@ static void stand_down_table_locked(table_t & t, int idx) {
      t.remap_dev    = nullptr;
      t.remap_cap    = 0;
      free_heat_dev_locked(t);   // keep the tally across a stand-down (folds the mirror into `heat`)
@@ -4001,7 +4048,7 @@ index 4fda11990..8e6e4751e 100644
      t.slots        = 0;
      t.slot_dirty   = true;
      t.slot_expert.clear();
-@@ -6475,6 +7534,12 @@ bool moe_cache_shrink_step(int device) {
+@@ -6475,6 +7545,12 @@ bool moe_cache_shrink_step(int device) {
          if (t.device != device) {
              continue;
          }
@@ -4014,7 +4061,7 @@ index 4fda11990..8e6e4751e 100644
          if (t.arena != nullptr && t.slots > 0) {
              const int64_t b = (int64_t) t.slots * (int64_t) t.expert_bytes;
              if (b > best_b) {
-@@ -6512,6 +7577,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -6512,6 +7588,11 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
      const size_t target = need_bytes + (256u << 20);
      std::vector<int> order;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
@@ -4026,7 +4073,7 @@ index 4fda11990..8e6e4751e 100644
          if (g_tables[i].arena != nullptr && g_tables[i].slots > 0) {
              order.push_back(i);
          }
-@@ -6549,6 +7619,7 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
+@@ -6549,6 +7630,7 @@ bool moe_cache_shrink_arena(size_t need_bytes) {
          t.identity = false;
          t.slot_expert.clear();
          t.slot_prov.clear();
@@ -4034,7 +4081,7 @@ index 4fda11990..8e6e4751e 100644
          t.expert_slot.clear();
          t.slot_dirty = true;
          n_freed++;
-@@ -6653,6 +7724,12 @@ static void report_snapshot_locked() {
+@@ -6653,6 +7735,12 @@ static void report_snapshot_locked() {
          g_report_snap.misses += t.misses;
          g_report_snap.fills += t.fills;
          g_report_snap.evictions += t.evictions;
@@ -4047,7 +4094,7 @@ index 4fda11990..8e6e4751e 100644
          if (t.slots > 0) {
              g_report_snap.n_tables++;
              g_report_snap.n_slots += t.slots;
-@@ -6664,6 +7741,12 @@ static void report_snapshot_locked() {
+@@ -6664,6 +7752,12 @@ static void report_snapshot_locked() {
          }
      }
      g_report_snap.arena_bytes = g_arena_bytes;
@@ -4060,7 +4107,7 @@ index 4fda11990..8e6e4751e 100644
      g_report_snap.n_pools     = (int64_t) g_host_pools.size();
      for (const auto & kv : g_host_pools) {
          const host_pool_t & p = kv.second;
-@@ -6969,6 +8052,11 @@ bool moe_cache_rearm() {
+@@ -6969,6 +8063,11 @@ bool moe_cache_rearm() {
      std::map<int, std::vector<int>> by_layer;
      for (int i = 0; i < (int) g_tables.size(); ++i) {
          const table_t & t = g_tables[i];
@@ -4072,7 +4119,7 @@ index 4fda11990..8e6e4751e 100644
          if (t.device >= 0 && t.allocated && t.slots == 0) {
              by_layer[t.layer].push_back(i);
          }
-@@ -7510,10 +8598,11 @@ void moe_cache_set_host_pool(bool on) {
+@@ -7510,10 +8609,11 @@ void moe_cache_set_host_pool(bool on) {
  // host-expert placement.  `moe_cache_set_host_source` opens it too, but only when the first tensor's DATA
  // is copied -- long after every buffer-type decision has been made, which would leave the pinned tier
  // with no ranking at load time.
@@ -4085,7 +4132,7 @@ index 4fda11990..8e6e4751e 100644
  }
  
  // The loader's `--load-mode` as a READ TRANSPORT (rdna-boosts): 0 = the mapping, 1 = a buffered `pread` per
-@@ -7582,7 +8671,13 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -7582,7 +8682,13 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
          heat_map_open_locked(path);
      }
      if (!moe_host_pool_on()) {
@@ -4100,7 +4147,7 @@ index 4fda11990..8e6e4751e 100644
      }
      host_src_t & s = g_host_src[tensor_data];
      s.path        = path;
-@@ -8242,6 +9337,7 @@ static span_buf_t * span_buf_acquire(int device, size_t need, size_t align) {
+@@ -8242,6 +9348,7 @@ static span_buf_t * span_buf_acquire(int device, size_t need, size_t align) {
      }
      (void) cudaGetLastError();
      g_stage_span_wait_us += ggml_time_us() - tw;
@@ -4108,7 +4155,7 @@ index 4fda11990..8e6e4751e 100644
      b.busy = false;
      g_span_next[device] = (g_span_next[device] + 1) % used;
      return span_buf_ensure(b, need, align);
-@@ -8309,7 +9405,7 @@ static cudaError_t stage_span_fill(table_t & t, host_pool_t * pool, const int32_
+@@ -8309,7 +9416,7 @@ static cudaError_t stage_span_fill(table_t & t, host_pool_t * pool, const int32_
          }
          while (e < run_end && err == cudaSuccess) {
              const size_t n     = std::min(chunk, (size_t) (run_end - e));
@@ -4117,7 +4164,7 @@ index 4fda11990..8e6e4751e 100644
                  e += (int) n;   // the leftover tail of a run: the per-expert path reads it
                  continue;
              }
-@@ -8978,6 +10074,1098 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -8978,6 +10085,1098 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      return false;
  }
  
@@ -5216,7 +5263,7 @@ index 4fda11990..8e6e4751e 100644
  // Geometry-only registration: the half of `moe_cache_update_host` that needs no routing.
  //
  // The scheduler calls it for every routed host-expert input of EVERY split before the first split of a
-@@ -9062,8 +11250,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
+@@ -9062,8 +11261,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
          table_t & t = g_tables[table];
          if (!t.primed) {
              t.primed = true;
@@ -5225,7 +5272,7 @@ index 4fda11990..8e6e4751e 100644
          }
          if (!g_sized && g_size_at_prime && moe_cache_tables_complete_locked()) {
              GGML_LOG_INFO("%s: the host-expert table set is complete at registration (%d tables); arming "
-@@ -9175,7 +11361,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9175,7 +11372,22 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              }
              t.prefill_tokens += n_tok;
          }
@@ -5249,7 +5296,7 @@ index 4fda11990..8e6e4751e 100644
      }
  
      // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
-@@ -9238,6 +11439,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9238,6 +11450,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          t.device = device;
          alloc_table_locked(t, old_slots);
          t.slot_expert.assign(t.slots, -1);
@@ -5257,7 +5304,7 @@ index 4fda11990..8e6e4751e 100644
          t.expert_slot.clear();
          GGML_LOG_WARN("%s: migrated layer=%d role=%s arena from device %d to %d (%d slots)\n",
                        __func__, t.layer, t.role.c_str(), old_device, device, t.slots);
-@@ -9249,7 +11451,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9249,7 +11462,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (priming, no arena, or `!all` below), the scheduler copies the FULL expert table and the op must
      // read that copy - not the previous token's remap.  The consumer only redirects while
      // `remap_n_used > 0`, so zeroing it here turns "hook declined" into "op reads `input_cpy`".
@@ -5267,7 +5314,7 @@ index 4fda11990..8e6e4751e 100644
  
      // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
      // only registers the tables and runs uncached (the scheduler copies the full experts); the
-@@ -9705,8 +11908,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -9705,8 +11919,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
      }
      g_write_seq++;
      const auto decline = [&]() {
@@ -5279,7 +5326,7 @@ index 4fda11990..8e6e4751e 100644
          return false;
      };
      const int64_t n  = n_used * n_tok;
-@@ -9763,8 +11967,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -9763,8 +11978,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  continue;
              }
              if (!devremap_prep_locked(u, stream)) {
@@ -5291,7 +5338,7 @@ index 4fda11990..8e6e4751e 100644
                  continue;   // its own call retries
              }
              add_job(u, k);
-@@ -9911,11 +12116,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -9911,11 +12127,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
          if (n_tok)        *n_tok        = 0;
          return true;
      }
@@ -5310,7 +5357,7 @@ index 4fda11990..8e6e4751e 100644
          return false;
      }
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
-@@ -10166,27 +12373,147 @@ static void report_locked() {
+@@ -10166,27 +12384,147 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -5467,7 +5514,7 @@ index 4fda11990..8e6e4751e 100644
      }
      if (g_uploadp_calls > 0) {
          GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
-@@ -10428,6 +12755,31 @@ static void report_locked() {
+@@ -10428,6 +12766,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }
@@ -5500,10 +5547,10 @@ index 4fda11990..8e6e4751e 100644
          // The prefill band's storage reads when they are NOT coalesced (a chunk that fell back, the 2-D
          // geometry, a pool with no free slot yet).  Read it against the span line above: `%.1f MiB/read`
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 3c5469637..409444053 100644
+index 3c5469637..cdd7dad7d 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -102,6 +102,17 @@ bool moe_cache_floor_active();
+@@ -102,6 +102,22 @@ bool moe_cache_floor_active();
  // the first call; returns true when the cache remains active.
  bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes);
  
@@ -5518,10 +5565,15 @@ index 3c5469637..409444053 100644
 +// True when this run's arena is the GTT store (see `moe_cache_preflight_store`).
 +bool moe_cache_gtt_arena();
 +
++// TODO #319: the smallest `extent_bytes` `moe_cache_preflight_store` accepts.  The model loader's `-lme` plan
++// asks for it (`ggml_backend_dev_gtt_store_arena_min`) so that "the store can stream" is decided with the
++// same floor the cache declines on, instead of with one slot per expert table alone.
++size_t moe_cache_gtt_arena_floor();
++
  // WIP r42 (TODO #42): hold `bytes` of the free VRAM on `device` for the post-prefill compute layout,
  // so the auto-sized arena does not take the space a later compute growth needs.  Called at the
  // prefill -> decode transition, before the arena is sized.
-@@ -266,7 +277,9 @@ void    moe_cache_heat_open(const char * model_path);
+@@ -266,7 +282,9 @@ void    moe_cache_heat_open(const char * model_path);
  // (pool residency, ranked by the heat prior) instead of per TENSOR (a pinned master).  The pool's expert-indexed
  // slots are also the region's presence bitmap, and with `MOE_HOST_POOL_COLD_MULTIDEV` a resident expert is read
  // in place by any device's kernel, so residency there buys the native transport at any device count.
@@ -5532,7 +5584,7 @@ index 3c5469637..409444053 100644
  // r212: the loader's RESOLVED `--load-mode` (1 = O_DIRECT), so the host pool's fill mode can mirror it.
  // The pool fills the same way the model was loaded, because `--load-mode` is the operator's caching
  // decision; `MOE_HOST_POOL_DIO=0|1` still forces either arm.  -1 (never told) keeps the historical
-@@ -352,6 +365,21 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -352,6 +370,21 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
                             size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
                             void * order_event);
  
@@ -5592,7 +5644,7 @@ index 03e7cbbbd..13c3ed786 100644
  
  // backend reg interface
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 702d2fa32..9a5f24bf8 100644
+index 702d2fa32..55c6d0e64 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -5668,7 +5720,7 @@ index 702d2fa32..9a5f24bf8 100644
          if (host_experts_limit_gib > 0) {
              snprintf(policy, sizeof(policy),
                       "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
-@@ -419,7 +447,619 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+@@ -419,7 +447,668 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
      LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
  }
  
@@ -5862,6 +5914,28 @@ index 702d2fa32..9a5f24bf8 100644
 +    // reports the truth (`mlocked X of Y` / `NOT locked ... RECLAIMABLE`), and all this function needs is the
 +    // number the policy is clamped to.
 +
++    // TODO #319 (r284): what the ARENA actually needs, asked for from the backend that owns it.  `arena_min`
++    // (one slot per expert table) is the hardware minimum, not the tier's minimum: the cache declines a store
++    // below its own floor (`moe_cache_gtt_arena_floor`, 2 GiB), and below it the arena can serve no table at
++    // all.  Testing `arena_min` alone let a clamp land in [arena_min, floor): the loader took it as a
++    // streaming tier, the cache declined it as too small, placement could not fit a >RAM model, and the load
++    // was refused with "the arena is unavailable on this device" plus the advice to pass `-lme` -- which the
++    // operator had already done.  One number for both tests, so the refusal can only fire when the tier truly
++    // cannot engage.
++    size_t arena_floor = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;
++        }
++        arena_floor = std::max(arena_floor, ggml_backend_dev_gtt_store_arena_min(d));
++    }
++    const size_t arena_need = std::max(arena_min, arena_floor);
++    const std::string arena_need_str = arena_need == arena_min
++        ? format("one slot per expert table, %.1f MiB", (double) arena_min / mib)
++        : format("one slot per expert table %.1f MiB and the GTT arena's own floor %.1f MiB",
++                 (double) arena_min / mib, (double) arena_floor / mib);
++
 +    // `-lme` is a CAP, not a floor: never register space no expert can occupy.  `extent_trunk` is the part the
 +    // budget buys; the head's tables (P3c) are on top of it, because they are not the policy's to spend.
 +    size_t extent_trunk = std::min(budget, padded_total);
@@ -5901,6 +5975,9 @@ index 702d2fa32..9a5f24bf8 100644
 +            "`DefaultLimitMEMLOCK=infinity` in /etc/systemd/system.conf, `* - memlock unlimited` in "
 +            "/etc/security/limits.conf, or run with CAP_IPC_LOCK.  `-lme auto` sizes the GTT store to whatever "
 +            "the limit allows.";
++        const std::string advice_need = format("`-lme` asks for %.1f MiB of it and this tier needs at least %.1f "
++            "MiB to stream anything (%s).  %s", (double) extent / mib, (double) arena_need / mib,
++            arena_need_str.c_str(), advice);
 +
 +        if (shortfall == 0 && !clamp_useful) {
 +            // (a) the model fits without the store, and the limit is too small to buy a useful one: this is an
@@ -5919,7 +5996,7 @@ index 702d2fa32..9a5f24bf8 100644
 +            extent = honour;
 +            extent_trunk = honour > head_padded ? honour - head_padded : 0;
 +            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
-+        } else if (clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream) {
++        } else if (clamp_useful && honour >= shortfall && honour >= arena_need && gtt_store_can_stream) {
 +            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
 +            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
 +                           "MiB, which still covers the %.1f MiB this model cannot fit in RAM.  %s\n", __func__,
@@ -5946,11 +6023,12 @@ index 702d2fa32..9a5f24bf8 100644
 +                (double) weights / mib, (double) avail / mib, (double) fit_cap / mib, (double) shortfall / mib,
 +                (double) extent / mib, source.c_str(), lim.c_str(), (double) honour / mib,
 +                clamps_but_cannot_stream
-+                    ? "\n  And even a LOCKED store of that size would not make it runnable in this build: it has no "
-+                      "eviction (P3) or streaming fill (P4), so the experts that do not fit would still take their "
-+                      "layer's device buffer and the load would over-commit."
++                    ? "\n  And even a LOCKED store of that size would not make it runnable: streaming is opted in BY "
++                      "`-lme`, so without a budget the store this clamp could buy is a placement tier -- the "
++                      "experts that do not fit would still take their layer's device buffer and the load would "
++                      "over-commit."
 +                    : "",
-+                advice));
++                !gtt_store_can_stream ? advice : advice_need.c_str()));
 +        }
 +    }
 +    if (extent < 4096) {
@@ -6048,11 +6126,12 @@ index 702d2fa32..9a5f24bf8 100644
 +    if (arena_wanted && lme_given && !store_live && extent_trunk < padded_total) {
 +        // Every table must be able to hold at least one slot, or the cache would serve some op from the
 +        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
-+        // per table before enabling the tier at all.
-+        if (extent < arena_min) {
-+            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB one slot per expert table "
-+                           "needs; falling back to whole-tensor placement\n", __func__,
-+                           (double) extent / mib, (double) arena_min / mib);
++        // per table, and at least the arena's own floor (#319: below it the cache declines the store, so a
++        // store in between cannot stream anything), before enabling the tier at all.
++        if (extent < arena_need) {
++            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB it needs (%s); falling back "
++                           "to whole-tensor placement\n", __func__,
++                           (double) extent / mib, (double) arena_need / mib, arena_need_str.c_str());
 +        } else {
 +            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
 +                ggml_backend_dev_t d = ggml_backend_dev_get(i);
@@ -6126,26 +6205,48 @@ index 702d2fa32..9a5f24bf8 100644
 +    // point with such a model means streaming is not available, for one of exactly four reasons, and the fix differs
 +    // per reason -- so say which and refuse, before a byte is read.
 +    if (fit_cap_now == 0 || weights_total > fit_cap_now) {
-+        const char * why =
-+            !lme_given              ? "`-lme` was not given, and the GTT arena -- the tier that streams the part of "
-+                                      "the expert set that does not fit -- is opted in BY `-lme`"
-+          : store_live              ? "a GTT expert store is already live in this process (a second model), and it "
-+                                      "is not this load's to size"
-+          : extent < arena_min      ? "the budget is smaller than one slot per expert table, which is the minimum "
-+                                      "the arena needs to serve a table at all"
-+          : arena_env != nullptr    ? "MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream"
-+          :                           "the arena is unavailable on this device";
++        // #319: name the constraint that actually binds, and give the fix for THAT one.  The pre-fix chain said
++        // "the arena is unavailable on this device" whenever the arena declined for its own size reasons, and
++        // recommended `-lme` to an operator who had already passed it.
++        const std::string why =
++            !lme_given              ? std::string("`-lme` was not given, and the GTT arena -- the tier that streams "
++                                      "the part of the expert set that does not fit -- is opted in BY `-lme`")
++          : store_live              ? std::string("a GTT expert store is already live in this process (a second "
++                                      "model), and it is not this load's to size")
++          : extent < arena_min      ? format("the budget is smaller than one slot per expert table, which is the "
++                                      "minimum the arena needs to serve a table at all (%.1f MiB asked for, %.1f "
++                                      "MiB needed)", (double) extent / mib, (double) arena_min / mib)
++          : extent < arena_floor    ? format("the budget (%.1f MiB) is below the GTT arena's own floor of %.1f MiB, "
++                                      "so the cache declines the store and placement would over-commit",
++                                      (double) extent / mib, (double) arena_floor / mib)
++          : arena_env != nullptr    ? std::string("MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream")
++          :                           std::string("the arena is unavailable on this device");
++        const std::string fix =
++            !lme_given           ? std::string("Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` "
++                                      "to opt into the GTT arena, which streams the remainder from the file-backed "
++                                      "page cache; `-lme auto` sizes it to whatever RAM and RLIMIT_MEMLOCK allow.  "
++                                      "Without a budget this load would place the unplaced experts as device "
++                                      "allocations, over-commit, and swap.")
++          : store_live           ? std::string("Only the FIRST model of a process sizes the store; load this one "
++                                      "alone, or give it the whole process's expert budget.")
++          :                        format("Raise `-lme` to at least %.1f MiB: %.1f MiB is what this model's expert "
++                                      "tables need at one slot each (the model-dependent minimum) and %.1f MiB is "
++                                      "the arena's own floor (which does not), and RLIMIT_MEMLOCK is %s.%s  `-lme auto` "
++                                      "sizes the store to whatever RAM and RLIMIT_MEMLOCK allow.",
++                                      (double) arena_need / mib, (double) arena_min / mib, (double) arena_floor / mib,
++                                      lockable == SIZE_MAX ? "unlimited"
++                                                           : format("%.1f MiB", (double) lockable / mib).c_str(),
++                                      lockable >= arena_need ? "" : "  Locking is what makes the tier a "
++                                          "reservation, so the clamp and the budget must both cover it.");
 +        throw std::runtime_error(format(
 +            "GTT expert store: this model's weights (%.1f MiB) do not fit in RAM (%.1f MiB available, "
 +            "%.1f MiB is the ceiling they may occupy), so the part that does not fit has to be streamed -- and "
 +            "streaming is not available here:\n"
 +            "  %s\n"
 +            "  asked for           %s\n"
-+            "Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena, which "
-+            "streams the remainder from the file-backed page cache; `-lme auto` sizes it to whatever RAM and "
-+            "RLIMIT_MEMLOCK allow.  Without a budget this load would place the unplaced experts as device "
-+            "allocations, over-commit, and swap.",
-+            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why, source.c_str()));
++            "%s",
++            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why.c_str(),
++            source.c_str(), fix.c_str()));
 +    }
 +
 +    // --- 3. open the GTT store, once, before any tensor is placed ---------------------------------------
@@ -6288,7 +6389,7 @@ index 702d2fa32..9a5f24bf8 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -1727,6 +2367,40 @@ void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
+@@ -1727,6 +2416,40 @@ void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
          return;
      }
  
@@ -6329,7 +6430,7 @@ index 702d2fa32..9a5f24bf8 100644
      size_t n_pinned  = 0;
      size_t sz_pinned = 0;
  
-@@ -2137,6 +2811,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2137,6 +2860,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -6370,7 +6471,7 @@ index 702d2fa32..9a5f24bf8 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2658,7 +3366,18 @@ bool llama_model_loader::load_all_data(
+@@ -2658,7 +3415,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -6390,7 +6491,7 @@ index 702d2fa32..9a5f24bf8 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2719,9 +3438,12 @@ bool llama_model_loader::load_all_data(
+@@ -2719,9 +3487,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

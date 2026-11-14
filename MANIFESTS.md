@@ -388,7 +388,11 @@ in CI.  The model-level gates are manual:
    `wip/kv-residency-cleanup/` §2.1): for the **window** and the **attendance pool**, a resident arm and a
    deliberately under-sized arm, on one binary.  A residency defect is a *wrong answer*, not a crash, so the
    oracle is same-seed text (plus the drafter's acceptance) -- and that is only an oracle if the arm provably
-   LEFT the resident placement, which is why the gate fails when the two arms report the same residency.  Window
+   LEFT the resident placement, which is why the gate fails when the two arms report the same residency.  **Every
+   arm pins the expert-cache state (`MOE_EXPERT_HEATMAP=load`, r284)** next to `ROCBLAS_USE_HIPBLASLT=0`: the
+   persisted heat prior orders residency, residency selects which MoE path serves an op, and the paths are not
+   bit-identical on a 2-device split with a drafter loaded -- so an arm that inherits the prior its predecessor
+   wrote compares cache states, not placements (`GREEDY-PURITY.md` §89).  Window
    arms (4B, `-c 16384` f16, 5 246-token prompt): `wref` (no knob), `wres` (`W=8192`, above the run depth:
    **must** never flip a mapping nor map a host byte) and `wspill` (`W=2048`: **must** do both, `FLIP device 0`
    > 0 and `of which host` > 0), text byte-identical on all three.  Pool arms (Flash-Next GSQ-IQ3_XXS + its MTP

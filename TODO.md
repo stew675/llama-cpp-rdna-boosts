@@ -35,9 +35,6 @@ are recorded in `WORKLOG.md` 261113.015.  What it left open is #322/#323/#324/#3
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **319** | block 16's lock policy refuses a >RAM model on a clamp too small for one expert table | capability (block 16, the UMA tier) | **OPEN** (2026-11-13) — the refusal is the safe branch; relaxing it needs the band's own arms — §319 |
-| **320** | sizing the GTT store for a separate drafter's head | parked (block 16; a `common`/`--fit` term) | **PARKED** (maintainer, r263) — the target sizes the region before the drafter loads — §320 |
-| **321** | an MTP draft over 2 devices is not reproducible (3 runs, 3 texts) | purity / determinism (pre-existing; the MTP driver) | **OPEN** — makes `gate-kv-residency.sh`'s multi-device section unsatisfiable; reproduces on `bin-r277` — §321 |
 | **322** | `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces (on ANY build) | tooling / stale gate baseline | **OPEN** (2026-11-13) — the arm fails identically on `bin-r277`; re-record, do not "fix" — §322 |
 | **323** | `gate-prefill-logits.sh`'s base file name does not carry `device`/`sm`, so the tensor arm overwrites the layer base | tooling (pre-release gate) | **OPEN** (2026-11-13) — record sequentially, canonical arm last — §323 |
 | **324** | both `optional/` artifacts are stale: neither applies to the r278 tree | tooling / optional artifacts | **OPEN** (2026-11-13) — re-cut against `69161d3b0` before they are offered again — §324 |
@@ -164,53 +161,6 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
 
-## 319. Block 16's lock policy refuses a >RAM model on a clamp too small for one expert table
-
-**A clamp that covers the RAM shortfall but cannot fund one slot per expert table REFUSES the load** instead of running it: `plan_gtt_expert_store()` (`src/llama-model-loader.cpp`, the `extent > lockable` branch) takes the clamp only when `clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream` (`gtt_store_can_stream` is `-lme` given), and otherwise throws **before a byte is read**, printing weights / MemAvailable / shortfall / `RLIMIT_MEMLOCK` / what it could honour and the fix.  So the combination this item used to worry about — the arena declining while placement over-commits — is **not reachable**: the load refuses instead.
-
-**What is still owed is whether the refusal is NECESSARY in that band.**  A store below one slot per table can place nothing, so every table keeps its layer's device buffer, and on an APU those bytes come out of the same DRAM the store wanted — which is why refusing is the honest answer today and why a relaxation must be measured, not argued.  The arms need a >RAM model on an APU (`Qwen3.5-122B-A10B Q8_0`, ~130 GiB against `halo`'s 123 GiB — the r266 arm already ran it at `-lme 90`) with `ulimit -l` set INSIDE the band `[shortfall, arena_min)`: one arm recording the refusal, one on a relaxed policy, and the coherence + prefill-logit gates on the relaxed arm.
-
-**Re-entry:** an operator who owns a clamp in that band, or a relaxation proposal with those arms attached.
-Record: `archive/work/apu-expert-gtt/README.md` §5 and §7 (`-lme` as the streaming opt-in), `WORKLOG.md` 261111.031, and the policy comments in `llama-model-loader.cpp`.
-
-## 320. Sizing the GTT store for a separate drafter's head — PARKED
-
-**The store's extent is decided by the TARGET's loader, before a drafter loads**, so a store sized to also hold the MTP head's expert tables would have to be a `common`/`--fit` term — a placement decision made once both models are known — not a loader change.  **Parked by the maintainer (r263):** no measurement is owed and nothing depends on it, because the head is pinned **outside** the `-lme` budget today (`plan_gtt_expert_store()`'s `head_cands`, r263), so the current shape is correct, just not budget-visible.  Record: `archive/work/apu-expert-gtt/README.md` §5.
-
----
-
-## 321. An MTP draft over 2 devices is not reproducible (same seed, temp 0, 3 runs, 3 texts)
-
-**Found at R16** by `scripts/gate-kv-residency.sh`'s multi-device pool section; recorded as `D20` in
-`archive/work/upstream-rebase-261113/DECISIONS.md`, which carries the full table.  Flash-Next `GSQ-IQ3_XXS` + its shared
-MTP sidecar, `-ncmoe 48`, q8_0 KV, `-c 32768`, the 25 763-token `prompts/kld-corpus-35b-in-domain.txt`,
-`-n 64 --seed 42 --temp 0`:
-
-* **2 devices, `-sm layer`, `--spec-type draft-mtp`** -> three identical reruns gave
-  `f260d1824ab3` / `7ca535e1da91` / `b08d3dbcb1e9` (and the dense-decode arm is unstable too).
-* **2 devices, `-sm layer`, `--spec-type none`** -> `7a347cbe5f1` x 3.  **1 device, draft-mtp** ->
-  `f260d1824ab3` x 3.
-* **Pre-existing: `bin-r277` reproduces it** (`b08d3dbcb1e9` / `2550c6866f6c` / `f260d1824ab3`), so it is not a
-  re-base regression.
-
-So the target is deterministic and one device is deterministic: the nondeterminism is in the **draft path across
-devices** (the MTP driver's h_nextn handoff and/or the draft's staging on a split, blocks 02/09/10/13).  It is a
-GREEDY-PURITY-class violation — an accept/reject decision must be a function of the target's logits and the
-seed — and it makes `gate-kv-residency.sh`'s multi-device section unsatisfiable, because that section's own
-2-device reference arm (`pmref`) is the unstable one.  **Do not "fix" this by relaxing the gate**: the gate's
-within-device-count comparison is right.
-
-**r279 re-measurement (2026-11-13): the loader is RULED OUT.**  The same 2-device `-sm layer` arm, 4 runs per load
-mode: `--load-mode none` -> 2 distinct texts in 4, `--load-mode mmap` -> 3 distinct texts in 4.  mmap never takes
-the staged chunked upload, so this is not a load-path defect (r279 fixed the one load-path ordering hazard there
-was, issue #308, and it did not change this).  A 3-run sample of the *tensor* split (35B-A3B, `draft-mtp n3`) was
-stable 3/3, which points at `-sm layer` as the affected geometry — 3 runs is a weak sample, so record it as a lead,
-not a conclusion.
-
-**Re-entry:** bisect the draft path on a 2-device `-sm layer` arm (kill switches: `GGML_CUDA_DISABLE_GRAPHS=1`,
-`MOE_EXPERT_CACHE_MIB=0`, `--lazy-mode off`, the draft KV window `--spec-draft-kv-window`), then a
-`INVARIANTS.md` entry once it is fixed.  Owner: the MTP driver, not block 15.
-
 ## 322. `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces on ANY build
 
 **Found at R18** (2026-11-13) while running the release gate set.  The two-slot host-expert DFlash arm
@@ -318,6 +268,38 @@ validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
 need on its own merits (a legal cold source for a neither-tier expert — the `#273`/gather side of the same
 population).  Record: [`benchmarks/2026-11-12-eager-takeover-arena-bound.md`](benchmarks/2026-11-12-eager-takeover-arena-bound.md);
 `WORKLOG.md` 261112.010; `ENVIRONMENT.md` (`MOE_EXPERT_CACHE_MIB`); `INVARIANTS.md` r274.
+
+### #319 / #320 / #321 — the APU store's refusal band, the drafter's head budget, and "the MTP draft is not reproducible" (retired r284)
+
+**#319 (the lock policy's refusal).**  The band it named -- a clamp that covers the RAM shortfall but not one slot
+per expert table -- turns out to be **unreachable for any model more than one slot-set over RAM**, and the real
+tier minimum is `max(one slot per expert table, the cache's own floor)`; the loader tested the first alone, so a
+clamp in between let the arena decline and then reported *"the arena is unavailable on this device"*.  The loader
+now asks the backend for the floor (`ggml_backend_dev_gtt_store_arena_min`) and refuses with the number to raise;
+the four measured arms on `halo` (refusal at `-lme 1`, refusal under a 1 GiB clamp, and `-lme 3` **running**) are in
+`INVARIANTS.md` r284.  Refusing inside the band is **necessary**, and an operator whose clamp is below it has two
+documented escapes (raise `ulimit -l`, or `MOE_EXPERT_GTT_MLOCK=0`, which bypasses the lock policy so the arena is
+reclaimable rather than reserved).  Nothing is owed.
+
+**#320 (sizing the store for a separate drafter's head).**  Parked by the maintainer (r263) and **retired
+unimplemented**: the head is pinned *outside* the `-lme` budget on purpose, its bytes are metadata overhead read on
+every draft step, so a store sized to include it would trade that away; making it budget-visible is a `common`/
+`--fit` term with no measurement behind it and nothing depending on it.  No course of action, so no item.
+
+**#321 ("an MTP draft over 2 devices is not reproducible").**  The attribution was wrong: it is **not** the draft
+path and not a race.  A run's greedy text depends on the **expert cache's residency**, i.e. on the persisted
+`.moe-heatmap` prior: with the drafter model *loaded* (not used) on a 2-device `-sm layer` split, one prior state
+gives `7ca535e1da91` and another `7a3474cbe5f1`, each reproducible within its own state, and
+`MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two (the r258/r266 in-place arm serves a fully resident table from the
+arena and stands its fusions down, so residency selects the kernel set).  The consequence is a *comparison* rule, not
+a driver fix: a text comparison across processes pins the cache state, exactly as it pins
+`ROCBLAS_USE_HIPBLASLT=0`.  `scripts/gate-kv-residency.sh` now forces `MOE_EXPERT_HEATMAP=load` and its multi-device
+section is green on the same assertions (`b08d3dbcb1e9` x3, per-device counters intact).  **Still open on the record,
+and deliberately not an item:** the two arms are documented as reading the same bytes, so their *magnitude* is
+unmeasured (`llama-perplexity` cannot load a drafter, which is the state that produces the partial residency);
+re-entry is a prefill-logit arm that can, and a measurement above the 0.005 tolerance.  Record:
+[`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
+`INVARIANTS.md` r284, `GREEDY-PURITY.md` §89.
 
 ### #300 — the attendance pool is NOT supported on a shared host/device pool (an APU) (retired r264)
 

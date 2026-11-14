@@ -496,6 +496,17 @@ measurement.
   GTT store does not depend on it.
 * **Do not probe UMA by host-dereferencing a device pointer.**  Gate on `prop.integrated`.
 
+**r284 note (2026-11-14, `TODO` #319 retired).**  The lock policy's refusal band was re-derived and the arithmetic
+was corrected: the tier's minimum is `max(one slot per expert table, the cache's own 2048 MiB floor)`, not
+`arena_min` alone, and the loader now asks the backend for the floor (`ggml_backend_dev_gtt_store_arena_min`) so
+its streaming test and `moe_cache_preflight_store()`'s acceptance are one number.  Measured on `halo`
+(`Qwen3.5-122B-A10B Q8_0`): weights 126 403.0 MiB, fit cap 101 669.6 MiB, shortfall 23 967 MiB, one slot per
+table 459.6 MiB -- so `[shortfall, arena_min)` is **empty** for any model more than one slot-set over RAM, the
+reachable refusal band is `[shortfall, 2048 MiB)`, refusing inside it is necessary, and `-lme 3` **runs** (arena
+3072.0 MiB, 2754.0 MiB of slots, 144 tables, 864 direct buffered fills at 4158 MiB/s).  The two documented escapes
+for an operator with a small clamp are `ulimit -l` and `MOE_EXPERT_GTT_MLOCK=0`.  `INVARIANTS.md` r284,
+`patches/README.md` (block 16, r284).
+
 ## 7. Open questions for the maintainer
 
 1. **Admission threshold `N`** -- *already measured once, on the discrete path, and 2 won.*  The delivery's

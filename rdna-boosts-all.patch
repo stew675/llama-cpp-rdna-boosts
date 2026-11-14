@@ -4663,10 +4663,10 @@ index 81cce2e2a..b7ec31448 100644
  // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
  GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index afb86338a..9cdf1aab0 100644
+index afb86338a..7a7ffd13f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -44,6 +44,136 @@ extern "C" {
+@@ -44,6 +44,142 @@ extern "C" {
      GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
      GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
  
@@ -4746,6 +4746,12 @@ index afb86338a..9cdf1aab0 100644
 +    // must not size, grow or take the arena tier (the extent is the first model's budget).
 +    GGML_API size_t                ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev);
 +
++    // TODO #319: the smallest store `ggml_backend_dev_gtt_store_arena` accepts on `dev`, in bytes; 0 when this
++    // device has no arena tier.  The loader's `-lme` lock policy tests the clamp against it as well as against
++    // one slot per expert table, because a store below it can never stream a table -- and streaming is the only
++    // thing that makes a model that does not fit in RAM runnable.
++    GGML_API size_t                ggml_backend_dev_gtt_store_arena_min(ggml_backend_dev_t dev);
++
 +    // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
 +    // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
 +    // No-op for a backend without a slab or with no ring hole.
@@ -4803,7 +4809,7 @@ index afb86338a..9cdf1aab0 100644
      //
      // Backend buffer
      //
-@@ -194,6 +324,20 @@ extern "C" {
+@@ -194,6 +330,20 @@ extern "C" {
      GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
      GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
  
@@ -4824,7 +4830,7 @@ index afb86338a..9cdf1aab0 100644
      GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
      GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
      GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
-@@ -357,6 +501,11 @@ extern "C" {
+@@ -357,6 +507,11 @@ extern "C" {
      GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
      GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
  
@@ -4836,7 +4842,7 @@ index afb86338a..9cdf1aab0 100644
      GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
      GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
  
-@@ -409,6 +558,18 @@ extern "C" {
+@@ -409,6 +564,18 @@ extern "C" {
          GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
          GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
  
@@ -4855,7 +4861,7 @@ index afb86338a..9cdf1aab0 100644
          // for internal bookkeeping only:
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
-@@ -445,6 +606,56 @@ extern "C" {
+@@ -445,6 +612,56 @@ extern "C" {
      GGML_API ggml_backend_dev_t ggml_backend_meta_device(
          ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
  
@@ -5605,7 +5611,7 @@ index 65d2bea27..20fc5dbc1 100644
          struct ggml_tensor * node = graph->nodes[i];
          struct node_alloc * node_alloc = &galloc->node_allocs[i];
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 545880b06..89d09a2a8 100644
+index 545880b06..d0bf5b3f2 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -10,6 +10,15 @@ extern "C" {
@@ -5869,7 +5875,7 @@ index 545880b06..89d09a2a8 100644
      };
  
      struct ggml_backend {
-@@ -224,6 +448,194 @@ extern "C" {
+@@ -224,6 +448,203 @@ extern "C" {
          ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
          void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
          void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
@@ -6061,6 +6067,15 @@ index 545880b06..89d09a2a8 100644
 +        // end for the positional-initializer reason above; zero-initialized = "no store", which is what a
 +        // backend without one must answer.
 +        size_t (*gtt_store_free_bytes)(ggml_backend_dev_t dev);
++
++        // (optional) TODO #319: the smallest store this device's ARENA can serve, in bytes (0 = no arena on
++        // this device).  `gtt_store_arena` declines anything below it, so a store that small can never stream
++        // an expert table -- and streaming is what makes a model that does not fit in RAM runnable.  The model
++        // loader's `-lme` lock policy asks for this so its "the store can stream" test and the cache's own
++        // floor are ONE number; without it a clamp in [one slot per table, floor) passed the loader's test,
++        // declined in the cache, and was refused as if the device had no arena at all.  APPENDED at the very
++        // end for the positional-initializer reason above; zero-initialized = no arena tier.
++        size_t (*gtt_store_arena_min)(ggml_backend_dev_t dev);
      };
  
      struct ggml_backend_device {
@@ -9465,7 +9480,7 @@ index 595a5824a..acda336b1 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index b70d0d874..0dfca15b0 100644
+index b70d0d874..79a70b16e 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,22 @@
@@ -9529,7 +9544,7 @@ index b70d0d874..0dfca15b0 100644
  size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
      GGML_ASSERT(buft);
      // get_alloc_size is optional, defaults to ggml_nbytes
-@@ -231,6 +276,271 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
+@@ -231,6 +276,278 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
      return buft->device;
  }
  
@@ -9614,6 +9629,13 @@ index b70d0d874..0dfca15b0 100644
 +        return SIZE_MAX;
 +    }
 +    return dev->iface.gtt_store_free_bytes(dev);
++}
++
++size_t ggml_backend_dev_gtt_store_arena_min(ggml_backend_dev_t dev) {
++    if (dev == nullptr || dev->iface.gtt_store_arena_min == nullptr) {
++        return 0;
++    }
++    return dev->iface.gtt_store_arena_min(dev);
 +}
 +
 +size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
@@ -9801,7 +9823,7 @@ index b70d0d874..0dfca15b0 100644
  // backend buffer
  
  ggml_backend_buffer_t ggml_backend_buffer_init(
-@@ -337,7 +647,16 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
+@@ -337,7 +654,16 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
  }
  
  enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(ggml_backend_buffer_t buffer) {
@@ -9819,7 +9841,7 @@ index b70d0d874..0dfca15b0 100644
      return buffer->usage;
  }
  
-@@ -771,7 +1090,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
+@@ -771,7 +1097,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
      if (backend->iface.synchronize == NULL) {
          return;
      }
@@ -9827,7 +9849,7 @@ index b70d0d874..0dfca15b0 100644
      backend->iface.synchronize(backend);
  }
  
-@@ -1172,6 +1490,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
+@@ -1172,6 +1497,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
  #define GGML_SCHED_MAX_COPIES 4
  #endif
  
@@ -9841,7 +9863,7 @@ index b70d0d874..0dfca15b0 100644
  struct ggml_backend_sched_split {
      int backend_id;
      int i_start;
-@@ -1183,6 +1508,11 @@ struct ggml_backend_sched_split {
+@@ -1183,6 +1515,11 @@ struct ggml_backend_sched_split {
      struct ggml_cgraph graph;
  };
  
@@ -9853,7 +9875,7 @@ index b70d0d874..0dfca15b0 100644
  struct ggml_backend_sched {
      bool is_reset; // true if the scheduler has been reset since the last graph split
      bool is_alloc;
-@@ -1218,6 +1548,13 @@ struct ggml_backend_sched {
+@@ -1218,6 +1555,13 @@ struct ggml_backend_sched {
      int cur_copy;
      int next_copy;
      ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
@@ -9867,7 +9889,7 @@ index b70d0d874..0dfca15b0 100644
      struct ggml_tensor ** graph_inputs;
      int n_graph_inputs;
      int graph_inputs_capacity;
-@@ -1238,6 +1575,26 @@ struct ggml_backend_sched {
+@@ -1238,6 +1582,26 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -9894,7 +9916,7 @@ index b70d0d874..0dfca15b0 100644
      int debug;
  
      // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
-@@ -1335,6 +1692,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
+@@ -1335,6 +1699,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
  #endif
  
  // returns the backend that should be used for the node based on the current locations
@@ -9914,7 +9936,7 @@ index b70d0d874..0dfca15b0 100644
  static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
      // assign pre-allocated nodes to their backend
      int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
-@@ -1375,6 +1745,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1375,6 +1752,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
      // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
      allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
  
@@ -9930,7 +9952,7 @@ index b70d0d874..0dfca15b0 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -1385,7 +1764,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1385,7 +1771,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                  int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                  // check if a backend with higher prio wants to offload the op
                  if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
@@ -9953,7 +9975,7 @@ index b70d0d874..0dfca15b0 100644
                          if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                              SET_CAUSE(tensor, "1.off");
                              return b;
-@@ -1451,6 +1845,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1451,6 +1852,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
      }
  }
  
@@ -9972,7 +9994,7 @@ index b70d0d874..0dfca15b0 100644
  static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
      ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
      ggml_backend_buffer_type_t buft = NULL;
-@@ -1469,6 +1875,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+@@ -1469,6 +1882,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
          }
      }
  
@@ -9994,7 +10016,7 @@ index b70d0d874..0dfca15b0 100644
      return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
  }
  
-@@ -1480,6 +1901,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+@@ -1480,6 +1908,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
  }
  
  // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -10050,7 +10072,7 @@ index b70d0d874..0dfca15b0 100644
  void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      // reset splits
      sched->n_splits = 0;
-@@ -1679,6 +2149,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1679,6 +2156,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          }
      }
  
@@ -10137,7 +10159,7 @@ index b70d0d874..0dfca15b0 100644
      // pass 4: assign backends to remaining src from dst and view_src
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -1727,6 +2277,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1727,6 +2284,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          split->i_start = 0;
          split->n_inputs = 0;
          int cur_backend_id = split->backend_id;
@@ -10148,7 +10170,7 @@ index b70d0d874..0dfca15b0 100644
          for (; i < graph->n_nodes; i++) {
              struct ggml_tensor * node = graph->nodes[i];
  
-@@ -1740,6 +2294,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1740,6 +2301,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
  
              // check if we should start a new split based on the sources of the current node
              bool need_new_split = false;
@@ -10156,7 +10178,7 @@ index b70d0d874..0dfca15b0 100644
              if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
                      struct ggml_tensor * src = node->src[j];
-@@ -1751,7 +2306,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1751,7 +2313,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -10231,7 +10253,7 @@ index b70d0d874..0dfca15b0 100644
                              break;
                          }
                      }
-@@ -1776,6 +2398,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1776,6 +2405,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                  split->i_start = i;
                  split->n_inputs = 0;
                  cur_backend_id = node_backend_id;
@@ -10239,7 +10261,7 @@ index b70d0d874..0dfca15b0 100644
              }
  
              // find inputs that are not on the same backend
-@@ -1799,6 +2422,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1799,6 +2429,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -10248,7 +10270,7 @@ index b70d0d874..0dfca15b0 100644
                              }
                              tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                              SET_CAUSE(tensor_copy, "4.cpy");
-@@ -1808,6 +2433,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1808,6 +2440,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              ggml_backend_sched_split_inputs_grow(split);
                          }
                          split->inputs[n_inputs] = src;
@@ -10278,7 +10300,7 @@ index b70d0d874..0dfca15b0 100644
                      }
                      // inputs of nodes that are not computed (e.g. the unselected branches of ggml_build_forward_select)
                      // stay in the split so that the allocation does not change, but they do not need to be copied
-@@ -1891,6 +2539,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1891,6 +2546,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              }
          },
          /* .user_data     = */ &alloc_deps,
@@ -10289,7 +10311,7 @@ index b70d0d874..0dfca15b0 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
-@@ -2069,15 +2721,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2069,15 +2728,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              }
          }
  
@@ -10345,7 +10367,7 @@ index b70d0d874..0dfca15b0 100644
          }
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -2088,13 +2774,452 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2088,13 +2781,452 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -10799,7 +10821,7 @@ index b70d0d874..0dfca15b0 100644
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
      ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
-@@ -2110,7 +3235,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2110,7 +3242,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          }
      }
  
@@ -10813,7 +10835,7 @@ index b70d0d874..0dfca15b0 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -2118,31 +3248,360 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2118,31 +3255,360 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -11194,7 +11216,7 @@ index b70d0d874..0dfca15b0 100644
      }
  }
  
-@@ -2207,17 +3666,65 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
+@@ -2207,17 +3673,65 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
      }
  }
  
@@ -11260,7 +11282,7 @@ index b70d0d874..0dfca15b0 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -2233,7 +3740,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2233,7 +3747,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              struct ggml_tensor * input = split->inputs[input_id];
              if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
@@ -11269,7 +11291,7 @@ index b70d0d874..0dfca15b0 100644
              }
          }
          // after the copies above, which may read host memory reused by the copies of the next split
-@@ -2241,8 +3748,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2241,8 +3755,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          ggml_backend_sched_prefetch_inputs(sched, split_id);
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              struct ggml_tensor * input = split->inputs[input_id];
@@ -11281,7 +11303,7 @@ index b70d0d874..0dfca15b0 100644
              }
          }
  
-@@ -2309,14 +3818,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2309,14 +3825,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -11298,7 +11320,7 @@ index b70d0d874..0dfca15b0 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2354,7 +3863,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2354,7 +3870,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -11314,7 +11336,7 @@ index b70d0d874..0dfca15b0 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2363,6 +3879,67 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2363,6 +3886,67 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -11382,7 +11404,7 @@ index b70d0d874..0dfca15b0 100644
  
      ggml_backend_sched_reset(sched);
  
-@@ -2378,6 +3955,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2378,6 +3962,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
              ggml_backend_event_free(sched->events[b][c]);
          }
          ggml_backend_event_free(sched->prefetch_events[b]);
@@ -11396,7 +11418,7 @@ index b70d0d874..0dfca15b0 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2444,6 +4028,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2444,6 +4035,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -11414,7 +11436,7 @@ index b70d0d874..0dfca15b0 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2481,6 +4076,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2481,6 +4083,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -11423,7 +11445,7 @@ index b70d0d874..0dfca15b0 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2488,6 +4085,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -2488,6 +4092,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
          ggml_backend_synchronize(sched->backends[i]);
@@ -11434,7 +11456,7 @@ index b70d0d874..0dfca15b0 100644
      }
      if (!sched->is_alloc) {
          // if the graph is not already allocated, always use copy 0 after a synchronization
-@@ -2575,6 +4176,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2575,6 +4183,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -11443,7 +11465,7 @@ index b70d0d874..0dfca15b0 100644
          case GGML_OP_MUL_MAT:
          case GGML_OP_MUL_MAT_ID:
          case GGML_OP_CUMSUM:
-@@ -2952,6 +4555,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2952,6 +4562,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -11453,7 +11475,7 @@ index b70d0d874..0dfca15b0 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2977,6 +4583,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2977,6 +4590,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -36886,7 +36908,7 @@ index 000000000..7570a3b06
 +void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
 +size_t ggml_cuda_slab_seed_floor(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 540c53614..43afcdcdc 100644
+index 540c53614..ff4b80d73 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -45922,17 +45944,11 @@ index 540c53614..43afcdcdc 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -5503,16 +8892,360 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
-             ggml_backend_event_synchronize(event);
-         };
- 
--        CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), wait_fn, event));
--#endif
--        GGML_ABORT("fatal error");
-+        CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), wait_fn, event));
-+#endif
-+        GGML_ABORT("fatal error");
-+    }
+@@ -5507,12 +8896,356 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ #endif
+         GGML_ABORT("fatal error");
+     }
+-}
 +}
 +
 +static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
@@ -46241,8 +46257,7 @@ index 540c53614..43afcdcdc 100644
 +                params->add_alloc_dep(params->user_data, rr, ca.out_xn);
 +            }
 +        }
-     }
--}
++    }
  
 -static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
 -    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -46271,7 +46286,8 @@ index 540c53614..43afcdcdc 100644
 +            }
 +        }
 +    }
-+
+ 
+-    const bool disable_fusion = ggml_cuda_fusion_disabled();
 +    // Prefill indexer relu-sum: keep the pre-relu scores alive until the summed output, so the
 +    // allocator cannot reuse that buffer for the fused destination.
 +    {
@@ -46284,8 +46300,7 @@ index 540c53614..43afcdcdc 100644
 +            }
 +        }
 +    }
- 
--    const bool disable_fusion = ggml_cuda_fusion_disabled();
++
 +    static const bool disable_fusion = [] { const char * e = getenv("GGML_CUDA_DISABLE_FUSION"); return e != nullptr && std::atoi(e); }();
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
@@ -46770,7 +46785,7 @@ index 540c53614..43afcdcdc 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -6748,6 +10821,342 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -6748,6 +10821,355 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -46979,6 +46994,19 @@ index 540c53614..43afcdcdc 100644
 +    return moe_cache_preflight_store(dev_ctx->device, extent_bytes, pinned_layers, n_pinned_layers);
 +}
 +
++static size_t ggml_backend_cuda_device_gtt_store_arena_min(ggml_backend_dev_t dev) {
++    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
++    if (dev_ctx == nullptr || !ggml_cuda_gtt_store_wanted()) {
++        return 0;
++    }
++    // Only an integrated device offers the arena (`gtt_store_arena` refuses every other device), and the floor
++    // belongs to the cache that serves it -- one definition, `moe_cache_gtt_arena_floor()`.
++    if (!ggml_cuda_info().devices[dev_ctx->device].integrated) {
++        return 0;
++    }
++    return moe_cache_gtt_arena_floor();
++}
++
 +static size_t ggml_backend_cuda_device_gtt_store_free_bytes(ggml_backend_dev_t dev) {
 +    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
 +    if (dev_ctx == nullptr) {
@@ -47113,7 +47141,7 @@ index 540c53614..43afcdcdc 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -6764,6 +11173,36 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -6764,6 +11186,37 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -47147,10 +47175,11 @@ index 540c53614..43afcdcdc 100644
 +    /* .gtt_store_lockable        = */ ggml_backend_cuda_device_gtt_store_lockable,
 +    /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
 +    /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
++    /* .gtt_store_arena_min       = */ ggml_backend_cuda_device_gtt_store_arena_min,
  };
  
  // backend reg
-@@ -6854,8 +11293,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -6854,8 +11307,73 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
      GGML_UNUSED(reg);
  }
  
@@ -47224,7 +47253,7 @@ index 540c53614..43afcdcdc 100644
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
          return (void *)ggml_backend_cuda_comm_init;
      }
-@@ -6957,6 +11461,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -6957,6 +11475,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  
@@ -63709,10 +63738,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..8e6e4751e
+index 000000000..1f541ca81
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,12987 @@
+@@ -0,0 +1,12998 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -71022,6 +71051,17 @@ index 000000000..8e6e4751e
 +    return true;
 +}
 +
++// wip/apu-expert-gtt P3 / TODO #319: the smallest GTT store the ARENA can serve.  Below it the cache stays
++// inert (a store that small cannot hold a useful part of an expert set), which means it can never stream a
++// table -- and streaming is the ONLY thing that makes a model that does not fit in RAM runnable.  The model
++// loader asks for this number (`ggml_backend_dev_gtt_store_arena_min`) so its refusal arithmetic and this
++// floor are one number: `arena_min` alone (one slot per expert table, typically a few hundred MiB) is far
++// below what the cache will actually accept, and testing only that let a clamp land between the two, decline
++// the arena, and then report the refusal as "the arena is unavailable on this device".
++size_t moe_cache_gtt_arena_floor() {
++    return (size_t) 2048 * 1024 * 1024;
++}
++
 +// wip/apu-expert-gtt P3: SELECT THE GTT STORE as this run's expert arena.
 +//
 +// This is the branch the campaign set out to replace: on an integrated device the cache used to be switched OFF
@@ -71044,7 +71084,7 @@ index 000000000..8e6e4751e
 +    }
 +    // A store smaller than the cache's own floor cannot hold a useful part of an expert set: leave the cache
 +    // inert, and the caller's `-lme` plan (whole-tensor placement, or its refusal) is what applies.
-+    const size_t floor_b = (size_t) 2048 * 1024 * 1024;
++    const size_t floor_b = moe_cache_gtt_arena_floor();
 +    if (extent_bytes < floor_b) {
 +        GGML_LOG_INFO("%s: device %d: GTT expert store is %.1f MiB, below the cache's %zu MiB floor -- the cache "
 +                      "stays OFF and the store keeps its whole-tensor placement\n", __func__, device,
@@ -76702,10 +76742,10 @@ index 000000000..8e6e4751e
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..409444053
+index 000000000..cdd7dad7d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,456 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -76820,6 +76860,11 @@ index 000000000..409444053
 +
 +// True when this run's arena is the GTT store (see `moe_cache_preflight_store`).
 +bool moe_cache_gtt_arena();
++
++// TODO #319: the smallest `extent_bytes` `moe_cache_preflight_store` accepts.  The model loader's `-lme` plan
++// asks for it (`ggml_backend_dev_gtt_store_arena_min`) so that "the store can stream" is decided with the
++// same floor the cache declines on, instead of with one slot per expert table alone.
++size_t moe_cache_gtt_arena_floor();
 +
 +// WIP r42 (TODO #42): hold `bytes` of the free VRAM on `device` for the post-prefill compute layout,
 +// so the auto-sized arena does not take the space a later compute growth needs.  Called at the
@@ -98559,10 +98604,10 @@ index 6c6393d57..1bdfdc8df 100644
  
  private:
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2cbee61d4..9a5f24bf8 100644
+index 2cbee61d4..55c6d0e64 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -10,15 +10,1087 @@
+@@ -10,15 +10,1136 @@
  #include <array>
  #include <cinttypes>
  #include <cstdint>
@@ -99193,6 +99238,28 @@ index 2cbee61d4..9a5f24bf8 100644
 +    // reports the truth (`mlocked X of Y` / `NOT locked ... RECLAIMABLE`), and all this function needs is the
 +    // number the policy is clamped to.
 +
++    // TODO #319 (r284): what the ARENA actually needs, asked for from the backend that owns it.  `arena_min`
++    // (one slot per expert table) is the hardware minimum, not the tier's minimum: the cache declines a store
++    // below its own floor (`moe_cache_gtt_arena_floor`, 2 GiB), and below it the arena can serve no table at
++    // all.  Testing `arena_min` alone let a clamp land in [arena_min, floor): the loader took it as a
++    // streaming tier, the cache declined it as too small, placement could not fit a >RAM model, and the load
++    // was refused with "the arena is unavailable on this device" plus the advice to pass `-lme` -- which the
++    // operator had already done.  One number for both tests, so the refusal can only fire when the tier truly
++    // cannot engage.
++    size_t arena_floor = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;
++        }
++        arena_floor = std::max(arena_floor, ggml_backend_dev_gtt_store_arena_min(d));
++    }
++    const size_t arena_need = std::max(arena_min, arena_floor);
++    const std::string arena_need_str = arena_need == arena_min
++        ? format("one slot per expert table, %.1f MiB", (double) arena_min / mib)
++        : format("one slot per expert table %.1f MiB and the GTT arena's own floor %.1f MiB",
++                 (double) arena_min / mib, (double) arena_floor / mib);
++
 +    // `-lme` is a CAP, not a floor: never register space no expert can occupy.  `extent_trunk` is the part the
 +    // budget buys; the head's tables (P3c) are on top of it, because they are not the policy's to spend.
 +    size_t extent_trunk = std::min(budget, padded_total);
@@ -99232,6 +99299,9 @@ index 2cbee61d4..9a5f24bf8 100644
 +            "`DefaultLimitMEMLOCK=infinity` in /etc/systemd/system.conf, `* - memlock unlimited` in "
 +            "/etc/security/limits.conf, or run with CAP_IPC_LOCK.  `-lme auto` sizes the GTT store to whatever "
 +            "the limit allows.";
++        const std::string advice_need = format("`-lme` asks for %.1f MiB of it and this tier needs at least %.1f "
++            "MiB to stream anything (%s).  %s", (double) extent / mib, (double) arena_need / mib,
++            arena_need_str.c_str(), advice);
 +
 +        if (shortfall == 0 && !clamp_useful) {
 +            // (a) the model fits without the store, and the limit is too small to buy a useful one: this is an
@@ -99250,7 +99320,7 @@ index 2cbee61d4..9a5f24bf8 100644
 +            extent = honour;
 +            extent_trunk = honour > head_padded ? honour - head_padded : 0;
 +            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
-+        } else if (clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream) {
++        } else if (clamp_useful && honour >= shortfall && honour >= arena_need && gtt_store_can_stream) {
 +            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
 +            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
 +                           "MiB, which still covers the %.1f MiB this model cannot fit in RAM.  %s\n", __func__,
@@ -99277,11 +99347,12 @@ index 2cbee61d4..9a5f24bf8 100644
 +                (double) weights / mib, (double) avail / mib, (double) fit_cap / mib, (double) shortfall / mib,
 +                (double) extent / mib, source.c_str(), lim.c_str(), (double) honour / mib,
 +                clamps_but_cannot_stream
-+                    ? "\n  And even a LOCKED store of that size would not make it runnable in this build: it has no "
-+                      "eviction (P3) or streaming fill (P4), so the experts that do not fit would still take their "
-+                      "layer's device buffer and the load would over-commit."
++                    ? "\n  And even a LOCKED store of that size would not make it runnable: streaming is opted in BY "
++                      "`-lme`, so without a budget the store this clamp could buy is a placement tier -- the "
++                      "experts that do not fit would still take their layer's device buffer and the load would "
++                      "over-commit."
 +                    : "",
-+                advice));
++                !gtt_store_can_stream ? advice : advice_need.c_str()));
 +        }
 +    }
 +    if (extent < 4096) {
@@ -99379,11 +99450,12 @@ index 2cbee61d4..9a5f24bf8 100644
 +    if (arena_wanted && lme_given && !store_live && extent_trunk < padded_total) {
 +        // Every table must be able to hold at least one slot, or the cache would serve some op from the
 +        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
-+        // per table before enabling the tier at all.
-+        if (extent < arena_min) {
-+            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB one slot per expert table "
-+                           "needs; falling back to whole-tensor placement\n", __func__,
-+                           (double) extent / mib, (double) arena_min / mib);
++        // per table, and at least the arena's own floor (#319: below it the cache declines the store, so a
++        // store in between cannot stream anything), before enabling the tier at all.
++        if (extent < arena_need) {
++            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB it needs (%s); falling back "
++                           "to whole-tensor placement\n", __func__,
++                           (double) extent / mib, (double) arena_need / mib, arena_need_str.c_str());
 +        } else {
 +            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
 +                ggml_backend_dev_t d = ggml_backend_dev_get(i);
@@ -99457,26 +99529,48 @@ index 2cbee61d4..9a5f24bf8 100644
 +    // point with such a model means streaming is not available, for one of exactly four reasons, and the fix differs
 +    // per reason -- so say which and refuse, before a byte is read.
 +    if (fit_cap_now == 0 || weights_total > fit_cap_now) {
-+        const char * why =
-+            !lme_given              ? "`-lme` was not given, and the GTT arena -- the tier that streams the part of "
-+                                      "the expert set that does not fit -- is opted in BY `-lme`"
-+          : store_live              ? "a GTT expert store is already live in this process (a second model), and it "
-+                                      "is not this load's to size"
-+          : extent < arena_min      ? "the budget is smaller than one slot per expert table, which is the minimum "
-+                                      "the arena needs to serve a table at all"
-+          : arena_env != nullptr    ? "MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream"
-+          :                           "the arena is unavailable on this device";
++        // #319: name the constraint that actually binds, and give the fix for THAT one.  The pre-fix chain said
++        // "the arena is unavailable on this device" whenever the arena declined for its own size reasons, and
++        // recommended `-lme` to an operator who had already passed it.
++        const std::string why =
++            !lme_given              ? std::string("`-lme` was not given, and the GTT arena -- the tier that streams "
++                                      "the part of the expert set that does not fit -- is opted in BY `-lme`")
++          : store_live              ? std::string("a GTT expert store is already live in this process (a second "
++                                      "model), and it is not this load's to size")
++          : extent < arena_min      ? format("the budget is smaller than one slot per expert table, which is the "
++                                      "minimum the arena needs to serve a table at all (%.1f MiB asked for, %.1f "
++                                      "MiB needed)", (double) extent / mib, (double) arena_min / mib)
++          : extent < arena_floor    ? format("the budget (%.1f MiB) is below the GTT arena's own floor of %.1f MiB, "
++                                      "so the cache declines the store and placement would over-commit",
++                                      (double) extent / mib, (double) arena_floor / mib)
++          : arena_env != nullptr    ? std::string("MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream")
++          :                           std::string("the arena is unavailable on this device");
++        const std::string fix =
++            !lme_given           ? std::string("Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` "
++                                      "to opt into the GTT arena, which streams the remainder from the file-backed "
++                                      "page cache; `-lme auto` sizes it to whatever RAM and RLIMIT_MEMLOCK allow.  "
++                                      "Without a budget this load would place the unplaced experts as device "
++                                      "allocations, over-commit, and swap.")
++          : store_live           ? std::string("Only the FIRST model of a process sizes the store; load this one "
++                                      "alone, or give it the whole process's expert budget.")
++          :                        format("Raise `-lme` to at least %.1f MiB: %.1f MiB is what this model's expert "
++                                      "tables need at one slot each (the model-dependent minimum) and %.1f MiB is "
++                                      "the arena's own floor (which does not), and RLIMIT_MEMLOCK is %s.%s  `-lme auto` "
++                                      "sizes the store to whatever RAM and RLIMIT_MEMLOCK allow.",
++                                      (double) arena_need / mib, (double) arena_min / mib, (double) arena_floor / mib,
++                                      lockable == SIZE_MAX ? "unlimited"
++                                                           : format("%.1f MiB", (double) lockable / mib).c_str(),
++                                      lockable >= arena_need ? "" : "  Locking is what makes the tier a "
++                                          "reservation, so the clamp and the budget must both cover it.");
 +        throw std::runtime_error(format(
 +            "GTT expert store: this model's weights (%.1f MiB) do not fit in RAM (%.1f MiB available, "
 +            "%.1f MiB is the ceiling they may occupy), so the part that does not fit has to be streamed -- and "
 +            "streaming is not available here:\n"
 +            "  %s\n"
 +            "  asked for           %s\n"
-+            "Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena, which "
-+            "streams the remainder from the file-backed page cache; `-lme auto` sizes it to whatever RAM and "
-+            "RLIMIT_MEMLOCK allow.  Without a budget this load would place the unplaced experts as device "
-+            "allocations, over-commit, and swap.",
-+            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why, source.c_str()));
++            "%s",
++            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why.c_str(),
++            source.c_str(), fix.c_str()));
 +    }
 +
 +    // --- 3. open the GTT store, once, before any tensor is placed ---------------------------------------
@@ -99650,7 +99744,7 @@ index 2cbee61d4..9a5f24bf8 100644
  const char * llama_file_version_name(llama_fver version) {
      switch (version) {
          case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
-@@ -98,8 +1170,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
+@@ -98,8 +1219,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
          throw std::runtime_error(format("invalid split file: %s", path.c_str()));
      }
  
@@ -99661,7 +99755,7 @@ index 2cbee61d4..9a5f24bf8 100644
          paths.push_back(std::string(buf.data(), ret));
      }
  
-@@ -542,15 +1614,19 @@ llama_model_loader::llama_model_loader(
+@@ -542,15 +1663,19 @@ llama_model_loader::llama_model_loader(
          std::vector<std::string> & splits,
          FILE * file,
          llama_load_mode load_mode,
@@ -99683,7 +99777,7 @@ index 2cbee61d4..9a5f24bf8 100644
      }
  
      if (param_overrides_p != nullptr) {
-@@ -560,9 +1636,56 @@ llama_model_loader::llama_model_loader(
+@@ -560,9 +1685,56 @@ llama_model_loader::llama_model_loader(
      }
  
      tensor_buft_overrides = param_tensor_buft_overrides_p;
@@ -99742,7 +99836,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
      if (!fname.empty()) {
          // Load the main GGUF
-@@ -1185,9 +2308,11 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1185,9 +2357,11 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
          return false;
      }
  
@@ -99756,7 +99850,7 @@ index 2cbee61d4..9a5f24bf8 100644
          return false;
      }
  
-@@ -1198,24 +2323,251 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1198,24 +2372,251 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
      }
  
      if (w) {
@@ -100013,7 +100107,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
          auto it = ctx_map.find(key);
          if (it == ctx_map.end()) {
-@@ -1270,9 +2622,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1270,9 +2671,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // skip unused tensors
@@ -100027,7 +100121,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -1311,7 +2665,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1311,7 +2714,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          const buft_list_t * buft_list;
          switch (info.layer) {
              case LLM_TENSOR_LAYER_INPUT:
@@ -100039,7 +100133,7 @@ index 2cbee61d4..9a5f24bf8 100644
                  break;
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
-@@ -1326,15 +2683,115 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1326,15 +2732,115 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
          ggml_backend_buffer_type_t buft = nullptr;
  
@@ -100159,7 +100253,7 @@ index 2cbee61d4..9a5f24bf8 100644
                          if (use_mmap) {
                              static std::once_flag once;
                              std::call_once(once, [] {
-@@ -1354,6 +2811,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1354,6 +2860,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -100200,7 +100294,7 @@ index 2cbee61d4..9a5f24bf8 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -1362,8 +2853,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1362,8 +2902,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          }
  
          // avoid using a host buffer when using mmap
@@ -100216,7 +100310,7 @@ index 2cbee61d4..9a5f24bf8 100644
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -1421,7 +2918,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1421,7 +2967,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          ggml_set_name(&t_meta, tn.str().c_str());
  
          ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -100231,7 +100325,7 @@ index 2cbee61d4..9a5f24bf8 100644
          ggml_context * ctx = ctx_for_buft(buft);
          ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
          ggml_set_name(ret, tn.str().c_str());
-@@ -1434,9 +2937,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1434,9 +2986,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -100256,7 +100350,7 @@ index 2cbee61d4..9a5f24bf8 100644
      }
  
      ggml_tensor t_meta = *cur;
-@@ -1459,6 +2975,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1459,6 +3024,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      if (buft == nullptr) {
          return nullptr;
      }
@@ -100267,7 +100361,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
      ggml_context * ctx = ctx_for_buft(buft);
  
-@@ -1502,6 +3022,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -1502,6 +3071,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
      }
  }
  
@@ -100283,7 +100377,7 @@ index 2cbee61d4..9a5f24bf8 100644
  void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
      // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
      if (use_mmap || lazy.any()) {
-@@ -1521,11 +3050,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1521,11 +3099,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                  }
              }
  
@@ -100300,7 +100394,7 @@ index 2cbee61d4..9a5f24bf8 100644
              if (mlock_mmaps) {
                  std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                  mlock_mmap->init(mapping->addr());
-@@ -1541,6 +3073,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1541,6 +3122,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
      }
  }
  
@@ -100314,7 +100408,7 @@ index 2cbee61d4..9a5f24bf8 100644
  using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
  
  // merge a list of [first, last) ranges into a sorted, non-overlapping list
-@@ -1658,10 +3197,12 @@ bool llama_model_loader::load_all_data(
+@@ -1658,10 +3246,12 @@ bool llama_model_loader::load_all_data(
      }
      GGML_ASSERT(size_data != 0 && "call init_mappings() first");
  
@@ -100329,7 +100423,7 @@ index 2cbee61d4..9a5f24bf8 100644
      constexpr size_t n_buffers = 4;
  
      size_t alignment = 1;
-@@ -1669,8 +3210,17 @@ bool llama_model_loader::load_all_data(
+@@ -1669,8 +3259,17 @@ bool llama_model_loader::load_all_data(
          alignment = std::max(file->read_alignment(), alignment);
      }
  
@@ -100349,7 +100443,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
      std::vector<ggml_backend_buffer_t> host_buffers;
      std::vector<ggml_backend_event_t> events;
-@@ -1696,6 +3246,15 @@ bool llama_model_loader::load_all_data(
+@@ -1696,6 +3295,15 @@ bool llama_model_loader::load_all_data(
              return nullptr;
          }
  
@@ -100365,7 +100459,7 @@ index 2cbee61d4..9a5f24bf8 100644
          if (buft != ggml_backend_dev_buffer_type(dev)) {
              LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                  ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-@@ -1711,6 +3270,21 @@ bool llama_model_loader::load_all_data(
+@@ -1711,6 +3319,21 @@ bool llama_model_loader::load_all_data(
          }
  
          auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -100387,7 +100481,7 @@ index 2cbee61d4..9a5f24bf8 100644
          if (!host_buft) {
              LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                  ggml_backend_dev_name(dev));
-@@ -1719,16 +3293,16 @@ bool llama_model_loader::load_all_data(
+@@ -1719,16 +3342,16 @@ bool llama_model_loader::load_all_data(
  
          // If the backend is supported, create pinned memory buffers and events for synchronisation.
          for (size_t idx = 0; idx < n_buffers; ++idx) {
@@ -100408,7 +100502,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
              auto * event = ggml_backend_event_new(dev);
              if (!event) {
-@@ -1792,7 +3366,18 @@ bool llama_model_loader::load_all_data(
+@@ -1792,7 +3415,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -100428,7 +100522,7 @@ index 2cbee61d4..9a5f24bf8 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -1824,18 +3409,41 @@ bool llama_model_loader::load_all_data(
+@@ -1824,18 +3458,41 @@ bool llama_model_loader::load_all_data(
                      lmlock->grow_to(weight->offs + n_size);
                  }
  
@@ -100474,7 +100568,7 @@ index 2cbee61d4..9a5f24bf8 100644
                  if (check_tensors) {
                      validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                          return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-@@ -1922,6 +3530,29 @@ bool llama_model_loader::load_all_data(
+@@ -1922,6 +3579,29 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -100504,7 +100598,7 @@ index 2cbee61d4..9a5f24bf8 100644
          size_done += n_size;
      }
  
-@@ -1953,11 +3584,20 @@ bool llama_model_loader::load_all_data(
+@@ -1953,11 +3633,20 @@ bool llama_model_loader::load_all_data(
          // unmap offloaded tensors and metadata
          if (use_mmap) {
              for (uint32_t idx = 0; idx < mappings.size(); idx++) {

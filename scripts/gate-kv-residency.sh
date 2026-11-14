@@ -137,6 +137,20 @@
 #                a threshold or message change should not need a re-run).  The arms must all be present.
 #   ROCBLAS_USE_HIPBLASLT   forced to 0: a fresh-process comparison is only meaningful without the library's
 #                           per-start autotuning (INVARIANTS.md §44)
+#   MOE_EXPERT_HEATMAP      forced to `load` on every arm: the persisted expert heat prior is a PLACEMENT
+#                           prior, and this gate compares fresh processes.  Residency selects which MoE path
+#                           serves an op (an identity table is served in place and its prefill fusions stand
+#                           down -- MOE_EXPERT_PREFILL_IN_PLACE, r258/r266), so each arm inheriting the prior
+#                           the PREVIOUS arm's run wrote is a confound, not a signal: measured 2026-11-14
+#                           (r284), Flash-Next GSQ-IQ3_XXS + its MTP sidecar, 2 devices, `-sm layer`,
+#                           `-ncmoe 48 -c 32768`, 64 tokens -- one `.moe-heatmap` state yields `7ca535e1da91`
+#                           and a different one `7a3474cbe5f1`, each reproducible within its own state, and
+#                           `MOE_EXPERT_PREFILL_IN_PLACE=0` collapses the two to one text.  `load` reads the
+#                           file and never writes it, so every arm of one gate run starts from the SAME
+#                           residency.  This is the same instrument-hygiene rule as the line above, and it is
+#                           what makes the multi-device section's within-device-count comparison satisfiable
+#                           (TODO #321, retired by this change; `INVARIANTS.md` r284, `GREEDY-PURITY.md` §89).
+#                           It does NOT weaken an assertion: the arms are still required to be byte-identical.
 #
 # Exit: 0 = pass, 1 = fail, 2 = usage/startup error.
 set -uo pipefail
@@ -212,7 +226,7 @@ run_arm() {
         [ -s "$err" ] || { fail "$arm: no log to re-grade at $err"; return 1; }
         return 0
     fi
-    if ! HIP_VISIBLE_DEVICES="${RUN_DEVS:-0}" ROCBLAS_USE_HIPBLASLT=0 "${launcher[@]}" timeout 2400 "$LLAMA_CLI" \
+    if ! HIP_VISIBLE_DEVICES="${RUN_DEVS:-0}" ROCBLAS_USE_HIPBLASLT=0 MOE_EXPERT_HEATMAP=load "${launcher[@]}" timeout 2400 "$LLAMA_CLI" \
             -m "$model" -ngl 99 -fit off -f "$prompt" -n "$NGEN" \
             --seed 42 --temp 0 --no-display-prompt --single-turn -v "$@" \
             >"$out" 2>"$err"; then

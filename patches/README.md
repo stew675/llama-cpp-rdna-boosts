@@ -5113,6 +5113,23 @@ really ran (the mechanism must be LIVE, not merely benign -- the text is identic
 **38/0** with the seed-queue census asserted, prefill-logit **0.000000 / 100.000 %**.  Record: `WORKLOG.md`
 261113.003, `INVARIANTS.md` (r277).
 
+**r284 amendment to block 16 -- the lock policy tests the number the CACHE accepts (`TODO` #319).**  The `-lme`
+lock policy decided "can this clamp still stream, so can this model run" against `arena_min` (one slot per expert
+table) -- but `moe_cache_preflight_store()` declines any store below its own **floor** (2048 MiB), so a clamp in
+`[arena_min, floor)` passed the loader's test, was declined by the cache, and the load was then refused as *"the
+arena is unavailable on this device"* with the advice to pass `-lme`, which the operator had already done.  The
+floor is now a backend answer (`ggml_backend_dev_gtt_store_arena_min` → `moe_cache_gtt_arena_floor()`, one
+definition), the streaming test is `max(arena_min, floor)`, and the refusal names the constraint that binds with
+the number to raise.  No new environment variable, no default moved, and it is inert on a discrete device (no
+IGPU answers, so `arena_need == arena_min`).  Measured on `halo` (gfx1151): `Qwen3.5-122B-A10B Q8_0`, weights
+126 403.0 MiB against a 101 669.6 MiB fit cap, one slot per table 459.6 MiB, floor 2048 MiB -- `-lme 1` refuses
+naming the floor and the 2048 MiB to raise to (r283 said "the arena is unavailable on this device"), `-lme auto`
+under a 1 GiB `ulimit -l` refuses naming the 21 741.3 MiB shortfall, and **`-lme 3` runs**: arena 3072.0 MiB,
+144 tables / 864 slots, 864 direct buffered fills at 4158 MiB/s, text produced.  Gates: `fork-refresh.sh` re-cut
+(tree `39ad82e0e`), `validate-set.sh` green, `gate-per-block-build.sh --fast --changed-from 6a4af82e2` (block 16,
+18 s), coherence identical on this box (4B 1 GPU `a77fa8c1107a`, 3 GPU tensor `eab86065e67e`).  Record:
+`WORKLOG.md` 261114.005, `INVARIANTS.md` (r284).
+
 ## Dated history
 
 [`../archive/docs/patch-notes-history.md`](../archive/docs/patch-notes-history.md) — every amendment note
