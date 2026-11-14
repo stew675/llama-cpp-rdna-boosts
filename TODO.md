@@ -38,10 +38,11 @@ left in this file.  The r236 re-base
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
+| **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
 
 ## Handle numbering
 
-**New handles append after `#326`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#327`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -159,6 +160,80 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
 
+## 327. A table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract
+
+**`MOE_EXPERT_PREFILL_IN_PLACE` (r258/r266) buys its prefill win by skipping the staged copy, and the three prefill
+MoE fusions are attached to that copy: so a table served in place runs the per-op chain instead.  Residency therefore
+selects the kernel set, and the two sets are not bit-identical in every configuration (measured r284), which makes a
+run's greedy text a function of the persisted heat prior.  The chosen fix is to give each fusion the in-place
+contract so residency stops mattering.**
+
+**Kind:** purity / architecture (blocks 06, 08, 09/12; `GREEDY-PURITY.md` §89).
+
+**The coupling, from the code.**  Above the decode/verify band (`n_tok > MOE_EXPERT_CACHE_MAX_TOK` = one band,
+`n_used × 16`) `sched_stage_split` (`ggml/src/ggml-backend.cpp`) asks `iface.moe_cache_in_place` →
+`moe_cache_serves_in_place` (`t.identity && t.arena && t.slots >= n_experts`, i.e. a table at its FULL slot count)
+and, when it answers yes, **skips staging entirely**: the op is handed the raw routing ids and `MUL_MAT_ID` reads the
+table out of its own arena region by base-pointer swap.  There is no `input_cpy`, and the fusions that own the
+gate/up/down chain — MMB's fused GLU (`GGML_CUDA_MMB_GLU`), the fused MMQ `gate+up` pair, and the MMQ
+`swiglu→down` fold — match the *staged* contract, so they **stand down** for such a table and the per-op chain
+redirects.  Which tables are identity is a placement decision ranked by the `.moe-heatmap` prior.
+
+**Measured consequence (r284, `benchmarks/2026-11-14-residency-reproducibility.md`).**  Flash-Next GSQ-IQ3_XXS + its
+MTP sidecar, 2 devices `-sm layer`, `-ncmoe 48 -c 32768`, 64 tokens, same build/seed: one prior state `7ca535e1da91`
+(×4), another `7a3474cbe5f1` (×4), `MOE_EXPERT_HEATMAP=load` `7ca535e1da91` (×6); `MOE_EXPERT_PREFILL_IN_PLACE=0`
+gives `7a3474cbe5f1` for **both** priors; `GGML_CUDA_MMB=0` changes the prior-absent arm's text and leaves the
+prior-set arm's alone (the proof the two arms run different kernel sets); `GGML_MOE_DEVREMAP=0` and
+`MOE_EXPERT_CACHE_IDENTITY_PREF=0` reproduce the default texts exactly (inert here).  The flip lands ~60 tokens into
+the generation: a near-tie under a ≲1e-6 difference, not a mis-read expert.  **The magnitude is unmeasured** -- see
+owed item 2.
+
+**The decision (maintainer, 2026-11-14).**  Three ways out were put up: (1) serve in place only when the whole
+ubatch can be, i.e. give up the arm's coverage; (2) teach the fusions the in-place contract; (3) declare the
+difference in-band.  **Chosen: (2)** -- residency must be **value-neutral**, and both the copy-skip (r258: prefill
+1489.6 -> 4033.9 t/s on the pinned tier; r266: +6.3 % prompt / +5 % decode on the APU 122B) and the fusions must
+apply regardless of what is resident.  Harder, and deliberately so.  **Deferred, not urgent:** the coupling is
+deterministic per cache state, every text gate now pins the cache state (`MOE_EXPERT_HEATMAP=load`, r284), and no
+default is at risk.  Note what the APU gate currently shows: `gate-uma-experts.sh`'s `inplace` arm reads the same
+text as every other arm on `halo` (`4f29f1e4a4d6`, 108 table calls in place, r285), so either the two chains agree
+in that geometry or that text has no near-tie -- it does not contradict the discrete 2-device differential.
+
+**What "teaching them" means, per fusion.**  The in-place contract offers `moe_cache_get_table()`'s identity fast
+path (`arena`, `n_slots`, `expert_bytes`, `remap_dev`, `n_used`, `n_tok`; identity ⇒ the raw ids need no remap) and
+the table's own arena region addressed by expert id -- but **no `input_cpy`**.  So each fusion needs (a) a second
+matcher for an arena-backed table instead of the staged one, (b) its own `src0` derivation (arena base + `expert *
+stride_expert`, keeping the SAME dot-product order and J tile as its staged twin, §69/§87), (c) the same epilogue
+arithmetic, and (d) the guard turned from "stand down" into "take the in-place arm".  Suggested order, by
+value/risk: **the MMQ `swiglu→down` fold** first (its epilogue is arithmetic on the gate/up result and the down
+matmul's `src0` simply becomes the arena table); **the fused MMQ `gate+up` pair** second (`GGML_PAIR_ROUTED_OFF` is
+its A/B and it is documented bit-identical to the triple, §69); **MMB's fused GLU last** -- MMB is a different GEMM
+(block 06) and it is the kernel the r284 differential shows being removed.
+
+**Owed before it ships.**
+1. **The acceptance test is the r284 differential, with the feature ON:** the same command on the same build must
+   give the same text for two *different* `.moe-heatmap` states (restore/copy the file before each run, or delete
+   it), 2/2 each way.  It belongs in a gate, not in a scratch harness -- the natural home is
+   `gate-uma-experts.sh`'s `inplace` arm on a config whose residency is forced partial, plus a discrete arm.
+2. **KLD across the two residency states must read `0.000000`.**  That is what value-neutral means; a nonzero
+   reading is the bug, not a tolerance question.  It is unmeasurable today: `llama-perplexity` cannot load a drafter
+   and the discrete partial-residency state needs one (r284: without `-md`, residency is 99.65 % and both priors
+   read 0.000000 / top-p 100 %).  So either `llama-perplexity` gains `-md`, or the arm forces partial residency
+   without a drafter (`MOE_EXPERT_CACHE_MIB=N` on a discrete box; `-lme 16` on the APU arm the gate already runs).
+3. **A `-lv 4` launch census** over the two residency states proving the same fusion fires in both (r284's evidence
+   for "different kernel sets" is the MMB switch differential, not a census).
+4. **The delivery's normal arm set for a fusion change:** coherence 1/2/3 devices, the MTP four-axis protocol,
+   `gate-prefill-logits.sh` on both residency states, `gate-host-pool.sh` (the discrete tier must stay inert), and
+   the per-block ladder for the blocks touched.
+
+**Where it lands.**  Blocks **06** (MMB), **08** (the old-08 fusions), **09/12** (the cache and scheduler contracts:
+`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 15/16 untouched.  **No new environment variable** --
+`MOE_EXPERT_PREFILL_IN_PLACE` stays a kill switch, and the per-fusion bisect arms already exist
+(`GGML_CUDA_MMB_GLU`, `GGML_PAIR_ROUTED_OFF`, `GGML_CUDA_DISABLE_FUSION`).
+
+**Re-entry:** fold it into the next block 06/08 pass over these fusions, or sooner on a reported residency-dependent
+answer.  Record: [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
+`GREEDY-PURITY.md` §89, `INVARIANTS.md` (r284), `ENVIRONMENT.md` (`MOE_EXPERT_PREFILL_IN_PLACE`, `MOE_EXPERT_HEATMAP`).
+
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
@@ -216,7 +291,9 @@ a driver fix: a text comparison across processes pins the cache state, exactly a
 section is green on the same assertions (`b08d3dbcb1e9` x3, per-device counters intact).  **Still open on the record,
 and deliberately not an item:** the two arms are documented as reading the same bytes, so their *magnitude* is
 unmeasured (`llama-perplexity` cannot load a drafter, which is the state that produces the partial residency);
-re-entry is a prefill-logit arm that can, and a measurement above the 0.005 tolerance.  Record:
+re-entry is a prefill-logit arm that can, and a measurement above the 0.005 tolerance.  The chosen way to remove the
+coupling altogether (teach the prefill fusions the in-place contract, so residency stops selecting the kernel set)
+is **`TODO` #327**, deferred and not urgent.  Record:
 [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
 `INVARIANTS.md` r284, `GREEDY-PURITY.md` §89.
 
