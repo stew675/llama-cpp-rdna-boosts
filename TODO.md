@@ -18,14 +18,15 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **17-block V2.1 set** (block 00 + blocks 01-16) at fork point **`a691b2345`**
-(the 2026-10-25 re-base); read `.release` in `release.json` for the release id -- it is the source of
+**Current state:** the **17-block V2.1 set** (block 00 + blocks 01-16) at fork point **`4f9dfa0e3`**
+(the 2026-11-13 r278 re-base); read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
 draft window -- all three opt-in, default off).  `release.json` is the source of truth for the
 tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
-The r236 re-base (`archive/work/upstream-rebase-261108/`, base `a691b2345`) is **cut**: its 17 blocks are climbed,
-every re-base-derived row is closed, and `patches/`/`release.json` carry the re-cut set
-(the base is unchanged since; the release id is `release.json.release`).
+The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
+`patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
+are recorded in `WORKLOG.md` 261113.015.  What it left open is #322/#323/#324/#325; the r236 re-base
+(`archive/work/upstream-rebase-261108/`) is superseded and closed.
 
 ## The open list
 
@@ -36,6 +37,11 @@ every re-base-derived row is closed, and `patches/`/`release.json` carry the re-
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **319** | block 16's lock policy refuses a >RAM model on a clamp too small for one expert table | capability (block 16, the UMA tier) | **OPEN** (2026-11-13) — the refusal is the safe branch; relaxing it needs the band's own arms — §319 |
 | **320** | sizing the GTT store for a separate drafter's head | parked (block 16; a `common`/`--fit` term) | **PARKED** (maintainer, r263) — the target sizes the region before the drafter loads — §320 |
+| **321** | an MTP draft over 2 devices is not reproducible (3 runs, 3 texts) | purity / determinism (pre-existing; the MTP driver) | **OPEN** — makes `gate-kv-residency.sh`'s multi-device section unsatisfiable; reproduces on `bin-r277` — §321 |
+| **322** | `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces (on ANY build) | tooling / stale gate baseline | **OPEN** (2026-11-13) — the arm fails identically on `bin-r277`; re-record, do not "fix" — §322 |
+| **323** | `gate-prefill-logits.sh`'s base file name does not carry `device`/`sm`, so the tensor arm overwrites the layer base | tooling (pre-release gate) | **OPEN** (2026-11-13) — record sequentially, canonical arm last — §323 |
+| **324** | both `optional/` artifacts are stale: neither applies to the r278 tree | tooling / optional artifacts | **OPEN** (2026-11-13) — re-cut against `69161d3b0` before they are offered again — §324 |
+| **325** | the R18 APU-only gate set is not runnable on gfx1201 and is owed to `halo`/`soar` | waiting on hardware (gfx1151) | **OPEN** — `gate-uma-experts.sh`, `gate-prefill-server-slots.sh`, `D17`'s store region — §325 |
 
 ## Handle numbering
 
@@ -175,7 +181,7 @@ Record: `archive/work/apu-expert-gtt/README.md` §5 and §7 (`-lme` as the strea
 ## 321. An MTP draft over 2 devices is not reproducible (same seed, temp 0, 3 runs, 3 texts)
 
 **Found at R16** by `scripts/gate-kv-residency.sh`'s multi-device pool section; recorded as `D20` in
-`wip/upstream-rebase-261113/DECISIONS.md`, which carries the full table.  Flash-Next `GSQ-IQ3_XXS` + its shared
+`archive/work/upstream-rebase-261113/DECISIONS.md`, which carries the full table.  Flash-Next `GSQ-IQ3_XXS` + its shared
 MTP sidecar, `-ncmoe 48`, q8_0 KV, `-c 32768`, the 25 763-token `prompts/kld-corpus-35b-in-domain.txt`,
 `-n 64 --seed 42 --temp 0`:
 
@@ -196,6 +202,66 @@ within-device-count comparison is right.
 **Re-entry:** bisect the draft path on a 2-device `-sm layer` arm (kill switches: `GGML_CUDA_DISABLE_GRAPHS=1`,
 `MOE_EXPERT_CACHE_MIB=0`, `--lazy-mode off`, the draft KV window `--spec-draft-kv-window`), then a
 `INVARIANTS.md` entry once it is fixed.  Owner: the MTP driver, not block 15.
+
+## 322. `gate-server-arms.sh`'s `35b10` baseline hash set no longer reproduces on ANY build
+
+**Found at R18** (2026-11-13) while running the release gate set.  The two-slot host-expert DFlash arm
+`35b10` (35B-A3B Q8_0 + its DFlash2, `-ncmoe 10`, `-sm layer`, 3 devices) reports
+`a9d494a15521 ee21682d22a5` against the recorded set `2cf19becd4ee e26a28d3f3ae`, with acceptance
+**0.42771 / 0.59124**.  **The shipped `bin-r277` build fails it with the same two texts and the same acceptance
+to the digit**, so this is a stale baseline (recorded at r236 on the r236 tree), not a re-base regression and
+not a delivery defect.  `fn24` and `fn10` pass on both builds.
+
+The criterion that still means something — acceptance is not a collapse (≥ 0.5x baseline) and the text is sane
+and identical across builds — passes; the exact-hash criterion is what is stale.  **Re-entry:** re-record the
+baseline with `./scripts/gate-server-arms.sh --record` on a tree whose numbers are trusted (and paste the
+`record:` lines into `ARMS`), then re-run on this tree and on `bin-r277` to confirm both.  Do **not** widen the
+tolerance instead: an exact-hash set is what makes this arm's silence-proof property real.
+
+## 323. `gate-prefill-logits.sh`'s base file is one point per (model, kv, ub, extra) — not per device/sm
+
+**Found at R18.**  The `.meta` pins `device` and `sm` and the compare refuses a mismatch, but the **file name**
+carries only the model/arch/kv/ub/extra, so recording an all-reduce arm (`--sm tensor --device 0,1,2`, which is
+how block 01's change is reachable) **silently overwrites** the default single-device `layer` base for the same
+model.  Re-running the default arm then fails the meta compatibility check until the base is re-recorded — which
+is safe but means a release that needs both arms must record them sequentially (and re-record the canonical one
+last), and there is no way to keep both on disk.
+
+**Re-entry:** fold `-dev<LIST>` / `-sm<MODE>` into the base file name (the meta already has the fields), then a
+release can hold both points at once.  Until then: record → compare → record the canonical point again, and say
+which point the file holds in the release record.
+
+## 324. Both `optional/` artifacts are stale (they do not apply to the r278 tree)
+
+`AGENTS.md` requires an `optional/` artifact to be rebased onto **every** release tree, and neither is:
+`optional/host-pool-fill-src/host-pool-fill-src.patch` was cut at r243's tree (`e9300f1dbd…`) and
+`optional/two-lane-prefill/two-lane-prefill.patch` at r259's (`7995db44…`).  Against the r278 tree `69161d3b0`
+both conflict under `git apply --3way` (`moe-expert-cache.cu`; `ggml-backend-impl.h`, `ggml-backend.cpp`,
+`ggml-cuda.cu`), so `scripts/apply-all.sh --include-optional` cannot produce a verified tree from either today.
+
+The conflicts are the expected kind — the artifacts edit files that blocks 12/15/16 rewrote — so the re-cut is a
+semantic resolution against the new code, not a mechanical replay.  **Re-entry:** apply the artifact's intent to
+the r278 tree, re-cut against `69161d3b0`, update the artifact's `README.md` (new sha256, new produced tree) and
+verify with `apply-all.sh --include-optional`; if an artifact has lost its premise, archive it under
+`archive/work/` instead.  Nothing in `patches/` is affected.
+
+## 325. The R18 APU-only gate set is owed to a gfx1151 box (`halo`/`soar`)
+
+**R18 could not run three of its own gate items on the primary box, and they are NOT marked passed**
+(`WORKLOG.md` 261113.015 states the same):
+
+* `scripts/gate-uma-experts.sh` (including its `inplace` and `pfcp` arms) — the integrated-GPU gate: it needs
+  `prop.integrated`, `-lme 4` on a 35B-A3B whose 18.2 GiB expert set evicts out of shared DRAM, and
+  `LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx1151/lib`.  On a discrete gfx1201 every arm executes but the `ref` arm
+  builds **no GTT arena** (`tables=''`, no releases, `evictions='0'`) — the store declining is the documented
+  discrete behaviour, so the assertions are unsatisfiable by construction.
+* `scripts/gate-prefill-server-slots.sh` — needs `Qwen3.5-122B-A10B Q8_0` (≈130 GiB, absent here) with `-lme 90`.
+* `D17`'s **store-region** half (the VMM region the store registers) — unobservable on a discrete GPU (**0 `GTT`
+  lines**); its VMM-pool half stays verified (r10).
+
+**Re-entry:** one session on `halo`/`soar` (gfx1151) with the two gates and the store region check, recorded as a
+`WORKLOG.md` entry on this release's tree.  The discrete-side evidence that CAN be stated is already recorded:
+the host-expert arena is live and evicting (`h=0.8127`, `fills=9418 evictions=689`) and the UMA tier is inert.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

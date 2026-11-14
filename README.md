@@ -11,11 +11,11 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
 It ships as **17 patches** (block 00 + blocks 01-16) for a clean llama.cpp checkout at the fork point
-**`a691b2345`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
+**`4f9dfa0e3`** (upstream master).  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block 14 is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
 [block 14](patches/README.md#block-14--sm-relaxed-tensor-for-the-moe-amax-arches-temporary-expect-removal)
-and treat it as a stop-gap, not a feature.  The current release is **`v17-a691b2345-r271`**: the release
+and treat it as a stop-gap, not a feature.  The current release is **`v17-4f9dfa0e3-r278`**: the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -23,8 +23,8 @@ not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout a691b2345
-bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (16 commits)
+git checkout 4f9dfa0e3
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (17 commits)
 
 # OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
@@ -46,7 +46,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 blocks + b
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-a691b2345-r243`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v17-4f9dfa0e3-r278`**; the block
 count in the tag follows the set, so `v15-*` tags are the 15-block releases up to r177 and `v16-*` the
 16-block releases from r178 on.  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
@@ -216,9 +216,9 @@ FORK=https://github.com/ggml-org/llama.cpp
 git clone $FORK && cd llama.cpp
 git checkout "$BASE"
 
-# 2. apply the set (automated; strict 16/16 git am on the recorded base)
+# 2. apply the set (automated; strict 17/17 git am on the recorded base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0000…0011  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0000…0016  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -295,13 +295,13 @@ any more**:
   `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults and the lazy reader
   (the old block 14 + the old block 15 remainder).
 
-Applying the 16 patches to the fork point in [`release.json`](release.json) therefore reproduces the
+Applying the 17 patches to the fork point in [`release.json`](release.json) therefore reproduces the
 **full campaign tree** in one pass:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout a691b2345          # the base recorded in release.json
-bash <path-to-this-repo>/scripts/apply-all.sh .   # 16/16 strict, tree checked against release.json
+git checkout 4f9dfa0e3          # the base recorded in release.json
+bash <path-to-this-repo>/scripts/apply-all.sh .   # 17/17 strict, tree checked against release.json
 ```
 
 The per-patch fold mapping and validation record are in

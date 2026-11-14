@@ -31,8 +31,8 @@ listed is a probe/cascade difference — note it in the rung log, do not assume 
 | R14 | 13 MTP vocab subset | **DONE 2026-11-13** | `aca78625a` | **0 conflicts, 0 first-error passes**; the block's own `test-mtp-draft-vocab` **PASS** (subset = -inf outside `N`, finite logits match the full vocab with 0 mismatches, two live contexts keep their own `N`); runtime `--spec-draft-mtp-vocab 32768` drafts on 32 801 of 248 320 rows; **`D7` re-verified and it has moved**: `-sm tensor` now takes the device row gather too, because block 09's `ggml_backend_meta_device_event_new()` closed the R03 gap |
 | R15 | 14 relaxed-tensor (**temporary**) | **DONE 2026-11-13** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` still refuses flint with the delivery's pointer, `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`), 4B tensor/relaxed/layer all `1c5d32ac537d`; **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and no range commit touches it, so the block stays TEMPORARY |
 | R16 | 15 streamed KV | **DONE 2026-11-13** | `f745bbf1b` + rung-repair `9c940db6f` | 5 files / 8 hunks, one first-error pass; `D11` = **107** ops / RPC **9**; `D3` superset (upstream's K/V scales + block 15's pool page), `D15` merge, `D19` unchanged; **R16r**: upstream `#31927`'s h_nextn assert now accepts the delivery's folded HC export; `gate-kv-residency` selftest + window + single-device pool **PASS**, `gate-kv-window-split` / `gate-spec-draft-window` / `gate-spec-reuse-window` **PASS**, quant-coherence **section E CLEARED** (`200edcd422c7`), `gate-host-pool` **50/54** with `fail`/`late`/`pinlate` now real (4 left = R17's); **new finding `D20`**: MTP draft on 2 devices is not reproducible (r277 too) |
-| R17 | 16 UMA GTT store | **NEXT** | — | `D17` verify |
-| R18 | release ladder | **NEXT (needs the maintainer's go-ahead)** | — | squash **both** rung-repairs (`R09r` -> block 05, R16r -> block 11); the APU gate set + `D17`'s store-region half; `gate-kv-residency.sh`'s multi-device section stays red (`D20`/#321, pre-existing) |
+| R17 | 16 UMA GTT store | **DONE 2026-11-13** | `767907a3f` | 16 files, **0 conflicts, 0 first-error passes**; `gate-host-pool.sh` **54/54** (the climb's last deferred arm); discrete arena live (`h=0.8127`, fills 9418, evictions 689) with **0 `GTT` lines**; `D17`'s store-region half is APU-only -> R18's `halo`/`soar` set |
+| R18 | release ladder (NOT a rung) | **DONE 2026-11-13** | squashed chain tip `fad1e27a9`, canonical re-cut **`0e264ad30`**, tree **`69161d3b0`** | both rung-repairs squashed (`R09r` -> block 05, R16r -> block 11), 17 commits, tree identical to the climb's tip; `validate-set.sh` green, per-block builds 17/17, `gate-rebase-release.sh` **RELEASABLE**; every block gate PASS except `gate-kv-residency.sh`'s **multi-device** section (`D20`/#321) and the APU-only set (#325).  See §R18 |
 
 ---
 
@@ -879,11 +879,54 @@ region check** — the halved VMM reservation + retry must not change the region
 box the store never opens, so the region question is unobservable; `D17` therefore stays **verified only for the
 VMM pool's own allocation** (R10's slab/arena) and its store-region half is R18-on-an-APU.
 
-## R18 — release ladder · **TODO**
+## R18 — release ladder · **DONE 2026-11-13** (not a rung; the delivery re-cut)
 
-See [`README.md`](README.md) §4.  Not a rung: `make-patches.sh`, `make-release.sh`, `validate-set.sh`,
-`gate-per-block-build.sh`, `gate-prefill-logits.sh --record` from a clean `4f9dfa0e3` build,
-`gate-rebase-release.sh`, the block gates, `check-gpu-faults.sh`, fork refresh, containers, records, and
-this campaign moved to `archive/work/`.
+`README.md` §4's ladder, in the order the traps fire.  Full numbers: `WORKLOG.md` 261113.015.
 
-**Every `DECISIONS.md` item marked `AWAITING` must be `DECIDED` before R18 starts.**
+**The re-cut.**
+
+* The climb's chain (`rebase-r278` at `767907a3f`, tree `69161d3b0`, 19 commits because it carried two
+  rung-repairs) was replayed as an interactive rebase that **fixups both repairs into their owning blocks**
+  (`9c94ce139` -> block 05 at position 6, `9c940db6f` -> block 11 at position 13).  **No conflict, and the
+  final tree is byte-identical** (`git diff pre-squash-767907a3f <squashed tip>` empty): the repair diffs
+  were 47 files of new FA instance files + a generator rewrite, and one 22-line `llama-graph.cpp` hunk, none
+  of which the intervening blocks rewrite.  Result: **exactly 17 commits**, block 00 keeps prefix `0000`;
+  squashed chain tip `fad1e27a9`.
+* `scripts/make-patches.sh ~/llama.cpp 4f9dfa0e3 fad1e27a9` -> 17 patches + `rdna-boosts-all.patch`;
+  a **canonical re-cut** in a throwaway `--shared` clone at `4f9dfa0e3` applied all 17 strictly and gave
+  **tip `0e264ad30`, tree `69161d3b0`** — the value `release.json .tip` carries.  The two commits differ only
+  by committer identity/date, as the `.tip` rule predicts.
+* `scripts/make-release.sh --base 4f9dfa0e3 --base-tree cfb1f99a2 --tip 0e264ad30 --tree 69161d3b0
+  --release v17-4f9dfa0e3-r278`.
+* The rung-repairs' own commit messages do not survive the squash: their rationale is in
+  `patches/README.md`'s r278 note and in `WORKLOG.md`.  (Whether to append re-base paragraphs to the 17 block
+  messages is a maintainer formatting call — nothing depends on it and the tree is unaffected.)
+
+**Gates (all run on the canonical re-cut, `~/llama.cpp` checked out at `canonical-r278`, build `0e264ad30`).**
+
+| gate | result |
+|---|---|
+| `validate-set.sh` | **green**: strict `git am` on a fresh tarball at `4f9dfa0e3`, applied tree `69161d3b0`, 17 sha256s, 337-file Windows lint |
+| `gate-per-block-build.sh` | **17/17 in 247 s** (`all` targets, build dir wiped per commit) |
+| coherence 4B, 1 GPU `-sm layer` | **100 chars `sha=1c5d32ac537d`** (unchanged since R01) |
+| field config 35B-A3B Q8_0 `-sm tensor 0,2` bf16 KV | `none` **271 chars `8d733a56c740`**; adaptive MTP acceptance **0.94444**, `adaptive draft depth enabled`, `target h rows on the device: yes` |
+| `gate-prefill-logits.sh` | base from **unpatched** `4f9dfa0e3` (`VMM=ON`, PPL 5.9301): default **0.000697 / 98.784 %**, `--kv q8_0` **0.000580 / 98.882 %**, `--kv f8_e4m3` **0.000987 / 98.716 %**, `--sm tensor --device 0,1,2` **0.000558 / 98.833 %** — all PASS |
+| `test-backend-ops` | FA **6997/6997**, `MUL_MAT` **2680/2680**, `MUL_MAT_ID` **1056/1056** |
+| `gate-host-pool.sh` | **54/54** |
+| `gate-node-budget.sh` | **4/4**, margin 440 entries |
+| `gate-hc-fusions.sh` / `gate-qwen4exp-quant-coherence.sh` | **PASS** (449 chars `d62340fbf566`; quant hashes + **section E** `200edcd422c7`) |
+| `gate-kv-window-split` / `-park-idle-slots` / `-ckpt-reuse` / `-state-pipe` / `-spec-align` / `-spec-width-band` / `-spec-draft-window` / `-spec-reuse-window` / `-fusion-alias-copy` / `-grid-stall-pad` / `-norm-rows-alias` | **PASS** |
+| `gate-kv-residency.sh` | **all green except the multi-device pool section**: `pmref 7ca535e1da91` / `pmres f260d1824ab3` / `pmlegacy b08d3dbcb1e9` = exactly R16's three values (`D20`, `TODO` #321).  Gate exit 1; not weakened |
+| `gate-server-arms.sh` | `fn24`/`fn10` PASS; `35b10` FAILs its r236 hash set **identically on `bin-r277`** (same texts, same acceptance) -> stale baseline, `TODO` #322 |
+| MTP four-axis (`-n 3000`) | R 63.4->104.5 (0.75118) · P 62.3->107.0 (0.75379) · C 62.6->107.1 (0.87798) · K 60.9->127.7 (0.98667); purity `2de120b8aeec` / `42c309c538dd`, `none` == `draft-mtp` n3 — reproduces the 2026-11-11 record |
+| `llama-batched-bench -npl 1,4,8` | PP 1149.67 / 2087.78 / 2229.36, TG 31.62 / 112.27 / 193.60 t/s |
+| perf vs `bin-r277` | dense-27B-prefill **+0.19 %**, moe-35B-prefill **+1.72 %**, moe-35B-decode **+0.38 %**, real-text prefill **-0.20 %** (`WARMUP=2`) |
+| `D4`/`D5` few-row | pp8 **145.12 vs 118.03 (+22.9 %)**, pp16 -0.1 %, pp32 +1.8 %, pp64 +4.7 %, tg128 +2.8 % (vs the unpatched base) |
+| `gate-rebase-release.sh --only state,text,logits,ops,faults` | **VERDICT: RELEASABLE** |
+| `check-gpu-faults.sh` | clean in every gate's own window |
+
+**Not run, and not marked passed:** `gate-uma-experts.sh`, `gate-prefill-server-slots.sh`, `D17`'s
+store-region half (APU-only; `TODO` #325).
+
+**Left to the maintainer (this session did none of them):** the commit/tag in this repo, the fork refresh
+(`scripts/fork-refresh.sh --build --gates --push`, personal fork only), and the off-host container images.

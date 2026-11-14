@@ -1,4 +1,4 @@
-From 7f17e753437294a15d1358c3fc0eb7e2e8d41931 Mon Sep 17 00:00:00 2001
+From 29c3e7679ac2220bcfe431497fe3ec2019390497 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/16] rdna-boosts: block 06: MMB quantized prefill GEMM
@@ -15,7 +15,7 @@ Validated: build green; MMB_DENSE fires (GGML_CUDA_MMB_LOG=1: `MMB_CFG ... dense
 routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`);
 `GGML_CUDA_MMB=0` byte-identical (108 chars, sha d94aef3f5033) on Qwen3-Coder-30B-A3B.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu   |   57 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu   |   55 +-
  ggml/src/ggml-cuda/mmb.cu         | 2436 +++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmb.cuh        |   32 +
  ggml/src/ggml-cuda/mmf.cu         |    2 +-
@@ -26,7 +26,7 @@ routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`
  ggml/src/ggml-cuda/mmq.cu         |    2 +-
  tests/CMakeLists.txt              |    1 +
  tests/test-logits-width-probe.cpp |  196 +++
- 11 files changed, 3001 insertions(+), 17 deletions(-)
+ 11 files changed, 3000 insertions(+), 16 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
  create mode 100644 ggml/src/ggml-cuda/mmf32.cu
@@ -34,15 +34,16 @@ routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`
  create mode 100644 tests/test-logits-width-probe.cpp
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 526a4349b..da967d39a 100644
+index 72f3cab87..ebda26a87 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -31,10 +31,12 @@
+@@ -32,11 +32,13 @@
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
  #include "ggml-cuda/mmf.cuh"
 +#include "ggml-cuda/mmb.cuh"
  #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmq-few.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
  #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -50,7 +51,7 @@ index 526a4349b..da967d39a 100644
  #include "ggml-cuda/norm.cuh"
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
-@@ -744,6 +746,7 @@ static std::condition_variable ggml_cuda_lock_cv;
+@@ -903,6 +905,7 @@ static std::condition_variable ggml_cuda_lock_cv;
  static std::atomic<int> ggml_cuda_lock_counter;
  
  ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -58,7 +59,7 @@ index 526a4349b..da967d39a 100644
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
-@@ -2797,6 +2800,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -2961,6 +2964,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
      //     probably because the internal kernel selection logic is suboptimal.
      if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
@@ -77,11 +78,12 @@ index 526a4349b..da967d39a 100644
          CUBLAS_CHECK(
              cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                      ne01, ne11, ne10,
-@@ -3297,13 +3312,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -3470,8 +3485,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      const int cc        = ggml_cuda_info().devices[ctx.device].cc;
      const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
  
--    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+-    if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
+-        // The custom vector kernel can be used over batched cuBLAS GEMM.
 +    // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
 +    // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
 +    // (n_tokens <= 8) stays on the existing kernels and W = 1..8 is bit-identical either way.
@@ -95,19 +97,12 @@ index 526a4349b..da967d39a 100644
 +    // fall through to MMF, which accumulates differently and produces different
 +    // logits. Use the decode (ne11 = 1) config for all small batches.
 +    const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE ? 1 : ne11;
-+    // upstream #29633 added `warp_size` to the predicate (it dispatches to should_use_mmf)
-+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11_mmvf)) {
-         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
++    if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11_mmvf)) {
++        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
          // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
          ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
          return;
--    }
--    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-+    }    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-             && src0->type == GGML_TYPE_F32
-             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-@@ -3396,6 +3424,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -3584,6 +3612,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              }
          }
  
@@ -119,7 +114,7 @@ index 526a4349b..da967d39a 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -5643,6 +5676,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5895,6 +5928,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -131,10 +126,10 @@ index 526a4349b..da967d39a 100644
 +                fused_node_count  = 3;
 +                break;
 +            }
-             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -6243,6 +6284,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6525,6 +6566,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -143,7 +138,7 @@ index 526a4349b..da967d39a 100644
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
-@@ -6329,6 +6372,14 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6613,6 +6656,14 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -3058,10 +3053,10 @@ index dc878a71c..2524ae403 100644
          const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
          const int si1, const int sis1, const bool write_inverse, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 367657508..462c0556c 100644
+index 2e6199766..4409530e4 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -328,7 +328,7 @@ void ggml_cuda_mul_mat_q(
+@@ -334,7 +334,7 @@ void ggml_cuda_mul_mat_q(
          const int si1  = ids->nb[1] / ggml_element_size(ids);
          const int sis1 = nb12 / nb11;
  
@@ -3071,7 +3066,7 @@ index 367657508..462c0556c 100644
          CUDA_CHECK(cudaGetLastError());
      }
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 009f23fb3..5f85e37db 100644
+index b2c99b356..aa3f72882 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -181,6 +181,7 @@ set(LLAMA_CONTEXT_TEST_SRC

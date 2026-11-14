@@ -1,4 +1,4 @@
-From 988bf344e4c96e5be9a5e4213861a82814db080d Mon Sep 17 00:00:00 2001
+From fad1e27a9339eb86621c310d7cd8adc6a54837ca Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 16/16] rdna-boosts: block 16: the UMA GTT expert store -- an
@@ -94,10 +94,10 @@ onto the TODO #87 note).
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index a3a39142c..aa3dd1797 100644
+index eadaae156..d44c0980a 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2768,18 +2768,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2760,18 +2760,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ));
      add_opt(common_arg(
          {"-lme", "--limit-host-experts"}, "auto|N",
@@ -139,7 +139,7 @@ index a3a39142c..aa3dd1797 100644
          [](common_params & params, const std::string & value) {
              if (value == "auto") {
                  params.host_experts_limit_gib = 0;
-@@ -2794,9 +2811,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2786,9 +2803,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.host_experts_limit_gib = (int64_t) n;
              params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
              if (n > 0) {
@@ -154,7 +154,7 @@ index a3a39142c..aa3dd1797 100644
                  FILE * mi = fopen("/proc/meminfo", "r");
                  long long avail_mib = -1;
                  if (mi != nullptr) {
-@@ -2806,11 +2825,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2798,11 +2817,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                      }
                      fclose(mi);
                  }
@@ -329,7 +329,7 @@ index 87c8164ec..89d09a2a8 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 393296efb..43c63fb24 100644
+index af7c35deb..8634cf3fa 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -342,6 +342,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -351,7 +351,7 @@ index 393296efb..43c63fb24 100644
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
-@@ -4805,6 +4817,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -4802,6 +4814,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
@@ -360,7 +360,7 @@ index 393296efb..43c63fb24 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 474166cef..6ff219ebd 100644
+index c25538fbe..0dfca15b0 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -301,11 +301,11 @@ void ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev) {
@@ -421,7 +421,7 @@ index 474166cef..6ff219ebd 100644
  bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
      if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
          return false;
-@@ -3425,6 +3462,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -3431,6 +3468,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                  }
              }
  
@@ -514,10 +514,10 @@ index d82930ec3..69f0d4411 100644
  bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
  bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8a797d911..c626f886a 100644
+index 545b72e17..43afcdcdc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -124,6 +124,7 @@
+@@ -126,6 +126,7 @@
  #include "ggml-cuda-vmm-region.h"
  #include "ggml-cuda-moe-cache-hooks.cuh"
  #include "ggml-cuda-arena.cuh"
@@ -525,7 +525,7 @@ index 8a797d911..c626f886a 100644
  
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
-@@ -5332,6 +5333,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
+@@ -5500,6 +5501,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
      return nullptr;
  }
  
@@ -702,7 +702,7 @@ index 8a797d911..c626f886a 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -9516,6 +9687,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -9761,6 +9932,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
@@ -710,7 +710,7 @@ index 8a797d911..c626f886a 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -10314,6 +10486,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
+@@ -10579,6 +10751,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
      return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
@@ -722,7 +722,7 @@ index 8a797d911..c626f886a 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -10401,6 +10578,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+@@ -10666,6 +10843,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
@@ -739,7 +739,7 @@ index 8a797d911..c626f886a 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -10484,9 +10671,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
+@@ -10749,9 +10936,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
      moe_cache_set_host_fill_mode(direct);
  }
  
@@ -752,7 +752,7 @@ index 8a797d911..c626f886a 100644
  }
  
  static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -10513,13 +10701,97 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -10778,13 +10966,97 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -852,7 +852,7 @@ index 8a797d911..c626f886a 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -10661,6 +10933,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -10926,6 +11198,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -5555,10 +5555,10 @@ index 3c5469637..409444053 100644
  // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:
  // `arena` holds `n_slots` experts of `expert_bytes`, and `remap_dev` holds the slot-remapped ids for
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 87f62c703..c2ee9c546 100644
+index 03e7cbbbd..13c3ed786 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -1334,6 +1334,13 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+@@ -1357,6 +1357,13 @@ static ggml_backend_i ggml_backend_rpc_interface = {
      /* .moe_cache_band          = */ NULL,
      /* .moe_cache_gather        = */ NULL,
      /* .moe_cache_remap         = */ NULL,
@@ -5572,7 +5572,7 @@ index 87f62c703..c2ee9c546 100644
  };
  
  ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
-@@ -3139,6 +3146,18 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -3203,6 +3210,18 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .slab_set_ring_cap    = */ nullptr,
      /* .slab_enabled         = */ nullptr,
      /* .slab_ring_slots      = */ nullptr,
@@ -5592,7 +5592,7 @@ index 87f62c703..c2ee9c546 100644
  
  // backend reg interface
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 80de01396..c19162f0b 100644
+index 702d2fa32..9a5f24bf8 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -136,11 +136,28 @@ void llama_model_loader::set_host_experts_umem(bool on) {
@@ -6288,7 +6288,7 @@ index 80de01396..c19162f0b 100644
      if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
          return;
      }
-@@ -1645,6 +2285,40 @@ void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
+@@ -1727,6 +2367,40 @@ void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
          return;
      }
  
@@ -6329,7 +6329,7 @@ index 80de01396..c19162f0b 100644
      size_t n_pinned  = 0;
      size_t sz_pinned = 0;
  
-@@ -2055,6 +2729,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2137,6 +2811,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -6370,7 +6370,7 @@ index 80de01396..c19162f0b 100644
          if (!buft) {
              buft = select_weight_buft(hparams, t_meta, op, buft_list);
              if (!buft) {
-@@ -2576,7 +3284,18 @@ bool llama_model_loader::load_all_data(
+@@ -2658,7 +3366,18 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -6390,7 +6390,7 @@ index 80de01396..c19162f0b 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2637,9 +3356,12 @@ bool llama_model_loader::load_all_data(
+@@ -2719,9 +3438,12 @@ bool llama_model_loader::load_all_data(
          } else {
              const auto & file = files.at(weight->idx);
  

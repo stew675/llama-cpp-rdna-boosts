@@ -1,6 +1,6 @@
 # HANDOVER — cold-start brief for the `4f9dfa0e3` re-base (`upstream-rebase-261113`)
 
-**Refreshed 2026-11-13 at the end of session 8 (R13 -> R17).  ALL RUNGS ARE DONE; R18 (the release ladder) is next and needs the maintainer's go-ahead.**  Read this first, then `RUNGS.md`.  It is a
+**Refreshed 2026-11-13 at the end of session 9 (R18, the release ladder).  THE CAMPAIGN IS COMPLETE: all 17 rungs are climbed and the delivery is re-cut and gated at `v17-4f9dfa0e3-r278`.**  What was left to the maintainer: the commit/tag, the fork refresh and the container images.  Read this first, then `RUNGS.md`.  It is a
 *state* document: the method is in [`README.md`](README.md), the per-rung ledger and resolution logs are in
 [`RUNGS.md`](RUNGS.md), the stop-and-ask register in [`DECISIONS.md`](DECISIONS.md), the measured conflict map
 in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next session in
@@ -12,17 +12,17 @@ in [`CONFLICT-MAP.md`](CONFLICT-MAP.md), and the paste-able brief for the next s
 
 | item | value |
 |---|---|
-| campaign | `wip/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
+| campaign | `archive/work/upstream-rebase-261113/` — 17 blocks from `a691b2345` onto **`4f9dfa0e3`** (164 commits, 751 files, +40 612 / −24 226) |
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`rebase-261113`** (never `main` until the climb is green) |
-| fork checkout | `~/llama.cpp`, branch **`rebase-r278`**, clean, **HEAD `767907a3f`** (`master` = pristine `4f9dfa0e3`, never commit to it) |
-| progress | **R00-R17 DONE = all 17 blocks + TWO rung-repairs**; next is **R18 = the release ladder, which needs the maintainer's go-ahead** |
+| fork checkout | `~/llama.cpp`, branch **`canonical-r278`** (the re-cut, tip `0e264ad30`), clean; the climb branch `rebase-r278` still exists (squashed tip `fad1e27a9`, same tree) and `pre-squash-767907a3f` / `rebase-r278-presquash` keep the pre-squash chain.  `master` = pristine `4f9dfa0e3`, never commit to it |
+| progress | **R00-R18 DONE — the whole climb AND the release ladder.**  The delivery is re-cut as **17 block commits** (both rung-repairs squashed) at base `4f9dfa0e3`, canonical tip **`0e264ad30`**, tree **`69161d3b0`**, release `v17-4f9dfa0e3-r278`.  Pushing/tagging/containers were left to the maintainer |
 | rung chain | `43a418c10` (00) `ab433a7dd` (01) `50a0b30f8` (02) `43891459e` (03) `4c6a5019a` (04) `22fcde21e` (05) `c1d8b7c04` (06) `626e398d2` (07) `a95c0497b` (08) **`9c94ce139` (R09r rung-repair, block 05's artifact)** `a6809f75b` (09) `13176810a` (10) `1d83b50e0` (11) `75d83f231` (12) `aca78625a` (13) `f040d394f` (14) `f745bbf1b` (15) **`9c940db6f` (R16r rung-repair, block 11's artifact)** `767907a3f` (16) |
-| canonical build | `~/llama.cpp/build-rocm` — **R17 tree** (`767907a3f`, tree `69161d3b0`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
+| canonical build | `~/llama.cpp/build-rocm` — the **re-cut tree** (`0e264ad30`, tree `69161d3b0`), `GGML_HIP_NO_VMM=OFF`, `gfx1201`, ROCm 10.1.0 |
 | old reference build | `~/llama.cpp/build-rocm/bin-r277` (the r277 release, `build 12222, commit 9d7c0502c`) — **the whole 17-block delivery**, so it is the answer to "would block N alone do this?" |
 | unpatched base build | `~/llama.cpp/build-rocm-base2` — `4f9dfa0e3`, **`GGML_HIP_NO_VMM=ON`** (the only unpatched configuration that *runs*; see §7) |
 | coherence oracle (current) | 4B, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**, unchanged at every rung since R01 (re-verified on the R17 tree) |
 | parked history | tags `r10-blocked-d4106d6f6` / `r10-reapplied` in `~/llama.cpp` (the R10 park, since re-applied as `a6809f75b`); no patch file is live — do not look for one |
-| delivery untouched | `patches/`, `release.json` and the fork are **not** changed until R18.  Nothing is pushed anywhere. |
+| delivery | `patches/` + `release.json` are **re-cut at r278** (`v17-4f9dfa0e3-r278`); `patches/` validated, per-block built and gated.  **Nothing is pushed anywhere and no tag exists** — fork refresh + containers are the maintainer's call. |
 
 A rung is **not** finished until its ledger row and resolution log in `RUNGS.md` are written; a session that
 stops mid-rung must `git cherry-pick --abort` first (see §8).
@@ -35,7 +35,7 @@ stops mid-rung must `git cherry-pick --abort` first (see §8).
 cd ~/llama.cpp            && git status --short --branch && git log --oneline -3
 ls ~/llama.cpp/.git/CHERRY_PICK_HEAD        # must fail
 cd ~/llama-cpp-rdna-boosts && git status --short --branch && git log --oneline -3
-grep -n '^## R' wip/upstream-rebase-261113/RUNGS.md | head -30   # find the open rung
+grep -n '^## R' archive/work/upstream-rebase-261113/RUNGS.md | head -30   # find the open rung
 ```
 
 Expect: `rebase-r278` clean at `1d83b50e0`, no `CHERRY_PICK_HEAD`, delivery on `rebase-261113` clean.
@@ -135,7 +135,7 @@ table).  Every gate that hashes text passes no `-lv` at all.
 | R15 | 14 relaxed-tensor (**TEMPORARY**) | **DONE** | `f040d394f` | **0 conflicts, 0 first-error passes**; `-sm tensor` refuses flint with the delivery's pointer and `-sm relaxed-tensor` == `-sm layer` byte-identically (`cc4fbc3e8367`; 4B tensor/relaxed/layer all `1c5d32ac537d`); **the drop condition is UNMET** — upstream's deny is verbatim at `4f9dfa0e3` and nothing in `a691b2345..4f9dfa0e3` touches `llm_arch_supports_sm_tensor`, so the block stays TEMPORARY (§5.8) |
 | R16 | 15 streamed KV | TODO | — | 5 conflicts; `D3`, `D19`, `D15`'s loader question; owes the KV residency gates, `gate-qwen4exp-quant-coherence.sh` **section E** (the sparse QSA arm — block 15 replaces `ggml_rope_get_truncate(dst)` on the fused `INDEXER_SCORE` node, which upstream `#30206`'s assert rejects) **and `gate-host-pool.sh`'s `fail`/`late`/`pinlate` arms** (block 15 is what makes the host master pageable — see §5.7) |
 | R17 | 16 UMA GTT store | **DONE** | `767907a3f` | 16 files, **0 conflicts, 0 first-error passes**; **`gate-host-pool.sh` 54/54 — the last deferred arm of the climb is cleared**; discrete arena live after the `moe-expert-cache.cu` rewrite (`h=0.8127`, fills 9418, evictions 689) with **0 GTT lines**; `gate-uma-experts.sh` + `gate-prefill-server-slots.sh` are **APU gates, not runnable on gfx1201** (§5.11) | **0 conflicts**; verify `D17` (VMM region size) with `gate-uma-experts.sh --quick`; owes **`gate-host-pool.sh`'s placement-transport checks** (`ref` `PLACEMENT reads: O_DIRECT` + placement queue, `qd1`, `bulkbuf` — block 16 ships `MOE_EXPERT_FILL_QD`, `MOE_HOST_POOL_BULK_DIO` and the read queue; §5.7) |
-| R18 | — | **NEXT — needs the go-ahead** | — | release ladder, `README.md` §4 + §10 below; squash **both** rung-repairs; the APU gate set + `D17`'s store-region half |
+| R18 | — (release ladder) | **DONE 2026-11-13** | `0e264ad30` (tree `69161d3b0`) | both rung-repairs squashed, 17 commits, `validate-set.sh` green, 17/17 per-block builds, `gate-rebase-release.sh` RELEASABLE; every block gate PASS except `gate-kv-residency.sh`'s multi-device section (`D20`) and the APU-only set (`TODO` #325).  Numbers: `RUNGS.md` §R18, `WORKLOG.md` 261113.015 |
 
 **Remaining block commits to cherry-pick** (from `release.json` order; a later block is judged against the
 rebased earlier ones, so the order is not negotiable):

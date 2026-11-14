@@ -1,7 +1,101 @@
+## 261113.015 (r278) -- the `4f9dfa0e3` re-base lands: the delivery is re-cut as 17 block commits with BOTH rung-repairs squashed, every runnable gate is green, and the three known-red / owed items are named (D20's multi-device pool section, the APU-only gate set, the stale `gate-server-arms` baseline)
+
+**`release.json` changed: base `a691b2345` -> `4f9dfa0e3`, tip `9d7c0502c` -> `0e264ad30`, tree `0104361a0` ->
+`69161d3b0`, release `v17-a691b2345-r277` -> `v17-4f9dfa0e3-r278`; all 17 patch sha256s regenerated.**  R18 of the
+`upstream-rebase-261113` climb (campaign record: `archive/work/upstream-rebase-261113/`).  Nothing was pushed, no
+tag was cut and no container image was built in this session: those are the maintainer's calls.
+
+* **What the re-cut is.** `scripts/make-patches.sh` from the finished climb, with **both rung-repairs squashed
+  into the blocks that own them** (`9c94ce139` -> block 05, its FA instance matrix + typed generator;
+  `9c940db6f` -> block 11, the folded hyper-connection `h_nextn` export vs upstream `#31927`).  The series is
+  **exactly 17 commits** (block 00 keeps prefix `0000`) and the squashed chain's tree is byte-identical to the
+  climb's tip (`69161d3b0`) — the two squashes are content-preserving, verified by `git diff` against the
+  pre-squash chain.  The repair rationale now lives here and in `patches/README.md`: the fixup commits' own
+  messages are folded away, and the block 05/11 messages still carry their r236 text.
+* **Delivery validation.** `scripts/validate-set.sh` **green**: strict `git am` of the 17 patches on a fresh
+  tarball at `4f9dfa0e3`, applied tree == `69161d3b0`, all sha256s, and the Windows path/portability lint clean
+  (337 added C/C++ files).  `scripts/gate-per-block-build.sh` **17/17 in 247 s** (`all` targets, build dir wiped
+  per commit).  `scripts/gate-rebase-release.sh --only state,text,logits,ops,faults` -> **VERDICT: RELEASABLE**.
+* **Coherence (same-seed greedy, no `-lv`).**  Dense 4B 1 GPU `-sm layer`: **100 chars `sha=1c5d32ac537d`** —
+  unchanged from R01 through the R17 tree and unchanged on the squashed/re-cut tree.  Field config (35B-A3B Q8_0,
+  `-sm tensor` on `0,2`, bf16 KV) `--spec-type none`: **271 chars `sha=8d733a56c740`**, and its adaptive-MTP arm
+  reports `adaptive draft depth enabled`, `target h rows on the device: yes`, acceptance **0.94444**.  qwen4exp
+  class: `gate-hc-fusions.sh` **PASS** (5 hard arms 449 chars `d62340fbf566`; the two numeric arms `6a102dbc62d6`
+  as their anchors say) and every measured quant in `gate-qwen4exp-quant-coherence.sh` **PASS** (`249787803687`,
+  `beb145b43949`, `16d7957b2c0f`, gather on == off) with **section E green** (`200edcd422c7` == chain, dense
+  `13406dc51399`, census sensitive).
+* **Prefill-logit KLD (issue #113).**  Base recorded from the **unpatched** `4f9dfa0e3` build
+  (`build-rocm-base2`, the only unpatched configuration that runs here — `GGML_HIP_NO_VMM=ON`, so the **VMM
+  asymmetry is stated, not hidden**: allocation only, not numerics).  Base PPL **5.9301**.  Candidate (canonical
+  `VMM=OFF` build, `0e264ad30`): default arm **KLD 0.000697 / same-top-p 98.784 %**; `--kv q8_0` **0.000580 /
+  98.882 %**; `--kv f8_e4m3` **0.000987 / 98.716 %**; `--sm tensor --device 0,1,2` (block 01's all-reduce arm)
+  **0.000558 / 98.833 %**.  All pass (limit 0.005 / floor 98 %); the top-p margins are thin by design of the
+  wikitext point, so they are recorded rather than rounded away.
+* **Op oracles (`tests/test-backend-ops`).**  `FLASH_ATTN_EXT` **6997/6997** (the R09r repair's heads 40/72 and
+  the FP8 KV column are live; the case set grew by 2 with block 05's own additions), `MUL_MAT` **2680/2680**,
+  `MUL_MAT_ID` **1056/1056**.
+* **Every block gate that owns moved code, re-run at the tip:** `gate-host-pool.sh` **54/54** (`ref` 182 chars
+  `a99ccbd97ecb`, `tsplit`/`tsplitnosink` 171 chars `8c39335bbceb`, placement queue 8 readers / `qd1` 1 /
+  `bulkbuf` buffered); `gate-node-budget.sh` **4/4** (all arms 31 chars `a1b7eb2ee7a6`);
+  `gate-kv-window-split.sh`, `gate-park-idle-slots.sh`, `gate-ckpt-reuse.sh`, `gate-state-pipe.sh`,
+  `gate-spec-align.sh`, `gate-spec-width-band.sh`, `gate-spec-draft-window.sh`, `gate-spec-reuse-window.sh`,
+  `gate-fusion-alias-copy.sh`, `gate-grid-stall-pad.sh`, `gate-norm-rows-alias.sh`, `gate-hc-fusions.sh` **all
+  PASS**, no GPU fault in any window.
+* **Known-red, unchanged and NOT weakened: `gate-kv-residency.sh`'s multi-device pool section** (`D20`,
+  `TODO` #321).  This run produced **`pmref 7ca535e1da91` / `pmres f260d1824ab3` / `pmlegacy b08d3dbcb1e9`** —
+  exactly the three values R16 recorded, i.e. the same nondeterministic 2-device MTP draft, and every other
+  check in the gate (window, selftest, the whole single-device pool section, the per-device counter blocks) is
+  green.  Gate exit 1 by design.
+* **`gate-server-arms.sh`'s `35b10` arm is a STALE BASELINE, not a regression** — measured, not assumed: the
+  shipped **`bin-r277`** build fails it with the **same texts and the same acceptance to the digit**
+  (`a9d494a15521 ee21682d22a5`, 0.42771/0.59124) against the recorded set `2cf19becd4ee e26a28d3f3ae`, so the
+  re-base changed nothing here and the r236-recorded hash set no longer reproduces on this box on **either**
+  build.  `fn24`/`fn10` pass on both.  Re-recording that baseline is an open item (`TODO` #322).
+* **MTP four-axis (`benchmarks/mtp-adaptive-methodology.md`, Protocol A, `-n 3000`).**  35B-A3B Q8_0,
+  `-sm layer -ncmoe 24 --limit-host-experts 8`, f16 KV, the shipped prompt set: plain -> `draft-mtp n3`
+  **R 63.4 -> 104.5 t/s (acc 0.75118)**, **P 62.3 -> 107.0 (0.75379)**, **C 62.6 -> 107.1 (0.87798)**,
+  **K 60.9 -> 127.7 (0.98667)** — MTP beats plain on every axis (rule 2) and acceptance is far above the 0.45
+  bar (rule 1); the acceptances reproduce the 2026-11-11 record to five decimals.  Purity (rule 4, no `-lv`):
+  prose **5 896 chars `2de120b8aeec`** and code **12 789 chars `42c309c538dd`**, `none` == `draft-mtp` n3 — the
+  same hashes that record carries.  Dense 27B (2 GPU `-sm tensor`): plain 32.6 -> `draft-mtp` **65.7 t/s**
+  (acc 0.54996) and adaptive n3 56.7 (0.68509), `target h rows on the device: yes` (D7).
+  `llama-batched-bench -npl 1,4,8` (27B Q8_0, 2 GPU): PP **1149.67 / 2087.78 / 2229.36 t/s**, TG **31.62 /
+  112.27 / 193.60 t/s**.
+* **No perf regression against the shipped build.**  Interleaved `llama-bench` A/B vs `bin-r277` (3 rounds):
+  dense-27B-prefill **+0.19 %**, moe-35B-prefill **+1.72 %**, moe-35B-decode **+0.38 %**; the real-text
+  `-ncmoe 48` prefill arm **-0.20 %** (rounds -0.38/+0.06/-0.27).  **`D4`/`D5`'s few-row ordering question is
+  answered by measurement** (27B Q8_0, 1 GPU, new build vs the unpatched base): pp8 **145.12 vs 118.03
+  (+22.9 %)**, pp16 262.66 vs 262.83 (-0.1 %), pp32 457.10 vs 448.89 (+1.8 %), pp64 800.24 vs 764.44 (+4.7 %),
+  tg128 20.38 vs 19.82 — the delivery's band promotion sitting *after* upstream's `ggml_cuda_should_use_mmq_few()`
+  gate costs nothing on the shapes few-row MMQ declines and wins at pp8.
+* **Doc drift found and fixed while auditing `ENVIRONMENT.md` against the tree: the DFlash device switches are
+  `LLAMA_DFLASH_DEV` (and `LLAMA_DFLASH_INGEST_TAIL`), not `GGML_LF_DFLASH_DEV`** — the catalogue, the
+  `scripts/README.md` gate row and the block-12 knobs list all carried the older name, and the
+  `GGML_LF_DFLASH_DEV_GRAPH` row described a switch the tree **does not read** (the r163 in-graph store is the
+  only shape).  Pre-existing (identical at `9d7c0502c`), unrelated to the re-base, and fixed in the three
+  current-state places; the dated records (`benchmarks/`, older `WORKLOG.md`, block 12's r163 amendment text)
+  keep the name that was correct when they were written.  An audit script (every `ENVIRONMENT.md` name greped
+  in the tree) is the cheap way to repeat this: of 478 names, these were the only real hits — the rest are
+  documented as removed/retired, placeholders or runtime variables.
+* **Owed to an APU box (`halo`/`soar`, gfx1151) and NOT marked passed:** `gate-uma-experts.sh` (incl. its
+  `inplace`/`pfcp` arms), `gate-prefill-server-slots.sh` (needs the 122B-A10B Q8_0, ~130 GiB, absent here) and
+  `D17`'s GTT store-region check (the store is inert on a discrete GPU — 0 `GTT` lines, the `ref` arm builds no
+  arena).  The discrete-side evidence stays what R17 measured: the host-expert arena is live and evicting.
+* **Tooling findings from this ladder (recorded, not fixed in place):** (a) `gate-prefill-logits.sh`'s base-file
+  name carries kv/ub/extra but **not `device`/`sm`**, so recording the `--sm tensor --device 0,1,2` arm silently
+  overwrites the default layer arm's base (the meta pins the point, so the compare then fails with a device
+  mismatch until it is re-recorded — done here) — `TODO` #323; (b) `gate-rebase-release.sh`'s text-prefill step
+  needs **`WARMUP=2`** on a `-ncmoe 48` arm: at the default it read **-11.59 %** because round 1 was a cold
+  page-cache pass (rounds 2/3 -0.18/+0.01 %), and at `WARMUP=2` the same step reads **-0.20 %** with a 0.44
+  spread — the default is one warm-up short for that arm; (c) `optional/host-pool-fill-src/` and
+  `optional/two-lane-prefill/` are **NOT rebased onto the new tree** (`git apply --3way` conflicts in
+  `moe-expert-cache.cu`, `ggml-backend-impl.h`, `ggml-backend.cpp` and `ggml-cuda.cu`), so they are stale
+  artifacts until re-cut — `TODO` #324.
+
 ## 261113.014 (r277 + campaign rung R17, NO delivery change) -- R17 (block 16) closes the climb: it is the cleanest rung of the set AND the one that turns `gate-host-pool.sh` fully green (54/54), the last deferred arm; block 16's own gates turn out to be APU gates
 
 **No patch changes, no `release.json` change.**  Rung R17 (`767907a3f`, tree `69161d3b0`; block 16 "the UMA GTT
-expert store").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R17.
+expert store").  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R17.
 
 * **16 files, 0 conflicts, 0 first-error passes.**  Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no
   stray markers.  **All 17 blocks are now on `rebase-r278`.**
@@ -34,7 +128,7 @@ expert store").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R17.
 
 **No patch changes, no `release.json` change.**  Rung R16 (`f745bbf1b` + the rung-repair `9c940db6f`, tree
 `14f99e579`; block 15 "the streamed KV -- window (Goal A) + attendance pool (Goal B) + MTP draft window").
-Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R16.
+Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R16.
 
 * **46 files, 5 conflicted files / 8 hunks** (the probe's 5 files was exactly right), one first-error pass.
   Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no stray markers.
@@ -83,7 +177,7 @@ Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R16.
 ## 261113.012 (r277 + campaign rung R15, NO delivery change) -- R15 (block 14) keeps `-sm relaxed-tensor` alive: the mode is byte-identical to `-sm layer` on Flint while `-sm tensor` still refuses it, and upstream has not started allowing those arches
 
 **No patch changes, no `release.json` change.**  Rung R15 (`f040d394f`, block 14 "relaxed-tensor split mode
-(TEMPORARY: MoE amax per-device scalar)").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R15.
+(TEMPORARY: MoE amax per-device scalar)").  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R15.
 
 * **Result `f040d394f`** (tree `0c8a1fd58`), 11 files, **0 conflicts**, **0 first-error passes**; coherence
   unchanged (**100 chars `sha=1c5d32ac537d`**); no stray markers; GPU faults clean over the rung's window and
@@ -112,7 +206,7 @@ Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R16.
 ## 261113.011 (r277 + campaign rung R14, NO delivery change) -- R14 (block 13) is the first rung with no conflict and no first-error pass: the draft-vocabulary subset lands, its own regression test passes, and `D7`'s `-sm tensor` asymmetry turns out to have been closed by block 09
 
 **No patch changes, no `release.json` change.**  Rung R14 (`aca78625a`, block 13 "MTP draft vocabulary subset,
-`--spec-draft-mtp-vocab N`").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R14.
+`--spec-draft-mtp-vocab N`").  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R14.
 
 * **Result `aca78625a`** (tree `061a71a98`), 19 files, **0 conflicts** and **0 first-error passes** — the
   cleanest rung of the whole climb.  Coherence unchanged (**100 chars `sha=1c5d32ac537d`**), no stray markers,
@@ -145,7 +239,7 @@ Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R16.
 
 **No patch changes, no `release.json` change.**  Rung R13 (`75d83f231`, block 12 "campaign remainder: CPU wins,
 backend iface fills, DFlash, FA build grouping, server prompt cache").  Campaign record:
-`wip/upstream-rebase-261113/RUNGS.md` §R13.
+`archive/work/upstream-rebase-261113/RUNGS.md` §R13.
 
 * **Result `75d83f231`** (tree `d862165c5`), **5 conflicted files / 8 hunks** (the probe said 4; the extra is
   `src/llama-ext.h`), build green with **zero** first-error passes (a first for the climb), coherence unchanged
@@ -197,7 +291,7 @@ backend iface fills, DFlash, FA build grouping, server prompt cache").  Campaign
 ## 261113.009 (r277 + campaign rung R12, NO delivery change) -- R12 (block 11, qwen4exp) is the cleanest rung of the climb: 6 hunks, and the `GGML_OP_COUNT` on neither side was the merged value (105)
 
 **No patch changes, no `release.json` change.**  Rung R12 (`1d83b50e0`, block 11 "qwen4exp: model,
-hyper-connections, lazy reader, QSA/indexer").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R12.
+hyper-connections, lazy reader, QSA/indexer").  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R12.
 
 * **Result `1d83b50e0`**, **5 conflicted files / 6 hunks** (the probe was exactly right), build green after
   **one** first-error pass, coherence unchanged (**100 chars `sha=1c5d32ac537d`**).
@@ -233,7 +327,7 @@ hyper-connections, lazy reader, QSA/indexer").  Campaign record: `wip/upstream-r
 ## 261113.008 (r277 + campaign rung R11, NO delivery change) -- R11 (block 10) is DONE: the fusion dispatcher moves into its own TU and merges clean, `gate-norm-rows-alias.sh` PASSES, and the node-budget gate turns out to be R13's
 
 **No patch changes, no `release.json` change.**  Rung R11 (`13176810a`, block 10 "slab, fusion dispatcher and
-async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R11.
+async input ring").  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` §R11.
 
 * **Result `13176810a`**, 9 conflicted files / **20 hunks** (the probe predicted 10 files; `norm.cu` auto-merged).
   Build green after six mechanical first-error passes; coherence unchanged (**100 chars
@@ -273,7 +367,7 @@ async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R1
 ## 261113.007 (r277 + campaign rungs R09r/R10, NO delivery change) -- `D5-a` repaired, so the FA instance matrix is complete again (heads 40/72, the FP8 KV column and a typed generator), and R10 (block 09) is DONE with its `-sm tensor` arms owned by R13
 
 **No patch changes, no `release.json` change.**  One rung repair (`R09r`) and one block (`R10`) of the
-`4f9dfa0e3` climb.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` (§R09r, §R10).
+`4f9dfa0e3` climb.  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` (§R09r, §R10).
 
 * **R09r = `9c94ce139` — the `D5-a` repair, decided (option 1) and applied.**  Upstream's typed ->
   head-agnostic instance conversion folded its two **new heads (40, 72)** into itself, so R06's correct "keep
@@ -317,7 +411,7 @@ async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R1
 ## 261113.006 (r277 + campaign rungs R09/R10, NO delivery change) -- R09 is green and R10 is PARKED: the host-expert arena faults on a 2-device `-sm tensor` split (a merge interaction, not a r277 shape), and the FA instance matrix is missing heads 40/72
 
 **No patch changes, no `release.json` change.**  Rungs R09 (block 08) and R10 (block 09) of the
-`4f9dfa0e3` climb.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md`.
+`4f9dfa0e3` climb.  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md`.
 
 * **R09 = block 08 (fused kernels), commit `a95c0497b` — DONE.**  Build green, coherence unchanged (`100 chars
   sha=1c5d32ac537d`), `test-backend-ops -o MUL_MAT_ID` **1056/1056**, `gate-hc-fusions.sh` **PASS** (7 arms,
@@ -337,8 +431,8 @@ async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R1
   Leading suspect: `D10` — upstream's new `hv_tensor_requires_copy` gate skips the copy of an input/weight it
   believes is not read, and the fill runs *inside* that copy callback, so a Meta-wrapped host expert weight
   marked not-required leaves the fused kernel reading the host master (the 1-device layout marks it required,
-  hence 1991 fills there).  The commit is preserved as the tag `r10-blocked-d4106d6f6` and as
-  `wip/upstream-rebase-261113/R10-blocked-d4106d6f6.patch`; the tree is clean at the green R09 tip.
+  hence 1991 fills there).  The commit is preserved as the tag `r10-blocked-d4106d6f6` (no patch file is live
+  any more — the rung was re-applied as `a6809f75b`); the tree was clean at the green R09 tip.
 * **`D1` is ANSWERED, not deferred, and no port was needed.**  Upstream `#32157` moved *its own* MoE cache from
   `llama-graph.cpp` to `src/llama-moe-cache.{cpp,h}` (`build_lookup()` / `get_experts()` / `copy()`); the
   delivery's tier is a different implementation in a different place (CUDA-side arena, movable-boundary slab,
@@ -362,7 +456,7 @@ async input ring").  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` §R1
 ## 261113.005 (r277 + campaign rung R09, NO delivery change) -- R09 lands (block 08, fused kernels): the BF16 RMS_NORM **dual store** survives `#32135`, and the merged FA instance matrix is missing heads 40/72 (`D5-a`, AWAITING)
 
 **No patch changes, no `release.json` change.**  Rung R09 of the `4f9dfa0e3` climb: block 08 replayed onto
-`rebase-r278`, resolved, built and verified.  Campaign record: `wip/upstream-rebase-261113/RUNGS.md` (`R09 result`).
+`rebase-r278`, resolved, built and verified.  Campaign record: `archive/work/upstream-rebase-261113/RUNGS.md` (`R09 result`).
 
 * **Rung commit `a95c0497b`** (block 08 `7f1ed0723`; build green with `GGML_HIP_NO_VMM=OFF` on gfx1201; coherence
 unchanged on the 4B -- **100 chars `sha=1c5d32ac537d`**; `test-backend-ops -o MUL_MAT_ID` **1056/1056**;
@@ -417,7 +511,7 @@ records the b236 re-base; this is the one after r277) and its setup rung only.
 * **New fork point `4f9dfa0e3`** (2026-11-13 17:50 +0100, `requirements, Fix CI: support Python 3.15 (#32199)`),
 the maintainer's snapshot of upstream `master` in `~/llama.cpp`.  The old point is `a691b2345`: **164 commits**,
 **751 files**, +40 612 / −24 226.  The delivery is replayed from its r277 tip `9d7c0502c` (tree `0104361a0`).
-* **Campaign [`wip/upstream-rebase-261113/`](wip/upstream-rebase-261113/README.md)** -- the method proved at r236,
+* **Campaign [`archive/work/upstream-rebase-261113/`](archive/work/upstream-rebase-261113/README.md)** -- the method proved at r236,
 carried forward as one rung per block so a session can stop after any rung: `RUNGS.md` (R00 setup, R01..R17 =
 blocks 00..16, R18 = release ladder), `DECISIONS.md` (19 stop-and-ask items), `CONFLICT-MAP.md` +
 `conflict-map.json` + `probe-conflicts.py` (the measured ladder).
@@ -443,7 +537,7 @@ taken in both platform variants and the delivery's real content -- `llama_mlock:
 auto-merged).  With the revert below folded in, the rung is **build green with the canonical `GGML_HIP_NO_VMM=OFF`**
 and coherent: `Qwen3.5-4B Q8_0`, 1 GPU, `-sm layer`, seed 42 -> **100 chars `sha=1c5d32ac537d`**
 (`Prompt 256.0 / Gen 92.1` t/s), `test-backend-ops -o MUL_MAT_ID` **1040/1040** on gfx1201.
-* **BASE BLOCKER (`D17`, `wip/upstream-rebase-261113/BASE-BLOCKER.md`): upstream `ac931b5bc` (`#30542`, the
+* **BASE BLOCKER (`D17`, `archive/work/upstream-rebase-261113/BASE-BLOCKER.md`): upstream `ac931b5bc` (`#30542`, the
 halved VMM reservation + retry) hangs the HIP VMM pool on ROCm 10.1/gfx1201.**  A *pure `master`* build
 (`4f9dfa0e3`, no delivery patches) never returns from its first GPU compute with `GGML_HIP_NO_VMM=OFF` -- the
 process spins in `ggml_cuda_pool_vmm::alloc` inside `libamdhip64` (the `AMD_LOG_LEVEL=3` trace shows a

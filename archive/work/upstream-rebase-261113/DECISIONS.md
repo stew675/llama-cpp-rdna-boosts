@@ -118,7 +118,12 @@ coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0
   wins.
 * **Questions:** measure the delivery's BF16 dispatch vs upstream's MMVF few-row arm at the shapes the
   delivery gates (decode rows 2-24, batch 1-8).
-* **Status:** `OPEN` — R07/R08.
+* **Status:** **`CLOSED` at R18 by measurement — no action, nothing dropped.**  The few-row arm was taken on the
+  release tree against the unpatched base (27B Q8_0, 1 GPU, `llama-bench -p 8,16,32,64 -n 128 -r 3`): delivery
+  **pp8 145.12 vs base 118.03 (+22.9 %)**, pp16 262.66 vs 262.83 (-0.1 %), pp32 457.10 vs 448.89 (+1.8 %),
+  pp64 800.24 vs 764.44 (+4.7 %), tg128 20.38 vs 19.82 (+2.8 %).  Upstream's BF16-MMVF few-row dispatch is
+  inside the delivery's predicate chain and the delivery is at least as fast at every held shape, so there is
+  nothing to gate and no ordering to change.  Record: `WORKLOG.md` 261113.015.
 
 ## D5 — Flash attention + few-row MMQ: the FA entry points and the MMQ dispatch moved
 
@@ -142,6 +147,11 @@ coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0
   (18 derived, 385 iq4_nl, 7 f8_e4m3, 448 head-40, 1010 head-72).  The **few-row MMQ half of D5 is still
   open**: `#31533`'s `mmq-few.cu` meets the delivery's MMB/MMQ dispatch at R07, and that is where the
   delivery-vs-upstream few-row measurement belongs.
+* **Few-row half `CLOSED` at R18 (measurement).**  The delivery's RDNA4/RDNA3_5 dense-band promotion sits
+  **after** upstream's `ggml_cuda_should_use_mmq_few()` gate, so it only decides the shapes few-row MMQ
+  declines — and there it wins: 27B Q8_0, 1 GPU, delivery vs the unpatched `4f9dfa0e3` base reads **pp8
+  145.12 vs 118.03 (+22.9 %)**, pp16 -0.1 %, pp32 +1.8 %, pp64 +4.7 %, tg128 +2.8 %.  No reordering is
+  warranted; re-measure if the `mmq_few` predicate moves.  Record: `WORKLOG.md` 261113.015.
 
 ## D5-a — the merged FA instance matrix has no `fattn-mma-f16` case for heads 40/72 (found at R09)
 
@@ -569,6 +579,10 @@ coherence arm are green on the merged cache.  Nothing dropped; the FP8/BF16/q8_0
   reference **within the 2-device count**, and that reference is itself unreproducible, so the section cannot be
   made green by any change to block 15.  It passed once by luck during R16 and failed on the next run.  **The
   gate is not weakened and the arm is not simplified**; the section stays red until this is fixed.
+* **Confirmed again at R18** (the release ladder's run of the same gate on the re-cut tree): `pmref
+  `7ca535e1da91`, `pmres` `f260d1824ab3`, `pmlegacy` `b08d3dbcb1e9` — **exactly the three R16 values**, on a
+  different day and a different build.  Everything else in the gate (window, selftest, the whole single-device
+  pool section, the per-device counter blocks) is green.
 * **Status:** `OPEN` — needs a real fix (owner: the MTP driver / slab staging on a split, not block 15).  Carry
-  as a `TODO.md` item; it blocks `gate-kv-residency.sh`'s multi-device section at R18 and it is worth an
-  `INVARIANTS.md` entry once fixed.
+  as `TODO.md` #321; it blocks `gate-kv-residency.sh`'s multi-device section and it is worth an `INVARIANTS.md`
+  entry once fixed.

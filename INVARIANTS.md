@@ -4557,3 +4557,51 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   and the eviction-capable `pool_slot_locked` had no caller left and were removed in r277.  The census's
   `evictions=0` is now true by construction rather than by policy; if a future change reintroduces eviction it must
   reintroduce the drain with it.
+
+## r278 — the `4f9dfa0e3` re-base (2026-11-13)
+
+* **The delivery's series identity is (base, 17 block trees), never the working chain's SHAs.**  `release.json`
+  now names base `4f9dfa0e3`, tip `0e264ad30`, tree `69161d3b0`; the climb's working chain (`rebase-r278`, tip
+  `fad1e27a9`) has the **same tree** and different ids, and re-cutting `patches/` from either produces the same
+  applied tree.  Compare trees, never SHAs (`AGENTS.md`, the `.tip` rule).
+* **A rung-repair can be squashed into its owning block without changing the tree** — and that is the test to
+  apply: the fixup is content-preserving iff the squashed chain's final tree equals the climb's tip tree.  Both
+  squashes here did (`git diff` against `pre-squash-767907a3f` was empty), even though the repair diffs were
+  replayed onto trees three-to-five commits earlier than where they were written.  The repairs were 47 files of
+  **new** FA instance files plus a generator rewrite (block 05) and a 22-line `llama-graph.cpp` hunk (block 11),
+  which is why they survived the move; a repair that edits a line a later block also edits would need a
+  resolution, and the tree check is what would catch a wrong one.
+* **`generate_cu_files.py` idempotency is an invariant of the delivered tree, not a nicety.**  Upstream's
+  head-agnostic switch left an `os.remove`-everything generator; running it on the delivery's typed matrix
+  would delete 126+ shipped instance files.  After any re-base: run it in
+  `ggml/src/ggml-cuda/template-instances/` and require a clean `git status`.  The matrix at this base is the
+  typed `…-dkqN-dvN.cu` set **including heads 40/72** (head 72 = `DKQp`/`DVp = GGML_PAD(head,16)`) **and the
+  `f8_e4m3` tile/vec column**; the FA oracle is 6997/6997.
+* **A pre-existing gate failure has to be reproduced on the shipped build before it is called pre-existing.**
+  `gate-server-arms.sh`'s `35b10` arm fails its recorded hash set on this tree *and* on `bin-r277`, with the
+  same two texts and the same acceptance to the digit (`0.42771 0.59124`) — that is a stale baseline (recorded
+  at r236), not a regression, and the criterion that still means something (acceptance is not ~0, the text is
+  sane and identical across builds) passes.  Same method settled `D20` (r277 reproduces the 2-device MTP
+  nondeterminism) and the R13 `tsplit` arms.
+* **`gate-prefill-logits.sh`'s base file is one point per (model, kv, ub, extra) — NOT per device/sm.**  The
+  meta pins `device` and `sm` and the compare refuses a mismatch, but the *file name* does not carry them, so
+  recording the `--sm tensor --device 0,1,2` arm silently overwrites the default `layer` base.  A release that
+  needs both arms must record them sequentially and re-record the canonical one last (`TODO` #323).
+* **The text-prefill perf arm needs two warm-up passes on a `-ncmoe 48` shape.**  With the release gate's
+  default `WARMUP=1` the first timed round read **-34.6 %** (rounds 2/3: -0.18/+0.01 %), because the first pass
+  fills the page cache for the host-expert tables; at `WARMUP=2` the same arm reads **-0.20 %** with a 0.44
+  spread.  A single round on a host-expert arm is a page-cache measurement, not a throughput one.
+* **The few-row placement question (`D4`/`D5`) is measured and costs nothing.**  27B Q8_0, 1 GPU, delivery vs
+  the unpatched base: pp8 **145.12 vs 118.03 (+22.9 %)**, pp16 262.66 vs 262.83 (-0.1 %), pp32 +1.8 %, pp64
+  +4.7 %, tg128 +2.8 %.  The band promotion sitting *after* upstream's `ggml_cuda_should_use_mmq_few()` gate
+  only decides the shapes few-row MMQ declines, and it wins there; no reordering is warranted.
+* **The MTP four-axis gate reproduces bit-reproducibly across a re-base.**  Same build-independent
+  acceptances to five decimals (0.75118 / 0.75379 / 0.87798 / 0.98667) and the same purity hashes
+  (`2de120b8aeec` prose, `42c309c538dd` code) as the 2026-11-11 record, on a tree 164 upstream commits newer —
+  so a re-base that keeps these numbers is not "presumed" MTP-neutral, it is measured.  Reproduce them before
+  shipping any decode/fusion change (`benchmarks/mtp-adaptive-methodology.md`).
+* **`optional/` artifacts are pinned to a release tree and therefore rot at every re-base.**  Both artifacts
+  (`host-pool-fill-src`, cut at r243's tree; `two-lane-prefill`, cut at r259's) now conflict under
+  `git apply --3way` against the r278 tree (`moe-expert-cache.cu`, `ggml-backend-impl.h`, `ggml-backend.cpp`,
+  `ggml-cuda.cu`).  They are stale until re-cut; `apply-all.sh --include-optional` is still the only sanctioned
+  way to test one (`TODO` #324).

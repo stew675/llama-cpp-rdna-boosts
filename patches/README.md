@@ -1,8 +1,52 @@
 # The delivery patches — what each block is and what it does
 
-**17 blocks** (block 00 + blocks 01-16) against `release.json.base` (**`a691b2345`**; the base is the
-2026-11-08 r236 re-base, which replaced the 2026-10-25 `6050b467c` base), one
-`git am` commit each.
+**17 blocks** (block 00 + blocks 01-16) against `release.json.base` (**`4f9dfa0e3`**; the base is the
+2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
+`git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
+
+> **r278: the `4f9dfa0e3` re-base.**  No contributor patch.  The whole set was replayed from `a691b2345` onto
+> upstream `master` at `4f9dfa0e3` (164 commits, 751 files, +40 612 / −24 226) as a ladder climb — one rung per
+> block, each rung resolved, built and coherent — then re-cut here.  The campaign's ledger, conflict map and 20
+> decisions are in `archive/work/upstream-rebase-261113/`; the release record is `WORKLOG.md` 261113.015.
+>
+> 1. **The series is still exactly 17 commits, and BOTH rung-repairs are squashed into the block that owns
+>    them** (they were separate commits on the climb because a rung had already shipped them):
+>    * **block 05** now carries the FA instance-set repair — upstream's `#31959`-era switch to head-agnostic
+>      instance files folded its two new heads into it, which left the delivery's unconditional dispatch with
+>      **32 undefined** `ggml_cuda_flash_attn_ext_mma_f16_case<40|72,…>` symbols and hid **14 FP8-KV**
+>      instances.  The set is the delivery's **typed** `…-dkqN-dvN.cu` layout again (one declaration per file,
+>      one file per (head, ncols1, ncols2)); head 72 is the `DKQp`/`DVp = GGML_PAD(head, 16)` form upstream
+>      introduced, and the `f8_e4m3` tile/vec column the same switch dropped is back.  `generate_cu_files.py`
+>      emits that typed layout again (as merged it would `os.remove` the delivery's typed files on a re-run):
+>      **invariant — running it in `ggml/src/ggml-cuda/template-instances/` leaves `git status` clean.**
+>      Oracle: `test-backend-ops -o FLASH_ATTN_EXT` **6997/6997** at this tip.
+>    * **block 11** now carries the folded hyper-connection `h_nextn` export fix.  Upstream `a8fad21e9`
+>      (`#31927`) asserts `src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens` in
+>      `build_h_nextn_dev()`; a qwen4exp graph exports the **contiguous** `build_hc_combine()` result
+>      `[n_embd, hc, n_tokens]` (a pure view gets no backend assignment and the host readback looks one up),
+>      whose memory layout *is* `[n_embd_out, n_tokens]`.  The invariant is re-keyed on the **folded row**
+>      (`ggml_nelements(src) == n_embd_out*n_tokens`, the original checks kept for the 2-D layout, the
+>      discriminator `ne[0] == n_embd_out` because a one-token graph is `[n_embd, hc, 1]`).  r277 never reaches
+>      it (`#31927` is not in the r236 base); `gate-kv-residency.sh`'s pool section is what found it.
+> 2. **Merged-count facts of this base** (they supersede the `108`/`109` note under block 11, which was a
+>    statement about the r127 tree): `GGML_OP_COUNT` is **106** after block 12 (`ALL_GATHER`), and
+>    `RPC_PROTO_PATCH_VERSION` is **8**, with all 24 `RPC_CMD` messages still paired.  Re-derive these from the
+>    merged enum at every re-base; never trust either side's literal.
+> 3. **`graph_max_nodes()` models the KV rotation normally on this base** — the r267 amendment's mechanism (the
+>    per-layer device rotation constants that upstream `#31073` introduced) is what the merged budget counts, and
+>    `gate-node-budget.sh` passes **4/4 with a 440-entry margin** on every arm, so no rescue path is needed here.
+> 4. **Upstream pruned its own GDN graph builders/tags**, so `LLM_FUSED_OP_GDN_AR/CH` do not exist any more: the
+>    delivery's `n_rs_batch` argument and the `gated_delta_net_chunked*.cu` kernels are the **surviving**
+>    implementation (block 03), not an addition beside upstream's.
+> 5. **Block 00 still carries the `ac931b5bc` (`#30542`) revert** (`D17`): the HIP VMM pool hangs this box on
+>    ROCm 10.1/gfx1201 with the `GGML_HIP_NO_VMM=OFF` build the host-expert tier needs.  Block 14 is still
+>    **TEMPORARY** (`-sm relaxed-tensor`): upstream's deny is verbatim at `4f9dfa0e3` and nothing in the range
+>    touches `llm_arch_supports_sm_tensor`.
+> 6. **Gates at the re-cut** (full numbers in `WORKLOG.md` 261113.015): 17/17 per-block builds, dense-4B
+>    coherence `1c5d32ac537d`, prefill-logit KLD 0.000697 / 98.784 % (base recorded from the unpatched
+>    `4f9dfa0e3`, `VMM=ON`) plus the `q8_0`, `f8_e4m3` and `--sm tensor 0,1,2` arms, `gate-host-pool` **54/54**,
+>    node-budget 4/4, every other block gate PASS, and `gate-kv-residency`'s **multi-device** pool section red on a
+>    pre-existing 2-device MTP nondeterminism (`D20`, `TODO` #321 — it reproduces on the shipped r277 build).
 
 > **r251: where this release's two handles closed.**  No contributor patch.  One block change and one
 > docs-only close.
@@ -3973,7 +4017,7 @@ had no other home.
   can resolve to `buffered`; forcing either fill mode still works.  Reporter's log lines (92 GiB box,
   `MOE_HOST_POOL_FRAC` 80 vs 50) land on the two arms the rule predicts.
 
-**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `GGML_LF_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
+**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `LLAMA_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
 `LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
 `LLAMA_STATE_TIMING` (r152), `LLAMA_STATE_STAGE_MIB` (r157),

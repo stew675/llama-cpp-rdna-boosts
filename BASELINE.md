@@ -16,13 +16,20 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
-**The base is fixed by a re-base.**  The last one is **`v16-a691b2345-r236`** (2026-11-08): it replayed the
+**The base is fixed by a re-base.**  The last one is **`v17-4f9dfa0e3-r278`** (2026-11-13): it replayed the
+set from `a691b2345` (the 2026-11-08 base) onto **`4f9dfa0e3`** — 164 upstream commits, 751 files, +40 612 /
+−24 226 — as a **ladder climb** (one rung per block, each resolved, built and coherent before the next), and
+re-cut it as exactly 17 block commits with **both rung-repairs squashed into their owning blocks** (block 05's
+FA instance set, block 11's folded `h_nextn` export).  The ladder, the per-rung conflict map and the 20
+decisions it forced are in `archive/work/upstream-rebase-261113/`; the narrative and the gate numbers are
+`WORKLOG.md` 261113.015, and what moved per block is the r278 note at the top of `patches/README.md`.  The
+previous re-base was **`v16-a691b2345-r236`** (2026-11-08): it replayed the
 set from `6050b467c` (the 2026-10-25 base) onto **`a691b2345`** — 318 upstream commits — with every block
 re-derived rather than re-applied: the CPU backend was rewritten around block 12's hunks, upstream grew its
 own `qwen4exp`, upstream's `tile_spec` replaced the ids grid block 00 rode on, and blocks 09/10/15 were
 re-expressed on the new slab/pool/graph-input surfaces.  The ladder, the per-rung conflict map and the
-decisions it forced (D1, D2, D3, D8, D12, D13, D15) are in `archive/work/upstream-rebase-261108/` until the campaign
-is archived, and the narrative is `WORKLOG.md` 261108.001-.015.  The previous re-base was
+decisions it forced (D1, D2, D3, D8, D12, D13, D15) are in `archive/work/upstream-rebase-261108/`, and its
+narrative is `WORKLOG.md` 261108.001-.015.  The re-base before that was
 `v15-6050b467c-r138`: it replayed the set from
 `3f03b1772` (2026-10-24) onto **`6050b467c`** (2026-10-25) — 21 upstream commits, 98 files.  Small but
 semantic: it carries a **fused FFN gate/up+GLU MMQ kernel (#29948, NVIDIA-only)** that duplicates block 08's

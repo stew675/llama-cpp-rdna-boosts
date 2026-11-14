@@ -1,4 +1,4 @@
-From 6b4d9865e006aff7a94879b592d7e15ee618c4e0 Mon Sep 17 00:00:00 2001
+From b26145a88f35b2590978646b76902e1ae82f5254 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 14/16] rdna-boosts: block 14: relaxed-tensor split mode
@@ -83,10 +83,10 @@ needed.  Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  11 files changed, 130 insertions(+), 16 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 729bbb13a..c808237f8 100644
+index 9aa335e38..3517b8380 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2885,12 +2885,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2877,12 +2877,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -105,7 +105,7 @@ index 729bbb13a..c808237f8 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -2900,6 +2904,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2892,6 +2896,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -115,7 +115,7 @@ index 729bbb13a..c808237f8 100644
                  throw std::invalid_argument("invalid value");
              }
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 45d5867f4..3f1c82251 100644
+index a9cc220ad..622d2acb6 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -603,7 +603,7 @@ static void common_params_fit_impl(
@@ -151,7 +151,7 @@ index cec0f033c..a69d3508c 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 4dfbf4f58..e250b8fe8 100644
+index c06fcddc6..ca3cf458c 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -54,6 +54,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -261,7 +261,7 @@ index 4dfbf4f58..e250b8fe8 100644
      auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
-@@ -1569,12 +1623,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1566,12 +1620,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_CONV_3D:
              case GGML_OP_CONV_2D_DW:
              case GGML_OP_CONV_TRANSPOSE_2D:
@@ -277,7 +277,7 @@ index 4dfbf4f58..e250b8fe8 100644
              case GGML_OP_PAD: {
                  split_state = handle_pad(src_ss);
              } break;
-@@ -2197,6 +2253,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
+@@ -2194,6 +2250,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
              GGML_ASSERT(value == 0);
              [[fallthrough]];
          }
@@ -287,7 +287,7 @@ index 4dfbf4f58..e250b8fe8 100644
          case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
              for (size_t j = 0; j < n_bufs; j++) {
                  ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-@@ -2355,6 +2414,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -2352,6 +2411,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                  ggml_backend_tensor_set(simple_tensor, data, offset, size);
              }
          } break;
@@ -297,7 +297,7 @@ index 4dfbf4f58..e250b8fe8 100644
          case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
              GGML_ASSERT(tensor->type == GGML_TYPE_F32);
              GGML_ASSERT(offset % sizeof(float) == 0);
-@@ -2554,6 +2616,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2551,6 +2613,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
                  ggml_backend_tensor_get(simple_tensor, data, offset, size);
              }
          } break;
@@ -308,7 +308,7 @@ index 4dfbf4f58..e250b8fe8 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -3587,7 +3653,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3584,7 +3650,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      }
                      ggml_tensor * next = cgraph->nodes[id+1];
                      if (next->op == GGML_OP_MUL && next->src[0] == node &&
@@ -324,7 +324,7 @@ index 4dfbf4f58..e250b8fe8 100644
                          id++;
                          idr = id;
 diff --git a/include/llama.h b/include/llama.h
-index b5405eedd..6e334e34b 100644
+index 7298fc2dd..e29eb2fab 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -203,6 +203,15 @@ extern "C" {
@@ -344,10 +344,10 @@ index b5405eedd..6e334e34b 100644
  
      enum llama_load_mode {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index b56d1c5d5..340a6c539 100644
+index a07b3a71a..42cdab1fc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -299,7 +299,7 @@ static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model)
+@@ -287,7 +287,7 @@ static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model)
              n_cuda_dev++;
          }
      }
@@ -356,7 +356,7 @@ index b56d1c5d5..340a6c539 100644
  }
  
  // true when this build exposes the CUDA/HIP backend at all
-@@ -2310,7 +2310,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -2454,7 +2454,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
  
      LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
  
@@ -365,7 +365,7 @@ index b56d1c5d5..340a6c539 100644
          static bool warned = false;
          if (!warned) {
              LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-@@ -6176,7 +6176,7 @@ llama_context * llama_init_from_model(
+@@ -6356,7 +6356,7 @@ llama_context * llama_init_from_model(
          params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
      }
  
@@ -401,7 +401,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index dd57134e1..0e75e9034 100644
+index a5314fa2b..4a1560d29 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -398,7 +398,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
@@ -420,10 +420,10 @@ index dd57134e1..0e75e9034 100644
      }
  
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index 965f6a177..70351ecae 100644
+index 1070b92b8..3e35a4ee6 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
-@@ -411,7 +411,7 @@ struct llama_moe_cache::impl {
+@@ -412,7 +412,7 @@ struct llama_moe_cache::impl {
          if (devices.empty()) {
              throw std::runtime_error("MoE cache requires a GPU backend");
          }
@@ -433,7 +433,7 @@ index 965f6a177..70351ecae 100644
          }
          if (model.hparams.n_expert == 0 || n_expert_used == 0) {
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 7a30642d5..0763a7b78 100644
+index 4e0bbd8a5..a5c85e003 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
 @@ -162,7 +162,7 @@ int64_t llama_time_us(void) {

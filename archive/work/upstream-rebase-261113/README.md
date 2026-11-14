@@ -1,7 +1,7 @@
 # Upstream re-base campaign — 17 blocks from `a691b2345` onto `4f9dfa0e3`
 
-**Status: ALL RUNGS DONE (R00..R17, 2026-11-13) — R18 (the release ladder) is next and needs the maintainer's
-go-ahead.**  Every one of the 17 blocks is on `rebase-r278` (`767907a3f`, tree `69161d3b0`), each rung built and
+**Status: COMPLETE (R00..R18, 2026-11-13) — the re-base is cut, validated, gated and recorded
+(`v17-4f9dfa0e3-r278`).**  Every one of the 17 blocks is on `rebase-r278` (`767907a3f`, tree `69161d3b0`), each rung built and
 coherent (`100 chars sha=1c5d32ac537d` at every rung since R01), and **every gate arm that was deferred mid-climb
 has been cleared by the block it was owed to**: `gate-host-pool.sh`'s `tsplit`/`tsplitnosink` (R13, block 12's
 `moe_cache_pool_backed`), `gate-node-budget.sh` (R13, 4/4 with a 440-entry margin), quant-coherence **section E**
@@ -147,7 +147,7 @@ bound: the probe chained through marker-carrying trees).
 | 5 | R15 | 14 relaxed-tensor (**temporary**) | **0** | re-check it is still not subsumed |
 | 5 | R16 | 15 streamed KV | 5 | `D3` (FP8 KV instance set), `D19` (recurrent cache rename); owes quant-coherence section E (sparse QSA) **and** `gate-host-pool`'s `fail`/`late`/`pinlate` |
 | 5 | R17 | 16 UMA GTT expert store | **0** | **DONE 2026-11-13** — 0 conflicts, 0 first-error passes; **`gate-host-pool.sh` 54/54**, the last deferred arm; discrete arena live (`h=0.8127`, fills 9418) with 0 `GTT` lines; its own gates are APU-only (§5.11) |
-| 6 | R18 | — | — | **NEXT (go-ahead needed)** — release ladder: regenerate (squash BOTH rung-repairs), validate, gates, `release.json`, fork refresh, records |
+| 6 | R18 | — (release ladder) | — | **DONE 2026-11-13** — both rung-repairs squashed into blocks 05/11, 17 commits, `validate-set.sh` green, 17/17 per-block builds, `gate-rebase-release.sh` **RELEASABLE**, every block gate PASS except `gate-kv-residency.sh`'s multi-device section (`D20`) and the APU-only set (`TODO` #325).  New base/tip/tree: `4f9dfa0e3` / `0e264ad30` / `69161d3b0`; numbers in `RUNGS.md` §R18 and `WORKLOG.md` 261113.015 |
 
 Rung mechanics, per-rung conflict file lists and the resume command: [`RUNGS.md`](RUNGS.md).
 
@@ -202,7 +202,7 @@ next rung's conflict plan, decision statuses, traps, the R18 ladder with this ca
 copy-paste brief for a fresh session is [`PROMPT.md`](PROMPT.md).
 
 ```bash
-cd ~/llama-cpp-rdna-boosts && grep -n '^## R' wip/upstream-rebase-261113/RUNGS.md   # find the open rung
+cd ~/llama-cpp-rdna-boosts && grep -n '^## R' archive/work/upstream-rebase-261113/RUNGS.md   # find the open rung
 cd ~/llama.cpp && git log --oneline -3 && git status                               # confirm the branch state
 ```
 

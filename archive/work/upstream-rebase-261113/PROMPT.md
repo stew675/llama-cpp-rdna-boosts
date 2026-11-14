@@ -21,12 +21,12 @@ LAYOUT
   prompts/prose-rdna-boosts.txt.
 
 READ FIRST, IN THIS ORDER
-1. wip/upstream-rebase-261113/HANDOVER.md   (§0 state, §3 mechanics, §5 decisions, §7 env, §8 traps)
-2. wip/upstream-rebase-261113/RUNGS.md      (§0 ledger — every rung is DONE — then §R18; §R13-R17 are what the
+1. archive/work/upstream-rebase-261113/HANDOVER.md   (§0 state, §3 mechanics, §5 decisions, §7 env, §8 traps)
+2. archive/work/upstream-rebase-261113/RUNGS.md      (§0 ledger — every rung is DONE — then §R18; §R13-R17 are what the
                                              rungs decided, which gate arms each cleared and which are owed to
                                              an APU box — HANDOVER §5.7/§5.9/§5.10/§5.11)
-3. wip/upstream-rebase-261113/DECISIONS.md  (D7 is now re-verified; D6/D8/D9/D10/D11/D12/D5-a are closed)
-4. wip/upstream-rebase-261113/README.md §1 and §5 (rung mechanics and the blocked-rung protocol)
+3. archive/work/upstream-rebase-261113/DECISIONS.md  (D7 is now re-verified; D6/D8/D9/D10/D11/D12/D5-a are closed)
+4. archive/work/upstream-rebase-261113/README.md §1 and §5 (rung mechanics and the blocked-rung protocol)
 
 STATE
 **R00..R17 are done — ALL 17 BLOCKS are on `rebase-r278` at `767907a3f` (tree `69161d3b0`), plus two
