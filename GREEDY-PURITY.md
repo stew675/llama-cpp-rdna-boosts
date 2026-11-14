@@ -14,14 +14,18 @@ pre-r100 narratives (`§§1-42`) **and** the verbatim pre-compression text of ev
 -- so they are never renumbered; a new finding appends and takes the next number, and an entry whose evidence
 is worth keeping moves it to that archive under its own number rather than growing the rulebook.
 
-> **Numbering.**  This document uses the **V2.1 block** numbering for new text (18 blocks, `00`-`17`; r109
-> split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp, and moved the campaign
-> remainder to block 12 and the MTP-vocab trim to block 13; block 16 is the UMA GTT expert store, block 17
-> the mixed K/V cache types).  Entries written
-> before 2026-10-13 use the **pre-V2.0 16-block** numbering ("block 10" = the k-quant/VDR umbrella, now
-> **block 07**; "block 13" = fused MoE/`mmvq`, now **block 08**; "block 14" = qwen4exp, now **block 11**;
-> "block 15" = the campaign remainder, now **block 12**).  §39/§40 appear twice in the original numbering;
-> the later pair is labelled **§39b/§40b** here.
+> **Numbering.**  This document uses the **r288 block** numbering for new text: the default set is the 16
+> official blocks `0000`-`0015` plus the temporary **`0300`**, and the optional blocks are `0100`
+> (two-lane prefill) and `0101` (mixed K/V cache types).  The r288 re-org mapped the r287 numbering as
+> old `0014` (relaxed-tensor) -> **`0300`**, old `0015` (streamed KV) -> **`0014`**, old `0016`
+> (UMA GTT expert store) -> **`0015`**, old `0017` (mixed K/V) -> **optional `0101`**.  **Dated entries
+> keep the block number they were written with** — an entry that says "block 15 Goal B" means the
+> streamed KV (today's block 14) and "block 16" means the UMA GTT store (today's block 15); the mapping
+> is in `WORKLOG.md` r288.  Entries written before 2026-10-13 use the **pre-V2.0 16-block** numbering
+> ("block 10" = the k-quant/VDR umbrella, now **block 07**; "block 13" = fused MoE/`mmvq`, now **block
+> 08**; "block 14" = qwen4exp, now **block 11**; "block 15" = the campaign remainder, now **block 12**),
+> and r109 split the old block 10 into block 10 = infrastructure and block 11 = qwen4exp.  §39/§40 appear
+> twice in the original numbering; the later pair is labelled **§39b/§40b** here.
 
 ## The invariants (everything below is evidence for these)
 

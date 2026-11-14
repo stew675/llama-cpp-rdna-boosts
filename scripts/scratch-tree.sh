@@ -21,7 +21,7 @@
 #   init                 create the scratch worktree (detached at release.json.base) if absent, build it
 #   state REV            check out REV in the scratch tree and rebuild incrementally
 #   blocks [BASE]        reset to BASE (default release.json.base), apply the delivery set with
-#                        scripts/apply-all.sh (14 block commits on branch `scratch`), rebuild
+#                        scripts/apply-all.sh (release.json.n_default commits on branch `scratch`), rebuild
 #   arm PATCH...         reset to the release tip, `git am -3` the given patch files on top, rebuild
 #                        (this is the PR-assessment / beta flow: one arm at a time, each a delta)
 #   tip                  reset to release.json.tip (the canonical release tree), rebuild

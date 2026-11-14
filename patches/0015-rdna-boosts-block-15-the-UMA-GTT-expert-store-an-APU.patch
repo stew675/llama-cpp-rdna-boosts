@@ -1,7 +1,7 @@
-From 83d2593fe450dceebaf16839c01cc09c2a33b4cf Mon Sep 17 00:00:00 2001
+From 78b2427ad79d80a87598c97f02d443eb73894962 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
-Subject: [PATCH 16/17] rdna-boosts: block 16: the UMA GTT expert store -- an
+Subject: [PATCH 15/16] rdna-boosts: block 15: the UMA GTT expert store -- an
  APU's MoE expert set served from ONE registered, mlocked region, sized by
  -lme
 
@@ -94,7 +94,7 @@ onto the TODO #87 note).
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 1d1e7904f..9020adc85 100644
+index a218d54de..93cc72d83 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2760,18 +2760,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -195,7 +195,7 @@ index 1d1e7904f..9020adc85 100644
              }
          }
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d72bb88d7..7a7ffd13f 100644
+index a5d21e6e4..3cac8c63f 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -84,12 +84,48 @@ extern "C" {
@@ -344,10 +344,10 @@ index 87c8164ec..d0bf5b3f2 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 4d816eaad..948a404d7 100644
+index 456e22979..b99131e7a 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -342,6 +342,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+@@ -340,6 +340,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .slab_set_ring_cap    = */ nullptr,
      /* .slab_enabled         = */ nullptr,
      /* .slab_ring_slots      = */ nullptr,
@@ -366,7 +366,7 @@ index 4d816eaad..948a404d7 100644
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
-@@ -4865,6 +4877,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -4793,6 +4805,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,

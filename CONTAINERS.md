@@ -20,7 +20,7 @@ the patched tree the same way the consumer workflow does:
    materialises that tip directly and verifies its git tree,
 2. `git init` + one base commit (`git add -A -f`, so upstream-tracked files
    that match `.gitignore` are kept and the base tree is canonical), then
-   `scripts/apply-all.sh` applies `patches/0000..0015` with strict `git am`,
+   `scripts/apply-all.sh` applies the default set (`patches/0000`-`patches/0015`, then the temporary `patches/0300`) with strict `git am` — the optional `01xx` artifacts are never in an image,
 3. write the build-context `.dockerignore` (from `.devops/dockerignore`) and
    build with [`.devops/rdna-rocm.Dockerfile`](.devops/rdna-rocm.Dockerfile),
    an adaptation of upstream llama.cpp's `.devops/rocm.Dockerfile`

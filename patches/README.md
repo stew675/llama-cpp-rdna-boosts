@@ -1,11 +1,22 @@
 # The delivery patches — what each block is and what it does
 
-**18 blocks** (block 00 + blocks 01-17) against `release.json.base` (**`4f9dfa0e3`**; the base is the
-2026-11-13 r278 re-base, which replaced the 2026-11-08 r236 `a691b2345` base), one
-`git am` commit each.  The base is a `release.json` field — this line only states which re-base it is.
+**16 official blocks (`0000`-`0015`) + the temporary block `0300` = 17 default patches** against
+`release.json.base` (**`4f9dfa0e3`**; the base is the 2026-11-13 r278 re-base, which replaced the
+2026-11-08 r236 `a691b2345` base), one `git am` commit each, applied in filename order (`0000`-`0015`
+then `0300`).  The optional artifacts (`optional/*/01xx-*.patch`: `0100` two-lane prefill, `0101` mixed
+K/V) are **not** in this set and never in the default apply.  The base is a `release.json` field — this
+line only states which re-base it is.
 
-> **r287: block 17 — mixed K/V cache types (PR #312, @mjohanning99).**  K `q8_0` with V `q4_0` / `q5_0` /
-> `q5_1` on a model whose attention layers are all 256-wide is read natively instead of staged through the
+> **r288: the block-number re-org.**  The old block 14 (`-sm relaxed-tensor`, temporary) became **`0300`**
+> and moved to the end of the apply; the old 15 (streamed KV) and 16 (UMA GTT) became **14** and **15**; the
+> old 17 (mixed K/V) became **optional `0101`** and left the default set; the unnumbered two-lane-prefill
+> optional artifact became **optional `0100`**.  The re-org changes no code: the new default tree is
+> byte-identical to r287's with block 17 removed, and default + `0101` reproduces r287's release tree
+> (`89b25552…`) byte for byte — both proved in `WORKLOG.md` r288.  Historical entries below keep the block
+> numbers they were written with; the mapping is in `WORKLOG.md` (r288).
+
+> **r287: block 17 — mixed K/V cache types (PR #312, @mjohanning99) — now optional block `0101`.**  K `q8_0`
+> with V `q4_0` / `q5_0` / `q5_1` on a model whose attention layers are all 256-wide is read natively instead of staged through the
 > whole-cache F16 scratch: the tile kernel takes a second type parameter for V, the three pairs have head-256
 > instances, and the RDNA4 band accepts them.  `GGML_CUDA_FA_KV_MIXED=0` restores the staged path; every other
 > mixed pair (and qwen4exp, whose QSA op asserts K->type == V->type) is still refused.  The default path is
@@ -13,7 +24,8 @@
 > a new block, not an amendment: the context-gate hunk lives in block 10's file and the width-probe hunk in
 > block 06's, so folding it into block 05 would have had to split it across three blocks.  Gate:
 > `scripts/gate-mixed-kv.sh`; record: `WORKLOG.md` r287.  The original artifact, measurements and review are
-> preserved in `archive/work/mixed-kv/`.
+> preserved in `archive/work/mixed-kv/`.  **r288 moved it out of the default set** as optional `0101` — the
+> section below (and `optional/mixed-kv/README.md`) is the current location.
 
 > **r283: the n-gram family gets the greedy-purity notice the draft family already had.**  A draftless
 > (n-gram) speculator's width is a verify-batch width like `--spec-draft-n-max` is, but it had no
@@ -112,7 +124,7 @@
 >    delivery's `n_rs_batch` argument and the `gated_delta_net_chunked*.cu` kernels are the **surviving**
 >    implementation (block 03), not an addition beside upstream's.
 > 5. **Block 00 still carries the `ac931b5bc` (`#30542`) revert** (`D17`): the HIP VMM pool hangs this box on
->    ROCm 10.1/gfx1201 with the `GGML_HIP_NO_VMM=OFF` build the host-expert tier needs.  Block 14 is still
+>    ROCm 10.1/gfx1201 with the `GGML_HIP_NO_VMM=OFF` build the host-expert tier needs.  Block `0300` is still
 >    **TEMPORARY** (`-sm relaxed-tensor`): upstream's deny is verbatim at `4f9dfa0e3` and nothing in the range
 >    touches `llm_arch_supports_sm_tensor`.
 > 6. **Gates at the re-cut** (full numbers in `WORKLOG.md` 261113.015): 17/17 per-block builds, dense-4B
@@ -289,9 +301,9 @@ rollback tracker, `build_conv_state_store`).  Gate `scripts/gate-slot-rev-share.
 > tile width) -> **block 08**; the per-graph MMB/BF16 LIFO fix and `#298` (BF16 src1 pool order) -> **block 10**;
 > `#297` (indexer census) -> **block 11**; `#296` (the two dead CPU hunks) -> **block 12**; the attendance-pool
 > refusal, the shared-host-pool expert refusal, the MMB pool slot order, `#301` (ids compaction) and the VMM
-> pool-order assert -> **block 15**.  The final tree is bit-identical to the campaign's working chain
+> pool-order assert -> **block 14**.  The final tree is bit-identical to the campaign's working chain
 > (`a4093f9da`), and the folded placement is what `scripts/gate-per-block-build.sh` verifies builds block by
-> block.  Block 14 is **temporary** (see its section): it is a local relaxation of an upstream
+> block.  Block `0300` is **temporary** (see its section): it is a local relaxation of an upstream
 rule, kept separate on purpose so it can be dropped without touching any other block.  This file
 is the per-block reference: what a block contains, what it changes, the knobs its code reads and the
 purity notes that constrain it.  It is **not** a changelog — the release-by-release record is
@@ -315,8 +327,9 @@ bash /path/to/rdna-boosts/scripts/apply-all.sh --include-beta .   # + beta/*/*.p
 ```
 
 All blocks with **`git am`**, in order.  `git apply` on the concatenated series silently drops hunks; the
-manual equivalent is `git am patches/000[0-9]-*.patch patches/001[0-5]-*.patch`.  `apply-all.sh` asserts
-the applied tree equals `release.json.tree` on the strict path.
+manual equivalent is `git am patches/00[0-9][0-9]-*.patch patches/03[0-9][0-9]-*.patch` (official
+`0000`-`0015`, then the temporary `0300`).  `apply-all.sh` asserts the applied tree equals
+`release.json.tree` on the strict path.
 
 ## Block index
 
@@ -341,8 +354,9 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228; + r190: the fused indexer scorer and the derived indexer pool read **quantized** indexer keys (q8_0 + the q4/q5 family + iq4_nl), so `-ctk q8_0` takes the fast path, TODO #118; + r209: **Windows** — the host-resident PLE gather prefetches a ubatch's rows through `llama_prefetch_rows`, as gemma4 and deepseek41 already did — PR #269; + r242: the prefill chain **`DSV4_HC_POST -> RMS_NORM -> MUL(gamma)`** is one kernel (`dsv4_hc_post_rms_f32`), and the two BF16-GEMM activation producers write their RNE BF16 copy in the same pass (`bf16_src1_cache`), so the rocBLAS BF16 hc GEMMs skip their conversion -- contributor PR #288, `GGML_CUDA_HC_POST_RMS` / `GGML_CUDA_BF16_PRODUCER`, +6.0-8.1 % prefill on a 2-device `-sm tensor` qwen4exp arm; + r243: the **host PLE gather** writes the rows straight into the graph input and fans out over `--threads` (one thread per 4096 rows) -- contributor PR #289, `LLAMA_PLE_DIRECT` / `LLAMA_PLE_THREADS`, +1.3 % prefill on the `-ub 4096` delivery arm) | +12574 / −503 | 51 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r227: the host pool's disk tier is real on Windows (`ReadFile`/`FILE_FLAG_NO_BUFFERING`), a refused pool allocation reports and latches, and the exit census prints from the model teardown with the pinned tier's realized bytes and, on Windows, the adapter's aperture budget; + r224: the host-expert pool campaign — a DECODE-ranked pool, an eviction demote with in-budget headroom, coalesced prefill reads, and the heat-save truncation fix; + r221: a host pool that covers its tensor has nothing to re-rank, so `pool_rerank_from_heat_locked` returns before any bookkeeping — the write-once layout the decode remap's cold map needs, TODO #269; + r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248; + r203: PR #266's `g_dr_key_to_id` reindex in `moe_cache_forget_all` and the `heat_dec` tally in the lag policy; + r209: **Windows** — the host pool and the KV spill ceiling read `GlobalMemoryStatusEx` as their available-RAM figure — PR #269; + r218: the DFlash/DSpark drafter's KV is realigned with the batch it ingests so a partially reused prompt cannot invalidate it, issue #272) (+ r237: the prefill-arena fix — the arena arms on the first complete table set, and the scheduler registers every split's host-expert tables before the first one computes, so `-sm tensor` arms too; pp512 438 -> 1209 on `-ncmoe 48`; + r240: the `hc_combine_norm` base copy is the last pool allocation of its window and is killed right after the launch, so a `-sm layer` prefill graph no longer holds one copy per layer — GitHub issue #290; + r244: PR #292's DFlash layer-input copies move to just after each layer (`build_layer_inp_dev()`, `LLAMA_LAYER_INP_EARLY`) — the target's compute buffer 756.97 → 624.99 MiB / 580.99 MiB on dense 27B + DFlash2; + r253: `moe_cache_register` sets the backend's device first, like the other cache hooks -- issue #294; + r254: the early narrow-floor probe uses the same full-cache context (`probe_mctx()`), and `tests/test-llama-archs.cpp` runs the dsv4 arches' `Host experts` row (`DEEPSEEK4`/`DEEPSEEK41` in `host_experts_test()`, which is the regression arm for the `cpy_k` assert) with a `moe_cache_test()` split so the tiny device-cache rows stay DEEPSEEK2-only — GitHub issue #300; + r258: an identity expert table is served IN PLACE in the prefill band (`moe_cache_in_place`, the take-over's band gate lifted for identity tables only) -- `TODO` #133) | +7832 / −1178 | 52 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +575 / −16 | 19 |
-| 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` | +130 / −18 | 11 |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | **windowed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`) | +7005 / −837 | 45 |
+| 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`) | +7515 / −865 | 49 |
+| 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured) | +4831 / −344 | 16 |
+| 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −16 | 11 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
 infrastructure split out of `ggml-cuda.cu` (slab/arena/try-fuse TUs) and block 11 is the qwen4exp
@@ -2198,7 +2212,7 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 * **The headroom default is `1152 + 128 x n_gpu` MiB (r206; it was `640 + 128 x n_gpu`, i.e. 768 / 896 / 1024
   MiB, from r86).**  `GGML_CUDA_SLAB_HEADROOM_MIB` is the steady-state free VRAM the slab leaves outside itself,
   and one GPU now gets **1280** MiB.  The 640 base was sized on the field GSQ / `-ub 4096` shape (~300 MiB of
-  outside transient per device); block 15's `-c 262144` host-expert runme needed 1536 there to stop
+  outside transient per device); block 14's `-c 262144` host-expert runme needed 1536 there to stop
   `hipBLASLt out of memory` on the first prefill (r194), so the shipped default was one workspace short on a
   documented config.  **This is margin, not a demonstrated fix**: the r194 cliff is order-dependent and r206 did
   not reproduce it (5 246 / 25 763 / 51 475-token prefixes at `-c 262144`, 768 and 1280, all clean, text
@@ -3222,7 +3236,7 @@ rms_norm -> rope_multi -> score mul_mat -> relu -> head-sum -> bias add` — and
 cache (`GGML_OP_INDEXER_FILL`, `GGML_CUDA_QSA_INDEXER_CACHE`) both read raw cache rows natively and supported
 **F32/BF16/F16 only**, so a quantized indexer key cache took the per-op chain and `pool_create` logged
 *"derived indexer cache pool skipped (q8_0 keys)"*.  Since `-ctk` drives the indexer cache, that is
-`-ctk q8_0` — the delivery's large-context KV type, and the type block 15's window and this block's pool takes by
+`-ctk q8_0` — the delivery's large-context KV type, and the type block 14's window and this block's pool takes by
 construction (r189's copy fix above is what made the *chain* affordable there; this makes it unnecessary).
 `indexer_score_ld_chan(row, c, nb0K, ktype)` replaces the element-address loader: a quantized row is addressed
 in `nb0K`-byte blocks and dequantized with **ggml's own** `dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl` — the
@@ -4128,7 +4142,7 @@ had no other home.
 
 * **The host pool's available-RAM figure on Windows is `GlobalMemoryStatusEx` (r209, PR #269).**  The
   zero-copy lookups (`pool_available_ram_bytes`) and the windowed KV spill ceiling
-  (`ggml_cuda_kv_available_ram_bytes`, block 15) read `MemAvailable` from `/proc/meminfo` and returned
+  (`ggml_cuda_kv_available_ram_bytes`, block 14) read `MemAvailable` from `/proc/meminfo` and returned
   `-1` off Linux, so on Windows the pool always took the box for **memory-tight**: `MOE_HOST_POOL_DIO`
   resolved to `O_DIRECT` ("no MemAvailable") and neither `MOE_HOST_POOL_RAM_PCT` nor
   `LLAMA_KV_SPILL_RAM_PCT` applied a ceiling.  Windows now returns `ullAvailPhys` (free plus standby, the
@@ -4407,67 +4421,7 @@ trim's share), `-sm tensor` (subset head is Meta-mirrored — **the draft matmul
 trim only pays when `N * n_devices < n_vocab`**; see "Device count" above), `--fit` (subset not estimated), the
 purity band (above).  Detail and numbers: `../archive/work/spec-draft-mtp-vocab/README.md` §5.
 
-## Block 14 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
-
-> **Status: temporary, local, and NOT a supported feature of the delivery.**  This block exists so `flint`,
-> `mellum` and `mistral4` can run `-sm tensor` today.  It relaxes a split-state rule upstream deliberately
-tightened (PR #31081) and is expected to be **replaced or dropped** when upstream lands a real fix — the
-> delivery is not committing to this mode.  Nothing else in the set depends on it: deleting patch `0014`
-> restores exactly the r136 tree, and `-sm tensor` keeps upstream's strict behaviour either way.
-> Read the limitations before using it; treat it as a stop-gap, not as a feature.
-
-**Why upstream refuses.**  `llm_graph_context::build_amax_src1_f16()` (`src/llama-graph.cpp`) gives the MoE
-down projection a per-`[expert, token]` rescale: it takes the max of the whole matmul row
-(`ggml_pool_1d(abs(cur), POOL_MAX, k = s = n_ff_exp)`), divides `cur` by a power of two derived from it, and
-multiplies the down-projection result back by the same value to restore f16/Q8 headroom.  Under
-`--split-mode tensor` the MoE intermediate is split on axis 0 (`n_ff_exp`), so **no device holds a complete
-row** and each one can only compute the max of its own slice.  #30861 handled `POOL_1D` by reporting the
-result `MIRRORED`; that claim is false (the values differ), so #31081 removed the case and denied
-`-sm tensor` for the three arches.
-
-**What this block does instead of a blanket deny.**  A new split state,
-`GGML_BACKEND_SPLIT_AXIS_PER_DEVICE`: same shape and element positions on every device, **its own values**
-on each.  `handle_pool_1d` produces it for a whole-row `POOL_MAX` over an axis-0 split (anything else keeps
-the old reject), `handle_bin_bcast` lets it be consumed elementwise and broadcast, and every path that would
-copy, gather, reconcile or read it back **aborts with a message** instead of silently returning one device's
-value.  `-sm relaxed-tensor` (`LLAMA_SPLIT_MODE_RELAXED_TENSOR`, `relaxed-tensor` in `--help`) is that
-permission; every "is this the tensor path?" site goes through `llm_split_mode_is_tensor_like()`.
-
-**Why it is exact, and the one piece that is easy to get wrong.**  The reduce point must stay **after** the
-per-device undo, i.e. each device applies its own `e` to its own partial and only then is the cross-device
-sum taken.  That is the delayed-reduce MUL-chain in `ggml_backend_meta_graph_compute`, and it only works
-because it accepts `PER_DEVICE` next to `MIRRORED`; if it stops matching, the all-reduce lands on the
-`mul_mat_id` output and **one device's `e` is applied to the summed result**— wrong, and invisible whenever
-every `e` happens to be 1 (which is the common case: the shipped divisor is 1024, so `e > 1` needs a row max
-above 1024).  Given the ordering, `e` is a power of two and `e_local <= e_global` (a local max cannot exceed
-the global one), so the scaling commutes with the sum and each device keeps at least the reference's f16
-headroom.
-
-**Cost.**  Zero VRAM: the weights are placed exactly as `-sm tensor` places them (Flint Q8_0, 39.39 GiB:
-95.1 % is the expert tables, which stay split — 20.66 GiB/device at 2 GPUs, 14.42 GiB at 3).  The only
-per-device tensor is the rescale factor, `[1, n_expert_used, n_tokens]` per MoE layer, in the existing
-compute buffer.
-
-**Limitations — do not read this block as general `-sm tensor` support.**
-
-| limitation | detail |
-|---|---|
-| not bit-identical everywhere | exact on RDNA/HIP (Q8_1's block scale is `max/127`, so a power-of-two factor passes through). A backend whose in-kernel `src1` rescale is **non-linear** (Vulkan's clamp-into-fp16-range, #30656) sees genuinely different values. Not validated outside ROCm |
-| no `-ncmoe`/expert-cache arm | the MoE expert arena still refuses tensor-like modes, so `relaxed-tensor` inherits that (as `tensor` does) |
-| `mellum`/`mistral4` unvalidated | enabled by the same change, no model on hand. `mistral4` was denied *before* the amax rescale, so it may still hit an unrelated unsupported path |
-| no MTP/draft coverage | no draft was run against these arches under this mode |
-| it is not a purity claim | the mode is *permitted*, not *promised*: `PER_DEVICE` is an assertion that the graph consumes the tensor only in the sound way, and any other consumer aborts |
-
-**Validation (r137).**  Flint Q8_0, 2× R9700: `-sm relaxed-tensor` runs at 77.9 t/s generation vs 59.5 for
-`-sm layer` (short decode-only run, not a depth-16384 measurement), greedy text **byte-identical** to
-`-sm layer` and to itself at 3 GPUs.  With the amax divisor forced to 1 (so `e != 1`), an instrumented pool
-kernel confirms each device pools its own 256-wide slice and the per-device maxima differ on ~half of the
-~185 calls per run, and the text still matches `-sm layer` exactly.  A non-amax arch (Qwen3.5-4B) is
-byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op without the amax node;
-`ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
-Purity notes: `GREEDY-PURITY.md` §58.
-
-## Block 15 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
+## Block 14 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
 
 
 > **r275 amendment:** `GGML_OP_KV_POOL` joins the GPU-only abort group in `ggml-cpu.c`'s compute dispatch (its
@@ -4727,7 +4681,7 @@ text).  `ENVIRONMENT.md` §18.
 **`--fit` (r190).**  The mirror is a *device* buffer type over a pinned host allocation, so `--fit` would
 otherwise book its bytes as VRAM — at 103k-180k that reserves 1.6-2.4 GiB for memory that is really host RAM,
 i.e. it hands back the very arena the pool exists to free.  `llama_kv_cache::memory_breakdown()` charges the
-mirror to the **host** bucket (the same treatment block 15's spill gets), so the device tier is the compact
+mirror to the **host** bucket (the same treatment block 14's spill gets), so the device tier is the compact
 pool alone; `llama_get_kv_pool_bytes()` reports the split for the fit's report; and the fit **skips the
 context-reduction interpolation** while the pool is active, because this KV's VRAM is fixed — reducing `-c`
 frees nothing there and the interpolation would divide by a near-zero bytes-per-context delta and hand back a
@@ -4770,7 +4724,7 @@ rejects an op whose sources live on another device, the CPU backend has no `KV_P
 block count.  A **tensor split** still declines (its Meta device has no per-device mirror), one message, KV unchanged.
 
 **Not in this block:** the pool declines a tensor split (one page table per device would need a per-device pool
-and a split-aware resolve — block 15's window has the same limitation), the *mirror* grows on demand (r196) and
+and a split-aware resolve — block 14's window has the same limitation), the *mirror* grows on demand (r196) and
 is bounded by the pinned-RAM ceiling `LLAMA_KV_SPILL_RAM_PCT`, which declines the pool loudly rather than being
 OOM-killed, and k-quant indexer keys stay on the chain (block 11's loader needs a 32-element block that
 divides `idx_dim`).
@@ -4962,7 +4916,7 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 `validate-set.sh` 16/16 (tree `c6c2f03d`), the re-cut tip is `2ed3997f5`, prefill-logit **0.000000 / 100.000 %**
 (build `2ed3997f5`); record `benchmarks/2026-11-01-spec-draft-window-264.md`.
 
-## Block 16 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
+## Block 15 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
 
 > **r275 amendment (issue #306):** the RESOLVED-layout census's local was named `near`, which `<windows.h>` defines as
 > an empty macro -- a hard Windows HIP compile error at `moe-expert-cache.cu:2716/2718/2721`.  Renamed `near_mirror`
@@ -4996,7 +4950,7 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 > could never reach the geometry -- and passes **48/48**.
 
 **What it is.**  On an integrated GPU there is no host-expert tier (r236 refuses `-ncmoe`/`--host-experts` there)
-and upstream disables the expert cache outright, so a MoE model whose expert set exceeds RAM cannot run.  Block 16
+and upstream disables the expert cache outright, so a MoE model whose expert set exceeds RAM cannot run.  Block 15
 adds the tier that can: ONE anonymous region (`mmap` + `MADV_HUGEPAGE`, `hipHostRegister(Mapped|ReadOnly)` once,
 `mlock`'ed, sliced per `(tensor, expert)`) that the GPU reads in place at 230-233 GB/s.  **`-lme N|auto` sizes it** --
 the same flag, units and heat ranking as the discrete host-expert budget, i.e. the one command line that carries
@@ -5050,7 +5004,7 @@ The store's sizing for a *separate* drafter's head is parked (a `common`/`--fit`
 loader change).  The lock policy still refuses a >RAM model on a clamp that covers the RAM shortfall but cannot fund
 one slot per table -- relaxing that is a separate change with its own arms.
 
-**r265 amendment to block 16 -- the prefill span plan is the USED set, and its census counts what it reads.**
+**r265 amendment to block 15 -- the prefill span plan is the USED set, and its census counts what it reads.**
 `moe_cache_prefill_stream()` planned its coalesced reads from "`map[e] < 0`", but `map[]` holds a slot only for an
 expert that is **both routed by this ubatch and resident**, so a "missing run" was really a run of *not (used and
 resident)* -- it fetched every expert the ubatch does not use, and those bytes were counted only when they happened
@@ -5068,7 +5022,7 @@ per-table complement, not the prompt width), so nothing changed there.  The per-
 set that remains is `TODO` #317 / [`archive/work/prefill-in-place-arena/`](../archive/work/prefill-in-place-arena/README.md).
 Record: `benchmarks/2026-11-11-gtt-prefill-span-set.md`, `WORKLOG.md` 261111.036.
 
-**r266 amendment to block 16 -- the prefill band is served IN PLACE out of the arena (`TODO` #317).**  The arena
+**r266 amendment to block 15 -- the prefill band is served IN PLACE out of the arena (`TODO` #317).**  The arena
 tier is only partly resident, so above the decode/verify band it staged the used set into the scheduler's split-input
 copy, D2D-copying every *resident* used expert out of the store on every pass: `O(used)`, not `O(missing)` --
 measured 30 060.5 MiB of copy against 1 578.6 MiB read for a 38-token prompt.  The prefill band now takes the same
@@ -5094,7 +5048,7 @@ one decoding while the other prefills: text identical, decode not slower) and MT
 **Record:** `archive/work/apu-expert-gtt/` (README §0 the shape, §5 sizing, §6 the trap list, IMPLEMENTATION P0-P6,
 MEASUREMENTS §13-§27, the probes, and the campaign's own gate).
 
-**r270 amendment to block 16 — ONE front-loading policy for both expert tiers (`TODO` #318), and the prewarm's fill
+**r270 amendment to block 15 — ONE front-loading policy for both expert tiers (`TODO` #318), and the prewarm's fill
 order.**  Both tiers began with a bulk fill at sizing (the arena from the persisted heat prior + the prompt tally,
 `apply_heat_seed_locked`/`apply_prefill_seed_locked`; the discrete host pool from `pool_prepopulate_locked` and
 then `pool_rerank_from_heat_locked`), and r266's in-place prefill band raised the question of whether that fill can
@@ -5117,8 +5071,8 @@ well: **12 546 -> 7 774 ms** for the same 42.7 GiB and the same set (3.67 -> 6.2
 default moves nothing on gfx1151).  Record: `benchmarks/2026-11-12-expert-seed-policy.md`, `archive/work/expert-seed-policy/`,
 `WORKLOG.md` 261112.006.
 
-**r277 amendment to block 16 -- the PLACEMENT READ QUEUE (and the pool-base alignment shift it exposed).**  Every
-placement fill is a work queue drained by the reader pool block 16 already had: the host pool's load-time prewarm
+**r277 amendment to block 15 -- the PLACEMENT READ QUEUE (and the pool-base alignment shift it exposed).**  Every
+placement fill is a work queue drained by the reader pool block 15 already had: the host pool's load-time prewarm
 (`pool_prepopulate_locked`), its one-shot band re-layout (`pool_rerank_from_heat_locked`), a covering mirror
 (`pool_mirror_bulk_fill_locked`) and this block's own GTT arena SIZING seeds (`apply_heat_seed_locked`,
 `apply_prefill_seed_locked`).  A placement fill has no decode latency to lose and its whole work list is known
@@ -5143,7 +5097,7 @@ really ran (the mechanism must be LIVE, not merely benign -- the text is identic
 **38/0** with the seed-queue census asserted, prefill-logit **0.000000 / 100.000 %**.  Record: `WORKLOG.md`
 261113.003, `INVARIANTS.md` (r277).
 
-**r284 amendment to block 16 -- the lock policy tests the number the CACHE accepts (`TODO` #319).**  The `-lme`
+**r284 amendment to block 15 -- the lock policy tests the number the CACHE accepts (`TODO` #319).**  The `-lme`
 lock policy decided "can this clamp still stream, so can this model run" against `arena_min` (one slot per expert
 table) -- but `moe_cache_preflight_store()` declines any store below its own **floor** (2048 MiB), so a clamp in
 `[arena_min, floor)` passed the loader's test, was declined by the cache, and the load was then refused as *"the
@@ -5156,9 +5110,82 @@ IGPU answers, so `arena_need == arena_min`).  Measured on `halo` (gfx1151): `Qwe
 naming the floor and the 2048 MiB to raise to (r283 said "the arena is unavailable on this device"), `-lme auto`
 under a 1 GiB `ulimit -l` refuses naming the 21 741.3 MiB shortfall, and **`-lme 3` runs**: arena 3072.0 MiB,
 144 tables / 864 slots, 864 direct buffered fills at 4158 MiB/s, text produced.  Gates: `fork-refresh.sh` re-cut
-(tree `39ad82e0e`), `validate-set.sh` green, `gate-per-block-build.sh --fast --changed-from 6a4af82e2` (block 16,
+(tree `39ad82e0e`), `validate-set.sh` green, `gate-per-block-build.sh --fast --changed-from 6a4af82e2` (block 15,
 18 s), coherence identical on this box (4B 1 GPU `a77fa8c1107a`, 3 GPU tensor `eab86065e67e`).  Record:
 `WORKLOG.md` 261114.005, `INVARIANTS.md` (r284).
+
+## Block 0300 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
+
+> **Status: temporary, local, and NOT a supported feature of the delivery.**  This block exists so `flint`,
+> `mellum` and `mistral4` can run `-sm tensor` today.  It relaxes a split-state rule upstream deliberately
+tightened (PR #31081) and is expected to be **replaced or dropped** when upstream lands a real fix — the
+> delivery is not committing to this mode.  Nothing else in the set depends on it: deleting patch `0300`
+> restores exactly the r136 tree, and `-sm tensor` keeps upstream's strict behaviour either way.
+> Read the limitations before using it; treat it as a stop-gap, not as a feature.
+
+**Why upstream refuses.**  `llm_graph_context::build_amax_src1_f16()` (`src/llama-graph.cpp`) gives the MoE
+down projection a per-`[expert, token]` rescale: it takes the max of the whole matmul row
+(`ggml_pool_1d(abs(cur), POOL_MAX, k = s = n_ff_exp)`), divides `cur` by a power of two derived from it, and
+multiplies the down-projection result back by the same value to restore f16/Q8 headroom.  Under
+`--split-mode tensor` the MoE intermediate is split on axis 0 (`n_ff_exp`), so **no device holds a complete
+row** and each one can only compute the max of its own slice.  #30861 handled `POOL_1D` by reporting the
+result `MIRRORED`; that claim is false (the values differ), so #31081 removed the case and denied
+`-sm tensor` for the three arches.
+
+**What this block does instead of a blanket deny.**  A new split state,
+`GGML_BACKEND_SPLIT_AXIS_PER_DEVICE`: same shape and element positions on every device, **its own values**
+on each.  `handle_pool_1d` produces it for a whole-row `POOL_MAX` over an axis-0 split (anything else keeps
+the old reject), `handle_bin_bcast` lets it be consumed elementwise and broadcast, and every path that would
+copy, gather, reconcile or read it back **aborts with a message** instead of silently returning one device's
+value.  `-sm relaxed-tensor` (`LLAMA_SPLIT_MODE_RELAXED_TENSOR`, `relaxed-tensor` in `--help`) is that
+permission; every "is this the tensor path?" site goes through `llm_split_mode_is_tensor_like()`.
+
+**Why it is exact, and the one piece that is easy to get wrong.**  The reduce point must stay **after** the
+per-device undo, i.e. each device applies its own `e` to its own partial and only then is the cross-device
+sum taken.  That is the delayed-reduce MUL-chain in `ggml_backend_meta_graph_compute`, and it only works
+because it accepts `PER_DEVICE` next to `MIRRORED`; if it stops matching, the all-reduce lands on the
+`mul_mat_id` output and **one device's `e` is applied to the summed result**— wrong, and invisible whenever
+every `e` happens to be 1 (which is the common case: the shipped divisor is 1024, so `e > 1` needs a row max
+above 1024).  Given the ordering, `e` is a power of two and `e_local <= e_global` (a local max cannot exceed
+the global one), so the scaling commutes with the sum and each device keeps at least the reference's f16
+headroom.
+
+**Cost.**  Zero VRAM: the weights are placed exactly as `-sm tensor` places them (Flint Q8_0, 39.39 GiB:
+95.1 % is the expert tables, which stay split — 20.66 GiB/device at 2 GPUs, 14.42 GiB at 3).  The only
+per-device tensor is the rescale factor, `[1, n_expert_used, n_tokens]` per MoE layer, in the existing
+compute buffer.
+
+**Limitations — do not read this block as general `-sm tensor` support.**
+
+| limitation | detail |
+|---|---|
+| not bit-identical everywhere | exact on RDNA/HIP (Q8_1's block scale is `max/127`, so a power-of-two factor passes through). A backend whose in-kernel `src1` rescale is **non-linear** (Vulkan's clamp-into-fp16-range, #30656) sees genuinely different values. Not validated outside ROCm |
+| no `-ncmoe`/expert-cache arm | the MoE expert arena still refuses tensor-like modes, so `relaxed-tensor` inherits that (as `tensor` does) |
+| `mellum`/`mistral4` unvalidated | enabled by the same change, no model on hand. `mistral4` was denied *before* the amax rescale, so it may still hit an unrelated unsupported path |
+| no MTP/draft coverage | no draft was run against these arches under this mode |
+| it is not a purity claim | the mode is *permitted*, not *promised*: `PER_DEVICE` is an assertion that the graph consumes the tensor only in the sound way, and any other consumer aborts |
+
+**Validation (r137).**  Flint Q8_0, 2× R9700: `-sm relaxed-tensor` runs at 77.9 t/s generation vs 59.5 for
+`-sm layer` (short decode-only run, not a depth-16384 measurement), greedy text **byte-identical** to
+`-sm layer` and to itself at 3 GPUs.  With the amax divisor forced to 1 (so `e != 1`), an instrumented pool
+kernel confirms each device pools its own 256-wide slice and the per-device maxima differ on ~half of the
+~185 calls per run, and the text still matches `-sm layer` exactly.  A non-amax arch (Qwen3.5-4B) is
+byte-identical under `tensor` and `relaxed-tensor`, so the mode is a no-op without the amax node;
+`ggml_pool_1d` has exactly one producer in the graph, so the state is unreachable from any other arch.
+Purity notes: `GREEDY-PURITY.md` §58.
+
+## Optional block 0101 — mixed K/V cache types (NOT in the default delivery)
+
+The mixed K/V cache types (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, head 256 only) were **block 17** in
+r287 and were moved OUT of the default set by the **r288 block-number re-org**, which gave them optional block
+number **`0101`**.  They are no longer part of `patches/` and a default `scripts/apply-all.sh` checkout does not
+contain them.
+
+* the artifact, its sha256 / produced tree, the layouts it reaches and its measurements:
+  [`../optional/mixed-kv/README.md`](../optional/mixed-kv/README.md)
+* its gate (run on the OPTIONAL-applied build, not a default release gate):
+  [`../scripts/gate-mixed-kv.sh`](../scripts/gate-mixed-kv.sh)
+* the submission, the review and the original measurements: [`../archive/work/mixed-kv/`](../archive/work/mixed-kv/)
 
 ## Dated history
 
@@ -5174,34 +5201,3 @@ inside a container), and the coalesced-span coupling is enforced: with `MOE_HOST
 arm is refused.  All three transports read the same bytes (greedy text `de81b28cab7d`; MTP acceptance identical to
 five decimal places across arms).  Gate: `scripts/gate-host-read-transport.sh`; record:
 `archive/work/host-read-transport/` + `benchmarks/2026-11-11-mtp-four-axis-host-read-transport.md`.
-
-## Block 17 — mixed K/V cache types: a q8_0 K cache with a q4_0 / q5_0 / q5_1 V cache, read natively
-
-**What it is.**  The delivery refused every `type_k != type_v` pair since 2026-09-11 because a mixed pair missed
-the native decode band and was staged through the whole-cache F16 scratch (1.7-3.6x slower, never smaller at the
-time).  Block 17 gives the tile kernel a second template parameter for V (`type_V`, defaulting to `type_KV`) and
-instantiates it for **head 256 only**: K `q8_0` with V `q4_0`, `q5_0` or `q5_1`.  The tile dispatch's V type comes
-from `ggml_cuda_fattn_tile_type_V()`, the same function the F16-scratch allocator asks, so the instantiation, the
-launcher and the allocator cannot disagree — the contract the three earlier drifts broke (the missing q4_0 arm,
-the mixed-K/V NaNs, the missing RDNA2 bf16 scratch).  `ggml_cuda_fattn_kv_mixed_native()` names the pairs, the
-RDNA4 band predicate accepts them, and `llama_init_from_model` accepts them on a model whose attention layers are
-all 256-wide and that does not use QSA (qwen4exp is refused; `GGML_OP_FLASH_ATTN_QSA` asserts `K->type ==
-V->type`).  Every other head size and pair keeps the same-type rule, and the error text names the one form.
-
-**Knobs.**  `GGML_CUDA_FA_KV_MIXED=0` (kill-switch, default on): the mixed pair takes the staged F16 path (the
-pre-block-17 behaviour); the context gate still accepts the pair.  A same-type cache does not reach the new code
-at all.  The three mixed instances are always compiled, so a build cannot accept a pair it did not compile (the
-context gate cannot see the backend's build flags; making them conditional would need a backend query).
-
-**Measured (r287, gfx1201 + gfx1100 + gfx1151).**  `test-backend-ops -o FLASH_ATTN_EXT` **7021/7021** on each
-arch, default / `GGML_CUDA_FA_KV_MIXED=0` / `GGML_CUDA_FA_KV_NATIVE=0`; W=1..8 width purity **maxdiff 0** for
-q8_0/q8_0 and all three pairs on 1 GPU, `-sm layer` and `-sm tensor`; plain == draft-mtp at n_max 1/3/7 on all
-three arches.  At `-c 131072`, 27B Q4_K_M, 3-GPU `-sm tensor`: KV **4352 MiB** (q8_0/q8_0) → **3712 / 3584 /
-3328** (q5_1 / q5_0 / q4_0), the same compute buffers and `graph splits = 2`; decode at 32768 cells is 0.3-3.2 %
-below q8_0/q8_0 and mixed sits between the same-type neighbours (47.0 vs 51.6 / 46.0 t/s at 3 GPUs, q8_0/q5_1).
-The staged kill-switch arm is 12 % behind the native read at 32768 cells and 25 % at 100000.  Quality (27B, 3-GPU
-tensor, WikiText-2, 8 x 4096): mean KLD against an f16 base 0.0071 (q8_0/q8_0), 0.0079 (q8_0/q5_1), 0.0082
-(q8_0/q5_0), 0.0074 (q8_0/q4_0) — the mixed pair is within ~11 % of the same-type q8_0/q8_0 cost.
-
-**Not covered.**  Head sizes other than 256 (still refused), other mixed pairs (still refused), and quality at
-depth (the KLD run is 4096-token chunks).  `scripts/gate-mixed-kv.sh`.

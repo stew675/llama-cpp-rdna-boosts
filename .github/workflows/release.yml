@@ -39,7 +39,9 @@ jobs:
           test -f release.json
           base="$(jq -r '.base' release.json)"
           tree="$(jq -r '.tree' release.json)"
-          n_blocks="$(jq -r '.n_blocks' release.json)"
+          n_blocks="$(jq -r '.n_blocks' release.json)"          # official 00xx blocks (v<N>)
+          n_default="$(jq -r '.n_default // .n_blocks' release.json)"  # default apply = 00xx + 03xx
+          n_optional="$(jq -r '.n_optional // 0' release.json)"
           rel="$(jq -r '.release' release.json)"
           test -n "$base" && test "$base" != "null"
           test -n "$tree" && test "$tree" != "null"
@@ -60,6 +62,8 @@ jobs:
             echo "base=$base"
             echo "tree=$tree"
             echo "n_blocks=$n_blocks"
+            echo "n_default=$n_default"
+            echo "n_optional=$n_optional"
           } >> "$GITHUB_OUTPUT"
           echo "release identity OK: ${rel}"
 
@@ -67,7 +71,10 @@ jobs:
         run: |
           set -euo pipefail
           tar czf patches.tar.gz patches/
-          sha256sum rdna-boosts-all.patch release.json patches/*.patch > SHA256SUMS
+          files=( rdna-boosts-all.patch release.json patches/*.patch )
+          opt=( optional/*/01[0-9][0-9]-*.patch )
+          [ -e "${opt[0]}" ] && files+=( "${opt[@]}" )
+          sha256sum "${files[@]}" > SHA256SUMS
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
 
@@ -77,15 +84,17 @@ jobs:
           BASE: ${{ steps.r.outputs.base }}
           TREE: ${{ steps.r.outputs.tree }}
           N_BLOCKS: ${{ steps.r.outputs.n_blocks }}
+          N_DEFAULT: ${{ steps.r.outputs.n_default }}
+          N_OPTIONAL: ${{ steps.r.outputs.n_optional }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"
           image="${REGISTRY}/${owner_lc}/${repo}"
-          notes="llama.cpp fork point \`${BASE}\`, canonical tree \`${TREE}\`, ${N_BLOCKS} patches (block 00 + blocks 01-$((N_BLOCKS-1))).
+          notes="llama.cpp fork point \`${BASE}\`, canonical tree \`${TREE}\`, ${N_DEFAULT} default patches: ${N_BLOCKS} official blocks \`0000-0015\` (a \`v${N_BLOCKS}\` release) plus the temporary block \`0300\`.
 
-          Apply with \`scripts/apply-all.sh\` on a fresh llama.cpp checkout at \`${BASE}\`; verify the artifacts against \`SHA256SUMS\`.
+          Apply with \`scripts/apply-all.sh\` on a fresh llama.cpp checkout at \`${BASE}\`; verify the artifacts against \`SHA256SUMS\`.  ${N_OPTIONAL} optional artifacts (\`optional/*/01xx-*.patch\`) are NOT in the default tree -- \`--include-optional\` applies them; they are not covered by the release gates.
 
           The release note for this tag is the top of \`WORKLOG.md\` (newest first); the apply order and the verification contract are \`MANIFESTS.md\`.
 

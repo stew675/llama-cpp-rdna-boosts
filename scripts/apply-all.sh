@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Apply the full rdna-boosts patch set (block 00 + blocks 01-N; N from release.json.n_blocks)
-# to a clean llama.cpp checkout at the recorded baseline.
+# Apply the full rdna-boosts DEFAULT patch set to a clean llama.cpp checkout at the recorded
+# baseline: **ALL official `00xx` blocks, then ALL temporary `03xx` blocks** (`0000`-`0099`
+# then `0300`-`0399`, in order; the count is release.json.n_default).  Optional blocks
+# (`optional/<name>/01xx-*.patch`) are NOT part of it -- they are applied last, and only with
+# --include-optional / --include-optional-all.
 #
 # Usage: ./apply-all.sh [--include-optional [--include-optional-all]] [--include-beta]
 #                      [llama.cpp-checkout] [rdna-boosts-repo]
-#   --include-optional   also apply the optional/<name>/*.patch artifacts, after the release blocks and
-#                        before the beta candidates (OPTIONAL: tracked as extra commits, and the checkout
-#                        is then NOT the release tree -- see optional/README.md).  Steps through the
-#                        artifacts one by one and asks [y/N] for each (default: N), so a consumer opts in
-#                        to the specific feature they want instead of the whole set.
+#   --include-optional   also apply the optional/<name>/01xx-*.patch artifacts, after the default blocks
+#                        and before the beta candidates (OPTIONAL: tracked as extra commits, and the
+#                        checkout is then NOT the release tree -- see optional/README.md).  They are
+#                        applied in NUMERIC block order (0100 before 0101), not directory order, and
+#                        each is cut against the default tree.  Steps through them one by one and asks
+#                        [y/N] for each (default: N), so a consumer opts in to the specific feature they
+#                        want instead of the whole set.
 #   --include-optional-all
 #                        apply every optional artifact without asking.  This is the non-interactive form
 #                        (a scripted apply, CI, a gate); it is required when stdin is not a terminal.
@@ -75,7 +80,7 @@ if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
 fi
 git checkout -q -b "$BRANCH"
 
-# Blocks 01-17: git am (commits each with the original subject).  Strict
+# The default chain: git am (commits each with the original subject).  Strict
 # first: on the recorded baseline this is exact (tree == canonical fork tip by
 # construction).  On failure, abort (returns the branch to the baseline) and
 # retry the whole series with `git am -3`, warning loudly that merged hunks
@@ -91,7 +96,28 @@ git checkout -q -b "$BRANCH"
 # checkout, every machine and every OS user produce the same commit ids, so `.tip` is
 # reproducible and verifiable (validate-set.sh compares it, scripts/fork-refresh.sh
 # prints it).
-SERIES_AUTHOR="$(sed -n 's/^From: //p' "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch | head -1)"
+# The default apply order is explicit: ALL official 00xx blocks first, then ALL temporary 03xx blocks
+# (a 03xx block is in the DEFAULT set but is not an official block -- `release.json.n_blocks` counts
+# only the 00xx ones, so this list is n_default long).  Sorted globs make 03xx last anyway; building
+# the array keeps that a contract rather than a side effect of ASCII order.
+shopt -s nullglob
+_any_patches=( "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch )
+for _p in "${_any_patches[@]}"; do
+    case "$(basename "$_p")" in
+        00[0-9][0-9]-*|03[0-9][0-9]-*) ;;
+        01[0-9][0-9]-*)
+            echo "ERROR: $(basename "$_p") is an OPTIONAL (01xx) block; it belongs in optional/<name>/" >&2
+            exit 1 ;;
+        *)
+            echo "ERROR: $(basename "$_p") is outside the default ranges (00xx official, 03xx temporary)" >&2
+            exit 1 ;;
+    esac
+done
+DEFAULT_PATCHES=( "$PATCHES"/00[0-9][0-9]-*.patch "$PATCHES"/03[0-9][0-9]-*.patch )
+shopt -u nullglob
+[ "${#DEFAULT_PATCHES[@]}" -gt 0 ] || { echo "ERROR: no default patches in $PATCHES (00xx/03xx)" >&2; exit 1; }
+
+SERIES_AUTHOR="$(sed -n 's/^From: //p' "${DEFAULT_PATCHES[0]}" | head -1)"
 SERIES_NAME="${SERIES_AUTHOR% <*}"
 SERIES_MAIL="${SERIES_AUTHOR##*<}"
 SERIES_MAIL="${SERIES_MAIL%%>*}"
@@ -104,17 +130,19 @@ export GIT_COMMITTER_EMAIL="$SERIES_MAIL"
 GIT_AM_DET=--committer-date-is-author-date
 
 APPLIED_WITH_3WAY=0
-if ! git am $GIT_AM_DET "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch; then
+if ! git am $GIT_AM_DET "${DEFAULT_PATCHES[@]}"; then
     echo "strict 'git am' failed at this base; aborting and retrying the series with 'git am -3' (3-way merge)" >&2
     git am --abort >/dev/null 2>&1 || true
-    git am $GIT_AM_DET -3 "$PATCHES"/[0-9][0-9][0-9][0-9]-*.patch
+    git am $GIT_AM_DET -3 "${DEFAULT_PATCHES[@]}"
     APPLIED_WITH_3WAY=1
 fi
 
 echo
-N_BLOCKS=12
+# n_default is the DEFAULT patch count (official 00xx + temporary 03xx); n_blocks is the official
+# count only and is what the v<N> tag names -- do not use it for the apply count.
+N_BLOCKS="${#DEFAULT_PATCHES[@]}"
 if [ -f "$RELEASE_JSON" ] && command -v jq >/dev/null 2>&1; then
-    _nb="$(jq -r '.n_blocks // empty' "$RELEASE_JSON" 2>/dev/null || true)"
+    _nb="$(jq -r '.n_default // .n_blocks // empty' "$RELEASE_JSON" 2>/dev/null || true)"
     [ -n "$_nb" ] && N_BLOCKS="$_nb"
 fi
 if [ "$APPLIED_WITH_3WAY" -eq 1 ]; then
@@ -159,9 +187,17 @@ echo "Applied tip: $(git rev-parse --short=9 HEAD) (this is the value for releas
 # ---------------------------------------------------------------------------
 OPTIONAL_COUNT=0
 if [ "$INCLUDE_OPTIONAL" -ne 0 ]; then
+    # 01xx only (the optional block range), ordered by the NUMERIC basename so 0100 is applied before
+    # 0101 regardless of directory name.  A plain path glob would sort by directory first.
     shopt -s nullglob
-    OPTIONAL_PATCHES=( "$RDNA"/optional/*/*.patch )
+    _opt_files=( "$RDNA"/optional/*/01[0-9][0-9]-*.patch )
     shopt -u nullglob
+    OPTIONAL_PATCHES=()
+    while IFS= read -r _line; do
+        [ -n "$_line" ] && OPTIONAL_PATCHES+=( "${_line#*$'\t'}" )
+    done < <( for _p in "${_opt_files[@]}"; do
+                  printf '%s\t%s\n' "$(basename "$_p" | cut -c1-4)" "$_p"
+              done | LC_ALL=C sort -n )
     echo
     # where the [y/N] answers come from: the caller's stdin when it is a terminal, else the controlling
     # terminal.  /dev/tty exists as a path even with no controlling terminal, so it has to be opened to
@@ -175,7 +211,7 @@ if [ "$INCLUDE_OPTIONAL" -ne 0 ]; then
         fi
     fi
     if [ "${#OPTIONAL_PATCHES[@]}" -eq 0 ]; then
-        echo "No optional artifacts found under optional/*/*.patch -- nothing to add."
+        echo "No optional artifacts found under optional/*/01xx-*.patch -- nothing to add."
     elif [ "$INCLUDE_OPTIONAL" -eq 1 ] && [ -z "$OPT_TTY" ]; then
         echo "ERROR: --include-optional asks [y/N] for each artifact and there is no terminal to ask on." >&2
         echo "       Use --include-optional-all to apply every optional artifact non-interactively." >&2
@@ -209,7 +245,7 @@ if [ "$INCLUDE_OPTIONAL" -ne 0 ]; then
             echo "No optional artifact selected -- the checkout is the release tree."
         else
             echo
-            echo "Applying ${#SELECTED_PATCHES[@]} OPTIONAL artifact patch(es) on top of the release tree:"
+            echo "Applying ${#SELECTED_PATCHES[@]} OPTIONAL artifact patch(es) in numeric order on top of the release tree:"
             for p in "${SELECTED_PATCHES[@]}"; do
                 echo "  ${p#"$RDNA"/}"
             done

@@ -18,11 +18,14 @@ campaign records.
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **18-block V2.1 set** (block 00 + blocks 01-17) at fork point **`4f9dfa0e3`**
-(the 2026-11-13 r278 re-base); read `.release` in `release.json` for the release id -- it is the source of
-truth, not this line.  Block 15 is the **streamed KV** (the resident window, the attendance pool and the MTP
-draft window -- all three opt-in, default off).  Block 17 is the **mixed K/V cache types** (r287, PR #312; the one native pair, head 256 only).  `release.json` is the source of truth for the
-tip/tree and hashes; the top of `WORKLOG.md` is the newest record.  **Block 14 is temporary** (item #104).
+**Current state:** the **17-patch default set** (16 official blocks `0000`-`0015` + the temporary `0300`)
+at fork point **`4f9dfa0e3`** (the 2026-11-13 r278 re-base); read `.release` in `release.json` for the
+release id -- it is the source of truth, not this line.  Block 14 is the **streamed KV** (the resident
+window, the attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA
+GTT expert store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number
+re-org (they were block 17 in r287, PR #312; the one native pair, head 256 only), and `0100` is two-lane
+prefill.  `release.json` is the source of truth for the tip/tree, counts and hashes; the top of `WORKLOG.md`
+is the newest record.  **Block `0300` is temporary** (item #104).
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
 are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the
@@ -226,7 +229,7 @@ its A/B and it is documented bit-identical to the triple, §69); **MMB's fused G
    the per-block ladder for the blocks touched.
 
 **Where it lands.**  Blocks **06** (MMB), **08** (the old-08 fusions), **09/12** (the cache and scheduler contracts:
-`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 15/16 untouched.  **No new environment variable** --
+`sched_stage_split`, `moe-expert-cache.{cu,h}`); blocks 14/15 untouched.  **No new environment variable** --
 `MOE_EXPERT_PREFILL_IN_PLACE` stays a kill switch, and the per-fusion bisect arms already exist
 (`GGML_CUDA_MMB_GLU`, `GGML_PAIR_ROUTED_OFF`, `GGML_CUDA_DISABLE_FUSION`).
 
@@ -254,7 +257,7 @@ asking too much of too little.
 
 **The answers, in order** (cheaper than a cold-source redesign, and why nothing is owed): `MOE_EXPERT_CACHE_MIB=0`
 is 2.2x faster than the declining arm; or `-lme auto` (the covering mirror) / `--host-experts pinned` (exempt by
-construction); or recover the capped VRAM with block 15's streaming KV (`--kv-window`, `--kv-attendance-pool`).
+construction); or recover the capped VRAM with block 14's streaming KV (`--kv-window`, `--kv-attendance-pool`).
 Not shipped on purpose: a WARN for the cell (a code change and a gate for a configuration the delivery does not
 validate, when `decline_all`/`takeover=` already name it at `-lv 4`).
 
@@ -332,7 +335,7 @@ refusal for a pool allocation the driver will not give.  The shipped guard is me
 refused `cudaHostAlloc` logs once and latches the pinned tier off, and no new pool is attempted after it.  The old
 `TODO` #95 pointer (the reporter's r227 log) has left this file; **re-entry is that log.**
 
-### No handle — block 16's GTT tier does not reach a multi-device split, or Windows, or a discrete box
+### No handle — block 15's GTT tier does not reach a multi-device split, or Windows, or a discrete box
 
 Three limits of the same tier, recorded together because they are one hardware story:
 
@@ -347,5 +350,5 @@ Three limits of the same tier, recorded together because they are one hardware s
   but the store/arena is **inert on a discrete GPU by measurement** (forced-on envs produce zero `GTT` lines:
   `plan_gtt_expert_store()` is only reached from the UMA branch, `gtt_store_open()` is never called, and
   `moe_cache_prefill_stream()` declines on `!g_gtt_arena`), so that arm cannot witness this tier there.  The width
-  arm's own subject is decode width (blocks 12/15) and it lives in the MTP protocol, not here.  Record:
+  arm's own subject is decode width (blocks 12/14) and it lives in the MTP protocol, not here.  Record:
   `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.

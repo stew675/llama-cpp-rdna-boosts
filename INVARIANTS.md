@@ -22,23 +22,34 @@ change), and let `WORKLOG.md` carry the narrative.
 > "the `AGENTS.md` fact about <Y>" — those now live here.  `AGENTS.md` keeps the policy and a short
 > "rules you must know before changing anything" list that points at this file.
 
+> **Block numbering changed in r288 (the block-number re-org).**  The default set is now the 16 official
+> blocks `0000`-`0015` plus the temporary `0300`; the mixed K/V types are optional `0101` and two-lane
+> prefill optional `0100`.  Mapping from the r287 numbering: old `0014` (relaxed-tensor) -> **`0300`**,
+> old `0015` (streamed KV) -> **`0014`**, old `0016` (UMA GTT) -> **`0015`**, old `0017` (mixed K/V) ->
+> **optional `0101`**.  **Dated entries below keep the block number they were written with** (an `rNN`
+> entry that says "block 15" means the streamed KV, i.e. today's block 14; a note from before V2.0 may use
+> the old pre-2026-10 numbering instead — see the mapping at the top of `GREEDY-PURITY.md` and
+> `WORKLOG.md` r288).  Only the current-state bullets and section titles are updated in place.
+
 ---
 
 - **`llama-cli` MUST be run with `--single-turn`** (plus `--no-display-prompt` for scripted output).
   Without it, the interactive chat loop blocks forever. Wrap potentially blocking commands in `timeout`.
-- **Apply method:** all 18 blocks with **`git am`**; `scripts/apply-all.sh` is the tested path. Plain
-  `git apply` of the concatenated series **silently drops hunks**. Every block is a normal commit.
-- **Naming (V2.1):** the current set is **18 blocks, 00-17** (block 15 is the **streamed KV** — both Goals
-  A and B of `TODO` #118; block 14 is the temporary `-sm relaxed-tensor` block, see `patches/README.md`;
-  the release tag lives in `release.json` — read `.release` there, it is never restated here).  **15**
-  carries **two opt-in placements of the same cache**, mutually exclusive by construction: the **window**
+- **Apply method:** the **17 default patches** with **`git am`** (`00xx` then `03xx`); `scripts/apply-all.sh`
+  is the tested path. Plain `git apply` of the concatenated series **silently drops hunks**. Every block is a
+  normal commit.  The optional `01xx` blocks are applied only with `--include-optional[-all]`.
+- **Naming (r288):** the current default set is **16 official blocks, 00-15**, plus the temporary **`0300`**
+  (block 14 is the **streamed KV** — both Goals A and B of `TODO` #118; `0300` is the temporary
+  `-sm relaxed-tensor` block, see `patches/README.md`; the release tag lives in `release.json` — read
+  `.release` there, it is never restated here).  **14** carries **two opt-in placements of the same cache**,
+  mutually exclusive by construction: the **window**
   (r178; `--kv-window`, formerly `LLAMA_KV_RESIDENT_CELLS` — an opt-in fixed-VRAM resident window with the
   tail in pinned system RAM, one VA range, no kernel change) and the **attendance pool** (r190;
   `--kv-attendance-pool`, formerly `--kv-region-pool` — the
   authoritative copy in a pinned host mirror plus a compact device pool the sparse decode arm resolves its
   top-k through), plus the streaming arm policy that makes either take the sparse decode (r190).  Both are
   **default OFF** — fittability features, and on a config whose KV fits they cost the sparse-vs-dense gap.
-  Since **r246 block 15's own knobs are first-class command-line options, not environment variables**; since
+  Since **r246 block 14's own knobs are first-class command-line options, not environment variables**; since
   **r247 all three placements default to OFF** with the same semantics (`auto` = the system picks the size,
   `N` = explicit, default = neither): `--kv-window [auto|N]` (the resident window, promoted from
   `LLAMA_KV_RESIDENT_CELLS`, which remains as its deprecated alias), `--kv-attendance-pool [on|off]` (renamed
@@ -52,18 +63,20 @@ change), and let `WORKLOG.md` carry the narrative.
   `!offload`, and the window now declines on `!offload` too — with `-nkvo` the cache is pageable host RAM end to
   end, so there is nothing to window (before r197 it announced a VRAM window and then built a plain `CPU KV
   buffer`, and `is_streaming()` took qwen4exp's sparse arm off that plan).  `is_streaming()` therefore keys on
-  `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **15 also carries Goal C** (r193,
+  `kv_region`, the placement actually taken, not on `kv_resident_cells`, the plan.  **14 also carries Goal C** (r193,
   `--spec-draft-kv-window`): the MTP draft context's KV is a *window* instead of `-c` cells, **default `0`**
   since r247 (a full `-c` draft cache; `auto` = THE CAP OR NOTHING and `N` = cells are a conscious opt-in — the
   earlier "measures non-negative" claim is corrected by the r247 entry below), and **when a window is active** an
   embedded MTP head's slab draft reserve is derived with it (aux 3.50 -> 0.76 GiB, arena +2.8 GiB).  MTP only, embedded-head only; a separate MTP draft GGUF (qwen4exp/Flash-Next) keeps its full
   cache.  The ring is `find_slot`'s `n_swa` reclaim, so no allocator and no mask change — and `kq_mask_derivable`
   needs **no** exclusion, because its predicate compares each cell's *position*.
-- **Block 16 is the UMA GTT expert store and block 17 is the mixed K/V cache types (r263 / r287).**  Block 16
-  (an APU's MoE expert set in one registered region, `-lme`-sized) has its own section below.  Block 17 adds
-  the one mixed K/V pair the delivery reads natively (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, 256-wide heads
-  only, qwen4exp refused; default on, `GGML_CUDA_FA_KV_MIXED=0` restores the staged path); every other mixed
-  pair is still refused.  See the mixed-K/V bullet above and `scripts/gate-mixed-kv.sh`.
+- **Block 15 is the UMA GTT expert store and optional block `0101` is the mixed K/V cache types (r263 / r287,
+  optional since r288).**  Block 15 (an APU's MoE expert set in one registered region, `-lme`-sized) has its
+  own section below.  Optional `0101` (formerly block 17, moved out of the default set by the r288 re-org) adds
+  the one mixed K/V pair the delivery can read natively (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, 256-wide heads
+  only, qwen4exp refused; default on when the artifact is applied, `GGML_CUDA_FA_KV_MIXED=0` restores the staged
+  path); every other mixed pair is still refused, and the default build does not contain the code at all.  See
+  the mixed-K/V bullet above, `optional/mixed-kv/README.md` and `scripts/gate-mixed-kv.sh`.
 - **The MTP draft window is PER SEQUENCE, and the cache is sized per sequence when the KV is unified (r200,
   issue #264).**  Under `--kv-unified` the one draft cache holds every sequence, so its cell count is
   `(win + one batch) x n_seq_max` (capped at the context) — the r193-r199 `win + n_ubatch` shape was shared by

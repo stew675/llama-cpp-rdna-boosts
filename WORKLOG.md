@@ -1,3 +1,109 @@
+## 261114.009 (r288) -- the block-number re-org: 16 official blocks `0000`-`0015` + the temporary `0300` + the optional `0100`/`0101`, and the mixed K/V cache leaves the default set; no code change, so the tag goes `v18` -> **`v16`**
+
+**`release.json` changed: release `v18-4f9dfa0e3-r287` -> `v16-4f9dfa0e3-r288`; 18 patches -> 17 default
+(16 official + 1 temporary) + 2 optional; `n_blocks` 18 -> 16, plus the new `n_default` 17,
+`n_temporary` 1, `n_optional` 2, an `optional` map and `optional_tree`; tip `f8c79c35c9…` ->
+`8b653ad6d64fda0703c240ed8deb0cb15c2b44b5`, tree `89b25552…` -> `79d18f41b9ab9b235d35fd3a5034858eddd94844`;
+base unchanged (`4f9dfa0e3`).**  **No block's code changed.**  This is a *structure* change: the apply order,
+the ranges and the counts.  The re-org was the maintainer's call (`wip/block-number-reorg/`, now
+`archive/work/block-number-reorg/`), not a gate outcome.
+
+**The ranges (now `AGENTS.md` policy).**  `00xx` = official supported blocks, contiguous from `0000`; `03xx`
+= **temporary** blocks, in the default apply after every `00xx`, **not** counted in `v<N>`; `01xx` =
+**optional** blocks under `optional/<name>/<NNNN>-<name>.patch`, applied only by
+`scripts/apply-all.sh --include-optional[-all]`, in numeric order, after the verified default tree.  The
+default apply is therefore **all `00xx` then all `03xx`** (`release.json.n_default` patches).
+
+| was | is | note |
+|---|---|---|
+| `0014` `-sm relaxed-tensor` (temporary) | **`0300`** | re-ported onto the new tip; applied last, not an official block |
+| `0015` streamed KV | **`0014`** | same bytes, new number |
+| `0016` UMA GTT expert store | **`0015`** | same bytes, new number |
+| `0017` mixed K/V cache types | **optional `0101`** | left the default set; `optional/mixed-kv/` |
+| (unnumbered) `optional/two-lane-prefill` | **optional `0100`** | `optional/two-lane-prefill/0100-two-lane-prefill.patch` |
+
+**Why `v16`, not `v17`.**  `N` is the number of **defined official blocks in `0000`-`0099`** only: 16
+(`0000`-`0015`).  `0300` is temporary and `0100`/`0101` are optional, so none of them counts.  The
+`v<N>` prefix is now **derived** by `scripts/make-release.sh` from that count (it refuses a `--release`
+whose prefix disagrees), never hand-written.
+
+* **Invariant 1 — the default tree is unchanged.**  `0000`-`0015` + `0300` builds
+  `79d18f41b9ab9b235d35fd3a5034858eddd94844`, byte-identical to r287's default tree with block 17 removed
+  (r287's `83d2593fe^{tree}`).  The intermediate trees *do* differ from r287's (old `0014`'s content now
+  arrives last), which is why the temporary block was re-ported rather than renamed; the final tree is the
+  contract and it matches.
+* **Invariant 2 — mixed K/V is preserved, bit for bit.**  The default tree + optional `0101` produces
+  `89b2555296146290f556f1cf017ed6ee124dfce6`, **exactly the r287 release tree**: moving block 17 to the
+  optional set changed no byte of it.  Cumulative `0100` then `0101` = `d85868cdd23447b4d7fa0f9b9f5f7bb5fa7363cf`
+  (the two artifacts do not conflict; numeric order is the contract `--include-optional-all` gives a
+  consumer).
+* **Invariant 3 — two-lane is preserved.**  The r285 artifact applied **strictly** on the r288 default tree
+  with nothing to reconcile, so its diff is byte-identical (a mechanical re-cut, not a port; recorded in
+  `optional/two-lane-prefill/README.md` item 19).  It produces `1bfccf843b7da66ac2d464bd7b89c27d02a426be`.
+  Re-measured: prefill **5312.7 / 5712.5 -> 6797.6 / 6813.7 t/s** (35B-A3B Q8_0, 5 298-token prose prompt,
+  `-sm layer -ot`, `-b 2048 -ub 2048`, `MOE_EXPERT_HEATMAP=load`), **+23.5 %** on the 1-lane mean (the r285
+  cut: 5426.6 -> 6815.6, +25.6 %), with the pair really engaging (3 x `pair decided: splits a=4 b=4,
+  interleaved=1`).  The 1-lane arm spreads ~7 % between two identical runs (5312.7 / 5712.5), so judge the
+  gain against both, not one.
+* **Gates, default tree.**  Full build of the new default tree (`~/bin/build-llama-rocm`, all targets,
+  0 errors).  Coherence identical to the r287 build on 1 GPU and 3-GPU `-sm tensor`: `1c5d32ac537d` on all
+  four arms.  `scripts/gate-prefill-logits.sh` **PASS, mean KLD 0.000697 / same-top-p 98.784 %** — the
+  release's own reading, so the default path did not move.  `scripts/gate-per-block-build.sh --fast
+  --changed-from f8c79c35c` **3/3 built** in 838 s: blocks 00-13 are skipped as delta-identical (their
+  commit ids are literally unchanged: `7d3f2c726` … `13d2196fd`), and the three re-ordered/renumbered commits
+  (`4d714fad6` streamed KV, `78b2427ad` UMA, `8b653ad6d` `0300`) each build the release profile.  GPU-fault
+  scan clean.
+* **Gates, optional build.**  Build of default + `0100` + `0101` (`d85868cdd`), 0 errors.
+  `scripts/gate-mixed-kv.sh` on that build: **PASS 12/12** — `FLASH_ATTN_EXT` 7021/7021 in the default,
+  `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms, W=1..8 width purity maxdiff 0 for
+  q8_0/q8_0 and the three pairs at `-sm tensor`, four greedy text arms, kernel journal clean.  The refusals
+  were SKIPped (no `--other-model` / `--qsa-model` was passed on this box); they are unchanged code and are
+  covered by the r287 run.  Two-lane numbers above.
+* **`scripts/validate-set.sh` is green** on the new layout: 17 default patch sha256 + counts
+  (official/temporary/default/optional) vs the files, strict 17/17 apply on a fresh tarball of the base,
+  base/applied tree equality, the every-block-tree conflict-marker scan, each optional artifact applied
+  **alone** and compared to its recorded tree, the cumulative numeric order against `optional_tree`, and the
+  Windows portability lint over `HEAD~17`.
+* **The tip is reproducible** — a fresh checkout of `4f9dfa0e3` + `scripts/apply-all.sh` prints
+  `8b653ad6d`.  The fork's `rdna-boosts` branch still carries r287's `f8c79c35c` **because this change was
+  not published**: no push, no tag, no fork refresh (deliberate — the maintainer publishes).  The
+  release-time `scripts/fork-refresh.sh` re-cuts and verifies `.tip`/`.tree` before the branch moves.
+
+**Tooling (the old globs are gone, not left beside the new ones).**
+* `apply-all.sh`: builds the default list as **all `00[0-9][0-9]` then all `03[0-9][0-9]`** and refuses any
+  other number in `patches/` (an `01xx` there is an error, not silently skipped); reads `n_default` for the
+  count; the optional list is `optional/*/01[0-9][0-9]-*.patch` sorted by **numeric basename** (0100 before
+  0101, not directory order) and applied with strict `git am` on the verified tree; `--include-beta`
+  unchanged.
+* `make-patches.sh`: exports `BASE..TIP` and **names every file after the block number in its own subject**
+  (`00`->`0000`, `0300`->`0300`), so it generalises to more than one `03xx` and refuses a `01xx` in the
+  chain; `--optional NNNN=<rev>[:<dir>]` exports one optional artifact as
+  `optional/<dir>/NNNN-<dir>.patch` and refuses a `<rev>` whose parent is not the default tip;
+  `rdna-boosts-all.patch` is the default tree only.
+* `make-release.sh`: `n_blocks` = official `00xx`, `n_temporary` = `03xx`, `n_default` = their sum,
+  `n_optional` + an `optional` map `{dir, sha256, tree}` + `optional_tree`; the `v<N>-` prefix is derived
+  from the official count; a re-cut artifact needs an explicit `--optional-tree` (only an unchanged sha256
+  inherits one), and `validate-set.sh` re-derives both trees.
+* `validate-set.sh`: default apply/commit count/Windows diff all use `n_default`; the optional check applies
+  each artifact alone (tree compared to `release.json.optional`) and then the numeric order (compared to
+  `optional_tree`); messages name official / temporary / default / optional separately.
+* `fork-refresh.sh` verifies the commit count against `n_default`; `gate-mixed-kv.sh` is retitled as
+  **optional block `0101`** and says it runs on the optional-applied build (`MANIFESTS.md` gate 7 no longer
+  lists it as a default release gate); the CI workflows read `n_default` for the reconstruction/apply count
+  while the tag and the `RELEASE_BLOCKS` label keep the **official** `n_blocks`, and `release.yml` hashes
+  the optional patches too.
+* New artifact `optional/mixed-kv/` (README with the trees/measurements/history); `optional/two-lane-prefill`
+  re-cut and renamed; `archive/work/mixed-kv/` re-headed as the submission record (it now points at the live
+  artifact).
+
+**Docs.**  Current-state references updated in `README.md`, `patches/README.md` (block index + sections
+renumbered, block 17's section replaced by a pointer to the artifact), `MANIFESTS.md`, `BASELINE.md`,
+`AGENTS.md` (the ranges are now policy; the layout table), `TODO.md`, `INVARIANTS.md`, `GREEDY-PURITY.md`,
+`ENVIRONMENT.md` (§17 -> block 14, §20 -> block 15, §18 + the `GGML_CUDA_FA_KV_MIXED` row -> optional 0101),
+`scripts/README.md`, `optional/README.md`, `CONTAINERS.md`.  Dated entries keep the block numbers they were
+written with; each of those files carries the r288 mapping note at the top.  Record:
+`archive/work/block-number-reorg/` (the handover and this entry).
+
 ## 261114.008 (r287) -- PR #312 is accepted as **block 17**: a q8_0 K cache with a q4_0 / q5_0 / q5_1 V cache is read natively on 256-wide heads, the QSA model and every other pair stay refused, and the default path is bit-identical (prefill-logit 0.000697 / 98.784 % f16, 0.000580 / 98.882 % q8_0)
 
 **`release.json` changed: tip `83d2593fe` -> `f8c79c35c9b56964ab7019569afda75678b506a7`, tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` ->

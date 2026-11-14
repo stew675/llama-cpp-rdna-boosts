@@ -1,8 +1,8 @@
-From 387f0ddd8a15046fe54856858beeaf7be864b893 Mon Sep 17 00:00:00 2001
+From 0903970d9691c088dfd99f08294fabfa129082dc Mon Sep 17 00:00:00 2001
 From: Marvin Johanning <email@marvinjohanning.de>
 Date: Sat, 14 Nov 2026 16:30:09 +0100
-Subject: [PATCH 17/17] rdna-boosts: block 17: mixed K/V cache types -- a q8_0
- K cache with a q4_0/q5_0/q5_1 V cache, read natively
+Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types -- a q8_0 K
+ cache with a q4_0/q5_0/q5_1 V cache, read natively
 
 The delivery's context gate has refused every mixed K/V cache type since 2026-09-11
 (`type_k != type_v`), because a mixed pair missed the native decode band and was staged
@@ -39,9 +39,17 @@ between the same-type neighbours (47.0 vs 51.6 / 46.0 t/s at 3 GPUs, q8_0/q5_1).
 staged kill-switch arm is 12 % behind the native read at 32768 cells and 25 % at 100000.
 
 Not covered: head sizes other than 256 (still refused), other mixed pairs (still refused),
-and quality at depth (KLD was measured at 4096-token chunks).  The original artifact,
-review and measurements are in `optional/mixed-kv/` in PR #312; promoted into the
-delivery as block 17 after the gate ladder in `MANIFESTS.md`.
+and quality at depth (KLD was measured at 4096-token chunks).  The submission, the review and
+the measurements are in PR #312 and `archive/work/mixed-kv/`; the artifact itself lives in
+`optional/mixed-kv/`.
+
+Block history: this was promoted into the delivery as block 17 in r287.  The r288 block-number
+re-org moved it OUT of the default set as optional block 0101 (the default set is now the 16
+official blocks 0000-0015 plus the temporary 0300); its measured trade -- a smaller KV cache for
+0.3-3.2 % decode at depth -- makes it a fittability opt-in in the same class as block 0014's KV
+window.  It is applied with `scripts/apply-all.sh --include-optional` and is not covered by the
+delivery's release gates; its own gate is `scripts/gate-mixed-kv.sh`, run on the
+optional-applied build.
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++

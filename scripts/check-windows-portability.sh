@@ -64,7 +64,7 @@
 # Exit: 0 = clean, 1 = findings, 2 = usage/prerequisite error.
 #
 # The caller that matters is scripts/validate-set.sh (tier-1 CI, no compiler): it runs this on the
-# freshly applied tree with `--diff-from HEAD~n_blocks`, so only what the delivery adds or inserts is
+# freshly applied tree with `--diff-from HEAD~n_default`, so only what the delivery adds or inserts is
 # judged -- added files whole, edited files on their inserted lines.
 set -uo pipefail
 

@@ -1,3 +1,10 @@
+> **CLOSED (r288, 2026-11-14) — this campaign is done and archived.**  The re-org it describes was
+> applied in r288: 16 official blocks `0000`-`0015` + the temporary `0300` + the optional `0100`/`0101`
+> (the mixed K/V cache left the default set), release `v16-4f9dfa0e3-r288`.  Everything below is the
+> handover as it was written, kept as the campaign record; the result, the tree identities, the `v16`
+> arithmetic and the gate numbers are in `WORKLOG.md` (r288, the top entry) and the mapping is carried in
+> the current-state headers of `AGENTS.md`, `patches/README.md`, `MANIFESTS.md` and `BASELINE.md`.
+
 # Handover prompt — block-number re-org (0300 / 0100 / 0101, close the 0014 gap)
 
 You are starting cold in `/home/stew675/llama-cpp-rdna-boosts` (the delivery repo; the fork is

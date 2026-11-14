@@ -118,7 +118,8 @@ base="$(jq -r .base "$MANIFEST")"
 tip="$(jq -r .tip "$MANIFEST")"
 tree="$(jq -r .tree "$MANIFEST")"
 release="$(jq -r .release "$MANIFEST")"
-n_blocks="$(jq -r .n_blocks "$MANIFEST")"
+n_blocks="$(jq -r .n_blocks "$MANIFEST")"          # official 00xx blocks (the label / release identity)
+n_default="$(jq -r '.n_default // .n_blocks' "$MANIFEST")"
 for x in base tip tree release; do
     v="$(eval "echo \$$x")"
     [ -n "$v" ] && [ "$v" != "null" ] || die "release.json is missing .$x"
@@ -129,7 +130,7 @@ done
 # Every image now also gets a `<tag>-<release>` tag, and the image labels name the release (and its canonical
 # tip) instead of only the fork point, so `docker inspect` answers the question.  The fork-point tags stay for
 # compatibility and are what the GHCR retention keep-rule matches.
-echo "==> release ${release} (fork point ${base} -> tip ${tip}, ${n_blocks} blocks, tree ${tree})"
+echo "==> release ${release} (fork point ${base} -> tip ${tip}, ${n_blocks} official + 0300 temporary = ${n_default} default patches, tree ${tree})"
 echo "==> engine=${ENGINE}  image=${IMAGE}  src=${SRC}"
 
 remove_src() {

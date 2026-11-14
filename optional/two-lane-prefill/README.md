@@ -1,31 +1,39 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Re-cut on `r285`** (against `release.json` tree
-`39ad82e0e7ad754eb52c5e833840e072195d6942`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their
-measurements are kept below as the dated record).  The r285 rebase is a **port, not a replay**: the delivery
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r288`** (against the
+r288 default delivery tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
+temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
+as the dated record).  The r288 re-cut is **mechanical**: the r285 patch applied STRICTLY on the r288 default
+tree with nothing to reconcile, so the artifact's diff is byte-identical to the r285 cut and the r285 numbers
+below stand (r285 -> r288 moved only the KV-window/spill, 2-D state-copy, `llama-bench` and `fit` code, outside
+this artifact's own mechanisms).  The r288 block-number re-org is also what gave it the `0100` number; it was
+an unnumbered `two-lane-prefill.patch` before.  The r285 rebase was a **port, not a replay**: the delivery
 rewrote both files the artifact owns between r259 and r284 (D10's "do not upload an input that is not read"
 now gates both copy passes; the copy helper is keyed per input slot; the decode loop grew the nextn/h_nextn
 device path and the `has_next`-gated readback).  The artifact's own mechanisms are unchanged (arm gate,
 sub-ubatch split, pair/hazard analysis, per-lane output extraction); `What changed in the rebase` item 16 says
-exactly what had to be reconciled.
+exactly what had to be reconciled, and item 19 records the r288 re-cut.
 
 From **PR #268, #279, #284, #296 then #301 by [@slavap](https://github.com/slavap)**, rebased onto the delivery,
 reviewed and amended (see *What changed in the rebase* below).  The submitter's own description and measurements
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
-* `two-lane-prefill.patch` — the artifact.  sha256 `9ec906a277938e3c5327042e908cd089ce0a4c7771a675b281c841a41474892d`
-* applies at `release.json` tree `3a6304107…` (r285), produces tree `772c652409f2f5830edbce0fcee37077ed787889`
-  (the r284 tree `39ad82e0e…` produced `a9384ba7dce5b8d341de1ba63ad974af12ea2492`; the r285 delivery is the r284
-  tree plus the two comment corrections of `TODO` #326, so the artifact's own bytes are unchanged)
-  (verified by strict `git am` on a fresh checkout of the r285 `rdna-boosts` branch; the r259 cut produced
-  `d1c3f0f9c3…` on `7995db44…`, the r254 cut `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…` on
-  `8f99d2dc6d…`)
+* `0100-two-lane-prefill.patch` — the artifact.  sha256
+  `d17958a29d4847c6541544baaa53760fcfb2df03e2f3dcdd98262e709d07a5ba`
+* applies at the r288 default tree `79d18f41…`, produces tree `1bfccf843b7da66ac2d464bd7b89c27d02a426be`
+  (the r285 cut, sha256 `9ec906a277…`, produced `772c652409f2f5830edbce0fcee37077ed787889` on the r285 tree
+  `3a6304107…`; the r284 tree `39ad82e0e…` produced `a9384ba7dce5b8d341de1ba63ad974af12ea2492`; the r259 cut
+  produced `d1c3f0f9c3…` on `7995db44…`, the r254 cut `896446c422…` on `3f2cad2a…`, the r247 cut `17f51fb30c…`
+  on `8f99d2dc6d…`).  The r288 tree is a different base, so a different produced tree is expected — the
+  **diff** is unchanged and applied strictly.
 * ```bash
   bash scripts/apply-all.sh --include-optional <clean-llama.cpp-at-release.json.base>
-  # --include-optional steps through the artifacts and asks [y/N] for each one
+  # --include-optional steps through the artifacts in NUMERIC block order and asks [y/N] for each one
+  # (0100 two-lane-prefill, then 0101 mixed-kv); --include-optional-all applies both, non-interactively
   ```
-  (r285: it is now the **only** artifact in `optional/` -- `host-pool-fill-src` was archived to
-  `archive/work/` because r262 promoted its premise into the delivery.)
+  (r288: it shares `optional/` with `mixed-kv` (`0101`), which moved out of the default delivery set in the
+  same re-org.  The cumulative tree with both applied, in numeric order, is
+  `d85868cdd23447b4d7fa0f9b9f5f7bb5fa7363cf`.)
 
 ## What it does
 
@@ -377,6 +385,12 @@ current tree with the gate delta and the layout/hardware stated.
     this directory, and its premise was promoted by r262's `MOE_HOST_POOL_TRANSPORT`.  `apply-all.sh
     --include-optional` therefore offers exactly one artifact now, and the combined-tree hash the r259 note
     records no longer applies.
+
+**r288: a mechanical re-cut, and the `0100` number.**  No code delta.  The r285 patch applied strictly on the
+r288 default tree (no conflict, no reconciliation), so the diff is byte-identical and item 16's reconciliation
+still describes the artifact.  The re-cut exists because the r288 block-number re-org renamed the artifact to
+optional block `0100` and re-based every optional artifact onto the new default tree; see `WORKLOG.md` (r288)
+and `optional/README.md`.
 
 ## Known open points
 

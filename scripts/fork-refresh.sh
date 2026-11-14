@@ -13,8 +13,10 @@
 # WHAT IT DOES
 #   1. checks the checkout is clean and has `release.json`'s base
 #   2. deletes `rdna-boosts`, checks the base out, runs `scripts/apply-all.sh`
-#   3. asserts the applied tree == `release.json.tree` (the contract) and reports the tip
-#      (`apply-all.sh` pins the committer identity and date, so the tip is reproducible)
+#   3. asserts the applied tree == `release.json.tree` (the contract), the commit count ==
+#      `n_default`, and reports the tip (`apply-all.sh` pins the committer identity and date,
+#      so the tip is reproducible).  The branch is the DEFAULT tree only: the temporary 0300 is
+#      in it, the optional 01xx artifacts are not.
 #   4. with --build, builds the branch; with --gates, runs the coherence + prefill-logit gates
 #   5. with --push, force-with-lease pushes to the PERSONAL FORK ONLY (the url is checked
 #      against an allow-list; there is no code path that pushes anywhere else)
@@ -62,11 +64,12 @@ command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 2; }
 base="$(jq -r '.base  // empty' "$MANIFEST")"
 tree="$(jq -r '.tree  // empty' "$MANIFEST")"
 tip="$(jq -r '.tip   // empty' "$MANIFEST")"
-n_blocks="$(jq -r '.n_blocks // empty' "$MANIFEST")"
+n_blocks="$(jq -r '.n_blocks // empty' "$MANIFEST")"          # official 00xx blocks (v<N>)
+n_default="$(jq -r '.n_default // empty' "$MANIFEST")"        # default apply = 00xx + 03xx
 release="$(jq -r '.release // empty' "$MANIFEST")"
 [ -n "$base" ] && [ -n "$tree" ] || { echo "ERROR: release.json has no base/tree" >&2; exit 2; }
 
-echo "==> $release: base $base, ${n_blocks:-?} blocks, tree $tree"
+echo "==> $release: base $base, ${n_blocks:-?} official + 0300 temporary = ${n_default:-?} default blocks, tree $tree"
 echo "    checkout $LLAMA"
 
 cd "$LLAMA"
@@ -99,8 +102,8 @@ if [ "$got_tree" != "$tree" ]; then
     echo "       the base and/or the patch set do not match the recorded delivery" >&2
     exit 1
 fi
-if [ -n "$n_blocks" ] && [ "$count" -ne "$n_blocks" ]; then
-    echo "ERROR: applied $count commits, release.json says $n_blocks" >&2; exit 1
+if [ -n "$n_default" ] && [ "$count" -ne "$n_default" ]; then
+    echo "ERROR: applied $count commits, release.json says n_default=$n_default" >&2; exit 1
 fi
 echo
 echo "    tree : $got_tree  (matches release.json)"

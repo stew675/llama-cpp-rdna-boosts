@@ -1,14 +1,17 @@
-# mixed-kv — the original optional artifact (promoted into block 17 in r287)
+# mixed-kv — the submission record (promoted as block 17 in r287, moved out as optional `0101` in r288)
 
-> **Status: promoted, not applied.**  PR #312 (@mjohanning99) was accepted and folded into the delivery as
-> **block 17** (`patches/0017-rdna-boosts-block-17-mixed-K-V-cache-types-a-q8_0-K-.patch`) in **r287**.  The
-> delivered code is that block; nothing here is part of the delivery, applied by `scripts/apply-all.sh`, or
-> covered by the release gates.  This directory keeps the **original artifact** as the record of the
-> submission, the review (the QSA refusal and the one-V-type-function change are revision 2) and the
-> measurements that led to the promotion.  `mixed-kv.patch` is the r281 cut, sha256
+> **Status: archived record; the live artifact is `optional/mixed-kv/`.**  PR #312 (@mjohanning99) was
+> accepted and folded into the delivery as **block 17** in **r287**.  The **r288 block-number re-org** then
+> moved it OUT of the default set, where it is **optional block `0101`**
+> (`optional/mixed-kv/0101-mixed-kv.patch`; applied only with `scripts/apply-all.sh --include-optional`); its
+> bytes are unchanged, so applied on the r288 default tree it reproduces the r287 release tree exactly
+> (`89b25552…`).  This directory keeps the **original submission** as the record of the review (the QSA
+> refusal and the one-V-type-function change are revision 2) and the measurements that led to the promotion;
+> nothing here is part of the delivery, applied by `scripts/apply-all.sh`, or covered by the release gates.
+> `mixed-kv.patch` is the r281 cut, sha256
 > `dca100d4096699b8a27bdd2255ce502487e1f13345c3b65122a357bfe73115c0`; it applies at r281, **not** at the
-> current tree.  The promoted block is verified by `scripts/gate-mixed-kv.sh` and recorded in `WORKLOG.md`
-> r287.
+> current tree.  The live artifact is verified by `scripts/gate-mixed-kv.sh` (run on the optional-applied
+> build); the promotions and the move are recorded in `WORKLOG.md` r287 and r288.
 
 # `mixed-kv` — a q8_0 K cache with a smaller V cache, read natively
 

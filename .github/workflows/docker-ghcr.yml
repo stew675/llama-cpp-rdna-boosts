@@ -20,8 +20,9 @@
 #   2. shallow-download upstream llama.cpp at release.json.base (codeload
 #      tarball by SHA -- no full history; `git add -A -f` so upstream-tracked
 #      files that match .gitignore are kept and the base tree is canonical),
-#   3. apply patches/0000..0015 with scripts/apply-all.sh (strict `git am`)
-#      and assert the applied tree == release.json.tree,
+#   3. apply the DEFAULT set (patches/0000-0015 then patches/0300) with
+#      scripts/apply-all.sh (strict `git am`) and assert the applied tree ==
+#      release.json.tree; the optional 01xx artifacts are NOT applied,
 #   4. build the full / light / server images against ROCm 7.14.1 and 10.1
 #      (both -full base).  ROCm 7.2 (-complete) is slower and remains
 #      requestable via the dispatch input.
@@ -68,6 +69,7 @@ jobs:
       base: ${{ steps.r.outputs.base }}
       tree: ${{ steps.r.outputs.tree }}
       n_blocks: ${{ steps.r.outputs.n_blocks }}
+      n_default: ${{ steps.r.outputs.n_default }}
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
       - name: Check out delivery repo
@@ -81,7 +83,8 @@ jobs:
           test -f release.json
           base="$(jq -r '.base' release.json)"
           tree="$(jq -r '.tree' release.json)"
-          n_blocks="$(jq -r '.n_blocks' release.json)"
+          n_blocks="$(jq -r '.n_blocks' release.json)"          # official 00xx blocks (release identity)
+          n_default="$(jq -r '.n_default // .n_blocks' release.json)"  # default apply = 00xx + 03xx
           test -n "$base" && test "$base" != "null"
           test -n "$tree" && test "$tree" != "null"
           # Release identity: on a tag push the tag must equal release.json.release, so a release
@@ -109,8 +112,9 @@ jobs:
             echo "base=$base"
             echo "tree=$tree"
             echo "n_blocks=$n_blocks"
+            echo "n_default=$n_default"
           } >> "$GITHUB_OUTPUT"
-          echo "release.json: base=$base tree=$tree blocks=$n_blocks"
+          echo "release.json: base=$base tree=$tree official=$n_blocks default=$n_default"
 
       - name: Build matrix from requested ROCm versions
         id: m
@@ -150,7 +154,7 @@ jobs:
       - name: Reconstruct the patched source tree
         env:
           BASE: ${{ needs.prepare.outputs.base }}
-          N_BLOCKS: ${{ needs.prepare.outputs.n_blocks }}
+          N_DEFAULT: ${{ needs.prepare.outputs.n_default }}
           EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
         run: |
           set -euo pipefail
@@ -169,13 +173,13 @@ jobs:
           git add -A -f
           git commit -q -m "llama.cpp ${BASE} (base)"
           bash "$GITHUB_WORKSPACE/scripts/apply-all.sh" .
-          test "$(git rev-list --count HEAD)" -eq "$((N_BLOCKS + 1))"
+          test "$(git rev-list --count HEAD)" -eq "$((N_DEFAULT + 1))"
           applied="$(git rev-parse HEAD^{tree})"
           if [ "$applied" != "$EXPECTED_TREE" ]; then
             echo "ERROR: applied tree $applied != release.json tree $EXPECTED_TREE" >&2
             exit 1
           fi
-          git log --oneline -"$N_BLOCKS"
+          git log --oneline -"$N_DEFAULT"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1

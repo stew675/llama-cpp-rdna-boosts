@@ -3,7 +3,7 @@
 # target" standard.
 #
 # WHY THIS EXISTS:
-#   The 16-block delivery is bisected and reviewed block by block, so every block
+#   The default delivery (16 official blocks + the temporary 0300) is bisected and reviewed block by block, so every block
 #   commit must build on its own.  Historically this regressed silently (the r2
 #   fix landed 2026-10-05; by r49 blocks 06-14 no longer built) because only the
 #   *tip* was ever built.  Fixes kept being folded into the last block instead of

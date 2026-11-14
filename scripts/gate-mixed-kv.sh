@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Mixed K/V cache gate -- block 17 (PR #312, @mjohanning99).
+# Mixed K/V cache gate -- OPTIONAL block 0101 (PR #312, @mjohanning99).
+#
+# NOTE (r288): the mixed K/V cache types are an OPTIONAL artifact now, not a default delivery
+# block (they were block 17 in r287 and moved OUT of the default set by the r288 block-number
+# re-org).  Run this gate on a build of the OPTIONAL-APPLIED tree:
+#
+#   bash scripts/apply-all.sh --include-optional-all <clean-llama.cpp-at-release.json.base>
+#   # then build that checkout and point BUILD at its build dir
+#
+# It is NOT a default release gate; the delivery's own gates no longer cover the pair, so this
+# script is the artifact's gate and its README says so (optional/mixed-kv/README.md).
 #
 # WHY THIS EXISTS:
-#   Block 17 lets a q8_0 K cache be paired with a q4_0 / q5_0 / q5_1 V cache on a model whose
+#   Optional block 0101 lets a q8_0 K cache be paired with a q4_0 / q5_0 / q5_1 V cache on a model whose
 #   attention layers are all 256-wide, reading each operand through its own dequant arm instead of
 #   staging both through the whole-cache F16 scratch.  It touches three things that can drift
 #   INDEPENDENTLY (the tile instantiation, the F16-scratch allocator, the RDNA4 band predicate) and
@@ -92,7 +102,7 @@ CHECKS=0
 pass() { CHECKS=$((CHECKS+1)); printf '  PASS  %s\n' "$*"; }
 fail() { CHECKS=$((CHECKS+1)); FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$*" >&2; }
 
-echo "==> mixed K/V gate (block 17)"
+echo "==> mixed K/V gate (optional block 0101 -- run on the OPTIONAL-applied build)"
 echo "    build=$BUILD"
 echo "    model=$MODEL"
 echo "    prompt=$PROMPT (P=$P ub=$UB)  device=$DEVICE split=${SPLIT:-none}"

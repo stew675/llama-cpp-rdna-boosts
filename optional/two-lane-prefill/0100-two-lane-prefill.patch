@@ -1,14 +1,20 @@
-From 0057bf93386ef55463ece650a8b7b4e8dbccdb74 Mon Sep 17 00:00:00 2001
+From 3190e2296a8382ad590168060e4376d18f13e5ea Mon Sep 17 00:00:00 2001
 From: "Slava P." <slavap@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 11:54:47 -0600
-Subject: [PATCH] rdna-boosts [optional]: two-lane prefill
+Subject: [PATCH] rdna-boosts: block 0100: two-lane prefill
  (LLAMA_PREFILL_LANES) -- consecutive-ubatch overlap
 
-The `two-lane-prefill` artifact, re-cut against the r285 release tree (tree
-39ad82e0e7ad754eb52c5e833840e072195d6942) from the r259 cut (commit c80fa8bda, tree
-7995db440ff79d805b4e1ad946ebfae605a56616), itself the r254 cut of PR #301 (which was the r246 cut of
-PR #296 rebased).  NOT part of the delivery: nothing here is in `patches/`, `release.json` or
-`rdna-boosts-all.patch`, and only `scripts/apply-all.sh --include-optional` picks it up.
+The `two-lane-prefill` artifact, re-cut against the r288 default delivery tree
+(79d18f41b9ab9b235d35fd3a5034858eddd94844: blocks 0000-0015 plus the temporary 0300, i.e. the r287
+release tree with block 0017 removed) from the r285 cut (tree 3a6304107056cda83098fbae658f057bd6c018d5),
+from the r259 cut (commit c80fa8bda, tree 7995db440ff79d805b4e1ad946ebfae605a56616), itself the r254 cut
+of PR #301 (which was the r246 cut of PR #296 rebased).  The r288 re-cut is mechanical: the r285 patch
+applied STRICTLY on the r288 tree with nothing to reconcile, so the diff is byte-identical to the r285
+cut and the numbers below stand (r285 -> r288 moved only the KV-window/spill, 2-D state-copy,
+llama-bench and fit files, outside this artifact's own mechanisms).  It is now optional block 0100
+(renamed from the unnumbered `two-lane-prefill.patch` by the r288 block-number re-org).
+NOT part of the delivery: nothing here is in `patches/`, `release.json` or `rdna-boosts-all.patch`,
+and only `scripts/apply-all.sh --include-optional` picks it up.
 
 What it does
 ------------
@@ -924,10 +930,10 @@ index 79a70b16e..73c3c407a 100644
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ff4b80d73..d08658dbf 100644
+index 6b9e69420..1929520a8 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -10800,7 +10800,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+@@ -11063,7 +11063,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
      ggml_cuda_set_device(dev_ctx->device);
  
      cudaEvent_t event;
@@ -949,7 +955,7 @@ index ff4b80d73..d08658dbf 100644
  
      return new ggml_backend_event {
          /* .device  = */ dev,
-@@ -10821,6 +10834,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -11084,6 +11097,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -977,7 +983,7 @@ index ff4b80d73..d08658dbf 100644
  // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
  // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
  // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
-@@ -11217,6 +11251,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11480,6 +11514,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
      /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
      /* .gtt_store_arena_min       = */ ggml_backend_cuda_device_gtt_store_arena_min,

@@ -10,12 +10,17 @@ current delivery.
 
 ## Current delivery
 
-18 blocks (`block 00` + `blocks 01-17`) against `release.json.base`, canonical chain `release.json.tip` /
-`.tree`.  `scripts/validate-set.sh` is green (checksums, then a strict 18/18 apply on a fresh tarball,
-tree equality, a conflict-marker/subject scan of every block tree, then the Windows portability lint of
-the files the set adds — issue #231).  **Block 14 is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule,
-not a supported feature) -- keep it separate and expect to drop it.  Each block is **one** `git am` commit and the series is **linear**: apply in order, never
-reorder, never insert.
+**16 official blocks (`0000`-`0015`) + the temporary block `0300` = 17 default patches** against
+`release.json.base`, canonical chain `release.json.tip` / `.tree` (`release.json.n_default` is the apply
+count; `release.json.n_blocks` is the **official** count that names the `v<N>` tag).  The optional blocks
+(`optional/*/01xx-*.patch`: `0100` two-lane prefill, `0101` mixed K/V) are **not** part of this set:
+`--include-optional` applies them on top, in numeric order, and the checkout is then not the release tree.
+`scripts/validate-set.sh` is green (checksums and recorded counts, then a strict 17/17 default apply on a
+fresh tarball, tree equality, a conflict-marker/subject scan of every block tree, the optional artifacts
+applied strictly and tree-checked, then the Windows portability lint of the files the set adds — issue
+#231).  **Block `0300` is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule, not a
+supported feature) -- it is applied last, kept separate, and expected to be dropped.  Each block is
+**one** `git am` commit and the series is **linear**: apply in order, never reorder, never insert.
 
 ## Apply order
 
@@ -35,10 +40,9 @@ reorder, never insert.
 | 11 | `0011-…-block-11-qwen4exp-…` | qwen4exp | model, hyper-connections, QSA/indexer, lazy reader, indexer cache (r109 split of the old block 10; + r148: the HC inject logit is the chain's 1/hc-scaled scatter logit, so the fused mixer and the fused combine agree with the model's own chain, issue #228) |
 | 12 | `0012-…-block-12-campaign-remainder-…` | campaign remainder | CPU wins, backend iface fills, DFlash (incl. the r130 prompt-ingest tail, the r162 draft-reserve split (issue #239) and the r163 in-graph layer-input store (issue #240)), FA build grouping, mmap reclaim, batched state restore, server prompt-cache residency, idle-slot parking (r136), and the backend-sampling compute-buffer reserve keyed on the chain's node count (r169, PR #245) |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-…` | MTP draft vocabulary subset | **opt-in** (`--spec-draft-mtp-vocab N`), default off; draft-only |
-| 14 | `0014-…-block-14-relaxed-tensor-split-mode-TEMPO` | `-sm relaxed-tensor` (TEMPORARY) | a local relaxation of upstream #31081: tensor split with a per-device MoE amax scalar, for `flint`/`mellum`/`mistral4`.  **Not a supported feature**; delete this patch to return to the r136 tree |
-| 15 | `0015-…-block-15-windowed-KV-a-fixed-VRAM-reside` | windowed KV (**opt-in**, `--kv-window <cells>\|auto`; `LLAMA_KV_RESIDENT_CELLS` = deprecated alias) | the KV's VRAM cost is a resident window of the newest `W` cells, the rest in pinned system RAM in ONE VA reservation (no kernel or op change); the window slides in whole map units and `--fit` sizes it; **since r204 it also runs on a tensor split** (one region PER CHILD device, all children at the same `W` cells, the grow fanned out to every child; `--fit` charges the physical `W x cell_bytes` against the split's per-device budget; a MIRRORED dsv4/HRM cache declines it) -- before r204 `-sm tensor` declined it (r181); `LLAMA_KV_SPILL_RAM_PCT` caps the pinned spill; + r190: a cache that is **streaming** at the depth it reads takes the **sparse** QSA decode arm (`LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm)  **+ r190: the ATTENDANCE POOL** (`--kv-attendance-pool [on|off]`, alias `--kv-region-pool`; **off by default**, and **since r247 not a size knob**: the pool is derived from the model, one decode band of the indexer working set, and a legacy numeric value is accepted-and-ignored) — the KV's authoritative copy in a pinned host **mirror** plus a compact **device pool** of indexer-block pages and a page table, resolved by `GGML_OP_KV_POOL` (mark / claim / map+fill) with the QSA reader taking a second id list; `--fit` books the mirror as host RAM (only the pool is VRAM) and does not interpolate `-c` while the pool is active.  A fittability feature like the window: **default off**, unset = byte-identical including the OOM, and mutually exclusive with the window.  **+ r193: the MTP DRAFT WINDOW** (`--spec-draft-kv-window`, **default `0` since r247** — a window the request outgrows cost −9.7 % of MTP decode on a `-sm tensor` split at ~105k tokens, `benchmarks/2026-11-10-mtp-draft-window-depth.md`; `auto` = *the cap or nothing*: 65536 cells, or no window when that would not leave a batch of room below every sequence's own context; `N` = cells; the r193 sizer was a quarter of the context clamped to [32768, 65536]) — the draft context's KV is a window instead of `-c` cells, and an embedded MTP head's slab draft reserve is derived with the window (aux 3.50 -> 0.76 GiB, arena +2.8 GiB); MTP only and embedded-head only (a separate MTP draft GGUF keeps its full cache); **+ r248: the window is a TRUE ring** — a batch whose positions do not advance (an M-RoPE image chunk puts every row on one temporal position) evicts the drafter's oldest cells instead of running the `win + one batch` spare room out and failing the request (`failed to find a memory slot` → HTTP 500 `failed to process mtmd chunk`, issue #297) — and **a drafter failure can no longer fail a request**: it drops the draft KV and retries once, then disables drafting for that sequence until the next request |
-| 16 | `0016-…-block-16-the-UMA-GTT-expert-store` | **the UMA GTT expert store** (an integrated GPU's expert set in ONE registered, `mlock`ed region; **sized by `-lme N|auto`**, which is also the opt-in for STREAMING) | an APU has no host-expert tier (r236) and upstream disables the expert cache there, so a MoE set larger than RAM could not run: the store is ONE anonymous region (`mmap` + `MADV_HUGEPAGE` + one `hipHostRegister(Mapped\|ReadOnly)`, `mlock`ed, sliced per `(tensor, expert)`) read in place at 230-233 GB/s.  **The shape follows the budget**: a budget that covers the whole set PLACES it (static, no eviction); a budget below it takes the **ARENA** (the store is the cache's slot storage, the expert tensors are holes in the read-only model mapping, LFRU residency serves every read, a miss is one buffered `pread` into the vacated slot).  `-lme` is also the streaming opt-in: a >RAM model runs on whatever `RLIMIT_MEMLOCK` allows, and one whose weights do not fit RAM is refused at load (0.2 s, with the fix).  The MTP/nextn head is pinned outside the budget and never evicted; one store is shared safely by two models; the fills run on block 12's adaptive transport (the buffered arm reads straight into the slot); on RDNA3_5 UMA the ladder starts on that arm; prefill streams only what is not resident, coalesced and in parallel.  **Inert on a discrete GPU by measurement.**  Since r263 |
-| 17 | `0017-…-block-17-mixed-K-V-cache-types` | **mixed K/V cache types** (K `q8_0` with V `q4_0` / `q5_0` / `q5_1`, head 256 only) | a mixed pair was refused since 2026-09-11 because it missed the native decode band and was staged through the whole-cache F16 scratch.  Block 17 gives the tile kernel a second V type parameter and the three head-256 instances, and the RDNA4 band accepts them; the instantiation, the launcher's `need_f16_V` and the allocator all read `ggml_cuda_fattn_tile_type_V()`.  `GGML_CUDA_FA_KV_MIXED=0` restores the staged path; qwen4exp (QSA asserts K->type == V->type) and every other head size/pair stay refused.  Same-type caches are unchanged.  Gate: `scripts/gate-mixed-kv.sh`; since r287 |
+| 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (**opt-in**, `--kv-window <cells>\|auto`; `LLAMA_KV_RESIDENT_CELLS` = deprecated alias) | the KV's VRAM cost is a resident window of the newest `W` cells, the rest in pinned system RAM in ONE VA reservation (no kernel or op change); the window slides in whole map units and `--fit` sizes it; **since r204 it also runs on a tensor split** (one region PER CHILD device, all children at the same `W` cells, the grow fanned out to every child; `--fit` charges the physical `W x cell_bytes` against the split's per-device budget; a MIRRORED dsv4/HRM cache declines it) -- before r204 `-sm tensor` declined it (r181); `LLAMA_KV_SPILL_RAM_PCT` caps the pinned spill; + r190: a cache that is **streaming** at the depth it reads takes the **sparse** QSA decode arm (`LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm)  **+ r190: the ATTENDANCE POOL** (`--kv-attendance-pool [on|off]`, alias `--kv-region-pool`; **off by default**, and **since r247 not a size knob**: the pool is derived from the model, one decode band of the indexer working set, and a legacy numeric value is accepted-and-ignored) — the KV's authoritative copy in a pinned host **mirror** plus a compact **device pool** of indexer-block pages and a page table, resolved by `GGML_OP_KV_POOL` (mark / claim / map+fill) with the QSA reader taking a second id list; `--fit` books the mirror as host RAM (only the pool is VRAM) and does not interpolate `-c` while the pool is active.  A fittability feature like the window: **default off**, unset = byte-identical including the OOM, and mutually exclusive with the window.  **+ r193: the MTP DRAFT WINDOW** (`--spec-draft-kv-window`, **default `0` since r247** — a window the request outgrows cost −9.7 % of MTP decode on a `-sm tensor` split at ~105k tokens, `benchmarks/2026-11-10-mtp-draft-window-depth.md`; `auto` = *the cap or nothing*: 65536 cells, or no window when that would not leave a batch of room below every sequence's own context; `N` = cells; the r193 sizer was a quarter of the context clamped to [32768, 65536]) — the draft context's KV is a window instead of `-c` cells, and an embedded MTP head's slab draft reserve is derived with the window (aux 3.50 -> 0.76 GiB, arena +2.8 GiB); MTP only and embedded-head only (a separate MTP draft GGUF keeps its full cache); **+ r248: the window is a TRUE ring** — a batch whose positions do not advance (an M-RoPE image chunk puts every row on one temporal position) evicts the drafter's oldest cells instead of running the `win + one batch` spare room out and failing the request (`failed to find a memory slot` → HTTP 500 `failed to process mtmd chunk`, issue #297) — and **a drafter failure can no longer fail a request**: it drops the draft KV and retries once, then disables drafting for that sequence until the next request |
+| 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an integrated GPU's expert set in ONE registered, `mlock`ed region; **sized by `-lme N|auto`**, which is also the opt-in for STREAMING) | an APU has no host-expert tier (r236) and upstream disables the expert cache there, so a MoE set larger than RAM could not run: the store is ONE anonymous region (`mmap` + `MADV_HUGEPAGE` + one `hipHostRegister(Mapped\|ReadOnly)`, `mlock`ed, sliced per `(tensor, expert)`) read in place at 230-233 GB/s.  **The shape follows the budget**: a budget that covers the whole set PLACES it (static, no eviction); a budget below it takes the **ARENA** (the store is the cache's slot storage, the expert tensors are holes in the read-only model mapping, LFRU residency serves every read, a miss is one buffered `pread` into the vacated slot).  `-lme` is also the streaming opt-in: a >RAM model runs on whatever `RLIMIT_MEMLOCK` allows, and one whose weights do not fit RAM is refused at load (0.2 s, with the fix).  The MTP/nextn head is pinned outside the budget and never evicted; one store is shared safely by two models; the fills run on block 12's adaptive transport (the buffered arm reads straight into the slot); on RDNA3_5 UMA the ladder starts on that arm; prefill streams only what is not resident, coalesced and in parallel.  **Inert on a discrete GPU by measurement.**  Since r263 |
+| 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | `-sm relaxed-tensor` (TEMPORARY, **in the default apply but not an official block**) | a local relaxation of upstream #31081: tensor split with a per-device MoE amax scalar, for `flint`/`mellum`/`mistral4`.  **Not a supported feature**; delete this patch to return to the r136 tree |
 
 `rdna-boosts-all.patch` (repo root) is the entire net as ONE patch.  It is a convenience for a one-off
 build at the fork point; it is **not** the reviewable increment and not a substitute for the per-block
@@ -49,7 +53,8 @@ flow.
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout "$(jq -r .base /path/to/rdna-boosts/release.json)"
-bash /path/to/rdna-boosts/scripts/apply-all.sh .     # strict 18/18 git am, tree checked vs release.json
+bash /path/to/rdna-boosts/scripts/apply-all.sh .     # strict 17/17 default git am, tree checked vs release.json
+# optional blocks 0100/0101 on top (NOT the release tree): --include-optional / --include-optional-all
 ```
 
 `scripts/apply-all.sh` is the only supported flow.  **Do not `git apply` the concatenated series** — it
@@ -66,16 +71,19 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
    itself cannot compare it (it builds `.base` from the commit tarball, so its commit ids differ by
    construction) — `scripts/fork-refresh.sh` does that comparison.  The `.tip` rule is in `AGENTS.md`.
    partially regenerated set fails here rather than at the build;
-5. `--include-optional` then steps through `optional/*/*.patch` on top of the *verified* tree and asks
-   `[y/N]` for each one (`N` is the default), applying the accepted ones with strict `git am`, one commit
-   each (an optional artifact is cut against exactly this tree, so the script refuses a 3-way merge);
-   `--include-optional-all` applies every one without asking, which is what a scripted or headless apply
-   must use.  `--include-beta` then applies `beta/*/*.patch` the same way.  Either flag leaves the checkout
-   **not** the release tree, which the script reports; optional artifacts are not covered by the gates
-   below (`optional/README.md`).  **What IS covered since r285: every `optional/*/*.patch` must still apply
-   strictly on this tree** -- `validate-set.sh`'s check 8 applies them cumulatively on the freshly built
-   release tree and fails when one has drifted (`TODO` #324: both artifacts had gone stale for 40+
-   releases because "rebase it every release" was a policy with no instrument).
+5. `--include-optional` then steps through `optional/*/01xx-*.patch` in **numeric block order** (`0100`
+   before `0101`, not directory order) on top of the *verified* tree and asks `[y/N]` for each one (`N` is
+   the default), applying the accepted ones with strict `git am`, one commit each (an optional artifact is
+   cut against exactly this tree, so the script refuses a 3-way merge); `--include-optional-all` applies
+   every one without asking, which is what a scripted or headless apply must use.  `--include-beta` then
+   applies `beta/*/*.patch` the same way.  Either flag leaves the checkout **not** the release tree, which
+   the script reports; optional artifacts are not covered by the gates below (`optional/README.md`).
+   **What IS covered since r285: every `optional/*/01xx-*.patch` must still apply strictly on the default
+   tree** -- `validate-set.sh`'s check 8 applies each one alone (and compares its tree to
+   `release.json.optional`), then all of them in numeric order (and compares
+   `release.json.optional_tree`), on the freshly built default tree, and fails when one has drifted
+   (`TODO` #324: both artifacts had gone stale for 40+ releases because "rebase it every release" was a
+   policy with no instrument).
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 
@@ -115,7 +123,7 @@ in CI.  The model-level gates are manual:
 2. **MTP** — the adaptive-MTP four-axis gate, `-n 3000` (2000 floor), `--reasoning on` for R and `off` for
    P/C/K, plus the stock-relative `llama-batched-bench -npl 1,4,8` arm.  Protocol:
    [`benchmarks/mtp-adaptive-methodology.md`](benchmarks/mtp-adaptive-methodology.md).
-3. **The UMA GTT expert store** — `scripts/gate-uma-experts.sh` (block 16): same-seed
+3. **The UMA GTT expert store** — `scripts/gate-uma-experts.sh` (block 15): same-seed
    greedy text byte-identical across the arena, placement, kill-switch, lock-clamp, cold-cache, fault, no-host-buffer
    and prefill arms; the arena census non-vacuous (`tables > 0`, `evictions > 0`, **0 arena releases**); both shape
    directions (a budget below the set -> arena, a budget that covers it -> placement); the `-lme`-absent **refusal**
@@ -172,13 +180,16 @@ in CI.  The model-level gates are manual:
    content at the established one).  The gate prints each commit's build time and the run's total; a first
    block that takes minutes on an otherwise unchanged tree means the path was new.
 6. **GPU faults** — `scripts/check-gpu-faults.sh` on the run's journal + log (never grep a log by hand).
-7. **The mixed K/V cache (block 17)** — `scripts/gate-mixed-kv.sh`: `test-backend-ops -o FLASH_ATTN_EXT`
+7. **The mixed K/V cache (OPTIONAL block `0101`, NOT a default release gate)** — `scripts/gate-mixed-kv.sh`
+   runs on the **optional-applied build** (`apply-all.sh --include-optional-all`, then build that checkout):
+   `test-backend-ops -o FLASH_ATTN_EXT`
    **7021/7021** in the default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms; W=1..8 width
    purity **maxdiff 0** for q8_0/q8_0 and the three mixed pairs at the requested split; a real load + greedy
    decode per pair; and the non-256-head and qwen4exp refusals (a mixed pair that loads on those is a FAIL).
    It is a new kernel family, so a change to the tile `type_V`, `ggml_cuda_fattn_tile_type_V()`, the mixed
-   instance list or the band predicate re-runs it.  The prefill-logit gate is still mandatory alongside it
-   (the default path must stay at the recorded value).
+   instance list or the band predicate re-runs it, and the artifact must be re-cut onto the current default
+   tree (`optional/mixed-kv/README.md`).  `validate-set.sh` check 8 is what keeps that artifact applicable;
+   the delivery's own gates do not cover a mixed pair.
 8. **Idle-slot parking** — `scripts/gate-park-idle-slots.sh`: drives a park/unpark request sequence
    (a long prompt on slot 0, a short one on slot 1, a return to slot 0, a launch on slot 2) and requires the
    parking arm to be **byte-identical** to `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, with the moves traced and no
@@ -378,7 +389,7 @@ in CI.  The model-level gates are manual:
    prefill-logit and MTP protocols run one sequence, where the geometry is unchanged (and identical to
    r198's), and the park/ckpt/state gates drive one slot at a time.  Required for any change to the draft
    window's sizing, `llama_spec_draft_kv_cells()`, `find_slot`'s truncating-window ring, `create_memory`'s MTP
-   branch or the derived draft reserve; every release that touches block 15.
+   branch or the derived draft reserve; every release that touches block 14.
 
 18. **The windowed KV across a tensor split** — `scripts/gate-kv-window-split.sh` (r204, `TODO` #124): the
    resident window is one VMM region **per child device** of a `-sm tensor` split, every child committing the
@@ -403,7 +414,7 @@ in CI.  The model-level gates are manual:
    single-device window arms do not build a Meta buffer type at all.  Required for any change to
    `ggml_backend_meta_kv_region_*`, the region buffer type/vmm region, `llama_kv_cache`'s region selection,
    the split branch of `common/fit.cpp` or `llama_model::kv_cache_split_mirrored`; every release that touches
-   block 15.
+   block 14.
 
 19. **KV residency** — `scripts/gate-kv-residency.sh` (r206, the archive plan's phase **P0**,
    `wip/kv-residency-cleanup/` §2.1): for the **window** and the **attendance pool**, a resident arm and a
@@ -427,7 +438,7 @@ in CI.  The model-level gates are manual:
    log (cells, bytes, the buffer the placement got, host-backed MiB, pool geometry, the counters line).
    **r217: the pool section also asserts the PROMPT RATE** -- `pres` must keep `PREFILL_MIN_PCT` (default
    40 %) of `pref`'s `prompt eval` tokens/s, both read from the arms' own logs, so a placement that is
-   *correct and slow* now fails: block 15's pool was measured at 427.5 against 829.3 t/s at pp32K (-48 %,
+   *correct and slow* now fails: block 14's pool was measured at 427.5 against 829.3 t/s at pp32K (-48 %,
    `WORKLOG.md` 261105.001) while every residency assertion passed, because its page-fill path runs per
    DECODE step and a prompt chunk reuses nothing.  The floor sits BELOW that known cost on purpose (a
    regression floor, not a target) and `pfloor` is not a timing arm (it carries the verify oracle).  The
@@ -452,9 +463,9 @@ in CI.  The model-level gates are manual:
    the device span, and the teardown counters must report **one counter block per device** -- that last assertion is
    the one that catches the r213 defect (a shared counter block or a device-invariant mirror buft name makes the
    resolve node unclaimable and the *load* aborts).  `MULTI_DEVICES=0` skips the section on a 1-GPU box.  Required
-   for any change to the window/region provider, the pool, `is_streaming()`, the sparse decode arm, block 15's
+   for any change to the window/region provider, the pool, `is_streaming()`, the sparse decode arm, block 14's
    `--fit` interaction, `memory_breakdown()`'s KV accounting or anything that makes a buffer type per device;
-   every release that touches block 15.  **r222 adds the provider's own SELFTEST as a gated arm pair**
+   every release that touches block 14.  **r222 adds the provider's own SELFTEST as a gated arm pair**
    (`wselftest` must PASS and `wselftest0`, with `LLAMA_KV_REGION_QUARANTINE=0`, must FAIL), so the primitive's
    oracle is proven sensitive on every run instead of on trust -- it was a documented-but-ungated diagnostic
    whose verdict was an INFO line, i.e. invisible at every default until r222.  ~15 s (`--window-only`),
