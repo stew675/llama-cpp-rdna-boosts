@@ -337,7 +337,8 @@ Flint/`-sm layer` text identity above.
 * The `llama-cli --version` string is baked **before** the commit, so a freshly committed rung still reports
   the previous sha.  Do not read it as "the build did not pick up the change".
 * Gate runtimes (this box): `gate-hc-fusions.sh` ~6 arms × ~1 min; `gate-qwen4exp-quant-coherence.sh` ~10 min;
-  `gate-host-pool.sh` 13 arms ~8 min; `gate-norm-rows-alias.sh` ~8 min; `gate-node-budget.sh` ~2 min.  Never
+  `gate-host-pool.sh` 13 arms **~3 min measured at R13/R15** (2m51 on `bin-r277`, 3m10 on the R13 tree);
+  `gate-norm-rows-alias.sh` ~8 min; `gate-node-budget.sh` ~2 min.  Never
   run two gates (or a gate and a bench) in parallel.
 
 ---
