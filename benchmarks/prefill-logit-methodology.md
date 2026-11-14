@@ -27,7 +27,17 @@ point:
 ./scripts/gate-prefill-logits.sh --ub 8            # ... and its own comparison (-ub 8 -b 8)
 ./scripts/gate-prefill-logits.sh --kv q8_0 --record        # the quantized-KV prefill paths (r156)
 ./scripts/gate-prefill-logits.sh --kv q8_0                 # ... and their own comparison
+./scripts/gate-prefill-logits.sh --device 0,1,2 --sm tensor --record   # the ALL-REDUCE arm (block 01):
+./scripts/gate-prefill-logits.sh --device 0,1,2 --sm tensor            #   it has its own base file (r285)
 ```
+
+**The device set and the split mode are a second point too (r285, `TODO` #323).**  An all-reduce change is
+only reachable on >= 2 devices with a `tensor` split, so a release that touches block 01 needs **two** bases:
+the canonical single-device `layer` reference and the multi-device `tensor` arm.  The `.meta` pinned `device=`
+and `sm=` since r272 and a compare refuses a mismatch, but the FILE NAME did not, so recording one overwrote
+the other.  Since r285 the name tags a non-canonical point (`...-dev0-1-2-smtensor.kld`) and leaves the
+canonical one untagged (so every base recorded before r285 is still found), and both can be held on disk at
+once.  The rule is unchanged: a base is one POINT, so record/label the point a release used.
 
 **A quantized KV cache is a second point (r156, issue #237).**  The gate's default is an f16 cache, which
 **skips every quantized-cache prefill path**: the F16 FA prefill **staging arena**, `GGML_CUDA_FA_KV_NATIVE`'s
