@@ -108,12 +108,12 @@ server multiplies the KV and the compute buffers (not the weights or the arena m
 |   └─ its *arena* (MoE expert cache) | 12 736 | `work 1.56 GiB + arena 12.44 GiB`; cache slots `arena 12365.3 MiB` |
 | model buffer, dense tensors | 3 983 | `load_tensors: ROCm0 model buffer size = 3983.00 MiB` |
 | MTP draft weights | 1 808 | `slab draft reserve derived from 'mtp-…': … the draft's 1808 MiB of weights` |
-| MTP draft context (kv 263 + compute 768 + slack 192) | 1 223 | same line |
+| MTP draft context (kv 263 + compute 768 + slack 192) | 1 223 | same line — the slab's **reserve estimate**; the measured context is 83 + 10 + 512 + 26 ≈ 610 MiB (`llama_kv_cache` 83.14 / indexer 10.39 / `compute buffer` 512.00 / `ROCm_Host` 26.32) |
 | main KV, q8_0, 80 128 cells, 12 full-attn layers | 998 | `llama_kv_cache: ROCm0 KV buffer size = 997.69 MiB` |
 | indexer KV (QSA lightning indexer, **K only**) | 125 | `creating indexer KV cache, size = 80128 cells` → `124.71 MiB … K (q8_0): 124.71, V: 0.00` |
 | SSM recurrent state (48 layers: R 16.88 + S 432.00 + P 1.41) | 450 | `llama_memory_recurrent: ROCm0 RS buffer size = 450.28 MiB` |
 | rope rotation buffers (256-d + 128-d indexer) | 4 | `init_rotation: rotation buffer size = 3.19 / 0.75 MiB` |
-| `ROCm_Host` compute buffer | 101 | `sched_reserve: ROCm_Host compute buffer size = 101.42 MiB` |
+| `ROCm_Host` compute buffer (**the CPU backend's** arena, pinned host RAM — not in the slab) | 101 | `sched_reserve: ROCm_Host compute buffer size = 101.42 MiB` |
 | driver / allocator / alignment remainder | ~391 | `mem_info_vram_used` − the rows above |
 | **measured used** | **23 419** | `/sys/class/drm/card1/device/mem_info_vram_used` |
 | free (the intentionally-kept cushion) | 1 141 | `GGML_CUDA_SLAB_HEADROOM_MIB=1280` is what the slab leaves outside; the rest is real free VRAM |
@@ -124,6 +124,24 @@ So the honest one-line summary is:
 24 GiB = 4.2 GiB weights + 3.0 GiB MTP draft (weights+context) + 1.6 GiB KV/indexer/SSM
        + 1.6 GiB compute (work region) + 12.4 GiB expert-cache arena + ~1.2 GiB cushion
 ```
+
+> **The `ROCm0` / `ROCm_Host` buffers in this log are not one thing — four different objects share those two
+> names.**  Only two of them are compute arenas, and the two compute arenas are **independent allocations in
+> different memories** (not two halves of one buffer, not aliased, neither inside the other):
+>
+> | buffer | what it is | where |
+> |---|---|---|
+> | `ROCm0 compute buffer` | the **GPU backend's** arena (buffer type `ggml_backend_cuda_buffer_type`) | **inside the slab's work region** — the slab wraps the device compute alloc, so this is the one the 1 600 MiB boundary covers |
+> | `ROCm_Host compute buffer` | the **CPU backend's** arena, whose default buffer type `llama-context.cpp:846-853` *swaps* for the first GPU's **host** buffer type ("for faster transfer of the intermediate state") → `cudaMallocHost`, pinned and device-readable; pageable fallback with a loud warning; 4 GiB max | outside the slab, **never** in it |
+> | `ROCm_HostMap model buffer` (~47 GiB over ~50 lines) | the **mmap'd host-expert tables** (`-ncmoe`) | a *model* buffer, not compute |
+> | `ROCm_Host output buffer` (0.95 MiB) | `llama_context`'s logits/output buffer | neither |
+>
+> The two compute arenas are sized separately by the same `sched_reserve` pass (1 539.07 vs 101.42 MiB at
+> `-ub 2048`; 512.00 vs 26.32 for the draft at `-ub 512`), and what makes them one mechanism is only the
+> pipeline: a node lives in exactly one of them and a tensor crossing the boundary is a copy — which is
+> exactly why the CPU arena is **pinned** rather than pageable.  It tracks the *graph*, not the context:
+> `ROCm_Host` reads 100.19 MiB at `-c 4096` against 101.42 at `-c 80000`, and only **0.3457 MiB** for a
+> `llama-cli` graph of the same model with no draft and no backend sampler.
 
 ---
 
@@ -282,3 +300,7 @@ multiply each tensor's element count by its type's bytes-per-block; `general.arc
   plus `-lme auto` resolves into)
 - [`ENVIRONMENT.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/ENVIRONMENT.md)
   — `GGML_CUDA_SLAB_HEADROOM_MIB`, `MOE_EXPERT_CACHE_MIB`, `LLAMA_PLE_*`, `MOE_HOST_POOL_RAM_PCT`
+- [`wip/slab-draft-aux-reserve/`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/wip/slab-draft-aux-reserve/README.md)
+  — the open campaign this page's MTP/arena numbers came out of, and the **2.4 GiB draft-reserve
+  accounting error** it found (the slab's `aux` reserve is written by the *last* preflight, so a
+  host-resident draft re-arms it with a weights-inclusive constant)
