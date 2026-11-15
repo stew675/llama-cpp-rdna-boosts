@@ -261,33 +261,41 @@ things follow:
 * This is a **fittability** feature, not a speed feature: at those depths the alternative to a spilled KV is an
   OOM.  If the table says seconds, use a smaller `-c`, `-sm layer`, or a model that fits.
 
-### Picking a split mode: `-sm layer` first on a mixed, imbalanced or slow-link set
+### Picking a split mode: `-sm tensor` on a matched pair, `-sm layer` on a mixed or stacked set
 
-`-sm tensor` shards **every tensor** across the devices by the `-ts` ratio, and that has two costs a `-sm layer`
-split does not pay:
+**Matched pair, even link: keep `-sm tensor`.**  It interleaves every layer across all the cards, so they work
+in parallel, and it is measured the faster of the two on a homogeneous set: 2x R9700 on PCIe 5.0 x8 root ports,
+Flash-Next IQ4_NL, `-ncmoe 48`, a 2000-token decode, **35.5 t/s (`tensor`) vs 25.7 (`layer`) at the same expert
+hit rate** (`COMMUNITY-CONFIG.md`, r16).  A layer split runs one card's layers at a time, so every layer
+boundary is a handoff with the other card idle.  `-sm tensor` is also what the all-reduce work and the
+multi-device KV target.
 
-* **Every layer pays a cross-device reduction.**  A tensor split needs the all-reduce (block 01) on the
-  critical path of every layer, so the *slowest* card and the *slowest* link set the pace of every token.  A
-  layer split keeps each layer's matrices whole on one device: no all-reduce, no per-step sync, and the
-  devices only hand off the residual stream once per layer boundary.
+**Mixed or imbalanced set: try `-sm layer` first.**  A tensor split shards **every tensor** by the `-ts` ratio,
+which costs two things a layer split does not:
+
+* **Every layer pays a cross-device reduction.**  The all-reduce (block 01) is on the critical path of every
+  layer, so the *slowest* card and the *slowest* link set the pace of every token.  A layer split needs no
+  all-reduce at all: each layer's matrices are whole on one device.
 * **An imbalanced ratio produces uneven shards.**  The KV row is sharded by the ratio and each shard is
   rounded to its own head grid, so a 60/40 split gives the K and V tensors of one cache *different* cell
-  strides (measured 1024 B and 1536 B in the same VMM region on a 27B).  That is legal and now handled, but
-  it is the class of shape where the streamed KV's boundary arithmetic, the quantized-cache paths and the
-  stride assumptions are hardest to keep right -- and it is exactly what produced the GPU fault in issue #314.
+  strides (measured 1024 B and 1536 B in the same VMM region on a 27B).  That is legal and handled, but it is
+  the shape where the streamed KV's boundary arithmetic, the quantized-cache paths and the stride assumptions
+  are hardest to keep right -- and it is what produced the GPU fault in issue #314.
 
-So on a heterogeneous pair (two different architectures, an x8 card next to an x16 one, cards behind a
-different switch or a PCIe 3.0 chipset link), try `-sm layer` **first**:
+So when the pair is *not* matched (two architectures, an x8 card next to an x16 one, cards behind a different
+switch or a PCIe 3.0 chipset link, or one card with materially less VRAM), or when you are **stacking several
+features at once** (tensor split + `--kv-window` + `--kv-attendance-pool` + `--spec-draft-kv-window` +
+host-expert pooling), reach for the simpler contract:
 
 ```bash
 # layer split: whole layers per device, no all-reduce, no sharded tensors
 -ngl 999 -sm layer -ts 24/16
 ```
 
-It usually wins on a mixed box, it is the simpler contract, and it is the configuration the release gates
-cover most heavily.  `-sm tensor` remains the right answer for a homogeneous set on an even link (and it is
-what the all-reduce and multi-device KV work targets), but if tensor split misbehaves or underperforms on your
-mix, `-sm layer` is the supported alternative -- not a workaround.  The streamed KV works on both.
+That is a support statement, not a workaround: `-sm layer` is a fully supported split, the streamed KV, the
+attendance pool and every fused path work on it, and every feature added on top inherits one device's geometry
+instead of a shard of every device's.  If `-sm tensor` misbehaves or underperforms on your mix, `-sm layer` is
+the first thing to try, and it is the arm to report against.
 
 ## Consumer workflow
 

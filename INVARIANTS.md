@@ -4942,10 +4942,15 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   calibrated in-place rate is a *cold burst* number — at 65536 cells the sustained aggregate is ~10 GB/s per
   device, so treat the quoted ms as a floor (the line already says a card that reads its aperture below its
   DMA link scales up from there).
-* **On a heterogeneous or slow-link set, `-sm layer` is the recommended split before `-sm tensor` (r289).**
-  Tensor split needs the cross-device all-reduce on every layer's critical path (block 01's reason for
-  existing), so the slowest card and the slowest link set every token's pace, and an imbalanced `-ts` ratio
-  produces the uneven shards above.  A layer split keeps whole layers per device: no all-reduce, no sharded
-  tensors, one device's KV per layer.  It is the simpler contract and the configuration the gates cover most
-  heavily; `-sm tensor` stays the target for a homogeneous set on an even link.  The streamed KV, the pool and
-  every fused path work on both.
+* **A MATCHED pair keeps `-sm tensor`; a mixed, imbalanced or feature-stacked set starts on `-sm layer`
+  (r289, guided by the r16 measurement).**  Tensor split interleaves every layer across all the cards, so they
+  work in parallel, and on a homogeneous pair it is measured well ahead: 2x R9700 on PCIe 5.0 x8 root ports,
+  Flash-Next IQ4_NL, `-ncmoe 48`, a 2000-token decode, **35.5 t/s (`tensor`) vs 25.7 (`layer`) at the same
+  expert hit rate** (`COMMUNITY-CONFIG.md`, r16) -- a layer split runs one card's layers at a time, so every
+  layer boundary is a handoff with the other card idle.  On a *mixed* set the same mechanism turns against it:
+  the cross-device all-reduce sits on every layer's critical path (block 01's reason for existing), so the
+  slowest card and the slowest link set every token's pace, and an imbalanced `-ts` ratio produces the uneven
+  shards above.  A layer split keeps whole layers per device: no all-reduce, no sharded tensors, one device's
+  KV per layer, and every feature stacked on top inherits one device's geometry instead of a shard of every
+  device's.  It is a fully supported split (the streamed KV, the pool and every fused path work on both), not a
+  fallback; report a tensor-split problem against the layer arm too.
