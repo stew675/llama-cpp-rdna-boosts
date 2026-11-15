@@ -89,7 +89,11 @@ arm's 43.2 ms, bound 3.0x; the write path is what the per-tensor boundary change
 PASS at both points: canonical 0.000697 / 98.784 %, and `--device 0,1,2 --sm tensor` 0.000000 / 99.990 % against
 the recorded base.  `gate-per-block-build.sh --changed-from 8b653ad6d`: 2/2 built (`all` target), 15 skipped as
 unchanged.  `validate-set.sh` OK (17 default + 2 optional, tree `7181d3969`, cumulative optional `1c09de9a0`,
-Windows portability lint clean over 510 files).  Kernel journal clean in every gate.
+Windows portability lint clean over 510 files).  Kernel journal clean in every gate.  MTP (the canonical dense
+arm of `benchmarks/mtp-adaptive-methodology.md`, 1 GPU, 27B UD-Q4_K_XL, bf16 KV, `-n 3000`): draft-mtp
+**55.4 t/s** against plain **30.1 t/s** (1.84x), acceptance **0.55463** (1 873/3 377, mean len 2.66), i.e.
+draft >= plain and acceptance above the ~0.45 floor; the windowed split's own MTP arm is covered by
+`gate-kv-window-split.sh` (`win2mtp == ref2mtp`, identical acceptance, batched state save on the region path).
 
 **Reply:** posted on issue #314 (no em dashes), including the `-sm layer` recommendation for heterogeneous or
 slow-link sets, and the issue is closed.
