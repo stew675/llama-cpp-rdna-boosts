@@ -1,0 +1,395 @@
+From 53b38ab0d220b5f769cc47ba7d2d64756aeb09c9 Mon Sep 17 00:00:00 2001
+From: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 03:55:35 +0100
+Subject: [PATCH] mmvq: speculative verify (2-16 columns) in WMMA iu8 on RDNA4
+ (opt-in: GGML_CUDA_WMMA_MMVQ=2)
+
+The ksplit mmvq path recomputes dequantization and dot products for every verified token: at 7-8
+columns it becomes instruction-bound. This path computes the same products with
+wmma_i32_16x16x16_iu8 for 2-16 columns, dequantizing each weight once for all columns: Q4_K, Q5_K,
+Q6_K, IQ4_XS, read in their original GGUF layout, on the existing q8_1 activations. RDNA4 only
+(gfx1200/gfx1201); everything else falls back to the existing path.
+
+Off by default. GGML_CUDA_WMMA_MMVQ=2 enables it from 2 columns. Not bit-identical to the
+single-token path (different accumulation order): with it enabled, the decode/verify greedy-purity
+guarantee does not hold.
+---
+ ggml/src/ggml-cuda/mmvq-wmma.cu  | 323 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq-wmma.cuh |  10 +
+ ggml/src/ggml-cuda/mmvq.cu       |   8 +
+ 3 files changed, 341 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/mmvq-wmma.cu
+ create mode 100644 ggml/src/ggml-cuda/mmvq-wmma.cuh
+
+diff --git a/ggml/src/ggml-cuda/mmvq-wmma.cu b/ggml/src/ggml-cuda/mmvq-wmma.cu
+new file mode 100644
+index 0000000..b7d20ee
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-wmma.cu
+@@ -0,0 +1,323 @@
++// Matrix × N vectors (N = 2..16) in WMMA iu8 16×16×16, for the speculative verify on RDNA4.
++//
++// Design:
++// - one workgroup = one tile of 16 rows; its waves split K into interleaved 256-element super-blocks,
++//   the next super-block is loaded before the current one is processed, final reduction in LDS;
++// - computes C^T = X^T · W^T: A = activations (16 columns × 16 K, signed), B = weights (16 K × 16 rows);
++//   lane (r = lane % 16, g = lane / 16) keeps its row r, so its block scales stay local;
++// - each weight is dequantized once for all columns: that is what makes the cost flat;
++// - the order of the K positions inside a 32-block is free as long as the activations follow:
++//   XL = 1: WMMA 0 on k = g·8 + i, WMMA 1 on 16 + g·8 + i (IQ4_XS, Q6_K);
++//   XL = 2: WMMA 0 on k = g·16 + i, WMMA 1 on g·16 + 8 + i (Q4_K, Q5_K: 16 contiguous bytes per lane).
++// - activation scale d (block_q8_1.ds): each lane reads one, then a DPP row_share broadcast to the 8 columns
++//   the lane accumulates. The min term (Q4_K, Q5_K) uses d·Σxq, the sum of the QUANTIZED activations, through
++//   one more WMMA against a ones matrix: as vec_dot_q4_K_q8_1 does, and consistent with the main term
++//   (ds.y = the float Σx moves the outputs by ~1 % and drops the DFlash2 acceptance).
++#include "mmvq-wmma.cuh"
++#include <cstdlib>
++
++#if defined(GGML_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
++#define WMMV_DEVICE 1
++#endif
++
++namespace wmmv {
++
++typedef int v2i __attribute__((ext_vector_type(2)));
++typedef int v8i __attribute__((ext_vector_type(8)));
++
++#ifdef WMMV_DEVICE
++#define WMMA(sa, a, sb, b, c) __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, false)
++#else
++#define WMMA(sa, a, sb, b, c) (c)
++#endif
++
++static __device__ __forceinline__ float h_lo(uint32_t v) { return __half2float(__ushort_as_half((unsigned short)(v & 0xFFFF))); }
++
++struct Act { v2i a0, a1; float dx[8]; };
++static constexpr v2i ONES = {0x01010101, 0x01010101};
++
++template <int XL>
++static __device__ __forceinline__ void load_act(Act & A, const block_q8_1 * __restrict__ y, const int stride_col_y,
++                                                const int kb, const int lane, const int N) {
++    const int c = lane & 15, g = lane >> 4;
++    A.a0 = v2i{0, 0}; A.a1 = v2i{0, 0};
++    if (c < N) {
++        const uint8_t * qs = (const uint8_t *) y[(int64_t) c*stride_col_y + kb].qs;
++        if constexpr (XL == 2) {
++            const int * p = (const int *) (qs + g*16);
++            A.a0 = v2i{p[0], p[1]}; A.a1 = v2i{p[2], p[3]};
++        } else {
++            const int * p0 = (const int *) (qs + g*8);
++            const int * p1 = (const int *) (qs + 16 + g*8);
++            A.a0 = v2i{p0[0], p0[1]}; A.a1 = v2i{p1[0], p1[1]};
++        }
++    }
++    // Lane i of row g reads the scale of column 8g + i%8; row_share:e broadcasts lane e of each row.
++    const int cc = (lane & 7) + 8*g;
++    int ds = 0;
++    if (cc < N) {
++        ds = *(const int *) &y[(int64_t) cc*stride_col_y + kb].ds;
++    }
++#ifdef WMMV_DEVICE
++#define WMMV_SHARE(e) { const uint32_t v = (uint32_t) __builtin_amdgcn_update_dpp(0, ds, 0x150 + e, 0xF, 0xF, false); \
++                        A.dx[e] = h_lo(v); }
++#else
++#define WMMV_SHARE(e) { A.dx[e] = h_lo((uint32_t) ds); }
++#endif
++    WMMV_SHARE(0) WMMV_SHARE(1) WMMV_SHARE(2) WMMV_SHARE(3) WMMV_SHARE(4) WMMV_SHARE(5) WMMV_SHARE(6) WMMV_SHARE(7)
++#undef WMMV_SHARE
++}
++
++static __device__ __forceinline__ void scale_min(const int j, const uint32_t s0, const uint32_t s1, const uint32_t s2, int & sc, int & mn) {
++    auto byte = [&](int i) -> uint32_t { const uint32_t w = i < 4 ? s0 : (i < 8 ? s1 : s2); return (w >> (8*(i & 3))) & 0xFF; };
++    if (j < 4) { sc = byte(j) & 63; mn = byte(j + 4) & 63; }
++    else { sc = (byte(j + 4) & 0xF) | ((byte(j - 4) >> 6) << 4); mn = (byte(j + 4) >> 4) | ((byte(j) >> 6) << 4); }
++}
++// bit j of each byte -> bit 4
++static __device__ __forceinline__ uint32_t hb4(const uint32_t h, const int j) {
++    return j <= 4 ? (h << (4 - j)) & 0x10101010u : (h >> (j - 4)) & 0x10101010u;
++}
++static __device__ __forceinline__ uint32_t sext6(const uint32_t v) {
++    const uint32_t t = v & 0x20202020u;
++    return v | (t << 1) | (t << 2);
++}
++
++// ---------------------------------------------------------------- Q4_K: d, dmin, scales[12] (16 B), qs[128] at 16
++struct Q4K {
++    static constexpr int BB = 144, XL = 2;
++    struct Regs { uint4 q[4]; uint4 hdr; };
++    static __device__ __forceinline__ void load(Regs & R, const uint8_t * b, const int g) {
++        R.hdr = *(const uint4 *) b;
++#pragma unroll
++        for (int p = 0; p < 4; ++p) R.q[p] = *(const uint4 *) (b + 16 + p*32 + g*16);
++    }
++    static __device__ __forceinline__ void compute(const Regs & R, const int s, const int lane, const block_q8_1 * y,
++                                                   const int stride_col_y, const int N, float acc[8]) {
++        const float d = h_lo(R.hdr.x), dmin = h_lo(R.hdr.x >> 16);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            int sc, mn; scale_min(j, R.hdr.y, R.hdr.z, R.hdr.w, sc, mn);
++            const float fs = d*(float) sc, fm = dmin*(float) mn;
++            const uint4 q = R.q[j >> 1]; const int sh = 4*(j & 1);
++            const v2i w0 = {(int) ((q.x >> sh) & 0x0F0F0F0Fu), (int) ((q.y >> sh) & 0x0F0F0F0Fu)};
++            const v2i w1 = {(int) ((q.z >> sh) & 0x0F0F0F0Fu), (int) ((q.w >> sh) & 0x0F0F0F0Fu)};
++            Act A; load_act<XL>(A, y, stride_col_y, s*8 + j, lane, N);
++            v8i c = {}, cs = {};
++            c  = WMMA(true, A.a0, false, w0, c);
++            c  = WMMA(true, A.a1, false, w1, c);
++            // the column's Σxq over the block (as d8·dot2 in vec_dot_q4_K_q8_1)
++            cs = WMMA(true, A.a0, false, ONES, cs);
++            cs = WMMA(true, A.a1, false, ONES, cs);
++#pragma unroll
++            for (int e = 0; e < 8; ++e) acc[e] += A.dx[e]*(fs*(float) c[e] - fm*(float) cs[e]);
++        }
++    }
++};
++
++// ---------------------------------------------------------------- Q5_K: 16 B header, qh[32] at 16, qs[128] at 48
++struct Q5K {
++    static constexpr int BB = 176, XL = 2;
++    struct Regs { uint4 q[4]; uint4 h; uint4 hdr; };
++    static __device__ __forceinline__ void load(Regs & R, const uint8_t * b, const int g) {
++        R.hdr = *(const uint4 *) b;
++        R.h   = *(const uint4 *) (b + 16 + g*16);
++#pragma unroll
++        for (int p = 0; p < 4; ++p) R.q[p] = *(const uint4 *) (b + 48 + p*32 + g*16);
++    }
++    static __device__ __forceinline__ void compute(const Regs & R, const int s, const int lane, const block_q8_1 * y,
++                                                   const int stride_col_y, const int N, float acc[8]) {
++        const float d = h_lo(R.hdr.x), dmin = h_lo(R.hdr.x >> 16);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            int sc, mn; scale_min(j, R.hdr.y, R.hdr.z, R.hdr.w, sc, mn);
++            const float fs = d*(float) sc, fm = dmin*(float) mn;
++            const uint4 q = R.q[j >> 1]; const int sh = 4*(j & 1);
++            const v2i w0 = {(int) (((q.x >> sh) & 0x0F0F0F0Fu) | hb4(R.h.x, j)), (int) (((q.y >> sh) & 0x0F0F0F0Fu) | hb4(R.h.y, j))};
++            const v2i w1 = {(int) (((q.z >> sh) & 0x0F0F0F0Fu) | hb4(R.h.z, j)), (int) (((q.w >> sh) & 0x0F0F0F0Fu) | hb4(R.h.w, j))};
++            Act A; load_act<XL>(A, y, stride_col_y, s*8 + j, lane, N);
++            v8i c = {}, cs = {};
++            c  = WMMA(true, A.a0, false, w0, c);
++            c  = WMMA(true, A.a1, false, w1, c);
++            // the column's Σxq over the block (as d8·dot2 in vec_dot_q4_K_q8_1)
++            cs = WMMA(true, A.a0, false, ONES, cs);
++            cs = WMMA(true, A.a1, false, ONES, cs);
++#pragma unroll
++            for (int e = 0; e < 8; ++e) acc[e] += A.dx[e]*(fs*(float) c[e] - fm*(float) cs[e]);
++        }
++    }
++};
++
++// ---------------------------------------------------------------- Q6_K: ql[128], qh[64] at 128, scales[16] at 192, d at 208
++// 210-byte blocks: unaligned loads (the hardware accepts them).
++struct Q6K {
++    static constexpr int BB = 210, XL = 1;
++    struct Regs { uint2 la[4], lb[4], ha[2], hb[2]; uint4 sc; uint32_t dd; };
++    static __device__ __forceinline__ void load(Regs & R, const uint8_t * b, const int g) {
++#pragma unroll
++        for (int n = 0; n < 2; ++n) {
++#pragma unroll
++            for (int o = 0; o < 2; ++o) {
++                R.la[n*2 + o] = *(const uint2 *) (b + n*64 + o*32 + g*8);
++                R.lb[n*2 + o] = *(const uint2 *) (b + n*64 + o*32 + 16 + g*8);
++            }
++            R.ha[n] = *(const uint2 *) (b + 128 + n*32 + g*8);
++            R.hb[n] = *(const uint2 *) (b + 128 + n*32 + 16 + g*8);
++        }
++        R.sc = *(const uint4 *) (b + 192);
++        R.dd = *(const uint16_t *) (b + 208);
++    }
++    static __device__ __forceinline__ uint32_t q6(const uint32_t lo, const int sl, const uint32_t h, const int qt) {
++        const uint32_t v = ((lo >> sl) & 0x0F0F0F0Fu) | ((qt <= 1 ? (h << (4 - 2*qt)) : (h >> (2*qt - 4))) & 0x30303030u);
++        return sext6(v ^ 0x20202020u);
++    }
++    static __device__ __forceinline__ void compute(const Regs & R, const int s, const int lane, const block_q8_1 * y,
++                                                   const int stride_col_y, const int N, float acc[8]) {
++        const float d = h_lo(R.dd);
++        const uint32_t sw[4] = {R.sc.x, R.sc.y, R.sc.z, R.sc.w};
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            const int n = j >> 2, qt = j & 3, o = qt & 1, sl = 4*(qt >> 1);
++            const uint2 la = R.la[n*2 + o], lb = R.lb[n*2 + o], ha = R.ha[n], hb = R.hb[n];
++            const v2i w0 = {(int) q6(la.x, sl, ha.x, qt), (int) q6(la.y, sl, ha.y, qt)};
++            const v2i w1 = {(int) q6(lb.x, sl, hb.x, qt), (int) q6(lb.y, sl, hb.y, qt)};
++            const int sc0 = (int) (int8_t) (sw[j >> 1] >> (16*(j & 1)));
++            const int sc1 = (int) (int8_t) (sw[j >> 1] >> (16*(j & 1) + 8));
++            Act A; load_act<XL>(A, y, stride_col_y, s*8 + j, lane, N);
++            const v8i z = {};
++            const v8i c0 = WMMA(true, A.a0, true, w0, z);
++            const v8i c1 = WMMA(true, A.a1, true, w1, z);
++#pragma unroll
++            for (int e = 0; e < 8; ++e) acc[e] += (d*A.dx[e])*(float) (c0[e]*sc0 + c1[e]*sc1);
++        }
++    }
++};
++
++// ---------------------------------------------------------------- IQ4_XS: d, scales_h, scales_l[4], qs[128] at 8
++struct IQ4XS {
++    static constexpr int BB = 136, XL = 1;
++    struct Regs { uint2 q[8]; uint2 hdr; };
++    static __device__ __forceinline__ void load(Regs & R, const uint8_t * b, const int g) {
++        R.hdr = *(const uint2 *) b;
++#pragma unroll
++        for (int j = 0; j < 8; ++j) R.q[j] = *(const uint2 *) (b + 8 + j*16 + g*8);
++    }
++    // 8 nibbles -> 8 signed kvalues_iq4nl bytes (low -> lo, high -> hi), as get_int_from_table_16.
++    static __device__ __forceinline__ void lut(const uint32_t q, uint32_t & lo, uint32_t & hi) {
++#ifdef WMMV_DEVICE
++        constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
++        const uint32_t qe = q & 0x07070707u, qo = (q >> 4) & 0x07070707u;
++        const uint32_t el = __builtin_amdgcn_perm(t1, t0, qe), eh = __builtin_amdgcn_perm(t3, t2, qe);
++        const uint32_t ol = __builtin_amdgcn_perm(t1, t0, qo), oh = __builtin_amdgcn_perm(t3, t2, qo);
++        lo = __builtin_amdgcn_perm(eh, el, 0x03020100u | ((q & 0x08080808u) >> 1));
++        hi = __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((q & 0x80808080u) >> 5));
++#else
++        lo = q; hi = q;
++#endif
++    }
++    static __device__ __forceinline__ void compute(const Regs & R, const int s, const int lane, const block_q8_1 * y,
++                                                   const int stride_col_y, const int N, float acc[8]) {
++        const float d = h_lo(R.hdr.x);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            const int ls = (int) (((R.hdr.y >> (4*j)) & 0xF) | (((R.hdr.x >> (16 + 2*j)) & 3) << 4));
++            const float dl = d*(float) (ls - 32);
++            uint32_t a, b, c2, d2;
++            lut(R.q[j].x, a, b); lut(R.q[j].y, c2, d2);
++            const v2i w0 = {(int) a, (int) c2}, w1 = {(int) b, (int) d2};
++            Act A; load_act<XL>(A, y, stride_col_y, s*8 + j, lane, N);
++            v8i c = {};
++            c = WMMA(true, A.a0, true, w0, c);
++            c = WMMA(true, A.a1, true, w1, c);
++#pragma unroll
++            for (int e = 0; e < 8; ++e) acc[e] += (dl*A.dx[e])*(float) c[e];
++        }
++    }
++};
++
++template <class F, int WAVES>
++__launch_bounds__(32*WAVES, 1)
++static __global__ void mmvq_wmma(const uint8_t * __restrict__ vx, const block_q8_1 * __restrict__ y, float * __restrict__ dst,
++                                 const int nsb, const int64_t row_bytes, const int stride_col_y, const int64_t stride_col_dst, const int N) {
++#ifdef WMMV_DEVICE
++    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, tile = blockIdx.x;
++    const int r = lane & 15, g = lane >> 4;
++    const uint8_t * row = vx + (int64_t) (tile*16 + r)*row_bytes;
++    float acc[8] = {0.0f};
++    int s = wave;
++    typename F::Regs cur, nxt;
++    if (s < nsb) F::load(cur, row + (int64_t) s*F::BB, g);
++    while (s < nsb) {
++        const int sn = s + WAVES;
++        if (sn < nsb) F::load(nxt, row + (int64_t) sn*F::BB, g);
++        F::compute(cur, s, lane, y, stride_col_y, N, acc);
++        cur = nxt; s = sn;
++    }
++    __shared__ float red[WAVES][8][32];
++#pragma unroll
++    for (int e = 0; e < 8; ++e) red[wave][e][lane] = acc[e];
++    __syncthreads();
++    for (int o = threadIdx.x; o < 256; o += 32*WAVES) {
++        const int e = o >> 5, l = o & 31;
++        float v = 0.0f;
++#pragma unroll
++        for (int w = 0; w < WAVES; ++w) v += red[w][e][l];
++        const int col = (l >> 4)*8 + e;
++        if (col < N) dst[(int64_t) col*stride_col_dst + tile*16 + (l & 15)] = v;
++    }
++#else
++    GGML_UNUSED_VARS(vx, y, dst, nsb, row_bytes, stride_col_y, stride_col_dst, N);
++    NO_DEVICE_CODE;
++#endif
++}
++
++template <class F>
++static bool launch(const void * vx, const void * vy, float * dst, const int64_t ncols_x, const int64_t nrows_x,
++                   const int64_t stride_row_x, const int N, const int64_t stride_col_y, const int64_t stride_col_dst, cudaStream_t stream) {
++    const int nsb = (int) (ncols_x / 256);
++    const dim3 grid((unsigned) (nrows_x / 16));
++    const auto * x = (const uint8_t *) vx;
++    const auto * y = (const block_q8_1 *) vy;
++    const int64_t rb = stride_row_x*F::BB;
++    const int scy = (int) stride_col_y;
++    // Wave count: it must divide the super-block count (otherwise part of the workgroup idles).
++    if (nsb % 10 == 0) { mmvq_wmma<F, 10><<<grid, 320, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
++    else if (nsb % 8 == 0) { mmvq_wmma<F, 8><<<grid, 256, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
++    else if (nsb % 4 == 0) { mmvq_wmma<F, 4><<<grid, 128, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
++    else if (nsb % 2 == 0) { mmvq_wmma<F, 2><<<grid, 64, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
++    else { mmvq_wmma<F, 1><<<grid, 32, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
++} // namespace wmmv
++
++static int wmmv_min_cols() {
++    // GGML_CUDA_WMMA_MMVQ unset or 0: off (opt-in, WIP); =n (n >= 2): from n columns (2 is the measured choice).
++    // Single-token decode always keeps the ksplit kernel, which is faster at 1 column.
++    static const int v = [] {
++        const char * e = getenv("GGML_CUDA_WMMA_MMVQ");
++        if (e == nullptr) return 0;
++        const int n = atoi(e);
++        return n <= 0 ? 0 : n;
++    }();
++    return v;
++}
++
++bool ggml_cuda_mmvq_wmma(ggml_type type, const void * vx, const void * vy, float * dst,
++                         int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x, int ncols_dst,
++                         int64_t stride_col_y, int64_t stride_col_dst, int cc, cudaStream_t stream) {
++    const int min_cols = wmmv_min_cols();
++    if (min_cols == 0 || ncols_dst < min_cols || ncols_dst > 16 || !GGML_CUDA_CC_IS_RDNA4(cc)) {
++        return false;
++    }
++    if (ncols_x % 256 != 0 || nrows_x % 16 != 0) {
++        return false;
++    }
++    switch (type) {
++        case GGML_TYPE_Q4_K:   return wmmv::launch<wmmv::Q4K>  (vx, vy, dst, ncols_x, nrows_x, stride_row_x, ncols_dst, stride_col_y, stride_col_dst, stream);
++        case GGML_TYPE_Q5_K:   return wmmv::launch<wmmv::Q5K>  (vx, vy, dst, ncols_x, nrows_x, stride_row_x, ncols_dst, stride_col_y, stride_col_dst, stream);
++        case GGML_TYPE_Q6_K:   return wmmv::launch<wmmv::Q6K>  (vx, vy, dst, ncols_x, nrows_x, stride_row_x, ncols_dst, stride_col_y, stride_col_dst, stream);
++        case GGML_TYPE_IQ4_XS: return wmmv::launch<wmmv::IQ4XS>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, ncols_dst, stride_col_y, stride_col_dst, stream);
++        default: return false;
++    }
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-wmma.cuh b/ggml/src/ggml-cuda/mmvq-wmma.cuh
+new file mode 100644
+index 0000000..d8dc5ae
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-wmma.cuh
+@@ -0,0 +1,10 @@
++#pragma once
++#include "common.cuh"
++
++// Matrix × 2-16 vectors in WMMA iu8 (RDNA4): the cost is nearly independent of the column count.
++// Reads the weights in their original GGUF layout and the existing q8_1 activations.
++// Returns false when the case is not covered (type, shape, GPU, or GGML_CUDA_WMMA_MMVQ unset/0): the caller
++// then takes the usual path.
++bool ggml_cuda_mmvq_wmma(ggml_type type, const void * vx, const void * vy, float * dst,
++                         int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x, int ncols_dst,
++                         int64_t stride_col_y, int64_t stride_col_dst, int cc, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 061a521..5adf7a0 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-wmma.cuh"
+ #include "graph.cuh"            // ggml_cuda_stream_context is defined there (the concurrent-region guard)
+ #include "gdn-conv.cuh"
+ #include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
+@@ -1979,6 +1980,13 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // Speculative verify (2-16 columns, dense matrix, no fusion): WMMA iu8, flat cost in the column count (RDNA4, opt-in).
++    if (!ids && fusion == nullptr && nrows_launch == ne01 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
++            ggml_cuda_mmvq_wmma(src0->type, src0->data, src1_q8_1, dst_d, ne00, ne01, s01, (int) ncols_dst,
++                                stride_col_y, stride_col_dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc, stream)) {
++        return;
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         nrows_launch,      ncols_dst,     s01, stride_col_y,     stride_col_dst,
+-- 
+2.53.0
+
