@@ -11,6 +11,7 @@ repository (`llama-cpp-rdna-boosts.wiki.git`); these files are the canonical, re
 | `Home.md` | **Home** — the landing page (`Home` is the wiki's front page) |
 | `MTP-and-Adaptive-MTP.md` | **MTP & Adaptive MTP** — the deep dive |
 | `MTP-Quick-Reference.md` | **MTP Quick Reference** — flags and commands |
+| `QFN-Memory-Usage.md` | **QFN Memory Usage** — where the VRAM goes on the one-card `Qwen3.8-Flash-Next` reference run |
 | `_Sidebar.md` | the wiki navigation sidebar |
 | `README.md` | this file (do **not** copy it to the wiki) |
 
@@ -24,7 +25,7 @@ After that:
 
 ```bash
 git clone git@github.com:stew675/llama-cpp-rdna-boosts.wiki.git /tmp/rdna-wiki
-cp Home.md MTP-and-Adaptive-MTP.md MTP-Quick-Reference.md _Sidebar.md /tmp/rdna-wiki/
+cp Home.md MTP-and-Adaptive-MTP.md MTP-Quick-Reference.md QFN-Memory-Usage.md _Sidebar.md /tmp/rdna-wiki/
 cd /tmp/rdna-wiki
 git add -A
 git commit -m "Sync wiki from the delivery repo"
