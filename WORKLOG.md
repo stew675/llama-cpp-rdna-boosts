@@ -53,10 +53,11 @@ shares and quote `max_i(share_i x bytes / rate_i)` (the children read in paralle
 (60 % of the split, its share in 97.7 ms) + 11.8 GB/s on device 1 (40 %, 127.6 ms) ... the slowest share sets
 the wait".  Two measured caveats are recorded in `INVARIANTS.md`: the calibrated number is a cold burst, so the
 quoted ms is a floor (at 65536 cells the sustained aggregate is ~10 GB/s per device), and a window at or above
-the run depth costs **nothing** on a split (2x R9700, 27B, a 5996-token request: 43.17 t/s without a window,
-43.22 at `W=8192`, 43.31 at `W=65536`; and 38.13 / 38.22 / 38.12 at `-ts 24/16`), so **F6 does not reproduce
-here** -- the 29 % the reporter measured is their mixed gfx1100+gfx1201 x8 pair with known-bad compiler flags,
-not the split's region-backed KV path.
+the run depth costs **nothing** on a split (2x R9700, 27B, a 5996-token request, pp5996 / tg64: 1853.9 / 43.07
+without a window, 1850.1 / 43.16 at `W=8192`, 1849.8 / 43.15 at `W=65536`, 1807.7 / 43.06 at `W=1`), so **F6
+does not reproduce here** -- the 29 % the reporter measured is their mixed gfx1100+gfx1201 x8 pair with
+known-bad compiler flags, not the split's region-backed KV path.  Same at `-ts 24/16`, `-p 4096`:
+1689.2 / 38.13 without a window, 1684.0 / 38.22 at `W=8192`, 1685.2 / 38.12 at `W=65536`.
 
 **F5 -- `--fit` does size a window on a split; the `auto` message is the defect.**  The reporter's
 "the windowed KV needs one region-backed KV cache to size against (this config has 2 device(s))" came from the

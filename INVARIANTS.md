@@ -4937,7 +4937,7 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   against 27.8 and 14.2 GB/s calibrated) and it never measures the second card.  `llama_kv_cache`'s window
   line and `--fit` now calibrate **every** child and quote each one's share and its wait.  Two more measured
   facts from the same arms: a window at or above the run depth costs **nothing** on a split (2x R9700, 27B, a
-  5996-token request: 43.17 t/s without a window, 43.22 with `W=8192`, 43.31 with `W=65536`, i.e. the 29 %
+  5996-token request: 43.07 t/s without a window, 43.16 with `W=8192`, 43.15 with `W=65536`, i.e. the 29 %
   the field report saw on the mixed gfx1100+gfx1201 x8 pair is that box, not the split path), and the
   calibrated in-place rate is a *cold burst* number — at 65536 cells the sustained aggregate is ~10 GB/s per
   device, so treat the quoted ms as a floor (the line already says a card that reads its aperture below its
