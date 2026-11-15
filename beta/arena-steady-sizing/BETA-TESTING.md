@@ -39,7 +39,10 @@ A/B is one environment variable and the same binary.
    llama-server ... --parallel 1 -ub 16384    # then a 4 k+ prompt, n_predict 2000, temp 0
    ```
    Report `predicted_per_second` for both switch arms, interleaved ABAB, at least 2 cycles.
-4. **Both host tiers.** The value depends on what a miss costs, so please report which tier you are on:
+4. **Both host tiers, and the SMALLEST card you have.** The value scales with `1/arena_size`: measured
+   **+4.0 %** on a 32 GiB R9700 (arena 23 GiB) and **+19.0 %** on a 24 GiB RX 7900 XTX (arena 8 GiB), same
+   fix, same ~-33 % miss traffic. A 16 GiB card should be worth more again; a 32 GiB card is a poor place to
+   judge this. Please report which tier you are on:
    * a **mirror** (`-lme auto` covering the set) — expect a few percent;
    * a **partial pool** (`-lme N` below the set) or a **disk** tier (`MOE_HOST_POOL_DIO=1`) — expect much
      more. Measured here: +4.0 % mirror, +29 % partial pool.

@@ -13,8 +13,9 @@
   (`4f0770d7538b`), via `scripts/apply-all.sh . --include-beta` on a fresh checkout of
   `release.json.base` (`4f9dfa0e3`).  `release.json` is unchanged; folding this into a block (§6) is what
   changes `.tip`/`.tree`.
-* measured on: 1 × R9700 (`gfx1201`, 32 624 MiB), 16-core, 93 GiB RAM, ROCm 10.1, Qwen3.8-Flash-Next
-  `GSQ-RCO-IQ3_S`, `-ncmoe 47`, `-ub 16384`, `--parallel 1`, 4 k prompt + **2 000** generated tokens
+* measured on: 1 × R9700 (`gfx1201`, 32 624 MiB, PCIe 5.0 x16, 93 GiB RAM) **and** 1 × RX 7900 XTX
+  (`gfx1100`, 24 560 MiB, **PCIe 4.0 x16**, 61 GiB RAM), ROCm 10.1, Qwen3.8-Flash-Next `GSQ-RCO-IQ3_S`,
+  `-ub 16384`, `--parallel 1`, 4 k prompt + **2 000** generated tokens
 
 ---
 
@@ -95,6 +96,37 @@ So the fix removes ≈ **29-32 % of the expert miss traffic**, and how much wall
 only on whether the expert path is the bottleneck: ~13 % of the wall on this box's mirror tier (+4.0 %),
 the whole wall on a partial pool (+29 %). A PCIe4 x16 card with a real mirror sits between; the portable
 estimate is `49 MiB/token saved ÷ link rate`, i.e. ~2 ms/token ≈ **+10 %** at 25 GB/s.
+
+### Validated on the target hardware — RX 7900 XTX, 24 GiB (`gfx1100`, PCIe 4.0 x16)
+
+Run on the maintainer's 24 GiB box at its own field `runme` (QFN `GSQ-RCO-IQ3_S`, `-ncmoe 48`, 61 GiB RAM so
+`-lme auto` resolves to a **mirror**, `-ub 16384`, ctx 32 768, **2 000** generated tokens, 2 interleaved
+cycles, heat prior pinned). `b1f559df7` tree, patch applied on top:
+
+| | base | settle | Δ |
+|---|---:|---:|---:|
+| slab (work + arena) | 14.62 GiB (6.50 + 8.12) | same | — |
+| arena sized at the drop | 7 962.5 MiB (16.6 %) | **12 888.2 MiB (26.9 %)** | **+62 %** |
+| arena hit | 0.6038 / 0.6039 | **0.7337 / 0.7337** | +13 pp |
+| host pool (L2) hit | 0.9849 | 0.9962 | |
+| expert fills | 128 433 | 88 487 | −31 % |
+| expert cold reads | 1 043 443 | 682 850 | −35 % |
+| **expert miss traffic** | **757 391.7 MiB** | **500 773.0 MiB** | **−33.9 %** |
+| **decode** | **45.20 / 45.68 → 45.44 t/s** | **53.33 / 54.85 → 54.09 t/s** | **+19.0 %** |
+| greedy text | `sha 4df76b729a6ba020` | **identical** | — |
+
+The defect there is `6.50 - 1.875 ≈ 4.6 GiB` of an **8.12 GiB** arena, i.e. the fix recovered essentially the
+whole region (12 888 of a ~12.7 GiB post-drop region).
+
+**This is the scaling that matters.** The same −32..−34 % traffic reduction is worth **+4.0 %** on the 32 GiB
+box (arena 23 GiB) and **+19.0 %** on the 24 GiB box (arena 8 GiB), because the budget the arena gets is what
+decides whether the expert path is the bottleneck: base miss traffic on the 24 GiB box is 379 MiB/token
+(≈17 GB/s of effective read at 45 t/s, i.e. the card *is* link-bound), and the settle removes 128 MiB/token
+of it. **Arena capacity is worth roughly `1 / arena_size`** — so smaller VRAM cards gain most, which is
+exactly where the defect is worst (49 % of the arena lost at `-ub 32768`).
+
+Two snapshot builds are left on that host as `/tmp/tree-base/bin` and `/tmp/tree-fix/bin` (drop-in
+`SERVER=` arguments to its `runme`), so the measurement can be repeated without rebuilding.
 
 **Correctness:** same-seed greedy text is **byte-identical** (`sha256 af0ec4edd999a414`, 489 chars,
 `--temp 0 --seed 42`, the settle provably firing: arena 18 411.9 → 22 705.1 MiB in the same run). The

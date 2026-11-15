@@ -5072,7 +5072,16 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    mirror where it is ~13 % of the wall, +29 % on a pool where it *is* the wall, for the same −29..−32 %
    traffic).  A box with PCIe5 x16 + a PCIe5 SSD is the *best* case for masking this and must not be used to
    size an arena policy.
-6. **The settle must scale the sizing count, not re-derive it.**  A per-device re-derivation has to reproduce
+6. **Arena capacity is worth ~`1 / arena_size`, and the 24 GiB card proves it — validate this class on the
+   smallest card available.**  Same fix, same ~-33 % miss traffic, two cards at `-ub 16384`, 2 000 tokens:
+   32 GiB (arena 23 GiB, mirror) **+4.0 %**; **RX 7900 XTX 24 GiB (`gfx1100`, PCIe 4.0 x16, arena 8.12 GiB,
+   mirror)** arena 7 962.5 -> **12 888.2 MiB (+62 %)**, hit 0.6038 -> 0.7337, miss traffic 757 391.7 ->
+   500 773.0 MiB (**-33.9 %**), decode 45.44 -> **54.09 t/s (+19.0 %)**, greedy text byte-identical
+   (`sha 4df76b729a6ba020`).  Base miss traffic there is **379 MiB/token ≈ 17 GB/s of effective read at
+   45 t/s**, i.e. the card is link-bound, and the settle removes 128 MiB/token of it.  The 24 GiB box's defect
+   is `6.50 - 1.875 = 4.6 GiB` of an **8.12 GiB** arena.  **A 32 GiB R9700 understates this class by ~5x; do
+   not size an arena policy on it.**
+7. **The settle must scale the sizing count, not re-derive it.**  A per-device re-derivation has to reproduce
    every sizing-time exclusion (`table_pinned_head`, the per-table arena-unit rounding, `g_extra_reserve`);
    diverging from it builds a **non-uniform layer**, the one state that reads the wrong expert.  Scaling by
    `min(avail_now, request) / avail_sizing` from the recorded sizing inputs is scan-free and cannot disagree.
