@@ -2,17 +2,18 @@
 
 > **Status: BETA candidate (2026-11-15).** Not in `patches/`, not in the release tree, not covered by the
 > delivery's gates. One commit, one file (`ggml/src/ggml-cuda/moe-expert-cache.cu`), against the
-> `release.json` tree `4f0770d7538b6e633ede9271bebdc5f83340a3c9` (`tip 14f3749bed`, r288).
+> `release.json` tree `8423b2b5eac33f97ad530229b8c35240aa64fa08` (`tip ec721312c`, **r291**).
 >
 > Why `beta/` and not `wip/`: it edits a file blocks **09/10/15** own, so it cannot be a standalone `wip/`
 > artefact — and where it should be *folded* (an amendment to block 09, which owns the re-arm, or a new
 > temporary block) is the maintainer's decision, not a gate outcome. See §6.
 
-* patch: `arena-steady-sizing.patch` — sha256 `adbc0a49d3bba11dc56c721e5372c360f435fc7834e13516d86a0ac1e9b08744`
-* applied tree (verified 2026-11-15): **`aa7e09dabe32`** — one commit on top of the r288 tree
-  (`4f0770d7538b`), via `scripts/apply-all.sh . --include-beta` on a fresh checkout of
+* patch: `arena-steady-sizing.patch` — sha256 `66af35b2ddb6c28890903d589934045c691be4a09d2d9dd3892d0ca556862f70`
+* applied tree (re-verified 2026-11-15 on r291): **`9848ad69ae8b`** — one commit on top of the r291 tree
+  (`8423b2b5eac3`), via `scripts/apply-all.sh . --include-beta` on a fresh checkout of
   `release.json.base` (`4f9dfa0e3`).  `release.json` is unchanged; folding this into a block (§6) is what
-  changes `.tip`/`.tree`.
+  changes `.tip`/`.tree`.  (Earlier cut against r288 gave applied tree `aa7e09dabe32`; the fix and its
+  numbers are identical on both — it re-applied verbatim to r291.)
 * measured on: 1 × R9700 (`gfx1201`, 32 624 MiB, PCIe 5.0 x16, 93 GiB RAM) **and** 1 × RX 7900 XTX
   (`gfx1100`, 24 560 MiB, **PCIe 4.0 x16**, 61 GiB RAM), ROCm 10.1, Qwen3.8-Flash-Next `GSQ-RCO-IQ3_S`,
   `-ub 16384`, `--parallel 1`, 4 k prompt + **2 000** generated tokens
@@ -80,6 +81,8 @@ same prompt/seed, `MOE_EXPERT_HEATMAP=load` so the prior is frozen:
 |---|---|---:|---:|---:|---:|
 | 100 % mirror (all 46.9 GiB pinned) | base | 18 411.9 MiB | 0.8337 | 51.50 / 51.39 | — |
 | | **settle** | **22 705.1 MiB** | **0.8866** | **53.56 / 53.52** | **+4.0 %** |
+| same, re-measured on the **r291** tree | base | 18 411.9 MiB | 0.8337 | 51.40 | — |
+| | **settle** | **22 705.1 MiB** | **0.8866** | **53.59** | **+4.3 %** |
 | partial pool (`-lme 8`, `DIO=1`) | base | 18 411.9 MiB | 0.8515 | 18.30 / 18.29 | — |
 | | **settle** | **22 705.1 MiB** | **0.8940** | **23.60 / 24.01** | **+29 %** |
 
@@ -114,6 +117,10 @@ cycles, heat prior pinned). `b1f559df7` tree, patch applied on top:
 | **expert miss traffic** | **757 391.7 MiB** | **500 773.0 MiB** | **−33.9 %** |
 | **decode** | **45.20 / 45.68 → 45.44 t/s** | **53.33 / 54.85 → 54.09 t/s** | **+19.0 %** |
 | greedy text | `sha 4df76b729a6ba020` | **identical** | — |
+
+(Measured on the `b1f559df7` tree = the release before r291; **re-measurement on the r291 tree on that host is
+pending** — it needs one `apply-all.sh` + two builds there and was not completed.  The change itself is
+tree-independent: it re-applied verbatim to r291 and the 32 GiB numbers below were re-measured on r291.)
 
 The defect there is `6.50 - 1.875 ≈ 4.6 GiB` of an **8.12 GiB** arena, i.e. the fix recovered essentially the
 whole region (12 888 of a ~12.7 GiB post-drop region).

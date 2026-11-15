@@ -35,7 +35,7 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-* **`arena-steady-sizing`** (2026-11-15, r291) — **the expert arena was sized once, from the slab's
+* **`arena-steady-sizing`** (2026-11-15, r292) — **the expert arena was sized once, from the slab's
   *prefill* boundary**, so a larger `-ub` permanently shrank it: measured `max(0, boundary_at_birth -
   narrow_floor)` = 21 % of the arena lost at `-ub 16384` and **49 %** at `-ub 32768`, with an explicit
   `MOE_EXPERT_CACHE_MIB` silently free-clamped on top.  One file, one commit: settle the per-layer slot count

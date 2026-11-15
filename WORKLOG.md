@@ -1,4 +1,4 @@
-## 261115.005 (r292) -- the expert arena was sized once, from the slab's *prefill* boundary: `-ub` silently shrank it by 21 % / 49 %.  A one-file beta candidate settles the count at each drop (+4.0 % mirror, +29 % partial pool, same-seed text byte-identical)
+## 261115.005 (r292) -- the expert arena was sized once, from the slab's *prefill* boundary: `-ub` silently shrank it by 21 % / 49 %.  A one-file beta candidate settles the count at each drop: +4.0 % on the 32 GiB R9700, +19.0 % on the 24 GiB 7900 XTX, same-seed text byte-identical
 
 Started as a feasibility question about a *strictly bimodal* slab (prefill band XOR expert arena on
 `--parallel 1`), and the assessment of that is `wip/bimodal-slab/` — short version: the modality mechanism
@@ -34,9 +34,6 @@ and 271 398 -> 192 635 MiB over the run) — the hardware-independent figure; ho
 depends only on whether the expert path is the bottleneck. **Same-seed greedy text byte-identical**
 (`sha256 af0ec4edd999a414`) with the settle provably firing.
 
-<<<<<<< HEAD
-Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
-=======
 **Validated on the target hardware (RX 7900 XTX, 24 560 MiB, `gfx1100`, PCIe 4.0 x16, 61 GiB RAM -> mirror
 host tier), at that box's own field `runme`, `-ub 16384`, ctx 32 768, 2 000 greedy tokens, 2 interleaved
 cycles:** arena **7 962.5 -> 12 888.2 MiB (+62 %)**, hit 0.6038 -> 0.7337, miss traffic **757 391.7 ->
@@ -48,8 +45,8 @@ by ~5x.**  That is the strongest argument yet for validating arena/residency wor
 available.  Reverting the patch on that host left `b1f559df7` clean; two snapshot builds are kept there as
 `/tmp/tree-base/bin` and `/tmp/tree-fix/bin`.
 
-Two methodology corrections this session produced, both now in `INVARIANTS.md` r291: **never measure a
->>>>>>> 922de9d (r291: validated on the 24 GiB RX 7900 XTX -- same fix, arena 7962.5 -> 12888.2 MiB (+62 %), miss traffic -33.9 %, decode 45.44 -> 54.09 t/s (+19.0 %), text byte-identical)
+Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
+Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
 residency change at 128 generated tokens** (the same change reads +1.8 % there and +4.0 % at 2 000, because
 the arena reaches steady state after a few hundred tokens), and **the arena's value is the cost of a miss,
 not the hit rate** (0.834 hit at 51.5 t/s on a mirror vs 0.852 hit at 18.3 t/s on a partial pool — quote the

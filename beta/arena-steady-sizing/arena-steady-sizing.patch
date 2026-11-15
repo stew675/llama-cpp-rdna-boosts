@@ -1,6 +1,6 @@
-From 9ae6ac03f93615e664b4239718af9b3f4b8d7dd8 Mon Sep 17 00:00:00 2001
+From 8a928c8fc178e01c3995355baf158b24b35224e1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Sun, 15 Nov 2026 13:21:13 -0600
+Date: Sun, 15 Nov 2026 15:14:36 -0600
 Subject: [PATCH] wip: settle the expert-cache slot count against the arena a
  prefill -> decode drop returns
 
@@ -13,8 +13,10 @@ and 11.2 of 22.8 GiB at -ub 32768, for the life of the process.
 
 Settle the count at each prefill -> decode drop by scaling the sizing count by the
 capacity ratio (no table scan, so it cannot disagree with the sizing about which tables
-count). Growth only, bounded by what the operator requested. Same-seed greedy text
-byte-identical; decode +4.0 % on a 100 % mirror host tier, +29 % on a partial pool.
+count). Growth only, bounded by what the operator requested.
+
+Re-cut on release r291 (tree 8423b2b5ea). Same-seed greedy text byte-identical; decode
++4.3 % on a 100 % mirror host tier (32 GiB), +19.0 % on a 24 GiB RX 7900 XTX.
 ---
  ggml/src/ggml-cuda/moe-expert-cache.cu | 170 +++++++++++++++++++++++--
  1 file changed, 161 insertions(+), 9 deletions(-)
