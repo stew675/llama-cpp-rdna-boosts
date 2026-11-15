@@ -97,12 +97,13 @@ draft >= plain and acceptance above the ~0.45 floor; the windowed split's own MT
 
 **Reply:** posted on issue #314 (no em dashes), including the split-mode recommendation, and the issue is
 closed.  The recommendation is stated with its counter-measurement so nobody reads it as "layer is always
-better": a MATCHED pair keeps `-sm tensor` (2x R9700, Flash-Next IQ4_NL, `-ncmoe 48`: 35.5 vs 25.7 t/s at the
+better": a HOMOGENEOUS deployment keeps `-sm tensor` (2x R9700, Flash-Next IQ4_NL, `-ncmoe 48`: 35.5 vs 25.7 t/s at the
 same hit rate, the r16 record), and `-sm layer` is the first thing to try on a **mixed or imbalanced** set
 (different architectures, uneven VRAM, a card behind a slower link) or when several multi-device features are
 stacked, because then the all-reduce on every layer's critical path and the uneven shards both bite.  That
 qualification is in `README.md` -> *Picking a split mode*, in `INVARIANTS.md`, and as a pointer from the
-`-sm layer` vs `-sm tensor` row of `COMMUNITY-CONFIG.md` (whose numbers are a matched pair).
+`-sm layer` vs `-sm tensor` row of `COMMUNITY-CONFIG.md` (whose numbers are, and are now labelled as, a
+homogeneous deployment).
 
 **Records:** `patches/README.md` block 14 amendment note, `INVARIANTS.md` (four new facts), `MANIFESTS.md`
 (block 14 row + gate 18), `ENVIRONMENT.md` (`LLAMA_KV_N_PAD_PREFILL` and a windowed KV), `README.md` (the split

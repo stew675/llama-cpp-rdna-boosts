@@ -261,10 +261,11 @@ things follow:
 * This is a **fittability** feature, not a speed feature: at those depths the alternative to a spilled KV is an
   OOM.  If the table says seconds, use a smaller `-c`, `-sm layer`, or a model that fits.
 
-### Picking a split mode: `-sm tensor` on a matched pair, `-sm layer` on a mixed or stacked set
+### Picking a split mode: `-sm tensor` on a HOMOGENEOUS deployment, `-sm layer` on a mixed or stacked set
 
-**Matched pair, even link: keep `-sm tensor`.**  It interleaves every layer across all the cards, so they work
-in parallel, and it is measured the faster of the two on a homogeneous set: 2x R9700 on PCIe 5.0 x8 root ports,
+**Homogeneous deployment (same card model, same VRAM, comparable links): keep `-sm tensor`.**  It interleaves
+every layer across all the cards, so they work in parallel, and it is measured the faster of the two on exactly
+that shape: 2x R9700 on PCIe 5.0 x8 root ports,
 Flash-Next IQ4_NL, `-ncmoe 48`, a 2000-token decode, **35.5 t/s (`tensor`) vs 25.7 (`layer`) at the same expert
 hit rate** (`COMMUNITY-CONFIG.md`, r16).  A layer split runs one card's layers at a time, so every layer
 boundary is a handoff with the other card idle.  `-sm tensor` is also what the all-reduce work and the
@@ -282,9 +283,9 @@ which costs two things a layer split does not:
   the shape where the streamed KV's boundary arithmetic, the quantized-cache paths and the stride assumptions
   are hardest to keep right -- and it is what produced the GPU fault in issue #314.
 
-So when the pair is *not* matched (two architectures, an x8 card next to an x16 one, cards behind a different
-switch or a PCIe 3.0 chipset link, or one card with materially less VRAM), or when you are **stacking several
-features at once** (tensor split + `--kv-window` + `--kv-attendance-pool` + `--spec-draft-kv-window` +
+So when the set is *not* homogeneous (two architectures, an x8 card next to an x16 one, cards behind a
+different switch or a PCIe 3.0 chipset link, or one card with materially less VRAM), or when you are **stacking
+several features at once** (tensor split + `--kv-window` + `--kv-attendance-pool` + `--spec-draft-kv-window` +
 host-expert pooling), reach for the simpler contract:
 
 ```bash
