@@ -1,3 +1,44 @@
+## 261115.001 (r289, wip) -- PR #316 (`wip/gdn-conv-norm-deferred-gather`) reviewed and NOT taken: the fusion it fixes is not issued on r289 at all -- the r244 one-kernel conv step owns the decode/verify band
+
+PR #316 (@burnoutIA) is one patch (`gdn-conv.cu`, +13/-2) that skips `gdn_conv_norm_match`'s overlap
+test against `m.state` when that state's `GET_ROWS` is in `gdn_deferred_gathers`, i.e. when the GDN conv
+kernel reads the cache row itself.  It is a correct change where it fires, and it applies with a strict
+`git am` on the r289 tree, but its motivating observation and its measurement are stale: **on r289 the
+shape it describes never reaches the matcher**, so nothing is refused and nothing is saved there.
+`CHANGES_REQUESTED` on the PR; nothing of it is applied or committed, and `wip/` is unchanged (the PR's
+`wip/gdn-conv-norm-deferred-gather/` directory is also not registered in `wip/CAMPAIGNS.md`).
+
+1. **The r244 one-kernel conv step owns the path.**  `ggml_cuda_gdn_store_try_fuse()` is dispatched ahead
+   of `ggml_cuda_gdn_conv_try_fuse()`, and `gdn_conv_store_kernel` (`gdn-conv-store.cu`) already writes
+   the q/k norm outputs.  Census on the r289 tree (27B UD-Q4_K_XL + DFlash2-Q4_K_M, `draft-dflash
+   n_max 7`, 128 tokens, one counter in the matcher's caller and one in `gdn_store_launch`):
+   `94 x GDN_CONV_STORE T=8 S=1` (every verify step) and `47 x GDN_CONV_DIRECT T=42 snap=0` (the
+   prefill).  No `T=8` call enters `gdn_conv_norm_match`.  The code agrees: the deferral needs `m.snap`,
+   every `n_rs_seq > 0` graph uses the SET_ROWS store, and `gdn_conv_check()` sets `snap_ok = false` for
+   it -- so `m.snap` is false and `ggml_cuda_gdn_conv_gather_deferrable()` declines.  The patch cannot
+   touch a draft-armed graph on r289, with the store on or off (with `GGML_CUDA_FUSE_GDN_CONV_STORE=0`
+   the matcher is not entered either; text identical).
+2. **The measurement predates r244.**  The README's numbers are from the delivery of `81e969e`
+   (2026-11-03) and say "the matcher is unchanged between that tree and r289" -- true of the matcher text
+   (only the `getenv` caching differs) but the *dispatch* changed on 2026-11-09 (r244, PR #292).  r289
+   reproduction (DFlash2 n7, `prompts/recall.txt`, 256 tokens, temp 1, seeds 42/43/44, patched vs
+   unpatched, interleaved): acceptance identical (170/586, 173/569, 208/328), generation 55.2/55.1,
+   56.8/56.7, 98.8/99.0 t/s -- inert.
+3. **The one arm that fires, and what is left open.**  `test-logits-width-probe
+   prompts/prose-rdna-boosts.txt 4096 512 KV=q8_0`: at `W=6,7,8` the unpatched build refuses (48/layer,
+   `snap=1`), the patched build folds, and the probe's W1..W8 + row0/row1 hashes are byte-identical with
+   `width_purity=PASS` (so the skip is safe).  No production arm reaches it: short prefills at T=9..15
+   already fold, and `--spec-type ngram-mod` verify at T=8 and T=16 already folds at a short and a
+   ~5.8k-token context (its T=65 arm is a legitimate non-deferred refusal, where the kernel really reads
+   the state buffer).  The open question returned to the submitter is a path census on a tree with r244
+   (or `main`) proving the matcher is reached with a deferred gather in a deliverable arm, plus the
+   README correction and the `wip/CAMPAIGNS.md` entry.
+4. **What was verified so it does not have to be re-derived.**  Strict `git am` on the r289 tree; the only
+   file touched is `ggml/src/ggml-cuda/gdn-conv.cu`; no new environment variable; `GGML_CUDA_FUSE_GDN_CONV_NORM=0`
+   still stands the fold down; `gdn_conv_decode_ok` keeps calling the matcher without a context, so the
+   single-token decide is unchanged; `test-backend-ops -o SSM_CONV,GATED_DELTA_NET,RMS_NORM` 236/236 on the
+   patched build (MUL_MAT is untouched by a gdn-conv-only diff).
+
 ## 261114.010 (r289) -- issue #314: a windowed KV on an UNEVEN tensor split faults the GPU because the spill boundary was one byte offset for tensors with different cell strides; the boundary is a per-tensor cell count from the USED extent now, every child's in-place rate is calibrated, and `-sm layer` becomes the recommended split on a heterogeneous or slow-link set
 
 **`release.json` changed: release `v16-4f9dfa0e3-r288` -> `v16-4f9dfa0e3-r289`; 17 default patches (16
