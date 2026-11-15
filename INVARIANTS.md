@@ -4902,3 +4902,50 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   gfx1100 and gfx1151: `FLASH_ATTN_EXT` 7021/7021 default / `MIXED=0` / `NATIVE=0`; W=1..8 width purity
   maxdiff 0 for q8_0/q8_0 and all three pairs on 1 GPU, `-sm layer` and `-sm tensor`; plain == draft-mtp at
   n_max 1/3/7.  Gate: `scripts/gate-mixed-kv.sh`.
+
+* **A tensor split shards the KV row, so one cache can hold tensors with DIFFERENT cell strides — and the
+  windowed KV's spill boundary is a CELL COUNT, not a byte offset (r289, issue #314 F1/F2/F7).**  `-sm tensor`
+  splits every tensor by the `-ts` ratio and rounds each shard to its own head grid, so an uneven ratio gives
+  the K and V tensors of one cache different `nb1` (measured on a 27B with `-ts 24/16`: 1024 B and 1536 B in
+  the same VMM region on device 0).  The window kept ONE byte boundary (`vmm_tensors[0].nb1`-derived) for
+  every tensor, which is wrong in both directions: for the shorter tensors the shared VRAM watermark (a max
+  over the region) already sat past their whole extent, so the resident tail was never mapped and the first
+  ubatch that wrote it FAULTED the GPU (`rms_norm_mul_rope_f32`, grid `[256, 2048, 1]`, "Page not present",
+  `-ts 24/16` 2-device 27B — reproduce on 3 identical R9700: an EVEN split is clean, so the gate's even arms
+  missed it); and on the last tensor it asked for a span past the end of the reservation (the field
+  "region 868 MiB, wanted 864..868 MiB" refusal).  The boundary is now computed per tensor in cells, floored
+  to the map unit in THAT tensor's `nb1`, with per-tensor `lead`/`dev` watermarks; `grow_regions()` passes the
+  PADDED n_kv (what the graph reads, so what is mapped) **and** the used extent (what exists), and the spill
+  boundary follows the **used** extent: with the padded one a coarse `LLAMA_KV_N_PAD_PREFILL` step (8192 on a
+  multi-device split) spilled cells that do not exist and pushed real used cells out of the resident window,
+  so fewer than `W` used cells stayed in VRAM (F7).  Consequence for anyone reading the map: a windowed split's
+  VRAM is `W + (padded - used)` cells, i.e. at most `W + LLAMA_KV_N_PAD_PREFILL`, and the spilled bytes are
+  `used - W` cells.
+* **A refusal log must name the reason that failed, and a debug verify belongs on the CHANGE, not on the call
+  (r289, issue #314 F2).**  `ggml_backend_cuda_kv_region_log()` printed `LLAMA_KV_REGION_MAP_MAX_MIB` as
+  "cap" unconditionally, and that knob is 0 when unset — so a pinned-host mapping failure, a VRAM exhaustion
+  and a real cap hit all read "cap 0 MiB" and pointed at a knob that was already unlimited.  It takes a
+  reason now and prints the cap clause only when a cap is configured; `ggml_cuda_kv_spill_allow()`'s refusal
+  already logged its arithmetic and the grow site now says which path stopped.  Same class, same file: the
+  `LLAMA_KV_REGION_DEBUG` host re-read (an O(mapped extent) verification) ran on EVERY `grow_regions()` call
+  — and that is every batch, not every change — which turned a 22 t/s decode into **1.3 t/s** with the knob
+  on and made three separate debug runs look like a regression.  Verify on `mapped_after != mapped_before`.
+* **A split's spill cost is a per-device PARALLEL read, so it is `max_i(share_i x bytes / rate_i)`, and the
+  per-device rates are not the link's (r289, issue #314 F4/F6).**  Every child reads its own slice of the
+  spill at the same time, so one card's rate for the whole spill is wrong in both directions: it over-charges
+  an even split by up to 2x (measured 2026-11-14 on 2x R9700: 768 MiB spilled per token at 37 GB/s effective,
+  against 27.8 and 14.2 GB/s calibrated) and it never measures the second card.  `llama_kv_cache`'s window
+  line and `--fit` now calibrate **every** child and quote each one's share and its wait.  Two more measured
+  facts from the same arms: a window at or above the run depth costs **nothing** on a split (2x R9700, 27B, a
+  5996-token request: 43.17 t/s without a window, 43.22 with `W=8192`, 43.31 with `W=65536`, i.e. the 29 %
+  the field report saw on the mixed gfx1100+gfx1201 x8 pair is that box, not the split path), and the
+  calibrated in-place rate is a *cold burst* number — at 65536 cells the sustained aggregate is ~10 GB/s per
+  device, so treat the quoted ms as a floor (the line already says a card that reads its aperture below its
+  DMA link scales up from there).
+* **On a heterogeneous or slow-link set, `-sm layer` is the recommended split before `-sm tensor` (r289).**
+  Tensor split needs the cross-device all-reduce on every layer's critical path (block 01's reason for
+  existing), so the slowest card and the slowest link set every token's pace, and an imbalanced `-ts` ratio
+  produces the uneven shards above.  A layer split keeps whole layers per device: no all-reduce, no sharded
+  tensors, one device's KV per layer.  It is the simpler contract and the configuration the gates cover most
+  heavily; `-sm tensor` stays the target for a homogeneous set on an even link.  The streamed KV, the pool and
+  every fused path work on both.

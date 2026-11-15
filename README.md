@@ -261,6 +261,34 @@ things follow:
 * This is a **fittability** feature, not a speed feature: at those depths the alternative to a spilled KV is an
   OOM.  If the table says seconds, use a smaller `-c`, `-sm layer`, or a model that fits.
 
+### Picking a split mode: `-sm layer` first on a mixed, imbalanced or slow-link set
+
+`-sm tensor` shards **every tensor** across the devices by the `-ts` ratio, and that has two costs a `-sm layer`
+split does not pay:
+
+* **Every layer pays a cross-device reduction.**  A tensor split needs the all-reduce (block 01) on the
+  critical path of every layer, so the *slowest* card and the *slowest* link set the pace of every token.  A
+  layer split keeps each layer's matrices whole on one device: no all-reduce, no per-step sync, and the
+  devices only hand off the residual stream once per layer boundary.
+* **An imbalanced ratio produces uneven shards.**  The KV row is sharded by the ratio and each shard is
+  rounded to its own head grid, so a 60/40 split gives the K and V tensors of one cache *different* cell
+  strides (measured 1024 B and 1536 B in the same VMM region on a 27B).  That is legal and now handled, but
+  it is the class of shape where the streamed KV's boundary arithmetic, the quantized-cache paths and the
+  stride assumptions are hardest to keep right -- and it is exactly what produced the GPU fault in issue #314.
+
+So on a heterogeneous pair (two different architectures, an x8 card next to an x16 one, cards behind a
+different switch or a PCIe 3.0 chipset link), try `-sm layer` **first**:
+
+```bash
+# layer split: whole layers per device, no all-reduce, no sharded tensors
+-ngl 999 -sm layer -ts 24/16
+```
+
+It usually wins on a mixed box, it is the simpler contract, and it is the configuration the release gates
+cover most heavily.  `-sm tensor` remains the right answer for a homogeneous set on an even link (and it is
+what the all-reduce and multi-device KV work targets), but if tensor split misbehaves or underperforms on your
+mix, `-sm layer` is the supported alternative -- not a workaround.  The streamed KV works on both.
+
 ## Consumer workflow
 
 ```

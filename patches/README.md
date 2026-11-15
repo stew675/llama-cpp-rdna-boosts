@@ -4618,6 +4618,34 @@ byte-identical to a build without this block, including its OOM.
 * **Not in the window's own part:** Goal C (the MTP drafter ring, `--spec-draft-kv-window`) and the
   superseded A1 two-base FA read (Goal B is the pool below).
 
+> **r289 amendment (issue #314): the spill boundary is per tensor, taken from the USED extent.**  A tensor
+> split shards the KV row by the `-ts` ratio and rounds each shard to its own head grid, so an **uneven** ratio
+> gives two tensors of one cache different cell strides in the same region (measured on a 27B at `-ts 24/16`:
+> 1024 B and 1536 B on device 0).  The window kept ONE byte boundary per region, derived from the first
+> tensor's `nb1`; that is wrong in both directions, and both happened in the field: for the shorter tensors the
+> shared VRAM watermark (a max over the region) already sat past their whole extent, so their resident tail was
+> never mapped and the first ubatch that wrote it **faulted the GPU** in `rms_norm_mul_rope_f32`
+> (`HSA_STATUS_ERROR_MEMORY_FAULT`, "Page not present", 2 devices `-ts 24/16`, reproduced on three identical
+> R9700 — an *even* split does not fault, which is why every gate arm missed it); and on the last tensor it
+> asked for a host span past the end of the reservation (the field "region 868 MiB, wanted 864..868 MiB"
+> refusal, reported as `cap 0 MiB`).  So: the boundary is a **cell count** (`used - W`), turned into bytes and
+> floored to the map unit **per tensor**, with per-tensor `lead`/`dev` watermarks (the write path picks the
+> owning tensor's boundary too); the region-end clamp on the grow is defensive and reports itself; and
+> `grow_regions(n_kv, n_used)` takes the used extent, because the padded one (`LLAMA_KV_N_PAD_PREFILL`, 8192 on
+> a multi-device split) used to decide what spilled — spilling cells that do not exist and pushing real used
+> cells out of the window, so fewer than `W` used cells stayed in VRAM.  The padded extent is still what is
+> **mapped** (the graph's views read it), so a windowed split's VRAM is `W + (padded - used)` cells at most.
+> Alongside: the refusal log names the reason that failed (the map cap only when it is configured — it is 0
+> when unset, which made a pin failure read as a knob that was already unlimited), the pinned-budget refusal is
+> no longer silent, the `WINDOWED KV ENABLED` per-cell figure is the **whole** cell (every K/V tensor — it
+> printed one tensor's row, 32x low on a 27B), the cost model calibrates **every** child and quotes
+> `max_i(share_i x bytes / rate_i)` (the children read in parallel), `--kv-window auto` on a non-tensor split
+> says it cannot be sized there instead of "left as configured", `LLAMA_KV_REGION_DEBUG`'s exhaustive host
+> verify runs only on a grow that CHANGED the mapping (it ran on every batch, turning a 22 t/s debug arm into
+> 1.3 t/s), and the split gate gains an uneven-`-ts 6,4` arm that must show two distinct cell strides and no
+> fault.  Text and logits unchanged: `gate-kv-window-split.sh` PASS including the new arm, `win2 == ref2 ==
+> 7a7430617465` as recorded in r204, `gate-kv-residency.sh` PASS, no GPU fault in the journal.
+
 ### The attendance pool (Goal B, r190)
 
 Promoted from the `archive/work/kv-residency` campaign in **r190** (the window above is Goal A of the same campaign;

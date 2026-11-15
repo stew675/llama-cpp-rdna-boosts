@@ -20,6 +20,10 @@
 #                                                              windowed on all three devices
 #   ref2 / win2        2 devices, 27B, `-c 524288` f16 KV.     win2 == ref2 byte for byte (a long prompt, so
 #                                                              the boundary slides on every device)
+#   ref2u / win2u      2 devices, 27B, `-c 8192`, UNEVEN `-ts 6,4`: win2u == ref2u, and the debug re-run must
+#                                                              show two distinct cell strides in one region
+#                                                              (an uneven split makes the K and V shards
+#                                                              different widths: issue #314's GPU fault)
 #   win2fine            as win2 with `LLAMA_KV_REGION_UNIT_MIB=1` (a finer slide: more flips, same text)
 #   big2               2 devices, 27B, `-c 1048576` f16 KV, W=131072: a context that does NOT fit fully
 #                                                              resident on this box -- the arm has to complete
@@ -193,6 +197,37 @@ n_coarse=$(grep -c "FLIP device" "$KEEPOUT/win2dbg.err" || true)
     || fail "the 1 MiB unit did not slide more often ($n_fine vs $n_coarse)"
 no_flip_refusal win2fine
 no_flip_refusal win2
+
+# ---- arm 2c: an UNEVEN split -- the arm that used to FAULT (issue #314) --------------------------------
+#
+# A tensor split shards the KV row by ratio and rounds each shard to its own head grid, so an UNEVEN ratio
+# gives two tensors of ONE cache different cell strides in the same region (measured 1024 B and 1536 B on
+# `-ts 24/16`).  The window's spill boundary is a cell count and has to become bytes with each tensor's OWN
+# stride: one shared byte boundary short-mapped the shorter tensors -- their VRAM watermark (a max over the
+# region) already sat past their whole extent, so the resident tail was never mapped and the first ubatch
+# that wrote it FAULTED the GPU in `rms_norm_mul_rope` -- and on the last tensor it asked for a span past the
+# end of the reservation (the "region 868 MiB, wanted 864..868 MiB" refusal).  An even split hides all of it.
+echo "-- uneven-split arms (2 devices, 60/40: two cell strides in one region)"
+run_cli ref2u 0,1 "$MODEL_BIG" -- -c 8192 -ctk f16 -ctv f16 -ts 6,4 || { fail "ref2u did not run"; exit 1; }
+run_cli win2u 0,1 "$MODEL_BIG" LLAMA_KV_RESIDENT_CELLS=1024 -- -c 8192 -ctk f16 -ctv f16 -ts 6,4 \
+    || { fail "win2u did not run"; exit 1; }
+H2UR=$(hash_of ref2u); H2UW=$(hash_of win2u)
+[ -n "$H2UR" ] && [ "$H2UR" = "$H2UW" ] && pass "win2u == ref2u (uneven split, text byte-identical)" \
+    || fail "win2u != ref2u (uneven split): '$H2UR' vs '$H2UW'"
+[ "$(count win2u 'WINDOWED KV ENABLED')" = 1 ] && pass "win2u enabled the window exactly once" \
+    || fail "win2u 'WINDOWED KV ENABLED' count = $(count win2u 'WINDOWED KV ENABLED') (want 1)"
+[ "$(count win2u 'KV region reserved')" = 2 ] && pass "win2u built one region per device (2)" \
+    || fail "win2u 'KV region reserved' count = $(count win2u 'KV region reserved') (want 2)"
+# ... and the arm is not vacuous: the debug re-run must show at least TWO cell strides in one region, or this
+# is an even split in disguise and proves nothing
+run_cli win2udbg 0,1 "$MODEL_BIG" LLAMA_KV_RESIDENT_CELLS=1024 LLAMA_KV_REGION_DEBUG=1 \
+    -- -c 8192 -ctk f16 -ctv f16 -ts 6,4 || { fail "win2udbg did not run"; exit 1; }
+n_strides=$(grep -oE 'tensor [0-9]+: off [0-9.]+ MiB, [0-9]+ cells x [0-9]+ B' "$KEEPOUT/win2udbg.err" \
+    | sed -E 's/.* x ([0-9]+) B/\1/' | sort -u | wc -l)
+[ "${n_strides:-0}" -ge 2 ] && pass "win2udbg saw $n_strides distinct cell strides in one region (the arm is real)" \
+    || fail "win2udbg saw ${n_strides:-0} cell stride(s): an even split cannot exercise the per-tensor boundary"
+no_flip_refusal win2u
+no_flip_refusal win2udbg
 
 # ---- arm 2b: MTP on the same split (verify batches + the batched state path) ---------------------------
 echo "-- MTP arms (2 devices: the drafter's verify batches write several cells at once and a checkpoint saves)"

@@ -1,4 +1,4 @@
-From 78b2427ad79d80a87598c97f02d443eb73894962 Mon Sep 17 00:00:00 2001
+From cd947f01ca52e3cebb27653fd2bd93849b460139 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/16] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -195,7 +195,7 @@ index a218d54de..93cc72d83 100644
              }
          }
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index a5d21e6e4..3cac8c63f 100644
+index fdf61d95d..724e77c3d 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -84,12 +84,48 @@ extern "C" {
@@ -344,7 +344,7 @@ index 87c8164ec..d0bf5b3f2 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 456e22979..b99131e7a 100644
+index d8c0918b2..d6fed69f2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -340,6 +340,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -366,7 +366,7 @@ index 456e22979..b99131e7a 100644
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
-@@ -4793,6 +4805,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -4795,6 +4807,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
@@ -536,7 +536,7 @@ index d82930ec3..69f0d4411 100644
  bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
  bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 42be6fdb2..6b9e69420 100644
+index b1165023d..759d117b9 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -126,6 +126,7 @@
@@ -547,7 +547,7 @@ index 42be6fdb2..6b9e69420 100644
  
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
-@@ -5773,6 +5774,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
+@@ -5870,6 +5871,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
      return nullptr;
  }
  
@@ -724,7 +724,7 @@ index 42be6fdb2..6b9e69420 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -10024,6 +10195,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -10121,6 +10292,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
@@ -732,7 +732,7 @@ index 42be6fdb2..6b9e69420 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -10842,6 +11014,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
+@@ -10939,6 +11111,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
      return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
@@ -744,7 +744,7 @@ index 42be6fdb2..6b9e69420 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -10929,6 +11106,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+@@ -11026,6 +11203,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
@@ -761,7 +761,7 @@ index 42be6fdb2..6b9e69420 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -11012,9 +11199,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
+@@ -11109,9 +11296,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
      moe_cache_set_host_fill_mode(direct);
  }
  
@@ -774,7 +774,7 @@ index 42be6fdb2..6b9e69420 100644
  }
  
  static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -11041,13 +11229,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -11138,13 +11326,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -887,7 +887,7 @@ index 42be6fdb2..6b9e69420 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -11189,6 +11474,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11286,6 +11571,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,

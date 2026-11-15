@@ -1,4 +1,4 @@
-From 4d714fad6606eb1ce0d46a074c1aa7a879a38210 Mon Sep 17 00:00:00 2001
+From 3da21bd9cea88657ee0cc0d8e69465a6813fc3ae Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/16] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -118,22 +118,22 @@ is unchanged) and divided by MiB only for display.
  common/common.h                            |   25 +
  common/draft-reserve.cpp                   |   57 +-
  common/draft-reserve.h                     |   12 +-
- common/fit.cpp                             |  588 ++++++-
+ common/fit.cpp                             |  638 ++++++-
  common/speculative.cpp                     |  108 +-
  common/speculative.h                       |    6 +
- ggml/include/ggml-backend.h                |   20 +
+ ggml/include/ggml-backend.h                |   22 +
  ggml/include/ggml-rpc.h                    |    9 +-
  ggml/include/ggml.h                        |   42 +
- ggml/src/ggml-backend-meta.cpp             |  143 +-
+ ggml/src/ggml-backend-meta.cpp             |  145 +-
  ggml/src/ggml-cpu/ggml-cpu.c               |    1 +
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
  ggml/src/ggml-cuda/cpy.cu                  |   39 +
  ggml/src/ggml-cuda/cpy.cuh                 |   10 +
  ggml/src/ggml-cuda/fattn-qsa.cu            |   40 +-
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
- ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1284 ++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1284 +++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  144 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1841 +++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1940 +++++++++++++++++++-
  ggml/src/ggml-cuda/indexer-score.cu        |   14 +-
  ggml/src/ggml-cuda/kv-pool.cu              |  353 ++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
@@ -149,20 +149,20 @@ is unchanged) and divided by MiB only for display.
  src/llama-context.h                        |    3 +
  src/llama-cparams.h                        |    9 +
  src/llama-ext.h                            |   90 +
- src/llama-kv-cache.cpp                     | 1265 +++++++++++++-
- src/llama-kv-cache.h                       |  120 +-
+ src/llama-kv-cache.cpp                     | 1369 +++++++++++++-
+ src/llama-kv-cache.h                       |  125 +-
  src/llama-memory-hybrid-idx.cpp            |   10 +-
  src/llama-memory-hybrid-idx.h              |    5 +-
  src/llama-memory-hybrid.cpp                |   15 +-
  src/llama-memory-hybrid.h                  |    8 +-
  src/llama-memory.h                         |   19 +
- src/llama-model-loader.cpp                 | 1372 ++++++++-------
+ src/llama-model-loader.cpp                 | 1372 +++++++-------
  src/llama-model-loader.h                   |   13 +
- src/llama-model.cpp                        |  198 ++-
+ src/llama-model.cpp                        |  198 +-
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   66 +-
  tools/llama-bench/llama-bench.cpp          |   52 +-
- 49 files changed, 7515 insertions(+), 865 deletions(-)
+ 49 files changed, 7777 insertions(+), 865 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -517,7 +517,7 @@ index 8e65564b6..20a42f3b2 100644
 +                                                   bool kv_unified = false,
 +                                                   int32_t draft_kv_window = -1);
 diff --git a/common/fit.cpp b/common/fit.cpp
-index a9cc220ad..24abfbd05 100644
+index a9cc220ad..8a541f31e 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -133,6 +133,123 @@ struct common_fit_cache_reserve {
@@ -866,7 +866,7 @@ index a9cc220ad..24abfbd05 100644
          }
      }
  
-@@ -766,6 +1026,152 @@ static void common_params_fit_impl(
+@@ -766,6 +1026,185 @@ static void common_params_fit_impl(
                  __func__, ntd, used_total/MiB, budget/MiB);
          }
  
@@ -916,7 +916,22 @@ index a9cc220ad..24abfbd05 100644
 +                } else {
 +                    const int64_t  headroom   = budget - used_other;   // VRAM the resident window may take
 +                    const size_t   ram_budget = fit_kv_spill_ram_budget(tdevs[0]);
-+                    const float    gbps       = fit_kv_spill_read_gbps(tdevs[0]);
++                    // F4: every child reads its own slice of the spill IN PARALLEL, so the wait is
++                    // max_i(share_i x spill_i / rate_i) -- calibrate every device, not device 0.
++                    std::vector<float>  rates(tdevs.size(), 0.0f);
++                    std::vector<double> share(tdevs.size(), 1.0 / (double) tdevs.size());
++                    {
++                        double sum = 0.0;
++                        for (size_t id = 0; id < ntd; ++id) {
++                            sum += ratio[id] > 0.0f ? (double) ratio[id] : 0.0;
++                        }
++                        for (size_t id = 0; id < tdevs.size(); ++id) {
++                            rates[id] = fit_kv_spill_read_gbps(tdevs[id]);
++                            if (sum > 0.0 && id < ntd) {
++                                share[id] = ratio[id] > 0.0f ? (double) ratio[id] / sum : 0.0;
++                            }
++                        }
++                    }
 +
 +                    size_t min_ttarget = (size_t) -1;   // for the per-device line of the report
 +                    for (size_t id = 0; id < ntd; id++) {
@@ -954,6 +969,25 @@ index a9cc220ad..24abfbd05 100644
 +                    const int64_t projected  = used_other + (int64_t) res_bytes;
 +                    const int64_t proj_free  = budget - projected;
 +
++                    // the wall time of the whole spill, per device: the slowest share sets it (issue #314 F4)
++                    double      cost_ms   = 0.0;
++                    bool        cost_ok   = false;
++                    std::string cost_text;
++                    for (size_t id = 0; id < rates.size(); ++id) {
++                        char b[160];
++                        if (rates[id] <= 0.0f) {
++                            snprintf(b, sizeof(b), "device %zu could not be calibrated", id);
++                        } else {
++                            const double ms = (double) ((double) spill_bytes * share[id]) /
++                                              ((double) rates[id] * 1e6);
++                            cost_ms = cost_ok ? std::max(cost_ms, ms) : ms;
++                            cost_ok = true;
++                            snprintf(b, sizeof(b), "%.1f GB/s on device %zu (%.0f %% of the split, its share in "
++                                     "%.1f ms)", (double) rates[id], id, 100.0 * share[id], ms);
++                        }
++                        cost_text += cost_text.empty() ? b : std::string(" + ") + b;
++                    }
++
 +                    if (ram_overshoot) {
 +                        LOG_WRN("%s: the windowed KV cannot serve %u cells on this tensor split: the pinned, "
 +                                "NON-SWAPPABLE RAM ceiling (%.1f MiB, LLAMA_KV_SPILL_RAM_PCT) needs a window wider "
@@ -988,18 +1022,17 @@ index a9cc220ad..24abfbd05 100644
 +                                (double) res_bytes / MiB / (double) ntd, (double) spill_bytes / MiB,
 +                                ram_clamped ? " (widened by the pinned-RAM ceiling)" : "");
 +                        LOG_WRN("%s:   -> it costs %.1f MiB less VRAM (%.1f MiB projected vs a %" PRId64 " MiB target, "
-+                                "%.1f MiB free); the spill reads %.1f KiB per cell IN PLACE (%s, not the copy-engine "
-+                                "rate) on every step, so a token at the full context reads %.1f MiB = about "
-+                                "%.1f ms at %s, and nothing spills below depth %zu.  The tightest per-device "
-+                                "target is %zu MiB, which is what makes each device able to hold its proportional "
-+                                "slice; unset --kv-window 0 to keep the KV fully resident.\n",
++                                "%.1f MiB free); every spilled cell is read IN PLACE by its own device on every "
++                                "step (%s -- each device reads its slice in parallel, so the slowest share sets "
++                                "the wait), so a token at the full context reads %.1f MiB in about %.1f ms, and "
++                                "nothing spills below depth %zu.  The tightest per-device target is %zu MiB, "
++                                "which is what makes each device able to hold its proportional slice; unset "
++                                "--kv-window 0 to keep the KV fully resident.\n",
 +                                __func__, (double) (kv_bytes - res_bytes) / MiB, (double) projected / MiB,
-+                                budget / MiB, (double) proj_free / MiB, (double) cell_bytes / 1024.0,
-+                                gbps > 0.0f ? (std::to_string((int) (gbps + 0.5f)) + " GB/s, calibrated").c_str()
-+                                            : "the measured link rate",
-+                                (double) spill_bytes / MiB,
-+                                gbps > 0.0f ? (double) spill_bytes / ((double) gbps * 1e6) : 0.0,
-+                                gbps > 0.0f ? "that rate" : "the link's own rate", w,
++                                budget / MiB, (double) proj_free / MiB,
++                                cost_ok ? cost_text.c_str()
++                                        : "the in-place read rate could not be calibrated on these devices",
++                                (double) spill_bytes / MiB, cost_ok ? cost_ms : 0.0, w,
 +                                min_ttarget == (size_t) -1 ? 0 : min_ttarget / MiB);
 +                        return;
 +                    } else {
@@ -1019,7 +1052,7 @@ index a9cc220ad..24abfbd05 100644
          if (used_total <= budget) {
              LOG_TRC("%s: tensor split: no changes needed\n", __func__);
              return;
-@@ -821,6 +1227,136 @@ static void common_params_fit_impl(
+@@ -821,6 +1260,153 @@ static void common_params_fit_impl(
          return;
      }
  
@@ -1049,8 +1082,25 @@ index a9cc220ad..24abfbd05 100644
 +        if (kv_auto || kv_fixed) {
 +            const bool have_kv = nd == 1 && kv_bytes_full.size() == 1 && kv_bytes_full[0] != 0;
 +            if (!have_kv) {
-+                LOG_WRN("%s: the windowed KV needs one region-backed KV cache to size against (this config has "
-+                        "%zu device(s)); the window is left as configured\n", __func__, nd);
++                // One region-backed KV cache is what the sizing arithmetic below reads (its byte count, its cell
++                // count, one device's free VRAM and one device's pinned-RAM ceiling).  A tensor split has its
++                // own branch above (one region PER CHILD, TODO #124).  A LAYER or ROW split does host the
++                // window (one region per device, each device's own K/V layers or shards), but this function
++                // cannot size it: there is no single KV byte count and no single budget to divide.
++                if (kv_auto) {
++                    llama_kv_region_set_resident_cells(0);
++                    LOG_WRN("%s: --kv-window auto cannot size a window on this %zu-device split: --fit sizes a "
++                            "window against ONE region-backed KV cache, and on -sm layer/-sm row the KV is split "
++                            "over %zu devices, so there is no single KV budget to divide (this is the --fit "
++                            "limitation, not a device one: a fixed --kv-window N is applied and spills).  The KV "
++                            "stays fully resident; pass a fixed N to window it.\n", __func__, nd, nd);
++                } else {
++                    LOG_WRN("%s: the windowed KV is applied as configured but NOT sized here: --fit sizes a window "
++                            "against ONE region-backed KV cache, and this config has %zu device(s) on a non-tensor "
++                            "split (no VRAM/RAM budget check, no cost line; the cache still clamps the window "
++                            "against the pinned-RAM ceiling at creation).  Use -sm tensor for a sized window.\n",
++                            __func__, nd);
++                }
 +            } else if (kv_auto && n_ctx_auto) {
 +                // `-c` is ours to choose: prefer a context that fits FULLY RESIDENT (no per-token cost) and say
 +                // how to get the bigger one, rather than silently trading decode speed for context length.
@@ -1156,7 +1206,7 @@ index a9cc220ad..24abfbd05 100644
      std::vector<std::string> dev_names;
      {
          dev_names.reserve(nd);
-@@ -921,7 +1457,15 @@ static void common_params_fit_impl(
+@@ -921,7 +1507,15 @@ static void common_params_fit_impl(
                      "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                      __func__, -global_surplus/MiB);
              }
@@ -1173,7 +1223,7 @@ index a9cc220ad..24abfbd05 100644
                  if (n_ctx_max > n_ctx_min_total) {
                      int64_t sum_used_target = sum_free;
                      if (nd == 0) {
-@@ -1006,27 +1550,34 @@ static void common_params_fit_impl(
+@@ -1006,27 +1600,34 @@ static void common_params_fit_impl(
                      }
                  }
                  const int64_t shortfall   = -global_surplus;
@@ -1220,7 +1270,7 @@ index a9cc220ad..24abfbd05 100644
              }
          }
      }
-@@ -1476,11 +2027,14 @@ enum common_params_fit_status common_fit_params(
+@@ -1476,11 +2077,14 @@ enum common_params_fit_status common_fit_params(
          ggml_log_level log_level) {
      const int64_t t0_us = llama_time_us();
      common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
@@ -1433,10 +1483,10 @@ index 3b1abb9b2..092b6c895 100644
      int32_t total;
      int32_t per_seq;
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cec0f033c..a5d21e6e4 100644
+index cec0f033c..fdf61d95d 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -594,6 +594,26 @@ extern "C" {
+@@ -594,6 +594,28 @@ extern "C" {
          const struct ggml_tensor * tensor, const struct ggml_backend_meta_split_state * split_state,
          size_t n_devs, size_t dev);
  
@@ -1454,11 +1504,13 @@ index cec0f033c..a5d21e6e4 100644
 +    // 1 = this Meta buffer type is a KV region (every child answers the backend's own predicate), 0 = no.
 +    GGML_API int ggml_backend_meta_kv_region_is_kv_buft(ggml_backend_buffer_type_t buft);
 +
-+    // Grow every child region to `n_cells` cells.
++    // Grow every child region to `n_cells` cells, with the UNPADDED used extent `n_used`.
 +    //   1 = grown, 0 = no child carries a region, -1 = refused (logged; the caller must not run the batch)
 +    // A Meta buffer whose children cannot be reached is a hard error (-1), never a silent 0: an unmapped
-+    // extent that the next batch reads faults the GPU instead of returning an error.
-+    GGML_API int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells);
++    // extent that the next batch reads faults the GPU instead of returning an error.  `n_cells` is what the
++    // graph's views read (the padded extent) and is what gets MAPPED; `n_used` is what exists, and it is what
++    // the windowed KV's spill boundary follows -- a coarse prefill pad must not decide which cells spill.
++    GGML_API int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells, uint32_t n_used);
 +
      //
      // Utils
@@ -1546,7 +1598,7 @@ index ec759281c..9c7daf95c 100644
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 433b9587f..456e22979 100644
+index 433b9587f..d8c0918b2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -15,6 +15,7 @@
@@ -1575,7 +1627,7 @@ index 433b9587f..456e22979 100644
 +typedef ggml_backend_buffer_type_t (*ggml_backend_meta_kv_region_buft_fn)(ggml_backend_dev_t dev);
 +typedef ggml_backend_buffer_type_t (*ggml_backend_meta_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t cells);
 +typedef int (*ggml_backend_meta_kv_region_is_kv_buft_fn)(ggml_backend_buffer_type_t buft);
-+typedef int (*ggml_backend_meta_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
++typedef int (*ggml_backend_meta_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells, uint32_t n_used);
 +
 +// A proc address on a simple device's reg, or nullptr when the device has no reg or does not answer.
 +static void * ggml_backend_meta_simple_dev_proc(ggml_backend_dev_t simple_dev, const char * name) {
@@ -1659,17 +1711,19 @@ index 433b9587f..456e22979 100644
  //
  // meta backend buffer
  //
-@@ -872,6 +968,48 @@ static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, cons
+@@ -872,6 +968,50 @@ static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, cons
      return -1;
  }
  
 +// TODO #124: grow every child region to `n_cells` cells (the windowed KV on a tensor split).  The children
 +// are the buffers the Meta buffer was built from, so each is the plain per-device region buffer of its own
-+// slice.  Returns
++// slice.  `n_used` is the UNPADDED extent and is passed through unchanged: every child of one cache sees the
++// same used cells, and each child turns that into bytes with its OWN per-tensor strides (an uneven
++// tensor_split gives the children different row lengths -- issue #314).  Returns
 +//    1 = every child that carries a region grew it,  0 = no child carries a region (nothing to do),
 +//   -1 = a child refused, or a child/handle is missing (a HARD error: an unmapped extent the next batch
 +//        reads faults the GPU instead of returning a status, so this must never read as success).
-+int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells) {
++int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells, uint32_t n_used) {
 +    if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer)) {
 +        return 0;
 +    }
@@ -1694,7 +1748,7 @@ index 433b9587f..456e22979 100644
 +                    __func__, i, n_bufs);
 +            return -1;
 +        }
-+        const int r = fn(simple_buf, n_cells);
++        const int r = fn(simple_buf, n_cells, n_used);
 +        if (r < 0) {
 +            return -1;
 +        }
@@ -1708,7 +1762,7 @@ index 433b9587f..456e22979 100644
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
  
  // [TAG_META_UNALLOC_ALIAS]
-@@ -3576,8 +3714,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3576,8 +3716,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
                  // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
                  // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
@@ -3412,7 +3466,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 44d32f3f0..42be6fdb2 100644
+index 44d32f3f0..b1165023d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -31,6 +31,7 @@
@@ -3545,7 +3599,7 @@ index 44d32f3f0..42be6fdb2 100644
          GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
      }
  };
-@@ -1625,6 +1707,23 @@ struct ggml_backend_cuda_buffer_context {
+@@ -1625,6 +1707,36 @@ struct ggml_backend_cuda_buffer_context {
      // region; together they form the boundary contribution `ggml_cuda_slab_work_release` removes.
      size_t slab_need = 0;
      size_t slab_off  = 0;
@@ -3555,21 +3609,34 @@ index 44d32f3f0..42be6fdb2 100644
 +    // frees it here instead of a cudaFree.
 +    ggml_cuda_vmm_region * vmm_region = nullptr;
 +    // wip/kv-residency (TODO #118) A2: the windowed KV -- W cells resident, the rest of the used extent in
-+    // pinned system RAM.  0 = no window.  `kv_lead_cells` is how many leading cells are already host-backed
-+    // (the slide's monotone position) and `kv_dev_cells` how far the VRAM part has been mapped; both keep the
-+    // per-batch work to the DELTAS (one cell per token, one unit every few thousand tokens).
++    // pinned system RAM.  0 = no window.  The slide's two watermarks are PER TENSOR (see
++    // `vmm_tens`): the boundary is a cell count, and a tensor split can give two tensors of the same cache
++    // different row lengths, so one byte boundary shared by all of them is wrong in both directions (it
++    // short-maps the shorter tensors -- a GPU fault -- and runs past the region end on the last one).
 +    size_t kv_resident_cells = 0;
-+    size_t kv_lead_bytes     = 0;   // the unit-aligned spill boundary (bytes, within one tensor's extent)
-+    size_t kv_dev_bytes      = 0;   // the unit-aligned VRAM watermark (same frame)
++    size_t kv_lead_bytes     = 0;   // MAX over the tensors of the unit-aligned spill boundary (debug only)
++    size_t kv_dev_bytes      = 0;   // MAX over the tensors of the unit-aligned VRAM watermark (debug only)
 +    bool   kv_tail_logged    = false;
 +    // The layout of every tensor placed in the region, so a cell-count grow can compute each tensor's
-+    // [off + s*nb2, off + s*nb2 + n_cells*nb1) extent without knowing anything about the KV cache.
-+    struct vmm_tens { size_t off; size_t nb1; size_t nb2; int64_t ne2; int64_t cells; };
++    // [off + s*nb2, off + s*nb2 + n_cells*nb1) extent without knowing anything about the KV cache.  The two
++    // watermarks live here, not on the context: `nb1` is one cell of THIS tensor, and a tensor split shards
++    // the KV row by ratio, so two tensors of one cache legitimately have different `nb1` (an uneven ratio
++    // rounds each sharded row to its own head grid: measured `-ts 24/16` on a 27B gives 1024 B and 512 B rows
++    // in the SAME region).
++    struct vmm_tens {
++        size_t   off;        // the tensor's place in the region
++        size_t   nb1;        // one cell
++        size_t   nb2;        // one stream
++        int64_t  ne2;        // streams
++        int64_t  cells;      // cells per stream
++        size_t   lead_bytes; // the unit-aligned spill boundary inside one stream of this tensor
++        size_t   dev_bytes;  // the unit-aligned VRAM watermark inside one stream of this tensor
++    };
 +    std::vector<vmm_tens>  vmm_tensors;
      std::string name;
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-@@ -1633,6 +1732,11 @@ struct ggml_backend_cuda_buffer_context {
+@@ -1633,6 +1745,11 @@ struct ggml_backend_cuda_buffer_context {
      }
  
      ~ggml_backend_cuda_buffer_context() {
@@ -3581,7 +3648,7 @@ index 44d32f3f0..42be6fdb2 100644
          if (slab_view) {
              ggml_cuda_slab_work_release(device, slab_off, slab_need);   // the slab owns the region; the slack may go to the arena
              return;
-@@ -2035,7 +2139,7 @@ struct ggml_cuda_async_input_done_guard {
+@@ -2035,7 +2152,7 @@ struct ggml_cuda_async_input_done_guard {
          }
          // default on only with GGML_CUDA_ASYNC_INPUT_BATCH=1 (i.e. the default): with per-copy uploads alone it measured
          // ~1 % slower on one GPU
@@ -3590,7 +3657,7 @@ index 44d32f3f0..42be6fdb2 100644
          if (lazy) {
              o.done_pending = true;
              o.done_stream  = stream;
-@@ -2513,6 +2617,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -2513,6 +2630,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
  struct ggml_backend_cuda_buffer_type_context {
      int device;
      std::string name;
@@ -3602,7 +3669,7 @@ index 44d32f3f0..42be6fdb2 100644
  };
  
  // See ggml-cuda-arena.cuh: the compute-buffer chunk decision needs this buffer type's device, because
-@@ -2681,30 +2790,1085 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -2681,30 +2803,1169 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_compute_chunk_bytes = */ ggml_backend_cuda_buffer_type_get_compute_chunk_bytes,
  };
  
@@ -4002,14 +4069,22 @@ index 44d32f3f0..42be6fdb2 100644
 +// the ceiling as the spill is actually mapped.
 +static size_t ggml_backend_cuda_kv_region_spill_ram_budget(void);
 +
++// A refusal, with the reason that ACTUALLY failed (issue #314 F2).  The map cap used to be printed as "cap"
++// unconditionally, and it is 0 whenever `LLAMA_KV_REGION_MAP_MAX_MIB` is unset -- so a pinned-host mapping
++// failure, a VRAM exhaustion and a cap hit all read as "cap 0 MiB", pointing the reader at a knob that is
++// already unlimited.  The cap clause is now only printed when a cap is configured.
 +static void ggml_backend_cuda_kv_region_log(const char * what, ggml_backend_cuda_buffer_context * ctx,
-+        const ggml_cuda_vmm_region * r, size_t need_off, size_t need_bytes) {
-+    GGML_LOG_ERROR("%s: device %d: %s refused (region %zu MiB, mapped %zu MiB, wanted %zu..%zu MiB, cap %zu MiB). "
-+                   "A kernel read or write above the mapped extent FAULTS THE GPU instead of returning an "
-+                   "error, so the batch is refused instead.  Lower -c, raise LLAMA_KV_REGION_MAP_MAX_MIB, "
-+                   "or unset LLAMA_KV_REGION to keep the whole KV resident.\n", __func__, ctx->device, what,
++        const ggml_cuda_vmm_region * r, size_t need_off, size_t need_bytes, const char * reason) {
++    GGML_LOG_ERROR("%s: device %d: %s refused (region %zu MiB, mapped %zu MiB of which host %zu MiB, wanted "
++                   "%zu..%zu MiB; reason: %s).  A kernel read or write above the mapped extent FAULTS THE GPU "
++                   "instead of returning an error, so the batch is refused instead.  Lower -c, widen the "
++                   "window (fewer spilled cells), raise LLAMA_KV_SPILL_RAM_PCT (the spill is PINNED, "
++                   "NON-SWAPPABLE RAM)%s, or unset LLAMA_KV_REGION to keep the whole KV resident.\n",
++                   __func__, ctx->device, what,
 +                   (ggml_cuda_vmm_region_size(r) >> 20), (ggml_cuda_vmm_region_mapped(r) >> 20),
-+                   (need_off >> 20), ((need_off + need_bytes) >> 20), (ggml_cuda_kv_region_map_cap() >> 20));
++                   (ggml_cuda_vmm_region_mapped_host(r) >> 20),
++                   (need_off >> 20), ((need_off + need_bytes) >> 20), reason,
++                   ggml_cuda_kv_region_map_cap() != 0 ? ", raise LLAMA_KV_REGION_MAP_MAX_MIB" : "");
 +}
 +
 +// wip/kv-residency: the diagnostic skip list (defined with the spill ceiling, below).
@@ -4018,10 +4093,17 @@ index 44d32f3f0..42be6fdb2 100644
 +// Grow the region so the first `n_cells` cells of every tensor it holds are mapped.  This is the extent the
 +// graph views read and write: `llama_kv_cache` sizes its views by the PADDED n_kv (`get_n_kv`), so growing
 +// to the used cells instead would leave a kernel reading unmapped VA.
++//
++// `n_used` is the UNPADDED extent (`get_n_kv` before the prefill pad).  It is what the window's SPILL
++// boundary follows (issue #314 F7): the newest W cells of the cells that actually exist are resident, and a
++// coarse `LLAMA_KV_N_PAD_PREFILL` step (8192 cells on a multi-device split) must not decide the boundary --
++// that spilled cells which do not exist into pinned RAM and out of the window, so the resident used extent
++// fell below W.  The MAPPED extent stays `n_cells`: the padded rows above `n_used` are read by the attention
++// kernel under the mask, so they must remain mapped, and they are not cells, so they are never pinned.
 +//   returns 1  = grown (or not a region buffer)
 +//           0  = not a region buffer
 +//          -1  = refused (the reason has been logged); the caller must not run the batch
-+static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, uint32_t n_cells) {
++static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, uint32_t n_cells, uint32_t n_used) {
 +    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_cuda_buffer_free_buffer) {
 +        return 0;
 +    }
@@ -4032,107 +4114,158 @@ index 44d32f3f0..42be6fdb2 100644
 +    ggml_cuda_set_device(ctx->device);
 +
 +    const size_t cap = ggml_cuda_kv_region_map_cap();
++    const size_t unit = ggml_cuda_vmm_region_unit(ctx->vmm_region);
++    const size_t rsize = ggml_cuda_vmm_region_size(ctx->vmm_region);
 +    const size_t mapped_before = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
 +
 +    // A2 the windowed KV: the newest `W` cells of the USED extent stay in VRAM, everything older is in pinned
 +    // system RAM.  The boundary therefore SLIDES with the watermark, and it moves in whole map units so a
 +    // remap (which must stage a unit's bytes out and back) happens once per few thousand tokens, not per
-+    // token.  `kv_lead_cells` only ever grows: a cell that has been handed to system RAM is not taken back.
++    // token.  The boundary only ever grows: a cell that has been handed to system RAM is not taken back.
++    //
++    // The boundary is computed PER TENSOR, in cell counts, and only then turned into bytes with that tensor's
++    // own `nb1`.  One byte boundary shared by every tensor is wrong as soon as two of them have different row
++    // lengths, which a tensor split produces for real: the sharded KV row is rounded to the per-device head
++    // grid, so an uneven ratio gives the K and V tensors different cell sizes (`-ts 24/16` on a 27B: 1024 B
++    // and 512 B rows in the same region).  Shared, it short-mapped the shorter tensors -- their VRAM
++    // watermark (max over the region) already sat past their whole extent, so the resident tail was never
++    // mapped and the first ubatch that wrote it FAULTED the GPU -- and on the last tensor it asked for a span
++    // past the end of the reservation (issue #314 F1/F2).
 +    if (ctx->kv_resident_cells != 0) {
 +        const uint64_t w = ctx->kv_resident_cells;
-+        // The boundary is quantised in BYTES to a whole map unit, because a mapping is created per unit and a
-+        // boundary that is not unit-aligned would (a) make every unit straddle it and (b) force a 4 KiB
-+        // mapping per cell -- and a *host* chunk costs ~130 us to create (measured), so that would be
-+        // milliseconds per token.  Quantising to the unit means one chunk per (unit/nb1) cells, i.e. about
-+        // one every 3855 cells on a 27B and 1930 on the 35B.
-+        const size_t unit = ggml_cuda_vmm_region_unit(ctx->vmm_region);
-+        const size_t nb1  = ctx->vmm_tensors.empty() ? 0 : ctx->vmm_tensors[0].nb1;
-+        size_t lead_bytes = 0;
-+        if (nb1 != 0 && n_cells > w) {
-+            lead_bytes = ((size_t) (n_cells - w) * nb1 / unit) * unit;   // down, so the window never shrinks
-+        }
-+        size_t used_unit = 0;
-+        if (nb1 != 0) {
-+            used_unit = (size_t) n_cells * nb1 / unit * unit;            // the unit-aligned used extent
-+        }
-+        if (lead_bytes > used_unit) { lead_bytes = used_unit; }
-+        if (lead_bytes < ctx->kv_lead_bytes) { lead_bytes = ctx->kv_lead_bytes; }
-+
++        const size_t lead_cells = n_used > w ? (size_t) (n_used - w) : 0;   // cells that SPILL
++        size_t lead_max = 0;
++        size_t dev_max  = 0;
 +        for (size_t it = 0; it < ctx->vmm_tensors.size(); ++it) {
-+            const auto & t = ctx->vmm_tensors[it];
-+            const size_t used_bytes = (size_t) n_cells * t.nb1;
-+            if (used_bytes == 0) {
++            auto & t = ctx->vmm_tensors[it];
++            if (t.nb1 == 0 || t.cells <= 0) {
 +                continue;
++            }
++            const size_t cells_mapped = std::min<size_t>(n_cells, (size_t) t.cells);
++            // diagnostic: a listed tensor never spills (so its cells are all VRAM, and its "boundary" is 0)
++            const size_t lead_c = ggml_cuda_kv_spill_skip((int) it)
++                    ? 0 : std::min(lead_cells, cells_mapped);
++            // the boundary in THIS tensor's bytes, floored to a map unit: down, so the window never shrinks
++            size_t lead_t = unit != 0 ? (lead_c * t.nb1 / unit) * unit : lead_c * t.nb1;
++            if (lead_t < t.lead_bytes) {
++                lead_t = t.lead_bytes;
 +            }
 +            // the VRAM extent is rounded UP to a whole unit (never past the tensor), so every mapping this
 +            // region makes ends on the unit grid the spill boundary is quantised to
-+            const size_t used_up = std::min(((used_bytes + unit - 1) / unit) * unit, (size_t) t.cells * t.nb1);
-+            // diagnostic: a listed tensor never spills (so its cells are all VRAM, and its "boundary" is 0)
-+            const size_t lead_t    = ggml_cuda_kv_spill_skip((int) it) ? 0 : lead_bytes;
-+            const size_t lead_cur  = ggml_cuda_kv_spill_skip((int) it) ? 0 : ctx->kv_lead_bytes;
++            const size_t used_bytes = cells_mapped * t.nb1;
++            size_t used_up = unit != 0 ? ((used_bytes + unit - 1) / unit) * unit : used_bytes;
++            used_up = std::min(used_up, (size_t) t.cells * t.nb1);
++            if (lead_t > used_up) {
++                lead_t = used_up;
++            }
 +            for (int64_t st = 0; st < t.ne2; ++st) {
 +                const size_t off = t.off + (size_t) st * t.nb2;
++                // never ask the driver for a byte past the reservation: a straddling request is refused, and
++                // the report then points at the wrong knob.  A tensor's own extent is inside its child region
++                // by construction (`alloc_size` is rounded up per tensor), so this is a defensive clamp.
++                const size_t room = off < rsize ? rsize - off : 0;
++                if (room < used_up) {
++                    GGML_LOG_ERROR("%s: device %d: the tensor at %.2f MiB needs a %.2f MiB extent but only %.2f "
++                                   "MiB of its %.2f MiB region is left -- the KV layout does not fit the child "
++                                   "region it was given.  Lower -c, and please report this.\n", __func__,
++                                   ctx->device, (double) off / 1048576.0, (double) used_up / 1048576.0,
++                                   (double) room / 1048576.0, (double) rsize / 1048576.0);
++                    return -1;
++                }
 +                if (cap != 0 && off + used_up > cap) {
-+                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, used_up);
++                    char why[160];
++                    snprintf(why, sizeof(why), "LLAMA_KV_REGION_MAP_MAX_MIB is %zu MiB and this mapping would end "
++                             "at %zu MiB", cap >> 20, (off + used_up) >> 20);
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, used_up, why);
 +                    return -1;
 +                }
 +                // 1. hand the newly-spilled leading cells to system RAM (the slide's forward step)
-+                if (lead_t > lead_cur) {
-+                    const size_t spill_bytes = lead_t - lead_cur;
++                if (lead_t > t.lead_bytes) {
++                    const size_t spill_bytes = lead_t - t.lead_bytes;
 +                    // item 3 of the campaign's owed list: the spill is PINNED, non-swappable RAM.  Ask the
 +                    // ceiling first so a run that is about to exhaust RAM says so instead of being OOM-killed.
++                    // `ggml_cuda_kv_spill_allow` logs the arithmetic once; say which path stopped here too.
 +                    if (!ggml_cuda_kv_spill_allow(spill_bytes)) {
++                        GGML_LOG_ERROR("%s: device %d: the KV spill cannot pin %.2f MiB more, so the window "
++                                       "cannot slide; see the LLAMA_KV_SPILL_RAM_PCT ceiling above\n", __func__,
++                                       ctx->device, (double) spill_bytes / 1048576.0);
 +                        return -1;
 +                    }
-+                    if (!ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + lead_cur,
++                    if (!ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + t.lead_bytes,
 +                                spill_bytes, /*host=*/ true)) {
-+                        ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region, off + lead_cur,
-+                                spill_bytes);
++                        ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region,
++                                off + t.lead_bytes, spill_bytes,
++                                "the PINNED host mapping could not be created (pinned RAM or MemLock "
++                                "exhausted, or the span straddles the region end)");
 +                        return -1;
 +                    }
 +                }
 +                // 2. map the newly-used resident cells in VRAM
-+                const size_t from = std::max(ctx->kv_dev_bytes, lead_t);
++                const size_t from = std::max(t.dev_bytes, lead_t);
 +                if (used_up > from &&
 +                        !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + from, used_up - from, /*host=*/ false)) {
-+                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off + from, used_up - from);
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off + from, used_up - from,
++                            "the VRAM mapping could not be committed (free device memory)");
 +                    return -1;
 +                }
 +            }
++            t.lead_bytes = lead_t;
++            t.dev_bytes  = std::max(t.dev_bytes, used_up);
++            lead_max = std::max(lead_max, t.lead_bytes);
++            dev_max  = std::max(dev_max,  t.dev_bytes);
 +        }
-+        ctx->kv_lead_bytes = lead_bytes;
-+        ctx->kv_dev_bytes  = std::max(ctx->kv_dev_bytes, used_unit);
++        ctx->kv_lead_bytes = lead_max;
++        ctx->kv_dev_bytes  = dev_max;
++        if (ggml_cuda_kv_region_debug()) {
++            // the per-tensor layout, once: a mismatched stride is what issue #314's fault was made of
++            static bool layout_logged = false;
++            if (!layout_logged) {
++                layout_logged = true;
++                for (size_t it = 0; it < ctx->vmm_tensors.size(); ++it) {
++                    const auto & t = ctx->vmm_tensors[it];
++                    GGML_LOG_INFO("%s: device %d: tensor %zu: off %.2f MiB, %lld cells x %zu B x %lld stream(s), "
++                                  "spill boundary %.2f MiB, VRAM watermark %.2f MiB\n", __func__, ctx->device, it,
++                                  (double) t.off / 1048576.0, (long long) t.cells, t.nb1, (long long) t.ne2,
++                                  (double) t.lead_bytes / 1048576.0, (double) t.dev_bytes / 1048576.0);
++                }
++            }
++        }
 +    } else {
 +        for (const auto & t : ctx->vmm_tensors) {
-+            const size_t bytes = (size_t) n_cells * t.nb1;
++            const size_t bytes = std::min((size_t) n_cells, (size_t) t.cells) * t.nb1;
 +            if (bytes == 0) {
 +                continue;
 +            }
 +            for (int64_t s = 0; s < t.ne2; ++s) {
 +                const size_t off = t.off + (size_t) s * t.nb2;
 +                if (cap != 0 && off + bytes > cap) {
-+                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes);
++                    char why[160];
++                    snprintf(why, sizeof(why), "LLAMA_KV_REGION_MAP_MAX_MIB is %zu MiB and this mapping would end "
++                             "at %zu MiB", cap >> 20, (off + bytes) >> 20);
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes, why);
 +                    return -1;
 +                }
 +                if (!ggml_cuda_vmm_region_grow_span(ctx->vmm_region, off, bytes)) {
-+                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes);
++                    ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off, bytes,
++                            "the VRAM mapping could not be grown (free device memory)");
 +                    return -1;
 +                }
 +            }
 +        }
 +    }
 +    if (ggml_cuda_kv_region_debug()) {
-+        static int grow_check = 0;
-+        char where[64];
-+        snprintf(where, sizeof(where), "grow#%d cells=%u", grow_check++, n_cells);
-+        ggml_cuda_vmm_region_verify_host(ctx->vmm_region, where);
-+    }
-+    if (ggml_cuda_kv_region_debug()) {
 +        const size_t mapped_after = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
 +        if (mapped_after != mapped_before) {
-+            GGML_LOG_INFO("%s: device %d: %u cells -> mapped %.2f of %.2f MiB (+%.2f MiB), of which host %.2f MiB "
-+                          "(window %zu cells, spill boundary %.2f MiB, VRAM watermark %.2f MiB)\n",
-+                          __func__, ctx->device, n_cells, mapped_after / 1024.0 / 1024.0,
++            // the exhaustive host re-read is O(the whole mapped extent), so it belongs to a grow that actually
++            // CHANGED the mapping: `grow_regions` is called for every batch even when the padded extent is
++            // unchanged, and verifying on those turned a 22 t/s decode into 1.3 t/s with the flag on.
++            static int grow_check = 0;
++            char where[64];
++            snprintf(where, sizeof(where), "grow#%d cells=%u used=%u", grow_check++, n_cells, n_used);
++            ggml_cuda_vmm_region_verify_host(ctx->vmm_region, where);
++            GGML_LOG_INFO("%s: device %d: %u cells (%u used) -> mapped %.2f of %.2f MiB (+%.2f MiB), of which "
++                          "host %.2f MiB (window %zu cells, spill boundary %.2f MiB, VRAM watermark %.2f MiB)\n",
++                          __func__, ctx->device, n_cells, n_used, mapped_after / 1024.0 / 1024.0,
 +                          ggml_cuda_vmm_region_size(ctx->vmm_region) / 1024.0 / 1024.0,
 +                          (mapped_after - mapped_before) / 1024.0 / 1024.0,
 +                          ggml_cuda_vmm_region_mapped_host(ctx->vmm_region) / 1024.0 / 1024.0,
@@ -4228,6 +4361,8 @@ index 44d32f3f0..42be6fdb2 100644
 +    t.nb2 = tensor->nb[2];
 +    t.ne2 = tensor->ne[2];
 +    t.cells = tensor->ne[1];
++    t.lead_bytes = 0;
++    t.dev_bytes  = 0;
 +    ctx->vmm_tensors.push_back(t);
 +
 +    // Quantized rows are padded up to MATRIX_ROW_PADDING (see the plain buffer's get_alloc_size) and a reader
@@ -4260,12 +4395,16 @@ index 44d32f3f0..42be6fdb2 100644
 +    }
 +    const size_t cap = ggml_cuda_kv_region_map_cap();
 +    if (cap != 0 && off + size > cap) {
-+        ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size);
++        char why[160];
++        snprintf(why, sizeof(why), "LLAMA_KV_REGION_MAP_MAX_MIB is %zu MiB and this mapping would end at %zu MiB",
++                 cap >> 20, (off + size) >> 20);
++        ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size, why);
 +        return;
 +    }
 +    if (ctx->kv_resident_cells == 0 || tensor->nb[2] == 0) {
 +        if (!ggml_cuda_vmm_region_grow_span(ctx->vmm_region, off, size)) {
-+            ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size);
++            ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off, size,
++                    "the VRAM mapping could not be grown (free device memory)");
 +        }
 +        return;
 +    }
@@ -4275,15 +4414,27 @@ index 44d32f3f0..42be6fdb2 100644
 +    const size_t tensor_off = (size_t) ((const char *) tensor->data - (const char *) ctx->dev_ptr);
 +    const size_t nb2        = (size_t) tensor->nb[2];
 +    const size_t rel        = (off - tensor_off) % nb2;                       // byte offset inside the extent
-+    const size_t lead       = ctx->kv_lead_bytes;                              // the current spill boundary
++    // the boundary belongs to the tensor these bytes are in, and its own `nb1` decided it (issue #314 F1:
++    // a split can give two tensors of one cache different row lengths)
++    size_t lead = ctx->kv_lead_bytes;
++    for (const auto & t : ctx->vmm_tensors) {
++        const size_t t_end = t.off + (size_t) t.ne2 * t.nb2;
++        if (tensor_off >= t.off && tensor_off < t_end) {
++            lead = t.lead_bytes;
++            break;
++        }
++    }
 +    const size_t host_end   = rel < lead ? (lead - rel < size ? lead - rel : size) : 0;
 +    if (host_end != 0 && ggml_cuda_kv_spill_allow(host_end) &&
 +            !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off, host_end, /*host=*/ true)) {
-+        ggml_backend_cuda_kv_region_log("a host write", ctx, ctx->vmm_region, off, host_end);
++        ggml_backend_cuda_kv_region_log("a host write", ctx, ctx->vmm_region, off, host_end,
++                "the PINNED host mapping could not be created (pinned RAM or MemLock exhausted, or the span "
++                "straddles the region end)");
 +    }
 +    if (size > host_end &&
 +            !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + host_end, size - host_end, /*host=*/ false)) {
-+        ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off + host_end, size - host_end);
++        ggml_backend_cuda_kv_region_log("a write", ctx, ctx->vmm_region, off + host_end, size - host_end,
++                "the VRAM mapping could not be committed (free device memory)");
 +    }
 +}
 +
@@ -4703,7 +4854,7 @@ index 44d32f3f0..42be6fdb2 100644
  }
  
  // Communication context for multi-GPU AllReduce during tensor parallelism.
-@@ -4220,6 +5384,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4220,6 +5481,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -5099,7 +5250,7 @@ index 44d32f3f0..42be6fdb2 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -4386,7 +5939,7 @@ static bool    g_cgc_reg = false;
+@@ -4386,7 +6036,7 @@ static bool    g_cgc_reg = false;
  static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
  static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
  static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
@@ -5108,7 +5259,7 @@ index 44d32f3f0..42be6fdb2 100644
  // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
  // under -sm tensor), so it is resolved once instead of per call.
  static const bool g_cuda_splice_env_on = [] {
-@@ -5794,6 +7347,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5794,6 +7444,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
              break;
@@ -5118,7 +5269,7 @@ index 44d32f3f0..42be6fdb2 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -5888,11 +7444,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+@@ -5888,11 +7541,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -5168,7 +5319,7 @@ index 44d32f3f0..42be6fdb2 100644
  
      // A pinned-source cudaMemcpyAsync is read by the copy engine when the stream reaches it, not when it is
      // issued, so the caller must not modify `data` until the copy has completed -- and this path's caller
-@@ -5938,7 +7531,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -5938,7 +7628,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5200,7 +5351,7 @@ index 44d32f3f0..42be6fdb2 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-@@ -5949,7 +7565,35 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -5949,7 +7662,35 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5237,7 +5388,7 @@ index 44d32f3f0..42be6fdb2 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -6043,11 +7687,47 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -6043,11 +7784,47 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5288,7 +5439,7 @@ index 44d32f3f0..42be6fdb2 100644
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -6825,13 +8505,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -6825,13 +8602,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
              }
  
              if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
@@ -5311,7 +5462,7 @@ index 44d32f3f0..42be6fdb2 100644
              ggml_cuda_gdn_gather_index gdn_gather_index;
              cuda_ctx->gdn_deferred_gathers.clear();
              for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -7217,7 +8901,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7217,7 +8998,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      use_cuda_graph = true;
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
@@ -5320,7 +5471,7 @@ index 44d32f3f0..42be6fdb2 100644
                      cuda_graph_update_required = graph->instances.empty() ||
                          (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
                  }
-@@ -7361,7 +9045,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7361,7 +9142,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -5329,7 +5480,7 @@ index 44d32f3f0..42be6fdb2 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -7392,7 +9076,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7392,7 +9173,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) {
                      ggml_cuda_mmb_mark_bf16_only(gr);
@@ -5338,7 +5489,7 @@ index 44d32f3f0..42be6fdb2 100644
                      if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
                  }
-@@ -7407,7 +9091,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7407,7 +9188,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -5347,7 +5498,7 @@ index 44d32f3f0..42be6fdb2 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
-@@ -7521,7 +9205,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7521,7 +9302,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              ggml_cuda_hc_combine_norm_args ca;
              if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
          }
@@ -5356,7 +5507,7 @@ index 44d32f3f0..42be6fdb2 100644
          if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
          if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
              std::vector<const ggml_tensor *> blks;
-@@ -7653,7 +9337,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7653,7 +9434,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -5365,7 +5516,7 @@ index 44d32f3f0..42be6fdb2 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -7675,14 +9359,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7675,14 +9456,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
          // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
          // size.  GGML_CUDA_QK_ROTATE=0: off.
@@ -5382,7 +5533,7 @@ index 44d32f3f0..42be6fdb2 100644
          const auto is_had = [](const ggml_tensor * t) {
              return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
          };
-@@ -7802,7 +9486,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7802,7 +9583,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
          // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
          // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
@@ -5391,7 +5542,7 @@ index 44d32f3f0..42be6fdb2 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -9120,6 +10804,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9120,6 +10901,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -5406,7 +5557,7 @@ index 44d32f3f0..42be6fdb2 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -9149,7 +10841,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9149,7 +10938,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -5416,14 +5567,16 @@ index 44d32f3f0..42be6fdb2 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -9587,8 +11280,63 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -9587,8 +11377,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
 +// wip/kv-residency (TODO #117): the KV cache reaches the region buffer type by proc address, so the delivery
 +// library gains no new public symbol and a backend without VMM simply does not answer.
 +//   ggml_backend_cuda_kv_region_buft : ggml_backend_buffer_type_t (*)(ggml_backend_dev_t)  -- nullptr = no region
-+//   ggml_backend_cuda_kv_region_grow : int (*)(ggml_backend_buffer_t, uint32_t n_cells)   -- 1 ok, 0 n/a, -1 refused
++//   ggml_backend_cuda_kv_region_grow : int (*)(ggml_backend_buffer_t, uint32_t n_cells, uint32_t n_used)
++//                                      -- 1 ok, 0 n/a, -1 refused   (n_used = the unpadded extent: the
++//                                      window's spill boundary follows it, the MAPPING follows n_cells)
 +static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_for_dev(ggml_backend_dev_t dev) {
 +    for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
 +        if (ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i) == dev) {
@@ -5480,7 +5633,7 @@ index 44d32f3f0..42be6fdb2 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -9705,6 +11453,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -9705,6 +11552,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -6503,10 +6656,10 @@ index 650e25ab5..b2c8d8bc7 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 5ddca5a53..fdad6ae73 100644
+index 5ddca5a53..bd38e90fe 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -18,6 +18,356 @@ static bool ggml_is_power_of_2(int n) {
+@@ -18,6 +18,435 @@ static bool ggml_is_power_of_2(int n) {
      return (n & (n - 1)) == 0;
  }
  
@@ -6525,7 +6678,11 @@ index 5ddca5a53..fdad6ae73 100644
 +// refusal, or no such hook at all -- the plain device buffer type is used and the numbers are the old ones.
 +//
 +
-+typedef int (*llama_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
++// `n_cells` = the PADDED extent the graph's views use (what must be MAPPED); `n_used` = the cells that
++// actually exist (the windowed KV's spill boundary follows THIS -- issue #314 F7).
++typedef int (*llama_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells, uint32_t n_used);
++// the attendance pool's pinned mirror grows with the same padded watermark; it has no window, so no n_used
++typedef int (*llama_kv_pool_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
 +
 +// Is the region PROVIDER usable at all?  Default yes: the buffer type is only ever taken when a window is
 +// actually asked for (`--kv-window`, or its `LLAMA_KV_RESIDENT_CELLS` alias), so the default path is the plain device buffer and this
@@ -6824,6 +6981,81 @@ index 5ddca5a53..fdad6ae73 100644
 +    }
 +}
 +
++// What a spilled cell costs per decode step, on EVERY device (issue #314 F4).
++//
++// Nothing is copied for a spilled cell: the attention kernel loads it from the host-location mapping IN PLACE,
++// over that device's PCIe link, so the per-step cost is the read rate of each device's own aperture.  On a
++// tensor split every child keeps its own slice of the window and the children read IN PARALLEL, so the wall
++// time is `max_i(share_i x spill_bytes / rate_i)` for the split's shares `share_i` -- not
++// `spill_bytes / rate_0`, which charged the whole spill at one card's rate (about 2x too pessimistic on the
++// 60/40 pair in #314) and never calibrated the other cards at all.
++struct llama_kv_spill_cost {
++    std::string text;       // the per-device rates, ready for a message
++    double      ms    = 0.0;  // wall time of the whole worst-case spill
++    bool        any   = false;
++};
++
++static llama_kv_spill_cost llama_kv_region_spill_cost(const llama_model & model, size_t spill_bytes) {
++    llama_kv_spill_cost cost;
++
++    std::vector<ggml_backend_dev_t> devs;
++    const ggml_backend_dev_t kv_dev = model.dev_layer(0);
++    if (kv_dev == nullptr) {
++        return cost;
++    }
++    if (ggml_backend_dev_is_meta(kv_dev)) {
++        const size_t n = ggml_backend_meta_dev_n_devs(kv_dev);
++        for (size_t i = 0; i < n; ++i) {
++            devs.push_back(ggml_backend_meta_dev_simple_dev(kv_dev, i));
++        }
++    } else {
++        devs.push_back(kv_dev);
++    }
++    if (devs.empty()) {
++        return cost;
++    }
++
++    // the loader shards the KV along the head axis by the same ratio it shards the weights by, so the split's
++    // shares are the weights' shares; even when tensor_split is unset (which means even)
++    std::vector<double> share(devs.size(), 1.0 / (double) devs.size());
++    const float * ts = model.tensor_split();
++    if (devs.size() > 1 && ts != nullptr) {
++        double sum = 0.0;
++        for (size_t i = 0; i < devs.size(); ++i) {
++            sum += ts[i] > 0.0f ? (double) ts[i] : 0.0;
++        }
++        if (sum > 0.0) {
++            for (size_t i = 0; i < devs.size(); ++i) {
++                share[i] = ts[i] > 0.0f ? (double) ts[i] / sum : 0.0;
++            }
++        }
++    }
++
++    char buf[192];
++    for (size_t i = 0; i < devs.size(); ++i) {
++        const float r = llama_kv_region_spill_read_gbps(devs[i]);
++        if (!cost.text.empty()) {
++            cost.text += devs.size() == 2 ? " and " : ", ";
++        }
++        if (r <= 0.0f) {
++            snprintf(buf, sizeof(buf), "device %zu could not be calibrated", i);
++            cost.text += buf;
++            continue;
++        }
++        cost.any = true;
++        const double ms = (double) spill_bytes * share[i] / ((double) r * 1e6);
++        cost.ms = cost.any ? std::max(cost.ms, ms) : ms;
++        if (devs.size() == 1) {
++            snprintf(buf, sizeof(buf), "%.1f GB/s in place, calibrated", (double) r);
++        } else {
++            snprintf(buf, sizeof(buf), "%.1f GB/s on device %zu (%.0f %% of the split, its share of the "
++                     "worst case in %.1f ms)", (double) r, i, 100.0 * share[i], ms);
++        }
++        cost.text += buf;
++    }
++    return cost;
++}
++
 +// The grow hook is the same for every device, so resolve it once.
 +static llama_kv_region_grow_fn llama_kv_region_grow_hook() {
 +    static llama_kv_region_grow_fn fn = nullptr;
@@ -6843,15 +7075,15 @@ index 5ddca5a53..fdad6ae73 100644
 +    return fn;
 +}
 +
-+// TODO #123: the attendance pool's pinned host mirror grows with the cell watermark too (same hook signature).
-+static llama_kv_region_grow_fn llama_kv_pool_mirror_grow_hook() {
-+    static llama_kv_region_grow_fn fn = nullptr;
++// TODO #123: the attendance pool's pinned host mirror grows with the cell watermark too.
++static llama_kv_pool_grow_fn llama_kv_pool_mirror_grow_hook() {
++    static llama_kv_pool_grow_fn fn = nullptr;
 +    static bool done = false;
 +    if (!done) {
 +        done = true;
 +        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
 +            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-+            fn = (llama_kv_region_grow_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_pool_mirror_grow");
++            fn = (llama_kv_pool_grow_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_pool_mirror_grow");
 +            if (fn != nullptr) {
 +                break;
 +            }
@@ -6863,7 +7095,7 @@ index 5ddca5a53..fdad6ae73 100644
  // orthonormal Walsh-Hadamard rotation matrix
  // note: res^2 == I
  static void ggml_gen_hadamard(ggml_tensor * tensor) {
-@@ -104,10 +454,13 @@ llama_kv_cache::llama_kv_cache(
+@@ -104,10 +533,13 @@ llama_kv_cache::llama_kv_cache(
      const  layer_share_cb & share,
               const char *   name_tag,
                       bool   is_indexer,
@@ -6879,7 +7111,7 @@ index 5ddca5a53..fdad6ae73 100644
      attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
      other(static_cast<llama_kv_cache *>(mem_other)),
      v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-@@ -187,6 +540,322 @@ llama_kv_cache::llama_kv_cache(
+@@ -187,6 +619,325 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -7022,26 +7254,29 @@ index 5ddca5a53..fdad6ae73 100644
 +                           "across layers); the KV stays fully resident\n", __func__);
 +        } else if (w_eff < kv_size) {
 +            const size_t tail = (size_t) kv_size - w_eff;
-+            const float  gbps = llama_kv_region_spill_read_gbps(model.dev_layer(0));
-+            const size_t cell_all = cell * n_tens * n_stream;
++            const size_t cell_all = cell * n_tens * n_stream;   // one cell: every K/V tensor, every stream
 +            const double spill_mib = (double) tail * cell_all / 1048576.0;
++            const llama_kv_spill_cost cost = llama_kv_region_spill_cost(model, (size_t) tail * cell_all);
 +            this->kv_resident_cells = w_eff;
 +            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %zu of up to %u cells stay in VRAM, everything "
-+                           "older spills to pinned system RAM (%.1f KiB per cell%s).  The spill grows with the "
++                           "older spills to pinned system RAM (%.1f KiB per cell%s: one cell of EVERY K/V tensor "
++                           "in the cache, which is what the spill below is counted in).  The spill grows with the "
 +                           "used extent, up to %.2f MiB at full context, and every spilled cell is read IN PLACE "
-+                           "over the PCIe link on every step (%s, the measured in-place read rate), so a token at "
-+                           "the full context reads %.1f MiB in about %.1f ms -- and that is linear in how far a "
-+                           "request outgrows the window, so judge W against the depth you actually run; a card "
-+                           "that reads its host aperture below its DMA link scales it up from there.  %s  Unset "
-+                           "LLAMA_KV_RESIDENT_CELLS or LLAMA_KV_REGION to keep the KV fully resident.%s\n",
-+                           __func__, w_eff, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
++                           "over the PCIe link on every step (%s), so a token at the full context reads %.1f MiB "
++                           "in about %.1f ms -- and that is linear in how far a request outgrows the window, so "
++                           "judge W against the depth you actually run; a card that reads its host aperture below "
++                           "its DMA link scales it up from there.  %s  Unset LLAMA_KV_RESIDENT_CELLS or "
++                           "LLAMA_KV_REGION to keep the KV fully resident.%s\n",
++                           __func__, w_eff, kv_size,
++                           (double) cell_all / 1024.0, n_stream > 1 ? ", per stream" : "",
 +                           spill_mib,
-+                           gbps > 0.0f ? (std::to_string(gbps).substr(0, 4) + " GB/s in place, calibrated").c_str()
-+                                       : "the rate could not be calibrated on this device",
++                           cost.any ? cost.text.c_str()
++                                    : "the in-place read rate could not be calibrated on this device",
 +                           spill_mib,
-+                           gbps > 0.0f ? 1000.0 * spill_mib / (1024.0 * (double) gbps) : 0.0,
++                           cost.any ? cost.ms : 0.0,
 +                           kv_meta ? "  On this tensor split every device keeps its own slice of the window (one "
-+                                      "VMM region per device, the same cells on each)." : "",
++                                      "VMM region per device, the same cells on each) and reads it in parallel."
++                                   : "",
 +                           spill_cap_bytes != 0 ? "  (The window was widened by the RAM budget -- see above.)" : "");
 +        }
 +    }
@@ -7202,7 +7437,7 @@ index 5ddca5a53..fdad6ae73 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -243,6 +912,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -243,6 +994,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -7243,7 +7478,7 @@ index 5ddca5a53..fdad6ae73 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -252,11 +955,31 @@ llama_kv_cache::llama_kv_cache(
+@@ -252,11 +1037,31 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -7277,7 +7512,7 @@ index 5ddca5a53..fdad6ae73 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -265,13 +988,50 @@ llama_kv_cache::llama_kv_cache(
+@@ -265,13 +1070,50 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -7330,7 +7565,7 @@ index 5ddca5a53..fdad6ae73 100644
      }
  
      if (reuse) {
-@@ -305,6 +1065,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -305,6 +1147,29 @@ llama_kv_cache::llama_kv_cache(
          LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
      }
  
@@ -7360,7 +7595,7 @@ index 5ddca5a53..fdad6ae73 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -461,6 +1244,9 @@ void llama_kv_cache::clear(bool data) {
+@@ -461,6 +1326,9 @@ void llama_kv_cache::clear(bool data) {
          for (auto & [_, buf] : ctxs_bufs) {
              ggml_backend_buffer_clear(buf.get(), 0);
          }
@@ -7370,7 +7605,7 @@ index 5ddca5a53..fdad6ae73 100644
      }
  }
  
-@@ -784,6 +1570,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+@@ -784,6 +1652,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
      }
  
      ggml_backend_meta_set_scratch_views(false);
@@ -7381,7 +7616,7 @@ index 5ddca5a53..fdad6ae73 100644
  }
  
  // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
-@@ -839,6 +1629,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+@@ -839,6 +1711,38 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
      if (!can_park()) {
          return false;
      }
@@ -7420,7 +7655,7 @@ index 5ddca5a53..fdad6ae73 100644
      if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
          return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
      }
-@@ -1060,8 +1882,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
+@@ -1060,8 +1964,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -7470,7 +7705,7 @@ index 5ddca5a53..fdad6ae73 100644
      for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
          ret[buft] += size;
      }
-@@ -1069,6 +1931,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -1069,6 +2013,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -7507,7 +7742,7 @@ index 5ddca5a53..fdad6ae73 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -1400,82 +2292,151 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1400,82 +2374,151 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
              return { };
          }
  
@@ -7706,7 +7941,7 @@ index 5ddca5a53..fdad6ae73 100644
      }
  
      assert(res.s1 >= res.s0);
-@@ -1585,6 +2546,164 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1585,6 +2628,164 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -7871,17 +8106,25 @@ index 5ddca5a53..fdad6ae73 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1646,6 +2765,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1646,6 +2847,54 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
-+void llama_kv_cache::grow_regions(uint32_t n_kv) const {
++void llama_kv_cache::grow_regions(uint32_t n_kv, uint32_t n_kv_used) const {
 +    // `kv_region` is the windowed KV; a pooled cache grows its pinned host MIRROR through the same cell
 +    // watermark (TODO #123), so the two providers share this hook site.
 +    if ((!kv_region && kv_pool_page == 0) || ctxs_bufs.empty()) {
 +        return;
 +    }
-+    llama_kv_region_grow_fn fn = kv_region ? llama_kv_region_grow_hook() : llama_kv_pool_mirror_grow_hook();
++    // `n_kv` is the PADDED extent (what the graph's views read, so what must be mapped); `n_kv_used` is what
++    // exists.  The windowed KV's spill boundary follows the used extent (issue #314 F7): with the padded one a
++    // coarse `LLAMA_KV_N_PAD_PREFILL` step (8192 cells on a multi-device split) spilled cells that do not exist
++    // into pinned RAM and out of the resident window, so fewer than W used cells stayed in VRAM.
++    if (n_kv_used > n_kv) {
++        n_kv_used = n_kv;
++    }
++    llama_kv_pool_grow_fn mirror_fn = kv_region ? nullptr : llama_kv_pool_mirror_grow_hook();
++    llama_kv_region_grow_fn fn      = kv_region ? llama_kv_region_grow_hook() : nullptr;
 +    for (const auto & [_, buf] : ctxs_bufs) {
 +        // TODO #124: under a tensor split the KV is ONE Meta buffer over per-device region buffers, and the
 +        // CUDA grow hook returns 0 (= "not a region buffer") for it -- a silent success on unmapped VA, which
@@ -7889,8 +8132,9 @@ index 5ddca5a53..fdad6ae73 100644
 +        // cannot be reached as a refusal (never as a 0).
 +        const ggml_backend_dev_t buf_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf.get()));
 +        const int r = buf_dev != nullptr && ggml_backend_dev_is_meta(buf_dev)
-+                ? ggml_backend_meta_kv_region_grow(buf.get(), n_kv)
-+                : (fn != nullptr ? fn(buf.get(), n_kv) : 0);
++                ? ggml_backend_meta_kv_region_grow(buf.get(), n_kv, n_kv_used)
++                : (kv_region ? (fn != nullptr ? fn(buf.get(), n_kv, n_kv_used) : 0)
++                             : (mirror_fn != nullptr ? mirror_fn(buf.get(), n_kv) : 0));
 +        if (r < 0) {
 +            // A refused grow is not something to continue past: the graph this batch would build reads cells
 +            // above the mapped extent, and that faults the GPU (it does not return an error).  The backend has
@@ -7902,10 +8146,22 @@ index 5ddca5a53..fdad6ae73 100644
 +    }
 +}
 +
++uint32_t llama_kv_cache::get_n_kv_used(const slot_info & sinfo) const {
++    // the cells that actually exist, with no padding: the windowed KV's spill boundary and the pinned-RAM
++    // accounting follow this, never the graph's padded extent (issue #314 F7)
++    uint32_t result = 0;
++    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++        const auto & cells = v_cells[sinfo.strm[s]];
++        const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
++        result = std::max(result, used);
++    }
++    return result;
++}
++
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -2054,6 +3200,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -2054,6 +3303,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -7915,7 +8171,7 @@ index 5ddca5a53..fdad6ae73 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3499,6 +4648,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3499,6 +4751,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -7925,20 +8181,21 @@ index 5ddca5a53..fdad6ae73 100644
      return true;
  }
  
-@@ -3676,6 +4828,11 @@ bool llama_kv_cache_context::apply() {
+@@ -3676,6 +4931,12 @@ bool llama_kv_cache_context::apply() {
      n_kv      = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
      n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
  
 +    // wip/kv-residency (TODO #117): this is the last point before the graph is built, and `n_kv` is the PADDED
 +    // extent its views use -- so it is also exactly the extent the region must have mapped.  Growing to the
-+    // used cells instead would leave a kernel reading unmapped VA (a GPU fault, not an error).
-+    kv->grow_regions(n_kv);
++    // used cells instead would leave a kernel reading unmapped VA (a GPU fault, not an error).  The used
++    // extent goes along as the windowed KV's spill boundary (issue #314 F7).
++    kv->grow_regions(n_kv, kv->get_n_kv_used(sinfos[i_cur]));
 +
      return true;
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 21ec3feda..031582c2f 100644
+index 21ec3feda..62771f305 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -120,9 +120,23 @@ public:
@@ -7976,7 +8233,7 @@ index 21ec3feda..031582c2f 100644
 +    // backed by physical memory.  `n_kv` must be the value the graph views use -- the PADDED one from
 +    // `get_n_kv()` -- because a kernel that reads a cell above the mapped extent faults the GPU rather than
 +    // returning an error.  A no-op unless the KV is region-backed (LLAMA_KV_REGION).
-+    void grow_regions(uint32_t n_kv) const;
++    void grow_regions(uint32_t n_kv, uint32_t n_kv_used) const;
 +
      bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
      void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -8027,7 +8284,17 @@ index 21ec3feda..031582c2f 100644
      bool get_has_shift() const;
  
      ggml_type type_k() const;
-@@ -332,6 +384,15 @@ private:
+@@ -211,6 +263,9 @@ public:
+ 
+     uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const;
+ 
++    // the UNPADDED extent: the cells that exist (the windowed KV's spill boundary follows this)
++    uint32_t get_n_kv_used(const slot_info & sinfo) const;
++
+     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+     // the ubatch splits into n_slices groups of tokens with one sequence each
+     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+@@ -332,6 +387,15 @@ private:
      // SWA
      const uint32_t n_swa = 0;
  
@@ -8043,13 +8310,15 @@ index 21ec3feda..031582c2f 100644
      const bool is_indexer = false;
  
      // env: LLAMA_ATTN_ROT_DISABLE
-@@ -360,6 +421,45 @@ private:
+@@ -360,6 +424,47 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      llama_memory_bufs ctxs_bufs;
  
 +    // wip/kv-residency (TODO #117): is a buffer of this cache backed by a growable VMM region (provider P1)?
 +    // Set once at construction from the backend's answer, and `grow_regions()` is then called with the extent
-+    // the graph is about to read/write.  Zero cost (and no proc lookup) when the feature is off.
++    // the graph is about to read/write (the padded n_kv -- what must be MAPPED) and with the used extent (what
++    // EXISTS -- the windowed KV's spill boundary follows that, issue #314 F7).  Zero cost (and no proc lookup)
++    // when the feature is off.
 +    bool kv_region = false;
 +
 +    // wip/kv-residency (TODO #118) A2/A3: the windowed KV's resident window, in CELLS (0 = no window).
@@ -8089,7 +8358,7 @@ index 21ec3feda..031582c2f 100644
      // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
-@@ -476,6 +576,20 @@ public:
+@@ -476,6 +581,20 @@ public:
      uint32_t get_n_kv() const;
      uint32_t get_n_kv_rows() const;
  

@@ -1,3 +1,102 @@
+## 261114.010 (r289) -- issue #314: a windowed KV on an UNEVEN tensor split faults the GPU because the spill boundary was one byte offset for tensors with different cell strides; the boundary is a per-tensor cell count from the USED extent now, every child's in-place rate is calibrated, and `-sm layer` becomes the recommended split on a heterogeneous or slow-link set
+
+**`release.json` changed: release `v16-4f9dfa0e3-r288` -> `v16-4f9dfa0e3-r289`; 17 default patches (16
+official + 1 temporary) and 2 optional, unchanged in number; tip `8b653ad6d…` ->
+`b1f559df78d472b70b1d7ce1c9e2139c9ca7ebd3`, tree `79d18f41b…` ->
+`7181d396977e90270528d8478ee7b04894a3f39e`; base unchanged (`4f9dfa0e3`).**  Block 14 (the streamed KV) is
+amended; blocks 00-13 and 15 carry the same deltas as r288 (the per-block ladder confirms it: 2/2 built, 15
+skipped as unchanged).  The optional artifacts are unchanged but their recorded trees moved with the default
+tree (`0100` -> `b15769c72`, `0101` -> `be40d5ed4`, cumulative `1c09de9a0`).
+
+**F1/F2.3 -- the fault, and its root cause (a real defect, reproduced on this box).**  The reporter's
+`-ts 24/16` 2-device 27B died in `rms_norm_mul_rope_f32` (`HSA_STATUS_ERROR_MEMORY_FAULT`, "Page not
+present", grid `[256, 2048, 1]`) at the first spill slide, and the q8_0 arm's refusal
+("region 868 MiB, mapped 734 MiB, wanted 864..868 MiB, cap 0 MiB") was the same bug's other face.  Cause: a
+tensor split shards the KV row by the `-ts` ratio and rounds each shard to its own head grid, so an **uneven**
+ratio gives two tensors of ONE cache different cell strides in the same VMM region (measured
+`LLAMA_KV_REGION_DEBUG` on a 27B at `-ts 24/16`: 1024 B and 1536 B on device 0, and the region is 480 MiB /
+288 MiB across the pair).  The window computed ONE byte boundary from `vmm_tensors[0].nb1` and applied it to
+every tensor: the shorter tensors' VRAM watermark (a max over the region) already sat past their whole extent,
+so their resident tail was never mapped and the first ubatch that wrote it faulted; on the last tensor the
+`lead` span ran past the region end, which is the "wanted 864..868 MiB" refusal.  An **even** split has uniform
+strides and is clean, which is exactly why every gate arm (all even) missed it.  Reproduced on 3 identical
+R9700 at `-ts 24/16` (`-b 8192 -ub 2048 -p 4096 -d 8096`, `--kv-window 8192`) and NOT at `-ts 1/1`.  Fix: the
+boundary is a **cell count** (`used - W`), turned into bytes and floored to the map unit in **that tensor's**
+`nb1`, with per-tensor `lead`/`dev` watermarks (the write path picks the owning tensor's boundary too), plus a
+defensive region-end clamp that reports itself.  After it: the same arm completes every depth, no journal
+fault, `-ts 1/1` unchanged (22.19 vs 21.95 t/s at `d16384`).
+
+**F7 -- the padded extent no longer decides what spills.**  `grow_regions()` grew and slid from the PADDED
+`get_n_kv()`; on a multi-device split `LLAMA_KV_N_PAD_PREFILL` defaults to 8192, so a 12192-cell depth asked
+for 16384 and spilled 8192 cells of a window of 8192, i.e. **fewer than W used cells stayed resident**.  The
+hook now takes both extents: `n_cells` (padded) is still what is MAPPED (the graph's views read it), `n_used`
+(the used extent) is what the spill boundary follows.  Measured effect at `d8096` `-ts 1/1`: no spill at all
+(used 10144 - W 8192 = 1952 cells is under one map unit) where the padded boundary spilled 8192 cells.  Cost of
+the honest model: a windowed split's VRAM is `W + (padded - used)` cells, stated in `ENVIRONMENT.md` and in the
+window line.
+
+**F2 -- the refusal now says what failed.**  `ggml_backend_cuda_kv_region_log()` printed
+`LLAMA_KV_REGION_MAP_MAX_MIB` as "cap" unconditionally, and that knob is 0 when unset, so a pinned-host
+mapping failure, a VRAM exhaustion and a real cap hit all read "cap 0 MiB".  It takes a reason now and prints
+the cap clause only when a cap is set; the pinned-budget refusal adds the bytes it could not pin next to
+`ggml_cuda_kv_spill_allow()`'s arithmetic.  Verified with `LLAMA_KV_REGION_MAP_MAX_MIB=8`:
+"...reason: LLAMA_KV_REGION_MAP_MAX_MIB is 8 MiB and this mapping would end at 20 MiB".
+
+**F3 -- the per-cell figure was 32x low.**  `WINDOWED KV ENABLED` printed `cell` (one tensor's row, 2.0 KiB on
+a 27B) where the spill is counted in `cell_all` (64.0 KiB: every K/V tensor).  It prints `cell_all` now and
+says so, matching the RAM-budget line in the same release.
+
+**F4 -- the cost model calibrates every child and reads them in parallel.**  `llama_kv_cache` and `--fit` both
+built the estimate from `dev_layer(0)`: one card's rate for the whole spill, and the other card never measured.
+Both now enumerate the Meta wrapper's children, calibrate each one's in-place host read, weight by the split's
+shares and quote `max_i(share_i x bytes / rate_i)` (the children read in parallel), e.g. "23.1 GB/s on device 0
+(60 % of the split, its share in 97.7 ms) + 11.8 GB/s on device 1 (40 %, 127.6 ms) ... the slowest share sets
+the wait".  Two measured caveats are recorded in `INVARIANTS.md`: the calibrated number is a cold burst, so the
+quoted ms is a floor (at 65536 cells the sustained aggregate is ~10 GB/s per device), and a window at or above
+the run depth costs **nothing** on a split (2x R9700, 27B, a 5996-token request: 43.17 t/s without a window,
+43.22 at `W=8192`, 43.31 at `W=65536`; and 38.13 / 38.22 / 38.12 at `-ts 24/16`), so **F6 does not reproduce
+here** -- the 29 % the reporter measured is their mixed gfx1100+gfx1201 x8 pair with known-bad compiler flags,
+not the split's region-backed KV path.
+
+**F5 -- `--fit` does size a window on a split; the `auto` message is the defect.**  The reporter's
+"the windowed KV needs one region-backed KV cache to size against (this config has 2 device(s))" came from the
+single-device branch, but a `-sm tensor` config takes the tensor-split branch that sizes and clamps against the
+split's per-device budget (verified: `--kv-window auto -fitt 1024` decides "no window is needed" instead of
+doing nothing, and `llama-fit-params -c 65536 --kv-window 8192` reports the windowed split).  On a **layer** or
+row split the window does host (one region per device, verified on 2 devices), but `--fit` cannot size it: there
+is no single KV byte count or budget to divide.  That branch now says exactly that and, for `auto`, declines the
+window explicitly ("pass a fixed N to window it") instead of leaving it "as configured".
+
+**Along the way (found while investigating, fixed here).**  `LLAMA_KV_REGION_DEBUG`'s exhaustive host re-read
+ran on **every** `grow_regions()` call, i.e. on every batch even when the mapping had not changed, which turned
+a 22 t/s decode into **1.3 t/s** with the knob on and made three debug runs look like a performance
+regression; it now runs only on a grow that changed the mapping (`mapped_after != mapped_before`), and logs the
+per-tensor layout once (that layout is what identified the F1 cause).  `-sm layer` is now the **recommended**
+split on a heterogeneous, imbalanced or slow-link set (`README.md`, `INVARIANTS.md`): a tensor split needs the
+cross-device all-reduce on every layer's critical path, so the slowest card and the slowest link set every
+token's pace, and an imbalanced ratio produces the uneven shards above; a layer split keeps whole layers per
+device (no all-reduce, no sharded tensors) and is what the gates cover most heavily.
+
+**Gates (all on the r289 tree).**  `scripts/gate-kv-window-split.sh` PASS, including a NEW uneven-split arm
+(`ref2u`/`win2u` at `-ts 6,4`, whose debug re-run must show >= 2 distinct cell strides in one region or the arm
+is an even split in disguise) with `win2u == ref2u` and no fault, and the recorded r204 hashes reproduced
+exactly (`win3 = 057ea27b1009`, `win2 = ref2 = win2mtp = ref2mtp = 7a7430617465`, acceptance 0.46154, 32 flips
+per device, 128 at a 1 MiB unit, `big2`, `win1`, `nkvo`, 6 fit arms).  `scripts/gate-kv-residency.sh` PASS
+(window + pool arms; `wspill` 64 MiB host-backed, pool 89.96 % / 89.24 % hit rates).  `scripts/gate-state-pipe.sh`
+PASS **with and without** `LLAMA_KV_RESIDENT_CELLS=2048` (windowed: batched save+load 23.6 ms vs the synchronous
+arm's 43.2 ms, bound 3.0x; the write path is what the per-tensor boundary changed).  `gate-prefill-logits.sh`
+PASS at both points: canonical 0.000697 / 98.784 %, and `--device 0,1,2 --sm tensor` 0.000000 / 99.990 % against
+the recorded base.  `gate-per-block-build.sh --changed-from 8b653ad6d`: 2/2 built (`all` target), 15 skipped as
+unchanged.  `validate-set.sh` OK (17 default + 2 optional, tree `7181d3969`, cumulative optional `1c09de9a0`,
+Windows portability lint clean over 510 files).  Kernel journal clean in every gate.
+
+**Reply:** posted on issue #314 (no em dashes), including the `-sm layer` recommendation for heterogeneous or
+slow-link sets, and the issue is closed.
+
+**Records:** `patches/README.md` block 14 amendment note, `INVARIANTS.md` (four new facts), `MANIFESTS.md`
+(block 14 row + gate 18), `ENVIRONMENT.md` (`LLAMA_KV_N_PAD_PREFILL` and a windowed KV), `README.md` (the split
+mode section), `scripts/README.md` + `scripts/gate-kv-window-split.sh` (the new arm).
+
 ## 261114.009 (r288) -- the block-number re-org: 16 official blocks `0000`-`0015` + the temporary `0300` + the optional `0100`/`0101`, and the mixed K/V cache leaves the default set; no code change, so the tag goes `v18` -> **`v16`**
 
 **`release.json` changed: release `v18-4f9dfa0e3-r287` -> `v16-4f9dfa0e3-r288`; 18 patches -> 17 default
