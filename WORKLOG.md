@@ -1,6 +1,6 @@
 ## 261115.002 (r290) -- block 07 gains the verify band's WMMA iu8 matvec family (PR #317): opt-in `--wmma-verify N|auto`, floor 7, Q8_0 included.  +10.6 % at 8 columns on a 2-GPU tensor split, byte-identical to r289 with it off
 
-PR #317 (@burnoutIA, `wip/rdna4-wmma-verify`) offers a 2..16-column WMMA `iu8` matvec family for the
+PR #317 (@burnoutIA; campaign record now in `archive/work/rdna4-wmma-verify/`) offers a 2..16-column WMMA `iu8` matvec family for the
 speculative verify band.  It is accepted **into block 07** (the decode-numerics block: it owns
 `vecdotq.cuh`'s `vec_dot_*` family and the `mmvq` K-split loop, and its contract is already "same
 real-number result, different addition order") as an **opt-in that is OFF by default**, with three
@@ -67,9 +67,12 @@ PR's `stride_row_x * BB` reads garbage there (it aborts).  (4) The "2..16 column
 the K-split kernel, contradicting the PR's own note.  (6) Reported to the submitter on the PR, which
 carries their authorship (`Co-authored-by` on blocks 07 and 08).
 
-**Attribution.**  The kernel, the four K-quant formats and the measurement protocol are
-@burnoutIA's (PR #317); the Q8_0 case, the floor, the option plumbing and the numbers above are this
-release's.  `README.md` has them under Community Acknowledgements.
+**Attribution and the campaign record.**  The kernel, the four K-quant formats and the measurement
+protocol are @burnoutIA's (PR #317); the Q8_0 case, the floor, the option plumbing and the numbers above are
+this release's.  The campaign is **promoted**, so its record lives in
+[`archive/work/rdna4-wmma-verify/`](archive/work/rdna4-wmma-verify/README.md) (the submitter's own README
+verbatim, plus the resolution: what shipped, what changed from the offer and why); blocks 07 and 08 of the
+fork carry `Co-authored-by: burnoutIA`, and `README.md` lists them under Community Acknowledgements.
 
 ---
 ## 261115.001 (r289, wip) -- PR #316 (`wip/gdn-conv-norm-deferred-gather`) reviewed and NOT taken: the fusion it fixes is not issued on r289 at all -- the r244 one-kernel conv step owns the decode/verify band
