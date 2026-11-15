@@ -5039,3 +5039,43 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   default chain carries with the feature on, and it is raw device memory, so the allocator breakdown is
   unchanged (the census line says which caller grew it).  A gather that declines (no scratch, multi-process,
   `GGML_SEQPAR_CE_GATHER=0`) warns with **its own** message and flag instead of consuming the all-reduce's.
+
+## r292 — the expert arena is sized ONCE, from the slab's *birth* boundary, so `-ub` silently shrinks it (beta candidate)
+
+1. **The arena's slot count is a one-shot function of the slab boundary at the instant the cache sizes, and
+   that boundary is the prefill layout.**  `alloc_all_locked` sizes from `ggml_cuda_slab_arena_total()` =
+   `arena_top - boundary` (`ggml-cuda-slab.cu`), whose own comment says it "must reflect what is allocatable
+   NOW".  The slab is born at the first compute-buffer allocation — the `sched_reserve` of the `pp` graph — so
+   its initial `boundary` is `narrow + ring + wide`, i.e. **ubatch-proportional** (`SLAB_INIT ... boundary=
+   6.50 GiB` at `-ub 16384`, `12.62 GiB` at `-ub 32768`).  `g_sized = true` latches the result, `moe_cache_rearm`
+   re-arms only to `g_rearm_slots[layer]`, and `TODO` #70 forbids revisiting a deficit layer.  The band the
+   prefill→decode drop returns is therefore **never given to the tables**.
+2. **The loss is a closed form: `max(0, boundary_at_birth - narrow_floor)`.**  Measured on 1 × R9700,
+   QFN `GSQ-RCO-IQ3_S`, `-ncmoe 47` (region vs the arena the tables were sized to): `-ub 4096` 1 600 vs 2 048
+   → **0** (saturated); `8192` 3 200 → 1 448 MiB (6 %); `16384` 6 656 → **4 948 MiB (21 %)**; `32768` 12 928 →
+   **11 215 MiB (49 %)**.  It is not the timing: `MOE_EXPERT_CACHE_SIZE_AT_PRIME=0` gives byte-identical
+   results, because the slab already exists, wide, before any sizing can run.
+3. **An explicit `MOE_EXPERT_CACHE_MIB` larger than that arena is silently clamped, and the census
+   contradicts itself.**  `MOE_EXPERT_CACHE_MIB=24000` at `-ub 16384` → `VRAM budget: requested=24000
+   MiB/device, free-clamped=1` beside `arena=18137.1 MiB total (budget 24000 MiB/device)` and
+   `evictions=10781`.  A user who raises `-ub` loses residency with no line saying why.  (The beta candidate
+   adds an `arena settle:` census line naming the effective figure; reconciling `requested` against the
+   reported arena is still open.)
+4. **Do not measure a residency/arena change at 128 generated tokens.**  The same change reads **+1.8 %** over
+   128 tokens and **+4.0 %** over 2 000 on the same arm: the arena only reaches its steady state after a few
+   hundred tokens, so a short decode understates every residency win.  Use >= 1 000, 2 000 preferred.
+5. **The arena's value is the *cost of a miss*, not the hit rate** (this extends r219 fact 6).  Two runs with
+   near-identical arena hit rates can differ by 2.8x: a 100 % mirror host tier (pool hit 1.000) does 51.5 t/s
+   at hit 0.834, while a partial pool (`-lme 8` of 46.9 GiB → **pool hit 0.094**) does 18.3 t/s at hit 0.852.
+   Quote the **miss bytes** (`expert H2D traffic:`), which are hardware-independent, and convert with the
+   link rate; the wall-time ratio then follows from whether the expert path is the bottleneck (+4.0 % on a
+   mirror where it is ~13 % of the wall, +29 % on a pool where it *is* the wall, for the same −29..−32 %
+   traffic).  A box with PCIe5 x16 + a PCIe5 SSD is the *best* case for masking this and must not be used to
+   size an arena policy.
+6. **The settle must scale the sizing count, not re-derive it.**  A per-device re-derivation has to reproduce
+   every sizing-time exclusion (`table_pinned_head`, the per-table arena-unit rounding, `g_extra_reserve`);
+   diverging from it builds a **non-uniform layer**, the one state that reads the wrong expert.  Scaling by
+   `min(avail_now, request) / avail_sizing` from the recorded sizing inputs is scan-free and cannot disagree.
+   The cap must use the **pre-clamp** request: recording the post-clamp budget makes `auto` indistinguishable
+   from an explicit budget that matched the capacity, and the ratio pins to 1.0 (the whole settle silently
+   does nothing — this was the first implementation's bug).

@@ -35,12 +35,25 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-**None.**  `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a no-XNACK
-GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning — the RAM saving
-disappears).  It is archived with a resolution at
+* **`arena-steady-sizing`** (2026-11-15, r291) — **the expert arena was sized once, from the slab's
+  *prefill* boundary**, so a larger `-ub` permanently shrank it: measured `max(0, boundary_at_birth -
+  narrow_floor)` = 21 % of the arena lost at `-ub 16384` and **49 %** at `-ub 32768`, with an explicit
+  `MOE_EXPERT_CACHE_MIB` silently free-clamped on top.  One file, one commit: settle the per-layer slot count
+  at each prefill -> decode drop against the arena the drop returns (growth only, kill-switch
+  `MOE_EXPERT_CACHE_STEADY_REARM=0`).  Same-seed greedy text **byte-identical**; arena 18 411.9 -> 22 705.1
+  MiB, expert miss traffic **-29..-32 %**, decode **+4.0 %** on a 100 % mirror host tier and **+29 %** on a
+  partial pool.  See [`arena-steady-sizing/`](arena-steady-sizing/README.md) (its `README.md` §6 lists the
+  three fold targets — the patch edits a file blocks 09/10/15 own, so where it lands is the maintainer's
+  call).
+
+**None else.**  `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
+no-XNACK GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning —
+the RAM saving disappears).  It is archived with a resolution at
 [`../archive/work/host-experts-window-beta/`](../archive/work/host-experts-window-beta/README.md) and
 [`../archive/work/host-expert-pinned-window/RESOLUTION.md`](../archive/work/host-expert-pinned-window/RESOLUTION.md);
-the two mechanisms worth keeping moved to [`../archive/work/host-pool-speed/`](../archive/work/host-pool-speed/HANDOVER-2026-11-02.md) (the campaign has since retired there).
+the two mechanisms worth keeping moved to
+[`../archive/work/host-pool-speed/`](../archive/work/host-pool-speed/HANDOVER-2026-11-02.md) (the campaign has
+since retired there).
 
 (Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 

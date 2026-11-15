@@ -1,3 +1,52 @@
+## 261115.005 (r292) -- the expert arena was sized once, from the slab's *prefill* boundary: `-ub` silently shrank it by 21 % / 49 %.  A one-file beta candidate settles the count at each drop (+4.0 % mirror, +29 % partial pool, same-seed text byte-identical)
+
+Started as a feasibility question about a *strictly bimodal* slab (prefill band XOR expert arena on
+`--parallel 1`), and the assessment of that is `wip/bimodal-slab/` — short version: the modality mechanism
+already exists and is already engaged (the boundary move evicts whole tables, `moe_cache_rearm` re-arms and
+bulk-fills them at 17-33 GB/s, and at `-ub 32768` the code already leaves the arena 1 024 MiB of a 24.3 GiB
+slab), and a *modal reload* moves the same bytes at the same link rate, so it is worth ~nothing on 24-32 GiB
+(the on-demand fill hides behind compute: 44.6 t/s over a 128-token decode against 27.7 over an 8-token one).
+What the session actually found was the reason the proposal was asked for: **the arena shrinks as `-ub`
+grows and never recovers.**
+
+**The defect (r292).** The cache sizes itself once from `ggml_cuda_slab_arena_total()` = `arena_top -
+boundary`, sampled while the wide (prefill) compute view is live — the slab's birth `boundary` is the widest
+`--fit` probe layout, so it is `narrow + ring + wide` and ubatch-proportional. `g_sized` latches it,
+`moe_cache_rearm` restores only `g_rearm_slots[layer]`, and `TODO` #70 deliberately never revisits a deficit
+layer, so the band the prefill->decode drop returns is never given to the tables. Loss is exactly
+`max(0, boundary_at_birth - narrow_floor)`: **0 at `-ub 4096` (saturated), 1.4 GiB at 8192, 4.9 of 23.4 GiB
+(21 %) at 16384, 11.2 of 22.8 GiB (49 %) at 32768.** `MOE_EXPERT_CACHE_SIZE_AT_PRIME=0` changes nothing
+(byte-identical), and an explicit `MOE_EXPERT_CACHE_MIB=24000` is silently free-clamped — the census reports
+`requested=24000 MiB/device, free-clamped=1` next to an 18 137 MiB arena and 10 781 evictions.
+
+**The candidate (`beta/arena-steady-sizing/`, one file, one commit).** At each drop (the narrow re-reserve
+has already shrunk the boundary, so `arena_total()` *is* the decode steady-state arena) scale the sizing
+count by `min(avail_now, request) / avail_sizing`, growth only, capped at each layer's expert count. No table
+scan, so it cannot disagree with the sizing about which tables count — diverging there builds a non-uniform
+layer, the one state that reads the wrong expert. Kill-switch `MOE_EXPERT_CACHE_STEADY_REARM=0` is bit-for-bit
+the old behaviour.
+
+**Measured** (1 × R9700, QFN IQ3_S, `-ncmoe 47`, `-ub 16384`, `--parallel 1`, 4 k prompt + **2 000** greedy
+tokens, two snapshot builds, interleaved ABAB, heat prior pinned): arena 18 411.9 -> **22 705.1 MiB**, hit
+0.8337 -> 0.8866, decode **51.45 -> 53.54 t/s (+4.0 %)** on a 100 % mirror host tier; and on a partial pool
+(`-lme 8`, `DIO=1`) **18.30 -> 23.60 (+29 %)**. Expert miss traffic **-32 % / -29 %** (302 194 -> 204 406 MiB
+and 271 398 -> 192 635 MiB over the run) — the hardware-independent figure; how much wall time that buys
+depends only on whether the expert path is the bottleneck. **Same-seed greedy text byte-identical**
+(`sha256 af0ec4edd999a414`) with the settle provably firing.
+
+Two methodology corrections this session produced, both now in `INVARIANTS.md` r292: **never measure a
+residency change at 128 generated tokens** (the same change reads +1.8 % there and +4.0 % at 2 000, because
+the arena reaches steady state after a few hundred tokens), and **the arena's value is the cost of a miss,
+not the hit rate** (0.834 hit at 51.5 t/s on a mirror vs 0.852 hit at 18.3 t/s on a partial pool — quote the
+miss bytes and convert with the link rate; this box's PCIe5 x16 + PCIe5 SSD is the best case for masking it).
+
+Not in `patches/`: the patch edits a file blocks 09/10/15 own, and where it folds is a maintainer decision
+(amend block 09 needs a chain rewrite — the sizing loop's block-09 context predates block 15's GTT branch;
+block 15 is one commit but a poor semantic fit; `0301` is a new block). Staged in `beta/` per the WIP and
+promotion rules, with the checklist in its `BETA-TESTING.md`. Gates not yet run: the MTP four-axis protocol,
+`gate-host-pool.sh`, `llama-batched-bench -npl 1,4,8`, depth-varied decode, and `validate-set.sh` once it is
+in the set.
+
 ## 261115.004 (r291, RELEASE v16-4f9dfa0e3-r291) -- block 12 gains sequence parallelism for the qwen4exp hyper-connection work (PR #315, @briansp2020): default ON, +7 % copy-engine / +2.2 % default-chain prefill at 31.5k, +15.3 % MTP prefill
 
 PR #315 (`wip/seqpar-r289`, v2 of a series reviewed here on 2026-11-15) keeps the qwen4exp residual streams
