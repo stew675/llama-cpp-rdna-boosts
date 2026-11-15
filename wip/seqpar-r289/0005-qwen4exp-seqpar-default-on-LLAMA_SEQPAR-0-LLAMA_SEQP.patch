@@ -1,0 +1,417 @@
+From a85a7cbaee08ddae5f4f339a5912c9ce1fb55d72 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 17:00:50 +0000
+Subject: [PATCH 5/5] qwen4exp seqpar: default on (LLAMA_SEQPAR=0 /
+ LLAMA_SEQPAR_GATHER_BF16=0 off), diagnostics
+
+- LLAMA_SEQPAR and the bf16 hc_mixed gather wire are on by default; LLAMA_SEQPAR=0 restores the
+  unsplit graph exactly, LLAMA_SEQPAR_GATHER_BF16=0 keeps the F32 wire.
+- Not engaged: one INFO line per context and reason (LLAMA_SEQPAR=0, not -sm tensor, a layer not on
+  exactly 2 devices, a drafter reading per-layer inputs, ubatch below LLAMA_SEQPAR_MIN / odd with
+  LLAMA_SEQPAR_ODD=0). Keyed per context, not per process: common's --fit builds trial contexts
+  with INFO demoted, which spent process-wide once-flags (the 0004 engage line never printed).
+  The MIN check now precedes the per-layer walk, so decode and verify graphs stop early.
+- Executed-form census (meta backend): cumulative counts of reduce-scatter by the comm backend /
+  all-reduce + slice / fallback all-reduce + slice and token all_gather by the comm backend /
+  generic copies, logged when a form first runs (one compute per scheduler split, so a per-compute
+  mix would repeat every ubatch). The graph-time line now says "fold an all-reduce" (eligible).
+- CUDA: the copy-engine reduce-scatter / all_gather log each decline reason once. The CE scratch
+  reserve takes its caller: a seqpar collective that cannot get the scratch warns with its own
+  message and flag (all-reduce + slice / generic copies) instead of the all-reduce's, which it no
+  longer consumes. Scratch growth is logged (raw device memory outside the ggml allocators).
+- CUDA: the reduce-scatter selects the default chain's large arm before deciding, as the
+  all-reduce does; before, a reduce-scatter ahead of the first large all-reduce took the copy
+  engine with host experts while the rest followed the RCCL ring.
+---
+ ggml/src/ggml-backend-meta.cpp  | 35 ++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 88 +++++++++++++++++++++++++++++----
+ src/models/qwen4exp.cpp         | 62 +++++++++++++++++------
+ 3 files changed, 160 insertions(+), 25 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 414648cec..b1cfb0e35 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3147,6 +3147,9 @@ struct ggml_backend_meta_context {
+     // per subgraph: the TOKEN_SCATTER node whose reduce-scatter replaces the subgraph's all-reduce (or -1);
+     // per node: 1 = that node is filled by a collective and left out of the per-device subgraphs
+     std::vector<int>            scatter_nodes;
++    // sequence parallelism: executed-form totals of this backend and the set of forms already reported
++    int64_t                     seqpar_exec_total[5] = { 0, 0, 0, 0, 0 };
++    unsigned                    seqpar_forms_logged = 0;
+     std::vector<char>           collective_node;
+ 
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+@@ -4159,14 +4162,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                         n_gather++;
+                     }
+                 }
++                // graph shape: the nodes ELIGIBLE to fold the all-reduce into a reduce-scatter; what each one actually
++                // runs as is counted at compute time (the executed-form census in graph_compute)
+                 static bool seqpar_logged = false;
+                 if (n_scatter > 0 && !seqpar_logged) {
+                     seqpar_logged = true;
+-                    GGML_LOG_INFO("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d as "
+-                                  "reduce-scatter, %d as local slices), %d all_gather nodes, %zu subgraphs\n",
++                    GGML_LOG_INFO("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d fold an all-reduce, "
++                                  "%d are local slices), %d all_gather nodes, %zu subgraphs\n",
+                                   __func__, (long long) n_tok, n_scatter, n_seqpar_rs, n_scatter - n_seqpar_rs,
+                                   n_gather, n_subgraphs);
+                 }
++
+             }
+         }
+ 
+@@ -4468,6 +4474,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         return v;
+     };
+ 
++    // executed-form census of the sequence-parallel collectives: reduce-scatter by the comm backend, all-reduce (comm)
++    // + local slice, all-reduce (meta fallback) + local slice; token-axis all_gather by the comm backend, generic copies.
++    // Totals per backend, logged when a form runs for the first time (a ubatch spans several graph computes, one per
++    // scheduler split, so a per-compute mix would repeat every ubatch).
++    int sp_exec[5] = { 0, 0, 0, 0, 0 };
++
+     // ALL_GATHER of a tensor split along its slowest axis (a token-split activation): each device's slice is
+     // one contiguous block of the whole tensor.  The comm backend's gather if it has one, else synchronous
+     // per-pair copies (correct, slow).
+@@ -4484,8 +4496,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+         if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_all_gather != nullptr &&
+                 backend_ctx->comm_all_gather(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
++            sp_exec[3]++;
+             return GGML_STATUS_SUCCESS;
+         }
++        sp_exec[4]++;
+         if (ggml_get_op_params_i32(node, 0) != 0) {
+             // a bf16-wire gather taking the plain F32 copies: correct, but not the rounded values the CE path gives
+             static bool warned = false;
+@@ -4634,9 +4648,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+         if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_reduce_scatter != nullptr &&
+                 backend_ctx->comm_reduce_scatter(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
++            sp_exec[0]++;
+             return GGML_STATUS_SUCCESS;
+         }
+         bool ok = backend_ctx->comm_ctx != nullptr && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, srcs.data());
++        sp_exec[ok ? 1 : 2]++;
+         if (!ok) {
+             const ggml_status status = allreduce_fallback(i_graph);
+             if (status != GGML_STATUS_SUCCESS) {
+@@ -4702,6 +4718,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             }
+         }
+     }
++    if (sp_exec[0] + sp_exec[1] + sp_exec[2] + sp_exec[3] + sp_exec[4] > 0) {
++        unsigned forms = 0;
++        for (int k = 0; k < 5; ++k) {
++            backend_ctx->seqpar_exec_total[k] += sp_exec[k];
++            forms |= backend_ctx->seqpar_exec_total[k] > 0 ? 1u << k : 0u;
++        }
++        if (forms != backend_ctx->seqpar_forms_logged) {
++            backend_ctx->seqpar_forms_logged = forms;
++            const int64_t * n = backend_ctx->seqpar_exec_total;
++            GGML_LOG_INFO("%s: sequence parallelism executed so far: reduce-scatter %lld by the comm backend (copy engine), "
++                          "%lld as all-reduce + slice, %lld as fallback all-reduce + slice; token all_gather %lld by the comm "
++                          "backend (copy engine), %lld as generic copies\n", __func__,
++                          (long long) n[0], (long long) n[1], (long long) n[2], (long long) n[3], (long long) n[4]);
++        }
++    }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6cf574b44..f0d3473ac 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4022,6 +4022,10 @@ struct ggml_backend_cuda_comm_context {
+     // re-attempting or re-logging.
+     bool                        ce_grow_disabled  = false;
+     bool                        ce_fallback_warned = false;
++    // the same for the sequence-parallel collectives that share the scratch (GGML_CUDA_CE_FOR_*): each caller
++    // warns once with its own fallback, without consuming the all-reduce's message
++    bool                        ce_rs_warned      = false;
++    bool                        ce_ag_warned      = false;
+     // `GGML_CUDA_ALLREDUCE=q8ce` (r259): the copy-engine large-tensor arm sends its staged payload as
+     // Walsh-Hadamard-rotated q8_0 blocks instead of bf16 (see the ce_q8 kernels).  Fixed for the life of
+     // the context by the chain that created it; no env variable other than the algorithm name.
+@@ -4539,7 +4543,25 @@ static bool ggml_cuda_ar_ce_single() {
+ // Grow the copy-engine scratch (ce_buf / ce_tmp / ce_tmp2, `need` bytes each on every rank) if it is smaller.
+ // false = it cannot be grown (OOM or over GGML_CUDA_AR_CE_SCRATCH_MIB); the caller falls back before any
+ // collective phase has run.  Shared by the all-reduce and the sequence-parallel reduce-scatter / all-gather.
+-static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * comm_ctx, size_t need) {
++// Callers of the copy-engine scratch: the all-reduce, and the sequence-parallel reduce-scatter / all-gather.
++enum ggml_cuda_ce_for { GGML_CUDA_CE_FOR_ALLREDUCE, GGML_CUDA_CE_FOR_REDUCE_SCATTER, GGML_CUDA_CE_FOR_ALL_GATHER };
++
++// A sequence-parallel collective that cannot use the scratch: one warning per caller, naming what runs instead.
++static bool ggml_backend_cuda_comm_ce_seqpar_unavailable(ggml_backend_cuda_comm_context * comm_ctx, ggml_cuda_ce_for who,
++                                                         size_t need, const char * why) {
++    bool & warned = who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? comm_ctx->ce_rs_warned : comm_ctx->ce_ag_warned;
++    if (!warned) {
++        warned = true;
++        GGML_LOG_WARN("%s: copy-engine scratch %.2f MiB for the sequence-parallel %s unavailable (%s); %s for the rest "
++                      "of this run\n", __func__, need / 1024.0 / 1024.0,
++                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "reduce-scatter" : "all_gather", why,
++                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "all-reduce + local slice" : "the meta backend's generic copies");
++    }
++    return false;
++}
++
++static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * comm_ctx, size_t need,
++                                              ggml_cuda_ce_for who = GGML_CUDA_CE_FOR_ALLREDUCE) {
+     const size_t nb = comm_ctx->backends.size();
+     if (comm_ctx->ce_bytes < need) {
+         // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
+@@ -4553,6 +4575,10 @@ static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * c
+             // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
+             // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
+             // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
++            if (who != GGML_CUDA_CE_FOR_ALLREDUCE) {
++                return ggml_backend_cuda_comm_ce_seqpar_unavailable(comm_ctx, who, need,
++                    comm_ctx->ce_grow_disabled ? "an earlier allocation failed" : "over GGML_CUDA_AR_CE_SCRATCH_MIB");
++            }
+             if (!comm_ctx->ce_fallback_warned) {
+                 comm_ctx->ce_fallback_warned = true;
+                 GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
+@@ -4587,6 +4613,9 @@ static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * c
+                     if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
+                     if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
+                 }
++                if (who != GGML_CUDA_CE_FOR_ALLREDUCE) {
++                    return ggml_backend_cuda_comm_ce_seqpar_unavailable(comm_ctx, who, need, "allocation failed");
++                }
+                 if (!comm_ctx->ce_fallback_warned) {
+                     comm_ctx->ce_fallback_warned = true;
+                     GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
+@@ -4606,6 +4635,13 @@ static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * c
+             comm_ctx->ce_tmp [i] = new_tmp [i];
+             comm_ctx->ce_tmp2[i] = new_tmp2[i];
+         }
++        // the scratch is raw device memory outside the ggml allocators: say what it holds (3 buffers per device; the
++        // retired ones stay until teardown)
++        const size_t old_bytes = comm_ctx->ce_bytes;
++        GGML_LOG_INFO("%s: copy-engine scratch now 3 x %.2f MiB per device (%s; was 3 x %.2f MiB, kept until teardown)\n",
++                      __func__, need / 1048576.0,
++                      who == GGML_CUDA_CE_FOR_ALLREDUCE ? "all-reduce" : who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "seqpar reduce-scatter" : "seqpar all_gather",
++                      old_bytes / 1048576.0);
+         comm_ctx->ce_bytes = need;
+     }
+     return true;
+@@ -4959,20 +4995,51 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+ // fp32(bf16(peer)))), the same rounding as the copy-engine all-reduce (single-exchange form, and the two-phase
+ // form's reduce + to_fp32), so the slice is bit-identical to all-reduce + slice.  2 ranks; false = not
+ // available (no copy-engine scratch), the caller then all-reduces and slices.
++// A sequence-parallel collective the copy engine does not take: one INFO line per process, collective and reason
++// (the meta backend then runs the generic form; its executed-form census counts both).
++static bool ggml_cuda_seqpar_ce_declined(ggml_cuda_ce_for who, int reason, const char * why) {
++    static bool logged[2][4] = {};
++    bool & l = logged[who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? 0 : 1][reason];
++    if (!l) {
++        l = true;
++        GGML_LOG_INFO("%s: sequence-parallel %s not on the copy engine: %s; %s\n", __func__,
++                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "reduce-scatter" : "all_gather", why,
++                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "all-reduce (the selected arm) + local slice instead"
++                                                             : "the meta backend's generic copies instead");
++    }
++    return false;
++}
++
++static void ggml_backend_cuda_comm_select_arm(ggml_backend_cuda_comm_context * comm_ctx);
++
+ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, struct ggml_tensor ** src,
+                                                          struct ggml_tensor ** dst, const int64_t * off) {
+     if (comm_ctx_v == nullptr) {
+         return false;
+     }
+     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+-    if (comm_ctx->backends.size() != 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+-        return false;
++    // 2 ranks by construction: one exchange of the other rank's half, one event pair (see the protocol below)
++    if (comm_ctx->backends.size() != 2) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 0, "the copy-engine exchange is 2-rank only");
++    }
++    if (!comm_ctx->ce_ready || comm_ctx->world_size > 0) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 1, "no copy-engine scratch (multi-process or not set up)");
+     }
+     // Only when the all-reduce itself would take the bf16 copy-engine arm: with another arm selected (the RCCL ring
+     // for host-resident experts, the q8 wire of GGML_CUDA_ALLREDUCE=q8ce, a not-yet-selected auto chain) the caller's
+     // all-reduce + slice follows that arm, so the result is always what the selected all-reduce gives.
+-    if (comm_ctx->ce_wire_q8 || comm_ctx->try_allreduce != ggml_backend_cuda_comm_allreduce_ce) {
+-        return false;
++    // the default chain picks its large arm at the first large all-reduce; a reduce-scatter can come first (the
++    // attention output of layer 0), so pick it here, or the early reduce-scatters would take the copy engine
++    // while the rest follow the RCCL ring
++    if (comm_ctx->auto_select) {
++        ggml_backend_cuda_comm_select_arm(comm_ctx);
++    }
++    if (comm_ctx->ce_wire_q8) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 2, "the all-reduce uses the q8 wire (GGML_CUDA_ALLREDUCE=q8ce)");
++    }
++    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_allreduce_ce) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 3,
++            "the selected all-reduce arm is not the bf16 copy engine (e.g. the RCCL ring with host experts)");
+     }
+     const int64_t ne = ggml_nelements(src[0]);
+     for (int i = 0; i < 2; ++i) {
+@@ -4988,7 +5055,7 @@ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, stru
+     // past what the all-reduce it replaces would have grown it to
+     const size_t esz  = sizeof(nv_bfloat16);
+     const size_t need = (size_t) 2 * (size_t) ((ne + 1) / 2) * esz;
+-    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
++    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need, GGML_CUDA_CE_FOR_REDUCE_SCATTER)) {
+         return false;
+     }
+ 
+@@ -5128,8 +5195,11 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+     const int n = (int) comm_ctx->backends.size();
+     // TEST: GGML_SEQPAR_CE_GATHER=0 declines, so the meta backend takes its generic gather
+     static const bool ce_gather = [] { const char * e = getenv("GGML_SEQPAR_CE_GATHER"); return e == nullptr || atoi(e) != 0; }();
+-    if (!ce_gather || n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+-        return false;
++    if (!ce_gather) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_ALL_GATHER, 0, "GGML_SEQPAR_CE_GATHER=0 (test switch)");
++    }
++    if (n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
++        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_ALL_GATHER, 1, "no copy-engine scratch (multi-process or not set up)");
+     }
+     const ggml_type type = dst[0]->type;
+     GGML_ASSERT(ggml_blck_size(type) == 1);
+@@ -5154,7 +5224,7 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+         // created (up to 24 MiB).
+         const size_t want = (size_t) (n - 1) * (size_t) n_max * esz;
+         const size_t need = comm_ctx->ce_bytes > 0 ? comm_ctx->ce_bytes : std::min(want, (size_t) 24 << 20);
+-        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
++        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need, GGML_CUDA_CE_FOR_ALL_GATHER)) {
+             return false;
+         }
+     }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index a381a4940..3b0253b93 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -4,6 +4,10 @@
+ #include "llama-memory-recurrent.h"
+ 
+ #include <algorithm>
++#include <functional>
++#include <set>
++#include <mutex>
++#include <string>
+ #include <cinttypes>
+ #include <cstdlib>
+ #include <system_error>
+@@ -127,13 +131,15 @@ static bool qwen4exp_qsa_off() {
+     return off;
+ }
+ 
+-// Sequence parallelism (prototype, LLAMA_SEQPAR=1, default off): in a 2-GPU -sm tensor prefill ubatch the
++// Sequence parallelism (default on, LLAMA_SEQPAR=0: off): in a 2-GPU -sm tensor prefill ubatch the
+ // per-token hyper-connection work (DSV4_HC_POST/PRE, their norms and BF16 GEMMs, the shared expert, the residual
+ // adds) runs on each GPU's half of the tokens instead of on all tokens on both.  The residual streams stay
+ // token-split from layer 0 to the last layer; each block gathers its [n_embd, T] input (all_gather, F32) for the
+ // feature-split attention / router / MoE, and the attention and MoE partial sums are reduce-scattered by tokens
+ // (token_scatter) instead of all-reduced.  The PLE layers and the last layer (output rows, MTP export) run on the
+-// gathered streams as before.  Off: the graph is unchanged.
++// gathered streams as before.  Off (LLAMA_SEQPAR=0, or any case it does not engage for): the graph is unchanged.
++// Not bit-identical to off: the per-token work runs at half the batch width on each device, a rounding-level change
++// (same as changing -ub).  Why it does not engage is logged once per reason (seqpar_not_engaged).
+ //   LLAMA_SEQPAR_MIN  smallest ubatch that splits (default 512; an odd ubatch splits ceil/floor, LLAMA_SEQPAR_ODD=0: even only)
+ //   LLAMA_SEQPAR_RS   bit 0: reduce-scatter the attention output, bit 1: the MoE output (default 3); a cleared
+ //                     bit all-reduces that output and slices it locally (same values, more link bytes)
+@@ -145,10 +151,28 @@ static int qwen4exp_seqpar_rs_mask() {
+     return mask;
+ }
+ 
++// Once per context and message: the key is the context's cparams, not the process, because common's --fit builds a
++// trial context with the log silenced first, and a process-wide flag would be spent there.
++static bool qwen4exp_seqpar_log_first(const llama_cparams & cparams, int what) {
++    static std::mutex mtx;
++    static std::set<std::pair<const void *, int>> seen;
++    std::lock_guard<std::mutex> lock(mtx);
++    return seen.insert({ (const void *) &cparams, what }).second;
++}
++
++// one INFO line per context and reason when sequence parallelism does not engage; the reason text is only built for
++// the line that is logged (the predicate runs for every graph, decode included)
++static bool qwen4exp_seqpar_not_engaged(const llama_cparams & cparams, int reason, const std::function<std::string()> & why) {
++    if (qwen4exp_seqpar_log_first(cparams, reason)) {
++        LLAMA_LOG_INFO("%s: sequence parallelism not engaged: %s (logged once per reason)\n", __func__, why().c_str());
++    }
++    return false;
++}
++
+ static bool qwen4exp_seqpar_enabled(const llama_model & model, const llama_cparams & cparams, int64_t n_tokens) {
+     static const bool on = [] {
+         const char * env = getenv("LLAMA_SEQPAR");
+-        return env != nullptr && std::atoi(env) != 0;
++        return env == nullptr || std::atoi(env) != 0;
+     }();
+     static const int64_t min_tokens = [] {
+         const char * env = getenv("LLAMA_SEQPAR_MIN");
+@@ -156,22 +180,33 @@ static bool qwen4exp_seqpar_enabled(const llama_model & model, const llama_cpara
+     }();
+     // LLAMA_SEQPAR_ODD=0: even token counts only (the step-1 rule); default: odd counts split ceil/floor
+     static const bool odd_ok = [] { const char * e = getenv("LLAMA_SEQPAR_ODD"); return e == nullptr || atoi(e) != 0; }();
+-    if (!on || n_tokens < std::max<int64_t>(min_tokens, 2) || (!odd_ok && n_tokens % 2 != 0)) {
+-        return false;
++    if (!on) {
++        return qwen4exp_seqpar_not_engaged(cparams, 0, [] { return std::string("LLAMA_SEQPAR=0"); });
+     }
+     if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+-        return false;
++        return qwen4exp_seqpar_not_engaged(cparams, 1, [] { return std::string("split mode is not -sm tensor"); });
++    }
++    // checked before the per-layer walk below: decode and verify graphs stop here
++    if (n_tokens < std::max<int64_t>(min_tokens, 2) || (!odd_ok && n_tokens % 2 != 0)) {
++        return qwen4exp_seqpar_not_engaged(cparams, 4, [&] {
++            return "ubatch of " + std::to_string(n_tokens) + " tokens (below LLAMA_SEQPAR_MIN = " + std::to_string(min_tokens) +
++                   ", or odd with LLAMA_SEQPAR_ODD=0); decode and verify never split";
++        });
+     }
+     for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+         ggml_backend_dev_t dev = model.dev_layer(il);
+         if (dev == nullptr || !ggml_backend_dev_is_meta(dev) || ggml_backend_meta_dev_n_devs(dev) != 2) {
+-            return false;
++            return qwen4exp_seqpar_not_engaged(cparams, 2, [&] {
++                const std::string where = dev == nullptr ? "no device" : !ggml_backend_dev_is_meta(dev) ? "1 device" :
++                                          std::to_string(ggml_backend_meta_dev_n_devs(dev)) + " devices";
++                return "layer " + std::to_string(il) + " is on " + where + ", the split needs exactly 2";
++            });
+         }
+     }
+     // the drafter taps read the per-layer residual of every token
+     for (bool tap : cparams.embeddings_layer_inp) {
+         if (tap) {
+-            return false;
++            return qwen4exp_seqpar_not_engaged(cparams, 3, [] { return std::string("a drafter reads the per-layer inputs (embeddings_layer_inp)"); });
+         }
+     }
+     return true;
+@@ -1103,9 +1138,10 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+         n_sp_scatter++;
+         return t;
+     };
+-    // LLAMA_SEQPAR_GATHER_BF16=1: the per-layer hc_mixed gathers ship bf16 (the BF16 GEMMs over them
+-    // round their src1 to bf16 anyway); the residual-stream gathers stay F32
+-    static const int sp_wire = [] { const char * e = getenv("LLAMA_SEQPAR_GATHER_BF16"); return e != nullptr && atoi(e) != 0 ? 1 : 0; }();
++    // the per-layer hc_mixed gathers ship bf16 (the BF16 GEMMs over them round their src1 to bf16 anyway; it rounds
++    // exactly as its F32-wire round-only control, GGML_SEQPAR_GATHER_ROUND=1); the residual-stream gathers stay F32.
++    // Default on, LLAMA_SEQPAR_GATHER_BF16=0: F32 wire
++    static const int sp_wire = [] { const char * e = getenv("LLAMA_SEQPAR_GATHER_BF16"); return e == nullptr || atoi(e) != 0 ? 1 : 0; }();
+     auto sp_gather = [&](ggml_tensor * t, int wire = 0) {
+         t = ggml_all_gather_wire(ctx0, t, wire);
+         ggml_build_forward_expand(gf, t);
+@@ -1243,9 +1279,7 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+ 
+     GGML_ASSERT(!res_split);
+     if (seqpar) {
+-        static bool logged = false;
+-        if (!logged) {
+-            logged = true;
++        if (qwen4exp_seqpar_log_first(cparams, 5)) {
+             LLAMA_LOG_INFO("%s: sequence parallelism (LLAMA_SEQPAR) on: T = %lld, %d token_scatter + %d all_gather "
+                            "nodes per graph, reduce-scatter mask %d\n", __func__, (long long) n_tokens, n_sp_scatter,
+                            n_sp_gather, sp_rs);
+-- 
+2.53.0
+

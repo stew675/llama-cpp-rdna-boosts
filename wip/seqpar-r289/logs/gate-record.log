@@ -1,0 +1,32 @@
+==> prefill-logit KLD gate (issue #113)
+    ppl=/pwd/w1100/sp289chk/build101/bin/llama-perplexity
+    model=/pwd/Downloads/flashnext-gsq-xxs/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+    corpus=/pwd/Downloads/wikitext-2-raw/wiki.test.raw  (sha256=173c87a53759e020...)
+    arch=gfx1201  device=0,1  ctx=512 chunks=40 fa=on kv=f16 ngl=99 threads=8  extra='-ncmoe 47 -ot per_layer_token_embd.*=CPU'
+    base=/pwd/w1100/spgate/base/prefill-logit-gfx1201-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002-familyswitch-xncmoe-47-ot-per-layer-token-embd.-CPU-dev0-1-smtensor.kld
+    thresholds: mean KLD <= 0.005, same-top-p >= 98.0%
+    mode=family-switch (control ubatch=256, max point PPL=10)
+    mode=record (base arm: LLAMA_SEQPAR=0)
+    --ab: base arm = 'LLAMA_SEQPAR=0', candidate arm = default
+    logs=/tmp/tmp.JGIIYB7PH3
+
+==> recording base with arm 'LLAMA_SEQPAR=0' (may take a few minutes)
+    base PPL=2.8450 build=00272a7e7893 sha256=964082f471507df89a5ebdeffa3c92af5feb0e0169ba6a533dcd79881bdc7746
+    wrote /pwd/w1100/spgate/base/prefill-logit-gfx1201-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002-familyswitch-xncmoe-47-ot-per-layer-token-embd.-CPU-dev0-1-smtensor.kld.meta
+==> recording the same-kernel control base (arm 'LLAMA_SEQPAR=0', -ub 256)
+    control base PPL=2.8502 (same kernel, -ub 256); wrote /pwd/w1100/spgate/base/prefill-logit-gfx1201-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002-familyswitch-xncmoe-47-ot-per-layer-token-embd.-CPU-dev0-1-smtensor-control-ub256.kld.meta
+
+==> comparing candidate (LLAMA_SEQPAR=1 vs base arm 'LLAMA_SEQPAR=0')
+
+    candidate: build=00272a7e7893
+    mean KLD = 0.014184   (limit 0.005)
+    same top p = 96.373 %   (floor 98.0 %)
+FAIL: mean KLD 0.014184 > 0.005
+FAIL: same top p 96.373 % < 98.0 %
+
+==> control: same kernel (arm 'LLAMA_SEQPAR=0'), 512-token chunks vs -ub 256
+    control (same-kernel reordering): mean KLD = 0.013587   same top p = 96.225 %
+
+
+==> FAIL: prefill-logit divergence (issue #113 class)
+    logs in /tmp/tmp.JGIIYB7PH3 (set KEEP=1 to retain on success too)

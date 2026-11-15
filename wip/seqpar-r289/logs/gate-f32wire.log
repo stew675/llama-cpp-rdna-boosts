@@ -1,0 +1,27 @@
+==> prefill-logit KLD gate (issue #113)
+    ppl=/pwd/w1100/sp289chk/build101/bin/llama-perplexity
+    model=/pwd/Downloads/flashnext-gsq-xxs/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+    corpus=/pwd/Downloads/wikitext-2-raw/wiki.test.raw  (sha256=173c87a53759e020...)
+    arch=gfx1201  device=0,1  ctx=512 chunks=40 fa=on kv=f16 ngl=99 threads=8  extra='-ncmoe 47 -ot per_layer_token_embd.*=CPU'
+    base=/pwd/w1100/spgate/base/prefill-logit-gfx1201-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002-familyswitch-xncmoe-47-ot-per-layer-token-embd.-CPU-dev0-1-smtensor.kld  (recorded with ROCm rocm)
+    thresholds: mean KLD <= 0.005, same-top-p >= 98.0%
+    mode=family-switch (control ubatch=256, max point PPL=10)
+    logs=/tmp/tmp.ZWqW38PsKb
+
+==> comparing candidate (LLAMA_SEQPAR_GATHER_BF16=0)
+
+    candidate: build=00272a7e7893
+    mean KLD = 0.010644   (limit 0.005)
+    same top p = 96.833 %   (floor 98.0 %)
+FAIL: mean KLD 0.010644 > 0.005
+FAIL: same top p 96.833 % < 98.0 %
+
+==> control: same kernel (arm 'LLAMA_SEQPAR=0'), 512-token chunks vs -ub 256
+    control (same-kernel reordering): mean KLD = 0.013587   same top p = 96.225 %
+
+
+    NOTE: the candidate is no worse than the same-kernel control, so the excess
+          is the point's, not the switch's — but the absolute limits are the
+          criterion.  Re-run with --allow-control-pass to accept the calibration.
+==> FAIL: prefill-logit divergence (issue #113 class)
+    logs in /tmp/tmp.ZWqW38PsKb (set KEEP=1 to retain on success too)

@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From cd47bcd529612c4cb170d1eff4bbd060be5545dd Mon Sep 17 00:00:00 2001
 From: bsp2020 <bsp2020@gmail.com>
 Date: Thu, 12 Nov 2026 13:29:28 +0000
-Subject: [PATCH 1/4] qwen4exp: sequence parallelism for the hyper-connection
+Subject: [PATCH 1/5] qwen4exp: sequence parallelism for the hyper-connection
  work in 2-GPU -sm tensor prefill (LLAMA_SEQPAR=1, default off)
 
 New op GGML_OP_TOKEN_SCATTER (ggml_token_scatter): on a single backend a copy;
@@ -22,7 +22,11 @@ reduce-scattered (LLAMA_SEQPAR_RS bitmask, default 3). PLE layers and the
 last layer run on gathered streams. Off: graph unchanged.
 GGML_SEQPAR_CE_GATHER=0 sends the gathers through the meta generic path (test).
 
-(cherry picked from commit 63ce608af788d81484bc54cc818b4ab33827bcbb)
+Output: on is not bit-identical to off. The per-token work (hc mixers and
+norms, the shared expert, the GEMMs over them) runs at half the batch width
+on each device, a rounding-level change of the same kind as changing -ub.
+The reduce-scatter itself is not a source: it equals all-reduce + slice bit
+for bit (LLAMA_SEQPAR_RS=0 gives the same logits).
 ---
  ggml/include/ggml-backend.h     |   9 +
  ggml/include/ggml-rpc.h         |   4 +-
