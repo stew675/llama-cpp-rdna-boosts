@@ -396,3 +396,19 @@ Three limits of the same tier, recorded together because they are one hardware s
   `moe_cache_prefill_stream()` declines on `!g_gtt_arena`), so that arm cannot witness this tier there.  The width
   arm's own subject is decode width (blocks 12/14) and it lives in the MTP protocol, not here.  Record:
   `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.
+
+### #329 -- block 07's WMMA verify family loses at 2..5 columns; a narrower tile would let the floor go to 2 (and the feature to default-on)
+
+**Open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
+dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
+below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
+computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
+does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
+both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
+cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
+
+**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
+candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
+across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
+floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
+low band on both a single card and a 2-GPU `tensor` split (the crossover moves).

@@ -1,4 +1,4 @@
-From 4a1ad243408db97418e3aaa333ec1f3ec34047ef Mon Sep 17 00:00:00 2001
+From d070b704cb843d1287b3f573c2ceb5e3e5309f74 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/16] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -115,10 +115,10 @@ passes.
  62 files changed, 8797 insertions(+), 1202 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index b8d173525..e145edfcd 100644
+index 676a2861a..f3155c0a4 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2656,7 +2656,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2683,7 +2683,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
          "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
          "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
@@ -129,7 +129,7 @@ index b8d173525..e145edfcd 100644
          [](common_params & params, const std::string & value) {
              /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
              else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
-@@ -2664,6 +2666,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2691,6 +2693,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
              else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
              else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
@@ -137,7 +137,7 @@ index b8d173525..e145edfcd 100644
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LOAD_MODE"));
-@@ -2671,7 +2674,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2698,7 +2701,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          {"--host-experts"}, "MODE",
          "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
          "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
@@ -151,7 +151,7 @@ index b8d173525..e145edfcd 100644
          [](common_params & params, const std::string & value) {
              fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "
 diff --git a/common/common.cpp b/common/common.cpp
-index 1193c8b17..e8683d436 100644
+index 4c99105cf..108fbe536 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1545,6 +1545,8 @@ common_init_result::common_init_result(common_params & params, bool model_only,
@@ -180,10 +180,10 @@ index 1193c8b17..e8683d436 100644
      common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
      if (ctx_dft) {
 diff --git a/common/common.h b/common/common.h
-index 452f00ac6..4d2c4d56f 100644
+index 4c1016015..4f0a18875 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -1167,6 +1167,13 @@ struct common_memory {
+@@ -1172,6 +1172,13 @@ struct common_memory {
      void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
      void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
      void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
@@ -2607,10 +2607,10 @@ index 64379e34c..e13528d03 100644
  
      return false;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index bdba7fdd6..44d32f3f0 100644
+index e4f5624ee..e1186c3a0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4220,6 +4220,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4221,6 +4221,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -2688,7 +2688,7 @@ index bdba7fdd6..44d32f3f0 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -5443,6 +5514,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5444,6 +5515,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -2699,7 +2699,7 @@ index bdba7fdd6..44d32f3f0 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -5838,6 +5913,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -5839,6 +5914,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -2724,7 +2724,7 @@ index bdba7fdd6..44d32f3f0 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -6035,7 +6128,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -6036,7 +6129,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -2734,7 +2734,7 @@ index bdba7fdd6..44d32f3f0 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -6089,16 +6183,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6090,16 +6184,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -2767,7 +2767,7 @@ index bdba7fdd6..44d32f3f0 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -6106,6 +6209,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6107,6 +6210,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -2783,7 +2783,7 @@ index bdba7fdd6..44d32f3f0 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -8191,6 +8303,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8192,6 +8304,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -2792,7 +2792,7 @@ index bdba7fdd6..44d32f3f0 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -8220,6 +8334,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8221,6 +8335,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -2805,7 +2805,7 @@ index bdba7fdd6..44d32f3f0 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8771,6 +8891,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8772,6 +8892,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -2814,7 +2814,7 @@ index bdba7fdd6..44d32f3f0 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -9157,6 +9279,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -9158,6 +9280,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -2837,7 +2837,7 @@ index bdba7fdd6..44d32f3f0 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -9176,6 +9314,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -9177,6 +9315,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -2849,7 +2849,7 @@ index bdba7fdd6..44d32f3f0 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -9199,6 +9342,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -9200,6 +9343,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -2869,7 +2869,7 @@ index bdba7fdd6..44d32f3f0 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -9333,11 +9489,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9334,11 +9490,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,

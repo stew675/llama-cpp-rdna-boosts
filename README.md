@@ -678,6 +678,7 @@ following users for the assistance in finding issues and offering solutions!
 
 - https://github.com/1337hero
 - https://github.com/bakon11
+- https://github.com/burnoutIA  (PR #317: the 2..8-column speculative-verify matvec family in WMMA `iu8` — Q4_K/Q5_K/Q6_K/IQ4_XS read in their GGUF layout on the existing q8_1 activations, each weight dequantized once for all the verified columns, plus the design notes and the min-term pitfall (`d.SUM(xq)`, not `ds.y`).  Folded into block 07 in r290 as an opt-in (`--wmma-verify N|auto`, floor 7, `GGML_CUDA_WMMA_MMVQ` kept as the A/B alias) with the Q8_0 case and the per-format stride unit added here; the band and end-to-end numbers are in `WORKLOG.md` 261115.002 and `ENVIRONMENT.md` §7.6)
 - https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18; PR #213: the split-state cache hit returns instead of copying the state, folded into block 09 in r132)
 - https://github.com/eoprede
 - https://github.com/mjohanning99  (PR #312: the mixed K/V cache types — a q8_0 K with a q4_0 / q5_0 / q5_1 V read natively through a second tile type parameter, head 256 only, with the QSA refusal and the one-V-type-function contract; promoted as block 17 in r287, moved to optional block `0101` in the r288 block-number re-org, `scripts/gate-mixed-kv.sh`)

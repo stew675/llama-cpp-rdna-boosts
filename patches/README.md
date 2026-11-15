@@ -1170,6 +1170,33 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 > and the tip tree is what ships.)  Gate: `scripts/gate-grid-stall-pad.sh`, `INVARIANTS.md` r226,
 > `WORKLOG.md` 261106.015.
 
+> **r290 amendment (PR #317, @burnoutIA): the VERIFY band's WMMA `iu8` matvec family, opt-in and OFF by
+> default.**  `mmvq-wmma.cu/.cuh` (new) plus a fall-through in `ggml_cuda_mul_mat_vec_q`: for a dense,
+> unfused `MUL_MAT` at N..8 columns on RDNA4, the product is computed with `wmma_i32_16x16x16_iu8`,
+> dequantizing each weight **once for all the verified columns** instead of once per column -- the K-split
+> kernel is instruction bound at 7-8 columns (matvec time 25.9 -> 34.3 ms per pass at 1 -> 8 verified
+> tokens, 27B UD-Q4_K_M).  Q4_K, Q5_K, Q6_K, IQ4_XS in their GGUF layout on the existing q8_1 activations,
+> plus **Q8_0** (r290, ours: no dequantization, no min term, no table -- and its own per-format stride unit,
+> because a Q8_0 block is 32 elements where a K-quant's is 256).  Numerics against the K-split kernel:
+> 3.2e-7 relative at widths 2..8 (Q8_0 1.7e-7).  **It is width-split by design** -- 1 column always keeps
+> the K-split kernel -- so *while the option is on* the block's byte-identical greedy contract does not hold
+> (`GREEDY-PURITY.md` §91); **off is the default, and with it off nothing of this amendment is reached**,
+> which is why this note does not change the block's own purity statement below (which is about VDR).
+> Knobs: `--wmma-verify off|auto|N` (`auto` = 7) and the deprecated alias `GGML_CUDA_WMMA_MMVQ`, `ENVIRONMENT.md`
+> §7.6.  The win is width-shaped and the shipped floor follows it: content-fixed TG t/s by verify width,
+> ON vs OFF, **1 GPU Q4_K_M** `-8.5 / -4.8 / -3.4 / -1.6 / +1.9 / +5.8 / +9.4` % at widths 2..8, **2-GPU
+> `tensor` Q4_K_M** `-5.7 / -4.7 / -5.3 / -4.7 / -4.4 / +7.1 / +10.6` %, **Q8_0 (2-GPU)** `-1.0 / -0.2 /
+> -0.7 / -0.5 / +1.4 / +2.0 / +3.7` %; end to end 27B Q4_K_M + DFlash2 n7 recall **205.6 -> 221.5 t/s**
+> (cycle -7.2 %, acceptance identical), 27B Q8_0 170.1 -> 177.3, and the adaptive-MTP four-axis at `-n 3000`
+> `+0.7 / +4.5 / +6.7 / +3.7 %`.  Widths 9..16 are **unreachable** on a dense model (the delivery dispatches
+> `ne11 > 8` to MMQ and the RDNA4 dense-band promotion needs `src0->ne[1] % 128 != 0`), so an adaptive
+> `n_max 12` arm is neutral and the feature's footprint is a fixed deep draft (`n_max 5..7`).  Blocks 07 and
+> 08 both carry this feature (08 moves the call to the `void *` the q8_1 cache hands it, as with the r226
+> grid-pad site); the tip tree is what ships.  Gate: coherence on the **OFF** arm against the previous
+> release (byte-identical: spec `sha ce6f9a37494b`, plain `sha 75baf55d43c0`), `gate-prefill-logits.sh`
+> (0.000697 / 98.784 %), the four-axis and `llama-batched-bench -npl 1,4,8` with it on.  `WORKLOG.md`
+> 261115.002.
+
 **Dense Q6_K VDR is upstream's now, on every arch (r170).**  The block's own per-arch gate
 (`#if defined(RDNA4) || defined(RDNA3_0)` → VDR=2, upstream's VDR=1 elsewhere) went away with the
 `6050b467c` re-base: upstream #30517 (`2744e48d1`, "faster MMVQ for low-bit types") made

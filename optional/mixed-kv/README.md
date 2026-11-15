@@ -16,6 +16,12 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
   it (r288 invariant 2)
 * cumulative with `0100` (`0100` first — numeric order) the pair produces
   `d85868cdd23447b4d7fa0f9b9f5f7bb5fa7363cf`; the two artifacts do not conflict
+* **r290 re-cut**: applies strictly at the r290 default tree
+  `4f0770d7538b6e633ede9271bebdc5f83340a3c9` and produces
+  `097c51af763fc338ad0d33cf7f0a853be2aa4b17`; cumulative with `0100` is
+  `00f2150fad1ad44c2d40c1456c708ea4c7103390`.  The produced tree is no longer the r287 release tree's
+  bytes — expected, since the r290 default tree moved (block 07's opt-in WMMA verify family) while this
+  artifact's own diff is unchanged.
 * **its own gate is `scripts/gate-mixed-kv.sh`**, run on the **optional-applied build**; it is **not** a
   default release gate any more, and the delivery's own gates do not cover a mixed pair.
 

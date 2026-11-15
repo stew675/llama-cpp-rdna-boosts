@@ -855,6 +855,42 @@ one of these as a **new reference**, not as a tuning experiment.
 
 ---
 
+### 7.6 `--wmma-verify` / `GGML_CUDA_WMMA_MMVQ` — the verify band's WMMA iu8 matvec family (block 07) — **opt-in, default OFF**
+
+> **This is the delivery's one deliberate, opt-in escape from the decode/verify purity contract.**  The
+> family replaces the K-split `mmvq` kernel for a dense, unfused `MUL_MAT` at N..8 columns and **always
+> leaves 1 column on it**, so while it is enabled a W=1 decode and a W=N verify of the same state take
+> different kernels (`GREEDY-PURITY.md` invariant 1, §91).  It is not bit-identical to the K-split kernel
+> (same real number, different accumulation order: **3.2e-7 relative**, Q8_0 1.7e-7) and greedy text
+> **does** move with it on.  With it **off** -- the default -- nothing of it is reached and the release's
+> byte-identical contract holds; that is the arm every gate runs.
+>
+> **Use it for a fixed deep draft.**  Content-fixed TG t/s by verify width, ON vs OFF
+> (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, 27B):
+>
+> | width | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+> |---|---|---|---|---|---|---|---|
+> | Q4_K_M, 1 GPU | -8.5 % | -4.8 % | -3.4 % | -1.6 % | +1.9 % | +5.8 % | **+9.4 %** |
+> | Q4_K_M, 2 GPU `tensor` | -5.7 % | -4.7 % | -5.3 % | -4.7 % | -4.4 % | +7.1 % | **+10.6 %** |
+> | Q8_0, 2 GPU `tensor` | -1.0 % | -0.2 % | -0.7 % | -0.5 % | +1.4 % | +2.0 % | **+3.7 %** |
+>
+> End to end (`--wmma-verify auto`, acceptance held identical, 2-GPU `tensor`): DFlash2 `n-max 7` recall
+> 27B Q4_K_M **205.6 -> 221.5 t/s** (cycle 36.5 -> 33.9 ms), 27B Q8_0 **170.1 -> 177.3 t/s** (43.6 -> 41.8
+> ms); the adaptive-MTP four-axis at `-n 3000` is `+0.7 / +4.5 / +6.7 / +3.7 %` on R/P/C/K.  **Widths above
+> 8 are MMQ**, so an adaptive `n_max 12` arm (deep rounds at 9-13 columns) is neutral -- the feature is for
+> a *fixed* deep draft (`n_max 5..7`), which is where the floor of 7 puts it.
+>
+> **RDNA4 only** (gfx1200/gfx1201 device code, `GGML_CUDA_CC_IS_RDNA4` at dispatch); every other type, shape
+> and GPU falls through to the K-split kernel, as does anything fused, `MUL_MAT_ID`, and a non-unit batch
+> dimension.  Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0.
+
+| variable / option | default | class | notes |
+|---|---|---|---|
+| `--wmma-verify off\|auto\|N` (`common`) | `off` | opt-in | the **floor** in verified columns: the first verify width that takes the family (2..16, clamped; `1` is clamped to 2 because width 1 is decode and must keep the K-split kernel).  `auto` = **7**, the first width it wins on both a single card and a 2-GPU tensor split.  Values above 8 are meaningless in practice (MMQ owns those widths) but are accepted, so a calibration arm can be run without editing the option. |
+| `GGML_CUDA_WMMA_MMVQ` | unset = off | opt-in (**deprecated alias**) | the contributor's original switch (PR #317): the same floor, read from the environment.  It is the A/B and bisection knob and it **wins when set**, so `GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled, and `=7` reproduces `--wmma-verify auto`.  Value-gated (`0` = off), latched once per process.  It is the only way to reach the family from a tool that does not go through `common` (`test-backend-ops`, a bench harness). |
+
+---
+
 ## 8. Flash attention / QSA (qwen4exp)
 
 | variable | default | class | notes |

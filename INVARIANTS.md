@@ -4956,3 +4956,35 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   KV per layer, and every feature stacked on top inherits one device's geometry instead of a shard of every
   device's.  It is a fully supported split (the streamed KV, the pool and every fused path work on both), not a
   fallback; report a tensor-split problem against the layer arm too.
+
+* **Block 07's WMMA `iu8` verify family covers widths 2..8, never 9..16, on a dense model (r290, PR #317).**
+  Two independent gates close the wider band: `ggml_cuda_mul_mat` sends `ne11 > MMVQ_MAX_BATCH_SIZE` (= 8)
+  to MMQ, and the RDNA4/RDNA3_5 "dense band" promotion that can lift 9..16 back onto `mmvq` requires
+  `src0->ne[1] % 128 != 0`, which a 27B's every matrix fails (`n_embd 5120`, `n_ff 17408`, `6144`, `1024`
+  -- all multiples of 128).  Measured on the tree that ships the family: **0.0 difference at widths 9, 13
+  and 16** for Q4_K against the same process with the family enabled, so those widths are not part of the
+  feature and a claim that spans them is measuring something else.  The practical consequence is that an
+  adaptive MTP `n_max 12` arm -- whose deep rounds verify 9-13 columns -- is **neutral** (recall cycle
+  +0.8 %), and the feature's footprint is a *fixed deep draft* (DFlash2 `n_max 5..7`).
+* **The WMMA verify family's win is width-shaped, and the shape is the design constraint (r290).**  It
+  amortizes *dequantization* over the verified columns, so it only wins where the K-split kernel is
+  instruction bound.  Content-fixed (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, TG t/s, ON vs OFF):
+  1 GPU 27B UD-Q4_K_M `-8.5 / -4.8 / -3.4 / -1.6 / +1.9 / +5.8 / +9.4` % at widths `2 / 3 / 4 / 5 / 6 / 7 /
+  8`; 2-GPU `tensor` `-5.7 / -4.7 / -5.3 / -4.7 / -4.4 / +7.1 / +10.6` %.  The crossover moves *up* on a
+  split, which is why the shipped floor (`--wmma-verify auto`) is **7** and not 2: at 6 columns a 2-GPU
+  split still loses 4.4 %.  End to end it is a cycle-time win at every acceptance level (DFlash2 n7 recall
+  36.5 -> 33.9 ms; four-axis R/P/C/K cycles -0.6/-2.3/-5.7/-3.5 %) -- tokens/s follow acceptance, which
+  moves because the text moves.
+* **Q8_0 is the strongest case for a tensor-core verify kernel and the weakest payoff, because its K-split
+  kernel has no dequantization to amortize (r290).**  `block_q8_0` is `{half d; int8 qs[32]}` -- the stored
+  int8 *is* the MMA operand -- so at 8 columns the existing kernel already reaches **74 %** of the perfect
+  weight-reuse ideal where a K-quant reaches **59 %** (same instrument).  The WMMA case is therefore worth
+  only **+3.7..+4.2 %** at 8 columns (vs +9.4..+10.6 % for the K-quants) and it loses almost nothing at
+  2..5 columns (-0.5..-1.0 %, against -3.4..-8.5 % for Q4_K).  Extension cost is ~40 lines: no min term, no
+  table, no dequantization.
+* **A quant type whose block is 32 elements cannot borrow a 256-element format's per-stride unit (r290).**
+  The verify kernel's row stride is `stride_row_x * BB` for the K-quants, where `stride_row_x`
+  (`src0->nb[1] / ts_src0`) counts the type's **own** blocks -- 256 elements for a K-quant, 32 for Q8_0 --
+  so Q8_0 needs its own unit (`RB = 34`).  With the K-quant unit the kernel walks past the row and the
+  launch aborts; the format structs each carry `RB` for this reason.  The same trap applies to any future
+  type added to the family.

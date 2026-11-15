@@ -1,3 +1,77 @@
+## 261115.002 (r290) -- block 07 gains the verify band's WMMA iu8 matvec family (PR #317): opt-in `--wmma-verify N|auto`, floor 7, Q8_0 included.  +10.6 % at 8 columns on a 2-GPU tensor split, byte-identical to r289 with it off
+
+PR #317 (@burnoutIA, `wip/rdna4-wmma-verify`) offers a 2..16-column WMMA `iu8` matvec family for the
+speculative verify band.  It is accepted **into block 07** (the decode-numerics block: it owns
+`vecdotq.cuh`'s `vec_dot_*` family and the `mmvq` K-split loop, and its contract is already "same
+real-number result, different addition order") as an **opt-in that is OFF by default**, with three
+changes to what was offered: the floor is a **CLI option** (`--wmma-verify off|auto|N`, `auto` = 7)
+rather than an environment variable alone, the shipped floor is **7 and not 2** (below 7 the family is
+slower than the kernel it replaces -- see the curve below), and the family covers **Q8_0 as well** (ours:
+~40 lines, exact to 1.7e-7, worth +4 % at 8 columns -- the format most likely to be run at a deep verify
+width on a 2-card box).  Nothing of the default delivery changes: with the floor at 0 the hook is not
+reached and this release is byte-identical to r289 on every measured arm.
+
+**What it is.**  For a dense, unfused `MUL_MAT` at N..8 columns on RDNA4, the product is computed with
+`wmma_i32_16x16x16_iu8`, dequantizing each weight **once for all the verified columns** instead of once
+per column (the K-split kernel's cost, which is why it becomes instruction bound at 7-8 columns: 25.9 ->
+34.3 ms of matvec time per pass at 1 -> 8 verified tokens on 27B UD-Q4_K_M).  Q4_K, Q5_K, Q6_K, IQ4_XS
+and Q8_0, read in their GGUF layout on the existing q8_1 activations (`block_q8_1.ds`, DPP `row_share` for
+the 8 column scales a lane accumulates); Q4_K/Q5_K's min term is `d.SUM(xq)` through a ones matrix, as
+`vec_dot_q4_K_q8_1` does.  Numerics against the K-split kernel: **~3.2e-7 relative** (max 4.2e-5 on a
+130-magnitude output) at widths 2..8 for every covered type; Q8_0 1.7e-7.  Not bit-identical, so it is
+opt-in -- see `GREEDY-PURITY.md` §91.
+
+**The band is 2..8, not 2..16, and the win is width-shaped.**  Two measurements decided both the "16"
+claim and the floor:
+
+| verify width | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9..16 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 GPU, Q4_K_M | -- | -8.5 % | -4.8 % | -3.4 % | -1.6 % | +1.9 % | +5.8 % | **+9.4 %** | n/a |
+| 2 GPU tensor, Q4_K_M | -- | -5.7 % | -4.7 % | -5.3 % | -4.7 % | -4.4 % | +7.1 % | **+10.6 %** | n/a |
+| 2 GPU tensor, Q8_0 | -- | -1.0 % | -0.2 % | -0.7 % | -0.5 % | +1.4 % | +2.0 % | **+3.7 %** | n/a |
+
+(Content-fixed: `llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, TG t/s, ON vs OFF.)  Widths 9..16 are
+**unreachable on a dense model**: the delivery dispatches `ne11 > 8` to MMQ, and the RDNA4 "dense band"
+promotion that could reach 9..16 requires `src0->ne[1] % 128 != 0`, which none of a 27B's matrices
+satisfies -- measured as **0.0 difference at widths 9, 13 and 16**.  Hence `auto` = 7 (the first width it
+wins) and hence adaptive MTP `n_max 12` -- whose deep rounds are width 9-13, i.e. MMQ -- is *neutral*
+(recall cycle +0.8 %): the feature's footprint is a **fixed deep draft**, DFlash2 `n_max 5..7`.
+
+**End to end** (27B, 2-GPU tensor split, `--wmma-verify auto`, acceptance held identical):
+
+| arm | off | on | cycle |
+|---|---|---|---|
+| DFlash2 `n-max 7`, recall | 205.6 t/s | **221.5 t/s (+7.7 %)** | 36.5 -> 33.9 ms (-7.2 %) |
+| four-axis R (adaptive n7, `-n 3000`) | 91.0 | 91.6 (+0.7 %) | 30.1 -> 29.9 ms |
+| four-axis P | 121.3 | 126.8 (+4.5 %) | 37.8 -> 37.0 ms |
+| four-axis C | 151.6 | 161.8 (+6.7 %) | 40.4 -> 38.1 ms |
+| four-axis K | 169.7 | 175.9 (+3.7 %) | 40.1 -> 38.7 ms |
+| `llama-batched-bench -npl 1,4,8` (TG) | 48.8 / 157.7 / 231.5 | 49.1 / 157.1 / **261.3** | +0.7 / -0.4 / **+12.9 %** |
+| 27B Q8_0 + DFlash2 `n-max 7`, recall | 170.1 | 177.3 (+4.2 %) | 43.6 -> 41.8 ms |
+
+**Gates (all of them, this release).**  Coherence: with the option unset the amended build is
+**byte-identical to the r289 build** on the spec arm (27B UD-Q4_K_M + DFlash2 n7, 2 GPU tensor, code
+prompt: sha `ce6f9a37494b` both) and on plain decode (prose, 1 GPU: sha `75baf55d43c0` both), both arms
+with `ROCBLAS_USE_HIPBLASLT=0`.  MTP: the four-axis above at `-n 3000` (all four non-negative) plus the
+`-npl 1,4,8` arm.  Prefill logits: KLD **0.000697** / same-top-p **98.784 %** (limit 0.005 / 98 %), i.e.
+the default path did not move.  Per-block build: **17/17** on a wiped build dir per commit.  GPU faults:
+clean (journal + logs).  `validate-set.sh`: OK, including the 512-file Windows portability scan and both
+optional artifacts re-cut onto the new tree.
+
+**What changed from the PR.**  (1) `--wmma-verify off|auto|N` is the interface; `GGML_CUDA_WMMA_MMVQ=N`
+stays as the environment alias and **wins when set**, so a gate can force either arm (`=0` disables a run
+the option enabled).  (2) The floor ships at 7, not 2.  (3) Q8_0 added, which needed a per-format stride
+unit (`row_bytes = stride_row_x * RB`): a Q8_0 block is 32 elements where a K-quant's is 256, and the
+PR's `stride_row_x * BB` reads garbage there (it aborts).  (4) The "2..16 columns" claim is corrected to
+2..8 with the reachability reason.  (5) `=1` is clamped to 2 -- it would have taken width-1 *decode* off
+the K-split kernel, contradicting the PR's own note.  (6) Reported to the submitter on the PR, which
+carries their authorship (`Co-authored-by` on blocks 07 and 08).
+
+**Attribution.**  The kernel, the four K-quant formats and the measurement protocol are
+@burnoutIA's (PR #317); the Q8_0 case, the floor, the option plumbing and the numbers above are this
+release's.  `README.md` has them under Community Acknowledgements.
+
+---
 ## 261115.001 (r289, wip) -- PR #316 (`wip/gdn-conv-norm-deferred-gather`) reviewed and NOT taken: the fusion it fixes is not issued on r289 at all -- the r244 one-kernel conv step owns the decode/verify band
 
 PR #316 (@burnoutIA) is one patch (`gdn-conv.cu`, +13/-2) that skips `gdn_conv_norm_match`'s overlap

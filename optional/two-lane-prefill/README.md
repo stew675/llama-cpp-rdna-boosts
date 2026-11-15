@@ -34,6 +34,11 @@ are in the PRs; this file records what *this repo* verified, what it measures he
   (r288: it shares `optional/` with `mixed-kv` (`0101`), which moved out of the default delivery set in the
   same re-org.  The cumulative tree with both applied, in numeric order, is
   `d85868cdd23447b4d7fa0f9b9f5f7bb5fa7363cf`.)
+* **r290 re-cut**: applies strictly at the r290 default tree
+  `4f0770d7538b6e633ede9271bebdc5f83340a3c9` and produces
+  `928c3c1c3442763f878d8b62025dd122fddc1238`; cumulative with `0101`, numeric order, is
+  `00f2150fad1ad44c2d40c1456c708ea4c7103390`.  Only the base tree moved (block 07 gained the opt-in
+  WMMA verify family); the artifact's own diff is unchanged.
 
 ## What it does
 
