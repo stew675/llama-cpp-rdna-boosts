@@ -42,10 +42,11 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
+| **328** | PR #315 (`wip/seqpar-r287`): qwen4exp hyper-connection sequence parallelism, to land **default on** once the submitter corrects the purity claim, inverts the switch and adds the diagnostics; we take the 3-card extension and the promotion | performance / new block (`wip` → `patches/`) | **WAITING ON SUBMITTER** (2026-11-15) — reviewed and measured here; correction list posted on the PR — §328 |
 
 ## Handle numbering
 
-**New handles append after `#327`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#328`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -236,6 +237,49 @@ its A/B and it is documented bit-identical to the triple, §69); **MMB's fused G
 **Re-entry:** fold it into the next block 06/08 pass over these fusions, or sooner on a reported residency-dependent
 answer.  Record: [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
 `GREEDY-PURITY.md` §89, `INVARIANTS.md` (r284), `ENVIRONMENT.md` (`MOE_EXPERT_PREFILL_IN_PLACE`, `MOE_EXPERT_HEATMAP`).
+
+## 328. PR #315 (`wip/seqpar-r287`) — qwen4exp hyper-connection sequence parallelism, to land default on after the submitter's corrections
+
+**Status: waiting on the submitter (2026-11-15).  Not in `patches/`, nothing applied from it, and no release owes it.**
+The campaign is a contributor PR (briansp2020) of four patches cut against r289 that keep the qwen4exp residual
+streams token-split through a 2-GPU `-sm tensor` prefill: a new `GGML_OP_TOKEN_SCATTER`, a token-axis `all_gather`
+and a copy-engine reduce-scatter behind `LLAMA_SEQPAR=1`.  **Reviewed and measured on this box (2x R9700,
+Flash-Next GSQ-RCO IQ3_XXS, `-sm tensor --ncmoe 47`) and the maintainer's decision is to ship it DEFAULT ON**, with
+the 3-card extension done here.  The full review, the numbers and the correction list are the 2026-11-15 comment on
+the PR; the review note below carries only what survives a compaction.
+
+**What was verified here.**  The four patches apply strictly on r289 and build; the OFF path is bit-inert (prefill
+logits mean KLD **0.000000** against the r289 binary at 2 devices; **0.000000** at 3 devices and at `-sm layer`);
+the CE reduce-scatter is bit-identical to all-reduce + slice (`LLAMA_SEQPAR_RS=0` reads the same KLD to six
+decimals); the bf16 wire is exactly its own round-only control (0.014372 both); patch 0004 follows the selected
+all-reduce arm (under `auto` + host experts the RS declines and only the gathers help).  Prefill on a 31.5k-token
+prompt, `-ub 4096`, 2 rounds: off 2908/2970, seqpar 3035/3048, seqpar + bf16 3199/3204 (**+7.9/+10.0 %**); default
+`auto` chain 2762/2754 -> 2869/2879 (+3.9/+4.5 %).  Decode without MTP flat; MTP prefill 1153 -> 1299 (+12.7 %),
+MTP decode 87.6 -> 84.6 with different text.  Kernel journal clean; Windows portability lint clean; op count and
+RPC patch version consistent (108 / 10).
+
+**The claim error that must be corrected before this repo records it.**  The PR states seqpar alone is
+KLD **0.000000** / top-p **99.992 %** / PPL identical.  Measured: **0.013706 / 95.892 %** at the canonical
+`-c 512 --chunks 40` 2-device tensor point (0.010644 pinned), **0.011392 / 96.549 %** at the PR's own 8192 x 3
+shape, PPL 2.8558 -> 2.8447.  Cause: **not** the reduce-scattered sums (RS=0 reads the identical number) but the
+per-token work running at half the batch width (GEMM tiling and reduction order at M = 256 vs M = 512).  It is a
+benign rounding-order change by the §46 calibration (a same-kernel `-ub 512` vs `-ub 256` control reads
+0.014141 / 96.059 %), not a bit-identical reorganisation, so it cannot be recorded as rounding-level on the
+gate's absolute limits (0.005 / 98 %) and a default-on promotion needs `gate-prefill-logits.sh --family-switch`.
+
+**What is owed by the submitter (posted on the PR):** corrected claims + the family-switch control; the switch
+inverted (`LLAMA_SEQPAR=0` disables) and `LLAMA_SEQPAR_MIN` justified by a T sweep; a census that names the
+EXECUTED collective form (CE reduce-scatter ran / declined and why / all-reduce + slice, same for the gathers), a
+"not engaged: <reason>" line, and a gather-side CE-scratch message that does not borrow the all-reduce's; a
+decode/verify inertness arm (no token_scatter / token-axis all_gather node in a decode or verify graph); the
+cross-backend fallback statement; and a raw-log pack (env table, gate recipe, benchmarks record with prompt
+hashes, per-device memory census).
+
+**What we do when it comes back:** the 3-card extension (keep the graph layer device-count agnostic; the 2-rank
+restriction belongs in the CE reduce-scatter and the enable predicate only), then the delivery work: a new block
+(a NEW block is the maintainer's call, asked and answered when the resubmission is in hand), `ENVIRONMENT.md`,
+`scripts/gate-seqpar.sh`, a benchmarks record, `INVARIANTS`/`GREEDY-PURITY` entries, the per-block note, and the
+full release ladder.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
