@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 00:56:05 +0000
+Subject: [PATCH 2/4] qwen4exp seqpar: bf16 wire for the hc_mixed all-gathers
+ (LLAMA_SEQPAR_GATHER_BF16=1, default off)
+
+ggml_all_gather_wire(ctx, a, wire) records the wire format in op_params[0]
+(1 = bf16, F32 only). qwen4exp uses it for the two per-layer hc_mixed gathers
+when LLAMA_SEQPAR_GATHER_BF16=1; the residual-stream gathers stay F32. The
+CUDA copy-engine gather stages each slice as bf16 in the own ce_buf, ships it
+through ce_tmp2 with the existing event protocol, and widens it on every
+rank, own slice included, so the gathered tensor is the same fp32(bf16(x)) on
+both GPUs (the rounding the BF16 GEMMs apply to src1 anyway).
+
+Output changes at rounding level. GGML_SEQPAR_GATHER_ROUND=1 (control) keeps
+the F32 wire and rounds in place; GGML_SEQPAR_GATHER_CHUNK caps the chunk
+(test). The meta generic gather warns once when it serves a bf16-wire gather
+unrounded.
+
+(cherry picked from commit fd42755b989b6658418ba620422d9c0fa4adb411)
+---
+ ggml/include/ggml.h             |   8 +++
+ ggml/src/ggml-backend-meta.cpp  |   8 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 107 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml.c                 |  10 +++
+ src/models/qwen4exp.cpp         |  11 ++--
+ 5 files changed, 140 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 013c9e41e..137bb5ea5 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -753,6 +753,14 @@ extern "C" {
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a);
+ 
++    // ggml_all_gather with a wire format (op_params[0]): 0 = native, 1 = bf16 (F32 only).  A backend that honours it
++    // (the CUDA copy-engine token-axis gather) stores fp32(bf16(x)) on every device, own slice included, so the
++    // gathered tensor stays identical on all devices; any other path (single backend, generic copies) is plain F32.
++    GGML_API struct ggml_tensor * ggml_all_gather_wire(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   wire);
++
+     // Sequence parallelism (token split) on a Meta (tensor-parallel) device.  The result has the shape of
+     // `a`, and on a single backend it is a plain copy.  On a Meta device it is split along the token axis
+     // (the last dim of `a` with ne > 1, recorded in op_params[0]) into equal per-device halves:
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 967640b48..d4e9dd87e 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -4474,6 +4474,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 backend_ctx->comm_all_gather(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
+             return GGML_STATUS_SUCCESS;
+         }
++        if (ggml_get_op_params_i32(node, 0) != 0) {
++            // a bf16-wire gather taking the plain F32 copies: correct, but not the rounded values the CE path gives
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                GGML_LOG_WARN("%s: bf16-wire all_gather fell back to the generic F32 copies (unrounded)\n", __func__);
++            }
++        }
+         // generic: quiesce every device (the destination may reuse memory a device is still reading), then
+         // one copy per (source, destination) pair
+         for (size_t j = 0; j < n_backends; j++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cf19a247f..eaf227f70 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5029,6 +5029,86 @@ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, stru
+     return true;
+ }
+ 
++// The bf16-wire all-gather (see ggml_backend_cuda_comm_all_gather_tensor).  Per chunk: rank i converts its slice
++// chunk to bf16 in its own ce_buf, ships it into every peer's ce_tmp2 region for it, and widens its own copy into
++// place; the receivers widen the peer chunks from ce_tmp2 into place.  ce_tmp2 keeps the gather's event protocol
++// (ce_ev_out guards a region against the peer's previous read, ce_ev_recv publishes the copies).
++static bool ggml_backend_cuda_comm_all_gather_bf16(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** src,
++                                                   struct ggml_tensor ** dst, const int64_t * off) {
++    const int n = (int) comm_ctx->backends.size();
++    const size_t esz = sizeof(nv_bfloat16);
++    int64_t n_max = 0;
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(src[i]->type == GGML_TYPE_F32 && dst[i]->type == GGML_TYPE_F32);
++        n_max = std::max<int64_t>(n_max, ggml_nelements(src[i]));
++    }
++    // ce_buf holds one chunk of the own slice, ce_tmp2 (n-1) peer chunks: both are ce_bytes long
++    // TEST: GGML_SEQPAR_GATHER_CHUNK caps the chunk (elements) to exercise the multi-chunk path
++    static const int64_t chunk_cap = [] { const char * e = getenv("GGML_SEQPAR_GATHER_CHUNK"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
++    int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
++    if (chunk_cap > 0) {
++        chunk = std::min(chunk, chunk_cap);
++    }
++    GGML_ASSERT(chunk > 0);
++    const size_t region = (size_t) chunk * esz;
++    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
++    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
++
++    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
++        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
++    };
++    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
++    auto cbuf  = [&](int i) -> char * { return (char *) comm_ctx->ce_buf[i]; };
++    auto ctmp2 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp2[i]; };
++    auto slot  = [&](int s, int d) -> size_t { return (size_t) (s < d ? s : s - 1) * region; };
++
++    for (int64_t c0 = 0; c0 < n_max; c0 += chunk) {
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[i]) - c0);
++            if (w > 0) {
++                to_bf16((const float *) src[i]->data + c0, (nv_bfloat16 *) cbuf(i), w, s);
++            }
++            for (int p = 0; p < n; ++p) {
++                if (p != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_out[p], 0));
++                }
++            }
++            for (int p = 0; p < n && w > 0; ++p) {
++                if (p == i) {
++                    continue;
++                }
++                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp2(p) + slot(i, p), cdev(p), cbuf(i), cdev(i), (size_t) w * esz, s));
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_recv[i], s));
++            if (w > 0) {
++                // own slice: the same fp32(bf16(x)) the peers store (src and dst are distinct allocations)
++                to_fp32((const nv_bfloat16 *) cbuf(i), (float *) dst[i]->data + off[i] + c0, w, s);
++            }
++        }
++        for (int d = 0; d < n; ++d) {
++            ggml_cuda_set_device(cctx(d)->device);
++            cudaStream_t s = cctx(d)->stream();
++            for (int p = 0; p < n; ++p) {
++                if (p != d) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_recv[p], 0));
++                }
++            }
++            for (int p = 0; p < n; ++p) {
++                const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[p]) - c0);
++                if (p == d || w <= 0) {
++                    continue;
++                }
++                to_fp32((const nv_bfloat16 *) (ctmp2(d) + slot(p, d)), (float *) dst[d]->data + off[p] + c0, w, s);
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
++            CUDA_CHECK(cudaGetLastError());
++        }
++    }
++    return true;
++}
++
+ // src[i]: rank i's slice (contiguous).  dst[i]: rank i's whole tensor (contiguous); rank r's slice lands at
+ // element off[r].  Plain copies, no conversion (any non-quantized type).  The peer slices go through ce_tmp2 in
+ // chunks of the scratch size, so a gather larger than the all-reduce scratch does not grow it.  false = no
+@@ -5072,6 +5152,18 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+             return false;
+         }
+     }
++    // bf16 wire (ggml_all_gather_wire): every slice crosses the link as bf16 and every rank -- own
++    // slice included -- stores fp32(bf16(x)), the GEMMs' own src1 rounding.  Staging: the own ce_buf, whose every
++    // read and write is on this rank's stream.  GGML_SEQPAR_GATHER_ROUND=1 (control): F32 wire, then the same
++    // rounding in place -- the same values, no link saving.
++    const int  wire  = ggml_get_op_params_i32(dst[0], 0);
++    static const bool round_only = [] { const char * e = getenv("GGML_SEQPAR_GATHER_ROUND"); return e != nullptr && atoi(e) != 0; }();
++    if (wire == 1) {
++        GGML_ASSERT(type == GGML_TYPE_F32);
++        if (!round_only) {
++            return ggml_backend_cuda_comm_all_gather_bf16(comm_ctx, src, dst, off);
++        }
++    }
+     const int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
+     GGML_ASSERT(chunk > 0);
+     const size_t region = (size_t) chunk * esz;
+@@ -5134,6 +5226,21 @@ static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct g
+             CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
+         }
+     }
++    if (wire == 1) {
++        // round_only control: fp32(bf16(x)) in place, through the own ce_buf, chunked like the wire path
++        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
++        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
++        const int64_t rc = (int64_t) (comm_ctx->ce_bytes / sizeof(nv_bfloat16));
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int64_t c0 = 0; c0 < ne; c0 += rc) {
++                const int64_t w = std::min<int64_t>(rc, ne - c0);
++                to_bf16((const float *) dst[i]->data + c0, (nv_bfloat16 *) comm_ctx->ce_buf[i], w, s);
++                to_fp32((const nv_bfloat16 *) comm_ctx->ce_buf[i], (float *) dst[i]->data + c0, w, s);
++            }
++        }
++    }
+     return true;
+ }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 07cdc903a..8e2548dac 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -2111,6 +2111,16 @@ struct ggml_tensor * ggml_all_gather(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_all_gather_wire(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   wire) {
++    GGML_ASSERT(wire == 0 || (wire == 1 && a->type == GGML_TYPE_F32));
++    struct ggml_tensor * result = ggml_all_gather(ctx, a);
++    ggml_set_op_params_i32(result, 0, wire);
++    return result;
++}
++
+ // ggml_token_scatter
+ 
+ struct ggml_tensor * ggml_token_scatter(
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index defcd41d3..2fc515dc7 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1101,8 +1101,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+         n_sp_scatter++;
+         return t;
+     };
+-    auto sp_gather = [&](ggml_tensor * t) {
+-        t = ggml_all_gather(ctx0, t);
++    // LLAMA_SEQPAR_GATHER_BF16=1: the per-layer hc_mixed gathers ship bf16 (the BF16 GEMMs over them
++    // round their src1 to bf16 anyway); the residual-stream gathers stay F32
++    static const int sp_wire = [] { const char * e = getenv("LLAMA_SEQPAR_GATHER_BF16"); return e != nullptr && atoi(e) != 0 ? 1 : 0; }();
++    auto sp_gather = [&](ggml_tensor * t, int wire = 0) {
++        t = ggml_all_gather_wire(ctx0, t, wire);
+         ggml_build_forward_expand(gf, t);
+         n_sp_gather++;
+         return t;
+@@ -1150,7 +1153,7 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+ 
+         if (res_split) {
+             // the feature-split projections need every token
+-            cur = sp_gather(cur);
++            cur = sp_gather(cur, sp_wire);
+         }
+ 
+         ggml_build_forward_expand(gf, cur);
+@@ -1208,7 +1211,7 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+ 
+         if (res_split) {
+             // shared expert on the local tokens, router + routed MoE on all of them
+-            cur = build_layer_ffn(cur, il, sp_gather(cur), (sp_rs & 2) != 0);
++            cur = build_layer_ffn(cur, il, sp_gather(cur, sp_wire), (sp_rs & 2) != 0);
+             n_sp_scatter++;
+         } else {
+             cur = build_layer_ffn(cur, il);
+-- 
+2.53.0
+

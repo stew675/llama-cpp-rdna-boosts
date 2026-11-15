@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 01:29:39 +0000
+Subject: [PATCH 3/4] qwen4exp seqpar: split odd token counts ceil/floor
+ (LLAMA_SEQPAR_ODD=0: even only)
+
+The TOKEN_SCATTER split rule gives the first T % n devices one token more
+instead of asserting an even split, and qwen4exp no longer skips an odd
+ubatch. Every consumer already sizes from the per-device split state (the
+reduce-scatter, both all-gathers, the AR + slice and generic fallbacks,
+token_slice_offsets). The meta proportional view-offset scaling warns once
+when it truncates (unreachable in the current graph).
+
+(cherry picked from commit d8fba9897b39424f3d6bdfbc44156a589b0ed356)
+---
+ ggml/src/ggml-backend-meta.cpp | 18 +++++++++++++++---
+ src/models/qwen4exp.cpp        |  6 ++++--
+ 2 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index d4e9dd87e..8568bfa7e 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1695,7 +1695,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         }
+ 
+-        // TOKEN_SCATTER (sequence parallelism): equal token slices of a mirrored input -- or of a partial sum
++        // TOKEN_SCATTER (sequence parallelism): contiguous token slices (equal, or one token more on the first
++        // T % n devices) of a mirrored input -- or of a partial sum
+         // whose all-reduce graph_compute turns into a reduce-scatter (assume_sync sees that one as mirrored
+         // too).  Returned here: no source is split, so the ratio bookkeeping below has nothing to take over.
+         if (tensor->op == GGML_OP_TOKEN_SCATTER) {
+@@ -1706,10 +1707,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
+                 GGML_ASSERT(tensor->ne[k] == 1 && "token_scatter: the token axis must be the slowest dim");
+             }
+-            GGML_ASSERT(tensor->ne[axis] % (int64_t) n_bufs == 0 && "token_scatter: the token count must divide evenly");
++            // an odd token count: the first T % n_bufs devices take one token more
+             ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
++            const int64_t nt = tensor->ne[axis];
+             for (size_t j = 0; j < n_bufs; j++) {
+-                ret.ne[j] = tensor->ne[axis] / (int64_t) n_bufs;
++                ret.ne[j] = nt / (int64_t) n_bufs + ((int64_t) j < nt % (int64_t) n_bufs ? 1 : 0);
+             }
+             return ret;
+         }
+@@ -2308,6 +2310,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+                     }
+                 }
+                 if (!split_internal_offset) {
++                    // uneven splits (odd seqpar token counts) can make this inexact: flag it once
++                    if ((t_ij->view_offs * ne[split_dim]) % tensor->ne[split_dim] != 0) {
++                        static bool warned = false;
++                        if (!warned) {
++                            warned = true;
++                            GGML_LOG_WARN("%s: inexact proportional view offset for %s (view_offs %zu, %lld of %lld): truncated\n",
++                                          __func__, tensor->name, (size_t) t_ij->view_offs, (long long) ne[split_dim],
++                                          (long long) tensor->ne[split_dim]);
++                        }
++                    }
+                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
+                 }
+             }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 2fc515dc7..85c2c3a23 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -134,7 +134,7 @@ static bool qwen4exp_qsa_off() {
+ // feature-split attention / router / MoE, and the attention and MoE partial sums are reduce-scattered by tokens
+ // (token_scatter) instead of all-reduced.  The PLE layers and the last layer (output rows, MTP export) run on the
+ // gathered streams as before.  Off: the graph is unchanged.
+-//   LLAMA_SEQPAR_MIN  smallest ubatch that splits (default 512; the ubatch must also be even)
++//   LLAMA_SEQPAR_MIN  smallest ubatch that splits (default 512; an odd ubatch splits ceil/floor, LLAMA_SEQPAR_ODD=0: even only)
+ //   LLAMA_SEQPAR_RS   bit 0: reduce-scatter the attention output, bit 1: the MoE output (default 3); a cleared
+ //                     bit all-reduces that output and slices it locally (same values, more link bytes)
+ static int qwen4exp_seqpar_rs_mask() {
+@@ -154,7 +154,9 @@ static bool qwen4exp_seqpar_enabled(const llama_model & model, const llama_cpara
+         const char * env = getenv("LLAMA_SEQPAR_MIN");
+         return env != nullptr ? (int64_t) std::atoll(env) : (int64_t) 512;
+     }();
+-    if (!on || n_tokens < std::max<int64_t>(min_tokens, 2) || n_tokens % 2 != 0) {
++    // LLAMA_SEQPAR_ODD=0: even token counts only (the step-1 rule); default: odd counts split ceil/floor
++    static const bool odd_ok = [] { const char * e = getenv("LLAMA_SEQPAR_ODD"); return e == nullptr || atoi(e) != 0; }();
++    if (!on || n_tokens < std::max<int64_t>(min_tokens, 2) || (!odd_ok && n_tokens % 2 != 0)) {
+         return false;
+     }
+     if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+-- 
+2.53.0
+

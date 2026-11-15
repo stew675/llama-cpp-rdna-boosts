@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 05:05:06 +0000
+Subject: [PATCH 4/4] qwen4exp seqpar: review fixes -- the reduce-scatter
+ follows the selected all-reduce arm (all-reduce + slice otherwise), RPC
+ op-table comment, INFO-level engage logs
+
+---
+ ggml/include/ggml-rpc.h         | 2 +-
+ ggml/src/ggml-backend-meta.cpp  | 2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 ++++++
+ src/models/qwen4exp.cpp         | 2 +-
+ 4 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 7878b0907..8463d74ce 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -9,7 +9,7 @@ extern "C" {
+ #define RPC_PROTO_MAJOR_VERSION    10
+ #define RPC_PROTO_MINOR_VERSION    0
+ // The fork's op set diverges from upstream's (block 11 adds 6 ops, block 12 the ALL_GATHER
+-// collective, block 15 the KV_POOL region op), so the patch version stays non-zero: an RPC peer must
++// collective, block 15 the KV_POOL region op, the seqpar TOKEN_SCATTER op), so the patch version stays non-zero: an RPC peer must
+ // already refuse a mismatched op table.  GGML_OP_COUNT below is the MERGED enum's value, never either
+ // side's literal one.
+ #define RPC_PROTO_PATCH_VERSION    10
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8568bfa7e..414648cec 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -4162,7 +4162,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 static bool seqpar_logged = false;
+                 if (n_scatter > 0 && !seqpar_logged) {
+                     seqpar_logged = true;
+-                    GGML_LOG_WARN("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d as "
++                    GGML_LOG_INFO("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d as "
+                                   "reduce-scatter, %d as local slices), %d all_gather nodes, %zu subgraphs\n",
+                                   __func__, (long long) n_tok, n_scatter, n_seqpar_rs, n_scatter - n_seqpar_rs,
+                                   n_gather, n_subgraphs);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index eaf227f70..6cf574b44 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4968,6 +4968,12 @@ static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, stru
+     if (comm_ctx->backends.size() != 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+         return false;
+     }
++    // Only when the all-reduce itself would take the bf16 copy-engine arm: with another arm selected (the RCCL ring
++    // for host-resident experts, the q8 wire of GGML_CUDA_ALLREDUCE=q8ce, a not-yet-selected auto chain) the caller's
++    // all-reduce + slice follows that arm, so the result is always what the selected all-reduce gives.
++    if (comm_ctx->ce_wire_q8 || comm_ctx->try_allreduce != ggml_backend_cuda_comm_allreduce_ce) {
++        return false;
++    }
+     const int64_t ne = ggml_nelements(src[0]);
+     for (int i = 0; i < 2; ++i) {
+         GGML_ASSERT(src[i] != nullptr && dst[i] != nullptr);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 85c2c3a23..a381a4940 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1246,7 +1246,7 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+         static bool logged = false;
+         if (!logged) {
+             logged = true;
+-            LLAMA_LOG_WARN("%s: sequence parallelism (LLAMA_SEQPAR) on: T = %lld, %d token_scatter + %d all_gather "
++            LLAMA_LOG_INFO("%s: sequence parallelism (LLAMA_SEQPAR) on: T = %lld, %d token_scatter + %d all_gather "
+                            "nodes per graph, reduce-scatter mask %d\n", __func__, (long long) n_tokens, n_sp_scatter,
+                            n_sp_gather, sp_rs);
+         }
+-- 
+2.53.0
+

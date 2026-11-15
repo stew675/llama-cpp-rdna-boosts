@@ -1,0 +1,1159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 12 Nov 2026 13:29:28 +0000
+Subject: [PATCH 1/4] qwen4exp: sequence parallelism for the hyper-connection
+ work in 2-GPU -sm tensor prefill (LLAMA_SEQPAR=1, default off)
+
+New op GGML_OP_TOKEN_SCATTER (ggml_token_scatter): on a single backend a copy;
+on the meta backend its output is split along the token axis. Right behind a
+partial sum's reduce point the meta backend replaces that all-reduce by a
+reduce-scatter (new comm hook; CUDA copy-engine implementation with the same
+bf16 rounding as the CE all-reduce); otherwise each device copies its slice
+of a mirrored input. ALL_GATHER accepts a split along the slowest axis (new
+comm all-gather hook through the CE scratch, chunked; the gather never grows
+a scratch that already exists). DSV4_HC_PRE / POST accept operands split
+consistently along their token axis.
+
+qwen4exp: with LLAMA_SEQPAR=1, 2 meta devices, -sm tensor and a ubatch of at
+least LLAMA_SEQPAR_MIN (512) tokens, the residual streams stay token-split
+from layer 0 to the last layer; each block gathers its hc_mixed input, the
+shared expert runs on local tokens, and the attention and MoE outputs are
+reduce-scattered (LLAMA_SEQPAR_RS bitmask, default 3). PLE layers and the
+last layer run on gathered streams. Off: graph unchanged.
+GGML_SEQPAR_CE_GATHER=0 sends the gathers through the meta generic path (test).
+
+(cherry picked from commit 63ce608af788d81484bc54cc818b4ab33827bcbb)
+---
+ ggml/include/ggml-backend.h     |   9 +
+ ggml/include/ggml-rpc.h         |   4 +-
+ ggml/include/ggml.h             |  14 ++
+ ggml/src/ggml-backend-meta.cpp  | 281 +++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/ggml-cpu.c    |  18 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 295 ++++++++++++++++++++++++++++----
+ ggml/src/ggml.c                 |  26 ++-
+ src/models/models.h             |   6 +-
+ src/models/qwen4exp.cpp         | 126 +++++++++++++-
+ 9 files changed, 730 insertions(+), 49 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 52ae840d6..b031d1b77 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -375,6 +375,15 @@ extern "C" {
+ 
+     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
+     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
++    // Sequence parallelism (token split), one tensor per backend, element offsets per backend:
++    //   reduce_scatter: src[i] = backend i's partial sum (whole tensor), dst[i] = its slice of the sum
++    //                   (elements [offsets[i], offsets[i] + nelements(dst[i]))).
++    //   all_gather    : src[i] = backend i's slice, dst[i] = the whole tensor, slice r lands at offsets[r].
++    // false = not available on this communicator (the meta backend then uses its generic path).
++    typedef bool   (*ggml_backend_comm_reduce_scatter_tensor_t)(void * comm_ctx, struct ggml_tensor ** src,
++                                                                struct ggml_tensor ** dst, const int64_t * offsets);
++    typedef bool   (*ggml_backend_comm_all_gather_tensor_t)(void * comm_ctx, struct ggml_tensor ** src,
++                                                            struct ggml_tensor ** dst, const int64_t * offsets);
+ 
+     // Split buffer type for tensor parallelism (old)
+     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 1088d4bec..7878b0907 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -12,10 +12,10 @@ extern "C" {
+ // collective, block 15 the KV_POOL region op), so the patch version stays non-zero: an RPC peer must
+ // already refuse a mismatched op table.  GGML_OP_COUNT below is the MERGED enum's value, never either
+ // side's literal one.
+-#define RPC_PROTO_PATCH_VERSION    9
++#define RPC_PROTO_PATCH_VERSION    10
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 9c7daf95c..013c9e41e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -437,6 +437,7 @@ extern "C" {
+         GGML_OP_GLU,
+ 
+         GGML_OP_ALL_GATHER,
++        GGML_OP_TOKEN_SCATTER,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -752,6 +753,19 @@ extern "C" {
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a);
+ 
++    // Sequence parallelism (token split) on a Meta (tensor-parallel) device.  The result has the shape of
++    // `a`, and on a single backend it is a plain copy.  On a Meta device it is split along the token axis
++    // (the last dim of `a` with ne > 1, recorded in op_params[0]) into equal per-device halves:
++    //   - when `a` is the partial sum that ends a reduction segment (the node right before this one) and
++    //     `allow_reduce_scatter` is set, the meta backend replaces that segment's all-reduce by a
++    //     reduce-scatter that writes each device's token slice of the sum;
++    //   - otherwise (a mirrored input) each device copies its own token slice (op_params[1] = the first
++    //     token of the slice, set per device by the meta backend; 0 on a single backend).
++    GGML_API struct ggml_tensor * ggml_token_scatter(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            bool                  allow_reduce_scatter);
++
+     GGML_API struct ggml_tensor * ggml_add(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 1b76236d0..967640b48 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1604,6 +1604,50 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+     };
+ 
++    // Sequence parallelism (LLAMA_SEQPAR): a per-token op whose operands are all split along their TOKEN axis
++    // (the slowest dim with more than one element) with the same per-device token counts computes each
++    // device's tokens locally; the result is split along its own token axis.  The hyper-connection mixers
++    // DSV4_HC_PRE ([n_embd, hc, T] x2 -> [n_embd, T]) and DSV4_HC_POST ([n_embd, T], [n_embd, hc, T], [hc, T]
++    // -> [n_embd, hc, T]) are such ops.  Every other combination keeps the old rule (all mirrored, else abort).
++    auto handle_token_split = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        bool    token_split = true;
++        bool    any_split   = false;
++        int64_t ext[GGML_MAX_DIMS*4] = {0};   // per-device token count of the first split operand
++        if (n_bufs > GGML_MAX_DIMS*4) {
++            token_split = false;   // ext[] holds at most GGML_MAX_DIMS*4 devices
++        }
++        for (size_t i = 0; i < GGML_MAX_SRC && token_split; i++) {
++            const ggml_tensor * t = tensor->src[i];
++            if (t == nullptr || t == tensor) {
++                continue;
++            }
++            if (src_ss[i].axis != ggml_n_dims(t) - 1 || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
++                token_split = false;
++                break;
++            }
++            for (size_t j = 0; j < n_bufs; j++) {
++                int64_t e = 0;
++                for (size_t sg = 0; sg < src_ss[i].n_segments; sg++) {
++                    e += src_ss[i].ne[sg*n_bufs + j] * src_ss[i].nr[sg];
++                }
++                if (!any_split) {
++                    ext[j] = e;
++                } else if (ext[j] != e) {
++                    token_split = false;
++                }
++            }
++            any_split = true;
++        }
++        if (!token_split || !any_split || n_bufs > GGML_MAX_DIMS*4) {
++            return handle_generic(src_ss, /*scalar_only =*/ true);
++        }
++        ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
++        for (size_t j = 0; j < n_bufs; j++) {
++            ret.ne[j] = ext[j];
++        }
++        return ret;
++    };
++
+     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
+         if (ggml_nelements(tensor) == 0) {
+             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+@@ -1651,6 +1695,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         }
+ 
++        // TOKEN_SCATTER (sequence parallelism): equal token slices of a mirrored input -- or of a partial sum
++        // whose all-reduce graph_compute turns into a reduce-scatter (assume_sync sees that one as mirrored
++        // too).  Returned here: no source is split, so the ratio bookkeeping below has nothing to take over.
++        if (tensor->op == GGML_OP_TOKEN_SCATTER) {
++            const int axis = ggml_get_op_params_i32(tensor, 0);
++            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
++                        "token_scatter needs a mirrored input (or the partial sum that ends a reduction segment)");
++            GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
++            for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
++                GGML_ASSERT(tensor->ne[k] == 1 && "token_scatter: the token axis must be the slowest dim");
++            }
++            GGML_ASSERT(tensor->ne[axis] % (int64_t) n_bufs == 0 && "token_scatter: the token count must divide evenly");
++            ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
++            for (size_t j = 0; j < n_bufs; j++) {
++                ret.ne[j] = tensor->ne[axis] / (int64_t) n_bufs;
++            }
++            return ret;
++        }
++
+         ggml_backend_meta_split_state split_state;
+         switch (tensor->op) {
+             case GGML_OP_NONE: {
+@@ -1870,9 +1933,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_LIGHTNING_INDEXER: {
+                 split_state = handle_lightning_indexer(src_ss);
+             } break;
+-            case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_DSV4_HC_POST: {
++                split_state = handle_token_split(src_ss);
++            } break;
++            case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_TOP_K_MASK: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+@@ -2212,6 +2277,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+         }
+         t_ij->flags = tensor->flags;
+         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
++        if (tensor->op == GGML_OP_TOKEN_SCATTER && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
++            // the first token of this device's slice: the per-device kernel copies from there
++            GGML_ASSERT(split_state.n_segments == 1 && split_state.nr[0] == 1);
++            int64_t first = 0;
++            for (size_t jj = 0; jj < j; jj++) {
++                first += split_state.ne[jj];
++            }
++            ggml_set_op_params_i32(t_ij, 1, (int32_t) first);
++        }
+         ggml_set_name(t_ij, tensor->name);
+         t_ij->buffer = simple_buf;
+         t_ij->view_src = tensor->view_src;
+@@ -3055,6 +3129,13 @@ struct ggml_backend_meta_context {
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
++    // sequence parallelism (TOKEN_SCATTER / token-axis ALL_GATHER); null = the generic paths in graph_compute
++    ggml_backend_comm_reduce_scatter_tensor_t comm_reduce_scatter = nullptr;
++    ggml_backend_comm_all_gather_tensor_t     comm_all_gather     = nullptr;
++    // per subgraph: the TOKEN_SCATTER node whose reduce-scatter replaces the subgraph's all-reduce (or -1);
++    // per node: 1 = that node is filled by a collective and left out of the per-device subgraphs
++    std::vector<int>            scatter_nodes;
++    std::vector<char>           collective_node;
+ 
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+@@ -3106,6 +3187,12 @@ struct ggml_backend_meta_context {
+                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+             GGML_ASSERT(comm_allreduce != nullptr);
++            comm_reduce_scatter = (ggml_backend_comm_reduce_scatter_tensor_t)
++                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
++                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_reduce_scatter_tensor");
++            comm_all_gather = (ggml_backend_comm_all_gather_tensor_t)
++                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
++                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_all_gather_tensor");
+         }
+     }
+ 
+@@ -3972,6 +4059,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+             int i_start = 0;
+             std::vector<int> gather_nodes_new;
++            std::vector<int> scatter_nodes_new;
++            backend_ctx->collective_node.assign(cgraph->n_nodes, 0);
++            int n_seqpar_rs = 0;
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+@@ -4012,16 +4102,60 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+                 i = i_delayed;
+ 
++                // Sequence parallelism: a TOKEN_SCATTER right behind the reduce point whose only reader it
++                // is turns this segment's all-reduce into a reduce-scatter that fills the scatter node
++                // directly (each device gets the summed rows of its own tokens).  Anything else keeps the
++                // all-reduce, and the scatter then runs as a local slice of the reduced tensor.
++                int scatter_node = -1;
++                if (!is_gather && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && n_backends == 2 &&
++                        i + 1 < cgraph->n_nodes) {
++                    ggml_tensor * red = cgraph->nodes[i];
++                    ggml_tensor * nx  = cgraph->nodes[i + 1];
++                    if (nx->op == GGML_OP_TOKEN_SCATTER && nx->src[0] == red && (ggml_get_op_params_i32(nx, 2) & 1) &&
++                            ggml_node_get_use_count(cgraph, i) == 1 && !(red->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++                            red->type == GGML_TYPE_F32 && nx->type == GGML_TYPE_F32) {
++                        scatter_node = i + 1;
++                        backend_ctx->collective_node[scatter_node] = 1;
++                        n_seqpar_rs++;
++                    }
++                }
++
+                 for (size_t j = 0; j < n_backends; j++) {
+                     auto & bcj = backend_ctx->backend_configs[j];
+                     bcj.cgraphs[n_subgraphs].offset = i_start;
+                 }
+                 gather_nodes_new.push_back(is_gather ? i + 1 : -1);
++                scatter_nodes_new.push_back(scatter_node);
+                 n_subgraphs++;
+                 i_start = i + 1;
+             }
+             GGML_ASSERT(i_start == cgraph->n_nodes);
+-            backend_ctx->gather_nodes = std::move(gather_nodes_new);
++            backend_ctx->gather_nodes  = std::move(gather_nodes_new);
++            backend_ctx->scatter_nodes = std::move(scatter_nodes_new);
++
++            // one-time note that a sequence-parallel graph ran (LLAMA_SEQPAR), with its collective counts
++            {
++                int n_scatter = 0;
++                int n_gather  = 0;
++                int64_t n_tok = 0;
++                for (int i = 0; i < cgraph->n_nodes; i++) {
++                    const ggml_tensor * t = cgraph->nodes[i];
++                    if (t->op == GGML_OP_TOKEN_SCATTER) {
++                        n_scatter++;
++                        n_tok = t->ne[ggml_get_op_params_i32(t, 0)];
++                    } else if (t->op == GGML_OP_ALL_GATHER) {
++                        n_gather++;
++                    }
++                }
++                static bool seqpar_logged = false;
++                if (n_scatter > 0 && !seqpar_logged) {
++                    seqpar_logged = true;
++                    GGML_LOG_WARN("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d as "
++                                  "reduce-scatter, %d as local slices), %d all_gather nodes, %zu subgraphs\n",
++                                  __func__, (long long) n_tok, n_scatter, n_seqpar_rs, n_scatter - n_seqpar_rs,
++                                  n_gather, n_subgraphs);
++                }
++            }
+         }
+ 
+         backend_ctx->uid         = cgraph->uid;
+@@ -4084,9 +4218,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 cgraph_ij->n_nodes = 0;
+                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
+                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+-                    if (cgraph->nodes[i_node]->op == GGML_OP_ALL_GATHER) {
++                    if (cgraph->nodes[i_node]->op == GGML_OP_ALL_GATHER || backend_ctx->collective_node[i_node]) {
+                         // the meta collective fills this tensor (each device's slice written into every
+-                        // device's copy); a device-local execution would copy its own slice only
++                        // device's copy, or a reduce-scatter's slice of the sum); a device-local execution
++                        // would copy its own slice only
+                         continue;
+                     }
+                     ggml_tensor * node_ij = bcj.nodes[i_node];
+@@ -4279,6 +4414,86 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    // Sequence parallelism (LLAMA_SEQPAR): the per-device element offsets of a tensor split along its slowest
++    // non-trivial axis, i.e. each device's slice is one contiguous run of the whole tensor.
++    auto token_slice_offsets = [&](const ggml_tensor * t, const ggml_backend_meta_split_state & ss,
++                                   std::vector<int64_t> & offs) {
++        const int axis = ss.axis;
++        GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
++        GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
++        for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
++            GGML_ASSERT(t->ne[k] == 1 && "token-axis collective: the split axis must be the slowest dim");
++        }
++        int64_t row = 1;
++        for (int k = 0; k < axis; k++) {
++            row *= t->ne[k];
++        }
++        offs.assign(n_backends, 0);
++        int64_t acc = 0;
++        for (size_t j = 0; j < n_backends; j++) {
++            offs[j] = acc * row;
++            acc += ss.ne[j];
++        }
++        GGML_ASSERT(acc == t->ne[axis]);
++    };
++
++    // a 1-D-shaped view of `src` with the layout of `like` starting `offs` bytes in (gather_views pool)
++    auto slice_view = [&](size_t & i_view, ggml_tensor * src, const ggml_tensor * like, size_t offs) -> ggml_tensor * {
++        GGML_ASSERT(i_view < backend_ctx->gather_views.size());
++        ggml_tensor * v = backend_ctx->gather_views[i_view++];
++        memset(v, 0, sizeof(ggml_tensor));
++        v->type = like->type;
++        for (int k = 0; k < GGML_MAX_DIMS; k++) {
++            v->ne[k] = like->ne[k];
++            v->nb[k] = like->nb[k];
++        }
++        v->view_src  = src;
++        v->view_offs = offs;
++        GGML_ASSERT(offs + ggml_nbytes(v) <= ggml_nbytes(src));
++        if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) {
++            return nullptr;
++        }
++        return v;
++    };
++
++    // ALL_GATHER of a tensor split along its slowest axis (a token-split activation): each device's slice is
++    // one contiguous block of the whole tensor.  The comm backend's gather if it has one, else synchronous
++    // per-pair copies (correct, slow).
++    auto all_gather_token_axis = [&](const int i_node, const int i_src, const ggml_backend_meta_split_state & ss) -> ggml_status {
++        ggml_tensor * node = cgraph->nodes[i_node];
++        GGML_ASSERT(ggml_is_contiguous(node) && ggml_is_contiguous(cgraph->nodes[i_src]));
++        std::vector<int64_t> offs;
++        token_slice_offsets(node, ss, offs);
++        std::vector<ggml_tensor *> srcs(n_backends), dsts(n_backends);
++        for (size_t j = 0; j < n_backends; j++) {
++            srcs[j] = backend_ctx->backend_configs[j].nodes[i_src];
++            dsts[j] = backend_ctx->backend_configs[j].nodes[i_node];
++            GGML_ASSERT(srcs[j] != nullptr && dsts[j] != nullptr);
++        }
++        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_all_gather != nullptr &&
++                backend_ctx->comm_all_gather(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
++            return GGML_STATUS_SUCCESS;
++        }
++        // generic: quiesce every device (the destination may reuse memory a device is still reading), then
++        // one copy per (source, destination) pair
++        for (size_t j = 0; j < n_backends; j++) {
++            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
++        }
++        const size_t elem = ggml_element_size(node);
++        size_t i_view = 0;
++        for (size_t s = 0; s < n_backends; s++) {
++            for (size_t d = 0; d < n_backends; d++) {
++                ggml_tensor * dst_v = slice_view(i_view, dsts[d], srcs[s], (size_t) offs[s] * elem);
++                if (dst_v == nullptr) {
++                    return GGML_STATUS_FAILED;
++                }
++                ggml_backend_tensor_copy_async(backend_ctx->backend_configs[s].backend,
++                        backend_ctx->backend_configs[d].backend, srcs[s], dst_v);
++            }
++        }
++        return GGML_STATUS_SUCCESS;
++    };
++
+     // The ALL_GATHER collective: every device ends up holding the WHOLE input tensor.
+     //
+     // On a Meta device an op that reduces along an axis-0 split (the DFlash2 selector's `ggml_top_k`
+@@ -4290,7 +4505,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     // vocabulary index produced by one device meaningful on the others.
+     //
+     // Only a plain axis-0 split (one segment, no repeats: each device holds a contiguous run of rows) is
+-    // implemented; anything else is a deliberate abort rather than a silently wrong gather.
++    // implemented here, plus a split along the slowest axis (all_gather_token_axis above); anything else is a
++    // deliberate abort rather than a silently wrong gather.
+     auto all_gather = [&](const int i_node) -> ggml_status {
+         ggml_tensor * node = cgraph->nodes[i_node];
+         ggml_tensor * src  = node->src[0];
+@@ -4307,6 +4523,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+         const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+         const bool split = ss.axis >= 0 && ss.axis < GGML_MAX_DIMS;
++        if (split && ss.axis != GGML_BACKEND_SPLIT_AXIS_0) {
++            return all_gather_token_axis(i_node, i_src, ss);
++        }
+         if (split) {
+             GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_0);
+             GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
+@@ -4375,6 +4594,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         return GGML_STATUS_SUCCESS;
+     };
+ 
++    // The reduce-scatter that replaces subgraph i_graph's all-reduce (sequence parallelism): the subgraph's last
++    // node is the partial sum, the TOKEN_SCATTER node right behind it receives each device's token slice of the
++    // sum.  Without a comm reduce-scatter: all-reduce as usual, then each device copies its own slice.
++    auto reduce_scatter = [&](const size_t i_graph, const int i_node) -> ggml_status {
++        ggml_tensor * node = cgraph->nodes[i_node];
++        GGML_ASSERT(node->op == GGML_OP_TOKEN_SCATTER);
++        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
++        std::vector<int64_t> offs;
++        token_slice_offsets(node, ss, offs);
++        std::vector<ggml_tensor *> srcs(n_backends), dsts(n_backends);
++        for (size_t j = 0; j < n_backends; j++) {
++            auto & bcj = backend_ctx->backend_configs[j];
++            ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
++            GGML_ASSERT(cgraph_ij->n_nodes > 0);
++            srcs[j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
++            dsts[j] = bcj.nodes[i_node];
++            GGML_ASSERT(dsts[j] != nullptr && dsts[j]->src[0] == srcs[j]);
++        }
++        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_reduce_scatter != nullptr &&
++                backend_ctx->comm_reduce_scatter(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
++            return GGML_STATUS_SUCCESS;
++        }
++        bool ok = backend_ctx->comm_ctx != nullptr && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, srcs.data());
++        if (!ok) {
++            const ggml_status status = allreduce_fallback(i_graph);
++            if (status != GGML_STATUS_SUCCESS) {
++                return status;
++            }
++        }
++        const size_t elem = ggml_element_size(node);
++        size_t i_view = 0;
++        for (size_t j = 0; j < n_backends; j++) {
++            ggml_tensor * src_v = slice_view(i_view, srcs[j], dsts[j], (size_t) offs[j] * elem);
++            if (src_v == nullptr) {
++                return GGML_STATUS_FAILED;
++            }
++            ggml_backend_t b = backend_ctx->backend_configs[j].backend;
++            ggml_backend_tensor_copy_async(b, b, src_v, dsts[j]);
++        }
++        return GGML_STATUS_SUCCESS;
++    };
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+@@ -4392,6 +4653,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             continue;
+         }
+ 
++        if (i < backend_ctx->n_subgraphs - 1 && i < backend_ctx->scatter_nodes.size() && backend_ctx->scatter_nodes[i] >= 0) {
++            const ggml_status status = reduce_scatter(i, backend_ctx->scatter_nodes[i]);
++            if (status != GGML_STATUS_SUCCESS) {
++                return status;
++            }
++            continue;
++        }
++
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+             bool backend_allreduce_success = false;
+             if (backend_ctx->comm_ctx) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 94dd9b174..b65c6c137 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2074,6 +2074,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+                 // single backend: the result is a plain copy of the input
+                 ggml_compute_forward_dup(params, tensor);
+             } break;
++        case GGML_OP_TOKEN_SCATTER:
++            {
++                // single backend: a copy of the token slice that starts at op_params[1] (0 unless the
++                // meta backend split the tokens across devices, which never runs on the CPU)
++                if (params->ith == 0) {
++                    const int32_t axis = ggml_get_op_params_i32(tensor, 0);
++                    const int32_t off  = ggml_get_op_params_i32(tensor, 1);
++                    const struct ggml_tensor * src = tensor->src[0];
++                    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(tensor));
++                    const size_t offs = (size_t) off * src->nb[axis];
++                    GGML_ASSERT(offs + ggml_nbytes(tensor) <= ggml_nbytes(src));
++                    memcpy(tensor->data, (const char *) src->data + offs, ggml_nbytes(tensor));
++                }
++            } break;
+         case GGML_OP_GLU:
+             {
+                 ggml_compute_forward_glu(params, tensor);
+@@ -2298,6 +2312,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+     }
+ 
+     switch (node->op) {
++        case GGML_OP_TOKEN_SCATTER:
++            {
++                n_tasks = 1;
++            } break;
+         case GGML_OP_CPY:
+         case GGML_OP_DUP:
+         case GGML_OP_CONT:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 759d117b9..cf19a247f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4536,42 +4536,11 @@ static bool ggml_cuda_ar_ce_single() {
+     return on;
+ }
+ 
+-static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+-    const int64_t ne = ggml_nelements(tensors[0]);
+-    if (ne == 0) {
+-        return true;
+-    }
++// Grow the copy-engine scratch (ce_buf / ce_tmp / ce_tmp2, `need` bytes each on every rank) if it is smaller.
++// false = it cannot be grown (OOM or over GGML_CUDA_AR_CE_SCRATCH_MIB); the caller falls back before any
++// collective phase has run.  Shared by the all-reduce and the sequence-parallel reduce-scatter / all-gather.
++static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * comm_ctx, size_t need) {
+     const size_t nb = comm_ctx->backends.size();
+-    if (nb < 2) {
+-        return false;
+-    }
+-    for (size_t i = 0; i < nb; ++i) {
+-        GGML_ASSERT(tensors[i] != nullptr && ggml_nelements(tensors[i]) == ne &&
+-                    ggml_is_contiguously_allocated(tensors[i]));
+-    }
+-
+-    const int n = (int) nb;
+-
+-    // Chunk c covers [off[c], off[c+1]); the first `rem` chunks take one extra element when ne is
+-    // not divisible by n.  Direct sends (no ring relay): for n = 3 every transfer is one hop.
+-    std::vector<int64_t> off(n + 1);
+-    for (int c = 0; c <= n; ++c) {
+-        off[c] = (int64_t) c * (ne / n) + std::min<int64_t>(c, ne % n);
+-    }
+-    const int64_t chunk_max = (ne + n - 1) / n;   // padded tmp region (sender-indexed)
+-
+-    // ce_buf[i] : this rank's staged bf16 copy (ne elements)
+-    // ce_tmp[i] : n receive regions of chunk_max elements, region <sender>; used for the
+-    //             reduce-scatter slices and then for the all-gather of the reduced chunks.
+-    // The 8-bit wire stages 34 B per 32 values (1.0625 B/value) instead of 2 B/value, so it always fits
+-    // in the bf16 layout -- but the q8 chunk boundaries are block-aligned (a whole q8_0 block per side),
+-    // which can add one padded receive region.  Size for whichever is larger; a call that cannot use the
+-    // 8-bit wire (ne not a multiple of QK8_0) then still has a bf16 layout to fall back into.
+-    const int64_t nblk_q8  = ne / QK8_0;
+-    const int64_t blk_max  = (nblk_q8 + n - 1) / n;
+-    const size_t need_bf16 = (size_t) n * (size_t) chunk_max * sizeof(nv_bfloat16);
+-    const size_t need_q8   = (size_t) std::max<int64_t>(nblk_q8, (int64_t) n * blk_max) * sizeof(block_q8_0);
+-    const size_t need = comm_ctx->ce_wire_q8 ? std::max(need_bf16, need_q8) : need_bf16;
+     if (comm_ctx->ce_bytes < need) {
+         // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
+         // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
+@@ -4639,6 +4608,48 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+         }
+         comm_ctx->ce_bytes = need;
+     }
++    return true;
++}
++
++static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
++    const int64_t ne = ggml_nelements(tensors[0]);
++    if (ne == 0) {
++        return true;
++    }
++    const size_t nb = comm_ctx->backends.size();
++    if (nb < 2) {
++        return false;
++    }
++    for (size_t i = 0; i < nb; ++i) {
++        GGML_ASSERT(tensors[i] != nullptr && ggml_nelements(tensors[i]) == ne &&
++                    ggml_is_contiguously_allocated(tensors[i]));
++    }
++
++    const int n = (int) nb;
++
++    // Chunk c covers [off[c], off[c+1]); the first `rem` chunks take one extra element when ne is
++    // not divisible by n.  Direct sends (no ring relay): for n = 3 every transfer is one hop.
++    std::vector<int64_t> off(n + 1);
++    for (int c = 0; c <= n; ++c) {
++        off[c] = (int64_t) c * (ne / n) + std::min<int64_t>(c, ne % n);
++    }
++    const int64_t chunk_max = (ne + n - 1) / n;   // padded tmp region (sender-indexed)
++
++    // ce_buf[i] : this rank's staged bf16 copy (ne elements)
++    // ce_tmp[i] : n receive regions of chunk_max elements, region <sender>; used for the
++    //             reduce-scatter slices and then for the all-gather of the reduced chunks.
++    // The 8-bit wire stages 34 B per 32 values (1.0625 B/value) instead of 2 B/value, so it always fits
++    // in the bf16 layout -- but the q8 chunk boundaries are block-aligned (a whole q8_0 block per side),
++    // which can add one padded receive region.  Size for whichever is larger; a call that cannot use the
++    // 8-bit wire (ne not a multiple of QK8_0) then still has a bf16 layout to fall back into.
++    const int64_t nblk_q8  = ne / QK8_0;
++    const int64_t blk_max  = (nblk_q8 + n - 1) / n;
++    const size_t need_bf16 = (size_t) n * (size_t) chunk_max * sizeof(nv_bfloat16);
++    const size_t need_q8   = (size_t) std::max<int64_t>(nblk_q8, (int64_t) n * blk_max) * sizeof(block_q8_0);
++    const size_t need = comm_ctx->ce_wire_q8 ? std::max(need_bf16, need_q8) : need_bf16;
++    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
++        return false;
++    }
+ 
+     to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+     to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+@@ -4931,6 +4942,201 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+     return true;
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Sequence parallelism (LLAMA_SEQPAR): the token-split collectives of the meta backend, on the copy-engine
++// scratch and events of the all-reduce above.  Both use the SAME buffers with the SAME event protocol as the
++// all-reduce phases they mirror, so they interleave with all-reduce calls in any order:
++//   reduce-scatter : ce_buf (own bf16 staging) + ce_tmp (peer's chunk), ce_ev_send / ce_ev_done -- the 2-rank
++//                    single-exchange all-reduce, minus the half of the data the receiver does not keep;
++//   all-gather     : ce_tmp2 (receive region), ce_ev_recv / ce_ev_out -- the all-reduce's phase 2.
++// Neither writes into another device's compute buffer: a peer copy only lands in the receiver's scratch and
++// the receiver's own stream copies it into place, so the meta allocator's reuse of the destination is ordered
++// on that device's stream like any other kernel.
++// ---------------------------------------------------------------------------------------------
++
++// src[i]: rank i's whole partial (F32, contiguous, ne elements).  dst[i]: rank i's token slice of the sum,
++// elements [off[i], off[i] + nelements(dst[i])).  Per element the result is fp32(bf16(fp32(bf16(own)) +
++// fp32(bf16(peer)))), the same rounding as the copy-engine all-reduce (single-exchange form, and the two-phase
++// form's reduce + to_fp32), so the slice is bit-identical to all-reduce + slice.  2 ranks; false = not
++// available (no copy-engine scratch), the caller then all-reduces and slices.
++static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, struct ggml_tensor ** src,
++                                                         struct ggml_tensor ** dst, const int64_t * off) {
++    if (comm_ctx_v == nullptr) {
++        return false;
++    }
++    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
++    if (comm_ctx->backends.size() != 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
++        return false;
++    }
++    const int64_t ne = ggml_nelements(src[0]);
++    for (int i = 0; i < 2; ++i) {
++        GGML_ASSERT(src[i] != nullptr && dst[i] != nullptr);
++        GGML_ASSERT(src[i]->type == GGML_TYPE_F32 && dst[i]->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_nelements(src[i]) == ne && ggml_is_contiguously_allocated(src[i]) && ggml_is_contiguous(dst[i]));
++        GGML_ASSERT(off[i] >= 0 && off[i] + ggml_nelements(dst[i]) <= ne);
++    }
++    if (ne == 0) {
++        return true;
++    }
++    // the all-reduce of the same tensor asks for this much (2 * ceil(ne/2) bf16), so the scratch never grows
++    // past what the all-reduce it replaces would have grown it to
++    const size_t esz  = sizeof(nv_bfloat16);
++    const size_t need = (size_t) 2 * (size_t) ((ne + 1) / 2) * esz;
++    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
++        return false;
++    }
++
++    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
++    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
++        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
++    };
++    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
++    auto cbuf  = [&](int i) -> char * { return (char *) comm_ctx->ce_buf[i]; };
++    auto ctmp1 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp[i]; };
++
++    // phase 0: stage the whole partial as bf16, exactly as the all-reduce does
++    for (int i = 0; i < 2; ++i) {
++        ggml_cuda_set_device(cctx(i)->device);
++        if (src[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
++            to_bf16(src[i]->data, (nv_bfloat16 *) cbuf(i), ne, cctx(i)->stream());
++        } else {
++            CUDA_CHECK(cudaMemsetAsync(cbuf(i), 0, (size_t) ne * esz, cctx(i)->stream()));
++        }
++    }
++    // phase 1: rank i ships the peer's token slice of its partial into the peer's tmp1 (guarded by the
++    // peer's previous read of it, ce_ev_done -- the all-reduce's own cross-call guard)
++    for (int i = 0; i < 2; ++i) {
++        const int p = 1 - i;
++        ggml_cuda_set_device(cctx(i)->device);
++        cudaStream_t s = cctx(i)->stream();
++        CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_done[p], 0));
++        CUDA_CHECK(cudaMemcpyPeerAsync(ctmp1(p), cdev(p), cbuf(i) + (size_t) off[p] * esz, cdev(i),
++                                       (size_t) ggml_nelements(dst[p]) * esz, s));
++        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_send[i], s));
++    }
++    // phase 2: own slice + peer's slice -> this rank's output, own operand first like the all-reduce
++    for (int i = 0; i < 2; ++i) {
++        const int p = 1 - i;
++        ggml_cuda_set_device(cctx(i)->device);
++        cudaStream_t s = cctx(i)->stream();
++        CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_send[p], 0));
++        ggml_cuda_ce_add_bf16_to_f32<<<256, 256, 0, s>>>(
++            (const nv_bfloat16 *) (cbuf(i) + (size_t) off[i] * esz), (const nv_bfloat16 *) ctmp1(i),
++            (float *) dst[i]->data, (long) ggml_nelements(dst[i]));
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_done[i], s));
++    }
++    return true;
++}
++
++// src[i]: rank i's slice (contiguous).  dst[i]: rank i's whole tensor (contiguous); rank r's slice lands at
++// element off[r].  Plain copies, no conversion (any non-quantized type).  The peer slices go through ce_tmp2 in
++// chunks of the scratch size, so a gather larger than the all-reduce scratch does not grow it.  false = no
++// copy-engine scratch; the caller then gathers with synchronous copies.
++static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct ggml_tensor ** src,
++                                                     struct ggml_tensor ** dst, const int64_t * off) {
++    if (comm_ctx_v == nullptr) {
++        return false;
++    }
++    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
++    const int n = (int) comm_ctx->backends.size();
++    // TEST: GGML_SEQPAR_CE_GATHER=0 declines, so the meta backend takes its generic gather
++    static const bool ce_gather = [] { const char * e = getenv("GGML_SEQPAR_CE_GATHER"); return e == nullptr || atoi(e) != 0; }();
++    if (!ce_gather || n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
++        return false;
++    }
++    const ggml_type type = dst[0]->type;
++    GGML_ASSERT(ggml_blck_size(type) == 1);
++    const size_t  esz = ggml_type_size(type);
++    const int64_t ne  = ggml_nelements(dst[0]);
++    int64_t n_max = 0;
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(src[i] != nullptr && dst[i] != nullptr && src[i]->type == type && dst[i]->type == type);
++        GGML_ASSERT(ggml_is_contiguous(src[i]) && ggml_is_contiguous(dst[i]) && ggml_nelements(dst[i]) == ne);
++        GGML_ASSERT(off[i] >= 0 && off[i] + ggml_nelements(src[i]) <= ne);
++        n_max = std::max<int64_t>(n_max, ggml_nelements(src[i]));
++    }
++    if (n_max == 0) {
++        return true;
++    }
++    // receive region per peer: (n-1) of them per rank.  Grow to the whole slice up to 24 MiB (the -ub 4096
++    // all-reduce of a 2560-wide activation already takes 20 MiB) or what is already there; chunk anything
++    // larger rather than growing the three scratch buffers for it.
++    {
++        // never grow a scratch that already exists -- growth retires the old buffers
++        // until teardown (~72 MiB per GPU at -ub 4096).  Chunk through what is there; only an empty scratch is
++        // created (up to 24 MiB).
++        const size_t want = (size_t) (n - 1) * (size_t) n_max * esz;
++        const size_t need = comm_ctx->ce_bytes > 0 ? comm_ctx->ce_bytes : std::min(want, (size_t) 24 << 20);
++        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
++            return false;
++        }
++    }
++    const int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
++    GGML_ASSERT(chunk > 0);
++    const size_t region = (size_t) chunk * esz;
++
++    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
++        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
++    };
++    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
++    auto ctmp2 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp2[i]; };
++    // the receive region rank `d` keeps for sender `s` (s != d)
++    auto slot  = [&](int s, int d) -> size_t { return (size_t) (s < d ? s : s - 1) * region; };
++
++    // own slice: a local copy on the own stream
++    for (int i = 0; i < n; ++i) {
++        ggml_cuda_set_device(cctx(i)->device);
++        const int64_t ni = ggml_nelements(src[i]);
++        if (ni > 0) {
++            CUDA_CHECK(cudaMemcpyAsync((char *) dst[i]->data + (size_t) off[i] * esz, src[i]->data, (size_t) ni * esz,
++                                       cudaMemcpyDeviceToDevice, cctx(i)->stream()));
++        }
++    }
++    for (int64_t c0 = 0; c0 < n_max; c0 += chunk) {
++        // send: rank i ships chunk [c0, c0 + chunk) of its slice into every peer's region for it, once the
++        // peer has finished reading that region (ce_ev_out, the all-reduce's phase-2 guard)
++        for (int i = 0; i < n; ++i) {
++            ggml_cuda_set_device(cctx(i)->device);
++            cudaStream_t s = cctx(i)->stream();
++            for (int p = 0; p < n; ++p) {
++                if (p != i) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_out[p], 0));
++                }
++            }
++            const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[i]) - c0);
++            for (int p = 0; p < n && w > 0; ++p) {
++                if (p == i) {
++                    continue;
++                }
++                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp2(p) + slot(i, p), cdev(p), (const char *) src[i]->data + (size_t) c0 * esz,
++                                               cdev(i), (size_t) w * esz, s));
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_recv[i], s));
++        }
++        // receive: rank d copies every peer's chunk from its region into place on its own stream
++        for (int d = 0; d < n; ++d) {
++            ggml_cuda_set_device(cctx(d)->device);
++            cudaStream_t s = cctx(d)->stream();
++            for (int p = 0; p < n; ++p) {
++                if (p != d) {
++                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_recv[p], 0));
++                }
++            }
++            for (int p = 0; p < n; ++p) {
++                const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[p]) - c0);
++                if (p == d || w <= 0) {
++                    continue;
++                }
++                CUDA_CHECK(cudaMemcpyAsync((char *) dst[d]->data + (size_t) (off[p] + c0) * esz, ctmp2(d) + slot(p, d),
++                                           (size_t) w * esz, cudaMemcpyDeviceToDevice, s));
++            }
++            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
++        }
++    }
++    return true;
++}
++
+ static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
+     const size_t nb = ret->backends.size();
+     if (nb < 2) {
+@@ -7339,6 +7545,17 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+             // single backend: the collective degenerates to a copy of the input
+             ggml_cuda_dup(ctx, dst);
+             break;
++        case GGML_OP_TOKEN_SCATTER: {
++            // this device's token slice of a mirrored input: one contiguous copy starting at the token
++            // the meta backend recorded in op_params[1] (0, i.e. a plain copy, on a single backend)
++            const ggml_tensor * src = dst->src[0];
++            GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && src->type == dst->type);
++            const int32_t axis = ggml_get_op_params_i32(dst, 0);
++            const size_t  offs = (size_t) ggml_get_op_params_i32(dst, 1) * src->nb[axis];
++            GGML_ASSERT(offs + ggml_nbytes(dst) <= ggml_nbytes(src));
++            CUDA_CHECK(cudaMemcpyAsync(dst->data, (const char *) src->data + offs, ggml_nbytes(dst),
++                                       cudaMemcpyDeviceToDevice, ctx.stream()));
++            } break;
+         case GGML_OP_CPY:
+             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+             break;
+@@ -10846,6 +11063,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 return true;
+         case GGML_OP_ALL_GATHER:
+                 return ggml_is_contiguous(op->src[0]);
++        case GGML_OP_TOKEN_SCATTER:
++                return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_ARGMAX:
+         case GGML_OP_COUNT_EQUAL:
+             return true;
+@@ -11748,6 +11967,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+     }
++    if (strcmp(name, "ggml_backend_comm_reduce_scatter_tensor") == 0) {
++        return (void *)ggml_backend_cuda_comm_reduce_scatter_tensor;
++    }
++    if (strcmp(name, "ggml_backend_comm_all_gather_tensor") == 0) {
++        return (void *)ggml_backend_cuda_comm_all_gather_tensor;
++    }
+ #ifdef GGML_USE_NCCL
+     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
+         return (void *)ggml_backend_cuda_comm_init_rank;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 09e63295a..07cdc903a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1121,9 +1121,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ 
+     "ALL_GATHER",
++    "TOKEN_SCATTER",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1243,9 +1244,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ 
+     "all_gather(x)",
++    "token_scatter(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -2109,6 +2111,26 @@ struct ggml_tensor * ggml_all_gather(
+     return result;
+ }
+ 
++// ggml_token_scatter
++
++struct ggml_tensor * ggml_token_scatter(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        bool                  allow_reduce_scatter) {
++    GGML_ASSERT(ggml_is_contiguous(a));
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++
++    // the token axis: the slowest dim with more than one element
++    const int32_t params[3] = { ggml_n_dims(a) - 1, 0, allow_reduce_scatter ? 1 : 0 };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_TOKEN_SCATTER;
++    result->src[0] = a;
++
++    return result;
++}
++
+ // ggml_add
+ 
+ static struct ggml_tensor * ggml_add_impl(
+diff --git a/src/models/models.h b/src/models/models.h
+index 69c72eee3..bbaf25b0b 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2785,9 +2785,13 @@ struct llama_model_qwen4exp : public llama_model_base {
+                     ggml_tensor * cur,
+                             int   il);
+ 
++        // cur_full != nullptr (sequence parallelism): `cur` is this device's token slice of the FFN input and
++        // cur_full all tokens (the routed MoE input); the result is token-split
+         ggml_tensor * build_layer_ffn(
+                     ggml_tensor * cur,
+-                            int   il);
++                            int   il,
++                    ggml_tensor * cur_full = nullptr,
++                           bool   reduce_scatter = false);
+ 
+         ggml_tensor * build_norm_gated(
+                     ggml_tensor * input,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 6b8efb62c..defcd41d3 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -127,6 +127,54 @@ static bool qwen4exp_qsa_off() {
+     return off;
+ }
+ 
++// Sequence parallelism (prototype, LLAMA_SEQPAR=1, default off): in a 2-GPU -sm tensor prefill ubatch the
++// per-token hyper-connection work (DSV4_HC_POST/PRE, their norms and BF16 GEMMs, the shared expert, the residual
++// adds) runs on each GPU's half of the tokens instead of on all tokens on both.  The residual streams stay
++// token-split from layer 0 to the last layer; each block gathers its [n_embd, T] input (all_gather, F32) for the
++// feature-split attention / router / MoE, and the attention and MoE partial sums are reduce-scattered by tokens
++// (token_scatter) instead of all-reduced.  The PLE layers and the last layer (output rows, MTP export) run on the
++// gathered streams as before.  Off: the graph is unchanged.
++//   LLAMA_SEQPAR_MIN  smallest ubatch that splits (default 512; the ubatch must also be even)
++//   LLAMA_SEQPAR_RS   bit 0: reduce-scatter the attention output, bit 1: the MoE output (default 3); a cleared
++//                     bit all-reduces that output and slices it locally (same values, more link bytes)
++static int qwen4exp_seqpar_rs_mask() {
++    static const int mask = [] {
++        const char * env = getenv("LLAMA_SEQPAR_RS");
++        return env != nullptr ? std::atoi(env) : 3;
++    }();
++    return mask;
++}
++
++static bool qwen4exp_seqpar_enabled(const llama_model & model, const llama_cparams & cparams, int64_t n_tokens) {
++    static const bool on = [] {
++        const char * env = getenv("LLAMA_SEQPAR");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    static const int64_t min_tokens = [] {
++        const char * env = getenv("LLAMA_SEQPAR_MIN");
++        return env != nullptr ? (int64_t) std::atoll(env) : (int64_t) 512;
++    }();
++    if (!on || n_tokens < std::max<int64_t>(min_tokens, 2) || n_tokens % 2 != 0) {
++        return false;
++    }
++    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
++        return false;
++    }
++    for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        if (dev == nullptr || !ggml_backend_dev_is_meta(dev) || ggml_backend_meta_dev_n_devs(dev) != 2) {
++            return false;
++        }
++    }
++    // the drafter taps read the per-layer residual of every token
++    for (bool tap : cparams.embeddings_layer_inp) {
++        if (tap) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
+ 
+ // Sparse-draft attention arm.  The draft's dense attention is O(n_q*n_kv) while the sparse cap is
+@@ -1039,6 +1087,27 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+     // built as a second tail, so the logits tail can stay gathered (see below)
+     ggml_tensor * res_hc_export = nullptr;
+ 
++    // sequence parallelism (see qwen4exp_seqpar_enabled): res_split = res_hc holds this device's tokens only
++    const bool seqpar = qwen4exp_seqpar_enabled(model, cparams, n_tokens);
++    const int  sp_rs  = seqpar ? qwen4exp_seqpar_rs_mask() : 0;
++    bool res_split    = false;
++    int  n_sp_scatter = 0;
++    int  n_sp_gather  = 0;
++    // token_scatter / all_gather land in the graph right behind their source: a reduce-scatter needs the
++    // scatter to be the node after the partial sum's reduce point
++    auto sp_scatter = [&](ggml_tensor * t, bool rs) {
++        t = ggml_token_scatter(ctx0, t, rs);
++        ggml_build_forward_expand(gf, t);
++        n_sp_scatter++;
++        return t;
++    };
++    auto sp_gather = [&](ggml_tensor * t) {
++        t = ggml_all_gather(ctx0, t);
++        ggml_build_forward_expand(gf, t);
++        n_sp_gather++;
++        return t;
++    };
++
+     for (int il = 0; il < n_layer; ++il) {
+         // Export the layer input only when a drafter taps it (dflash/dspark set these from the head's
+         // target_layers): the tap wants the n_embd-wide mean over the hc streams, not the wide residual
+@@ -1050,10 +1119,26 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+         }
+ 
++        // sequence parallelism: the PLE conv mixes tokens and the last layer drops output rows, so those run
++        // on the gathered streams; every other layer keeps them token-split
++        const bool sp_layer = seqpar && il < n_layer - 1;
++
+         if (hparams.is_ple(il)) {
++            if (res_split) {
++                res_hc    = sp_gather(res_hc);
++                res_split = false;
++            }
+             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+         }
+ 
++        if (sp_layer && !res_split) {
++            res_hc    = sp_scatter(res_hc, false);
++            res_split = true;
++        } else if (!sp_layer && res_split) {
++            res_hc    = sp_gather(res_hc);
++            res_split = false;
++        }
++
+         ggml_tensor * inject = nullptr;
+         ggml_tensor * cur = build_hc_mix(res_hc,
+                 model.layers[il].hc_attn_norm,
+@@ -1063,6 +1148,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+                 model.layers[il].hc_attn_down_inject,
+                 &inject, il);
+ 
++        if (res_split) {
++            // the feature-split projections need every token
++            cur = sp_gather(cur);
++        }
++
+         ggml_build_forward_expand(gf, cur);
+ 
+         if (hparams.is_recr(il)) {
+@@ -1071,6 +1161,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+         }
+ 
++        if (res_split) {
++            // the partial attention output: reduce-scattered by tokens (or all-reduced and sliced)
++            cur = sp_scatter(cur, (sp_rs & 1) != 0);
++        }
++
+         // The last layer's tail is always computed on the gathered output rows, so the
+         // logits path is bit-identical to `--spec-type none` (a plain decode gathers here
+         // too).  An unmasked MTP export additionally needs a hidden row for *every* token,
+@@ -1111,7 +1206,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+                 model.layers[il].hc_ffn_down_inject,
+                 &inject, il);
+ 
+-        cur = build_layer_ffn(cur, il);
++        if (res_split) {
++            // shared expert on the local tokens, router + routed MoE on all of them
++            cur = build_layer_ffn(cur, il, sp_gather(cur), (sp_rs & 2) != 0);
++            n_sp_scatter++;
++        } else {
++            cur = build_layer_ffn(cur, il);
++        }
+         cb(cur, "ffn_out", il);
+ 
+         res_hc = build_hc_combine(res_hc, cur, inject, il);
+@@ -1135,6 +1236,17 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+         }
+     }
+ 
++    GGML_ASSERT(!res_split);
++    if (seqpar) {
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            LLAMA_LOG_WARN("%s: sequence parallelism (LLAMA_SEQPAR) on: T = %lld, %d token_scatter + %d all_gather "
++                           "nodes per graph, reduce-scatter mask %d\n", __func__, (long long) n_tokens, n_sp_scatter,
++                           n_sp_gather, sp_rs);
++        }
++    }
++
+     // The MTP head consumes the wide residual before the head mixer collapses it. Export the
+     // combine result itself rather than a reshape of it: a pure view gets no backend
+     // assignment from the scheduler, and the readback in llama_context looks one up. It is
+@@ -2829,7 +2941,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     return cur;
+ }
+ 
+-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
++ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * cur_full,
++        bool reduce_scatter) {
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
+     // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
+@@ -2853,7 +2966,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+     }
+ 
+     ggml_tensor * moe_out =
+-        build_moe_ffn(cur,
++        build_moe_ffn(cur_full ? cur_full : cur,
+             model.layers[il].ffn_gate_inp,
+             model.layers[il].ffn_up_exps,
+             model.layers[il].ffn_gate_exps,
+@@ -2869,6 +2982,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+             model.layers[il].ffn_down_exps_s);
+     cb(moe_out, "ffn_moe_out", il);
+ 
++    if (cur_full != nullptr) {
++        // sequence parallelism: this device's tokens of the routed sum (reduce-scattered when the scatter is the
++        // node right behind the reduce point, which the immediate expansion keeps it)
++        moe_out = ggml_token_scatter(ctx0, moe_out, reduce_scatter);
++        ggml_build_forward_expand(gf, moe_out);
++    }
++
+     // shared experts, as in the Qwen3Next reference
+     if (ffn_shexp != nullptr) {
+         // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+-- 
+2.53.0
+
